@@ -84,8 +84,9 @@ pub(super) fn admitted_command(
         }
         command
     };
-    let output = prefix()
-        .args(["/bin/sh", "-c", &admission_script(checks), "seat-admission"])
+    let script = admission_script(checks);
+    let mut child = prefix()
+        .args(["/bin/sh", "-s", "seat-admission"])
         .envs(
             environment
                 .iter()
@@ -93,8 +94,27 @@ pub(super) fn admitted_command(
                 .map(|(k, v)| (k, v)),
         )
         .env_remove(crate::SEAT_LAUNCH_ENV)
-        .output()
+        .env_remove(crate::SEAT_PEERS_ENV)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .map_err(|e| refuse(e.to_string()))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| refuse("missing admission shell stdin".into()))?;
+    let output = std::thread::scope(|scope| {
+        let script_bytes = script.as_bytes();
+        let writer = scope.spawn(move || {
+            use std::io::Write as _;
+            let _ = stdin.write_all(script_bytes);
+        });
+        let result = child.wait_with_output();
+        let _ = writer.join();
+        result
+    })
+    .map_err(|e| refuse(e.to_string()))?;
     if !output.status.success() {
         let why = String::from_utf8_lossy(&output.stderr);
         return Err(refuse(
@@ -123,10 +143,15 @@ fn admission_script(checks: impl IntoIterator<Item = Check>) -> String {
     for check in checks {
         // Labels are static diagnostic text, never a path, capability or command output.
         let label = check.what.replace('\'', "'\\''");
-        // A failing left operand of `&&` is exempt from errexit. Make the
-        // complete check a standalone command so its nonzero result must fail;
-        // do not put it in an if/|| context that disables inner errexit.
-        script.push_str(&format!("check='{label}'\n(\n{}\n)\n", check.program));
+        // A failing left operand of `&&` is exempt from errexit. Wrap checks
+        // containing `&&` or `||` in a subshell so a nonzero compound result
+        // fails immediately; run simple single-command/semicolon checks
+        // in-process under `set -e` to avoid tens of thousands of forks.
+        if check.program.contains("&&") || check.program.contains("||") {
+            script.push_str(&format!("check='{label}'\n(\n{}\n)\n", check.program));
+        } else {
+            script.push_str(&format!("check='{label}'\n{}\n", check.program));
+        }
     }
     script
 }
@@ -157,7 +182,7 @@ fn checks_with_principals(
         let path = quote(path)?;
         Ok(Check {
             what,
-            program: format!("[ ! -r {path} ] && [ ! -w {path} ] && [ ! -x {path} ]"),
+            program: format!("[ ! -r {path} ]; [ ! -w {path} ]; [ ! -x {path} ]"),
         })
     };
     let mut list = vec![
@@ -181,11 +206,20 @@ fn checks_with_principals(
     for name in [
         "state.db",
         "secrets",
-        "anyagents.sock",
         "operator-token",
         "identity-boundary.json",
+        "execution-principals.json",
     ] {
         list.push(deny("the server's own files are denied", &data.join(name))?);
+    }
+    {
+        let sock = quote(&data.join("anyagents.sock"))?;
+        list.push(Check {
+            what: "the server's own files are denied",
+            program: format!(
+                "[ -S {sock} ] || ([ ! -r {sock} ] && [ ! -w {sock} ] && [ ! -x {sock} ])"
+            ),
+        });
     }
     // The seat can traverse known children without being able to list agents/.
     // Enumerate under the server identity, and refuse an incomplete inventory:
@@ -200,28 +234,45 @@ fn checks_with_principals(
         Err(err) => return Err(err),
     };
     peers.sort();
+    let same_seat_roots: std::collections::HashSet<&Path> = principals
+        .iter()
+        .filter(|p| p.uid == uid && p.gid == gid)
+        .map(|p| p.root.as_path())
+        .collect();
     let mut foreign_roots = Vec::new();
+    let mut peer_trees_program = String::new();
+    let mut peer_caps_program = String::new();
     for peer in peers {
         // Two agents can legitimately share one OS principal. Only a host-
         // resolved UID/GID+root tuple grants this exception, never directory
         // ownership or a seat-controlled marker.
-        let same_seat = principals
-            .iter()
-            .any(|p| p.uid == uid && p.gid == gid && p.root == peer);
+        let same_seat = same_seat_roots.contains(peer.as_path());
         if Some(peer.as_path()) == config.and_then(Path::parent) || same_seat {
             continue;
         }
         foreign_roots.push(std::fs::canonicalize(&peer)?);
         for name in ["config", "memory", "skills"] {
-            list.push(deny(
-                "peer seats' private trees are denied",
-                &peer.join(name),
-            )?);
+            let p = quote(&peer.join(name))?;
+            peer_trees_program.push_str(&format!(
+                "{{ [ ! -r {p} ] && [ ! -w {p} ] && [ ! -x {p} ]; }} || exit 1\n"
+            ));
         }
-        list.push(deny(
-            "peer capabilities are denied",
-            &peer.join("config/mcp-capability"),
-        )?);
+        let cap = quote(&peer.join("config/mcp-capability"))?;
+        peer_caps_program.push_str(&format!(
+            "{{ [ ! -r {cap} ] && [ ! -w {cap} ] && [ ! -x {cap} ]; }} || exit 1\n"
+        ));
+    }
+    if !peer_trees_program.is_empty() {
+        list.push(Check {
+            what: "peer seats' private trees are denied",
+            program: peer_trees_program,
+        });
+    }
+    if !peer_caps_program.is_empty() {
+        list.push(Check {
+            what: "peer capabilities are denied",
+            program: peer_caps_program,
+        });
     }
     if let Some(config) = config {
         let mine = quote(config)?;
@@ -262,11 +313,13 @@ fn checks_with_principals(
                 program.push_str(&format!(
                     "if [ -L {path} ]{managed}; then resolved=$(CDPATH= cd -P {path} 2>/dev/null && pwd -P) || exit 1;\n"
                 ));
-                for peer in &foreign_roots {
-                    let peer = quote(peer)?;
-                    program.push_str(&format!(
-                        "case \"$resolved\" in {peer}|{peer}/*) exit 1;; esac\n"
-                    ));
+                if !foreign_roots.is_empty() {
+                    program.push_str("case \"$resolved\" in\n");
+                    for peer in &foreign_roots {
+                        let peer = quote(peer)?;
+                        program.push_str(&format!("{peer}|{peer}/*) exit 1;;\n"));
+                    }
+                    program.push_str("esac\n");
                 }
                 program.push_str("fi\n");
             }
@@ -587,6 +640,10 @@ mod tests {
         for name in ["memory", "skills", "config"] {
             std::fs::create_dir_all(peer.join(name)).unwrap();
         }
+        // Population size never widens a same-seat grant to another UID.
+        for n in 0..40 {
+            std::fs::create_dir_all(dir.path().join(format!("agents/padding-{n:02}"))).unwrap();
+        }
         let run = |principals: Vec<crate::SeatPeer>| {
             let checks =
                 checks_with_principals(Some(&config), dir.path(), 24031, 24032, &principals)
@@ -637,6 +694,50 @@ mod tests {
                 "boundary check failed: peer seats' private trees are denied\n"
             );
         }
+    }
+
+    #[test]
+    fn large_peer_inventory_checks_unregistered_tail_after_known_foreign_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("agents/own/config");
+        std::fs::create_dir_all(&config).unwrap();
+        let mut principals = Vec::new();
+        for n in 0..40 {
+            let root = dir.path().join(format!("agents/peer-{n:02}"));
+            std::fs::create_dir_all(&root).unwrap();
+            principals.push(crate::SeatPeer {
+                root,
+                uid: 25000 + n,
+                gid: 26000 + n,
+            });
+        }
+        let tail = dir.path().join("agents/zzz-unregistered/memory");
+        std::fs::create_dir_all(&tail).unwrap();
+        let run = || {
+            let checks =
+                checks_with_principals(Some(&config), dir.path(), 24031, 24032, &principals)
+                    .unwrap();
+            std::process::Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    &admission_script(
+                        checks
+                            .into_iter()
+                            .filter(|c| c.what == "peer seats' private trees are denied"),
+                    ),
+                ])
+                .output()
+                .unwrap()
+        };
+        assert!(
+            !run().status.success(),
+            "the 41st foreign root must still be checked"
+        );
+        std::fs::remove_dir(&tail).unwrap();
+        assert!(
+            run().status.success(),
+            "absent optional subtrees remain permitted"
+        );
     }
 
     #[test]

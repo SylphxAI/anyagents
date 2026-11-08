@@ -56,7 +56,7 @@ pub struct AgentView {
     /// Private operating instructions (`instructions` column in SQLite, Layer 2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
-    /// Assigned OS seat account name (e.g. `seat-atlas`, `seat-rhea`, `seat-worker`).
+    /// Assigned OS seat account name (e.g. `seat-atlas`, `seat-worker`, `seat-worker`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seat_user: Option<String>,
     /// Assigned OS seat numeric UID from the agent's `seat_launch` spec.
@@ -419,6 +419,29 @@ pub struct SendRequest {
     /// instead of a second one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
+}
+
+impl SendRequest {
+    /// A text-only closing token is a turn boundary, not an outbound message.
+    pub(crate) fn is_turn_closing_sentinel(&self) -> bool {
+        if self.media.is_some()
+            || self.location.is_some()
+            || self.poll.is_some()
+            || self.checklist.is_some()
+            || self.article.is_some()
+            || self.quote.is_some()
+        {
+            return false;
+        }
+        let text = self.text.trim();
+        let token = text.trim_matches(|c: char| {
+            c.is_whitespace() || matches!(c, '.' | '。' | '!' | '！' | '?' | '？')
+        });
+        matches!(
+            token.to_ascii_lowercase().as_str(),
+            "no_reply" | "done" | "end" | "停止" | "no more" | "終了" | "final"
+        ) || (!text.is_empty() && text.chars().all(|c| c == '。'))
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]

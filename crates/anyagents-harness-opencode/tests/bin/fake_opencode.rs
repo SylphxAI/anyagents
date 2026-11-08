@@ -148,6 +148,10 @@ fn api(args: &[String]) {
             print!("{{\"data\":[{{\"id\":\"ses_fake\"}}]}}");
         }
         ("GET", p) if p.starts_with("/api/session/ses_") && !p.contains("/message") => {
+            if mode == "session-unavailable" {
+                eprintln!("service unavailable (503)");
+                exit(1);
+            }
             // `gone` mode: the stored session no longer exists in this store.
             if mode == "gone" {
                 print!("{{\"error\":{{\"code\":404,\"message\":\"no such session\"}}}}");
@@ -189,6 +193,13 @@ fn api(args: &[String]) {
                 log(&format!("prompt:{text}"));
             }
             print!("{{\"data\":{{\"id\":\"msg_1\"}}}}");
+        }
+        ("POST", p) if p.ends_with("/interrupt") => {
+            if mode == "interrupt-failed" {
+                eprintln!("interruption refused (503)");
+                exit(1);
+            }
+            print!("{{\"data\":true}}");
         }
         ("GET", p) if p.ends_with("/message") => {
             // The user message this service last received, as JSON, so the

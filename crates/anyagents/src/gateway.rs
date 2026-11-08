@@ -41,9 +41,12 @@ pub fn start(data: &Path) -> Result<(), Error> {
     }
     let (port, listener) = crate::server::listen_on_loopback()?;
     let routes = MemoryRoutes::new();
-    for agent in Store::open(data.join("state.db"))?.list_agents()? {
+    let store = Store::open(data.join("state.db"))?;
+    let mut provider_agents = Vec::new();
+    for agent in store.list_agents()? {
         if let Some(image) = ProviderImage::load(data, &agent.id)? {
             routes.insert(token(data, &agent.id)?, image.route(&agent.name));
+            provider_agents.push(agent.id);
         }
     }
     let usage = anyagents_gateway::MemoryUsage::new();
@@ -52,14 +55,10 @@ pub fn start(data: &Path) -> Result<(), Error> {
     // The port is this process's, so every agent pointed at the gateway is
     // repointed now: a recorded origin from an earlier start no longer answers.
     let origin = format!("http://127.0.0.1:{port}");
-    let store = Store::open(data.join("state.db"))?;
-    for agent in store.list_agents()? {
-        if ProviderImage::load(data, &agent.id)?.is_none() {
-            continue;
-        }
-        let env = env_for(data, &agent.id, &origin);
+    for agent_id in provider_agents {
+        let env = env_for(data, &agent_id, &origin);
         if !env.is_empty() {
-            store.set_agent_launch_env(&agent.id, &env)?;
+            store.set_agent_launch_env(&agent_id, &env)?;
         }
     }
     drop(guard);
@@ -274,14 +273,17 @@ impl ProviderImage {
             value
                 .get(key)
                 .and_then(|value| value.as_str())
-                .unwrap_or_default()
-                .to_string()
+                .filter(|text| !text.trim().is_empty())
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    Error::Message(format!("provider configuration requires nonempty {key}"))
+                })
         };
         Ok(Some(Self {
-            harness: text("harness"),
-            model: text("model"),
-            base_url: text("baseUrl"),
-            api_key: text("apiKey"),
+            harness: text("harness")?,
+            model: text("model")?,
+            base_url: text("baseUrl")?,
+            api_key: text("apiKey")?,
         }))
     }
 
@@ -345,5 +347,30 @@ mod tests {
         assert_eq!(protocol_of("claude-code"), Protocol::AnthropicMessages);
         assert_eq!(protocol_of("codex"), Protocol::OpenAiResponses);
         assert_eq!(protocol_of("opencode"), Protocol::OpenAiChat);
+    }
+    #[test]
+    fn present_provider_images_require_every_routing_and_authentication_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = AgentId::generate();
+        assert!(ProviderImage::load(dir.path(), &id).unwrap().is_none());
+        let file = image_file(dir.path(), &id);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let valid = serde_json::json!({"harness":"opencode","model":"example-model","baseUrl":"https://provider.example.test/v1","apiKey":"fixture-token"});
+        std::fs::write(&file, serde_json::to_vec(&valid).unwrap()).unwrap();
+        assert!(ProviderImage::load(dir.path(), &id).unwrap().is_some());
+        for key in ["harness", "model", "baseUrl", "apiKey"] {
+            for invalid in [
+                serde_json::Value::Null,
+                serde_json::json!(""),
+                serde_json::json!(17),
+            ] {
+                let mut value = valid.clone();
+                value[key] = invalid;
+                std::fs::write(&file, serde_json::to_vec(&value).unwrap()).unwrap();
+                assert!(ProviderImage::load(dir.path(), &id).is_err(), "{key}");
+            }
+        }
+        std::fs::write(&file, b"{}").unwrap();
+        assert!(ProviderImage::load(dir.path(), &id).is_err());
     }
 }

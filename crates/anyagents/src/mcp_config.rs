@@ -5,6 +5,30 @@ use std::path::Path;
 
 use anyagents_core::Error;
 
+pub(crate) fn read_candidates(paths: &[std::path::PathBuf]) -> Result<serde_json::Value, Error> {
+    let mut selected = None;
+    for path in paths {
+        match std::fs::read(path) {
+            Ok(bytes) => {
+                let value: serde_json::Value = serde_json::from_slice(&bytes)
+                    .map_err(|err| Error::Message(format!("{}: {err}", path.display())))?;
+                if !value.is_object() {
+                    return Err(Error::Message(format!(
+                        "{} is not an object",
+                        path.display()
+                    )));
+                }
+                if selected.is_none() {
+                    selected = Some(value);
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => (),
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Ok(selected.unwrap_or_else(|| serde_json::json!({})))
+}
+
 pub fn write_claude(path: &Path, command: &Path, args: &[String]) -> Result<(), Error> {
     let mut root = read_json(path)?;
     let servers = root
@@ -44,9 +68,9 @@ pub fn sanitize_claude_settings(config_dir: &Path) -> Result<(), Error> {
         })
         .unwrap_or(true);
     let settings_path = config_dir.join("settings.json");
-    let mut root = read_json(&settings_path).unwrap_or_else(|_| serde_json::json!({}));
+    let mut root = read_json(&settings_path)?;
     if !root.is_object() {
-        root = serde_json::json!({});
+        return Err(Error::Message("settings.json is not an object".into()));
     }
     if let Some(obj) = root.as_object_mut() {
         obj.remove("hooks");
@@ -61,6 +85,16 @@ pub fn sanitize_claude_settings(config_dir: &Path) -> Result<(), Error> {
                 env_obj.remove("ANTHROPIC_API_KEY");
             }
         }
+        let env_val = obj
+            .entry("env".to_string())
+            .or_insert_with(|| serde_json::json!({}));
+        if let Some(env_obj) = env_val.as_object_mut() {
+            env_obj.insert(
+                "CLAUDE_CODE_DISABLE_AUTO_MEMORY".to_string(),
+                serde_json::Value::String("1".to_string()),
+            );
+        }
+        obj.insert("autoMemoryEnabled".to_string(), serde_json::json!(false));
         obj.insert("includeCoAuthoredBy".to_string(), serde_json::json!(false));
         obj.insert(
             "attribution".to_string(),
@@ -158,14 +192,7 @@ pub fn write_codex_with_model(
     );
     let mut existing = match std::fs::read_to_string(path) {
         Ok(text) => text,
-        Err(err)
-            if matches!(
-                err.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
-            ) =>
-        {
-            String::new()
-        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(err) => return Err(err.into()),
     };
     let config_dir = path.parent();
@@ -214,6 +241,12 @@ pub fn write_codex_with_model(
     if !existing.contains("project_doc_max_bytes") {
         existing = upsert_top_key(&existing, "project_doc_max_bytes", "131072");
     }
+    if !std::env::var("ANYAGENTS_ALLOW_NATIVE_FILE_TOOLS")
+        .ok()
+        .is_some_and(|v| v.trim() == "1")
+    {
+        existing = upsert_top_key(&existing, "web_search", "\"disabled\"");
+    }
     let mut updated = upsert_table(&existing, &body);
     if use_sylphx {
         let (base_url, api_key) = resolve_sylphx_codex_provider(config_dir);
@@ -236,12 +269,11 @@ pub fn write_codex_with_model(
         }
         updated.push_str("\n[projects.\"/\"]\ntrust_level = \"trusted\"\n");
     }
-    if !updated.contains("[memories]") {
-        if !updated.ends_with('\n') {
-            updated.push('\n');
-        }
-        updated.push_str("\n[memories]\ngenerate_memories = false\nuse_memories = false\n");
-    }
+    updated = upsert_named_table(
+        &updated,
+        "[memories]",
+        "[memories]\ngenerate_memories = false\nuse_memories = false\n",
+    );
     if std::env::var_os("ANYAGENTS_ALLOW_NATIVE_SUBAGENTS").is_none() {
         updated = upsert_named_table(
             &updated,
@@ -258,14 +290,7 @@ pub fn sync_codex_developer_instructions(
 ) -> Result<(), Error> {
     let existing = match std::fs::read_to_string(path) {
         Ok(text) => text,
-        Err(err)
-            if matches!(
-                err.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
-            ) =>
-        {
-            String::new()
-        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(err) => return Err(err.into()),
     };
     let updated = match instructions.map(str::trim).filter(|s| !s.is_empty()) {
@@ -340,16 +365,9 @@ fn upsert_top_key(text: &str, key: &str, value_literal: &str) -> String {
 
 fn read_json(path: &Path) -> Result<serde_json::Value, Error> {
     match std::fs::read(path) {
-        Ok(bytes) if bytes.is_empty() => Ok(serde_json::json!({})),
-        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|err| Error::Message(err.to_string())),
-        Err(err)
-            if matches!(
-                err.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
-            ) =>
-        {
-            Ok(serde_json::json!({}))
-        }
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map_err(|err| Error::Message(format!("{}: {err}", path.display()))),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(serde_json::json!({})),
         Err(err) => Err(err.into()),
     }
 }
@@ -495,17 +513,21 @@ mod tests {
     #[test]
     fn sanitize_claude_settings_strips_host_gateway_and_hooks_for_oauth_profile() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join(".anyagents-profile"), "anthropic/vulcan\n").unwrap();
+        std::fs::write(
+            dir.path().join(".anyagents-profile"),
+            "anthropic/secondary\n",
+        )
+        .unwrap();
         std::fs::write(
             dir.path().join("settings.json"),
             r#"{
-  "apiKeyHelper": "/scratch/wt/owners-main/.claude/gateway-key",
+  "apiKeyHelper": "/srv/workspace/example-project/.claude/gateway-key",
   "env": {
     "ANTHROPIC_BASE_URL": "https://api.sylphx.com",
     "OTHER": "1"
   },
   "hooks": {"SessionStart": []},
-  "claudeMdExcludes": ["/workspace-data/workspace/github.com/SylphxAI/owner/AGENTS.md"]
+  "claudeMdExcludes": ["/srv/workspace/example/project/AGENTS.md"]
 }"#,
         )
         .unwrap();
@@ -521,5 +543,57 @@ mod tests {
         assert_eq!(cleaned["env"]["OTHER"], "1");
         assert_eq!(cleaned["includeCoAuthoredBy"], false);
         assert_eq!(cleaned["skipDangerousModePermissionPrompt"], true);
+        let denied = cleaned["permissions"]["deny"].as_array().unwrap();
+        for tool in [
+            "Read",
+            "Write",
+            "Edit",
+            "MultiEdit",
+            "Glob",
+            "Grep",
+            "LS",
+            "NotebookEdit",
+            "TodoRead",
+            "TodoWrite",
+            "WebSearch",
+            "WebFetch",
+        ] {
+            assert!(
+                !denied.iter().any(|value| value.as_str() == Some(tool)),
+                "{tool}"
+            );
+        }
+        if std::env::var_os("ANYAGENTS_ALLOW_NATIVE_SUBAGENTS").is_none() {
+            for tool in ["Task", "Agent", "TeamCreate", "TeamDelete", "SendMessage"] {
+                assert!(
+                    denied.iter().any(|value| value.as_str() == Some(tool)),
+                    "{tool}"
+                );
+            }
+        }
+    }
+    #[test]
+    fn malformed_settings_and_non_notfound_reads_preserve_existing_bytes() {
+        for bytes in [b"{broken".as_slice(), b"[]", &[0xff, 0xfe]] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("settings.json");
+            std::fs::write(&path, bytes).unwrap();
+            assert!(sanitize_claude_settings(dir.path()).is_err());
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("settings.json")).unwrap();
+        assert!(sanitize_claude_settings(dir.path()).is_err());
+        assert!(dir.path().join("settings.json").is_dir());
+    }
+
+    #[test]
+    fn absent_settings_initialize_and_valid_settings_keep_unmanaged_values() {
+        let dir = tempfile::tempdir().unwrap();
+        sanitize_claude_settings(dir.path()).unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, br#"{"theme":"night"}"#).unwrap();
+        sanitize_claude_settings(dir.path()).unwrap();
+        assert_eq!(read_json(&path).unwrap()["theme"], "night");
     }
 }

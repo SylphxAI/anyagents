@@ -130,7 +130,7 @@ fn an_opencode_agent_answers_one_line_and_the_answer_is_on_its_mailbox() {
     let dir = support::physical_tempdir();
     let data = dir.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
-    support::operator_with_configured_seat(&data);
+    support::operator_for_contract(&data);
 
     let server = Server::start(&data);
     let created = create(&data, "alpha");
@@ -154,6 +154,8 @@ fn an_opencode_agent_answers_one_line_and_the_answer_is_on_its_mailbox() {
     assert_eq!(parsed["model"], "opencode/big-pickle");
     assert_eq!(parsed["mcp"]["anyagents"]["type"], "local");
 
+    let other = create(&data, "owner");
+    assert!(other.status.success(), "{other:?}");
     let socket = data.join("anyagents.sock");
     let sent = call(
         &socket,
@@ -164,7 +166,9 @@ fn an_opencode_agent_answers_one_line_and_the_answer_is_on_its_mailbox() {
     // The ask reaches the session as one steer prompt carrying its mailbox id,
     // and the ask is delivered once the prompt API has taken it.
     let deadline = Instant::now() + Duration::from_secs(30);
-    let asked = sent["deliveries"][0]["seq"].as_i64().unwrap();
+    let asked = sent["deliveries"][0]["seq"]
+        .as_i64()
+        .unwrap_or_else(|| panic!("send refused: {sent}"));
     while store.delivered_cursor(&agent.id).unwrap() < asked {
         assert!(Instant::now() < deadline, "messages not delivered");
         std::thread::sleep(Duration::from_millis(50));
@@ -186,8 +190,6 @@ fn an_opencode_agent_answers_one_line_and_the_answer_is_on_its_mailbox() {
     // session printed: the adapter scrapes no answer and writes no reply row.
     // To a second agent, so the reply is the switchboard's routing of the
     // agent's own tool call.
-    let other = create(&data, "owner");
-    assert!(other.status.success(), "{other:?}");
     let mcp_stderr = data.join("mcp.stderr");
     let answered = Command::new(env!("CARGO_BIN_EXE_anyagents"))
         .env_remove("ANYAGENTS_AGENT_ROUTE")
@@ -224,7 +226,11 @@ fn an_opencode_agent_answers_one_line_and_the_answer_is_on_its_mailbox() {
         }
         std::thread::sleep(Duration::from_millis(50));
     };
-    assert_eq!(reply.sender.as_deref(), Some("agent:alpha"));
+    let author = store.agent_by_name("alpha").unwrap();
+    assert_eq!(
+        reply.sender.as_deref(),
+        Some(format!("agent:{}", author.id).as_str())
+    );
     assert!(reply.text.contains("pong from opencode"), "{}", reply.text);
     // Exercise the shared-log case deterministically: the reply also becomes
     // a prompt in the owner's session, but must not echo back to alpha.
@@ -259,7 +265,7 @@ fn deleting_an_opencode_agent_removes_its_allocation_and_releases_only_its_port(
     let dir = support::physical_tempdir();
     let data = dir.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
-    support::operator_with_configured_seat(&data);
+    support::operator_for_contract(&data);
     let _server = Server::start(&data);
     std::thread::scope(|scope| {
         let a = scope.spawn(|| create(&data, "alpha"));
@@ -298,6 +304,17 @@ fn deleting_an_opencode_agent_removes_its_allocation_and_releases_only_its_port(
         })
         .collect();
     assert_ne!(ports[0], ports[1]);
+    // A bound service can still be processing the initial creation turn.
+    // Deletion requires that turn to finish, not merely a listening port.
+    let alpha = store.agent_by_name("alpha").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while store.has_open_turn(&alpha.id).unwrap() {
+        assert!(
+            Instant::now() < deadline,
+            "alpha's initial turn is still open"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
     let deleted = Command::new(env!("CARGO_BIN_EXE_anyagents"))
         .arg("--data")
         .arg(&data)

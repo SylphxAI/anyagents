@@ -33,6 +33,19 @@ cargo test --workspace --locked
 npm test
 ```
 
+## Synthetic agent identities
+
+The shared server fixtures derive eight distinct nonzero synthetic agent UIDs
+while excluding the executor's real UID. `operator()` and the explicit identity-
+admission fixture use that same map; these numbers are fixture metadata, not
+host-account provisioning. `server_harnesses` covers every candidate collision,
+including real UID 2106, and runs the unchanged server against a deliberately
+matching UID (refused before socket creation) and the collision-free fixture
+(accepted). Both sides retain the same configured seat and launcher; protocol
+round-trip fixtures separately use the seat-free `contract_server()` helper.
+The strict product launch guard remains enabled; this startup check does not
+claim a real cross-UID launch.
+
 ## Seat Git configuration
 
 Seat Git configuration runs file-only edits in daemon-owned staging, with
@@ -144,9 +157,10 @@ on a sleep to hit the crash window.
 
 Takeover starts with the original desktop page, fitted to a full-viewport canvas.
 The floating control pill expands to reveal typing, Enter, Backspace, reset/1:1,
-and an opt-in phone layout. Touch pinches zoom locally; dragging pans when
-zoomed and scrolls the remote page at fit. Mouse dragging continues to operate
-the remote page. Phone layout resizes only the browser window, leaving its
+and an opt-in phone layout. A single finger clicks or press-drags the remote page, including sliders.
+Two fingers scroll the remote page or pinch to zoom locally. The explicit
+“Touch: pan view” mode moves the zoomed local view without interacting with
+the page. Mouse press-drag and wheel operate the remote page. Phone layout resizes only the browser window, leaving its
 User-Agent, Client Hints, screen and DPR unchanged. The original window bounds
 and state are restored on Done, agent release, expiry, navigation away, or a
 lost viewer heartbeat (more than 10 seconds). The viewer polls state 800 ms
@@ -162,8 +176,13 @@ the viewport regression advances the reaper's explicit clock without writing
 expired deadlines or stale heartbeats that race its background loop. Neither
 regression needs timing sleeps or retries.
 
-Desktop takeover accepts native modifier chords, including select-all, copy,
-cut, paste and undo. Paste inserts local clipboard text into the remote focus;
+Takeover routes keyboard shortcuts globally, including when the canvas,
+page background, stage or a HUD button has focus. Only local HUD text fields
+keep their own typing and clipboard. Both Control and Command support
+select-all, copy, cut, paste, undo and redo (Shift+Z or Control+Y). The remote
+host maps a Mac viewer’s Command to Control on Linux/Windows. A native paste
+event and a clipboard-read fallback share a single-insertion guard. Clipboard
+permission refusal remains visible; failed inputs are never automatically replayed. Paste inserts local clipboard text into the remote focus;
 copy and cut export the remote selection only after checking that the focus is
 not a password field. The viewer keeps new-tab, close-tab and address-bar
 shortcuts local. The floating pill also exposes Paste, Copy, Select all, Tab and Esc;
@@ -172,16 +191,115 @@ On touch devices the native keyboard input overlays the remote field and tracks
 its position through zoom and pan, so the device's Paste menu works in place.
 No typed or pasted text is returned in input acknowledgements.
 
-`takeover_clipboard_ui_acceptance` runs the Chromium viewer clipboard and
-keyboard regressions in the ordinary native suite when Chromium is available.
+The server gives input a persistent CDP session independent of screenshots and
+state inspection. At most 32 concurrent HTTP clients are admitted. Frame metadata
+uses short locks; viewport/heartbeat/completion updates share a separate control
+lock that input never waits on. Unsent mouse moves are coalesced without crossing
+press/release/key boundaries, and coalesced wheels preserve total scroll distance.
+The viewer polls JPEGs 32 ms after each completed frame and automatically retries
+frame/state reads on the same URL after disconnection. Each fetch has a 5-second
+deadline. Input failures report connection loss rather than replaying a possibly
+committed action.
+
+`tests/browser-takeover-interaction.mjs` drives the actual Rust HTTP server with
+trusted Chromium input at 1440×900, 834×1194 and 390×844. It covers global focus
+owners, native/fallback single paste, password paste, clipboard/undo/redo, IME,
+local HUD isolation, sign-in clicks, desktop/touch slider drag, mouse/two-finger
+scroll, delayed two-finger pinch, same-URL reconnect and 20 input-to-painted-JPEG
+latency samples with a 150 ms maximum. Frame polling has no successful-capture
+cooldown: capture already waits for the remote compositor, so another delay can
+put input behind two stale capture intervals. Capture failures back off for
+100 ms. Touches resolve as a tap on lift, a drag at 8 CSS px, or a sustained press
+after 150 ms, leaving 50 ms for remote delivery. A five-second stationary touch
+must press within 200 ms, remain held remotely for at least 4800 ms and release
+only at lift. Immediate two-finger gestures send no mouse events; pairs after
+250 or 600 ms cancel a committed press before scrolling or pinching, without
+clicking the original button, including when it holds native pointer capture.
+Cancellation guards are installed and acknowledged in isolated worlds for
+all frames/OOPIFs **before admitting the native press**. Persistent root and
+per-OOPIF CDP connections retain new-document script registrations; temporary
+connections would lose them on disconnect. A real Chromium regression replaces
+the root document after admission but before native press and requires zero
+target clicks plus terminal pointerup/capture release. Failed discovery or
+installation therefore prevents an uncommitted press, not its terminal release.
+Viewer mouse events use no keyboard modifiers; cancellation reserves all four
+modifier bits on its native release. The persistent guard recognizes that marker
+on the resulting click without requiring an observed pointerdown or pointerup.
+An intentional four-modifier press remains usable when its observed native
+pointerup and click share the same timestamp; a stale modified release cannot
+authorize a later click. A real Chromium regression installs an earlier page
+capture listener that stops pointerdown propagation and requires zero additional
+clicks and exactly one terminal release. The guard never consumes terminal
+pointerup/mouseup, including on controls preventing compatibility mouse events. Cancellation performs no discovery,
+installation, deadline check or cleanup round-trip. The next ordinary click and
+an intentionally four-modifier click remain usable; page-world globals are not
+introduced. Protocol tests reject incomplete/failed prepress admission, allow
+slow successful admission, and require exactly one native release even when all
+discovery/script operations would fail slowly. Deterministic shipped-handler
+regressions cover committed pointer cancellation, hidden/zero-size surfaces and
+finite last coordinates, plus obsolete clipboard reads after local focus, blur
+or a newer paste turn. Accepted HTTP workers recheck the live token, holder,
+completion and expiry after reading. Shared HTTP dispatch and exclusive ownership
+transitions use the same profile file lock across processes. Before handback, one
+shared terminal path drains the retained native press on its original page target;
+HTTP/direct completion, agent reclaim, CAPTCHA auto-completion and expiry all use
+it. Their five Chromium regressions each require one release, zero clicks and no
+second release after repeated completion/cleanup. An unfinished old-token request
+cannot dispatch after completion or replacement.
+Emulated touch is not a physical iPhone Safari receipt.
+`npm test` checks bounded move/wheel queues and no replay on input failure. The
+resource-free Rust regression holds an incomplete frame HTTP request open while
+verifying a separate input request completes, distinguishing the old serial
+listener. A manual `ci` dispatch with `takeover=true` executes the full ignored
+Chromium fixture and uploads `takeover-evidence`; it does not remove the existing
+startup quarantine from ordinary PR/merge-group runs.
+
+`takeover_clipboard_ui_acceptance` covers the Chromium viewer clipboard and
+keyboard regressions. It is temporarily quarantined by #118: Linux jobs
+128295856130 (PR #114, run 42336924651) and 128298493004 (PR #115, run
+42337744143) failed before the driver ran because the CDP port did not open
+within the existing 12-second startup budget. Their discarded Chromium logs
+cannot distinguish delayed startup from a crash. The startup path now waits
+for a valid `/json/version` response under that same 12-second ceiling and
+reports the last readiness failure, original child exit status, cleanup status,
+and the final 8192 bytes of Chromium stdout/stderr. Deterministic controls cover
+a TCP listener with incomplete/error responses before readiness, early exit,
+stalled HTTP, missing logs and non-UTF-8 log tails. These controls improve
+readiness and diagnosis; they do not establish the cause of those CI failures.
+Keep the quarantine until captured failure evidence supports a causal repair.
+
+The ordinary real-Chromium Rust fixtures share one in-process scenario guard,
+held through teardown; resource-free startup controls still run concurrently.
+This bounds browser-launch contention without changing the 12-second readiness
+ceiling, skipping assertions or retrying interactions. PR #129 run
+`42402630072`, Linux job `128493544529`, reported simultaneous startup timeouts
+in the iframe, held-key, CAPTCHA and viewport fixtures. Each browser was still
+alive before cleanup, with connection-refused as its last CDP readiness result.
+The same candidate tree passed the workspace and full Chromium takeover fixture
+in dispatch `42402639225`. This shows a nondeterministic startup failure, not its
+underlying cause; the guard limits fixture contention and does not justify
+removing the existing clipboard or OOPIF quarantine. Manual `ci` dispatch with
+`takeover=true` also runs those two ignored fixtures explicitly after the full
+mobile acceptance; any failed fixture fails the job without a retry.
+
+Run the fixture explicitly for takeover changes:
+
+```sh
+cargo test -p anyagents --bin anyagents --locked \
+  browser::tests::takeover_clipboard_ui_acceptance -- --ignored --exact --nocapture
+```
+
 The 1440×900 and 390×844 cases cover native and synthetic paste (one insertion),
 copy/cut, undo, Tab/Shift+Tab, aligned touch input, permission refusal and password
-export denial. Viewer teardown retries only recursive deletion of its disposable
-profile (five retries, 100 ms linear backoff), because Chromium helpers can finish
-profile writes after the browser parent exits. An exhausted cleanup retry still
-fails the fixture; interaction assertions are never retried. This addresses the
-Linux `ENOTEMPTY` cleanup failure in CI run 42334433646 after all clipboard
-assertions passed.
+export denial. The viewer starts in a dedicated process group. Teardown signals
+the whole group, waits up to 5 seconds for graceful exit, then uses SIGKILL and
+waits up to 5 more seconds if necessary. It removes the disposable profile only
+after no non-zombie group members remain; zombies cannot write the profile. A
+timeout fails cleanup and preserves the profile. There are no deletion or
+interaction retries. This replaces the deletion-retry workaround for the Linux
+`ENOTEMPTY` failure in CI run 42334433646, where Chromium helpers could still
+write after the browser parent exited. `npm test` includes deterministic live-
+descendant and graceful-exit controls; both Linux and macOS CI execute them.
 
 Actual iPhone Safari keyboard and long-press menus require a
 post-deployment device check; Chromium emulation does not certify those OS menus.
@@ -227,6 +345,18 @@ assertions still require the first click to find the child input at offset
 (60, 80); there is no interaction retry. Remove the quarantine only after both
 failure modes have deterministic fixes.
 
+Copy assertions first replace the local clipboard with a distinct sentinel.
+The preceding paste may already have left the expected Copy text there, so an
+unchanged-value read is not proof that asynchronous Copy completed. In takeover
+run `42406668267` at head `4ba8682d`, the phone native-paste assertion timed out
+with the previous `pill paste` value. A Chromium 156.0.8078.47 control on
+2026-11-07 held a real `ClipboardItem` selection promise: the old equality
+predicate passed before Copy finished, then the late Copy overwrote the next
+`mobile paste` value. A distinct sentinel held the predicate false until Copy
+completed and preserved the subsequent value. The fixture now requires that
+transition in all three affected copy checks; native paste still must produce
+its original exact expected text without retries or a longer deadline.
+
 The full UI acceptance test additionally requires Node.js 22 or newer (native
 WebSocket support). It launches its own headless Chromium viewer and remote test
 page, records trusted remote click coordinates within 2 CSS pixels, and saves
@@ -246,6 +376,21 @@ entered. This is separate from the deterministic local fixture and does not
 certify Google sign-in, a physical phone's keyboard, or deployed release bytes.
 
 ## Host memory under a managed UID
+
+The active-writer, discovery-retry, busy-global-lock and daemon-launch Rust
+fixtures run once in fresh single-test subprocesses before creating their
+disposable lock files.
+Unrelated parallel tests can fork while a fixture holds a flock; closing the
+parent descriptor does not release an inherited open-file-description lock
+until that fork executes. Isolation preserves immediate-reacquisition assertions
+without treating a permitted `WouldBlock` as a product failure. The active-writer
+case exposed the missing isolation in macOS jobs `128496005441` (main run
+`42403446504`) and `128498340368` (PR #129 run `42404211626`). The daemon-launch
+case failed at its second launch in macOS job `128500482068` (PR #122 run
+`42404927262`). These four cover every same-file lock reacquisition in the six
+`host_memory::tests` fixtures; the other two acquire the migration lock only once.
+Child exit status and exactly one passed test are required; no assertion,
+production lock behaviour or retry policy is changed.
 
 The required public Linux CI lane builds the shipping `anyagents` binary and
 runs `scripts/verify-host-memory-seat.py` with native `/usr/bin/setpriv`. The
@@ -279,6 +424,24 @@ fixture uses a newly created leaf under `/var/tmp`: the runner's private home
 ancestor makes its ordinary `RUNNER_TEMP` inaccessible to the distinct UID.
 The receipt remains in `RUNNER_TEMP`, read only by the invoking CI process.
 No account, ACL, real agent directory or daemon is changed.
+
+An already-started native Sylphx harness refreshes the embedding host's registered
+peer principal inventory before every local workspace command. A child or sibling
+created mid-turn in the same seat is admitted by its resolved UID, GID and exact
+agent root, not directory group or mode. The unit regression creates a `02770`
+child after retaining a running turn's environment, proves the stale snapshot
+refuses, and exercises current-authority admission, wrong UID/GID refusal,
+unregistered-peer refusal and failed-refresh refusal without a file write. Its
+launcher mocks process-identity/procfs/stat reporting only; actual peer access
+checks run on fixture directories. Real `setpriv` enforcement remains covered by
+the managed-UID acceptance below.
+
+Host-memory migration fixtures that release and immediately reacquire `flock`
+locks run in single-test subprocesses with fixture directories created only after
+`exec`. This isolates active-append, stopped-owner retry and daemon-launch checks
+from concurrent test threads' forked descriptors on macOS without retrying or
+weakening any lock assertion.
+
 
 A required isolated Rust test invokes `vendor_launch` through the real Claude
 adapter and native setpriv, not the CLI route. It removes the executor's DAC
@@ -323,7 +486,7 @@ write or unlink/replace its `config.worktree`, or alter `commondir`; C can use
 its own checkout but cannot read B's HEAD/index, nor can B read C's metadata.
 B's ordinary status, commit and local bare-remote push use its generated seat
 config, with no `-c user.*` or author/committer environment overrides; the commit
-records the exact Kyle author and committer. A's common config retains its owner,
+records the exact caller-configured author and committer. A's common config retains its owner,
 inode, content and owner read access during adoption. Parent config, remote-add
 and `git push -u` each replace the target inode while retaining the managed link;
 both active child UIDs must immediately read common config and run status, with
@@ -366,3 +529,56 @@ ACLs remain unchanged, and outside-link contents and ACLs are preserved.
 
 Shared refs are intentionally writable within one repository. These checks do not
 claim branch-tip integrity for arbitrary agent shell commits or pushes.
+
+## Scheduler isolation and clean-host server fixtures
+
+The local scheduler owns an immediate startup pass and an independent one-second
+loop for `at`, `every`, `file:`, `pid:` and `agent:idle:` schedules. Network-backed
+GitHub and Spiron watches run on a separate loop; a pending external response must
+not hold a later local tick. `local_scheduler_keeps_ticking_while_external_probe_is_blocked`
+starts the production loops, holds a real HTTP response, then creates all five
+local schedule kinds and verifies delivery before releasing that response. A
+future timer and the pending external watch remain undelivered.
+
+`overdue_at_delivers_on_first_local_tick_after_restart` reopens the database and
+checks first-pass delivery of a one-day-overdue timer without duplicate delivery.
+`overdue_at_records_busy_and_paused_deferrals_until_fired` verifies durable
+`deferred:busy` and `deferred:paused` observations while preserving the due time,
+then checks the transition to `fired` after the owner becomes eligible.
+
+Readiness and sign-in server fixtures explicitly clear all six seat/principal
+environment selectors and assert single-UID admission. They exercise token
+routing without depending on a workstation's `anyagents-setpriv` installation.
+Each complete server fixture runs in its own test process. Protected-root
+admission canonicalizes configured aliases before comparing them with the target;
+its regression covers the selected tree, a symlink spelling, a descendant and an
+allowed sibling on Linux and macOS.
+
+## Integration invariants
+
+Seat admission inventories every foreign root, including unregistered roots and
+roots beyond the first 32 peers. Sharing a primary GID does not make two different
+UIDs the same principal. Missing optional peer subtrees are permitted; readable
+foreign config, memory or skills refuse admission. A real authenticated daemon
+socket remains usable, but a regular file at that path receives no exception.
+
+History visibility is applied before candidate limits for every authorized-set
+size. Host refresh holds lifecycle locks through publication and readback, includes
+archived authorized history, and propagates malformed or unreadable source errors
+in production as well as tests. Corpus size never disables mailbox backfill.
+
+Unified code results expose a top-level delivery list collected by host dispatch.
+Snippet return values, source text and console logs cannot populate it. Native
+reply settlement requires an acknowledged message ID and the exact retained
+recipient, including when sends share a parallel tool batch. Updated memory topic
+files do not rewrite an existing host-session snapshot; a new explicit session
+pins the next snapshot.
+
+The regression checks are included in the normal workspace tests:
+
+- Seat admission: more than 40 foreign roots, a readable unregistered tail root,
+  mismatched UID/GID pairs and a registered exact-principal positive control.
+- Scoped history: 18 authorized IDs competing with 2,010 hidden candidates.
+- Code delivery: invented return-value receipts and a caught malformed send
+  yield no host receipt; a real loopback send yields the returned message ID
+  even when the snippet returns null.

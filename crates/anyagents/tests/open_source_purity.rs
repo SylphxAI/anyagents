@@ -55,6 +55,22 @@ fn repository_has_no_hardcoded_host_paths_or_internal_identifiers() {
         ("internal domain", concat!("desk.", "kylet.se")),
         ("hardcoded seat name", concat!("seat-", "argon")),
         ("hardcoded seat name", concat!("seat-", "calliope")),
+        ("hardcoded company role", concat!("主", "腦")),
+        ("hardcoded company hub", concat!("樞", "紐")),
+        ("hardcoded company runner", concat!("執行", "器")),
+        ("hardcoded memory topic slug", concat!("domain-", "facts")),
+        (
+            "hardcoded memory topic slug",
+            concat!("verified-domain-", "outcomes"),
+        ),
+        (
+            "hardcoded memory topic slug",
+            concat!("principal-", "directives"),
+        ),
+        (
+            "hardcoded memory topic slug",
+            concat!("owner-history-", "archive"),
+        ),
     ];
 
     let mut files = Vec::new();
@@ -110,6 +126,7 @@ fn single_uid_local_mode_starts_and_routes_without_setpriv_or_seat_uids() {
         let out = Command::new(bin)
             .env("ANYAGENTS_OPERATOR_TOKEN_FILE", &token_path)
             .env("ANYAGENTS_CAPABILITY_KEY", support::CAPABILITY_KEY)
+            .env("ANYAGENTS_TESTS", "contract-double")
             .env_remove("ANYAGENTS_AGENTS")
             .env_remove("ANYAGENTS_AGENT_UID")
             .env_remove("ANYAGENTS_AGENT_GID")
@@ -147,6 +164,7 @@ fn single_uid_local_mode_starts_and_routes_without_setpriv_or_seat_uids() {
     let mut server = Command::new(bin)
         .env("ANYAGENTS_OPERATOR_TOKEN_FILE", &token_path)
         .env("ANYAGENTS_CAPABILITY_KEY", support::CAPABILITY_KEY)
+        .env("ANYAGENTS_TESTS", "contract-double")
         .env_remove("ANYAGENTS_AGENTS")
         .env_remove("ANYAGENTS_AGENT_UID")
         .env_remove("ANYAGENTS_AGENT_GID")

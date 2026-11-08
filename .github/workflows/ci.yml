@@ -22,6 +22,11 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      takeover:
+        description: Run the real Chromium takeover interaction acceptance
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -94,10 +99,36 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Release admission policy
         run: python3 -m unittest discover -s tests -p 'test_release_admission.py' -v
-      - name: Takeover geometry
-        run: node --test tests/browser-takeover-geometry.test.mjs
+      - name: Browser fixture tests
+        run: npm test
       - name: Test
         run: cargo test --workspace --locked
+      - name: Takeover interaction acceptance
+        if: github.event_name == 'workflow_dispatch' && inputs.takeover && github.event.repository.visibility == 'public'
+        env:
+          TAKEOVER_EVIDENCE_DIR: ${{ runner.temp }}/takeover-evidence
+          ANYAGENTS_CHROMIUM_BIN: /usr/bin/google-chrome
+        run: |
+          set -euo pipefail
+          node --version
+          "$ANYAGENTS_CHROMIUM_BIN" --version
+          cargo test -p anyagents --bin anyagents --locked \
+            browser::tests::mobile_takeover_ui_acceptance -- --ignored --exact --nocapture
+          cargo test -p anyagents --bin anyagents --locked \
+            browser::tests::takeover_clipboard_ui_acceptance -- --ignored --exact --nocapture
+          cargo test -p anyagents --bin anyagents --locked \
+            browser::tests::takeover_focus_finds_cross_origin_input -- --ignored --exact --nocapture
+          cargo test -p anyagents --bin anyagents --locked \
+            releases_held_press -- --ignored --nocapture
+          cargo test -p anyagents --bin anyagents --locked \
+            browser::tests::takeover_cancel_survives_earlier_stopped_pointerdown -- --ignored --exact --nocapture
+      - name: Takeover acceptance evidence
+        if: always() && github.event_name == 'workflow_dispatch' && inputs.takeover && github.event.repository.visibility == 'public'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: takeover-evidence
+          path: ${{ runner.temp }}/takeover-evidence
+          if-no-files-found: error
 
       # Same public Linux sudo lane as the cross-UID worktree acceptance.
       # This is required: missing privilege, identity change or setpriv fails.
@@ -145,6 +176,8 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Browser fixture cleanup
+        run: node --test tests/browser-process-group.test.mjs
       - name: Test
         run: cargo test --workspace --locked
 

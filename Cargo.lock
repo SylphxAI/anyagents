@@ -232,6 +232,7 @@ dependencies = [
  "anyagents-harness",
  "libc",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -261,6 +262,7 @@ dependencies = [
  "anyagents-core",
  "anyagents-harness",
  "anyagents-harness-claude",
+ "rusqlite",
  "serde_json",
  "tempfile",
 ]

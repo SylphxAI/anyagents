@@ -1,7 +1,7 @@
 //! Host-owned logical sessions. Vendor IDs are aliases learned after dispatch,
 //! not authority to refresh memory. Call lifecycle operations under the host's
 //! per-agent lifecycle lock; no marker/mtime/compaction heuristic starts a session.
-use crate::learned_memory::{MemoryPin, atomic_write, pin_session, read_pin, sha256};
+use crate::learned_memory::{MemoryPin, atomic_write, pin_session_from_source, read_pin, sha256};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -13,13 +13,19 @@ use std::{
 // Serialize host transitions and late vendor aliases across daemon threads and
 // restarts. This lock is host-only, outside the writable learned-memory tree.
 fn lock(root: &Path) -> io::Result<fs::File> {
-    fs::create_dir_all(root.join("sessions"))?;
+    let sessions = root.join("sessions");
+    fs::create_dir_all(&sessions)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = fs::set_permissions(&sessions, fs::Permissions::from_mode(0o700));
+    }
     let file = fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(root.join("sessions/registry.lock"))?;
+        .open(sessions.join("registry.lock"))?;
     file.lock()?;
     Ok(file)
 }
@@ -174,11 +180,55 @@ pub fn recover_pending(root: &Path) -> io::Result<()> {
     read_ready(root).map(|_| ())
 }
 
+/// Prepare a configured harness before rendering or dispatch. A harness change
+/// rotates the active generation and retires the destination's native resume
+/// pointer, preserving all old pins, aliases and transcripts. First dispatch
+/// still owns allocation when there is no active session.
+pub fn prepare_harness_with_source(
+    root: &Path,
+    harness: &str,
+    marker: Option<&str>,
+    source: Option<&Path>,
+) -> io::Result<Option<HostSession>> {
+    if harness.trim().is_empty() || marker.is_some_and(|name| !single_filename(name)) {
+        return Err(io::Error::other("invalid harness session identity"));
+    }
+    let _lock = lock(root)?;
+    let mut registry = read_ready(root)?;
+    let Some(old) = registry.active.as_ref() else {
+        return Ok(None);
+    };
+    let previous = materialize(root, old)?;
+    if old.harness == harness {
+        return Ok(Some(previous));
+    }
+    // This marker belongs to the destination harness's historical session,
+    // never to the outgoing generation. Keep its existing alias unchanged.
+    let retired_marker = marker
+        .map(|name| {
+            marker_bytes(&root.join("config").join(name))
+                .map(|bytes| bytes.map(|bytes| (name.to_owned(), sha256(&bytes))))
+        })
+        .transpose()?
+        .flatten();
+    start_reset(root, &mut registry, harness, retired_marker, source).map(Some)
+}
+
 /// Explicit reset of a quiescent agent. Preserve old pins, vendor aliases and
 /// raw/vendor state; retire only the small native resume pointer. The durable
 /// intent makes either side of the pointer rename recoverable after a crash.
 /// Caller must hold both lifecycle and vendor-process admission locks.
 pub fn reset_session(root: &Path, harness: &str, marker: Option<&str>) -> io::Result<HostSession> {
+    reset_session_with_source(root, harness, marker, Some(Path::new("memory/MEMORY.md")))
+}
+
+/// Explicit reset with caller-selected prompt-memory source; None disables it.
+pub fn reset_session_with_source(
+    root: &Path,
+    harness: &str,
+    marker: Option<&str>,
+    source: Option<&Path>,
+) -> io::Result<HostSession> {
     if harness.trim().is_empty() {
         return Err(io::Error::other("empty session harness"));
     }
@@ -220,23 +270,40 @@ pub fn reset_session(root: &Path, harness: &str, marker: Option<&str>) -> io::Re
             registry.aliases.insert(key, old.clone());
         }
     }
+    let retired_marker = old_marker.map(|(name, bytes)| (name.to_owned(), sha256(&bytes)));
+    start_reset(root, &mut registry, harness, retired_marker, source)
+}
+
+fn start_reset(
+    root: &Path,
+    registry: &mut Registry,
+    harness: &str,
+    marker: Option<(String, String)>,
+    source: Option<&Path>,
+) -> io::Result<HostSession> {
     let session = Session {
         generation: uuid::Uuid::now_v7().to_string(),
         harness: harness.to_owned(),
     };
-    pin_session(root, &session.generation)?;
-    registry.pending_reset = Some(PendingReset {
-        session,
-        marker: old_marker.map(|(name, bytes)| (name.to_owned(), sha256(&bytes))),
-    });
-    write(root, &registry)?;
-    complete_reset(root, &mut registry)?;
+    pin_session_from_source(root, &session.generation, source)?;
+    registry.pending_reset = Some(PendingReset { session, marker });
+    write(root, registry)?;
+    complete_reset(root, registry)?;
     materialize(root, registry.active.as_ref().unwrap())
 }
 
 /// Allocate before first dispatch only when there is no host session yet.
 /// A different configured harness alone cannot silently discard the saved pin.
 pub fn ensure_active(root: &Path, harness: &str) -> io::Result<HostSession> {
+    ensure_active_with_source(root, harness, Some(Path::new("memory/MEMORY.md")))
+}
+
+/// Select the source only when allocating the first session, never on resume.
+pub fn ensure_active_with_source(
+    root: &Path,
+    harness: &str,
+    source: Option<&Path>,
+) -> io::Result<HostSession> {
     let _lock = lock(root)?;
     let registry = read_ready(root)?;
     match registry.active {
@@ -244,18 +311,31 @@ pub fn ensure_active(root: &Path, harness: &str) -> io::Result<HostSession> {
         Some(_) => Err(io::Error::other(
             "host session requires explicit harness switch",
         )),
-        None => new_session_unlocked(root, harness),
+        None => new_session_unlocked(root, harness, source),
     }
 }
 
 /// Only an explicit reset/new-session or deliberate harness-switch lifecycle
 /// transition may call this. Ordinary config updates and compaction do not.
 pub fn new_session(root: &Path, harness: &str) -> io::Result<HostSession> {
-    let _lock = lock(root)?;
-    new_session_unlocked(root, harness)
+    new_session_with_source(root, harness, Some(Path::new("memory/MEMORY.md")))
 }
 
-fn new_session_unlocked(root: &Path, harness: &str) -> io::Result<HostSession> {
+/// Allocate explicitly from a caller-selected source; None disables pin input.
+pub fn new_session_with_source(
+    root: &Path,
+    harness: &str,
+    source: Option<&Path>,
+) -> io::Result<HostSession> {
+    let _lock = lock(root)?;
+    new_session_unlocked(root, harness, source)
+}
+
+fn new_session_unlocked(
+    root: &Path,
+    harness: &str,
+    source: Option<&Path>,
+) -> io::Result<HostSession> {
     if harness.trim().is_empty() {
         return Err(io::Error::other("empty session harness"));
     }
@@ -266,7 +346,7 @@ fn new_session_unlocked(root: &Path, harness: &str) -> io::Result<HostSession> {
     };
     // Persist the complete pin before publishing its generation. A crash here
     // can leave an orphan pin but can never expose an unpinned active session.
-    let memory = pin_session(root, &session.generation)?;
+    let memory = pin_session_from_source(root, &session.generation, source)?;
     let result = HostSession {
         generation: session.generation.clone(),
         harness: session.harness.clone(),
@@ -347,9 +427,62 @@ pub fn resume_vendor(root: &Path, harness: &str, vendor_id: &str) -> io::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::learned_memory::pin_session;
     fn memory(root: &Path, text: &str) {
         fs::create_dir_all(root.join("memory")).unwrap();
         fs::write(root.join("memory/MEMORY.md"), text).unwrap();
+    }
+    #[test]
+    fn preparing_harness_switches_once_and_preserves_history_and_aliases() {
+        let dir = crate::test_tempdir();
+        let root = dir.path();
+        let source = Some(Path::new("memory/MEMORY.md"));
+        assert!(
+            prepare_harness_with_source(root, "opencode", None, source)
+                .unwrap()
+                .is_none()
+        );
+        fs::create_dir_all(root.join("config")).unwrap();
+        memory(root, "original fact");
+        let original = ensure_active(root, "opencode").unwrap();
+        bind_vendor(root, "opencode", "old-opencode").unwrap();
+        fs::write(root.join("config/opencode-session-id"), "old-opencode\n").unwrap();
+        fs::write(root.join("config/history.jsonl"), "retained transcript").unwrap();
+        memory(root, "sylphx fact");
+        let switched = prepare_harness_with_source(root, "sylphx", None, source)
+            .unwrap()
+            .unwrap();
+        assert_ne!(switched.generation, original.generation);
+        assert_eq!(switched.harness, "sylphx");
+        assert!(switched.memory.section.contains("sylphx fact"));
+        memory(root, "roundtrip fact");
+        let roundtrip =
+            prepare_harness_with_source(root, "opencode", Some("opencode-session-id"), source)
+                .unwrap()
+                .unwrap();
+        assert_ne!(roundtrip.generation, switched.generation);
+        assert!(!root.join("config/opencode-session-id").exists());
+        let retired = root.join(format!(
+            "sessions/retired-{}/opencode-session-id",
+            roundtrip.generation
+        ));
+        assert_eq!(fs::read_to_string(retired).unwrap(), "old-opencode\n");
+        assert_eq!(
+            fs::read_to_string(root.join("config/history.jsonl")).unwrap(),
+            "retained transcript"
+        );
+        memory(root, "must not repin");
+        assert_eq!(
+            prepare_harness_with_source(root, "opencode", Some("opencode-session-id"), source)
+                .unwrap()
+                .unwrap(),
+            roundtrip
+        );
+        assert_eq!(active(root).unwrap().unwrap(), roundtrip);
+        assert_eq!(
+            resume_vendor(root, "opencode", "old-opencode").unwrap(),
+            original
+        );
     }
     #[test]
     fn explicit_reset_retires_only_pointer_and_resumes_prepared_intent_without_repin() {
@@ -520,5 +653,41 @@ mod tests {
         memory(root, "new must not leak into old session");
         assert!(ensure_active(root, "sylphx").is_err());
         assert!(!path.exists());
+    }
+    #[test]
+    fn caller_selected_source_flows_through_creation_resume_switch_and_reset() {
+        let dir = crate::test_tempdir();
+        let root = dir.path();
+        fs::write(root.join("notes.md"), "selected snapshot").unwrap();
+        let selected =
+            ensure_active_with_source(root, "test", Some(Path::new("notes.md"))).unwrap();
+        assert!(selected.memory.section.contains("selected snapshot"));
+        fs::write(root.join("notes.md"), "later snapshot").unwrap();
+        assert_eq!(
+            ensure_active_with_source(root, "test", None).unwrap(),
+            selected
+        );
+        let disabled = reset_session_with_source(root, "test", None, None).unwrap();
+        assert_eq!(
+            disabled.memory.section,
+            crate::learned_memory::bounded_section("")
+        );
+        assert_ne!(selected.generation, disabled.generation);
+        assert_eq!(
+            read_pin(root, &selected.generation).unwrap(),
+            selected.memory
+        );
+        let switched = new_session_with_source(root, "other", Some(Path::new("notes.md"))).unwrap();
+        assert!(switched.memory.section.contains("later snapshot"));
+        assert_eq!(active(root).unwrap().unwrap(), switched);
+        assert!(!root.join("memory").exists());
+        fs::write(root.join("bad.md"), [0xff]).unwrap();
+        assert_eq!(
+            new_session_with_source(root, "other", Some(Path::new("bad.md")))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(active(root).unwrap().unwrap(), switched);
     }
 }

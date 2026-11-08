@@ -18,6 +18,9 @@ use crate::error::Error;
 use crate::id::{AgentId, ChannelId, MessageId, UsageId};
 use crate::quote::Quote;
 
+#[cfg(test)]
+#[path = "store/audit_tests.rs"]
+mod audit_tests;
 mod group_policy;
 pub use group_policy::{Group, GroupAction, GroupActor};
 
@@ -406,7 +409,7 @@ pub struct HistorySearchQuery {
     pub queries: Vec<String>,
     /// Negative terms — any turn containing any of these substrings (case-insensitive) is excluded.
     pub exclude: Vec<String>,
-    /// Agent name (`"sage"`, `"all"`) or `agt_...` ID.
+    /// Agent name (`"assistant"`, `"all"`) or `agt_...` ID.
     pub agent: Option<String>,
     /// Optional peer filter (user, channel chat, internal group, or other agent).
     pub with_peer: Option<String>,
@@ -623,6 +626,15 @@ const CAPABILITY_BYTES: usize = 32;
 /// New rows always have an explicit scope. This bounded, transactional upgrade
 /// touches only legacy environment metadata, never identities or work state.
 fn preserve_legacy_scopes(conn: &mut Connection) -> Result<(), Error> {
+    let missing_scope_sql = "SELECT EXISTS(SELECT 1 FROM agents WHERE NOT EXISTS (
+                SELECT 1 FROM json_each(CASE WHEN json_valid(launch_env) THEN launch_env ELSE '[]' END) entry
+                WHERE entry.key % 2 = 0 AND entry.value = 'ANYAGENTS_SCOPE'
+                  AND lower(trim(json_extract(launch_env, '$[' || (entry.key + 1) || ']'))) IN (
+                    'isolated','none','private','false','0','siblings','sibling','team',
+                    'public','org','all','true','1')))";
+    if !conn.query_row(missing_scope_sql, [], |r| r.get::<_, bool>(0))? {
+        return Ok(());
+    }
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let ids: Vec<String> = {
         let mut stmt = tx.prepare(
@@ -670,51 +682,76 @@ impl Store {
         let conn = Connection::open(path)?;
         conn.busy_timeout(Duration::from_secs(15))?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        let mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
+        let mut mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+        if !mode.eq_ignore_ascii_case("wal") {
+            mode = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
+        }
         if !mode.eq_ignore_ascii_case("wal") {
             return Err(Error::Message(format!(
                 "sqlite journal mode is {mode}, not wal"
             )));
         }
         let mut conn = conn;
+        let schema_version = migrate::current_version(&conn)?;
         migrate::migrate(&mut conn)?;
         preserve_legacy_scopes(&mut conn)?;
         if migrate::current_version(&conn)? < 1 {
             return Err(Error::Message("migrations did not apply".into()));
         }
-        let has_legacy_state: bool = conn
-            .query_row(
-                "SELECT 1 FROM agents WHERE state NOT IN ('created', 'running', 'idle', 'paused', 'archived') LIMIT 1",
-                [],
-                |_| Ok(true),
-            )
-            .unwrap_or(false);
+        let has_legacy_state: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM agents WHERE state NOT IN ('created', 'running', 'idle', 'paused', 'archived'))",
+            [],
+            |row| row.get(0),
+        )?;
         if has_legacy_state {
-            let _ = conn.execute(
+            conn.execute(
                 "UPDATE agents SET state = 'archived' WHERE state NOT IN ('created', 'running', 'idle', 'paused', 'archived')",
                 [],
-            );
+            )?;
         }
-        let _ = conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS message_versions (
-                agent_id TEXT NOT NULL,
-                chat_id INTEGER NOT NULL,
-                message_id INTEGER NOT NULL,
-                body TEXT NOT NULL,
-                updated_at_ms INTEGER NOT NULL,
-                PRIMARY KEY (agent_id, chat_id, message_id)
-            );
-            CREATE TABLE IF NOT EXISTS agent_topology_state (
-                agent_id TEXT PRIMARY KEY,
-                state_json TEXT NOT NULL,
-                updated_at_ms INTEGER NOT NULL
-            );",
-        );
-        let _ = conn.execute(
-            "ALTER TABLE groups ADD COLUMN public INTEGER NOT NULL DEFAULT 0",
+        let has_aux_schema: bool = conn.query_row(
+            "SELECT (SELECT count(*) FROM sqlite_master WHERE name IN ('message_versions', 'agent_topology_state', 'idx_rag_chunks_agent_id_time')) = 3",
             [],
-        );
-        let _ = ensure_lexical_fts_backfilled(&mut conn);
+            |row| row.get(0),
+        )?;
+        if !has_aux_schema {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS message_versions (
+                    agent_id TEXT NOT NULL,
+                    chat_id INTEGER NOT NULL,
+                    message_id INTEGER NOT NULL,
+                    body TEXT NOT NULL,
+                    updated_at_ms INTEGER NOT NULL,
+                    PRIMARY KEY (agent_id, chat_id, message_id)
+                );
+                CREATE TABLE IF NOT EXISTS agent_topology_state (
+                    agent_id TEXT PRIMARY KEY,
+                    state_json TEXT NOT NULL,
+                    updated_at_ms INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_rag_chunks_agent_id_time
+                    ON rag_chunks(agent_id, timestamp_ms DESC, chunk_id);",
+            )?;
+        }
+        // Older databases may already have this column from an earlier runtime.
+        // Presence, not an arbitrary failed ALTER, is the idempotency condition.
+        let has_public: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('groups') WHERE name = 'public')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_public {
+            conn.execute(
+                "ALTER TABLE groups ADD COLUMN public INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        // Current schemas maintain FTS transactionally on every history write.
+        // Only legacy upgrades need the full derivative-index validation; doing
+        // it on every open scans history and competes with the server writer.
+        if schema_version < 23 {
+            ensure_lexical_fts_backfilled(&mut conn)?;
+        }
         Ok(Self {
             conn: Mutex::new(conn),
             db_path: path.to_path_buf(),
@@ -1176,7 +1213,7 @@ impl Store {
         Ok(updated)
     }
 
-    /// Set or clear an agent's short role label (e.g. `"Spiron"`, `"Design"`, `"Revenue"`).
+    /// Set or clear an agent's short role label (e.g. `"Research"`, `"Design"`, `"Support"`).
     pub fn set_agent_role(&self, id: &AgentId, role: Option<&str>) -> Result<Agent, Error> {
         let clean = role.map(str::trim).filter(|s| !s.is_empty());
         let conn = self.conn();
@@ -1366,23 +1403,22 @@ impl Store {
         incoming: Incoming,
     ) -> Result<Vec<(Agent, ReceiveOutcome)>, Error> {
         let sender = incoming.sender.clone();
-        // A sender may name itself `alpha` or `agent:alpha`; both are the author.
-        let author = sender
-            .as_deref()
-            .map(|value| value.strip_prefix("agent:").unwrap_or(value).to_string());
-        let author_id = author
-            .as_deref()
-            .and_then(|a| self.agent_by_name(a).ok().map(|ag| ag.id));
+        // Immutable IDs never fall back to a same-spelled display name. Legacy
+        // names (with or without agent:) retain their existing alias lookup.
+        let author_id = sender.as_deref().and_then(|value| {
+            let reference = value.strip_prefix("agent:").unwrap_or(value);
+            match AgentId::parse(reference) {
+                Ok(id) => Some(id),
+                Err(_) => self.agent_by_name(reference).ok().map(|agent| agent.id),
+            }
+        });
         let members = self.room_members(room)?;
         let mut delivered = Vec::new();
         for agent in self.list_agents()? {
             if agent.state == "archived" || agent.state == "paused" {
                 continue;
             }
-            if author.as_deref() == Some(agent.name.as_str())
-                || author.as_deref() == Some(agent.id.as_str())
-                || author_id.as_ref() == Some(&agent.id)
-            {
+            if author_id.as_ref() == Some(&agent.id) {
                 continue;
             }
             if let Some(members) = &members
@@ -1517,12 +1553,11 @@ impl Store {
         Ok(())
     }
 
-    /// Remove an agent from all non-system virtual groups (`group_agents`, excluding `owners`)
-    /// when an ephemeral sub-agent is archived or deleted.
+    /// Remove every group membership for an agent. Group names have no lifecycle privilege.
     pub fn leave_all_groups(&self, agent_id: &AgentId) -> Result<(), Error> {
         let conn = self.conn();
         conn.execute(
-            "DELETE FROM group_agents WHERE agent_id = ?1 AND group_name != 'owners'",
+            "DELETE FROM group_agents WHERE agent_id = ?1",
             [agent_id.as_str()],
         )?;
         Ok(())
@@ -1749,11 +1784,37 @@ impl Store {
         incoming: Incoming,
         wake_archived: bool,
     ) -> Result<ReceiveOutcome, Error> {
+        self.receive_with_admission(agent_id, incoming, wake_archived, |_| Ok(true))
+            .map(|outcome| outcome.expect("unconditional message admission"))
+    }
+
+    fn receive_with_admission(
+        &self,
+        agent_id: &AgentId,
+        incoming: Incoming,
+        wake_archived: bool,
+        admit: impl FnOnce(&Connection) -> Result<bool, Error>,
+    ) -> Result<Option<ReceiveOutcome>, Error> {
         let mut incoming = incoming;
         let source_key = incoming.source_key.take().filter(|key| !key.is_empty());
         let received_at_ms = incoming.received_at_ms.unwrap_or_else(now_ms);
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Author validity shares the write transaction with delivery. A sender
+        // deleted while waiting for publication cannot borrow a same-spelled
+        // display name or produce a stale-principal mailbox/context receipt.
+        if let Some(author) = incoming
+            .sender
+            .as_deref()
+            .map(str::trim)
+            .and_then(|sender| sender.strip_prefix("agent:"))
+            .and_then(|reference| AgentId::parse(reference).ok())
+        {
+            agent_by_id(&tx, &author)?;
+        }
+        if !admit(&tx)? {
+            return Ok(None);
+        }
         agent_by_id(&tx, agent_id)?;
         // Erasure is authoritative over provider retries/edits, including basic
         // group relays and rows outside the normal bounded origin scan. Refuse
@@ -1773,14 +1834,14 @@ impl Store {
             // canonical message or audit, so a source-only retry stays erased.
             retain_message_aliases(&tx, &existing, ingress_origin, source_key.as_deref())?;
             tx.commit()?;
-            return Ok(ReceiveOutcome::Duplicate(existing));
+            return Ok(Some(ReceiveOutcome::Duplicate(existing)));
         }
         if let Some(key) = &source_key
             && let Some(existing) = message_by_source(&tx, agent_id, key)?
         {
             retain_message_aliases(&tx, &existing, ingress_origin, Some(key))?;
             tx.commit()?;
-            return Ok(ReceiveOutcome::Duplicate(existing));
+            return Ok(Some(ReceiveOutcome::Duplicate(existing)));
         }
         if let Some(ref mut quote) = incoming.quote {
             enrich_quote_from_store(&tx, quote, incoming.origin);
@@ -1832,7 +1893,7 @@ impl Store {
             )?
         {
             tx.commit()?;
-            return Ok(ReceiveOutcome::Duplicate(existing));
+            return Ok(Some(ReceiveOutcome::Duplicate(existing)));
         }
         if let Some((edited_msg_id, new_raw_text)) = parse_edited_message_text(&incoming.text) {
             let msg_id = incoming
@@ -1880,7 +1941,7 @@ impl Store {
                             source_key.as_deref(),
                         )?;
                         tx.commit()?;
-                        return Ok(ReceiveOutcome::Duplicate(existing));
+                        return Ok(Some(ReceiveOutcome::Duplicate(existing)));
                     }
                     let diff = format_edited_message_diff(&prev, new_raw_text);
                     let formatted_edit = format!("[Edited message #{msg_id}]:\n{diff}");
@@ -2076,25 +2137,24 @@ impl Store {
                 [agent_id.as_str()],
             )? > 0
         };
-        if let Ok(agent) = agent_by_id(&tx, agent_id) {
-            let _ = index_rag_chunk(
-                &tx,
-                message.id.as_str(),
-                message.agent_id.as_str(),
-                &agent.name,
-                "in",
-                message.sender.as_deref().unwrap_or("unknown"),
-                message
-                    .reply_to
-                    .as_deref()
-                    .unwrap_or(&format!("agent:{}", agent.name)),
-                message.received_at_ms,
-                &message.text,
-                None,
-                None,
-                message.seq,
-            );
-        }
+        let agent = agent_by_id(&tx, agent_id)?;
+        index_rag_chunk(
+            &tx,
+            message.id.as_str(),
+            message.agent_id.as_str(),
+            &agent.name,
+            "in",
+            message.sender.as_deref().unwrap_or("unknown"),
+            message
+                .reply_to
+                .as_deref()
+                .unwrap_or(&format!("agent:{}", agent.name)),
+            message.received_at_ms,
+            &message.text,
+            None,
+            None,
+            message.seq,
+        )?;
         tx.commit()?;
         drop(conn);
         if woke_agent {
@@ -2107,7 +2167,7 @@ impl Store {
                 agent_id: agent_id.clone(),
             });
         }
-        Ok(ReceiveOutcome::New(message))
+        Ok(Some(ReceiveOutcome::New(message)))
     }
 
     /// Replace the harness launch environment, preserving communication policy.
@@ -2264,10 +2324,17 @@ impl Store {
                 .query_row(
                     "SELECT a.parent_id, a.name, tr.completed_seq
                      FROM agents a
+                     JOIN agents p ON p.id = a.parent_id
                      JOIN turn_recovery tr ON tr.agent_id = a.id
                      WHERE a.id = ?1
                        AND a.parent_id IS NOT NULL
                        AND a.state = 'running'
+                       AND EXISTS (
+                           SELECT 1 FROM messages m
+                           WHERE m.agent_id = ?1
+                             AND m.seq >= tr.opened_seq
+                             AND m.sender = 'agent:' || p.name
+                       )
                        AND NOT EXISTS (
                            SELECT 1 FROM outbound_messages om
                            WHERE om.agent_id = ?1
@@ -2417,24 +2484,72 @@ impl Store {
         reply_to: Option<&str>,
         body: &str,
     ) -> Result<String, Error> {
-        let conn = self.conn();
-        let agent = agent_by_id(&conn, agent_id)?;
-        let id = format!("out_{}", MessageId::generate());
+        self.record_outbound_id(
+            format!("out_{}", MessageId::generate()),
+            agent_id,
+            destination,
+            reply_to,
+            body,
+        )
+    }
+
+    /// Settle the history of an already-completed effect without repeating it.
+    /// Keys are scoped to the immutable sender. Exact retries keep the original
+    /// ID/time; changed destination, reply or body refuses without mutation.
+    pub fn record_outbound_once(
+        &self,
+        effect_key: &str,
+        agent_id: &AgentId,
+        destination: &str,
+        reply_to: Option<&str>,
+        body: &str,
+    ) -> Result<String, Error> {
+        if effect_key.trim().is_empty() {
+            return Err(Error::Message("empty outbound effect key".into()));
+        }
+        let id = format!(
+            "out_{}",
+            crate::learned_memory::sha256(format!("{agent_id}:{effect_key}").as_bytes())
+        );
+        self.record_outbound_id(id, agent_id, destination, reply_to, body)
+    }
+
+    fn record_outbound_id(
+        &self,
+        id: String,
+        agent_id: &AgentId,
+        destination: &str,
+        reply_to: Option<&str>,
+        body: &str,
+    ) -> Result<String, Error> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let agent = agent_by_id(&tx, agent_id)?;
         let ts_ms = now_ms();
-        conn.execute(
+        tx.execute(
             "INSERT INTO outbound_messages (id, agent_id, destination, reply_to, body, sent_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(id) DO NOTHING",
             params![id, agent_id.as_str(), destination, reply_to, body, ts_ms,],
         )?;
-        let cur_seq: i64 = conn
-            .query_row(
-                "SELECT COALESCE(MAX(seq), 0) FROM messages WHERE agent_id = ?1",
-                [agent_id.as_str()],
-                |r| r.get(0),
-            )
-            .unwrap_or(0);
-        let _ = index_rag_chunk(
-            &conn,
+        let (matches, ts_ms): (bool, i64) = tx.query_row(
+            "SELECT agent_id=?2 AND destination=?3 AND reply_to IS ?4 AND body=?5, sent_at_ms
+             FROM outbound_messages WHERE id=?1",
+            params![id, agent_id.as_str(), destination, reply_to, body],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if !matches {
+            return Err(Error::Message(
+                "outbound effect key payload conflict".into(),
+            ));
+        }
+        let cur_seq: i64 = tx.query_row(
+            "SELECT COALESCE((SELECT seq FROM rag_chunks WHERE agent_id=?1 AND chunk_id=?2),
+                (SELECT COALESCE(MAX(seq),0) FROM messages WHERE agent_id=?1))",
+            params![agent_id.as_str(), id],
+            |r| r.get(0),
+        )?;
+        index_rag_chunk(
+            &tx,
             &id,
             agent_id.as_str(),
             &agent.name,
@@ -2446,7 +2561,8 @@ impl Store {
             None,
             None,
             cur_seq,
-        );
+        )?;
+        tx.commit()?;
         Ok(id)
     }
 
@@ -2459,8 +2575,9 @@ impl Store {
         tool_name: &str,
         summary: &str,
     ) -> Result<String, Error> {
-        let conn = self.conn();
-        let agent = agent_by_id(&conn, agent_id)?;
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let agent = agent_by_id(&tx, agent_id)?;
         let id = format!("tool_{}", MessageId::generate());
         let ts_ms = now_ms();
         let clean_tool = tool_name.trim().to_ascii_lowercase();
@@ -2470,15 +2587,13 @@ impl Store {
         } else {
             format!("[tool:{clean_tool}] {}", summary.trim())
         };
-        let cur_seq: i64 = conn
-            .query_row(
-                "SELECT COALESCE(MAX(seq), 0) FROM messages WHERE agent_id = ?1",
-                [agent_id.as_str()],
-                |r| r.get(0),
-            )
-            .unwrap_or(0);
+        let cur_seq: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(seq), 0) FROM messages WHERE agent_id = ?1",
+            [agent_id.as_str()],
+            |r| r.get(0),
+        )?;
         index_rag_chunk(
-            &conn,
+            &tx,
             &id,
             agent_id.as_str(),
             &agent.name,
@@ -2491,6 +2606,7 @@ impl Store {
             Some(&clean_tool),
             cur_seq,
         )?;
+        tx.commit()?;
         Ok(id)
     }
 
@@ -2721,23 +2837,32 @@ impl Store {
         Ok(turns)
     }
 
-    /// Upgrade only authorized derivative chunks, in bounded batches. Old
+    /// Repair missing and legacy authorized derivative chunks, in bounded batches. Old
     /// standalone tool summaries have no recoverable raw mailbox body: preserve
     /// them exactly rather than inventing the clipped-away suffix. New tools use
     /// the full-text policy. Redacted mailbox bodies are the authoritative input.
     fn backfill_full_mailbox_history(&self, visible: Option<&[String]>) -> Result<(), Error> {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut after = String::new();
         loop {
-            let visibility = visible_agent_ids_sql("c.agent_id", visible, 1);
+            let visibility = visible_agent_ids_sql("r.agent_id", visible, 2);
             let mut select = tx.prepare(&format!(
-                "SELECT c.chunk_id,c.agent_id,c.agent_name,c.direction,c.sender,c.destination,
-                        c.timestamp_ms,COALESCE(m.body,o.body),c.kind,c.tool_name,c.seq
-                 FROM rag_chunks c
-                 LEFT JOIN messages m ON m.agent_id=c.agent_id AND m.id=c.chunk_id
-                 LEFT JOIN outbound_messages o ON o.agent_id=c.agent_id AND o.id=c.chunk_id
-                 WHERE c.text_format<2 AND COALESCE(m.body,o.body) IS NOT NULL{visibility}
-                 ORDER BY c.chunk_id LIMIT 32"
+                "WITH raw AS (
+                    SELECT id,agent_id,'in' AS direction,COALESCE(sender,'unknown') AS sender,
+                           reply_to AS destination,received_at_ms AS timestamp_ms,body,seq FROM messages
+                    UNION ALL
+                    SELECT o.id,o.agent_id,'out','agent:' || a.name,o.destination,o.sent_at_ms,o.body,
+                           COALESCE((SELECT max(seq) FROM messages WHERE agent_id=o.agent_id),0)
+                    FROM outbound_messages o JOIN agents a ON a.id=o.agent_id
+                 )
+                 SELECT r.id,r.agent_id,a.name,r.direction,r.sender,
+                        COALESCE(r.destination,'agent:' || a.name),r.timestamp_ms,
+                        r.body,c.kind,c.tool_name,COALESCE(c.seq,r.seq)
+                 FROM raw r JOIN agents a ON a.id=r.agent_id
+                 LEFT JOIN rag_chunks c ON c.agent_id=r.agent_id AND c.chunk_id=r.id
+                 WHERE r.id > ?1 AND (c.chunk_id IS NULL OR c.text_format<2){visibility}
+                 ORDER BY r.id LIMIT 32"
             ))?;
             struct Chunk {
                 id: String,
@@ -2748,13 +2873,13 @@ impl Store {
                 destination: String,
                 timestamp: i64,
                 text: String,
-                kind: String,
-                tool: String,
+                kind: Option<String>,
+                tool: Option<String>,
                 seq: i64,
             }
             let chunks = select
                 .query_map(
-                    rusqlite::params_from_iter(scoped_params(&[], visible)),
+                    rusqlite::params_from_iter(scoped_params(&[&after], visible)),
                     |r| {
                         Ok(Chunk {
                             id: r.get(0)?,
@@ -2776,6 +2901,7 @@ impl Store {
                 break;
             }
             for chunk in chunks {
+                after = chunk.id.clone();
                 if clean_rag_text(&chunk.text).chars().count() < 2 {
                     tx.execute("DELETE FROM rag_chunks_fts WHERE chunk_id=?1", [&chunk.id])?;
                     tx.execute(
@@ -2794,8 +2920,8 @@ impl Store {
                     &chunk.destination,
                     chunk.timestamp,
                     &chunk.text,
-                    Some(&chunk.kind),
-                    Some(&chunk.tool),
+                    chunk.kind.as_deref(),
+                    chunk.tool.as_deref(),
                     chunk.seq,
                 )?;
                 tx.execute(
@@ -2981,8 +3107,13 @@ impl Store {
             let visibility_sql = visible_agent_ids_sql("agent_id", visible_agent_ids, 5);
             if !fts_query.is_empty()
                 && let Ok(mut fstmt) = conn.prepare(&format!(
-                    "SELECT c.chunk_id, c.direction, c.sender, c.destination, c.text, c.timestamp_ms,
-                            c.agent_name, c.kind, c.tool_name, c.seq, f.score
+                    "SELECT c.chunk_id, c.direction, c.sender, c.destination,
+                            COALESCE(
+                                (SELECT m.body FROM messages m WHERE m.agent_id = c.agent_id AND m.id = c.chunk_id),
+                                (SELECT o.body FROM outbound_messages o WHERE o.agent_id = c.agent_id AND o.id = c.chunk_id),
+                                c.text
+                            ),
+                            c.timestamp_ms, c.agent_name, c.kind, c.tool_name, c.seq, f.score
                      FROM (
                          SELECT chunk_id, bm25(rag_chunks_fts, 0.5, 1.0, 1.0, 1.0, 0.5, 2.0, 3.0, 2.5) as score
                          FROM rag_chunks_fts
@@ -3361,6 +3492,284 @@ impl Store {
             limit: limit.unwrap_or(20),
             ..HistorySearchQuery::default()
         })
+    }
+
+    /// Neutral host-level sleep-time memory index and semantic consolidation.
+    /// Synchronizes `<agent_root>/memory/MEMORY.md` and `HostIndex` whenever topic
+    /// files in `<agent_root>/memory/<topic>.md` are added, modified, or deleted,
+    /// and when unconsolidated substantive conversation turns exist and cooldown
+    /// has elapsed, runs the 4-phase LLM sleep-time semantic consolidation pass.
+    pub fn consolidate_agent_sleep_memory(&self, agent_id: &AgentId) -> Result<bool, Error> {
+        self.consolidate_agent_sleep_memory_with_options(agent_id, true)
+            .map(|(modified, _)| modified)
+    }
+
+    /// Performs deterministic disk topic synchronization and optionally executes
+    /// the LLM sleep-time consolidation pass (`allow_llm`). Returns
+    /// `(memory_modified, executed_llm_call)`.
+    pub fn consolidate_agent_sleep_memory_with_options(
+        &self,
+        agent_id: &AgentId,
+        allow_llm: bool,
+    ) -> Result<(bool, bool), Error> {
+        let agent = self.agent(agent_id)?;
+        if agent.state == "archived" {
+            return Ok((false, false));
+        }
+        let agent_root = self.data_dir().join("agents").join(agent.id.as_str());
+        let mem_dir = agent_root.join("memory");
+        if !mem_dir.is_dir() {
+            return Ok((false, false));
+        }
+        let mut sleep = crate::learned_memory::read_sleep_state(&agent_root);
+        let now = crate::now_ms();
+
+        // Phase 1a: Fast deterministic disk topic check & index sync.
+        let updated_topics = crate::learned_memory::list_memory_topics(&agent_root)?;
+        let mem_path = mem_dir.join("MEMORY.md");
+        let mem_exists = mem_path.is_file();
+        let current_mem = std::fs::read_to_string(&mem_path).unwrap_or_default();
+        let mem_mtime_ms = std::fs::metadata(&mem_path)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| i64::try_from(d.as_millis()).unwrap_or(0))
+            .unwrap_or(0);
+        let any_newer_topic = updated_topics
+            .iter()
+            .any(|t| t.updated_at_ms > mem_mtime_ms);
+        let is_truncated =
+            crate::learned_memory::bounded_section(&current_mem).contains("[Memory truncated;");
+        let is_legacy_index =
+            current_mem.contains("\n## Topics (") && !current_mem.contains("\n## Active Topics");
+        let missing_index_with_topics = !mem_exists && !updated_topics.is_empty();
+        let mut modified = false;
+        if missing_index_with_topics
+            || any_newer_topic
+            || is_truncated
+            || is_legacy_index
+            || sleep.consolidated_topics != updated_topics.len()
+        {
+            crate::learned_memory::rebuild_memory_index(
+                &agent_root,
+                &agent.name,
+                agent.role.as_deref(),
+            )?;
+            let _ = self.sync_agent_memory_index(&agent);
+            modified = true;
+        }
+
+        // Phase 1b: Delta turn watermarks & quote/noise filtering.
+        let (max_in_seq, latest_in_ms, max_out_ms, substantive_turns) = {
+            let conn = self.read_conn();
+            let (max_in_seq, latest_in_ms): (i64, i64) = conn
+                .query_row(
+                    "SELECT COALESCE(MAX(seq), 0), COALESCE(MAX(received_at_ms), 0)
+                     FROM messages WHERE agent_id = ?1",
+                    params![agent.id.as_str()],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap_or((0, 0));
+            let max_out_ms: i64 = conn
+                .query_row(
+                    "SELECT COALESCE(MAX(sent_at_ms), 0) FROM outbound_messages WHERE agent_id = ?1",
+                    params![agent.id.as_str()],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+
+            let has_new_turns =
+                max_in_seq > sleep.last_inbound_seq || max_out_ms > sleep.last_outbound_ms;
+            if !has_new_turns {
+                (max_in_seq, latest_in_ms, max_out_ms, None)
+            } else {
+                let mut raw_turns: Vec<crate::learned_memory::SleepTurnDelta> = Vec::new();
+                if max_in_seq > sleep.last_inbound_seq
+                    && let Ok(mut stmt) = conn.prepare(
+                        "SELECT received_at_ms, COALESCE(sender, 'unknown'), body
+                         FROM messages
+                         WHERE agent_id = ?1 AND seq > ?2
+                         ORDER BY seq DESC
+                         LIMIT 30",
+                    )
+                    && let Ok(mut rows) =
+                        stmt.query(params![agent.id.as_str(), sleep.last_inbound_seq])
+                {
+                    while let Ok(Some(row)) = rows.next() {
+                        let ts: i64 = row.get(0).unwrap_or(0);
+                        let peer: String = row.get(1).unwrap_or_default();
+                        let body: String = row.get(2).unwrap_or_default();
+                        if let Some(clean) = crate::learned_memory::clean_sleep_turn_text(&body) {
+                            raw_turns.push(crate::learned_memory::SleepTurnDelta {
+                                timestamp_ms: ts,
+                                direction: "in".to_string(),
+                                peer,
+                                text: clean,
+                            });
+                        }
+                    }
+                }
+                if max_out_ms > sleep.last_outbound_ms
+                    && let Ok(mut stmt) = conn.prepare(
+                        "SELECT sent_at_ms, destination, body
+                         FROM outbound_messages
+                         WHERE agent_id = ?1 AND sent_at_ms > ?2
+                         ORDER BY sent_at_ms DESC
+                         LIMIT 30",
+                    )
+                    && let Ok(mut rows) =
+                        stmt.query(params![agent.id.as_str(), sleep.last_outbound_ms])
+                {
+                    while let Ok(Some(row)) = rows.next() {
+                        let ts: i64 = row.get(0).unwrap_or(0);
+                        let peer: String = row.get(1).unwrap_or_default();
+                        let body: String = row.get(2).unwrap_or_default();
+                        if let Some(clean) = crate::learned_memory::clean_sleep_turn_text(&body) {
+                            raw_turns.push(crate::learned_memory::SleepTurnDelta {
+                                timestamp_ms: ts,
+                                direction: "out".to_string(),
+                                peer,
+                                text: clean,
+                            });
+                        }
+                    }
+                }
+                raw_turns.sort_by_key(|t| t.timestamp_ms);
+                let filtered = crate::learned_memory::filter_substantive_sleep_turns(raw_turns);
+                let start = filtered.len().saturating_sub(30);
+                let bounded_turns = filtered[start..].to_vec();
+                (max_in_seq, latest_in_ms, max_out_ms, Some(bounded_turns))
+            }
+        };
+
+        let Some(substantive_turns) = substantive_turns else {
+            if modified {
+                sleep.last_consolidated_ms = now;
+                sleep.consolidated_topics = updated_topics.len();
+                let _ = crate::learned_memory::write_sleep_state(&agent_root, &sleep);
+            }
+            return Ok((modified, false));
+        };
+
+        // If all delta turns were empty, "NO_REPLY", system prompt echoes, or
+        // routine schedule ticks without outbound actions, advance watermarks
+        // without invoking the LLM.
+        if substantive_turns.is_empty() {
+            sleep.last_consolidated_ms = now;
+            sleep.last_inbound_seq = max_in_seq;
+            sleep.last_outbound_ms = max_out_ms;
+            sleep.consolidated_topics = updated_topics.len();
+            let _ = crate::learned_memory::write_sleep_state(&agent_root, &sleep);
+            return Ok((modified, false));
+        }
+
+        if !allow_llm {
+            if modified {
+                sleep.consolidated_topics = updated_topics.len();
+                let _ = crate::learned_memory::write_sleep_state(&agent_root, &sleep);
+            }
+            return Ok((modified, false));
+        }
+
+        // Phase 2: Resolve LLM endpoint first; if none is configured (e.g. offline test mode),
+        // advance watermarks cleanly without waiting for LLM cooldown.
+        let Some(endpoint) =
+            crate::learned_memory::resolve_sleep_model_endpoint(self.data_dir(), &agent.id)
+        else {
+            sleep.last_consolidated_ms = now;
+            sleep.last_inbound_seq = max_in_seq;
+            sleep.last_outbound_ms = max_out_ms;
+            sleep.consolidated_topics = updated_topics.len();
+            let _ = crate::learned_memory::write_sleep_state(&agent_root, &sleep);
+            return Ok((modified, false));
+        };
+
+        // Phase 2b: Quiescence & cooldown gate (2m turn quiescence + 10m consolidation cooldown).
+        let force = std::env::var("ANYAGENTS_SLEEP_CONSOLIDATION_FORCE")
+            .ok()
+            .as_deref()
+            == Some("1");
+        let custom_url_set = std::env::var("ANYAGENTS_SLEEP_MODEL_URL")
+            .ok()
+            .is_some_and(|s| !s.trim().is_empty());
+        let latest_turn_ms = latest_in_ms.max(max_out_ms);
+        let turn_quiescent = custom_url_set || now.saturating_sub(latest_turn_ms) >= 120_000;
+        let consolidation_cooled_down = sleep.last_consolidated_ms == 0
+            || now.saturating_sub(sleep.last_consolidated_ms) >= 600_000;
+        if !force && (!turn_quiescent || !consolidation_cooled_down) {
+            if modified {
+                sleep.consolidated_topics = updated_topics.len();
+                let _ = crate::learned_memory::write_sleep_state(&agent_root, &sleep);
+            }
+            return Ok((modified, false));
+        }
+
+        let Ok(plan) = crate::learned_memory::request_sleep_consolidation_plan(
+            &endpoint,
+            &agent_root,
+            &agent.name,
+            agent.role.as_deref(),
+            &updated_topics,
+            &substantive_turns,
+        ) else {
+            // Preserve `last_inbound_seq` / `last_outbound_ms` on transient HTTP failure
+            // so the unconsolidated turns are retried on a subsequent pass.
+            if modified {
+                sleep.consolidated_topics = updated_topics.len();
+                let _ = crate::learned_memory::write_sleep_state(&agent_root, &sleep);
+            }
+            return Ok((modified, true));
+        };
+
+        // Phase 4: Apply upsert & defragmentation delete operations, rebuild MEMORY.md,
+        // synchronize HostIndex FTS5, and advance watermarks.
+        for op in &plan.operations {
+            match op {
+                crate::learned_memory::SleepMemoryOp::Upsert {
+                    topic,
+                    description,
+                    content,
+                } => {
+                    crate::learned_memory::upsert_memory_topic(
+                        &agent_root,
+                        &agent.name,
+                        agent.role.as_deref(),
+                        topic,
+                        description.as_deref(),
+                        content,
+                        now,
+                    )?;
+                    modified = true;
+                }
+                crate::learned_memory::SleepMemoryOp::Delete { topic } => {
+                    let (removed, _) = crate::learned_memory::delete_memory_topic(
+                        &agent_root,
+                        &agent.name,
+                        agent.role.as_deref(),
+                        topic,
+                    )?;
+                    if removed {
+                        modified = true;
+                    }
+                }
+            }
+        }
+        if !plan.operations.is_empty() {
+            crate::learned_memory::rebuild_memory_index(
+                &agent_root,
+                &agent.name,
+                agent.role.as_deref(),
+            )?;
+            let _ = self.sync_agent_memory_index(&agent);
+        }
+
+        let final_topics = crate::learned_memory::list_memory_topics(&agent_root)?;
+        sleep.last_consolidated_ms = now;
+        sleep.last_inbound_seq = max_in_seq;
+        sleep.last_outbound_ms = max_out_ms;
+        sleep.consolidated_topics = final_topics.len();
+        let _ = crate::learned_memory::write_sleep_state(&agent_root, &sleep);
+        Ok((modified, true))
     }
 
     /// The next message the harness has not taken, or `None` when delivery has
@@ -4021,45 +4430,56 @@ impl Store {
         watch_baseline: Option<&str>,
         last_observed: Option<&str>,
     ) -> Result<bool, Error> {
-        let conn = self.conn();
-        let updated = match expected_next_fire_at_ms {
-            Some(expected) => conn.execute(
-                "UPDATE agent_schedules
-                 SET state = ?3,
-                     next_fire_at_ms = ?4,
-                     last_fired_at_ms = COALESCE(?5, last_fired_at_ms),
-                     watch_baseline = COALESCE(?6, watch_baseline),
-                     last_observed = COALESCE(?7, last_observed)
-                 WHERE id = ?1 AND state = 'active' AND next_fire_at_ms = ?2",
-                params![
-                    id,
-                    expected,
-                    new_state,
-                    new_next_fire_at_ms,
-                    fired_at_ms,
-                    watch_baseline,
-                    last_observed
-                ],
-            )?,
-            None => conn.execute(
-                "UPDATE agent_schedules
-                 SET state = ?2,
-                     next_fire_at_ms = ?3,
-                     last_fired_at_ms = COALESCE(?4, last_fired_at_ms),
-                     watch_baseline = COALESCE(?5, watch_baseline),
-                     last_observed = COALESCE(?6, last_observed)
-                 WHERE id = ?1 AND state = 'active'",
-                params![
-                    id,
-                    new_state,
-                    new_next_fire_at_ms,
-                    fired_at_ms,
-                    watch_baseline,
-                    last_observed
-                ],
-            )?,
-        };
-        Ok(updated == 1)
+        claim_schedule_tick_on(
+            &self.conn(),
+            id,
+            expected_next_fire_at_ms,
+            new_state,
+            new_next_fire_at_ms,
+            fired_at_ms,
+            watch_baseline,
+            last_observed,
+        )
+    }
+
+    /// Atomically claim a timer/watch transition and retain its mailbox wake.
+    /// The caller holds the agent lifecycle lock and checks external retirement
+    /// markers. A failed index/mail insert rolls back the claim for retry.
+    #[allow(clippy::too_many_arguments)]
+    pub fn claim_schedule_tick_with_wake(
+        &self,
+        id: &str,
+        expected_next_fire_at_ms: Option<i64>,
+        new_state: &str,
+        new_next_fire_at_ms: Option<i64>,
+        fired_at_ms: Option<i64>,
+        watch_baseline: Option<&str>,
+        last_observed: Option<&str>,
+        agent_id: &AgentId,
+        incoming: Incoming,
+    ) -> Result<bool, Error> {
+        let outcome = self.receive_with_admission(agent_id, incoming, true, |conn| {
+            let eligible: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM agent_schedules s JOIN agents a ON a.id=s.agent_id
+                 WHERE s.id=?1 AND s.agent_id=?2 AND a.state NOT IN ('paused','archived'))",
+                params![id, agent_id.as_str()],
+                |r| r.get(0),
+            )?;
+            if !eligible {
+                return Ok(false);
+            }
+            claim_schedule_tick_on(
+                conn,
+                id,
+                expected_next_fire_at_ms,
+                new_state,
+                new_next_fire_at_ms,
+                fired_at_ms,
+                watch_baseline,
+                last_observed,
+            )
+        })?;
+        Ok(outcome.is_some())
     }
 
     pub fn restore_skipped_at_schedules(&self, min_next_fire_at_ms: i64) -> Result<usize, Error> {
@@ -4819,63 +5239,96 @@ fn classify_chunk_kind_and_tool(
     ("message".to_string(), String::new())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn claim_schedule_tick_on(
+    conn: &Connection,
+    id: &str,
+    expected_next_fire_at_ms: Option<i64>,
+    new_state: &str,
+    new_next_fire_at_ms: Option<i64>,
+    fired_at_ms: Option<i64>,
+    watch_baseline: Option<&str>,
+    last_observed: Option<&str>,
+) -> Result<bool, Error> {
+    let updated = match expected_next_fire_at_ms {
+        Some(expected) => conn.execute(
+            "UPDATE agent_schedules
+                 SET state = ?3,
+                     next_fire_at_ms = ?4,
+                     last_fired_at_ms = COALESCE(?5, last_fired_at_ms),
+                     watch_baseline = COALESCE(?6, watch_baseline),
+                     last_observed = COALESCE(?7, last_observed)
+                 WHERE id = ?1 AND state = 'active' AND next_fire_at_ms = ?2",
+            params![
+                id,
+                expected,
+                new_state,
+                new_next_fire_at_ms,
+                fired_at_ms,
+                watch_baseline,
+                last_observed
+            ],
+        )?,
+        None => conn.execute(
+            "UPDATE agent_schedules
+                 SET state = ?2,
+                     next_fire_at_ms = ?3,
+                     last_fired_at_ms = COALESCE(?4, last_fired_at_ms),
+                     watch_baseline = COALESCE(?5, watch_baseline),
+                     last_observed = COALESCE(?6, last_observed)
+                 WHERE id = ?1 AND state = 'active'",
+            params![
+                id,
+                new_state,
+                new_next_fire_at_ms,
+                fired_at_ms,
+                watch_baseline,
+                last_observed
+            ],
+        )?,
+    };
+    Ok(updated == 1)
+}
+
 fn ensure_lexical_fts_backfilled(conn: &mut Connection) -> Result<(), Error> {
-    let has_chunks: i64 = conn
-        .query_row("SELECT EXISTS(SELECT 1 FROM rag_chunks LIMIT 1)", [], |r| {
-            r.get(0)
-        })
-        .unwrap_or(0);
-    if has_chunks == 0 {
-        return Ok(());
-    }
-    let has_fts: i64 = conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM rag_chunks_fts_docsize LIMIT 1)",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
-    if has_fts != 0 {
+    let fts_complete_sql =
+        "SELECT (SELECT count(*) FROM rag_chunks) = (SELECT count(*) FROM rag_chunks_fts)
+         AND NOT EXISTS (
+            SELECT chunk_id, agent_name, sender, destination, kind, tool_name, text FROM rag_chunks
+            EXCEPT
+            SELECT chunk_id, agent_name, sender, destination, kind, tool_name, text FROM rag_chunks_fts)";
+    if conn.query_row(fts_complete_sql, [], |r| r.get::<_, bool>(0))? {
         return Ok(());
     }
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    {
+    // A nonempty index can still be partial, duplicated or stale. Check the
+    // entire derivative membership under the same lock as any rebuild.
+    let complete: bool = tx.query_row(fts_complete_sql, [], |r| r.get(0))?;
+    if !complete {
         tx.execute("DELETE FROM rag_chunks_fts", [])?;
         let mut sel = tx.prepare(
             "SELECT chunk_id, agent_name, sender, destination, kind, tool_name, text
              FROM rag_chunks",
         )?;
-        let rows: Vec<(String, String, String, String, String, String, String)> = sel
-            .query_map([], |r| {
-                Ok((
-                    r.get(0)?,
-                    r.get(1)?,
-                    r.get(2)?,
-                    r.get(3)?,
-                    r.get(4)?,
-                    r.get(5)?,
-                    r.get(6)?,
-                ))
-            })?
-            .filter_map(Result::ok)
-            .collect();
+        let mut rows = sel.query([])?;
         let mut ins = tx.prepare(
             "INSERT INTO rag_chunks_fts (
                 chunk_id, agent_name, sender, destination, kind, tool_name, text, search_tokens
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         )?;
-        for (cid, aname, sender, dest, kind, tool_name, text) in rows {
+        while let Some(row) = rows.next()? {
+            let text: String = row.get(6)?;
             let search_tokens = tokenize_hybrid_search_tokens(&text).join(" ");
-            let _ = ins.execute(params![
-                cid,
-                aname,
-                sender,
-                dest,
-                kind,
-                tool_name,
+            ins.execute(params![
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
                 text,
-                search_tokens
-            ]);
+                search_tokens,
+            ])?;
         }
     }
     tx.commit()?;
@@ -4926,15 +5379,15 @@ fn index_rag_chunk(
         ],
     )?;
     if seq <= 0 {
-        let _ = conn.execute(
+        conn.execute(
             "UPDATE rag_chunks SET seq = rowid WHERE chunk_id = ?1 AND seq <= 0",
             params![chunk_id],
-        );
+        )?;
     }
-    let _ = conn.execute(
+    conn.execute(
         "DELETE FROM rag_chunks_fts WHERE chunk_id MATCH ?1",
         params![format!("\"{}\"", chunk_id.replace('"', ""))],
-    );
+    )?;
     conn.execute(
         "INSERT INTO rag_chunks_fts (
             chunk_id, agent_name, sender, destination, kind, tool_name, text, search_tokens
@@ -5877,21 +6330,28 @@ fn resolve_sender_relationship_and_role(
     if sender_raw == "operator" {
         return (None, Some("operator".to_string()));
     }
-    let Some(sender_name) = sender_raw.strip_prefix("agent:") else {
+    let Some(sender_reference) = sender_raw.strip_prefix("agent:") else {
         return (None, None);
     };
-    let Some(sender_id_str) = conn
-        .query_row(
-            "SELECT id FROM agents WHERE name = ?1",
-            [sender_name],
-            |r| r.get::<_, String>(0),
-        )
-        .ok()
-    else {
-        return (None, None);
-    };
-    let Ok(sender_id) = AgentId::parse(&sender_id_str) else {
-        return (None, None);
+    // An admitted immutable sender cannot change identity while waiting for
+    // publication. Syntactically valid IDs are never resolved as display names,
+    // even if their exact ID is absent. Non-ID legacy senders keep name lookup.
+    let sender_id = match AgentId::parse(sender_reference) {
+        Ok(id) => id,
+        Err(_) => {
+            let Some(id) = conn
+                .query_row(
+                    "SELECT id FROM agents WHERE name = ?1",
+                    [sender_reference],
+                    |r| r.get::<_, String>(0),
+                )
+                .ok()
+                .and_then(|id| AgentId::parse(&id).ok())
+            else {
+                return (None, None);
+            };
+            id
+        }
     };
     let Ok(sender_agent) = agent_by_id(conn, &sender_id) else {
         return (None, None);
@@ -6753,7 +7213,7 @@ mod tests {
         }
         conn.execute_batch(
             "INSERT INTO agents (id, name, harness, state, created_at_ms)
-                 VALUES ('agt_01h455vb4pex5vsknk084sn02q', 'juno', 'opencode', 'running', 1);
+                 VALUES ('agt_01h455vb4pex5vsknk084sn02q', 'migrated_worker', 'opencode', 'running', 1);
              INSERT INTO mailbox_cursors (agent_id, accepted_seq, processed_seq)
                  VALUES ('agt_01h455vb4pex5vsknk084sn02q', 4, 2);
              INSERT INTO messages (id, agent_id, seq, source_key, body, received_at_ms, delivered_at_ms, processed_at_delivery)
@@ -6770,7 +7230,7 @@ mod tests {
         .unwrap();
         drop(conn);
         let store = Store::open(&path).unwrap();
-        let agent = store.agent_by_name("juno").unwrap();
+        let agent = store.agent_by_name("migrated_worker").unwrap();
         // delivered = the higher of the two old cursors: 4 is kept even though
         // the answer row at 3 was removed, so the upgrade never re-sends what a
         // harness already took.
@@ -7257,7 +7717,10 @@ mod tests {
                 2_000 + n,
             );
         }
-        let visible = vec![own.id.to_string()];
+        let mut visible = vec![own.id.to_string()];
+        for n in 0..17 {
+            visible.push(agent(&store, &format!("also-visible-{n}")).id.to_string());
+        }
         for query in [Some("scopeword"), Some("gmentpart"), None] {
             let hits = store
                 .search_history(&HistorySearchQuery {
@@ -7968,104 +8431,111 @@ mod tests {
     #[test]
     fn rename_agent_preserves_id_grants_history_and_resolves_old_alias_and_role() {
         let (_dir, store) = setup();
-        let argon = agent(&store, "argon");
-        store.set_agent_admin(&argon.id, true).unwrap();
-        store.join_group("owners", &argon.id).unwrap();
+        let original_worker = agent(&store, "original_worker");
+        store.set_agent_admin(&original_worker.id, true).unwrap();
+        store.join_group("owners", &original_worker.id).unwrap();
         store
-            .receive(&argon.id, Incoming::new("revenue check"))
+            .receive(&original_worker.id, Incoming::new("revenue check"))
             .unwrap();
 
-        let renamed = store.rename_agent(&argon.id, "plutus").unwrap();
-        assert_eq!(renamed.id, argon.id);
-        assert_eq!(renamed.name, "plutus");
+        let renamed = store
+            .rename_agent(&original_worker.id, "renamed_worker")
+            .unwrap();
+        assert_eq!(renamed.id, original_worker.id);
+        assert_eq!(renamed.name, "renamed_worker");
         assert!(renamed.is_admin);
 
-        let with_role = store.set_agent_role(&argon.id, Some("Revenue")).unwrap();
+        let with_role = store
+            .set_agent_role(&original_worker.id, Some("Revenue"))
+            .unwrap();
         assert_eq!(with_role.role.as_deref(), Some("Revenue"));
 
         // Old name resolves via alias table
-        let by_old = store.agent_by_name("argon").unwrap();
-        assert_eq!(by_old.id, argon.id);
-        assert_eq!(by_old.name, "plutus");
+        let by_old = store.agent_by_name("original_worker").unwrap();
+        assert_eq!(by_old.id, original_worker.id);
+        assert_eq!(by_old.name, "renamed_worker");
         assert_eq!(by_old.role.as_deref(), Some("Revenue"));
 
-        let by_prefixed = store.agent_by_name("agent:argon").unwrap();
-        assert_eq!(by_prefixed.id, argon.id);
+        let by_prefixed = store.agent_by_name("agent:original_worker").unwrap();
+        assert_eq!(by_prefixed.id, original_worker.id);
 
         assert_eq!(
-            store.agent_aliases(&argon.id).unwrap(),
-            vec!["argon".to_string()]
+            store.agent_aliases(&original_worker.id).unwrap(),
+            vec!["original_worker".to_string()]
         );
         assert_eq!(
             store.group_members("owners").unwrap(),
-            vec!["plutus".to_string()]
+            vec!["renamed_worker".to_string()]
         );
-        assert_eq!(store.inbox(&argon.id, None).unwrap().len(), 1);
+        assert_eq!(store.inbox(&original_worker.id, None).unwrap().len(), 1);
     }
 
     #[test]
     fn telegram_reaction_is_not_dropped_by_origin_dedup_and_wakes_targeted_author_only() {
         let (_dir, store) = setup();
-        let orion = agent(&store, "orion");
-        let nova = agent(&store, "nova");
+        let author_worker = agent(&store, "author_worker");
+        let peer_worker = agent(&store, "peer_worker");
 
-        // 1. Orion posts message #42 in group -100999, which is recorded in both bots' mailboxes.
-        let mut msg42 = Incoming::new("Here is the HKMT economy simulation report.");
-        msg42.sender = Some("agent:orion".to_string());
+        // 1. AuthorWorker posts message #42 in group -100999, which is recorded in both bots' mailboxes.
+        let mut msg42 = Incoming::new("Here is the sample economy simulation report.");
+        msg42.sender = Some("agent:author_worker".to_string());
         msg42.origin = Some(Origin {
             chat_id: Some(-100999),
             thread_id: None,
             message_id: Some(42),
         });
-        store.receive(&orion.id, msg42.clone()).unwrap();
-        store.receive(&nova.id, msg42).unwrap();
-        store.note_delivered(&orion.id, 1).unwrap();
-        store.note_delivered(&nova.id, 1).unwrap();
-        store.set_agent_state(&orion.id, "idle").unwrap();
-        store.set_agent_state(&nova.id, "idle").unwrap();
+        store.receive(&author_worker.id, msg42.clone()).unwrap();
+        store.receive(&peer_worker.id, msg42).unwrap();
+        store.note_delivered(&author_worker.id, 1).unwrap();
+        store.note_delivered(&peer_worker.id, 1).unwrap();
+        store.set_agent_state(&author_worker.id, "idle").unwrap();
+        store.set_agent_state(&peer_worker.id, "idle").unwrap();
 
-        // 2. Kyle reacts 👍 on message #42. Neither bot drops it as a duplicate of #42!
-        //    Orion (the author of #42) receives `event = "reaction"` and wakes to `running`.
-        //    Nova (a peer bot in the same multi-bot group) receives `event = "reaction_passive"`
+        // 2. Alex reacts 👍 on message #42. Neither bot drops it as a duplicate of #42!
+        //    AuthorWorker (the author of #42) receives `event = "reaction"` and wakes to `running`.
+        //    PeerWorker (a peer bot in the same multi-bot group) receives `event = "reaction_passive"`
         //    in full awareness without waking from `idle` on the reaction alone.
         let mut react = Incoming::new("[Reaction 👍 on message #42]");
-        react.sender = Some("telegram:user:777:kyle".to_string());
+        react.sender = Some("telegram:user:777:alex".to_string());
         react.origin = Some(Origin {
             chat_id: Some(-100999),
             thread_id: None,
             message_id: Some(42),
         });
 
-        let orion_out = store.receive(&orion.id, react.clone()).unwrap();
-        let ReceiveOutcome::New(orion_msg) = orion_out else {
+        let author_worker_out = store.receive(&author_worker.id, react.clone()).unwrap();
+        let ReceiveOutcome::New(author_worker_msg) = author_worker_out else {
             panic!("reaction must not be dropped as duplicate of original message #42");
         };
-        assert_eq!(orion_msg.context.event.as_deref(), Some("reaction"));
+        assert_eq!(author_worker_msg.context.event.as_deref(), Some("reaction"));
         assert_eq!(
-            orion_msg.context.reply_to_author.as_deref(),
-            Some("agent:orion")
+            author_worker_msg.context.reply_to_author.as_deref(),
+            Some("agent:author_worker")
         );
         assert!(
-            orion_msg
+            author_worker_msg
                 .text
-                .contains("Here is the HKMT economy simulation report.")
+                .contains("Here is the sample economy simulation report.")
         );
-        assert_eq!(store.agent(&orion.id).unwrap().state, "running");
-        assert!(store.has_actionable_undelivered(&orion.id).unwrap());
+        assert_eq!(store.agent(&author_worker.id).unwrap().state, "running");
+        assert!(store.has_actionable_undelivered(&author_worker.id).unwrap());
 
-        let nova_out = store.receive(&nova.id, react).unwrap();
-        let ReceiveOutcome::New(nova_msg) = nova_out else {
+        let peer_worker_out = store.receive(&peer_worker.id, react).unwrap();
+        let ReceiveOutcome::New(peer_worker_msg) = peer_worker_out else {
             panic!("peer bot must also record reaction for full awareness");
         };
-        assert_eq!(nova_msg.context.event.as_deref(), Some("reaction_passive"));
-        assert_eq!(store.agent(&nova.id).unwrap().state, "idle");
-        assert!(!store.has_actionable_undelivered(&nova.id).unwrap());
+        assert_eq!(
+            peer_worker_msg.context.event.as_deref(),
+            Some("reaction_passive")
+        );
+        assert_eq!(store.agent(&peer_worker.id).unwrap().state, "idle");
+        assert!(!store.has_actionable_undelivered(&peer_worker.id).unwrap());
     }
 
     #[test]
     fn edited_message_delivers_compact_line_diff_preserving_edit_awareness_and_skips_noop() {
         let (_dir, store) = setup();
-        let argus = agent(&store, "argus");
+        let root_worker = agent(&store, "root_worker");
         let origin = Origin {
             chat_id: Some(-100777),
             thread_id: None,
@@ -8082,10 +8552,10 @@ mod tests {
 - Line D: Unchanged 4
 - Line E: Unchanged 5";
         let mut initial = Incoming::new(v0);
-        initial.sender = Some("agent:helios".to_string());
+        initial.sender = Some("agent:helper".to_string());
         initial.origin = Some(origin);
         initial.source_key = Some("bot-a:1".into());
-        let ReceiveOutcome::New(msg0) = store.receive(&argus.id, initial).unwrap() else {
+        let ReceiveOutcome::New(msg0) = store.receive(&root_worker.id, initial).unwrap() else {
             panic!("initial message must be stored");
         };
         assert_eq!(msg0.text, v0);
@@ -8093,10 +8563,10 @@ mod tests {
         // Edit 1: changes `Status: CI running` -> `Status: Merged (#67)`
         let v1 = v0.replace("Status: CI running", "Status: Merged (#67)");
         let mut edit1 = Incoming::new(format!("[Edited message #88]: {v1}"));
-        edit1.sender = Some("agent:helios".to_string());
+        edit1.sender = Some("agent:helper".to_string());
         edit1.origin = Some(origin);
         edit1.source_key = Some("bot-a:2".into());
-        let ReceiveOutcome::New(msg1) = store.receive(&argus.id, edit1).unwrap() else {
+        let ReceiveOutcome::New(msg1) = store.receive(&root_worker.id, edit1).unwrap() else {
             panic!("first edit must deliver a new edited event");
         };
         assert_eq!(msg1.context.event.as_deref(), Some("edited"));
@@ -8108,10 +8578,10 @@ mod tests {
         // Edit 2: changes `Deploy: pending` -> `Deploy: live` (must diff against v1, not v0!)
         let v2 = v1.replace("Deploy: pending", "Deploy: live");
         let mut edit2 = Incoming::new(format!("[Edited message #88]: {v2}"));
-        edit2.sender = Some("agent:helios".to_string());
+        edit2.sender = Some("agent:helper".to_string());
         edit2.origin = Some(origin);
         edit2.source_key = Some("bot-a:3".into());
-        let ReceiveOutcome::New(msg2) = store.receive(&argus.id, edit2).unwrap() else {
+        let ReceiveOutcome::New(msg2) = store.receive(&root_worker.id, edit2).unwrap() else {
             panic!("second edit must deliver a new edited event");
         };
         assert_eq!(msg2.context.event.as_deref(), Some("edited"));
@@ -8121,36 +8591,37 @@ mod tests {
 
         // Edit 3: no-op edit with identical v2 text must be skipped as Duplicate
         let mut edit3 = Incoming::new(format!("[Edited message #88]: {v2}"));
-        edit3.sender = Some("agent:helios".to_string());
+        edit3.sender = Some("agent:helper".to_string());
         edit3.origin = Some(origin);
         edit3.source_key = Some("bot-a:4".into());
-        let out3 = store.receive(&argus.id, edit3).unwrap();
+        let out3 = store.receive(&root_worker.id, edit3).unwrap();
         assert!(matches!(out3, ReceiveOutcome::Duplicate(_)));
     }
 
     #[test]
     fn group_quote_enriches_stored_attachments_and_delivers_late_quote_upgrade() {
         let (_dir, store) = setup();
-        let sage = agent(&store, "sage");
-        let plutus = agent(&store, "plutus");
+        let reader_worker = agent(&store, "reader_worker");
+        let renamed_worker = agent(&store, "renamed_worker");
         let chat_id = -5290931492;
 
-        // 1. Original post by plutus (`message_id = 1750`) with local attachment path in `messages`
+        // 1. Original post by renamed_worker (`message_id = 1750`) with local attachment path in `messages`
         let mut orig = Incoming::new(
-            "重型國風刺繡錦袍 3D 牌桌實測渲染\n[Attachment (photo): /scratch/tmp/renders/robe_3d.png]",
+            "Attachment render preview\n[Attachment (photo): /tmp/example/renders/preview.png]",
         );
-        orig.sender = Some("agent:plutus".to_string());
-        orig.source_key = Some(format!("tg-out:{chat_id}:plutus:1750"));
+        orig.sender = Some("agent:renamed_worker".to_string());
+        orig.source_key = Some(format!("tg-out:{chat_id}:renamed_worker:1750"));
         orig.origin = Some(Origin {
             chat_id: Some(chat_id),
             thread_id: None,
             message_id: Some(1750),
         });
-        store.receive(&sage.id, orig).unwrap();
+        store.receive(&reader_worker.id, orig).unwrap();
 
         // 2. Peer bot without quote relays human reply first (`message_id = 3255`, `quote = None`)
         let mut unquoted_relay = Incoming::new("仲有呢啲");
-        unquoted_relay.sender = Some("telegram:user:107671190:3255 (Kyle @kyletse)".to_string());
+        unquoted_relay.sender =
+            Some("telegram:user:107671190:3255 (Alex @alex_example)".to_string());
         unquoted_relay.source_time_ms = Some(1_793_798_602_000);
         unquoted_relay.source_key = Some(format!("tg-in:{chat_id}:vulcan:3255"));
         unquoted_relay.origin = Some(Origin {
@@ -8158,26 +8629,29 @@ mod tests {
             thread_id: None,
             message_id: Some(3255),
         });
-        let ReceiveOutcome::New(first_msg) = store.receive(&sage.id, unquoted_relay).unwrap()
+        let ReceiveOutcome::New(first_msg) =
+            store.receive(&reader_worker.id, unquoted_relay).unwrap()
         else {
             panic!("first relay must be stored");
         };
         assert!(!has_quoted_block(&first_msg.text));
 
         // Simulate harness having already delivered `orig` (seq 1) and `first_msg` (seq 2) before the quoted webhook arrives
-        store.note_delivered(&sage.id, 1).unwrap();
-        store.note_delivered(&sage.id, first_msg.seq).unwrap();
+        store.note_delivered(&reader_worker.id, 1).unwrap();
+        store
+            .note_delivered(&reader_worker.id, first_msg.seq)
+            .unwrap();
 
-        // 3. Replied-to bot (`plutus`, `message_id = 2506`) relays the same message WITH `quote`
+        // 3. Replied-to bot (`renamed_worker`, `message_id = 2506`) relays the same message WITH `quote`
         let mut quoted_relay = Incoming::new("仲有呢啲");
-        quoted_relay.sender = Some("telegram:user:107671190:2506 (Kyle @kyletse)".to_string());
+        quoted_relay.sender = Some("telegram:user:107671190:2506 (Alex @alex_example)".to_string());
         quoted_relay.source_time_ms = Some(1_793_798_602_000);
-        quoted_relay.source_key = Some(format!("tg-in:{chat_id}:{}:2506", plutus.id));
+        quoted_relay.source_key = Some(format!("tg-in:{chat_id}:{}:2506", renamed_worker.id));
         quoted_relay.quote = Some(crate::Quote {
-            author: "Plutus (@plutus_bot)".to_string(),
+            author: "RenamedWorker (@renamed_worker_bot)".to_string(),
             author_is_bot: true,
             sender_id: Some(9002),
-            text: "重型國風刺繡錦袍 3D 牌桌實測渲染".to_string(),
+            text: "Attachment render preview".to_string(),
             reference: Some(crate::QuoteRef {
                 chat_id,
                 message_id: 1750,
@@ -8189,7 +8663,8 @@ mod tests {
             thread_id: None,
             message_id: Some(2506),
         });
-        let ReceiveOutcome::New(upgraded_msg) = store.receive(&sage.id, quoted_relay).unwrap()
+        let ReceiveOutcome::New(upgraded_msg) =
+            store.receive(&reader_worker.id, quoted_relay).unwrap()
         else {
             panic!("late quote arrival after unquoted delivery must deliver the quoted message");
         };
@@ -8197,31 +8672,32 @@ mod tests {
         assert!(
             upgraded_msg
                 .text
-                .contains("[Attachment (photo): /scratch/tmp/renders/robe_3d.png]"),
+                .contains("[Attachment (photo): /tmp/example/renders/preview.png]"),
             "quote must be enriched with stored attachment path: {}",
             upgraded_msg.text
         );
 
-        // 4. Subsequent webhook from sage's own bot (`message_id = 14257`) is deduplicated
+        // 4. Subsequent webhook from reader_worker's own bot (`message_id = 14257`) is deduplicated
         let mut third_webhook = Incoming::new("仲有呢啲");
-        third_webhook.sender = Some("telegram:user:107671190:14257 (Kyle @kyletse)".to_string());
+        third_webhook.sender =
+            Some("telegram:user:107671190:14257 (Alex @alex_example)".to_string());
         third_webhook.source_time_ms = Some(1_793_798_602_000);
-        third_webhook.source_key = Some("bot_sage:99999".to_string());
+        third_webhook.source_key = Some("bot_reader_worker:99999".to_string());
         third_webhook.origin = Some(Origin {
             chat_id: Some(chat_id),
             thread_id: None,
             message_id: Some(14257),
         });
-        let third_out = store.receive(&sage.id, third_webhook).unwrap();
+        let third_out = store.receive(&reader_worker.id, third_webhook).unwrap();
         assert!(matches!(third_out, ReceiveOutcome::Duplicate(_)));
     }
 
     #[test]
     fn event_driven_topology_initial_delta_and_isolated_scope() {
         let (_dir, store) = setup();
-        let argus = store
+        let root_worker = store
             .create_agent(NewAgent {
-                name: "argus".to_string(),
+                name: "root_worker".to_string(),
                 role: Some("公司業務總管".to_string()),
                 description: None,
                 harness: "agy".to_string(),
@@ -8231,38 +8707,40 @@ mod tests {
                 parent_id: None,
             })
             .unwrap();
-        let helios = store
+        let helper = store
             .create_agent(NewAgent {
-                name: "helios".to_string(),
+                name: "helper".to_string(),
                 role: Some("產品與功能".to_string()),
                 description: None,
                 harness: "agy".to_string(),
                 model: None,
                 workdir: None,
                 instructions: None,
-                parent_id: Some(argus.id.clone()),
+                parent_id: Some(root_worker.id.clone()),
             })
             .unwrap();
-        let plutus = store
+        let renamed_worker = store
             .create_agent(NewAgent {
-                name: "plutus".to_string(),
+                name: "renamed_worker".to_string(),
                 role: Some("商業化與營收".to_string()),
                 description: None,
                 harness: "agy".to_string(),
                 model: None,
                 workdir: None,
                 instructions: None,
-                parent_id: Some(argus.id.clone()),
+                parent_id: Some(root_worker.id.clone()),
             })
             .unwrap();
-        assert_eq!(argus.scope(), "public");
-        store.set_agent_scope(&helios.id, "siblings").unwrap();
-        store.set_agent_scope(&plutus.id, "siblings").unwrap();
+        assert_eq!(root_worker.scope(), "public");
+        store.set_agent_scope(&helper.id, "siblings").unwrap();
+        store
+            .set_agent_scope(&renamed_worker.id, "siblings")
+            .unwrap();
 
-        // 1. First message to helios from argus -> emits `<topology event="initial" ... />`
+        // 1. First message to helper from root_worker -> emits `<topology event="initial" ... />`
         let mut m1 = Incoming::new("Start sprint");
-        m1.sender = Some("agent:argus".to_string());
-        let ReceiveOutcome::New(msg1) = store.receive(&helios.id, m1).unwrap() else {
+        m1.sender = Some("agent:root_worker".to_string());
+        let ReceiveOutcome::New(msg1) = store.receive(&helper.id, m1).unwrap() else {
             panic!("expected new message");
         };
         assert_eq!(msg1.context.sender_rel.as_deref(), Some("parent"));
@@ -8271,18 +8749,18 @@ mod tests {
         assert!(topo1.contains("event=\"initial\""), "topo1={topo1}");
         assert!(topo1.contains("scope=\"siblings\""), "topo1={topo1}");
         assert!(
-            topo1.contains("parent=\"agent:argus [公司業務總管]\""),
+            topo1.contains("parent=\"agent:root_worker [公司業務總管]\""),
             "topo1={topo1}"
         );
         assert!(
-            topo1.contains("agent:plutus [商業化與營收]"),
+            topo1.contains("agent:renamed_worker [商業化與營收]"),
             "topo1={topo1}"
         );
 
         // 2. Second message with no topology change -> `topology` is None
         let mut m2 = Incoming::new("Status check");
-        m2.sender = Some("agent:plutus".to_string());
-        let ReceiveOutcome::New(msg2) = store.receive(&helios.id, m2).unwrap() else {
+        m2.sender = Some("agent:renamed_worker".to_string());
+        let ReceiveOutcome::New(msg2) = store.receive(&helper.id, m2).unwrap() else {
             panic!("expected new message");
         };
         assert_eq!(msg2.context.sender_rel.as_deref(), Some("sibling"));
@@ -8291,23 +8769,25 @@ mod tests {
             "no delta expected when unchanged"
         );
 
-        // 3. New standing sibling `sage` added -> next message to helios emits `<topology event="delta" ... />`
-        let sage = store
+        // 3. New standing sibling `reader_worker` added -> next message to helper emits `<topology event="delta" ... />`
+        let reader_worker = store
             .create_agent(NewAgent {
-                name: "sage".to_string(),
+                name: "reader_worker".to_string(),
                 role: Some("用戶體驗與設計".to_string()),
                 description: None,
                 harness: "agy".to_string(),
                 model: None,
                 workdir: None,
                 instructions: None,
-                parent_id: Some(argus.id.clone()),
+                parent_id: Some(root_worker.id.clone()),
             })
             .unwrap();
-        store.set_agent_scope(&sage.id, "siblings").unwrap();
+        store
+            .set_agent_scope(&reader_worker.id, "siblings")
+            .unwrap();
         let mut m3 = Incoming::new("Design sync");
-        m3.sender = Some("agent:argus".to_string());
-        let ReceiveOutcome::New(msg3) = store.receive(&helios.id, m3).unwrap() else {
+        m3.sender = Some("agent:root_worker".to_string());
+        let ReceiveOutcome::New(msg3) = store.receive(&helper.id, m3).unwrap() else {
             panic!("expected new message");
         };
         let topo3 = msg3
@@ -8317,15 +8797,17 @@ mod tests {
             .expect("delta topology on add");
         assert!(topo3.contains("event=\"delta\""), "topo3={topo3}");
         assert!(
-            topo3.contains("+sibling: agent:sage [用戶體驗與設計]"),
+            topo3.contains("+sibling: agent:reader_worker [用戶體驗與設計]"),
             "topo3={topo3}"
         );
 
-        // 4. Archive `sage` -> next message to helios emits `-sibling: sage`
-        store.set_agent_state(&sage.id, "archived").unwrap();
+        // 4. Archive `reader_worker` -> next message to helper emits `-sibling: reader_worker`
+        store
+            .set_agent_state(&reader_worker.id, "archived")
+            .unwrap();
         let mut m4 = Incoming::new("After archive");
-        m4.sender = Some("agent:argus".to_string());
-        let ReceiveOutcome::New(msg4) = store.receive(&helios.id, m4).unwrap() else {
+        m4.sender = Some("agent:root_worker".to_string());
+        let ReceiveOutcome::New(msg4) = store.receive(&helper.id, m4).unwrap() else {
             panic!("expected new message");
         };
         let topo4 = msg4
@@ -8334,7 +8816,7 @@ mod tests {
             .as_deref()
             .expect("delta topology on archive");
         assert!(
-            topo4.contains("-sibling: agent:sage [用戶體驗與設計]"),
+            topo4.contains("-sibling: agent:reader_worker [用戶體驗與設計]"),
             "topo4={topo4}"
         );
 
@@ -8348,12 +8830,12 @@ mod tests {
                 model: None,
                 workdir: None,
                 instructions: None,
-                parent_id: Some(argus.id.clone()),
+                parent_id: Some(root_worker.id.clone()),
             })
             .unwrap();
         store.set_agent_scope(&stanley.id, "isolated").unwrap();
         let mut m5 = Incoming::new("Hello Stanley");
-        m5.sender = Some("agent:argus".to_string());
+        m5.sender = Some("agent:root_worker".to_string());
         let ReceiveOutcome::New(msg5) = store.receive(&stanley.id, m5).unwrap() else {
             panic!("expected new message");
         };
@@ -8364,5 +8846,425 @@ mod tests {
             .expect("initial topology for isolated");
         assert!(topo5.contains("scope=\"isolated\""), "topo5={topo5}");
         assert!(!topo5.contains("siblings="), "topo5={topo5}");
+    }
+
+    fn sleep_test_env_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    struct ScopedSleepModelEnv {
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl ScopedSleepModelEnv {
+        fn new(url: Option<&str>) -> Self {
+            let guard = sleep_test_env_lock()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            unsafe {
+                match url {
+                    Some(u) => std::env::set_var("ANYAGENTS_SLEEP_MODEL_URL", u),
+                    None => std::env::remove_var("ANYAGENTS_SLEEP_MODEL_URL"),
+                }
+                std::env::remove_var("ANYAGENTS_SLEEP_CONSOLIDATION_FORCE");
+            }
+            Self { _guard: guard }
+        }
+    }
+
+    impl Drop for ScopedSleepModelEnv {
+        fn drop(&mut self) {
+            unsafe {
+                std::env::remove_var("ANYAGENTS_SLEEP_MODEL_URL");
+                std::env::remove_var("ANYAGENTS_SLEEP_CONSOLIDATION_FORCE");
+            }
+        }
+    }
+
+    fn spawn_mock_sleep_model_server(
+        plan_json: String,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        std::thread::JoinHandle<()>,
+    ) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let req_clone = std::sync::Arc::clone(&requests);
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    match stream.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            buf.extend_from_slice(&chunk[..n]);
+                            let s = String::from_utf8_lossy(&buf);
+                            if let Some((hdrs, body)) = s.split_once("\r\n\r\n") {
+                                let content_len = hdrs
+                                    .lines()
+                                    .find_map(|l| {
+                                        let (k, v) = l.split_once(':')?;
+                                        if k.trim().eq_ignore_ascii_case("content-length") {
+                                            v.trim().parse::<usize>().ok()
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .unwrap_or(0);
+                                if body.len() >= content_len {
+                                    break;
+                                }
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                req_clone
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&buf).into_owned());
+                let resp_body = serde_json::json!({
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": plan_json
+                            }
+                        }
+                    ]
+                })
+                .to_string();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    resp_body.len(),
+                    resp_body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (
+            format!("http://{addr}/v1/chat/completions"),
+            requests,
+            handle,
+        )
+    }
+
+    #[test]
+    fn sleep_memory_maintenance_rebuilds_index_for_disk_edits_without_hardcoded_topics() {
+        let _env = ScopedSleepModelEnv::new(None);
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(NewAgent::new("sleep-neutral", "sylphx"))
+            .unwrap();
+        let mut msg = Incoming::new("Directive message body that exceeds thirty characters easily");
+        msg.sender = Some("operator".into());
+        store.receive(&agent.id, msg).unwrap();
+
+        let root = dir.path().join("agents").join(agent.id.as_str());
+        std::fs::create_dir_all(root.join("memory")).unwrap();
+        std::fs::write(
+            root.join("memory/custom-topic.md"),
+            "# Custom Topic\n\nAgent-authored invariant fact.\n",
+        )
+        .unwrap();
+
+        let modified = store.consolidate_agent_sleep_memory(&agent.id).unwrap();
+        assert!(modified);
+        let mem_md = std::fs::read_to_string(root.join("memory/MEMORY.md")).unwrap();
+        assert!(mem_md.contains("custom-topic"));
+        let topics = crate::learned_memory::list_memory_topics(&root).unwrap();
+        assert_eq!(topics.len(), 1);
+        assert_eq!(topics[0].slug, "custom-topic");
+        let sleep = crate::learned_memory::read_sleep_state(&root);
+        assert_eq!(sleep.last_inbound_seq, 1);
+        assert_eq!(sleep.consolidated_topics, 1);
+    }
+
+    #[test]
+    fn sleep_consolidation_strips_quotes_and_rejects_noise() {
+        let (url, requests, handle) =
+            spawn_mock_sleep_model_server(r#"{"operations":[]}"#.to_string());
+        let _env = ScopedSleepModelEnv::new(Some(&url));
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(NewAgent::new("sleep-noise", "sylphx"))
+            .unwrap();
+        let root = dir.path().join("agents").join(agent.id.as_str());
+        std::fs::create_dir_all(root.join("memory")).unwrap();
+
+        let mut quoted_msg = Incoming::new("OK, checking now");
+        quoted_msg.sender = Some("user:alex".into());
+        quoted_msg.quote = Some(crate::quote::Quote {
+            author: "Alex".into(),
+            text: "quoted_echo_secret_should_be_stripped".into(),
+            ..Default::default()
+        });
+        store.receive(&agent.id, quoted_msg).unwrap();
+
+        let mut no_reply = Incoming::new("NO_REPLY");
+        no_reply.sender = Some("agent:peer".into());
+        store.receive(&agent.id, no_reply).unwrap();
+
+        let modified = store.consolidate_agent_sleep_memory(&agent.id).unwrap();
+        handle.join().unwrap();
+        assert!(!modified, "noise rejection should not create topic files");
+
+        let captured = requests.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert!(captured[0].contains("OK, checking now"));
+        assert!(
+            !captured[0].contains("quoted_echo_secret_should_be_stripped"),
+            "quoted block must be stripped before LLM consolidation"
+        );
+        assert!(
+            !captured[0].contains("NO_REPLY"),
+            "NO_REPLY turns must be filtered out"
+        );
+
+        let topics = crate::learned_memory::list_memory_topics(&root).unwrap();
+        assert!(topics.is_empty());
+        let sleep = crate::learned_memory::read_sleep_state(&root);
+        assert_eq!(sleep.last_inbound_seq, 2);
+        assert_eq!(sleep.consolidated_topics, 0);
+    }
+
+    #[test]
+    fn sleep_consolidation_upserts_existing_topic_in_place_and_resolves_conflicts() {
+        let plan = serde_json::json!({
+            "operations": [
+                {
+                    "op": "upsert",
+                    "topic": "service-endpoint",
+                    "description": "Primary API endpoint migrated to port 9090 (replaced 8080)",
+                    "content": "# Service Endpoint\n\nPrimary API endpoint runs on port 9090 in production."
+                }
+            ]
+        })
+        .to_string();
+        let (url, requests, handle) = spawn_mock_sleep_model_server(plan);
+        let _env = ScopedSleepModelEnv::new(Some(&url));
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(NewAgent::new("sleep-upsert", "sylphx"))
+            .unwrap();
+        let root = dir.path().join("agents").join(agent.id.as_str());
+        crate::learned_memory::upsert_memory_topic(
+            &root,
+            &agent.name,
+            None,
+            "service-endpoint",
+            Some("Primary API endpoint on port 8080"),
+            "# Service Endpoint\n\nPrimary API endpoint runs on port 8080.",
+            1700000000000,
+        )
+        .unwrap();
+
+        let mut msg = Incoming::new("We migrated the service-endpoint port from 8080 to 9090.");
+        msg.sender = Some("operator".into());
+        store.receive(&agent.id, msg).unwrap();
+
+        let modified = store.consolidate_agent_sleep_memory(&agent.id).unwrap();
+        handle.join().unwrap();
+        assert!(modified);
+
+        let captured = requests.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert!(
+            captured[0].contains("Primary API endpoint runs on port 8080."),
+            "existing topic body must be included in consolidation prompt"
+        );
+
+        let topics = crate::learned_memory::list_memory_topics(&root).unwrap();
+        assert_eq!(
+            topics.len(),
+            1,
+            "must update topic in place without duplicating"
+        );
+        assert_eq!(topics[0].slug, "service-endpoint");
+        assert_eq!(
+            topics[0].description,
+            "Primary API endpoint migrated to port 9090 (replaced 8080)"
+        );
+        assert!(topics[0].updated_at_ms > 1700000000000);
+
+        let on_disk = std::fs::read_to_string(root.join("memory/service-endpoint.md")).unwrap();
+        assert!(on_disk.contains("created_at_ms: 1700000000000"));
+        assert!(on_disk.contains("port 9090 in production"));
+        assert!(!on_disk.contains("runs on port 8080"));
+    }
+
+    #[test]
+    fn sleep_consolidation_defragments_duplicate_topics_and_syncs_fts5() {
+        let plan = serde_json::json!({
+            "operations": [
+                {
+                    "op": "upsert",
+                    "topic": "cache-ttl",
+                    "description": "Unified cache TTL policy (300s L1, 3600s L2)",
+                    "content": "# Unified Cache TTL\n\nCanonical merged token unifiedcachetoken."
+                },
+                {
+                    "op": "delete",
+                    "topic": "cache-ttl-v1"
+                },
+                {
+                    "op": "delete",
+                    "topic": "cache-ttl-v2"
+                }
+            ]
+        })
+        .to_string();
+        let (url, _requests, handle) = spawn_mock_sleep_model_server(plan);
+        let _env = ScopedSleepModelEnv::new(Some(&url));
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(NewAgent::new("sleep-defrag", "sylphx"))
+            .unwrap();
+        let root = dir.path().join("agents").join(agent.id.as_str());
+        crate::learned_memory::upsert_memory_topic(
+            &root,
+            &agent.name,
+            None,
+            "cache-ttl-v1",
+            Some("Legacy L1 cache TTL"),
+            "Fragment one oldfragmenttoken",
+            1700000000000,
+        )
+        .unwrap();
+        crate::learned_memory::upsert_memory_topic(
+            &root,
+            &agent.name,
+            None,
+            "cache-ttl-v2",
+            Some("Legacy L2 cache TTL"),
+            "Fragment two secondfragmenttoken",
+            1700000001000,
+        )
+        .unwrap();
+        store.sync_agent_memory_index(&agent).unwrap();
+
+        let mut msg = Incoming::new("Consolidate cache TTL notes into a single topic.");
+        msg.sender = Some("operator".into());
+        store.receive(&agent.id, msg).unwrap();
+
+        let modified = store.consolidate_agent_sleep_memory(&agent.id).unwrap();
+        handle.join().unwrap();
+        assert!(modified);
+
+        let topics = crate::learned_memory::list_memory_topics(&root).unwrap();
+        assert_eq!(topics.len(), 1);
+        assert_eq!(topics[0].slug, "cache-ttl");
+        let mem_md = std::fs::read_to_string(root.join("memory/MEMORY.md")).unwrap();
+        assert!(mem_md.contains("cache-ttl"));
+        assert!(!mem_md.contains("cache-ttl-v1"));
+        assert!(!mem_md.contains("cache-ttl-v2"));
+
+        let ids = [agent.id.to_string()];
+        let merged_hits = store
+            .search_host_files(
+                &ids,
+                crate::host_index::MemoryScope::Memory,
+                &HistorySearchQuery {
+                    query: Some("unifiedcachetoken".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(merged_hits.len(), 1);
+        let old_hits = store
+            .search_host_files(
+                &ids,
+                crate::host_index::MemoryScope::Memory,
+                &HistorySearchQuery {
+                    query: Some("oldfragmenttoken".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            old_hits.is_empty(),
+            "deleted fragmented topic must be evicted from HostIndex FTS5"
+        );
+    }
+
+    #[test]
+    fn sleep_consolidation_defers_turns_during_cooldown_without_data_loss() {
+        let plan = serde_json::json!({
+            "operations": [
+                {
+                    "op": "upsert",
+                    "topic": "deferred-fact",
+                    "description": "Fact consolidated after cooldown expiry",
+                    "content": "Durable fact body after cooldown."
+                }
+            ]
+        })
+        .to_string();
+        let (url, requests, handle) = spawn_mock_sleep_model_server(plan);
+        let _env = ScopedSleepModelEnv::new(Some(&url));
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(NewAgent::new("sleep-cooldown", "sylphx"))
+            .unwrap();
+        let root = dir.path().join("agents").join(agent.id.as_str());
+        std::fs::create_dir_all(root.join("memory")).unwrap();
+
+        // Simulate a consolidation that just ran at `now_ms()`.
+        let now = crate::now_ms();
+        crate::learned_memory::write_sleep_state(
+            &root,
+            &crate::learned_memory::SleepState {
+                last_consolidated_ms: now,
+                last_inbound_seq: 0,
+                last_outbound_ms: 0,
+                consolidated_topics: 0,
+            },
+        )
+        .unwrap();
+
+        let mut msg = Incoming::new("Durable fact arriving during the 10-minute cooldown window.");
+        msg.sender = Some("operator".into());
+        store.receive(&agent.id, msg).unwrap();
+
+        // First call during cooldown: must defer LLM call and preserve last_inbound_seq = 0.
+        let modified_in_cooldown = store.consolidate_agent_sleep_memory(&agent.id).unwrap();
+        assert!(!modified_in_cooldown);
+        assert!(requests.lock().unwrap().is_empty());
+        let sleep_during = crate::learned_memory::read_sleep_state(&root);
+        assert_eq!(
+            sleep_during.last_inbound_seq, 0,
+            "must not advance watermark while deferred by cooldown"
+        );
+
+        // Expire the 10-minute cooldown and run again: now it consolidates and advances watermark.
+        crate::learned_memory::write_sleep_state(
+            &root,
+            &crate::learned_memory::SleepState {
+                last_consolidated_ms: now - 605_000,
+                last_inbound_seq: 0,
+                last_outbound_ms: 0,
+                consolidated_topics: 0,
+            },
+        )
+        .unwrap();
+        let modified_after = store.consolidate_agent_sleep_memory(&agent.id).unwrap();
+        handle.join().unwrap();
+        assert!(modified_after);
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        let sleep_after = crate::learned_memory::read_sleep_state(&root);
+        assert_eq!(sleep_after.last_inbound_seq, 1);
+        assert_eq!(sleep_after.consolidated_topics, 1);
     }
 }

@@ -30,14 +30,30 @@ fn owner_pages(data: &Path, test_mode: bool) -> PathBuf {
     if test_mode {
         data.join("legacy-owner-pages")
     } else {
-        PathBuf::from("/scratch/tmp/owners")
+        std::env::var_os("ANYAGENTS_LEGACY_MEMORY_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| data.join("legacy-memory"))
     }
 }
 
 /// The caller owns this agent's process lock and has not started a vendor yet.
 /// The global migration lock serializes receipt publication across agents.
 pub(crate) fn before_launch(data: &Path, agent: &AgentId) -> Result<(), Error> {
-    before_launch_from(data, agent, &owner_pages(data, explicit_test_mode()))
+    if !explicit_test_mode()
+        && data
+            .join("host-memory-migration/population-v1.json")
+            .is_file()
+    {
+        return Ok(());
+    }
+    match before_launch_from(data, agent, &owner_pages(data, explicit_test_mode())) {
+        Ok(()) => Ok(()),
+        Err(err) if !explicit_test_mode() => {
+            eprintln!("warning: host memory before_launch deferred for {agent}: {err}");
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
 }
 fn before_launch_from(data: &Path, agent: &AgentId, owners_pages: &Path) -> Result<(), Error> {
     let store = Store::open(data.join("state.db"))?;
@@ -78,6 +94,14 @@ fn before_launch_from(data: &Path, agent: &AgentId, owners_pages: &Path) -> Resu
 /// archived identities that will never launch. Process locks, not SQL state,
 /// establish quiescence; live or busy identities are explicitly deferred.
 pub(crate) fn on_start(store: &Store) {
+    if !explicit_test_mode()
+        && store
+            .data_dir()
+            .join("host-memory-migration/population-v1.json")
+            .is_file()
+    {
+        return;
+    }
     // Migration is maintenance, never a prerequisite for binding host sockets.
     // Failed integrity checks preserve their sources; keep a retryable receipt
     // and allow authorized non-migration operations to remain available.
@@ -216,6 +240,31 @@ mod tests {
         host_migration::{MigrationKind, MigrationStatus},
         learned_memory::sha256,
     };
+    // Make fixture locks only after exec. An unrelated in-process test can
+    // otherwise fork while a flock is held and retain the descriptor until exec.
+    fn run_in_single_test_process(name: &str) -> bool {
+        const CHILD: &str = "ANYAGENTS_HOST_MEMORY_FIXTURE_CHILD";
+        if std::env::var(CHILD).as_deref() == Ok(name) {
+            return false;
+        }
+        let environment = std::env::vars_os()
+            .filter(|(key, _)| !key.as_encoded_bytes().starts_with(b"ANYAGENTS_"));
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .env_clear()
+            .envs(environment)
+            .env(CHILD, name)
+            .args(["--exact", name, "--nocapture", "--test-threads=1"])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed; 0 failed;"),
+            "{name}: stdout={stdout} stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        true
+    }
+
     #[test]
     fn fixture_owner_pages_are_scoped_without_changing_production_discovery() {
         let dir = crate::test_tempdir();
@@ -223,14 +272,14 @@ mod tests {
         fs::create_dir(&data).unwrap();
         let store = Store::open(data.join("state.db")).unwrap();
         let agent = store
-            .create_agent(NewAgent::new("lyra", "claude-code"))
+            .create_agent(NewAgent::new("sample-delta", "claude-code"))
             .unwrap();
         let selected = owner_pages(&data, true);
         let outside = dir.path().join("other-host-owners");
         fs::create_dir(&selected).unwrap();
         fs::create_dir(&outside).unwrap();
-        fs::write(selected.join("lyra.md"), b"synthetic selected page").unwrap();
-        fs::write(outside.join("lyra.md"), b"unrelated host page").unwrap();
+        fs::write(selected.join("sample-delta.md"), b"synthetic selected page").unwrap();
+        fs::write(outside.join("sample-delta.md"), b"unrelated host page").unwrap();
         on_start_from(&store, &selected).unwrap();
         let migration = HostMigration::open(&data).unwrap();
         let pages: Vec<_> = migration
@@ -246,10 +295,10 @@ mod tests {
             b"synthetic selected page"
         );
         assert_eq!(
-            fs::read(outside.join("lyra.md")).unwrap(),
+            fs::read(outside.join("sample-delta.md")).unwrap(),
             b"unrelated host page"
         );
-        assert_eq!(owner_pages(&data, false), Path::new("/scratch/tmp/owners"));
+        assert_ne!(owner_pages(&data, false), outside);
     }
 
     #[test]
@@ -306,6 +355,11 @@ mod tests {
 
     #[test]
     fn active_append_and_unreadable_bundle_do_not_block_startup_or_other_launches() {
+        if run_in_single_test_process(
+            "host_memory::tests::active_append_and_unreadable_bundle_do_not_block_startup_or_other_launches",
+        ) {
+            return;
+        }
         use std::os::unix::fs::PermissionsExt;
         use std::{
             io::Write,
@@ -400,28 +454,9 @@ mod tests {
     #[test]
     fn discovery_failure_is_deferred_per_stopped_owner_and_retried() {
         use std::os::unix::fs::PermissionsExt;
-        // A concurrent test can fork while this fixture owns a flock. CLOEXEC
-        // closes its inherited descriptor only at exec, so a nonblocking retry
-        // can legitimately defer after the owning guard has been dropped. Make
-        // this fixture's data/locks only after exec in a single-test process.
-        const CHILD: &str = "ANYAGENTS_HOST_MEMORY_RETRY_FIXTURE_CHILD";
-        if std::env::var_os(CHILD).is_none() {
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "host_memory::tests::discovery_failure_is_deferred_per_stopped_owner_and_retried",
-                    "--nocapture",
-                    "--test-threads=1",
-                ])
-                .env(CHILD, "1")
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "retry fixture: stdout={} stderr={}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
+        if run_in_single_test_process(
+            "host_memory::tests::discovery_failure_is_deferred_per_stopped_owner_and_retried",
+        ) {
             return;
         }
         for block_page in [false, true] {
@@ -501,6 +536,11 @@ mod tests {
 
     #[test]
     fn busy_global_lock_defers_launch_and_startup_without_moving_sources() {
+        if run_in_single_test_process(
+            "host_memory::tests::busy_global_lock_defers_launch_and_startup_without_moving_sources",
+        ) {
+            return;
+        }
         let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let agent = store
@@ -569,6 +609,11 @@ mod tests {
 
     #[test]
     fn daemon_launch_migrates_facts_stages_state_and_never_hands_off_native_raw() {
+        if run_in_single_test_process(
+            "host_memory::tests::daemon_launch_migrates_facts_stages_state_and_never_hands_off_native_raw",
+        ) {
+            return;
+        }
         let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let agent = store
@@ -628,5 +673,34 @@ mod tests {
             fs::read(config.join("sylphx-transcript.jsonl")).unwrap(),
             raw
         );
+    }
+    #[test]
+    fn production_migration_root_is_operator_selected_without_host_directory_inference() {
+        let _env = crate::server::tests::env_lock();
+        let key = "ANYAGENTS_LEGACY_MEMORY_ROOT";
+        let old = std::env::var_os(key);
+        let dir = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::remove_var(key);
+        }
+        assert_eq!(
+            owner_pages(dir.path(), false),
+            dir.path().join("legacy-memory")
+        );
+        let selected = dir.path().join("operator-selected");
+        unsafe {
+            std::env::set_var(key, &selected);
+        }
+        assert_eq!(owner_pages(dir.path(), false), selected);
+        assert_eq!(
+            owner_pages(dir.path(), true),
+            dir.path().join("legacy-owner-pages")
+        );
+        unsafe {
+            match old {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
     }
 }

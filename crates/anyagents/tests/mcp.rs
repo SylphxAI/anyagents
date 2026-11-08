@@ -134,7 +134,7 @@ fn start_server(data: &std::path::Path) -> Serve {
 }
 
 fn start_server_mode(data: &std::path::Path, mode: &str) -> Serve {
-    let mut child = bin()
+    let mut child = support::contract_server()
         .arg("--data")
         .arg(data)
         .arg(mode)
@@ -365,15 +365,8 @@ async fn mcp_tools_use_the_server_socket() {
     let names: Vec<_> = tools.iter().map(|tool| tool.name.to_string()).collect();
     assert_eq!(
         names,
-        vec![
-            "agents".to_string(),
-            "browser".to_string(),
-            "conversation".to_string(),
-            "groups".to_string(),
-            "schedule".to_string(),
-            "send".to_string(),
-        ],
-        "expected consolidated 6 canonical orthogonal MCP tools, got {names:?}"
+        vec!["code".to_string()],
+        "expected Pure Code Mode (`CANONICAL_MCP_TOOLS = &[\"code\"]`), got {names:?}"
     );
 
     let listed: AgentsResponse = ok_json(call(&alpha, "agents", serde_json::json!({})).await);
@@ -436,7 +429,12 @@ async fn mcp_tools_use_the_server_socket() {
         ok_json(call(&beta, "conversation", serde_json::json!({})).await);
     assert_eq!(got.turns.len(), 2);
     assert_eq!(got.turns[0].text, "hello");
-    assert_eq!(got.turns[0].from, "agent:alpha");
+    let alpha_id = anyagents_core::Store::open(dir.path().join("state.db"))
+        .unwrap()
+        .agent_by_name("alpha")
+        .unwrap()
+        .id;
+    assert_eq!(got.turns[0].from, format!("agent:{alpha_id}"));
 
     // A room reaches every other agent, and not the sender.
     // A named group reaches its own members.
@@ -588,10 +586,15 @@ async fn mcp_tools_use_the_server_socket() {
         .join(&spawned.id)
         .join("config")
         .join("fixture-claude-started");
-    support::wait_for(
-        || marker.is_file(),
-        "canonical Claude fixture was not launched",
-    );
+    let deadline = Instant::now() + support::WAIT;
+    while !marker.is_file() {
+        if Instant::now() >= deadline {
+            let views: serde_json::Value =
+                ok_json(call(&alpha, "agents", serde_json::json!({"state":"all"})).await);
+            panic!("canonical Claude fixture was not launched: {views}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
     assert_eq!(
         std::fs::read_to_string(&marker).unwrap().trim(),
         dir.path().join("bin/fixture-claude").to_str().unwrap()
@@ -1352,7 +1355,7 @@ async fn describe_preserves_config_permissions_without_vendor_restart_writers() 
 async fn history_search_defaults_and_all_never_escape_a_private_childs_tree() {
     use anyagents_core::{Incoming, Store};
     let dir = support::physical_tempdir();
-    for name in ["argus", "lyra", "helios", "runner"] {
+    for name in ["coordinator", "planner", "reviewer", "runner"] {
         let created = bin()
             .env("PATH", machine_path(dir.path()))
             .arg("--data")
@@ -1363,25 +1366,31 @@ async fn history_search_defaults_and_all_never_escape_a_private_childs_tree() {
         assert!(created.status.success(), "{created:?}");
     }
     let store = Store::open(dir.path().join("state.db")).unwrap();
-    let argus = store.agent_by_name("argus").unwrap();
-    let lyra = store.agent_by_name("lyra").unwrap();
-    let helios = store.agent_by_name("helios").unwrap();
+    let coordinator = store.agent_by_name("coordinator").unwrap();
+    let planner = store.agent_by_name("planner").unwrap();
+    let reviewer = store.agent_by_name("reviewer").unwrap();
     let runner = store.agent_by_name("runner").unwrap();
-    store.set_agent_parent(&lyra.id, Some(&argus.id)).unwrap();
-    store.set_agent_parent(&helios.id, Some(&argus.id)).unwrap();
-    store.set_agent_parent(&runner.id, Some(&lyra.id)).unwrap();
+    store
+        .set_agent_parent(&planner.id, Some(&coordinator.id))
+        .unwrap();
+    store
+        .set_agent_parent(&reviewer.id, Some(&coordinator.id))
+        .unwrap();
+    store
+        .set_agent_parent(&runner.id, Some(&planner.id))
+        .unwrap();
     // Synthetic bodies only. These identifiers reproduce the reported search
     // shape without importing any production conversation content.
     for (id, text) in [
         (
-            &argus.id,
+            &coordinator.id,
             "C msg_01m6svh4znevfapf3mmpsnk0a4 #2291 private parent",
         ),
         (
-            &helios.id,
+            &reviewer.id,
             "C msg_01m6svrywtez39wvnttdvz53xf #2291 private sibling",
         ),
-        (&lyra.id, "C #2291 authorized own mailbox"),
+        (&planner.id, "C #2291 authorized own mailbox"),
         (&runner.id, "C #2291 authorized descendant"),
     ] {
         store
@@ -1390,10 +1399,10 @@ async fn history_search_defaults_and_all_never_escape_a_private_childs_tree() {
                 Incoming {
                     text: text.into(),
                     sender: Some(
-                        if id == &argus.id {
-                            "agent:lyra"
+                        if id == &coordinator.id {
+                            "agent:planner"
                         } else {
-                            "agent:argus"
+                            "agent:coordinator"
                         }
                         .into(),
                     ),
@@ -1412,7 +1421,7 @@ async fn history_search_defaults_and_all_never_escape_a_private_childs_tree() {
     }
     store
         .record_outbound(
-            &argus.id,
+            &coordinator.id,
             "telegram:chat:-100",
             None,
             "C out_msg_01m6svqn4nesw9ws13fjy48kzt #2291 private outbound",
@@ -1420,12 +1429,12 @@ async fn history_search_defaults_and_all_never_escape_a_private_childs_tree() {
         .unwrap();
     let server = start_server_mode(dir.path(), "serve-admin");
     std::os::unix::fs::symlink("admin.sock", dir.path().join("anyagents.sock")).unwrap();
-    let client = connect(dir.path(), "lyra").await;
+    let client = connect(dir.path(), "planner").await;
     let native: ConversationResponse = ok_json(
         call(
             &client,
             "conversation",
-            serde_json::json!({"with":"lyra", "direction":"in", "query":"C", "limit":4}),
+            serde_json::json!({"with":"planner", "direction":"in", "query":"C", "limit":4}),
         )
         .await,
     );
@@ -1457,7 +1466,12 @@ async fn history_search_defaults_and_all_never_escape_a_private_childs_tree() {
             response.turns
         );
     }
-    for target in ["argus", "helios", argus.id.as_str(), helios.id.as_str()] {
+    for target in [
+        "coordinator",
+        "reviewer",
+        coordinator.id.as_str(),
+        reviewer.id.as_str(),
+    ] {
         for tool in ["conversation", "search"] {
             let denied = call(
                 &client,
@@ -1471,6 +1485,119 @@ async fn history_search_defaults_and_all_never_escape_a_private_childs_tree() {
             );
         }
     }
+    client.cancel().await.unwrap();
+    drop(server);
+}
+
+#[tokio::test]
+async fn code_mode_supports_memory_sdk_workspace_patch_list_exec_and_computer_snapshot_refs() {
+    let dir = support::physical_tempdir();
+    let created = bin()
+        .env("PATH", machine_path(dir.path()))
+        .arg("--data")
+        .arg(dir.path())
+        .args(["agents", "create", "sage"])
+        .output()
+        .unwrap();
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let server = start_server(dir.path());
+    let client = connect(dir.path(), "sage").await;
+
+    let code_res: serde_json::Value = ok_json(
+        call(
+            &client,
+            "code",
+            serde_json::json!({
+                "code": r##"
+                // 1. First-class anyagents.memory SDK
+                const w = await anyagents.memory.write({
+                    topic: "arch-decisions",
+                    description: "Pure Code Mode architecture",
+                    content: "# Pure Code Mode\nOnly `code` is exposed in list_tools."
+                });
+                const r = await anyagents.memory.read("arch-decisions");
+                const list = await anyagents.memory.list();
+                const search = await anyagents.memory.search("Pure Code Mode");
+                const del = await anyagents.memory.delete("arch-decisions");
+
+                // 2. Enhanced workspace SDK: write, 4-stage edit, patch, list, exec
+                await workspace.write("src/demo.rs", "fn main() {\n    let x = 1;\n    println!(\"{}\", x);\n}\n");
+                // Indentation-different edit (stage 3)
+                const edited = await workspace.edit({
+                    path: "src/demo.rs",
+                    target: "let x = 1;\nprintln!(\"{}\", x);",
+                    replacement: "let x = 42;\n    println!(\"val={}\", x);"
+                });
+                // V4A patch
+                const patched = await workspace.patch([
+                    "*** Begin Patch",
+                    "*** Update File: src/demo.rs",
+                    "@@",
+                    "-    let x = 42;",
+                    "+    let x = 99;",
+                    "*** Add File: src/extra.txt",
+                    "+hello patch",
+                    "*** End Patch"
+                ].join("\n"));
+                const listed = await workspace.list("src");
+                const execOut = await workspace.exec({ cmd: "printf 'exec-ok'" });
+
+                // 3. Semantic Accessibility Snapshot & STALE_REF guard on tools.computer
+                const snap = await tools.computer.snapshot();
+                let staleCaught = false;
+                try {
+                    await tools.computer.click("@e1");
+                } catch (err: any) {
+                    staleCaught = String(err).includes("STALE_REF") && String(err).includes("stale_ref");
+                }
+
+                return {
+                    memTopic: r.topic,
+                    memHasContent: r.content.includes("Only `code` is exposed"),
+                    memCountBeforeDelete: list.count,
+                    memSearchCount: search.count,
+                    memDeleted: del.deleted,
+                    editReplacements: edited.replacements_made,
+                    patchCount: patched.count,
+                    listCount: listed.count,
+                    execStdout: execOut.stdout,
+                    snapshotIdPrefix: snap.snapshot_id.startsWith("s"),
+                    firstRef: snap.elements[0]?.ref_id,
+                    staleCaught,
+                };
+            "##
+            }),
+        )
+        .await,
+    );
+
+    let res = &code_res["result"];
+    assert_eq!(res["memTopic"], "arch-decisions", "{code_res:?}");
+    assert_eq!(res["memHasContent"], true, "{code_res:?}");
+    assert!(
+        res["memCountBeforeDelete"].as_u64().unwrap_or(0) >= 1,
+        "{code_res:?}"
+    );
+    assert!(
+        res["memSearchCount"].as_u64().unwrap_or(0) >= 1,
+        "{code_res:?}"
+    );
+    assert_eq!(res["memDeleted"], true, "{code_res:?}");
+    assert_eq!(res["editReplacements"], 1, "{code_res:?}");
+    assert_eq!(res["patchCount"], 2, "{code_res:?}");
+    assert_eq!(res["listCount"], 2, "{code_res:?}");
+    assert_eq!(res["execStdout"], "exec-ok", "{code_res:?}");
+    assert_eq!(res["snapshotIdPrefix"], true, "{code_res:?}");
+    assert!(
+        res["firstRef"].as_str().unwrap_or("").contains(":e1"),
+        "{code_res:?}"
+    );
+    assert_eq!(res["staleCaught"], true, "{code_res:?}");
+
     client.cancel().await.unwrap();
     drop(server);
 }

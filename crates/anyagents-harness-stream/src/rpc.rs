@@ -421,7 +421,9 @@ fn read_stdout(
             (Some(method), Some(id)) => {
                 if let Some(result) = on_request(method, &value) {
                     let answer = json!({"jsonrpc": "2.0", "id": id, "result": result});
-                    let _ = write_stdin(&stdin, &answer);
+                    if write_stdin(&stdin, &answer).is_err() {
+                        break;
+                    }
                 }
             }
             (Some(method), None) => {
@@ -433,16 +435,18 @@ fn read_stdout(
             }
             (None, Some(id)) => {
                 let Some(id) = id.as_i64() else { continue };
+                let response = decode_response(&value);
                 let is_async = {
                     let mut state = lock(&shared);
                     match state.pending.get(&id) {
                         Some(Answer::Waiting) => {
-                            if let Some(error) = value.get("error") {
-                                state.pending.insert(id, Answer::Err(error.clone()));
-                            } else {
-                                let result = value.get("result").cloned().unwrap_or(Value::Null);
-                                state.pending.insert(id, Answer::Done(result));
-                            }
+                            state.pending.insert(
+                                id,
+                                match &response {
+                                    Ok(result) => Answer::Done(result.clone()),
+                                    Err(error) => Answer::Err(error.clone()),
+                                },
+                            );
                             false
                         }
                         Some(Answer::Async) => {
@@ -453,13 +457,13 @@ fn read_stdout(
                     }
                 };
                 if is_async {
+                    let (result, error) = match response {
+                        Ok(result) => (result, Value::Null),
+                        Err(error) => (Value::Null, error),
+                    };
                     let effect = on_line(&json!({
                         "method": "$rpc/response",
-                        "params": {
-                            "id": id,
-                            "result": value.get("result").cloned().unwrap_or(Value::Null),
-                            "error": value.get("error").cloned().unwrap_or(Value::Null),
-                        }
+                        "params": { "id": id, "result": result, "error": error }
                     }));
                     if let Some(reset_at_ms) = effect.quota_reset_at_ms {
                         lock(&shared).quota_reset_at_ms = Some(reset_at_ms);
@@ -485,6 +489,21 @@ fn read_stdout(
     wake.notify_all();
 }
 
+fn decode_response(value: &Value) -> Result<Value, Value> {
+    match (value.get("result"), value.get("error")) {
+        (Some(result), None) => Ok(result.clone()),
+        (None, Some(error))
+            if error.get("code").and_then(Value::as_i64).is_some()
+                && error.get("message").and_then(Value::as_str).is_some() =>
+        {
+            Err(error.clone())
+        }
+        _ => Err(
+            json!({"code": -32600, "message": "malformed JSON-RPC response: expected exactly one result or valid error"}),
+        ),
+    }
+}
+
 fn write_stdin(slot: &Mutex<Option<ChildStdin>>, value: &Value) -> std::io::Result<()> {
     let mut guard = lock(slot);
     let Some(stdin) = guard.as_mut() else {
@@ -496,4 +515,136 @@ fn write_stdin(slot: &Mutex<Option<ChildStdin>>, value: &Value) -> std::io::Resu
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|err| err.into_inner())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    fn launch(
+        script: String,
+        on_line: Arc<dyn Fn(&Value) -> NotificationEffect + Send + Sync>,
+    ) -> RpcChild {
+        launch_with_request_handler(
+            script,
+            on_line,
+            Arc::new(|_, _| Some(json!({"approved": true}))),
+        )
+    }
+
+    fn launch_with_request_handler(
+        script: String,
+        on_line: Arc<dyn Fn(&Value) -> NotificationEffect + Send + Sync>,
+        on_request: RequestHandler,
+    ) -> RpcChild {
+        RpcChild::launch(
+            RpcLaunch {
+                name: "rpc-fixture".into(),
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), script],
+                environment: Vec::new(),
+                work_dir: None,
+            },
+            on_line,
+            on_request,
+        )
+        .unwrap()
+    }
+
+    fn response_child(response: Value) -> RpcChild {
+        launch(
+            format!("IFS= read -r request; printf '%s\\n' '{response}'; exec cat >/dev/null"),
+            Arc::new(|_| NotificationEffect::default()),
+        )
+    }
+
+    #[test]
+    fn valid_result_including_explicit_null_and_structured_errors_complete_requests() {
+        for result in [Value::Null, json!({"ok": true})] {
+            let child = response_child(json!({"jsonrpc": "2.0", "id": 1, "result": result}));
+            assert_eq!(
+                child
+                    .request("cancel", json!({}), Duration::from_secs(5))
+                    .unwrap(),
+                result
+            );
+        }
+        let child = response_child(json!({"id": 1, "error": {"code": 41, "message": "refused"}}));
+        assert!(
+            matches!(child.request("cancel", json!({}), Duration::from_secs(5)),
+            Err(RpcFail::Failed(ref error)) if error["code"] == 41)
+        );
+    }
+
+    #[test]
+    fn missing_conflicting_or_malformed_response_fields_fail_instead_of_returning_null() {
+        for fields in [
+            json!({}),
+            json!({"result": null, "error": {"code": 1, "message": "bad"}}),
+            json!({"error": null}),
+            json!({"error": "bad"}),
+            json!({"error": {"message": "bad"}}),
+        ] {
+            let mut response = fields;
+            response["id"] = json!(1);
+            let child = response_child(response);
+            assert!(
+                matches!(child.request("cancel", json!({}), Duration::from_secs(5)),
+                Err(RpcFail::Failed(ref error)) if error["code"] == -32600)
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_async_response_is_reported_to_the_adapter_as_an_error() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let child = launch(
+            "IFS= read -r request; printf '%s\n' '{\"id\":1}'; exec cat >/dev/null".into(),
+            Arc::new(move |line| {
+                tx.send(line.clone()).unwrap();
+                NotificationEffect::default()
+            }),
+        );
+        child.send_request("turn", json!({})).unwrap();
+        let event = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(event["method"], "$rpc/response");
+        assert_eq!(event["params"]["error"]["code"], -32600);
+    }
+
+    #[test]
+    fn required_reply_write_failure_marks_child_dead_and_wakes_pending_request() {
+        let (stdin_tx, stdin_rx) =
+            std::sync::mpsc::sync_channel::<Arc<Mutex<Option<ChildStdin>>>>(1);
+        let stdin_rx = Mutex::new(stdin_rx);
+        let child = launch_with_request_handler(
+            "IFS= read -r request; printf '%s\n' '{\"id\":99,\"method\":\"approval/request\"}'; exec sleep 30".into(),
+            Arc::new(|_| NotificationEffect::default()),
+            Arc::new(move |_, _| {
+                // Close the host writer while handling the vendor's request.
+                // A shell closing fd 0 does not guarantee EPIPE while another
+                // process still holds an inherited copy of the pipe's read end.
+                let stdin = lock(&stdin_rx).recv_timeout(Duration::from_secs(5)).unwrap();
+                *lock(&stdin) = None;
+                Some(json!({"approved": true}))
+            }),
+        );
+        stdin_tx.send(Arc::clone(&child.stdin)).unwrap();
+        assert!(matches!(
+            child.request("turn", json!({}), Duration::from_secs(5)),
+            Err(RpcFail::Dead)
+        ));
+        assert!(!child.alive());
+    }
+
+    #[test]
+    fn successful_required_reply_allows_the_pending_request_to_finish() {
+        let child = launch("IFS= read -r request; printf '%s\n' '{\"id\":99,\"method\":\"approval/request\"}'; IFS= read -r reply; printf '%s\n' '{\"id\":1,\"result\":true}'; exec cat >/dev/null".into(),
+            Arc::new(|_| NotificationEffect::default()));
+        assert_eq!(
+            child
+                .request("turn", json!({}), Duration::from_secs(5))
+                .unwrap(),
+            json!(true)
+        );
+    }
 }

@@ -7,9 +7,10 @@
 //! Wakes fire only when the owning agent is idle and not quota-blocked.
 //! A missed wake never fires twice, and cancelling a schedule takes effect immediately.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
-use anyagents_core::{Agent, AgentSchedule, Incoming, NewSchedule, Store};
+use anyagents_core::{Agent, AgentId, AgentSchedule, Incoming, NewSchedule, Store};
 use anyagents_supervisor::HealthBoard;
 
 use crate::api::ScheduleView;
@@ -512,13 +513,11 @@ pub fn list_agent_schedules(
     store: &Store,
     agent_id: &anyagents_core::AgentId,
     active_only: bool,
-) -> Vec<ScheduleView> {
+) -> Result<Vec<ScheduleView>, String> {
     store
         .list_schedules(Some(agent_id), active_only)
-        .unwrap_or_default()
-        .into_iter()
-        .map(ScheduleView::from)
-        .collect()
+        .map(|rows| rows.into_iter().map(ScheduleView::from).collect())
+        .map_err(|err| err.to_string())
 }
 
 pub fn cancel_agent_schedule(
@@ -539,7 +538,9 @@ fn initial_watch_baseline(
     now: i64,
 ) -> Option<String> {
     match target {
-        WatchTarget::SpironPromise { id, kind } => probe_spiron_state(id, kind),
+        WatchTarget::SpironPromise { id, kind } => {
+            Some(probe_spiron_state(id, kind).unwrap_or_else(|err| err.observation().into()))
+        }
         WatchTarget::AgentIdle { target } => {
             if let Ok(found) = store.agent_by_name(target) {
                 if is_agent_busy(store, health, &found, now) {
@@ -621,21 +622,24 @@ pub fn agent_wake_block_reason(
 
 pub fn is_agent_busy(store: &Store, health: &HealthBoard, agent: &Agent, now: i64) -> bool {
     // Local DeliveryLoops hold this lock while idle; Sylphx locks only per turn.
-    if agent.harness == "sylphx"
-        && matches!(
-            store.try_lock_agent(&agent.id),
-            Err(anyagents_core::Error::AgentBusy)
-        )
-    {
+    if agent.harness == "sylphx" && store.try_lock_agent(&agent.id).is_err() {
         return true;
     }
-    if store.has_open_turn(&agent.id).unwrap_or(false) {
-        return true;
+    match store.has_open_turn(&agent.id) {
+        Ok(false) => {}
+        Ok(true) => return true,
+        Err(err) => {
+            eprintln!("Schedule turn state unavailable: {err}");
+            return true;
+        }
     }
-    if let Ok(lag) = store.lag(&agent.id, now)
-        && lag.oldest_undelivered_age_ms.is_some()
-    {
-        return true;
+    match store.lag(&agent.id, now) {
+        Ok(lag) if lag.oldest_undelivered_age_ms.is_none() => {}
+        Ok(_) => return true,
+        Err(err) => {
+            eprintln!("Schedule mailbox lag unavailable: {err}");
+            return true;
+        }
     }
     if let Some(live) = health.get(&agent.id)
         && live.process_alive
@@ -646,30 +650,85 @@ pub fn is_agent_busy(store: &Store, health: &HealthBoard, agent: &Agent, now: i6
     false
 }
 
-/// Evaluate all active schedules once at timestamp `now`.
-/// Returns the number of wakes delivered.
-pub fn tick_schedules_once(store: &Store, health: &HealthBoard, now: i64) -> usize {
-    let _ = store.restore_skipped_at_schedules(now.saturating_sub(3_600_000));
-    let Ok(schedules) = store.list_schedules(None, true) else {
+/// Evaluate local timers and watches without issuing any external probe.
+/// This is called on its own one-second loop, including the startup tick.
+pub fn tick_local_schedules_once(store: &Store, health: &HealthBoard, now: i64) -> usize {
+    if let Err(err) = store.restore_skipped_at_schedules(now.saturating_sub(3_600_000)) {
+        eprintln!("Schedule recovery unavailable: {err}");
         return 0;
+    }
+    tick_schedule_partition(store, health, now, false)
+}
+
+/// Evaluate network-backed watches on a separate loop. Slow external services
+/// cannot delay a later local tick or consume a timer's due transition.
+pub fn tick_external_watches_once(store: &Store, health: &HealthBoard, now: i64) -> usize {
+    tick_schedule_partition(store, health, now, true)
+}
+
+fn is_external_watch(sched: &AgentSchedule) -> bool {
+    sched.kind == "watch"
+        && matches!(
+            parse_watch_spec(&sched.spec),
+            Ok(WatchTarget::GitHubPr { .. }
+                | WatchTarget::GitHubCheck { .. }
+                | WatchTarget::SpironPromise { .. })
+        )
+}
+
+// Retain the complete single-pass fixture for existing cross-class contracts;
+// production never serializes the two partitions through this helper.
+#[cfg(test)]
+fn tick_schedules_once(store: &Store, health: &HealthBoard, now: i64) -> usize {
+    tick_local_schedules_once(store, health, now) + tick_external_watches_once(store, health, now)
+}
+
+fn tick_schedule_partition(store: &Store, health: &HealthBoard, now: i64, external: bool) -> usize {
+    let schedules: Vec<_> = match store.list_schedules(None, true) {
+        Ok(schedules) => schedules
+            .into_iter()
+            .filter(|sched| is_external_watch(sched) == external)
+            .collect(),
+        Err(err) => {
+            eprintln!("Schedule census unavailable: {err}");
+            return 0;
+        }
     };
-    github::begin_cycle(&schedules, now);
+    if external {
+        github::begin_cycle(&schedules, now);
+    }
     let mut fired_count = 0;
+    let mut wake_blocks: HashMap<AgentId, Option<&'static str>> = HashMap::new();
     for sched in schedules {
         if (sched.kind == "at" || sched.kind == "every")
             && sched.next_fire_at_ms.is_none_or(|due| now < due)
         {
             continue;
         }
-        let Ok(agent) = store.agent(&sched.agent_id) else {
-            let _ = store.cancel_schedule(None, &sched.id);
-            continue;
+        let agent = match store.agent(&sched.agent_id) {
+            Ok(agent) => agent,
+            Err(anyagents_core::Error::AgentNotFound(_)) => {
+                if let Err(err) = store.cancel_schedule(None, &sched.id) {
+                    eprintln!("Schedule cancellation failed: {err}");
+                }
+                continue;
+            }
+            Err(err) => {
+                eprintln!("Schedule agent state unavailable: {err}");
+                continue;
+            }
         };
         if agent.state == "archived" {
-            let _ = store.cancel_schedule(None, &sched.id);
+            if let Err(err) = store.cancel_schedule(None, &sched.id) {
+                eprintln!("Schedule cancellation failed: {err}");
+            }
             continue;
         }
-        let block = agent_wake_block_reason(store, health, &agent, now);
+        // Wakes admitted in this pass must not make later schedules for the
+        // same initially idle agent appear busy because of our own mailbox writes.
+        let block = *wake_blocks
+            .entry(agent.id.clone())
+            .or_insert_with(|| agent_wake_block_reason(store, health, &agent, now));
         match sched.kind.as_str() {
             "at" => {
                 let Some(due) = sched.next_fire_at_ms else {
@@ -678,30 +737,28 @@ pub fn tick_schedules_once(store: &Store, health: &HealthBoard, now: i64) -> usi
                 if now < due {
                     continue;
                 }
-                if block.is_some() {
-                    // Defer one-shot timer wakes while the owning agent is busy, paused, or
-                    // quota-blocked so the wake is delivered as soon as the agent becomes idle.
+                if let Some(reason) = block {
+                    // Preserve the due time and make the outstanding hold visible. A later
+                    // local tick delivers exactly once as soon as the owner is eligible.
+                    let observed = format!("deferred:{reason}");
+                    if sched.last_observed.as_deref() != Some(observed.as_str())
+                        && let Err(err) = store.update_schedule_watch_observation(
+                            &sched.id,
+                            sched.watch_baseline.as_deref(),
+                            Some(&observed),
+                        )
+                    {
+                        eprintln!("Schedule {} deferral write failed: {err}", sched.id);
+                    }
                     continue;
                 }
-                if store
-                    .claim_schedule_tick(
-                        &sched.id,
-                        Some(due),
-                        "fired",
-                        None,
-                        Some(now),
-                        None,
-                        Some("fired"),
-                    )
-                    .unwrap_or(false)
-                {
-                    deliver_scheduled_wake(
-                        store,
-                        &agent,
-                        &sched,
-                        &format!("schedule:{}:{}", sched.id, due),
-                        now,
-                    );
+                if deliver_scheduled_wake(
+                    store,
+                    &agent,
+                    &sched,
+                    &format!("schedule:{}:{}", sched.id, due),
+                    now,
+                ) {
                     fired_count += 1;
                 }
             }
@@ -719,7 +776,7 @@ pub fn tick_schedules_once(store: &Store, health: &HealthBoard, now: i64) -> usi
                 }
                 if let Some(reason) = block {
                     // Advance next_fire_at_ms past `now` without firing so missed ticks never queue or double-fire.
-                    let _ = store.claim_schedule_tick(
+                    if let Err(err) = store.claim_schedule_tick(
                         &sched.id,
                         Some(due),
                         "active",
@@ -727,28 +784,24 @@ pub fn tick_schedules_once(store: &Store, health: &HealthBoard, now: i64) -> usi
                         None,
                         None,
                         Some(&format!("skipped:{reason}")),
-                    );
+                    ) {
+                        eprintln!("Schedule {} skip write failed: {err}", sched.id);
+                    }
                     continue;
                 }
-                if store
-                    .claim_schedule_tick(
-                        &sched.id,
-                        Some(due),
-                        "active",
-                        Some(next_due),
-                        Some(now),
-                        None,
-                        Some("fired"),
-                    )
-                    .unwrap_or(false)
-                {
-                    deliver_scheduled_wake(
-                        store,
-                        &agent,
-                        &sched,
-                        &format!("schedule:{}:{}", sched.id, due),
-                        now,
-                    );
+                if claim_and_deliver_scheduled_wake(
+                    store,
+                    &agent,
+                    &sched,
+                    Some(due),
+                    "active",
+                    Some(next_due),
+                    None,
+                    Some("fired"),
+                    &sched.prompt,
+                    &format!("schedule:{}:{}", sched.id, due),
+                    now,
+                ) {
                     fired_count += 1;
                 }
             }
@@ -757,12 +810,15 @@ pub fn tick_schedules_once(store: &Store, health: &HealthBoard, now: i64) -> usi
                 if block.is_some() {
                     // Record latest observation while the owning agent is busy/paused without
                     // consuming a terminal transition or mutating the baseline.
-                    if eval.observed.is_some() && eval.observed != sched.last_observed {
-                        let _ = store.update_schedule_watch_observation(
+                    if eval.observed.is_some()
+                        && eval.observed != sched.last_observed
+                        && let Err(err) = store.update_schedule_watch_observation(
                             &sched.id,
                             sched.watch_baseline.as_deref(),
                             eval.observed.as_deref(),
-                        );
+                        )
+                    {
+                        eprintln!("Schedule {} observation write failed: {err}", sched.id);
                     }
                     continue;
                 }
@@ -776,43 +832,37 @@ pub fn tick_schedules_once(store: &Store, health: &HealthBoard, now: i64) -> usi
                                 .observed
                                 .as_ref()
                                 .is_some_and(|o| Some(o) != sched.last_observed.as_ref()))
-                    {
-                        let _ = store.update_schedule_watch_observation(
+                        && let Err(err) = store.update_schedule_watch_observation(
                             &sched.id,
                             eval.baseline.as_deref(),
                             eval.observed.as_deref(),
-                        );
+                        )
+                    {
+                        eprintln!("Schedule {} observation write failed: {err}", sched.id);
                     }
                     continue;
                 }
-                if store
-                    .claim_schedule_tick(
-                        &sched.id,
-                        None,
-                        eval.next_state,
-                        None,
-                        Some(now),
-                        eval.baseline.as_deref(),
-                        eval.observed.as_deref(),
+                let (wake_prompt, source_key) = if let Some(ref tr) = eval.transition {
+                    (
+                        format!("[watch: {} transition={tr}]\n{}", sched.spec, sched.prompt),
+                        format!("schedule:{}:watch:{tr}:{now}", sched.id),
                     )
-                    .unwrap_or(false)
-                {
-                    let (wake_prompt, source_key) = if let Some(ref tr) = eval.transition {
-                        (
-                            format!("[watch: {} transition={tr}]\n{}", sched.spec, sched.prompt),
-                            format!("schedule:{}:watch:{tr}:{now}", sched.id),
-                        )
-                    } else {
-                        (sched.prompt.clone(), format!("schedule:{}:watch", sched.id))
-                    };
-                    deliver_scheduled_wake_with_prompt(
-                        store,
-                        &agent,
-                        &sched,
-                        &wake_prompt,
-                        &source_key,
-                        now,
-                    );
+                } else {
+                    (sched.prompt.clone(), format!("schedule:{}:watch", sched.id))
+                };
+                if claim_and_deliver_scheduled_wake(
+                    store,
+                    &agent,
+                    &sched,
+                    None,
+                    eval.next_state,
+                    None,
+                    eval.baseline.as_deref(),
+                    eval.observed.as_deref(),
+                    &wake_prompt,
+                    &source_key,
+                    now,
+                ) {
                     fired_count += 1;
                 }
             }
@@ -828,51 +878,79 @@ fn deliver_scheduled_wake(
     sched: &AgentSchedule,
     source_key: &str,
     now: i64,
-) {
-    deliver_scheduled_wake_with_prompt(store, agent, sched, &sched.prompt, source_key, now);
+) -> bool {
+    claim_and_deliver_scheduled_wake(
+        store,
+        agent,
+        sched,
+        sched.next_fire_at_ms,
+        "fired",
+        None,
+        None,
+        Some("fired"),
+        &sched.prompt,
+        source_key,
+        now,
+    )
 }
 
-fn deliver_scheduled_wake_with_prompt(
+#[allow(clippy::too_many_arguments)]
+fn claim_and_deliver_scheduled_wake(
     store: &Store,
     agent: &Agent,
     sched: &AgentSchedule,
-    prompt_text: &str,
+    expected_due: Option<i64>,
+    next_state: &str,
+    next_due: Option<i64>,
+    baseline: Option<&str>,
+    observed: Option<&str>,
+    prompt: &str,
     source_key: &str,
     now: i64,
-) {
-    // A timer/watch may have been selected before an archive completed. Keep
-    // its fresh lifecycle check and delivery serialized with archive/wake.
-    let Ok(_lifecycle) = store.lock_agent_lifecycle(&agent.id) else {
-        return;
-    };
-    let Ok(agent) = store.agent(&agent.id) else {
-        return;
-    };
-    let agent = &agent;
-    if agent.state == "paused"
-        || agent.state == "archived"
-        || crate::server::is_explicitly_archived(store.data_dir(), agent)
-    {
-        return;
+) -> bool {
+    let result = (|| -> Result<bool, anyagents_core::Error> {
+        // Fresh lifecycle and external retirement are serialized with archive.
+        let _lifecycle = store.lock_agent_lifecycle(&agent.id)?;
+        let agent = store.agent(&agent.id)?;
+        if agent.state == "paused"
+            || agent.state == "archived"
+            || crate::server::is_explicitly_archived(store.data_dir(), &agent)
+        {
+            return Ok(false);
+        }
+        let delivered = store.claim_schedule_tick_with_wake(
+            &sched.id,
+            expected_due,
+            next_state,
+            next_due,
+            Some(now),
+            baseline,
+            observed,
+            &agent.id,
+            Incoming {
+                text: prompt.into(),
+                sender: Some(format!("schedule:{}", sched.id)),
+                source_time_ms: Some(now),
+                source_key: Some(source_key.into()),
+                reply_to: None,
+                quote: None,
+                origin: None,
+                received_at_ms: Some(now),
+            },
+        )?;
+        if delivered {
+            crate::create::poke_agent_wake_socket(store.data_dir(), &agent.id);
+            crate::create::poke_agent_wake_socket_mail(store.data_dir(), &agent.id);
+        }
+        Ok(delivered)
+    })();
+    match result {
+        Ok(delivered) => delivered,
+        Err(err) => {
+            eprintln!("Schedule {} not consumed: {err}", sched.id);
+            false
+        }
     }
-    if agent.state != "running" {
-        let _ = store.set_agent_state(&agent.id, "running");
-    }
-    let _ = store.receive(
-        &agent.id,
-        Incoming {
-            text: prompt_text.to_string(),
-            sender: Some(format!("schedule:{}", sched.id)),
-            source_time_ms: Some(now),
-            source_key: Some(source_key.to_string()),
-            reply_to: None,
-            quote: None,
-            origin: None,
-            received_at_ms: Some(now),
-        },
-    );
-    crate::create::poke_agent_wake_socket(store.data_dir(), &agent.id);
-    crate::create::poke_agent_wake_socket_mail(store.data_dir(), &agent.id);
 }
 
 struct WatchEval {
@@ -932,25 +1010,16 @@ fn evaluate_watch(
             }
         }
         WatchTarget::SpironPromise { id, kind } => {
-            let Some(current) = probe_spiron_state(&id, &kind) else {
-                return WatchEval::pending(sched.watch_baseline.clone(), None);
+            let current = match probe_spiron_state(&id, &kind) {
+                Ok(current) => current,
+                Err(err) => {
+                    return WatchEval::pending(
+                        sched.watch_baseline.clone(),
+                        Some(err.observation().into()),
+                    );
+                }
             };
-            match &sched.watch_baseline {
-                Some(base) => {
-                    if &current != base {
-                        WatchEval::fired(Some(base.clone()), Some(format!("{base}->{current}")))
-                    } else {
-                        WatchEval::pending(Some(base.clone()), Some(current))
-                    }
-                }
-                None => {
-                    if is_spiron_terminal(&current) {
-                        WatchEval::fired(Some(current.clone()), Some(current))
-                    } else {
-                        WatchEval::pending(Some(current.clone()), Some(current))
-                    }
-                }
-            }
+            evaluate_spiron_observation(sched.watch_baseline.as_deref(), current)
         }
         WatchTarget::GitHubPr {
             owner,
@@ -1104,6 +1173,21 @@ fn probe_path_fingerprint(path: &str) -> String {
     }
 }
 
+/// Failed initial probes are visible diagnostics, not provider lifecycle states.
+/// Recovery establishes the first valid baseline rather than inventing a transition.
+fn evaluate_spiron_observation(baseline: Option<&str>, current: String) -> WatchEval {
+    match baseline.filter(|base| !base.starts_with("probe_error:")) {
+        Some(base) if current != base => {
+            WatchEval::fired(Some(base.into()), Some(format!("{base}->{current}")))
+        }
+        Some(base) => WatchEval::pending(Some(base.into()), Some(current)),
+        None if is_spiron_terminal(&current) => {
+            WatchEval::fired(Some(current.clone()), Some(current))
+        }
+        None => WatchEval::pending(Some(current.clone()), Some(current)),
+    }
+}
+
 fn is_spiron_terminal(state: &str) -> bool {
     matches!(
         state.to_ascii_lowercase().as_str(),
@@ -1129,57 +1213,85 @@ fn spiron_api_key() -> Option<String> {
     {
         return Some(k.trim().to_string());
     }
-    let key_file = std::env::var("SPIRON_KEY_FILE")
-        .unwrap_or_else(|_| "/scratch/secrets/spiron/desk-ops.key".to_string());
+    let key_file = std::env::var("SPIRON_KEY_FILE").ok()?;
     std::fs::read_to_string(key_file)
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
 }
 
-/// Pull a Spiron promise or task state from the Spiron public API (`GET /v1/promises/{id}` or `/v1/tasks/{id}`).
-pub fn probe_spiron_state(id: &str, kind: &str) -> Option<String> {
-    let base =
-        std::env::var("SPIRON_API_BASE").unwrap_or_else(|_| "https://api.spiron.ai".to_string());
-    let base = base.trim_end_matches('/');
-    let key = spiron_api_key();
+#[derive(Debug, PartialEq, Eq)]
+pub enum SpironProbeError {
+    NotFound,
+    Auth,
+    Http,
+    Transport,
+    Payload,
+}
+impl SpironProbeError {
+    fn observation(&self) -> &'static str {
+        match self {
+            Self::NotFound => "probe_error:not_found",
+            Self::Auth => "probe_error:auth",
+            Self::Http => "probe_error:http",
+            Self::Transport => "probe_error:transport",
+            Self::Payload => "probe_error:payload",
+        }
+    }
+}
+
+/// Distinguish a valid pending state from an unavailable observation.
+pub fn probe_spiron_state(id: &str, kind: &str) -> Result<String, SpironProbeError> {
+    let base = std::env::var("SPIRON_API_BASE").unwrap_or_else(|_| "https://api.spiron.ai".into());
+    probe_spiron_at(&base, spiron_api_key().as_deref(), id, kind)
+}
+
+fn probe_spiron_at(
+    base: &str,
+    key: Option<&str>,
+    id: &str,
+    kind: &str,
+) -> Result<String, SpironProbeError> {
     let agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(5)))
         .max_redirects(0)
+        .http_status_as_error(false)
         .build()
         .new_agent();
-
-    let paths = if kind == "task" {
-        [
-            format!("{base}/v1/tasks/{id}"),
-            format!("{base}/v1/promises/{id}"),
-        ]
+    let kinds = if kind == "task" {
+        ["tasks", "promises"]
     } else {
-        [
-            format!("{base}/v1/promises/{id}"),
-            format!("{base}/v1/tasks/{id}"),
-        ]
+        ["promises", "tasks"]
     };
-
-    for url in paths {
+    for resource in kinds {
+        let url = format!("{}/v1/{resource}/{id}", base.trim_end_matches('/'));
         let mut req = agent.get(&url).header("accept", "application/json");
-        if let Some(ref token) = key {
+        if let Some(token) = key {
             req = req.header("authorization", &format!("Bearer {token}"));
         }
-        if let Ok(resp) = req.call()
-            && let Ok(body) = resp.into_body().read_to_string()
-            && let Ok(val) = serde_json::from_str::<serde_json::Value>(&body)
-            && let Some(st) = val
-                .get("state")
-                .or_else(|| val.get("status"))
-                .and_then(serde_json::Value::as_str)
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-        {
-            return Some(st.to_string());
+        let response = req.call().map_err(|_| SpironProbeError::Transport)?;
+        match response.status().as_u16() {
+            404 => continue,
+            401 | 403 => return Err(SpironProbeError::Auth),
+            200 => {}
+            _ => return Err(SpironProbeError::Http),
         }
+        let body = response
+            .into_body()
+            .read_to_string()
+            .map_err(|_| SpironProbeError::Transport)?;
+        let val: serde_json::Value =
+            serde_json::from_str(&body).map_err(|_| SpironProbeError::Payload)?;
+        return val
+            .get("state")
+            .or_else(|| val.get("status"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|state| !state.is_empty())
+            .map(str::to_string)
+            .ok_or(SpironProbeError::Payload);
     }
-    None
+    Err(SpironProbeError::NotFound)
 }
 
 mod github;
@@ -1238,9 +1350,9 @@ mod tests {
         assert_eq!(parse_duration_ms("daily").unwrap(), 86_400_000);
 
         assert_eq!(
-            parse_watch_spec("github:pr:SylphxAI/anyagents#41").unwrap(),
+            parse_watch_spec("github:pr:AnotherOrg/anyagents#41").unwrap(),
             WatchTarget::GitHubPr {
-                owner: "SylphxAI".to_string(),
+                owner: "AnotherOrg".to_string(),
                 repo: "anyagents".to_string(),
                 number: 41,
             }
@@ -1268,6 +1380,283 @@ mod tests {
                 path: "/tmp/out.json".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn first_tick_admits_local_watches_and_timers_before_older_external_probes() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::Arc;
+        let _env = crate::server::tests::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        let health = HealthBoard::default();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let external_owner = store
+            .create_agent(NewAgent::new("external", "codex"))
+            .unwrap();
+        store
+            .set_agent_running(&external_owner.id, "/work")
+            .unwrap();
+        let external = store
+            .create_schedule(NewSchedule {
+                agent_id: external_owner.id,
+                kind: "watch".into(),
+                spec: "github:pr:example-org/project#1".into(),
+                prompt: "external".into(),
+                interval_ms: None,
+                next_fire_at_ms: None,
+                watch_baseline: Some("pending".into()),
+            })
+            .unwrap();
+        // Make the external watch strictly older, independent of clock resolution.
+        rusqlite::Connection::open(dir.path().join("state.db"))
+            .unwrap()
+            .execute(
+                "UPDATE agent_schedules SET created_at_ms=1 WHERE id=?1",
+                [external.id.as_str()],
+            )
+            .unwrap();
+        let target = store
+            .create_agent(NewAgent::new("idle-target", "codex"))
+            .unwrap();
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        assert!(child.wait().unwrap().success());
+        let path = dir.path().join("ready");
+        std::fs::write(&path, "ready").unwrap();
+        let now = anyagents_core::now_ms();
+        let mut owners = Vec::new();
+        for (label, kind, spec) in [
+            ("file", "watch", format!("file:{}", path.display())),
+            ("process", "watch", format!("pid:{pid}")),
+            ("idle", "watch", format!("agent:idle:{}", target.name)),
+            ("timer", "at", "due".into()),
+            ("interval", "every", "1s".into()),
+        ] {
+            let owner = store.create_agent(NewAgent::new(label, "codex")).unwrap();
+            store.set_agent_running(&owner.id, "/work").unwrap();
+            store
+                .create_schedule(NewSchedule {
+                    agent_id: owner.id.clone(),
+                    kind: kind.into(),
+                    spec,
+                    prompt: label.into(),
+                    interval_ms: (kind == "every").then_some(1000),
+                    next_fire_at_ms: (kind != "watch").then_some(now - 1),
+                    watch_baseline: (label == "file").then(|| "missing".into()),
+                })
+                .unwrap();
+            owners.push(owner.id);
+        }
+        assert_eq!(store.list_schedules(None, true).unwrap()[0].id, external.id);
+        let observing_store = Arc::clone(&store);
+        let observed_owners = owners.clone();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = [0; 4096];
+            let _ = stream.read(&mut request).unwrap();
+            // This is the start of an actual external HTTP probe, before it
+            // can finish or release the scheduler. Local admission must be done.
+            let counts: Vec<_> = observed_owners
+                .iter()
+                .map(|id| observing_store.inbox(id, None).unwrap().len())
+                .collect();
+            stream
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                )
+                .unwrap();
+            counts
+        });
+        // SAFETY: serialized with all other process-wide GitHub API overrides.
+        unsafe {
+            std::env::set_var("ANYAGENTS_GITHUB_API_BASE", format!("http://{address}"));
+        }
+        let fired = tick_schedules_once(&store, &health, now);
+        unsafe {
+            std::env::remove_var("ANYAGENTS_GITHUB_API_BASE");
+        }
+        let counts_at_external_start = server.join().unwrap();
+        assert_eq!(fired, 5);
+        assert_eq!(counts_at_external_start, vec![1; 5]);
+        for owner in owners {
+            assert_eq!(store.inbox(&owner, None).unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn same_agent_ready_local_watches_fire_together_unless_initially_blocked() {
+        for blocked in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store::open(dir.path().join("state.db")).unwrap();
+            let health = HealthBoard::default();
+            let owner = store.create_agent(NewAgent::new("owner", "codex")).unwrap();
+            let target = store
+                .create_agent(NewAgent::new("target", "codex"))
+                .unwrap();
+            let path = dir.path().join("ready");
+            std::fs::write(&path, "ready").unwrap();
+            let mut child = std::process::Command::new("/bin/sh")
+                .args(["-c", "exit 0"])
+                .spawn()
+                .unwrap();
+            let pid = child.id();
+            assert!(child.wait().unwrap().success());
+            for (spec, baseline) in [
+                (format!("file:{}", path.display()), Some("missing".into())),
+                (format!("pid:{pid}"), None),
+                (format!("agent:idle:{}", target.name), None),
+            ] {
+                store
+                    .create_schedule(NewSchedule {
+                        agent_id: owner.id.clone(),
+                        kind: "watch".into(),
+                        spec,
+                        prompt: "wake".into(),
+                        interval_ms: None,
+                        next_fire_at_ms: None,
+                        watch_baseline: baseline,
+                    })
+                    .unwrap();
+            }
+            if blocked {
+                store.set_agent_state(&owner.id, "paused").unwrap();
+            }
+            let fired = tick_local_schedules_once(&store, &health, anyagents_core::now_ms());
+            assert_eq!(fired, if blocked { 0 } else { 3 });
+            let inbox = store.inbox(&owner.id, None).unwrap();
+            assert_eq!(inbox.len(), fired);
+            let schedules = store.list_schedules(Some(&owner.id), false).unwrap();
+            assert_eq!(schedules.len(), 3);
+            assert!(
+                schedules
+                    .iter()
+                    .all(|s| s.state == if blocked { "active" } else { "fired" })
+            );
+            assert_eq!(
+                tick_local_schedules_once(&store, &health, anyagents_core::now_ms()),
+                0
+            );
+            assert_eq!(store.inbox(&owner.id, None).unwrap().len(), fired);
+        }
+    }
+
+    #[test]
+    fn overdue_at_delivers_on_first_local_tick_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("state.db");
+        let store = Store::open(&db).unwrap();
+        let owner = store
+            .create_agent(NewAgent::new("restart-owner", "codex"))
+            .unwrap();
+        let now = anyagents_core::now_ms();
+        let sched = store
+            .create_schedule(NewSchedule {
+                agent_id: owner.id.clone(),
+                kind: "at".into(),
+                spec: "past".into(),
+                prompt: "restart wake".into(),
+                interval_ms: None,
+                next_fire_at_ms: Some(now - 86_400_000),
+                watch_baseline: None,
+            })
+            .unwrap();
+        drop(store);
+        let restarted = Store::open(&db).unwrap();
+        let health = HealthBoard::default();
+        assert_eq!(tick_local_schedules_once(&restarted, &health, now), 1);
+        let inbox = restarted.inbox(&owner.id, None).unwrap();
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].text, "restart wake");
+        let saved = restarted.list_schedules(Some(&owner.id), false).unwrap();
+        assert_eq!(saved[0].id, sched.id);
+        assert_eq!(saved[0].state, "fired");
+        assert_eq!(saved[0].last_observed.as_deref(), Some("fired"));
+        assert_eq!(
+            tick_local_schedules_once(&restarted, &health, now + 1000),
+            0
+        );
+        assert_eq!(restarted.inbox(&owner.id, None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn overdue_at_records_busy_and_paused_deferrals_until_fired() {
+        for reason in ["busy", "paused"] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("state.db");
+            let store = Store::open(&db).unwrap();
+            let owner = store
+                .create_agent(NewAgent::new("deferred-owner", "codex"))
+                .unwrap();
+            let now = anyagents_core::now_ms();
+            let due = now - 1000;
+            store
+                .create_schedule(NewSchedule {
+                    agent_id: owner.id.clone(),
+                    kind: "at".into(),
+                    spec: "past".into(),
+                    prompt: "deferred wake".into(),
+                    interval_ms: None,
+                    next_fire_at_ms: Some(due),
+                    watch_baseline: None,
+                })
+                .unwrap();
+            let health = HealthBoard::default();
+            if reason == "paused" {
+                store.set_agent_state(&owner.id, "paused").unwrap();
+            } else {
+                health.publish(
+                    &owner.id,
+                    LiveState {
+                        process_alive: true,
+                        turn_state: TurnState::InTurn,
+                        delivery_mode: DeliveryMode::Steer,
+                        steer_support: SteerSupport::Yes,
+                        quota_reset_at_ms: None,
+                        restart_at_ms: None,
+                        pid: None,
+                        live_harness: Some("codex".into()),
+                        live_model: None,
+                        process_started_at_ms: Some(now),
+                        last_error: None,
+                    },
+                );
+            }
+            for at in [now, now + 1000] {
+                assert_eq!(tick_local_schedules_once(&store, &health, at), 0);
+                let saved = store.list_schedules(Some(&owner.id), false).unwrap();
+                assert_eq!(saved[0].state, "active");
+                assert_eq!(saved[0].next_fire_at_ms, Some(due));
+                assert_eq!(saved[0].last_fired_at_ms, None);
+                assert_eq!(saved[0].last_observed, Some(format!("deferred:{reason}")));
+                assert!(store.inbox(&owner.id, None).unwrap().is_empty());
+            }
+            // The visible reason is durable; an independent store sees it too.
+            drop(store);
+            let store = Store::open(&db).unwrap();
+            assert_eq!(
+                store.list_schedules(Some(&owner.id), false).unwrap()[0].last_observed,
+                Some(format!("deferred:{reason}"))
+            );
+            store.set_agent_running(&owner.id, "/work").unwrap();
+            let idle = HealthBoard::default();
+            assert_eq!(tick_local_schedules_once(&store, &idle, now + 2000), 1);
+            let saved = store.list_schedules(Some(&owner.id), false).unwrap();
+            assert_eq!(saved[0].state, "fired");
+            assert_eq!(saved[0].last_observed.as_deref(), Some("fired"));
+            assert_eq!(saved[0].last_fired_at_ms, Some(now + 2000));
+            assert_eq!(store.inbox(&owner.id, None).unwrap().len(), 1);
+            assert_eq!(tick_local_schedules_once(&store, &idle, now + 3000), 0);
+            assert_eq!(store.inbox(&owner.id, None).unwrap().len(), 1);
+        }
     }
 
     #[test]
@@ -1582,6 +1971,7 @@ mod tests {
 
     #[test]
     fn github_pr_watch_stays_active_across_checks_and_review_failure_until_merged() {
+        let _env = crate::server::tests::env_lock();
         use std::io::{Read, Write};
         use std::net::TcpListener;
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1650,7 +2040,7 @@ mod tests {
             &owner,
             None,
             None,
-            Some("github:pr:Cubeage/hk-mahjong-tycoon#452"),
+            Some("github:pr:ExampleOrg/project#452"),
             "verify PR 452",
         )
         .unwrap();
@@ -1664,8 +2054,8 @@ mod tests {
                     barrier.wait();
                     // Agent identity must not fragment the single-flight cache.
                     probe_github_check_terminal(
-                        "Cubeage",
-                        "hk-mahjong-tycoon",
+                        "ExampleOrg",
+                        "project",
                         "#452",
                         &format!("agent{i}"),
                         now,
@@ -1678,7 +2068,13 @@ mod tests {
             assert_eq!(handle.join().unwrap().unwrap().1, "checks_in_progress");
         }
         assert_eq!(calls.load(Ordering::SeqCst), 3);
-        assert_eq!(tick_schedules_once(&store, &health, now), 0);
+        // Keep the manually advanced tick and subprocess completion clocks in
+        // one time domain; production reads the wall clock after every probe.
+        let now = anyagents_core::now_ms();
+        let tick = |store: &Store, health: &HealthBoard, at| {
+            github::with_completion_clock(at, || tick_schedules_once(store, health, at))
+        };
+        assert_eq!(tick(&store, &health, now), 0);
         assert_eq!(calls.load(Ordering::SeqCst), 3);
         for (stage_num, transition) in [
             (1, "checks_completed"),
@@ -1687,20 +2083,20 @@ mod tests {
         ] {
             *stage.lock().unwrap() = stage_num;
             let at = now + i64::from(stage_num) * 60_000;
-            assert_eq!(tick_schedules_once(&store, &health, at), 1);
+            assert_eq!(tick(&store, &health, at), 1);
             let inbox = store.inbox(&owner.id, None).unwrap();
             let last = inbox.last().unwrap();
-            assert!(last.text.starts_with(&format!("[watch: github:pr:Cubeage/hk-mahjong-tycoon#452 transition={transition}]\nverify PR 452")), "{}", last.text);
+            assert!(last.text.starts_with(&format!("[watch: github:pr:ExampleOrg/project#452 transition={transition}]\nverify PR 452")), "{}", last.text);
             store.note_delivered(&owner.id, last.seq).unwrap();
             store.note_turn_completed(&owner.id).unwrap();
-            assert_eq!(tick_schedules_once(&store, &health, at + 1_000), 0);
+            assert_eq!(tick(&store, &health, at + 1_000), 0);
             let active = store.list_schedules(Some(&owner.id), true).unwrap();
             assert_eq!(active.len(), 1);
         }
         // A shared secondary-limit window records one typed error, retains
         // the successful baseline, and rereads the terminal state on recovery.
         *stage.lock().unwrap() = 5;
-        assert_eq!(tick_schedules_once(&store, &health, now + 240_000), 0);
+        assert_eq!(tick(&store, &health, now + 240_000), 0);
         let active = store.list_schedules(Some(&owner.id), true).unwrap();
         assert_eq!(
             active[0].watch_baseline.as_deref(),
@@ -1713,11 +2109,11 @@ mod tests {
         let before = calls.load(Ordering::SeqCst);
         *stage.lock().unwrap() = 4;
         for at in [240_001, 300_000, 359_999, 360_000, 361_000] {
-            assert_eq!(tick_schedules_once(&store, &health, now + at), 0);
+            assert_eq!(tick(&store, &health, now + at), 0);
         }
         assert_eq!(calls.load(Ordering::SeqCst), before);
         // Recovery is jittered across reset+60..300 seconds, not reset itself.
-        assert_eq!(tick_schedules_once(&store, &health, now + 660_000), 1);
+        assert_eq!(tick(&store, &health, now + 660_000), 1);
         assert_eq!(calls.load(Ordering::SeqCst), before + 1);
         let inbox = store.inbox(&owner.id, None).unwrap();
         assert!(inbox.last().unwrap().text.contains("transition=merged]"));
@@ -1784,5 +2180,145 @@ mod tests {
             assert!(cfg.join(".anyagents-archived").exists());
             assert!(store.inbox(&agent.id, None).unwrap().is_empty());
         }
+    }
+    #[test]
+    fn schedule_list_error_is_not_successful_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(NewAgent::new("helper", "codex"))
+            .unwrap();
+        assert!(
+            list_agent_schedules(&store, &agent.id, false)
+                .unwrap()
+                .is_empty()
+        );
+        let conn = rusqlite::Connection::open(dir.path().join("state.db")).unwrap();
+        conn.execute_batch("ALTER TABLE agent_schedules RENAME TO unavailable_schedules")
+            .unwrap();
+        assert!(
+            list_agent_schedules(&store, &agent.id, false)
+                .unwrap_err()
+                .contains("agent_schedules")
+        );
+    }
+    #[test]
+    fn unreadable_turn_state_never_proves_idle() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(NewAgent::new("helper", "codex"))
+            .unwrap();
+        let health = HealthBoard::default();
+        assert!(!is_agent_busy(&store, &health, &agent, 1));
+        let conn = rusqlite::Connection::open(dir.path().join("state.db")).unwrap();
+        conn.execute_batch("ALTER TABLE turn_recovery RENAME TO unavailable_turns")
+            .unwrap();
+        assert!(is_agent_busy(&store, &health, &agent, 1));
+        assert_eq!(
+            agent_wake_block_reason(&store, &health, &agent, 1),
+            Some("busy")
+        );
+        conn.execute_batch("ALTER TABLE unavailable_turns RENAME TO turn_recovery")
+            .unwrap();
+        assert!(!is_agent_busy(&store, &health, &agent, 1));
+        conn.execute_batch("ALTER TABLE messages RENAME TO unavailable_messages")
+            .unwrap();
+        assert!(is_agent_busy(&store, &health, &agent, 1));
+        conn.execute_batch("ALTER TABLE unavailable_messages RENAME TO messages")
+            .unwrap();
+        assert!(!is_agent_busy(&store, &health, &agent, 1));
+    }
+    #[test]
+    fn spiron_failed_observations_are_typed_and_no_auth_fallback() {
+        use std::io::{Read, Write};
+        for (statuses, body, expected) in [
+            (vec![200], r#"{"state":"pending"}"#, Ok("pending".into())),
+            (vec![200], r#"{"state":"complete"}"#, Ok("complete".into())),
+            (vec![401], "{}", Err(SpironProbeError::Auth)),
+            (vec![404, 404], "{}", Err(SpironProbeError::NotFound)),
+            (vec![200], "not json", Err(SpironProbeError::Payload)),
+            (vec![200], "{}", Err(SpironProbeError::Payload)),
+            (vec![503], "{}", Err(SpironProbeError::Http)),
+            (
+                vec![404, 200],
+                r#"{"status":"running"}"#,
+                Ok("running".into()),
+            ),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let body = body.to_string();
+            let task = std::thread::spawn(move || {
+                for status in statuses {
+                    let (mut socket, _) = listener.accept().unwrap();
+                    socket
+                        .set_read_timeout(Some(Duration::from_secs(3)))
+                        .unwrap();
+                    let mut bytes = Vec::new();
+                    while !bytes.ends_with(b"\r\n\r\n") {
+                        let mut b = [0];
+                        socket.read_exact(&mut b).unwrap();
+                        bytes.push(b[0]);
+                    }
+                    write!(socket,"HTTP/1.1 {status} Synthetic\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+                }
+            });
+            assert_eq!(probe_spiron_at(&base, None, "id", "promise"), expected);
+            task.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn failed_wake_insert_rolls_back_timer_claim_and_retries_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(NewAgent::new("helper", "codex"))
+            .unwrap();
+        let health = HealthBoard::default();
+        let now = anyagents_core::now_ms();
+        let schedule = store
+            .create_schedule(NewSchedule {
+                agent_id: agent.id.clone(),
+                kind: "at".into(),
+                spec: "now".into(),
+                prompt: "one wake".into(),
+                interval_ms: None,
+                next_fire_at_ms: Some(now),
+                watch_baseline: None,
+            })
+            .unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("state.db")).unwrap();
+        conn.execute_batch("CREATE TRIGGER reject_wake BEFORE INSERT ON messages BEGIN SELECT RAISE(ABORT, 'wake insert failure'); END;").unwrap();
+        assert_eq!(tick_schedules_once(&store, &health, now), 0);
+        let retained = store.get_schedule(&schedule.id).unwrap().unwrap();
+        assert_eq!(retained.state, "active");
+        assert_eq!(retained.last_fired_at_ms, None);
+        assert!(store.inbox(&agent.id, None).unwrap().is_empty());
+        conn.execute_batch("DROP TRIGGER reject_wake").unwrap();
+        assert_eq!(tick_schedules_once(&store, &health, now + 1), 1);
+        assert_eq!(
+            store.get_schedule(&schedule.id).unwrap().unwrap().state,
+            "fired"
+        );
+        assert_eq!(store.inbox(&agent.id, None).unwrap().len(), 1);
+        assert_eq!(tick_schedules_once(&store, &health, now + 2), 0);
+        assert_eq!(store.inbox(&agent.id, None).unwrap().len(), 1);
+    }
+    #[test]
+    fn spiron_probe_recovery_is_not_a_fabricated_state_change() {
+        for baseline in [
+            None,
+            Some("probe_error:auth"),
+            Some("probe_error:not_found"),
+        ] {
+            let pending = evaluate_spiron_observation(baseline, "pending".into());
+            assert!(!pending.triggered);
+            assert_eq!(pending.baseline.as_deref(), Some("pending"));
+            assert!(evaluate_spiron_observation(baseline, "completed".into()).triggered);
+        }
+        assert!(!evaluate_spiron_observation(Some("pending"), "pending".into()).triggered);
+        assert!(evaluate_spiron_observation(Some("running"), "completed".into()).triggered);
     }
 }

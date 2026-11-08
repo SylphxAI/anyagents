@@ -156,10 +156,10 @@ impl HostMigration {
         }
     }
     /// Enumerates only per-agent config roots plus the explicitly authorized
-    /// owners-page directory. Unknown and multiply claimed pages are inventoried
+    /// history-page directory. Unknown and multiply claimed pages are inventoried
     /// but never moved. Nested symlinks are inventoried, not followed.
-    pub fn discover(&mut self, agents: &[AgentOwnership], owners_pages: &Path) -> io::Result<()> {
-        self.discover_selected(agents, owners_pages, None)
+    pub fn discover(&mut self, agents: &[AgentOwnership], history_pages: &Path) -> io::Result<()> {
+        self.discover_selected(agents, history_pages, None)
     }
     /// Inspect only selected owners' config and page directories. The complete
     /// registry is still required to reconcile shared aliases without guessing.
@@ -167,7 +167,7 @@ impl HostMigration {
     pub fn discover_selected(
         &mut self,
         agents: &[AgentOwnership],
-        owners_pages: &Path,
+        history_pages: &Path,
         selected: Option<&HashSet<String>>,
     ) -> io::Result<()> {
         // Report only the host's declared personal namespace; do not discover,
@@ -259,7 +259,7 @@ impl HostMigration {
                 aliases.entry(alias).or_default().push(&agent.id);
             }
         }
-        for page in children(owners_pages)? {
+        for page in children(history_pages)? {
             let name = if page.is_dir() {
                 page.file_name()
             } else {
@@ -299,13 +299,13 @@ impl HostMigration {
                     self.data_dir
                         .join("agents")
                         .join(id.to_string())
-                        .join("history/owners")
+                        .join("history/archive")
                         .join(sha256(file.as_os_str().as_encoded_bytes()))
                         .join(file.file_name().unwrap_or_default())
                 });
                 let reason = if unique.is_none() {
                     Some("unknown or ambiguous reconciled agent ownership")
-                } else if has_symlink_component(&file, owners_pages)? {
+                } else if has_symlink_component(&file, history_pages)? {
                     Some("symlink source retained")
                 } else {
                     None
@@ -792,7 +792,7 @@ mod tests {
         let dir = crate::test_tempdir();
         let agent = AgentOwnership {
             id: AgentId::generate(),
-            aliases: vec!["sage".into()],
+            aliases: vec!["reader_worker".into()],
         };
         let root = dir.path().join("agents").join(agent.id.to_string());
         let memory = root.join("config/projects/known/memory/MEMORY.md");
@@ -805,8 +805,11 @@ mod tests {
         }
         let raw = root.join("config/sylphx-transcript.jsonl");
         write(&raw, b"{\"event\":1}\n");
-        let pages = dir.path().join("owners");
-        write(&pages.join("sage.md"), b"progress never in prompt\n");
+        let pages = dir.path().join("pages");
+        write(
+            &pages.join("reader_worker.md"),
+            b"progress never in prompt\n",
+        );
         write(&pages.join("unknown.md"), b"unknown stays\n");
         let mut migration = HostMigration::open(dir.path()).unwrap();
         migration
@@ -841,7 +844,7 @@ mod tests {
             e.kind != MigrationKind::History
                 || e.destination
                     .as_ref()
-                    .is_none_or(|p| !p.starts_with(root.join("memory")))
+                    .is_none_or(|p| p.starts_with(root.join("history/archive")))
         }));
         assert!(
             migration
@@ -873,7 +876,7 @@ mod tests {
         let destination = root.join("memory/MEMORY.md");
         let mut migration = HostMigration::open(dir.path()).unwrap();
         migration
-            .discover(std::slice::from_ref(&agent), &dir.path().join("owners"))
+            .discover(std::slice::from_ref(&agent), &dir.path().join("pages"))
             .unwrap();
         let fp = fingerprint(&source).unwrap();
         let idx = migration
@@ -913,7 +916,7 @@ mod tests {
         write(&other, b"unique old");
         write(&root.join("memory/other.md"), b"unique new");
         migration
-            .discover(std::slice::from_ref(&agent), &dir.path().join("owners"))
+            .discover(std::slice::from_ref(&agent), &dir.path().join("pages"))
             .unwrap();
         migration
             .stage(&HashSet::from([agent.id.to_string()]))
@@ -944,7 +947,7 @@ mod tests {
         write(&source.with_file_name("fact.md"), b"original\n");
         let mut migration = HostMigration::open(dir.path()).unwrap();
         migration
-            .discover(std::slice::from_ref(&agent), &dir.path().join("owners"))
+            .discover(std::slice::from_ref(&agent), &dir.path().join("pages"))
             .unwrap();
         let stopped = HashSet::from([agent.id.to_string()]);
         migration.stage(&stopped).unwrap();
@@ -981,7 +984,7 @@ mod tests {
             write(&memory.join("unique.md"), project.as_bytes());
         }
         migration
-            .discover(&[agent], &dir.path().join("owners"))
+            .discover(&[agent], &dir.path().join("pages"))
             .unwrap();
         migration.stage(&stopped).unwrap();
         for project in ["b", "c"] {

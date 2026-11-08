@@ -25,6 +25,17 @@ pub struct HostRawRead<'a> {
 }
 
 impl Store {
+    pub fn is_host_path_redacted(&self, owner: &str, path: &Path) -> Result<bool, IndexError> {
+        let root = self.data_dir().join("agents").join(owner);
+        if !safe_components(self.data_dir(), &root)? {
+            return Ok(true);
+        }
+        Ok(self
+            .unresolved_host_paths(owner)?
+            .iter()
+            .any(|p| path.starts_with(p)))
+    }
+
     fn unresolved_host_paths(&self, owner: &str) -> Result<Vec<PathBuf>, IndexError> {
         let paths = self
             .conn()
@@ -155,10 +166,13 @@ impl Store {
             return Ok(None);
         }
         let paths = match hit.metadata.source {
-            MemoryScope::Memory => regular_files(&root.join("memory"), true)?,
+            MemoryScope::Memory => regular_files(&root.join("memory"), true)?
+                .into_iter()
+                .filter(|p| !is_hidden_memory_file(p))
+                .collect(),
             MemoryScope::Transcripts => {
                 let mut paths = native_transcripts(&root)?;
-                paths.extend(regular_files(&root.join("history/owners"), true)?);
+                paths.extend(history_archives(&root)?);
                 paths
             }
             MemoryScope::All => return Ok(None),
@@ -170,6 +184,45 @@ impl Store {
             crate::raw_segment::read_raw_range(&hit.raw, request.offset, request.length)?;
         hit.window = window;
         Ok(Some((hit, bytes)))
+    }
+
+    /// Immediately synchronize an agent's `memory/` directory into `HostIndex`
+    /// so newly upserted, read, or
+    /// deleted topics are immediately readable via `raw_id` and `search_host_files`.
+    pub fn sync_agent_memory_index(&self, agent: &Agent) -> Result<(), IndexError> {
+        let root = self.data_dir().join("agents").join(agent.id.as_str());
+        let mut index = HostIndex::open(&self.data_dir().join(INDEX_FILE))?;
+        if !safe_components(self.data_dir(), &root)? {
+            index.retain_agent_scope(agent.id.as_str(), MemoryScope::Memory, &HashSet::new())?;
+            return Ok(());
+        }
+        let unresolved = self.unresolved_host_paths(agent.id.as_str())?;
+        let mut ids = HashSet::new();
+        for path in memory_indexable_files(&root.join("memory"))? {
+            if unresolved.iter().any(|blocked| path.starts_with(blocked)) {
+                continue;
+            }
+            let id = format!(
+                "memory:{}:{}",
+                agent.id,
+                sha256(path.as_os_str().as_encoded_bytes())
+            );
+            let metadata = IndexMetadata {
+                agent_id: agent.id.to_string(),
+                source: MemoryScope::Memory,
+                timestamp_ms: Some(modified_ms(&path)?),
+                direction: "in".into(),
+                sender: format!("agent:{}", agent.name),
+                destination: format!("agent:{}", agent.name),
+                tool_name: None,
+                tool_names: Vec::new(),
+                role: Some("memory".into()),
+            };
+            refresh_document(&mut index, &id, &metadata, &path)?;
+            ids.insert(id);
+        }
+        index.retain_agent_scope(agent.id.as_str(), MemoryScope::Memory, &ids)?;
+        Ok(())
     }
 
     /// The caller has already resolved the authorized immutable ID set. Locks
@@ -216,7 +269,7 @@ impl Store {
             // an unrelated unsupported store does not hide scrubbed local data.
             let unresolved = self.unresolved_host_paths(agent.id.as_str())?;
             if scope != MemoryScope::Transcripts {
-                for path in regular_files(&root.join("memory"), true)? {
+                for path in memory_indexable_files(&root.join("memory"))? {
                     if unresolved.iter().any(|blocked| path.starts_with(blocked)) {
                         continue;
                     }
@@ -247,9 +300,9 @@ impl Store {
                     }
                     ids.extend(refresh_native(&mut index, agent, &path)?.documents);
                 }
-                // Reconciled owner pages are lossless historical documents,
+                // Reconciled archive pages are lossless historical documents,
                 // not necessarily JSONL. Their entire text remains searchable.
-                for path in regular_files(&root.join("history/owners"), true)? {
+                for path in history_archives(&root)? {
                     if unresolved.iter().any(|blocked| path.starts_with(blocked)) {
                         continue;
                     }
@@ -517,6 +570,43 @@ fn document_coordinate(path: &Path) -> io::Result<RawCoordinate> {
         seq: 1,
     })
 }
+/// Read both the generic archive and the historical directory spelling so an
+/// upgrade never makes already-migrated documents disappear. New migrations
+/// only write the generic location.
+fn history_archives(root: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut paths = regular_files(&root.join("history/archive"), true)?;
+    paths.extend(regular_files(&root.join("history").join("owners"), true)?);
+    Ok(paths)
+}
+fn is_hidden_memory_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|s| s.to_str())
+        .is_some_and(|name| name.starts_with('.'))
+}
+
+fn memory_indexable_files(mem_dir: &Path) -> io::Result<Vec<PathBuf>> {
+    let files: Vec<PathBuf> = regular_files(mem_dir, true)?
+        .into_iter()
+        .filter(|p| !is_hidden_memory_file(p))
+        .collect();
+    let has_topic_files = files.iter().any(|p| {
+        p.file_name()
+            .and_then(|s| s.to_str())
+            .is_some_and(|name| !name.eq_ignore_ascii_case("MEMORY.md"))
+    });
+    if !has_topic_files {
+        return Ok(files);
+    }
+    Ok(files
+        .into_iter()
+        .filter(|p| {
+            !p.file_name()
+                .and_then(|s| s.to_str())
+                .is_some_and(|name| name.eq_ignore_ascii_case("MEMORY.md"))
+        })
+        .collect())
+}
+
 fn regular_files(root: &Path, recursive: bool) -> io::Result<Vec<PathBuf>> {
     let meta = match fs::symlink_metadata(root) {
         Ok(m) => m,
@@ -880,7 +970,7 @@ mod tests {
                 .path()
                 .join("agents")
                 .join(agent.id.as_str())
-                .join("history/owners/pagehash");
+                .join("history/archive/pagehash");
             fs::create_dir_all(&root).unwrap();
             let path = root.join("history.md");
             fs::write(
@@ -1687,6 +1777,124 @@ mod tests {
                 .search_host_files(&ids, MemoryScope::Memory, &q)
                 .unwrap()
                 .is_empty()
+        );
+    }
+    #[test]
+    fn generic_and_legacy_archives_remain_scoped_and_raw_readable_after_reopen() {
+        let dir = crate::test_tempdir();
+        let path = dir.path().join("state.db");
+        let store = Store::open(&path).unwrap();
+        let own = store
+            .create_agent(NewAgent::new("archive-reader", "test"))
+            .unwrap();
+        let hidden = store
+            .create_agent(NewAgent::new("archive-hidden", "test"))
+            .unwrap();
+        for agent in [&own, &hidden] {
+            let root = dir.path().join("agents").join(agent.id.as_str());
+            for folder in [
+                root.join("history/archive"),
+                root.join("history").join("owners"),
+            ] {
+                fs::create_dir_all(&folder).unwrap();
+                fs::write(
+                    folder.join("page.md"),
+                    format!("archiveneedle {} {:?}", agent.name, folder),
+                )
+                .unwrap();
+            }
+        }
+        let query = HistorySearchQuery {
+            query: Some("archiveneedle".into()),
+            ..Default::default()
+        };
+        let ids = [own.id.to_string()];
+        for store in [store, Store::open(&path).unwrap()] {
+            let hits = store
+                .search_host_files(&ids, MemoryScope::Transcripts, &query)
+                .unwrap();
+            assert_eq!(hits.len(), 2);
+            for (hit, bytes) in hits {
+                assert_eq!(hit.metadata.agent_id, own.id.as_str());
+                assert_eq!(read_raw(&hit.raw).unwrap(), bytes);
+                assert!(String::from_utf8_lossy(&bytes).contains("archive-reader"));
+            }
+            assert!(
+                store
+                    .search_host_files(&[], MemoryScope::Transcripts, &query)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn memory_index_excludes_dotfiles_and_generated_index_when_topics_exist() {
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(NewAgent::new("topic-owner", "sylphx"))
+            .unwrap();
+        let root = dir.path().join("agents").join(agent.id.as_str());
+        crate::learned_memory::write_sleep_state(
+            &root,
+            &crate::learned_memory::SleepState {
+                last_consolidated_ms: 123,
+                last_inbound_seq: 4,
+                last_outbound_ms: 5,
+                consolidated_topics: 1,
+            },
+        )
+        .unwrap();
+        crate::learned_memory::upsert_memory_topic(
+            &root,
+            &agent.name,
+            None,
+            "cache-architecture",
+            Some("uniqueindexphrase for cache architecture"),
+            "Detailed topic body with uniqueindexphrase",
+            1700000000000,
+        )
+        .unwrap();
+        fs::write(root.join("memory/.hidden-note.md"), "hiddensecretneedle").unwrap();
+        assert!(root.join("memory/MEMORY.md").is_file());
+        assert!(root.join("memory/.sleep-state.json").is_file());
+        let ids = [agent.id.to_string()];
+        let hits = store
+            .search_host_files(
+                &ids,
+                MemoryScope::Memory,
+                &HistorySearchQuery {
+                    query: Some("uniqueindexphrase".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "MEMORY.md must not duplicate topic search hit"
+        );
+        assert!(
+            hits[0]
+                .0
+                .raw
+                .segment
+                .ends_with("memory/cache-architecture.md")
+        );
+        let dot_hits = store
+            .search_host_files(
+                &ids,
+                MemoryScope::Memory,
+                &HistorySearchQuery {
+                    query: Some("hiddensecretneedle".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            dot_hits.is_empty(),
+            "dotfiles in memory/ must never be indexed"
         );
     }
 }

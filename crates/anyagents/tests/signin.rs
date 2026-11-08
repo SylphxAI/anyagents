@@ -64,7 +64,7 @@ fn sign_in_runs_the_vendor_command_in_the_agents_config_dir() {
         .args(["--data", ".", "sign-in", "ada"])
         .current_dir(data.path())
         // Not a real `claude`: prints a link and the outcome the collector reads.
-        .env("ANYAGENTS_FAKE_VENDOR_MODE", ":")
+        .env("ANYAGENTS_FAKE_VENDOR_MODE", r#"printf '%s' '{"claudeAiOauth":{"refreshToken":"synthetic-login-refresh"}}' > "$CLAUDE_CONFIG_DIR/.credentials.json""#)
         .env("PATH", format!("{}:/usr/bin:/bin", fake_dir().display()))
         .env("ANYAGENTS_SIGN_IN_LOG", &log)
         .output()

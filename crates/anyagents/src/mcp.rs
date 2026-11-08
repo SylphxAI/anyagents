@@ -34,6 +34,7 @@ use crate::server;
 pub struct AgentRef {
     pub id: AgentId,
     pub name: String,
+    pub workdir: Option<PathBuf>,
 }
 
 /// Run the tool server for the agent whose config directory is `config`. The
@@ -149,9 +150,16 @@ impl Client {
             .get("name")
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| "the server named no agent".to_string())?;
+        let workdir = who
+            .get("workdir")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from);
         Ok(AgentRef {
             id: AgentId::parse(id).map_err(|err| err.to_string())?,
             name: name.to_string(),
+            workdir,
         })
     }
 
@@ -172,35 +180,8 @@ impl Client {
     ) -> Result<T, String> {
         let named = crate::client::agent_identity().map(|id| id.to_string());
         let cap = self.current_capability();
-        let body_clone = body.clone();
-        let admin_socket = self.socket.parent().map(|p| p.join("admin.sock"));
-        let prefer_admin = admin_socket.as_ref().is_some_and(|s| s.exists())
-            && ((method == "POST" && path == "/v1/agents")
-                || (method == "GET" && path == "/v1/agents")
-                || path.ends_with("/harness")
-                || path.ends_with("/model")
-                || path.ends_with("/rename")
-                || path.ends_with("/role")
-                || path.ends_with("/description")
-                || path.ends_with("/wake")
-                || path.ends_with("/pause")
-                || path.ends_with("/archive")
-                || path.starts_with("/v1/subagent-defaults")
-                || path.starts_with("/v1/profiles")
-                || path.starts_with("/v1/schedules")
-                || path.starts_with("/v1/browser")
-                || path.starts_with("/v1/channels")
-                || path.starts_with("/v1/send")
-                || path.starts_with("/v1/interact")
-                || path.contains("/schedules")
-                || path.contains("/conversation"));
-        let (primary_sock, secondary_sock) = match (&admin_socket, prefer_admin) {
-            (Some(adm), true) => (adm.as_path(), Some(self.socket.as_path())),
-            (Some(adm), false) if adm.exists() => (self.socket.as_path(), Some(adm.as_path())),
-            _ => (self.socket.as_path(), None),
-        };
-        let primary_res = request_naming(
-            primary_sock,
+        let (status, bytes) = request_naming(
+            &self.socket,
             method,
             path,
             body,
@@ -208,42 +189,7 @@ impl Client {
             None,
             named.as_deref(),
         )
-        .await;
-        let (mut status, mut bytes) = match primary_res {
-            Ok(ans) => ans,
-            Err(primary_err) => {
-                if let Some(sec_sock) = secondary_sock {
-                    request_naming(
-                        sec_sock,
-                        method,
-                        path,
-                        body_clone.clone(),
-                        Some(&cap),
-                        None,
-                        named.as_deref(),
-                    )
-                    .await?
-                } else {
-                    return Err(primary_err);
-                }
-            }
-        };
-        if !status.is_success()
-            && let Some(sec_sock) = secondary_sock
-            && let Ok(fallback) = request_naming(
-                sec_sock,
-                method,
-                path,
-                body_clone,
-                Some(&cap),
-                None,
-                named.as_deref(),
-            )
-            .await
-            && fallback.0.is_success()
-        {
-            (status, bytes) = fallback;
-        }
+        .await?;
         if !status.is_success() {
             return Err(error_message(&bytes));
         }
@@ -251,80 +197,11 @@ impl Client {
     }
 
     async fn get_agents(&self) -> Result<AgentsResponse, String> {
-        let mut resp: AgentsResponse = self.get("/v1/agents", None).await?;
-        if let Some(parent_dir) = self.socket.parent() {
-            let admin_socket = parent_dir.join("admin.sock");
-            if admin_socket.exists() {
-                let named = crate::client::agent_identity().map(|id| id.to_string());
-                let cap = self.current_capability();
-                if let Ok((st, bytes)) = request_naming(
-                    &admin_socket,
-                    "GET",
-                    "/v1/agents",
-                    None,
-                    Some(&cap),
-                    None,
-                    named.as_deref(),
-                )
-                .await
-                    && st.is_success()
-                    && let Ok(admin_resp) = serde_json::from_slice::<AgentsResponse>(&bytes)
-                {
-                    let by_id: std::collections::HashMap<String, AgentView> = admin_resp
-                        .agents
-                        .into_iter()
-                        .map(|a| (a.id.clone(), a))
-                        .collect();
-                    for view in &mut resp.agents {
-                        if let Some(adm) = by_id.get(&view.id) {
-                            view.name = adm.name.clone();
-                            view.harness = adm.harness.clone();
-                            if adm.model.is_some() {
-                                view.model = adm.model.clone();
-                            }
-                            view.install = adm.install.clone();
-                            view.delivery_mode = adm.delivery_mode.clone();
-                            view.steer_support = adm.steer_support.clone();
-                            if adm.role.is_some() {
-                                view.role = adm.role.clone();
-                            }
-                            if !adm.aliases.is_empty() {
-                                view.aliases = adm.aliases.clone();
-                            }
-                            if view.quota_reset_at_ms.is_none() {
-                                view.quota_reset_at_ms = adm.quota_reset_at_ms;
-                            }
-                            if view.block_reason.is_none() {
-                                view.block_reason = adm.block_reason.clone();
-                            }
-                            if view.last_error.is_none() {
-                                view.last_error = adm.last_error.clone();
-                            }
-                            if adm.turn_state == "errored"
-                                || ((view.state == "running" || view.state == "idle")
-                                    && view.last_error.is_some()
-                                    && view.quota_reset_at_ms.is_none())
-                            {
-                                view.turn_state = "errored".to_string();
-                            }
-                            if view.oldest_undelivered_age_ms.is_none() {
-                                view.oldest_undelivered_age_ms = adm.oldest_undelivered_age_ms;
-                            }
-                            if adm.seat_user.is_some() {
-                                view.seat_user = adm.seat_user.clone();
-                                view.seat_uid = adm.seat_uid;
-                                view.seat_gid = adm.seat_gid;
-                            }
-                            view.schedules = adm.schedules.clone();
-                        }
-                    }
-                }
-            }
-        }
-        Ok(resp)
+        self.get("/v1/agents", None).await
     }
 }
 
+#[derive(Clone)]
 struct AgentMcp {
     agent: AgentRef,
     client: Client,
@@ -332,7 +209,7 @@ struct AgentMcp {
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 struct SendArgs {
-    /// Destinations: agent names or IDs (`sage`, `agent:sage`, `agt_...`, `parent`,
+    /// Destinations: agent names or IDs (`planner`, `agent:planner`, `agt_...`, `parent`,
     /// `children`), internal groups (`group:owners`, `group:<name>`, `group:all`, `all`),
     /// or external channel targets (`telegram:chat:<chat_id>[:<topic_id>]`,
     /// `telegram:user:<user_id>[:<message_id>]`). An authored send addressed to
@@ -407,6 +284,20 @@ struct ConversationArgs {
     /// Search both sources (default), only learned memory, or only transcripts.
     #[serde(default)]
     scope: Option<String>,
+    /// Optional memory topic slug (e.g. `"architecture-decisions"`, `"billing-rules"`) to write,
+    /// upsert, or delete in `<agent_root>/memory/<topic>.md` and automatically rebuild `MEMORY.md`
+    /// without needing host paths. When set, `scope` defaults to `"memory"` and `agent` defaults to `self`.
+    #[serde(default)]
+    topic: Option<String>,
+    /// Optional 1-line description / trigger phrase for `topic` when upserting learned memory.
+    #[serde(default)]
+    description: Option<String>,
+    /// Markdown body to write into `<agent_root>/memory/<topic>.md` when upserting learned memory.
+    #[serde(default, alias = "body", alias = "text")]
+    content: Option<String>,
+    /// When `true` with `topic`, deletes `<agent_root>/memory/<topic>.md` and rebuilds `MEMORY.md`.
+    #[serde(default)]
+    delete: Option<bool>,
     /// Optional lexical + structured search query (`Raw-RAG`: SQLite FTS5 BM25 with hybrid
     /// ASCII identifier + CJK bigram tokenization, exact phrase boost, and substring fallback).
     /// When set, searches authorized historical and live turns without loading the
@@ -420,7 +311,7 @@ struct ConversationArgs {
     /// Optional negative terms — any turn containing any of these substrings is excluded.
     #[serde(default, deserialize_with = "crate::api::deserialize_string_or_vec")]
     exclude: Vec<String>,
-    /// Agent name (`sage`, `volt`, `xenon`, `"all"`) or `agt_...` ID whose complete
+    /// Agent name (`planner`, `builder`, `reviewer`, `"all"`) or `agt_...` ID whose complete
     /// two-way (`in` + `out`) conversation to read or search. Defaults to `"all"` when
     /// searching, or this agent when reading recent chronological turns. Non-admin
     /// callers can read only self and descendants; `all` means that authorized set.
@@ -664,7 +555,7 @@ struct SpawnArgs {
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 struct DescribeArgs {
-    /// Target agent name (`"self"`, `"xenon"`, `"sage"`, `"all"`, or `agt_...` ID). Defaults to `"self"`.
+    /// Target agent name (`"self"`, `"reviewer"`, `"planner"`, `"all"`, or `agt_...` ID). Defaults to `"self"`.
     #[serde(default, alias = "name", alias = "target")]
     agent: Option<String>,
     /// Concise public role/responsibility summary (`description`, Layer 1 — visible to all peers and group rosters).
@@ -890,6 +781,191 @@ struct ScheduleArgs {
     agent: Option<String>,
 }
 
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+struct MemoryArgs {
+    /// Learned-memory operation to perform:
+    /// - `"list"` (default when no `topic`, `query`, `content`, or `delete` is passed): Read `MEMORY.md` and list all topic entries.
+    /// - `"read"` (inferred when `topic` is provided without `content` or `delete`): Read `<agent_root>/memory/<topic>.md` in O(1).
+    /// - `"write"` / `"upsert"` (inferred when `content` is provided): Create or update `<agent_root>/memory/<topic>.md` and rebuild `MEMORY.md`.
+    /// - `"delete"` (inferred when `delete: true` is provided): Delete `<agent_root>/memory/<topic>.md` and rebuild `MEMORY.md`.
+    /// - `"search"` (inferred when `query` is provided): Search the FTS5 learned-memory index.
+    #[serde(default)]
+    action: Option<String>,
+    /// Learned-memory topic slug (`<agent_root>/memory/<topic>.md`, e.g. `"deployment-runbook"`).
+    #[serde(default, alias = "slug", alias = "name")]
+    topic: Option<String>,
+    /// 1-line trigger description indexed in `MEMORY.md` when `action = "write"` / `"upsert"`.
+    #[serde(default, alias = "summary", alias = "trigger")]
+    description: Option<String>,
+    /// Markdown body to write into `<agent_root>/memory/<topic>.md` when `action = "write"` / `"upsert"`.
+    #[serde(default, alias = "body", alias = "text", alias = "markdown")]
+    content: Option<String>,
+    /// Search query when `action = "search"`.
+    #[serde(default, alias = "q", alias = "search")]
+    query: Option<String>,
+    /// When `true`, deletes `<agent_root>/memory/<topic>.md` and rebuilds `MEMORY.md`.
+    #[serde(default)]
+    delete: Option<bool>,
+    /// Target agent name or `agt_...` ID (defaults to this agent itself).
+    #[serde(default, alias = "target")]
+    agent: Option<String>,
+    /// Maximum number of results when `action = "search"` or `"list"` (default 20).
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
+struct FileEditSpec {
+    /// Target string in the file to replace (supports exact, CRLF-normalized, trailing-whitespace-trimmed, and indentation-tolerant matching).
+    #[serde(
+        default,
+        alias = "old_str",
+        alias = "old_string",
+        alias = "search",
+        alias = "find"
+    )]
+    target: String,
+    /// Replacement string to substitute in place of `target`.
+    #[serde(default, alias = "new_str", alias = "new_string", alias = "replace")]
+    replacement: String,
+    /// Optional per-edit override for whether multiple occurrences of `target` should all be replaced (`true` by default).
+    #[serde(default)]
+    replace_all: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+struct FilesArgs {
+    /// File/workspace operation to perform:
+    /// - `"read"`: Read a file with optional 1-based `start_line`, `end_line`, `byte_offset`, and `max_bytes` (default 46080).
+    /// - `"write"`: Create, overwrite, or append (`append: true`) a file, automatically creating parent directories and returning `{ path, bytes_written, sha256 }`.
+    /// - `"edit"` / `"multi_edit"`: Apply a `target` -> `replacement` edit (or an atomic array of `edits: [{ target, replacement }]`) with 4-stage cascade matching, returning `{ path, replacements_made, lines_added, lines_removed, sha256 }`.
+    /// - `"patch"`: Apply an OpenAI V4A patch (`*** Begin Patch` / `*** Update File:` / `*** Add File:` / `*** Delete File:`) or standard unified diff (`--- a/...` / `+++ b/...`).
+    /// - `"list"`: List directory entries (`name`, `path`, `kind`: `"file" | "dir" | "symlink"`, `bytes`) sorted deterministically.
+    /// - `"glob"`: Fast glob file listing (`pattern`, optional `path`, `max_results` default 200), skipping `.git`/`target`/`node_modules` and respecting `.gitignore` by default.
+    /// - `"grep"`: Fast regex/literal content search (`query`, optional `path`, `glob`, `max_results` default 100, `context_lines`), returning `{ matches: [{ path, line, text }] }`.
+    #[serde(default)]
+    action: Option<String>,
+    /// File or directory path (relative paths are resolved against the agent's `workdir`).
+    #[serde(
+        default,
+        alias = "file",
+        alias = "file_path",
+        alias = "filepath",
+        alias = "dir",
+        alias = "directory"
+    )]
+    path: Option<String>,
+    /// 1-based inclusive start line when `action = "read"`.
+    #[serde(default, alias = "from_line", alias = "offset_line")]
+    start_line: Option<usize>,
+    /// 1-based inclusive end line when `action = "read"`.
+    #[serde(default, alias = "to_line", alias = "limit_line")]
+    end_line: Option<usize>,
+    /// Byte offset into the selected line window when `action = "read"` (default 0).
+    #[serde(default, alias = "offset")]
+    byte_offset: Option<usize>,
+    /// Maximum bytes to read when `action = "read"` (default 46080, max 262144).
+    #[serde(default)]
+    max_bytes: Option<usize>,
+    /// File content to write when `action = "write"`.
+    #[serde(default, alias = "text", alias = "body")]
+    content: Option<String>,
+    /// Whether to allow overwriting an existing file when `action = "write"` (`true` by default; set `false` to fail if the file already exists).
+    #[serde(default)]
+    overwrite: Option<bool>,
+    /// Whether to append `content` to the end of the file when `action = "write"` (`false` by default).
+    #[serde(default)]
+    append: Option<bool>,
+    /// Target string to replace when `action = "edit"`.
+    #[serde(default, alias = "old_str", alias = "old_string")]
+    target: Option<String>,
+    /// Replacement string when `action = "edit"`.
+    #[serde(default, alias = "new_str", alias = "new_string", alias = "replace")]
+    replacement: Option<String>,
+    /// Array of `{ target, replacement }` edits applied atomically when `action = "edit"` or `"multi_edit"`.
+    #[serde(default)]
+    edits: Vec<FileEditSpec>,
+    /// Whether multiple occurrences of `target` should all be replaced (`true` by default; set `false` to require a unique match).
+    #[serde(default)]
+    replace_all: Option<bool>,
+    /// OpenAI V4A patch (`*** Begin Patch` ...) or unified diff (`--- a/...` / `+++ b/...`) when `action = "patch"`.
+    #[serde(default, alias = "diff")]
+    patch: Option<String>,
+    /// Glob pattern when `action = "glob"` (e.g. `"**/*.rs"`, `"src/**/*.ts"`).
+    #[serde(default)]
+    pattern: Option<String>,
+    /// Optional file filter glob when `action = "grep"` (or alias for `pattern` when `action = "glob"`).
+    #[serde(default)]
+    glob: Option<String>,
+    /// Search regex or literal string when `action = "grep"`.
+    #[serde(default, alias = "q", alias = "search", alias = "regex")]
+    query: Option<String>,
+    /// Maximum number of results to return (`200` default for `glob`, `100` default for `grep`, `500` default for `list`).
+    #[serde(default, alias = "limit")]
+    max_results: Option<usize>,
+    /// Number of context lines (`0..=10`) before and after each match when `action = "grep"`.
+    #[serde(default, alias = "context")]
+    context_lines: Option<usize>,
+    /// Case-insensitive matching when `action = "grep"` (`false` by default).
+    #[serde(default, alias = "ignore_case")]
+    case_insensitive: Option<bool>,
+    /// Force literal substring matching when `action = "grep"` (`false` by default).
+    #[serde(default)]
+    literal: Option<bool>,
+    /// Include hidden dotfiles/directories during `glob`, `grep`, or `list` (`false` by default for `glob`/`grep`, `true` by default for `list`).
+    #[serde(default)]
+    include_hidden: Option<bool>,
+    /// Include `.git`, `target`, `node_modules`, and `.gitignore`-matched paths during `glob` or `grep` (`false` by default).
+    #[serde(default)]
+    include_ignored: Option<bool>,
+    /// Shell command string (`bash -c <cmd>`) when `action = "exec"`.
+    #[serde(default, alias = "command")]
+    cmd: Option<String>,
+    /// Optional working directory (relative to the agent's `workdir` or absolute) when `action = "exec"`.
+    #[serde(default, alias = "workdir")]
+    cwd: Option<String>,
+    /// Optional execution timeout in milliseconds when `action = "exec"` (default `30000`, max `120000`).
+    #[serde(default, alias = "timeout")]
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+struct DynamicObjectArgs {
+    /// Action name to execute on the target capability (`computer`, `device`, or `media`).
+    #[serde(default)]
+    action: Option<String>,
+    /// Additional action-specific fields.
+    #[serde(flatten)]
+    extra: serde_json::Map<String, serde_json::Value>,
+}
+
+impl DynamicObjectArgs {
+    fn from_value(val: serde_json::Value) -> Result<Self, String> {
+        serde_json::from_value(val).map_err(|e| format!("invalid object arguments: {e}"))
+    }
+
+    fn into_value(self) -> serde_json::Value {
+        let mut map = self.extra;
+        if let Some(act) = self.action {
+            map.insert("action".to_string(), serde_json::Value::String(act));
+        }
+        serde_json::Value::Object(map)
+    }
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+struct CodeArgs {
+    /// Async TypeScript / JavaScript snippet body to execute in the AnyAgents capability sandbox.
+    /// Has access to `anyagents.{memory,conversation,send,agents,schedule,groups,browser,files}` (and `tools.anyagents.*`)
+    /// plus `workspace.{read,write,edit,multi_edit,patch,glob,grep,list}` (and `tools.workspace.*`) and `console.{log,warn,error}`.
+    /// Ambient `process.env`, `require`, `child_process`, and raw `fs` are isolated and unavailable.
+    #[serde(alias = "script", alias = "source")]
+    code: String,
+    /// Optional execution timeout in milliseconds (default `30000`, max `120000`).
+    #[serde(default, alias = "timeout")]
+    timeout_ms: Option<u64>,
+}
+
 fn generate_subagent_name(parent_name: &str) -> String {
     let raw = AgentId::generate().to_string();
     let short = raw
@@ -902,10 +978,25 @@ fn generate_subagent_name(parent_name: &str) -> String {
     format!("{parent_name}-sub-{short}")
 }
 
+fn send_turn_result(response: SendResponse, closing: bool) -> Result<serde_json::Value, String> {
+    let mut result = serde_json::to_value(response).map_err(|e| e.to_string())?;
+    if closing {
+        result["status"] = serde_json::json!("turn_complete_no_reply_sent");
+        result["turn_complete_hint"] = serde_json::json!(
+            "No message was sent. End this turn immediately. Do not call send or any other tool again."
+        );
+    } else {
+        result["turn_complete_hint"] = serde_json::json!(
+            "The send request is complete. If your work is finished, end this turn without calling send again for a closing token."
+        );
+    }
+    Ok(result)
+}
+
 #[tool_router]
 impl AgentMcp {
     #[tool(
-        description = "Unified outbound communication and message interaction tool: send a message, media file (`photo`, `video`, `audio`, `music`, `voice`, `document`, `animation`), GPS `location`/venue, interactive `poll`, `checklist`, or Instant View `article` to one or multiple agents (`sage`, `agt_...`, `parent`, `children`), internal groups (`group:<name>`, `group:all`, `all`), or external channel targets (`telegram:chat:<id>[:<topic>]`, `telegram:user:<id>`); OR perform a message interaction (`action`: `\"react\"` | `\"vote\"` | `\"check\"` | `\"uncheck\"` | `\"edit\"` | `\"delete\"` | `\"pin\"` | `\"unpin\"` | `\"stop_poll\"`) on a target message (`target` or `reply_to`: `anyagents:reply:msg_...` or `telegram:chat:<chat_id>:<message_id>`)."
+        description = "Unified outbound communication and message interaction tool: send a message, media file (`photo`, `video`, `audio`, `music`, `voice`, `document`, `animation`), GPS `location`/venue, interactive `poll`, `checklist`, or Instant View `article` to one or multiple agents (`planner`, `agt_...`, `parent`, `children`), internal groups (`group:<name>`, `group:all`, `all`), or external channel targets (`telegram:chat:<id>[:<topic>]`, `telegram:user:<id>`); OR perform a message interaction (`action`: `\"react\"` | `\"vote\"` | `\"check\"` | `\"uncheck\"` | `\"edit\"` | `\"delete\"` | `\"pin\"` | `\"unpin\"` | `\"stop_poll\"`) on a target message (`target` or `reply_to`: `anyagents:reply:msg_...` or `telegram:chat:<chat_id>:<message_id>`)."
     )]
     async fn send(
         &self,
@@ -977,6 +1068,7 @@ impl AgentMcp {
             article: args.article,
             idempotency_key: args.idempotency_key,
         };
+        let closing = body.is_turn_closing_sentinel();
         let response: SendResponse = self
             .client
             .get(
@@ -984,13 +1076,13 @@ impl AgentMcp {
                 Some(serde_json::to_vec(&body).map_err(|err| err.to_string())?),
             )
             .await?;
-        Ok(rmcp::handler::server::wrapper::Json(
-            serde_json::to_value(response).map_err(|e| e.to_string())?,
-        ))
+        Ok(rmcp::handler::server::wrapper::Json(send_turn_result(
+            response, closing,
+        )?))
     }
 
     #[tool(
-        description = "Unified two-way (`in` + `out`) conversation reader and host memory search (`scope`: all|memory|transcripts; default all). Exact bounded raw readback uses `raw_id` and `raw_sha256` from a result plus optional `raw_offset`/`raw_length` (bytes, max65536); it returns exact `raw_bytes`, full raw coordinates and the requested window. Paths are never accepted. Native historical events without source time return timestamp_ms:null (CLI: unknown); missing time is never inferred from file mtime, and timestamp bounds exclude unknown times. Lexical + Structured History Search (`query`, `queries`, `exclude`, `include_tools`, `only_tools`, `tool_name`, `direction`, `sender`, `since_ms`, `until_ms`, `from_seq`, `to_seq`, `range`, `sort`, `radius`, `limit`). Live incoming messages are pushed automatically to your session, so you never need to poll an inbox. Pass `query` / `queries` (or structured filters like `only_tools: true`, `tool_name`, `range`) to search the caller's and descendants' historical memory (`agent` defaults to `\"all\"`), or omit them to read recent chronological two-way turns. Non-admin agents read only self and descendants; `all` never grants peer, sibling or parent history access."
+        description = "Unified two-way (`in` + `out`) conversation reader, host memory search (`scope`: all|memory|transcripts; default all), and zero-friction learned-memory topic reader/writer (`topic`, `description`, `content`, `delete`). Exact bounded raw readback uses `raw_id` and `raw_sha256` from a result plus optional `raw_offset`/`raw_length` (bytes, max65536); it returns exact `raw_bytes`, full raw coordinates and the requested window. Paths are never accepted. Native historical events without source time return timestamp_ms:null (CLI: unknown); missing time is never inferred from file mtime, and timestamp bounds exclude unknown times. Lexical + Structured History Search (`query`, `queries`, `exclude`, `include_tools`, `only_tools`, `tool_name`, `direction`, `sender`, `since_ms`, `until_ms`, `from_seq`, `to_seq`, `range`, `sort`, `radius`, `limit`). To read a learned-memory topic directly in O(1), pass `topic: \"<slug>\"` (without `content` or `delete`). To write or update a durable learned-memory topic without host file paths, pass `topic: \"<slug>\"`, `description: \"<1-line trigger>\"`, and `content: \"<markdown>\"` (or `delete: true` to remove a stale topic); AnyAgents writes `<agent_root>/memory/<topic>.md`, syncs the host index immediately, and rebuilds `MEMORY.md` automatically."
     )]
     async fn conversation(
         &self,
@@ -1001,30 +1093,21 @@ impl AgentMcp {
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty());
-        let (range_from, range_to) = if let Some(r) = args
-            .range
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            let stripped = r.strip_prefix("seq:").unwrap_or(r).trim();
-            if let Some((a, b)) = stripped.split_once('-') {
-                (a.trim().parse::<i64>().ok(), b.trim().parse::<i64>().ok())
-            } else {
-                let single = stripped.parse::<i64>().ok();
-                (single, single)
-            }
-        } else {
-            (None, None)
-        };
+        let (range_from, range_to) = parse_sequence_range(args.range.as_deref())?;
         let from_seq = args.from_seq.or(range_from);
         let to_seq = args.to_seq.or(range_to);
-        let is_search_mode = args.raw_id.is_some()
-            || clean_q.is_some()
-            || !args.queries.is_empty()
-            || !args.exclude.is_empty()
-            || args.only_tools == Some(true)
-            || args.tool_name.is_some();
+        let has_topic_mutation = args
+            .topic
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|s| !s.is_empty());
+        let is_search_mode = !has_topic_mutation
+            && (args.raw_id.is_some()
+                || clean_q.is_some()
+                || !args.queries.is_empty()
+                || !args.exclude.is_empty()
+                || args.only_tools == Some(true)
+                || args.tool_name.is_some());
         let default_agent = if is_search_mode {
             "all".to_string()
         } else {
@@ -1058,6 +1141,30 @@ impl AgentMcp {
                 return Err("scope must be all, memory or transcripts".into());
             }
             query.push(format!("scope={scope}"));
+        } else if has_topic_mutation {
+            query.push("scope=memory".to_string());
+        }
+        if let Some(topic) = args
+            .topic
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            query.push(format!("topic={}", urlencoding_simple(topic)));
+        }
+        if let Some(desc) = args
+            .description
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            query.push(format!("description={}", urlencoding_simple(desc)));
+        }
+        if let Some(content) = args.content.as_deref() {
+            query.push(format!("content={}", urlencoding_simple(content)));
+        }
+        if let Some(del) = args.delete {
+            query.push(format!("delete={del}"));
         }
         if let Some(q) = clean_q {
             query.push(format!("query={}", urlencoding_simple(q)));
@@ -1686,7 +1793,7 @@ impl AgentMcp {
     }
 
     #[tool(
-        description = "Spawn a new sub-agent with this agent as its `parent` (supports multi-level sub-agent trees). Pass `repo` (e.g. `\"SylphxAI/spiron\"` or `\"inherit\"` to branch from your current repo, with optional `branch` and `base`) to automatically provision an isolated, lifecycle-managed Git worktree at `<data>/agents/<id>/work` (cleanly reaped on `archive` when pushed, or preserved if dirty). If both `repo` and `workdir` are omitted, defaults to its own isolated `<data>/agents/<id>/work`. Every sub-agent automatically receives the shared `AGENTS.md` and top-level `skills` in its config home."
+        description = "Spawn a new sub-agent with this agent as its `parent` (supports multi-level sub-agent trees). Pass `repo` (e.g. `\"example-org/workspace\"` or `\"inherit\"` to branch from your current repo, with optional `branch` and `base`) to automatically provision an isolated, lifecycle-managed Git worktree at `<data>/agents/<id>/work` (cleanly reaped on `archive` when pushed, or preserved if dirty). If both `repo` and `workdir` are omitted, defaults to its own isolated `<data>/agents/<id>/work`. Every sub-agent automatically receives the shared `AGENTS.md` and top-level `skills` in its config home."
     )]
     async fn spawn(
         &self,
@@ -2281,16 +2388,28 @@ impl AgentMcp {
     )]
     async fn browser(
         &self,
-        Parameters(args): Parameters<crate::browser::BrowserRequest>,
-    ) -> Result<rmcp::handler::server::wrapper::Json<serde_json::Value>, String> {
-        let response: serde_json::Value = self
+        Parameters(mut args): Parameters<crate::browser::BrowserRequest>,
+    ) -> Result<MultimediaJson, String> {
+        if let Some(raw_path) = args
+            .path
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            && !Path::new(raw_path).is_absolute()
+            && let Ok(resolved) =
+                resolve_workspace_path(&self.resolve_workdir(), Some(raw_path), true)
+        {
+            args.path = Some(resolved.display().to_string());
+        }
+        let mut response: serde_json::Value = self
             .client
             .get(
                 "/v1/browser",
                 Some(serde_json::to_vec(&args).map_err(|err| err.to_string())?),
             )
             .await?;
-        Ok(rmcp::handler::server::wrapper::Json(response))
+        let media = extract_media_blocks_from_tool_value("browser", &mut response);
+        Ok(MultimediaJson(response, media))
     }
 
     #[tool(
@@ -2328,16 +2447,121 @@ impl AgentMcp {
             .await?;
         Ok(rmcp::handler::server::wrapper::Json(response))
     }
+
+    #[tool(
+        description = "First-class learned-memory manager (`action`: `\"list\"` | `\"read\"` | `\"write\"` | `\"upsert\"` | `\"delete\"` | `\"search\"`). Inferred automatically when `action` is omitted: `delete: true` -> `\"delete\"`, `content` -> `\"write\"`, `query` -> `\"search\"`, `topic` -> `\"read\"`, else `\"list\"`. Writes `<agent_root>/memory/<topic>.md`, syncs the FTS5 memory index, and rebuilds `MEMORY.md` (<150 lines / 4 KB)."
+    )]
+    async fn memory(
+        &self,
+        Parameters(args): Parameters<MemoryArgs>,
+    ) -> Result<rmcp::handler::server::wrapper::Json<serde_json::Value>, String> {
+        let val = self.execute_memory_tool(args).await?;
+        Ok(rmcp::handler::server::wrapper::Json(val))
+    }
+
+    #[tool(
+        description = "Multi-provider policy-aware web search and URL extraction tool (`action`: `\"search\"` | `\"fetch\"`; `engine`: `\"auto\"` | `\"parallel\"` | `\"exa\"` | `\"tavily\"` | `\"firecrawl\"` | `\"perplexity\"` | `\"brave\"` | `\"anysearch\"` | `\"direct\"`). Supports `allowed_domains`, `blocked_domains`, `country`, `max_results`, `max_chars`, `mode`, and `external_web_access` with bounded automatic failover."
+    )]
+    async fn web(
+        &self,
+        Parameters(args): Parameters<crate::web::WebRequest>,
+    ) -> Result<rmcp::handler::server::wrapper::Json<serde_json::Value>, String> {
+        let data_dir = self.client.socket.parent().map(Path::to_path_buf);
+        let local_has_keys = !crate::web::load_web_keys(data_dir.as_deref()).is_empty();
+        let server_available = self.client.socket.exists();
+        if !local_has_keys && server_available {
+            let body = serde_json::to_vec(&args).map_err(|e| e.to_string())?;
+            if let Ok(val) = self
+                .client
+                .get::<serde_json::Value>("/v1/web", Some(body))
+                .await
+            {
+                return Ok(rmcp::handler::server::wrapper::Json(val));
+            }
+        }
+        let val = tokio::task::spawn_blocking(move || {
+            crate::web::execute_web_request(data_dir.as_deref(), args)
+        })
+        .await
+        .map_err(|e| format!("web task join error: {e}"))??;
+        Ok(rmcp::handler::server::wrapper::Json(val))
+    }
+
+    #[tool(
+        description = "Desktop GUI Computer Use tool supporting Semantic Accessibility Snapshot Mode (`action: \"snapshot\"`, returning `@<snapshot_id>:e<N>` refs with Web Wrapper Skipping and `STALE_REF` guard), Window/Clipboard management (`list_windows`, `focus_window`, `clipboard_get`, `clipboard_set`), and Visual Pixel Mode (`screenshot`, `cursor_position`, `move`, `click`, `mouse_down`, `mouse_up`, `drag`, `scroll`, `type`, `key`, `hold_key`, `wait`, `zoom`, or Anthropic/OpenAI `action`)."
+    )]
+    async fn computer(
+        &self,
+        Parameters(args): Parameters<DynamicObjectArgs>,
+    ) -> Result<MultimediaJson, String> {
+        let data_dir = self.client.socket.parent().map(Path::to_path_buf);
+        let mut val = crate::computer::execute_computer_request(
+            data_dir.as_deref(),
+            &self.client.config,
+            args.into_value(),
+        )
+        .await?;
+        let media = extract_media_blocks_from_tool_value("computer", &mut val);
+        Ok(MultimediaJson(val, media))
+    }
+
+    #[tool(
+        description = "Android / iOS Mobile Device Control tool (`action`: `\"screenshot\"` | `\"tap\"` | `\"swipe\"` | `\"type\"` | `\"press\"` | `\"install_app\"` | `\"launch_app\"` | `\"terminate_app\"` | `\"open_url\"` | `\"rotate\"`)."
+    )]
+    async fn device(
+        &self,
+        Parameters(args): Parameters<DynamicObjectArgs>,
+    ) -> Result<MultimediaJson, String> {
+        let work_dir = self.resolve_workdir();
+        let mut val = crate::computer::execute_device_request(&work_dir, args.into_value()).await?;
+        let media = extract_media_blocks_from_tool_value("device", &mut val);
+        Ok(MultimediaJson(val, media))
+    }
+
+    #[tool(
+        description = "Multimodal Media tool (`action`: `\"image_generate\"` | `\"speech\"` | `\"transcribe\"`) backed by the Sylphx AI Gateway (`/v1/images/generations`, `/v1/audio/speech`, `/v1/audio/transcriptions`)."
+    )]
+    async fn media(
+        &self,
+        Parameters(args): Parameters<DynamicObjectArgs>,
+    ) -> Result<MultimediaJson, String> {
+        let data_dir = self.client.socket.parent().map(Path::to_path_buf);
+        let work_dir = self.resolve_workdir();
+        let mut val = crate::computer::execute_media_request(
+            data_dir.as_deref(),
+            &self.client.config,
+            &work_dir,
+            args.into_value(),
+        )
+        .await?;
+        let media = extract_media_blocks_from_tool_value("media", &mut val);
+        Ok(MultimediaJson(val, media))
+    }
+
+    #[tool(
+        description = "Unified cross-harness file, edit, patch, list, glob, grep, and command exec tool (`action`: `\"read\"` | `\"write\"` | `\"edit\"` | `\"multi_edit\"` | `\"patch\"` | `\"list\"` | `\"glob\"` | `\"grep\"` | `\"exec\"`), resolving relative paths deterministically against your `workdir`. Calling `action: \"read\"` on multimedia files (`image/png`, `image/jpeg`, `image/webp`, `image/gif`, `image/bmp`, `image/avif`, `image/x-icon`, `application/pdf`, `audio/wav`, `audio/mpeg`, `audio/ogg`, `audio/flac`, `audio/mp4`, `audio/aac`, `video/mp4`, `video/webm`, `video/quicktime`) natively attaches MCP multimedia content blocks (`image`, `audio`, `resource`) for direct model inspection."
+    )]
+    async fn files(
+        &self,
+        Parameters(args): Parameters<FilesArgs>,
+    ) -> Result<MultimediaJson, String> {
+        let base_dir = self.resolve_workdir();
+        let (val, media) =
+            tokio::task::spawn_blocking(move || execute_files_tool_with_media(&base_dir, args))
+                .await
+                .map_err(|e| format!("files task join error: {e}"))??;
+        Ok(MultimediaJson(val, media))
+    }
+
+    #[tool(
+        description = "Unified Cross-Harness Code Mode / Programmatic Tool Calling (`code`, optional `timeout_ms` default 30000, max 120000). Executes an async TypeScript / JavaScript snippet in an isolated capability sandbox (`process.env`, `require`, `child_process`, and raw `fs` are unavailable) with `anyagents.{memory,conversation,send,agents,schedule,groups,browser,web,computer,device,media,files}` (alias `tools.anyagents`), `web.{search,fetch}` (alias `tools.web`), `computer.{snapshot,list_windows,focus_window,clipboard_get,clipboard_set,screenshot,cursor_position,move,click,mouse_down,mouse_up,drag,scroll,type,key,hold_key,wait,zoom,action}` (alias `tools.computer`), `device.{screenshot,tap,swipe,type,press,install_app,launch_app,terminate_app,open_url,rotate}` (alias `tools.device`), `media.{image_generate,speech,transcribe}` (alias `tools.media`), and `workspace.{read,write,edit,multi_edit,patch,glob,grep,list,exec}` (alias `tools.workspace`). Calling `workspace.read(path)` on images, PDFs, audio, or video (or calling `browser.screenshot`, `computer.screenshot`, `device.screenshot`, `media.image_generate`, `media.speech`) natively attaches MCP multimedia content blocks (`image`, `audio`, `resource`) directly to the tool response for visual/multimodal inspection. Compose parallel multi-tool queries with `await Promise.all([...])`, filter/aggregate intermediate data in memory, log diagnostics via `console.log`, and `return` only the compact result `{ result, logs, duration_ms }`."
+    )]
+    async fn code(&self, Parameters(args): Parameters<CodeArgs>) -> Result<MultimediaJson, String> {
+        self.execute_code_tool(args).await
+    }
 }
 
-const CANONICAL_MCP_TOOLS: &[&str] = &[
-    "agents",
-    "browser",
-    "conversation",
-    "groups",
-    "schedule",
-    "send",
-];
+pub const CANONICAL_MCP_TOOLS: &[&str] = &["code"];
 
 #[rmcp::tool_handler(router = Self::tool_router())]
 impl rmcp::ServerHandler for AgentMcp {
@@ -2375,6 +2599,3926 @@ fn urlencoding_simple(s: &str) -> String {
         }
     }
     out
+}
+
+const DEFAULT_READ_MAX_BYTES: usize = 46_080;
+const HARD_READ_MAX_BYTES: usize = 262_144;
+const DEFAULT_GLOB_MAX_RESULTS: usize = 200;
+const HARD_GLOB_MAX_RESULTS: usize = 5_000;
+const DEFAULT_GREP_MAX_RESULTS: usize = 100;
+const HARD_GREP_MAX_RESULTS: usize = 2_000;
+const DEFAULT_LIST_MAX_RESULTS: usize = 500;
+const HARD_LIST_MAX_RESULTS: usize = 5_000;
+const DEFAULT_CODE_TIMEOUT_MS: u64 = 30_000;
+const MAX_CODE_TIMEOUT_MS: u64 = 120_000;
+const MAX_CODE_RESULT_BYTES: usize = 48 * 1024;
+const MAX_CODE_TOOL_CALLS: usize = 256;
+
+const DEFAULT_IGNORED_DIRS: &[&str] = &[
+    ".git",
+    "target",
+    "node_modules",
+    ".next",
+    "dist",
+    ".venv",
+    "__pycache__",
+];
+
+const CODE_SANDBOX_WORKER_JS: &str = r#"
+const Module = require("module");
+const vm = require("vm");
+const readline = require("readline");
+const stripTS = typeof Bun !== "undefined" && Bun.Transpiler
+  ? (src) => new Bun.Transpiler({ loader: "ts" }).transformSync(src)
+  : (src) => Module.stripTypeScriptTypes(src);
+
+const stdoutWrite = process.stdout.write.bind(process.stdout);
+const exitProcess = process.exit.bind(process);
+const outerSetTimeout = setTimeout;
+const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+
+for (const k of Object.keys(process.env)) {
+  try { delete process.env[k]; } catch {}
+}
+try {
+  Object.defineProperty(process, "env", {
+    value: Object.freeze(Object.create(null)),
+    writable: false,
+    configurable: false,
+  });
+} catch {}
+Module._load = () => {
+  throw new Error("require/import is disabled in AnyAgents code sandbox; use tools.anyagents.*");
+};
+try { delete globalThis.process; } catch {}
+try { delete globalThis.require; } catch {}
+try { delete globalThis.Bun; } catch {}
+try { delete globalThis.Deno; } catch {}
+try { delete globalThis.fetch; } catch {}
+try { delete globalThis.WebSocket; } catch {}
+
+const pending = new Map();
+let nextId = 1;
+const logs = [];
+const MAX_LOGS = 200;
+const MAX_LOG_LEN = 4096;
+
+function hostLogRaw(level, text) {
+  if (logs.length >= MAX_LOGS) return;
+  const prefix = level === "log" ? "" : `[${level}] `;
+  const msg = prefix + String(text);
+  logs.push(msg.length > MAX_LOG_LEN ? msg.slice(0, MAX_LOG_LEN) + "...(truncated)" : msg);
+}
+
+function hostCallRaw(tool, reqJson, onOk, onErr) {
+  const id = nextId++;
+  let args = {};
+  try { args = JSON.parse(reqJson); } catch {}
+  pending.set(id, { onOk, onErr });
+  stdoutWrite(JSON.stringify({ type: "call", id, tool: String(tool), args }) + "\n");
+}
+
+function hostSleepRaw(ms, cb) {
+  const delay = Math.max(0, Math.min(120000, Number(ms) || 0));
+  outerSetTimeout(() => {
+    try { cb(); } catch {}
+  }, delay);
+}
+
+function compileUserCode(rawCode, ctx) {
+  const trimmed = String(rawCode ?? "").trim();
+  if (!trimmed) {
+    return vm.runInContext("(async () => null)", ctx);
+  }
+  if (!/\breturn\b/.test(trimmed)) {
+    try {
+      const exprBody = trimmed.replace(/;+\s*$/, "");
+      const exprTs = "var __fn = async (tools: any, anyagents: any, workspace: any, web: any, console: any) => {\n  \"use strict\";\n  return (\n" + exprBody + "\n  );\n};";
+      const exprJs = stripTS(exprTs) + "\n;__fn;";
+      return vm.runInContext(exprJs, ctx);
+    } catch {}
+  }
+  const stmtTs = "var __fn = async (tools: any, anyagents: any, workspace: any, web: any, console: any) => {\n  \"use strict\";\n" + rawCode + "\n};";
+  const stmtJs = stripTS(stmtTs) + "\n;__fn;";
+  return vm.runInContext(stmtJs, ctx);
+}
+
+rl.on("line", async (line) => {
+  if (!line.trim()) return;
+  let msg;
+  try { msg = JSON.parse(line); } catch { return; }
+  if (msg.type === "reply") {
+    const p = pending.get(msg.id);
+    if (p) {
+      pending.delete(msg.id);
+      if (msg.ok) {
+        p.onOk(JSON.stringify(msg.result ?? null));
+      } else {
+        p.onErr(String(msg.error || "tool call failed"));
+      }
+    }
+    return;
+  }
+  if (msg.type === "start") {
+    try {
+      const ctx = vm.createContext(Object.create(null), {
+        codeGeneration: { strings: false, wasm: false },
+      });
+      const bootstrap = vm.runInContext(`(function(hostCallRaw, hostLogRaw, hostSleepRaw) {
+        "use strict";
+        const callTool = (tool, req) => new Promise((resolve, reject) => {
+          hostCallRaw(String(tool), JSON.stringify(req ?? {}), (resJson) => {
+            try {
+              const parsed = JSON.parse(resJson);
+              if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+                if ("results" in parsed && !("hits" in parsed)) {
+                  Object.defineProperty(parsed, "hits", {
+                    get() { return this.results; },
+                    enumerable: false,
+                    configurable: true,
+                  });
+                }
+                if ("content" in parsed && !("text" in parsed)) {
+                  Object.defineProperty(parsed, "text", {
+                    get() { return this.content; },
+                    enumerable: false,
+                    configurable: true,
+                  });
+                }
+              }
+              resolve(parsed);
+            } catch (e) { reject(e); }
+          }, (errStr) => {
+            reject(new Error(String(errStr)));
+          });
+        });
+        const fmt = (v) => {
+          if (typeof v === "string") return v;
+          try { return JSON.stringify(v); } catch { return String(v); }
+        };
+        const log = (lvl, args) => hostLogRaw(lvl, args.map(fmt).join(" "));
+        const memoryFn = (req = {}) => callTool("memory", typeof req === "string" ? { action: "read", topic: req } : req);
+        memoryFn.read = (topicOrObj = {}) => callTool("memory", typeof topicOrObj === "string" ? { action: "read", topic: topicOrObj } : { ...topicOrObj, action: "read" });
+        memoryFn.write = (opts = {}) => callTool("memory", { ...opts, action: "write" });
+        memoryFn.upsert = (opts = {}) => callTool("memory", { ...opts, action: "write" });
+        memoryFn.delete = (topicOrObj = {}) => callTool("memory", typeof topicOrObj === "string" ? { action: "delete", topic: topicOrObj, delete: true } : { ...topicOrObj, action: "delete", delete: true });
+        memoryFn.list = (opts = {}) => callTool("memory", { ...(typeof opts === "string" ? { agent: opts } : opts), action: "list" });
+        memoryFn.search = (queryOrObj = {}) => callTool("memory", typeof queryOrObj === "string" ? { action: "search", query: queryOrObj } : { ...queryOrObj, action: "search" });
+        memoryFn.recall = (queryOrObj = {}) => callTool("memory", typeof queryOrObj === "string" ? { action: "recall", query: queryOrObj } : { ...queryOrObj, action: "recall" });
+        memoryFn.status = (opts = {}) => callTool("memory", { ...(typeof opts === "string" ? { agent: opts } : opts), action: "status" });
+        memoryFn.consolidate = (opts = {}) => callTool("memory", { ...opts, action: "consolidate" });
+        Object.freeze(memoryFn);
+
+        const webFn = (req = {}) => callTool("web", typeof req === "string"
+          ? (/^https?:/i.test(req.trim()) ? { action: "fetch", url: req } : { action: "search", query: req })
+          : req);
+        webFn.search = (queryOrObj = {}) => callTool("web", typeof queryOrObj === "string"
+          ? { action: "search", query: queryOrObj }
+          : { ...queryOrObj, action: "search" });
+        webFn.fetch = (urlOrObj = {}) => callTool("web", typeof urlOrObj === "string"
+          ? { action: "fetch", url: urlOrObj }
+          : { ...urlOrObj, action: "fetch" });
+        Object.freeze(webFn);
+
+        const computerFn = (req = {}) => callTool("computer", typeof req === "string" ? { action: req } : req);
+        computerFn.snapshot = (opts = {}) => callTool("computer", { ...opts, action: "snapshot" });
+        computerFn.list_windows = (opts = {}) => callTool("computer", { ...opts, action: "list_windows" });
+        computerFn.focus_window = (opts = {}) => callTool("computer", typeof opts === "string" ? { action: "focus_window", window_id: opts } : { ...opts, action: "focus_window" });
+        computerFn.clipboard_get = (opts = {}) => callTool("computer", { ...opts, action: "clipboard_get" });
+        computerFn.clipboard_set = (textOrObj = {}) => callTool("computer", typeof textOrObj === "string" ? { action: "clipboard_set", text: textOrObj } : { ...textOrObj, action: "clipboard_set" });
+        computerFn.screenshot = (opts = {}) => callTool("computer", { ...opts, action: "screenshot" });
+        computerFn.cursor_position = (opts = {}) => callTool("computer", { ...opts, action: "cursor_position" });
+        computerFn.move = (opts = {}) => callTool("computer", { ...opts, action: "move" });
+        computerFn.click = (opts = {}) => callTool("computer", typeof opts === "string" ? { action: "click", ref: opts } : { ...opts, action: "click" });
+        computerFn.mouse_down = (opts = {}) => callTool("computer", { ...opts, action: "mouse_down" });
+        computerFn.mouse_up = (opts = {}) => callTool("computer", { ...opts, action: "mouse_up" });
+        computerFn.drag = (opts = {}) => callTool("computer", { ...opts, action: "drag" });
+        computerFn.scroll = (opts = {}) => callTool("computer", { ...opts, action: "scroll" });
+        computerFn.type = (textOrObj = {}) => callTool("computer", typeof textOrObj === "string" ? { action: "type", text: textOrObj } : { ...textOrObj, action: "type" });
+        computerFn.key = (keyOrObj = {}) => callTool("computer", typeof keyOrObj === "string" ? { action: "key", key: keyOrObj } : { ...keyOrObj, action: "key" });
+        computerFn.hold_key = (opts = {}) => callTool("computer", { ...opts, action: "hold_key" });
+        computerFn.wait = (msOrObj = {}) => callTool("computer", typeof msOrObj === "number" ? { action: "wait", duration_ms: msOrObj } : { ...msOrObj, action: "wait" });
+        computerFn.zoom = (opts = {}) => callTool("computer", { ...opts, action: "zoom" });
+        computerFn.action = (actionJson = {}) => callTool("computer", actionJson);
+        Object.freeze(computerFn);
+
+        const deviceFn = (req = {}) => callTool("device", typeof req === "string" ? { action: req } : req);
+        deviceFn.screenshot = (opts = {}) => callTool("device", { ...opts, action: "screenshot" });
+        deviceFn.tap = (opts = {}) => callTool("device", { ...opts, action: "tap" });
+        deviceFn.swipe = (opts = {}) => callTool("device", { ...opts, action: "swipe" });
+        deviceFn.type = (textOrObj = {}) => callTool("device", typeof textOrObj === "string" ? { action: "type", text: textOrObj } : { ...textOrObj, action: "type" });
+        deviceFn.press = (btnOrObj = {}) => callTool("device", typeof btnOrObj === "string" ? { action: "press", button: btnOrObj } : { ...btnOrObj, action: "press" });
+        deviceFn.install_app = (apkOrObj = {}) => callTool("device", typeof apkOrObj === "string" ? { action: "install_app", apk_path: apkOrObj } : { ...apkOrObj, action: "install_app" });
+        deviceFn.launch_app = (pkgOrObj = {}) => callTool("device", typeof pkgOrObj === "string" ? { action: "launch_app", package: pkgOrObj } : { ...pkgOrObj, action: "launch_app" });
+        deviceFn.terminate_app = (pkgOrObj = {}) => callTool("device", typeof pkgOrObj === "string" ? { action: "terminate_app", package: pkgOrObj } : { ...pkgOrObj, action: "terminate_app" });
+        deviceFn.open_url = (urlOrObj = {}) => callTool("device", typeof urlOrObj === "string" ? { action: "open_url", url: urlOrObj } : { ...urlOrObj, action: "open_url" });
+        deviceFn.rotate = (orientOrObj = {}) => callTool("device", typeof orientOrObj === "string" ? { action: "rotate", orientation: orientOrObj } : { ...orientOrObj, action: "rotate" });
+        Object.freeze(deviceFn);
+
+        const mediaFn = (req = {}) => callTool("media", req);
+        mediaFn.image_generate = (promptOrObj = {}) => callTool("media", typeof promptOrObj === "string" ? { action: "image_generate", prompt: promptOrObj } : { ...promptOrObj, action: "image_generate" });
+        mediaFn.speech = (inputOrObj = {}) => callTool("media", typeof inputOrObj === "string" ? { action: "speech", input: inputOrObj } : { ...inputOrObj, action: "speech" });
+        mediaFn.transcribe = (pathOrObj = {}) => callTool("media", typeof pathOrObj === "string" ? { action: "transcribe", file_path: pathOrObj } : { ...pathOrObj, action: "transcribe" });
+        Object.freeze(mediaFn);
+
+        const anyagents = Object.freeze({
+          memory: memoryFn,
+          web: webFn,
+          computer: computerFn,
+          device: deviceFn,
+          media: mediaFn,
+          agents: (req = {}) => callTool("agents", req),
+          send: (req = {}) => callTool("send", req),
+          conversation: (req = {}) => callTool("conversation", req),
+          search: (req = {}) => callTool("conversation", req),
+          groups: (req = {}) => callTool("groups", req),
+          schedule: (req = {}) => callTool("schedule", req),
+          browser: (req = {}) => callTool("browser", req),
+          files: (req = {}) => callTool("files", req),
+          subagents: (req = {}) => callTool("subagents", req),
+          spawn: (req = {}) => callTool("spawn", req),
+          describe: (req = {}) => callTool("describe", req),
+          archive: (req = {}) => callTool("archive", req),
+          wake: (req = {}) => callTool("wake", req),
+          interact: (req = {}) => callTool("interact", req),
+        });
+        const workspace = Object.freeze({
+          read: (opts = {}) => callTool("files", { ...(typeof opts === "string" ? { path: opts } : opts), action: "read" }),
+          write: (opts = {}, content) => callTool("files", typeof opts === "string" ? { path: opts, content: content ?? "", action: "write" } : { ...opts, action: "write" }),
+          edit: (opts = {}) => callTool("files", { ...opts, action: "edit" }),
+          multi_edit: (opts = {}) => callTool("files", { ...opts, action: "multi_edit" }),
+          patch: (opts = {}) => callTool("files", { ...(typeof opts === "string" ? { patch: opts } : opts), action: "patch" }),
+          glob: (opts = {}) => callTool("files", { ...(typeof opts === "string" ? { pattern: opts } : opts), action: "glob" }),
+          grep: (opts = {}) => callTool("files", { ...(typeof opts === "string" ? { query: opts } : opts), action: "grep" }),
+          list: (opts = {}) => callTool("files", { ...(typeof opts === "string" ? { path: opts } : opts), action: "list" }),
+          exec: (opts = {}) => callTool("files", { ...(typeof opts === "string" ? { cmd: opts } : opts), action: "exec" }),
+        });
+        const tools = Object.freeze({ anyagents, workspace, memory: memoryFn, web: webFn, computer: computerFn, device: deviceFn, media: mediaFn });
+        const console = Object.freeze({
+          log: (...a) => log("log", a),
+          info: (...a) => log("info", a),
+          warn: (...a) => log("warn", a),
+          error: (...a) => log("error", a),
+          debug: (...a) => log("debug", a),
+        });
+        const setTimeout = (cb, ms = 0) => {
+          hostSleepRaw(Number(ms) || 0, () => {
+            if (typeof cb === "function") cb();
+          });
+        };
+        globalThis.tools = tools;
+        globalThis.anyagents = anyagents;
+        globalThis.workspace = workspace;
+        globalThis.memory = memoryFn;
+        globalThis.web = webFn;
+        globalThis.computer = computerFn;
+        globalThis.device = deviceFn;
+        globalThis.media = mediaFn;
+        globalThis.console = console;
+        globalThis.setTimeout = setTimeout;
+        return Object.freeze({ tools, anyagents, workspace, memory: memoryFn, web: webFn, computer: computerFn, device: deviceFn, media: mediaFn, console });
+      })`, ctx);
+      const env = bootstrap(hostCallRaw, hostLogRaw, hostSleepRaw);
+      const fn = compileUserCode(msg.code, ctx);
+      try {
+        Object.defineProperty(Function.prototype, "constructor", { value: undefined, writable: false, configurable: false });
+        Object.defineProperty((async () => {}).constructor.prototype, "constructor", { value: undefined, writable: false, configurable: false });
+      } catch {}
+      const result = await fn(env.tools, env.anyagents, env.workspace, env.web, env.console);
+      let safeResult = result === undefined ? null : result;
+      let doneLine;
+      try {
+        doneLine = JSON.stringify({ type: "done", ok: true, result: safeResult, logs }) + "\n";
+      } catch {
+        doneLine = JSON.stringify({ type: "done", ok: true, result: String(safeResult), logs }) + "\n";
+      }
+      stdoutWrite(doneLine, () => exitProcess(0));
+    } catch (err) {
+      const errMsg = err && err.stack ? String(err.stack) : String(err);
+      stdoutWrite(JSON.stringify({ type: "done", ok: false, error: errMsg, logs }) + "\n", () => exitProcess(0));
+    }
+  }
+});
+"#;
+
+struct CodeChildGuard {
+    child: Option<std::process::Child>,
+}
+
+impl Drop for CodeChildGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            #[cfg(unix)]
+            {
+                let pgid = child.id() as i32;
+                if pgid > 0 {
+                    unsafe {
+                        let _ = libc::kill(-pgid, libc::SIGKILL);
+                    }
+                }
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+static CACHED_JS_RUNTIME: std::sync::OnceLock<Option<(PathBuf, bool)>> = std::sync::OnceLock::new();
+
+fn find_js_runtime() -> Option<(PathBuf, bool)> {
+    CACHED_JS_RUNTIME
+        .get_or_init(|| {
+            let mut dirs = Vec::new();
+            if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+                dirs.push(home.join(".local/opt/node/bin"));
+                dirs.push(home.join(".local/opt/bun/bin"));
+                if let Some(host_home) = crate::sandbox::host_home_dir() {
+                    dirs.push(host_home.join(".local/opt/node/bin"));
+                    dirs.push(host_home.join(".local/opt/bun/bin"));
+                }
+                dirs.push(home.join(".local/bin"));
+                dirs.push(home.join(".bun/bin"));
+            } else if let Some(host_home) = crate::sandbox::host_home_dir() {
+                dirs.push(host_home.join(".local/opt/node/bin"));
+                dirs.push(host_home.join(".local/opt/bun/bin"));
+            }
+            if let Some(path_os) = std::env::var_os("PATH") {
+                dirs.extend(std::env::split_paths(&path_os));
+            }
+            dirs.push(PathBuf::from("/usr/local/bin"));
+            dirs.push(PathBuf::from("/usr/bin"));
+            dirs.push(PathBuf::from("/bin"));
+
+            for (bin_name, is_node) in [("node", true), ("bun", false)] {
+                for dir in &dirs {
+                    let candidate = dir.join(bin_name);
+                    if candidate.is_file() {
+                        return Some((candidate, is_node));
+                    }
+                }
+            }
+            None
+        })
+        .clone()
+}
+
+impl AgentMcp {
+    fn resolve_workdir(&self) -> PathBuf {
+        if let Some(ref wd) = self.agent.workdir
+            && !wd.as_os_str().is_empty()
+        {
+            return wd.clone();
+        }
+        if let Some(agent_root) = self.client.config.parent() {
+            let sibling_work = agent_root.join("work");
+            if sibling_work.is_dir() {
+                return sibling_work;
+            }
+        }
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    }
+
+    async fn execute_memory_tool(&self, args: MemoryArgs) -> Result<serde_json::Value, String> {
+        let raw_topic = args
+            .topic
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let raw_query = args
+            .query
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let is_index_topic = raw_topic.as_deref().is_some_and(|t| {
+            t.eq_ignore_ascii_case("memory")
+                || t.eq_ignore_ascii_case("memory.md")
+                || t.eq_ignore_ascii_case("index")
+        });
+
+        let mut action = args
+            .action
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_else(|| {
+                if args.delete == Some(true) {
+                    "delete".to_string()
+                } else if args.content.is_some() {
+                    "write".to_string()
+                } else if raw_query.is_some() {
+                    "search".to_string()
+                } else if raw_topic.is_some() && !is_index_topic {
+                    "read".to_string()
+                } else {
+                    "list".to_string()
+                }
+            });
+        if (action == "read" || action == "get") && (raw_topic.is_none() || is_index_topic) {
+            action = "list".to_string();
+        }
+
+        let target_arg = args
+            .agent
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.strip_prefix("agent:").unwrap_or(s).to_string());
+        let is_self_target = target_arg.as_deref().is_none_or(|t| {
+            t.eq_ignore_ascii_case("self")
+                || t.eq_ignore_ascii_case(&self.agent.name)
+                || t == self.agent.id.as_str()
+        });
+        let local_agent_root = self.client.config.parent().map(Path::to_path_buf);
+
+        match action.as_str() {
+            "list" | "ls" | "index" => {
+                let mut index_text = String::new();
+                let mut topics_val = Vec::new();
+                let mut turns_val = Vec::new();
+
+                if is_self_target && let Some(ref root) = local_agent_root {
+                    if let Ok(topics) = anyagents_core::learned_memory::list_memory_topics(root) {
+                        if let Some(lim) = args.limit {
+                            topics_val = topics
+                                .into_iter()
+                                .take(lim.max(1))
+                                .filter_map(|t| serde_json::to_value(t).ok())
+                                .collect();
+                        } else {
+                            topics_val = topics
+                                .into_iter()
+                                .filter_map(|t| serde_json::to_value(t).ok())
+                                .collect();
+                        }
+                    }
+                    if let Ok(txt) = std::fs::read_to_string(root.join("memory/MEMORY.md")) {
+                        index_text = txt;
+                    }
+                }
+
+                if (index_text.is_empty() || !is_self_target)
+                    && let Ok(resp) = self
+                        .conversation(Parameters(ConversationArgs {
+                            scope: Some("memory".into()),
+                            topic: Some("MEMORY".into()),
+                            agent: target_arg.clone(),
+                            ..ConversationArgs::default()
+                        }))
+                        .await
+                {
+                    if let Some(first) = resp.0.turns.first()
+                        && index_text.is_empty()
+                    {
+                        index_text = first.text.clone();
+                    }
+                    turns_val = resp
+                        .0
+                        .turns
+                        .into_iter()
+                        .filter_map(|t| serde_json::to_value(t).ok())
+                        .collect();
+                }
+                if index_text.is_empty() {
+                    index_text = format!(
+                        "# {} — Learned Memory Index\n- No topic files recorded yet.\n",
+                        target_arg.as_deref().unwrap_or(&self.agent.name)
+                    );
+                }
+                let count = topics_val.len();
+                Ok(serde_json::json!({
+                    "action": "list",
+                    "agent": target_arg.unwrap_or_else(|| self.agent.name.clone()),
+                    "index": index_text,
+                    "topics": topics_val,
+                    "count": count,
+                    "turns": turns_val,
+                }))
+            }
+            "read" | "get" => {
+                let topic =
+                    raw_topic.ok_or_else(|| "`memory` read requires `topic`".to_string())?;
+                let slug = anyagents_core::learned_memory::sanitize_topic_slug(&topic)
+                    .map_err(|e| e.to_string())?;
+                let filename = format!("{slug}.md");
+
+                match self
+                    .conversation(Parameters(ConversationArgs {
+                        scope: Some("memory".into()),
+                        topic: Some(slug.clone()),
+                        agent: target_arg.clone(),
+                        ..ConversationArgs::default()
+                    }))
+                    .await
+                {
+                    Ok(resp) => {
+                        let content = resp
+                            .0
+                            .turns
+                            .first()
+                            .map(|t| t.text.clone())
+                            .unwrap_or_default();
+                        let (_, description) =
+                            anyagents_core::learned_memory::parse_topic_frontmatter(
+                                &slug, &content,
+                            );
+                        Ok(serde_json::json!({
+                            "action": "read",
+                            "agent": resp.0.agent,
+                            "topic": slug,
+                            "filename": filename,
+                            "description": description,
+                            "content": content,
+                            "turns": resp.0.turns,
+                        }))
+                    }
+                    Err(err) => {
+                        if is_self_target && let Some(ref root) = local_agent_root {
+                            let path = root.join("memory").join(&filename);
+                            if let Ok(content) = std::fs::read_to_string(&path) {
+                                let (_, description) =
+                                    anyagents_core::learned_memory::parse_topic_frontmatter(
+                                        &slug, &content,
+                                    );
+                                return Ok(serde_json::json!({
+                                    "action": "read",
+                                    "agent": self.agent.name,
+                                    "topic": slug,
+                                    "filename": filename,
+                                    "description": description,
+                                    "content": content,
+                                    "turns": [{
+                                        "id": format!("memory:{}:{}", self.agent.id, slug),
+                                        "text": content,
+                                        "source": "memory",
+                                        "direction": "in",
+                                        "from": format!("agent:{}", self.agent.name),
+                                        "to": format!("agent:{}", self.agent.name),
+                                        "reply_to": filename,
+                                    }],
+                                }));
+                            }
+                        }
+                        Err(err)
+                    }
+                }
+            }
+            "write" | "upsert" | "set" => {
+                let topic =
+                    raw_topic.ok_or_else(|| "`memory` write requires `topic`".to_string())?;
+                let slug = anyagents_core::learned_memory::sanitize_topic_slug(&topic)
+                    .map_err(|e| e.to_string())?;
+                let content = args.content.unwrap_or_default();
+
+                match self
+                    .conversation(Parameters(ConversationArgs {
+                        scope: Some("memory".into()),
+                        topic: Some(slug.clone()),
+                        description: args.description.clone(),
+                        content: Some(content.clone()),
+                        agent: target_arg.clone(),
+                        ..ConversationArgs::default()
+                    }))
+                    .await
+                {
+                    Ok(resp) => {
+                        let written_text = resp
+                            .0
+                            .turns
+                            .first()
+                            .map(|t| t.text.clone())
+                            .unwrap_or_default();
+                        let (_, description) =
+                            anyagents_core::learned_memory::parse_topic_frontmatter(
+                                &slug,
+                                &written_text,
+                            );
+                        let sha256 = sha256_hex(written_text.as_bytes());
+                        Ok(serde_json::json!({
+                            "action": "write",
+                            "agent": resp.0.agent,
+                            "topic": slug,
+                            "filename": format!("{slug}.md"),
+                            "description": description,
+                            "content": written_text,
+                            "sha256": sha256,
+                            "turns": resp.0.turns,
+                        }))
+                    }
+                    Err(err) => {
+                        if is_self_target && let Some(ref root) = local_agent_root {
+                            let (path, entry, index_md) =
+                                anyagents_core::learned_memory::upsert_memory_topic(
+                                    root,
+                                    &self.agent.name,
+                                    None,
+                                    &slug,
+                                    args.description.as_deref(),
+                                    &content,
+                                    anyagents_core::now_ms(),
+                                )
+                                .map_err(|e| e.to_string())?;
+                            let written_text = std::fs::read_to_string(&path).unwrap_or_default();
+                            let sha256 = sha256_hex(written_text.as_bytes());
+                            return Ok(serde_json::json!({
+                                "action": "write",
+                                "agent": self.agent.name,
+                                "topic": entry.slug,
+                                "filename": entry.filename,
+                                "description": entry.description,
+                                "content": written_text,
+                                "index": index_md,
+                                "sha256": sha256,
+                                "turns": [{
+                                    "id": format!("memory:{}:{}", self.agent.id, slug),
+                                    "text": written_text,
+                                    "source": "memory",
+                                    "direction": "in",
+                                    "from": format!("agent:{}", self.agent.name),
+                                    "to": format!("agent:{}", self.agent.name),
+                                    "reply_to": format!("{slug}.md"),
+                                }],
+                            }));
+                        }
+                        Err(err)
+                    }
+                }
+            }
+            "delete" | "remove" | "rm" => {
+                let topic =
+                    raw_topic.ok_or_else(|| "`memory` delete requires `topic`".to_string())?;
+                let slug = anyagents_core::learned_memory::sanitize_topic_slug(&topic)
+                    .map_err(|e| e.to_string())?;
+
+                match self
+                    .conversation(Parameters(ConversationArgs {
+                        scope: Some("memory".into()),
+                        topic: Some(slug.clone()),
+                        delete: Some(true),
+                        agent: target_arg.clone(),
+                        ..ConversationArgs::default()
+                    }))
+                    .await
+                {
+                    Ok(resp) => {
+                        let first_text = resp
+                            .0
+                            .turns
+                            .first()
+                            .map(|t| t.text.clone())
+                            .unwrap_or_default();
+                        let deleted = first_text.starts_with("deleted=true");
+                        let index = first_text
+                            .split_once('\n')
+                            .map(|(_, rest)| rest.to_string())
+                            .unwrap_or_default();
+                        Ok(serde_json::json!({
+                            "action": "delete",
+                            "agent": resp.0.agent,
+                            "topic": slug,
+                            "deleted": deleted,
+                            "index": index,
+                            "turns": resp.0.turns,
+                        }))
+                    }
+                    Err(err) => {
+                        if is_self_target && let Some(ref root) = local_agent_root {
+                            let (removed, index) =
+                                anyagents_core::learned_memory::delete_memory_topic(
+                                    root,
+                                    &self.agent.name,
+                                    None,
+                                    &slug,
+                                )
+                                .map_err(|e| e.to_string())?;
+                            return Ok(serde_json::json!({
+                                "action": "delete",
+                                "agent": self.agent.name,
+                                "topic": slug,
+                                "deleted": removed,
+                                "index": index,
+                                "turns": [{
+                                    "id": format!("memory:{}:deleted:{}", self.agent.id, slug),
+                                    "text": format!("deleted={removed}\n{index}"),
+                                    "source": "memory",
+                                    "direction": "in",
+                                    "from": format!("agent:{}", self.agent.name),
+                                    "to": format!("agent:{}", self.agent.name),
+                                }],
+                            }));
+                        }
+                        Err(err)
+                    }
+                }
+            }
+            "search" | "query" | "find" => {
+                let q = raw_query
+                    .or(raw_topic)
+                    .ok_or_else(|| "`memory` search requires `query`".to_string())?;
+                match self
+                    .conversation(Parameters(ConversationArgs {
+                        scope: Some("memory".into()),
+                        query: Some(q.clone()),
+                        agent: target_arg.clone(),
+                        limit: args.limit,
+                        ..ConversationArgs::default()
+                    }))
+                    .await
+                {
+                    Ok(resp) => {
+                        let count = resp.0.turns.len();
+                        Ok(serde_json::json!({
+                            "action": "search",
+                            "agent": resp.0.agent,
+                            "query": q,
+                            "turns": resp.0.turns,
+                            "matches": resp.0.turns,
+                            "count": count,
+                        }))
+                    }
+                    Err(err) => {
+                        if is_self_target
+                            && let Some(ref root) = local_agent_root
+                            && let Ok(topics) =
+                                anyagents_core::learned_memory::list_memory_topics(root)
+                        {
+                            let tokens: Vec<String> = q
+                                .to_ascii_lowercase()
+                                .split_whitespace()
+                                .filter(|t| !t.is_empty())
+                                .map(str::to_string)
+                                .collect();
+                            let limit = args.limit.unwrap_or(20).max(1);
+                            let mut hits = Vec::new();
+                            for entry in topics {
+                                let path = root.join("memory").join(&entry.filename);
+                                let text = std::fs::read_to_string(&path).unwrap_or_default();
+                                let hay = format!("{} {} {}", entry.slug, entry.description, text)
+                                    .to_ascii_lowercase();
+                                if tokens.iter().all(|tok| hay.contains(tok)) {
+                                    hits.push(serde_json::json!({
+                                        "id": format!("memory:{}:{}", self.agent.id, entry.slug),
+                                        "topic": entry.slug,
+                                        "filename": entry.filename,
+                                        "description": entry.description,
+                                        "text": text,
+                                        "source": "memory",
+                                        "direction": "in",
+                                        "from": format!("agent:{}", self.agent.name),
+                                        "to": format!("agent:{}", self.agent.name),
+                                        "reply_to": entry.filename,
+                                        "timestamp_ms": entry.updated_at_ms,
+                                    }));
+                                    if hits.len() >= limit {
+                                        break;
+                                    }
+                                }
+                            }
+                            let count = hits.len();
+                            return Ok(serde_json::json!({
+                                "action": "search",
+                                "agent": self.agent.name,
+                                "query": q,
+                                "turns": hits,
+                                "matches": hits,
+                                "count": count,
+                            }));
+                        }
+                        Err(err)
+                    }
+                }
+            }
+            "status" => {
+                if let Some(ref root) = local_agent_root {
+                    let topics = anyagents_core::learned_memory::list_memory_topics(root)
+                        .unwrap_or_default();
+                    let sleep_state = anyagents_core::learned_memory::read_sleep_state(root);
+                    let index_text =
+                        std::fs::read_to_string(root.join("memory/MEMORY.md")).unwrap_or_default();
+                    return Ok(serde_json::json!({
+                        "action": "status",
+                        "agent": self.agent.name,
+                        "topic_count": topics.len(),
+                        "index_bytes": index_text.len(),
+                        "index_lines": index_text.lines().count(),
+                        "last_consolidated_ms": sleep_state.last_consolidated_ms,
+                        "consolidated_topics": sleep_state.consolidated_topics,
+                    }));
+                }
+                Err("local memory root is not available for `memory.status`".to_string())
+            }
+            "recall" | "history" => {
+                let q = raw_query
+                    .or(raw_topic)
+                    .ok_or_else(|| "`memory` recall requires `query`".to_string())?;
+                let resp = self
+                    .conversation(Parameters(ConversationArgs {
+                        scope: Some("all".into()),
+                        query: Some(q.clone()),
+                        agent: target_arg.clone(),
+                        limit: args.limit,
+                        ..ConversationArgs::default()
+                    }))
+                    .await?;
+                let count = resp.0.turns.len();
+                Ok(serde_json::json!({
+                    "action": "recall",
+                    "agent": resp.0.agent,
+                    "query": q,
+                    "turns": resp.0.turns,
+                    "matches": resp.0.turns,
+                    "count": count,
+                }))
+            }
+            "consolidate" | "sleep" => {
+                if let Some(ref root) = local_agent_root {
+                    let index_md = anyagents_core::learned_memory::rebuild_memory_index(
+                        root,
+                        &self.agent.name,
+                        None,
+                    )
+                    .map_err(|e| e.to_string())?;
+                    let topics = anyagents_core::learned_memory::list_memory_topics(root)
+                        .unwrap_or_default();
+                    return Ok(serde_json::json!({
+                        "action": "consolidate",
+                        "agent": self.agent.name,
+                        "topic_count": topics.len(),
+                        "index": index_md,
+                    }));
+                }
+                Err("local memory root is not available for `memory.consolidate`".to_string())
+            }
+            other => Err(format!(
+                "unknown `memory` action `{other}`; expected `list`, `read`, `write`, `delete`, `search`, `recall`, `status`, or `consolidate`"
+            )),
+        }
+    }
+
+    async fn dispatch_code_tool(
+        &self,
+        tool: &str,
+        args: serde_json::Value,
+    ) -> Result<(serde_json::Value, Vec<rmcp::model::ContentBlock>), String> {
+        let norm = tool
+            .trim()
+            .strip_prefix("mcp__anyagents__")
+            .unwrap_or(tool.trim());
+        match norm {
+            "memory" => {
+                let parsed: MemoryArgs = serde_json::from_value(args)
+                    .map_err(|e| format!("invalid `memory` arguments: {e}"))?;
+                Ok((self.memory(Parameters(parsed)).await?.0, Vec::new()))
+            }
+            "agents" => {
+                let parsed: AgentsArgs = serde_json::from_value(args)
+                    .map_err(|e| format!("invalid `agents` arguments: {e}"))?;
+                Ok((self.agents(Parameters(parsed)).await?.0, Vec::new()))
+            }
+            "send" => {
+                let parsed: SendArgs = serde_json::from_value(args)
+                    .map_err(|e| format!("invalid `send` arguments: {e}"))?;
+                Ok((self.send(Parameters(parsed)).await?.0, Vec::new()))
+            }
+            "conversation" | "search" => {
+                let parsed: ConversationArgs = serde_json::from_value(args)
+                    .map_err(|e| format!("invalid `conversation` arguments: {e}"))?;
+                let res = self.conversation(Parameters(parsed)).await?.0;
+                Ok((
+                    serde_json::to_value(res).map_err(|e| e.to_string())?,
+                    Vec::new(),
+                ))
+            }
+            "groups" => {
+                let parsed: GroupsArgs = serde_json::from_value(args)
+                    .map_err(|e| format!("invalid `groups` arguments: {e}"))?;
+                let res = self.groups(Parameters(parsed)).await?.0;
+                Ok((
+                    serde_json::to_value(res).map_err(|e| e.to_string())?,
+                    Vec::new(),
+                ))
+            }
+            "schedule" => {
+                let parsed: ScheduleArgs = serde_json::from_value(args)
+                    .map_err(|e| format!("invalid `schedule` arguments: {e}"))?;
+                Ok((self.schedule(Parameters(parsed)).await?.0, Vec::new()))
+            }
+            "browser" => {
+                let parsed: crate::browser::BrowserRequest = serde_json::from_value(args)
+                    .map_err(|e| format!("invalid `browser` arguments: {e}"))?;
+                let MultimediaJson(val, media) = self.browser(Parameters(parsed)).await?;
+                Ok((val, media))
+            }
+            "web" | "web_search" | "web_fetch" => {
+                let mut parsed: crate::web::WebRequest = serde_json::from_value(args)
+                    .map_err(|e| format!("invalid `web` arguments: {e}"))?;
+                if parsed.action.is_none() {
+                    if norm == "web_search" {
+                        parsed.action = Some("search".to_string());
+                    } else if norm == "web_fetch" {
+                        parsed.action = Some("fetch".to_string());
+                    }
+                }
+                Ok((self.web(Parameters(parsed)).await?.0, Vec::new()))
+            }
+            "computer" => {
+                let MultimediaJson(val, media) = self
+                    .computer(Parameters(DynamicObjectArgs::from_value(args)?))
+                    .await?;
+                Ok((val, media))
+            }
+            "device" => {
+                let MultimediaJson(val, media) = self
+                    .device(Parameters(DynamicObjectArgs::from_value(args)?))
+                    .await?;
+                Ok((val, media))
+            }
+            "media" => {
+                let MultimediaJson(val, media) = self
+                    .media(Parameters(DynamicObjectArgs::from_value(args)?))
+                    .await?;
+                Ok((val, media))
+            }
+            "files" => {
+                let parsed: FilesArgs = serde_json::from_value(args)
+                    .map_err(|e| format!("invalid `files` arguments: {e}"))?;
+                let MultimediaJson(val, media) = self.files(Parameters(parsed)).await?;
+                Ok((val, media))
+            }
+            "subagents" => {
+                let parsed: SubagentsArgs = serde_json::from_value(args)
+                    .map_err(|e| format!("invalid `subagents` arguments: {e}"))?;
+                Ok((self.subagents(Parameters(parsed)).await?.0, Vec::new()))
+            }
+            "spawn" => {
+                let parsed: SpawnArgs = serde_json::from_value(args)
+                    .map_err(|e| format!("invalid `spawn` arguments: {e}"))?;
+                let res = self.spawn(Parameters(parsed)).await?.0;
+                Ok((
+                    serde_json::to_value(res).map_err(|e| e.to_string())?,
+                    Vec::new(),
+                ))
+            }
+            "describe" => {
+                let parsed: DescribeArgs = serde_json::from_value(args)
+                    .map_err(|e| format!("invalid `describe` arguments: {e}"))?;
+                Ok((self.describe(Parameters(parsed)).await?.0, Vec::new()))
+            }
+            "archive" => {
+                let parsed: ArchiveArgs = serde_json::from_value(args)
+                    .map_err(|e| format!("invalid `archive` arguments: {e}"))?;
+                let res = self.archive(Parameters(parsed)).await?.0;
+                Ok((
+                    serde_json::to_value(res).map_err(|e| e.to_string())?,
+                    Vec::new(),
+                ))
+            }
+            "wake" => {
+                let parsed: WakeArgs = serde_json::from_value(args)
+                    .map_err(|e| format!("invalid `wake` arguments: {e}"))?;
+                let res = self.wake(Parameters(parsed)).await?.0;
+                Ok((
+                    serde_json::to_value(res).map_err(|e| e.to_string())?,
+                    Vec::new(),
+                ))
+            }
+            "interact" => {
+                let parsed: InteractArgs = serde_json::from_value(args)
+                    .map_err(|e| format!("invalid `interact` arguments: {e}"))?;
+                let res = self.interact(Parameters(parsed)).await?.0;
+                Ok((
+                    serde_json::to_value(res).map_err(|e| e.to_string())?,
+                    Vec::new(),
+                ))
+            }
+            other => Err(format!(
+                "unknown AnyAgents tool `{other}` in code mode; expected one of `memory`, `web`, `agents`, `send`, `conversation`, `groups`, `schedule`, `browser`, `files`"
+            )),
+        }
+    }
+
+    async fn execute_code_tool(&self, args: CodeArgs) -> Result<MultimediaJson, String> {
+        use std::io::{BufRead, BufReader, Write};
+        use std::process::{Command, Stdio};
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+
+        let timeout_ms = args
+            .timeout_ms
+            .unwrap_or(DEFAULT_CODE_TIMEOUT_MS)
+            .clamp(100, MAX_CODE_TIMEOUT_MS);
+        let (runtime_bin, is_node) = find_js_runtime().ok_or_else(|| {
+            "neither `node` nor `bun` was found on this machine to execute `code` mode".to_string()
+        })?;
+
+        let started = Instant::now();
+        let mut cmd = Command::new(&runtime_bin);
+        cmd.env_clear()
+            .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+            .env("DESK_NODE_SHIM", "off")
+            .env("NODE_NO_WARNINGS", "1");
+        if let Some(home) = std::env::var_os("HOME") {
+            cmd.env("HOME", home);
+        }
+        if is_node {
+            cmd.arg("--no-warnings");
+        }
+        cmd.arg("-e")
+            .arg(CODE_SANDBOX_WORKER_JS)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            cmd.process_group(0);
+        }
+
+        let mut child = cmd.spawn().map_err(|e| {
+            format!(
+                "failed to spawn code sandbox ({}): {e}",
+                runtime_bin.display()
+            )
+        })?;
+        let mut child_stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "code sandbox stdin missing".to_string())?;
+        let child_stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "code sandbox stdout missing".to_string())?;
+        let child_stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| "code sandbox stderr missing".to_string())?;
+        let _guard = CodeChildGuard { child: Some(child) };
+
+        let start_payload = serde_json::json!({
+            "type": "start",
+            "code": args.code,
+        });
+        let mut start_line = serde_json::to_vec(&start_payload).map_err(|e| e.to_string())?;
+        start_line.push(b'\n');
+        child_stdin
+            .write_all(&start_line)
+            .and_then(|()| child_stdin.flush())
+            .map_err(|e| format!("failed to send code to sandbox: {e}"))?;
+
+        let shared_stdin = Arc::new(Mutex::new(child_stdin));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
+
+        std::thread::spawn(move || {
+            let reader = BufReader::new(child_stdout);
+            for line in reader.lines().map_while(Result::ok) {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed)
+                    && tx.send(val).is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        let stderr_handle = std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buf = Vec::new();
+            let mut take = child_stderr.take(16 * 1024);
+            let _ = take.read_to_end(&mut buf);
+            String::from_utf8_lossy(&buf).into_owned()
+        });
+
+        // Receipts and native MCP multimedia blocks come from actual host
+        // dispatches, never snippet return values, source text or logs.
+        let deliveries = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let media_blocks = Arc::new(Mutex::new(Vec::<rmcp::model::ContentBlock>::new()));
+        let mut in_flight = tokio::task::JoinSet::new();
+        let mut call_count = 0usize;
+
+        let loop_res = tokio::time::timeout(Duration::from_millis(timeout_ms), async {
+            while let Some(msg) = rx.recv().await {
+                let msg_type = msg.get("type").and_then(serde_json::Value::as_str).unwrap_or("");
+                match msg_type {
+                    "call" => {
+                        call_count += 1;
+                        let id = msg.get("id").and_then(serde_json::Value::as_u64).unwrap_or(0);
+                        if call_count > MAX_CODE_TOOL_CALLS {
+                            let reply = serde_json::json!({
+                                "type": "reply",
+                                "id": id,
+                                "ok": false,
+                                "error": format!("exceeded maximum of {MAX_CODE_TOOL_CALLS} tool calls per `code` turn"),
+                            });
+                            if let Ok(mut guard) = shared_stdin.lock() {
+                                let _ = writeln!(guard, "{reply}");
+                                let _ = guard.flush();
+                            }
+                            continue;
+                        }
+                        let tool_name = msg
+                            .get("tool")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        let tool_args = msg
+                            .get("args")
+                            .cloned()
+                            .unwrap_or_else(|| serde_json::json!({}));
+                        let mcp = self.clone();
+                        let stdin_clone = Arc::clone(&shared_stdin);
+                        let deliveries = Arc::clone(&deliveries);
+                        let media_blocks = Arc::clone(&media_blocks);
+                        in_flight.spawn(async move {
+                            let res = mcp.dispatch_code_tool(&tool_name, tool_args).await;
+                            if tool_name.trim().trim_start_matches("mcp__anyagents__") == "send"
+                                && let Ok((val, _)) = &res
+                                && let Some(items) = val.get("deliveries").and_then(serde_json::Value::as_array)
+                            {
+                                deliveries.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .extend(items.iter().cloned());
+                            }
+                            let reply = match res {
+                                Ok((val, blocks)) => {
+                                    if !blocks.is_empty() {
+                                        media_blocks
+                                            .lock()
+                                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                            .extend(blocks);
+                                    }
+                                    serde_json::json!({
+                                        "type": "reply",
+                                        "id": id,
+                                        "ok": true,
+                                        "result": val,
+                                    })
+                                }
+                                Err(err) => serde_json::json!({
+                                    "type": "reply",
+                                    "id": id,
+                                    "ok": false,
+                                    "error": err,
+                                }),
+                            };
+                            if let Ok(mut guard) = stdin_clone.lock() {
+                                let _ = writeln!(guard, "{reply}");
+                                let _ = guard.flush();
+                            }
+                        });
+                    }
+                    "done" => {
+                        return Ok(msg);
+                    }
+                    _ => {}
+                }
+            }
+            Err("code sandbox exited before returning a result".to_string())
+        })
+        .await;
+
+        in_flight.abort_all();
+        let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(timeout_ms);
+
+        let done_msg = match loop_res {
+            Ok(Ok(msg)) => msg,
+            Ok(Err(err)) => {
+                let stderr_text = stderr_handle.join().unwrap_or_default();
+                let stderr_trimmed = stderr_text.trim();
+                if stderr_trimmed.is_empty() {
+                    return Err(err);
+                }
+                return Err(format!("{err}: {stderr_trimmed}"));
+            }
+            Err(_) => {
+                return Err(format!(
+                    "`code` execution timed out after {timeout_ms}ms and was terminated"
+                ));
+            }
+        };
+
+        let logs: Vec<String> = done_msg
+            .get("logs")
+            .and_then(serde_json::Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let ok = done_msg
+            .get("ok")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        if !ok {
+            let err = done_msg
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown code execution error");
+            if logs.is_empty() {
+                return Err(format!("code execution error: {err}"));
+            }
+            return Err(format!(
+                "code execution error: {err}\nlogs:\n{}",
+                logs.join("\n")
+            ));
+        }
+
+        let deliveries = deliveries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let media_blocks = media_blocks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let raw_result = done_msg
+            .get("result")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let serialized = serde_json::to_string(&raw_result).unwrap_or_default();
+        if serialized.len() > MAX_CODE_RESULT_BYTES {
+            let head_end = floor_char_boundary_str(&serialized, 36 * 1024);
+            let tail_start =
+                ceil_char_boundary_str(&serialized, serialized.len().saturating_sub(8 * 1024));
+            let preview = format!(
+                "{}\n...[result truncated: {} bytes exceeded {} byte cap; filter or map fields inside `code` before returning]...\n{}",
+                &serialized[..head_end],
+                serialized.len(),
+                MAX_CODE_RESULT_BYTES,
+                &serialized[tail_start..]
+            );
+            return Ok(MultimediaJson(
+                serde_json::json!({
+                    "result": preview,
+                    "deliveries": deliveries,
+                    "truncated": true,
+                    "original_bytes": serialized.len(),
+                    "max_bytes": MAX_CODE_RESULT_BYTES,
+                    "logs": logs,
+                    "duration_ms": duration_ms,
+                }),
+                media_blocks,
+            ));
+        }
+
+        Ok(MultimediaJson(
+            serde_json::json!({
+                "result": raw_result,
+                "deliveries": deliveries,
+                "truncated": false,
+                "logs": logs,
+                "duration_ms": duration_ms,
+            }),
+            media_blocks,
+        ))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MultimediaJson(pub serde_json::Value, pub Vec<rmcp::model::ContentBlock>);
+
+impl rmcp::handler::server::tool::IntoCallToolResult for MultimediaJson {
+    fn into_call_tool_result(self) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
+        let mut res = rmcp::model::CallToolResult::structured(self.0);
+        res.content.extend(self.1);
+        Ok(res.into())
+    }
+}
+
+const MAX_MULTIMEDIA_READ_BYTES: usize = 20 * 1024 * 1024;
+
+fn detect_multimedia_mime(path: &Path, bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Some("image/png");
+    }
+    if bytes.starts_with(b"\xff\xd8\xff") {
+        return Some("image/jpeg");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    if bytes.starts_with(b"%PDF-") {
+        return Some("application/pdf");
+    }
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WAVE" {
+        return Some("audio/wav");
+    }
+    if bytes.starts_with(b"ID3") {
+        return Some("audio/mpeg");
+    }
+    if bytes.starts_with(b"OggS") {
+        return Some("audio/ogg");
+    }
+    if bytes.starts_with(b"fLaC") {
+        return Some("audio/flac");
+    }
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase);
+    if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
+        let brand = &bytes[8..12];
+        if brand == b"avif" || brand == b"avis" {
+            return Some("image/avif");
+        }
+        if brand == b"M4A " || brand == b"M4B " {
+            return Some("audio/mp4");
+        }
+        if brand == b"qt  " {
+            return Some("video/quicktime");
+        }
+        return match ext.as_deref() {
+            Some("m4a") => Some("audio/mp4"),
+            Some("mov") => Some("video/quicktime"),
+            Some("avif") => Some("image/avif"),
+            _ => Some("video/mp4"),
+        };
+    }
+    if bytes.starts_with(b"\x1a\x45\xdf\xa3") {
+        return match ext.as_deref() {
+            Some("webm") => Some("video/webm"),
+            _ => Some("video/x-matroska"),
+        };
+    }
+    match ext.as_deref() {
+        Some("png") => Some("image/png"),
+        Some("jpg" | "jpeg") => Some("image/jpeg"),
+        Some("gif") => Some("image/gif"),
+        Some("webp") => Some("image/webp"),
+        Some("bmp") => Some("image/bmp"),
+        Some("avif") => Some("image/avif"),
+        Some("ico") => Some("image/x-icon"),
+        Some("pdf") => Some("application/pdf"),
+        Some("wav" | "wave") => Some("audio/wav"),
+        Some("mp3") => Some("audio/mpeg"),
+        Some("ogg" | "oga" | "opus") => Some("audio/ogg"),
+        Some("flac") => Some("audio/flac"),
+        Some("m4a") => Some("audio/mp4"),
+        Some("aac") => Some("audio/aac"),
+        Some("mp4" | "m4v") => Some("video/mp4"),
+        Some("webm") => Some("video/webm"),
+        Some("mov") => Some("video/quicktime"),
+        _ => None,
+    }
+}
+
+fn parse_image_dimensions(mime_type: &str, bytes: &[u8]) -> Option<(u32, u32)> {
+    match mime_type {
+        "image/png" => crate::computer::parse_png_dimensions(bytes),
+        "image/gif" => {
+            if bytes.len() >= 10 && (&bytes[0..6] == b"GIF87a" || &bytes[0..6] == b"GIF89a") {
+                let w = u32::from(u16::from_le_bytes([bytes[6], bytes[7]]));
+                let h = u32::from(u16::from_le_bytes([bytes[8], bytes[9]]));
+                Some((w, h))
+            } else {
+                None
+            }
+        }
+        "image/bmp" => {
+            if bytes.len() >= 26 && &bytes[0..2] == b"BM" {
+                let w =
+                    i32::from_le_bytes([bytes[18], bytes[19], bytes[20], bytes[21]]).unsigned_abs();
+                let h =
+                    i32::from_le_bytes([bytes[22], bytes[23], bytes[24], bytes[25]]).unsigned_abs();
+                Some((w, h))
+            } else {
+                None
+            }
+        }
+        "image/webp" => {
+            if bytes.len() >= 30 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+                if &bytes[12..16] == b"VP8 " {
+                    let w = u32::from(u16::from_le_bytes([bytes[26], bytes[27]]) & 0x3fff);
+                    let h = u32::from(u16::from_le_bytes([bytes[28], bytes[29]]) & 0x3fff);
+                    return Some((w, h));
+                } else if &bytes[12..16] == b"VP8L" {
+                    let b0 = u32::from(bytes[21]);
+                    let b1 = u32::from(bytes[22]);
+                    let b2 = u32::from(bytes[23]);
+                    let b3 = u32::from(bytes[24]);
+                    let w = 1 + (((b1 & 0x3f) << 8) | b0);
+                    let h = 1 + (((b3 & 0x0f) << 10) | (b2 << 2) | ((b1 & 0xc0) >> 6));
+                    return Some((w, h));
+                } else if &bytes[12..16] == b"VP8X" {
+                    let w = 1
+                        + (u32::from(bytes[24])
+                            | (u32::from(bytes[25]) << 8)
+                            | (u32::from(bytes[26]) << 16));
+                    let h = 1
+                        + (u32::from(bytes[27])
+                            | (u32::from(bytes[28]) << 8)
+                            | (u32::from(bytes[29]) << 16));
+                    return Some((w, h));
+                }
+            }
+            None
+        }
+        "image/jpeg" => {
+            if bytes.len() < 4 || !bytes.starts_with(b"\xff\xd8") {
+                return None;
+            }
+            let mut pos = 2usize;
+            while pos + 1 < bytes.len() {
+                if bytes[pos] != 0xff {
+                    pos += 1;
+                    continue;
+                }
+                while pos < bytes.len() && bytes[pos] == 0xff {
+                    pos += 1;
+                }
+                if pos >= bytes.len() {
+                    break;
+                }
+                let marker = bytes[pos];
+                pos += 1;
+                if marker == 0xd8
+                    || marker == 0xd9
+                    || marker == 0x01
+                    || (0xd0..=0xd7).contains(&marker)
+                {
+                    continue;
+                }
+                if pos + 2 > bytes.len() {
+                    break;
+                }
+                let seg_len = usize::from(u16::from_be_bytes([bytes[pos], bytes[pos + 1]]));
+                if seg_len < 2 || pos + seg_len > bytes.len() {
+                    break;
+                }
+                if matches!(
+                    marker,
+                    0xc0..=0xc3 | 0xc5..=0xc7 | 0xc9..=0xcb | 0xcd..=0xcf
+                ) && seg_len >= 7
+                {
+                    let h = u32::from(u16::from_be_bytes([bytes[pos + 3], bytes[pos + 4]]));
+                    let w = u32::from(u16::from_be_bytes([bytes[pos + 5], bytes[pos + 6]]));
+                    return Some((w, h));
+                }
+                pos += seg_len;
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+struct ScopedTempDir(PathBuf);
+
+impl ScopedTempDir {
+    fn new() -> std::io::Result<Self> {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "anyagents-media-{}-{}-{}",
+            std::process::id(),
+            anyagents_core::now_ms(),
+            seq
+        ));
+        std::fs::create_dir_all(&dir)?;
+        Ok(Self(dir))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for ScopedTempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn transcode_image_to_png_bytes(path: &Path) -> Option<Vec<u8>> {
+    let dir = ScopedTempDir::new().ok()?;
+    let out_png = dir.path().join("converted.png");
+    let status = std::process::Command::new("convert")
+        .arg(format!("{}[0]", path.display()))
+        .arg(&out_png)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .ok()?;
+    if status.success() {
+        std::fs::read(&out_png).ok()
+    } else {
+        None
+    }
+}
+
+fn extract_media_blocks_from_tool_value(
+    tool_name: &str,
+    val: &mut serde_json::Value,
+) -> Vec<rmcp::model::ContentBlock> {
+    let mut blocks = Vec::new();
+    let Some(obj) = val.as_object_mut() else {
+        return blocks;
+    };
+
+    // 1. Direct `image_base64` (computer.screenshot, computer.zoom, device.screenshot, browser.screenshot)
+    if let Some(serde_json::Value::String(b64)) = obj.remove("image_base64")
+        && !b64.is_empty()
+    {
+        let mime = obj
+            .get("mime_type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("image/png")
+            .to_string();
+        blocks.push(rmcp::model::ContentBlock::image(b64, mime));
+        obj.insert("image_attached".to_string(), serde_json::Value::Bool(true));
+    }
+
+    // 2. Browser screenshot path fallback (e.g. takeover screenshot_path or local path)
+    if blocks.is_empty() && tool_name == "browser" {
+        for key in ["screenshot_path", "path"] {
+            if let Some(p_str) = obj.get(key).and_then(serde_json::Value::as_str) {
+                let p = Path::new(p_str);
+                if p.is_file()
+                    && let Ok(bytes) = std::fs::read(p)
+                    && let Some(mime) = detect_multimedia_mime(p, &bytes)
+                    && mime.starts_with("image/")
+                {
+                    let b64 = crate::computer::base64_encode(&bytes);
+                    blocks.push(rmcp::model::ContentBlock::image(b64, mime));
+                    obj.insert("image_attached".to_string(), serde_json::Value::Bool(true));
+                    break;
+                }
+            }
+        }
+    }
+
+    // 3. `audio_base64` (media.speech)
+    if let Some(serde_json::Value::String(b64)) = obj.remove("audio_base64")
+        && !b64.is_empty()
+    {
+        let fmt = obj
+            .get("response_format")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("mp3");
+        let mime = match fmt.to_ascii_lowercase().as_str() {
+            "wav" | "wave" => "audio/wav",
+            "ogg" | "opus" => "audio/ogg",
+            "flac" => "audio/flac",
+            "aac" => "audio/aac",
+            "m4a" | "mp4" => "audio/mp4",
+            _ => "audio/mpeg",
+        };
+        blocks.push(rmcp::model::ContentBlock::audio(b64, mime));
+        obj.insert("audio_attached".to_string(), serde_json::Value::Bool(true));
+    }
+
+    // 4. `data: [{"b64_json": ...}]` (media.image_generate)
+    if let Some(serde_json::Value::Array(items)) = obj.get_mut("data") {
+        for item in items.iter_mut() {
+            if let Some(item_obj) = item.as_object_mut()
+                && let Some(serde_json::Value::String(b64)) = item_obj.remove("b64_json")
+                && !b64.is_empty()
+            {
+                blocks.push(rmcp::model::ContentBlock::image(b64, "image/png"));
+                item_obj.insert("image_attached".to_string(), serde_json::Value::Bool(true));
+            }
+        }
+    }
+
+    blocks
+}
+
+fn read_multimedia_file(
+    resolved: &Path,
+    full_bytes: &[u8],
+    mime_type: &'static str,
+    sha256: String,
+    args: &FilesArgs,
+) -> Result<(serde_json::Value, Vec<rmcp::model::ContentBlock>), String> {
+    let total_bytes = full_bytes.len();
+    if total_bytes > MAX_MULTIMEDIA_READ_BYTES {
+        return Err(format!(
+            "multimedia file {} is {} bytes, exceeding maximum of {} bytes",
+            resolved.display(),
+            total_bytes,
+            MAX_MULTIMEDIA_READ_BYTES
+        ));
+    }
+
+    let mut media_blocks = Vec::new();
+    let uri = format!("file://{}", resolved.display());
+
+    if mime_type.starts_with("image/") {
+        let dims = parse_image_dimensions(mime_type, full_bytes);
+        let (b64, attached_mime) = if matches!(
+            mime_type,
+            "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+        ) {
+            (crate::computer::base64_encode(full_bytes), mime_type)
+        } else if let Some(png_bytes) = transcode_image_to_png_bytes(resolved) {
+            (crate::computer::base64_encode(&png_bytes), "image/png")
+        } else {
+            (crate::computer::base64_encode(full_bytes), mime_type)
+        };
+        media_blocks.push(rmcp::model::ContentBlock::image(b64, attached_mime));
+        let (width, height) = dims.unwrap_or((0, 0));
+        let dim_str = if width > 0 && height > 0 {
+            format!("{width}x{height}, ")
+        } else {
+            String::new()
+        };
+        return Ok((
+            serde_json::json!({
+                "action": "read",
+                "path": resolved.display().to_string(),
+                "mime_type": mime_type,
+                "media_kind": "image",
+                "width": width,
+                "height": height,
+                "bytes_read": total_bytes,
+                "total_bytes": total_bytes,
+                "truncated": false,
+                "sha256": sha256,
+                "image_attached": true,
+                "content": format!(
+                    "[Native {mime_type} image ({dim_str}{total_bytes} bytes) attached as MCP image content block]"
+                ),
+            }),
+            media_blocks,
+        ));
+    }
+
+    if mime_type == "application/pdf" {
+        let b64_pdf = crate::computer::base64_encode(full_bytes);
+        media_blocks.push(rmcp::model::ContentBlock::resource(
+            rmcp::model::ResourceContents::BlobResourceContents {
+                uri,
+                mime_type: Some("application/pdf".to_string()),
+                blob: b64_pdf,
+                meta: None,
+            },
+        ));
+
+        let start_page = args.start_line.unwrap_or(1).max(1);
+        let end_page = args
+            .end_line
+            .unwrap_or(start_page + 4)
+            .max(start_page)
+            .min(start_page + 9);
+
+        let extracted_text = std::process::Command::new("pdftotext")
+            .args([
+                "-f",
+                &start_page.to_string(),
+                "-l",
+                &end_page.to_string(),
+                &resolved.display().to_string(),
+                "-",
+            ])
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+            .unwrap_or_default();
+
+        let mut pages_rendered = 0usize;
+        if let Ok(tmp_dir) = ScopedTempDir::new() {
+            let prefix = tmp_dir.path().join("page");
+            if let Ok(status) = std::process::Command::new("pdftoppm")
+                .args([
+                    "-jpeg",
+                    "-r",
+                    "100",
+                    "-f",
+                    &start_page.to_string(),
+                    "-l",
+                    &end_page.to_string(),
+                    &resolved.display().to_string(),
+                    &prefix.display().to_string(),
+                ])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                && status.success()
+                && let Ok(entries) = std::fs::read_dir(tmp_dir.path())
+            {
+                let mut jpg_paths: Vec<PathBuf> = entries
+                    .filter_map(Result::ok)
+                    .map(|e| e.path())
+                    .filter(|p| {
+                        p.extension()
+                            .and_then(|e| e.to_str())
+                            .is_some_and(|e| e.eq_ignore_ascii_case("jpg"))
+                    })
+                    .collect();
+                jpg_paths.sort();
+                for jpg_path in jpg_paths {
+                    if let Ok(jpg_bytes) = std::fs::read(&jpg_path) {
+                        media_blocks.push(rmcp::model::ContentBlock::image(
+                            crate::computer::base64_encode(&jpg_bytes),
+                            "image/jpeg",
+                        ));
+                        pages_rendered += 1;
+                    }
+                }
+            }
+        }
+
+        let max_bytes = args
+            .max_bytes
+            .unwrap_or(DEFAULT_READ_MAX_BYTES)
+            .clamp(1, HARD_READ_MAX_BYTES);
+        let text_end = floor_char_boundary_str(&extracted_text, max_bytes);
+        let text_slice = &extracted_text[..text_end];
+        let content_summary = if text_slice.is_empty() {
+            format!(
+                "[Native application/pdf ({total_bytes} bytes, pages {start_page}-{end_page}, {pages_rendered} page image(s)) attached as MCP content blocks]"
+            )
+        } else {
+            text_slice.to_string()
+        };
+
+        return Ok((
+            serde_json::json!({
+                "action": "read",
+                "path": resolved.display().to_string(),
+                "mime_type": "application/pdf",
+                "media_kind": "pdf",
+                "start_page": start_page,
+                "end_page": end_page,
+                "pages_rendered": pages_rendered,
+                "bytes_read": total_bytes,
+                "total_bytes": total_bytes,
+                "truncated": text_end < extracted_text.len(),
+                "sha256": sha256,
+                "resource_attached": true,
+                "content": content_summary,
+            }),
+            media_blocks,
+        ));
+    }
+
+    if mime_type.starts_with("audio/") {
+        let b64 = crate::computer::base64_encode(full_bytes);
+        media_blocks.push(rmcp::model::ContentBlock::audio(b64, mime_type));
+        return Ok((
+            serde_json::json!({
+                "action": "read",
+                "path": resolved.display().to_string(),
+                "mime_type": mime_type,
+                "media_kind": "audio",
+                "bytes_read": total_bytes,
+                "total_bytes": total_bytes,
+                "truncated": false,
+                "sha256": sha256,
+                "audio_attached": true,
+                "content": format!(
+                    "[Native {mime_type} audio ({total_bytes} bytes) attached as MCP audio content block]"
+                ),
+            }),
+            media_blocks,
+        ));
+    }
+
+    let b64 = crate::computer::base64_encode(full_bytes);
+    media_blocks.push(rmcp::model::ContentBlock::resource(
+        rmcp::model::ResourceContents::BlobResourceContents {
+            uri,
+            mime_type: Some(mime_type.to_string()),
+            blob: b64,
+            meta: None,
+        },
+    ));
+    let media_kind = if mime_type.starts_with("video/") {
+        "video"
+    } else {
+        "binary"
+    };
+    Ok((
+        serde_json::json!({
+            "action": "read",
+            "path": resolved.display().to_string(),
+            "mime_type": mime_type,
+            "media_kind": media_kind,
+            "bytes_read": total_bytes,
+            "total_bytes": total_bytes,
+            "truncated": false,
+            "sha256": sha256,
+            "resource_attached": true,
+            "content": format!(
+                "[Native {mime_type} {media_kind} ({total_bytes} bytes) attached as MCP resource content block]"
+            ),
+        }),
+        media_blocks,
+    ))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(64);
+    for b in digest {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+fn floor_char_boundary_str(s: &str, index: usize) -> usize {
+    if index >= s.len() {
+        return s.len();
+    }
+    let mut i = index;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+fn ceil_char_boundary_str(s: &str, index: usize) -> usize {
+    if index >= s.len() {
+        return s.len();
+    }
+    let mut i = index;
+    while i < s.len() && !s.is_char_boundary(i) {
+        i += 1;
+    }
+    i
+}
+
+fn normalize_lexical_path(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::Prefix(p) => out.push(p.as_os_str()),
+            Component::RootDir => out.push(comp.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) {
+                    out.pop();
+                } else if !out.is_absolute() {
+                    out.push("..");
+                }
+            }
+            Component::Normal(c) => out.push(c),
+        }
+    }
+    if out.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        out
+    }
+}
+
+fn resolve_workspace_path(
+    base: &Path,
+    raw: Option<&str>,
+    required: bool,
+) -> Result<PathBuf, String> {
+    let Some(raw_str) = raw else {
+        if required {
+            return Err("`path` is required for this `files` action".to_string());
+        }
+        return Ok(normalize_lexical_path(base));
+    };
+    if raw_str.contains('\0') {
+        return Err("`path` must not contain null bytes".to_string());
+    }
+    let trimmed = raw_str.trim();
+    if trimmed.is_empty() {
+        if required {
+            return Err("`path` must not be empty".to_string());
+        }
+        return Ok(normalize_lexical_path(base));
+    }
+    let candidate = Path::new(trimmed);
+    let joined = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        base.join(candidate)
+    };
+    Ok(normalize_lexical_path(&joined))
+}
+
+fn execute_files_tool_with_media(
+    base_dir: &Path,
+    args: FilesArgs,
+) -> Result<(serde_json::Value, Vec<rmcp::model::ContentBlock>), String> {
+    let is_read_action = matches!(
+        args.action
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("read" | "cat" | "view")
+    ) || (args.action.as_deref().is_none_or(|s| s.trim().is_empty())
+        && args.cmd.is_none()
+        && args.patch.is_none()
+        && args.edits.is_empty()
+        && args.target.is_none()
+        && args.content.is_none()
+        && args.query.is_none()
+        && args.pattern.is_none()
+        && args.glob.is_none());
+
+    if is_read_action {
+        let resolved = resolve_workspace_path(base_dir, args.path.as_deref(), true)?;
+        let meta = std::fs::metadata(&resolved)
+            .map_err(|e| format!("cannot read {}: {e}", resolved.display()))?;
+        if meta.is_dir() {
+            return Err(format!(
+                "{} is a directory; use `action: \"list\"` or `action: \"glob\"` to list files",
+                resolved.display()
+            ));
+        }
+        let full_bytes = std::fs::read(&resolved)
+            .map_err(|e| format!("cannot read {}: {e}", resolved.display()))?;
+        if let Some(mime_type) = detect_multimedia_mime(&resolved, &full_bytes) {
+            let sha256 = sha256_hex(&full_bytes);
+            return read_multimedia_file(&resolved, &full_bytes, mime_type, sha256, &args);
+        }
+    }
+
+    let val = execute_files_tool(base_dir, args)?;
+    Ok((val, Vec::new()))
+}
+
+fn execute_files_tool(base_dir: &Path, args: FilesArgs) -> Result<serde_json::Value, String> {
+    let action = args
+        .action
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_else(|| {
+            if args.cmd.is_some() {
+                "exec".to_string()
+            } else if args.patch.is_some() {
+                "patch".to_string()
+            } else if !args.edits.is_empty() {
+                "multi_edit".to_string()
+            } else if args.target.is_some() {
+                "edit".to_string()
+            } else if args.content.is_some() {
+                "write".to_string()
+            } else if args.query.is_some() {
+                "grep".to_string()
+            } else if args.pattern.is_some() || args.glob.is_some() {
+                "glob".to_string()
+            } else {
+                "read".to_string()
+            }
+        });
+
+    match action.as_str() {
+        "read" | "cat" | "view" => {
+            let resolved = resolve_workspace_path(base_dir, args.path.as_deref(), true)?;
+            let meta = std::fs::metadata(&resolved)
+                .map_err(|e| format!("cannot read {}: {e}", resolved.display()))?;
+            if meta.is_dir() {
+                return Err(format!(
+                    "{} is a directory; use `action: \"list\"` or `action: \"glob\"` to list files",
+                    resolved.display()
+                ));
+            }
+            let full_bytes = std::fs::read(&resolved)
+                .map_err(|e| format!("cannot read {}: {e}", resolved.display()))?;
+            let sha256 = sha256_hex(&full_bytes);
+            let total_bytes = full_bytes.len();
+            let text = String::from_utf8_lossy(&full_bytes);
+            let all_lines: Vec<&str> = text.lines().collect();
+            let total_lines = all_lines.len();
+
+            let max_bytes = args
+                .max_bytes
+                .unwrap_or(DEFAULT_READ_MAX_BYTES)
+                .clamp(1, HARD_READ_MAX_BYTES);
+            let byte_offset = args.byte_offset.unwrap_or(0);
+
+            if total_lines == 0 {
+                return Ok(serde_json::json!({
+                    "action": "read",
+                    "path": resolved.display().to_string(),
+                    "content": "",
+                    "numbered": "",
+                    "start_line": 0,
+                    "end_line": 0,
+                    "total_lines": 0,
+                    "bytes_read": 0,
+                    "total_bytes": total_bytes,
+                    "byte_offset": byte_offset,
+                    "truncated": false,
+                    "sha256": sha256,
+                }));
+            }
+
+            let start_line = args.start_line.unwrap_or(1).max(1);
+            if start_line > total_lines {
+                return Ok(serde_json::json!({
+                    "action": "read",
+                    "path": resolved.display().to_string(),
+                    "content": "",
+                    "numbered": "",
+                    "start_line": start_line,
+                    "end_line": total_lines,
+                    "total_lines": total_lines,
+                    "bytes_read": 0,
+                    "total_bytes": total_bytes,
+                    "byte_offset": byte_offset,
+                    "truncated": false,
+                    "sha256": sha256,
+                }));
+            }
+            let requested_end = args
+                .end_line
+                .unwrap_or(total_lines)
+                .min(total_lines)
+                .max(start_line);
+            let selected_lines = &all_lines[start_line - 1..requested_end];
+            let joined = selected_lines.join("\n");
+
+            let start_byte = floor_char_boundary_str(&joined, byte_offset.min(joined.len()));
+            let after_offset = &joined[start_byte..];
+            let end_byte = floor_char_boundary_str(after_offset, max_bytes);
+            let sliced = &after_offset[..end_byte];
+            let truncated = end_byte < after_offset.len() || requested_end < total_lines;
+
+            let offset_lines = joined[..start_byte].bytes().filter(|&b| b == b'\n').count();
+            let first_line_no = start_line + offset_lines;
+            let sliced_lines: Vec<&str> = sliced.lines().collect();
+            let actual_end_line = if sliced_lines.is_empty() {
+                first_line_no
+            } else {
+                first_line_no + sliced_lines.len() - 1
+            };
+            let mut numbered = String::with_capacity(sliced.len() + sliced_lines.len() * 8);
+            for (idx, line) in sliced_lines.iter().enumerate() {
+                if idx > 0 {
+                    numbered.push('\n');
+                }
+                numbered.push_str(&format!("{}: {line}", first_line_no + idx));
+            }
+
+            Ok(serde_json::json!({
+                "action": "read",
+                "path": resolved.display().to_string(),
+                "content": sliced,
+                "numbered": numbered,
+                "start_line": first_line_no,
+                "end_line": actual_end_line,
+                "total_lines": total_lines,
+                "bytes_read": sliced.len(),
+                "total_bytes": total_bytes,
+                "byte_offset": start_byte,
+                "truncated": truncated,
+                "sha256": sha256,
+            }))
+        }
+        "write" | "create" => {
+            let resolved = resolve_workspace_path(base_dir, args.path.as_deref(), true)?;
+            let content = args.content.unwrap_or_default();
+            let append = args.append.unwrap_or(false);
+            let overwrite = args.overwrite.unwrap_or(true);
+            if !append && !overwrite && resolved.exists() {
+                return Err(format!(
+                    "file {} already exists and `overwrite` is false",
+                    resolved.display()
+                ));
+            }
+            if let Some(parent) = resolved.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    format!("cannot create parent directory {}: {e}", parent.display())
+                })?;
+            }
+            if append {
+                use std::io::Write as _;
+                let mut f = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&resolved)
+                    .map_err(|e| format!("cannot open {} for append: {e}", resolved.display()))?;
+                f.write_all(content.as_bytes())
+                    .map_err(|e| format!("cannot append to {}: {e}", resolved.display()))?;
+            } else {
+                std::fs::write(&resolved, content.as_bytes())
+                    .map_err(|e| format!("cannot write {}: {e}", resolved.display()))?;
+            }
+            let final_bytes = std::fs::read(&resolved)
+                .map_err(|e| format!("cannot read back {}: {e}", resolved.display()))?;
+            let sha256 = sha256_hex(&final_bytes);
+            Ok(serde_json::json!({
+                "action": "write",
+                "path": resolved.display().to_string(),
+                "bytes_written": content.len(),
+                "total_bytes": final_bytes.len(),
+                "append": append,
+                "sha256": sha256,
+            }))
+        }
+        "edit" | "multi_edit" | "replace" => {
+            let resolved = resolve_workspace_path(base_dir, args.path.as_deref(), true)?;
+            let mut specs = Vec::new();
+            if let Some(target) = args.target {
+                specs.push(FileEditSpec {
+                    target,
+                    replacement: args.replacement.unwrap_or_default(),
+                    replace_all: args.replace_all,
+                });
+            }
+            specs.extend(args.edits);
+            if specs.is_empty() {
+                return Err(
+                    "`files` edit requires `target` (and optional `replacement`) or non-empty `edits`"
+                        .to_string(),
+                );
+            }
+            let existing = std::fs::read_to_string(&resolved)
+                .map_err(|e| format!("cannot read {} for edit: {e}", resolved.display()))?;
+            let (updated, replacements_made, lines_added, lines_removed) = apply_atomic_edits(
+                &existing,
+                &specs,
+                args.replace_all.unwrap_or(true),
+                &resolved,
+            )?;
+            std::fs::write(&resolved, updated.as_bytes())
+                .map_err(|e| format!("cannot write edited file {}: {e}", resolved.display()))?;
+            let sha256 = sha256_hex(updated.as_bytes());
+            Ok(serde_json::json!({
+                "action": if action == "multi_edit" { "multi_edit" } else { "edit" },
+                "path": resolved.display().to_string(),
+                "replacements_made": replacements_made,
+                "lines_added": lines_added,
+                "lines_removed": lines_removed,
+                "sha256": sha256,
+            }))
+        }
+        "patch" | "apply_patch" => {
+            let patch_text = args
+                .patch
+                .or(args.content)
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| "`files` patch requires non-empty `patch`".to_string())?;
+            apply_workspace_patch(base_dir, &patch_text)
+        }
+        "list" | "ls" | "list_dir" => {
+            let dir_path = resolve_workspace_path(base_dir, args.path.as_deref(), false)?;
+            let rd = std::fs::read_dir(&dir_path)
+                .map_err(|e| format!("cannot list directory {}: {e}", dir_path.display()))?;
+            let include_hidden = args.include_hidden.unwrap_or(true);
+            let max_results = args
+                .max_results
+                .unwrap_or(DEFAULT_LIST_MAX_RESULTS)
+                .clamp(1, HARD_LIST_MAX_RESULTS);
+
+            let mut raw_entries: Vec<(String, serde_json::Value)> = Vec::new();
+            for entry_res in rd {
+                let Ok(entry) = entry_res else {
+                    continue;
+                };
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if !include_hidden && name.starts_with('.') {
+                    continue;
+                }
+                let entry_path = entry.path();
+                let Ok(sym_meta) = std::fs::symlink_metadata(&entry_path) else {
+                    continue;
+                };
+                let ft = sym_meta.file_type();
+                let (kind, bytes) = if ft.is_symlink() {
+                    let target_len = std::fs::metadata(&entry_path)
+                        .ok()
+                        .filter(|m| m.is_file())
+                        .map_or(0, |m| m.len());
+                    ("symlink", target_len)
+                } else if ft.is_dir() {
+                    ("dir", 0)
+                } else {
+                    ("file", sym_meta.len())
+                };
+                let rel_path = entry_path
+                    .strip_prefix(base_dir)
+                    .ok()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| entry_path.display().to_string());
+                raw_entries.push((
+                    name.clone(),
+                    serde_json::json!({
+                        "name": name,
+                        "path": rel_path,
+                        "kind": kind,
+                        "bytes": bytes,
+                    }),
+                ));
+            }
+            raw_entries.sort_by(|a, b| a.0.cmp(&b.0));
+            let truncated = raw_entries.len() > max_results;
+            let entries: Vec<serde_json::Value> = raw_entries
+                .into_iter()
+                .take(max_results)
+                .map(|(_, v)| v)
+                .collect();
+            let count = entries.len();
+            Ok(serde_json::json!({
+                "action": "list",
+                "path": dir_path.display().to_string(),
+                "entries": entries,
+                "count": count,
+                "truncated": truncated,
+            }))
+        }
+        "glob" => {
+            let mut raw_pattern = args
+                .pattern
+                .or(args.glob)
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let mut raw_path = args
+                .path
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            if raw_pattern.is_none()
+                && let Some(ref p) = raw_path
+                && (p.contains('*') || p.contains('?') || p.contains('[') || p.contains('{'))
+            {
+                raw_pattern = Some(p.clone());
+                raw_path = None;
+            }
+            let search_root = resolve_workspace_path(base_dir, raw_path.as_deref(), false)?;
+            if !search_root.exists() {
+                return Err(format!(
+                    "glob base directory {} does not exist",
+                    search_root.display()
+                ));
+            }
+            let pattern = raw_pattern.unwrap_or_else(|| "**/*".to_string());
+            let clean_pat = pattern.strip_prefix("./").unwrap_or(&pattern);
+            let max_results = args
+                .max_results
+                .unwrap_or(DEFAULT_GLOB_MAX_RESULTS)
+                .clamp(1, HARD_GLOB_MAX_RESULTS);
+            let include_hidden = args
+                .include_hidden
+                .unwrap_or_else(|| clean_pat.starts_with('.') || clean_pat.contains("/."));
+            let include_ignored = args.include_ignored.unwrap_or(false)
+                || DEFAULT_IGNORED_DIRS.iter().any(|d| clean_pat.contains(d));
+
+            let mut candidate_files = Vec::new();
+            let gitignore_patterns = if include_ignored {
+                Vec::new()
+            } else {
+                read_gitignore_patterns(&search_root)
+            };
+            collect_workspace_files(
+                &search_root,
+                &search_root,
+                include_hidden,
+                include_ignored,
+                &gitignore_patterns,
+                &mut candidate_files,
+            );
+            candidate_files.sort();
+
+            let mut matched = Vec::new();
+            let mut truncated = false;
+            let pat_has_slash = clean_pat.contains('/');
+            for rel in candidate_files {
+                let file_name = Path::new(&rel)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(&rel);
+                let is_match = glob_matches(clean_pat, &rel)
+                    || (!pat_has_slash && glob_matches(clean_pat, file_name));
+                if is_match {
+                    if matched.len() >= max_results {
+                        truncated = true;
+                        break;
+                    }
+                    matched.push(rel);
+                }
+            }
+            let count = matched.len();
+            Ok(serde_json::json!({
+                "action": "glob",
+                "base_dir": search_root.display().to_string(),
+                "pattern": pattern,
+                "files": matched,
+                "matches": matched,
+                "count": count,
+                "truncated": truncated,
+            }))
+        }
+        "grep" | "search" => {
+            let query = args
+                .query
+                .or(args.pattern)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| "`files` grep requires a non-empty `query`".to_string())?;
+            let target_path = resolve_workspace_path(base_dir, args.path.as_deref(), false)?;
+            if !target_path.exists() {
+                return Err(format!(
+                    "grep target path {} does not exist",
+                    target_path.display()
+                ));
+            }
+            let max_results = args
+                .max_results
+                .unwrap_or(DEFAULT_GREP_MAX_RESULTS)
+                .clamp(1, HARD_GREP_MAX_RESULTS);
+            let context_lines = args.context_lines.unwrap_or(0).min(10);
+            let matcher = GrepMatcher::compile(
+                &query,
+                args.case_insensitive.unwrap_or(false),
+                args.literal.unwrap_or(false),
+            );
+            let file_glob = args
+                .glob
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.strip_prefix("./").unwrap_or(s));
+
+            let files_to_search: Vec<(PathBuf, String)> = if target_path.is_file() {
+                let display = target_path
+                    .strip_prefix(base_dir)
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| target_path.display().to_string());
+                vec![(target_path, display)]
+            } else {
+                let include_hidden = args.include_hidden.unwrap_or(false);
+                let include_ignored = args.include_ignored.unwrap_or(false);
+                let gitignore_patterns = if include_ignored {
+                    Vec::new()
+                } else {
+                    read_gitignore_patterns(&target_path)
+                };
+                let mut rels = Vec::new();
+                collect_workspace_files(
+                    &target_path,
+                    &target_path,
+                    include_hidden,
+                    include_ignored,
+                    &gitignore_patterns,
+                    &mut rels,
+                );
+                rels.sort();
+                rels.into_iter()
+                    .filter(|rel| {
+                        if let Some(g) = file_glob {
+                            let fname = Path::new(rel)
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or(rel);
+                            glob_matches(g, rel) || (!g.contains('/') && glob_matches(g, fname))
+                        } else {
+                            true
+                        }
+                    })
+                    .map(|rel| {
+                        let abs = target_path.join(&rel);
+                        let disp = abs
+                            .strip_prefix(base_dir)
+                            .map(|p| p.display().to_string())
+                            .unwrap_or(rel);
+                        (abs, disp)
+                    })
+                    .collect()
+            };
+
+            let mut matches = Vec::new();
+            let mut truncated = false;
+            'file_loop: for (abs_path, disp_path) in files_to_search {
+                let Ok(bytes) = std::fs::read(&abs_path) else {
+                    continue;
+                };
+                let probe_len = bytes.len().min(8192);
+                if bytes[..probe_len].contains(&0) {
+                    continue;
+                }
+                let text = String::from_utf8_lossy(&bytes);
+                let lines: Vec<&str> = text.lines().collect();
+                for (idx, line) in lines.iter().enumerate() {
+                    if matcher.is_match(line) {
+                        if matches.len() >= max_results {
+                            truncated = true;
+                            break 'file_loop;
+                        }
+                        let mut hit = serde_json::json!({
+                            "path": disp_path,
+                            "line": idx + 1,
+                            "text": line,
+                        });
+                        if context_lines > 0
+                            && let Some(obj) = hit.as_object_mut()
+                        {
+                            let before_start = idx.saturating_sub(context_lines);
+                            let after_end = (idx + 1 + context_lines).min(lines.len());
+                            let before: Vec<&str> = lines[before_start..idx].to_vec();
+                            let after: Vec<&str> = lines[idx + 1..after_end].to_vec();
+                            obj.insert("context_before".to_string(), serde_json::json!(before));
+                            obj.insert("context_after".to_string(), serde_json::json!(after));
+                        }
+                        matches.push(hit);
+                    }
+                }
+            }
+            let count = matches.len();
+            Ok(serde_json::json!({
+                "action": "grep",
+                "query": query,
+                "matches": matches,
+                "count": count,
+                "truncated": truncated,
+            }))
+        }
+        "exec" | "bash" | "sh" | "command" => {
+            if std::env::var("ANYAGENTS_DISABLE_WORKSPACE_EXEC")
+                .ok()
+                .is_some_and(|v| {
+                    matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes")
+                })
+            {
+                return Err(
+                    "workspace.exec is disabled for this agent (ANYAGENTS_DISABLE_WORKSPACE_EXEC=1); delegate command execution to a subagent".to_string(),
+                );
+            }
+            let cmd_str = args
+                .cmd
+                .as_deref()
+                .or(args.content.as_deref())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| "`workspace.exec` requires a non-empty `cmd`".to_string())?;
+            let raw_cwd = args.cwd.as_deref().or(args.path.as_deref());
+            let resolved_cwd = resolve_workspace_path(base_dir, raw_cwd, false)?;
+            if !resolved_cwd.is_dir() {
+                return Err(format!(
+                    "workspace.exec cwd {} does not exist or is not a directory",
+                    resolved_cwd.display()
+                ));
+            }
+            let timeout_ms = args
+                .timeout_ms
+                .unwrap_or(DEFAULT_CODE_TIMEOUT_MS)
+                .clamp(100, MAX_CODE_TIMEOUT_MS);
+            let started = std::time::Instant::now();
+            let mut cmd = std::process::Command::new("/bin/bash");
+            cmd.arg("-c")
+                .arg(cmd_str)
+                .current_dir(&resolved_cwd)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt as _;
+                cmd.process_group(0);
+            }
+            let mut child = cmd
+                .spawn()
+                .map_err(|e| format!("failed to spawn bash for workspace.exec: {e}"))?;
+            let stdout_pipe = child
+                .stdout
+                .take()
+                .ok_or_else(|| "workspace.exec stdout missing".to_string())?;
+            let stderr_pipe = child
+                .stderr
+                .take()
+                .ok_or_else(|| "workspace.exec stderr missing".to_string())?;
+            let stdout_handle = std::thread::spawn(move || {
+                use std::io::Read as _;
+                let mut buf = Vec::new();
+                let mut take = stdout_pipe.take(64 * 1024);
+                let _ = take.read_to_end(&mut buf);
+                String::from_utf8_lossy(&buf).into_owned()
+            });
+            let stderr_handle = std::thread::spawn(move || {
+                use std::io::Read as _;
+                let mut buf = Vec::new();
+                let mut take = stderr_pipe.take(64 * 1024);
+                let _ = take.read_to_end(&mut buf);
+                String::from_utf8_lossy(&buf).into_owned()
+            });
+            let mut guard = CodeChildGuard { child: Some(child) };
+            let deadline = started + std::time::Duration::from_millis(timeout_ms);
+            let status_opt = loop {
+                if let Some(ref mut c) = guard.child {
+                    match c.try_wait() {
+                        Ok(Some(st)) => break Some(st),
+                        Ok(None) => {
+                            if std::time::Instant::now() >= deadline {
+                                break None;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                        Err(e) => return Err(format!("workspace.exec wait failed: {e}")),
+                    }
+                } else {
+                    break None;
+                }
+            };
+            drop(guard);
+            let stdout = stdout_handle.join().unwrap_or_default();
+            let stderr = stderr_handle.join().unwrap_or_default();
+            let duration_ms = started.elapsed().as_millis() as u64;
+            let Some(status) = status_opt else {
+                return Err(format!(
+                    "workspace.exec timed out after {timeout_ms}ms (stdout: {}, stderr: {})",
+                    stdout.trim(),
+                    stderr.trim()
+                ));
+            };
+            let exit_code = status.code().unwrap_or(-1);
+            Ok(serde_json::json!({
+                "action": "exec",
+                "cmd": cmd_str,
+                "cwd": resolved_cwd.display().to_string(),
+                "exit_code": exit_code,
+                "stdout": stdout,
+                "stderr": stderr,
+                "duration_ms": duration_ms,
+            }))
+        }
+        other => Err(format!(
+            "unknown `files` action `{other}`; expected `read`, `write`, `edit`, `multi_edit`, `patch`, `list`, `glob`, `grep`, or `exec`"
+        )),
+    }
+}
+
+fn apply_atomic_edits(
+    existing: &str,
+    specs: &[FileEditSpec],
+    default_replace_all: bool,
+    path: &Path,
+) -> Result<(String, usize, usize, usize), String> {
+    let mut working = existing.to_string();
+    let mut total_replacements = 0usize;
+    let mut total_lines_added = 0usize;
+    let mut total_lines_removed = 0usize;
+
+    for (idx, spec) in specs.iter().enumerate() {
+        if spec.target.is_empty() {
+            return Err(format!(
+                "edit #{} in {}: `target` must not be empty",
+                idx + 1,
+                path.display()
+            ));
+        }
+        let replace_all = spec.replace_all.unwrap_or(default_replace_all);
+        let tgt_lines = spec
+            .target
+            .lines()
+            .count()
+            .max(usize::from(!spec.target.is_empty()));
+        let rep_lines = spec
+            .replacement
+            .lines()
+            .count()
+            .max(usize::from(!spec.replacement.is_empty()));
+
+        match apply_single_edit_cascade(&working, &spec.target, &spec.replacement, replace_all) {
+            Ok((next, count)) => {
+                working = next;
+                total_replacements += count;
+                total_lines_removed += count * tgt_lines;
+                total_lines_added += count * rep_lines;
+            }
+            Err(reason) => {
+                let hint = find_closest_lines(&working, &spec.target);
+                return Err(format!(
+                    "edit #{} in {}: {reason}{hint}",
+                    idx + 1,
+                    path.display()
+                ));
+            }
+        }
+    }
+
+    Ok((
+        working,
+        total_replacements,
+        total_lines_added,
+        total_lines_removed,
+    ))
+}
+
+fn apply_single_edit_cascade(
+    content: &str,
+    target: &str,
+    replacement: &str,
+    replace_all: bool,
+) -> Result<(String, usize), String> {
+    // Stage 1: Exact match
+    let exact_matches: Vec<usize> = content.match_indices(target).map(|(pos, _)| pos).collect();
+    if exact_matches.len() == 1 || (exact_matches.len() > 1 && replace_all) {
+        let count = if replace_all { exact_matches.len() } else { 1 };
+        let updated = if replace_all {
+            content.replace(target, replacement)
+        } else {
+            content.replacen(target, replacement, 1)
+        };
+        return Ok((updated, count));
+    } else if exact_matches.len() > 1 {
+        let lines: Vec<String> = exact_matches
+            .iter()
+            .take(8)
+            .map(|&pos| (content[..pos].bytes().filter(|&b| b == b'\n').count() + 1).to_string())
+            .collect();
+        return Err(format!(
+            "`target` matched {} times (at lines {}); include more context or set `replace_all: true`",
+            exact_matches.len(),
+            lines.join(", ")
+        ));
+    }
+
+    // Stage 2: CRLF/LF normalized match
+    let uses_crlf = content.contains("\r\n");
+    let norm_content = content.replace("\r\n", "\n");
+    let norm_target = target.replace("\r\n", "\n");
+    let norm_replacement = replacement.replace("\r\n", "\n");
+    if norm_content != content || norm_target != target {
+        let crlf_matches: Vec<usize> = norm_content
+            .match_indices(&norm_target)
+            .map(|(pos, _)| pos)
+            .collect();
+        if crlf_matches.len() == 1 || (crlf_matches.len() > 1 && replace_all) {
+            let count = if replace_all { crlf_matches.len() } else { 1 };
+            let updated_lf = if replace_all {
+                norm_content.replace(&norm_target, &norm_replacement)
+            } else {
+                norm_content.replacen(&norm_target, &norm_replacement, 1)
+            };
+            let final_str = if uses_crlf {
+                updated_lf.replace('\n', "\r\n")
+            } else {
+                updated_lf
+            };
+            return Ok((final_str, count));
+        } else if crlf_matches.len() > 1 {
+            let lines: Vec<String> = crlf_matches
+                .iter()
+                .take(8)
+                .map(|&pos| {
+                    (norm_content[..pos].bytes().filter(|&b| b == b'\n').count() + 1).to_string()
+                })
+                .collect();
+            return Err(format!(
+                "`target` matched {} times (at lines {}); include more context or set `replace_all: true`",
+                crlf_matches.len(),
+                lines.join(", ")
+            ));
+        }
+    }
+
+    let doc_lines: Vec<&str> = norm_content.split('\n').collect();
+    let target_lines: Vec<&str> = norm_target.split('\n').collect();
+    if target_lines.is_empty() || target_lines.len() > doc_lines.len() {
+        return Err("`target` not found.".to_string());
+    }
+
+    // Stage 3: Line-end whitespace-trimmed (`trim_end()`) match
+    let mut trim_end_hits = Vec::new();
+    for i in 0..=(doc_lines.len() - target_lines.len()) {
+        if (0..target_lines.len())
+            .all(|j| doc_lines[i + j].trim_end() == target_lines[j].trim_end())
+        {
+            trim_end_hits.push(i);
+        }
+    }
+    if trim_end_hits.len() == 1 {
+        let i = trim_end_hits[0];
+        let repl_lines: Vec<&str> = norm_replacement.split('\n').collect();
+        let mut new_doc: Vec<String> = Vec::with_capacity(doc_lines.len() + repl_lines.len());
+        new_doc.extend(doc_lines[..i].iter().map(|s| (*s).to_string()));
+        new_doc.extend(repl_lines.iter().map(|s| (*s).to_string()));
+        new_doc.extend(
+            doc_lines[i + target_lines.len()..]
+                .iter()
+                .map(|s| (*s).to_string()),
+        );
+        let joined = if uses_crlf {
+            new_doc.join("\r\n")
+        } else {
+            new_doc.join("\n")
+        };
+        return Ok((joined, 1));
+    } else if trim_end_hits.len() > 1 {
+        let lines: Vec<String> = trim_end_hits
+            .iter()
+            .take(8)
+            .map(|&i| (i + 1).to_string())
+            .collect();
+        return Err(format!(
+            "`target` matched {} times (at lines {}); include more surrounding context lines",
+            trim_end_hits.len(),
+            lines.join(", ")
+        ));
+    }
+
+    // Stage 4: Indentation-tolerant (`trim()`) match preserving relative indentation
+    let has_substantive_line = target_lines.iter().any(|l| l.trim().len() >= 3);
+    if has_substantive_line {
+        let mut trim_hits = Vec::new();
+        for i in 0..=(doc_lines.len() - target_lines.len()) {
+            if (0..target_lines.len()).all(|j| doc_lines[i + j].trim() == target_lines[j].trim()) {
+                trim_hits.push(i);
+            }
+        }
+        if trim_hits.len() == 1 {
+            let i = trim_hits[0];
+            let mut indent_delta: isize = 0;
+            for j in 0..target_lines.len() {
+                if !target_lines[j].trim().is_empty() && !doc_lines[i + j].trim().is_empty() {
+                    let doc_indent = doc_lines[i + j].len() - doc_lines[i + j].trim_start().len();
+                    let tgt_indent = target_lines[j].len() - target_lines[j].trim_start().len();
+                    indent_delta = doc_indent as isize - tgt_indent as isize;
+                    break;
+                }
+            }
+            let repl_lines: Vec<String> = norm_replacement
+                .split('\n')
+                .map(|line| {
+                    if line.trim().is_empty() || indent_delta == 0 {
+                        line.to_string()
+                    } else if indent_delta > 0 {
+                        format!("{}{}", " ".repeat(indent_delta as usize), line)
+                    } else {
+                        let remove = (-indent_delta) as usize;
+                        let leading = line.len() - line.trim_start_matches(' ').len();
+                        line[remove.min(leading)..].to_string()
+                    }
+                })
+                .collect();
+            let mut new_doc: Vec<String> = Vec::with_capacity(doc_lines.len() + repl_lines.len());
+            new_doc.extend(doc_lines[..i].iter().map(|s| (*s).to_string()));
+            new_doc.extend(repl_lines);
+            new_doc.extend(
+                doc_lines[i + target_lines.len()..]
+                    .iter()
+                    .map(|s| (*s).to_string()),
+            );
+            let joined = if uses_crlf {
+                new_doc.join("\r\n")
+            } else {
+                new_doc.join("\n")
+            };
+            return Ok((joined, 1));
+        } else if trim_hits.len() > 1 {
+            let lines: Vec<String> = trim_hits
+                .iter()
+                .take(8)
+                .map(|&i| (i + 1).to_string())
+                .collect();
+            return Err(format!(
+                "`target` matched {} times by indentation-tolerant comparison (at lines {}); include more context lines",
+                trim_hits.len(),
+                lines.join(", ")
+            ));
+        }
+    }
+
+    Err("`target` not found.".to_string())
+}
+
+fn is_v4a_patch(text: &str) -> bool {
+    text.lines().any(|l| {
+        let t = l.trim();
+        t == "*** Begin Patch"
+            || t.starts_with("*** Update File:")
+            || t.starts_with("*** Add File:")
+            || t.starts_with("*** Delete File:")
+    })
+}
+
+fn resolve_patch_rel_path(base_dir: &Path, raw: &str) -> Result<PathBuf, String> {
+    let clean = raw
+        .trim()
+        .strip_prefix("a/")
+        .or_else(|| raw.trim().strip_prefix("b/"))
+        .unwrap_or(raw.trim());
+    resolve_workspace_path(base_dir, Some(clean), true)
+}
+
+fn apply_workspace_patch(base_dir: &Path, patch_text: &str) -> Result<serde_json::Value, String> {
+    let normalized = patch_text.replace("\r\n", "\n");
+    let lines: Vec<&str> = normalized.lines().collect();
+    let mut operations = Vec::new();
+    let mut files = Vec::new();
+
+    if is_v4a_patch(&normalized) {
+        let mut i = 0usize;
+        while i < lines.len() {
+            let line = lines[i].trim();
+            if line.is_empty()
+                || line == "*** Begin Patch"
+                || line == "*** End Patch"
+                || line.starts_with("```")
+            {
+                i += 1;
+                continue;
+            }
+            if let Some(rel) = line.strip_prefix("*** Add File:").map(str::trim) {
+                i += 1;
+                let mut body_lines = Vec::new();
+                while i < lines.len() && !lines[i].trim().starts_with("*** ") {
+                    let raw_l = lines[i];
+                    if let Some(stripped) = raw_l.strip_prefix('+') {
+                        body_lines.push(stripped);
+                    } else {
+                        body_lines.push(raw_l);
+                    }
+                    i += 1;
+                }
+                let target = resolve_patch_rel_path(base_dir, rel)?;
+                if let Some(p) = target.parent()
+                    && !p.as_os_str().is_empty()
+                {
+                    std::fs::create_dir_all(p).map_err(|e| {
+                        format!("failed creating parent directory {}: {e}", p.display())
+                    })?;
+                }
+                let mut content = body_lines.join("\n");
+                if !content.is_empty() && !content.ends_with('\n') {
+                    content.push('\n');
+                }
+                std::fs::write(&target, content.as_bytes())
+                    .map_err(|e| format!("failed writing `{rel}`: {e}"))?;
+                let sha256 = sha256_hex(content.as_bytes());
+                files.push(rel.to_string());
+                operations.push(serde_json::json!({
+                    "op": "add",
+                    "path": rel,
+                    "resolved_path": target.display().to_string(),
+                    "sha256": sha256,
+                }));
+                continue;
+            }
+            if let Some(rel) = line.strip_prefix("*** Delete File:").map(str::trim) {
+                i += 1;
+                while i < lines.len() && !lines[i].trim().starts_with("*** ") {
+                    i += 1;
+                }
+                let target = resolve_patch_rel_path(base_dir, rel)?;
+                if target.exists() {
+                    std::fs::remove_file(&target)
+                        .map_err(|e| format!("failed deleting `{rel}`: {e}"))?;
+                }
+                files.push(rel.to_string());
+                operations.push(serde_json::json!({
+                    "op": "delete",
+                    "path": rel,
+                    "resolved_path": target.display().to_string(),
+                }));
+                continue;
+            }
+            if let Some(rel) = line.strip_prefix("*** Update File:").map(str::trim) {
+                i += 1;
+                let mut move_to: Option<String> = None;
+                if i < lines.len()
+                    && let Some(mv) = lines[i].trim().strip_prefix("*** Move to:").map(str::trim)
+                {
+                    move_to = Some(mv.to_string());
+                    i += 1;
+                }
+                let mut hunk_lines = Vec::new();
+                while i < lines.len() && !lines[i].trim().starts_with("*** ") {
+                    if !lines[i].trim().starts_with("```") {
+                        hunk_lines.push(lines[i]);
+                    }
+                    i += 1;
+                }
+                let target = resolve_patch_rel_path(base_dir, rel)?;
+                let existing = std::fs::read_to_string(&target)
+                    .map_err(|e| format!("failed reading `{rel}`: {e}"))?;
+                let updated = apply_patch_context_hunks(&existing, &hunk_lines)
+                    .map_err(|e| format!("failed patching `{rel}`: {e}"))?;
+                let sha256 = sha256_hex(updated.as_bytes());
+                if let Some(dest_rel) = move_to {
+                    let dest = resolve_patch_rel_path(base_dir, &dest_rel)?;
+                    if let Some(p) = dest.parent()
+                        && !p.as_os_str().is_empty()
+                    {
+                        std::fs::create_dir_all(p).map_err(|e| {
+                            format!("failed creating parent directory {}: {e}", p.display())
+                        })?;
+                    }
+                    std::fs::write(&dest, updated.as_bytes())
+                        .map_err(|e| format!("failed writing `{dest_rel}`: {e}"))?;
+                    if dest != target && target.exists() {
+                        let _ = std::fs::remove_file(&target);
+                    }
+                    files.push(dest_rel.clone());
+                    operations.push(serde_json::json!({
+                        "op": "update",
+                        "path": rel,
+                        "moved_to": dest_rel,
+                        "resolved_path": dest.display().to_string(),
+                        "sha256": sha256,
+                    }));
+                } else {
+                    std::fs::write(&target, updated.as_bytes())
+                        .map_err(|e| format!("failed writing `{rel}`: {e}"))?;
+                    files.push(rel.to_string());
+                    operations.push(serde_json::json!({
+                        "op": "update",
+                        "path": rel,
+                        "resolved_path": target.display().to_string(),
+                        "sha256": sha256,
+                    }));
+                }
+                continue;
+            }
+            i += 1;
+        }
+    } else {
+        let mut i = 0usize;
+        while i < lines.len() {
+            let line = lines[i];
+            if line.starts_with("--- ") && i + 1 < lines.len() && lines[i + 1].starts_with("+++ ") {
+                let old_header = line
+                    .strip_prefix("--- ")
+                    .unwrap_or("")
+                    .split('\t')
+                    .next()
+                    .unwrap_or("")
+                    .trim();
+                let new_header = lines[i + 1]
+                    .strip_prefix("+++ ")
+                    .unwrap_or("")
+                    .split('\t')
+                    .next()
+                    .unwrap_or("")
+                    .trim();
+                i += 2;
+                let mut hunk_lines = Vec::new();
+                while i < lines.len()
+                    && !lines[i].starts_with("diff --git ")
+                    && !(lines[i].starts_with("--- ")
+                        && i + 1 < lines.len()
+                        && lines[i + 1].starts_with("+++ "))
+                {
+                    hunk_lines.push(lines[i]);
+                    i += 1;
+                }
+                if new_header == "/dev/null" {
+                    let target = resolve_patch_rel_path(base_dir, old_header)?;
+                    if target.exists() {
+                        std::fs::remove_file(&target)
+                            .map_err(|e| format!("failed deleting `{old_header}`: {e}"))?;
+                    }
+                    let clean_rel = old_header.strip_prefix("a/").unwrap_or(old_header);
+                    files.push(clean_rel.to_string());
+                    operations.push(serde_json::json!({
+                        "op": "delete",
+                        "path": clean_rel,
+                        "resolved_path": target.display().to_string(),
+                    }));
+                } else if old_header == "/dev/null" {
+                    let target = resolve_patch_rel_path(base_dir, new_header)?;
+                    if let Some(p) = target.parent()
+                        && !p.as_os_str().is_empty()
+                    {
+                        std::fs::create_dir_all(p).map_err(|e| {
+                            format!("failed creating parent directory {}: {e}", p.display())
+                        })?;
+                    }
+                    let mut added = Vec::new();
+                    for hl in &hunk_lines {
+                        if hl.starts_with("@@") || hl.starts_with("\\ No newline") {
+                            continue;
+                        }
+                        if let Some(rest) = hl.strip_prefix('+') {
+                            added.push(rest);
+                        } else if let Some(rest) = hl.strip_prefix(' ') {
+                            added.push(rest);
+                        }
+                    }
+                    let mut content = added.join("\n");
+                    if !content.is_empty() {
+                        content.push('\n');
+                    }
+                    std::fs::write(&target, content.as_bytes())
+                        .map_err(|e| format!("failed writing `{new_header}`: {e}"))?;
+                    let sha256 = sha256_hex(content.as_bytes());
+                    let clean_rel = new_header.strip_prefix("b/").unwrap_or(new_header);
+                    files.push(clean_rel.to_string());
+                    operations.push(serde_json::json!({
+                        "op": "add",
+                        "path": clean_rel,
+                        "resolved_path": target.display().to_string(),
+                        "sha256": sha256,
+                    }));
+                } else {
+                    let rel = if !new_header.is_empty() {
+                        new_header
+                    } else {
+                        old_header
+                    };
+                    let target = resolve_patch_rel_path(base_dir, rel)?;
+                    let existing = std::fs::read_to_string(&target)
+                        .map_err(|e| format!("failed reading `{rel}`: {e}"))?;
+                    let updated = apply_patch_context_hunks(&existing, &hunk_lines)
+                        .map_err(|e| format!("failed applying hunk to `{rel}`: {e}"))?;
+                    std::fs::write(&target, updated.as_bytes())
+                        .map_err(|e| format!("failed writing `{rel}`: {e}"))?;
+                    let sha256 = sha256_hex(updated.as_bytes());
+                    let clean_rel = rel
+                        .strip_prefix("b/")
+                        .or_else(|| rel.strip_prefix("a/"))
+                        .unwrap_or(rel);
+                    files.push(clean_rel.to_string());
+                    operations.push(serde_json::json!({
+                        "op": "update",
+                        "path": clean_rel,
+                        "resolved_path": target.display().to_string(),
+                        "sha256": sha256,
+                    }));
+                }
+                continue;
+            }
+            i += 1;
+        }
+    }
+
+    if operations.is_empty() {
+        return Err(
+            "patch failed: no valid V4A (`*** Begin Patch` / `*** Update File:`) or unified diff (`--- a/...` / `+++ b/...`) hunks found"
+                .to_string(),
+        );
+    }
+    let count = operations.len();
+    Ok(serde_json::json!({
+        "action": "patch",
+        "files": files,
+        "operations": operations,
+        "count": count,
+    }))
+}
+
+fn apply_patch_context_hunks(existing: &str, hunk_lines: &[&str]) -> Result<String, String> {
+    let had_trailing_newline = existing.ends_with('\n');
+    let mut doc_lines: Vec<String> = existing
+        .replace("\r\n", "\n")
+        .lines()
+        .map(String::from)
+        .collect();
+
+    let mut hunks: Vec<Vec<&str>> = Vec::new();
+    let mut current_hunk: Vec<&str> = Vec::new();
+    for &line in hunk_lines {
+        if line.starts_with("@@") {
+            if !current_hunk.is_empty() {
+                hunks.push(std::mem::take(&mut current_hunk));
+            }
+            continue;
+        }
+        if line.starts_with("\\ No newline") {
+            continue;
+        }
+        current_hunk.push(line);
+    }
+    if !current_hunk.is_empty() {
+        hunks.push(current_hunk);
+    }
+
+    let mut search_cursor = 0usize;
+    for (hunk_idx, hunk) in hunks.iter().enumerate() {
+        let mut old_block: Vec<&str> = Vec::new();
+        let mut new_block: Vec<String> = Vec::new();
+        for &hl in hunk {
+            if let Some(rem) = hl.strip_prefix('-') {
+                old_block.push(rem);
+            } else if let Some(add) = hl.strip_prefix('+') {
+                new_block.push(add.to_string());
+            } else if let Some(ctx) = hl.strip_prefix(' ') {
+                old_block.push(ctx);
+                new_block.push(ctx.to_string());
+            } else {
+                old_block.push(hl);
+                new_block.push(hl.to_string());
+            }
+        }
+
+        if old_block.is_empty() {
+            let pos = search_cursor.min(doc_lines.len());
+            doc_lines.splice(pos..pos, new_block);
+            continue;
+        }
+
+        if let Some(pos) = find_patch_subslice_lines(&doc_lines, &old_block, search_cursor) {
+            let new_len = new_block.len();
+            doc_lines.splice(pos..pos + old_block.len(), new_block);
+            search_cursor = pos + new_len;
+        } else {
+            return Err(format!(
+                "hunk #{} context did not match target file around line `{}`",
+                hunk_idx + 1,
+                old_block.first().unwrap_or(&"")
+            ));
+        }
+    }
+
+    let mut out = doc_lines.join("\n");
+    if had_trailing_newline && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+fn find_patch_subslice_lines(doc: &[String], needle: &[&str], cursor: usize) -> Option<usize> {
+    if needle.len() > doc.len() {
+        return None;
+    }
+    let max_start = doc.len() - needle.len();
+    let start_pos = cursor.min(max_start);
+
+    for idx in (start_pos..=max_start).chain(0..start_pos) {
+        if (0..needle.len()).all(|j| doc[idx + j] == needle[j]) {
+            return Some(idx);
+        }
+    }
+    for idx in (start_pos..=max_start).chain(0..start_pos) {
+        if (0..needle.len()).all(|j| doc[idx + j].trim_end() == needle[j].trim_end()) {
+            return Some(idx);
+        }
+    }
+    for idx in (start_pos..=max_start).chain(0..start_pos) {
+        if (0..needle.len()).all(|j| doc[idx + j].trim() == needle[j].trim()) {
+            return Some(idx);
+        }
+    }
+    None
+}
+
+fn find_closest_lines(content: &str, target: &str) -> String {
+    let first_non_empty = target
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    if first_non_empty.is_empty() {
+        return String::new();
+    }
+    let needle_lower = first_non_empty.to_ascii_lowercase();
+    let tokens: Vec<&str> = needle_lower
+        .split_whitespace()
+        .filter(|t| t.len() >= 3)
+        .take(4)
+        .collect();
+
+    let mut candidates = Vec::new();
+    for (idx, line) in content.lines().enumerate() {
+        let lower = line.to_ascii_lowercase();
+        let hit = lower.contains(&needle_lower)
+            || (!tokens.is_empty() && tokens.iter().all(|t| lower.contains(t)));
+        if hit {
+            candidates.push(format!("  {}: {}", idx + 1, line));
+            if candidates.len() >= 5 {
+                break;
+            }
+        }
+    }
+    if candidates.is_empty() {
+        let preview: Vec<String> = content
+            .lines()
+            .take(5)
+            .enumerate()
+            .map(|(i, l)| format!("  {}: {l}", i + 1))
+            .collect();
+        if preview.is_empty() {
+            return " (file is empty)".to_string();
+        }
+        return format!("\nFirst lines of file:\n{}", preview.join("\n"));
+    }
+    format!("\nClosest lines in file:\n{}", candidates.join("\n"))
+}
+
+fn read_gitignore_patterns(root: &Path) -> Vec<String> {
+    let path = root.join(".gitignore");
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with('!'))
+        .map(|l| l.trim_matches('/').to_string())
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+fn is_gitignored(rel_path: &str, file_name: &str, patterns: &[String]) -> bool {
+    for pat in patterns {
+        if pat == file_name || pat == rel_path {
+            return true;
+        }
+        if glob_matches(pat, rel_path) || (!pat.contains('/') && glob_matches(pat, file_name)) {
+            return true;
+        }
+    }
+    false
+}
+
+fn collect_workspace_files(
+    root: &Path,
+    current: &Path,
+    include_hidden: bool,
+    include_ignored: bool,
+    gitignore_patterns: &[String],
+    out: &mut Vec<String>,
+) {
+    let Ok(rd) = std::fs::read_dir(current) else {
+        return;
+    };
+    let mut entries: Vec<std::fs::DirEntry> = rd.flatten().collect();
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
+        let name_os = entry.file_name();
+        let Some(name) = name_os.to_str() else {
+            continue;
+        };
+        if !include_hidden && name.starts_with('.') {
+            continue;
+        }
+        if !include_ignored && DEFAULT_IGNORED_DIRS.contains(&name) {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(rel) = path.strip_prefix(root) else {
+            continue;
+        };
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        if !include_ignored && is_gitignored(&rel_str, name, gitignore_patterns) {
+            continue;
+        }
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        if ft.is_dir() {
+            collect_workspace_files(
+                root,
+                &path,
+                include_hidden,
+                include_ignored,
+                gitignore_patterns,
+                out,
+            );
+        } else if ft.is_file() {
+            out.push(rel_str);
+        }
+    }
+}
+
+fn glob_matches(pattern: &str, text: &str) -> bool {
+    if let Some(open) = pattern.find('{')
+        && let Some(close_rel) = pattern[open + 1..].find('}')
+    {
+        let close = open + 1 + close_rel;
+        let prefix = &pattern[..open];
+        let suffix = &pattern[close + 1..];
+        for alt in pattern[open + 1..close].split(',') {
+            let expanded = format!("{prefix}{alt}{suffix}");
+            if glob_matches(&expanded, text) {
+                return true;
+            }
+        }
+        return false;
+    }
+    let pat_chars: Vec<char> = pattern.chars().collect();
+    let txt_chars: Vec<char> = text.chars().collect();
+    glob_match_chars(&pat_chars, 0, &txt_chars, 0)
+}
+
+fn glob_match_chars(pat: &[char], mut pi: usize, txt: &[char], mut ti: usize) -> bool {
+    while pi < pat.len() {
+        if pi + 1 < pat.len() && pat[pi] == '*' && pat[pi + 1] == '*' {
+            pi += 2;
+            if pi < pat.len() && pat[pi] == '/' {
+                pi += 1;
+                if glob_match_chars(pat, pi, txt, ti) {
+                    return true;
+                }
+                for idx in ti..txt.len() {
+                    if txt[idx] == '/' && glob_match_chars(pat, pi, txt, idx + 1) {
+                        return true;
+                    }
+                }
+                return false;
+            }
+            if pi == pat.len() {
+                return true;
+            }
+            for idx in ti..=txt.len() {
+                if glob_match_chars(pat, pi, txt, idx) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        match pat[pi] {
+            '*' => {
+                pi += 1;
+                for idx in ti..=txt.len() {
+                    if idx > ti && txt[idx - 1] == '/' {
+                        break;
+                    }
+                    if glob_match_chars(pat, pi, txt, idx) {
+                        return true;
+                    }
+                }
+                return false;
+            }
+            '?' => {
+                if ti >= txt.len() || txt[ti] == '/' {
+                    return false;
+                }
+                pi += 1;
+                ti += 1;
+            }
+            '[' => {
+                if ti >= txt.len() || txt[ti] == '/' {
+                    return false;
+                }
+                if let Some((matched, next_pi)) = match_char_class(pat, pi + 1, txt[ti], false) {
+                    if !matched {
+                        return false;
+                    }
+                    pi = next_pi;
+                    ti += 1;
+                } else {
+                    if pat[pi] != txt[ti] {
+                        return false;
+                    }
+                    pi += 1;
+                    ti += 1;
+                }
+            }
+            c => {
+                if ti >= txt.len() || txt[ti] != c {
+                    return false;
+                }
+                pi += 1;
+                ti += 1;
+            }
+        }
+    }
+    ti == txt.len()
+}
+
+fn match_char_class(
+    pat: &[char],
+    mut idx: usize,
+    ch: char,
+    case_insensitive: bool,
+) -> Option<(bool, usize)> {
+    if idx >= pat.len() {
+        return None;
+    }
+    let negated = if pat[idx] == '!' || pat[idx] == '^' {
+        idx += 1;
+        true
+    } else {
+        false
+    };
+    let target = if case_insensitive {
+        ch.to_ascii_lowercase()
+    } else {
+        ch
+    };
+    let mut found = false;
+    let mut closed = false;
+    while idx < pat.len() {
+        if pat[idx] == ']' {
+            closed = true;
+            idx += 1;
+            break;
+        }
+        let mut start = pat[idx];
+        if start == '\\' && idx + 1 < pat.len() {
+            idx += 1;
+            start = pat[idx];
+        }
+        if idx + 2 < pat.len() && pat[idx + 1] == '-' && pat[idx + 2] != ']' {
+            let end = pat[idx + 2];
+            let (s, e) = if case_insensitive {
+                (start.to_ascii_lowercase(), end.to_ascii_lowercase())
+            } else {
+                (start, end)
+            };
+            if target >= s && target <= e {
+                found = true;
+            }
+            idx += 3;
+        } else {
+            let s = if case_insensitive {
+                start.to_ascii_lowercase()
+            } else {
+                start
+            };
+            if target == s {
+                found = true;
+            }
+            idx += 1;
+        }
+    }
+    if !closed {
+        return None;
+    }
+    Some((if negated { !found } else { found }, idx))
+}
+
+enum GrepMatcher {
+    Literal {
+        needle: String,
+        case_insensitive: bool,
+    },
+    Regex {
+        node: RegexNode,
+        case_insensitive: bool,
+    },
+}
+
+#[derive(Clone)]
+enum RegexNode {
+    Alt(Vec<RegexSeq>),
+}
+
+#[derive(Clone)]
+struct RegexSeq {
+    pieces: Vec<RegexPiece>,
+}
+
+#[derive(Clone)]
+struct RegexPiece {
+    atom: RegexAtom,
+    min: usize,
+    max: Option<usize>,
+}
+
+#[derive(Clone)]
+enum RegexAtom {
+    AnchorStart,
+    AnchorEnd,
+    WordBoundary,
+    AnyChar,
+    Literal(char),
+    Digit(bool),
+    Word(bool),
+    Space(bool),
+    Class {
+        negated: bool,
+        ranges: Vec<(char, char)>,
+    },
+    Group(Box<RegexNode>),
+}
+
+impl GrepMatcher {
+    fn compile(query: &str, mut case_insensitive: bool, force_literal: bool) -> Self {
+        let mut pat = query;
+        if let Some(stripped) = pat.strip_prefix("(?i)") {
+            case_insensitive = true;
+            pat = stripped;
+        }
+        if force_literal {
+            return Self::Literal {
+                needle: if case_insensitive {
+                    pat.to_ascii_lowercase()
+                } else {
+                    pat.to_string()
+                },
+                case_insensitive,
+            };
+        }
+        let chars: Vec<char> = pat.chars().collect();
+        let mut pos = 0;
+        if let Some(node) = parse_regex_alt(&chars, &mut pos, false, case_insensitive)
+            && pos == chars.len()
+        {
+            return Self::Regex {
+                node,
+                case_insensitive,
+            };
+        }
+        Self::Literal {
+            needle: if case_insensitive {
+                pat.to_ascii_lowercase()
+            } else {
+                pat.to_string()
+            },
+            case_insensitive,
+        }
+    }
+
+    fn is_match(&self, line: &str) -> bool {
+        match self {
+            Self::Literal {
+                needle,
+                case_insensitive,
+            } => {
+                if *case_insensitive {
+                    line.to_ascii_lowercase().contains(needle)
+                } else {
+                    line.contains(needle)
+                }
+            }
+            Self::Regex {
+                node,
+                case_insensitive,
+            } => {
+                let chars: Vec<char> = line.chars().collect();
+                let mut steps = 0usize;
+                for start in 0..=chars.len() {
+                    if eval_regex_node(node, &chars, start, *case_insensitive, &mut steps).is_some()
+                    {
+                        return true;
+                    }
+                    if steps > 50_000 {
+                        break;
+                    }
+                }
+                false
+            }
+        }
+    }
+}
+
+fn parse_regex_alt(
+    chars: &[char],
+    pos: &mut usize,
+    in_group: bool,
+    case_insensitive: bool,
+) -> Option<RegexNode> {
+    let mut branches = Vec::new();
+    loop {
+        branches.push(parse_regex_seq(chars, pos, in_group, case_insensitive)?);
+        if *pos < chars.len() && chars[*pos] == '|' {
+            *pos += 1;
+        } else {
+            break;
+        }
+    }
+    Some(RegexNode::Alt(branches))
+}
+
+fn parse_regex_seq(
+    chars: &[char],
+    pos: &mut usize,
+    in_group: bool,
+    case_insensitive: bool,
+) -> Option<RegexSeq> {
+    let mut pieces = Vec::new();
+    while *pos < chars.len() {
+        let ch = chars[*pos];
+        if ch == '|' || (in_group && ch == ')') {
+            break;
+        }
+        if ch == ')' && !in_group {
+            return None;
+        }
+        let atom = match ch {
+            '^' => {
+                *pos += 1;
+                RegexAtom::AnchorStart
+            }
+            '$' => {
+                *pos += 1;
+                RegexAtom::AnchorEnd
+            }
+            '.' => {
+                *pos += 1;
+                RegexAtom::AnyChar
+            }
+            '(' => {
+                *pos += 1;
+                if *pos + 1 < chars.len() && chars[*pos] == '?' && chars[*pos + 1] == ':' {
+                    *pos += 2;
+                }
+                let inner = parse_regex_alt(chars, pos, true, case_insensitive)?;
+                if *pos >= chars.len() || chars[*pos] != ')' {
+                    return None;
+                }
+                *pos += 1;
+                RegexAtom::Group(Box::new(inner))
+            }
+            '[' => {
+                *pos += 1;
+                parse_regex_class(chars, pos, case_insensitive)?
+            }
+            '\\' => {
+                *pos += 1;
+                if *pos >= chars.len() {
+                    return None;
+                }
+                let esc = chars[*pos];
+                *pos += 1;
+                match esc {
+                    'd' => RegexAtom::Digit(true),
+                    'D' => RegexAtom::Digit(false),
+                    'w' => RegexAtom::Word(true),
+                    'W' => RegexAtom::Word(false),
+                    's' => RegexAtom::Space(true),
+                    'S' => RegexAtom::Space(false),
+                    'b' => RegexAtom::WordBoundary,
+                    'n' => RegexAtom::Literal('\n'),
+                    'r' => RegexAtom::Literal('\r'),
+                    't' => RegexAtom::Literal('\t'),
+                    other => RegexAtom::Literal(if case_insensitive {
+                        other.to_ascii_lowercase()
+                    } else {
+                        other
+                    }),
+                }
+            }
+            '*' | '+' | '?' => return None,
+            other => {
+                *pos += 1;
+                RegexAtom::Literal(if case_insensitive {
+                    other.to_ascii_lowercase()
+                } else {
+                    other
+                })
+            }
+        };
+        let (min, max) = if *pos < chars.len() {
+            match chars[*pos] {
+                '*' => {
+                    *pos += 1;
+                    if *pos < chars.len() && chars[*pos] == '?' {
+                        *pos += 1;
+                    }
+                    (0, None)
+                }
+                '+' => {
+                    *pos += 1;
+                    if *pos < chars.len() && chars[*pos] == '?' {
+                        *pos += 1;
+                    }
+                    (1, None)
+                }
+                '?' => {
+                    *pos += 1;
+                    if *pos < chars.len() && chars[*pos] == '?' {
+                        *pos += 1;
+                    }
+                    (0, Some(1))
+                }
+                '{' => {
+                    if let Some((m, mx, next_p)) = parse_bounded_rep(chars, *pos + 1) {
+                        *pos = next_p;
+                        (m, mx)
+                    } else {
+                        (1, Some(1))
+                    }
+                }
+                _ => (1, Some(1)),
+            }
+        } else {
+            (1, Some(1))
+        };
+        pieces.push(RegexPiece { atom, min, max });
+    }
+    Some(RegexSeq { pieces })
+}
+
+fn parse_bounded_rep(chars: &[char], mut idx: usize) -> Option<(usize, Option<usize>, usize)> {
+    let start = idx;
+    while idx < chars.len() && chars[idx].is_ascii_digit() {
+        idx += 1;
+    }
+    if idx == start || idx >= chars.len() {
+        return None;
+    }
+    let min: usize = chars[start..idx].iter().collect::<String>().parse().ok()?;
+    if chars[idx] == '}' {
+        return Some((min, Some(min), idx + 1));
+    }
+    if chars[idx] != ',' {
+        return None;
+    }
+    idx += 1;
+    let max_start = idx;
+    while idx < chars.len() && chars[idx].is_ascii_digit() {
+        idx += 1;
+    }
+    if idx >= chars.len() || chars[idx] != '}' {
+        return None;
+    }
+    let max = if idx == max_start {
+        None
+    } else {
+        Some(
+            chars[max_start..idx]
+                .iter()
+                .collect::<String>()
+                .parse::<usize>()
+                .ok()?,
+        )
+    };
+    Some((min, max, idx + 1))
+}
+
+fn parse_regex_class(chars: &[char], pos: &mut usize, case_insensitive: bool) -> Option<RegexAtom> {
+    if *pos >= chars.len() {
+        return None;
+    }
+    let negated = if chars[*pos] == '^' {
+        *pos += 1;
+        true
+    } else {
+        false
+    };
+    let mut ranges = Vec::new();
+    let mut closed = false;
+    while *pos < chars.len() {
+        if chars[*pos] == ']' && !ranges.is_empty() {
+            closed = true;
+            *pos += 1;
+            break;
+        }
+        let mut c = chars[*pos];
+        *pos += 1;
+        if c == '\\' {
+            if *pos >= chars.len() {
+                return None;
+            }
+            let esc = chars[*pos];
+            *pos += 1;
+            match esc {
+                'd' => {
+                    ranges.push(('0', '9'));
+                    continue;
+                }
+                's' => {
+                    for sp in [' ', '\t', '\n', '\r'] {
+                        ranges.push((sp, sp));
+                    }
+                    continue;
+                }
+                'w' => {
+                    ranges.push(('a', 'z'));
+                    ranges.push(('A', 'Z'));
+                    ranges.push(('0', '9'));
+                    ranges.push(('_', '_'));
+                    continue;
+                }
+                other => c = other,
+            }
+        }
+        if *pos + 1 < chars.len() && chars[*pos] == '-' && chars[*pos + 1] != ']' {
+            *pos += 1;
+            let mut end = chars[*pos];
+            *pos += 1;
+            if end == '\\' && *pos < chars.len() {
+                end = chars[*pos];
+                *pos += 1;
+            }
+            let (s, e) = if case_insensitive {
+                (c.to_ascii_lowercase(), end.to_ascii_lowercase())
+            } else {
+                (c, end)
+            };
+            ranges.push((s, e));
+        } else {
+            let s = if case_insensitive {
+                c.to_ascii_lowercase()
+            } else {
+                c
+            };
+            ranges.push((s, s));
+        }
+    }
+    if !closed {
+        return None;
+    }
+    Some(RegexAtom::Class { negated, ranges })
+}
+
+fn is_word_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+fn eval_regex_node(
+    node: &RegexNode,
+    chars: &[char],
+    idx: usize,
+    case_insensitive: bool,
+    steps: &mut usize,
+) -> Option<usize> {
+    let RegexNode::Alt(branches) = node;
+    for seq in branches {
+        if let Some(end) = eval_regex_seq(&seq.pieces, chars, idx, case_insensitive, steps) {
+            return Some(end);
+        }
+    }
+    None
+}
+
+fn eval_regex_seq(
+    pieces: &[RegexPiece],
+    chars: &[char],
+    idx: usize,
+    case_insensitive: bool,
+    steps: &mut usize,
+) -> Option<usize> {
+    *steps += 1;
+    if *steps > 50_000 {
+        return None;
+    }
+    let Some((first, rest)) = pieces.split_first() else {
+        return Some(idx);
+    };
+    let max_rep = first.max.unwrap_or(chars.len().saturating_sub(idx) + 1);
+    let mut positions = vec![idx];
+    let mut cur = idx;
+    for _ in 0..max_rep {
+        if let Some(next_idx) = eval_regex_atom(&first.atom, chars, cur, case_insensitive, steps) {
+            if next_idx == cur && positions.len() > first.min {
+                break;
+            }
+            positions.push(next_idx);
+            cur = next_idx;
+        } else {
+            break;
+        }
+    }
+    if positions.len() <= first.min {
+        return None;
+    }
+    for &pos in positions[first.min..].iter().rev() {
+        if let Some(end) = eval_regex_seq(rest, chars, pos, case_insensitive, steps) {
+            return Some(end);
+        }
+    }
+    None
+}
+
+fn eval_regex_atom(
+    atom: &RegexAtom,
+    chars: &[char],
+    idx: usize,
+    case_insensitive: bool,
+    steps: &mut usize,
+) -> Option<usize> {
+    match atom {
+        RegexAtom::AnchorStart => (idx == 0).then_some(idx),
+        RegexAtom::AnchorEnd => (idx == chars.len()).then_some(idx),
+        RegexAtom::WordBoundary => {
+            let prev_w = idx > 0 && is_word_char(chars[idx - 1]);
+            let next_w = idx < chars.len() && is_word_char(chars[idx]);
+            (prev_w != next_w).then_some(idx)
+        }
+        RegexAtom::AnyChar => (idx < chars.len() && chars[idx] != '\n').then_some(idx + 1),
+        RegexAtom::Literal(expected) => {
+            if idx >= chars.len() {
+                return None;
+            }
+            let actual = if case_insensitive {
+                chars[idx].to_ascii_lowercase()
+            } else {
+                chars[idx]
+            };
+            (actual == *expected).then_some(idx + 1)
+        }
+        RegexAtom::Digit(want) => {
+            if idx >= chars.len() {
+                return None;
+            }
+            (chars[idx].is_ascii_digit() == *want).then_some(idx + 1)
+        }
+        RegexAtom::Word(want) => {
+            if idx >= chars.len() {
+                return None;
+            }
+            (is_word_char(chars[idx]) == *want).then_some(idx + 1)
+        }
+        RegexAtom::Space(want) => {
+            if idx >= chars.len() {
+                return None;
+            }
+            (chars[idx].is_ascii_whitespace() == *want).then_some(idx + 1)
+        }
+        RegexAtom::Class { negated, ranges } => {
+            if idx >= chars.len() {
+                return None;
+            }
+            let c = if case_insensitive {
+                chars[idx].to_ascii_lowercase()
+            } else {
+                chars[idx]
+            };
+            let hit = ranges.iter().any(|&(s, e)| c >= s && c <= e);
+            let ok = if *negated { !hit } else { hit };
+            ok.then_some(idx + 1)
+        }
+        RegexAtom::Group(inner) => eval_regex_node(inner, chars, idx, case_insensitive, steps),
+    }
 }
 
 fn agent_matches_query(agent: &AgentView, query: &str) -> bool {
@@ -2572,8 +6716,222 @@ pub(crate) async fn request_naming(
     Ok((status, bytes))
 }
 
+/// Parse an explicit bounded read without turning malformed bounds into absence.
+fn parse_sequence_range(range: Option<&str>) -> Result<(Option<i64>, Option<i64>), String> {
+    let Some(range) = range.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok((None, None));
+    };
+    let range = range.strip_prefix("seq:").unwrap_or(range).trim();
+    let parse = |raw: &str| -> Result<i64, String> {
+        let value = raw
+            .trim()
+            .parse::<i64>()
+            .map_err(|_| "range must be seq:<start>-<end> or seq:<number>".to_string())?;
+        if value < 0 {
+            return Err("sequence bounds must be nonnegative".into());
+        }
+        Ok(value)
+    };
+    let (start, end) = match range.split_once('-') {
+        Some((start, end)) => (parse(start)?, parse(end)?),
+        None => {
+            let value = parse(range)?;
+            (value, value)
+        }
+    };
+    if start > end {
+        return Err("sequence range start must not exceed end".into());
+    }
+    Ok((Some(start), Some(end)))
+}
+
 #[cfg(test)]
 mod spawn_args_tests {
+    #[tokio::test]
+    async fn mcp_and_cli_use_only_primary_socket_and_preserve_its_errors() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("anyagents.sock");
+        let primary = tokio::net::UnixListener::bind(&socket).unwrap();
+        let admin = tokio::net::UnixListener::bind(dir.path().join("admin.sock")).unwrap();
+        let admin_calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&admin_calls);
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, status, body) = tokio::select! {
+                    accepted = primary.accept() => (accepted.unwrap().0, "500 Internal Server Error", r#"{"error":"primary refused"}"#),
+                    accepted = admin.accept() => {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                        (accepted.unwrap().0, "200 OK", r#"{"agents":[]}"#)
+                    }
+                };
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(stream.read_u8().await.unwrap());
+                }
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let client = Client {
+            socket,
+            config: dir.path().join("config"),
+            capability: "test-capability".into(),
+        };
+        assert_eq!(
+            client
+                .request_method::<serde_json::Value>("POST", "/v1/agents", None)
+                .await
+                .unwrap_err(),
+            "primary refused"
+        );
+        assert_eq!(client.get_agents().await.err().unwrap(), "primary refused");
+        let data = dir.path().to_owned();
+        let error = tokio::task::spawn_blocking(move || {
+            crate::client::call::<serde_json::Value>(
+                &data,
+                "POST",
+                "/v1/agents",
+                None,
+                &crate::client::Authority::None,
+            )
+            .unwrap_err()
+        })
+        .await
+        .unwrap();
+        assert_eq!(error, "primary refused");
+        assert_eq!(admin_calls.load(Ordering::SeqCst), 0);
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[test]
+    fn send_turn_result_ends_closing_tokens_without_an_interrupt_failure() {
+        let closed = send_turn_result(
+            SendResponse {
+                deliveries: vec![],
+                skipped: vec![],
+            },
+            true,
+        )
+        .unwrap();
+        assert_eq!(closed["status"], "turn_complete_no_reply_sent");
+        assert!(
+            closed["turn_complete_hint"]
+                .as_str()
+                .unwrap()
+                .contains("Do not call send or any other tool again")
+        );
+        let normal = send_turn_result(
+            SendResponse {
+                deliveries: vec![],
+                skipped: vec![],
+            },
+            false,
+        )
+        .unwrap();
+        assert!(normal.get("status").is_none());
+        assert!(
+            normal["turn_complete_hint"]
+                .as_str()
+                .unwrap()
+                .contains("without calling send again")
+        );
+        assert_eq!(normal["deliveries"], json!([]));
+    }
+
+    #[test]
+    fn send_closing_sentinels_are_exact_text_only_tokens() {
+        for text in [
+            "NO_REPLY",
+            " End. ",
+            "end",
+            "停止。",
+            "停止",
+            "No more.",
+            "NO MORE",
+            "。",
+            "Done.",
+            "done",
+            "終了。",
+            "Final!",
+            "done...",
+            " \nNO_REPLY。 \n",
+        ] {
+            assert!(
+                SendRequest {
+                    text: text.into(),
+                    ..Default::default()
+                }
+                .is_turn_closing_sentinel(),
+                "{text:?}"
+            );
+        }
+        for text in [
+            "",
+            " ",
+            "End of report.",
+            "Done. The build passed.",
+            "NO_REPLY is a token",
+            "Final version",
+            "Stopping",
+            "!",
+            ".",
+        ] {
+            assert!(
+                !SendRequest {
+                    text: text.into(),
+                    ..Default::default()
+                }
+                .is_turn_closing_sentinel(),
+                "{text:?}"
+            );
+        }
+        for attachment in [
+            json!({"media":{"kind":"photo","source":"fixture.png"}}),
+            json!({"location":{"latitude":1.0,"longitude":2.0}}),
+            json!({"poll":{"question":"End?","options":["yes","no"]}}),
+            json!({"checklist":{"title":"End","tasks":["finish"]}}),
+            json!({"article":{"title":"End","content":"report"}}),
+            json!({"quote":{"text":"real quoted content"}}),
+        ] {
+            let mut value = attachment;
+            value["text"] = json!("End.");
+            let request: SendRequest = serde_json::from_value(value).unwrap();
+            assert!(!request.is_turn_closing_sentinel());
+        }
+    }
+
+    #[test]
+    fn explicit_sequence_range_refuses_invalid_bounds() {
+        for range in [
+            "seq:bad-bad",
+            "seq:1-bad",
+            "seq:bad-2",
+            "seq:5-2",
+            "seq:-1",
+            "seq:1-2-3",
+            "seq:9223372036854775808",
+        ] {
+            assert!(super::parse_sequence_range(Some(range)).is_err(), "{range}");
+        }
+        assert_eq!(
+            super::parse_sequence_range(Some("seq:1-2")).unwrap(),
+            (Some(1), Some(2))
+        );
+        assert_eq!(
+            super::parse_sequence_range(Some("3")).unwrap(),
+            (Some(3), Some(3))
+        );
+        assert_eq!(super::parse_sequence_range(None).unwrap(), (None, None));
+    }
+
     use super::*;
     use serde_json::json;
 
@@ -2909,6 +7267,7 @@ mod spawn_args_tests {
             agent: AgentRef {
                 id: parent_id,
                 name: "parent".into(),
+                workdir: None,
             },
             client: Client {
                 socket,
@@ -2987,5 +7346,658 @@ mod spawn_args_tests {
                 Some("Private standing SOP")
             );
         }
+    }
+
+    #[tokio::test]
+    async fn files_tool_supports_read_write_atomic_multi_edit_glob_and_grep() {
+        let dir = tempfile::tempdir().unwrap();
+        let workdir = dir.path().join("work");
+        std::fs::create_dir_all(&workdir).unwrap();
+        std::fs::write(workdir.join(".gitignore"), "ignored_dir\n*.log\n").unwrap();
+        std::fs::create_dir_all(workdir.join("target")).unwrap();
+        std::fs::write(workdir.join("target/skip.rs"), "fn skipped() {}\n").unwrap();
+        std::fs::create_dir_all(workdir.join("ignored_dir")).unwrap();
+        std::fs::write(workdir.join("ignored_dir/skip2.rs"), "fn skipped2() {}\n").unwrap();
+
+        let mcp = AgentMcp {
+            agent: AgentRef {
+                id: AgentId::generate(),
+                name: "tester".into(),
+                workdir: Some(workdir.clone()),
+            },
+            client: Client {
+                socket: dir.path().join("unused.sock"),
+                config: dir.path().join("config"),
+                capability: "test-cap".into(),
+            },
+        };
+
+        // 1. Write a nested file (auto-creating parent directories).
+        let write_res = mcp
+            .files(Parameters(
+                serde_json::from_value(json!({
+                    "action": "write",
+                    "path": "src/engine.rs",
+                    "content": "pub fn alpha() -> i32 {\n    10\n}\npub fn beta() -> i32 {\n    20\n}\n"
+                }))
+                .unwrap(),
+            ))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(write_res["action"], "write");
+        assert_eq!(write_res["bytes_written"], 65);
+        let initial_sha = write_res["sha256"].as_str().unwrap().to_string();
+        assert_eq!(initial_sha.len(), 64);
+
+        // 2. Append to the file.
+        let append_res = mcp
+            .files(Parameters(
+                serde_json::from_value(json!({
+                    "action": "write",
+                    "path": "src/engine.rs",
+                    "content": "pub fn gamma() -> i32 {\n    30\n}\n",
+                    "append": true
+                }))
+                .unwrap(),
+            ))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(append_res["append"], true);
+        assert_ne!(append_res["sha256"].as_str().unwrap(), initial_sha);
+
+        // 3. Read line range.
+        let read_res = mcp
+            .files(Parameters(
+                serde_json::from_value(json!({
+                    "action": "read",
+                    "path": "src/engine.rs",
+                    "start_line": 4,
+                    "end_line": 6
+                }))
+                .unwrap(),
+            ))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(read_res["start_line"], 4);
+        assert_eq!(read_res["end_line"], 6);
+        assert_eq!(read_res["total_lines"], 9);
+        assert_eq!(read_res["content"], "pub fn beta() -> i32 {\n    20\n}");
+        assert!(
+            read_res["numbered"]
+                .as_str()
+                .unwrap()
+                .contains("4: pub fn beta()")
+        );
+
+        // 4. Atomic multi_edit: if second edit fails, first edit must NOT be written to disk.
+        let failed_edit = mcp
+            .files(Parameters(
+                serde_json::from_value(json!({
+                    "action": "multi_edit",
+                    "path": "src/engine.rs",
+                    "edits": [
+                        { "target": "    10", "replacement": "    100" },
+                        { "target": "pub fn beta() -> u64", "replacement": "pub fn beta() -> i64" }
+                    ]
+                }))
+                .unwrap(),
+            ))
+            .await;
+        let err_msg = match failed_edit {
+            Err(msg) => msg,
+            Ok(_) => panic!("expected missing target edit to fail"),
+        };
+        assert!(err_msg.contains("target` not found"), "{err_msg}");
+        assert!(err_msg.contains("4: pub fn beta() -> i32"), "{err_msg}");
+        let unchanged = std::fs::read_to_string(workdir.join("src/engine.rs")).unwrap();
+        assert!(unchanged.contains("    10\n"));
+
+        // 5. Valid multi_edit succeeds atomically.
+        let edit_res = mcp
+            .files(Parameters(
+                serde_json::from_value(json!({
+                    "action": "multi_edit",
+                    "path": "src/engine.rs",
+                    "edits": [
+                        { "target": "    10", "replacement": "    100" },
+                        { "target": "    20", "replacement": "    200\n    + 1" }
+                    ]
+                }))
+                .unwrap(),
+            ))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(edit_res["replacements_made"], 2);
+        assert_eq!(edit_res["lines_removed"], 2);
+        assert_eq!(edit_res["lines_added"], 3);
+
+        // 6. Glob respects .gitignore and skips target/.git by default.
+        let glob_res = mcp
+            .files(Parameters(
+                serde_json::from_value(json!({
+                    "action": "glob",
+                    "pattern": "**/*.rs"
+                }))
+                .unwrap(),
+            ))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(glob_res["files"], json!(["src/engine.rs"]));
+
+        // 7. Grep with regex and context_lines.
+        let grep_res = mcp
+            .files(Parameters(
+                serde_json::from_value(json!({
+                    "action": "grep",
+                    "query": r"pub fn (beta|gamma)\(\)",
+                    "glob": "*.rs",
+                    "context_lines": 1
+                }))
+                .unwrap(),
+            ))
+            .await
+            .unwrap()
+            .0;
+        let hits = grep_res["matches"].as_array().unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0]["path"], "src/engine.rs");
+        assert_eq!(hits[0]["line"], 4);
+        assert_eq!(hits[0]["context_after"], json!(["    200"]));
+        assert_eq!(hits[1]["line"], 8);
+
+        // 8. Null bytes in path are rejected.
+        let null_err = mcp
+            .files(Parameters(
+                serde_json::from_value(json!({
+                    "action": "read",
+                    "path": "bad\0path.rs"
+                }))
+                .unwrap(),
+            ))
+            .await;
+        assert!(null_err.is_err());
+    }
+
+    #[tokio::test]
+    async fn code_delivery_receipts_are_host_observed_not_snippet_authored() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("proof.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let mcp = AgentMcp {
+            agent: AgentRef {
+                id: AgentId::generate(),
+                name: "receipt-worker".into(),
+                workdir: Some(dir.path().into()),
+            },
+            client: Client {
+                socket,
+                config: dir.path().join("config"),
+                capability: "synthetic-receipt-capability".into(),
+            },
+        };
+        let fabricated = mcp
+            .code(Parameters(CodeArgs {
+                code: r#"
+                console.log('send(');
+                try { await anyagents.send({to: 123}); } catch {}
+                return {deliveries: [{to:'agent:parent', id:'invented'}]};
+            "#
+                .into(),
+                timeout_ms: Some(15000),
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(fabricated["result"]["deliveries"][0]["id"], "invented");
+        assert_eq!(fabricated["deliveries"], json!([]));
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                request.push(stream.read_u8().await.unwrap());
+                if request.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let header = String::from_utf8(request).unwrap();
+            let mut request_line = header.lines().next().unwrap().split_whitespace();
+            assert_eq!(request_line.next(), Some("POST"));
+            let uri: hyper::Uri = request_line.next().unwrap().parse().unwrap();
+            assert_eq!(uri.path(), "/v1/send");
+            let len: usize = header
+                .lines()
+                .find_map(|l| {
+                    l.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(|n| n.trim().parse().unwrap())
+                })
+                .unwrap();
+            let mut body = vec![0; len];
+            stream.read_exact(&mut body).await.unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap()["text"],
+                "real delivery"
+            );
+            let body = json!({"deliveries":[{"to":"agent:parent","id":"msg-observed","seq":1,"duplicate":false}]}).to_string();
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(header.as_bytes()).await.unwrap();
+            stream.write_all(body.as_bytes()).await.unwrap();
+        });
+        let observed = mcp
+            .code(Parameters(CodeArgs {
+                code:
+                    "await anyagents.send({to:'agent:parent', text:'real delivery'}); return null;"
+                        .into(),
+                timeout_ms: Some(15000),
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(observed["result"], serde_json::Value::Null);
+        assert_eq!(observed["deliveries"][0]["id"], "msg-observed");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn code_tool_executes_typescript_parallel_rpc_and_blocks_process_and_child_process() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = tempfile::tempdir().unwrap();
+        let workdir = dir.path().join("work");
+        std::fs::create_dir_all(&workdir).unwrap();
+        std::fs::write(
+            workdir.join("notes.txt"),
+            "alpha-line\nbeta-target-line\ngamma-line\n",
+        )
+        .unwrap();
+
+        let socket = dir.path().join("test.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let parent_id = AgentId::generate();
+        let population = vec![
+            dummy_agent_view("agt_1", "alpha-worker", "running", "working", Some("First")),
+            dummy_agent_view("agt_2", "beta-worker", "idle", "idle", Some("Second")),
+        ];
+        let body = serde_json::to_vec(&AgentsResponse {
+            agents: population,
+            gateway: None,
+        })
+        .unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let byte = stream.read_u8().await.unwrap();
+                request.push(byte);
+                if request.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(header.as_bytes()).await.unwrap();
+            stream.write_all(&body).await.unwrap();
+        });
+
+        let mcp = AgentMcp {
+            agent: AgentRef {
+                id: parent_id,
+                name: "parent".into(),
+                workdir: Some(workdir.clone()),
+            },
+            client: Client {
+                socket,
+                config: dir.path().join("config"),
+                capability: "synthetic-test-capability".into(),
+            },
+        };
+
+        // 1. Parallel Promise.all across `tools.anyagents.agents` and `tools.anyagents.files` / `tools.workspace` with TypeScript syntax.
+        let code_res = mcp
+            .code(Parameters(CodeArgs {
+                code: r#"
+                    interface Summary {
+                        activeAgents: string[];
+                        matchedLines: number[];
+                        editedSha: string;
+                    }
+                    const [roster, grepRes, editRes] = await Promise.all([
+                        tools.anyagents.agents({ action: "list", state: "all" }),
+                        tools.workspace.grep({ query: "beta-target", path: "notes.txt" }),
+                        tools.workspace.write({ path: "computed.txt", content: "ok\n" }),
+                    ]);
+                    console.log("parallel calls done", roster.agents.length);
+                    const out: Summary = {
+                        activeAgents: roster.agents
+                            .filter((a: any) => a.state === "running")
+                            .map((a: any) => a.name),
+                        matchedLines: grepRes.matches.map((m: any) => m.line),
+                        editedSha: editRes.sha256,
+                    };
+                    return out;
+                "#
+                .to_string(),
+                timeout_ms: Some(15_000),
+            }))
+            .await
+            .unwrap()
+            .0;
+
+        assert_eq!(code_res["truncated"], false);
+        assert_eq!(code_res["result"]["activeAgents"], json!(["alpha-worker"]));
+        assert_eq!(code_res["result"]["matchedLines"], json!([2]));
+        assert_eq!(code_res["logs"], json!(["parallel calls done 2"]));
+        assert!(workdir.join("computed.txt").is_file());
+        server.await.unwrap();
+
+        // 2. Verify capability sandbox blocks `process`, `process.env`, `require`, `child_process`, `fs`, `fetch`, and Function constructor escapes.
+        let sandbox_probe = mcp
+            .code(Parameters(CodeArgs {
+                code: r#"
+                    let constructorEscapeBlocked = false;
+                    try {
+                        (tools as any).constructor.constructor("return process")();
+                    } catch {
+                        constructorEscapeBlocked = true;
+                    }
+                    let fnEscapeBlocked = false;
+                    try {
+                        tools.anyagents.files.constructor("return process")();
+                    } catch {
+                        fnEscapeBlocked = true;
+                    }
+                    return {
+                        typeofProcess: typeof (globalThis as any).process,
+                        typeofRequire: typeof (globalThis as any).require,
+                        typeofChildProcess: typeof (globalThis as any).child_process,
+                        typeofFs: typeof (globalThis as any).fs,
+                        typeofFetch: typeof (globalThis as any).fetch,
+                        typeofBun: typeof (globalThis as any).Bun,
+                        constructorEscapeBlocked,
+                        fnEscapeBlocked,
+                    };
+                "#
+                .to_string(),
+                timeout_ms: Some(10_000),
+            }))
+            .await
+            .unwrap()
+            .0;
+
+        assert_eq!(
+            sandbox_probe["result"],
+            json!({
+                "typeofProcess": "undefined",
+                "typeofRequire": "undefined",
+                "typeofChildProcess": "undefined",
+                "typeofFs": "undefined",
+                "typeofFetch": "undefined",
+                "typeofBun": "undefined",
+                "constructorEscapeBlocked": true,
+                "fnEscapeBlocked": true,
+            })
+        );
+
+        // 3. Direct attempt to call `require("child_process")` or read `process.env` throws an error.
+        for forbidden_snippet in [
+            r#"return require("child_process").execSync("id").toString();"#,
+            r#"return process.env.PATH;"#,
+        ] {
+            let res = mcp
+                .code(Parameters(CodeArgs {
+                    code: forbidden_snippet.to_string(),
+                    timeout_ms: Some(5_000),
+                }))
+                .await;
+            assert!(
+                res.is_err(),
+                "expected `{forbidden_snippet}` to fail in sandbox"
+            );
+        }
+
+        // 4. Oversized return payloads (>48 KB) are safely truncated with `truncated: true`.
+        let huge_res = mcp
+            .code(Parameters(CodeArgs {
+                code: r#"return "x".repeat(60000);"#.to_string(),
+                timeout_ms: Some(10_000),
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(huge_res["truncated"], true);
+        assert!(huge_res["original_bytes"].as_u64().unwrap() >= 60_000);
+        assert!(
+            huge_res["result"]
+                .as_str()
+                .unwrap()
+                .contains("result truncated:")
+        );
+
+        // 5. Pure Code Mode exposes only `code` in CANONICAL_MCP_TOOLS, and `anyagents.memory` + `workspace.{list,patch,edit}` work end-to-end inside `code`.
+        assert_eq!(CANONICAL_MCP_TOOLS, &["code"]);
+        std::fs::write(
+            workdir.join("indent.rs"),
+            "fn outer() {\n        let value = 41;\n        println!(\"{value}\");\n}\n",
+        )
+        .unwrap();
+
+        let evo_res = mcp
+            .code(Parameters(CodeArgs {
+                code: r##"
+                    await anyagents.memory.write({
+                        topic: "build-invariants",
+                        description: "Verified build and deployment invariants",
+                        content: "# Build Invariants\n\nAlways verify live receipts.\n",
+                    });
+                    const readTopic = await anyagents.memory.read("build-invariants");
+                    const listedMem = await anyagents.memory.list();
+                    const searchedMem = await anyagents.memory.search("receipts");
+                    const deletedMem = await anyagents.memory.delete("build-invariants");
+
+                    // Indentation-tolerant edit (target has 0 spaces, file has 8 spaces)
+                    await workspace.edit({
+                        path: "indent.rs",
+                        target: "let value = 41;\nprintln!(\"{value}\");",
+                        replacement: "let value = 42;\nprintln!(\"answer={value}\");",
+                    });
+
+                    // V4A patch (Add + Update)
+                    await workspace.patch([
+                        "*** Begin Patch",
+                        "*** Add File: src/patched.txt",
+                        "+line one",
+                        "+line two",
+                        "*** Update File: src/patched.txt",
+                        "@@",
+                        " line one",
+                        "-line two",
+                        "+line two updated",
+                        "*** End Patch",
+                    ].join("\n"));
+
+                    // Unified diff patch
+                    await workspace.patch([
+                        "--- a/src/patched.txt",
+                        "+++ b/src/patched.txt",
+                        "@@ -1,2 +1,3 @@",
+                        " line one",
+                        " line two updated",
+                        "+line three unified",
+                    ].join("\n"));
+
+                    const dirList = await workspace.list("src");
+                    const patchedRead = await workspace.read("src/patched.txt");
+                    const indentRead = await workspace.read("indent.rs");
+                    const execRes = await tools.workspace.exec({ cmd: "printf 'hello-%s' exec", cwd: "src" });
+                    const hasWebHelpers = typeof tools.web.search === "function"
+                        && typeof tools.web.fetch === "function"
+                        && typeof web.search === "function"
+                        && typeof anyagents.web.fetch === "function";
+
+                    return {
+                        topicSlug: readTopic.topic,
+                        hasFact: readTopic.content.includes("Always verify live receipts."),
+                        listedCount: listedMem.count,
+                        searchCount: searchedMem.count,
+                        deleted: deletedMem.deleted,
+                        dirNames: dirList.entries.map((e: any) => e.name),
+                        patchedContent: patchedRead.content,
+                        indentContent: indentRead.content,
+                        execExit: execRes.exit_code,
+                        execStdout: execRes.stdout,
+                        hasWebHelpers,
+                    };
+                "##
+                .to_string(),
+                timeout_ms: Some(15_000),
+            }))
+            .await
+            .unwrap()
+            .0;
+
+        assert_eq!(evo_res["result"]["topicSlug"], "build-invariants");
+        assert_eq!(evo_res["result"]["hasFact"], true);
+        assert_eq!(evo_res["result"]["listedCount"], 1);
+        assert_eq!(evo_res["result"]["searchCount"], 1);
+        assert_eq!(evo_res["result"]["deleted"], true);
+        assert_eq!(evo_res["result"]["dirNames"], json!(["patched.txt"]));
+        assert_eq!(
+            evo_res["result"]["patchedContent"],
+            "line one\nline two updated\nline three unified"
+        );
+        assert_eq!(
+            evo_res["result"]["indentContent"],
+            "fn outer() {\n        let value = 42;\n        println!(\"answer={value}\");\n}"
+        );
+        assert_eq!(evo_res["result"]["execExit"], 0);
+        assert_eq!(evo_res["result"]["execStdout"], "hello-exec");
+        assert_eq!(evo_res["result"]["hasWebHelpers"], true);
+    }
+
+    #[tokio::test]
+    async fn files_and_code_tools_emit_native_mcp_multimedia_content_blocks() {
+        use rmcp::handler::server::tool::IntoCallToolResult as _;
+        let dir = tempfile::tempdir().unwrap();
+        let workdir = dir.path().join("work");
+        std::fs::create_dir_all(&workdir).unwrap();
+
+        // 1. Write a valid PNG header (640x480), WAV header, and minimal PDF file.
+        let mut png_bytes = Vec::new();
+        png_bytes.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+        png_bytes.extend_from_slice(&13u32.to_be_bytes());
+        png_bytes.extend_from_slice(b"IHDR");
+        png_bytes.extend_from_slice(&640u32.to_be_bytes());
+        png_bytes.extend_from_slice(&480u32.to_be_bytes());
+        png_bytes.extend_from_slice(&[8, 6, 0, 0, 0, 0, 0, 0, 0]);
+        std::fs::write(workdir.join("frame.png"), &png_bytes).unwrap();
+
+        let mut wav_bytes = Vec::new();
+        wav_bytes.extend_from_slice(b"RIFF");
+        wav_bytes.extend_from_slice(&36u32.to_le_bytes());
+        wav_bytes.extend_from_slice(b"WAVEfmt ");
+        wav_bytes.extend_from_slice(&[16, 0, 0, 0, 1, 0, 1, 0]);
+        std::fs::write(workdir.join("clip.wav"), &wav_bytes).unwrap();
+
+        let pdf_bytes = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n";
+        std::fs::write(workdir.join("spec.pdf"), pdf_bytes).unwrap();
+
+        let mcp = AgentMcp {
+            agent: AgentRef {
+                id: AgentId::generate(),
+                name: "multimedia-worker".into(),
+                workdir: Some(workdir.clone()),
+            },
+            client: Client {
+                socket: dir.path().join("unused.sock"),
+                config: dir.path().join("config"),
+                capability: "test-cap".into(),
+            },
+        };
+
+        // Direct `files` read on PNG returns clean metadata + native MCP Image ContentBlock.
+        let MultimediaJson(png_json, png_media) = mcp
+            .files(Parameters(
+                serde_json::from_value(json!({
+                    "action": "read",
+                    "path": "frame.png",
+                }))
+                .unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(png_json["mime_type"], "image/png");
+        assert_eq!(png_json["media_kind"], "image");
+        assert_eq!(png_json["width"], 640);
+        assert_eq!(png_json["height"], 480);
+        assert_eq!(png_json["image_attached"], true);
+        assert_eq!(png_media.len(), 1);
+        match &png_media[0] {
+            rmcp::model::ContentBlock::Image(img) => {
+                assert_eq!(img.mime_type, "image/png");
+                assert_eq!(img.data, crate::computer::base64_encode(&png_bytes));
+            }
+            other => panic!("expected ContentBlock::Image, got {other:?}"),
+        }
+
+        // Calling `workspace.read` inside `code` attaches Image, Audio, and PDF Resource ContentBlocks to the outer `code` tool result!
+        let code_multimedia = mcp
+            .code(Parameters(CodeArgs {
+                code: r#"
+                    const [img, aud, doc] = await Promise.all([
+                        workspace.read("frame.png"),
+                        workspace.read("clip.wav"),
+                        workspace.read("spec.pdf"),
+                    ]);
+                    return {
+                        imgDims: [img.width, img.height],
+                        audMime: aud.mime_type,
+                        docMime: doc.mime_type,
+                    };
+                "#
+                .to_string(),
+                timeout_ms: Some(15_000),
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(code_multimedia.0["result"]["imgDims"], json!([640, 480]));
+        assert_eq!(code_multimedia.0["result"]["audMime"], "audio/wav");
+        assert_eq!(code_multimedia.0["result"]["docMime"], "application/pdf");
+        assert!(
+            code_multimedia.1.len() >= 3,
+            "expected at least 3 native multimedia content blocks, got {}",
+            code_multimedia.1.len()
+        );
+
+        let call_tool_resp = code_multimedia.into_call_tool_result().unwrap();
+        let rmcp::model::CallToolResponse::Complete(call_res) = call_tool_resp else {
+            panic!("expected CallToolResponse::Complete");
+        };
+        assert!(call_res.structured_content.is_some());
+        assert!(call_res.content.iter().any(
+            |c| matches!(c, rmcp::model::ContentBlock::Image(i) if i.mime_type == "image/png")
+        ));
+        assert!(call_res.content.iter().any(
+            |c| matches!(c, rmcp::model::ContentBlock::Audio(a) if a.mime_type == "audio/wav")
+        ));
+        assert!(call_res.content.iter().any(|c| matches!(
+            c,
+            rmcp::model::ContentBlock::Resource(r)
+                if matches!(
+                    &r.resource,
+                    rmcp::model::ResourceContents::BlobResourceContents { mime_type: Some(m), .. }
+                        if m == "application/pdf"
+                )
+        )));
     }
 }

@@ -84,7 +84,10 @@ fn grant(file: &File, uid: u32, gid: u32, capability: bool) -> io::Result<()> {
     if meta.uid() == uid && meta.is_dir() && meta.mode() & 0o700 == 0o700 {
         return Ok(());
     }
-    let mode = if meta.is_dir() {
+    if meta.uid() == uid && !meta.is_dir() && !capability && meta.mode() & 0o600 == 0o600 {
+        return Ok(());
+    }
+    let mode: libc::mode_t = if meta.is_dir() {
         0o2770
     } else if capability {
         0o640
@@ -93,6 +96,13 @@ fn grant(file: &File, uid: u32, gid: u32, capability: bool) -> io::Result<()> {
     } else {
         0o660
     };
+    #[allow(
+        clippy::unnecessary_cast,
+        reason = "MetadataExt::mode is u32 while libc::mode_t is u16 on macOS"
+    )]
+    if meta.gid() == gid && (meta.mode() as libc::mode_t & 0o7777) == mode {
+        return Ok(());
+    }
     let fd = file.as_raw_fd();
     let group_ok = meta.gid() == gid || unsafe { libc::fchown(fd, u32::MAX, gid) } == 0;
     let mode_ok = unsafe { libc::fchmod(fd, mode) } == 0;
@@ -166,9 +176,14 @@ fn inaccessible_child(
             "seat tree inode changed before owner repair",
         ));
     }
-    if meta.uid() == uid && meta.is_dir() && meta.mode() & 0o700 == 0o700 {
-        // The existing seat-private vendor parent already has its owner's
-        // required grant. Do not widen it just to enumerate as the daemon.
+    if meta.uid() == uid
+        && ((meta.is_dir() && meta.mode() & 0o700 == 0o700)
+            || (!meta.is_dir()
+                && name.as_bytes() != b"mcp-capability"
+                && meta.mode() & 0o600 == 0o600))
+    {
+        // The existing seat-private inode already has its owner's required
+        // grant. Do not widen it just to reopen as the daemon.
         return Ok(None);
     }
     grant(&bound, uid, gid, name.as_bytes() == b"mcp-capability")?;
@@ -376,9 +391,19 @@ fn share_open(
                 | "target"
                 | ".git"
                 | "cache-home"
+                | "data-home"
+                | "state-home"
                 | "tmp"
                 | ".cargo"
                 | ".rustup"
+                | "brain"
+                | ".system_generated"
+                | "plugins"
+                | "sessions"
+                | "shell-snapshots"
+                | "telemetry"
+                | "statsig"
+                | "__pycache__"
         ) || (text == "op" && path.ends_with(".config"))
         {
             continue;
@@ -394,11 +419,15 @@ fn share_open(
             )
         } != 0
         {
-            return Err(io::Error::last_os_error());
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::NotFound {
+                continue;
+            }
+            return Err(err);
         }
         let stat = unsafe { stat.assume_init() };
         let kind = stat.st_mode & libc::S_IFMT;
-        if kind == libc::S_IFLNK {
+        if kind == libc::S_IFLNK || kind == libc::S_IFSOCK || kind == libc::S_IFIFO {
             continue;
         }
         if kind != libc::S_IFDIR && kind != libc::S_IFREG {
@@ -407,10 +436,13 @@ fn share_open(
         before_open(path, &name);
         let child = match open_child(&directory, &name, kind == libc::S_IFDIR) {
             Ok(child) => child,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
-                match inaccessible_child(&directory, &name, uid, gid, &stat)? {
-                    Some(child) => child,
-                    None => continue,
+                match inaccessible_child(&directory, &name, uid, gid, &stat) {
+                    Ok(Some(child)) => child,
+                    Ok(None) => continue,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(e),
                 }
             }
             Err(error) => return Err(error),
@@ -427,7 +459,11 @@ fn share_open(
             ));
         }
         if kind == libc::S_IFDIR {
-            share_open(child, &child_path, uid, gid, before_open)?;
+            match share_open(child, &child_path, uid, gid, before_open) {
+                Ok(()) => (),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            }
         } else {
             grant(&child, uid, gid, text == "mcp-capability")?;
             if !text.starts_with(".seat-")
@@ -436,7 +472,11 @@ fn share_open(
                     || text.contains(".sqlite"))
                 && child.metadata()?.uid() != uid
             {
-                migrate_open_file(&directory, &name, &child, uid, gid)?;
+                match migrate_open_file(&directory, &name, &child, uid, gid) {
+                    Ok(()) => (),
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(e),
+                }
             }
         }
     }

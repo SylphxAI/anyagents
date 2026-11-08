@@ -1360,8 +1360,42 @@ fn read_stdout(
                 }
             }
         }
+        let error = value
+            .pointer("/result/error")
+            .or_else(|| value.get("error"))
+            .and_then(|v| {
+                v.as_str().or_else(|| {
+                    v.get("message")
+                        .and_then(Value::as_str)
+                        .or_else(|| v.get("code").and_then(Value::as_str))
+                })
+            })
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let poisoned_agy = spec.name == "anyagents-agy"
+            && matches!(kind, Some("done") | Some("result"))
+            && error.is_some_and(|error| {
+                error
+                    .to_ascii_lowercase()
+                    .contains("invalid_argument (code 400)")
+            });
+        if poisoned_agy {
+            effect.finishes_turn = false;
+        }
         if let Some(ref rpc) = agy_rpc {
-            if let Some(reset_at_ms) = effect.quota_reset_at_ms {
+            if poisoned_agy {
+                let _ = std::fs::write(
+                    rpc.config_dir.join(".anyagents-last-error.json"),
+                    json!({
+                        "error": error,
+                        "timestamp_ms": std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as i64)
+                            .unwrap_or(0),
+                    })
+                    .to_string(),
+                );
+            } else if let Some(reset_at_ms) = effect.quota_reset_at_ms {
                 let err_msg = value
                     .pointer("/result/error")
                     .or_else(|| value.get("error"))
@@ -1506,21 +1540,18 @@ fn read_stdout(
                     finish_open(&mut state, usage);
                 }
             } else if correlated
-                && effect.quota_reset_at_ms.is_none()
+                && (poisoned_agy || effect.quota_reset_at_ms.is_none())
                 && matches!(kind, Some("done") | Some("result"))
-                && let Some(err_str) = value
-                    .pointer("/result/error")
-                    .or_else(|| value.get("error"))
-                    .and_then(|v| {
-                        v.as_str().or_else(|| {
-                            v.get("message")
-                                .and_then(Value::as_str)
-                                .or_else(|| v.get("code").and_then(Value::as_str))
-                        })
-                    })
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
+                && let Some(err_str) = error
             {
+                if poisoned_agy {
+                    if let Some(ref rpc) = agy_rpc {
+                        let _ = std::fs::remove_file(rpc.config_dir.join("agy-session-id"));
+                    }
+                    // Do not let sync_session recreate the retired pointer.
+                    state.session_id = None;
+                    state.alive = false;
+                }
                 state.sign_in_fault = Some(err_str.to_string());
                 state.open.clear();
                 state.followups.clear();
@@ -1536,6 +1567,9 @@ fn read_stdout(
             state.epoch = state.epoch.wrapping_add(1);
         }
         wake.notify_all();
+        if poisoned_agy {
+            break;
+        }
     }
     // EOF can race waitpid and the independent stderr drainer. Collect both
     // before publishing a normal exit, with the old bounded reap grace period.
@@ -1926,29 +1960,35 @@ fn agy_rpc_is_running(
     session_id: &str,
 ) -> Result<(String, bool), String> {
     let resp = agy_rpc_post(port, csrf_token, "GetAllCascadeTrajectories", &json!({}))?;
-    let Some(summaries) = resp.get("trajectorySummaries").and_then(Value::as_object) else {
-        return Ok((session_id.to_string(), false));
-    };
-    if let Some(entry) = summaries.get(session_id) {
-        let status = entry
-            .get("status")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        return Ok((
-            session_id.to_string(),
-            status == "CASCADE_RUN_STATUS_RUNNING",
-        ));
+    agy_running_status(&resp, session_id)
+}
+
+fn agy_running_status(resp: &Value, session_id: &str) -> Result<(String, bool), String> {
+    let summaries = resp
+        .get("trajectorySummaries")
+        .and_then(Value::as_object)
+        .ok_or("GetAllCascadeTrajectories missing trajectorySummaries")?;
+    // Validate every candidate before inferring that no cascade is running.
+    let statuses: Result<Vec<_>, String> = summaries
+        .iter()
+        .map(|(cid, entry)| {
+            let running = match entry.get("status").and_then(Value::as_str) {
+                Some("CASCADE_RUN_STATUS_RUNNING") => true,
+                Some("CASCADE_RUN_STATUS_IDLE") => false,
+                _ => return Err(format!("invalid cascade run status for {cid}")),
+            };
+            Ok((cid.clone(), running))
+        })
+        .collect();
+    let statuses = statuses?;
+    if let Some(entry) = statuses.iter().find(|(cid, _)| cid == session_id) {
+        return Ok(entry.clone());
     }
-    if let Some((cid, _)) = summaries.iter().find(|(_, v)| {
-        v.get("status").and_then(Value::as_str) == Some("CASCADE_RUN_STATUS_RUNNING")
-    }) {
-        return Ok((cid.clone(), true));
+    if let Some(entry) = statuses.iter().find(|(_, running)| *running) {
+        return Ok(entry.clone());
     }
-    if summaries.len() == 1
-        && let Some((cid, v)) = summaries.iter().next()
-    {
-        let status = v.get("status").and_then(Value::as_str).unwrap_or_default();
-        return Ok((cid.clone(), status == "CASCADE_RUN_STATUS_RUNNING"));
+    if let [entry] = statuses.as_slice() {
+        return Ok(entry.clone());
     }
     Ok((session_id.to_string(), false))
 }
@@ -1984,12 +2024,25 @@ fn agy_rpc_is_latest_step_quota_error(
     else {
         return Ok(true);
     };
-    let step_type = last_step.get("type").and_then(Value::as_str).unwrap_or("");
+    agy_step_quota_error(last_step)
+}
+
+fn agy_step_quota_error(last_step: &Value) -> Result<bool, String> {
+    let step_type = last_step
+        .get("type")
+        .and_then(Value::as_str)
+        .filter(|kind| {
+            kind.starts_with("CORTEX_STEP_TYPE_") && kind.len() > "CORTEX_STEP_TYPE_".len()
+        })
+        .ok_or("latest cascade step missing valid type")?;
+    if step_type != "CORTEX_STEP_TYPE_ERROR_MESSAGE" {
+        return Ok(false);
+    }
     let status = last_step
         .get("status")
         .and_then(Value::as_str)
-        .unwrap_or("");
-    if step_type != "CORTEX_STEP_TYPE_ERROR_MESSAGE" || status == "CORTEX_STEP_STATUS_CLEARED" {
+        .ok_or("latest cascade error step missing status")?;
+    if status == "CORTEX_STEP_STATUS_CLEARED" {
         return Ok(false);
     }
     let raw = last_step.to_string().to_ascii_lowercase();

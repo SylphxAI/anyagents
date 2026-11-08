@@ -1563,3 +1563,326 @@ fn nested_serialized_json_and_unicode_escapes_scrub_logical_text() {
     assert_eq!(inner["rows"][0]["value"], "prefix [redacted] suffix");
     assert_eq!(outer["call_id"], "stable");
 }
+
+#[test]
+fn pending_outbound_history_refuses_erasure_until_recovery_retires_the_body() {
+    let f = Fixture::new();
+    let message = f.message("pendinghistorycanary");
+    let journal = f.dir.path().join("outbound-history");
+    std::fs::create_dir_all(&journal).unwrap();
+    let pending = journal.join("effect.pending");
+    let payload = json!({"effect_key":"effect-1", "agent_id":f.target.id.as_str(),
+        "destination":"peer", "reply_to":null, "body":"pendinghistorycanary", "receipt":null});
+    std::fs::write(&pending, serde_json::to_vec(&payload).unwrap()).unwrap();
+    let error = f.redact(&request(message.id.as_str(), None)).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("unresolved or unreadable obligations"),
+        "{error:?}"
+    );
+    assert_eq!(
+        f.store.inbox(&f.target.id, None).unwrap()[0].text,
+        "pendinghistorycanary"
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&std::fs::read(&pending).unwrap()).unwrap(),
+        payload
+    );
+    // Recovery, not erasure, owns the journal transition. Its terminal metadata
+    // contains no body or digest. Foreign pending effects do not block this owner.
+    std::fs::remove_file(&pending).unwrap();
+    std::fs::write(
+        journal.join("effect.done"),
+        b"{\"receipt\":\"acknowledged\"}",
+    )
+    .unwrap();
+    let mut foreign = payload;
+    foreign["agent_id"] = json!(f.peer.id.as_str());
+    std::fs::write(
+        journal.join("foreign.pending"),
+        serde_json::to_vec(&foreign).unwrap(),
+    )
+    .unwrap();
+    let receipt = f.redact(&request(message.id.as_str(), None)).unwrap();
+    assert!(receipt.full_scrub, "{receipt:?}");
+    assert_eq!(
+        f.store.inbox(&f.target.id, None).unwrap()[0].text,
+        TOMBSTONE
+    );
+    // A later unknown journal invalidates reuse of an earlier successful receipt.
+    std::fs::write(journal.join("unknown.pending"), b"{broken").unwrap();
+    let error = f.redact(&request(message.id.as_str(), None)).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("unresolved or unreadable obligations"),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn malformed_linked_and_oversized_pending_history_never_claims_full_scrub() {
+    for shape in [
+        "missing-owner",
+        "invalid-body",
+        "oversized",
+        "symlink",
+        "hardlink",
+        "fifo",
+        "directory",
+    ] {
+        let f = Fixture::new();
+        let message = f.message("uncertainhistorycanary");
+        let journal = f.dir.path().join("outbound-history");
+        std::fs::create_dir_all(&journal).unwrap();
+        let pending = journal.join("unknown.pending");
+        match shape {
+            "missing-owner" => std::fs::write(&pending, b"{}").unwrap(),
+            "invalid-body" => std::fs::write(&pending, serde_json::to_vec(&json!({
+                "agent_id":f.peer.id.as_str(), "effect_key":"effect-1", "destination":"peer", "body":42
+            })).unwrap()).unwrap(),
+            "oversized" => std::fs::write(&pending, vec![b'x'; 1024 * 1024 + 1]).unwrap(),
+            "symlink" => {
+                let outside = f.dir.path().join("foreign-copy");
+                std::fs::write(&outside, b"unique retained bytes").unwrap();
+                std::os::unix::fs::symlink(&outside, &pending).unwrap();
+            }
+            "hardlink" => {
+                let outside = f.dir.path().join("foreign-copy");
+                std::fs::write(&outside, serde_json::to_vec(&json!({
+                    "agent_id":f.peer.id.as_str(), "effect_key":"effect-1",
+                    "destination":"peer", "body":"unique retained bytes"
+                })).unwrap()).unwrap();
+                std::fs::hard_link(&outside, &pending).unwrap();
+            }
+            "fifo" => {
+                use std::os::unix::ffi::OsStrExt;
+                let name = std::ffi::CString::new(pending.as_os_str().as_bytes()).unwrap();
+                assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+            }
+            "directory" => std::fs::create_dir(&pending).unwrap(),
+            _ => unreachable!(),
+        }
+        let error = f.redact(&request(message.id.as_str(), None)).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unresolved or unreadable obligations"),
+            "{shape}: {error:?}"
+        );
+        assert_eq!(
+            f.store.inbox(&f.target.id, None).unwrap()[0].text,
+            "uncertainhistorycanary"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn publication_barrier_precedes_store_locks_and_rechecks_new_pending_copies() {
+    use std::{
+        sync::mpsc,
+        time::{Duration, Instant},
+    };
+    let f = Fixture::new();
+    let message = f.message("barrierhistorycanary");
+    let journal = f.dir.path().join("outbound-history");
+    std::fs::create_dir_all(&journal).unwrap();
+    let publication = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(journal.join(".publication.lock"))
+        .unwrap();
+    publication.lock_shared().unwrap();
+    let inode = publication.metadata().unwrap().ino();
+    std::thread::scope(|scope| {
+        let erasure = scope.spawn(|| f.redact(&request(message.id.as_str(), None)));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut waiting = false;
+        while Instant::now() < deadline {
+            waiting = std::fs::read_to_string("/proc/locks")
+                .unwrap()
+                .lines()
+                .any(|line| {
+                    line.contains("-> FLOCK")
+                        && line.contains("WRITE")
+                        && line
+                            .split_whitespace()
+                            .any(|field| field.ends_with(&format!(":{inode}")))
+                });
+            if waiting {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let (send, recv) = mpsc::channel();
+        let fixture = &f;
+        scope.spawn(move || {
+            send.send(fixture.store.record_outbound_once(
+                "barrier-effect",
+                &fixture.target.id,
+                "peer",
+                None,
+                "barrierhistorycanary",
+            ))
+            .unwrap();
+        });
+        // A publisher sharing the barrier must still be able to enter Store;
+        // if erasure held SQLite while waiting, this would time out.
+        let progress = recv.recv_timeout(Duration::from_secs(5));
+        std::fs::write(
+            journal.join("late.pending"),
+            serde_json::to_vec(&json!({
+                "effect_key":"late-effect", "agent_id":f.target.id.as_str(),
+                "destination":"peer", "body":"barrierhistorycanary", "receipt":null
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        publication.unlock().unwrap();
+        let refusal = erasure.join().unwrap().unwrap_err();
+        assert!(
+            waiting,
+            "exclusive erasure waiter was not observed in the kernel lock table"
+        );
+        progress
+            .expect("publisher must progress before the barrier is released")
+            .unwrap();
+        assert!(
+            refusal
+                .to_string()
+                .contains("unresolved or unreadable obligations"),
+            "{refusal:?}"
+        );
+    });
+    assert_eq!(
+        f.store.inbox(&f.target.id, None).unwrap()[0].text,
+        "barrierhistorycanary"
+    );
+}
+
+#[test]
+fn outbound_effect_history_replay_cannot_restore_erased_canonical_text() {
+    let f = Fixture::new();
+    let id = f
+        .store
+        .record_outbound_once(
+            "erased-effect",
+            &f.target.id,
+            "peer",
+            None,
+            "effectredactioncanary",
+        )
+        .unwrap();
+    assert!(f.redact(&request(&id, None)).unwrap().full_scrub);
+    let error = f
+        .store
+        .record_outbound_once(
+            "erased-effect",
+            &f.target.id,
+            "peer",
+            None,
+            "effectredactioncanary",
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("payload conflict"), "{error:?}");
+    let history = f
+        .store
+        .conversation(&f.target.id, None, None, None)
+        .unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].text, TOMBSTONE);
+    assert!(
+        f.store
+            .search_history(&crate::HistorySearchQuery {
+                query: Some("effectredactioncanary".into()),
+                ..Default::default()
+            })
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn orphaned_outbound_temporaries_refuse_erasure_after_history_settlement() {
+    for shape in ["matching", "malformed", "missing-owner", "invalid-owner"] {
+        let f = Fixture::new();
+        let message = f.message("orphanedtemporarycanary");
+        let journal = f.dir.path().join("outbound-history");
+        std::fs::create_dir_all(&journal).unwrap();
+        // A retry can finish the named obligation without owning an earlier
+        // crashed writer's synced temporary. Terminal state is not a census.
+        std::fs::write(journal.join("effect.done"), b"{\"receipt\":\"settled\"}").unwrap();
+        let temporary = journal.join(format!(".{}.tmp", crate::MessageId::generate()));
+        let mut record = json!({"effect_key":"effect-1", "agent_id":f.target.id.as_str(),
+            "destination":"peer", "reply_to":null, "body":"orphanedtemporarycanary", "receipt":null});
+        let bytes = match shape {
+            "malformed" => b"{\"body\":\"orphanedtemporarycanary\"".to_vec(),
+            "missing-owner" => {
+                record.as_object_mut().unwrap().remove("agent_id");
+                serde_json::to_vec(&record).unwrap()
+            }
+            "invalid-owner" => {
+                record["agent_id"] = json!("unknown");
+                serde_json::to_vec(&record).unwrap()
+            }
+            _ => serde_json::to_vec(&record).unwrap(),
+        };
+        std::fs::write(&temporary, &bytes).unwrap();
+        let error = f.redact(&request(message.id.as_str(), None)).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unresolved or unreadable obligations"),
+            "{shape}: {error:?}"
+        );
+        assert_eq!(
+            f.store.inbox(&f.target.id, None).unwrap()[0].text,
+            "orphanedtemporarycanary"
+        );
+        assert_eq!(std::fs::read(&temporary).unwrap(), bytes);
+        // The recovery authority retires the copy; only then can erase finish.
+        std::fs::remove_file(&temporary).unwrap();
+        assert!(
+            f.redact(&request(message.id.as_str(), None))
+                .unwrap()
+                .full_scrub
+        );
+    }
+}
+
+#[test]
+fn orphaned_outbound_temporaries_recheck_receipt_replay_and_allow_foreign_owner() {
+    let f = Fixture::new();
+    let message = f.message("replayedtemporarycanary");
+    let req = request(message.id.as_str(), None);
+    assert!(f.redact(&req).unwrap().full_scrub);
+    let journal = f.dir.path().join("outbound-history");
+    let temporary = journal.join(format!(".{}.tmp", crate::MessageId::generate()));
+    let mut record = json!({"effect_key":"effect-1", "agent_id":f.target.id.as_str(),
+        "destination":"peer", "reply_to":null, "body":"replayedtemporarycanary", "receipt":null});
+    for bytes in [serde_json::to_vec(&record).unwrap(), b"{broken".to_vec()] {
+        std::fs::write(&temporary, &bytes).unwrap();
+        let error = f.redact(&req).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unresolved or unreadable obligations"),
+            "{error:?}"
+        );
+        assert_eq!(std::fs::read(&temporary).unwrap(), bytes);
+        assert_eq!(
+            f.store.inbox(&f.target.id, None).unwrap()[0].text,
+            TOMBSTONE
+        );
+    }
+    record["agent_id"] = json!(f.peer.id.as_str());
+    let foreign = serde_json::to_vec(&record).unwrap();
+    std::fs::write(&temporary, &foreign).unwrap();
+    assert!(f.redact(&req).unwrap().full_scrub);
+    assert_eq!(std::fs::read(&temporary).unwrap(), foreign);
+}

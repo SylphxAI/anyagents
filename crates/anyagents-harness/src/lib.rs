@@ -135,10 +135,10 @@ fn extract_quoted_xml<'a>(
 pub struct Context {
     /// The authenticated author: `agent:<name>`, `telegram:user:<id>`, ...
     pub sender: Option<String>,
-    /// Human-readable display name of the sender (e.g. `Kyle (@shtse8)`), when known.
+    /// Human-readable display name of the sender (e.g. `Alex (@alex)`), when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sender_name: Option<String>,
-    /// Role label of the sender agent (e.g. `公司業務總管`), when the sender is an agent.
+    /// Role label of the sender agent (e.g. `Reviewer`), when the sender is an agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sender_role: Option<String>,
     /// Structural relationship of the sender to the recipient (`parent`, `sibling`, `child`, `peer`, `external_user`, etc.).
@@ -609,7 +609,7 @@ pub struct SteerLine {
 /// The pushing side appends one JSON [`SteerLine`] per message to the file.
 /// The host takes the oldest `limit` lines and keeps them, so a crash between
 /// the take and the vendor's acceptance loses nothing: they are still held by
-/// the host that took them and, after a crash, [`SteerQueue::release`] puts
+/// the host that took them and, after a crash, [`SteerQueue::release_for`] puts
 /// them back. A file read or write failure leaves the cursor where it is.
 #[derive(Clone, Debug)]
 pub struct SteerQueue {
@@ -634,29 +634,55 @@ impl SteerQueue {
         &self.path
     }
 
-    /// The push file's lines, oldest first.
+    /// The push file's lines, oldest first. Failures are diagnosed and leave
+    /// pending bytes untouched. Use [`Self::try_lines`] to handle them directly.
     pub fn lines(&self) -> Vec<SteerLine> {
-        let Ok(text) = std::fs::read_to_string(&self.path) else {
-            return Vec::new();
+        self.try_lines().unwrap_or_else(|err| {
+            eprintln!("steer queue {}: {err}", self.path.display());
+            Vec::new()
+        })
+    }
+
+    /// Read every pending record, refusing corrupt input rather than skipping it.
+    pub fn try_lines(&self) -> std::io::Result<Vec<SteerLine>> {
+        let text = match std::fs::read_to_string(&self.path) {
+            Ok(text) => text,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => return Err(err),
         };
         text.lines()
-            .filter_map(|line| serde_json::from_str::<SteerLine>(line).ok())
+            .enumerate()
+            .map(|(index, line)| {
+                serde_json::from_str::<SteerLine>(line).map_err(|err| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("invalid pending record at line {}: {err}", index + 1),
+                    )
+                })
+            })
             .collect()
     }
 
     /// Take the oldest lines, unless one taken earlier is still held.
+    /// Errors are diagnosed; no pending record is consumed on a failed read.
     pub fn take(&self) -> Option<SteerItem> {
+        self.try_take().unwrap_or_else(|err| {
+            eprintln!("steer queue {}: {err}", self.path.display());
+            None
+        })
+    }
+
+    pub fn try_take(&self) -> std::io::Result<Option<SteerItem>> {
         let mut held = self.lock();
         if !held.is_empty() {
-            return None;
+            return Ok(None);
         }
-        let mut lines = self.lines();
-        lines.truncate(self.limit);
+        let mut lines = self.try_lines()?;
         if lines.is_empty() {
-            return None;
+            return Ok(None);
         }
-        let rest = &self.lines()[lines.len()..];
-        write_lines(&self.path, rest).ok()?;
+        let rest = lines.split_off(lines.len().min(self.limit));
+        write_lines(&self.path, &rest)?;
         *held = lines
             .into_iter()
             .map(|line| SteerItem {
@@ -672,7 +698,7 @@ impl SteerQueue {
                 },
             })
             .collect();
-        held.first().cloned()
+        Ok(held.first().cloned())
     }
 
     /// Records the vendor's acceptance of `id`, keeping the older held ones.
@@ -689,6 +715,12 @@ impl SteerQueue {
     /// Put every held line except `except` back at the front of the push file,
     /// oldest first, so the next step, or a restarted host, takes it again.
     pub fn release_for(&self, except: &str) {
+        if let Err(err) = self.try_release_for(except) {
+            eprintln!("steer queue {}: {err}", self.path.display());
+        }
+    }
+
+    pub fn try_release_for(&self, except: &str) -> std::io::Result<()> {
         let mut held = self.lock();
         let back_lines: Vec<SteerItem> = held
             .iter()
@@ -696,7 +728,7 @@ impl SteerQueue {
             .cloned()
             .collect();
         if back_lines.is_empty() {
-            return;
+            return Ok(());
         }
         let mut lines: Vec<SteerLine> = back_lines
             .iter()
@@ -711,14 +743,14 @@ impl SteerQueue {
             .map(|item| item.message.id.clone())
             .collect();
         let rest: Vec<SteerLine> = self
-            .lines()
+            .try_lines()?
             .into_iter()
             .filter(|line| !ids.contains(&line.id))
             .collect();
         lines.extend(rest);
-        if write_lines(&self.path, &lines).is_ok() {
-            held.retain(|item| item.message.id == except);
-        }
+        write_lines(&self.path, &lines)?;
+        held.retain(|item| item.message.id == except);
+        Ok(())
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Vec<SteerItem>> {
@@ -727,11 +759,11 @@ impl SteerQueue {
 }
 
 fn write_lines(path: &std::path::Path, lines: &[SteerLine]) -> std::io::Result<()> {
-    let text: String = lines
-        .iter()
-        .filter_map(|line| serde_json::to_string(line).ok())
-        .map(|line| line + "\n")
-        .collect();
+    let mut text = String::new();
+    for line in lines {
+        text.push_str(&serde_json::to_string(line).map_err(std::io::Error::other)?);
+        text.push('\n');
+    }
     std::fs::write(path, text)
 }
 
@@ -762,6 +794,51 @@ pub fn mentions_marker(value: &Value, id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn corrupt_pending_records_are_diagnosed_without_rewriting_any_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("steer.jsonl");
+        let queue = SteerQueue::new(&path, 1);
+        let original = "{\"id\":\"m1\",\"seq\":1,\"message\":\"one\"}\n{broken\n";
+        std::fs::write(&path, original).unwrap();
+        let error = queue.try_take().unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("line 2"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert!(queue.take().is_none()); // Legacy path diagnoses the same error.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        std::fs::write(&path, original.lines().next().unwrap()).unwrap();
+        assert_eq!(queue.try_take().unwrap().unwrap().message.id, "m1");
+    }
+
+    #[test]
+    fn release_refuses_corrupt_pending_data_and_keeps_held_work_retryable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("steer.jsonl");
+        let queue = SteerQueue::new(&path, 1);
+        std::fs::write(&path, "{\"id\":\"m1\",\"seq\":1,\"message\":\"one\"}\n").unwrap();
+        queue.try_take().unwrap().unwrap();
+        std::fs::write(&path, "corrupt\n").unwrap();
+        assert_eq!(
+            queue.try_release_for("").unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "corrupt\n");
+        assert!(queue.try_take().unwrap().is_none());
+        std::fs::write(&path, "").unwrap();
+        queue.try_release_for("").unwrap();
+        assert_eq!(queue.try_take().unwrap().unwrap().message.id, "m1");
+    }
+
+    #[test]
+    fn missing_queue_is_empty_but_unreadable_queue_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = SteerQueue::new(dir.path().join("missing"), 1);
+        assert!(queue.try_take().unwrap().is_none());
+        std::fs::create_dir(queue.path()).unwrap();
+        assert!(queue.try_take().is_err());
+    }
 
     #[test]
     fn marker_is_only_the_first_line() {

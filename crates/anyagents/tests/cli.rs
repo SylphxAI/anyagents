@@ -30,7 +30,14 @@ fn machine_path(dir: &std::path::Path) -> std::ffi::OsString {
 }
 
 fn bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_anyagents"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_anyagents"));
+    // These commands act as the fixture's operator, not its executor's agent.
+    command
+        .env_remove("ANYAGENTS_AGENT_ID")
+        .env_remove("ANYAGENTS_AGENT_CONFIG")
+        .env_remove("ANYAGENTS_DATA")
+        .env_remove("ANYAGENTS_PARENT_NAME");
+    command
 }
 
 /// A command in a fresh data directory whose harness needs no download.
@@ -43,6 +50,34 @@ fn bin_in(dir: &std::path::Path) -> Command {
         .arg("--data")
         .arg(dir);
     command
+}
+
+#[test]
+fn operator_fixture_ignores_an_inherited_agent_session() {
+    let inherited = tempfile::tempdir().unwrap();
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "create_send_inbox_and_usage", "--nocapture"])
+        .env(
+            "ANYAGENTS_AGENT_ID",
+            anyagents_core::AgentId::generate().as_str(),
+        )
+        .env("ANYAGENTS_AGENT_CONFIG", inherited.path().join("config"))
+        .env("ANYAGENTS_DATA", inherited.path().join("data"))
+        .env("ANYAGENTS_PARENT_NAME", "inherited-parent")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "the operator fixture inherited an agent session:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+        "the nested operator fixture must execute, not select zero tests"
+    );
+    assert!(!inherited.path().join("data").exists());
+    assert!(!inherited.path().join("config").exists());
 }
 
 #[test]
@@ -405,7 +440,48 @@ fn add_telegram_copies_the_token_and_lists_no_secret() {
     );
     let token_file = dir.path().join("token");
     std::fs::write(&token_file, b"123456:ABC\n").unwrap();
+    // Token custody is tested through the real CLI, but identity lookup is
+    // always local, independent of test-runner environment heuristics.
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let api = format!("http://{}", listener.local_addr().unwrap());
+    let provider = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            let mut byte = [0];
+            socket.read_exact(&mut byte).unwrap();
+            request.push(byte[0]);
+        }
+        assert!(
+            String::from_utf8_lossy(&request).starts_with("POST /bot123456:ABC/getMe HTTP/1.1\r\n")
+        );
+        let header = String::from_utf8(request).unwrap();
+        let length: usize = header
+            .lines()
+            .find_map(|line| {
+                let (key, value) = line.split_once(':')?;
+                key.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse().unwrap())
+            })
+            .unwrap();
+        let mut body = vec![0; length];
+        socket.read_exact(&mut body).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({})
+        );
+        let body =
+            r#"{"ok":true,"result":{"id":123456,"is_bot":true,"username":"alpha_fixture_bot"}}"#;
+        write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+    });
     let added = bin()
+        .env("ANYAGENTS_TELEGRAM_API", api)
+        .env("ANYAGENTS_FAKE_MODE", "1")
+        .env_remove("ANYAGENTS_TELEGRAM_WEBHOOK_URL")
         .arg("--data")
         .arg(dir.path())
         .args([
@@ -424,6 +500,7 @@ fn add_telegram_copies_the_token_and_lists_no_secret() {
         "{}",
         String::from_utf8_lossy(&added.stderr)
     );
+    provider.join().unwrap();
     let line = String::from_utf8(added.stdout).unwrap();
     assert!(!line.contains("123456"), "{line}");
     let id = line.split('\t').next().unwrap().trim();

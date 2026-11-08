@@ -4,6 +4,8 @@ import { spawn } from 'node:child_process';
 import { mkdtemp, readFile, writeFile, mkdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { stopProcessGroup } from './browser-process-group.mjs';
+import { interactionAcceptance } from './browser-takeover-interaction.mjs';
 const [url, remoteWs, output] = process.argv.slice(2);
 assert.ok(url && remoteWs && output, 'usage: node browser-takeover.mjs URL REMOTE_WS OUTPUT');
 await mkdir(output, { recursive: true });
@@ -32,7 +34,7 @@ class Cdp {
   close() { this.ws.close(); }
 }
 const dir = await mkdtemp(path.join(tmpdir(), 'takeover-viewer-'));
-const chrome = spawn(process.env.ANYAGENTS_CHROMIUM || '/usr/bin/chromium', ['--headless=new', '--no-sandbox', '--disable-gpu', '--remote-debugging-port=0', '--user-data-dir=' + dir, 'about:blank'], { stdio: 'ignore' });
+const chrome = spawn(process.env.ANYAGENTS_CHROMIUM || '/usr/bin/chromium', ['--headless=new', '--no-sandbox', '--disable-gpu', '--remote-debugging-port=0', '--user-data-dir=' + dir, 'about:blank'], { stdio: 'ignore', detached: true });
 let viewer, remote;
 const logs = [];
 try {
@@ -69,7 +71,7 @@ try {
     }
   }
   async function key(key, code, vk, modifiers = 0) {
-    await viewer.call('Input.dispatchKeyEvent', { type:'keyDown', key, code, windowsVirtualKeyCode:vk, modifiers });
+    await viewer.call('Input.dispatchKeyEvent', { type:'keyDown', key, code, windowsVirtualKeyCode:vk, modifiers, ...(key.length===1 && !(modifiers&7) ? {text:key,unmodifiedText:key} : {}) });
     await viewer.call('Input.dispatchKeyEvent', { type:'keyUp', key, code, windowsVirtualKeyCode:vk, modifiers });
   }
   async function remoteField(id) {
@@ -83,6 +85,7 @@ try {
     await until(() => remote.eval(`document.activeElement.id === '${id}'`), 'remote field '+id);
   }
   await viewer.call('Browser.grantPermissions', {origin:new URL(url).origin,permissions:['clipboardReadWrite','clipboardSanitizedWrite']});
+  await interactionAcceptance({viewer,remote,url,output,until,key,touch,api,screenshot});
   for (const [width,height] of [[1440,900],[390,844]]) {
     await viewer.call('Emulation.setDeviceMetricsOverride', {width,height,deviceScaleFactor:1,mobile:width<700});
     await viewer.call('Emulation.setTouchEmulationEnabled', {enabled:width<700});
@@ -102,6 +105,9 @@ try {
     await until(() => remote.eval(`document.querySelector('#entry').value === 'pasted once ✓'`), 'native paste inserted once');
     // Cmd+A must select, never type a literal a. Cmd+C returns that selection.
     await key('a','KeyA',65,4);
+    // The preceding paste already populated the clipboard with this text.
+    // A distinct sentinel makes the next read prove Copy actually completed.
+    await viewer.eval(`navigator.clipboard.writeText('shortcut copy pending')`);
     await key('c','KeyC',67,4);
     await until(() => viewer.eval(`navigator.clipboard.readText().then(v=>v==='pasted once ✓')`), 'copy remote selection');
     await key('x','KeyX',88,4);
@@ -134,6 +140,9 @@ try {
     await clickSelector('#paste-btn');
     await until(() => remote.eval(`document.querySelector('#entry').value === 'pill paste'`), 'one-tap paste pill');
     await clickSelector('#select-all-btn');
+    // Do not let the paste's existing clipboard value satisfy the Copy wait.
+    // Otherwise a late Copy can overwrite the next native-paste fixture.
+    await viewer.eval(`navigator.clipboard.writeText('pill copy pending')`);
     await clickSelector('#copy-btn');
     await until(() => viewer.eval(`navigator.clipboard.readText().then(v=>v==='pill paste')`), 'one-tap copy pill');
     if (width<700) {
@@ -186,6 +195,7 @@ try {
     await writeFile(path.join(output,'clipboard-result.json'),JSON.stringify({passed:true,viewports:2,nativePaste:true,copy:true,cut:true,tab:true,overlay:true,passwordGuard:true}));
     console.log(JSON.stringify({passed:true,clipboard:true,screenshots:output}));
   } else {
+  await remote.eval(`window.geometryReleases=0;document.addEventListener('mouseup',()=>window.geometryReleases++)`);
   for (const [width, height] of [[390, 844], [588, 1280], [1280, 800], [1440, 900]]) {
     await viewer.call('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: width < 700 });
     await viewer.call('Emulation.setTouchEmulationEnabled', { enabled: width < 700 });
@@ -209,9 +219,13 @@ try {
         await touch('touchStart', [[width/2-40,height/2],[width/2+40,height/2]]);
         await touch('touchMove', [[width/2-100,height/2],[width/2+100,height/2]]);
         await touch('touchEnd', []);
+        const releases = await remote.eval('window.geometryReleases');
         await touch('touchStart', [[width/2,height/2]]);
         await touch('touchMove', [[width/2-25,height/2-30]]);
         await touch('touchEnd', []);
+        // Viewer CDP delivery precedes the queued remote release/click. Drain
+        // this drag before taking the next tap's click-log baseline.
+        await until(() => remote.eval(`window.geometryReleases === ${releases+1}`), 'remote drag release');
       } else {
         // Desktop trackpad zoom retains remote mouse input and wheel scroll.
         await viewer.call('Input.dispatchMouseEvent', { type: 'mouseWheel', x: width/2, y: height/2, deltaX: 0, deltaY: -100, modifiers: 2 });
@@ -223,7 +237,7 @@ try {
       else { await viewer.call('Input.dispatchMouseEvent', { type: 'mousePressed', button: 'left', buttons: 1, clickCount: 1, ...local }); await viewer.call('Input.dispatchMouseEvent', { type: 'mouseReleased', button: 'left', buttons: 0, clickCount: 1, ...local }); }
       await until(async () => (await remote.eval('window.clicks.length')) > before, 'remote click log');
       const actual = await remote.eval('window.clicks.at(-1)');
-      assert.equal(actual.target, 'target'); assert.equal(actual.trusted, true);
+      assert.equal(actual.target, 'target', JSON.stringify({width,height,dpr,actual,expected})); assert.equal(actual.trusted, true);
       assert.ok(Math.abs(actual.x - expected.x) <= 2 && Math.abs(actual.y - expected.y) <= 2, JSON.stringify({actual,expected}));
       const frameState = await api('/state');
       logs.push({width,height,dpr,naturalWidth:frameState.natural_width,naturalHeight:frameState.natural_height,remoteViewport:frameState.viewport,expected,actual});
@@ -306,10 +320,36 @@ try {
   await writeFile(path.join(output, 'remote-click-log.json'), JSON.stringify(logs, null, 2));
   console.log(JSON.stringify({passed:true, viewports:4, clicks:logs.length, screenshots:output}));
   }
+} catch (error) {
+  // Keep the original failure even if diagnostics or teardown also fail. These
+  // pages contain only disposable fixture values, never a user's browser data.
+  const evidence = { passed:false, error:String(error), stack:error.stack };
+  async function capture(name, operation) {
+    let timer;
+    try {
+      evidence[name] = await Promise.race([operation(), new Promise((_, reject) => {
+        timer=setTimeout(()=>reject(new Error('diagnostic timeout')),2000);
+      })]);
+    } catch (failure) { evidence[name] = { error:String(failure) }; }
+    finally { clearTimeout(timer); }
+  }
+  if (viewer) {
+    await capture('viewer',()=>viewer.eval(`({active:document.activeElement.id,proxyType:document.querySelector('#keyboard-proxy')?.type,proxyLength:document.querySelector('#keyboard-proxy')?.value.length,status:document.querySelector('#connection')?.textContent,connectionHidden:document.querySelector('#connection')?.hidden,pointerTrace:window.pointerTrace,canvas:document.querySelector('#screen')?.getBoundingClientRect().toJSON()})`));
+    await capture('screenshot',async()=>{
+      const shot=await viewer.call('Page.captureScreenshot',{format:'png',captureBeyondViewport:false});
+      await writeFile(path.join(output,'failure.png'),Buffer.from(shot.data,'base64'));
+      return 'failure.png';
+    });
+  }
+  if (remote) await capture('remote',()=>remote.eval(`({active:document.activeElement.id,entry:document.querySelector('#entry')?.value,passwordLength:document.querySelector('#password')?.value.length,clicks:window.clicks,trajectory:window.trajectory,wheelHistory:window.wheelHistory,scrollTop:document.querySelector('#scrollbox')?.scrollTop})`));
+  try { await writeFile(path.join(output,'failure.json'),JSON.stringify(evidence,null,2)); }
+  catch (failure) { console.error('could not retain failure evidence',failure); }
+  console.error('acceptance failure evidence',JSON.stringify(evidence));
+  throw error;
 } finally {
-  viewer?.close(); remote?.close(); chrome.kill('SIGTERM');
-  await new Promise(resolve => { if (chrome.exitCode !== null) resolve(); else chrome.once('exit', resolve); });
-  // Chromium helpers may finish profile writes after the browser parent exits.
-  // Retry only idempotent cleanup; never rerun the interaction assertions.
-  await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  viewer?.close(); remote?.close();
+  // Parent exit does not establish helper exit. Refuse deletion while any
+  // process in this fixture's group can still write the disposable profile.
+  await stopProcessGroup(chrome);
+  await rm(dir, { recursive: true, force: true });
 }

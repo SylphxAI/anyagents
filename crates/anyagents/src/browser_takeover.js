@@ -21,6 +21,41 @@ export function zoomAt(view, scale, x, y) {
   return { scale, x: x - (x - view.x) * scale / view.scale, y: y - (y - view.y) * scale / view.scale };
 }
 
+// Keep discrete actions ordered while retaining only the newest unsent motion.
+// Coalescing never crosses a press/release/key boundary; wheels retain distance.
+export function inputDispatcher(request, onError = () => {}) {
+  const queue = [];
+  let running = false, tail = Promise.resolve();
+  async function drain() {
+    if (running) return;
+    running = true;
+    while (queue.length) {
+      const item = queue.shift();
+      try { item.resolve(await request(item.payload)); }
+      catch (error) { item.reject(error); onError(error); }
+    }
+    running = false;
+  }
+  return {
+    send(payload) {
+      const last = queue.at(-1);
+      if (last && payload.type === 'mouse' && payload.event_type === 'mouseMoved' &&
+          last.payload.type === 'mouse' && last.payload.event_type === 'mouseMoved') {
+        last.payload = payload; return last.promise;
+      }
+      if (last && payload.type === 'wheel' && last.payload.type === 'wheel') {
+        last.payload = { ...payload, delta_x: last.payload.delta_x + payload.delta_x, delta_y: last.payload.delta_y + payload.delta_y };
+        return last.promise;
+      }
+      const item = { payload };
+      item.promise = new Promise((resolve, reject) => { item.resolve = resolve; item.reject = reject; });
+      queue.push(item); tail = item.promise.catch(() => {}); drain();
+      return item.promise;
+    },
+    idle: () => tail,
+  };
+}
+
 if (typeof document !== 'undefined') {
   const { token } = JSON.parse(document.getElementById('takeover-config').textContent);
   const BASE = '/takeover/' + encodeURIComponent(token);
@@ -28,14 +63,22 @@ if (typeof document !== 'undefined') {
   const canvas = $('screen'), ctx = canvas.getContext('2d'), stage = $('stage'), proxy = $('keyboard-proxy');
   let view = { x: 0, y: 0, scale: 1 }, metrics = { device_scale_factor: 1 }, ready = false, completed = false, fitMode = true;
   let phone = false, remoteFocus = null, keyboardActive = false, composing = false;
-  let frameRevision = 0, inputQueue = Promise.resolve(), lastFrame = 0;
+  let frameRevision = 0, lastFrame = 0;
   const pointers = new Map();
-  let gesture = null, mouseDown = false;
+  let gesture = null, pressed = null, touchPan = false, motion = null, motionFrame = 0, pairFrame = 0;
+  let touchTimer = 0, focusSequence = 0;
+  // Proxy focus is an acknowledgement of remote ownership, not a new choice.
+  document.addEventListener('focusin', e => { if (e.target !== proxy) focusSequence++; });
+  // Blurring into a non-focusable local surface has no matching focusin.
+  document.addEventListener('focusout', e => { if (e.relatedTarget !== proxy) focusSequence++; });
   const size = () => ({ width: stage.clientWidth, height: stage.clientHeight });
   const extent = () => remoteExtent(canvas.width, canvas.height, metrics);
-  const fitScale = () => Math.min(size().width / extent().width, size().height / extent().height);
+  const surfaceAvailable = () => !document.hidden && size().width > 0 && size().height > 0 &&
+    stage.checkVisibility?.({ checkVisibilityCSS: true }) !== false;
+  const fitScale = () => surfaceAvailable() ? Math.min(size().width / extent().width, size().height / extent().height) : view.scale;
   const point = (x, y) => remotePoint(x, y, view, canvas.width, canvas.height, metrics);
   function paintView() {
+    if (!surfaceAvailable()) { cancelInteraction(); return; }
     const s = size(), r = extent();
     view = boundedView(view, s.width, s.height, r.width, r.height);
     canvas.style.width = r.width + 'px'; canvas.style.height = r.height + 'px';
@@ -50,7 +93,8 @@ if (typeof document !== 'undefined') {
   }
   function reconnect() { $('connection').hidden = false; $('connection').textContent = 'Reconnecting…'; }
   async function request(path, payload) {
-    const res = await fetch(BASE + path, payload === undefined ? {} : {
+    const res = await fetch(BASE + path, payload === undefined ? { signal: AbortSignal.timeout(5000) } : {
+      signal: AbortSignal.timeout(5000),
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
     });
     if (!res.ok) throw new Error('Remote connection failed');
@@ -58,15 +102,27 @@ if (typeof document !== 'undefined') {
     if (result.ok === false) throw new Error(result.error || 'Remote request failed');
     return result;
   }
-  // Keep press/release, typing/Enter and IME commits in order, even on slow links.
-  function sendInput(payload) {
-    const operation = inputQueue.then(() => completed ? null : request('/input', payload));
-    inputQueue = operation.catch(reconnect);
-    return operation;
+  const dispatcher = inputDispatcher(payload => completed ? null : request('/input', payload), reconnect);
+  const sendInput = payload => dispatcher.send(payload);
+  function sendWithFocus(payload) {
+    // Capture ownership when the action is accepted, not when its queue drains.
+    const sequence = focusSequence;
+    return sendInput(payload).then(result => {
+      if (!completed && sequence === focusSequence && result?.focus) focusField(result.focus);
+      return result;
+    });
+  }
+  function flushMotion() {
+    cancelAnimationFrame(motionFrame); motionFrame = 0;
+    if (motion) { sendInput(motion).catch(reconnect); motion = null; }
+  }
+  function move(payload) {
+    motion = payload;
+    if (!motionFrame) motionFrame = requestAnimationFrame(flushMotion);
   }
   function placeKeyboard() {
     const r = remoteFocus?.rect;
-    const active = !!r && remoteFocus.editable && matchMedia('(pointer: coarse)').matches;
+    const active = !!r && remoteFocus.editable && remoteTarget(document.activeElement) && matchMedia('(pointer: coarse)').matches;
     proxy.style.pointerEvents = active ? 'auto' : 'none';
     if (!active) return;
     proxy.style.left = (view.x + r.x * view.scale) + 'px';
@@ -83,8 +139,13 @@ if (typeof document !== 'undefined') {
   }
   function focusField(focus) {
     remoteFocus = focus;
+    // An HTTP acknowledgement can arrive after the person chose local text.
+    // Update remote metadata, but never move their new editable focus away.
+    if (!remoteTarget(document.activeElement)) {
+      keyboardActive = false; proxy.style.pointerEvents = 'none'; return;
+    }
     if (!focus?.editable) { keyboardActive = false; proxy.style.pointerEvents = 'none'; proxy.blur(); return; }
-    if (matchMedia('(pointer: coarse)').matches) openKeyboard();
+    openKeyboard();
     if (!matchMedia('(pointer: coarse)').matches) return;
     const s = size(), r = focus.rect;
     const scale = Math.min(4, Math.max(fitScale(), 1, (s.width - 32) / Math.max(r.width, 200)));
@@ -92,75 +153,121 @@ if (typeof document !== 'undefined') {
     view = { scale, x: s.width / 2 - (r.x + r.width / 2) * scale, y: Math.min(s.height * .28, 180) - (r.y + r.height / 2) * scale };
     paintView();
   }
-  function tap(x, y) {
-    // iOS requires focus within the gesture, before the asynchronous CDP focus reply.
-    // Optimistically focus the proxy, then dismiss it if CDP reports a non-input.
-    if (matchMedia('(pointer: coarse)').matches) openKeyboard(); else canvas.focus();
-    return sendInput({ type: 'click', ...point(x, y) }).then(res => focusField(res?.focus)).catch(reconnect);
-  }
   const pair = () => {
     const [a, b] = [...pointers.values()];
     return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2, distance: Math.max(1, Math.hypot(a.x - b.x, a.y - b.y)) };
   };
+  function releasePointer() {
+    flushMotion();
+    if (!pressed) return;
+    const p = pressed; pressed = null;
+    sendWithFocus({ type: 'mouse', event_type: 'mouseReleased', ...p.point, button: p.button, buttons: 0 }).catch(reconnect);
+  }
+  function cancelTouchTimer() { clearTimeout(touchTimer); touchTimer = 0; }
+  function cancelPointer() {
+    flushMotion();
+    if (!pressed) return;
+    const p = pressed; pressed = null;
+    // A late second finger must end a held press without activating its target.
+    sendInput({ type: 'mouseCancel', ...p.point, button: p.button }).catch(reconnect);
+  }
+  function pressPointer(g) {
+    cancelTouchTimer();
+    if (g.pointerType !== 'mouse' && matchMedia('(pointer: coarse)').matches) openKeyboard();
+    else canvas.focus({ preventScroll: true });
+    pressed = { point: g.point, button: g.button, buttons: g.buttons };
+    sendInput({ type: 'mouse', event_type: 'mousePressed', ...pressed.point, button: pressed.button, buttons: pressed.buttons }).catch(reconnect);
+  }
   stage.addEventListener('pointerdown', e => {
-    if (!ready || completed) return;
-    e.preventDefault(); stage.setPointerCapture(e.pointerId);
+    if (!ready || completed || !surfaceAvailable()) return;
+    e.preventDefault();
+    stage.setPointerCapture(e.pointerId);
     pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
-    if (e.pointerType === 'mouse') {
-      canvas.focus(); mouseDown = true;
-      sendInput({ type: 'mouse', event_type: 'mousePressed', ...point(e.clientX, e.clientY), button: e.button === 2 ? 'right' : 'left', buttons: e.buttons }).catch(reconnect);
-    } else if (pointers.size === 2) {
-      gesture = { kind: 'pinch', ...pair(), view: { ...view }, moved: true };
-    } else {
-      gesture = { kind: 'touch', x: e.clientX, y: e.clientY, lastX: e.clientX, lastY: e.clientY, view: { ...view }, moved: false };
+    if (pointers.size === 2) {
+      cancelTouchTimer(); cancelPointer();
+      gesture = { kind: 'pair', ...pair(), last: pair(), view: { ...view } };
+    } else if (pointers.size === 1) {
+      // Immediate pairs never press. A stationary hold commits after 150ms
+      // for press-and-hold challenges, leaving delivery margin within 200ms.
+      // A later pair explicitly cancels it.
+      const button = e.button === 2 ? 'right' : e.button === 1 ? 'middle' : 'left';
+      const g = gesture = { kind: 'single', x: e.clientX, y: e.clientY, view: { ...view },
+        point: point(e.clientX, e.clientY), button, buttons: e.pointerType === 'mouse' ? e.buttons : 1, pointerType: e.pointerType };
+      if (e.pointerType !== 'mouse' && touchPan) return;
+      if (e.pointerType === 'mouse') pressPointer(g);
+      else touchTimer = setTimeout(() => { if (gesture === g && pointers.size === 1) pressPointer(g); }, 150);
     }
   });
-  stage.addEventListener('pointermove', e => {
-    if (!pointers.has(e.pointerId)) return;
-    e.preventDefault(); pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
-    if (e.pointerType === 'mouse' && mouseDown) {
-      sendInput({ type: 'mouse', event_type: 'mouseMoved', ...point(e.clientX, e.clientY), buttons: e.buttons }).catch(reconnect); return;
-    }
-    if (pointers.size >= 2 && gesture?.kind === 'pinch') {
-      const p = pair(), g = gesture;
+  function flushPairMotion() {
+    if (!pairFrame) return;
+    cancelAnimationFrame(pairFrame); pairFrame = 0;
+    if (pointers.size < 2 || gesture?.kind !== 'pair') return;
+    const p = pair(), g = gesture;
+    if (g.zooming || Math.abs(p.distance / g.distance - 1) > .08) {
+      g.zooming = true;
       const scale = Math.min(8, Math.max(fitScale(), g.view.scale * p.distance / g.distance));
       view = zoomAt(g.view, scale, g.x, g.y);
       view.x += p.x - g.x; view.y += p.y - g.y; fitMode = false; paintView();
-    } else if (gesture?.kind === 'touch') {
-      const g = gesture, dx = e.clientX - g.x, dy = e.clientY - g.y;
-      if (Math.hypot(dx, dy) > 6) g.moved = true;
-      if (!g.moved) return;
-      if (view.scale > fitScale() + .001) {
-        view.x = g.view.x + dx; view.y = g.view.y + dy; paintView();
-      } else {
-        sendInput({ type: 'wheel', ...point(g.x, g.y), delta_x: (g.lastX - e.clientX) / view.scale, delta_y: (g.lastY - e.clientY) / view.scale }).catch(reconnect);
+    } else {
+      sendInput({ type: 'wheel', ...point(g.x, g.y), delta_x: (g.last.x - p.x) / view.scale, delta_y: (g.last.y - p.y) / view.scale }).catch(reconnect);
+    }
+    g.last = p;
+  }
+  stage.addEventListener('pointermove', e => {
+    if (!pointers.has(e.pointerId)) return;
+    if (!surfaceAvailable()) { cancelInteraction(); return; }
+    e.preventDefault(); pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (pointers.size >= 2 && gesture?.kind === 'pair') {
+      // Pointer Events deliver each finger separately. Evaluate one native
+      // sample together, or a parallel translation looks like a false pinch.
+      if (!pairFrame) pairFrame = requestAnimationFrame(flushPairMotion);
+    } else {
+      if (!pressed && gesture?.kind === 'single' && !touchPan && Math.hypot(e.clientX - gesture.x, e.clientY - gesture.y) >= 8) pressPointer(gesture);
+      if (pressed) {
+        pressed.point = point(e.clientX, e.clientY);
+        move({ type: 'mouse', event_type: 'mouseMoved', ...pressed.point, button: pressed.button, buttons: pressed.buttons });
+      } else if (gesture?.kind === 'single' && touchPan) {
+        view.x = gesture.view.x + e.clientX - gesture.x; view.y = gesture.view.y + e.clientY - gesture.y; paintView();
       }
-      g.lastX = e.clientX; g.lastY = e.clientY;
     }
   });
   function endPointer(e) {
     if (!pointers.has(e.pointerId)) return;
-    const g = gesture; pointers.delete(e.pointerId);
-    if (e.pointerType === 'mouse' && mouseDown) {
-      mouseDown = false;
-      sendInput({ type: 'mouse', event_type: 'mouseReleased', ...point(e.clientX, e.clientY), buttons: 0 }).then(res => focusField(res?.focus)).catch(reconnect);
-    } else if (e.type === 'pointerup' && g?.kind === 'touch' && !g.moved) tap(e.clientX, e.clientY);
-    // A remaining finger after a pinch must not become an accidental click.
+    cancelTouchTimer(); flushPairMotion();
+    if (!pressed && gesture?.kind === 'single' && !touchPan && e.type === 'pointerup' && surfaceAvailable()) pressPointer(gesture);
+    if (e.type === 'pointerup' && surfaceAvailable()) {
+      if (pressed) pressed.point = point(e.clientX, e.clientY);
+      releasePointer();
+    } else cancelPointer();
+    pointers.delete(e.pointerId);
+    // The remaining finger after a two-finger gesture cannot click/drag.
     gesture = null;
-    if (pointers.size === 1) {
-      const p = [...pointers.values()][0];
-      gesture = { kind: 'touch', ...p, lastX: p.x, lastY: p.y, view: { ...view }, moved: true };
-    }
   }
   stage.addEventListener('pointerup', endPointer);
   stage.addEventListener('pointercancel', endPointer);
+  stage.addEventListener('lostpointercapture', endPointer);
+  function cancelInteraction() {
+    cancelTouchTimer(); cancelAnimationFrame(pairFrame); pairFrame = 0;
+    cancelPointer(); pointers.clear(); gesture = null;
+  }
+  addEventListener('blur', () => { focusSequence++; cancelInteraction(); });
+  document.addEventListener('visibilitychange', () => { if (document.hidden) { focusSequence++; cancelInteraction(); } });
+  if (typeof ResizeObserver !== 'undefined') new ResizeObserver(() => {
+    if (!surfaceAvailable()) cancelInteraction();
+  }).observe(stage);
   stage.addEventListener('contextmenu', e => e.preventDefault());
   stage.addEventListener('wheel', e => {
     e.preventDefault();
+    if (!surfaceAvailable()) return;
     if (e.ctrlKey || e.metaKey) zoom(view.scale * Math.exp(-e.deltaY * .01), e.clientX, e.clientY);
     else sendInput({ type: 'wheel', ...point(e.clientX, e.clientY), delta_x: e.deltaX, delta_y: e.deltaY }).catch(reconnect);
   }, { passive: false });
-  const remoteTarget = target => target === canvas || target === proxy || target === document.body;
+  $('touch-mode-btn').onclick = () => {
+    touchPan = !touchPan;
+    $('touch-mode-btn').textContent = touchPan ? 'Touch: pan view' : 'Touch: interact';
+    $('touch-mode-btn').setAttribute('aria-pressed', String(touchPan));
+  };
+  const remoteTarget = target => target === proxy || !(target?.closest?.('#type-input, #hud-panel input, #hud-panel textarea, #hud-panel [contenteditable="true"]'));
   const modifiers = e => (e.altKey ? 1 : 0) | (e.ctrlKey ? 2 : 0) | (e.metaKey ? 4 : 0) | (e.shiftKey ? 8 : 0);
   function clipboardError(error) { $('clipboard-status').textContent = error?.message?.includes('Cut cancelled') ? error.message : 'Allow clipboard access, or use your device’s Paste menu.'; }
   async function clipboardOut(action = 'copy') {
@@ -182,11 +289,23 @@ if (typeof document !== 'undefined') {
   }
   function pasteText(text) {
     $('clipboard-status').textContent = '';
-    return sendInput({ type: 'paste', text }).then(result => { if (result?.focus) focusField(result.focus); });
+    return sendWithFocus({ type: 'paste', text });
   }
+  let pendingPaste = null, pasteSequence = 0;
+  function invalidatePaste() { pendingPaste = null; pasteSequence++; }
+  const ownsPaste = attempt => !completed && !document.hidden && attempt.sequence === pasteSequence &&
+    attempt.focus === focusSequence && remoteTarget(document.activeElement);
   document.addEventListener('paste', e => {
     if (!remoteTarget(e.target) || completed) return;
     e.preventDefault();
+    // One native paste consumes one shortcut turn, regardless of trust.
+    // Later Paste-menu actions must not be swallowed by a timing window.
+    const attempt = pendingPaste; pendingPaste = null;
+    if (!attempt) pasteSequence++;
+    if (attempt) {
+      if (attempt.inserted) return;
+      attempt.inserted = true;
+    }
     pasteText(e.clipboardData?.getData('text/plain') || '').catch(reconnect);
   });
   for (const action of ['copy', 'cut']) document.addEventListener(action, e => {
@@ -194,22 +313,40 @@ if (typeof document !== 'undefined') {
     e.preventDefault(); clipboardOut(action);
   });
   function remoteKey(e) {
-    if (e.isComposing || completed) return;
+    if (e.isComposing || composing || completed || !remoteTarget(e.target)) return;
     const shortcut = e.ctrlKey || e.metaKey, key = e.key.toLowerCase();
     // These belong to the viewer's browser, never the remote page.
-    if (shortcut && ['w', 't', 'l'].includes(key)) return;
+    if (shortcut && ['w', 't', 'l'].includes(key)) { invalidatePaste(); return; }
     // The paste event carries the real local clipboard. Forwarding keydown
     // as well would insert twice or type a literal 'v'.
-    if (shortcut && key === 'v') return;
+    if (shortcut && key === 'v') {
+      const attempt = pendingPaste = { inserted: false, sequence: ++pasteSequence, focus: focusSequence };
+      // Begin the permission-sensitive read inside the gesture, but let the
+      // native paste event win. Neither path may insert a second time.
+      const read = navigator.clipboard?.readText?.().then(text => ({ text }), error => ({ error }));
+      setTimeout(async () => {
+        if (attempt.inserted || !read || !ownsPaste(attempt)) return;
+        const result = await read;
+        if (attempt.inserted || !ownsPaste(attempt)) return;
+        if (result.error) { clipboardError(result.error); return; }
+        attempt.inserted = true;
+        pasteText(result.text).catch(reconnect);
+      }, 0);
+      return;
+    }
+    if (!['Control', 'Meta', 'Shift', 'Alt'].includes(e.key)) invalidatePaste();
     if (shortcut && ['c', 'x'].includes(key)) { e.preventDefault(); clipboardOut(key === 'x' ? 'cut' : 'copy'); return; }
     if (e.target === proxy && !shortcut && e.key.length === 1) return;
     if (['Control', 'Meta', 'Shift', 'Alt'].includes(e.key)) return;
     e.preventDefault();
-    sendInput({ type: 'key', key: e.key, modifiers: modifiers(e), commands: shortcut && key === 'a' ? ['selectAll'] : [] })
-      .then(result => { if (result?.focus) focusField(result.focus); }).catch(reconnect);
+    sendWithFocus({ type: 'key', key: e.key, modifiers: modifiers(e), commands: shortcut && key === 'a' ? ['selectAll'] : [] }).catch(reconnect);
   }
-  canvas.addEventListener('keydown', remoteKey);
-  proxy.addEventListener('keydown', remoteKey);
+  window.addEventListener('keydown', remoteKey);
+  // Native shortcut paste fires before keyup. End an unmatched fallback turn
+  // here too, so a later OS/menu paste remains an independent action.
+  window.addEventListener('keyup', e => { if (e.key.toLowerCase() === 'v') pendingPaste = null; });
+  window.addEventListener('blur', invalidatePaste);
+  canvas.focus({ preventScroll: true });
   proxy.addEventListener('compositionstart', () => { composing = true; });
   function commit() {
     if (proxy.value) { sendInput({ type: 'text', text: proxy.value }).catch(reconnect); proxy.value = ''; }
@@ -224,11 +361,15 @@ if (typeof document !== 'undefined') {
     $(id).addEventListener('pointerdown', e => e.preventDefault());
   }
   $('paste-btn').onclick = async () => {
-    try { await pasteText(await navigator.clipboard.readText()); } catch (_) { clipboardError(); }
+    const attempt = { sequence: ++pasteSequence, focus: focusSequence }; pendingPaste = null;
+    try {
+      const text = await navigator.clipboard.readText();
+      if (ownsPaste(attempt)) await pasteText(text);
+    } catch (_) { if (ownsPaste(attempt)) clipboardError(); }
   };
   $('copy-btn').onclick = () => clipboardOut();
   $('select-all-btn').onclick = () => sendInput({ type: 'key', key: 'a', modifiers: 2, commands: ['selectAll'] }).catch(reconnect);
-  $('tab-btn').onclick = () => sendInput({ type: 'key', key: 'Tab' }).then(result => focusField(result?.focus)).catch(reconnect);
+  $('tab-btn').onclick = () => sendWithFocus({ type: 'key', key: 'Tab' }).catch(reconnect);
   $('esc-btn').onclick = () => sendInput({ type: 'key', key: 'Escape' }).catch(reconnect);
   $('hud-toggle').onclick = () => {
     const expanded = $('hud-panel').hidden;
@@ -260,22 +401,22 @@ if (typeof document !== 'undefined') {
   function finish() { completed = true; proxy.blur(); $('done-overlay').hidden = false; }
   $('done-btn').onclick = async () => {
     $('done-btn').disabled = true;
-    try { await inputQueue; await request('/complete', { note: 'completed by user in takeover UI' }); finish(); }
+    try { cancelInteraction(); invalidatePaste(); await dispatcher.idle(); await request('/complete', { note: 'completed by user in takeover UI' }); finish(); }
     catch (_) { reconnect(); $('done-btn').disabled = false; }
   };
   // A normal navigation restores immediately; an abrupt disconnect uses the server's heartbeat lease.
   addEventListener('pagehide', () => { if (phone && !completed) navigator.sendBeacon(BASE + '/viewport', new Blob([JSON.stringify({ enabled: false })], { type: 'application/json' })); });
-  addEventListener('resize', () => { if (ready) { if (fitMode) reset(); else paintView(); } });
+  addEventListener('resize', () => { if (!surfaceAvailable()) cancelInteraction(); if (ready) { if (fitMode) reset(); else paintView(); } });
   if (window.visualViewport) visualViewport.addEventListener('resize', () => {
     const vv = visualViewport;
     $('hud').style.bottom = `calc(${Math.max(0, innerHeight - vv.height - vv.offsetTop) + 10}px + env(safe-area-inset-bottom))`;
-    if (keyboardActive && remoteFocus?.editable) focusField(remoteFocus);
+    if (document.activeElement === proxy && keyboardActive && remoteFocus?.editable) focusField(remoteFocus);
   });
   async function pollFrame() {
     if (completed) return;
     const revision = frameRevision;
     try {
-      const res = await fetch(BASE + '/frame.jpg?t=' + Date.now());
+      const res = await fetch(BASE + '/frame.jpg?t=' + Date.now(), { signal: AbortSignal.timeout(5000) });
       if (!res.ok) throw new Error('frame');
       const image = await createImageBitmap(await res.blob());
       if (revision === frameRevision) {
@@ -289,8 +430,10 @@ if (typeof document !== 'undefined') {
         lastFrame = Date.now(); $('connection').hidden = true;
       }
       image.close();
-    } catch (_) { reconnect(); }
-    setTimeout(pollFrame, 160);
+    } catch (_) { reconnect(); setTimeout(pollFrame, 100); return; }
+    // Capture already waits for the remote compositor. Start the next request
+    // immediately: a cooldown adds to the stale-frame wait after every input.
+    setTimeout(pollFrame, 0);
   }
   async function pollState() {
     if (completed) return;

@@ -53,6 +53,10 @@ impl FakeTelegram {
             while !*shared_stop.lock().unwrap() {
                 match listener.accept() {
                     Ok((stream, _)) => {
+                        // BSD/macOS accept inherits the listener's O_NONBLOCK.
+                        // The request reader must wait for the client body, not
+                        // mistake WouldBlock for EOF and close the connection.
+                        stream.set_nonblocking(false).unwrap();
                         let asked = Arc::clone(&shared_asked);
                         let pending = Arc::clone(&shared_pending);
                         thread::spawn(move || serve(stream, asked, pending));
@@ -258,6 +262,7 @@ fn machine_path(dir: &Path) -> std::ffi::OsString {
 }
 
 fn create(dir: &Path, name: &str) -> String {
+    support::operator_at(dir);
     let created = Command::new(env!("CARGO_BIN_EXE_anyagents"))
         .arg("--data")
         .arg(dir)
@@ -265,7 +270,6 @@ fn create(dir: &Path, name: &str) -> String {
         .env("PATH", machine_path(dir))
         .env("ANYAGENTS_CLAUDE_CODE_BIN", "/bin/true")
         .env("ANYAGENTS_LAUNCHER", support::fake_launcher(dir))
-        .env("ANYAGENTS_AGENTS", support::agents_line())
         .env("ANYAGENTS_TESTS", "own-seat")
         .env(
             "ANYAGENTS_OPERATOR_TOKEN_FILE",
@@ -291,6 +295,7 @@ fn create(dir: &Path, name: &str) -> String {
 
 /// Add one Telegram bot for `agent`, with the bot id as its token's first field.
 fn add_channel(dir: &Path, agent: &str, bot: i64) {
+    let fake = FakeTelegram::start();
     let token = dir.join(format!("bot-token-{bot}"));
     std::fs::write(&token, format!("{bot}:test-token")).unwrap();
     let added = Command::new(env!("CARGO_BIN_EXE_anyagents"))
@@ -300,8 +305,8 @@ fn add_channel(dir: &Path, agent: &str, bot: i64) {
         .arg("--token-file")
         .arg(&token)
         .env("ANYAGENTS_LAUNCHER", support::fake_launcher(dir))
-        .env("ANYAGENTS_AGENTS", support::agents_line())
         .env("ANYAGENTS_TESTS", "own-seat")
+        .env("ANYAGENTS_TELEGRAM_API", &fake.address)
         .env(
             "ANYAGENTS_OPERATOR_TOKEN_FILE",
             dir.join(support::TOKEN_FILE),

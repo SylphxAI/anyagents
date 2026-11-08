@@ -12,6 +12,7 @@ mod auth;
 mod browser;
 mod channel;
 mod client;
+mod computer;
 mod create;
 mod data;
 mod dsh;
@@ -37,6 +38,7 @@ mod spiron;
 mod telegram;
 mod ui;
 mod vendor;
+mod web;
 mod worktree;
 mod worktree_access;
 
@@ -237,7 +239,7 @@ enum Command {
     },
     /// Send a message, media file, GPS location/venue, or poll to one or more agents, groups, or channels.
     Send {
-        /// Target(s): `agent:<name>`, bare name, comma-separated names (`sage,forge`), `parent`, `children`, `group:<name>`, `all`, or `telegram:chat:<id>[:<topic>]`.
+        /// Target(s): `agent:<name>`, bare name, comma-separated names (`planner,builder`), `parent`, `children`, `group:<name>`, `all`, or `telegram:chat:<id>[:<topic>]`.
         to: String,
         /// Message text or caption (optional when sending media, location, or poll).
         #[arg(default_value = "")]
@@ -359,11 +361,14 @@ enum Command {
     },
     /// Read or search (`--query`) authorized agents' full two-way (`in` + `out`) conversation across users, channels, groups, and peers.
     Conversation {
-        /// Agent name (`sage`, `volt`, `xenon`, `all`) or `agt_...` id (defaults to this agent, or `all` when `--query` is set).
+        /// Agent name (`planner`, `builder`, `reviewer`, `all`) or `agt_...` id (defaults to this agent, or `all` when `--query` is set).
         agent: Option<String>,
         /// Optional lexical + structured search query (SQLite FTS5 BM25 + CJK bigram + exact phrase boost).
         #[arg(short = 'q', long)]
         query: Option<String>,
+        /// Optional scope filter (`all`, `memory`, `transcripts`).
+        #[arg(long)]
+        scope: Option<String>,
         /// Optional peer filter (e.g. `alice`, `agent:beta`, `group:crew`, `telegram:chat:-1001234567890`).
         #[arg(long)]
         with: Option<String>,
@@ -398,9 +403,12 @@ enum Command {
     Search {
         /// Search query (matched via SQLite FTS5 BM25 with hybrid ASCII + CJK bigrams and exact substring boost).
         query: String,
-        /// Optional agent filter (`sage`, `volt`, `xenon`, or `all`; defaults to `all`).
+        /// Optional agent filter (`planner`, `builder`, `reviewer`, or `all`; defaults to `all`).
         #[arg(long)]
         agent: Option<String>,
+        /// Optional scope filter (`all`, `memory`, `transcripts`).
+        #[arg(long)]
+        scope: Option<String>,
         /// Optional peer filter.
         #[arg(long)]
         with: Option<String>,
@@ -479,7 +487,7 @@ enum Command {
     },
     /// View or update an agent's role & responsibility description (`anyagents describe [agent] [description]`).
     Describe {
-        /// Target agent name (`self`, `all`, `xenon`, `sage`, ...) or description text when updating `self`.
+        /// Target agent name (`self`, `all`, `reviewer`, `planner`, ...) or description text when updating `self`.
         agent: Option<String>,
         /// New role/responsibility description (syncs into the agent's private system prompt and group roster).
         description: Option<String>,
@@ -519,7 +527,7 @@ enum Command {
         target: Option<String>,
         /// Secondary argument: text to enter when `action` is `fill` / `type`.
         value: Option<String>,
-        /// Persistent browser profile name (e.g. `default`, `xenon`, `github`).
+        /// Persistent browser profile name (e.g. `default`, `reviewer`, `github`).
         #[arg(short = 'p', long)]
         profile: Option<String>,
         /// Explicit URL override.
@@ -698,7 +706,7 @@ enum AgentsCommand {
     /// Record an agent. The harness is a catalog key.
     Create {
         name: String,
-        /// Optional short role label (`Spiron`, `Design`, `Revenue`, ...).
+        /// Optional short role label (`Planner`, `Design`, `Support`, ...).
         #[arg(long)]
         role: Option<String>,
         #[arg(long, default_value = "")]
@@ -811,6 +819,7 @@ fn resolve_data_dir(raw: PathBuf, _is_serve: bool) -> PathBuf {
 
 fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
     let data = resolve_data_dir(cli.data, matches!(cli.command, Command::Serve));
+    sandbox::load_principal_registry(&data)?;
     match cli.command {
         Command::Serve => server::run(&data),
         Command::ServeAdmin => server::run_admin(&data),
@@ -1126,6 +1135,7 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
         Command::Conversation {
             agent,
             query,
+            scope,
             with,
             since_ms,
             limit,
@@ -1136,6 +1146,7 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
             since_ms,
             limit,
             query.as_deref(),
+            scope.as_deref(),
         ),
         Command::Redact {
             agent,
@@ -1179,6 +1190,7 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
         Command::Search {
             query,
             agent,
+            scope,
             with,
             since_ms,
             limit,
@@ -1189,6 +1201,7 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
             since_ms,
             Some(limit.unwrap_or(20)),
             Some(&query),
+            scope.as_deref(),
         ),
         Command::Usage { agent, by } => agent::usage(&data, agent.as_deref(), by.as_deref())
             .map_err(|err| match err {
@@ -1335,7 +1348,7 @@ fn schedule_cmd(
                 "agent_id": rec.id.to_string(),
                 "agent": rec.name,
                 "cancelled": count,
-                "schedules": schedule::list_agent_schedules(&store, &rec.id, false),
+                "schedules": schedule::list_agent_schedules(&store, &rec.id, false).map_err(anyagents_core::Error::Message)?,
             });
             println!(
                 "{}",
@@ -1374,7 +1387,8 @@ fn schedule_cmd(
             }
         }
         _ => {
-            let list = schedule::list_agent_schedules(&store, &rec.id, false);
+            let list = schedule::list_agent_schedules(&store, &rec.id, false)
+                .map_err(anyagents_core::Error::Message)?;
             if json {
                 println!(
                     "{}",
@@ -1454,7 +1468,8 @@ fn inspect_cmd(
     }
     let store = anyagents_core::Store::open(data.join("state.db"))?;
     let rec = store.agent_by_name(&target)?;
-    let schedules = schedule::list_agent_schedules(&store, &rec.id, false);
+    let schedules = schedule::list_agent_schedules(&store, &rec.id, false)
+        .map_err(anyagents_core::Error::Message)?;
     let out = serde_json::json!({
         "agent": {
             "id": rec.id.to_string(),
@@ -1897,7 +1912,10 @@ fn profiles_cmd(
             Ok(())
         }
         Some("refresh") | Some("reset") => {
-            create::force_refresh_provider_profiles(data, target);
+            create::force_refresh_provider_profiles(data, target)?;
+            if let Ok(store) = anyagents_core::Store::open(data.join("state.db")) {
+                let _ = create::sync_and_list_provider_profiles(&store, data);
+            }
             list_profiles_cmd(data, target)
         }
         Some("models") | Some("catalog") => {
@@ -2007,14 +2025,14 @@ fn sign_in(data: &Path, target: &str, profile: Option<&str>) -> Result<(), anyag
         let expected_prov = create::upstream_provider_of(&rec.harness, rec.model.as_deref());
         let (prov, prof_name) = prof.split_once('/').unwrap_or((&expected_prov, prof));
         let normalized = format!("{prov}/{prof_name}");
-        let _ = std::fs::write(cfg.join(".anyagents-profile"), format!("{normalized}\n"));
+        std::fs::write(cfg.join(".anyagents-profile"), format!("{normalized}\n"))?;
         let prof_dir = data.join("profiles").join(prov).join(prof_name);
         let has_stored_creds = std::fs::read_dir(&prof_dir)
             .ok()
             .is_some_and(|entries| entries.flatten().any(|e| e.file_name() != "profile.json"));
         if has_stored_creds && let Ok(store) = anyagents_core::Store::open(data.join("state.db")) {
-            create::seed_harness_credentials(&store, data, &rec, &cfg);
-            if let Some((_, uid, gid, _)) = crate::sandbox::seat_for_agent(&rec.name) {
+            create::seed_harness_credentials(&store, data, &rec, &cfg)?;
+            if let Some((_, uid, gid, _)) = crate::sandbox::seat_for_agent(rec.id.as_str()) {
                 crate::sandbox::share_config_with_seat_uid(&cfg, uid, gid);
             }
             println!("signed in\t{target}\t{}\tprofile:{normalized}", rec.harness);
@@ -2030,19 +2048,29 @@ fn sign_in(data: &Path, target: &str, profile: Option<&str>) -> Result<(), anyag
             "{target} is not signed in: the vendor command finished without reporting a sign-in (install: {hint})"
         )));
     }
-    create::finalize_agent_signin(data, &rec);
+    create::finalize_agent_signin(data, &rec)?;
+    // A sign-in is a new instance: the server gives the agent a fresh
+    // capability and retires the last one.
+    if server::socket_path(data).exists() || data.join("admin.sock").exists() {
+        client::call::<serde_json::Value>(
+            data,
+            "POST",
+            &format!("/v1/operator/agents/{target}/capability"),
+            Some(b"{}".to_vec()),
+            &client::Authority::Operator,
+        )
+        .map_err(anyagents_core::Error::Message)?
+        .ok_or_else(|| {
+            anyagents_core::Error::Message("capability rotation returned no receipt".into())
+        })?;
+    } else {
+        // An offline instance uses the same durable capability rotation mechanism.
+        let store = agent::open_with_key(data)?;
+        operator::mint(&store, &rec.id)?;
+    }
     println!(
         "signed in\t{target}\t{harness}\t{}",
         outcome.account.as_deref().unwrap_or("-")
-    );
-    // A sign-in is a new instance: the server gives the agent a fresh
-    // capability and retires the last one.
-    let _ = client::call::<serde_json::Value>(
-        data,
-        "POST",
-        &format!("/v1/operator/agents/{target}/capability"),
-        Some(b"{}".to_vec()),
-        &client::Authority::Operator,
     );
     Ok(())
 }
@@ -2220,7 +2248,7 @@ fn list_profiles_cmd(data: &Path, filter: Option<&str>) -> Result<(), anyagents_
             && !t.eq_ignore_ascii_case("reset")
     });
     let mut entries = if let Ok(store) = anyagents_core::Store::open(data.join("state.db")) {
-        create::sync_and_list_provider_profiles(&store, data)
+        create::list_provider_profiles_fast(&store, data)
     } else if client::can_call_server(data) {
         match client::call::<Vec<create::ProviderProfileEntry>>(
             data,
@@ -2239,9 +2267,11 @@ fn list_profiles_cmd(data: &Path, filter: Option<&str>) -> Result<(), anyagents_
         }
     } else {
         let store = anyagents_core::Store::open(data.join("state.db"))?;
-        create::sync_and_list_provider_profiles(&store, data)
+        create::list_provider_profiles_fast(&store, data)
     };
-    create::enrich_profiles_usage(data, &mut entries);
+    if entries.iter().any(|e| e.usage.is_none()) {
+        create::enrich_profiles_usage(data, &mut entries);
+    }
     let matches_filter = |e: &create::ProviderProfileEntry, f_trimmed: &str| -> bool {
         e.provider == f_trimmed
             || e.profile == f_trimmed
@@ -2410,7 +2440,8 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
                         seat_user: seat_info.as_ref().map(|(u, _, _, _)| u.clone()),
                         seat_uid: seat_info.as_ref().map(|(_, uid, _, _)| *uid),
                         seat_gid: seat_info.as_ref().map(|(_, _, gid, _)| *gid),
-                        schedules: schedule::list_agent_schedules(&store, &a.id, false),
+                        schedules: schedule::list_agent_schedules(&store, &a.id, false)
+                            .map_err(anyagents_core::Error::Message)?,
                     });
                 }
             }
