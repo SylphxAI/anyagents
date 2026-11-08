@@ -1,6 +1,6 @@
 // The launcher must run the native binary for the current platform, take its
 // arguments verbatim, forward its exit status, and say something useful when
-// there is no binary. Run with `node --test packages/anyagents/test`.
+// there is no binary. Run with `node --test packages/anyagents/test/*.test.js`.
 "use strict";
 const assert = require("node:assert/strict");
 const { mkdtempSync, writeFileSync, chmodSync, rmSync } = require("node:fs");

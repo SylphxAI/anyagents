@@ -8,7 +8,7 @@
     * { box-sizing: border-box; }
     html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; background: #0b1019; color: #f3f6fc; font-family: system-ui, sans-serif; }
     #stage { position: fixed; inset: 0; overflow: hidden; touch-action: none; }
-    #screen { position: absolute; left: 0; top: 0; transform-origin: 0 0; outline: none; cursor: crosshair; }
+    #screen { position: absolute; left: 0; top: 0; transform-origin: 0 0; outline: none; cursor: default; }
     #connection { position: fixed; top: max(12px, env(safe-area-inset-top)); left: 50%; transform: translateX(-50%); padding: 8px 14px; border-radius: 24px; background: #452d13; color: #ffe2a2; font-size: 14px; pointer-events: none; }
     #connection[hidden] { display: none; }
     #hud { position: fixed; bottom: calc(10px + env(safe-area-inset-bottom)); left: max(10px, env(safe-area-inset-left)); right: max(10px, env(safe-area-inset-right)); margin: auto; width: max-content; max-width: calc(100% - 20px); border: 1px solid #40516b; border-radius: 24px; background: #121c2bf2; box-shadow: 0 8px 32px #0007; padding: 1px; }
@@ -35,7 +35,7 @@
   </style>
 </head>
 <body>
-  <main id="stage" aria-label="Remote browser. Pinch to zoom; drag to pan when zoomed."><canvas id="screen" width="1280" height="800" tabindex="0" aria-label="Remote browser screen"></canvas></main>
+  <main id="stage" aria-label="Remote browser. Single finger interacts; two fingers scroll or pinch to zoom."><canvas id="screen" width="1280" height="800" tabindex="0" aria-label="Remote browser screen"></canvas></main>
   <div id="connection" role="status">Connecting…</div>
   <section id="hud" aria-label="Browser controls">
     <div id="hud-bar">
@@ -53,7 +53,8 @@
       <div class="row"><button id="send-text-btn">Send</button><button id="enter-btn">Enter ↵</button><button id="bksp-btn" aria-label="Backspace">⌫</button></div>
       <div class="row"><button id="reset-btn">Reset zoom</button><button id="fit-btn">1:1</button></div>
       <button id="viewport-btn" aria-pressed="false">Phone layout: off</button>
-      <div id="hint">Pinch to zoom · drag to pan · swipe to scroll at fit</div>
+      <button id="touch-mode-btn" aria-pressed="false">Touch: interact</button>
+      <div id="hint">One finger clicks or drags · two fingers scroll or pinch · pan mode moves the view</div>
       <details><summary>Session details · {{PROFILE}}</summary><p>{{REASON}}</p><p>Phone layout is optional. It resizes the remote page without changing its browser identity.</p><div id="captcha-badge"></div><div id="page-url"></div><button id="reload-btn" aria-label="Reload remote page">Reload ↻</button></details>
     </div>
   </section>

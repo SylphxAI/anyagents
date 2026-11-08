@@ -232,10 +232,10 @@ mod tests {
             .args(["--exact", name, "--nocapture", "--test-threads=1"])
             .output()
             .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
-            output.status.success(),
-            "{name}: stdout={} stderr={}",
-            String::from_utf8_lossy(&output.stdout),
+            output.status.success() && stdout.contains("1 passed; 0 failed;"),
+            "{name}: stdout={stdout} stderr={}",
             String::from_utf8_lossy(&output.stderr)
         );
         true
@@ -512,6 +512,11 @@ mod tests {
 
     #[test]
     fn busy_global_lock_defers_launch_and_startup_without_moving_sources() {
+        if run_in_single_test_process(
+            "host_memory::tests::busy_global_lock_defers_launch_and_startup_without_moving_sources",
+        ) {
+            return;
+        }
         let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let agent = store
