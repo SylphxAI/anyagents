@@ -67,9 +67,16 @@ pub(crate) fn sequence(value: Option<&Value>, allow_zero: bool) -> Result<i64, S
     n.ok_or_else(|| "missing or invalid cloud event sequence".into())
 }
 pub(crate) fn post_required(url: &str, key: &str, body: &Value) -> Result<(), String> {
-    let (status, _) = crate::auth::post_cloud_json(url, Some(key), body)?;
+    let (status, resp) = crate::auth::post_cloud_json(url, Some(key), body)?;
     if !(200..300).contains(&status) {
-        return Err(format!("required cloud operation HTTP {status}: {url}"));
+        let detail = resp.trim();
+        if detail.is_empty() {
+            return Err(format!("required cloud operation HTTP {status}: {url}"));
+        }
+        let snippet: String = detail.chars().take(240).collect();
+        return Err(format!(
+            "required cloud operation HTTP {status}: {url}: {snippet}"
+        ));
     }
     Ok(())
 }

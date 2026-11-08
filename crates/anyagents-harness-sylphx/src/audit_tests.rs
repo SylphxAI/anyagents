@@ -870,3 +870,41 @@ fn teleport_requires_durable_instruction_revision_and_retains_created_binding_on
         }
     }
 }
+
+#[test]
+fn transcript_validation_recovers_crash_spliced_lines_and_local_switch_clears_receipt() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = tmp.path();
+    let tr = cfg.join("sylphx-transcript.jsonl");
+    std::fs::write(
+        &tr,
+        "{\"role\":\"user\",\"content\":\"first\"}\n{\"type\":\"reasoning\",\"summary\":[{\"text\":\"truncated{\"role\":\"user\",\"content\":\"anyagents-message:recovery_msg_1\"}\n",
+    )
+    .unwrap();
+    memory::validate_transcript(&tr).unwrap();
+    let repaired = std::fs::read_to_string(&tr).unwrap();
+    assert!(repaired.contains("anyagents-message:recovery_msg_1"));
+    assert!(!repaired.contains("truncated"));
+
+    let rcpt = cfg.join("sylphx-cloud-tool-receipt.json");
+    std::fs::write(
+        &rcpt,
+        json!({
+            "session_path": "orgs/a/projects/b/envs/c/agent_sessions/s1",
+            "call_id": "call-local",
+            "event_sequence": 2,
+            "state": "completed",
+            "output": "{\n  \"status\": \"ok\",\n  \"placement\": \"local\",\n  \"note\": \"Switched workspace execution to host-local Sylphx harness\"\n}",
+            "error": false
+        })
+        .to_string(),
+    )
+    .unwrap();
+    flush_cloud_tool_receipt(cfg, "http://127.0.0.1:1", "fixture-key").unwrap();
+    assert!(!rcpt.exists());
+
+    assert!(auth::is_transient_gateway_failure(
+        503,
+        r#"{"error":{"type":"service_unavailable","code":"service_unavailable","message":"Durable spend authorization is unavailable."},"retryable":false}"#,
+    ));
+}
