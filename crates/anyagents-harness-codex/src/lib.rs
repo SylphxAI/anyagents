@@ -1277,7 +1277,7 @@ mod protocol_write_tests {
     #[test]
     fn successful_required_approval_reply_preserves_protocol_progress() {
         let harness = reader_fixture(
-            "printf '%s\n' '{\"id\":99,\"method\":\"approval/request\"}'; IFS= read -r reply; printf '%s\n' '{\"method\":\"turn/started\",\"params\":{\"turnId\":\"reply-received\"}}'; exec cat >/dev/null",
+            "printf '%s\n' '{\"id\":99,\"method\":\"approval/request\"}'; IFS= read -r reply; printf '%s\n' '{\"method\":\"turn/started\",\"params\":{\"turnId\":\"reply-received\"}}'; exec sleep 30",
             false,
         );
         assert!(
@@ -1301,7 +1301,7 @@ mod protocol_write_tests {
     #[test]
     fn successful_retry_write_is_counted_and_reaches_the_vendor() {
         let harness = reader_fixture(
-            "printf '%s\n' '{\"method\":\"ready\"}'; IFS= read -r retry; printf '%s\n' '{\"method\":\"turn/started\",\"params\":{\"turnId\":\"retry-received\"}}'; exec cat >/dev/null",
+            "printf '%s\n' '{\"method\":\"ready\"}'; IFS= read -r retry; printf '%s\n' '{\"method\":\"turn/started\",\"params\":{\"turnId\":\"retry-received\"}}'; exec sleep 30",
             true,
         );
         assert!(
