@@ -7088,9 +7088,10 @@ pub(crate) mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn local_sender_identity_survives_rename_while_journal_waits() {
+    fn local_sender_identity_survives_rename_and_refuses_deletion_while_journal_waits() {
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
         use std::time::{Duration, Instant};
+        for delete in [false, true] {
         let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let original = store.create_agent(anyagents_core::NewAgent::new("author", "opencode")).unwrap();
@@ -7118,19 +7119,26 @@ pub(crate) mod tests {
             };
             // Release even on a failed observation, so the fixture cannot deadlock.
             if waiting {
-                store.rename_agent(&original.id, "renamed").unwrap();
+                if delete { store.delete_agent(&original.id).unwrap(); }
+                else { store.rename_agent(&original.id, "renamed").unwrap(); }
                 let replacement = store.create_agent(anyagents_core::NewAgent::new("author", "opencode")).unwrap();
                 store.set_agent_role(&replacement.id, Some("wrong role")).unwrap();
             }
             drop(lock);
-            sending.join().unwrap().unwrap();
+            let result = sending.join().unwrap();
+            if delete {
+                let error = result.err().expect("deleted admitted author cannot publish");
+                assert!(error.contains("agent not found"), "{error}");
+            } else { result.unwrap(); }
             assert!(waiting, "actual journal-lock waiter must be observed");
         });
         let inbox = store.inbox(&recipient.id, None).unwrap();
+        if delete { assert!(inbox.is_empty()); continue; }
         assert_eq!(inbox.len(), 1);
         assert_eq!(inbox[0].sender.as_deref(), Some(format!("agent:{}", original.id).as_str()));
         assert_eq!(inbox[0].context.sender_role.as_deref(), Some("admitted role"));
         assert_eq!(inbox[0].context.sender_rel.as_deref(), Some("parent"));
+        }
     }
 
     #[test]

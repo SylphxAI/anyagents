@@ -2033,10 +2033,6 @@ fn sign_in(data: &Path, target: &str, profile: Option<&str>) -> Result<(), anyag
         )));
     }
     create::finalize_agent_signin(data, &rec)?;
-    println!(
-        "signed in\t{target}\t{harness}\t{}",
-        outcome.account.as_deref().unwrap_or("-")
-    );
     // A sign-in is a new instance: the server gives the agent a fresh
     // capability and retires the last one.
     if server::socket_path(data).exists() || data.join("admin.sock").exists() {
@@ -2056,6 +2052,10 @@ fn sign_in(data: &Path, target: &str, profile: Option<&str>) -> Result<(), anyag
         let store = agent::open(data)?;
         operator::mint(&store, &rec.id)?;
     }
+    println!(
+        "signed in\t{target}\t{harness}\t{}",
+        outcome.account.as_deref().unwrap_or("-")
+    );
     Ok(())
 }
 

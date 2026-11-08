@@ -2015,7 +2015,7 @@ fn notify_agent_takeover_completed(
     let text = format!(
         "[Browser Takeover Completed] User finished browser takeover on profile `{profile}`{note_suffix} (current url: {url}). Control is now back with you; call `browser({{ \"action\": \"snapshot\", \"profile\": \"{profile}\" }})` to inspect the updated page and continue."
     );
-    store.receive(
+    let outcome = store.receive(
         &agent.id,
         anyagents_core::Incoming {
             source_key: Some(msg_id),
@@ -2028,6 +2028,8 @@ fn notify_agent_takeover_completed(
             origin: None,
         },
     )?;
+    // Receipt replay must not replay lifecycle effects after a later archive.
+    if matches!(outcome, anyagents_core::ReceiveOutcome::Duplicate(_)) { return Ok(()); }
     if agent.state == "idle" || agent.state == "archived" {
         store.set_agent_state(&agent.id, "running")?;
     }
@@ -2725,39 +2727,30 @@ fn complete_takeover_session(
         }
     }
     if let Some(mut st) = load_takeover_state(data, profile)? {
-        restore_takeover_viewport(&mut st)?;
-        if let Some(tpid) = st.tunnel_pid.take() {
-            stop_process_group(tpid);
+        if !st.completed {
+            restore_takeover_viewport(&mut st)?;
+            if let Some(tpid) = st.tunnel_pid.take() { stop_process_group(tpid); }
+            st.holder = "agent".to_string();
+            st.completed = true;
+            st.notification_pending = true;
+            st.completed_at_ms = Some(now);
+            st.completion_note = note.map(str::to_string)
+                .or_else(|| Some("completed by user".to_string()));
+            save_takeover_state(data, &st)?;
         }
-        st.holder = "agent".to_string();
-        st.completed = true;
-        st.notification_pending = true;
-        st.completed_at_ms = Some(now);
-        st.completion_note = note
-            .map(str::to_string)
-            .or_else(|| Some("completed by user".to_string()));
-        save_takeover_state(data, &st)?;
-        notify_agent_takeover_completed(
-            data,
-            st.owner_agent.as_deref(),
-            profile,
-            &current_url,
-            st.completion_note.as_deref(),
-            st.started_at_ms,
-        )
-        .map_err(|err| {
-            Error::Message(format!(
-                "takeover completed; owner notification pending: {err}"
-            ))
-        })?;
-        st.notification_pending = false;
-        save_takeover_state(data, &st)?;
+        if st.notification_pending {
+            notify_agent_takeover_completed(data, st.owner_agent.as_deref(), profile,
+                &current_url, st.completion_note.as_deref(), st.started_at_ms)
+                .map_err(|err| Error::Message(format!("takeover completed; owner notification pending: {err}")))?;
+            st.notification_pending = false;
+            save_takeover_state(data, &st)?;
+        }
         Ok(serde_json::json!({
             "ok": true,
             "profile": profile,
             "holder": "agent",
             "completed": true,
-            "completed_at_ms": now,
+            "completed_at_ms": st.completed_at_ms,
             "url": current_url,
         }))
     } else {
@@ -4126,6 +4119,20 @@ fn execute_inner(
                     r#"(() => {{
                       const el = document.querySelector({sel_json});
                       if (!el) return false;
+                      // Auto-advancing single-cell codes deliberately spread the
+                      // trusted keystrokes across controls; verify the whole group,
+                      // never replace or approve only its first cell.
+                      if (el.maxLength === 1 && Array.from({val_json}).length > 1) {{
+                        const root = el.form || el.parentElement;
+                        if (!root) return false;
+                        const cells = Array.from(root.querySelectorAll('input')).filter(cell =>
+                          cell.maxLength === 1 && !cell.disabled && !cell.readOnly && cell.type !== 'hidden');
+                        const start = cells.indexOf(el);
+                        const group = cells.slice(start, start + Array.from({val_json}).length);
+                        if (start < 0 || group.length !== Array.from({val_json}).length || group.map(cell => cell.value).join('') !== {val_json}) return false;
+                        for (const cell of group) cell.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                        return group.map(cell => cell.value).join('') === {val_json};
+                      }}
                       if (typeof el.value === 'string' && el.value !== {val_json} && (!el.maxLength || el.maxLength < 0 || {val_json}.length <= el.maxLength)) {{
                         const proto = Object.getPrototypeOf(el);
                         const desc = Object.getOwnPropertyDescriptor(proto, 'value')
@@ -5267,6 +5274,85 @@ mod tests {
     }
 
     #[test]
+    fn chromium_split_otp_fill_verifies_all_cells_before_submit() {
+        assert!(
+            Path::new(&chromium_binary()).exists(),
+            "Chromium is required for split OTP input verification"
+        );
+        let data = tempfile::tempdir().unwrap();
+        let (mut runtime, _) =
+            ensure_browser_running(data.path(), "split-code", Some(true)).unwrap();
+        let target = select_page_target(data.path(), &mut runtime, None).unwrap();
+        let mut session =
+            CdpSession::connect(runtime.cdp_port, target.ws_url.as_deref().unwrap()).unwrap();
+        let mut outcomes = Vec::new();
+        for (cells, corrupt) in [(6, false), (6, true), (5, false)] {
+            eval_js(
+                &mut session,
+                &format!(
+                    r#"(() => {{
+              document.body.innerHTML = '<form id="code"></form>';
+              const form = document.querySelector('form');
+              window.codeSubmissions = 0;
+              window.trustedCodeInputs = 0;
+              for (let i = 0; i < {cells}; i++) {{
+                const field = document.createElement('input');
+                field.id = 'digit-' + i;
+                field.maxLength = 1;
+                field.inputMode = 'numeric';
+                field.addEventListener('input', event => {{
+                  if (event.isTrusted) window.trustedCodeInputs++;
+                  if ({corrupt} && i === 2) field.value = 'x';
+                  if (field.value && field.nextElementSibling) field.nextElementSibling.focus();
+                }});
+                form.appendChild(field);
+              }}
+              form.addEventListener('keydown', event => {{
+                if (event.key === 'Enter') {{ event.preventDefault(); window.codeSubmissions++; }}
+              }});
+              return true;
+            }})()"#
+                ),
+            )
+            .unwrap();
+            let result = execute(
+                data.path(),
+                "split-code",
+                BrowserRequest {
+                    action: "fill".into(),
+                    selector: Some("#digit-0".into()),
+                    text: Some("123456".into()),
+                    submit: Some(true),
+                    ..Default::default()
+                },
+            );
+            let observed = eval_js(&mut session, r#"({ value: Array.from(document.querySelectorAll('input')).map(el => el.value).join(''), submissions: window.codeSubmissions, trusted: window.trustedCodeInputs })"#).unwrap();
+            outcomes.push((result, observed));
+        }
+        drop(session);
+        stop_profile(data.path(), "split-code").unwrap();
+        let (result, observed) = &outcomes[0];
+        assert!(result.is_ok(), "split code must be accepted: {result:?}");
+        assert_eq!(observed["value"], "123456");
+        assert_eq!(observed["submissions"], 1);
+        assert_eq!(observed["trusted"], 6);
+        for (result, observed) in &outcomes[1..] {
+            assert!(
+                result
+                    .as_ref()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("input value verification failed")
+            );
+            assert_ne!(observed["value"], "123456");
+            assert_eq!(
+                observed["submissions"], 0,
+                "an incomplete or wrong split code cannot submit"
+            );
+        }
+    }
+
+    #[test]
     fn navigation_and_tab_refusals_do_not_acknowledge_or_change_target() {
         for action in ["navigate", "reload"] {
             let fixture = ScriptedBrowser::new(move |request| {
@@ -5670,6 +5756,62 @@ mod tests {
                 .started_at_ms,
             state.started_at_ms
         );
+    }
+
+    #[test]
+    fn completed_takeover_retries_preserve_owner_lifecycle_and_receipt() {
+        let fixture = ScriptedBrowser::new(cdp_ok_response);
+        let store = anyagents_core::Store::open(fixture.data.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(anyagents_core::NewAgent::new("reader", "codex"))
+            .unwrap();
+        store.set_agent_state(&agent.id, "idle").unwrap();
+        start_or_reuse_takeover_session(
+            fixture.data.path(),
+            "fixture",
+            Some("reader"),
+            None,
+            None,
+            Some(false),
+            &CaptchaDetection::default(),
+        )
+        .unwrap();
+        let initial =
+            complete_takeover_session(fixture.data.path(), "fixture", Some("first completion"))
+                .unwrap();
+        assert_eq!(store.agent_by_name("reader").unwrap().state, "running");
+        store.set_agent_state(&agent.id, "archived").unwrap();
+        let before = std::fs::read(takeover_path(fixture.data.path(), "fixture")).unwrap();
+        let replay =
+            complete_takeover_session(fixture.data.path(), "fixture", Some("repeat completion"))
+                .unwrap();
+        assert_eq!(
+            store.agent_by_name("reader").unwrap().state,
+            "archived",
+            "replayed completion must not wake an archived owner"
+        );
+        assert_eq!(
+            std::fs::read(takeover_path(fixture.data.path(), "fixture")).unwrap(),
+            before
+        );
+        assert_eq!(replay["completed_at_ms"], initial["completed_at_ms"]);
+        // The message can be queued before clearing the pending flag fails. Its
+        // recovery must observe a duplicate receipt without replaying wake effects.
+        let mut pending = load_takeover_state(fixture.data.path(), "fixture")
+            .unwrap()
+            .unwrap();
+        pending.notification_pending = true;
+        save_takeover_state(fixture.data.path(), &pending).unwrap();
+        complete_takeover_session(fixture.data.path(), "fixture", Some("pending recovery"))
+            .unwrap();
+        assert_eq!(store.agent_by_name("reader").unwrap().state, "archived");
+        let recovered = load_takeover_state(fixture.data.path(), "fixture")
+            .unwrap()
+            .unwrap();
+        assert!(!recovered.notification_pending);
+        assert_eq!(recovered.completed_at_ms, pending.completed_at_ms);
+        assert_eq!(recovered.completion_note, pending.completion_note);
+        assert_eq!(store.inbox(&agent.id, None).unwrap().len(), 1);
     }
 
     #[test]
