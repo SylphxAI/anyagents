@@ -23,6 +23,21 @@ fn directory(store: &Store) -> PathBuf {
     store.data_dir().join("outbound-history")
 }
 
+/// Shared with core redaction; acquire before entering any Store transaction.
+fn publication_barrier(store: &Store) -> Result<File, Error> {
+    let directory = directory(store);
+    std::fs::create_dir_all(&directory)?;
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open(directory.join(".publication.lock"))?;
+    file.lock_shared()?;
+    Ok(file)
+}
+
 fn write(path: &Path, intent: &Intent) -> Result<(), Error> {
     let bytes = serde_json::to_vec(intent)
         .map_err(|error| Error::Message(format!("serialize outbound obligation: {error}")))?;
@@ -101,6 +116,7 @@ pub(super) fn deliver<F>(
 where
     F: FnOnce() -> Result<Vec<Delivery>, ApiError>,
 {
+    let _barrier = publication_barrier(store).map_err(ApiError::from_store)?;
     let directory = directory(store);
     std::fs::create_dir_all(&directory)
         .map_err(Error::from)
@@ -183,6 +199,7 @@ where
 /// Only receipts of already acknowledged effects are replayed. Prepared or
 /// malformed obligations remain untouched and produce an explicit diagnostic.
 pub(super) fn reconcile(store: &Store) -> Result<(), Error> {
+    let _barrier = publication_barrier(store)?;
     let directory = directory(store);
     let entries = match std::fs::read_dir(&directory) {
         Ok(entries) => entries,
