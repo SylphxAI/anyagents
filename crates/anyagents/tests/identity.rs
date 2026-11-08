@@ -508,10 +508,10 @@ fn the_capability_file_of_one_agent_never_opens_another() {
     assert!(op_only.starts_with("HTTP/1.1 403"), "{op_only}");
 }
 
-/// The health response describes each serving process even when the installed
-/// pathname is replaced while both processes remain alive.
+/// The health response describes the running image even when its installed
+/// pathname is replaced while the process remains alive.
 #[test]
-fn health_reports_each_running_image_and_survives_atomic_install() {
+fn health_reports_running_image_and_survives_atomic_install() {
     use sha2::{Digest, Sha256};
     use std::io::{Read, Write};
     use std::os::unix::fs::PermissionsExt;
@@ -531,7 +531,6 @@ fn health_reports_each_running_image_and_survives_atomic_install() {
     let image = dir.path().join("anyagents");
     std::fs::copy(env!("CARGO_BIN_EXE_anyagents"), &image).unwrap();
     let expected_hash = format!("{:x}", Sha256::digest(std::fs::read(&image).unwrap()));
-    let earliest_start = anyagents_core::now_ms();
     let start = |verb: &str, socket: &str| {
         let child = Command::new(&image)
             .arg("--data")
@@ -586,28 +585,14 @@ fn health_reports_each_running_image_and_survives_atomic_install() {
         }
     };
     let serve = start("serve", "anyagents.sock");
-    let admin = start("serve-admin", "admin.sock");
     let serving = complete(&serve.socket);
-    let administering = complete(&admin.socket);
-    for value in [&serving, &administering] {
-        assert_eq!(value["ok"], true);
-        assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
-        assert_eq!(value["source_sha"], expected_source);
-        assert_eq!(value["binary_sha256"], expected_hash);
-    }
+    assert_eq!(serving["ok"], true);
+    assert_eq!(serving["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(serving["source_sha"], expected_source);
+    assert_eq!(serving["binary_sha256"], expected_hash);
     assert!(serving.get("pid").is_none());
     assert!(serving.get("process_started_at_ms").is_none());
     assert_eq!(serving.as_object().unwrap().len(), 5);
-    assert_eq!(administering["pid"], admin.child.id());
-    assert_ne!(administering["pid"], serve.child.id());
-    let started = administering["process_started_at_ms"].as_i64().unwrap();
-    assert!(started >= earliest_start && started <= anyagents_core::now_ms());
-    assert_eq!(
-        administering.as_object().unwrap().len(),
-        7,
-        "no private state in health"
-    );
-
     // Public health aliases report the same image with no process-local details.
     let addr = std::fs::read_to_string(data.join("webhook.addr")).unwrap();
     for path in ["/", "/healthz", "/v1/webhooks/healthz"] {
@@ -634,24 +619,6 @@ fn health_reports_each_running_image_and_survives_atomic_install() {
     assert_ne!(
         format!("{:x}", Sha256::digest(std::fs::read(&image).unwrap())),
         expected_hash
-    );
-    assert_eq!(health(&serve.socket), serving);
-    assert_eq!(health(&admin.socket), administering);
-
-    // Restarting just the sidecar gets a new process identity; serve is stable.
-    let old_pid = admin.child.id();
-    drop(admin);
-    std::fs::copy(env!("CARGO_BIN_EXE_anyagents"), &image).unwrap();
-    // The old sidecar leaves its socket file, so remove only this test's file.
-    std::fs::remove_file(data.join("admin.sock")).unwrap();
-    let restarted = start("serve-admin", "admin.sock");
-    let identity = complete(&restarted.socket);
-    assert_ne!(identity["pid"], old_pid);
-    assert_eq!(identity["pid"], restarted.child.id());
-    assert_eq!(identity["binary_sha256"], expected_hash);
-    assert!(
-        identity["process_started_at_ms"].as_i64().unwrap()
-            >= administering["process_started_at_ms"].as_i64().unwrap()
     );
     assert_eq!(health(&serve.socket), serving);
 }
@@ -844,99 +811,93 @@ fn conversation_reads_are_downward_only_for_every_scope_and_cli_fails_closed() {
     }
 }
 
-/// Exercise both executable entrypoints, not just a maintenance helper: neither
+/// Exercise the executable entrypoint, not just a maintenance helper: neither
 /// corrupt recovery state nor a held global lock may prevent socket service.
 #[test]
-fn migration_failure_and_busy_global_lock_do_not_block_host_sockets() {
+fn migration_failure_and_busy_global_lock_do_not_block_host_socket() {
     use anyagents_core::{NewAgent, Store};
     use std::fs;
     let _env = support::lock();
-    for command in ["serve", "serve-admin"] {
-        for busy in [false, true] {
-            let dir = support::physical_tempdir();
-            let data = dir.path();
-            support::operator_for_contract(data);
-            let store = Store::open(data.join("state.db")).unwrap();
-            let agent = store
-                .create_agent(NewAgent::new("maintenance-only", "sylphx"))
-                .unwrap();
-            store.set_agent_state(&agent.id, "archived").unwrap();
-            let memory = data
-                .join("agents")
-                .join(agent.id.as_str())
-                .join("config/projects/known/memory");
-            fs::create_dir_all(&memory).unwrap();
-            fs::write(memory.join("MEMORY.md"), b"must survive failed maintenance").unwrap();
-            let migration = data.join("host-memory-migration");
-            fs::create_dir_all(&migration).unwrap();
-            let manifest = migration.join("manifest-v1.json");
-            let original = if busy {
-                b"{\"version\":1,\"entries\":[]}".as_slice()
-            } else {
-                b"corrupt manifest must not be replaced".as_slice()
-            };
-            fs::write(&manifest, original).unwrap();
-            let held = fs::OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .read(true)
-                .write(true)
-                .open(migration.join("migration.lock"))
-                .unwrap();
-            if busy {
-                held.lock().unwrap();
-            }
-            let child = Command::new(env!("CARGO_BIN_EXE_anyagents"))
-                .env("PATH", support::machine_path(data))
-                .env("ANYAGENTS_TESTS", "1")
-                .env("ANYAGENTS_CLAUDE_CODE_BIN", "/bin/true")
-                .arg("--data")
-                .arg(data)
-                .arg(command)
-                .stdout(Stdio::null())
-                .stderr(Stdio::from(
-                    fs::File::create(data.join("server.stderr")).unwrap(),
-                ))
-                .spawn()
-                .unwrap();
-            let socket = data.join(if command == "serve" {
-                "anyagents.sock"
-            } else {
-                "admin.sock"
-            });
-            let server = Serve { child, socket };
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while std::os::unix::net::UnixStream::connect(&server.socket).is_err() {
-                assert!(
-                    Instant::now() < deadline,
-                    "{command}, busy={busy}: {}",
-                    fs::read_to_string(data.join("server.stderr")).unwrap_or_default()
-                );
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            let receipt_path = migration.join(if busy {
-                "deferred-startup-v1.json"
-            } else {
-                "startup-error-v1.json"
-            });
-            let receipt: Value = serde_json::from_slice(&fs::read(receipt_path).unwrap()).unwrap();
-            assert_eq!(
-                receipt["status"],
-                if busy {
-                    "deferred_busy_lock"
-                } else {
-                    "deferred_error"
-                }
-            );
-            assert_eq!(receipt["retryable"], true);
-            assert_eq!(fs::read(&manifest).unwrap(), original);
-            assert_eq!(
-                fs::read(memory.join("MEMORY.md")).unwrap(),
-                b"must survive failed maintenance"
-            );
-            drop(server);
-            drop(held);
+    for busy in [false, true] {
+        let dir = support::physical_tempdir();
+        let data = dir.path();
+        support::operator_for_contract(data);
+        let store = Store::open(data.join("state.db")).unwrap();
+        let agent = store
+            .create_agent(NewAgent::new("maintenance-only", "sylphx"))
+            .unwrap();
+        store.set_agent_state(&agent.id, "archived").unwrap();
+        let memory = data
+            .join("agents")
+            .join(agent.id.as_str())
+            .join("config/projects/known/memory");
+        fs::create_dir_all(&memory).unwrap();
+        fs::write(memory.join("MEMORY.md"), b"must survive failed maintenance").unwrap();
+        let migration = data.join("host-memory-migration");
+        fs::create_dir_all(&migration).unwrap();
+        let manifest = migration.join("manifest-v1.json");
+        let original = if busy {
+            b"{\"version\":1,\"entries\":[]}".as_slice()
+        } else {
+            b"corrupt manifest must not be replaced".as_slice()
+        };
+        fs::write(&manifest, original).unwrap();
+        let held = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(migration.join("migration.lock"))
+            .unwrap();
+        if busy {
+            held.lock().unwrap();
         }
+        let child = Command::new(env!("CARGO_BIN_EXE_anyagents"))
+            .env("PATH", support::machine_path(data))
+            .env("ANYAGENTS_TESTS", "1")
+            .env("ANYAGENTS_CLAUDE_CODE_BIN", "/bin/true")
+            .arg("--data")
+            .arg(data)
+            .arg("serve")
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(
+                fs::File::create(data.join("server.stderr")).unwrap(),
+            ))
+            .spawn()
+            .unwrap();
+        let socket = data.join("anyagents.sock");
+        let server = Serve { child, socket };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while std::os::unix::net::UnixStream::connect(&server.socket).is_err() {
+            assert!(
+                Instant::now() < deadline,
+                "serve, busy={busy}: {}",
+                fs::read_to_string(data.join("server.stderr")).unwrap_or_default()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let receipt_path = migration.join(if busy {
+            "deferred-startup-v1.json"
+        } else {
+            "startup-error-v1.json"
+        });
+        let receipt: Value = serde_json::from_slice(&fs::read(receipt_path).unwrap()).unwrap();
+        assert_eq!(
+            receipt["status"],
+            if busy {
+                "deferred_busy_lock"
+            } else {
+                "deferred_error"
+            }
+        );
+        assert_eq!(receipt["retryable"], true);
+        assert_eq!(fs::read(&manifest).unwrap(), original);
+        assert_eq!(
+            fs::read(memory.join("MEMORY.md")).unwrap(),
+            b"must survive failed maintenance"
+        );
+        drop(server);
+        drop(held);
     }
 }
 

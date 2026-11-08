@@ -130,14 +130,10 @@ fn claude_double(data: &std::path::Path) -> std::path::PathBuf {
 }
 
 fn start_server(data: &std::path::Path) -> Serve {
-    start_server_mode(data, "serve")
-}
-
-fn start_server_mode(data: &std::path::Path, mode: &str) -> Serve {
     let mut child = support::contract_server()
         .arg("--data")
         .arg(data)
-        .arg(mode)
+        .arg("serve")
         .env("PATH", machine_path(data))
         .env("ANYAGENTS_CLAUDE_CODE_BIN", claude_double(data))
         .env("ANYAGENTS_CODEX_BIN", "/bin/true")
@@ -154,11 +150,7 @@ fn start_server_mode(data: &std::path::Path, mode: &str) -> Serve {
         let _ = pipe.read_to_string(&mut buf);
         *captured.lock().unwrap() = buf;
     });
-    let socket = data.join(if mode == "serve-admin" {
-        "admin.sock"
-    } else {
-        "anyagents.sock"
-    });
+    let socket = data.join("anyagents.sock");
     let started = Instant::now();
     loop {
         if socket.exists() {
@@ -1308,13 +1300,11 @@ async fn describe_preserves_config_permissions_without_vendor_restart_writers() 
         "{}",
         String::from_utf8_lossy(&created.stderr)
     );
-    // The primary fixture's /bin/true harness exits and restarts, concurrently
-    // preparing config. This case measures describe's own permission contract,
-    // so keep the real MCP/auth/HTTP path but run no vendor-config writer.
-    let server = start_server_mode(dir.path(), "serve-admin");
-    // MCP initialization asks whoami on the primary socket name. Route that
-    // fixture-only name to the admin router rather than starting a supervisor.
-    std::os::unix::fs::symlink("admin.sock", dir.path().join("anyagents.sock")).unwrap();
+    // Pause before startup so describe is the only config writer.
+    let store = anyagents_core::Store::open(dir.path().join("state.db")).unwrap();
+    let agent = store.agent_by_name("alpha").unwrap();
+    store.set_agent_state(&agent.id, "paused").unwrap();
+    let server = start_server(dir.path());
     let alpha = connect(dir.path(), "alpha").await;
     let alpha_id = created_id(dir.path(), "alpha");
     #[cfg(unix)]
@@ -1417,8 +1407,11 @@ async fn history_search_defaults_and_all_never_escape_a_private_childs_tree() {
             "C out_msg_01m6svqn4nesw9ws13fjy48kzt #2291 private outbound",
         )
         .unwrap();
-    let server = start_server_mode(dir.path(), "serve-admin");
-    std::os::unix::fs::symlink("admin.sock", dir.path().join("anyagents.sock")).unwrap();
+    // Keep synthetic history stable while exercising the real API and MCP path.
+    for agent in [&coordinator, &planner, &reviewer, &runner] {
+        store.set_agent_state(&agent.id, "paused").unwrap();
+    }
+    let server = start_server(dir.path());
     let client = connect(dir.path(), "planner").await;
     let native: ConversationResponse = ok_json(
         call(

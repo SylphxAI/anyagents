@@ -62,9 +62,6 @@ struct Cli {
 enum Command {
     /// Run the server.
     Serve,
-    /// Run the authenticated admin API sidecar on `<data>/admin.sock`.
-    #[command(hide = true)]
-    ServeAdmin,
     /// Inspect server health, boundary/token state, installed harnesses, master profiles, and agents.
     Status {
         /// Output machine-readable JSON.
@@ -794,7 +791,6 @@ enum AgentsCommand {
 }
 
 fn main() -> ExitCode {
-    identity::mark_process_start();
     sandbox::hydrate_operator_groups_if_needed();
     let cli = Cli::parse();
     match run(cli) {
@@ -822,7 +818,6 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
     sandbox::load_principal_registry(&data)?;
     match cli.command {
         Command::Serve => server::run(&data),
-        Command::ServeAdmin => server::run_admin(&data),
         Command::Status { json } => status_cmd(&data, json),
         Command::SignIn { agent, profile } => sign_in(&data, &agent, profile.as_deref()),
         Command::Harnesses { action } => match action {
@@ -2051,7 +2046,7 @@ fn sign_in(data: &Path, target: &str, profile: Option<&str>) -> Result<(), anyag
     create::finalize_agent_signin(data, &rec)?;
     // A sign-in is a new instance: the server gives the agent a fresh
     // capability and retires the last one.
-    if server::socket_path(data).exists() || data.join("admin.sock").exists() {
+    if server::socket_path(data).exists() {
         client::call::<serde_json::Value>(
             data,
             "POST",
