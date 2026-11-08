@@ -993,7 +993,7 @@ fn a_group_quoted_message_is_answered_in_its_group_and_topic() {
         &json!({
             "sender": "agent:ada",
             "to": [],
-            "text": "done",
+            "text": "The schema update is complete.",
             "reply_to": format!("anyagents:reply:{message_id}"),
         })
         .to_string(),
@@ -1006,7 +1006,7 @@ fn a_group_quoted_message_is_answered_in_its_group_and_topic() {
         sent[0],
         Sent {
             chat_id: -1007,
-            text: "done".into(),
+            text: "The schema update is complete.".into(),
             reply_to: Some(61),
             thread: Some(3),
         },

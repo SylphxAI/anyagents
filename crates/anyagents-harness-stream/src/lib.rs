@@ -1086,8 +1086,42 @@ fn read_stdout(
                 }
             }
         }
+        let error = value
+            .pointer("/result/error")
+            .or_else(|| value.get("error"))
+            .and_then(|v| {
+                v.as_str().or_else(|| {
+                    v.get("message")
+                        .and_then(Value::as_str)
+                        .or_else(|| v.get("code").and_then(Value::as_str))
+                })
+            })
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let poisoned_agy = spec.name == "anyagents-agy"
+            && matches!(kind, Some("done") | Some("result"))
+            && error.is_some_and(|error| {
+                error
+                    .to_ascii_lowercase()
+                    .contains("invalid_argument (code 400)")
+            });
+        if poisoned_agy {
+            effect.finishes_turn = false;
+        }
         if let Some(ref rpc) = agy_rpc {
-            if let Some(reset_at_ms) = effect.quota_reset_at_ms {
+            if poisoned_agy {
+                let _ = std::fs::write(
+                    rpc.config_dir.join(".anyagents-last-error.json"),
+                    json!({
+                        "error": error,
+                        "timestamp_ms": std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as i64)
+                            .unwrap_or(0),
+                    })
+                    .to_string(),
+                );
+            } else if let Some(reset_at_ms) = effect.quota_reset_at_ms {
                 let err_msg = value
                     .pointer("/result/error")
                     .or_else(|| value.get("error"))
@@ -1150,21 +1184,18 @@ fn read_stdout(
                 state.sign_in_fault = None;
                 let usage = effect.usage.unwrap_or_default();
                 finish_open(&mut state, usage);
-            } else if effect.quota_reset_at_ms.is_none()
+            } else if (poisoned_agy || effect.quota_reset_at_ms.is_none())
                 && matches!(kind, Some("done") | Some("result"))
-                && let Some(err_str) = value
-                    .pointer("/result/error")
-                    .or_else(|| value.get("error"))
-                    .and_then(|v| {
-                        v.as_str().or_else(|| {
-                            v.get("message")
-                                .and_then(Value::as_str)
-                                .or_else(|| v.get("code").and_then(Value::as_str))
-                        })
-                    })
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
+                && let Some(err_str) = error
             {
+                if poisoned_agy {
+                    if let Some(ref rpc) = agy_rpc {
+                        let _ = std::fs::remove_file(rpc.config_dir.join("agy-session-id"));
+                    }
+                    // Do not let sync_session recreate the retired pointer.
+                    state.session_id = None;
+                    state.alive = false;
+                }
                 state.sign_in_fault = Some(err_str.to_string());
                 state.open.clear();
                 state.followups.clear();
@@ -1172,6 +1203,9 @@ fn read_stdout(
             state.epoch = state.epoch.wrapping_add(1);
         }
         wake.notify_all();
+        if poisoned_agy {
+            break;
+        }
     }
     {
         let mut state = lock(&shared);
