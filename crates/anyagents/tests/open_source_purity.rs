@@ -55,6 +55,22 @@ fn repository_has_no_hardcoded_host_paths_or_internal_identifiers() {
         ("internal domain", concat!("desk.", "kylet.se")),
         ("hardcoded seat name", concat!("seat-", "argon")),
         ("hardcoded seat name", concat!("seat-", "calliope")),
+        ("hardcoded company role", concat!("主", "腦")),
+        ("hardcoded company hub", concat!("樞", "紐")),
+        ("hardcoded company runner", concat!("執行", "器")),
+        ("hardcoded memory topic slug", concat!("domain-", "facts")),
+        (
+            "hardcoded memory topic slug",
+            concat!("verified-domain-", "outcomes"),
+        ),
+        (
+            "hardcoded memory topic slug",
+            concat!("principal-", "directives"),
+        ),
+        (
+            "hardcoded memory topic slug",
+            concat!("owner-history-", "archive"),
+        ),
     ];
 
     let mut files = Vec::new();

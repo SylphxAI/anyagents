@@ -699,9 +699,11 @@ pub(crate) fn write_agent_instructions_with_continuity(
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        doc.push_str("\n## 2. Role, Responsibilities & Private Instructions (`instructions`)\n\n");
+        doc.push_str(
+            "\n## 2. Role, Responsibilities & Private Instructions (`instructions`)\n\n<role_instructions>\n",
+        );
         doc.push_str(custom);
-        doc.push('\n');
+        doc.push_str("\n</role_instructions>\n");
     }
 
     doc.push_str(
@@ -727,38 +729,104 @@ pub(crate) fn write_agent_instructions_with_continuity(
     }
 
     doc.push_str(
-        "\n## 3. Runtime Awareness & the 6 Canonical MCP Tools (`agents`, `send`, `conversation`, `groups`, `schedule`, `browser`)\n\n\
-         - **Cache-Stable Routing & Native Tools**:\n\
+        "\n## 3. Runtime Awareness & Code Mode (`code`)\n\n\
+         - **Cache-Stable Routing & Pure Code Mode (`code`)**:\n\
            - Live routing context arrives per message in `<message ...>` (`id`, `from`, `sender_name`, `to`, `participants`, `channel`, `chat`, `topic`, `reply_to`, `answer_to`).\n\
-           - Call your **AnyAgents MCP tools** (`agents`, `send`, `conversation`, `groups`, `schedule`, `browser`) directly (or via `await tools.anyagents.<tool>({...})` in OpenCode Code Mode).\n\
-         - **1. Unified Agent & Sub-Agent Manager (`agents`)**:\n\
-           - Vendor sub-agent tools are disabled by default; always use `agents`:\n\
-             - **List / Inspect**: `agents({ \"action\": \"list\", \"parent\": \"self\" | \"root\", \"state\": \"running\" | \"all\" })`, `agents({ \"action\": \"inspect\", \"name\": \"<name-or-id>\", \"limit\": 10 })`.\n\
-             - **Spawn**: `agents({ \"action\": \"spawn\", \"name\": \"<opt>\", \"repo\": \"<org>/<repo>\" | \"inherit\", \"branch\": \"<opt>\", \"base\": \"<opt>\", \"workdir\": \"<opt>\", \"description\": \"...\", \"instructions\": \"...\", \"prompt\": \"...\" })`.\n\
-             - **Describe**: `agents({ \"action\": \"describe\", \"name\": \"self\" | \"all\", \"description\": \"...\", \"instructions\": \"...\" })`.\n\
-             - **Steer & Lifecycle**: `agents({ \"action\": \"steer\" | \"wake\" | \"pause\" | \"archive\" | \"delete\" | \"create\" | \"rename\" | \"role\" | \"harness\" | \"models\", ... })`.\n\
-           - **Workspaces & Managed Git Worktrees**:\n\
-             - **Default When `repo` and `workdir` Are Omitted**: Every sub-agent defaults to its own isolated `<data>/agents/<id>/work`; roots do too unless the operator configures a root working directory. Pass `workdir: \"inherit\"` only when explicitly sharing your parent directory.\n\
-             - `repo: \"<org>/<repo>\"` or `repo: \"inherit\"` provisions an isolated Git worktree automatically; on `archive`, clean/pushed worktrees are reaped while dirty/unpushed worktrees are preserved.\n\
-             - **Universal Shared `AGENTS.md` & `Skills` + Repo-Local Layering**: Global `<data>/AGENTS.md` and `<data>/skills` are mounted in every agent's `config/` home, with `<workdir>/AGENTS.md` and `.agents/skills` layered on top.\n\
-         - **2. Outbound Messages & Interactions (`send`)**:\n\
-           - Stdout is never delivered to peers/parents/channels; always call `send` (`to`: `[\"parent\"]`, `[\"children\"]`, `[\"siblings\"]`, `[\"agent:<name>\"]`, or `answer_to`; `reply_to`: `anyagents:reply:msg_...`; `text`, `media`, `poll`, `checklist`, `article`, or `action`: `\"react\"` | `\"vote\"` | `\"edit\"` | `\"delete\"` | `\"pin\"`).\n\
-         - **3. Lossless History & Lexical Search (`conversation` & `search`)**:\n\
-           - Never poll an inbox. Query history via `conversation({ \"query\": \"...\", \"queries\": [...], \"agent\": \"all\" | \"self\", \"include_tools\": true, \"range\": \"seq:10-25\", \"limit\": 20 })` or omit `query` for chronological turns.\n\
-         - **4. Internal Multi-Agent Groups (`groups`)**:\n\
-           - `groups({ \"action\": \"list\" })`, `groups({ \"action\": \"join\" | \"leave\", \"group\": \"<name>\" })`.\n\
-         - **5. Self-Wakes & Event Watches (`schedule`)**:\n\
-           - `schedule({ \"every\": \"15m\" | \"at\": \"1m\", \"prompt\": \"...\" })`, `schedule({ \"watch\": \"github:pr:<owner>/<repo>#<num>\" | \"github:check:<owner>/<repo>@<ref>\" | \"agent:idle:<name>\" | \"pid:<pid>\" | \"file:<path>\", \"prompt\": \"...\" })`, `schedule({ \"action\": \"list\" | \"cancel\" })`.\n\
-         - **6. Anti-Detect Browser & Persistent Profiles (`browser`)**:\n\
-           - Headed Chromium with persistent `--user-data-dir` profiles (`open`, `snapshot`, `click`, `fill`, `press`, `eval`, `screenshot`, `cookies`, `tabs`, `profiles`, `close`).\n\
-           - **Zero-Knowledge Secret/OTP Fill**: Pass `secret_ref: \"op://Vault/Item/password\"` or `\"op-otp://Vault/Item\"` on `fill` without reading secrets into LLM context.\n\
-           - **Human Takeover**: On `captcha_detected: true`, call `browser({ \"action\": \"takeover\", \"reason\": \"Solve CAPTCHA\" })`, send `takeover_url` to the user, and resume via `wait_for_user` / `release_takeover`.\n",
+           - The AnyAgents MCP server exposes **`code`** (`mcp__anyagents__code` / `anyagents_code`) as your universal programmatic tool-calling surface across all harnesses. Execute an async TypeScript/JavaScript snippet (`code({ \"code\": \"...\", \"timeout_ms\": 30000 })`) inside an isolated capability sandbox (`process.env`, `require`, `child_process`, and raw `fs` are unavailable) to compose `anyagents.*`, `workspace.*`, and `web.*` calls in parallel and return only compact results:\n\
+```ts\n\
+declare const anyagents: {\n\
+  memory: {\n\
+    (req?: string | { action?: \"list\"|\"read\"|\"write\"|\"upsert\"|\"delete\"|\"search\"; topic?: string; description?: string; content?: string; query?: string; delete?: boolean; agent?: string; limit?: number }): Promise<any>;\n\
+    read(topicOrOpts: string | { topic: string; agent?: string }): Promise<{ topic: string; description: string; content: string; turns: any[] }>;\n\
+    write(opts: { topic: string; description?: string; content: string; agent?: string }): Promise<{ topic: string; filename: string; sha256: string }>;\n\
+    delete(topicOrOpts: string | { topic: string; agent?: string }): Promise<{ topic: string; deleted: boolean; index: string }>;\n\
+    list(opts?: string | { agent?: string; limit?: number }): Promise<{ index: string; topics: any[]; count: number }>;\n\
+    search(queryOrOpts: string | { query: string; agent?: string; limit?: number }): Promise<{ matches: any[]; count: number }>;\n\
+  };\n\
+  conversation(req?: { query?: string; queries?: string[]; exclude?: string[]; agent?: string; with?: string; scope?: \"all\"|\"memory\"|\"transcripts\"; direction?: \"in\"|\"out\"; since_ms?: number; until_ms?: number; include_tools?: boolean; range?: string; limit?: number; raw_id?: string; raw_sha256?: string; raw_offset?: number; raw_length?: number }): Promise<any>;\n\
+  send(req: { to?: string[]; text?: string; reply_to?: string; action?: \"react\"|\"vote\"|\"check\"|\"uncheck\"|\"edit\"|\"delete\"|\"pin\"|\"unpin\"|\"stop_poll\"; target?: string; emoji?: string; media?: any; poll?: any; checklist?: any; article?: any }): Promise<any>;\n\
+  agents(req?: { action?: \"list\"|\"inspect\"|\"spawn\"|\"create\"|\"describe\"|\"steer\"|\"wake\"|\"pause\"|\"archive\"|\"delete\"|\"rename\"|\"role\"|\"harness\"|\"models\"|\"reset_session\"; name?: string; parent?: string; state?: string; query?: string; repo?: string; branch?: string; base?: string; workdir?: string; description?: string; instructions?: string; prompt?: string; limit?: number }): Promise<any>;\n\
+  schedule(req?: { action?: \"set\"|\"list\"|\"cancel\"; at?: string; every?: string; watch?: string; prompt?: string; id?: string }): Promise<any>;\n\
+  groups(req?: { action?: \"list\"|\"members\"|\"join\"|\"leave\"; group?: string; agents?: string[]; public?: boolean }): Promise<any>;\n\
+  browser(req: { action: string; url?: string; selector?: string; value?: string; secret_ref?: string; key?: string; profile?: string }): Promise<any>;\n\
+  web: typeof web;\n\
+  files(req: any): Promise<any>;\n\
+};\n\
+declare const workspace: {\n\
+  read(opts: string | { path: string; start_line?: number; end_line?: number; byte_offset?: number; max_bytes?: number }): Promise<{ path: string; content: string; numbered: string; total_lines: number; sha256: string }>;\n\
+  write(opts: string | { path: string; content: string; overwrite?: boolean; append?: boolean }, content?: string): Promise<{ path: string; bytes_written: number; sha256: string }>;\n\
+  edit(opts: { path: string; target: string; replacement: string; replace_all?: boolean }): Promise<{ path: string; replacements_made: number; lines_added: number; lines_removed: number; sha256: string }>;\n\
+  multi_edit(opts: { path: string; edits: Array<{ target: string; replacement: string; replace_all?: boolean }> }): Promise<{ path: string; replacements_made: number; sha256: string }>;\n\
+  patch(patchOrOpts: string | { patch: string }): Promise<{ files_changed: any[]; count: number }>;\n\
+  glob(opts?: string | { pattern?: string; path?: string; max_results?: number }): Promise<{ files: string[]; count: number }>;\n\
+  grep(opts: string | { query: string; path?: string; glob?: string; max_results?: number; context_lines?: number }): Promise<{ matches: Array<{ path: string; line: number; text: string }> }>;\n\
+  list(opts?: string | { path?: string; max_results?: number; include_hidden?: boolean }): Promise<{ entries: Array<{ name: string; path: string; kind: \"file\"|\"dir\"|\"symlink\"; bytes: number }>; count: number }>;\n\
+  exec(cmdOrOpts: string | { cmd: string; cwd?: string; timeout_ms?: number }): Promise<{ exit_code: number; stdout: string; stderr: string; duration_ms: number }>;\n\
+};\n\
+declare const web: {\n\
+  search(queryOrOpts: string | { query: string; engine?: \"auto\"|\"parallel\"|\"exa\"|\"tavily\"|\"firecrawl\"|\"perplexity\"|\"brave\"|\"anysearch\"; allowed_domains?: string[]; blocked_domains?: string[]; country?: string; max_results?: number; mode?: string; external_web_access?: boolean }): Promise<{ engine: string; results: Array<{ title: string; url: string; snippet: string }>; answer?: string }>;\n\
+  fetch(urlOrOpts: string | { url: string; engine?: \"auto\"|\"firecrawl\"|\"exa\"|\"parallel\"|\"tavily\"|\"anysearch\"|\"direct\"; allowed_domains?: string[]; blocked_domains?: string[]; max_chars?: number; external_web_access?: boolean }): Promise<{ engine: string; url: string; title?: string; content: string; truncated: boolean }>;\n\
+};\n\
+declare const computer: {\n\
+  snapshot(opts?: { app?: string; window_id?: string; skeleton?: boolean; root_ref?: string; interactive_only?: boolean }): Promise<{ snapshot_id: string; elements: Array<{ ref_id: string; role: string; name: string; bounds: { x: number; y: number; width: number; height: number } }> }>;\n\
+  list_windows(): Promise<{ windows: Array<{ window_id: string; title: string; bounds: any }> }>;\n\
+  focus_window(widOrOpts: string | { window_id: string }): Promise<any>;\n\
+  clipboard_get(): Promise<{ text: string }>;\n\
+  clipboard_set(textOrOpts: string | { text: string }): Promise<{ bytes: number; stdin_piped: boolean }>;\n\
+  screenshot(opts?: { provider?: string; session_id?: string; display?: string }): Promise<{ width: number; height: number; image_base64: string }>;\n\
+  click(refOrOpts: string | { ref?: string; x?: number; y?: number; button?: \"left\"|\"right\"|\"middle\"; count?: 1|2|3; modifiers?: string[] }): Promise<any>;\n\
+  move(opts: { ref?: string; x?: number; y?: number }): Promise<any>;\n\
+  drag(opts: { from_x: number; from_y: number; to_x: number; to_y: number; button?: string }): Promise<any>;\n\
+  scroll(opts: { x?: number; y?: number; direction: \"up\"|\"down\"|\"left\"|\"right\"; amount?: number }): Promise<any>;\n\
+  type(textOrOpts: string | { ref?: string; text: string; delay_ms?: number }): Promise<any>;\n\
+  key(keyOrOpts: string | { key: string; modifiers?: string[] }): Promise<any>;\n\
+  zoom(opts: { x: number; y: number; width: number; height: number }): Promise<{ image_base64: string }>;\n\
+  action(actionJson: any): Promise<any>;\n\
+};\n\
+declare const device: {\n\
+  screenshot(opts?: { serial?: string }): Promise<{ width: number; height: number; image_base64: string }>;\n\
+  tap(opts: { x: number; y: number; serial?: string }): Promise<any>;\n\
+  swipe(opts: { from_x: number; from_y: number; to_x: number; to_y: number; duration_ms?: number; serial?: string }): Promise<any>;\n\
+  type(textOrOpts: string | { text: string; serial?: string }): Promise<any>;\n\
+  press(btnOrOpts: string | { button: \"home\"|\"back\"|\"app_switch\"|\"power\"|\"volume_up\"|\"volume_down\"; serial?: string }): Promise<any>;\n\
+  install_app(apkOrOpts: string | { apk_path: string; serial?: string }): Promise<any>;\n\
+  launch_app(pkgOrOpts: string | { package: string; activity?: string; serial?: string }): Promise<any>;\n\
+  terminate_app(pkgOrOpts: string | { package: string; serial?: string }): Promise<any>;\n\
+  open_url(urlOrOpts: string | { url: string; serial?: string }): Promise<any>;\n\
+  rotate(orientOrOpts: string | { orientation: \"portrait\"|\"landscape\"; serial?: string }): Promise<any>;\n\
+};\n\
+declare const media: {\n\
+  image_generate(promptOrOpts: string | { prompt: string; model?: string; size?: string; n?: number; output_path?: string }): Promise<any>;\n\
+  speech(inputOrOpts: string | { input: string; model?: string; voice?: string; response_format?: string; output_path?: string }): Promise<{ bytes: number; sha256: string; output_path?: string; audio_base64: string }>;\n\
+  transcribe(pathOrOpts: string | { file_path: string; model?: string; language?: string; prompt?: string }): Promise<{ text: string }>;\n\
+};\n\
+declare const tools: { anyagents: typeof anyagents; workspace: typeof workspace; web: typeof web; computer: typeof computer; device: typeof device; media: typeof media };\n\
+const [roster, mem, hits] = await Promise.all([\n\
+  anyagents.agents({ action: \"list\", parent: \"self\" }),\n\
+  anyagents.memory.list(),\n\
+  workspace.grep({ query: \"CANONICAL_MCP_TOOLS\", path: \"crates\" }),\n\
+]);\n\
+return { running: roster.agents.map((a: any) => a.name), topics: mem.count, hits: hits.matches };\n\
+```\n\
+         - **Domain Capabilities Inside `code`**:\n\
+           - **1. Learned Memory (`anyagents.memory`) vs. Episodic History (`anyagents.conversation`)**:\n\
+             - Curate durable semantic memory (`MEMORY.md` + `<topic>.md`) via `anyagents.memory.list()`, `anyagents.memory.read(\"<slug>\")`, `anyagents.memory.write({ topic, description, content })`, `anyagents.memory.delete(\"<slug>\")`, and `anyagents.memory.search(\"<query>\")`.\n\
+             - Search raw episodic turns & transcripts via `anyagents.conversation({ query, agent: \"all\" | \"self\", include_tools: true, range: \"seq:10-25\", limit: 20 })`.\n\
+           - **2. Workspace Files, Patches & Exec (`workspace.*`)**:\n\
+             - Deterministic paths resolved against your `workdir`: `workspace.read`, `workspace.write`, `workspace.edit` (4-stage indentation-tolerant cascade), `workspace.multi_edit`, `workspace.patch` (OpenAI V4A `*** Begin Patch` or unified diff `--- a/...`), `workspace.list`, `workspace.glob`, `workspace.grep`, and `workspace.exec({ cmd, cwd, timeout_ms })`.\n\
+           - **3. Multi-Provider Web Search & Fetch (`web.search`, `web.fetch`)**:\n\
+             - Policy-aware search (`parallel -> exa -> tavily -> firecrawl -> perplexity -> brave -> anysearch`) and extraction (`firecrawl -> exa -> parallel -> tavily -> anysearch -> direct`) with domain filtering and automatic failover.\n\
+           - **4. Agents, Worktrees, Messaging, Groups, Schedules & Browser (`anyagents.*`)**:\n\
+             - **Sub-Agents & Worktrees**: `anyagents.agents({ action: \"spawn\" | \"list\" | \"inspect\" | \"describe\" | \"steer\" | \"wake\" | \"archive\" | \"delete\", ... })`. Sub-agents default to isolated `<data>/agents/<id>/work`; pass `repo: \"<org>/<repo>\" | \"inherit\"` for a managed Git worktree or `workdir: \"inherit\"` to share.\n\
+             - **Outbound Messaging**: Stdout is never delivered; always call `anyagents.send({ to: [\"parent\"] | [\"agent:<name>\"] | [\"<answer_to>\"], reply_to: \"anyagents:reply:msg_...\", text: \"...\" })`.\n\
+             - **Schedules & Event Watches**: `anyagents.schedule({ at: \"1m\" | every: \"15m\" | watch: \"github:pr:<owner>/<repo>#<num>\" | \"agent:idle:<name>\" | \"pid:<pid>\", prompt: \"...\" })`.\n\
+             - **Browser**: `anyagents.browser({ action: \"open\" | \"snapshot\" | \"click\" | \"fill\" | \"takeover\", secret_ref: \"op://...\" })`.\n",
     );
 
     // Only the host lifecycle allocates a generation. Describe/restart/render
     // consume its persisted pin without opening live learned-memory files.
     if let Some(root) = config.parent() {
-        doc.push_str(&format!("\n## Host File Operating Instructions (fixed; not learned memory)\n\nLearned facts live in `{}/memory/`, indexed by `MEMORY.md`; preserve fact-file frontmatter and relative links. Edit those host files when learning durable facts, never vendor project memory or another agent's namespace. Long progress pages belong in history, not the prompt index. Your authored skills live in `{}/skills/`; shared skills are read-only. File edits are searchable immediately but enter the system prompt only at an explicit new host session. Only the separately delimited `<learned_memory>` section is the bounded immutable snapshot for this session.\n", root.display(), root.display()));
+        doc.push_str(&format!("\n## Host File Operating Instructions (fixed; not learned memory)\n\nAll vendor-native auto-memory systems (`~/.claude/projects/*/memory`, Codex `[memories]`, Gemini/AGY auto-memory) are disabled so every agent shares the unified AnyAgents memory architecture. Learned facts live exclusively in `{}/memory/`, indexed by `MEMORY.md` (<150 lines / 4KB); you own curating your topic files via `conversation({{ \"scope\": \"memory\", \"topic\": \"<slug>\", \"description\": \"<1-line trigger>\", \"content\": \"<markdown>\" }})` (or `\"delete\": true` to prune superseded topics) or by editing `{}/memory/<topic>.md` directly. While idle, the host automatically rebuilds `MEMORY.md`, synchronizes the FTS5 memory index, and refreshes your `<learned_memory>` session pin. Your authored skills live in `{}/skills/`; shared skills are read-only. Memory updates are searchable immediately (`conversation` with `scope: \"memory\"`) and enter `<learned_memory>` on your next idle refresh or new host session.\n", root.display(), root.display(), root.display()));
         match anyagents_core::host_session::active(root) {
             Ok(Some(session)) if session.harness == agent.harness => {
                 doc.push('\n');
@@ -844,40 +912,36 @@ pub(crate) fn write_agent_instructions_with_continuity(
         }
         let _ = write_seat_shared_file(path, doc.as_bytes(), 0o664);
     }
-    // Antigravity (`agy`) deduplicates global rules by resolved file path (`EvalSymlinks`),
-    // not by content. Point `.gemini/config/AGENTS.md` and `.gemini/config/rules/AGENTS.md`
-    // at `.gemini/config/GEMINI.md` via relative symlinks so `agy` loads the rule once
-    // instead of 3 times while callers reading any of the three paths still get `doc`.
+    // Antigravity (`agy`) loads `.gemini/config/GEMINI.md` under the fixed rule key
+    // `"user_global"`, and additionally loads every `.md` file in `.gemini/config/rules/`
+    // under its canonical path key (`EvalSymlinks`). Because `"user_global"` differs from
+    // the canonical file path key, any file or symlink at `.gemini/config/rules/AGENTS.md`
+    // causes `agy` to inject the entire `SYSTEM_PROMPT.md` twice into `<user_rules>`.
+    // Remove `.gemini/config/rules/AGENTS.md` so `agy` loads `.gemini/config/GEMINI.md`
+    // (`<RULE[user_global]>`) once, and keep `.gemini/config/AGENTS.md -> GEMINI.md`
+    // as a symlink for callers inspecting `.gemini/config/AGENTS.md`.
     let gemini_cfg = config.join(".gemini").join("config");
     let gemini_agents = gemini_cfg.join("AGENTS.md");
-    let gemini_rules_dir = gemini_cfg.join("rules");
-    let _ = std::fs::create_dir_all(&gemini_rules_dir);
-    let gemini_rules_agents = gemini_rules_dir.join("AGENTS.md");
+    let gemini_rules_agents = gemini_cfg.join("rules").join("AGENTS.md");
+    let _ = std::fs::remove_file(&gemini_rules_agents);
     #[cfg(unix)]
     {
-        for (link_path, rel_target) in [
-            (&gemini_agents, "GEMINI.md"),
-            (&gemini_rules_agents, "../GEMINI.md"),
-        ] {
-            let already_linked = std::fs::symlink_metadata(link_path)
-                .ok()
-                .is_some_and(|m| m.file_type().is_symlink())
-                && std::fs::read_link(link_path).ok().as_deref()
-                    == Some(std::path::Path::new(rel_target));
-            if !already_linked {
-                let _ = std::fs::remove_file(link_path);
-                if std::os::unix::fs::symlink(rel_target, link_path).is_err() {
-                    let _ = write_seat_shared_file(link_path, doc.as_bytes(), 0o664);
-                }
+        let already_linked = std::fs::symlink_metadata(&gemini_agents)
+            .ok()
+            .is_some_and(|m| m.file_type().is_symlink())
+            && std::fs::read_link(&gemini_agents).ok().as_deref()
+                == Some(std::path::Path::new("GEMINI.md"));
+        if !already_linked {
+            let _ = std::fs::remove_file(&gemini_agents);
+            if std::os::unix::fs::symlink("GEMINI.md", &gemini_agents).is_err() {
+                let _ = write_seat_shared_file(&gemini_agents, doc.as_bytes(), 0o664);
             }
         }
     }
     #[cfg(not(unix))]
     {
-        for path in [&gemini_agents, &gemini_rules_agents] {
-            if std::fs::read(path).ok().as_deref() != Some(doc.as_bytes()) {
-                let _ = write_seat_shared_file(path, doc.as_bytes(), 0o664);
-            }
+        if std::fs::read(&gemini_agents).ok().as_deref() != Some(doc.as_bytes()) {
+            let _ = write_seat_shared_file(&gemini_agents, doc.as_bytes(), 0o664);
         }
     }
 }
@@ -1147,16 +1211,25 @@ fn install_skill_projection_as_owner(
         .take_while(|p| p.starts_with(config))
         .find_map(|p| std::fs::symlink_metadata(p).ok().filter(|m| m.is_dir()));
     let owner = owner.ok_or_else(|| std::io::Error::other("skill projection owner missing"))?;
-    if owner.uid() == crate::sandbox::server_uid() {
+    let (eff_uid, eff_gid) = if owner.uid() == 0 && owner.gid() >= 2000 {
+        (owner.gid(), owner.gid())
+    } else {
+        (owner.uid(), owner.gid())
+    };
+    if eff_uid == crate::sandbox::server_uid() {
         return Err(std::io::Error::other(
             "skill projection is not owned by another seat",
         ));
     }
     let launcher = crate::sandbox::descriptor_launcher()
         .ok_or_else(|| std::io::Error::other("skill projection launcher missing"))?;
+    let groups = match crate::sandbox::sock_gid_for() {
+        Some(sg) if sg != eff_gid && sg != 0 => format!("{eff_gid},{sg}"),
+        _ => eff_gid.to_string(),
+    };
     let output = std::process::Command::new(launcher).args([
-        "--reuid", &owner.uid().to_string(), "--regid", &owner.gid().to_string(),
-        "--groups", &owner.gid().to_string(), "--no-new-privs", "--", "/bin/sh", "-c",
+        "--reuid", &eff_uid.to_string(), "--regid", &eff_gid.to_string(),
+        "--groups", &groups, "--no-new-privs", "--", "/bin/sh", "-c",
         r#"set -eu
 config=$1; relative=$2; view=$3; global=$4; overlay=$5
 # Every existing component is inspected by its actual owner, not the daemon
@@ -1516,9 +1589,12 @@ pub(crate) fn seed_harness_credentials(
     agent: &Agent,
     target_config: &Path,
 ) {
-    let Ok(all_agents) = store.list_agents() else {
+    let Ok(mut all_agents) = store.list_agents() else {
         return;
     };
+    if all_agents.len() > 32 {
+        all_agents.retain(|a| a.state != "archived");
+    }
     let provider = upstream_provider_of(&agent.harness, agent.model.as_deref());
     let static_rel_paths: &[&str] = match agent.harness.as_str() {
         "claude-code" => &[".credentials.json", ".claude/.credentials.json"],
@@ -2541,7 +2617,9 @@ pub(crate) fn configure_agent_runtime(
         None => existing.harness.clone(),
     };
     crate::install::adapter(&target_harness)?;
-    if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none() && !crate::sandbox::is_isolated_test_env()
+    if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none()
+        && !crate::sandbox::is_isolated_test_env()
+        && actor != "system:profile-rebalance"
     {
         crate::install::record(data, &target_harness).map_err(Error::Message)?;
     }
@@ -2657,12 +2735,40 @@ pub(crate) fn configure_agent_runtime(
             std::fs::create_dir_all(target)?;
             for entry in std::fs::read_dir(source)? {
                 let entry = entry?;
+                let fname = entry.file_name();
+                let fname_s = fname.to_string_lossy();
+                if matches!(
+                    fname_s.as_ref(),
+                    "annotations"
+                        | "bin"
+                        | "brain"
+                        | "builtin"
+                        | "cache"
+                        | "cache-home"
+                        | "conversations"
+                        | "crashes"
+                        | "implicit"
+                        | "log"
+                        | "presence"
+                        | "updater"
+                        | "projects"
+                        | "sessions"
+                        | "session-env"
+                        | "shell-snapshots"
+                        | "backups"
+                        | "cli.log"
+                        | "conversation_summaries.db"
+                        | "conversation_summaries.db-shm"
+                        | "conversation_summaries.db-wal"
+                ) {
+                    continue;
+                }
                 let kind = entry.file_type()?;
-                let target = target.join(entry.file_name());
+                let target = target.join(&fname);
                 if kind.is_dir() {
                     copy_files(&entry.path(), &target)?;
                 } else if kind.is_file()
-                    && entry.file_name() != "profile.json"
+                    && fname != "profile.json"
                     && let Ok(bytes) = std::fs::read(entry.path())
                 {
                     let _ = write_seat_shared_file(&target, &bytes, 0o660);
@@ -2855,23 +2961,24 @@ pub(crate) fn propagate_profile_files_to_bound_agents(
         .as_ref()
         .and_then(|s| s.list_agents().ok())
         .unwrap_or_default();
-    let Ok(agents_dir) = std::fs::read_dir(data.join("agents")) else {
-        return;
-    };
-    for entry in agents_dir.flatten() {
-        let cfg = entry.path().join("config");
+    let active_agents: Vec<&Agent> = all_agents
+        .iter()
+        .filter(|a| a.state != "archived")
+        .collect();
+    for agent_rec in active_agents {
+        let cfg = agent_config_dir(data, &agent_rec.id);
         if !cfg.is_dir() {
             continue;
         }
-        let dir_id = entry.file_name().to_string_lossy().into_owned();
-        let agent_rec = all_agents.iter().find(|a| a.id.as_str() == dir_id);
         let bound = bound_profile_name(&cfg);
         let matches_target = match bound.as_deref() {
             Some(b) if b == target_tag => true,
-            Some(b) if b == profile => agent_rec
-                .is_some_and(|a| upstream_provider_of(&a.harness, a.model.as_deref()) == provider),
-            None if profile == "default" => agent_rec
-                .is_some_and(|a| upstream_provider_of(&a.harness, a.model.as_deref()) == provider),
+            Some(b) if b == profile => {
+                upstream_provider_of(&agent_rec.harness, agent_rec.model.as_deref()) == provider
+            }
+            None if profile == "default" => {
+                upstream_provider_of(&agent_rec.harness, agent_rec.model.as_deref()) == provider
+            }
             _ => false,
         };
         if !matches_target {
@@ -2891,6 +2998,9 @@ pub(crate) fn propagate_profile_files_to_bound_agents(
                 }
             }
             if let Ok(raw_bytes) = std::fs::read(&src) {
+                if raw_bytes.is_empty() {
+                    continue;
+                }
                 let bytes = if matches!(*rel, ".credentials.json" | ".claude/.credentials.json") {
                     seat_sanitized_anthropic_credentials(&raw_bytes, anyagents_core::now_ms())
                 } else {
@@ -2910,11 +3020,11 @@ pub(crate) fn propagate_profile_files_to_bound_agents(
             &format!("{}\n", anyagents_core::now_ms()),
         );
         let _ = std::fs::remove_file(cfg.join(".anyagents-last-error.json"));
-        if let (Some(s), Some(a)) = (store_opt.as_ref(), agent_rec) {
-            if let Some((_, uid, gid, _)) = resolved_agent_seat_info(s, a) {
+        if let Some(s) = store_opt.as_ref() {
+            if let Some((_, uid, gid, _)) = resolved_agent_seat_info(s, agent_rec) {
                 crate::sandbox::share_config_with_seat_uid(&cfg, uid, gid);
             }
-            poke_agent_wake_socket(data, &a.id);
+            poke_agent_wake_socket(data, &agent_rec.id);
         }
     }
 }
@@ -4029,6 +4139,22 @@ fn copy_seat_file_if_newer(src: &Path, dst: &Path) -> bool {
     {
         return false;
     }
+    if src
+        .file_name()
+        .is_some_and(|n| n == "antigravity-oauth-token")
+    {
+        let valid_agy_tok = serde_json::from_slice::<serde_json::Value>(&src_bytes)
+            .ok()
+            .is_some_and(|v| {
+                v.pointer("/token/refresh_token")
+                    .or_else(|| v.get("refresh_token"))
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|s| !s.trim().is_empty())
+            });
+        if !valid_agy_tok {
+            return false;
+        }
+    }
     if let Ok(dst_meta) = std::fs::metadata(dst)
         && dst_meta.is_file()
         && dst_meta.len() > 0
@@ -4099,7 +4225,14 @@ pub(crate) fn sync_and_list_provider_profiles(
     store: &Store,
     data: &Path,
 ) -> Vec<ProviderProfileEntry> {
-    sync_and_list_provider_profiles_with_options(store, data, true)
+    sync_and_list_provider_profiles_inner(store, data, true, true)
+}
+
+pub(crate) fn list_provider_profiles_fast(
+    store: &Store,
+    data: &Path,
+) -> Vec<ProviderProfileEntry> {
+    sync_and_list_provider_profiles_inner(store, data, true, false)
 }
 
 pub(crate) fn sync_and_list_provider_profiles_with_options(
@@ -4107,135 +4240,155 @@ pub(crate) fn sync_and_list_provider_profiles_with_options(
     data: &Path,
     probe_usage: bool,
 ) -> Vec<ProviderProfileEntry> {
+    sync_and_list_provider_profiles_inner(store, data, probe_usage, probe_usage)
+}
+
+fn sync_and_list_provider_profiles_inner(
+    store: &Store,
+    data: &Path,
+    probe_usage: bool,
+    rebalance: bool,
+) -> Vec<ProviderProfileEntry> {
     let agents = store.list_agents().unwrap_or_default();
     let profiles_root = data.join("profiles");
     let _ = std::fs::create_dir_all(&profiles_root);
 
-    // Migrate any legacy harness-named empty/default directories if they match a harness name
-    // rather than a provider name and have no `profile.json`.
-    for legacy_harness in [
-        "claude-code",
-        "codex",
-        "opencode",
-        "agy",
-        "omp",
-        "dsh",
-        "grok",
-        "opengateway",
-    ] {
-        let legacy_dir = profiles_root.join(legacy_harness);
-        if legacy_dir.is_dir() && !legacy_dir.join("default").join("profile.json").exists() {
-            let _ = std::fs::remove_dir_all(&legacy_dir);
-        }
-    }
+    let now_ms = anyagents_core::now_ms();
+    let seed_stamp = profiles_root.join(".last-agent-cred-sync-ms");
+    let skip_heavy_seed = !rebalance
+        && !crate::sandbox::is_isolated_test_env()
+        && std::fs::read_to_string(&seed_stamp)
+            .ok()
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .is_some_and(|last_ms| now_ms.saturating_sub(last_ms) < 30_000);
 
-    // Seed upstream provider profiles from existing seats on this server so pre-existing
-    // logins (Subscriptions, Coding Plans, API Keys) are registered in the Master Pool.
-    for agent in &agents {
-        if agent.state == "archived" {
-            continue;
+    if !skip_heavy_seed {
+        // Migrate any legacy harness-named empty/default directories if they match a harness name
+        // rather than a provider name and have no `profile.json`.
+        for legacy_harness in [
+            "claude-code",
+            "codex",
+            "opencode",
+            "agy",
+            "omp",
+            "dsh",
+            "grok",
+            "opengateway",
+        ] {
+            let legacy_dir = profiles_root.join(legacy_harness);
+            if legacy_dir.is_dir() && !legacy_dir.join("default").join("profile.json").exists() {
+                let _ = std::fs::remove_dir_all(&legacy_dir);
+            }
         }
-        let cfg = agent_config_dir(data, &agent.id);
-        let provider = upstream_provider_of(&agent.harness, agent.model.as_deref());
-        let bound = bound_profile_name(&cfg);
-        let seeded = seeded_profile_name(&cfg);
-        if seeded.is_some() && bound.is_some() && seeded != bound {
-            continue;
-        }
-        let prof_name = bound
-            .and_then(|b| {
-                let p = b.split_once('/').map(|(_, p)| p.to_string()).unwrap_or(b);
-                (!p.is_empty()).then_some(p)
-            })
-            .unwrap_or_else(|| "default".to_string());
-        let profile_dir = profiles_root.join(&provider).join(&prof_name);
-        match provider.as_str() {
-            "anthropic" => {
-                let rels = [".credentials.json", ".claude/.credentials.json"];
-                for src_rel in rels {
-                    let src = cfg.join(src_rel);
-                    if src.is_file() {
-                        ensure_provider_profile_meta(&profile_dir, "anthropic", None);
-                        for dst_rel in rels {
-                            let _ = copy_seat_file_if_newer(&src, &profile_dir.join(dst_rel));
-                        }
-                    }
-                }
-            }
-            "openai" => {
-                let rels = ["auth.json", ".codex/auth.json"];
-                for src_rel in rels {
-                    let src = cfg.join(src_rel);
-                    if src.is_file() {
-                        ensure_provider_profile_meta(&profile_dir, "openai", None);
-                        for dst_rel in rels {
-                            let _ = copy_seat_file_if_newer(&src, &profile_dir.join(dst_rel));
-                        }
-                    }
-                }
-            }
-            "google-antigravity" => {
-                for rel in [
-                    ".gemini/antigravity-cli/antigravity-oauth-token",
-                    ".gemini/antigravity-cli/antigravity_state.pbtxt",
-                    ".gemini/config/config.json",
-                ] {
-                    let src = cfg.join(rel);
-                    if src.is_file() {
-                        ensure_provider_profile_meta(&profile_dir, "google-antigravity", None);
-                        let _ = copy_seat_file_if_newer(&src, &profile_dir.join(rel));
-                    }
-                }
-            }
-            "muse" => {
-                for rel in ["muse/auth.json", ".config/muse/auth.json"] {
-                    let src = cfg.join(rel);
-                    if src.is_file() {
-                        ensure_provider_profile_meta(&profile_dir, "muse", None);
-                        let _ = copy_seat_file_if_newer(&src, &profile_dir.join(rel));
-                    }
-                }
-            }
-            "sylphx" | "qwen-token-plan" | "kimi-code-plan" | "glm-code-plan"
-            | "minimax-code-plan" => {
-                let kind = if provider == "sylphx" {
-                    "api-key"
-                } else {
-                    "coding-plan"
-                };
-                let opencode_rel = ".config/opencode/opencode.json";
-                let src_json = cfg.join(opencode_rel);
-                if src_json.is_file() {
-                    ensure_provider_profile_meta(&profile_dir, &provider, Some(kind));
-                    let dst_json = profile_dir.join(opencode_rel);
-                    if !dst_json.is_file()
-                        && let Ok(text) = std::fs::read_to_string(&src_json)
-                        && let Ok(val) = serde_json::from_str::<serde_json::Value>(&text)
-                        && let Some(prov_block) = val.get("provider")
-                    {
-                        if let Some(p) = dst_json.parent() {
-                            let _ = std::fs::create_dir_all(p);
-                        }
-                        let clean = serde_json::json!({
-                            "$schema": "https://opencode.ai/config.json",
-                            "provider": prov_block,
-                        });
-                        if let Ok(clean_bytes) = serde_json::to_vec_pretty(&clean) {
-                            let _ = std::fs::write(&dst_json, clean_bytes);
-                        }
-                    }
-                    if let Ok(text) = std::fs::read_to_string(&src_json) {
-                        for rel in extract_file_tilde_refs(&text) {
-                            let _ = copy_host_file(&cfg.join(&rel), &profile_dir.join(&rel));
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
 
-    deduplicate_same_account_profiles(data);
+        // Seed upstream provider profiles from existing seats on this server so pre-existing
+        // logins (Subscriptions, Coding Plans, API Keys) are registered in the Master Pool.
+        for agent in &agents {
+            if agent.state == "archived" {
+                continue;
+            }
+            let cfg = agent_config_dir(data, &agent.id);
+            let provider = upstream_provider_of(&agent.harness, agent.model.as_deref());
+            let bound = bound_profile_name(&cfg);
+            let seeded = seeded_profile_name(&cfg);
+            if seeded.is_some() && bound.is_some() && seeded != bound {
+                continue;
+            }
+            let prof_name = bound
+                .and_then(|b| {
+                    let p = b.split_once('/').map(|(_, p)| p.to_string()).unwrap_or(b);
+                    (!p.is_empty()).then_some(p)
+                })
+                .unwrap_or_else(|| "default".to_string());
+            let profile_dir = profiles_root.join(&provider).join(&prof_name);
+            match provider.as_str() {
+                "anthropic" => {
+                    let rels = [".credentials.json", ".claude/.credentials.json"];
+                    for src_rel in rels {
+                        let src = cfg.join(src_rel);
+                        if src.is_file() {
+                            ensure_provider_profile_meta(&profile_dir, "anthropic", None);
+                            for dst_rel in rels {
+                                let _ = copy_seat_file_if_newer(&src, &profile_dir.join(dst_rel));
+                            }
+                        }
+                    }
+                }
+                "openai" => {
+                    let rels = ["auth.json", ".codex/auth.json"];
+                    for src_rel in rels {
+                        let src = cfg.join(src_rel);
+                        if src.is_file() {
+                            ensure_provider_profile_meta(&profile_dir, "openai", None);
+                            for dst_rel in rels {
+                                let _ = copy_seat_file_if_newer(&src, &profile_dir.join(dst_rel));
+                            }
+                        }
+                    }
+                }
+                "google-antigravity" => {
+                    for rel in [
+                        ".gemini/antigravity-cli/antigravity-oauth-token",
+                        ".gemini/antigravity-cli/antigravity_state.pbtxt",
+                        ".gemini/config/config.json",
+                    ] {
+                        let src = cfg.join(rel);
+                        if src.is_file() {
+                            ensure_provider_profile_meta(&profile_dir, "google-antigravity", None);
+                            let _ = copy_seat_file_if_newer(&src, &profile_dir.join(rel));
+                        }
+                    }
+                }
+                "muse" => {
+                    for rel in ["muse/auth.json", ".config/muse/auth.json"] {
+                        let src = cfg.join(rel);
+                        if src.is_file() {
+                            ensure_provider_profile_meta(&profile_dir, "muse", None);
+                            let _ = copy_seat_file_if_newer(&src, &profile_dir.join(rel));
+                        }
+                    }
+                }
+                "sylphx" | "qwen-token-plan" | "kimi-code-plan" | "glm-code-plan"
+                | "minimax-code-plan" => {
+                    let kind = if provider == "sylphx" {
+                        "api-key"
+                    } else {
+                        "coding-plan"
+                    };
+                    let opencode_rel = ".config/opencode/opencode.json";
+                    let src_json = cfg.join(opencode_rel);
+                    if src_json.is_file() {
+                        ensure_provider_profile_meta(&profile_dir, &provider, Some(kind));
+                        let dst_json = profile_dir.join(opencode_rel);
+                        if !dst_json.is_file()
+                            && let Ok(text) = std::fs::read_to_string(&src_json)
+                            && let Ok(val) = serde_json::from_str::<serde_json::Value>(&text)
+                            && let Some(prov_block) = val.get("provider")
+                        {
+                            if let Some(p) = dst_json.parent() {
+                                let _ = std::fs::create_dir_all(p);
+                            }
+                            let clean = serde_json::json!({
+                                "$schema": "https://opencode.ai/config.json",
+                                "provider": prov_block,
+                            });
+                            if let Ok(clean_bytes) = serde_json::to_vec_pretty(&clean) {
+                                let _ = std::fs::write(&dst_json, clean_bytes);
+                            }
+                        }
+                        if let Ok(text) = std::fs::read_to_string(&src_json) {
+                            for rel in extract_file_tilde_refs(&text) {
+                                let _ = copy_host_file(&cfg.join(&rel), &profile_dir.join(&rel));
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        deduplicate_same_account_profiles(data);
+    }
 
     let mut entries: Vec<ProviderProfileEntry> = Vec::new();
     if let Ok(providers) = std::fs::read_dir(&profiles_root) {
@@ -4314,7 +4467,7 @@ pub(crate) fn sync_and_list_provider_profiles_with_options(
         enrich_profiles_usage(data, &mut entries);
     }
 
-    if probe_usage
+    if rebalance
         && !crate::sandbox::is_isolated_test_env()
         && let Ok(store) = Store::open(data.join("state.db"))
     {
@@ -4734,13 +4887,24 @@ fn overlay_active_quota_reset_on_cached_usage(
 pub(crate) fn sync_fresher_bound_agent_credentials(data: &Path) {
     let profiles_root = data.join("profiles");
     let now_ms = anyagents_core::now_ms();
+    let sync_stamp = profiles_root.join(".last-agent-cred-sync-ms");
+    if !crate::sandbox::is_isolated_test_env()
+        && let Ok(raw) = std::fs::read_to_string(&sync_stamp)
+        && let Ok(last_ms) = raw.trim().parse::<i64>()
+        && now_ms.saturating_sub(last_ms) < 15_000
+    {
+        return;
+    }
+    let _ = std::fs::write(&sync_stamp, format!("{now_ms}\n"));
     if let Ok(store) = Store::open(data.join("state.db"))
         && let Ok(agents) = store.list_agents()
     {
         for agent in &agents {
+            if agent.state == "archived" {
+                continue;
+            }
             let cfg = agent_config_dir(data, &agent.id);
-            if agent.state != "archived"
-                && agent.harness == "claude-code"
+            if agent.harness == "claude-code"
                 && let Some(reset_ms) =
                     anyagents_harness_claude::detect_session_quota_reset_ms(&cfg, now_ms)
             {
@@ -4851,40 +5015,79 @@ fn read_dsh_yaml_ref(base: &Path, key_name: &str) -> Option<String> {
 }
 
 fn extract_agy_oauth_clients() -> Vec<(String, String)> {
-    let mut candidates = Vec::new();
-    if let Some(home) = crate::sandbox::host_home_dir() {
-        candidates.push(home.join(".local/bin/agy"));
-    }
-    candidates.push(PathBuf::from("/usr/local/bin/agy"));
-    let Some(agy_bin) = candidates.into_iter().find(|p| p.is_file()) else {
-        return Vec::new();
-    };
-    let Ok(bytes) = std::fs::read(&agy_bin) else {
-        return Vec::new();
-    };
-    let cid_needle = b"1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
-    if !bytes.windows(cid_needle.len()).any(|w| w == cid_needle) {
-        return Vec::new();
-    }
-    let Ok(cid) = String::from_utf8(cid_needle.to_vec()) else {
-        return Vec::new();
-    };
-    let sec_prefix = b"GOCSPX-";
-    let mut out = Vec::new();
-    for idx in 0..bytes.len().saturating_sub(35) {
-        if &bytes[idx..idx + 7] == sec_prefix {
-            let candidate = &bytes[idx..idx + 35];
-            if candidate[7..]
-                .iter()
-                .all(|b| b.is_ascii_alphanumeric() || *b == b'-' || *b == b'_')
-                && let Ok(secret) = String::from_utf8(candidate.to_vec())
-                && !out.iter().any(|(_, s)| s == &secret)
-            {
-                out.push((cid.clone(), secret));
+    static AGY_CLIENTS: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
+    AGY_CLIENTS
+        .get_or_init(|| {
+            let mut candidates = Vec::new();
+            let cache_path = crate::sandbox::host_home_dir()
+                .map(|h| h.join(".cache/anyagents-agy-oauth-clients.json"));
+            if let Some(home) = crate::sandbox::host_home_dir() {
+                candidates.push(home.join(".local/bin/agy"));
             }
-        }
-    }
-    out
+            candidates.push(PathBuf::from("/usr/local/bin/agy"));
+            let Some(agy_bin) = candidates.into_iter().find(|p| p.is_file()) else {
+                return Vec::new();
+            };
+            let bin_meta = std::fs::metadata(&agy_bin).ok();
+            let bin_size = bin_meta.as_ref().map(|m| m.len()).unwrap_or(0);
+            if let Some(ref cp) = cache_path
+                && let Ok(raw) = std::fs::read_to_string(cp)
+                && let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw)
+                && val.get("bin_size").and_then(|v| v.as_u64()) == Some(bin_size)
+                && let Some(arr) = val.get("clients").and_then(|v| v.as_array())
+            {
+                let parsed: Vec<(String, String)> = arr
+                    .iter()
+                    .filter_map(|item| {
+                        Some((
+                            item.get(0)?.as_str()?.to_string(),
+                            item.get(1)?.as_str()?.to_string(),
+                        ))
+                    })
+                    .collect();
+                if !parsed.is_empty() {
+                    return parsed;
+                }
+            }
+            let Ok(bytes) = std::fs::read(&agy_bin) else {
+                return Vec::new();
+            };
+            let cid_needle =
+                b"1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
+            if !bytes.windows(cid_needle.len()).any(|w| w == cid_needle) {
+                return Vec::new();
+            }
+            let Ok(cid) = String::from_utf8(cid_needle.to_vec()) else {
+                return Vec::new();
+            };
+            let sec_prefix = b"GOCSPX-";
+            let mut out = Vec::new();
+            for idx in 0..bytes.len().saturating_sub(35) {
+                if &bytes[idx..idx + 7] == sec_prefix {
+                    let candidate = &bytes[idx..idx + 35];
+                    if candidate[7..]
+                        .iter()
+                        .all(|b| b.is_ascii_alphanumeric() || *b == b'-' || *b == b'_')
+                        && let Ok(secret) = String::from_utf8(candidate.to_vec())
+                        && !out.iter().any(|(_, s)| s == &secret)
+                    {
+                        out.push((cid.clone(), secret));
+                    }
+                }
+            }
+            if let Some(ref cp) = cache_path {
+                if let Some(parent) = cp.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let cache_obj = serde_json::json!({
+                    "bin_size": bin_size,
+                    "clients": out,
+                });
+                let _ = std::fs::write(cp, cache_obj.to_string());
+            }
+            out
+        })
+        .clone()
 }
 
 fn extract_cursor_oauth_from_db(prof_dir: &Path) -> Option<(String, String)> {
@@ -5365,12 +5568,36 @@ pub(crate) fn probe_one_profile_usage(
     profile: &str,
 ) -> Option<String> {
     let prof_dir = data.join("profiles").join(provider).join(profile);
+    let last_usage_path = prof_dir.join(".anyagents-last-usage.txt");
+    let now_ms = anyagents_core::now_ms();
+    if provider != "anthropic"
+        && let Ok(meta) = std::fs::metadata(&last_usage_path)
+        && let Ok(mtime) = meta.modified()
+        && let Ok(dur) = mtime.duration_since(std::time::UNIX_EPOCH)
+        && now_ms.saturating_sub(dur.as_millis() as i64) < 120_000
+        && let Ok(cached) = std::fs::read_to_string(&last_usage_path)
+    {
+        let trimmed = cached.trim();
+        if trimmed == "__NONE__" {
+            return None;
+        }
+        if !trimmed.is_empty() {
+            return Some(overlay_active_quota_reset_on_cached_usage(
+                &prof_dir,
+                &last_usage_path,
+                trimmed,
+                now_ms,
+            ));
+        }
+    }
+
     let http = ureq::Agent::config_builder()
-        .timeout_global(Some(std::time::Duration::from_secs(8)))
+        .timeout_global(Some(std::time::Duration::from_secs(3)))
         .build()
         .new_agent();
 
-    match provider {
+    let result = (|| -> Option<String> {
+        match provider {
         "anthropic" => {
             let cred_text = std::fs::read_to_string(prof_dir.join(".credentials.json"))
                 .or_else(|_| std::fs::read_to_string(prof_dir.join(".claude/.credentials.json")))
@@ -5754,6 +5981,16 @@ pub(crate) fn probe_one_profile_usage(
             let mut active_token = token;
             let mut summary_val = fetch_summary(&active_token);
             if summary_val.is_none() {
+                let attempt_path = prof_dir.join(".anyagents-oauth-refresh-attempt-ms");
+                let last_attempt_ms = std::fs::read_to_string(&attempt_path)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<i64>().ok())
+                    .unwrap_or(0);
+                if now_ms.saturating_sub(last_attempt_ms) < 300_000 {
+                    let _ = std::fs::write(&last_usage_path, "__NONE__\n");
+                    return None;
+                }
+                let _ = std::fs::write(&attempt_path, format!("{now_ms}\n"));
                 let rtok = tok_val
                     .pointer("/token/refresh_token")
                     .or_else(|| tok_val.get("refresh_token"))
@@ -5761,6 +5998,7 @@ pub(crate) fn probe_one_profile_usage(
                     .trim()
                     .to_string();
                 if rtok.is_empty() {
+                    let _ = std::fs::write(&last_usage_path, "__NONE__\n");
                     return None;
                 }
                 let mut refreshed_acc = None;
@@ -5784,7 +6022,10 @@ pub(crate) fn probe_one_profile_usage(
                         break;
                     }
                 }
-                let new_acc = refreshed_acc?;
+                let Some(new_acc) = refreshed_acc else {
+                    let _ = std::fs::write(&last_usage_path, "__NONE__\n");
+                    return None;
+                };
                 if let Some(tok_obj) = tok_val
                     .get_mut("token")
                     .and_then(serde_json::Value::as_object_mut)
@@ -6453,6 +6694,15 @@ pub(crate) fn probe_one_profile_usage(
         }
         _ => None,
     }
+    })();
+    if provider != "anthropic" {
+        if let Some(ref s) = result {
+            let _ = std::fs::write(&last_usage_path, format!("{s}\n"));
+        } else {
+            let _ = std::fs::write(&last_usage_path, "__NONE__\n");
+        }
+    }
+    result
 }
 
 pub(crate) fn parse_remaining_pct_from_usage(usage: &str, model: Option<&str>) -> Option<i64> {
@@ -6526,16 +6776,22 @@ pub(crate) fn force_refresh_provider_profiles(data: &Path, target: Option<&str>)
     let filter = target.map(str::trim).filter(|s| {
         !s.is_empty() && !s.eq_ignore_ascii_case("refresh") && !s.eq_ignore_ascii_case("reset")
     });
+    let _ = std::fs::remove_file(data.join("profiles/.last-agent-cred-sync-ms"));
     sync_fresher_bound_agent_credentials(data);
     let now_ms = anyagents_core::now_ms();
-    if let Ok(agents_dir) = std::fs::read_dir(data.join("agents")) {
-        for entry in agents_dir.flatten() {
-            let cfg = entry.path().join("config");
+    if let Ok(store) = Store::open(data.join("state.db"))
+        && let Ok(agents) = store.list_agents()
+    {
+        for agent in agents {
+            if agent.state == "archived" {
+                continue;
+            }
+            let cfg = agent_config_dir(data, &agent.id);
             let _ = std::fs::remove_file(cfg.join(".anyagents-last-quota-check-ms"));
         }
     }
     let http = ureq::Agent::config_builder()
-        .timeout_global(Some(std::time::Duration::from_secs(6)))
+        .timeout_global(Some(std::time::Duration::from_secs(4)))
         .build()
         .new_agent();
     let profiles_root = data.join("profiles");
@@ -6566,6 +6822,8 @@ pub(crate) fn force_refresh_provider_profiles(data: &Path, target: Option<&str>)
                 continue;
             }
             let _ = std::fs::remove_file(prof_dir.join(".anyagents-profile-meta-sync-ms"));
+            let _ = std::fs::remove_file(prof_dir.join(".anyagents-last-usage.txt"));
+            let _ = std::fs::remove_file(prof_dir.join(".anyagents-oauth-refresh-attempt-ms"));
             match provider.as_str() {
                 "anthropic" => {
                     let Ok(cred_text) = std::fs::read_to_string(prof_dir.join(".credentials.json"))
@@ -7331,6 +7589,7 @@ pub(crate) fn parse_archetype_markdown(raw: &str) -> Result<ArchetypeTemplate, E
                 ));
             }
             match key.to_ascii_lowercase().as_str() {
+                "name" => {}
                 "description" | "summary" => tpl.description = Some(value.to_string()),
                 "scope" => tpl.scope = Some(anyagents_core::parse_agent_scope(value)?.to_string()),
                 "workdir" | "workspace" => tpl.workdir = Some(value.to_string()),
@@ -7384,11 +7643,14 @@ pub(crate) fn resolve_archetype_template(
     search_roots.push((data_dir.to_path_buf(), PathBuf::from("agents-templates")));
     search_roots.push((data_dir.to_path_buf(), PathBuf::from("archetypes")));
     search_roots.push((data_dir.to_path_buf(), PathBuf::from(".agents/agents")));
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        search_roots.push((home, PathBuf::from(".agents/agents")));
-    }
-    if let Some(owd) = crate::server::owner_workdir() {
-        search_roots.push((owd, PathBuf::from(".agents/agents")));
+    #[cfg(not(test))]
+    {
+        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+            search_roots.push((home, PathBuf::from(".agents/agents")));
+        }
+        if let Some(owd) = crate::server::owner_workdir() {
+            search_roots.push((owd, PathBuf::from(".agents/agents")));
+        }
     }
 
     let candidates = [
@@ -10200,6 +10462,11 @@ git -c safe.directory="$5" -C "$5" status --porcelain
         let cfg = anyagents_core::agent_config_dir(data, &agent.id);
         std::fs::write(cfg.join("sylphx-cloud-session.json"), "{}").unwrap();
 
+        let gemini_rules_dir = cfg.join(".gemini/config/rules");
+        std::fs::create_dir_all(&gemini_rules_dir).unwrap();
+        let gemini_rules_agents = gemini_rules_dir.join("AGENTS.md");
+        std::fs::write(&gemini_rules_agents, "stale duplicate rule").unwrap();
+
         let huge_continuity = format!(
             "## 4. Cross-Harness Session Continuity (`claude-code` -> `agy`)\n\n{}",
             "- `[OUT (already sent/completed)]` `msg_1`: Completed verification step.\n"
@@ -10211,7 +10478,7 @@ git -c safe.directory="$5" -C "$5" status --porcelain
         assert!(sys_prompt.contains("- **Agent Name**: `hermes`"));
         assert!(sys_prompt.contains("- **Role Label**: `Growth Mind`"));
         assert!(sys_prompt.contains("Public Layer 1 charter for Hermes."));
-        assert!(sys_prompt.contains("Private Layer 2 execution SOP for Hermes."));
+        assert!(sys_prompt.contains("<role_instructions>\nPrivate Layer 2 execution SOP for Hermes.\n</role_instructions>"));
         assert!(sys_prompt.contains("## 4. Shared Instructions (AGENTS.md)"));
         assert!(sys_prompt.contains("## 4. Cross-Harness Session Continuity"));
         assert!(
@@ -10226,21 +10493,16 @@ git -c safe.directory="$5" -C "$5" status --porcelain
 
         let gemini_md = cfg.join(".gemini/config/GEMINI.md");
         let gemini_agents = cfg.join(".gemini/config/AGENTS.md");
-        let gemini_rules_agents = cfg.join(".gemini/config/rules/AGENTS.md");
         assert_eq!(std::fs::read_to_string(&gemini_md).unwrap(), sys_prompt);
         assert_eq!(std::fs::read_to_string(&gemini_agents).unwrap(), sys_prompt);
-        assert_eq!(
-            std::fs::read_to_string(&gemini_rules_agents).unwrap(),
-            sys_prompt
+        assert!(
+            !gemini_rules_agents.exists(),
+            "rules/AGENTS.md must be removed so agy does not load GEMINI.md twice"
         );
         #[cfg(unix)]
         {
             let canon_base = std::fs::canonicalize(&gemini_md).unwrap();
             assert_eq!(std::fs::canonicalize(&gemini_agents).unwrap(), canon_base);
-            assert_eq!(
-                std::fs::canonicalize(&gemini_rules_agents).unwrap(),
-                canon_base
-            );
         }
     }
 }

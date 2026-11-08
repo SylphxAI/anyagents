@@ -660,6 +660,18 @@ fn vendor_launch_inner(request: LaunchRequest) -> Result<VendorHarness, String> 
                 .map(|(u, uid, gid, _)| (u, uid, gid, None))
         }) {
             crate::sandbox::share_config_with_seat_uid(&request.config_dir, uid, gid);
+            let managed_work = anyagents_core::agent_work_dir(&request.data_dir, &request.agent.id);
+            if request.work_dir == managed_work
+                && managed_work.is_dir()
+                && !managed_work.join(".git").exists()
+            {
+                let _ = crate::sandbox::share_worktree_with_seat(
+                    &managed_work,
+                    uid,
+                    gid,
+                    &crate::worktree_access::grant_path(&request.data_dir, &request.agent.id),
+                );
+            }
         }
         crate::create::ensure_seat_op_config(&request.config_dir, seat_launch);
         env.push(("HOME".to_string(), request.config_dir.display().to_string()));
@@ -1096,6 +1108,10 @@ pub(crate) fn ensure_agy_steering_settings(config_dir: &Path, work_dir: &Path) {
                 "queuedMessages".to_string(),
                 serde_json::Value::String("send-immediately".to_string()),
             );
+            changed = true;
+        }
+        if map.get("autoMemory").and_then(|v| v.as_bool()) != Some(false) {
+            map.insert("autoMemory".to_string(), serde_json::Value::Bool(false));
             changed = true;
         }
         let perms = map

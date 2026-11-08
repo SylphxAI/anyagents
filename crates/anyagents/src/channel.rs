@@ -347,8 +347,10 @@ pub fn conversation(
     since_ms: Option<i64>,
     limit: Option<usize>,
     query: Option<&str>,
+    scope: Option<&str>,
 ) -> Result<(), Error> {
     let clean_query = query.map(str::trim).filter(|s| !s.is_empty());
+    let clean_scope = scope.map(str::trim).filter(|s| !s.is_empty());
     let target = match agent.map(str::trim).filter(|s| !s.is_empty()) {
         Some(a) => a.to_string(),
         None => {
@@ -376,6 +378,9 @@ pub fn conversation(
         }
         if let Some(q) = clean_query {
             params.push(format!("query={}", urlencoding_simple(q)));
+        }
+        if let Some(sc) = clean_scope {
+            params.push(format!("scope={}", urlencoding_simple(sc)));
         }
         let path = if params.is_empty() {
             format!("/v1/agents/{target}/conversation")

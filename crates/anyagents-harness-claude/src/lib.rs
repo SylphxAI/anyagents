@@ -268,6 +268,7 @@ impl ClaudeHarness {
 
     fn launch(&mut self, session_id: Option<&str>) -> Result<(), HarnessError> {
         let mut cmd = anyagents_harness::spawn_command(&self.program, &self.environment)?;
+        cmd.env("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1");
         cmd.arg("-p")
             .arg("--input-format")
             .arg("stream-json")

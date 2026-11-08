@@ -13,13 +13,19 @@ use std::{
 // Serialize host transitions and late vendor aliases across daemon threads and
 // restarts. This lock is host-only, outside the writable learned-memory tree.
 fn lock(root: &Path) -> io::Result<fs::File> {
-    fs::create_dir_all(root.join("sessions"))?;
+    let sessions = root.join("sessions");
+    fs::create_dir_all(&sessions)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = fs::set_permissions(&sessions, fs::Permissions::from_mode(0o700));
+    }
     let file = fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(root.join("sessions/registry.lock"))?;
+        .open(sessions.join("registry.lock"))?;
     file.lock()?;
     Ok(file)
 }
@@ -321,6 +327,25 @@ pub fn resume_vendor(root: &Path, harness: &str, vendor_id: &str) -> io::Result<
     registry.active = Some(session);
     write(root, &registry)?;
     Ok(result)
+}
+
+/// Refresh the active session's memory pin when the agent is quiescent/idle
+/// (no open turn) and `memory/MEMORY.md` has changed on disk.
+pub fn refresh_active_pin(root: &Path) -> io::Result<Option<HostSession>> {
+    let _lock = lock(root)?;
+    let registry = read_ready(root)?;
+    let Some(session) = registry.active else {
+        return Ok(None);
+    };
+    let Some(memory) = crate::learned_memory::repin_session_if_changed(root, &session.generation)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(HostSession {
+        generation: session.generation,
+        harness: session.harness,
+        memory,
+    }))
 }
 
 #[cfg(test)]

@@ -194,7 +194,7 @@ pub fn launch_boundary(agents: &[String]) -> bool {
 
 /// The socket group: the configured one, else the host's `anyagents-sock`
 /// when running outside isolated tests.
-fn sock_gid_for() -> Option<u32> {
+pub(crate) fn sock_gid_for() -> Option<u32> {
     number("ANYAGENTS_SOCKET_GID").or_else(|| {
         if is_isolated_test_env() {
             None
@@ -356,6 +356,14 @@ fn fallback_seat(agent_name: &str, parent_name: Option<&str>) -> Option<(String,
 }
 
 fn host_seat_users() -> Vec<(String, (u32, u32))> {
+    if !is_isolated_test_env() {
+        static CACHE: std::sync::OnceLock<Vec<(String, (u32, u32))>> = std::sync::OnceLock::new();
+        return CACHE.get_or_init(host_seat_users_uncached).clone();
+    }
+    host_seat_users_uncached()
+}
+
+fn host_seat_users_uncached() -> Vec<(String, (u32, u32))> {
     let Ok(text) = std::fs::read_to_string("/etc/passwd") else {
         return Vec::new();
     };
@@ -665,6 +673,16 @@ pub fn share_config_with_seat_uid(config_dir: &Path, uid: u32, gid: u32) {
             eprintln!("seat: cannot share {}: {error}", path.display());
         }
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        for host_only in ["sessions", "transcripts"] {
+            let p = config_dir.with_file_name(host_only);
+            if p.is_dir() {
+                let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+    }
 }
 
 /// Share a working directory and both per-worktree and common Git metadata.
@@ -819,17 +837,61 @@ pub fn hydrate_operator_groups_if_needed() {
 /// Registered root-to-principal resolution is the same authority used by vendor
 /// launch. Unregistered directories remain foreign in the shared inventory.
 pub(crate) fn peer_principals(store: &anyagents_core::Store) -> Result<String, Error> {
-    let mut peers = Vec::new();
-    for agent in store.list_agents()? {
-        if let Some((_, uid, gid, _)) = crate::create::resolved_agent_seat_info(store, &agent) {
-            peers.push(anyagents_harness::SeatPeer {
-                root: anyagents_core::agent_config_dir(store.data_dir(), &agent.id)
-                    .parent()
-                    .unwrap()
-                    .to_owned(),
-                uid,
-                gid,
+    let agents = store.list_agents()?;
+    let by_id: std::collections::HashMap<&str, &anyagents_core::Agent> =
+        agents.iter().map(|a| (a.id.as_str(), a)).collect();
+    let mut seat_cache: std::collections::HashMap<(String, Option<String>), Option<(u32, u32)>> =
+        std::collections::HashMap::new();
+    let large_inventory = agents.len() > 32;
+    let mut peers = Vec::with_capacity(agents.len().min(512));
+    for agent in &agents {
+        if large_inventory && agent.state == "archived" {
+            continue;
+        }
+        let cfg = anyagents_core::agent_config_dir(store.data_dir(), &agent.id);
+        let root = cfg.parent().unwrap().to_owned();
+        if let Some((_, uid, gid, _)) = existing_config_seat(&cfg) {
+            peers.push(anyagents_harness::SeatPeer { root, uid, gid });
+            continue;
+        }
+        let mut curr = agent.parent_id.as_ref().map(|p| p.as_str());
+        let mut hops = 0usize;
+        let mut last_name = None;
+        while let Some(pid) = curr {
+            if hops >= 16 {
+                break;
+            }
+            hops += 1;
+            let Some(parent) = by_id.get(pid) else {
+                break;
+            };
+            last_name = Some(parent.name.clone());
+            curr = parent.parent_id.as_ref().map(|p| p.as_str());
+        }
+        let hint = last_name.or_else(|| {
+            agent
+                .launch_env
+                .iter()
+                .find(|(k, _)| k == "ANYAGENTS_PARENT_NAME")
+                .map(|(_, v)| v.clone())
+        });
+        let key = (agent.name.clone(), hint.clone());
+        let resolved = *seat_cache
+            .entry(key)
+            .or_insert_with(|| {
+                if let Some((_, spec)) = seat_launch_spec_with_hint(&agent.name, hint.as_deref()) {
+                    let mut parts = spec.split('\t');
+                    if let (_, Some(u), Some(g)) = (parts.next(), parts.next(), parts.next())
+                        && let (Ok(uid), Ok(gid)) = (u.parse::<u32>(), g.parse::<u32>())
+                    {
+                        return Some((uid, gid));
+                    }
+                }
+                seat_for_agent_with_hint(&agent.name, hint.as_deref())
+                    .map(|(_, uid, gid, _)| (uid, gid))
             });
+        if let Some((uid, gid)) = resolved {
+            peers.push(anyagents_harness::SeatPeer { root, uid, gid });
         }
     }
     serde_json::to_string(&peers).map_err(|e| Error::Message(e.to_string()))

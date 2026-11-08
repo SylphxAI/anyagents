@@ -81,18 +81,64 @@ pub fn write(
             }
         });
     }
-    if std::env::var_os("ANYAGENTS_ALLOW_NATIVE_SUBAGENTS").is_none() {
+    let allow_native_subagents = std::env::var_os("ANYAGENTS_ALLOW_NATIVE_SUBAGENTS").is_some();
+    let allow_native_file_tools = std::env::var("ANYAGENTS_ALLOW_NATIVE_FILE_TOOLS")
+        .ok()
+        .is_some_and(|v| v.trim() == "1");
+    if !allow_native_subagents || !allow_native_file_tools {
         if !root.get("tools").is_some_and(|v| v.is_object()) {
             root["tools"] = serde_json::json!({});
         }
-        root["tools"]["task"] = serde_json::Value::Bool(false);
+        if !allow_native_subagents {
+            root["tools"]["task"] = serde_json::Value::Bool(false);
+        }
+        if !allow_native_file_tools {
+            for tool in [
+                "read",
+                "write",
+                "edit",
+                "multiedit",
+                "patch",
+                "glob",
+                "grep",
+                "list",
+                "todowrite",
+                "todoread",
+                "webfetch",
+                "websearch",
+                "task",
+            ] {
+                root["tools"][tool] = serde_json::Value::Bool(false);
+            }
+        }
         if let Some(build) = root.get_mut("agent").and_then(|a| a.get_mut("build"))
             && build.is_object()
         {
             if !build.get("tools").is_some_and(|v| v.is_object()) {
                 build["tools"] = serde_json::json!({});
             }
-            build["tools"]["task"] = serde_json::Value::Bool(false);
+            if !allow_native_subagents {
+                build["tools"]["task"] = serde_json::Value::Bool(false);
+            }
+            if !allow_native_file_tools {
+                for tool in [
+                    "read",
+                    "write",
+                    "edit",
+                    "multiedit",
+                    "patch",
+                    "glob",
+                    "grep",
+                    "list",
+                    "todowrite",
+                    "todoread",
+                    "webfetch",
+                    "websearch",
+                    "task",
+                ] {
+                    build["tools"][tool] = serde_json::Value::Bool(false);
+                }
+            }
         }
     }
     root["mcp"] = serde_json::json!({
