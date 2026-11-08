@@ -372,6 +372,13 @@ fn three_lines_sent_while_a_turn_is_open_are_all_taken_and_none_twice() {
         "{:?}",
         other.inbox(&agent.id, None)
     );
+    // The cursor commits the pipe write before the child necessarily reads it.
+    // Wait for its third receipt before checking the complete log.
+    assert!(
+        wait_until(|| log_contains(&log, "user:3:")),
+        "child did not read all three messages: {}",
+        std::fs::read_to_string(&log).unwrap_or_default()
+    );
     let text = std::fs::read_to_string(&log).unwrap_or_default();
     for seq in 1..=3 {
         let id = other
@@ -431,6 +438,8 @@ fn a_restart_mid_stream_loses_nothing_and_writes_nothing_twice() {
     assert!(wait_until(
         || other.delivered_cursor(&agent.id).unwrap() >= 1
     ));
+    // Do not kill the child until it has read the first accepted pipe write.
+    assert!(wait_until(|| log_contains(&log, "user:1:")));
     // The process dies with the turn still open. The supervisor starts a new
     // one after its backoff, and the next two lines go to it in order.
     let pid = supervisor.live(&agent.id).unwrap().pid.unwrap();
@@ -453,6 +462,13 @@ fn a_restart_mid_stream_loses_nothing_and_writes_nothing_twice() {
         other.inbox(&agent.id, None)
     );
     let inbox = other.inbox(&agent.id, None).unwrap();
+    assert!(
+        wait_until(|| inbox
+            .iter()
+            .all(|message| { log_contains(&log, &format!("anyagents-message:{}", message.id)) })),
+        "child did not read all messages across restart: {}",
+        std::fs::read_to_string(&log).unwrap_or_default()
+    );
     let text = std::fs::read_to_string(&log).unwrap_or_default();
     for message in &inbox {
         assert_eq!(
