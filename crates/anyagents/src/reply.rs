@@ -290,7 +290,7 @@ mod tests {
     fn agent() -> Principal {
         Principal::Agent {
             agent_id: AgentId::parse("agt_01h455vb4pex5vsknk084sn02q").unwrap(),
-            name: "sage".into(),
+            name: "coordinator".into(),
         }
     }
 

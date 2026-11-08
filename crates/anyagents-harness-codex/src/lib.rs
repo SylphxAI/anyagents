@@ -813,7 +813,9 @@ fn read_stdout(
                 "id": id,
                 "result": {"decision": "approved", "approved": true}
             });
-            let _ = write_stdin(&stdin, &reply);
+            if write_stdin(&stdin, &reply).is_err() {
+                break;
+            }
         }
         let retry_payload = {
             let mut state = lock(&shared);
@@ -823,7 +825,6 @@ fn read_stdout(
                 state.last_turn_input.clone().map(|(tid, inp, mid)| {
                     state.next_rpc += 1;
                     let rpc_id = state.next_rpc;
-                    state.turns_started += 1;
                     json!({
                         "jsonrpc": "2.0",
                         "id": rpc_id,
@@ -842,7 +843,10 @@ fn read_stdout(
             retry
         };
         if let Some(req) = retry_payload {
-            let _ = write_stdin(&stdin, &req);
+            if write_stdin(&stdin, &req).is_err() {
+                break;
+            }
+            lock(&shared).turns_started += 1;
         }
         wake.notify_all();
     }
@@ -1225,4 +1229,85 @@ fn write_stdin(slot: &Mutex<Option<ChildStdin>>, value: &Value) -> std::io::Resu
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|err| err.into_inner())
+}
+
+#[cfg(all(test, unix))]
+mod protocol_write_tests {
+    use super::*;
+
+    fn reader_fixture(script: &str, retry: bool) -> CodexHarness {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = Arc::new(Mutex::new(child.stdin.take()));
+        let stdout = child.stdout.take().unwrap();
+        let shared = Arc::new(Mutex::new(State {
+            alive: true,
+            child: Some(child),
+            open: vec!["m1".into()],
+            last_turn_input: retry.then(|| ("thread-1".into(), json!([]), "m1".into())),
+            retry_turn_start: retry,
+            ..State::default()
+        }));
+        let wake = Arc::new(Condvar::new());
+        let (s, w, i) = (Arc::clone(&shared), Arc::clone(&wake), Arc::clone(&stdin));
+        let reader = thread::spawn(move || read_stdout(stdout, s, w, i));
+        CodexHarness {
+            environment: Vec::new(),
+            shared,
+            stdin,
+            wake,
+            reader: Some(reader),
+        }
+    }
+
+    #[test]
+    fn failed_required_approval_reply_marks_the_protocol_dead_without_finishing_work() {
+        let harness = reader_fixture(
+            "exec 0<&-; printf '%s\n' '{\"id\":99,\"method\":\"approval/request\"}'; exec sleep 30",
+            false,
+        );
+        assert!(harness.wait_pred(Duration::from_secs(5), |state| !state.alive));
+        assert!(!harness.is_finished("m1"));
+    }
+
+    #[test]
+    fn successful_required_approval_reply_preserves_protocol_progress() {
+        let harness = reader_fixture(
+            "printf '%s\n' '{\"id\":99,\"method\":\"approval/request\"}'; IFS= read -r reply; printf '%s\n' '{\"method\":\"turn/started\",\"params\":{\"turnId\":\"reply-received\"}}'; exec cat >/dev/null",
+            false,
+        );
+        assert!(
+            harness.wait_pred(Duration::from_secs(5), |state| state.turn_id.as_deref()
+                == Some("reply-received"))
+        );
+        assert!(harness.health().process_alive);
+    }
+
+    #[test]
+    fn failed_retry_write_does_not_count_a_turn_that_was_never_sent() {
+        let harness = reader_fixture(
+            "exec 0<&-; printf '%s\n' '{\"method\":\"ready\"}'; exec sleep 30",
+            true,
+        );
+        assert!(harness.wait_pred(Duration::from_secs(5), |state| !state.alive));
+        assert_eq!(harness.turns_started(), 0);
+        assert!(!harness.is_finished("m1"));
+    }
+
+    #[test]
+    fn successful_retry_write_is_counted_and_reaches_the_vendor() {
+        let harness = reader_fixture(
+            "printf '%s\n' '{\"method\":\"ready\"}'; IFS= read -r retry; printf '%s\n' '{\"method\":\"turn/started\",\"params\":{\"turnId\":\"retry-received\"}}'; exec cat >/dev/null",
+            true,
+        );
+        assert!(
+            harness.wait_pred(Duration::from_secs(5), |state| state.turn_id.as_deref()
+                == Some("retry-received"))
+        );
+        assert_eq!(harness.turns_started(), 1);
+    }
 }

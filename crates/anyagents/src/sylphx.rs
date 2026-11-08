@@ -35,6 +35,9 @@ mod tests {
         let data = tmp.path().join("data");
         std::fs::create_dir_all(&data).unwrap();
         let store = anyagents_core::Store::open(data.join("state.db")).unwrap();
+        store
+            .hold_capability_key("test-capability-key-0123456789abcdef")
+            .unwrap();
 
         let root = crate::create::create(
             &store,

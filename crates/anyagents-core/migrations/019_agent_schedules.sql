@@ -1,4 +1,4 @@
--- Per-agent self-scheduled wakes (at/every) and event watches (github/spiron/agent:idle).
+-- Per-agent self-scheduled wakes (at/every) and event watches.
 CREATE TABLE IF NOT EXISTS agent_schedules (
     id TEXT PRIMARY KEY,
     agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,

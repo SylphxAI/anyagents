@@ -290,6 +290,95 @@ fn open_managed_config(data: &Path, target: &AgentId) -> std::io::Result<File> {
     open_child(&agent, std::ffi::OsStr::new("config"), true, false)
 }
 
+// This barrier is shared with effect publication/reconciliation. Acquire it
+// before any lifecycle or SQLite lock: senders hold a shared guard while they
+// settle history through Store. Erasure must never invert that lock order.
+fn lock_history_publication(data: &Path) -> std::io::Result<(File, File)> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let root = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+        .open(data)?;
+    let name = c"outbound-history";
+    if unsafe { libc::mkdirat(root.as_raw_fd(), name.as_ptr(), 0o700) } < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(error);
+        }
+    }
+    let dir = open_child(&root, std::ffi::OsStr::new("outbound-history"), true, false)?;
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            c".publication.lock".as_ptr(),
+            libc::O_CREAT | libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let file = unsafe { File::from_raw_fd(fd) };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.nlink() != 1 {
+        return Err(std::io::Error::other("unsafe history publication lock"));
+    }
+    file.lock()?;
+    Ok((file, dir))
+}
+
+/// Pending effects and crashed writers' temporary copies remain the sender's
+/// recovery authority. Never rewrite or replay them during erasure. Unknown
+/// ownership/content is uncertainty, not evidence that a local copy is absent. Bound inspection independently of body
+/// size; oversized records conservatively refuse erasure rather than allocate.
+fn unresolved_history(data: &Path, dir: &File, target: &AgentId) -> std::io::Result<bool> {
+    const LIMIT: u64 = 1024 * 1024;
+    let path = data.join("outbound-history");
+    for entry in std::fs::read_dir(&path)? {
+        let entry = entry?;
+        if !Path::new(&entry.file_name())
+            .extension()
+            .is_some_and(|ext| ext == "pending" || ext == "tmp")
+        {
+            continue;
+        }
+        let file = match open_child(dir, &entry.file_name(), false, false) {
+            Ok(file) if file.metadata().is_ok_and(|m| m.is_file() && m.nlink() == 1) => file,
+            _ => return Ok(true),
+        };
+        let mut bytes = Vec::new();
+        file.take(LIMIT + 1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > LIMIT {
+            return Ok(true);
+        }
+        let record: serde_json::Value = match serde_json::from_slice(&bytes) {
+            Ok(record) => record,
+            Err(_) => return Ok(true),
+        };
+        let owner = record
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| AgentId::parse(s).ok());
+        let valid = record
+            .get("effect_key")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.trim().is_empty())
+            && record.get("destination").is_some_and(|v| v.is_string())
+            && record.get("body").is_some_and(|v| v.is_string());
+        if !valid || owner.as_ref().is_none_or(|owner| owner == target) {
+            return Ok(true);
+        }
+    }
+    let bound = dir.metadata()?;
+    let current = std::fs::symlink_metadata(&path)?;
+    if !current.is_dir() || bound.dev() != current.dev() || bound.ino() != current.ino() {
+        return Err(std::io::Error::other(
+            "history publication directory changed",
+        ));
+    }
+    Ok(false)
+}
+
 struct SessionFile {
     path: PathBuf,
     file: File,
@@ -469,10 +558,16 @@ impl Store {
         if request.message_id.is_some() == request.seq.is_some() {
             return Err(invalid("supply exactly one message_id or mailbox seq"));
         }
+        let (_history_publication, history_dir) = lock_history_publication(self.data_dir())?;
         let _lifecycle = self.lock_agent_lifecycle(target)?;
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let actor = authorize(&tx, &actor, target)?;
+        if unresolved_history(self.data_dir(), &history_dir, target)? {
+            return Err(invalid(
+                "outbound history has unresolved or unreadable obligations; reconcile before redaction",
+            ));
+        }
         let id = if let Some(id) = &request.message_id {
             id.clone()
         } else {

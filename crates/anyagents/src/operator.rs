@@ -69,6 +69,62 @@ pub fn ensure(store: &Store, agent_id: &anyagents_core::AgentId) -> Result<(), E
     mint(store, agent_id)
 }
 
+/// Verify through held daemon authority, or ask the primary daemon when this
+/// process owns only a reopened store (for example a separate launch worker).
+/// A file's presence is never evidence that it authenticates the intended ID.
+pub(crate) fn verify_capability(
+    store: &Store,
+    agent_id: &anyagents_core::AgentId,
+    token: &str,
+) -> Result<(), Error> {
+    match store.authenticate_capability(token) {
+        Ok(id) if &id == agent_id => return Ok(()),
+        Ok(_) => {
+            return Err(Error::Message(
+                "mailbox capability belongs to another agent".into(),
+            ));
+        }
+        Err(local_error) => {
+            use std::io::{Read, Write};
+            // Raw capability values enter an HTTP header only after validation.
+            if token.is_empty() || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(local_error);
+            }
+            let mut stream = match std::os::unix::net::UnixStream::connect(
+                store.data_dir().join("anyagents.sock"),
+            ) {
+                Ok(stream) => stream,
+                Err(_) => return Err(local_error),
+            };
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
+            stream.set_write_timeout(Some(std::time::Duration::from_secs(2)))?;
+            write!(
+                stream,
+                "GET /v1/whoami HTTP/1.1\r\nHost: local\r\n{AGENT_HEADER}: {token}\r\nConnection: close\r\n\r\n"
+            )?;
+            let mut response = String::new();
+            stream.take(65_537).read_to_string(&mut response)?;
+            if response.len() > 65_536 || !response.starts_with("HTTP/1.1 200 ") {
+                return Err(Error::Message(
+                    "primary daemon refused mailbox capability verification".into(),
+                ));
+            }
+            let body = response
+                .split_once("\r\n\r\n")
+                .map(|(_, body)| body)
+                .ok_or_else(|| Error::Message("invalid capability verification response".into()))?;
+            let value: serde_json::Value = serde_json::from_str(body)
+                .map_err(|_| Error::Message("invalid capability verification response".into()))?;
+            if value.get("agent_id").and_then(|value| value.as_str()) != Some(agent_id.as_str()) {
+                return Err(Error::Message(
+                    "mailbox capability belongs to another agent".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Mint a capability for one agent and leave it where that agent's harness
 /// reads it. The value is never printed, never an argument and never logged.
 pub fn mint(store: &Store, agent_id: &anyagents_core::AgentId) -> Result<(), Error> {
@@ -125,6 +181,57 @@ mod tests {
     use super::*;
     use anyagents_core::{NewAgent, Store};
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn reopened_store_verification_requires_exact_primary_daemon_identity() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixListener;
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        store
+            .hold_capability_key("test-capability-key-0123456789abcdef")
+            .unwrap();
+        let agent = store
+            .create_agent(NewAgent::new("worker", "codex"))
+            .unwrap();
+        let peer = store.create_agent(NewAgent::new("peer", "codex")).unwrap();
+        let token = store.issue_capability(&agent.id).unwrap();
+        assert!(verify_capability(&store, &agent.id, &token).is_ok());
+        assert!(verify_capability(&store, &peer.id, &token).is_err());
+        let reopened = Store::open(dir.path().join("state.db")).unwrap();
+        assert!(verify_capability(&reopened, &agent.id, &token).is_err());
+        let socket = dir.path().join("anyagents.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let id = agent.id.to_string();
+        let peer_id = peer.id.to_string();
+        let worker = std::thread::spawn(move || {
+            for body in [
+                serde_json::json!({"agent_id":id}).to_string(),
+                serde_json::json!({"agent_id":peer_id}).to_string(),
+                "{}".into(),
+                "corrupt".into(),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0; 4096];
+                let size = stream.read(&mut request).unwrap();
+                let request = std::str::from_utf8(&request[..size]).unwrap();
+                assert!(request.starts_with("GET /v1/whoami "));
+                assert!(!request.contains(HEADER));
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+        assert!(verify_capability(&reopened, &agent.id, &token).is_ok());
+        assert!(verify_capability(&reopened, &agent.id, &token).is_err());
+        assert!(verify_capability(&reopened, &agent.id, &token).is_err());
+        assert!(verify_capability(&reopened, &agent.id, &token).is_err());
+        worker.join().unwrap();
+        assert!(verify_capability(&reopened, &agent.id, "header\r\ninjection").is_err());
+    }
 
     #[test]
     fn a_minted_capability_is_a_private_file_and_replaces_the_last_one() {

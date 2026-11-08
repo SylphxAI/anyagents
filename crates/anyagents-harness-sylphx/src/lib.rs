@@ -19,6 +19,8 @@
 //!      autonomous `context_window_open` compaction, and lossless `Raw-RAG` hybrid
 //!      BM25 + episode recall (`memory` submodule).
 
+mod contracts;
+use contracts::*;
 mod aci;
 mod auth;
 mod cloud;
@@ -262,7 +264,7 @@ impl SylphxHarness {
         (DeliveryMode::Steer, SteerSupport::Yes)
     }
 
-    fn cloud_environment(&self) -> Option<String> {
+    fn cloud_environment(&self) -> Result<Option<String>, String> {
         resolve_cloud_agent_environment(&self.config_dir, &self.env)
     }
 }
@@ -270,81 +272,50 @@ impl SylphxHarness {
 pub fn resolve_cloud_agent_environment(
     config_dir: &Path,
     env: &[(String, String)],
-) -> Option<String> {
+) -> Result<Option<String>, String> {
+    let mode = sdk::SylphxExecutionMode::from_env(config_dir, env)?;
+    if mode == sdk::SylphxExecutionMode::LocalOnly {
+        return Ok(None);
+    }
+    // Validate selected inference settings even when placement is external-provider local.
+    let settings = read_json(&config_dir.join("sylphx-agent.json"))?;
+    if settings
+        .as_ref()
+        .and_then(|v| v.get("model"))
+        .is_some_and(|v| !v.is_string())
+    {
+        return Err("invalid configured model".into());
+    }
     if auth::is_external_chat_provider_model(None, config_dir) {
-        return None;
+        return Ok(None);
     }
-    if std::fs::read_to_string(config_dir.join("sylphx-workspace-placement.json"))
-        .ok()
-        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-        .and_then(|v| {
-            v.get("placement")
-                .and_then(Value::as_str)
-                .map(|s| s.trim().eq_ignore_ascii_case("local"))
-        })
-        == Some(true)
+    let explicit = env
+        .iter()
+        .find(|(k, _)| k == "SYLPHX_AGENT_ENV")
+        .map(|(_, v)| v.clone())
+        .or_else(|| std::env::var("SYLPHX_AGENT_ENV").ok());
+    if let Some(value) = explicit {
+        return normalize_cloud_env_slug(&value).map(Some);
+    }
+    if let Some(persisted) = load_persisted_cloud_session(config_dir)? {
+        return Ok(Some(persisted.env_slug));
+    }
+    if let Some(context) = read_json(&config_dir.join(".config/sylphx/context.json"))?
+        && context.get("cloud_session").and_then(Value::as_bool) == Some(true)
     {
-        clear_persisted_cloud_session(config_dir);
-        let _ = std::fs::remove_file(config_dir.join("sylphx-sandbox-lease.json"));
-        return None;
-    }
-    if matches!(
-        sdk::SylphxExecutionMode::from_env(config_dir, env),
-        sdk::SylphxExecutionMode::LocalOnly
-    ) {
-        return None;
-    }
-    for (k, v) in env {
-        if k == "SYLPHX_AGENT_ENV" && !v.trim().is_empty() {
-            let trimmed = v.trim();
-            if matches!(
-                trimmed.to_ascii_lowercase().as_str(),
-                "local" | "none" | "off" | "false" | "0"
-            ) {
-                return None;
-            }
-            return Some(normalize_cloud_env_slug(trimmed));
-        }
-    }
-    if let Ok(v) = std::env::var("SYLPHX_AGENT_ENV")
-        && !v.trim().is_empty()
-    {
-        let trimmed = v.trim();
-        if matches!(
-            trimmed.to_ascii_lowercase().as_str(),
-            "local" | "none" | "off" | "false" | "0"
-        ) {
-            return None;
-        }
-        return Some(normalize_cloud_env_slug(trimmed));
-    }
-    if let Some(persisted) = load_persisted_cloud_session(config_dir)
-        && !persisted.env_slug.trim().is_empty()
-    {
-        return Some(normalize_cloud_env_slug(&persisted.env_slug));
-    }
-    let ctx_path = config_dir.join(".config/sylphx/context.json");
-    if let Ok(raw) = std::fs::read_to_string(ctx_path)
-        && let Ok(val) = serde_json::from_str::<Value>(&raw)
-        && val.get("cloud_session").and_then(Value::as_bool) == Some(true)
-        && let Some(env_slug) = val
+        let value = context
             .get("environment")
-            .or_else(|| val.get("env"))
+            .or_else(|| context.get("env"))
             .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-    {
-        return Some(normalize_cloud_env_slug(env_slug));
+            .ok_or("cloud context missing environment")?;
+        return normalize_cloud_env_slug(value).map(Some);
     }
-    let mode = sdk::SylphxExecutionMode::from_env(config_dir, env);
-    if (matches!(mode, sdk::SylphxExecutionMode::CloudOnly)
-        || (matches!(mode, sdk::SylphxExecutionMode::AutoCloudFirst)
-            && !crate::sandbox::is_isolated_test_env()))
-        && resolve_sylphx_cloud_access_key(config_dir, env).is_some()
-    {
-        return Some(DEFAULT_SYLPHX_SANDBOX_PARENT.to_string());
+    if mode == sdk::SylphxExecutionMode::CloudOnly {
+        return Err(
+            "cloud execution requires an explicit authorized environment (SYLPHX_AGENT_ENV)".into(),
+        );
     }
-    None
+    Ok(None)
 }
 
 pub(crate) fn is_recoverable_cloud_session_lease_error(err: &str) -> bool {
@@ -353,13 +324,6 @@ pub(crate) fn is_recoverable_cloud_session_lease_error(err: &str) -> bool {
         || err.contains("Sandbox lease is not ready")
         || err.contains("already been released")
         || err.contains("Existing sandbox lease could not be read")
-}
-
-pub(crate) fn is_retryable_cloud_turn_error(err: &str) -> bool {
-    is_recoverable_cloud_session_lease_error(err)
-        || err.contains("model_refused")
-        || err.contains("empty_model_response")
-        || err.contains("stalled in")
 }
 
 fn compose_text(message: &OutboundMessage) -> String {
@@ -392,28 +356,34 @@ impl Harness for SylphxHarness {
                 });
             }
             if guard.in_turn {
-                guard.steer_queue.push_back(marked.clone());
-                guard.last_activity = Some(Instant::now());
                 let cloud_sess = guard.cloud_session_id.clone();
                 let notify = guard.notify.clone();
-                drop(guard);
-
-                // If bound to a remote Sylphx Cloud AgentSession, forward the `:steer` call immediately.
-                if let (Some(env_slug), Some(sess_id)) = (self.cloud_environment(), cloud_sess)
-                    && let Some(api_key) = resolve_sylphx_api_key(&self.config_dir, &self.env)
-                {
-                    let api_url = resolve_cloud_api_url(&self.env);
-                    let sess_path = cloud_session_resource_path(&env_slug, &sess_id);
-                    let steer_url = format!("{api_url}/v1/{sess_path}:steer");
-                    let _ = curl_post_json(
-                        &steer_url,
-                        Some(&api_key),
-                        &json!({
-                            "message": {
-                                "parts": [{ "text": marked }]
-                            }
-                        }),
-                    );
+                if let Some(sess_id) = cloud_sess {
+                    drop(guard);
+                    let env_slug = self
+                        .cloud_environment()
+                        .map_err(HarnessError::Failed)?
+                        .ok_or_else(|| {
+                            HarnessError::Failed(
+                                "cloud session has no environment; steer retained by caller".into(),
+                            )
+                        })?;
+                    let api_key = resolve_sylphx_cloud_access_key(&self.config_dir, &self.env)
+                        .ok_or_else(|| {
+                            HarnessError::Failed("missing cloud steer credentials".into())
+                        })?;
+                    let base = resolve_cloud_api_url(&self.env);
+                    let path = cloud_session_resource_path(&env_slug, &sess_id);
+                    post_required(
+                        &format!("{base}/v1/{path}:steer"),
+                        &api_key,
+                        &json!({"message": {"parts": [{"text": marked}]}}),
+                    )
+                    .map_err(HarnessError::Failed)?;
+                } else {
+                    guard.steer_queue.push_back(marked.clone());
+                    guard.last_activity = Some(Instant::now());
+                    drop(guard);
                 }
                 if let Some(cb) = notify {
                     cb();
@@ -472,8 +442,8 @@ impl Harness for SylphxHarness {
         let cloud_env = self.cloud_environment();
 
         std::thread::spawn(move || {
-            let outcome = if let Some(env_slug) = cloud_env {
-                let first_try = run_cloud_session_turn(
+            let outcome = match cloud_env {
+                Ok(Some(env_slug)) => run_cloud_session_turn(
                     &state,
                     &cancel_flag,
                     &config_dir,
@@ -484,65 +454,9 @@ impl Harness for SylphxHarness {
                     &mcp_args,
                     &env_slug,
                     &marked,
-                );
-                let resolved = match first_try {
-                    Ok(usage) => Ok(usage),
-                    Err(ref first_err)
-                        if is_retryable_cloud_turn_error(first_err)
-                            && !cancel_flag.load(Ordering::SeqCst) =>
-                    {
-                        clear_persisted_cloud_session(&config_dir);
-                        {
-                            let mut g = state.lock().unwrap_or_else(PoisonError::into_inner);
-                            g.cloud_agent_id = None;
-                            g.cloud_session_id = None;
-                        }
-                        run_cloud_session_turn(
-                            &state,
-                            &cancel_flag,
-                            &config_dir,
-                            &work_dir,
-                            model.as_deref(),
-                            &env,
-                            &mcp_command,
-                            &mcp_args,
-                            &env_slug,
-                            &marked,
-                        )
-                    }
-                    Err(first_err) => Err(first_err),
-                };
-                match resolved {
-                    Ok(usage) => Ok(usage),
-                    Err(cloud_err) => {
-                        if matches!(
-                            sdk::SylphxExecutionMode::from_env(&config_dir, &env),
-                            sdk::SylphxExecutionMode::CloudOnly
-                        ) {
-                            Err(cloud_err)
-                        } else {
-                            clear_persisted_cloud_session(&config_dir);
-                            {
-                                let mut g = state.lock().unwrap_or_else(PoisonError::into_inner);
-                                g.cloud_agent_id = None;
-                                g.cloud_session_id = None;
-                            }
-                            run_native_gateway_turn(
-                                &state,
-                                &cancel_flag,
-                                &config_dir,
-                                &work_dir,
-                                model.as_deref(),
-                                &env,
-                                &mcp_command,
-                                &mcp_args,
-                                &marked,
-                            )
-                        }
-                    }
-                }
-            } else {
-                run_native_gateway_turn(
+                ),
+                Err(e) => Err(e),
+                Ok(None) => run_native_gateway_turn(
                     &state,
                     &cancel_flag,
                     &config_dir,
@@ -552,7 +466,7 @@ impl Harness for SylphxHarness {
                     &mcp_command,
                     &mcp_args,
                     &marked,
-                )
+                ),
             };
 
             let notify = {
@@ -637,23 +551,31 @@ impl Harness for SylphxHarness {
     }
 
     fn cancel(&mut self) -> Result<(), HarnessError> {
-        self.cancel_flag.store(true, Ordering::SeqCst);
         let (cloud_sess, notify) = {
+            let g = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            (g.cloud_session_id.clone(), g.notify.clone())
+        };
+        if let Some(sess_id) = cloud_sess {
+            let env_slug = self
+                .cloud_environment()
+                .map_err(HarnessError::Failed)?
+                .ok_or_else(|| HarnessError::Failed("missing cloud environment".into()))?;
+            let api_key =
+                resolve_sylphx_cloud_access_key(&self.config_dir, &self.env).ok_or_else(|| {
+                    HarnessError::Failed("missing cloud interrupt credentials".into())
+                })?;
+            interrupt_and_settle(
+                &resolve_cloud_api_url(&self.env),
+                &cloud_session_resource_path(&env_slug, &sess_id),
+                &api_key,
+            )
+            .map_err(HarnessError::Failed)?;
+        }
+        self.cancel_flag.store(true, Ordering::SeqCst);
+        {
             let mut g = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             g.steer_queue.clear();
             g.in_turn = false;
-            (g.cloud_session_id.clone(), g.notify.clone())
-        };
-        if let (Some(env_slug), Some(sess_id)) = (self.cloud_environment(), cloud_sess)
-            && let Some(api_key) = resolve_sylphx_api_key(&self.config_dir, &self.env)
-        {
-            let api_url = std::env::var("SYLPHX_API_URL")
-                .ok()
-                .unwrap_or_else(|| DEFAULT_SYLPHX_API_URL.to_string());
-            let sess_path = cloud_session_resource_path(&env_slug, &sess_id);
-            let interrupt_url =
-                format!("{}/v1/{sess_path}:interrupt", api_url.trim_end_matches('/'));
-            let _ = curl_post_json(&interrupt_url, Some(&api_key), &json!({}));
         }
         if let Some(cb) = notify {
             cb();
@@ -750,7 +672,7 @@ fn cloud_session_resource_path(env_slug: &str, sess_id: &str) -> String {
     if trimmed.contains("/agent_sessions/") {
         trimmed.to_string()
     } else {
-        let canonical_env = normalize_cloud_env_slug(env_slug);
+        let canonical_env = env_slug.to_string();
         format!("{canonical_env}/agent_sessions/{trimmed}")
     }
 }
@@ -855,7 +777,7 @@ fn capture_cloud_turn_execution(
             "credential": credential,
             "expires_at": expires_at,
         });
-        let (st, raw) = curl_post_json(&capture_url, Some(api_key), &body)?;
+        let (st, raw) = auth::post_cloud_json(&capture_url, Some(api_key), &body)?;
         if st == 404 {
             return Ok(None);
         }
@@ -937,24 +859,42 @@ pub struct PersistedCloudSession {
     pub last_seq: i64,
 }
 
-pub fn load_persisted_cloud_session(config_dir: &Path) -> Option<PersistedCloudSession> {
-    let raw = std::fs::read_to_string(config_dir.join("sylphx-cloud-session.json")).ok()?;
-    let parsed: PersistedCloudSession = serde_json::from_str(&raw).ok()?;
-    if parsed.agent_id.trim().is_empty() || parsed.session_id.trim().is_empty() {
-        return None;
-    }
-    Some(parsed)
+pub fn load_persisted_cloud_session(
+    config_dir: &Path,
+) -> Result<Option<PersistedCloudSession>, String> {
+    let Some(value) = read_json(&config_dir.join("sylphx-cloud-session.json"))? else {
+        return Ok(None);
+    };
+    let parsed: PersistedCloudSession =
+        serde_json::from_value(value).map_err(|e| format!("invalid cloud binding: {e}"))?;
+    validate_cloud_binding(&parsed)?;
+    Ok(Some(parsed))
 }
 
-pub fn save_persisted_cloud_session(config_dir: &Path, session: &PersistedCloudSession) {
-    if let Ok(raw) = serde_json::to_string_pretty(session) {
-        let _ = std::fs::write(config_dir.join("sylphx-cloud-session.json"), raw);
+fn validate_cloud_binding(binding: &PersistedCloudSession) -> Result<(), String> {
+    if binding.agent_id.trim().is_empty()
+        || binding.session_id.trim().is_empty()
+        || binding.model_id.trim().is_empty()
+        || binding.last_seq < 0
+    {
+        return Err("invalid cloud binding identity or cursor".into());
     }
+    normalize_cloud_env_slug(&binding.env_slug)?;
+    Ok(())
 }
 
-pub fn clear_persisted_cloud_session(config_dir: &Path) {
-    let _ = std::fs::remove_file(config_dir.join("sylphx-cloud-session.json"));
-    let _ = std::fs::remove_file(config_dir.join(".sylphx-cloud-instructions-fingerprint"));
+pub fn save_persisted_cloud_session(
+    config_dir: &Path,
+    session: &PersistedCloudSession,
+) -> Result<(), String> {
+    validate_cloud_binding(session)?;
+    let raw = serde_json::to_vec_pretty(session).map_err(|e| e.to_string())?;
+    write_atomic(&config_dir.join("sylphx-cloud-session.json"), &raw)
+}
+
+pub fn clear_persisted_cloud_session(config_dir: &Path) -> Result<(), String> {
+    remove_optional(&config_dir.join("sylphx-cloud-session.json"))?;
+    remove_optional(&config_dir.join(".sylphx-cloud-instructions-fingerprint"))
 }
 
 pub fn resolve_agent_short_name(config_dir: &Path, env: &[(String, String)]) -> String {
@@ -1080,18 +1020,24 @@ pub(crate) fn run_cloud_session_turn(
         resolve_sylphx_gateway_key(config_dir, env).unwrap_or_else(|| api_key.clone());
     let repo_token = resolve_github_token(env);
     let base = resolve_cloud_api_url(env);
-    let canonical_env = normalize_cloud_env_slug(env_slug);
+    let canonical_env = normalize_cloud_env_slug(env_slug)?;
     let (model_id, _) = parse_sylphx_model_and_effort(model);
     let transcript_path = config_dir.join("sylphx-transcript.jsonl");
+    memory::validate_transcript(&transcript_path)?;
 
     let (mut agent_id, mut session_id) = {
         let g = state.lock().unwrap_or_else(PoisonError::into_inner);
         (g.cloud_agent_id.clone(), g.cloud_session_id.clone())
     };
+    // Reconcile retained local effects before interrupting/reusing a remote session.
+    flush_cloud_tool_receipt(config_dir, &base, &api_key)?;
+    if read_json(&config_dir.join("sylphx-cloud-turn-pending.json"))?.is_some() {
+        return Err("cloud turn has an unresolved retained submission; pull/reconcile before another dispatch".into());
+    }
     let mut initial_last_seq: i64 = 0;
     let mut next_turn: i64 = 1;
 
-    if let Some(persisted) = load_persisted_cloud_session(config_dir) {
+    if let Some(persisted) = load_persisted_cloud_session(config_dir)? {
         if persisted.model_id == model_id && persisted.env_slug == canonical_env {
             if agent_id.is_none() {
                 agent_id = Some(persisted.agent_id.clone());
@@ -1104,9 +1050,8 @@ pub(crate) fn run_cloud_session_turn(
             // Model or environment changed: interrupt the old cloud session and open a fresh one for the new model.
             let old_sess_path =
                 cloud_session_resource_path(&persisted.env_slug, &persisted.session_id);
-            let old_interrupt_url = format!("{base}/v1/{old_sess_path}:interrupt");
-            let _ = curl_post_json(&old_interrupt_url, Some(&api_key), &json!({}));
-            clear_persisted_cloud_session(config_dir);
+            interrupt_and_settle(&base, &old_sess_path, &api_key)?;
+            clear_persisted_cloud_session(config_dir)?;
             agent_id = None;
             session_id = None;
             let mut g = state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1121,7 +1066,9 @@ pub(crate) fn run_cloud_session_turn(
         let sess_url = format!("{base}/v1/{sess_path}");
         match curl_get(&sess_url, Some(&api_key)) {
             Ok((200..=299, raw_poll)) => {
-                if let Ok(val) = serde_json::from_str::<Value>(&raw_poll) {
+                let val: Value = serde_json::from_str(&raw_poll)
+                    .map_err(|e| format!("invalid cloud session response: {e}"))?;
+                {
                     let status = val
                         .get("state")
                         .or_else(|| val.get("status"))
@@ -1162,10 +1109,9 @@ pub(crate) fn run_cloud_session_turn(
                             || status.contains("waiting")
                             || status.contains("awaiting")
                         {
-                            let interrupt_url = format!("{base}/v1/{sess_path}:interrupt");
-                            let _ = curl_post_json(&interrupt_url, Some(&api_key), &json!({}));
+                            interrupt_and_settle(&base, &sess_path, &api_key)?;
                         }
-                        clear_persisted_cloud_session(config_dir);
+                        clear_persisted_cloud_session(config_dir)?;
                         agent_id = None;
                         session_id = None;
                         initial_last_seq = 0;
@@ -1178,8 +1124,7 @@ pub(crate) fn run_cloud_session_turn(
                         || status.contains("waiting")
                         || status.contains("awaiting")
                     {
-                        let interrupt_url = format!("{base}/v1/{sess_path}:interrupt");
-                        let _ = curl_post_json(&interrupt_url, Some(&api_key), &json!({}));
+                        interrupt_and_settle(&base, &sess_path, &api_key)?;
                         let mut settled = false;
                         for _ in 0..20 {
                             std::thread::sleep(Duration::from_millis(200));
@@ -1222,26 +1167,26 @@ pub(crate) fn run_cloud_session_turn(
                             }
                         }
                         if !settled {
-                            clear_persisted_cloud_session(config_dir);
-                            agent_id = None;
-                            session_id = None;
-                            initial_last_seq = 0;
-                            next_turn = 1;
-                            let mut g = state.lock().unwrap_or_else(PoisonError::into_inner);
-                            g.cloud_agent_id = None;
-                            g.cloud_session_id = None;
+                            return Err(
+                                "remote turn has not settled; retaining cloud binding".into()
+                            );
                         }
                     }
                 }
             }
             Ok((404, _)) => {
-                clear_persisted_cloud_session(config_dir);
+                clear_persisted_cloud_session(config_dir)?;
                 agent_id = None;
                 session_id = None;
                 initial_last_seq = 0;
                 next_turn = 1;
             }
-            _ => {}
+            Ok((status, _)) => {
+                return Err(format!(
+                    "cloud session read HTTP {status}; binding retained"
+                ));
+            }
+            Err(error) => return Err(error),
         }
     }
 
@@ -1262,27 +1207,7 @@ pub(crate) fn run_cloud_session_turn(
     if let Some(prior_block) = build_prior_transcript_continuity_block(&transcript_path) {
         initial_session_context.push_str(&prior_block);
     }
-    for state_md_candidate in [
-        work_dir.join("STATE.md"),
-        PathBuf::from(format!("/scratch/tmp/{agent_short_name}/STATE.md")),
-        PathBuf::from(format!("/scratch/tmp/owners/{agent_short_name}.md")),
-    ] {
-        if let Ok(state_md) = std::fs::read_to_string(&state_md_candidate) {
-            let trimmed = state_md.trim();
-            if !trimmed.is_empty() {
-                let bounded =
-                    truncate_tool_output_middle_utf8(trimmed.to_string(), 4_000, 1_800, 1_800);
-                if !initial_session_context.is_empty() {
-                    initial_session_context.push_str("\n\n");
-                }
-                initial_session_context.push_str(&format!(
-                    "<local_state_md>\nSnapshot of `STATE.md` from `{}`:\n{bounded}\n</local_state_md>",
-                    state_md_candidate.display()
-                ));
-                break;
-            }
-        }
-    }
+    initial_session_context.push_str(&load_explicit_context(config_dir, work_dir)?);
     let environment_spec = build_cloud_environment_spec(config_dir, Some(work_dir), env);
     system_prompt.push_str(&format!(
         "\n\n<cloud_workspace>\nYou are running on a general-purpose Linux computer (workspace `{CLOUD_WORKSPACE_DIR}`) whose files persist across turns.\n\
@@ -1290,31 +1215,28 @@ Standard tools (`python3`, `node`, `git`, `gh`, `sylphx`, `curl`) are pre-instal
 Clone any Git repository you need directly (`git clone` / `gh repo clone`).\n\
 The local VM is lightweight (`1 vCPU / 2 GiB RAM`); whenever you need to run a CPU- or memory-intensive command of any kind, you can execute it on an on-demand 16-vCPU / 32-GiB remote machine and sync output files back via:\n\
 `sylphx build run --size large [--artifact \"<glob>\" --out .] -- <command>`\n\
-If a task requires host-local dev-machine resources (`/scratch`, `op` 1Password CLI, `kubectl`/`talosctl`, or `desk-*` wrappers), call `sandbox` with `action: \"placement\"` and `placement: \"local\"` to switch this session seamlessly to the local Sylphx harness.\n\
+If a task requires deployment-provided host-only capabilities, call `sandbox` with `action: \"placement\"` and `placement: \"local\"` to switch this session seamlessly to the local Sylphx harness.\n\
 </cloud_workspace>"
     ));
 
     let current_fp = compute_instructions_fingerprint(&agent_short_name, &system_prompt);
     let fp_path = config_dir.join(".sylphx-cloud-instructions-fingerprint");
-    if let Ok(prev_raw) = std::fs::read_to_string(&fp_path) {
-        let prev_fp = prev_raw.trim();
-        if !prev_fp.is_empty() && prev_fp != current_fp {
-            if let Some(ref sid) = session_id {
-                let old_sess_path = cloud_session_resource_path(&canonical_env, sid);
-                let old_interrupt_url = format!("{base}/v1/{old_sess_path}:interrupt");
-                let _ = curl_post_json(&old_interrupt_url, Some(&api_key), &json!({}));
-            }
-            clear_persisted_cloud_session(config_dir);
-            agent_id = None;
-            session_id = None;
-            initial_last_seq = 0;
-            next_turn = 1;
-            let mut g = state.lock().unwrap_or_else(PoisonError::into_inner);
-            g.cloud_agent_id = None;
-            g.cloud_session_id = None;
+    let previous_fp = read_optional(&fp_path)?;
+    if session_id.is_some() && previous_fp.as_deref().map(str::trim) != Some(current_fp.as_str()) {
+        if let Some(ref sid) = session_id {
+            let old_sess_path = cloud_session_resource_path(&canonical_env, sid);
+            interrupt_and_settle(&base, &old_sess_path, &api_key)?;
         }
+        clear_persisted_cloud_session(config_dir)?;
+        agent_id = None;
+        session_id = None;
+        initial_last_seq = 0;
+        next_turn = 1;
+        let mut g = state.lock().unwrap_or_else(PoisonError::into_inner);
+        g.cloud_agent_id = None;
+        g.cloud_session_id = None;
     }
-    let _ = std::fs::write(&fp_path, format!("{current_fp}\n"));
+    write_atomic(&fp_path, format!("{current_fp}\n").as_bytes())?;
 
     if agent_id.is_none() {
         let create_agent_url = format!("{base}/v1/{canonical_env}/agents");
@@ -1332,7 +1254,7 @@ If a task requires host-local dev-machine resources (`/scratch`, `op` 1Password 
                 "tools": build_cloud_agent_tools(),
             },
         });
-        let (st, raw) = curl_post_json(&create_agent_url, Some(&api_key), &spec_body)?;
+        let (st, raw) = auth::post_cloud_json(&create_agent_url, Some(&api_key), &spec_body)?;
         if !(200..300).contains(&st) {
             return Err(format!("cloud create_agent HTTP {st}: {}", raw.trim()));
         }
@@ -1342,6 +1264,7 @@ If a task requires host-local dev-machine resources (`/scratch`, `op` 1Password 
             .or_else(|| val.get("id"))
             .or_else(|| val.get("uid"))
             .and_then(Value::as_str)
+            .filter(|id| !id.trim().is_empty())
             .ok_or_else(|| "cloud create_agent missing name/id".to_string())?
             .to_string();
         agent_id = Some(id.clone());
@@ -1353,13 +1276,15 @@ If a task requires host-local dev-machine resources (`/scratch`, `op` 1Password 
 
     if session_id.is_none() {
         let create_sess_url = format!("{base}/v1/{canonical_env}/agent_sessions");
-        let agent_ref = agent_id.as_deref().unwrap_or_default();
+        let agent_ref = agent_id
+            .as_deref()
+            .ok_or("cloud creation missing agent identity")?;
         let body = json!({
             "agent": agent_ref,
             "title": "AnyAgents Session",
             "environment": environment_spec,
         });
-        let (st, raw) = curl_post_json(&create_sess_url, Some(&api_key), &body)?;
+        let (st, raw) = auth::post_cloud_json(&create_sess_url, Some(&api_key), &body)?;
         if !(200..300).contains(&st) {
             return Err(format!("cloud create_session HTTP {st}: {}", raw.trim()));
         }
@@ -1369,6 +1294,7 @@ If a task requires host-local dev-machine resources (`/scratch`, `op` 1Password 
             .or_else(|| val.get("id"))
             .or_else(|| val.get("uid"))
             .and_then(Value::as_str)
+            .filter(|id| !id.trim().is_empty())
             .ok_or_else(|| "cloud create_session missing name/id".to_string())?
             .to_string();
         session_id = Some(sid.clone());
@@ -1377,11 +1303,14 @@ If a task requires host-local dev-machine resources (`/scratch`, `op` 1Password 
         let mut g = state.lock().unwrap_or_else(PoisonError::into_inner);
         g.cloud_session_id = Some(sid.clone());
         g.session_id = Some(sid.clone());
-        let _ = std::fs::write(config_dir.join("sylphx-session-id"), format!("{sid}\n"));
+        write_atomic(
+            &config_dir.join("sylphx-session-id"),
+            format!("{sid}\n").as_bytes(),
+        )?;
     }
 
-    let aid = agent_id.unwrap_or_default();
-    let mut sid = session_id.unwrap_or_default();
+    let aid = agent_id.ok_or("cloud creation missing agent identity")?;
+    let sid = session_id.ok_or("cloud creation missing session identity")?;
     save_persisted_cloud_session(
         config_dir,
         &PersistedCloudSession {
@@ -1391,9 +1320,9 @@ If a task requires host-local dev-machine resources (`/scratch`, `op` 1Password 
             env_slug: canonical_env.clone(),
             last_seq: initial_last_seq,
         },
-    );
+    )?;
 
-    let mut sess_path = cloud_session_resource_path(&canonical_env, &sid);
+    let sess_path = cloud_session_resource_path(&canonical_env, &sid);
     let has_repo = environment_spec.get("repo").is_some();
     let execution_opt = capture_cloud_turn_execution(
         &base,
@@ -1419,93 +1348,33 @@ If a task requires host-local dev-machine resources (`/scratch`, `op` 1Password 
     if let (Some(exec_val), Some(obj)) = (execution_opt, send_body.as_object_mut()) {
         obj.insert("execution".to_string(), exec_val);
     }
-    let (mut st, mut raw) = curl_post_json(&send_url, Some(&api_key), &send_body)?;
-    if matches!(st, 400 | 404 | 409 | 410)
-        && (raw.contains("INVALID_STATE")
-            || raw.contains("undelivered waits")
-            || raw.contains("NOT_FOUND"))
-    {
-        let interrupt_old = format!("{base}/v1/{sess_path}:interrupt");
-        let _ = curl_post_json(&interrupt_old, Some(&api_key), &json!({}));
-        clear_persisted_cloud_session(config_dir);
-        let create_sess_url = format!("{base}/v1/{canonical_env}/agent_sessions");
-        let body = json!({
-            "agent": aid,
-            "title": "AnyAgents Session",
-            "environment": environment_spec,
-        });
-        let (st_new, raw_new) = curl_post_json(&create_sess_url, Some(&api_key), &body)?;
-        if (200..300).contains(&st_new)
-            && let Ok(val_new) = serde_json::from_str::<Value>(&raw_new)
-            && let Some(new_sid) = val_new
-                .get("name")
-                .or_else(|| val_new.get("id"))
-                .or_else(|| val_new.get("uid"))
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        {
-            sid = new_sid.clone();
-            initial_last_seq = 0;
-            next_turn = 1;
-            {
-                let mut g = state.lock().unwrap_or_else(PoisonError::into_inner);
-                g.cloud_session_id = Some(sid.clone());
-                g.session_id = Some(sid.clone());
-            }
-            let _ = std::fs::write(config_dir.join("sylphx-session-id"), format!("{sid}\n"));
-            save_persisted_cloud_session(
-                config_dir,
-                &PersistedCloudSession {
-                    agent_id: aid.clone(),
-                    session_id: sid.clone(),
-                    model_id: model_id.clone(),
-                    env_slug: canonical_env.clone(),
-                    last_seq: 0,
-                },
-            );
-            sess_path = cloud_session_resource_path(&canonical_env, &sid);
-            let new_exec = capture_cloud_turn_execution(
-                &base,
-                &canonical_env,
-                &api_key,
-                &gateway_key,
-                repo_token.as_deref(),
-                &sess_path,
-                1,
-                has_repo,
-            )?;
-            let new_send_url = format!("{base}/v1/{sess_path}:send");
-            let recreated_turn_text = if !initial_session_context.is_empty() {
-                format!("{}\n\n{user_message}", initial_session_context.trim())
-            } else {
-                user_message.to_string()
-            };
-            let mut new_send_body = json!({
-                "message": {
-                    "parts": [{ "text": recreated_turn_text }]
-                }
-            });
-            if let (Some(exec_val), Some(obj)) = (new_exec, new_send_body.as_object_mut()) {
-                obj.insert("execution".to_string(), exec_val);
-            }
-            (st, raw) = curl_post_json(&new_send_url, Some(&api_key), &new_send_body)?;
-        }
-    }
-    if !(200..300).contains(&st) {
-        return Err(format!("cloud session send HTTP {st}: {}", raw.trim()));
-    }
     append_transcript_message(
         &transcript_path,
-        &json!({
-            "role": "user",
-            "content": user_message,
-        }),
-    );
+        &json!({"role":"user", "content":user_message}),
+    )?;
+    let pending_cloud_turn = config_dir.join("sylphx-cloud-turn-pending.json");
+    write_atomic(
+        &pending_cloud_turn,
+        json!({"session_path":sess_path, "message":user_message, "state":"submitting"})
+            .to_string()
+            .as_bytes(),
+    )?;
+    let (st, raw) = auth::post_cloud_json(&send_url, Some(&api_key), &send_body)?;
+    if !(200..300).contains(&st) {
+        return Err(format!(
+            "cloud session send HTTP {st}; submission retained for reconciliation: {}",
+            raw.trim()
+        ));
+    }
+    write_atomic(
+        &pending_cloud_turn,
+        json!({"session_path":sess_path, "message":user_message, "state":"accepted"})
+            .to_string()
+            .as_bytes(),
+    )?;
 
     let sess_url = format!("{base}/v1/{sess_path}");
     let events_url = format!("{base}/v1/{sess_path}/session_events");
-    let submit_tool_url = format!("{base}/v1/{sess_path}:submitToolResult");
-    let interrupt_url = format!("{base}/v1/{sess_path}:interrupt");
     let mut handled_call_ids = std::collections::HashSet::new();
     let mut last_seq: i64 = initial_last_seq;
     let baseline_seq: i64 = initial_last_seq;
@@ -1545,13 +1414,7 @@ If a task requires host-local dev-machine resources (`/scratch`, `op` 1Password 
                 .and_then(Value::as_array)
         {
             for ev in events {
-                let seq = ev
-                    .get("sequence")
-                    .and_then(|v| {
-                        v.as_i64()
-                            .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
-                    })
-                    .unwrap_or(0);
+                let seq = sequence(ev.get("sequence"), false)?;
                 if seq > 0 && seq <= last_seq {
                     continue;
                 }
@@ -1596,24 +1459,26 @@ If a task requires host-local dev-machine resources (`/scratch`, `op` 1Password 
                         .unwrap_or(tool_name);
                     let is_client = is_cloud_client_coordination_tool(norm_fn)
                         && tc.get("client").and_then(Value::as_bool).unwrap_or(true);
-                    if !call_id.is_empty() && is_client && handled_call_ids.insert(call_id.clone())
-                    {
+                    if is_client && call_id.trim().is_empty() {
+                        return Err("missing cloud tool call id".into());
+                    }
+                    if is_client && handled_call_ids.insert(call_id.clone()) {
                         let input_val = tc
                             .get("input")
                             .or_else(|| tc.get("arguments"))
                             .cloned()
-                            .unwrap_or_else(|| json!({}));
+                            .ok_or("missing cloud tool arguments")?;
                         let parsed_args = if let Some(s) = input_val.as_str() {
-                            serde_json::from_str::<Value>(s).unwrap_or_else(|_| json!({}))
+                            tool_arguments(s)?
                         } else {
                             input_val
                         };
+                        if !parsed_args.is_object() {
+                            return Err("cloud tool arguments must be an object".into());
+                        }
                         let norm_fn = tool_name
                             .strip_prefix("mcp__anyagents__")
                             .unwrap_or(tool_name);
-                        if norm_fn == "send" {
-                            sent_any_reply = true;
-                        }
                         if norm_fn == "archive"
                             && parsed_args
                                 .get("agent")
@@ -1633,7 +1498,9 @@ If a task requires host-local dev-machine resources (`/scratch`, `op` 1Password 
                                 "name": tool_name,
                                 "arguments": serde_json::to_string(&parsed_args).unwrap_or_else(|_| "{}".to_string()),
                             }),
-                        );
+                        )?;
+                        let receipt_path = config_dir.join("sylphx-cloud-tool-receipt.json");
+                        write_atomic(&receipt_path, json!({"session_path": sess_path, "call_id": call_id, "state": "executing", "event_sequence": seq}).to_string().as_bytes())?;
                         let output = execute_sylphx_tool(
                             tool_name,
                             &parsed_args,
@@ -1650,23 +1517,24 @@ If a task requires host-local dev-machine resources (`/scratch`, `op` 1Password 
                                 "call_id": call_id,
                                 "output": output,
                             }),
-                        );
+                        )?;
+                        if norm_fn == "send"
+                            && reply_delivered(
+                                &output,
+                                extract_envelope_sender(user_message).as_deref(),
+                            )
+                        {
+                            sent_any_reply = true;
+                        }
                         let is_err = output.starts_with("error:");
-                        let _ = curl_post_json(
-                            &submit_tool_url,
-                            Some(&api_key),
-                            &json!({
-                                "call_id": call_id,
-                                "output": output,
-                                "error": is_err,
-                            }),
-                        );
+                        write_atomic(&receipt_path, json!({"session_path": sess_path, "call_id": call_id, "state": "completed", "event_sequence": seq, "output": output, "error": is_err}).to_string().as_bytes())?;
+                        flush_cloud_tool_receipt(config_dir, &base, &api_key)?;
                         last_progress = Instant::now();
                         if norm_fn == "sandbox"
                             && !is_err
-                            && resolve_cloud_agent_environment(config_dir, env).is_none()
+                            && resolve_cloud_agent_environment(config_dir, env)?.is_none()
                         {
-                            let _ = curl_post_json(&interrupt_url, Some(&api_key), &json!({}));
+                            // The placement tool already settled and durably pulled the cloud session.
                             {
                                 let mut g = state.lock().unwrap_or_else(PoisonError::into_inner);
                                 g.cloud_agent_id = None;
@@ -1731,7 +1599,7 @@ If a task requires host-local dev-machine resources (`/scratch`, `op` 1Password 
                         if err_text.contains("permanent")
                             || is_recoverable_cloud_session_lease_error(err_text)
                         {
-                            clear_persisted_cloud_session(config_dir);
+                            clear_persisted_cloud_session(config_dir)?;
                             let mut g = state.lock().unwrap_or_else(PoisonError::into_inner);
                             g.cloud_agent_id = None;
                             g.cloud_session_id = None;
@@ -1745,7 +1613,7 @@ If a task requires host-local dev-machine resources (`/scratch`, `op` 1Password 
                                     env_slug: canonical_env.clone(),
                                     last_seq,
                                 },
-                            );
+                            )?;
                         }
                         return Err(format!("cloud session turn error: {err_text}"));
                     }
@@ -1780,8 +1648,8 @@ If a task requires host-local dev-machine resources (`/scratch`, `op` 1Password 
                                 "1\n",
                             );
                         }
-                        let _ = curl_post_json(&interrupt_url, Some(&api_key), &json!({}));
-                        clear_persisted_cloud_session(config_dir);
+                        interrupt_and_settle(&base, &sess_path, &api_key)?;
+                        clear_persisted_cloud_session(config_dir)?;
                         let mut g = state.lock().unwrap_or_else(PoisonError::into_inner);
                         g.cloud_agent_id = None;
                         g.cloud_session_id = None;
@@ -1806,14 +1674,11 @@ If a task requires host-local dev-machine resources (`/scratch`, `op` 1Password 
                 .unwrap_or("")
                 .to_ascii_lowercase();
             if status == "idle" || status == "session_state_idle" || status == "completed" {
-                let session_last_seq = val
-                    .get("last_event_sequence")
-                    .or_else(|| val.get("lastEventSequence"))
-                    .and_then(|v| {
-                        v.as_i64()
-                            .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
-                    })
-                    .unwrap_or(0);
+                let session_last_seq = sequence(
+                    val.get("last_event_sequence")
+                        .or_else(|| val.get("lastEventSequence")),
+                    true,
+                )?;
                 if session_last_seq > last_seq {
                     continue;
                 }
@@ -1826,7 +1691,7 @@ If a task requires host-local dev-machine resources (`/scratch`, `op` 1Password 
                         env_slug: canonical_env.clone(),
                         last_seq,
                     },
-                );
+                )?;
                 let content_text = assistant_texts.join("\n\n");
                 if !content_text.trim().is_empty() {
                     append_transcript_message(
@@ -1836,13 +1701,13 @@ If a task requires host-local dev-machine resources (`/scratch`, `op` 1Password 
                             "role": "assistant",
                             "content": [{ "type": "output_text", "text": content_text.trim() }],
                         }),
-                    );
+                    )?;
                 }
                 if !sent_any_reply
                     && !content_text.trim().is_empty()
                     && let Some(reply_to) = extract_envelope_sender(user_message)
                 {
-                    let _ = call_anyagents_mcp_tool(
+                    let reply_receipt = call_anyagents_mcp_tool(
                         mcp_command,
                         mcp_args,
                         env,
@@ -1852,6 +1717,15 @@ If a task requires host-local dev-machine resources (`/scratch`, `op` 1Password 
                             "text": content_text.trim(),
                         }),
                     );
+                    if !reply_delivered(
+                        &reply_receipt,
+                        extract_envelope_sender(user_message).as_deref(),
+                    ) {
+                        return Err(
+                            "automatic reply delivery was not acknowledged; pending reply retained"
+                                .into(),
+                        );
+                    }
                 }
                 let in_tok = if turn_in_tok > 0 {
                     turn_in_tok
@@ -1883,6 +1757,7 @@ If a task requires host-local dev-machine resources (`/scratch`, `op` 1Password 
                     .or_else(|| val.pointer("/usage/cache_write_tokens"))
                     .and_then(Value::as_u64)
                     .unwrap_or(0);
+                remove_optional(&pending_cloud_turn)?;
                 return Ok(TurnUsage {
                     input_tokens: in_tok,
                     output_tokens: out_tok,
@@ -1896,7 +1771,7 @@ If a task requires host-local dev-machine resources (`/scratch`, `op` 1Password 
                 || status == "terminated"
                 || status == "errored"
             {
-                clear_persisted_cloud_session(config_dir);
+                clear_persisted_cloud_session(config_dir)?;
                 return Err(format!("cloud session ended with status `{status}`"));
             }
             if last_seq <= baseline_seq + 2
@@ -1904,7 +1779,7 @@ If a task requires host-local dev-machine resources (`/scratch`, `op` 1Password 
                 && handled_call_ids.is_empty()
                 && last_progress.elapsed() >= Duration::from_millis(stall_timeout_ms)
             {
-                let _ = curl_post_json(&interrupt_url, Some(&api_key), &json!({}));
+                interrupt_and_settle(&base, &sess_path, &api_key)?;
                 return Err(format!(
                     "cloud session `{sess_path}` stalled in `{status}` for {}ms without progress",
                     stall_timeout_ms
@@ -1913,7 +1788,7 @@ If a task requires host-local dev-machine resources (`/scratch`, `op` 1Password 
         }
     }
     if cancel_flag.load(Ordering::SeqCst) {
-        let _ = curl_post_json(&interrupt_url, Some(&api_key), &json!({}));
+        interrupt_and_settle(&base, &sess_path, &api_key)?;
     }
     save_persisted_cloud_session(
         config_dir,
@@ -1924,7 +1799,10 @@ If a task requires host-local dev-machine resources (`/scratch`, `op` 1Password 
             env_slug: canonical_env,
             last_seq,
         },
-    );
+    )?;
+    if cancel_flag.load(Ordering::SeqCst) {
+        remove_optional(&pending_cloud_turn)?;
+    }
     Ok(TurnUsage {
         input_tokens: turn_in_tok,
         output_tokens: turn_out_tok,
@@ -1983,9 +1861,11 @@ fn build_chat_completions_request(
                     .get("call_id")
                     .or_else(|| fc.get("id"))
                     .and_then(Value::as_str)
-                    .unwrap_or("call_0");
+                    .filter(|id| !id.trim().is_empty())
+                    .ok_or("missing tool call id")?;
                 let fname = fc.get("name").and_then(Value::as_str).unwrap_or("");
-                let fargs = fc.get("arguments").and_then(Value::as_str).unwrap_or("{}");
+                let fargs = required_text(fc, "arguments")?;
+                tool_arguments(fargs)?;
                 if let Some(rc) = fc
                     .get("reasoning_content")
                     .and_then(Value::as_str)
@@ -2018,8 +1898,12 @@ fn build_chat_completions_request(
             let cid = item
                 .get("call_id")
                 .and_then(Value::as_str)
-                .unwrap_or("call_0");
-            let out = item.get("output").and_then(Value::as_str).unwrap_or("");
+                .filter(|id| !id.trim().is_empty())
+                .ok_or("missing tool call id")?;
+            let out = item
+                .get("output")
+                .and_then(Value::as_str)
+                .ok_or("invalid retained tool output")?;
             messages.push(json!({
                 "role": "tool",
                 "tool_call_id": cid,
@@ -2113,7 +1997,11 @@ fn chat_completions_to_responses_envelope(raw_resp: &Value) -> Result<Value, Str
         }
         if let Some(tcs) = msg.get("tool_calls").and_then(Value::as_array) {
             for (i, tc) in tcs.iter().enumerate() {
-                let cid = tc.get("id").and_then(Value::as_str).unwrap_or("call_0");
+                let cid = tc
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.trim().is_empty())
+                    .ok_or("missing tool call id")?;
                 let fname = tc
                     .pointer("/function/name")
                     .or_else(|| tc.get("name"))
@@ -2123,7 +2011,7 @@ fn chat_completions_to_responses_envelope(raw_resp: &Value) -> Result<Value, Str
                     .pointer("/function/arguments")
                     .or_else(|| tc.get("arguments"))
                     .and_then(Value::as_str)
-                    .unwrap_or("{}");
+                    .ok_or("missing tool arguments")?;
                 let mut fc_item = json!({
                     "type": "function_call",
                     "call_id": cid,
@@ -2213,7 +2101,10 @@ fn extract_attached_image_marker(output: &str) -> (String, Option<String>) {
     (output.to_string(), None)
 }
 
-fn close_dangling_function_calls(transcript_path: &Path, input_items: &mut Vec<Value>) {
+fn close_dangling_function_calls(
+    transcript_path: &Path,
+    input_items: &mut Vec<Value>,
+) -> Result<(), String> {
     let mut answered = std::collections::HashSet::new();
     for item in input_items.iter() {
         if item.get("type").and_then(Value::as_str) == Some("function_call_output")
@@ -2240,11 +2131,12 @@ fn close_dangling_function_calls(transcript_path: &Path, input_items: &mut Vec<V
                 "call_id": cid,
                 "output": "[tool execution interrupted before output was recorded]",
             });
-            append_transcript_message(transcript_path, &synthetic);
+            append_transcript_message(transcript_path, &synthetic)?;
             fixed.push(synthetic);
         }
     }
     *input_items = fixed;
+    Ok(())
 }
 
 /// Reconstruct unfinished inbound across failed turns/restarts. Snapshots live
@@ -2289,14 +2181,15 @@ fn is_pending_native_message(item: &Value) -> bool {
             .is_some_and(|s| !s.trim_start().starts_with("<context-event "))
 }
 
-fn record_pending_native_messages(transcript_path: &Path, pending: &[Value]) {
+fn record_pending_native_messages(transcript_path: &Path, pending: &[Value]) -> Result<(), String> {
     append_transcript_message(
         transcript_path,
         &json!({
             "type": "native_turn_state", "pending_messages": pending,
             "timestamp_ms": anyagents_core::now_ms(),
         }),
-    );
+    )?;
+    Ok(())
 }
 
 /// Compact only between completed tool batches. Keep exact inbound messages and
@@ -2491,7 +2384,7 @@ fn prepare_budgeted_request(
         body = build_bounded(&candidate)?;
         let used = request_token_upper_bound(&body)?.saturating_add(output_reserve);
         if used <= ceiling {
-            append_transcript_message(transcript_path, &anchor);
+            append_transcript_message(transcript_path, &anchor)?;
             *input = candidate;
             return Ok(body);
         }
@@ -2542,11 +2435,13 @@ pub(crate) fn run_native_gateway_turn(
     let model_id = endpoint.model_id;
     let reasoning_effort = endpoint.reasoning_effort;
     let upstream_kind = endpoint.kind;
-    let system_prompt = assemble_system_prompt(config_dir, work_dir);
+    let mut system_prompt = assemble_system_prompt(config_dir, work_dir);
+    system_prompt.push_str(&load_explicit_context(config_dir, work_dir)?);
     let transcript_path = config_dir.join("sylphx-transcript.jsonl");
+    memory::validate_transcript(&transcript_path)?;
 
     let mut input_items = load_transcript_input_items(&transcript_path);
-    close_dangling_function_calls(&transcript_path, &mut input_items);
+    close_dangling_function_calls(&transcript_path, &mut input_items)?;
     let stripped_body = match initial_user_message.strip_prefix("[anyagents") {
         Some(rest) => rest
             .find("]\n")
@@ -2570,7 +2465,7 @@ pub(crate) fn run_native_gateway_turn(
             "role": "user",
             "content": initial_user_message,
         });
-        append_transcript_message(&transcript_path, &user_msg);
+        append_transcript_message(&transcript_path, &user_msg)?;
         input_items.push(user_msg);
     }
 
@@ -2599,7 +2494,7 @@ pub(crate) fn run_native_gateway_turn(
     if limits.source == memory::ContextLimitSource::ConservativeFallback {
         let warning = json!({"role": "user", "content": format!(
             "<context-event kind=\"context.limit_fallback\" model=\"{}\" window_tokens=\"{}\">Catalog limit unavailable; using conservative offline budget. No model or harness switch.</context-event>", model_id, limits.window_tokens)});
-        append_transcript_message(&transcript_path, &warning);
+        append_transcript_message(&transcript_path, &warning)?;
         input_items.push(warning);
     }
     let mut pending_messages = load_pending_native_messages(&transcript_path, &input_items);
@@ -2607,7 +2502,7 @@ pub(crate) fn run_native_gateway_turn(
     if !pending_messages.contains(&initial) {
         pending_messages.push(initial);
     }
-    record_pending_native_messages(&transcript_path, &pending_messages);
+    record_pending_native_messages(&transcript_path, &pending_messages)?;
     let mut overflow_compacted_in_turn = false;
     let mut force_compact = false;
     for step in 0usize.. {
@@ -2620,10 +2515,10 @@ pub(crate) fn run_native_gateway_turn(
             &transcript_path,
             &mut input_items,
             &mut unanswered_reply_target,
-        );
+        )?;
         if input_items.len() > before_steer {
             pending_messages.extend_from_slice(&input_items[before_steer..]);
-            record_pending_native_messages(&transcript_path, &pending_messages);
+            record_pending_native_messages(&transcript_path, &pending_messages)?;
         }
         let custom_ua = match &upstream_kind {
             auth::UpstreamGatewayKind::SylphxResponses => None,
@@ -2745,7 +2640,7 @@ pub(crate) fn run_native_gateway_turn(
         let mut assistant_texts = Vec::new();
 
         for item in output_arr {
-            append_transcript_message(&transcript_path, &item);
+            append_transcript_message(&transcript_path, &item)?;
             input_items.push(item.clone());
             match item.get("type").and_then(Value::as_str) {
                 Some("function_call") => {
@@ -2782,12 +2677,14 @@ pub(crate) fn run_native_gateway_turn(
             let mut did_context_edit = false;
             let mut parsed_calls: Vec<(String, String, Value)> =
                 Vec::with_capacity(function_calls.len());
+            let mut batch_ids = std::collections::HashSet::new();
             for fc in function_calls {
                 let call_id = fc
                     .get("call_id")
                     .or_else(|| fc.get("id"))
                     .and_then(Value::as_str)
-                    .unwrap_or("call_0")
+                    .filter(|id| !id.trim().is_empty())
+                    .ok_or("missing tool call id")?
                     .to_string();
                 let fn_name = fc
                     .get("name")
@@ -2799,20 +2696,13 @@ pub(crate) fn run_native_gateway_turn(
                     .get("arguments")
                     .or_else(|| fc.pointer("/function/arguments"))
                     .and_then(Value::as_str)
-                    .unwrap_or("{}");
-                let parsed_args: Value =
-                    serde_json::from_str(raw_args).unwrap_or_else(|_| json!({}));
-                let norm_fn = fn_name.strip_prefix("mcp__anyagents__").unwrap_or(&fn_name);
-                if (norm_fn == "send"
-                    && send_args_satisfy_target(&parsed_args, unanswered_reply_target.as_deref()))
-                    || (norm_fn == "code"
-                        && parsed_args
-                            .get("code")
-                            .and_then(Value::as_str)
-                            .is_some_and(|c| c.contains("send(")))
-                {
-                    unanswered_reply_target = None;
+                    .ok_or("missing tool arguments")?;
+                let parsed_args: Value = tool_arguments(raw_args)?;
+                if !batch_ids.insert(call_id.clone()) {
+                    return Err("duplicate tool call id in batch".into());
                 }
+                validate_tool_input(&fn_name, &parsed_args)?;
+                let norm_fn = fn_name.strip_prefix("mcp__anyagents__").unwrap_or(&fn_name);
                 if matches!(norm_fn, "context_edit" | "context_prune")
                     || (norm_fn == "context"
                         && (parsed_args.get("action").and_then(Value::as_str) == Some("edit")
@@ -2850,13 +2740,21 @@ pub(crate) fn run_native_gateway_turn(
                         })
                         .collect()
                 });
-                for ((call_id, _, _), output) in parsed_calls.into_iter().zip(outputs) {
+                for ((call_id, fn_name, _), output) in parsed_calls.into_iter().zip(outputs) {
+                    if matches!(
+                        fn_name.trim_start_matches("mcp__anyagents__"),
+                        "send" | "code"
+                    ) && reply_delivered(&output, unanswered_reply_target.as_deref())
+                    {
+                        unanswered_reply_target = None;
+                    }
                     let tool_out_item = json!({
                         "type": "function_call_output",
                         "call_id": call_id,
                         "output": output,
                     });
-                    let tool_out_item = append_transcript_message(&transcript_path, &tool_out_item);
+                    let tool_out_item =
+                        append_transcript_message(&transcript_path, &tool_out_item)?;
                     input_items.push(tool_out_item);
                 }
             } else {
@@ -2926,6 +2824,13 @@ pub(crate) fn run_native_gateway_turn(
                         mcp_command,
                         mcp_args,
                     );
+                    if matches!(
+                        fn_name.trim_start_matches("mcp__anyagents__"),
+                        "send" | "code"
+                    ) && reply_delivered(&output, unanswered_reply_target.as_deref())
+                    {
+                        unanswered_reply_target = None;
+                    }
                     let (clean_output, attached_image_data_url) =
                         extract_attached_image_marker(&output);
                     let tool_out_item = json!({
@@ -2933,7 +2838,8 @@ pub(crate) fn run_native_gateway_turn(
                         "call_id": call_id,
                         "output": clean_output,
                     });
-                    let tool_out_item = append_transcript_message(&transcript_path, &tool_out_item);
+                    let tool_out_item =
+                        append_transcript_message(&transcript_path, &tool_out_item)?;
                     input_items.push(tool_out_item);
                     if let Some(data_url) = attached_image_data_url {
                         let image_item = json!({
@@ -2949,7 +2855,7 @@ pub(crate) fn run_native_gateway_turn(
                                 }
                             ]
                         });
-                        append_transcript_message(&transcript_path, &image_item);
+                        append_transcript_message(&transcript_path, &image_item)?;
                         input_items.push(image_item);
                     }
                 }
@@ -2960,12 +2866,12 @@ pub(crate) fn run_native_gateway_turn(
                     "handoff": handoff,
                     "timestamp_ms": anyagents_core::now_ms(),
                 });
-                append_transcript_message(&transcript_path, &anchor);
+                append_transcript_message(&transcript_path, &anchor)?;
                 input_items = load_transcript_input_items(&transcript_path);
             } else if did_context_edit {
                 input_items = load_transcript_input_items(&transcript_path);
             } else {
-                maybe_emit_context_watermark_event(&transcript_path, &mut input_items);
+                maybe_emit_context_watermark_event(&transcript_path, &mut input_items)?;
             }
             if self_archived {
                 break;
@@ -2979,7 +2885,7 @@ pub(crate) fn run_native_gateway_turn(
             && !trimmed_content.eq_ignore_ascii_case("NO_REPLY")
             && let Some(reply_to) = unanswered_reply_target.take()
         {
-            let _ = call_anyagents_mcp_tool(
+            let reply_receipt = call_anyagents_mcp_tool(
                 mcp_command,
                 mcp_args,
                 env,
@@ -2989,6 +2895,11 @@ pub(crate) fn run_native_gateway_turn(
                     "text": trimmed_content,
                 }),
             );
+            if !reply_delivered(&reply_receipt, Some(reply_to.as_str())) {
+                return Err(
+                    "automatic reply delivery was not acknowledged; pending reply retained".into(),
+                );
+            }
         }
 
         let before_steer = input_items.len();
@@ -2997,20 +2908,20 @@ pub(crate) fn run_native_gateway_turn(
             &transcript_path,
             &mut input_items,
             &mut unanswered_reply_target,
-        ) {
+        )? {
             pending_messages.extend_from_slice(&input_items[before_steer..]);
-            record_pending_native_messages(&transcript_path, &pending_messages);
+            record_pending_native_messages(&transcript_path, &pending_messages)?;
             continue;
         }
 
-        if let Some(goal_continuation) = load_active_goal_continuation_prompt(config_dir) {
+        if let Some(goal_continuation) = load_active_goal_continuation_prompt(config_dir)? {
             let cont_msg = json!({
                 "role": "user",
                 "content": goal_continuation,
             });
-            append_transcript_message(&transcript_path, &cont_msg);
+            append_transcript_message(&transcript_path, &cont_msg)?;
             pending_messages.push(cont_msg.clone());
-            record_pending_native_messages(&transcript_path, &pending_messages);
+            record_pending_native_messages(&transcript_path, &pending_messages)?;
             input_items.push(cont_msg);
             continue;
         }
@@ -3019,7 +2930,7 @@ pub(crate) fn run_native_gateway_turn(
     }
 
     if !cancel_flag.load(Ordering::SeqCst) {
-        record_pending_native_messages(&transcript_path, &[]);
+        record_pending_native_messages(&transcript_path, &[])?;
     }
     Ok(TurnUsage {
         input_tokens: total_in,
@@ -3042,15 +2953,26 @@ pub fn run_stdio_adapter(
         .map(PathBuf::from)
         .or_else(|| config_path.parent().map(Path::to_path_buf))
         .unwrap_or_else(|| PathBuf::from("."));
-    let work_dir = std::env::current_dir().unwrap_or_else(|_| config_dir.clone());
+    let work_dir = std::env::current_dir()?;
+    let selected_settings =
+        read_json(&config_dir.join("sylphx-agent.json")).map_err(anyagents_core::Error::Message)?;
+    if config_val.get("model").is_some_and(|v| !v.is_string())
+        || selected_settings
+            .as_ref()
+            .and_then(|v| v.get("model"))
+            .is_some_and(|v| !v.is_string())
+    {
+        return Err(anyagents_core::Error::Message(
+            "invalid configured model".into(),
+        ));
+    }
     let model = config_val
         .get("model")
         .and_then(Value::as_str)
         .map(str::to_string)
         .or_else(|| {
-            std::fs::read_to_string(config_dir.join("sylphx-agent.json"))
-                .ok()
-                .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+            selected_settings
+                .clone()
                 .and_then(|v| v.get("model").and_then(Value::as_str).map(str::to_string))
         });
     let mcp_command = clean_exe_path(
@@ -3059,14 +2981,11 @@ pub fn run_stdio_adapter(
             .and_then(Value::as_str)
             .map(PathBuf::from)
             .or_else(|| {
-                std::fs::read_to_string(config_dir.join("sylphx-agent.json"))
-                    .ok()
-                    .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-                    .and_then(|v| {
-                        v.pointer("/mcpServers/anyagents/command")
-                            .and_then(Value::as_str)
-                            .map(PathBuf::from)
-                    })
+                selected_settings.clone().and_then(|v| {
+                    v.pointer("/mcpServers/anyagents/command")
+                        .and_then(Value::as_str)
+                        .map(PathBuf::from)
+                })
             })
             .unwrap_or_else(|| {
                 std::env::current_exe().unwrap_or_else(|_| PathBuf::from("anyagents"))
@@ -3081,18 +3000,15 @@ pub fn run_stdio_adapter(
                 .collect()
         })
         .or_else(|| {
-            std::fs::read_to_string(config_dir.join("sylphx-agent.json"))
-                .ok()
-                .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-                .and_then(|v| {
-                    v.pointer("/mcpServers/anyagents/args")
-                        .and_then(Value::as_array)
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|x| x.as_str().map(str::to_string))
-                                .collect()
-                        })
-                })
+            selected_settings.clone().and_then(|v| {
+                v.pointer("/mcpServers/anyagents/args")
+                    .and_then(Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|x| x.as_str().map(str::to_string))
+                            .collect()
+                    })
+            })
         })
         .unwrap_or_default();
 
@@ -3114,10 +3030,27 @@ pub fn run_stdio_adapter(
     let cancel_flag = Arc::new(AtomicBool::new(false));
     let steered_in_turn = Arc::new(Mutex::new(0usize));
 
-    let stdin = std::io::stdin();
-    for line in stdin.lock().lines() {
-        let Ok(line) = line else {
-            break;
+    let transport_error = Arc::new(Mutex::new(None::<String>));
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in std::io::stdin().lock().lines() {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    loop {
+        if let Some(error) = transport_error
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+        {
+            return Err(anyagents_core::Error::Message(error));
+        }
+        let line = match rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(line) => line?,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         };
         let Ok(msg) = serde_json::from_str::<Value>(&line) else {
             continue;
@@ -3125,9 +3058,7 @@ pub fn run_stdio_adapter(
         let kind = msg.get("type").and_then(Value::as_str).unwrap_or("");
         if kind == "cancel" || kind == "interrupt" {
             cancel_flag.store(true, Ordering::SeqCst);
-            let mut g = state.lock().unwrap_or_else(PoisonError::into_inner);
-            g.steer_queue.clear();
-            g.in_turn = false;
+            // The running turn owns cancellation settlement and retained steers.
             continue;
         }
         if kind != "user" && kind != "prompt" {
@@ -3178,11 +3109,12 @@ pub fn run_stdio_adapter(
         let mcp_cmd_cl = mcp_command.clone();
         let mcp_args_cl = mcp_args.clone();
         let sess_cl = session_id.clone();
+        let transport_cl = Arc::clone(&transport_error);
 
         std::thread::spawn(move || {
             let cloud_env = resolve_cloud_agent_environment(&cfg_cl, &env_cl);
-            let outcome = if let Some(env_slug) = cloud_env {
-                match run_cloud_session_turn(
+            let outcome = match cloud_env {
+                Ok(Some(env_slug)) => run_cloud_session_turn(
                     &state_cl,
                     &cancel_cl,
                     &cfg_cl,
@@ -3193,37 +3125,9 @@ pub fn run_stdio_adapter(
                     &mcp_args_cl,
                     &env_slug,
                     &user_text,
-                ) {
-                    Ok(usage) => Ok(usage),
-                    Err(cloud_err) => {
-                        if matches!(
-                            sdk::SylphxExecutionMode::from_env(&cfg_cl, &env_cl),
-                            sdk::SylphxExecutionMode::CloudOnly
-                        ) {
-                            Err(cloud_err)
-                        } else {
-                            clear_persisted_cloud_session(&cfg_cl);
-                            {
-                                let mut g = state_cl.lock().unwrap_or_else(PoisonError::into_inner);
-                                g.cloud_agent_id = None;
-                                g.cloud_session_id = None;
-                            }
-                            run_native_gateway_turn(
-                                &state_cl,
-                                &cancel_cl,
-                                &cfg_cl,
-                                &work_cl,
-                                model_cl.as_deref(),
-                                &env_cl,
-                                &mcp_cmd_cl,
-                                &mcp_args_cl,
-                                &user_text,
-                            )
-                        }
-                    }
-                }
-            } else {
-                run_native_gateway_turn(
+                ),
+                Err(e) => Err(e),
+                Ok(None) => run_native_gateway_turn(
                     &state_cl,
                     &cancel_cl,
                     &cfg_cl,
@@ -3233,12 +3137,11 @@ pub fn run_stdio_adapter(
                     &mcp_cmd_cl,
                     &mcp_args_cl,
                     &user_text,
-                )
+                ),
             };
 
             let extra_followups = {
                 let mut g = state_cl.lock().unwrap_or_else(PoisonError::into_inner);
-                g.in_turn = false;
                 g.last_activity = Some(Instant::now());
                 let mut sc = steered_cl.lock().unwrap_or_else(PoisonError::into_inner);
                 let count = *sc;
@@ -3246,62 +3149,80 @@ pub fn run_stdio_adapter(
                 count
             };
 
-            let mut out = std::io::stdout().lock();
-            match outcome {
-                Ok(usage) => {
-                    let _ = std::fs::remove_file(cfg_cl.join(".anyagents-last-error.json"));
-                    let done_evt = json!({
-                        "type": "done",
-                        "session_id": sess_cl,
-                        "usage": {
-                            "input_tokens": usage.input_tokens,
-                            "output_tokens": usage.output_tokens,
-                            "cache_read_tokens": usage.cache_read_tokens,
-                            "cache_write_tokens": usage.cache_write_tokens,
-                        }
-                    });
-                    let _ = writeln!(out, "{done_evt}");
-                    if extra_followups > 0 {
-                        let followup_done = json!({
+            let terminal_result = (|| -> std::io::Result<()> {
+                let mut out = std::io::stdout().lock();
+                match outcome {
+                    Ok(usage) => {
+                        let _ = std::fs::remove_file(cfg_cl.join(".anyagents-last-error.json"));
+                        let done_evt = json!({
                             "type": "done",
                             "session_id": sess_cl,
                             "usage": {
-                                "input_tokens": 0,
-                                "output_tokens": 0,
-                                "cache_read_tokens": 0,
-                                "cache_write_tokens": 0,
+                                "input_tokens": usage.input_tokens,
+                                "output_tokens": usage.output_tokens,
+                                "cache_read_tokens": usage.cache_read_tokens,
+                                "cache_write_tokens": usage.cache_write_tokens,
                             }
                         });
-                        let _ = writeln!(out, "{followup_done}");
-                    }
-                    let _ = out.flush();
-                }
-                Err(err_msg) => {
-                    persist_turn_error(&cfg_cl, &err_msg);
-                    let err_evt = json!({
-                        "type": "done",
-                        "session_id": sess_cl,
-                        "error": err_msg,
-                        "result": {
-                            "status": "ERROR",
-                            "error": err_msg,
-                        },
-                        "usage": {
-                            "input_tokens": 0,
-                            "output_tokens": 0,
+                        write_terminal_frame(&mut out, &done_evt)?;
+                        if extra_followups > 0 {
+                            let followup_done = json!({
+                                "type": "done",
+                                "session_id": sess_cl,
+                                "usage": {
+                                    "input_tokens": 0,
+                                    "output_tokens": 0,
+                                    "cache_read_tokens": 0,
+                                    "cache_write_tokens": 0,
+                                }
+                            });
+                            write_terminal_frame(&mut out, &followup_done)?;
                         }
-                    });
-                    let _ = writeln!(out, "{err_evt}");
-                    if extra_followups > 0 {
-                        let _ = writeln!(out, "{err_evt}");
+                        out.flush()?;
                     }
-                    let _ = out.flush();
+                    Err(err_msg) => {
+                        persist_turn_error(&cfg_cl, &err_msg);
+                        let err_evt = json!({
+                            "type": "done",
+                            "session_id": sess_cl,
+                            "error": err_msg,
+                            "result": {
+                                "status": "ERROR",
+                                "error": err_msg,
+                            },
+                            "usage": {
+                                "input_tokens": 0,
+                                "output_tokens": 0,
+                            }
+                        });
+                        write_terminal_frame(&mut out, &err_evt)?;
+                        if extra_followups > 0 {
+                            write_terminal_frame(&mut out, &err_evt)?;
+                        }
+                        out.flush()?;
+                    }
                 }
+                Ok(())
+            })();
+            if let Err(e) = terminal_result {
+                *transport_cl.lock().unwrap_or_else(PoisonError::into_inner) =
+                    Some(format!("terminal output transport failed: {e}"));
             }
+            state_cl
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .in_turn = false;
         });
     }
 
     for _ in 0..2400 {
+        if let Some(error) = transport_error
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+        {
+            return Err(anyagents_core::Error::Message(error));
+        }
         let busy = state.lock().unwrap_or_else(PoisonError::into_inner).in_turn;
         if !busy {
             break;
@@ -3316,22 +3237,23 @@ fn drain_steered_messages(
     transcript_path: &Path,
     messages: &mut Vec<Value>,
     unanswered_reply_target: &mut Option<String>,
-) -> bool {
+) -> Result<bool, String> {
     let mut g = state.lock().unwrap_or_else(PoisonError::into_inner);
     if g.steer_queue.is_empty() {
-        return false;
+        return Ok(false);
     }
-    while let Some(steered) = g.steer_queue.pop_front() {
+    while let Some(steered) = g.steer_queue.front().cloned() {
         update_unanswered_reply_target(unanswered_reply_target, &steered);
         let msg = json!({
             "role": "user",
             "content": steered,
         });
-        append_transcript_message(transcript_path, &msg);
+        append_transcript_message(transcript_path, &msg)?;
         messages.push(msg);
+        g.steer_queue.pop_front();
     }
     g.last_activity = Some(Instant::now());
-    true
+    Ok(true)
 }
 
 fn update_unanswered_reply_target(current: &mut Option<String>, incoming_text: &str) {
@@ -3343,36 +3265,6 @@ fn update_unanswered_reply_target(current: &mut Option<String>, incoming_text: &
     {
         *current = Some(new_target);
     }
-}
-
-fn send_args_satisfy_target(parsed_args: &Value, expected: Option<&str>) -> bool {
-    let Some(expected) = expected else {
-        return true;
-    };
-    if !expected.starts_with("telegram:") {
-        return true;
-    }
-    let chat_suffix = expected.rsplit(':').next().unwrap_or(expected);
-    let matches_addr = |s: &str| {
-        let t = s.trim();
-        t == expected
-            || t.starts_with("telegram:")
-            || (!chat_suffix.is_empty() && t.ends_with(chat_suffix))
-    };
-    if let Some(s) = parsed_args.get("to").and_then(Value::as_str)
-        && s.split(',').any(matches_addr)
-    {
-        return true;
-    }
-    if let Some(arr) = parsed_args.get("to").and_then(Value::as_array)
-        && arr
-            .iter()
-            .filter_map(Value::as_str)
-            .any(|s| s.split(',').any(matches_addr))
-    {
-        return true;
-    }
-    false
 }
 
 fn extract_envelope_sender(text: &str) -> Option<String> {
@@ -3393,9 +3285,22 @@ fn extract_envelope_sender(text: &str) -> Option<String> {
         .then(|| sender.to_string())
 }
 
-fn read_workspace_agents_md(work_dir: &Path) -> Option<String> {
+fn read_workspace_agents_md(work_dir: &Path, shared_path: Option<&Path>) -> Option<String> {
     for dir in work_dir.ancestors() {
         let candidate = dir.join("AGENTS.md");
+        // A shared file reached through workspace ancestry is one source, not
+        // a second instruction scope. Distinct workspace files remain layered
+        // even when their bytes or headings happen to match the shared file.
+        if shared_path.is_some_and(|shared| {
+            candidate == shared
+                || candidate
+                    .canonicalize()
+                    .ok()
+                    .zip(shared.canonicalize().ok())
+                    .is_some_and(|(work, shared)| work == shared)
+        }) {
+            break;
+        }
         if let Ok(text) = std::fs::read_to_string(&candidate)
             && !text.trim().is_empty()
         {
@@ -3431,7 +3336,7 @@ fn extract_embedded_shared_agents_section(sys: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
-fn read_shared_agents_md_for_config(config_dir: &Path) -> Option<String> {
+fn read_shared_agents_md_for_config(config_dir: &Path) -> Option<(PathBuf, String)> {
     let mut candidates = Vec::new();
     if let Some(data_dir) = config_dir
         .parent()
@@ -3452,11 +3357,11 @@ fn read_shared_agents_md_for_config(config_dir: &Path) -> Option<String> {
             }
             if trimmed.starts_with("# AnyAgents Identity & Environment Awareness") {
                 if let Some(extracted) = extract_embedded_shared_agents_section(trimmed) {
-                    return Some(extracted);
+                    return Some((cand, extracted));
                 }
                 continue;
             }
-            return Some(text);
+            return Some((cand, text));
         }
     }
     None
@@ -3477,10 +3382,6 @@ fn strip_embedded_shared_agents_section(sys: &str) -> String {
     }
 }
 
-fn is_owner_root_agents_md(text: &str) -> bool {
-    text.trim_start().starts_with("# SylphxAI/owner")
-}
-
 pub fn assemble_system_prompt(config_dir: &Path, work_dir: &Path) -> String {
     let mut parts: Vec<String> = Vec::new();
     if let Ok(sys) = std::fs::read_to_string(config_dir.join("SYSTEM_PROMPT.md"))
@@ -3491,47 +3392,29 @@ pub fn assemble_system_prompt(config_dir: &Path, work_dir: &Path) -> String {
             parts.push(cleaned);
         }
     }
-    let shared_agents = read_shared_agents_md_for_config(config_dir).filter(|s| {
+    let shared_agents = read_shared_agents_md_for_config(config_dir).filter(|(_, s)| {
         !s.trim().is_empty()
             && !s
                 .trim_start()
                 .starts_with("# AnyAgents Identity & Environment Awareness")
     });
-    let work_agents = read_workspace_agents_md(work_dir).filter(|s| !s.trim().is_empty());
+    let work_agents = read_workspace_agents_md(
+        work_dir,
+        shared_agents.as_ref().map(|(path, _)| path.as_path()),
+    )
+    .filter(|s| !s.trim().is_empty());
 
-    match (shared_agents, work_agents) {
-        (Some(shared), Some(work)) => {
-            if is_owner_root_agents_md(&shared) && is_owner_root_agents_md(&work) {
-                let trimmed = work.trim();
-                if !parts.iter().any(|p| p.contains(trimmed)) {
-                    parts.push(format!(
-                        "## 4. Shared Instructions (AGENTS.md)\n\n{trimmed}"
-                    ));
-                }
-            } else {
-                let s_trim = shared.trim();
-                if !parts.iter().any(|p| p.contains(s_trim)) {
-                    parts.push(format!("## 4. Shared Instructions (AGENTS.md)\n\n{s_trim}"));
-                }
-                let w_trim = work.trim();
-                if !parts.iter().any(|p| p.contains(w_trim)) {
-                    parts.push(work);
-                }
-            }
-        }
-        (Some(shared), None) => {
-            let s_trim = shared.trim();
-            if !parts.iter().any(|p| p.contains(s_trim)) {
-                parts.push(format!("## 4. Shared Instructions (AGENTS.md)\n\n{s_trim}"));
-            }
-        }
-        (None, Some(work)) => {
-            let w_trim = work.trim();
-            if !parts.iter().any(|p| p.contains(w_trim)) {
-                parts.push(format!("## 4. Shared Instructions (AGENTS.md)\n\n{w_trim}"));
-            }
-        }
-        (None, None) => {}
+    if let Some((_, shared)) = shared_agents {
+        parts.push(format!(
+            "## 4. Shared Instructions (AGENTS.md)\n\n{}",
+            shared.trim()
+        ));
+    }
+    if let Some(work) = work_agents {
+        parts.push(format!(
+            "## Workspace Instructions (AGENTS.md)\n\n{}",
+            work.trim()
+        ));
     }
     if parts.is_empty() {
         parts.push(
@@ -3681,31 +3564,35 @@ fn discover_skills_index(work_dir: &Path, config_dir: &Path) -> String {
     out
 }
 
-fn load_active_goal_continuation_prompt(config_dir: &Path) -> Option<String> {
+fn load_active_goal_continuation_prompt(config_dir: &Path) -> Result<Option<String>, String> {
     let goal_path = config_dir.join("sylphx-goal.json");
-    let raw = std::fs::read_to_string(&goal_path).ok()?;
-    let mut val: Value = serde_json::from_str(&raw).ok()?;
+    let Some(mut val) = read_json(&goal_path)? else {
+        return Ok(None);
+    };
+    validate_goal(&val)?;
     if val.get("state").and_then(Value::as_str) != Some("active") {
-        return None;
+        return Ok(None);
     }
     let continuations = val
         .get("auto_continuations")
         .and_then(Value::as_u64)
         .unwrap_or(0);
     if continuations >= 12 {
-        return None;
+        return Ok(None);
     }
     if let Some(obj) = val.as_object_mut() {
         obj.insert("auto_continuations".to_string(), json!(continuations + 1));
     }
-    let _ = std::fs::write(
+    write_atomic(
         &goal_path,
-        serde_json::to_string_pretty(&val).unwrap_or_default(),
-    );
-    Some(format!(
+        serde_json::to_string_pretty(&val)
+            .map_err(|e| e.to_string())?
+            .as_bytes(),
+    )?;
+    Ok(Some(format!(
         "[Session Goal state] {}\nContinue executing toward the active Goal's acceptance criteria, or call `goal` with `action: \"complete\"` (or `\"pause\"` / `\"cancel\"`) once verified.",
         serde_json::to_string(&val).unwrap_or_default()
-    ))
+    )))
 }
 
 /// Converts `build_tool_definitions()` into the flat `/v1/responses` function tool schema
@@ -4010,7 +3897,7 @@ fn build_legacy_tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "sandbox",
-                "description": "Inspect or switch workspace execution placement (`action`: `\"placement\"` | `\"status\"`, `placement`: `\"local\"` | `\"cloud\"`). Use `placement: \"local\"` when a task needs host-local resources (`/scratch`, `op` 1Password CLI, `kubectl`/`talosctl`, `desk-*`).",
+                "description": "Inspect or switch workspace execution placement (`action`: `\"placement\"` | `\"status\"`, `placement`: `\"local\"` | `\"cloud\"`). Use local placement for capabilities explicitly provided by the host deployment.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -4290,6 +4177,9 @@ fn execute_sylphx_tool(
     mcp_command: &Path,
     mcp_args: &[String],
 ) -> String {
+    if let Err(e) = validate_tool_input(name, args) {
+        return format!("error: {e}");
+    }
     let raw = execute_sylphx_tool_raw(name, args, config_dir, work_dir, env, mcp_command, mcp_args);
     let masked = anyagents_core::masking::mask_known_secrets(&raw).into_owned();
     let normalized = name.strip_prefix("mcp__anyagents__").unwrap_or(name);
@@ -4487,18 +4377,23 @@ fn execute_sylphx_tool_raw(
                             "error: workspace placement `{target}` is not permitted by SYLPHX_WORKSPACE_PLACEMENTS (`{allowed_raw}`)"
                         );
                     }
+                    if target == "local" {
+                        if let Err(e) = sdk::pull_session_from_cloud(config_dir, env) {
+                            return format!("error: {e}");
+                        }
+                    } else {
+                        if let Err(e) = resolve_cloud_agent_environment(config_dir, env) {
+                            return format!("error: {e}");
+                        }
+                    }
                     let doc = json!({
                         "placement": target,
                         "updated_at_ms": anyagents_core::now_ms(),
                     });
-                    if let Err(e) = std::fs::write(
-                        &placement_path,
-                        serde_json::to_string_pretty(&doc).unwrap_or_default(),
-                    ) {
+                    if let Err(e) = write_atomic(&placement_path, doc.to_string().as_bytes()) {
                         return format!("error persisting workspace placement: {e}");
                     }
                     if target == "local" {
-                        clear_persisted_cloud_session(config_dir);
                         let _ = std::fs::remove_file(config_dir.join("sylphx-sandbox-lease.json"));
                     }
                     serde_json::to_string_pretty(&json!({
@@ -4514,7 +4409,10 @@ fn execute_sylphx_tool_raw(
                     .unwrap_or_default()
                 }
                 _ => {
-                    let current = if resolve_cloud_agent_environment(config_dir, env).is_some() {
+                    let current = if match resolve_cloud_agent_environment(config_dir, env) {
+                        Ok(value) => value.is_some(),
+                        Err(e) => return format!("error: {e}"),
+                    } {
                         "cloud"
                     } else {
                         "local"
@@ -4533,6 +4431,12 @@ fn execute_sylphx_tool_raw(
             let Some(skill_name) = args.get("name").and_then(Value::as_str).map(str::trim) else {
                 return "error: missing `name`".to_string();
             };
+            if skill_name.is_empty()
+                || Path::new(skill_name).components().count() != 1
+                || skill_name == ".."
+            {
+                return "error: invalid skill name".into();
+            }
             let ref_name = args
                 .get("reference")
                 .and_then(Value::as_str)
@@ -4543,6 +4447,13 @@ fn execute_sylphx_tool_raw(
                 let skill_md = skill_dir.join("SKILL.md");
                 if skill_md.is_file() {
                     if let Some(r) = ref_name {
+                        if Path::new(r).is_absolute()
+                            || Path::new(r)
+                                .components()
+                                .any(|c| c == std::path::Component::ParentDir)
+                        {
+                            return "error: invalid skill reference".into();
+                        }
                         let clean_r = r
                             .trim_start_matches("./")
                             .trim_start_matches("references/")
@@ -4556,7 +4467,10 @@ fn execute_sylphx_tool_raw(
                             format!("error reading {}: {e}", ref_file.display())
                         });
                     }
-                    let body = std::fs::read_to_string(&skill_md).unwrap_or_default();
+                    let body = match std::fs::read_to_string(&skill_md) {
+                        Ok(body) => body,
+                        Err(e) => return format!("error reading {}: {e}", skill_md.display()),
+                    };
                     let mut refs = Vec::new();
                     if let Ok(entries) = std::fs::read_dir(skill_dir.join("references")) {
                         for e in entries.flatten() {
@@ -4593,10 +4507,16 @@ fn execute_sylphx_tool_raw(
                     .trim(),
             };
             let goal_path = config_dir.join("sylphx-goal.json");
-            let mut current = std::fs::read_to_string(&goal_path)
-                .ok()
-                .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-                .unwrap_or_else(|| json!({ "state": "none" }));
+            let mut current = match read_json(&goal_path) {
+                Ok(Some(value)) => {
+                    if let Err(e) = validate_goal(&value) {
+                        return format!("error: {e}");
+                    }
+                    value
+                }
+                Ok(None) => json!({"state": "none"}),
+                Err(e) => return format!("error: {e}"),
+            };
             match action {
                 "create" | "set" => {
                     let title = args.get("title").and_then(Value::as_str).unwrap_or("Goal");
@@ -4613,10 +4533,9 @@ fn execute_sylphx_tool_raw(
                         "auto_continuations": 0,
                         "updated_at_ms": anyagents_core::now_ms(),
                     });
-                    let _ = std::fs::write(
-                        &goal_path,
-                        serde_json::to_string_pretty(&current).unwrap_or_default(),
-                    );
+                    if let Err(e) = write_atomic(&goal_path, current.to_string().as_bytes()) {
+                        return format!("error: {e}");
+                    }
                 }
                 "update" => {
                     if let Some(obj) = current.as_object_mut() {
@@ -4632,10 +4551,9 @@ fn execute_sylphx_tool_raw(
                         obj.insert("auto_continuations".to_string(), json!(0));
                         obj.insert("updated_at_ms".to_string(), json!(anyagents_core::now_ms()));
                     }
-                    let _ = std::fs::write(
-                        &goal_path,
-                        serde_json::to_string_pretty(&current).unwrap_or_default(),
-                    );
+                    if let Err(e) = write_atomic(&goal_path, current.to_string().as_bytes()) {
+                        return format!("error: {e}");
+                    }
                 }
                 "complete" | "pause" | "cancel" => {
                     let new_state = match action {
@@ -4650,12 +4568,12 @@ fn execute_sylphx_tool_raw(
                         }
                         obj.insert("updated_at_ms".to_string(), json!(anyagents_core::now_ms()));
                     }
-                    let _ = std::fs::write(
-                        &goal_path,
-                        serde_json::to_string_pretty(&current).unwrap_or_default(),
-                    );
+                    if let Err(e) = write_atomic(&goal_path, current.to_string().as_bytes()) {
+                        return format!("error: {e}");
+                    }
                 }
-                _ => {}
+                "status" | "get" => {}
+                _ => return format!("error: invalid goal action `{action}`"),
             }
             serde_json::to_string_pretty(&current).unwrap_or_default()
         }
@@ -5213,7 +5131,7 @@ mod tests {
             id: "msg_1".to_string(),
             seq: 1,
             text: "sleep:1 please".to_string(),
-            sender: Some("agent:vulcan".to_string()),
+            sender: Some("agent:worker-a".to_string()),
             reply_to: None,
             source_time_ms: None,
             context: Context::default(),
@@ -5230,7 +5148,7 @@ mod tests {
             id: "msg_2".to_string(),
             seq: 2,
             text: "mid-turn steer message".to_string(),
-            sender: Some("agent:vulcan".to_string()),
+            sender: Some("agent:worker-a".to_string()),
             reply_to: None,
             source_time_ms: None,
             context: Context::default(),
@@ -5336,7 +5254,7 @@ mod tests {
             steer.clone(),
         ];
         for item in &input {
-            append_transcript_message(&transcript, item);
+            append_transcript_message(&transcript, item).unwrap();
         }
         let raw_before = std::fs::read_to_string(&transcript).unwrap();
         let request = prepare_budgeted_request(
@@ -5388,20 +5306,21 @@ mod tests {
                             &json!({"role":"assistant", "tool_calls":[
                                 {"id":"reused", "type":"function", "function":{"name":"bash", "arguments":"{}"}}
                             ]}),
-                        );
+                        ).unwrap();
                         append_transcript_message(
                             &transcript,
                             &json!({"role":"tool", "tool_call_id":"reused", "content":output}),
-                        );
+                        )
+                        .unwrap();
                     } else {
-                        append_transcript_message(&transcript, &call);
+                        append_transcript_message(&transcript, &call).unwrap();
                         append_transcript_message(
                             &transcript,
                             &json!({"type":"function_call_output", "call_id":"reused", "output":output}),
-                        );
+                        ).unwrap();
                     }
                 }
-                append_transcript_message(&transcript, &pending);
+                append_transcript_message(&transcript, &pending).unwrap();
                 let mut input = load_transcript_input_items(&transcript);
                 validate_responses_input(&input).unwrap();
                 if anchored {
@@ -5411,7 +5330,7 @@ mod tests {
                         append_transcript_message(
                             &transcript,
                             &json!({"type":"context_window_open", "handoff":"keep current work", "retained_items":input}),
-                        );
+                        ).unwrap();
                         input = load_transcript_input_items(&transcript);
                     }
                 }
@@ -5490,7 +5409,7 @@ mod tests {
                 pending.clone(),
             ];
             for item in &input {
-                append_transcript_message(&transcript, item);
+                append_transcript_message(&transcript, item).unwrap();
             }
             prepare_budgeted_request(
                 &transcript,
@@ -5524,16 +5443,16 @@ mod tests {
         let a = json!({"role":"user", "content":"unfinished inbox A"});
         let steer = json!({"role":"user", "content":"steer after failure"});
         let b = json!({"role":"user", "content":"new inbox B"});
-        append_transcript_message(&transcript, &a);
-        record_pending_native_messages(&transcript, std::slice::from_ref(&a));
+        append_transcript_message(&transcript, &a).unwrap();
+        record_pending_native_messages(&transcript, std::slice::from_ref(&a)).unwrap();
         // Failure means no completion/empty snapshot. A steer may have been
         // appended just before a crash, without its updated snapshot.
-        append_transcript_message(&transcript, &steer);
-        append_transcript_message(&transcript, &b);
+        append_transcript_message(&transcript, &steer).unwrap();
+        append_transcript_message(&transcript, &b).unwrap();
         let mut input = load_transcript_input_items(&transcript);
         let pending = load_pending_native_messages(&transcript, &input);
         assert_eq!(pending, vec![a.clone(), steer.clone(), b.clone()]);
-        record_pending_native_messages(&transcript, &pending);
+        record_pending_native_messages(&transcript, &pending).unwrap();
         prepare_budgeted_request(
             &transcript,
             &mut input,
@@ -5551,7 +5470,7 @@ mod tests {
         // Metadata is not sent to the provider, and success closes the pending
         // boundary so a later normal turn does not revive completed work.
         assert!(!input.iter().any(|item| item["type"] == "native_turn_state"));
-        record_pending_native_messages(&transcript, &[]);
+        record_pending_native_messages(&transcript, &[]).unwrap();
         assert!(load_pending_native_messages(&transcript, &input).is_empty());
     }
 
@@ -5736,15 +5655,16 @@ mod tests {
         append_transcript_message(
             &transcript,
             &json!({"role":"assistant", "content":"old verbose history".repeat(12_000)}),
-        );
+        )
+        .unwrap();
         let huge_call = json!({"type":"function_call", "call_id":"completed", "name":"memory_recall", "arguments":"{}"});
         let huge_result = json!({"type":"function_call_output", "call_id":"completed", "output":"raw original 中\"".repeat(65_000)});
-        append_transcript_message(&transcript, &huge_call);
-        append_transcript_message(&transcript, &huge_result);
+        append_transcript_message(&transcript, &huge_call).unwrap();
+        append_transcript_message(&transcript, &huge_result).unwrap();
         append_transcript_message(
             &transcript,
             &json!({"type":"context_window_open", "handoff":"resume skills batch", "retained_items":[huge_call, huge_result]}),
-        );
+        ).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let gateway = format!("http://{}/v1", listener.local_addr().unwrap());
         let transcript_at_dispatch = transcript.clone();
@@ -5846,7 +5766,7 @@ mod tests {
         // must stay completed; the exact failed inbound must remain pending.
         let failed = json!({"role":"user", "content":irreducible});
         let next = json!({"role":"user", "content":"next short inbound"});
-        append_transcript_message(&transcript, &next);
+        append_transcript_message(&transcript, &next).unwrap();
         let mut restarted = load_transcript_input_items(&transcript);
         let pending = load_pending_native_messages(&transcript, &restarted);
         assert_eq!(pending, vec![failed.clone(), next.clone()]);
@@ -5872,7 +5792,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let transcript = tmp.path().join("sylphx-transcript.jsonl");
         let pending = json!({"role":"user", "content":"must not disappear".repeat(20_000)});
-        append_transcript_message(&transcript, &pending);
+        append_transcript_message(&transcript, &pending).unwrap();
         let mut input = vec![pending.clone()];
         let raw_before = std::fs::read(&transcript).unwrap();
         let input_before = input.clone();
@@ -5926,11 +5846,11 @@ mod tests {
         let transcript = cfg.join("sylphx-transcript.jsonl");
         let text = "raw file original 中文\n\"".repeat(4_000);
         let inbound = json!({"role":"user", "content":text});
-        append_transcript_message(&transcript, &inbound);
+        append_transcript_message(&transcript, &inbound).unwrap();
         append_transcript_message(
             &transcript,
             &json!({"type":"context_window_open", "handoff":"continue", "retained_items":[inbound]}),
-        );
+        ).unwrap();
         let read = |args: &Value| {
             execute_sylphx_tool(
                 "read_file",
@@ -5956,7 +5876,8 @@ mod tests {
         append_transcript_message(
             &transcript,
             &json!({"type":"context_window_open", "handoff":"evicted", "retained_items":[]}),
-        );
+        )
+        .unwrap();
         let mut combined = String::new();
         loop {
             let page = read(&args);
@@ -5985,7 +5906,7 @@ mod tests {
         append_transcript_message(
             &transcript,
             &json!({ "role": "user", "content": "Deploy release v2.4.1 with token ALPHA_99182_KEY and 測試記憶檢索" }),
-        );
+        ).unwrap();
         append_transcript_message(
             &transcript,
             &json!({
@@ -5994,7 +5915,8 @@ mod tests {
                 "name": "bash",
                 "arguments": "{\"command\":\"./deploy.sh --version v2.4.1\"}"
             }),
-        );
+        )
+        .unwrap();
         append_transcript_message(
             &transcript,
             &json!({
@@ -6002,7 +5924,8 @@ mod tests {
                 "call_id": "call_1",
                 "output": "exit_code: 0\ndeployed commit sha 8f91b2c"
             }),
-        );
+        )
+        .unwrap();
         append_transcript_message(
             &transcript,
             &json!({
@@ -6010,11 +5933,13 @@ mod tests {
                 "handoff": "Goal: verify v2.4.1 rollout. Facts: deployed commit 8f91b2c.",
                 "timestamp_ms": 1760000000000u64
             }),
-        );
+        )
+        .unwrap();
         append_transcript_message(
             &transcript,
             &json!({ "role": "user", "content": "Now check production health" }),
-        );
+        )
+        .unwrap();
 
         // Active window only contains items from the latest `context_window_open` onward.
         let active = load_transcript_input_items(&transcript);
@@ -6112,13 +6037,15 @@ mod tests {
             append_transcript_message(
                 &transcript,
                 &json!({ "role": "user", "content": format!("msg_{i}") }),
-            );
+            )
+            .unwrap();
         }
         let w1 = load_transcript_input_items(&transcript);
         append_transcript_message(
             &transcript,
             &json!({ "role": "user", "content": format!("msg_{initial_items}") }),
-        );
+        )
+        .unwrap();
         let w2 = load_transcript_input_items(&transcript);
         // A cut occurred, it is stride-aligned, and appending one message does
         // not change the pinned prefix between consecutive stride boundaries.
@@ -6347,7 +6274,8 @@ mod tests {
         append_transcript_message(
             &transcript,
             &json!({ "role": "user", "content": "Initial task prompt" }),
-        );
+        )
+        .unwrap();
         append_transcript_message(
             &transcript,
             &json!({
@@ -6356,7 +6284,8 @@ mod tests {
                 "name": "grep",
                 "arguments": "{\"pattern\":\"obsolete_symbol_xyz\"}"
             }),
-        );
+        )
+        .unwrap();
         append_transcript_message(
             &transcript,
             &json!({
@@ -6364,7 +6293,8 @@ mod tests {
                 "call_id": "call_deadend",
                 "output": "exit_code: 1\nno matches for obsolete_symbol_xyz"
             }),
-        );
+        )
+        .unwrap();
         append_transcript_message(
             &transcript,
             &json!({
@@ -6373,7 +6303,8 @@ mod tests {
                 "name": "bash",
                 "arguments": "{\"command\":\"cargo test\"}"
             }),
-        );
+        )
+        .unwrap();
         append_transcript_message(
             &transcript,
             &json!({
@@ -6381,7 +6312,7 @@ mod tests {
                 "call_id": "call_biglog",
                 "output": "exit_code: 0\n".to_string() + &"test line pass SECRET_BUILD_MARKER_777\n".repeat(100)
             }),
-        );
+        ).unwrap();
 
         let inspect_raw = execute_sylphx_tool(
             "context_edit",
@@ -6470,14 +6401,14 @@ mod tests {
         .unwrap();
         std::fs::write(
             work.join("AGENTS.md"),
-            "# SylphxAI/owner\nWorkspace repository instructions.\n",
+            "# example/project\nWorkspace repository instructions.\n",
         )
         .unwrap();
 
         let prompt = assemble_system_prompt(&cfg, &work);
         assert!(prompt.contains("# Agent Identity"));
         assert!(prompt.contains("Two limits and operating defaults"));
-        assert!(prompt.contains("# SylphxAI/owner"));
+        assert!(prompt.contains("# example/project"));
         assert_eq!(
             prompt.matches("Two limits and operating defaults").count(),
             1
@@ -6716,7 +6647,9 @@ mod tests {
             ("SYLPHX_AGENT_ENV".to_string(), "org/proj/dev".to_string()),
         ];
         assert_eq!(
-            resolve_cloud_agent_environment(&cfg, &env).as_deref(),
+            resolve_cloud_agent_environment(&cfg, &env)
+                .unwrap()
+                .as_deref(),
             Some("org/proj/dev")
         );
 
@@ -6732,7 +6665,11 @@ mod tests {
         let parsed: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(parsed["status"], "ok");
         assert_eq!(parsed["placement"], "local");
-        assert!(resolve_cloud_agent_environment(&cfg, &env).is_none());
+        assert!(
+            resolve_cloud_agent_environment(&cfg, &env)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -7264,8 +7201,10 @@ exec "$@"
             env_slug: "environments/env_1".to_string(),
             last_seq: 14,
         };
-        save_persisted_cloud_session(cfg, &saved);
-        let loaded = load_persisted_cloud_session(cfg).expect("persisted cloud session");
+        save_persisted_cloud_session(cfg, &saved).unwrap();
+        let loaded = load_persisted_cloud_session(cfg)
+            .unwrap()
+            .expect("persisted cloud session");
         assert_eq!(loaded.agent_id, saved.agent_id);
         assert_eq!(loaded.session_id, saved.session_id);
         assert_eq!(loaded.model_id, "openai/gpt-6.1-sol");
@@ -7275,7 +7214,8 @@ exec "$@"
         append_transcript_message(
             &transcript,
             &json!({ "role": "user", "content": "Check deployment status of service-alpha" }),
-        );
+        )
+        .unwrap();
         append_transcript_message(
             &transcript,
             &json!({
@@ -7284,7 +7224,8 @@ exec "$@"
                 "name": "bash",
                 "arguments": "{\"command\":\"kubectl get pods\"}"
             }),
-        );
+        )
+        .unwrap();
         append_transcript_message(
             &transcript,
             &json!({
@@ -7292,7 +7233,7 @@ exec "$@"
                 "role": "assistant",
                 "content": [{ "type": "output_text", "text": "service-alpha is healthy (3/3 pods ready)." }]
             }),
-        );
+        ).unwrap();
 
         let block = build_prior_transcript_continuity_block(&transcript)
             .expect("prior transcript continuity block");
@@ -7301,15 +7242,16 @@ exec "$@"
         assert!(block.contains("[tool_call:bash]"));
         assert!(block.contains("service-alpha is healthy (3/3 pods ready)."));
 
-        clear_persisted_cloud_session(cfg);
-        assert!(load_persisted_cloud_session(cfg).is_none());
+        clear_persisted_cloud_session(cfg).unwrap();
+        assert!(load_persisted_cloud_session(cfg).unwrap().is_none());
 
         let sdk_session = SylphxSdkSession::new(
             cfg,
             cfg,
             Some("sylphx/openai/gpt-6.1-sol#medium".to_string()),
             vec![("SYLPHX_EXECUTION_MODE".to_string(), "local".to_string())],
-        );
+        )
+        .unwrap();
         assert_eq!(sdk_session.execution_mode, SylphxExecutionMode::LocalOnly);
         assert!(NoopClientTools.tool_definitions().is_empty());
         assert!(NoopClientTools.execute("send", &json!({})).is_none());
@@ -7323,18 +7265,18 @@ exec "$@"
         // When `sylphx-workspace-placement.json` specifies `"placement": "local"`,
         // `resolve_cloud_agent_environment` returns `None` and purges any stale
         // `sylphx-cloud-session.json` / `sylphx-sandbox-lease.json`.
-        save_persisted_cloud_session(cfg, &saved);
+        save_persisted_cloud_session(cfg, &saved).unwrap();
         std::fs::write(cfg.join("sylphx-sandbox-lease.json"), "{}").unwrap();
         std::fs::write(
             cfg.join("sylphx-workspace-placement.json"),
             r#"{"placement":"local"}"#,
         )
         .unwrap();
-        assert_eq!(resolve_cloud_agent_environment(cfg, &[]), None);
-        assert!(load_persisted_cloud_session(cfg).is_none());
-        assert!(!cfg.join("sylphx-sandbox-lease.json").exists());
+        assert_eq!(resolve_cloud_agent_environment(cfg, &[]).unwrap(), None);
+        assert!(load_persisted_cloud_session(cfg).unwrap().is_some());
+        assert!(cfg.join("sylphx-sandbox-lease.json").exists());
         assert_eq!(
-            SylphxExecutionMode::from_env(cfg, &[]),
+            SylphxExecutionMode::from_env(cfg, &[]).unwrap(),
             SylphxExecutionMode::LocalOnly
         );
     }
@@ -7352,7 +7294,7 @@ exec "$@"
                        ## 1. Your Identity (Who You Are)\n\n\
                        - **Agent Name**: `nova`\n\n\
                        ## 4. Shared Instructions (AGENTS.md)\n\n\
-                       # SylphxAI/owner\n\n\
+                       # example/project\n\n\
                        Old stale rule v1.\n\n\
                        # Cross-Harness Continuity\n\n\
                        Prior turn summary.";
@@ -7360,24 +7302,24 @@ exec "$@"
         std::fs::write(cfg.join("AGENTS.md"), sys_doc).unwrap();
         std::fs::write(
             data_dir.join("AGENTS.md"),
-            "# SylphxAI/owner\n\nShared rule v2.\n",
+            "# example/project\n\nShared rule v2.\n",
         )
         .unwrap();
         std::fs::write(
             work.join("AGENTS.md"),
-            "# SylphxAI/owner\n\nLive workspace rule v3.\n",
+            "# example/project\n\nLive workspace rule v3.\n",
         )
         .unwrap();
 
         let assembled = assemble_system_prompt(&cfg, &work);
         assert_eq!(
-            assembled.matches("# SylphxAI/owner").count(),
-            1,
-            "must inject exactly one copy of # SylphxAI/owner: {assembled}"
+            assembled.matches("# example/project").count(),
+            2,
+            "must retain shared and workspace scope: {assembled}"
         );
         assert!(assembled.contains("Live workspace rule v3."));
         assert!(!assembled.contains("Old stale rule v1."));
-        assert!(!assembled.contains("Shared rule v2."));
+        assert!(assembled.contains("Shared rule v2."));
         assert!(assembled.contains("# Cross-Harness Continuity"));
         assert!(assembled.contains("Prior turn summary."));
 
@@ -7387,7 +7329,7 @@ exec "$@"
                           ## 1. Your Identity (Who You Are)\n\n\
                           - **Agent Name**: `nova` (addressable as `agent:nova`)\n\n\
                           ## 4. Shared Instructions (AGENTS.md)\n\n\
-                          # SylphxAI/owner\n\n\
+                          # example/project\n\n\
                           Old stale rule v1.\n\n\
                           ## 4. Cross-Harness Session Continuity (`codex` -> `sylphx`)\n\n\
                           Recent completed turn digest.";
@@ -7395,13 +7337,16 @@ exec "$@"
         let assembled_v2 = assemble_system_prompt(&cfg, &work);
         assert!(assembled_v2.contains("## 4. Cross-Harness Session Continuity"));
         assert!(assembled_v2.contains("Recent completed turn digest."));
-        assert_eq!(resolve_agent_short_name(&cfg, &[]), "nova");
+        assert_eq!(
+            resolve_agent_short_name(&cfg, &[("ANYAGENTS_AGENT_NAME".into(), "nova".into())]),
+            "nova"
+        );
         assert_eq!(
             resolve_agent_short_name(
                 &cfg,
-                &[("ANYAGENTS_AGENT_NAME".to_string(), "chronos".to_string())]
+                &[("ANYAGENTS_AGENT_NAME".to_string(), "worker-b".to_string())]
             ),
-            "chronos"
+            "worker-b"
         );
 
         let norm1 = normalize_mcp_tool_arguments(
@@ -7454,3 +7399,142 @@ exec "$@"
         assert!(ctx_compact.contains("window_opened"), "{ctx_compact}");
     }
 }
+
+fn validate_goal(value: &Value) -> Result<(), String> {
+    match value.get("state").and_then(Value::as_str) {
+        Some("none" | "active" | "completed" | "paused" | "cancelled") => {}
+        _ => return Err("invalid goal state".into()),
+    }
+    if value.get("auto_continuations").is_some_and(|n| !n.is_u64()) {
+        return Err("invalid goal continuation counter".into());
+    }
+    Ok(())
+}
+
+pub(crate) fn interrupt_and_settle(base: &str, path: &str, key: &str) -> Result<Value, String> {
+    post_required(&format!("{base}/v1/{path}:interrupt"), key, &json!({}))?;
+    for _ in 0..20 {
+        let (status, raw) = curl_get(&format!("{base}/v1/{path}"), Some(key))?;
+        if !(200..300).contains(&status) {
+            return Err(format!("cloud settle HTTP {status}; binding retained"));
+        }
+        let value: Value =
+            serde_json::from_str(&raw).map_err(|e| format!("invalid settle response: {e}"))?;
+        let state = value
+            .get("state")
+            .or_else(|| value.get("status"))
+            .and_then(Value::as_str)
+            .ok_or("invalid cloud settle state; binding retained")?;
+        if matches!(
+            state.to_ascii_lowercase().as_str(),
+            "idle" | "session_state_idle" | "completed" | "terminated" | "failed"
+        ) {
+            return Ok(value);
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    Err("cloud session did not settle; binding retained".into())
+}
+
+fn validate_tool_input(name: &str, args: &Value) -> Result<(), String> {
+    if !args.is_object() {
+        return Err("tool arguments must be an object".into());
+    }
+    let name = name.strip_prefix("mcp__anyagents__").unwrap_or(name);
+    if let Some(tool) = build_tool_definitions()
+        .into_iter()
+        .chain(build_legacy_tool_definitions())
+        .find(|tool| tool.pointer("/function/name").and_then(Value::as_str) == Some(name))
+    {
+        validate_schema(args, &tool["function"]["parameters"], name)?;
+    }
+    Ok(())
+}
+
+fn flush_cloud_tool_receipt(config_dir: &Path, base: &str, key: &str) -> Result<(), String> {
+    let path = config_dir.join("sylphx-cloud-tool-receipt.json");
+    let Some(receipt) = read_json(&path)? else {
+        return Ok(());
+    };
+    if required_text(&receipt, "state")? != "completed" {
+        return Err("cloud tool effect unresolved; retained execution receipt requires reconciliation, not replay".into());
+    }
+    let session = required_text(&receipt, "session_path")?;
+    let call_id = required_text(&receipt, "call_id")?;
+    let output = receipt
+        .get("output")
+        .and_then(Value::as_str)
+        .ok_or("invalid retained cloud tool output")?;
+    let is_error = receipt
+        .get("error")
+        .and_then(Value::as_bool)
+        .ok_or("invalid retained cloud tool status")?;
+    if let Some(mut binding) = load_persisted_cloud_session(config_dir)? {
+        let seq = sequence(receipt.get("event_sequence"), false)?;
+        if cloud_session_resource_path(&binding.env_slug, &binding.session_id) != session {
+            return Err("cloud tool receipt does not belong to retained binding".into());
+        }
+        post_required(
+            &format!("{base}/v1/{session}:submitToolResult"),
+            key,
+            &json!({"call_id":call_id,"output":output,"error":is_error}),
+        )?;
+        binding.last_seq = binding.last_seq.max(seq);
+        save_persisted_cloud_session(config_dir, &binding)?;
+    } else {
+        post_required(
+            &format!("{base}/v1/{session}:submitToolResult"),
+            key,
+            &json!({"call_id":call_id,"output":output,"error":is_error}),
+        )?;
+    }
+    remove_optional(&path)
+}
+
+fn write_terminal_frame(out: &mut impl std::io::Write, frame: &Value) -> std::io::Result<()> {
+    writeln!(out, "{frame}")?;
+    out.flush()
+}
+
+fn load_explicit_context(config_dir: &Path, work_dir: &Path) -> Result<String, String> {
+    let mut context = String::new();
+    if let Some(settings) = read_json(&config_dir.join("sylphx-agent.json"))?
+        && let Some(sources) = settings.get("context_sources")
+    {
+        let sources = sources
+            .as_array()
+            .ok_or("context_sources must be an array of workspace-relative files")?;
+        let workspace = work_dir
+            .canonicalize()
+            .map_err(|e| format!("context workspace: {e}"))?;
+        for source in sources {
+            let source = source
+                .as_str()
+                .ok_or("context source must be a path string")?;
+            let relative = Path::new(source);
+            if relative.is_absolute()
+                || relative
+                    .components()
+                    .any(|c| c == std::path::Component::ParentDir)
+            {
+                return Err("context source must be workspace-relative".into());
+            }
+            let path = workspace
+                .join(relative)
+                .canonicalize()
+                .map_err(|e| format!("context source: {e}"))?;
+            if !path.starts_with(&workspace) || !path.is_file() {
+                return Err("context source must be a file owned by the selected workspace".into());
+            }
+            let text = std::fs::read_to_string(&path)
+                .map_err(|e| format!("context source {}: {e}", path.display()))?;
+            context.push_str(&format!(
+                "\n<context_source path={source:?}>\n{text}\n</context_source>"
+            ));
+        }
+    }
+    Ok(context)
+}
+
+#[cfg(test)]
+mod audit_tests;

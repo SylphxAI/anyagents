@@ -306,6 +306,12 @@ pub(super) fn validate_responses_input(items: &[Value]) -> Result<(), String> {
             .and_then(Value::as_str)
             .filter(|id| !id.is_empty())
             .ok_or_else(|| format!("invalid Responses input[{index}].call_id: missing call ID"))?;
+        if kind == Some("function_call") {
+            crate::contracts::required_text(item, "name")?;
+            crate::contracts::tool_arguments(crate::contracts::required_text(item, "arguments")?)?;
+        } else if !item.get("output").is_some_and(Value::is_string) {
+            return Err(format!("invalid Responses input[{index}].output"));
+        }
         match kind {
             Some("function_call") if !open_calls.insert(call_id) => {
                 return Err(format!(
@@ -590,6 +596,19 @@ fn load_transcript_indexed_items_before(transcript_path: &Path, end: usize) -> V
         if m.get("type").and_then(Value::as_str) == Some("native_turn_state") {
             continue;
         }
+        if m.get("type").and_then(Value::as_str) == Some("cloud_session_event") {
+            if let Some(parts) = m.pointer("/event/message/parts").and_then(Value::as_array) {
+                let text = parts
+                    .iter()
+                    .filter_map(|part| part.get("text").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !text.is_empty() {
+                    history.push((raw_idx, json!({"role":"assistant", "content":text})));
+                }
+            }
+            continue;
+        }
         if m.get("type").is_some() {
             if include_after_context_edit(&m, &mut pruned_open_calls) {
                 history.push((raw_idx, m));
@@ -815,9 +834,9 @@ fn has_watermark_in_window(items: &[Value]) -> bool {
 pub(super) fn maybe_emit_context_watermark_event(
     transcript_path: &Path,
     input_items: &mut Vec<Value>,
-) {
+) -> Result<(), String> {
     if has_watermark_in_window(input_items) {
-        return;
+        return Ok(());
     }
     let (window_tokens, _, watermark_percent) =
         resolve_context_window_for_transcript(transcript_path);
@@ -831,85 +850,119 @@ pub(super) fn maybe_emit_context_watermark_event(
                 "<context-event kind=\"context.watermark\" used_percent=\"{used_percent}\" active_items=\"{item_count}\">\nContext window watermark reached ({used_tokens} / {window_tokens} est. tokens, {item_count} active items). At your next coherent milestone, you can either:\n1. Call `context_edit` (`drop: [\"from-to\"]` or `replace: [{{\"range\": \"from-to\", \"with\": \"1-line note\"}}]`) to surgically prune obsolete turns or compress verbose tool outputs without writing a full summary (`Context Language Models`), OR\n2. Call `context_window_open` with a structured `handoff` (`Goal`, `Verified Facts`, `Decisions`, `Next Action`) to open a fresh window.\n100% of raw turns remain searchable via `memory_recall`.\n</context-event>"
             ),
         });
-        append_transcript_message(transcript_path, &evt);
+        append_transcript_message(transcript_path, &evt)?;
         input_items.push(evt);
     }
+    Ok(())
 }
 
-pub(super) fn append_transcript_message(transcript_path: &Path, msg: &Value) -> Value {
+pub(super) fn append_transcript_message(
+    transcript_path: &Path,
+    msg: &Value,
+) -> Result<Value, String> {
     let mut msg = msg.clone();
     anyagents_core::masking::mask_json_strings(&mut msg);
-    let Ok(line) = serde_json::to_string(&msg) else {
-        return msg;
-    };
-    match std::fs::OpenOptions::new()
+    let line = serde_json::to_string(&msg).map_err(|e| e.to_string())?;
+    let opened = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(transcript_path)
+        .open(transcript_path);
+    #[cfg(unix)]
+    if opened
+        .as_ref()
+        .is_err_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied)
     {
-        Ok(mut f) => {
-            let _ = writeln!(f, "{line}");
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt as _;
-                if let Ok(meta) = f.metadata()
-                    && (meta.permissions().mode() & 0o060) != 0o060
-                {
-                    let _ = f.set_permissions(std::fs::Permissions::from_mode(0o660));
-                }
-            }
-        }
-        #[cfg(unix)]
-        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
-            use std::os::unix::fs::MetadataExt as _;
-            use std::process::{Command, Stdio};
-            let meta = std::fs::metadata(transcript_path).or_else(|_| {
+        use std::os::unix::fs::MetadataExt as _;
+        use std::process::{Command, Stdio};
+        let metadata = std::fs::metadata(transcript_path)
+            .or_else(|_| {
                 transcript_path
                     .parent()
                     .ok_or_else(|| std::io::Error::other("missing parent"))
                     .and_then(std::fs::metadata)
-            });
-            let launcher = std::env::var_os("ANYAGENTS_LAUNCHER")
-                .or_else(|| std::env::var_os("ANYAGENTS_SETPRIV"))
-                .filter(|p| !p.is_empty())
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| std::path::PathBuf::from("/usr/local/bin/anyagents-setpriv"));
-            if let Ok(meta) = meta
-                && launcher.is_file()
-            {
-                let uid = meta.uid().to_string();
-                let gid = meta.gid().to_string();
-                if let Ok(mut child) = Command::new(&launcher)
-                    .args([
-                        "--reuid",
-                        &uid,
-                        "--regid",
-                        &gid,
-                        "--groups",
-                        &gid,
-                        "--no-new-privs",
-                        "--",
-                        "sh",
-                        "-c",
-                        "umask 007 && cat >> \"$1\" && chmod 0660 \"$1\"",
-                        "sh",
-                    ])
-                    .arg(transcript_path)
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .spawn()
-                {
-                    if let Some(mut stdin) = child.stdin.take() {
-                        let _ = writeln!(stdin, "{line}");
-                    }
-                    let _ = child.wait();
-                }
+            })
+            .map_err(|e| format!("transcript ownership: {e}"))?;
+        let launcher = std::env::var_os("ANYAGENTS_LAUNCHER")
+            .or_else(|| std::env::var_os("ANYAGENTS_SETPRIV"))
+            .filter(|p| !p.is_empty())
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| "/usr/local/bin/anyagents-setpriv".into());
+        let mut command = Command::new(launcher);
+        command.args(["--reuid", &metadata.uid().to_string(), "--regid", &metadata.gid().to_string(), "--groups", &metadata.gid().to_string(), "--no-new-privs", "--", "python3", "-c",
+            "import os,sys; f=open(sys.argv[1],'ab'); f.write(sys.stdin.buffer.read()); f.flush(); os.fchmod(f.fileno(),0o660); os.fsync(f.fileno())"]).arg(transcript_path).stdin(Stdio::piped());
+        let result = crate::workspace::output(command, format!("{line}\n").as_bytes())?;
+        if !result.status.success() {
+            return Err(format!(
+                "delegated transcript append failed ({}): {}",
+                result.status,
+                String::from_utf8_lossy(&result.stderr)
+            ));
+        }
+        return Ok(msg);
+    }
+    let mut file =
+        opened.map_err(|e| format!("opening transcript {}: {e}", transcript_path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = file
+            .metadata()
+            .map_err(|e| format!("transcript metadata: {e}"))?
+            .permissions()
+            .mode();
+        if mode & 0o060 != 0o060 {
+            file.set_permissions(std::fs::Permissions::from_mode(0o660))
+                .map_err(|e| format!("transcript sharing permissions: {e}"))?;
+        }
+    }
+    writeln!(file, "{line}")
+        .and_then(|()| file.sync_data())
+        .map_err(|e| format!("appending transcript {}: {e}", transcript_path.display()))?;
+    Ok(msg)
+}
+
+/// Validate retained payloads before any paid inference or session transfer.
+pub(super) fn validate_transcript(path: &Path) -> Result<(), String> {
+    let Some(raw) = crate::contracts::read_optional(path)? else {
+        return Ok(());
+    };
+    for (index, line) in raw.lines().enumerate() {
+        let value: Value = serde_json::from_str(line)
+            .map_err(|e| format!("corrupt transcript line {index}: {e}"))?;
+        let validate = |call: &Value, id: &str, args: &str| -> Result<(), String> {
+            crate::contracts::required_text(call, id)?;
+            crate::contracts::tool_arguments(crate::contracts::required_text(call, args)?)?;
+            Ok(())
+        };
+        match value.get("type").and_then(Value::as_str) {
+            Some("function_call") => {
+                validate(&value, "call_id", "arguments")?;
+                crate::contracts::required_text(&value, "name")?;
+            }
+            Some("function_call_output") if !value.get("output").is_some_and(Value::is_string) => {
+                return Err(format!("corrupt transcript output at line {index}"));
+            }
+            _ => {}
+        }
+        if let Some(calls) = value.get("tool_calls") {
+            for call in calls.as_array().ok_or("corrupt transcript tool_calls")? {
+                crate::contracts::required_text(call, "id")?;
+                let function = call.get("function").ok_or("corrupt transcript function")?;
+                crate::contracts::required_text(function, "name")?;
+                crate::contracts::tool_arguments(crate::contracts::required_text(
+                    function,
+                    "arguments",
+                )?)?;
             }
         }
-        Err(_) => {}
+        if value.get("role").and_then(Value::as_str) == Some("tool") {
+            crate::contracts::required_text(&value, "tool_call_id")?;
+            if !value.get("content").is_some_and(Value::is_string) {
+                return Err(format!("corrupt transcript tool content at line {index}"));
+            }
+        }
     }
-    msg
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -1151,6 +1204,9 @@ fn tokenize_hybrid_raw_rag(text: &str) -> Vec<String> {
 }
 
 pub(super) fn execute_context_budget_read(transcript_path: &Path) -> String {
+    if let Err(e) = validate_transcript(transcript_path) {
+        return format!("error: {e}");
+    }
     let raw_items = read_all_raw_transcript_items(transcript_path);
     let active_indexed = load_transcript_indexed_items(transcript_path);
     let active_items: Vec<Value> = active_indexed.iter().map(|(_, v)| v.clone()).collect();
@@ -1192,6 +1248,9 @@ pub(super) fn execute_context_budget_read(transcript_path: &Path) -> String {
 /// 1-line notes (`replace` / `mask`) without writing a full summary, while keeping 100% of
 /// raw history intact in `sylphx-transcript.jsonl` for `memory_recall`.
 pub(super) fn execute_context_edit(transcript_path: &Path, args: &Value) -> String {
+    if let Err(e) = validate_transcript(transcript_path) {
+        return format!("error: {e}");
+    }
     let before_indexed = load_transcript_indexed_items(transcript_path);
     let before_items: Vec<Value> = before_indexed.iter().map(|(_, v)| v.clone()).collect();
     let tokens_before = estimate_items_tokens(&before_items);
@@ -1277,7 +1336,9 @@ pub(super) fn execute_context_edit(transcript_path: &Path, args: &Value) -> Stri
         "replace": args.get("replace").or_else(|| args.get("mask")).cloned().unwrap_or(Value::Null),
         "timestamp_ms": anyagents_core::now_ms(),
     });
-    append_transcript_message(transcript_path, &edit_event);
+    if let Err(e) = append_transcript_message(transcript_path, &edit_event) {
+        return format!("error: {e}");
+    }
 
     let after_items = load_transcript_input_items(transcript_path);
     let tokens_after = estimate_items_tokens(&after_items);
@@ -1309,6 +1370,9 @@ pub(super) fn execute_context_edit(transcript_path: &Path, args: &Value) -> Stri
 pub(super) const MEMORY_RECALL_MAX_BYTES: usize = 32_768;
 
 pub(super) fn execute_memory_recall(transcript_path: &Path, args: &Value) -> String {
+    if let Err(e) = validate_transcript(transcript_path) {
+        return format!("error: {e}");
+    }
     let all_items = read_all_raw_transcript_items(transcript_path);
     let default_snapshot = all_items.last().map_or(0, |item| item.index + 1);
     let (snapshot, offset) = match args.get("cursor").and_then(Value::as_str) {
@@ -1363,6 +1427,17 @@ fn render_memory_recall(
     active: &[(usize, Value)],
     args: &Value,
 ) -> String {
+    if let Some(raw) = args.get("range") {
+        let Some(raw) = raw.as_str() else {
+            return "error: range must be a string".into();
+        };
+        let raw = raw.strip_prefix("transcript:").unwrap_or(raw).trim();
+        let (a, b) = raw.split_once('-').unwrap_or((raw, raw));
+        match (a.trim().parse::<usize>(), b.trim().parse::<usize>()) {
+            (Ok(a), Ok(b)) if a <= b && a < all_items.len() => {}
+            _ => return "error: invalid or out-of-bounds transcript range".into(),
+        }
+    }
     if all_items.is_empty() {
         return serde_json::to_string_pretty(&json!({
             "mode": "empty",
@@ -1787,7 +1862,7 @@ mod projection_tests {
             json!({"type":"function_call", "call_id":"reused", "name":"bash", "arguments":"{}"});
         let output = json!({"type":"function_call_output", "call_id":"reused", "output":"same exact output"});
         for item in [&call, &output, &call, &output] {
-            append_transcript_message(&path, item);
+            append_transcript_message(&path, item).unwrap();
         }
         for _ in 0..3 {
             let indexed = load_transcript_indexed_items(&path);
@@ -1803,7 +1878,7 @@ mod projection_tests {
             append_transcript_message(
                 &path,
                 &json!({"type":"context_window_open", "handoff":"keep both occurrences", "retained_items":retained}),
-            );
+            ).unwrap();
         }
     }
 
@@ -1822,7 +1897,8 @@ mod projection_tests {
                 break;
             };
             // New receipts must not shift the result represented by a cursor.
-            append_transcript_message(path, &json!({"role":"user", "content":"later receipt"}));
+            append_transcript_message(path, &json!({"role":"user", "content":"later receipt"}))
+                .unwrap();
             args["cursor"] = json!(cursor);
         }
         combined
@@ -1837,14 +1913,16 @@ mod projection_tests {
         append_transcript_message(
             &path,
             &json!({"type":"function_call", "call_id":"huge", "name":"bash", "arguments":"{}"}),
-        );
-        append_transcript_message(&path, &result);
+        )
+        .unwrap();
+        append_transcript_message(&path, &result).unwrap();
         append_transcript_message(
             &path,
             &json!({"type":"context_window_open", "handoff":"continue", "retained_items":[
                 {"type":"function_call", "call_id":"huge", "name":"bash", "arguments":"{}"}, result
             ]}),
-        );
+        )
+        .unwrap();
         let active = execute_memory_recall(&path, &json!({"range":"transcript:1-1"}));
         assert!(active.contains("Already present in active context"));
         assert!(!active.contains("large needle"));
@@ -1856,7 +1934,7 @@ mod projection_tests {
                 {"type":"function_call", "call_id":"huge", "name":"bash", "arguments":"{}"},
                 {"type":"function_call_output", "call_id":"huge", "output":"raw pointer transcript:1-1"}
             ]}),
-        );
+        ).unwrap();
         for args in [
             json!({"range":"transcript:1-1"}),
             json!({"only_tools":true, "sort":"oldest", "limit":2}),
@@ -1877,12 +1955,14 @@ mod projection_tests {
             append_transcript_message(
                 &path,
                 &json!({"role":"assistant", "content":format!("needle {n}: {}", "x".repeat(2500))}),
-            );
+            )
+            .unwrap();
         }
         append_transcript_message(
             &path,
             &json!({"type":"context_window_open", "handoff":"done", "retained_items":[]}),
-        );
+        )
+        .unwrap();
         let query =
             execute_memory_recall(&path, &json!({"query":"needle", "limit":50, "radius":10}));
         assert!(query.len() <= MEMORY_RECALL_MAX_BYTES);
@@ -1931,7 +2011,7 @@ mod projection_tests {
         assert_eq!(raw.len(), total_len);
         assert!(validate_responses_input(&raw[cut_point..]).is_err());
         for item in raw {
-            append_transcript_message(&path, &item);
+            append_transcript_message(&path, &item).unwrap();
         }
         let before = std::fs::read(&path).unwrap();
         let projected = load_transcript_input_items(&path);
@@ -2032,7 +2112,7 @@ mod projection_tests {
                 output(1),
                 json!({"role": "user", "content": "future message must remain"}),
             ] {
-                append_transcript_message(&path, &item);
+                append_transcript_message(&path, &item).unwrap();
             }
             let before = std::fs::read(&path).unwrap();
             let projected = load_transcript_input_items(&path);
@@ -2054,12 +2134,13 @@ mod projection_tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("sylphx-transcript.jsonl");
         let raw = json!({"type":"function_call_output", "call_id":"fixture", "output":"password=fixturecanaryappend keep"});
-        let safe = append_transcript_message(&path, &raw);
+        let safe = append_transcript_message(&path, &raw).unwrap();
         assert_eq!(safe["output"], "password=[redacted] keep");
         append_transcript_message(
             &path,
             &json!({"type":"native_turn_state", "pending_messages":[raw]}),
-        );
+        )
+        .unwrap();
         let stored = std::fs::read_to_string(&path).unwrap();
         assert!(!stored.contains("fixturecanaryappend"));
         assert_eq!(stored.lines().count(), 2);
@@ -2067,7 +2148,10 @@ mod projection_tests {
             serde_json::from_str::<Value>(line).unwrap();
         }
         let ordinary = json!({"type":"function_call_output", "call_id":"fixture-control", "output":"exit_code: 7\nnovel long actionable diagnostic 測試🙂"});
-        assert_eq!(append_transcript_message(&path, &ordinary), ordinary);
+        assert_eq!(
+            append_transcript_message(&path, &ordinary).unwrap(),
+            ordinary
+        );
         assert_eq!(
             std::fs::read_to_string(&path)
                 .unwrap()
@@ -2102,7 +2186,7 @@ mod projection_tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("legacy.jsonl");
         for _ in 0..159 {
-            append_transcript_message(&path, &json!({"role": "user", "content": "old"}));
+            append_transcript_message(&path, &json!({"role": "user", "content": "old"})).unwrap();
         }
         append_transcript_message(
             &path,
@@ -2110,12 +2194,14 @@ mod projection_tests {
                 {"id": "a", "function": {"name": "read_file", "arguments": "{}"}},
                 {"id": "b", "function": {"name": "read_file", "arguments": "{}"}}
             ]}),
-        );
+        )
+        .unwrap();
         for id in ["b", "a"] {
             append_transcript_message(
                 &path,
                 &json!({"role": "tool", "tool_call_id": id, "content": "done"}),
-            );
+            )
+            .unwrap();
         }
         validate_responses_input(&load_transcript_input_items(&path)).unwrap();
     }
@@ -2132,7 +2218,7 @@ mod projection_tests {
             output(1),
             json!({"role": "user", "content": "continue"}),
         ] {
-            append_transcript_message(&path, &item);
+            append_transcript_message(&path, &item).unwrap();
         }
         let before = std::fs::read(&path).unwrap();
         let projected = load_transcript_input_items(&path);

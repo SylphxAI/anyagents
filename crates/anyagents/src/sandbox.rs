@@ -93,16 +93,7 @@ pub fn is_isolated_test_env() -> bool {
 }
 
 fn isolated_test_env(test_build: bool) -> bool {
-    test_build
-        || std::env::var_os("ANYAGENTS_FAKE_MODE").is_some()
-        || std::env::var_os("ANYAGENTS_TESTS").is_some()
-        || std::env::var_os("ANYAGENTS_FAKE_LOG").is_some()
-        || std::env::var_os("ANYAGENTS_HARNESS_BIN").is_some()
-        || std::env::var_os("ANYAGENTS_CLAUDE_BIN").is_some()
-        || std::env::var_os("ANYAGENTS_CODEX_BIN").is_some()
-        || std::env::var_os("ANYAGENTS_FAKE_VENDOR_MODE").is_some()
-        || std::env::var_os("CARGO_TARGET_TMPDIR").is_some()
-        || std::env::var_os("NEXTEST_RUN_ID").is_some()
+    test_build || std::env::var_os("ANYAGENTS_TESTS").is_some()
 }
 
 /// The server user's home directory on the host, resolved from
@@ -150,10 +141,20 @@ pub fn seat_named() -> bool {
 }
 
 /// Whether multi-UID OS seats are configured for this deployment (either via
-/// explicit `ANYAGENTS_*` environment variables or provisioned host `seat-*`
-/// accounts with `anyagents-sock` and `anyagents-setpriv` outside test harnesses).
+/// explicit `ANYAGENTS_*` environment variables). Host account names alone
+/// do not select an execution mode or admit a principal.
 pub fn seats_configured() -> bool {
+    // Presence is selection: an empty or malformed map must not downgrade to
+    // single-UID execution or fall back to another principal source.
+    if std::env::var_os("ANYAGENTS_PRINCIPALS").is_some()
+        || std::env::var_os("ANYAGENTS_PRINCIPAL_REGISTRY").is_some_and(|path| {
+            !matches!(std::fs::symlink_metadata(path), Err(err) if err.kind() == std::io::ErrorKind::NotFound)
+        })
+    {
+        return true;
+    }
     if [
+        "ANYAGENTS_PRINCIPALS",
         "ANYAGENTS_AGENTS",
         "ANYAGENTS_AGENT_UID",
         "ANYAGENTS_AGENT_GID",
@@ -164,10 +165,7 @@ pub fn seats_configured() -> bool {
     {
         return true;
     }
-    !is_isolated_test_env()
-        && launcher().is_file()
-        && lookup_group("anyagents-sock").is_some()
-        && !host_seat_users().is_empty()
+    false
 }
 
 /// Whether every harness process this server starts satisfies the deployment's
@@ -176,19 +174,14 @@ pub fn seats_configured() -> bool {
 /// `anyagents-setpriv`. When OS seats are configured, the launcher must be
 /// installed and every pinned uid must be distinct from root and the server uid.
 pub fn launch_boundary(agents: &[String]) -> bool {
-    if std::env::var_os("ANYAGENTS_FAKE_MODE").is_some() {
-        // A test machine has no OS accounts of its own to place an agent in.
-        return true;
-    }
     if !seats_configured() {
         return true;
     }
     if !launcher().is_file() {
         return false;
     }
-    agents.iter().all(|agent| match pinned_uid(agent) {
-        Some(uid) => uid != 0 && Some(uid) != Some(current_uid()),
-        None => true,
+    agents.iter().all(|agent| {
+        seat_for_agent(agent).is_some_and(|(_, uid, _, _)| uid != 0 && uid != current_uid())
     })
 }
 
@@ -196,45 +189,10 @@ pub fn launch_boundary(agents: &[String]) -> bool {
 /// when running outside isolated tests.
 pub(crate) fn sock_gid_for() -> Option<u32> {
     number("ANYAGENTS_SOCKET_GID").or_else(|| {
-        if is_isolated_test_env() {
-            None
-        } else {
-            lookup_group("anyagents-sock")
-        }
+        (!is_isolated_test_env())
+            .then(|| lookup_group("anyagents-sock"))
+            .flatten()
     })
-}
-
-/// The uid the deployment's own line gives one agent: `<agent>=<uid>` entries
-/// of `ANYAGENTS_AGENTS`.
-pub fn pinned_uid(agent_name: &str) -> Option<u32> {
-    let line = std::env::var("ANYAGENTS_AGENTS").ok()?;
-    line.split(',')
-        .filter_map(|entry| entry.split_once('='))
-        .find(|(name, _)| name.trim() == agent_name)
-        .and_then(|(_, uid)| uid.trim().parse::<u32>().ok())
-}
-
-/// The seat user name a host provisions for one agent: `seat-<name>`.
-fn seat_user(agent_name: &str) -> String {
-    let lower = agent_name.to_ascii_lowercase();
-    if lower.starts_with("seat-") {
-        lower
-    } else {
-        format!("seat-{lower}")
-    }
-}
-
-fn lookup_user(name: &str) -> Option<(u32, u32)> {
-    let c_name = std::ffi::CString::new(name).ok()?;
-    // SAFETY: `c_name` is NUL-terminated; the fields are copied at once.
-    unsafe {
-        let entry = libc::getpwnam(c_name.as_ptr());
-        if entry.is_null() {
-            None
-        } else {
-            Some(((*entry).pw_uid, (*entry).pw_gid))
-        }
-    }
 }
 
 fn lookup_group(name: &str) -> Option<u32> {
@@ -250,12 +208,15 @@ fn lookup_group(name: &str) -> Option<u32> {
     }
 }
 
+mod principals;
+#[cfg(test)]
+use principals::read_principal_registry;
+pub(crate) use principals::{bind_principal, load_principal_registry, reconcile_principals};
+
 /// The seat one agent runs in: `(seat user, uid, gid, socket gid)`.
 ///
-/// A single-agent test deployment takes its configured uid. A deployment with
-/// several agents reads the host's own account for each, `seat-<agent name>`,
-/// and the `anyagents-sock` group every seat belongs to. A host account is
-/// this machine's admission; it is never invented from a name an agent wrote.
+/// Only the operator-owned ANYAGENTS_PRINCIPALS map keyed by immutable agent
+/// identity admits a principal. Names and filesystem ownership cannot admit one.
 #[allow(dead_code)]
 pub fn seat_for_agent(agent_name: &str) -> Option<(String, u32, u32, u32)> {
     seat_for_agent_with_hint(agent_name, None)
@@ -265,146 +226,34 @@ pub fn seat_for_agent_with_hint(
     agent_name: &str,
     parent_name: Option<&str>,
 ) -> Option<(String, u32, u32, u32)> {
-    let configured = configured_seat();
-    let agents = std::env::var("ANYAGENTS_AGENTS").unwrap_or_default();
-    let explicit = configured.is_some() && agents.trim() == agent_name;
-    if let Some((uid, gid, sock_gid)) = configured
-        && (explicit || std::env::var_os("ANYAGENTS_FAKE_MODE").is_some())
-    {
-        return Some((agent_name.to_string(), uid, gid, sock_gid));
+    let _ = parent_name; // Display/ancestry metadata is never execution authority.
+    if let Some(raw) = std::env::var_os("ANYAGENTS_PRINCIPALS") {
+        return admitted_principal(raw.to_str()?, agent_name);
     }
-    if pinned_uid(agent_name).is_some() && std::env::var_os("ANYAGENTS_TESTS").is_some() {
-        // A test machine is its own single seat. Its primary group need not
-        // have the same numeric ID as its user (for example, on macOS).
-        return Some((
-            agent_name.to_string(),
-            current_uid(),
-            server_gid(),
-            server_gid(),
-        ));
-    }
-    if let Some(uid) = pinned_uid(agent_name)
-        && let Some(sock_gid) = sock_gid_for()
-    {
-        // The deployment's own line gives this agent its uid; the server gives
-        // the capability to the group that uid shares, and no other.
-        return Some((seat_user(agent_name), uid, uid, sock_gid));
-    }
-    if std::env::var_os("ANYAGENTS_FAKE_MODE").is_some() || !seats_configured() {
-        return None;
-    }
-    // The uid this deployment gives the agent, or the host's provisioned
-    // `seat-<name>` account when `ANYAGENTS_AGENTS` is not explicitly set.
-    let mut user = seat_user(agent_name);
-    let (uid, gid) = match pinned_uid(agent_name) {
-        Some(uid) => (uid, lookup_user(&user).map(|(_, gid)| gid).unwrap_or(uid)),
-        None => {
-            if is_isolated_test_env() {
-                return None;
-            }
-            if let Some(found) = lookup_user(&user) {
-                found
-            } else if std::env::var_os("ANYAGENTS_AGENTS").is_none() {
-                let (fallback_user, found) = fallback_seat(agent_name, parent_name)?;
-                user = fallback_user;
-                found
-            } else {
-                return None;
-            }
-        }
-    };
-    let sock_gid = sock_gid_for()?;
+    let path = std::env::var_os("ANYAGENTS_PRINCIPAL_REGISTRY")?;
+    let raw = principals::read_principal_registry(Path::new(&path).parent()?).ok()??;
+    admitted_principal(&raw, agent_name)
+}
+
+/// Operator-owned map keyed by immutable agent ID, never inferred from names or files.
+fn admitted_principal(raw: &str, agent_id: &str) -> Option<(String, u32, u32, u32)> {
+    let values: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let entry = values.get(agent_id)?;
+    let number = |key| entry.get(key)?.as_u64().and_then(|n| u32::try_from(n).ok());
+    let uid = number("uid")?;
     if uid == 0 || uid == current_uid() {
         return None;
     }
-    Some((user, uid, gid, sock_gid))
-}
-
-fn fallback_seat(agent_name: &str, parent_name: Option<&str>) -> Option<(String, (u32, u32))> {
-    if let Some(parent) = parent_name {
-        let direct = seat_user(parent);
-        if let Some((uid, gid)) = lookup_user(&direct)
-            && server_has_gid(gid)
-        {
-            return Some((direct, (uid, gid)));
-        }
-        if let Some((prefix, _)) = parent.split_once('-') {
-            let candidate = seat_user(prefix);
-            if let Some((uid, gid)) = lookup_user(&candidate)
-                && server_has_gid(gid)
-            {
-                return Some((candidate, (uid, gid)));
-            }
-        }
-    }
-    if let Some((prefix, _)) = agent_name.split_once('-') {
-        let candidate = seat_user(prefix);
-        if let Some((uid, gid)) = lookup_user(&candidate)
-            && server_has_gid(gid)
-        {
-            return Some((candidate, (uid, gid)));
-        }
-    }
-    let all_seats = host_seat_users();
-    if all_seats.is_empty() {
-        return None;
-    }
-    let hash = agent_name.bytes().fold(0usize, |acc, b| {
-        acc.wrapping_mul(31).wrapping_add(b as usize)
-    });
-    all_seats.get(hash % all_seats.len()).cloned()
-}
-
-fn host_seat_users() -> Vec<(String, (u32, u32))> {
-    if !is_isolated_test_env() {
-        static CACHE: std::sync::OnceLock<Vec<(String, (u32, u32))>> = std::sync::OnceLock::new();
-        return CACHE.get_or_init(host_seat_users_uncached).clone();
-    }
-    host_seat_users_uncached()
-}
-
-fn host_seat_users_uncached() -> Vec<(String, (u32, u32))> {
-    let Ok(text) = std::fs::read_to_string("/etc/passwd") else {
-        return Vec::new();
-    };
-    let me = current_uid();
-    let mut out = Vec::new();
-    for line in text.lines() {
-        let mut parts = line.split(':');
-        let (Some(name), Some(_), Some(uid_s), Some(gid_s)) =
-            (parts.next(), parts.next(), parts.next(), parts.next())
-        else {
-            continue;
-        };
-        if !name.starts_with("seat-") {
-            continue;
-        }
-        if let (Ok(uid), Ok(gid)) = (uid_s.parse::<u32>(), gid_s.parse::<u32>())
-            && uid != 0
-            && uid != me
-            && server_has_gid(gid)
-        {
-            out.push((name.to_string(), (uid, gid)));
-        }
-    }
-    out
-}
-
-fn server_has_gid(target_gid: u32) -> bool {
-    if server_gid() == target_gid {
-        return true;
-    }
-    // SAFETY: getgroups(0, null) returns the supplementary group count.
-    let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
-    if count > 0 {
-        let mut gids = vec![0 as libc::gid_t; count as usize];
-        // SAFETY: `gids` has capacity `count`.
-        let read = unsafe { libc::getgroups(count, gids.as_mut_ptr()) };
-        if read > 0 && gids[..read as usize].contains(&target_gid) {
-            return true;
-        }
-    }
-    !is_isolated_test_env() && server_user_in_group_db(target_gid) && launcher().is_file()
+    Some((
+        entry
+            .get("user")?
+            .as_str()
+            .filter(|user| !user.trim().is_empty())?
+            .to_string(),
+        uid,
+        number("gid")?,
+        number("socket_gid")?,
+    ))
 }
 
 fn server_user_in_group_db(target_gid: u32) -> bool {
@@ -522,73 +371,11 @@ pub fn seat_launch_spec_with_hint(
     ))
 }
 
-/// If `config_dir` already exists on disk and its group belongs to a provisioned
-/// host `seat-*` account, return that seat's `(user, uid, gid, seat_launch_spec)`
-/// so `describe()`, `rename`, and runtime reconciliation never flip a running
-/// agent's config directory to a different seat group.
+/// Historical directory ownership is not an admission record. Kept as a
+/// compatibility query that deliberately grants no execution authority.
 pub fn existing_config_seat(config_dir: &Path) -> Option<(String, u32, u32, Option<String>)> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-        if is_isolated_test_env() {
-            return None;
-        }
-        let meta = std::fs::metadata(config_dir).ok()?;
-        let dir_gid = meta.gid();
-        if dir_gid == 0 || dir_gid == server_gid() {
-            return None;
-        }
-        let candidates: Vec<(String, (u32, u32))> = host_seat_users()
-            .into_iter()
-            .filter(|(_, (_, gid))| *gid == dir_gid)
-            .collect();
-        if candidates.is_empty() {
-            return None;
-        }
-        let chosen = if candidates.len() == 1 {
-            candidates.into_iter().next()
-        } else {
-            let marker = std::fs::read_to_string(config_dir.join(".anyagents-seat"))
-                .ok()
-                .map(|s| seat_user(s.trim()));
-            let by_marker = marker.and_then(|m| candidates.iter().find(|(u, _)| u == &m).cloned());
-            by_marker
-                .or_else(|| {
-                    for key_file in ["state_5.sqlite", "installation_id", "logs_2.sqlite"] {
-                        if let Ok(m) = std::fs::metadata(config_dir.join(key_file)) {
-                            let f_uid = m.uid();
-                            if let Some(found) =
-                                candidates.iter().find(|(_, (uid, _))| *uid == f_uid)
-                            {
-                                return Some(found.clone());
-                            }
-                        }
-                    }
-                    let mut uid_counts = std::collections::HashMap::<u32, usize>::new();
-                    if let Ok(entries) = std::fs::read_dir(config_dir) {
-                        for entry in entries.flatten() {
-                            if let Ok(em) = entry.metadata() {
-                                *uid_counts.entry(em.uid()).or_insert(0) += 1;
-                            }
-                        }
-                    }
-                    candidates
-                        .iter()
-                        .filter(|(_, (uid, _))| uid_counts.contains_key(uid))
-                        .max_by_key(|(_, (uid, _))| uid_counts.get(uid).copied().unwrap_or(0))
-                        .cloned()
-                })
-                .or_else(|| candidates.into_iter().next())
-        };
-        if let Some((user, (uid, gid))) = chosen {
-            let spec = sock_gid_for()
-                .filter(|_| launcher().is_file())
-                .map(|sock_gid| {
-                    format!("{}\t{uid}\t{gid}\t{gid},{sock_gid}", launcher().display())
-                });
-            return Some((user, uid, gid, spec));
-        }
-    }
+    let _ = config_dir;
+    // Historical ownership and mutable vendor-file owners cannot admit a principal.
     None
 }
 
@@ -621,32 +408,17 @@ pub fn share_capability_with_seat(path: &Path, gid: u32) -> std::io::Result<()> 
     Ok(())
 }
 
-/// Give one agent's config directory to its seat. Workdirs have their own
-/// fail-closed sharing and admission before the agent becomes running.
-#[allow(dead_code)]
-pub fn share_config_with_seat(config_dir: &Path, gid: u32) {
-    let uid = host_seat_users()
-        .into_iter()
-        .find_map(|(_, (u, g))| (g == gid).then_some(u))
-        .unwrap_or(gid);
-    share_config_with_seat_uid(config_dir, uid, gid);
-}
-
+/// Give one agent's config directory to its explicitly admitted principal.
+/// Workdirs have separate fail-closed sharing before admission.
 pub fn share_config_with_seat_uid(config_dir: &Path, uid: u32, gid: u32) {
     let (eff_uid, eff_gid) = match existing_config_seat(config_dir) {
         Some((_, existing_uid, existing_gid, _)) => (existing_uid, existing_gid),
         None => (uid, gid),
     };
-    if config_dir.is_dir() {
-        if let Some((user, _)) = host_seat_users()
-            .into_iter()
-            .find(|(_, (u, g))| *u == eff_uid && *g == eff_gid)
-        {
-            let _ = std::fs::write(config_dir.join(".anyagents-seat"), format!("{user}\n"));
-        }
-        if let Err(err) = give_tree(config_dir, eff_uid, eff_gid) {
-            eprintln!("seat: cannot share {}: {err}", config_dir.display());
-        }
+    if config_dir.is_dir()
+        && let Err(err) = give_tree(config_dir, eff_uid, eff_gid)
+    {
+        eprintln!("seat: cannot share {}: {err}", config_dir.display());
     }
     // Learned facts and agent-authored skills are the only writable host
     // authority outside config/work. Session pins, raw history and migration
@@ -703,16 +475,9 @@ pub fn share_worktree_with_seat(
         .count();
     if depth < 3
         || host_home_dir().is_some_and(|h| canon == h || canon == h.join("workspace"))
-        || matches!(
-            canon.to_str(),
-            Some(
-                "/scratch/wt"
-                    | "/scratch/wt/owners-main"
-                    | "/workspace-data/workspace"
-                    | "/workspace-data/workspace/.worktrees"
-            )
-        )
-        || canon.starts_with("/workspace-data/build-targets")
+        || protected_roots()
+            .iter()
+            .any(|root| canon == *root || canon.starts_with(root))
     {
         return Err(Error::WorkdirPermission {
             path: path.display().to_string(),
@@ -720,6 +485,19 @@ pub fn share_worktree_with_seat(
         });
     }
     crate::worktree_access::share(path, uid, gid, journal)
+}
+
+fn protected_roots() -> Vec<PathBuf> {
+    std::env::var_os("ANYAGENTS_PROTECTED_ROOTS")
+        .map(|raw| {
+            std::env::split_paths(&raw)
+                // Match the canonical target against the canonical protected
+                // tree, including macOS /var and /tmp aliases. Missing roots
+                // retain their declared path until they can be resolved.
+                .map(|root| std::fs::canonicalize(&root).unwrap_or(root))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Share a Unix socket (`anyagents.sock` or `wake.sock`) with the deployment's
@@ -747,6 +525,10 @@ pub fn share_socket_with_seats(path: &Path) {
 /// Ensure an operator CLI or server invocation running in a pre-existing login
 /// shell inherits every supplementary `seat-*` / `anyagents-sock` group granted
 /// to the operator user in `/etc/group`.
+fn operator_may_hydrate(uid: u32, admitted: Option<u32>) -> bool {
+    uid != 0 && admitted == Some(uid)
+}
+
 pub fn hydrate_operator_groups_if_needed() {
     #[cfg(unix)]
     {
@@ -758,7 +540,12 @@ pub fn hydrate_operator_groups_if_needed() {
             return;
         }
         let me = current_uid();
-        if me == 0 || me >= 2100 {
+        if !operator_may_hydrate(
+            me,
+            std::env::var("ANYAGENTS_OPERATOR_UID")
+                .ok()
+                .and_then(|v| v.parse().ok()),
+        ) {
             return;
         }
         let Some(my_name) = lookup_user_name(me) else {
@@ -771,14 +558,11 @@ pub fn hydrate_operator_groups_if_needed() {
         let mut expected_gids = vec![my_gid];
         for line in group_text.lines() {
             let mut parts = line.split(':');
-            let (Some(gname), Some(_pw), Some(gid_s), Some(members)) =
+            let (Some(_gname), Some(_pw), Some(gid_s), Some(members)) =
                 (parts.next(), parts.next(), parts.next(), parts.next())
             else {
                 continue;
             };
-            if !(gname == "anyagents-sock" || gname.starts_with("seat-")) {
-                continue;
-            }
             let Ok(gid) = gid_s.trim().parse::<u32>() else {
                 continue;
             };
@@ -834,64 +618,26 @@ pub fn hydrate_operator_groups_if_needed() {
     }
 }
 
-type SeatCacheKey = (String, Option<String>);
-type SeatCacheMap = std::collections::HashMap<SeatCacheKey, Option<(u32, u32)>>;
-
 /// Registered root-to-principal resolution is the same authority used by vendor
 /// launch. Unregistered directories remain foreign in the shared inventory.
 pub(crate) fn peer_principals(store: &anyagents_core::Store) -> Result<String, Error> {
-    let agents = store.list_agents()?;
-    let by_id: std::collections::HashMap<&str, &anyagents_core::Agent> =
-        agents.iter().map(|a| (a.id.as_str(), a)).collect();
-    let mut seat_cache: SeatCacheMap = std::collections::HashMap::new();
-    let large_inventory = agents.len() > 32;
-    let mut peers = Vec::with_capacity(agents.len().min(512));
-    for agent in &agents {
-        if large_inventory && agent.state == "archived" {
-            continue;
-        }
-        let cfg = anyagents_core::agent_config_dir(store.data_dir(), &agent.id);
-        let root = cfg.parent().unwrap().to_owned();
-        if let Some((_, uid, gid, _)) = existing_config_seat(&cfg) {
-            peers.push(anyagents_harness::SeatPeer { root, uid, gid });
-            continue;
-        }
-        let mut curr = agent.parent_id.as_ref().map(|p| p.as_str());
-        let mut hops = 0usize;
-        let mut last_name = None;
-        while let Some(pid) = curr {
-            if hops >= 16 {
-                break;
+    let mut peers = Vec::new();
+    for agent in store.list_agents()? {
+        if let Some((_, uid, gid, _)) = crate::create::resolved_agent_seat_info(store, &agent) {
+            let config = anyagents_core::agent_config_dir(store.data_dir(), &agent.id);
+            // The immutable-ID grant, not historical ownership, authorizes this
+            // projection. Reconcile created peers before another seat probes them.
+            if config.is_dir() && existing_config_seat(&config).is_none() {
+                share_config_with_seat_uid(&config, uid, gid);
             }
-            hops += 1;
-            let Some(parent) = by_id.get(pid) else {
-                break;
-            };
-            last_name = Some(parent.name.clone());
-            curr = parent.parent_id.as_ref().map(|p| p.as_str());
-        }
-        let hint = last_name.or_else(|| {
-            agent
-                .launch_env
-                .iter()
-                .find(|(k, _)| k == "ANYAGENTS_PARENT_NAME")
-                .map(|(_, v)| v.clone())
-        });
-        let key = (agent.name.clone(), hint.clone());
-        let resolved = *seat_cache.entry(key).or_insert_with(|| {
-            if let Some((_, spec)) = seat_launch_spec_with_hint(&agent.name, hint.as_deref()) {
-                let mut parts = spec.split('\t');
-                if let (_, Some(u), Some(g)) = (parts.next(), parts.next(), parts.next())
-                    && let (Ok(uid), Ok(gid)) = (u.parse::<u32>(), g.parse::<u32>())
-                {
-                    return Some((uid, gid));
-                }
-            }
-            seat_for_agent_with_hint(&agent.name, hint.as_deref())
-                .map(|(_, uid, gid, _)| (uid, gid))
-        });
-        if let Some((uid, gid)) = resolved {
-            peers.push(anyagents_harness::SeatPeer { root, uid, gid });
+            peers.push(anyagents_harness::SeatPeer {
+                root: anyagents_core::agent_config_dir(store.data_dir(), &agent.id)
+                    .parent()
+                    .unwrap()
+                    .to_owned(),
+                uid,
+                gid,
+            });
         }
     }
     serde_json::to_string(&peers).map_err(|e| Error::Message(e.to_string()))
@@ -1022,35 +768,145 @@ mod tests {
     }
 
     #[test]
-    fn an_own_seat_test_uses_the_process_group_not_its_uid() {
-        let _env = crate::server::tests::env_lock();
-        // SAFETY: under the server test lock, restored before releasing it.
-        let names = ["ANYAGENTS_TESTS", "ANYAGENTS_AGENTS", "ANYAGENTS_FAKE_MODE"];
-        let previous = names.map(std::env::var_os);
-        unsafe {
-            std::env::set_var("ANYAGENTS_TESTS", "own-seat");
-            std::env::set_var("ANYAGENTS_AGENTS", "own-seat=2101");
-            std::env::remove_var("ANYAGENTS_FAKE_MODE");
+    fn admitted_principals_are_bound_to_immutable_ids_not_names_or_owners() {
+        let raw = r#"{"agt_example":{"user":"worker","uid":42001,"gid":42002,"socket_gid":42003}}"#;
+        assert_eq!(
+            admitted_principal(raw, "agt_example"),
+            Some(("worker".into(), 42001, 42002, 42003))
+        );
+        for alias in ["worker", "seat-worker", "worker-child", "unrelated"] {
+            assert_eq!(admitted_principal(raw, alias), None);
         }
-        let seat = seat_for_agent("own-seat");
-        // SAFETY: as above.
+        for invalid in [
+            "{}",
+            "not-json",
+            r#"{"agt_example":{"user":"worker","uid":0,"gid":1,"socket_gid":1}}"#,
+            r#"{"agt_example":{"user":"worker","uid":42001,"gid":"42002","socket_gid":1}}"#,
+        ] {
+            assert!(admitted_principal(invalid, "agt_example").is_none());
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".anyagents-seat"), "worker").unwrap();
+        std::fs::write(dir.path().join("installation_id"), "mutable vendor file").unwrap();
+        assert!(existing_config_seat(dir.path()).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn peer_inventory_reconciles_created_configs_only_for_registered_principals() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let _env = crate::server::tests::env_lock();
+        let previous = std::env::var_os("ANYAGENTS_PRINCIPALS");
+        let dir = crate::test_tempdir();
+        let store = anyagents_core::Store::open(dir.path().join("state.db")).unwrap();
+        let admitted = store
+            .create_agent(anyagents_core::NewAgent::new("created-worker", "opencode"))
+            .unwrap();
+        let foreign = store
+            .create_agent(anyagents_core::NewAgent::new(
+                "unregistered-worker",
+                "opencode",
+            ))
+            .unwrap();
+        let config = anyagents_core::agent_config_dir(dir.path(), &admitted.id);
+        let foreign_config = anyagents_core::agent_config_dir(dir.path(), &foreign.id);
+        for path in [&config, &foreign_config] {
+            std::fs::create_dir_all(path).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::write(path.join("sentinel"), "preserved").unwrap();
+        }
+        assert_eq!(admitted.state, "created");
+        let uid = if server_uid() == 42001 { 42002 } else { 42001 };
+        let gid = server_gid();
         unsafe {
-            for (name, value) in names.into_iter().zip(previous) {
-                match value {
-                    Some(value) => std::env::set_var(name, value),
-                    None => std::env::remove_var(name),
-                }
-            }
+            std::env::set_var("ANYAGENTS_PRINCIPALS", serde_json::json!({
+            admitted.id.as_str(): {"user":"registered-worker", "uid":uid, "gid":gid, "socket_gid":gid}
+        }).to_string());
+        }
+        let peers: Vec<anyagents_harness::SeatPeer> =
+            serde_json::from_str(&peer_principals(&store).unwrap()).unwrap();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].root, config.parent().unwrap());
+        assert_eq!((peers[0].uid, peers[0].gid), (uid, gid));
+        assert_eq!(std::fs::metadata(&config).unwrap().mode() & 0o7777, 0o2770);
+        assert_eq!(
+            std::fs::metadata(&foreign_config).unwrap().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(store.agent(&admitted.id).unwrap().state, "created");
+        for path in [&config, &foreign_config] {
+            assert_eq!(
+                std::fs::read_to_string(path.join("sentinel")).unwrap(),
+                "preserved"
+            );
         }
         assert_eq!(
-            seat,
-            Some((
-                "own-seat".to_string(),
-                current_uid(),
-                server_gid(),
-                server_gid(),
-            ))
+            peer_principals(&store).unwrap(),
+            serde_json::to_string(&peers).unwrap()
         );
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("ANYAGENTS_PRINCIPALS", value),
+                None => std::env::remove_var("ANYAGENTS_PRINCIPALS"),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_principal_registry_preserves_explicit_grants_without_name_inference() {
+        use std::os::unix::fs::PermissionsExt;
+        let _env = crate::server::tests::env_lock();
+        let dir = crate::test_tempdir();
+        assert!(read_principal_registry(dir.path()).unwrap().is_none());
+        let id = anyagents_core::AgentId::generate();
+        let uid = if current_uid() == 42001 { 42002 } else { 42001 };
+        let raw = serde_json::json!({id.as_str(): {"user":"worker", "uid":uid, "gid":42003, "socket_gid":42004}}).to_string();
+        let path = dir.path().join("execution-principals.json");
+        std::fs::write(&path, &raw).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let previous = std::env::var_os("ANYAGENTS_PRINCIPALS");
+        let previous_registry = std::env::var_os("ANYAGENTS_PRINCIPAL_REGISTRY");
+        unsafe {
+            std::env::remove_var("ANYAGENTS_PRINCIPALS");
+        }
+        load_principal_registry(dir.path()).unwrap();
+        assert_eq!(
+            seat_for_agent(id.as_str()),
+            Some(("worker".into(), uid, 42003, 42004))
+        );
+        assert!(seat_for_agent("worker").is_none());
+        // An explicit map is authoritative even when the fallback is broken.
+        std::fs::write(&path, "corrupted").unwrap();
+        unsafe {
+            std::env::set_var("ANYAGENTS_PRINCIPALS", "{}");
+        }
+        load_principal_registry(dir.path()).unwrap();
+        assert!(seat_for_agent(id.as_str()).is_none());
+        unsafe {
+            std::env::remove_var("ANYAGENTS_PRINCIPALS");
+        }
+        assert!(read_principal_registry(dir.path()).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "corrupted");
+        std::fs::write(&path, &raw).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(read_principal_registry(dir.path()).is_err());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::write(&path, "[]").unwrap();
+        assert!(read_principal_registry(dir.path()).is_err());
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("missing"), &path).unwrap();
+        assert!(read_principal_registry(dir.path()).is_err());
+        unsafe {
+            match previous_registry {
+                Some(value) => std::env::set_var("ANYAGENTS_PRINCIPAL_REGISTRY", value),
+                None => std::env::remove_var("ANYAGENTS_PRINCIPAL_REGISTRY"),
+            }
+            match previous {
+                Some(value) => std::env::set_var("ANYAGENTS_PRINCIPALS", value),
+                None => std::env::remove_var("ANYAGENTS_PRINCIPALS"),
+            }
+        }
     }
 
     #[test]
@@ -1092,6 +948,75 @@ mod tests {
             std::env::remove_var("ANYAGENTS_AGENT_UID");
             std::env::remove_var("ANYAGENTS_AGENT_GID");
             std::env::remove_var("ANYAGENTS_SOCKET_GID");
+        }
+    }
+    #[test]
+    fn operator_hydration_requires_explicit_identity_not_a_uid_range() {
+        for uid in [1000, 2100, 42001, u32::MAX] {
+            assert!(operator_may_hydrate(uid, Some(uid)));
+            assert!(!operator_may_hydrate(uid, None));
+            assert!(!operator_may_hydrate(uid, Some(uid - 1)));
+        }
+        assert!(!operator_may_hydrate(0, Some(0)));
+    }
+
+    #[test]
+    fn protected_roots_are_explicit_and_refuse_only_the_selected_tree() {
+        let _env = crate::server::tests::env_lock();
+        let key = "ANYAGENTS_PROTECTED_ROOTS";
+        let old = std::env::var_os(key);
+        let dir = tempfile::tempdir().unwrap();
+        let selected = dir.path().join("selected");
+        let allowed = dir.path().join("allowed");
+        std::fs::create_dir(&selected).unwrap();
+        std::fs::create_dir(&allowed).unwrap();
+        unsafe {
+            std::env::remove_var(key);
+        }
+        assert!(protected_roots().is_empty());
+        unsafe {
+            std::env::set_var(key, std::env::join_paths([&selected]).unwrap());
+        }
+        assert_eq!(protected_roots(), vec![selected.canonicalize().unwrap()]);
+        let alias = dir.path().join("selected-alias");
+        std::os::unix::fs::symlink(&selected, &alias).unwrap();
+        // An explicit alias protects the same tree, not only its spelling.
+        unsafe {
+            std::env::set_var(key, std::env::join_paths([&alias]).unwrap());
+        }
+        assert_eq!(protected_roots(), vec![selected.canonicalize().unwrap()]);
+        assert!(
+            share_worktree_with_seat(
+                &selected,
+                server_uid(),
+                server_gid(),
+                &dir.path().join("refused.json")
+            )
+            .is_err()
+        );
+        let nested = selected.join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        assert!(
+            share_worktree_with_seat(
+                &nested,
+                server_uid(),
+                server_gid(),
+                &dir.path().join("nested-refused.json")
+            )
+            .is_err()
+        );
+        share_worktree_with_seat(
+            &allowed,
+            server_uid(),
+            server_gid(),
+            &dir.path().join("allowed.json"),
+        )
+        .unwrap();
+        unsafe {
+            match old {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
         }
     }
 }

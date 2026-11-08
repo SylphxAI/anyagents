@@ -31,7 +31,7 @@ pub struct Quote {
     /// The quoted author's id, when Telegram sent one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sender_id: Option<i64>,
-    /// The author, as Telegram names it: `Alex`, `Sage` or `Sage (@sage_bot)`.
+    /// The author, as Telegram names it: `Alex`, `Assistant` or `Assistant (@assistant_bot)`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub author: String,
     /// The quoted message's text, or its caption.
@@ -178,12 +178,12 @@ mod tests {
 
     #[test]
     fn an_agent_quote_reads_as_an_agent_and_markup_never_passes_through() {
-        let mut sage = quote();
-        sage.author_is_bot = true;
-        sage.author = "Sage (@sage_bot)".into();
-        let body = compose("ok", Some(&sage));
+        let mut reader_worker = quote();
+        reader_worker.author_is_bot = true;
+        reader_worker.author = "ReaderWorker (@reader_worker_bot)".into();
+        let body = compose("ok", Some(&reader_worker));
         assert!(
-            body.contains("The agent replied to Sage (@sage_bot)"),
+            body.contains("The agent replied to ReaderWorker (@reader_worker_bot)"),
             "{body}"
         );
         let hostile = Quote {

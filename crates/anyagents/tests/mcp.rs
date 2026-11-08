@@ -134,7 +134,7 @@ fn start_server(data: &std::path::Path) -> Serve {
 }
 
 fn start_server_mode(data: &std::path::Path, mode: &str) -> Serve {
-    let mut child = bin()
+    let mut child = support::contract_server()
         .arg("--data")
         .arg(data)
         .arg(mode)
@@ -429,7 +429,12 @@ async fn mcp_tools_use_the_server_socket() {
         ok_json(call(&beta, "conversation", serde_json::json!({})).await);
     assert_eq!(got.turns.len(), 2);
     assert_eq!(got.turns[0].text, "hello");
-    assert_eq!(got.turns[0].from, "agent:alpha");
+    let alpha_id = anyagents_core::Store::open(dir.path().join("state.db"))
+        .unwrap()
+        .agent_by_name("alpha")
+        .unwrap()
+        .id;
+    assert_eq!(got.turns[0].from, format!("agent:{alpha_id}"));
 
     // A room reaches every other agent, and not the sender.
     // A named group reaches its own members.
@@ -581,10 +586,15 @@ async fn mcp_tools_use_the_server_socket() {
         .join(&spawned.id)
         .join("config")
         .join("fixture-claude-started");
-    support::wait_for(
-        || marker.is_file(),
-        "canonical Claude fixture was not launched",
-    );
+    let deadline = Instant::now() + support::WAIT;
+    while !marker.is_file() {
+        if Instant::now() >= deadline {
+            let views: serde_json::Value =
+                ok_json(call(&alpha, "agents", serde_json::json!({"state":"all"})).await);
+            panic!("canonical Claude fixture was not launched: {views}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
     assert_eq!(
         std::fs::read_to_string(&marker).unwrap().trim(),
         dir.path().join("bin/fixture-claude").to_str().unwrap()
@@ -1335,7 +1345,7 @@ async fn describe_preserves_config_permissions_without_vendor_restart_writers() 
 async fn history_search_defaults_and_all_never_escape_a_private_childs_tree() {
     use anyagents_core::{Incoming, Store};
     let dir = support::physical_tempdir();
-    for name in ["argus", "lyra", "helios", "runner"] {
+    for name in ["coordinator", "planner", "reviewer", "runner"] {
         let created = bin()
             .env("PATH", machine_path(dir.path()))
             .arg("--data")
@@ -1346,25 +1356,31 @@ async fn history_search_defaults_and_all_never_escape_a_private_childs_tree() {
         assert!(created.status.success(), "{created:?}");
     }
     let store = Store::open(dir.path().join("state.db")).unwrap();
-    let argus = store.agent_by_name("argus").unwrap();
-    let lyra = store.agent_by_name("lyra").unwrap();
-    let helios = store.agent_by_name("helios").unwrap();
+    let coordinator = store.agent_by_name("coordinator").unwrap();
+    let planner = store.agent_by_name("planner").unwrap();
+    let reviewer = store.agent_by_name("reviewer").unwrap();
     let runner = store.agent_by_name("runner").unwrap();
-    store.set_agent_parent(&lyra.id, Some(&argus.id)).unwrap();
-    store.set_agent_parent(&helios.id, Some(&argus.id)).unwrap();
-    store.set_agent_parent(&runner.id, Some(&lyra.id)).unwrap();
+    store
+        .set_agent_parent(&planner.id, Some(&coordinator.id))
+        .unwrap();
+    store
+        .set_agent_parent(&reviewer.id, Some(&coordinator.id))
+        .unwrap();
+    store
+        .set_agent_parent(&runner.id, Some(&planner.id))
+        .unwrap();
     // Synthetic bodies only. These identifiers reproduce the reported search
     // shape without importing any production conversation content.
     for (id, text) in [
         (
-            &argus.id,
+            &coordinator.id,
             "C msg_01m6svh4znevfapf3mmpsnk0a4 #2291 private parent",
         ),
         (
-            &helios.id,
+            &reviewer.id,
             "C msg_01m6svrywtez39wvnttdvz53xf #2291 private sibling",
         ),
-        (&lyra.id, "C #2291 authorized own mailbox"),
+        (&planner.id, "C #2291 authorized own mailbox"),
         (&runner.id, "C #2291 authorized descendant"),
     ] {
         store
@@ -1373,10 +1389,10 @@ async fn history_search_defaults_and_all_never_escape_a_private_childs_tree() {
                 Incoming {
                     text: text.into(),
                     sender: Some(
-                        if id == &argus.id {
-                            "agent:lyra"
+                        if id == &coordinator.id {
+                            "agent:planner"
                         } else {
-                            "agent:argus"
+                            "agent:coordinator"
                         }
                         .into(),
                     ),
@@ -1395,7 +1411,7 @@ async fn history_search_defaults_and_all_never_escape_a_private_childs_tree() {
     }
     store
         .record_outbound(
-            &argus.id,
+            &coordinator.id,
             "telegram:chat:-100",
             None,
             "C out_msg_01m6svqn4nesw9ws13fjy48kzt #2291 private outbound",
@@ -1403,12 +1419,12 @@ async fn history_search_defaults_and_all_never_escape_a_private_childs_tree() {
         .unwrap();
     let server = start_server_mode(dir.path(), "serve-admin");
     std::os::unix::fs::symlink("admin.sock", dir.path().join("anyagents.sock")).unwrap();
-    let client = connect(dir.path(), "lyra").await;
+    let client = connect(dir.path(), "planner").await;
     let native: ConversationResponse = ok_json(
         call(
             &client,
             "conversation",
-            serde_json::json!({"with":"lyra", "direction":"in", "query":"C", "limit":4}),
+            serde_json::json!({"with":"planner", "direction":"in", "query":"C", "limit":4}),
         )
         .await,
     );
@@ -1440,7 +1456,12 @@ async fn history_search_defaults_and_all_never_escape_a_private_childs_tree() {
             response.turns
         );
     }
-    for target in ["argus", "helios", argus.id.as_str(), helios.id.as_str()] {
+    for target in [
+        "coordinator",
+        "reviewer",
+        coordinator.id.as_str(),
+        reviewer.id.as_str(),
+    ] {
         for tool in ["conversation", "search"] {
             let denied = call(
                 &client,

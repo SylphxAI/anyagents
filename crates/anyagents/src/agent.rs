@@ -179,8 +179,9 @@ pub fn rename_cmd(data: &Path, agent: &str, new_name: &str) -> Result<(), Error>
                 .into(),
         ));
     }
-    let store = open(data)?;
+    let store = open_with_key(data)?;
     let old = store.agent_by_name(clean_agent)?;
+    crate::operator::ensure(&store, &old.id)?;
     store.record_admin_audit("operator", "agents.rename", &old.name)?;
     let updated = store.rename_agent(&old.id, clean_new)?;
     if old.name != updated.name {
@@ -203,7 +204,7 @@ pub fn rename_cmd(data: &Path, agent: &str, new_name: &str) -> Result<(), Error>
         .as_deref()
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| anyagents_core::agent_work_dir(data, &updated.id));
-    let _ = crate::create::reconcile_agent_runtime_config(&store, data, &updated, &cfg, &work_dir);
+    crate::create::reconcile_agent_runtime_config(&store, data, &updated, &cfg, &work_dir)?;
     crate::telegram::sync_agent_telegram_bot_name(&store, data, &updated);
     let aliases = store.agent_aliases(&updated.id).unwrap_or_default();
     println!(
@@ -253,8 +254,9 @@ pub fn role_cmd(data: &Path, agent: &str, role: Option<&str>, clear: bool) -> Re
                 .into(),
         ));
     }
-    let store = open(data)?;
+    let store = open_with_key(data)?;
     let found = store.agent_by_name(clean_agent)?;
+    crate::operator::ensure(&store, &found.id)?;
     store.record_admin_audit("operator", "agents.role", &found.name)?;
     let new_role = if clear { None } else { role };
     let updated = store.set_agent_role(&found.id, new_role)?;
@@ -264,7 +266,7 @@ pub fn role_cmd(data: &Path, agent: &str, role: Option<&str>, clear: bool) -> Re
         .as_deref()
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| anyagents_core::agent_work_dir(data, &updated.id));
-    let _ = crate::create::reconcile_agent_runtime_config(&store, data, &updated, &cfg, &work_dir);
+    crate::create::reconcile_agent_runtime_config(&store, data, &updated, &cfg, &work_dir)?;
     crate::telegram::sync_agent_telegram_bot_name(&store, data, &updated);
     println!(
         "{}\t{}\t{}",
@@ -380,7 +382,7 @@ pub fn describe_cmd(
             && !clear
         {
             if let Ok(store) = Store::open(data.join("state.db")) {
-                crate::create::sync_all_agent_instructions(&store, data);
+                crate::create::sync_all_agent_instructions(&store, data)?;
             }
             let listed = client::call::<AgentsResponse>(
                 data,
@@ -463,7 +465,7 @@ pub fn describe_cmd(
     }
     let store = Store::open(data.join("state.db"))?;
     if target_name == "all" {
-        crate::create::sync_all_agent_instructions(&store, data);
+        crate::create::sync_all_agent_instructions(&store, data)?;
         println!("synced\tall");
         return Ok(());
     }
@@ -501,10 +503,10 @@ pub fn describe_cmd(
         }
     }
     if rec.parent_id.is_none() {
-        crate::create::sync_all_agent_instructions(&store, data);
+        crate::create::sync_all_agent_instructions(&store, data)?;
     } else {
         let cfg = anyagents_core::agent_config_dir(data, &rec.id);
-        crate::create::sync_agent_description_files(&store, &rec, &cfg);
+        crate::create::sync_agent_description_files(&store, &rec, &cfg)?;
     }
     let pub_desc = rec.public_description();
     if new_desc.is_some() || instructions.is_some() || role.is_some() || clear {
@@ -702,11 +704,12 @@ fn set_state(data: &Path, name: &str, state: &str) -> Result<AgentView, Error> {
             answered.ok_or_else(|| Error::Message("the server answered nothing".to_string()))?;
         return Ok(view);
     }
-    let store = open(data)?;
+    let store = open_with_key(data)?;
     let found = store.agent_by_name(name)?;
     let _lifecycle = store.lock_agent_lifecycle(&found.id)?;
     let found = store.agent(&found.id)?;
     if state == "running" {
+        crate::operator::ensure(&store, &found.id)?;
         let cfg = anyagents_core::agent_config_dir(data, &found.id);
         let work_dir = found
             .workdir
@@ -782,7 +785,8 @@ fn set_state(data: &Path, name: &str, state: &str) -> Result<AgentView, Error> {
         seat_user: seat_info.as_ref().map(|(u, _, _, _)| u.clone()),
         seat_uid: seat_info.as_ref().map(|(_, uid, _, _)| *uid),
         seat_gid: seat_info.as_ref().map(|(_, _, gid, _)| *gid),
-        schedules: crate::schedule::list_agent_schedules(&store, &agent.id, false),
+        schedules: crate::schedule::list_agent_schedules(&store, &agent.id, false)
+            .map_err(Error::Message)?,
     })
 }
 
@@ -856,13 +860,15 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
             .set_agent_scope_as(&agent.id, scope_val, "operator")
             .map_err(|err| err.to_string())?;
         let cfg = anyagents_core::agent_config_dir(data, &agent.id);
-        crate::create::sync_agent_description_files(&store, &agent, &cfg);
+        crate::create::sync_agent_description_files(&store, &agent, &cfg)
+            .map_err(|error| error.to_string())?;
     } else if let Some(pub_val) = parsed.public {
         agent = store
             .set_agent_public_as(&agent.id, pub_val, "operator")
             .map_err(|err| err.to_string())?;
         let cfg = anyagents_core::agent_config_dir(data, &agent.id);
-        crate::create::sync_agent_description_files(&store, &agent, &cfg);
+        crate::create::sync_agent_description_files(&store, &agent, &cfg)
+            .map_err(|error| error.to_string())?;
     }
     // A create is a new instance: its capability is minted so its harness
     // starts with one.
@@ -873,7 +879,9 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        let _ = store.receive(&agent.id, anyagents_core::Incoming::new(prompt));
+        store
+            .receive(&agent.id, anyagents_core::Incoming::new(prompt))
+            .map_err(|e| e.to_string())?;
     }
     let lag = store
         .lag(&agent.id, anyagents_core::now_ms())
@@ -914,7 +922,7 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
         seat_user: seat_info.as_ref().map(|(u, _, _, _)| u.clone()),
         seat_uid: seat_info.as_ref().map(|(_, uid, _, _)| *uid),
         seat_gid: seat_info.as_ref().map(|(_, _, gid, _)| *gid),
-        schedules: crate::schedule::list_agent_schedules(&store, &agent.id, false),
+        schedules: crate::schedule::list_agent_schedules(&store, &agent.id, false)?,
     })
 }
 
@@ -939,8 +947,7 @@ fn set_admin(data: &Path, agent: &str, admin: bool) -> Result<(), Error> {
     }
     let store = open(data)?;
     let rec = store.agent_by_name(agent)?;
-    store.set_agent_admin(&rec.id, admin)?;
-    let _ = store.record_admin_audit(
+    store.record_admin_audit(
         "operator",
         if admin {
             "agents.grant_admin"
@@ -948,7 +955,8 @@ fn set_admin(data: &Path, agent: &str, admin: bool) -> Result<(), Error> {
             "agents.revoke_admin"
         },
         &rec.name,
-    );
+    )?;
+    store.set_agent_admin(&rec.id, admin)?;
     println!("{}", serde_json::json!({"agent": rec.name, "admin": admin}));
     Ok(())
 }
@@ -1018,7 +1026,12 @@ pub fn reconcile_and_enrich_views(data: &Path, views: &mut [AgentView]) {
                 view.seat_gid = Some(gid);
             }
             if view.schedules.is_empty() {
-                view.schedules = crate::schedule::list_agent_schedules(&store, &id, false);
+                match crate::schedule::list_agent_schedules(&store, &id, false) {
+                    Ok(schedules) => view.schedules = schedules,
+                    Err(error) => {
+                        view.last_error = Some(format!("cannot read schedules: {error}"));
+                    }
+                }
             }
         }
         let cfg = anyagents_core::agent_config_dir(data, &id);
@@ -1121,7 +1134,14 @@ pub fn reconcile_and_enrich_views(data: &Path, views: &mut [AgentView]) {
                 view.last_error = None;
             }
         }
-        let mut open_turn = store.has_open_turn(&id).unwrap_or(false);
+        let mut open_turn = match store.has_open_turn(&id) {
+            Ok(value) => value,
+            Err(error) => {
+                view.last_error = Some(format!("cannot read durable turn state: {error}"));
+                view.turn_state = "unknown".into();
+                continue;
+            }
+        };
         if view.state == "running" && view.process == "alive" {
             if open_turn
                 && view.harness == "agy"
@@ -1129,16 +1149,27 @@ pub fn reconcile_and_enrich_views(data: &Path, views: &mut [AgentView]) {
                 && view.quota_reset_at_ms.is_none()
                 && view.last_error.is_none()
             {
-                let opened_at_ms = store
-                    .open_turn(&id)
-                    .ok()
-                    .flatten()
-                    .map(|o| o.opened_at_ms)
-                    .unwrap_or(0);
-                if is_agy_turn_settled_on_disk(&cfg, opened_at_ms, now) {
-                    let _ = store.note_turn_completed(&id);
-                    open_turn = false;
-                    view.turn_state = "idle".to_string();
+                match store.open_turn(&id) {
+                    Ok(Some(open)) if is_agy_turn_settled_on_disk(&cfg, open.opened_at_ms, now) => {
+                        match store.note_turn_completed(&id) {
+                            Ok(()) => {
+                                open_turn = false;
+                                view.turn_state = "idle".to_string();
+                            }
+                            Err(error) => {
+                                view.last_error =
+                                    Some(format!("cannot persist turn completion: {error}"));
+                                view.turn_state = "unknown".into();
+                                continue;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        view.last_error = Some(format!("cannot read open turn: {error}"));
+                        view.turn_state = "unknown".into();
+                        continue;
+                    }
+                    _ => {}
                 }
             }
             if view.quota_reset_at_ms.is_some_and(|ms| ms > now) {
@@ -1410,7 +1441,8 @@ fn list_filtered(
                 seat_user: seat_info.as_ref().map(|(u, _, _, _)| u.clone()),
                 seat_uid: seat_info.as_ref().map(|(_, uid, _, _)| *uid),
                 seat_gid: seat_info.as_ref().map(|(_, _, gid, _)| *gid),
-                schedules: crate::schedule::list_agent_schedules(&store, &agent.id, false),
+                schedules: crate::schedule::list_agent_schedules(&store, &agent.id, false)
+                    .map_err(Error::Message)?,
             });
             continue;
         }
@@ -1685,7 +1717,7 @@ pub fn flush(data: &Path, name: &str) -> Result<(), anyagents_core::Error> {
             work_dir,
             extra_env: Vec::new(),
         };
-        let mut harness = match crate::vendor::vendor_launch(request) {
+        let mut harness = match crate::vendor::vendor_launch_with_store(request, &store) {
             Ok(harness) => harness,
             Err(reason) => {
                 println!("{}\tskipped\t{reason}", agent.name);

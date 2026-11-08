@@ -320,7 +320,11 @@ pub fn write_grok_config(
     let grok_dir = config_dir.join(".grok");
     std::fs::create_dir_all(&grok_dir)?;
     let path = grok_dir.join("config.toml");
-    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(err) => return Err(err.into()),
+    };
     let mut lines: Vec<String> = Vec::new();
     let mut in_mcp_anyagents = false;
     for line in existing.lines() {
@@ -386,11 +390,19 @@ pub fn write_omp_mcp_config(
 fn on_request(method: &str, params: &Value) -> Option<Value> {
     match method {
         "session/request_permission" => {
-            let option_id = params
-                .pointer("/params/options/0/optionId")
-                .or_else(|| params.pointer("/options/0/optionId"))
-                .and_then(Value::as_str)
-                .unwrap_or("allow");
+            let options = params
+                .pointer("/params/options")
+                .or_else(|| params.get("options"))?
+                .as_array()?;
+            // Permission policy is explicit. Malformed/unsupported requests cannot invent a grant.
+            let policy = std::env::var("ANYAGENTS_GROK_PERMISSION_KIND")
+                .unwrap_or_else(|_| "reject_once".into());
+            let option_id = options
+                .iter()
+                .find(|o| o.get("kind").and_then(Value::as_str) == Some(policy.as_str()))?
+                .get("optionId")?
+                .as_str()
+                .filter(|id| !id.is_empty())?;
             Some(json!({
                 "outcome": {
                     "outcome": "selected",
@@ -463,4 +475,54 @@ fn fail(fail: RpcFail) -> HarnessError {
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn unreadable_config_is_preserved_and_absent_config_can_initialize() {
+        let dir = tempfile::tempdir().unwrap();
+        write_grok_config(dir.path(), None, Path::new("/opt/bin/anyagents"), &[]).unwrap();
+        let path = dir.path().join(".grok/config.toml");
+        std::fs::write(&path, [0xff, 0xfe]).unwrap();
+        assert!(write_grok_config(dir.path(), None, Path::new("/opt/bin/anyagents"), &[]).is_err());
+        assert_eq!(std::fs::read(path).unwrap(), [0xff, 0xfe]);
+    }
+
+    #[test]
+    fn permission_selection_requires_an_explicit_valid_configured_option() {
+        let _lock = crate::server::tests::env_lock();
+        let old = std::env::var_os("ANYAGENTS_GROK_PERMISSION_KIND");
+        unsafe {
+            std::env::remove_var("ANYAGENTS_GROK_PERMISSION_KIND");
+        }
+        for malformed in [
+            json!({}),
+            json!({"options":[]}),
+            json!({"options":[{"kind":"allow_once","optionId":"allow"}]}),
+            json!({"options":[{"kind":"reject_once"}]}),
+            json!({"options":[{"kind":"reject_once","optionId":17}]}),
+        ] {
+            assert!(on_request("session/request_permission", &malformed).is_none());
+        }
+        let options = json!({"options":[{"kind":"reject_once","optionId":"deny"},{"kind":"allow_once","optionId":"grant"}]});
+        assert_eq!(
+            on_request("session/request_permission", &options).unwrap()["outcome"]["optionId"],
+            "deny"
+        );
+        unsafe {
+            std::env::set_var("ANYAGENTS_GROK_PERMISSION_KIND", "allow_once");
+        }
+        assert_eq!(
+            on_request("session/request_permission", &options).unwrap()["outcome"]["optionId"],
+            "grant"
+        );
+        unsafe {
+            match old {
+                Some(value) => std::env::set_var("ANYAGENTS_GROK_PERMISSION_KIND", value),
+                None => std::env::remove_var("ANYAGENTS_GROK_PERMISSION_KIND"),
+            }
+        }
+    }
 }

@@ -486,7 +486,7 @@ write or unlink/replace its `config.worktree`, or alter `commondir`; C can use
 its own checkout but cannot read B's HEAD/index, nor can B read C's metadata.
 B's ordinary status, commit and local bare-remote push use its generated seat
 config, with no `-c user.*` or author/committer environment overrides; the commit
-records the exact Kyle author and committer. A's common config retains its owner,
+records the exact caller-configured author and committer. A's common config retains its owner,
 inode, content and owner read access during adoption. Parent config, remote-add
 and `git push -u` each replace the target inode while retaining the managed link;
 both active child UIDs must immediately read common config and run status, with
@@ -529,3 +529,56 @@ ACLs remain unchanged, and outside-link contents and ACLs are preserved.
 
 Shared refs are intentionally writable within one repository. These checks do not
 claim branch-tip integrity for arbitrary agent shell commits or pushes.
+
+## Scheduler isolation and clean-host server fixtures
+
+The local scheduler owns an immediate startup pass and an independent one-second
+loop for `at`, `every`, `file:`, `pid:` and `agent:idle:` schedules. Network-backed
+GitHub and Spiron watches run on a separate loop; a pending external response must
+not hold a later local tick. `local_scheduler_keeps_ticking_while_external_probe_is_blocked`
+starts the production loops, holds a real HTTP response, then creates all five
+local schedule kinds and verifies delivery before releasing that response. A
+future timer and the pending external watch remain undelivered.
+
+`overdue_at_delivers_on_first_local_tick_after_restart` reopens the database and
+checks first-pass delivery of a one-day-overdue timer without duplicate delivery.
+`overdue_at_records_busy_and_paused_deferrals_until_fired` verifies durable
+`deferred:busy` and `deferred:paused` observations while preserving the due time,
+then checks the transition to `fired` after the owner becomes eligible.
+
+Readiness and sign-in server fixtures explicitly clear all six seat/principal
+environment selectors and assert single-UID admission. They exercise token
+routing without depending on a workstation's `anyagents-setpriv` installation.
+Each complete server fixture runs in its own test process. Protected-root
+admission canonicalizes configured aliases before comparing them with the target;
+its regression covers the selected tree, a symlink spelling, a descendant and an
+allowed sibling on Linux and macOS.
+
+## Integration invariants
+
+Seat admission inventories every foreign root, including unregistered roots and
+roots beyond the first 32 peers. Sharing a primary GID does not make two different
+UIDs the same principal. Missing optional peer subtrees are permitted; readable
+foreign config, memory or skills refuse admission. A real authenticated daemon
+socket remains usable, but a regular file at that path receives no exception.
+
+History visibility is applied before candidate limits for every authorized-set
+size. Host refresh holds lifecycle locks through publication and readback, includes
+archived authorized history, and propagates malformed or unreadable source errors
+in production as well as tests. Corpus size never disables mailbox backfill.
+
+Unified code results expose a top-level delivery list collected by host dispatch.
+Snippet return values, source text and console logs cannot populate it. Native
+reply settlement requires an acknowledged message ID and the exact retained
+recipient, including when sends share a parallel tool batch. Updated memory topic
+files do not rewrite an existing host-session snapshot; a new explicit session
+pins the next snapshot.
+
+The regression checks are included in the normal workspace tests:
+
+- Seat admission: more than 40 foreign roots, a readable unregistered tail root,
+  mismatched UID/GID pairs and a registered exact-principal positive control.
+- Scoped history: 18 authorized IDs competing with 2,010 hidden candidates.
+- Code delivery: invented return-value receipts and a caught malformed send
+  yield no host receipt; a real loopback send yields the returned message ID
+  even when the snippet returns null.

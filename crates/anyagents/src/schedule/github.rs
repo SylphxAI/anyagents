@@ -14,6 +14,11 @@ const MAX_PAGES: usize = 1_000;
 
 type Observation = (bool, String);
 
+/// Exact configured check identity; a preview or unrelated audit is not review.
+fn review_check_name() -> String {
+    std::env::var("ANYAGENTS_GITHUB_REVIEW_CHECK").unwrap_or_else(|_| "review".into())
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Checks {
     count: usize,
@@ -127,7 +132,7 @@ pub(super) fn probe(
     let base = std::env::var("ANYAGENTS_GITHUB_API_BASE").unwrap_or_default();
     let key = target_key(&base, owner, repo, reference, pr);
     let mut probes = PROBES.lock().ok()?;
-    Some(probes.probe(
+    Some(probes.probe_with_clock(
         &key,
         owner,
         repo,
@@ -135,7 +140,33 @@ pub(super) fn probe(
         pr,
         now,
         |path, etag, modified| request(&base, path, etag, modified, agent_id, owner),
+        completed_now,
     ))
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static COMPLETION_CLOCK: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) fn with_completion_clock<T>(now: i64, call: impl FnOnce() -> T) -> T {
+    struct Reset(Option<i64>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            COMPLETION_CLOCK.set(self.0);
+        }
+    }
+    let _reset = Reset(COMPLETION_CLOCK.replace(Some(now)));
+    call()
+}
+
+fn completed_now() -> i64 {
+    #[cfg(test)]
+    if let Some(now) = COMPLETION_CLOCK.get() {
+        return now;
+    }
+    anyagents_core::now_ms()
 }
 
 fn target_key(base: &str, owner: &str, repo: &str, reference: &str, pr: bool) -> String {
@@ -246,6 +277,7 @@ impl Probes {
         target.resume_at = until.saturating_add(MIN_INTERVAL + offset);
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn probe(
         &mut self,
@@ -255,7 +287,22 @@ impl Probes {
         reference: &str,
         pr: bool,
         now: i64,
+        request: impl FnMut(&str, Option<&str>, Option<&str>) -> Result<Response, Error>,
+    ) -> Observation {
+        self.probe_with_clock(key, owner, repo, reference, pr, now, request, || now)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn probe_with_clock(
+        &mut self,
+        key: &str,
+        owner: &str,
+        repo: &str,
+        reference: &str,
+        pr: bool,
+        now: i64,
         mut request: impl FnMut(&str, Option<&str>, Option<&str>) -> Result<Response, Error>,
+        completed_at: impl FnOnce() -> i64,
     ) -> Observation {
         let auth_owner = owner.to_ascii_lowercase();
         if now < self.auth_until.get(&auth_owner).copied().unwrap_or(0) {
@@ -302,6 +349,8 @@ impl Probes {
                 Ok(response)
             },
         );
+        // Network/subprocess time belongs to this probe, not its next interval.
+        let completed_at = completed_at();
         // Consume the response that crossed the floor, but admit no next page or
         // target until reset. A terminal final page can still be delivered.
         let previous_until = self.limited_until;
@@ -324,7 +373,7 @@ impl Probes {
                 };
                 target.successful = Some(observation.clone());
                 target.result = Some(observation.clone());
-                target.next_at = now.saturating_add(target.interval);
+                target.next_at = completed_at.saturating_add(target.interval);
                 self.limit_interval = 0;
                 observation
             }
@@ -341,7 +390,7 @@ impl Probes {
                         self.auth_until
                             .insert(auth_owner, now.saturating_add(MIN_INTERVAL));
                     }
-                    target.next_at = now.saturating_add(MIN_INTERVAL);
+                    target.next_at = completed_at.saturating_add(MIN_INTERVAL);
                     target.result = Some(error.observation());
                 }
                 error.observation()
@@ -590,7 +639,7 @@ fn read_page(
                 .or_else(|| item.get("state"))
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            checks.review_failed |= name.to_ascii_lowercase().contains("review")
+            checks.review_failed |= name == review_check_name()
                 && matches!(
                     conclusion.to_ascii_uppercase().as_str(),
                     "FAILURE" | "ERROR" | "TIMED_OUT" | "ACTION_REQUIRED"
@@ -926,6 +975,67 @@ mod tests {
             json!({"total_count":101,"check_runs":[{"id":101,"name":"ci-last","status":"in_progress","conclusion":null}]}),
             &[("etag", "\"page2-v1\"")],
         )
+    }
+
+    #[test]
+    fn probe_backoff_starts_after_successful_or_failed_request_completion() {
+        for fails in [false, true] {
+            let mut probes = Probes::default();
+            let result = probes.probe_with_clock(
+                "slow",
+                "o",
+                "r",
+                "1",
+                true,
+                1000,
+                |path, _, _| {
+                    if fails {
+                        return Err(Error::Transport);
+                    }
+                    Ok(response(
+                        200,
+                        if path.contains("/pulls/") {
+                            pull("open", false, SHA)
+                        } else if path.contains("/check-runs") {
+                            pending()
+                        } else {
+                            json!({"statuses":[]})
+                        },
+                        &[],
+                    ))
+                },
+                || 9000,
+            );
+            let next = 9000 + MIN_INTERVAL;
+            assert_eq!(probes.targets["slow"].next_at, next);
+            let cached = probes.probe_with_clock(
+                "slow",
+                "o",
+                "r",
+                "1",
+                true,
+                next - 1,
+                |_, _, _| panic!("slow probe must retain a complete post-request interval"),
+                || next - 1,
+            );
+            assert_eq!(cached, result);
+            let mut calls = 0;
+            probes.probe_with_clock(
+                "slow",
+                "o",
+                "r",
+                "1",
+                true,
+                next,
+                |_, _, _| {
+                    calls += 1;
+                    Err(Error::Transport)
+                },
+                || next + 2000,
+            );
+            assert_eq!(calls, 1, "an expired interval must admit another request");
+            assert_eq!(probes.targets["slow"].next_at, next + 2000 + MIN_INTERVAL);
+        }
     }
 
     // Acceptance assertion, deliberately not should_panic: an unsafe terminal is a failure.
@@ -1631,6 +1741,21 @@ mod tests {
                 "checks_completed",
             ),
             (json!({"total_count":0,"check_runs":[]}), json!([]), "open"),
+            (
+                json!({"total_count":1,"check_runs":[{"id":1,"name":"preview-build","status":"completed","conclusion":"failure"}]}),
+                json!([{ "context":"deploy", "state":"pending"}]),
+                "checks_in_progress",
+            ),
+            (
+                json!({"total_count":1,"check_runs":[{"id":1,"name":"review-extra","status":"completed","conclusion":"failure"}]}),
+                json!([]),
+                "checks_completed",
+            ),
+            (
+                json!({"total_count":1,"check_runs":[{"id":1,"name":"Review","status":"completed","conclusion":"failure"}]}),
+                json!([]),
+                "checks_completed",
+            ),
         ] {
             let mut probes = Probes::default();
             assert_eq!(
@@ -2201,8 +2326,8 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         for (owner, token) in [
-            ("SylphxAI", "fixture-sylphx"),
-            ("Cubeage", "fixture-cubeage"),
+            ("AnotherOrg", "fixture-another"),
+            ("ExampleOrg", "fixture-exampleorg"),
         ] {
             let path = dir.path().join(format!("{owner}.token"));
             std::fs::write(&path, token).unwrap();
@@ -2216,17 +2341,17 @@ mod tests {
             token_for_owner(dir.path(), "missing"),
             Err(Error::Auth)
         ));
-        let path = dir.path().join("Cubeage.token");
+        let path = dir.path().join("ExampleOrg.token");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(matches!(
-            token_for_owner(dir.path(), "Cubeage"),
+            token_for_owner(dir.path(), "ExampleOrg"),
             Err(Error::Auth)
         ));
-        assert!(token_for_owner(dir.path(), "SylphxAI").is_ok());
+        assert!(token_for_owner(dir.path(), "AnotherOrg").is_ok());
         let mut probes = Probes::default();
         assert_eq!(
             probes
-                .probe("bad", "Cubeage", "r", "sha", false, 0, |_, _, _| Err(
+                .probe("bad", "ExampleOrg", "r", "sha", false, 0, |_, _, _| Err(
                     Error::Auth
                 ))
                 .1,
@@ -2236,7 +2361,7 @@ mod tests {
             probes
                 .probe(
                     "same-owner",
-                    "cubeage",
+                    "exampleorg",
                     "r",
                     "sha",
                     false,
@@ -2248,7 +2373,7 @@ mod tests {
         );
         assert_eq!(
             probes
-                .probe("good", "SylphxAI", "r", "sha", false, 1, |_, _, _| Ok(
+                .probe("good", "AnotherOrg", "r", "sha", false, 1, |_, _, _| Ok(
                     response(200, pending(), &[])
                 ))
                 .1,
@@ -2340,18 +2465,18 @@ mod tests {
             std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o600)).unwrap();
             std::fs::rename(staged, dir.path().join(format!("{owner}.token"))).unwrap();
         };
-        write_token("SylphxAI", "fixture-first");
-        write_token("Cubeage", "fixture-cubeage");
+        write_token("AnotherOrg", "fixture-first");
+        write_token("ExampleOrg", "fixture-exampleorg");
         let path =
             |owner: &str| format!("repos/{owner}/r/commits/sha/check-runs?per_page=100&page=1");
         let expected = [
-            ("sylphxai", "fixture-first", 200),
-            ("cubeage", "fixture-cubeage", 200),
-            ("sylphxai", "fixture-rotated", 200),
-            ("cubeage", "fixture-cubeage", 401),
-            ("sylphxai", "fixture-rotated", 200),
-            ("cubeage", "fixture-recovered", 200),
-            ("sylphxai", "fixture-rotated", 200),
+            ("anotherorg", "fixture-first", 200),
+            ("exampleorg", "fixture-exampleorg", 200),
+            ("anotherorg", "fixture-rotated", 200),
+            ("exampleorg", "fixture-exampleorg", 401),
+            ("anotherorg", "fixture-rotated", 200),
+            ("exampleorg", "fixture-recovered", 200),
+            ("anotherorg", "fixture-rotated", 200),
         ]
         .into_iter()
         .map(|(owner, token, status)| (path(owner), token.to_string(), status, None))
@@ -2370,21 +2495,21 @@ mod tests {
             ),
             Err(Error::Auth)
         ));
-        let cubeage = dir.path().join("Cubeage.token");
-        std::fs::set_permissions(&cubeage, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let exampleorg = dir.path().join("ExampleOrg.token");
+        std::fs::set_permissions(&exampleorg, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(matches!(
             request_with_token_dir(
                 &base,
-                &path("cubeage"),
+                &path("exampleorg"),
                 None,
                 None,
                 "agent",
-                "cubeage",
+                "exampleorg",
                 Some(dir.path())
             ),
             Err(Error::Auth)
         ));
-        std::fs::set_permissions(&cubeage, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(&exampleorg, std::fs::Permissions::from_mode(0o600)).unwrap();
         let mut probes = Probes::default();
         let poll = |probes: &mut Probes, key: &str, owner: &str, now: i64| {
             probes
@@ -2409,33 +2534,39 @@ mod tests {
                 )
                 .1
         };
-        assert_eq!(poll(&mut probes, "s", "sylphxai", 0), "checks_in_progress");
-        assert_eq!(poll(&mut probes, "c", "cubeage", 0), "checks_in_progress");
-        write_token("SylphxAI", "fixture-rotated");
         assert_eq!(
-            poll(&mut probes, "s", "sylphxai", 60_000),
+            poll(&mut probes, "s", "anotherorg", 0),
             "checks_in_progress"
         );
         assert_eq!(
-            poll(&mut probes, "c", "cubeage", 60_000),
+            poll(&mut probes, "c", "exampleorg", 0),
+            "checks_in_progress"
+        );
+        write_token("AnotherOrg", "fixture-rotated");
+        assert_eq!(
+            poll(&mut probes, "s", "anotherorg", 60_000),
+            "checks_in_progress"
+        );
+        assert_eq!(
+            poll(&mut probes, "c", "exampleorg", 60_000),
             "probe_error:auth"
         );
         // The owner's 401 holds all its targets, but not the other owner.
         assert_eq!(
-            poll(&mut probes, "c2", "Cubeage", 119_999),
+            poll(&mut probes, "c2", "ExampleOrg", 119_999),
             "probe_error:auth"
         );
         assert_eq!(
-            poll(&mut probes, "s2", "sylphxai", 119_999),
+            poll(&mut probes, "s2", "anotherorg", 119_999),
             "checks_in_progress"
         );
-        write_token("Cubeage", "fixture-recovered");
+        write_token("ExampleOrg", "fixture-recovered");
         assert_eq!(
-            poll(&mut probes, "c", "cubeage", 120_000),
+            poll(&mut probes, "c", "exampleorg", 120_000),
             "checks_in_progress"
         );
         assert_eq!(
-            poll(&mut probes, "s", "sylphxai", 180_000),
+            poll(&mut probes, "s", "anotherorg", 180_000),
             "checks_in_progress"
         );
         server.join().unwrap();

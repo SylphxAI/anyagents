@@ -56,7 +56,7 @@ pub struct AgentView {
     /// Private operating instructions (`instructions` column in SQLite, Layer 2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
-    /// Assigned OS seat account name (e.g. `seat-atlas`, `seat-rhea`, `seat-worker`).
+    /// Assigned OS seat account name (e.g. `seat-atlas`, `seat-worker`, `seat-worker`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seat_user: Option<String>,
     /// Assigned OS seat numeric UID from the agent's `seat_launch` spec.

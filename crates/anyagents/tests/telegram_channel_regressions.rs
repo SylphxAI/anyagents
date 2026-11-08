@@ -93,12 +93,10 @@ fn fake_wire(response: Option<String>) -> (String, std::thread::JoinHandle<Value
     (address, task)
 }
 
-static API_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-// Environment changes are serialized within this standalone test process.
+// Share the lock with the channel unit tests included in this test process.
 #[test]
 fn offline_provider_errors() {
-    let _lock = API_ENV.lock().unwrap_or_else(|err| err.into_inner());
+    let _lock = telegram::tests::env_lock();
     let dir = tempfile::tempdir().unwrap();
     let store = setup(dir.path());
     for (status, description, class) in [
@@ -286,7 +284,7 @@ fn offline_provider_errors() {
 
 #[test]
 fn offline_topic_quote_delivery_survives_restart_and_replay() {
-    let _lock = API_ENV.lock().unwrap_or_else(|err| err.into_inner());
+    let _lock = telegram::tests::env_lock();
     let dir = tempfile::tempdir().unwrap();
     let store = setup(dir.path());
     let (address, task) = fake(
@@ -351,7 +349,7 @@ fn offline_topic_quote_delivery_survives_restart_and_replay() {
 
 #[test]
 fn offline_lost_or_invalid_acknowledgement_is_uncertain_and_never_retried() {
-    let _lock = API_ENV.lock().unwrap_or_else(|err| err.into_inner());
+    let _lock = telegram::tests::env_lock();
     let dir = tempfile::tempdir().unwrap();
     let store = setup(dir.path());
     for (wire, expected_class, expected_status) in [
@@ -390,7 +388,7 @@ fn offline_lost_or_invalid_acknowledgement_is_uncertain_and_never_retried() {
 
 #[test]
 fn offline_unknown_fields_and_redirect_do_not_expose_or_forward_secrets() {
-    let _lock = API_ENV.lock().unwrap_or_else(|err| err.into_inner());
+    let _lock = telegram::tests::env_lock();
     let dir = tempfile::tempdir().unwrap();
     let store = setup(dir.path());
     let redirect_target = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -438,7 +436,7 @@ fn offline_unknown_fields_and_redirect_do_not_expose_or_forward_secrets() {
 
 #[test]
 fn offline_invalid_identity_and_updates_never_echo_provider_data() {
-    let _lock = API_ENV.lock().unwrap_or_else(|err| err.into_inner());
+    let _lock = telegram::tests::env_lock();
     let dir = tempfile::tempdir().unwrap();
     let store = setup(dir.path());
     let channel = store

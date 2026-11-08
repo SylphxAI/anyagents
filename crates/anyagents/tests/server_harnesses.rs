@@ -105,17 +105,23 @@ fn the_real_server_refuses_a_matching_uid_but_accepts_the_fixture() {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
-    support::operator_with_configured_seat(&data);
+    support::operator_for_contract(&data);
     create_asker(&data);
-    assert_eq!(
-        std::env::var("ANYAGENTS_AGENTS").unwrap(),
-        support::agents_line()
-    );
+    let agent = Store::open(data.join("state.db"))
+        .unwrap()
+        .agent_by_name("kind")
+        .unwrap();
+    let principals = |seat_uid| {
+        serde_json::json!({
+            agent.id.as_str(): {"user":"worker", "uid":seat_uid, "gid":42002, "socket_gid":42003}
+        })
+        .to_string()
+    };
     // SAFETY: getuid takes no arguments and cannot fail.
     let uid = unsafe { libc::getuid() };
     let log = data.join("matching-uid.log");
     let child = bin()
-        .env("ANYAGENTS_AGENTS", format!("kind={uid}"))
+        .env("ANYAGENTS_PRINCIPALS", principals(uid))
         .arg("--data")
         .arg(&data)
         .arg("serve")
@@ -146,7 +152,10 @@ fn the_real_server_refuses_a_matching_uid_but_accepts_the_fixture() {
     // not distinguish a corrected map from an absent launch boundary.
     let accepted_log = data.join("distinct-uid.log");
     let child = bin()
-        .env("ANYAGENTS_AGENTS", support::agents_line())
+        .env(
+            "ANYAGENTS_PRINCIPALS",
+            principals(if uid != 42001 { 42001 } else { 42004 }),
+        )
         .arg("--data")
         .arg(&data)
         .arg("serve")
@@ -295,6 +304,8 @@ fn call(socket: &Path, request: &str) -> Value {
 fn ask(dir: &Path, name: &str, harness: &str, sent_id: &str) {
     let store = Store::open(dir.join("state.db")).unwrap();
     let agent = store.agent_by_name("kind").unwrap();
+    let author = store.agent_by_name(name).unwrap();
+    let expected_sender = format!("agent:{}", author.id);
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let inbox = store.inbox(&agent.id, None).unwrap();
@@ -309,7 +320,7 @@ fn ask(dir: &Path, name: &str, harness: &str, sent_id: &str) {
                     && message
                         .sender
                         .as_deref()
-                        .is_some_and(|sender| sender == format!("agent:{name}"))
+                        .is_some_and(|sender| sender == expected_sender)
             })
             .collect();
         assert!(
@@ -348,7 +359,7 @@ fn repeated_replies(harness: &str) {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
-    support::operator_with_configured_seat(&data);
+    support::operator_for_contract(&data);
     create_asker(&data);
     let name = "responder";
     let agent_file = data.join("responder-name");
@@ -383,7 +394,7 @@ fn an_agy_agent_and_a_muse_agent_each_answer_a_mailbox_message() {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
-    support::operator_with_configured_seat(&data);
+    support::operator_for_contract(&data);
     // The agent that asks: the answers come back to it.
     create_asker(&data);
     let (agy_file, muse_file) = (data.join("agent-gamma"), data.join("agent-delta"));

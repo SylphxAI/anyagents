@@ -172,7 +172,7 @@ impl Store {
                 .collect(),
             MemoryScope::Transcripts => {
                 let mut paths = native_transcripts(&root)?;
-                paths.extend(regular_files(&root.join("history/owners"), true)?);
+                paths.extend(history_archives(&root)?);
                 paths
             }
             MemoryScope::All => return Ok(None),
@@ -187,18 +187,9 @@ impl Store {
     }
 
     /// Immediately synchronize an agent's `memory/` directory into `HostIndex`
-    /// and invalidate its 60-second refresh cache so newly upserted, read, or
+    /// so newly upserted, read, or
     /// deleted topics are immediately readable via `raw_id` and `search_host_files`.
     pub fn sync_agent_memory_index(&self, agent: &Agent) -> Result<(), IndexError> {
-        if let Ok(mut cache) = host_refresh_cache().lock() {
-            for scope_key in [0u8, 1u8, 2u8] {
-                cache.remove(&(
-                    self.data_dir().to_path_buf(),
-                    agent.id.to_string(),
-                    scope_key,
-                ));
-            }
-        }
         let root = self.data_dir().join("agents").join(agent.id.as_str());
         let mut index = HostIndex::open(&self.data_dir().join(INDEX_FILE))?;
         if !safe_components(self.data_dir(), &root)? {
@@ -258,100 +249,16 @@ impl Store {
             .filter(|a| selected.as_ref().is_none_or(|id| id == &a.id))
             .collect();
         agents.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
-        let is_large_production = !is_test_mode() && agents.len() > 32;
-        let bulk_memory_only = is_large_production && scope == MemoryScope::Memory;
         let mut guards = Vec::new();
-        if !is_large_production {
-            for a in &agents {
-                guards.push(
-                    self.lock_agent_lifecycle(&a.id)
-                        .map_err(|e| io::Error::other(e.to_string()))?,
-                );
-            }
+        for a in &agents {
+            guards.push(
+                self.lock_agent_lifecycle(&a.id)
+                    .map_err(|e| io::Error::other(e.to_string()))?,
+            );
         }
-        let scope_key = match scope {
-            MemoryScope::All => 0u8,
-            MemoryScope::Memory => 1u8,
-            MemoryScope::Transcripts => 2u8,
-        };
-        let now_ms = crate::now_ms();
         let mut index = HostIndex::open(&self.data_dir().join(INDEX_FILE))?;
         for agent in &agents {
             let root = self.data_dir().join("agents").join(agent.id.as_str());
-            if bulk_memory_only {
-                if agent.state == "archived" || !root.join("memory").is_dir() {
-                    continue;
-                }
-                let cache_key = (self.data_dir().to_path_buf(), agent.id.to_string(), 1u8);
-                if let Ok(cache) = host_refresh_cache().lock()
-                    && let Some(&last_ms) = cache.get(&cache_key)
-                    && now_ms.saturating_sub(last_ms) < 60_000
-                {
-                    continue;
-                }
-                if safe_components(self.data_dir(), &root)? {
-                    let unresolved = self.unresolved_host_paths(agent.id.as_str())?;
-                    let mut ids = HashSet::new();
-                    for path in memory_indexable_files(&root.join("memory"))? {
-                        if unresolved.iter().any(|blocked| path.starts_with(blocked)) {
-                            continue;
-                        }
-                        let id = format!(
-                            "memory:{}:{}",
-                            agent.id,
-                            sha256(path.as_os_str().as_encoded_bytes())
-                        );
-                        let metadata = IndexMetadata {
-                            agent_id: agent.id.to_string(),
-                            source: MemoryScope::Memory,
-                            timestamp_ms: Some(modified_ms(&path)?),
-                            direction: "in".into(),
-                            sender: format!("agent:{}", agent.name),
-                            destination: format!("agent:{}", agent.name),
-                            tool_name: None,
-                            tool_names: Vec::new(),
-                            role: Some("memory".into()),
-                        };
-                        refresh_document(&mut index, &id, &metadata, &path)?;
-                        ids.insert(id);
-                    }
-                    index.retain_agent_scope(agent.id.as_str(), MemoryScope::Memory, &ids)?;
-                } else {
-                    index.retain_agent_scope(
-                        agent.id.as_str(),
-                        MemoryScope::Memory,
-                        &HashSet::new(),
-                    )?;
-                }
-                if let Ok(mut cache) = host_refresh_cache().lock() {
-                    cache.insert(cache_key, now_ms);
-                }
-                continue;
-            }
-            let _per_agent_guard = if is_large_production {
-                if agent.state == "archived"
-                    && !(scope == MemoryScope::Memory && root.join("memory").is_dir())
-                {
-                    continue;
-                }
-                let cache_key = (
-                    self.data_dir().to_path_buf(),
-                    agent.id.to_string(),
-                    scope_key,
-                );
-                if let Ok(cache) = host_refresh_cache().lock()
-                    && let Some(&last_ms) = cache.get(&cache_key)
-                    && now_ms.saturating_sub(last_ms) < 60_000
-                {
-                    continue;
-                }
-                let Ok(guard) = self.try_lock_agent_lifecycle(&agent.id) else {
-                    continue;
-                };
-                Some((guard, cache_key))
-            } else {
-                None
-            };
             if !safe_components(self.data_dir(), &root)? {
                 index.retain_agent_scope(agent.id.as_str(), scope, &HashSet::new())?;
                 continue;
@@ -393,9 +300,9 @@ impl Store {
                     }
                     ids.extend(refresh_native(&mut index, agent, &path)?.documents);
                 }
-                // Reconciled owner pages are lossless historical documents,
+                // Reconciled archive pages are lossless historical documents,
                 // not necessarily JSONL. Their entire text remains searchable.
-                for path in regular_files(&root.join("history/owners"), true)? {
+                for path in history_archives(&root)? {
                     if unresolved.iter().any(|blocked| path.starts_with(blocked)) {
                         continue;
                     }
@@ -420,11 +327,6 @@ impl Store {
                 }
             }
             index.retain_agent_scope(agent.id.as_str(), scope, &ids)?;
-            if let Some((_, cache_key)) = _per_agent_guard
-                && let Ok(mut cache) = host_refresh_cache().lock()
-            {
-                cache.insert(cache_key, now_ms);
-            }
         }
         let visible: Vec<_> = agents.iter().map(|a| a.id.to_string()).collect();
         let mut request = query.clone();
@@ -439,15 +341,6 @@ impl Store {
             })
             .collect()
     }
-}
-
-type HostRefreshKey = (PathBuf, String, u8);
-type HostRefreshMap = std::collections::HashMap<HostRefreshKey, i64>;
-
-fn host_refresh_cache() -> &'static std::sync::Mutex<HostRefreshMap> {
-    static LAST_HOST_REFRESH_MS: std::sync::OnceLock<std::sync::Mutex<HostRefreshMap>> =
-        std::sync::OnceLock::new();
-    LAST_HOST_REFRESH_MS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
 #[derive(Default)]
@@ -534,13 +427,7 @@ fn refresh_native_at(
             ..Default::default()
         });
     }
-    let scan = match crate::host_cursor::scan_jsonl(path, &stamp, old.as_ref(), force_full) {
-        Ok(scan) => scan,
-        Err(_) if !is_test_mode() => {
-            return Ok(RefreshStats::default());
-        }
-        Err(e) => return Err(e.into()),
-    };
+    let scan = crate::host_cursor::scan_jsonl(path, &stamp, old.as_ref(), force_full)?;
     index.refresh_source(|index| {
         if scan.replace {
             index.clear_source(agent.id.as_str(), path)?;
@@ -552,11 +439,7 @@ fn refresh_native_at(
             let mut file = open_readonly(path)?;
             file.seek(SeekFrom::Start(raw.offset))?;
             let header: EventHeader =
-                match serde_json::from_reader(MetadataReader::new(file.take(raw.length))) {
-                    Ok(h) => h,
-                    Err(_) if !is_test_mode() => EventHeader::default(),
-                    Err(e) => return Err(e.into()),
-                };
+                serde_json::from_reader(MetadataReader::new(file.take(raw.length)))?;
             let mut metadata = event_metadata(agent, &header);
             let records = header.tool_records();
             let mut names = Vec::new();
@@ -687,10 +570,14 @@ fn document_coordinate(path: &Path) -> io::Result<RawCoordinate> {
         seq: 1,
     })
 }
-fn is_test_mode() -> bool {
-    cfg!(test) || std::env::var_os("ANYAGENTS_TESTS").is_some()
+/// Read both the generic archive and the historical directory spelling so an
+/// upgrade never makes already-migrated documents disappear. New migrations
+/// only write the generic location.
+fn history_archives(root: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut paths = regular_files(&root.join("history/archive"), true)?;
+    paths.extend(regular_files(&root.join("history").join("owners"), true)?);
+    Ok(paths)
 }
-
 fn is_hidden_memory_file(path: &Path) -> bool {
     path.file_name()
         .and_then(|s| s.to_str())
@@ -724,23 +611,13 @@ fn regular_files(root: &Path, recursive: bool) -> io::Result<Vec<PathBuf>> {
     let meta = match fs::symlink_metadata(root) {
         Ok(m) => m,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(vec![]),
-        Err(e) if e.kind() == io::ErrorKind::PermissionDenied && !is_test_mode() => {
-            return Ok(vec![]);
-        }
         Err(e) => return Err(e),
     };
     if !meta.is_dir() || meta.file_type().is_symlink() {
         return Ok(vec![]);
     }
-    let entries = match fs::read_dir(root) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == io::ErrorKind::PermissionDenied && !is_test_mode() => {
-            return Ok(vec![]);
-        }
-        Err(e) => return Err(e),
-    };
     let mut result = Vec::new();
-    for entry in entries {
+    for entry in fs::read_dir(root)? {
         let entry = entry?;
         let kind = entry.file_type()?;
         if kind.is_file() {
@@ -1093,7 +970,7 @@ mod tests {
                 .path()
                 .join("agents")
                 .join(agent.id.as_str())
-                .join("history/owners/pagehash");
+                .join("history/archive/pagehash");
             fs::create_dir_all(&root).unwrap();
             let path = root.join("history.md");
             fs::write(
@@ -1901,6 +1778,54 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+    #[test]
+    fn generic_and_legacy_archives_remain_scoped_and_raw_readable_after_reopen() {
+        let dir = crate::test_tempdir();
+        let path = dir.path().join("state.db");
+        let store = Store::open(&path).unwrap();
+        let own = store
+            .create_agent(NewAgent::new("archive-reader", "test"))
+            .unwrap();
+        let hidden = store
+            .create_agent(NewAgent::new("archive-hidden", "test"))
+            .unwrap();
+        for agent in [&own, &hidden] {
+            let root = dir.path().join("agents").join(agent.id.as_str());
+            for folder in [
+                root.join("history/archive"),
+                root.join("history").join("owners"),
+            ] {
+                fs::create_dir_all(&folder).unwrap();
+                fs::write(
+                    folder.join("page.md"),
+                    format!("archiveneedle {} {:?}", agent.name, folder),
+                )
+                .unwrap();
+            }
+        }
+        let query = HistorySearchQuery {
+            query: Some("archiveneedle".into()),
+            ..Default::default()
+        };
+        let ids = [own.id.to_string()];
+        for store in [store, Store::open(&path).unwrap()] {
+            let hits = store
+                .search_host_files(&ids, MemoryScope::Transcripts, &query)
+                .unwrap();
+            assert_eq!(hits.len(), 2);
+            for (hit, bytes) in hits {
+                assert_eq!(hit.metadata.agent_id, own.id.as_str());
+                assert_eq!(read_raw(&hit.raw).unwrap(), bytes);
+                assert!(String::from_utf8_lossy(&bytes).contains("archive-reader"));
+            }
+            assert!(
+                store
+                    .search_host_files(&[], MemoryScope::Transcripts, &query)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
     }
 
     #[test]

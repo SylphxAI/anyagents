@@ -85,11 +85,7 @@ fn parse_tool(protocol: Protocol, value: &Value) -> Result<Tool, Fail> {
             Ok(Tool {
                 name: required_string(function, "name")?,
                 description: optional_string(function, "description")?,
-                parameters: function
-                    .get("parameters")
-                    .filter(|value| value.is_object())
-                    .cloned()
-                    .unwrap_or_else(|| json!({"type": "object", "properties": {}})),
+                parameters: optional_parameters(function)?,
             })
         }
         Protocol::OpenAiResponses => {
@@ -101,13 +97,17 @@ fn parse_tool(protocol: Protocol, value: &Value) -> Result<Tool, Fail> {
             Ok(Tool {
                 name: required_string(obj, "name")?,
                 description: optional_string(obj, "description")?,
-                parameters: obj
-                    .get("parameters")
-                    .filter(|value| value.is_object())
-                    .cloned()
-                    .unwrap_or_else(|| json!({"type": "object", "properties": {}})),
+                parameters: optional_parameters(obj)?,
             })
         }
+    }
+}
+
+fn optional_parameters(obj: &Map<String, Value>) -> Result<Value, Fail> {
+    match obj.get("parameters") {
+        None => Ok(json!({"type": "object", "properties": {}})),
+        Some(value) if value.is_object() => Ok(value.clone()),
+        Some(_) => Err(Fail::invalid("parameters")),
     }
 }
 
@@ -337,5 +337,65 @@ mod tests {
         assert_eq!(restored["content"][1]["input"]["city"], "Paris");
         assert_eq!(restored["usage"]["input_tokens"], 5);
         assert_eq!(restored["usage"]["output_tokens"], 7);
+    }
+}
+
+#[cfg(test)]
+mod schema_tests {
+    use super::*;
+    use crate::canonical::{encode_request, parse_request};
+
+    fn request(protocol: Protocol, parameters: Option<Value>) -> Value {
+        let mut tool = json!({"type": "function", "name": "weather"});
+        if let Some(parameters) = parameters {
+            tool["parameters"] = parameters;
+        }
+        match protocol {
+            Protocol::OpenAiChat => {
+                tool.as_object_mut().unwrap().remove("type");
+                json!({"model": "model", "max_tokens": 64, "messages": [{"role": "user", "content": "hello"}],
+                    "tools": [{"type": "function", "function": tool}]})
+            }
+            _ => {
+                json!({"model": "model", "max_output_tokens": 64, "input": "hello", "tools": [tool]})
+            }
+        }
+    }
+
+    #[test]
+    fn missing_schema_defaults_and_supplied_objects_survive_translation() {
+        for protocol in [Protocol::OpenAiChat, Protocol::OpenAiResponses] {
+            for schema in [
+                None,
+                Some(json!({"type": "object", "properties": {"city": {"type": "string"}}})),
+            ] {
+                let parsed = parse_request(protocol, &request(protocol, schema.clone())).unwrap();
+                let encoded =
+                    encode_request(Protocol::AnthropicMessages, &parsed, "model", false).unwrap();
+                assert_eq!(
+                    encoded["tools"][0]["input_schema"],
+                    schema.unwrap_or(json!({"type": "object", "properties": {}}))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn supplied_nonobject_schemas_are_invalid_requests() {
+        for protocol in [Protocol::OpenAiChat, Protocol::OpenAiResponses] {
+            for schema in [
+                json!("broken"),
+                Value::Null,
+                json!(42),
+                json!(false),
+                json!([]),
+            ] {
+                let error = parse_request(protocol, &request(protocol, Some(schema))).unwrap_err();
+                assert!(
+                    matches!(error, Fail::Invalid(ref field) if field == "parameters"),
+                    "{error:?}"
+                );
+            }
+        }
     }
 }

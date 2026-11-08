@@ -10,7 +10,6 @@ use serde_json::{Value, json};
 
 use super::auth::{DEFAULT_SYLPHX_API_URL, resolve_sylphx_api_key};
 
-pub const DEFAULT_SYLPHX_SANDBOX_PARENT: &str = "orgs/org_fs01afbdccgn8xdk1ghj5y47w0vtph/projects/prj_fs01nh48z2cee2ccqddykqeys3rvc4/envs/env_fs014mk148yf5ngawpe4zcey9rvq89";
 pub const DEFAULT_SYLPHX_SANDBOX_SHAPE: &str = "linux-s";
 pub const CLOUD_WORKSPACE_DIR: &str = "/home/user";
 
@@ -22,20 +21,26 @@ pub struct CloudWorktreeSpec {
     pub base: Option<String>,
 }
 
-pub fn normalize_cloud_env_slug(raw: &str) -> String {
-    let trimmed = raw.trim().trim_matches('/');
-    match trimmed {
-        ""
-        | "default"
-        | "prod"
-        | "sylphx"
-        | "sylphx/default/prod"
-        | "orgs/sylphx/projects/default/envs/prod"
-        | "organizations/sylphx/projects/default/environments/prod" => {
-            DEFAULT_SYLPHX_SANDBOX_PARENT.to_string()
-        }
-        other => other.to_string(),
+pub fn normalize_cloud_env_slug(raw: &str) -> Result<String, String> {
+    let value = raw.trim().trim_matches('/');
+    let parts: Vec<_> = value.split('/').collect();
+    let scoped = (parts.len() == 6
+        && matches!(parts[0], "orgs" | "organizations")
+        && parts[2] == "projects"
+        && matches!(parts[4], "envs" | "environments"))
+        || (parts.len() == 2 && parts[0] == "environments")
+        || parts.len() == 3;
+    if !scoped
+        || parts.iter().any(|p| {
+            p.is_empty()
+                || !p
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        })
+    {
+        return Err("cloud environment must be an explicit orgs/<org>/projects/<project>/envs/<env> resource".into());
     }
+    Ok(value.to_string())
 }
 
 pub(super) fn resolve_cloud_api_url(env: &[(String, String)]) -> String {

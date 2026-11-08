@@ -97,10 +97,10 @@ fn owner_authority_is_explicit_live_revocable_and_never_inherited() {
     let dir = support::physical_tempdir();
     let data = dir.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
-    support::operator_with_configured_seat(&data);
+    support::operator_for_contract(&data);
     let server = start_server(&data);
-    let sage = create(&data, "sage");
-    let auth = format!("x-anyagents-agent: {}\r\n", capability(&data, &sage));
+    let coordinator = create(&data, "coordinator");
+    let auth = format!("x-anyagents-agent: {}\r\n", capability(&data, &coordinator));
     let request = |method: &str, path: &str, body: Value| {
         support::call_raw(&server.socket, method, path, &body.to_string(), &auth)
     };
@@ -108,30 +108,35 @@ fn owner_authority_is_explicit_live_revocable_and_never_inherited() {
     let (status, _) = support::call(
         &server.socket,
         "POST",
-        "/v1/agents/sage/admin",
+        "/v1/agents/coordinator/admin",
         r#"{"admin":true}"#,
     );
     assert!(status.contains("200"), "{status}");
     assert!(
-        request("POST", "/v1/agents/sage/admin", json!({"admin":true})).starts_with("HTTP/1.1 403")
+        request(
+            "POST",
+            "/v1/agents/coordinator/admin",
+            json!({"admin":true})
+        )
+        .starts_with("HTTP/1.1 403")
     );
     let root = request(
         "POST",
         "/v1/agents",
-        json!({"name":"rhea", "harness":"claude-code", "parent":"root"}),
+        json!({"name":"builder", "harness":"claude-code", "parent":"root"}),
     );
     assert!(root.starts_with("HTTP/1.1 201"), "{root}");
     let store = anyagents_core::Store::open(data.join("state.db")).unwrap();
-    let rhea = store.agent_by_name("rhea").unwrap();
-    assert!(rhea.parent_id.is_none());
-    assert!(!rhea.is_admin);
-    let rhea_auth = format!(
+    let builder = store.agent_by_name("builder").unwrap();
+    assert!(builder.parent_id.is_none());
+    assert!(!builder.is_admin);
+    let builder_auth = format!(
         "x-anyagents-agent: {}\r\n",
-        capability(&data, rhea.id.as_str())
+        capability(&data, builder.id.as_str())
     );
     for path in ["/v1/channels", "/v1/profiles"] {
         assert!(
-            support::call_raw(&server.socket, "GET", path, "", &rhea_auth)
+            support::call_raw(&server.socket, "GET", path, "", &builder_auth)
                 .starts_with("HTTP/1.1 403")
         );
     }
@@ -150,13 +155,13 @@ fn owner_authority_is_explicit_live_revocable_and_never_inherited() {
     let mut responses = Vec::new();
     responses.push(request(
         "POST",
-        "/v1/agents/rhea/model",
+        "/v1/agents/builder/model",
         json!({"model":"test-model", "base_url":"https://api.example.test", "key":key}),
     ));
     responses.push(request(
         "POST",
         "/v1/channels",
-        json!({"kind":"telegram", "agent":"rhea", "token":token}),
+        json!({"kind":"telegram", "agent":"builder", "token":token}),
     ));
     for response in &responses {
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
@@ -166,19 +171,19 @@ fn owner_authority_is_explicit_live_revocable_and_never_inherited() {
     // Unknown path fields are rejected rather than read in the daemon's seat.
     let rejected = request(
         "POST",
-        "/v1/agents/rhea/model",
+        "/v1/agents/builder/model",
         json!({"model":"test", "key_file":"/etc/passwd"}),
     );
     assert!(rejected.starts_with("HTTP/1.1 422"), "{rejected}");
     responses.push(request(
         "POST",
         "/v1/channels",
-        json!({"kind":"invalid", "agent":"rhea", "token":token}),
+        json!({"kind":"invalid", "agent":"builder", "token":token}),
     ));
     let (status, _) = support::call(
         &server.socket,
         "POST",
-        "/v1/agents/sage/admin",
+        "/v1/agents/coordinator/admin",
         r#"{"admin":false}"#,
     );
     assert!(status.contains("200"));
@@ -197,12 +202,12 @@ fn owner_authority_is_explicit_live_revocable_and_never_inherited() {
     assert!(
         audit
             .iter()
-            .any(|r| r == "agent:sage:agents.create_root:rhea")
+            .any(|r| r == "agent:coordinator:agents.create_root:builder")
     );
     assert!(
         audit
             .iter()
-            .any(|r| r == "operator:agents.revoke_admin:sage")
+            .any(|r| r == "operator:agents.revoke_admin:coordinator")
     );
     for text in responses.iter().chain(audit.iter()) {
         assert!(!text.contains(key));
@@ -216,7 +221,7 @@ fn a_session_acts_as_its_own_agent_and_nothing_else() {
     let dir = support::physical_tempdir();
     let data = dir.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
-    support::operator_with_configured_seat(&data);
+    support::operator_for_contract(&data);
     let server = start_server(&data);
     let socket = data.join("anyagents.sock");
     let alpha = create(&data, "alpha");
@@ -245,7 +250,10 @@ fn a_session_acts_as_its_own_agent_and_nothing_else() {
     );
     assert!(beta_inbox.contains("hello"), "{beta_inbox}");
     // The author recorded is the capability's agent, never the body.
-    assert!(beta_inbox.contains("agent:alpha"), "{beta_inbox}");
+    assert!(
+        beta_inbox.contains(&format!("agent:{alpha}")),
+        "{beta_inbox}"
+    );
 
     // A body that names another sender is refused, with nothing written.
     let forged = support::call_raw(
@@ -349,7 +357,7 @@ fn a_session_acts_as_its_own_agent_and_nothing_else() {
         &socket,
         "POST",
         "/v1/send",
-        &json!({"to": ["gamma"], "text": "message while archived"}).to_string(),
+        &json!({"to": ["gamma"], "text": "mescoordinator while archived"}).to_string(),
         &alpha_auth,
     );
     assert!(
@@ -409,7 +417,7 @@ fn each_agents_capability_reads_only_own_mailbox_not_peer_history() {
     let dir = support::physical_tempdir();
     let data = dir.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
-    support::operator_with_configured_seat(&data);
+    support::operator_for_contract(&data);
     let first = start_server(&data);
     let socket = data.join("anyagents.sock");
     let alpha = create(&data, "alpha");
@@ -463,7 +471,7 @@ fn the_capability_file_of_one_agent_never_opens_another() {
     let dir = support::physical_tempdir();
     let data = dir.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
-    support::operator_with_configured_seat(&data);
+    support::operator_for_contract(&data);
     let server = start_server(&data);
     let _ = server;
     let socket = data.join("anyagents.sock");
@@ -655,9 +663,9 @@ fn conversation_reads_are_downward_only_for_every_scope_and_cli_fails_closed() {
     let dir = support::physical_tempdir();
     let data = dir.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
-    support::operator_with_configured_seat(&data);
+    support::operator_for_contract(&data);
     let server = start_server(&data);
-    let ids: Vec<_> = ["argus", "lyra", "helios", "runner", "outsider"]
+    let ids: Vec<_> = ["coordinator", "planner", "reviewer", "runner", "outsider"]
         .into_iter()
         .map(|name| create(&data, name))
         .collect();
@@ -674,7 +682,7 @@ fn conversation_reads_are_downward_only_for_every_scope_and_cli_fails_closed() {
                 id,
                 Incoming {
                     text: format!("C private fixture {name}"),
-                    sender: Some("agent:argus".into()),
+                    sender: Some("agent:coordinator".into()),
                     source_time_ms: None,
                     source_key: None,
                     reply_to: None,
@@ -715,8 +723,8 @@ fn conversation_reads_are_downward_only_for_every_scope_and_cli_fails_closed() {
             "effective scope must match the conversation visibility test case"
         );
         for target in [
-            "argus",
-            "helios",
+            "coordinator",
+            "reviewer",
             "outsider",
             ids[0].as_str(),
             ids[2].as_str(),
@@ -738,7 +746,7 @@ fn conversation_reads_are_downward_only_for_every_scope_and_cli_fails_closed() {
             "all",
             "*",
             "self",
-            "lyra",
+            "planner",
             ids[1].as_str(),
             "runner",
             ids[3].as_str(),
@@ -748,14 +756,18 @@ fn conversation_reads_are_downward_only_for_every_scope_and_cli_fails_closed() {
                 "?query=C&radius=10",
                 "?only_tools=true&tool_name=browser",
                 "?from_seq=1&to_seq=1&direction=in",
-                "?query=C&with=argus&sender=argus&direction=in",
+                "?query=C&with=coordinator&sender=coordinator&direction=in",
             ] {
                 let response = as_agent(1, target, suffix);
                 assert!(
                     response.starts_with("HTTP/1.1 200"),
                     "{scope} {target} {suffix}: {response}"
                 );
-                for hidden in ["fixture argus", "fixture helios", "fixture outsider"] {
+                for hidden in [
+                    "fixture coordinator",
+                    "fixture reviewer",
+                    "fixture outsider",
+                ] {
                     assert!(
                         !response.contains(hidden),
                         "{scope} {target} {suffix}: {response}"
@@ -768,11 +780,11 @@ fn conversation_reads_are_downward_only_for_every_scope_and_cli_fails_closed() {
     // Grandchildren are visible to ancestors, but neither ancestors nor
     // siblings are visible in the opposite direction.
     assert!(as_agent(0, "runner", "?query=C").contains("private fixture runner"));
-    assert!(as_agent(3, "lyra", "").starts_with("HTTP/1.1 403"));
-    assert!(as_agent(2, "lyra", "").starts_with("HTTP/1.1 403"));
-    assert!(!as_agent(4, "all", "?query=C").contains("fixture lyra"));
+    assert!(as_agent(3, "planner", "").starts_with("HTTP/1.1 403"));
+    assert!(as_agent(2, "planner", "").starts_with("HTTP/1.1 403"));
+    assert!(!as_agent(4, "all", "?query=C").contains("fixture planner"));
     // Party copies in the caller's own mailbox remain readable.
-    assert!(as_agent(1, "self", "?query=C&with=argus").contains("private fixture lyra"));
+    assert!(as_agent(1, "self", "?query=C&with=coordinator").contains("private fixture planner"));
     assert!(!as_agent(1, "all", "?query=C&with=outsider").contains("fixture"));
 
     let cli = |target: &str| {
@@ -789,18 +801,18 @@ fn conversation_reads_are_downward_only_for_every_scope_and_cli_fails_closed() {
             .output()
             .unwrap()
     };
-    let denied = cli("argus");
+    let denied = cli("coordinator");
     assert!(!denied.status.success());
     assert!(denied.stdout.is_empty(), "{denied:?}");
     let allowed = cli("all");
     assert!(allowed.status.success(), "{allowed:?}");
     let text = String::from_utf8(allowed.stdout).unwrap();
     assert!(
-        text.contains("fixture lyra") && text.contains("fixture runner"),
+        text.contains("fixture planner") && text.contains("fixture runner"),
         "{text}"
     );
     assert!(
-        !text.contains("fixture argus") && !text.contains("fixture helios"),
+        !text.contains("fixture coordinator") && !text.contains("fixture reviewer"),
         "{text}"
     );
 
@@ -809,7 +821,7 @@ fn conversation_reads_are_downward_only_for_every_scope_and_cli_fails_closed() {
     assert!(!as_agent(0, "all", "?query=C").contains("fixture outsider"));
     store.set_agent_admin(&aids[0], true).unwrap();
     assert!(as_agent(0, "all", "?query=C").contains("fixture outsider"));
-    assert!(as_agent(0, "self", "?query=C").contains("fixture argus"));
+    assert!(as_agent(0, "self", "?query=C").contains("fixture coordinator"));
     let (status, body) = support::call(
         &server.socket,
         "GET",
@@ -819,13 +831,13 @@ fn conversation_reads_are_downward_only_for_every_scope_and_cli_fails_closed() {
     assert!(status.contains("200"), "{status} {body}");
     assert!(body.to_string().contains("fixture outsider"));
     let db = rusqlite::Connection::open(data.join("state.db")).unwrap();
-    for actor in ["operator", "agent:argus"] {
+    for actor in ["operator", "agent:coordinator"] {
         let count: i64 = db.query_row("SELECT COUNT(*) FROM admin_audit WHERE action = 'conversation.read' AND target = 'all' AND actor = ?1", [actor], |row| row.get(0)).unwrap();
         assert!(count > 0, "{actor} read must have an audit row");
     }
     drop(server);
     // Existing fixture SQLite data must not make a failed socket read succeed.
-    for target in ["all", "argus", "lyra"] {
+    for target in ["all", "coordinator", "planner"] {
         let offline = cli(target);
         assert!(!offline.status.success(), "{offline:?}");
         assert!(offline.stdout.is_empty(), "{offline:?}");
@@ -843,7 +855,7 @@ fn migration_failure_and_busy_global_lock_do_not_block_host_sockets() {
         for busy in [false, true] {
             let dir = support::physical_tempdir();
             let data = dir.path();
-            support::operator_with_configured_seat(data);
+            support::operator_for_contract(data);
             let store = Store::open(data.join("state.db")).unwrap();
             let agent = store
                 .create_agent(NewAgent::new("maintenance-only", "sylphx"))
@@ -1081,7 +1093,7 @@ fn group_permissions_bind_ownership_and_refuse_both_reported_payloads_atomically
     let dir = support::physical_tempdir();
     let data = dir.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
-    support::operator_with_configured_seat(&data);
+    support::operator_for_contract(&data);
     let server = start_server(&data);
     let owner = create(&data, "group-owner");
     let member = create(&data, "other-agent");

@@ -17,11 +17,10 @@ use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
 use crate::{
-    DEFAULT_SYLPHX_SANDBOX_PARENT, PersistedCloudSession, SharedState, append_transcript_message,
-    assemble_system_prompt, build_cloud_agent_tools, build_cloud_environment_spec,
-    build_prior_transcript_continuity_block, clear_persisted_cloud_session,
-    cloud_session_resource_path, compute_instructions_fingerprint, curl_get, curl_post_json,
-    load_persisted_cloud_session, load_transcript_input_items, normalize_cloud_env_slug,
+    PersistedCloudSession, SharedState, append_transcript_message, assemble_system_prompt,
+    build_cloud_agent_tools, build_cloud_environment_spec, build_prior_transcript_continuity_block,
+    clear_persisted_cloud_session, cloud_session_resource_path, compute_instructions_fingerprint,
+    curl_get, load_persisted_cloud_session, load_transcript_input_items, normalize_cloud_env_slug,
     parse_sylphx_model_and_effort, resolve_agent_short_name, resolve_cloud_api_url,
     resolve_sylphx_cloud_access_key, run_cloud_session_turn, run_native_gateway_turn,
     save_persisted_cloud_session,
@@ -35,8 +34,8 @@ use std::sync::{Arc, Mutex};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SylphxExecutionMode {
-    /// Default: run on Sylphx Cloud (`agent_sessions` + Kata microVM) when healthy,
-    /// and automatically fall back to the local loop on any Cloud failure.
+    /// Prefer the explicitly configured Cloud environment; use local only when
+    /// no Cloud environment is selected. Never replay an uncertain remote effect.
     AutoCloudFirst,
     /// Run the multi-step agent loop strictly on the local machine (`/v1/responses`).
     LocalOnly,
@@ -45,41 +44,39 @@ pub enum SylphxExecutionMode {
 }
 
 impl SylphxExecutionMode {
-    pub fn from_env(config_dir: &Path, env: &[(String, String)]) -> Self {
-        let mode_str = env
+    pub fn from_env(config_dir: &Path, env: &[(String, String)]) -> Result<Self, String> {
+        let settings = crate::contracts::read_json(&config_dir.join("sylphx-agent.json"))?;
+        let placement =
+            crate::contracts::read_json(&config_dir.join("sylphx-workspace-placement.json"))?;
+        let configured = settings.as_ref().and_then(|v| v.get("execution_mode"));
+        let placed = placement.as_ref().and_then(|v| v.get("placement"));
+        if placement.is_some() && placed.is_none() {
+            return Err("placement setting is missing".into());
+        }
+        if configured.is_some_and(|v| !v.is_string()) || placed.is_some_and(|v| !v.is_string()) {
+            return Err("execution mode/placement must be a string".into());
+        }
+        let explicit = env
             .iter()
-            .find(|(k, v)| k == "SYLPHX_EXECUTION_MODE" && !v.trim().is_empty())
-            .map(|(_, v)| v.trim().to_ascii_lowercase())
-            .or_else(|| {
-                std::env::var("SYLPHX_EXECUTION_MODE")
-                    .ok()
-                    .map(|s| s.trim().to_ascii_lowercase())
-                    .filter(|s| !s.is_empty())
-            })
-            .or_else(|| {
-                std::fs::read_to_string(config_dir.join("sylphx-agent.json"))
-                    .ok()
-                    .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-                    .and_then(|v| {
-                        v.get("execution_mode")
-                            .and_then(Value::as_str)
-                            .map(|s| s.trim().to_ascii_lowercase())
-                    })
-            })
-            .or_else(|| {
-                std::fs::read_to_string(config_dir.join("sylphx-workspace-placement.json"))
-                    .ok()
-                    .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-                    .and_then(|v| {
-                        v.get("placement")
-                            .and_then(Value::as_str)
-                            .map(|s| s.trim().to_ascii_lowercase())
-                    })
-            });
-        match mode_str.as_deref() {
-            Some("local" | "local_only" | "native") => Self::LocalOnly,
-            Some("cloud_only" | "strict_cloud") => Self::CloudOnly,
-            _ => Self::AutoCloudFirst,
+            .find(|(k, _)| k == "SYLPHX_EXECUTION_MODE")
+            .map(|(_, v)| v.clone())
+            .or_else(|| std::env::var("SYLPHX_EXECUTION_MODE").ok());
+        // Persistent placement owns routing, independent of SDK session transfer.
+        let mode = placed
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or(explicit)
+            .or_else(|| configured.and_then(Value::as_str).map(str::to_string));
+        match mode
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            None | Some("auto_cloud_first" | "auto" | "cloud") => Ok(Self::AutoCloudFirst),
+            Some("local" | "local_only" | "native") => Ok(Self::LocalOnly),
+            Some("cloud_only" | "strict_cloud") => Ok(Self::CloudOnly),
+            Some(other) => Err(format!("invalid execution mode/placement: {other}")),
         }
     }
 }
@@ -132,6 +129,11 @@ pub fn teleport_session_to_cloud(
     env: &[(String, String)],
     explicit_env_slug: Option<&str>,
 ) -> Result<SessionTeleportReceipt, String> {
+    if load_persisted_cloud_session(config_dir)?.is_some() {
+        return Err(
+            "teleport requires reconciling/pulling the retained cloud session first".into(),
+        );
+    }
     let api_key = resolve_sylphx_cloud_access_key(config_dir, env).ok_or_else(|| {
         "missing Sylphx API key; run `anyagents sign-in sylphx` first".to_string()
     })?;
@@ -151,13 +153,15 @@ pub fn teleport_session_to_cloud(
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
         })
-        .unwrap_or_else(|| DEFAULT_SYLPHX_SANDBOX_PARENT.to_string());
-    let canonical_env = normalize_cloud_env_slug(&env_slug);
+        .ok_or("teleport requires an explicit authorized cloud environment (SYLPHX_AGENT_ENV)")?;
+    let canonical_env = normalize_cloud_env_slug(&env_slug)?;
     let (model_id, _) = parse_sylphx_model_and_effort(model);
     let transcript_path = config_dir.join("sylphx-transcript.jsonl");
+    crate::memory::validate_transcript(&transcript_path)?;
     let transcript_items = load_transcript_input_items(&transcript_path).len();
 
     let mut system_prompt = assemble_system_prompt(config_dir, work_dir);
+    system_prompt.push_str(&crate::load_explicit_context(config_dir, work_dir)?);
     if let Some(prior_block) = build_prior_transcript_continuity_block(&transcript_path) {
         system_prompt.push_str("\n\n");
         system_prompt.push_str(&prior_block);
@@ -181,7 +185,8 @@ pub fn teleport_session_to_cloud(
             "tools": build_cloud_agent_tools(),
         },
     });
-    let (st_agent, raw_agent) = curl_post_json(&create_agent_url, Some(&api_key), &spec_body)?;
+    let (st_agent, raw_agent) =
+        crate::auth::post_cloud_json(&create_agent_url, Some(&api_key), &spec_body)?;
     if !(200..300).contains(&st_agent) {
         return Err(format!(
             "teleport_to_cloud create_agent HTTP {st_agent}: {}",
@@ -194,6 +199,7 @@ pub fn teleport_session_to_cloud(
         .or_else(|| agent_val.get("id"))
         .or_else(|| agent_val.get("uid"))
         .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
         .ok_or_else(|| "teleport_to_cloud create_agent missing name/id".to_string())?
         .to_string();
 
@@ -203,7 +209,8 @@ pub fn teleport_session_to_cloud(
         "title": "Teleported Sylphx SDK Session",
         "environment": environment_spec,
     });
-    let (st_sess, raw_sess) = curl_post_json(&create_sess_url, Some(&api_key), &sess_body)?;
+    let (st_sess, raw_sess) =
+        crate::auth::post_cloud_json(&create_sess_url, Some(&api_key), &sess_body)?;
     if !(200..300).contains(&st_sess) {
         return Err(format!(
             "teleport_to_cloud create_session HTTP {st_sess}: {}",
@@ -216,6 +223,7 @@ pub fn teleport_session_to_cloud(
         .or_else(|| sess_val.get("id"))
         .or_else(|| sess_val.get("uid"))
         .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
         .ok_or_else(|| "teleport_to_cloud create_session missing name/id".to_string())?
         .to_string();
 
@@ -228,15 +236,15 @@ pub fn teleport_session_to_cloud(
             env_slug: canonical_env.clone(),
             last_seq: 0,
         },
-    );
-    let _ = std::fs::write(
-        config_dir.join(".sylphx-cloud-instructions-fingerprint"),
-        format!("{current_fp}\n"),
-    );
-    let _ = std::fs::write(
-        config_dir.join("sylphx-session-id"),
-        format!("{session_id}\n"),
-    );
+    )?;
+    crate::contracts::write_atomic(
+        &config_dir.join(".sylphx-cloud-instructions-fingerprint"),
+        format!("{current_fp}\n").as_bytes(),
+    )?;
+    crate::contracts::write_atomic(
+        &config_dir.join("sylphx-session-id"),
+        format!("{session_id}\n").as_bytes(),
+    )?;
     let _ = std::fs::remove_file(config_dir.join("sylphx-cloud-session-fallback.json"));
     let _ = std::fs::remove_file(config_dir.join("sylphx-sandbox-fallback.json"));
 
@@ -261,80 +269,99 @@ pub fn pull_session_from_cloud(
     env: &[(String, String)],
 ) -> Result<SessionTeleportReceipt, String> {
     let transcript_path = config_dir.join("sylphx-transcript.jsonl");
+    crate::memory::validate_transcript(&transcript_path)?;
     let mut synced_events = 0usize;
     let mut prev_agent_id = None;
     let mut prev_session_id = None;
     let mut prev_env_slug = None;
 
-    if let Some(persisted) = load_persisted_cloud_session(config_dir) {
+    if let Some(mut persisted) = load_persisted_cloud_session(config_dir)? {
         prev_agent_id = Some(persisted.agent_id.clone());
         prev_session_id = Some(persisted.session_id.clone());
         prev_env_slug = Some(persisted.env_slug.clone());
-
-        if let Some(api_key) = resolve_sylphx_cloud_access_key(config_dir, env) {
-            let base = resolve_cloud_api_url(env);
-            let sess_path = cloud_session_resource_path(&persisted.env_slug, &persisted.session_id);
-            let interrupt_url = format!("{base}/v1/{sess_path}:interrupt");
-            let _ = curl_post_json(&interrupt_url, Some(&api_key), &json!({}));
-
-            let events_url = if persisted.last_seq > 0 {
-                format!(
-                    "{base}/v1/{sess_path}/session_events?filter=sequence%20%3E%20{}",
-                    persisted.last_seq
-                )
-            } else {
-                format!("{base}/v1/{sess_path}/session_events")
-            };
-            if let Ok((200..=299, raw_events)) = curl_get(&events_url, Some(&api_key))
-                && let Ok(ev_doc) = serde_json::from_str::<Value>(&raw_events)
-                && let Some(events) = ev_doc
-                    .get("session_events")
-                    .or_else(|| ev_doc.get("sessionEvents"))
-                    .or_else(|| ev_doc.get("events"))
-                    .and_then(Value::as_array)
-            {
-                for ev in events {
-                    let seq = ev
-                        .get("sequence")
-                        .and_then(|v| {
-                            v.as_i64()
-                                .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
-                        })
-                        .unwrap_or(0);
-                    if seq > 0 && seq <= persisted.last_seq {
-                        continue;
-                    }
-                    let ev_type = ev
-                        .get("type")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_ascii_uppercase();
-                    if (ev_type.contains("AGENT_MESSAGE") || ev_type.contains("RESPONSE"))
-                        && let Some(parts) = ev.pointer("/message/parts").and_then(Value::as_array)
-                    {
-                        for p in parts {
-                            if let Some(t) = p
-                                .get("text")
-                                .and_then(Value::as_str)
-                                .map(str::trim)
-                                .filter(|s| !s.is_empty())
-                            {
-                                append_transcript_message(
-                                    &transcript_path,
-                                    &json!({
-                                        "type": "message",
-                                        "role": "assistant",
-                                        "content": [{ "type": "output_text", "text": t }],
-                                    }),
-                                );
-                                synced_events += 1;
-                            }
-                        }
-                    }
+        let api_key = resolve_sylphx_cloud_access_key(config_dir, env)
+            .ok_or("cloud pull requires credentials; binding retained")?;
+        let base = resolve_cloud_api_url(env);
+        let sess_path = cloud_session_resource_path(&persisted.env_slug, &persisted.session_id);
+        let settled = crate::interrupt_and_settle(&base, &sess_path, &api_key)?;
+        let terminal_seq = crate::contracts::sequence(
+            settled
+                .get("last_event_sequence")
+                .or_else(|| settled.get("lastEventSequence")),
+            true,
+        )?;
+        let starting_seq = persisted.last_seq;
+        let mut page_token = String::new();
+        let mut seen_tokens = std::collections::HashSet::new();
+        loop {
+            let url = format!(
+                "{base}/v1/{sess_path}/session_events?filter=sequence%20%3E%20{starting_seq}{page_token}"
+            );
+            let (status, raw) = curl_get(&url, Some(&api_key))?;
+            if !(200..300).contains(&status) {
+                return Err(format!("cloud pull events HTTP {status}; binding retained"));
+            }
+            let doc: Value = serde_json::from_str(&raw)
+                .map_err(|e| format!("invalid cloud pull events: {e}"))?;
+            let events = doc
+                .get("session_events")
+                .or_else(|| doc.get("sessionEvents"))
+                .or_else(|| doc.get("events"))
+                .and_then(Value::as_array)
+                .ok_or("cloud pull missing events array")?;
+            // Validate the full page before retaining any of it.
+            for event in events {
+                crate::contracts::sequence(event.get("sequence"), false)?;
+            }
+            for event in events {
+                let seq = crate::contracts::sequence(event.get("sequence"), false)?;
+                if seq <= persisted.last_seq {
+                    continue;
                 }
+                // A retained identity lets a retry reconcile append-before-cursor failure.
+                let existing =
+                    crate::contracts::read_optional(&transcript_path)?.unwrap_or_default();
+                let duplicate = existing
+                    .lines()
+                    .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                    .any(|item| {
+                        item.get("cloud_session").and_then(Value::as_str)
+                            == Some(&persisted.session_id)
+                            && item.get("cloud_sequence").and_then(Value::as_i64) == Some(seq)
+                    });
+                if !duplicate {
+                    append_transcript_message(
+                        &transcript_path,
+                        &json!({
+                            "type": "cloud_session_event", "cloud_session": persisted.session_id,
+                            "cloud_sequence": seq, "event": event,
+                        }),
+                    )?;
+                    synced_events += 1;
+                }
+                persisted.last_seq = seq;
+                save_persisted_cloud_session(config_dir, &persisted)?;
+            }
+            let next = doc
+                .get("next_page_token")
+                .or_else(|| doc.get("nextPageToken"));
+            if let Some(token) = next.and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                if !seen_tokens.insert(token.to_string()) {
+                    return Err("cloud pull repeated pagination token; binding retained".into());
+                }
+                let encoded: String = token.bytes().map(|byte| format!("%{byte:02X}")).collect();
+                page_token = format!("&page_token={encoded}");
+            } else {
+                break;
             }
         }
-        clear_persisted_cloud_session(config_dir);
+        if persisted.last_seq < terminal_seq {
+            return Err(
+                "cloud pull did not reach the settled event watermark; binding retained".into(),
+            );
+        }
+        clear_persisted_cloud_session(config_dir)?;
+        crate::contracts::remove_optional(&config_dir.join("sylphx-cloud-turn-pending.json"))?;
     }
 
     let transcript_items = load_transcript_input_items(&transcript_path).len();
@@ -366,17 +393,17 @@ impl SylphxSdkSession {
         work_dir: impl Into<PathBuf>,
         model: Option<String>,
         env: Vec<(String, String)>,
-    ) -> Self {
+    ) -> Result<Self, String> {
         let config_dir = config_dir.into();
         let work_dir = work_dir.into();
-        let execution_mode = SylphxExecutionMode::from_env(&config_dir, &env);
-        Self {
+        let execution_mode = SylphxExecutionMode::from_env(&config_dir, &env)?;
+        Ok(Self {
             config_dir,
             work_dir,
             model,
             execution_mode,
             env,
-        }
+        })
     }
 
     pub fn teleport_to_cloud(
@@ -405,8 +432,30 @@ impl SylphxSdkSession {
             &std::env::current_exe().unwrap_or_else(|_| PathBuf::from("anyagents")),
         );
         let environment = self.env.clone().into();
-        match self.execution_mode {
-            SylphxExecutionMode::LocalOnly => run_native_gateway_turn(
+        // A submitted/unknown cloud effect must not be repeated locally or on a new session.
+        let selected = if self.execution_mode == SylphxExecutionMode::LocalOnly {
+            None
+        } else {
+            crate::resolve_cloud_agent_environment(&self.config_dir, &self.env)?
+        };
+        if self.execution_mode == SylphxExecutionMode::CloudOnly && selected.is_none() {
+            return Err("cloud execution requires an explicit authorized environment".into());
+        }
+        if let Some(env_slug) = selected {
+            run_cloud_session_turn(
+                &state,
+                &cancel_flag,
+                &self.config_dir,
+                &self.work_dir,
+                self.model.as_deref(),
+                &environment,
+                &exe,
+                &[],
+                &env_slug,
+                user_prompt,
+            )
+        } else {
+            run_native_gateway_turn(
                 &state,
                 &cancel_flag,
                 &self.config_dir,
@@ -416,97 +465,7 @@ impl SylphxSdkSession {
                 &exe,
                 &[],
                 user_prompt,
-            ),
-            SylphxExecutionMode::CloudOnly => {
-                let first = run_cloud_session_turn(
-                    &state,
-                    &cancel_flag,
-                    &self.config_dir,
-                    &self.work_dir,
-                    self.model.as_deref(),
-                    &environment,
-                    &exe,
-                    &[],
-                    DEFAULT_SYLPHX_SANDBOX_PARENT,
-                    user_prompt,
-                );
-                match first {
-                    Ok(u) => Ok(u),
-                    Err(ref e) if crate::is_recoverable_cloud_session_lease_error(e) => {
-                        clear_persisted_cloud_session(&self.config_dir);
-                        run_cloud_session_turn(
-                            &state,
-                            &cancel_flag,
-                            &self.config_dir,
-                            &self.work_dir,
-                            self.model.as_deref(),
-                            &environment,
-                            &exe,
-                            &[],
-                            DEFAULT_SYLPHX_SANDBOX_PARENT,
-                            user_prompt,
-                        )
-                    }
-                    Err(e) => Err(e),
-                }
-            }
-            SylphxExecutionMode::AutoCloudFirst => {
-                let first = run_cloud_session_turn(
-                    &state,
-                    &cancel_flag,
-                    &self.config_dir,
-                    &self.work_dir,
-                    self.model.as_deref(),
-                    &environment,
-                    &exe,
-                    &[],
-                    DEFAULT_SYLPHX_SANDBOX_PARENT,
-                    user_prompt,
-                );
-                let resolved = match first {
-                    Ok(u) => Ok(u),
-                    Err(ref e) if crate::is_recoverable_cloud_session_lease_error(e) => {
-                        clear_persisted_cloud_session(&self.config_dir);
-                        run_cloud_session_turn(
-                            &state,
-                            &cancel_flag,
-                            &self.config_dir,
-                            &self.work_dir,
-                            self.model.as_deref(),
-                            &environment,
-                            &exe,
-                            &[],
-                            DEFAULT_SYLPHX_SANDBOX_PARENT,
-                            user_prompt,
-                        )
-                    }
-                    Err(e) => Err(e),
-                };
-                match resolved {
-                    Ok(u) => Ok(u),
-                    Err(_) => {
-                        clear_persisted_cloud_session(&self.config_dir);
-                        {
-                            let mut g = state
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            g.cloud_agent_id = None;
-                            g.cloud_session_id = None;
-                        }
-                        run_native_gateway_turn(
-                            &state,
-                            &cancel_flag,
-                            &self.config_dir,
-                            &self.work_dir,
-                            self.model.as_deref(),
-                            &environment,
-                            &exe,
-                            &[],
-                            user_prompt,
-                        )
-                    }
-                }
-            }
+            )
         }
     }
 

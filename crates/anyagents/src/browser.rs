@@ -137,7 +137,7 @@ pub struct BrowserRequest {
     /// or `"close"` / `"stop"` (shut down the browser process to scale to zero while keeping profile login state on disk).
     #[serde(default)]
     pub action: String,
-    /// Persistent browser profile name (e.g. `"default"`, `"xenon"`, `"github"`, `"x"`).
+    /// Persistent browser profile name (e.g. `"default"`, `"research"`, `"shopping"`).
     /// Login cookies, localStorage, and deterministic anti-detect fingerprint persist per profile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
@@ -298,13 +298,66 @@ fn chromium_binary() -> String {
         .clone()
 }
 
+fn read_profile_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>, Error> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(Error::Message(format!(
+                "cannot read {}: {err}",
+                path.display()
+            )));
+        }
+    };
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|err| Error::Message(format!("invalid {}: {err}", path.display())))
+}
+
+fn write_profile_json<T: Serialize + ?Sized>(path: &Path, value: &T) -> Result<(), Error> {
+    static NEXT_WRITE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dir = path
+        .parent()
+        .ok_or_else(|| Error::Message("profile path has no parent".into()))?;
+    std::fs::create_dir_all(dir)?;
+    let seq = NEXT_WRITE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = dir.join(format!(".profile.{}.{seq}.json", std::process::id()));
+    let publish = || -> Result<(), Error> {
+        let bytes =
+            serde_json::to_vec_pretty(value).map_err(|err| Error::Message(err.to_string()))?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&tmp)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)?;
+        #[cfg(unix)]
+        std::fs::File::open(dir)?.sync_all()?;
+        Ok(())
+    };
+    let result = publish();
+    let _ = std::fs::remove_file(tmp);
+    result
+}
+
+fn remove_profile_file(path: &Path) -> Result<(), Error> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
 pub fn ensure_fingerprint(data: &Path, profile: &str) -> Result<BrowserFingerprint, Error> {
     let dir = profile_dir(data, profile);
     std::fs::create_dir_all(&dir)?;
     let fp_path = dir.join("fingerprint.json");
-    if let Ok(bytes) = std::fs::read(&fp_path)
-        && let Ok(existing) = serde_json::from_slice::<BrowserFingerprint>(&bytes)
-    {
+    if let Some(existing) = read_profile_json::<BrowserFingerprint>(&fp_path)? {
         return Ok(existing);
     }
     let seed = deterministic_profile_seed(profile);
@@ -359,9 +412,7 @@ pub fn ensure_fingerprint(data: &Path, profile: &str) -> Result<BrowserFingerpri
         ],
         timezone: "Asia/Hong_Kong".to_string(),
     };
-    if let Ok(bytes) = serde_json::to_vec_pretty(&fp) {
-        let _ = std::fs::write(&fp_path, bytes);
-    }
+    write_profile_json(&fp_path, &fp)?;
     Ok(fp)
 }
 
@@ -374,7 +425,7 @@ fn stealth_init_script(fp: &BrowserFingerprint) -> String {
     let noise_seed = (fp.seed % 9973) as u32 + 1;
     format!(
         r#"(() => {{
-  try {{
+  'use strict';
     Object.defineProperty(navigator, 'webdriver', {{ get: () => false, configurable: true }});
     Object.defineProperty(navigator, 'languages', {{ get: () => {langs}, configurable: true }});
     Object.defineProperty(navigator, 'language', {{ get: () => 'zh-HK', configurable: true }});
@@ -448,7 +499,7 @@ fn stealth_init_script(fp: &BrowserFingerprint) -> String {
         return imageData;
       }};
     }}
-  }} catch (_) {{}}
+  return true;
 }})();"#,
         langs = langs,
         cores = fp.hardware_concurrency,
@@ -460,9 +511,17 @@ fn stealth_init_script(fp: &BrowserFingerprint) -> String {
 }
 
 fn process_alive(pid: u32) -> bool {
-    if pid == 0 {
+    if pid == 0 || pid > i32::MAX as u32 {
         return false;
     }
+    #[cfg(unix)]
+    {
+        // /proc is not mounted on macOS. Signal 0 checks existence without
+        // changing the process; lack of permission still proves it is alive.
+        let exists = unsafe { libc::kill(pid as i32, 0) == 0 };
+        exists || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(not(unix))]
     Path::new(&format!("/proc/{pid}")).exists()
 }
 
@@ -474,31 +533,35 @@ fn cdp_port_alive(port: u16) -> bool {
     .is_ok()
 }
 
-fn load_runtime(data: &Path, profile: &str) -> Option<BrowserRuntimeState> {
+fn load_runtime(data: &Path, profile: &str) -> Result<Option<BrowserRuntimeState>, Error> {
     let path = profile_dir(data, profile).join("runtime.json");
-    let bytes = std::fs::read(&path).ok()?;
-    let state: BrowserRuntimeState = serde_json::from_slice(&bytes).ok()?;
-    if process_alive(state.pid) && cdp_port_alive(state.cdp_port) {
-        Some(state)
+    let Some(state) = read_profile_json::<BrowserRuntimeState>(&path)? else {
+        return Ok(None);
+    };
+    if process_alive(state.pid) {
+        if !cdp_port_alive(state.cdp_port) {
+            return Err(Error::Message(format!(
+                "browser process {} is alive but CDP is unavailable",
+                state.pid
+            )));
+        }
+        Ok(Some(state))
     } else {
-        let _ = std::fs::remove_file(&path);
-        None
+        remove_profile_file(&path)?;
+        Ok(None)
     }
 }
 
-fn save_runtime(data: &Path, state: &BrowserRuntimeState) {
-    let dir = profile_dir(data, &state.profile);
-    let _ = std::fs::create_dir_all(&dir);
-    if let Ok(bytes) = serde_json::to_vec_pretty(state) {
-        // A frame/state reader must never mistake a truncated runtime for a
-        // stopped browser while the independent input lane updates activity.
-        let _ = publish_browser_json(&dir.join("runtime.json"), &bytes);
-    }
+fn save_runtime(data: &Path, state: &BrowserRuntimeState) -> Result<(), Error> {
+    write_profile_json(
+        &profile_dir(data, &state.profile).join("runtime.json"),
+        state,
+    )
 }
 
-fn touch_runtime(data: &Path, state: &mut BrowserRuntimeState) {
+fn touch_runtime(data: &Path, state: &mut BrowserRuntimeState) -> Result<(), Error> {
     state.last_used_at_ms = now_ms();
-    save_runtime(data, state);
+    save_runtime(data, state)
 }
 
 fn allocate_free_port() -> Result<u16, Error> {
@@ -523,8 +586,8 @@ fn ensure_browser_running(
     headless_override: Option<bool>,
 ) -> Result<(BrowserRuntimeState, BrowserFingerprint), Error> {
     let fp = ensure_fingerprint(data, profile)?;
-    if let Some(mut running) = load_runtime(data, profile) {
-        touch_runtime(data, &mut running);
+    if let Some(mut running) = load_runtime(data, profile)? {
+        touch_runtime(data, &mut running)?;
         return Ok((running, fp));
     }
 
@@ -631,7 +694,10 @@ fn ensure_browser_running(
         started_at_ms: now,
         last_used_at_ms: now,
     };
-    save_runtime(data, &state);
+    if let Err(err) = save_runtime(data, &state) {
+        stop_process_group(pid);
+        return Err(err);
+    }
     Ok((state, fp))
 }
 
@@ -723,9 +789,8 @@ fn wait_for_chromium_cdp(
     // for the cause of a startup failure. Reap the launched child after cleanup.
     let before_cleanup = format!("{:?}", child.try_wait());
     stop_process_group(child.id());
-    // `process_alive` is /proc-based; on hosts without /proc the group helper
-    // may return before a TERM-ignoring launcher exits. Never wait for that
-    // child indefinitely on the startup failure path.
+    // Also terminate the direct child if group cleanup could not observe it.
+    // Never wait for a TERM-ignoring launcher indefinitely on startup failure.
     let _ = child.kill();
     let after_cleanup = format!("{:?}", child.wait());
     Err(Error::Message(format!(
@@ -765,22 +830,20 @@ pub fn stop_profile(data: &Path, profile: &str) -> Result<serde_json::Value, Err
     let rt_path = dir.join("runtime.json");
     let mut stopped_pid = None;
     let mut released_keys = Vec::new();
-    if let Ok(bytes) = std::fs::read(&rt_path)
-        && let Ok(mut rt) = serde_json::from_slice::<BrowserRuntimeState>(&bytes)
-    {
+    if let Some(mut rt) = read_profile_json::<BrowserRuntimeState>(&rt_path)? {
         if cdp_port_alive(rt.cdp_port)
             && let Ok(page) = select_page_target(data, &mut rt, None)
             && let Some(ws_url) = page.ws_url
             && let Ok(mut cdp) = CdpSession::connect(rt.cdp_port, &ws_url)
         {
-            released_keys = release_recorded_held_keys(data, profile, &mut cdp);
+            released_keys = release_recorded_held_keys(data, profile, &mut cdp)?;
         }
         stopped_pid = Some(rt.pid);
         stop_process_group(rt.pid);
     }
-    clear_held_keys(data, profile);
-    let _ = cleanup_takeover_session(data, profile);
-    let _ = std::fs::remove_file(&rt_path);
+    clear_held_keys(data, profile)?;
+    cleanup_takeover_session(data, profile)?;
+    remove_profile_file(&rt_path)?;
     cleanup_singleton_locks(&dir.join("user-data"));
     Ok(serde_json::json!({
         "profile": profile,
@@ -811,11 +874,13 @@ pub fn reap_idle_browsers(data: &Path) {
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        reap_expired_takeover(data, name, now);
-        if is_human_takeover_active(data, name, now) {
+        if reap_expired_takeover(data, name, now).is_err() {
             continue;
         }
-        if let Some(rt) = load_runtime(data, name)
+        if is_human_takeover_active(data, name, now).unwrap_or(true) {
+            continue;
+        }
+        if let Ok(Some(rt)) = load_runtime(data, name)
             && now.saturating_sub(rt.last_used_at_ms) > idle_ms
         {
             let _ = stop_profile(data, name);
@@ -858,6 +923,15 @@ fn cdp_http_get(port: u16, path: &str) -> Result<Vec<u8>, Error> {
                     let hend = pos + 4;
                     header_end = Some(hend);
                     let headers_str = String::from_utf8_lossy(&buf[..pos]);
+                    let status = headers_str
+                        .lines()
+                        .next()
+                        .and_then(|s| s.split_whitespace().nth(1))
+                        .and_then(|s| s.parse::<u16>().ok())
+                        .ok_or_else(|| Error::Message("invalid CDP HTTP status".into()))?;
+                    if !(200..300).contains(&status) {
+                        return Err(Error::Message(format!("CDP HTTP {path}: status {status}")));
+                    }
                     for line in headers_str.lines() {
                         if let Some((k, v)) = line.split_once(':')
                             && k.trim().eq_ignore_ascii_case("content-length")
@@ -886,7 +960,7 @@ fn cdp_http_get(port: u16, path: &str) -> Result<Vec<u8>, Error> {
     if let Some(hend) = header_end {
         Ok(buf[hend..].to_vec())
     } else {
-        Ok(buf)
+        Err(Error::Message("CDP HTTP response has no headers".into()))
     }
 }
 
@@ -915,7 +989,7 @@ fn select_page_target(
     {
         if rt.active_target_id.as_deref() != Some(&found.id) {
             rt.active_target_id = Some(found.id.clone());
-            save_runtime(data, rt);
+            save_runtime(data, rt)?;
         }
         return Ok(found);
     }
@@ -924,7 +998,7 @@ fn select_page_target(
         .next()
         .ok_or_else(|| Error::Message("no browser page target available".into()))?;
     rt.active_target_id = Some(chosen.id.clone());
-    save_runtime(data, rt);
+    save_runtime(data, rt)?;
     Ok(chosen)
 }
 
@@ -1134,11 +1208,11 @@ impl CdpSession {
 }
 
 fn apply_stealth(cdp: &mut CdpSession, fp: &BrowserFingerprint) -> Result<(), Error> {
-    let _ = cdp.call("Page.enable", serde_json::json!({}));
-    let _ = cdp.call("Runtime.enable", serde_json::json!({}));
-    let _ = cdp.call("DOM.enable", serde_json::json!({}));
-    let _ = cdp.call("Network.enable", serde_json::json!({}));
-    let _ = cdp.call(
+    cdp.call("Page.enable", serde_json::json!({}))?;
+    cdp.call("Runtime.enable", serde_json::json!({}))?;
+    cdp.call("DOM.enable", serde_json::json!({}))?;
+    cdp.call("Network.enable", serde_json::json!({}))?;
+    cdp.call(
         "Emulation.setUserAgentOverride",
         serde_json::json!({
             "userAgent": fp.user_agent,
@@ -1164,23 +1238,21 @@ fn apply_stealth(cdp: &mut CdpSession, fp: &BrowserFingerprint) -> Result<(), Er
                 "wow64": false
             }
         }),
-    );
-    let _ = cdp.call(
+    )?;
+    cdp.call(
         "Emulation.setTimezoneOverride",
         serde_json::json!({ "timezoneId": fp.timezone }),
-    );
+    )?;
     let script = stealth_init_script(fp);
-    let _ = cdp.call(
+    cdp.call(
         "Page.addScriptToEvaluateOnNewDocument",
         serde_json::json!({ "source": script }),
-    );
-    let _ = cdp.call(
-        "Runtime.evaluate",
-        serde_json::json!({
-            "expression": script,
-            "returnByValue": true,
-        }),
-    );
+    )?;
+    if eval_js(cdp, &script)?.as_bool() != Some(true) {
+        return Err(Error::Message(
+            "stealth initialization did not complete".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -1513,6 +1585,9 @@ pub struct BrowserTakeoverState {
     /// `"human"` while the user holds control; `"agent"` once completed or released.
     pub holder: String,
     pub completed: bool,
+    /// Completion was persisted but the owner's continuation still needs delivery.
+    #[serde(default)]
+    pub notification_pending: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_at_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1558,60 +1633,29 @@ fn takeover_ownership_lock(
     Ok(file)
 }
 
-fn load_takeover_state(data: &Path, profile: &str) -> Option<BrowserTakeoverState> {
-    let bytes = std::fs::read(takeover_path(data, profile)).ok()?;
-    serde_json::from_slice(&bytes).ok()
+fn load_takeover_state(data: &Path, profile: &str) -> Result<Option<BrowserTakeoverState>, Error> {
+    read_profile_json(&takeover_path(data, profile))
 }
 
-fn publish_browser_json(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    static NEXT_WRITE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let seq = NEXT_WRITE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let dir = path.parent().unwrap();
-    let tmp = dir.join(format!(".browser.{}.{seq}.json", std::process::id()));
-    let result = (|| {
-        std::fs::create_dir_all(dir)?;
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(&tmp)?;
-        file.write_all(bytes)?;
-        // Listener, frame and input readers always see a complete snapshot.
-        std::fs::rename(&tmp, path)
-    })();
-    let _ = std::fs::remove_file(tmp);
-    result
+fn save_takeover_state(data: &Path, state: &BrowserTakeoverState) -> Result<(), Error> {
+    write_profile_json(&takeover_path(data, &state.profile), state)
 }
 
-fn save_takeover_state(data: &Path, state: &BrowserTakeoverState) {
-    if let Ok(bytes) = serde_json::to_vec_pretty(state) {
-        let _ = publish_browser_json(&takeover_path(data, &state.profile), &bytes);
-    }
-}
-
-fn is_human_takeover_active(data: &Path, profile: &str, now: i64) -> bool {
-    load_takeover_state(data, profile).is_some_and(|st| {
+fn is_human_takeover_active(data: &Path, profile: &str, now: i64) -> Result<bool, Error> {
+    Ok(load_takeover_state(data, profile)?.is_some_and(|st| {
         st.holder == "human" && !st.completed && now < st.expires_at_ms && cdp_port_alive(st.port)
-    })
+    }))
 }
 
-fn reap_expired_takeover(data: &Path, profile: &str, now: i64) {
-    let Ok(_ownership) = takeover_ownership_lock(data, profile, true) else {
-        return;
-    };
-    if let Some(mut st) = load_takeover_state(data, profile)
+fn reap_expired_takeover(data: &Path, profile: &str, now: i64) -> Result<(), Error> {
+    let _ownership = takeover_ownership_lock(data, profile, true)?;
+    if let Some(mut st) = load_takeover_state(data, profile)?
         && st.holder == "human"
         && !st.completed
         && (now >= st.expires_at_ms || !cdp_port_alive(st.port))
     {
-        if drain_takeover_mouse(data, profile).is_err()
-            || restore_takeover_viewport(&mut st).is_err()
-        {
-            return;
-        }
+        drain_takeover_mouse(data, profile)?;
+        restore_takeover_viewport(&mut st)?;
         if let Some(tpid) = st.tunnel_pid.take() {
             stop_process_group(tpid);
         }
@@ -1619,8 +1663,9 @@ fn reap_expired_takeover(data: &Path, profile: &str, now: i64) {
         st.completed = true;
         st.completed_at_ms = Some(now);
         st.completion_note = Some("takeover session expired".to_string());
-        save_takeover_state(data, &st);
+        save_takeover_state(data, &st)?;
     }
+    Ok(())
 }
 
 fn cleanup_takeover_session(data: &Path, profile: &str) -> Result<(), Error> {
@@ -1630,13 +1675,18 @@ fn cleanup_takeover_session(data: &Path, profile: &str) -> Result<(), Error> {
 
 fn cleanup_takeover_session_owned(data: &Path, profile: &str) -> Result<(), Error> {
     drain_takeover_mouse(data, profile)?;
-    if let Some(mut st) = load_takeover_state(data, profile) {
+    if let Some(mut st) = load_takeover_state(data, profile)? {
+        if st.notification_pending {
+            return Err(Error::Message(
+                "takeover owner notification pending; retry completion before cleanup".into(),
+            ));
+        }
         restore_takeover_viewport(&mut st)?;
         if let Some(tpid) = st.tunnel_pid {
             stop_process_group(tpid);
         }
     }
-    let _ = std::fs::remove_file(takeover_path(data, profile));
+    remove_profile_file(&takeover_path(data, profile))?;
     Ok(())
 }
 
@@ -1699,16 +1749,17 @@ fn restore_takeover_viewport(st: &mut BrowserTakeoverState) -> Result<(), Error>
 
 /// Phone layout is a short lease, renewed by /state. A vanished client must not
 /// leave the agent with an emulated viewport, even before the takeover expires.
-fn reap_disconnected_takeover_viewport(data: &Path, profile: &str, now: i64) {
-    if let Some(mut st) = load_takeover_state(data, profile)
+fn reap_disconnected_takeover_viewport(data: &Path, profile: &str, now: i64) -> Result<(), Error> {
+    if let Some(mut st) = load_takeover_state(data, profile)?
         && st.original_viewport.is_some()
         && st
             .viewport_heartbeat_ms
             .is_none_or(|last| now - last > 10_000)
-        && restore_takeover_viewport(&mut st).is_ok()
     {
-        save_takeover_state(data, &st);
+        restore_takeover_viewport(&mut st)?;
+        save_takeover_state(data, &st)?;
     }
+    Ok(())
 }
 
 fn set_takeover_viewport(
@@ -1716,19 +1767,26 @@ fn set_takeover_viewport(
     profile: &str,
     payload: &serde_json::Value,
 ) -> Result<serde_json::Value, Error> {
-    let mut st = load_takeover_state(data, profile)
+    let enabled = payload
+        .get("enabled")
+        .and_then(|v| v.as_bool())
+        .ok_or_else(|| Error::Message("viewport requires boolean enabled".into()))?;
+    for field in ["width", "height"] {
+        if payload.get(field).is_some_and(|v| v.as_u64().is_none()) {
+            return Err(Error::Message(format!(
+                "viewport {field} must be an unsigned integer"
+            )));
+        }
+    }
+    let mut st = load_takeover_state(data, profile)?
         .ok_or_else(|| Error::Message("takeover session is not active".into()))?;
     if st.completed || st.holder != "human" || now_ms() >= st.expires_at_ms {
         return Err(Error::Message("takeover session has ended".into()));
     }
-    let enabled = payload
-        .get("enabled")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
     if !enabled {
         restore_takeover_viewport(&mut st)?;
     } else {
-        let mut rt = load_runtime(data, profile)
+        let mut rt = load_runtime(data, profile)?
             .ok_or_else(|| Error::Message("browser is not running".into()))?;
         let target = select_page_target(data, &mut rt, None)?;
         let ws_url = target
@@ -1765,7 +1823,7 @@ fn set_takeover_viewport(
                     .to_string(),
             });
             st.viewport_heartbeat_ms = Some(now_ms());
-            save_takeover_state(data, &st);
+            save_takeover_state(data, &st)?;
         }
         // Resize only the window: no Emulation/UA/Client Hints/DPR changes.
         // Metrics overrides disappear with their short-lived CDP session; window
@@ -1786,7 +1844,7 @@ fn set_takeover_viewport(
         )?;
         st.viewport_heartbeat_ms = Some(now_ms());
     }
-    save_takeover_state(data, &st);
+    save_takeover_state(data, &st)?;
     Ok(serde_json::json!({ "ok": true, "phone_layout": st.original_viewport.is_some() }))
 }
 
@@ -1942,21 +2000,19 @@ fn dispatch_takeover_key(cdp: &mut CdpSession, payload: &serde_json::Value) -> R
     Ok(())
 }
 
-fn generate_takeover_token() -> String {
+fn generate_takeover_token() -> Result<String, Error> {
+    takeover_token_from_entropy(std::fs::File::open("/dev/urandom")?)
+}
+
+fn takeover_token_from_entropy(mut entropy: impl Read) -> Result<String, Error> {
     let mut bytes = [0u8; 16];
-    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-        let _ = f.read_exact(&mut bytes);
-    } else {
-        let seed = deterministic_profile_seed(&format!("takeover-{}", now_ms()));
-        bytes[..8].copy_from_slice(&seed.to_le_bytes());
-        bytes[8..].copy_from_slice(&seed.rotate_left(19).to_le_bytes());
-    }
+    entropy.read_exact(&mut bytes)?;
     let mut out = String::with_capacity(36);
     out.push_str("tok_");
     for b in bytes {
         out.push_str(&format!("{b:02x}"));
     }
-    out
+    Ok(out)
 }
 
 fn constant_time_eq(a: &str, b: &str) -> bool {
@@ -2085,25 +2141,24 @@ fn notify_agent_takeover_completed(
     profile: &str,
     url: &str,
     note: Option<&str>,
-) {
+    completion_id: i64,
+) -> Result<(), Error> {
     let Some(agent_name) = owner_agent
         .map(str::trim)
         .filter(|s| !s.is_empty() && *s != "default" && *s != "operator")
     else {
-        return;
+        return Ok(());
     };
     let db_path = data.join("state.db");
-    if !db_path.exists() {
-        return;
+    if !db_path.try_exists()? {
+        return Err(Error::Message(
+            "takeover completion owner store is missing".into(),
+        ));
     }
-    let Ok(store) = anyagents_core::Store::open(db_path) else {
-        return;
-    };
-    let Ok(agent) = store.agent_by_name(agent_name) else {
-        return;
-    };
+    let store = anyagents_core::Store::open(db_path)?;
+    let agent = store.agent_by_name(agent_name)?;
     let now = now_ms();
-    let msg_id = format!("msg_takeover_{profile}_{now}");
+    let msg_id = format!("msg_takeover_{profile}_{completion_id}");
     let note_suffix = note
         .filter(|s| !s.trim().is_empty())
         .map(|n| format!(" ({n})"))
@@ -2111,7 +2166,7 @@ fn notify_agent_takeover_completed(
     let text = format!(
         "[Browser Takeover Completed] User finished browser takeover on profile `{profile}`{note_suffix} (current url: {url}). Control is now back with you; call `browser({{ \"action\": \"snapshot\", \"profile\": \"{profile}\" }})` to inspect the updated page and continue."
     );
-    let _ = store.receive(
+    let outcome = store.receive(
         &agent.id,
         anyagents_core::Incoming {
             source_key: Some(msg_id),
@@ -2123,12 +2178,17 @@ fn notify_agent_takeover_completed(
             received_at_ms: Some(now),
             origin: None,
         },
-    );
+    )?;
+    // Receipt replay must not replay lifecycle effects after a later archive.
+    if matches!(outcome, anyagents_core::ReceiveOutcome::Duplicate(_)) {
+        return Ok(());
+    }
     if agent.state == "idle" || agent.state == "archived" {
-        let _ = store.set_agent_state(&agent.id, "running");
+        store.set_agent_state(&agent.id, "running")?;
     }
     crate::create::poke_agent_wake_socket(data, &agent.id);
     crate::create::poke_agent_wake_socket_mail(data, &agent.id);
+    Ok(())
 }
 
 fn spawn_cloudflared_quick_tunnel(local_port: u16, token: &str) -> (Option<String>, Option<u32>) {
@@ -2258,6 +2318,14 @@ fn render_takeover_html(profile: &str, token: &str, reason: Option<&str>) -> Str
         .replace("{{SCRIPT}}", include_str!("browser_takeover.js"))
 }
 
+fn navigate_page(cdp: &mut CdpSession, url: &str) -> Result<(), Error> {
+    let result = cdp.call("Page.navigate", serde_json::json!({ "url": url }))?;
+    if let Some(error) = result["errorText"].as_str().filter(|s| !s.is_empty()) {
+        return Err(Error::Message(format!("Page.navigate: {error}")));
+    }
+    Ok(())
+}
+
 struct TakeoverPageSession {
     target_id: String,
     cdp: CdpSession,
@@ -2278,9 +2346,10 @@ fn dispatch_takeover_input_session(
     payload: &serde_json::Value,
     session: &mut Option<TakeoverPageSession>,
 ) -> Result<serde_json::Value, Error> {
-    let mut rt = load_runtime(data, profile)
+    validate_takeover_input(payload)?;
+    let mut rt = load_runtime(data, profile)?
         .ok_or_else(|| Error::Message(format!("browser profile `{profile}` is not running")))?;
-    touch_runtime(data, &mut rt);
+    touch_runtime(data, &mut rt)?;
     if session.as_ref().is_some_and(|page| {
         page.cdp.port != rt.cdp_port || rt.active_target_id.as_deref() != Some(&page.target_id)
     }) {
@@ -2477,8 +2546,7 @@ fn retain_takeover_mouse(cdp: &CdpSession, payload: &serde_json::Value) -> Resul
             target_id: target_id.clone(),
             payload: payload.clone(),
         };
-        let bytes = serde_json::to_vec(&held).map_err(|e| Error::Message(e.to_string()))?;
-        publish_browser_json(path, &bytes)?;
+        write_profile_json(path, &held)?;
     }
     Ok(())
 }
@@ -2534,10 +2602,7 @@ fn dispatch_takeover_cdp_input(
     cdp: &mut CdpSession,
     payload: &serde_json::Value,
 ) -> Result<serde_json::Value, Error> {
-    let kind = payload
-        .get("type")
-        .and_then(|v| v.as_str())
-        .unwrap_or("click");
+    let kind = validate_takeover_input(payload)?;
     match kind {
         "mouseCancel" => cancel_takeover_mouse(cdp, payload),
         "click" => {
@@ -2718,12 +2783,12 @@ fn dispatch_takeover_cdp_input(
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
             {
-                let _ = cdp.call("Page.navigate", serde_json::json!({ "url": u }));
+                navigate_page(cdp, u)?;
             }
             Ok(serde_json::json!({ "ok": true, "type": "navigate" }))
         }
         "reload" => {
-            let _ = cdp.call("Page.reload", serde_json::json!({}));
+            cdp.call("Page.reload", serde_json::json!({}))?;
             Ok(serde_json::json!({ "ok": true, "type": "reload" }))
         }
         other => Err(Error::Message(format!(
@@ -2788,6 +2853,32 @@ fn jpeg_size(bytes: &[u8]) -> Option<TakeoverFrameSize> {
     None
 }
 
+fn decode_takeover_payload(bytes: &[u8]) -> Result<serde_json::Value, Error> {
+    let value: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|err| Error::Message(format!("invalid takeover JSON: {err}")))?;
+    if !value.is_object() {
+        return Err(Error::Message("takeover payload must be an object".into()));
+    }
+    Ok(value)
+}
+
+fn validate_takeover_input(payload: &serde_json::Value) -> Result<&str, Error> {
+    let kind = payload
+        .get("type")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| Error::Message("takeover input requires type".into()))?;
+    if matches!(kind, "click" | "mouse") && (!payload["x"].is_number() || !payload["y"].is_number())
+    {
+        return Err(Error::Message(
+            "pointer input requires numeric x and y".into(),
+        ));
+    }
+    if kind == "navigate" && payload["url"].as_str().is_none_or(|s| s.is_empty()) {
+        return Err(Error::Message("navigation requires url".into()));
+    }
+    Ok(kind)
+}
+
 #[derive(Default)]
 struct TakeoverServerShared {
     last_frame: Mutex<Option<TakeoverFrameSize>>,
@@ -2835,13 +2926,13 @@ fn spawn_takeover_client(
     }
 }
 
-fn takeover_request_active(data: &Path, profile: &str, token: &str) -> bool {
-    load_takeover_state(data, profile).is_some_and(|state| {
+fn takeover_request_active(data: &Path, profile: &str, token: &str) -> Result<bool, Error> {
+    Ok(load_takeover_state(data, profile)?.is_some_and(|state| {
         constant_time_eq(&state.token, token)
             && state.holder == "human"
             && !state.completed
             && now_ms() < state.expires_at_ms
-    })
+    }))
 }
 
 fn handle_takeover_http_client(
@@ -2851,20 +2942,43 @@ fn handle_takeover_http_client(
     expected_token: &str,
     shared: &TakeoverServerShared,
 ) -> bool {
+    match handle_takeover_http_client_inner(&mut stream, data, profile, expected_token, shared) {
+        Ok(done) => done,
+        Err(err) => {
+            let body = serde_json::json!({ "ok":false, "error":err.to_string() }).to_string();
+            let _ = write_http_response(
+                &mut stream,
+                "400 Bad Request",
+                "application/json",
+                body.as_bytes(),
+            );
+            false
+        }
+    }
+}
+
+fn handle_takeover_http_client_inner(
+    stream: &mut TcpStream,
+    data: &Path,
+    profile: &str,
+    expected_token: &str,
+    shared: &TakeoverServerShared,
+) -> Result<bool, Error> {
+    load_takeover_state(data, profile)?;
     let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
     let mut buf = Vec::with_capacity(2048);
     let mut chunk = [0u8; 1024];
     let header_end = loop {
         match stream.read(&mut chunk) {
-            Ok(0) | Err(_) => return false,
+            Ok(0) | Err(_) => return Ok(false),
             Ok(n) => {
                 buf.extend_from_slice(&chunk[..n]);
                 if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
                     break pos + 4;
                 }
                 if buf.len() > 65536 {
-                    return false;
+                    return Ok(false);
                 }
             }
         }
@@ -2876,21 +2990,25 @@ fn handle_takeover_http_client(
     let raw_path = parts.next().unwrap_or("/");
     let path_only = raw_path.split('?').next().unwrap_or("/");
 
-    let content_len: usize = header_str
-        .lines()
-        .find_map(|line| {
-            let (k, v) = line.split_once(':')?;
-            if k.trim().eq_ignore_ascii_case("content-length") {
-                v.trim().parse::<usize>().ok()
-            } else {
-                None
-            }
-        })
-        .unwrap_or(0);
-    while buf.len() < header_end + content_len && buf.len() < 131_072 {
+    let content_len = match header_str.lines().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        key.trim()
+            .eq_ignore_ascii_case("content-length")
+            .then_some(value.trim())
+    }) {
+        Some(value) => value
+            .parse::<usize>()
+            .map_err(|_| Error::Message("invalid Content-Length".into()))?,
+        None => 0,
+    };
+    if content_len > 131_072 {
+        return Err(Error::Message("takeover request body is too large".into()));
+    }
+    while buf.len() < header_end + content_len {
         match stream.read(&mut chunk) {
-            Ok(0) | Err(_) => break,
+            Ok(0) => return Err(Error::Message("incomplete takeover request body".into())),
             Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(err) => return Err(err.into()),
         }
     }
     let body_bytes = if buf.len() >= header_end {
@@ -2900,8 +3018,8 @@ fn handle_takeover_http_client(
     };
 
     if path_only == "/healthz" {
-        let _ = write_http_response(&mut stream, "200 OK", "application/json", b"{\"ok\":true}");
-        return false;
+        let _ = write_http_response(stream, "200 OK", "application/json", b"{\"ok\":true}");
+        return Ok(false);
     }
 
     let prefix = format!("/takeover/{expected_token}");
@@ -2914,12 +3032,12 @@ fn handle_takeover_http_client(
                 .is_some_and(|tok| constant_time_eq(tok, expected_token));
             if !matched {
                 let _ = write_http_response(
-                    &mut stream,
+                    stream,
                     "403 Forbidden",
                     "application/json",
                     b"{\"error\":\"invalid takeover token\"}",
                 );
-                return false;
+                return Ok(false);
             }
             ""
         }
@@ -2928,27 +3046,25 @@ fn handle_takeover_http_client(
     // Accepting TCP or recognizing a captured URL is not admission. A worker
     // may have waited on headers while this takeover completed or was replaced.
     let completing = method == "POST" && subpath == "/complete";
-    let Ok(_ownership) = takeover_ownership_lock(data, profile, completing) else {
-        return false;
-    };
+    let _ownership = takeover_ownership_lock(data, profile, completing)?;
     let _completion = completing.then(|| shared.dispatch.write().unwrap());
     let _dispatch = (!completing).then(|| shared.dispatch.read().unwrap());
-    if !takeover_request_active(data, profile, expected_token) {
+    if !takeover_request_active(data, profile, expected_token)? {
         let _ = write_http_response(
-            &mut stream,
+            stream,
             "403 Forbidden",
             "application/json",
             b"{\"error\":\"takeover session is no longer active\"}",
         );
-        return false;
+        return Ok(false);
     }
 
-    match (method, subpath) {
+    Ok(match (method, subpath) {
         ("GET", "" | "/") => {
-            let reason = load_takeover_state(data, profile).and_then(|s| s.reason);
+            let reason = load_takeover_state(data, profile)?.and_then(|s| s.reason);
             let html = render_takeover_html(profile, expected_token, reason.as_deref());
             let _ = write_http_response(
-                &mut stream,
+                stream,
                 "200 OK",
                 "text/html; charset=utf-8",
                 html.as_bytes(),
@@ -2956,24 +3072,24 @@ fn handle_takeover_http_client(
             false
         }
         ("GET", "/frame.jpg") => {
-            let Some(mut rt) = load_runtime(data, profile) else {
+            let Some(mut rt) = load_runtime(data, profile)? else {
                 let _ = write_http_response(
-                    &mut stream,
+                    stream,
                     "503 Service Unavailable",
                     "application/json",
                     b"{\"error\":\"browser not running\"}",
                 );
-                return false;
+                return Ok(false);
             };
             let mut session = shared.frame.lock().unwrap();
             let Ok(cdp) = takeover_page_session(data, &mut rt, &mut session) else {
                 let _ = write_http_response(
-                    &mut stream,
+                    stream,
                     "503 Service Unavailable",
                     "application/json",
                     b"{\"error\":\"no page target\"}",
                 );
-                return false;
+                return Ok(false);
             };
             let metrics = eval_js(cdp, TAKEOVER_METRICS_JS).unwrap_or(serde_json::Value::Null);
             if let Ok(shot) = cdp.call(
@@ -2992,7 +3108,7 @@ fn handle_takeover_http_client(
                 let width = metrics["width"].as_u64().unwrap_or(1280);
                 let height = metrics["height"].as_u64().unwrap_or(800);
                 let _ = write_http_response_with_headers(
-                    &mut stream,
+                    stream,
                     "200 OK",
                     "image/jpeg",
                     &jpeg_bytes,
@@ -3003,7 +3119,7 @@ fn handle_takeover_http_client(
             } else {
                 *session = None;
                 let _ = write_http_response(
-                    &mut stream,
+                    stream,
                     "500 Internal Server Error",
                     "application/json",
                     b"{\"error\":\"capture failed\"}",
@@ -3018,7 +3134,7 @@ fn handle_takeover_http_client(
             let mut title = String::new();
             let mut cap = CaptchaDetection::default();
             let mut metrics = serde_json::Value::Null;
-            if let Some(mut rt) = load_runtime(data, profile)
+            if let Some(mut rt) = load_runtime(data, profile)?
                 && let Ok(target) = select_page_target(data, &mut rt, None)
             {
                 url = target.url.clone();
@@ -3041,12 +3157,12 @@ fn handle_takeover_http_client(
                     }
                 }
             }
-            let mut st = load_takeover_state(data, profile);
+            let mut st = load_takeover_state(data, profile)?;
             if let Some(st) = st.as_mut()
                 && st.original_viewport.is_some()
             {
                 st.viewport_heartbeat_ms = Some(now_ms());
-                save_takeover_state(data, st);
+                save_takeover_state(data, st)?;
             }
             let dpr = metrics["device_scale_factor"].as_f64().unwrap_or(1.0);
             let body = serde_json::json!({
@@ -3066,13 +3182,13 @@ fn handle_takeover_http_client(
                 "natural_height": last_frame.map(|f| f.height),
             });
             let bytes = serde_json::to_vec(&body).unwrap_or_default();
-            let _ = write_http_response(&mut stream, "200 OK", "application/json", &bytes);
+            let _ = write_http_response(stream, "200 OK", "application/json", &bytes);
             false
         }
         ("POST", "/viewport") => {
             let _control = shared.control.lock().unwrap();
-            let payload = serde_json::from_slice(body_bytes).unwrap_or(serde_json::Value::Null);
-            let result = set_takeover_viewport(data, profile, &payload);
+            let result = decode_takeover_payload(body_bytes)
+                .and_then(|payload| set_takeover_viewport(data, profile, &payload));
             let (status, body) = match result {
                 Ok(value) => ("200 OK", value),
                 Err(err) => (
@@ -3081,7 +3197,7 @@ fn handle_takeover_http_client(
                 ),
             };
             let _ = write_http_response(
-                &mut stream,
+                stream,
                 status,
                 "application/json",
                 &serde_json::to_vec(&body).unwrap_or_default(),
@@ -3089,22 +3205,22 @@ fn handle_takeover_http_client(
             false
         }
         ("POST", "/input") => {
-            let payload: serde_json::Value =
-                serde_json::from_slice(body_bytes).unwrap_or_else(|_| serde_json::json!({}));
             let mut session = shared.input.lock().unwrap();
-            if !takeover_request_active(data, profile, expected_token) {
+            if !takeover_request_active(data, profile, expected_token)? {
                 let _ = write_http_response(
-                    &mut stream,
+                    stream,
                     "403 Forbidden",
                     "application/json",
                     b"{\"error\":\"takeover session is no longer active\"}",
                 );
-                return false;
+                return Ok(false);
             }
-            match dispatch_takeover_input_session(data, profile, &payload, &mut session) {
+            match decode_takeover_payload(body_bytes).and_then(|payload| {
+                dispatch_takeover_input_session(data, profile, &payload, &mut session)
+            }) {
                 Ok(res) => {
                     let bytes = serde_json::to_vec(&res).unwrap_or_default();
-                    let _ = write_http_response(&mut stream, "200 OK", "application/json", &bytes);
+                    let _ = write_http_response(stream, "200 OK", "application/json", &bytes);
                 }
                 Err(err) => {
                     let bytes = serde_json::to_vec(&serde_json::json!({
@@ -3112,48 +3228,42 @@ fn handle_takeover_http_client(
                         "error": err.to_string(),
                     }))
                     .unwrap_or_default();
-                    let _ = write_http_response(
-                        &mut stream,
-                        "400 Bad Request",
-                        "application/json",
-                        &bytes,
-                    );
+                    let _ =
+                        write_http_response(stream, "400 Bad Request", "application/json", &bytes);
                 }
             }
             false
         }
         ("POST", "/complete") => {
             let _control = shared.control.lock().unwrap();
-            let payload: serde_json::Value =
-                serde_json::from_slice(body_bytes).unwrap_or_else(|_| serde_json::json!({}));
+            let payload = decode_takeover_payload(body_bytes)?;
             let note = payload
                 .get("note")
                 .and_then(|v| v.as_str())
                 .map(str::to_string);
-            let done = complete_takeover_session_owned(data, profile, note.as_deref());
+            let done = complete_takeover_session_owned(data, profile, note.as_deref())?;
             let bytes = serde_json::to_vec(&done).unwrap_or_default();
-            let _ = write_http_response(&mut stream, "200 OK", "application/json", &bytes);
+            let _ = write_http_response(stream, "200 OK", "application/json", &bytes);
             done["completed"].as_bool().unwrap_or(false)
         }
         _ => {
             let _ = write_http_response(
-                &mut stream,
+                stream,
                 "404 Not Found",
                 "application/json",
                 b"{\"error\":\"not found\"}",
             );
             false
         }
-    }
+    })
 }
 
-fn complete_takeover_session(data: &Path, profile: &str, note: Option<&str>) -> serde_json::Value {
-    let _ownership = match takeover_ownership_lock(data, profile, true) {
-        Ok(lock) => lock,
-        Err(error) => {
-            return serde_json::json!({"ok":false,"completed":false,"error":error.to_string()});
-        }
-    };
+fn complete_takeover_session(
+    data: &Path,
+    profile: &str,
+    note: Option<&str>,
+) -> Result<serde_json::Value, Error> {
+    let _ownership = takeover_ownership_lock(data, profile, true)?;
     complete_takeover_session_owned(data, profile, note)
 }
 
@@ -3161,13 +3271,11 @@ fn complete_takeover_session_owned(
     data: &Path,
     profile: &str,
     note: Option<&str>,
-) -> serde_json::Value {
-    if let Err(error) = drain_takeover_mouse(data, profile) {
-        return serde_json::json!({"ok":false,"completed":false,"error":error.to_string()});
-    }
+) -> Result<serde_json::Value, Error> {
+    drain_takeover_mouse(data, profile)?;
     let now = now_ms();
     let mut current_url = String::new();
-    if let Some(mut rt) = load_runtime(data, profile)
+    if let Some(mut rt) = load_runtime(data, profile)?
         && let Ok(target) = select_page_target(data, &mut rt, None)
     {
         current_url = target.url.clone();
@@ -3179,46 +3287,54 @@ fn complete_takeover_session_owned(
             current_url = s.to_string();
         }
     }
-    if let Some(mut st) = load_takeover_state(data, profile) {
-        let was_completed = st.completed;
-        if let Err(err) = restore_takeover_viewport(&mut st) {
-            return serde_json::json!({ "ok": false, "error": err.to_string(), "completed": false });
+    if let Some(mut st) = load_takeover_state(data, profile)? {
+        if !st.completed {
+            restore_takeover_viewport(&mut st)?;
+            if let Some(tpid) = st.tunnel_pid.take() {
+                stop_process_group(tpid);
+            }
+            st.holder = "agent".to_string();
+            st.completed = true;
+            st.notification_pending = true;
+            st.completed_at_ms = Some(now);
+            st.completion_note = note
+                .map(str::to_string)
+                .or_else(|| Some("completed by user".to_string()));
+            save_takeover_state(data, &st)?;
         }
-        if let Some(tpid) = st.tunnel_pid.take() {
-            stop_process_group(tpid);
-        }
-        st.holder = "agent".to_string();
-        st.completed = true;
-        st.completed_at_ms = Some(now);
-        st.completion_note = note
-            .map(str::to_string)
-            .or_else(|| Some("completed by user".to_string()));
-        save_takeover_state(data, &st);
-        if !was_completed {
+        if st.notification_pending {
             notify_agent_takeover_completed(
                 data,
                 st.owner_agent.as_deref(),
                 profile,
                 &current_url,
                 st.completion_note.as_deref(),
-            );
+                st.started_at_ms,
+            )
+            .map_err(|err| {
+                Error::Message(format!(
+                    "takeover completed; owner notification pending: {err}"
+                ))
+            })?;
+            st.notification_pending = false;
+            save_takeover_state(data, &st)?;
         }
-        serde_json::json!({
+        Ok(serde_json::json!({
             "ok": true,
             "profile": profile,
             "holder": "agent",
             "completed": true,
-            "completed_at_ms": now,
+            "completed_at_ms": st.completed_at_ms,
             "url": current_url,
-        })
+        }))
     } else {
-        serde_json::json!({
+        Ok(serde_json::json!({
             "ok": true,
             "profile": profile,
             "holder": "agent",
             "completed": true,
             "url": current_url,
-        })
+        }))
     }
 }
 
@@ -3236,7 +3352,7 @@ fn start_or_reuse_takeover_session(
     let duration_ms = ttl_ms
         .unwrap_or(DEFAULT_TAKEOVER_TTL_MS)
         .clamp(5_000, 3_600_000) as i64;
-    if let Some(mut existing) = load_takeover_state(data, profile)
+    if let Some(mut existing) = load_takeover_state(data, profile)?
         && existing.holder == "human"
         && !existing.completed
         && now < existing.expires_at_ms
@@ -3246,16 +3362,19 @@ fn start_or_reuse_takeover_session(
         if let Some(r) = reason.filter(|s| !s.trim().is_empty()) {
             existing.reason = Some(r.to_string());
         }
-        save_takeover_state(data, &existing);
+        save_takeover_state(data, &existing)?;
         return Ok(existing);
     }
 
+    if load_takeover_state(data, profile)?.is_some_and(|s| s.notification_pending) {
+        complete_takeover_session_owned(data, profile, None)?;
+    }
     cleanup_takeover_session_owned(data, profile)?;
 
     let listener = TcpListener::bind("0.0.0.0:0").or_else(|_| TcpListener::bind("127.0.0.1:0"))?;
     let port = listener.local_addr()?.port();
     let _ = listener.set_nonblocking(true);
-    let token = generate_takeover_token();
+    let token = generate_takeover_token()?;
     let local_url = format!("http://127.0.0.1:{port}/takeover/{token}");
 
     let allow_tunnel = want_tunnel.unwrap_or_else(|| {
@@ -3279,6 +3398,7 @@ fn start_or_reuse_takeover_session(
         reason: reason.map(str::to_string),
         holder: "human".to_string(),
         completed: false,
+        notification_pending: false,
         completed_at_ms: None,
         completion_note: None,
         started_at_ms: now,
@@ -3289,7 +3409,12 @@ fn start_or_reuse_takeover_session(
         original_viewport: None,
         viewport_heartbeat_ms: None,
     };
-    save_takeover_state(data, &state);
+    if let Err(err) = save_takeover_state(data, &state) {
+        if let Some(pid) = state.tunnel_pid {
+            stop_process_group(pid);
+        }
+        return Err(err);
+    }
 
     let data_dir = data.to_path_buf();
     let prof = profile.to_string();
@@ -3303,15 +3428,15 @@ fn start_or_reuse_takeover_session(
                 let now = now_ms();
                 // Never wait for state inspection in the accept loop.
                 if let Ok(_control) = shared.control.try_lock() {
-                    reap_disconnected_takeover_viewport(&data_dir, &prof, now);
+                    let _ = reap_disconnected_takeover_viewport(&data_dir, &prof, now);
                 }
-                let Some(cur) = load_takeover_state(&data_dir, &prof) else {
-                    break;
-                };
-                if cur.token != tok || cur.completed || now >= cur.expires_at_ms {
+                let cur = load_takeover_state(&data_dir, &prof);
+                if matches!(cur, Ok(None)) { break; }
+                if let Ok(Some(cur)) = cur
+                    && (cur.token != tok || cur.completed || now >= cur.expires_at_ms) {
                     if cur.token == tok && !cur.completed && now >= cur.expires_at_ms {
-                        reap_expired_takeover(&data_dir, &prof, now);
-                        if load_takeover_state(&data_dir, &prof).is_some_and(|s| !s.completed) {
+                        let _ = reap_expired_takeover(&data_dir, &prof, now);
+                        if !matches!(load_takeover_state(&data_dir, &prof), Ok(Some(s)) if s.completed) {
                             std::thread::sleep(Duration::from_millis(100));
                             continue;
                         }
@@ -3345,15 +3470,15 @@ fn wait_for_takeover_completion(
     data: &Path,
     profile: &str,
     wait_ms: u64,
-) -> (Option<BrowserTakeoverState>, CaptchaDetection) {
+) -> Result<(Option<BrowserTakeoverState>, CaptchaDetection), Error> {
     let deadline = std::time::Instant::now() + Duration::from_millis(wait_ms.clamp(100, 600_000));
     let mut consecutive_cleared = 0u32;
     loop {
         let now = now_ms();
-        reap_expired_takeover(data, profile, now);
-        let st = load_takeover_state(data, profile);
+        reap_expired_takeover(data, profile, now)?;
+        let st = load_takeover_state(data, profile)?;
         let mut cap = CaptchaDetection::default();
-        if let Some(mut rt) = load_runtime(data, profile)
+        if let Some(mut rt) = load_runtime(data, profile)?
             && let Ok(target) = select_page_target(data, &mut rt, None)
             && let Some(ws_url) = target.ws_url
             && let Ok(mut cdp) = CdpSession::connect(rt.cdp_port, &ws_url)
@@ -3361,28 +3486,33 @@ fn wait_for_takeover_completion(
             cap = detect_captcha(&mut cdp);
         }
         let Some(ref cur) = st else {
-            return (None, cap);
+            return Ok((None, cap));
         };
+        if cur.notification_pending {
+            return Err(Error::Message(
+                "takeover completed; owner notification pending; retry completion".into(),
+            ));
+        }
         if cur.completed || cur.holder != "human" {
-            return (st, cap);
+            return Ok((st, cap));
         }
         if cur.initial_captcha_detected {
             if !cap.detected {
                 consecutive_cleared += 1;
                 if consecutive_cleared >= 2 {
-                    let _ = complete_takeover_session(
+                    complete_takeover_session(
                         data,
                         profile,
                         Some("CAPTCHA challenge automatically detected as solved"),
-                    );
-                    return (load_takeover_state(data, profile), cap);
+                    )?;
+                    return Ok((load_takeover_state(data, profile)?, cap));
                 }
             } else {
                 consecutive_cleared = 0;
             }
         }
         if std::time::Instant::now() >= deadline {
-            return (st, cap);
+            return Ok((st, cap));
         }
         std::thread::sleep(Duration::from_millis(400));
     }
@@ -3415,8 +3545,8 @@ fn check_human_takeover_fence(data: &Path, profile: &str, action: &str) -> Resul
         return Ok(());
     }
     let now = now_ms();
-    reap_expired_takeover(data, profile, now);
-    if let Some(st) = load_takeover_state(data, profile)
+    reap_expired_takeover(data, profile, now)?;
+    if let Some(st) = load_takeover_state(data, profile)?
         && st.holder == "human"
         && !st.completed
         && now < st.expires_at_ms
@@ -3510,9 +3640,7 @@ fn capture_snapshot(
         captured_at_ms: now_ms(),
         elements: all_elements,
     };
-    if let Ok(bytes) = serde_json::to_vec_pretty(&stored) {
-        let _ = std::fs::write(profile_dir(data, profile).join("refs.json"), bytes);
-    }
+    write_profile_json(&profile_dir(data, profile).join("refs.json"), &stored)?;
     Ok(val)
 }
 
@@ -3549,74 +3677,11 @@ fn resolve_selector(data: &Path, profile: &str, raw_target: &str) -> ResolvedTar
     }
 }
 
-fn load_op_service_account_token() -> Option<String> {
-    if let Ok(tok) = std::env::var("OP_SERVICE_ACCOUNT_TOKEN")
-        && !tok.trim().is_empty()
-    {
-        return Some(tok.trim().to_string());
-    }
-    if let Some(home) = crate::sandbox::host_home_dir() {
-        for rel in [
-            ".config/op-seat/service-account-token",
-            ".config/op/service-account-token",
-        ] {
-            if let Ok(raw) = std::fs::read_to_string(home.join(rel)) {
-                let trimmed = raw.trim();
-                if !trimmed.is_empty() {
-                    return Some(trimmed.to_string());
-                }
-            }
-        }
-    }
-    None
-}
-
-fn ensure_caller_op_home_and_config_dir() -> Option<(PathBuf, PathBuf)> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-        let uid = unsafe { libc::geteuid() };
-        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-            let candidate = home.join(".config/op");
-            if let Ok(meta) = std::fs::metadata(&candidate)
-                && meta.uid() == uid
-                && (meta.permissions().mode() & 0o777) == 0o700
-            {
-                return Some((home, candidate));
-            }
-        }
-        let home_dir = std::env::temp_dir().join(format!("anyagents-op-home-{uid}"));
-        let cfg_root = home_dir.join(".config");
-        let op_dir = cfg_root.join("op");
-        let _ = std::fs::create_dir_all(&op_dir);
-        let _ = std::fs::set_permissions(&home_dir, std::fs::Permissions::from_mode(0o700));
-        let _ = std::fs::set_permissions(&cfg_root, std::fs::Permissions::from_mode(0o700));
-        let _ = std::fs::set_permissions(&op_dir, std::fs::Permissions::from_mode(0o700));
-        if op_dir.is_dir() {
-            return Some((home_dir, op_dir));
-        }
-        None
-    }
-    #[cfg(not(unix))]
-    {
-        None
-    }
-}
-
+/// Inherit the provider's documented HOME, OP_CONFIG_DIR and
+/// OP_SERVICE_ACCOUNT_TOKEN settings. Operators can select an adapter via PATH;
+/// the browser must not impose a workstation-specific credential policy.
 fn configure_op_command(cmd: &mut Command) {
     cmd.stdin(Stdio::null());
-    cmd.env("DESK_SECRET_READ", "1");
-    if let Some(host_home) = crate::sandbox::host_home_dir() {
-        cmd.env("DESK_OP_HOME", host_home);
-    }
-    if let Some((op_home, cfg_dir)) = ensure_caller_op_home_and_config_dir() {
-        cmd.env("HOME", &op_home);
-        cmd.env("XDG_CONFIG_HOME", op_home.join(".config"));
-        cmd.env("OP_CONFIG_DIR", cfg_dir);
-    }
-    if let Some(token) = load_op_service_account_token() {
-        cmd.env("OP_SERVICE_ACCOUNT_TOKEN", token);
-    }
 }
 
 /// Resolve a secret reference (`op://...`, `op-otp://...`, `secret://...`) in memory
@@ -3911,30 +3976,19 @@ fn held_keys_path(data: &Path, profile: &str) -> PathBuf {
     profile_dir(data, profile).join("held_keys.json")
 }
 
-fn load_held_keys(data: &Path, profile: &str) -> Vec<KeySpec> {
-    let path = held_keys_path(data, profile);
-    std::fs::read(&path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<Vec<KeySpec>>(&bytes).ok())
-        .unwrap_or_default()
+fn load_held_keys(data: &Path, profile: &str) -> Result<Vec<KeySpec>, Error> {
+    Ok(read_profile_json(&held_keys_path(data, profile))?.unwrap_or_default())
 }
 
-fn save_held_keys(data: &Path, profile: &str, keys: &[KeySpec]) {
-    let path = held_keys_path(data, profile);
+fn save_held_keys(data: &Path, profile: &str, keys: &[KeySpec]) -> Result<(), Error> {
     if keys.is_empty() {
-        let _ = std::fs::remove_file(&path);
-        return;
+        return clear_held_keys(data, profile);
     }
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Ok(bytes) = serde_json::to_vec_pretty(keys) {
-        let _ = std::fs::write(&path, bytes);
-    }
+    write_profile_json(&held_keys_path(data, profile), keys)
 }
 
-fn clear_held_keys(data: &Path, profile: &str) {
-    let _ = std::fs::remove_file(held_keys_path(data, profile));
+fn clear_held_keys(data: &Path, profile: &str) -> Result<(), Error> {
+    remove_profile_file(&held_keys_path(data, profile))
 }
 
 fn dispatch_cdp_key_down(
@@ -3965,7 +4019,7 @@ fn dispatch_cdp_key_down(
               el.dispatchEvent(new KeyboardEvent('keydown', {{ key: {key_json}, code: {code_json}, keyCode: {vk}, which: {vk}, repeat: {auto_repeat}, bubbles: true }}));
             }})()"#
         );
-        let _ = eval_js_in_frame(cdp, Some(fid), &js);
+        eval_js_in_frame(cdp, Some(fid), &js)?;
     }
     Ok(())
 }
@@ -3996,23 +4050,47 @@ fn dispatch_cdp_key_up(
               el.dispatchEvent(new KeyboardEvent('keyup', {{ key: {key_json}, code: {code_json}, keyCode: {vk}, which: {vk}, bubbles: true }}));
             }})()"#
         );
-        let _ = eval_js_in_frame(cdp, Some(fid), &js);
+        eval_js_in_frame(cdp, Some(fid), &js)?;
     }
     Ok(())
 }
 
-fn release_recorded_held_keys(data: &Path, profile: &str, cdp: &mut CdpSession) -> Vec<String> {
-    let held = load_held_keys(data, profile);
-    if held.is_empty() {
-        return Vec::new();
-    }
-    let mut released = Vec::with_capacity(held.len());
+fn release_key_ledger(
+    data: &Path,
+    profile: &str,
+    cdp: &mut CdpSession,
+    frame: Option<&str>,
+) -> Result<Vec<String>, Error> {
+    let held = load_held_keys(data, profile)?;
+    let mut remaining = held.clone();
+    let mut released = Vec::new();
+    let mut first_err = None;
     for spec in held.iter().rev() {
-        let _ = dispatch_cdp_key_up(cdp, spec, None);
-        released.push(spec.key.clone());
+        match dispatch_cdp_key_up(cdp, spec, frame) {
+            Ok(()) => {
+                remaining.retain(|s| s.code != spec.code || s.key != spec.key);
+                released.push(spec.key.clone());
+            }
+            Err(err) => {
+                if first_err.is_none() {
+                    first_err = Some(err);
+                }
+            }
+        }
     }
-    clear_held_keys(data, profile);
-    released
+    save_held_keys(data, profile, &remaining)?;
+    if let Some(err) = first_err {
+        return Err(err);
+    }
+    Ok(released)
+}
+
+fn release_recorded_held_keys(
+    data: &Path,
+    profile: &str,
+    cdp: &mut CdpSession,
+) -> Result<Vec<String>, Error> {
+    release_key_ledger(data, profile, cdp, None)
 }
 
 struct HeldKeyGuard<'a> {
@@ -4024,37 +4102,28 @@ struct HeldKeyGuard<'a> {
     released: bool,
 }
 
-impl<'a> HeldKeyGuard<'a> {
+impl HeldKeyGuard<'_> {
     fn release(&mut self) -> Result<(), Error> {
         if self.released {
             return Ok(());
         }
         self.released = true;
-        let mut first_err = None;
-        for spec in self.specs.iter().rev() {
-            if let Err(err) = dispatch_cdp_key_up(self.cdp, spec, self.target_frame_id.as_deref())
-                && first_err.is_none()
-            {
-                first_err = Some(err);
-            }
-        }
-        clear_held_keys(self.data, self.profile);
-        if let Some(err) = first_err {
-            Err(err)
-        } else {
-            Ok(())
-        }
+        release_key_ledger(
+            self.data,
+            self.profile,
+            self.cdp,
+            self.target_frame_id.as_deref(),
+        )?;
+        Ok(())
     }
 }
 
 impl Drop for HeldKeyGuard<'_> {
     fn drop(&mut self) {
+        // Drop cannot acknowledge failure, but must preserve failed releases in
+        // the durable ledger so the next explicit release can recover them.
         if !self.released {
-            self.released = true;
-            for spec in self.specs.iter().rev() {
-                let _ = dispatch_cdp_key_up(self.cdp, spec, self.target_frame_id.as_deref());
-            }
-            clear_held_keys(self.data, self.profile);
+            let _ = self.release();
         }
     }
 }
@@ -4101,7 +4170,7 @@ pub fn list_profiles(data: &Path) -> Result<Vec<BrowserProfileSummary>, Error> {
     let mut out = Vec::new();
     for name in names {
         let fp = ensure_fingerprint(data, &name)?;
-        if let Some(rt) = load_runtime(data, &name) {
+        if let Some(rt) = load_runtime(data, &name)? {
             let pages = list_page_targets(rt.cdp_port).unwrap_or_default();
             let current = pages.first();
             out.push(BrowserProfileSummary {
@@ -4139,6 +4208,25 @@ pub fn execute(
     default_profile: &str,
     req: BrowserRequest,
 ) -> Result<serde_json::Value, Error> {
+    let secret = req.secret_ref.is_some()
+        || req.text.as_deref().is_some_and(|s| {
+            let s = s.trim();
+            s.starts_with("op://") || s.starts_with("op-otp://") || s.starts_with("secret://")
+        });
+    execute_inner(data, default_profile, req).map_err(|err| {
+        if secret {
+            Error::Message("browser secret input failed (provider/page details withheld)".into())
+        } else {
+            err
+        }
+    })
+}
+
+fn execute_inner(
+    data: &Path,
+    default_profile: &str,
+    req: BrowserRequest,
+) -> Result<serde_json::Value, Error> {
     reap_idle_browsers(data);
     let action = if req.action.trim().is_empty() {
         if req.url.is_some() { "open" } else { "status" }
@@ -4161,12 +4249,12 @@ pub fn execute(
         }
         "status" | "info" | "fingerprint" => {
             let fp = ensure_fingerprint(data, &profile)?;
-            let held: Vec<String> = load_held_keys(data, &profile)
+            let held: Vec<String> = load_held_keys(data, &profile)?
                 .into_iter()
                 .map(|k| k.key)
                 .collect();
-            let takeover = load_takeover_state(data, &profile);
-            if let Some(rt) = load_runtime(data, &profile) {
+            let takeover = load_takeover_state(data, &profile)?;
+            if let Some(rt) = load_runtime(data, &profile)? {
                 let pages = list_page_targets(rt.cdp_port).unwrap_or_default();
                 return Ok(serde_json::json!({
                     "profile": profile,
@@ -4225,7 +4313,7 @@ pub fn execute(
                     .to_string();
                 if !tid.is_empty() {
                     rt.active_target_id = Some(tid.clone());
-                    save_runtime(data, &rt);
+                    save_runtime(data, &rt)?;
                 }
                 return Ok(serde_json::json!({
                     "profile": profile,
@@ -4238,9 +4326,9 @@ pub fn execute(
                     .target_id
                     .as_deref()
                     .ok_or_else(|| Error::Message("tabs activate requires target_id".into()))?;
-                let _ = cdp_http_get(rt.cdp_port, &format!("/json/activate/{tid}"));
+                cdp_http_get(rt.cdp_port, &format!("/json/activate/{tid}"))?;
                 rt.active_target_id = Some(tid.to_string());
-                save_runtime(data, &rt);
+                save_runtime(data, &rt)?;
                 return Ok(serde_json::json!({
                     "profile": profile,
                     "active_target_id": tid,
@@ -4253,10 +4341,10 @@ pub fn execute(
                     .or(rt.active_target_id.as_deref())
                     .ok_or_else(|| Error::Message("tabs close requires target_id".into()))?
                     .to_string();
-                let _ = cdp_http_get(rt.cdp_port, &format!("/json/close/{tid}"));
+                cdp_http_get(rt.cdp_port, &format!("/json/close/{tid}"))?;
                 if rt.active_target_id.as_deref() == Some(&tid) {
                     rt.active_target_id = None;
-                    save_runtime(data, &rt);
+                    save_runtime(data, &rt)?;
                 }
                 return Ok(serde_json::json!({
                     "profile": profile,
@@ -4289,8 +4377,8 @@ pub fn execute(
             } else {
                 format!("https://{raw_url}")
             };
-            clear_held_keys(data, &profile);
-            cdp.call("Page.navigate", serde_json::json!({ "url": url }))?;
+            release_recorded_held_keys(data, &profile, &mut cdp)?;
+            navigate_page(&mut cdp, &url)?;
             let wait_ms = req.wait_ms.unwrap_or(1000);
             let deadline = std::time::Instant::now() + Duration::from_secs(10);
             while std::time::Instant::now() < deadline {
@@ -4348,7 +4436,7 @@ pub fn execute(
             if let Some(hint) = snap.get("takeover_hint").cloned() {
                 out["takeover_hint"] = hint;
             }
-            if let Some(st) = load_takeover_state(data, &profile) {
+            if let Some(st) = load_takeover_state(data, &profile)? {
                 out["takeover"] = serde_json::to_value(st).unwrap_or_default();
             }
             Ok(out)
@@ -4407,18 +4495,9 @@ pub fn execute(
                     .unwrap_or((0.0, 0.0));
                 let x = target_info.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0) + off_x;
                 let y = target_info.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0) + off_y;
-                let _ = dispatch_trusted_click(&mut cdp, x, y);
-                let check_js = format!(
-                    r#"(() => {{
-                      if (window.__anyagents_click_hit) return true;
-                      const el = document.querySelector({sel_json});
-                      if (el && el.click) {{ el.focus && el.focus(); el.click(); return true; }}
-                      return false;
-                    }})()"#
-                );
-                let _ = eval_js_in_frame(&mut cdp, active_frame_id.as_deref(), &check_js);
+                dispatch_trusted_click(&mut cdp, x, y)?;
             } else if let Some((x, y)) = resolved.fallback_xy {
-                let _ = dispatch_trusted_click(&mut cdp, x, y);
+                dispatch_trusted_click(&mut cdp, x, y)?;
             } else {
                 return Err(Error::Message(format!(
                     "element `{raw_sel}` not found on page; run `snapshot` first to refresh @e refs"
@@ -4470,18 +4549,18 @@ pub fn execute(
                   const tag = el.tagName.toLowerCase();
                   if (tag === 'select') {{
                     const targetVal = {val_json};
-                    let matched = false;
+                    let selectedValue = null;
                     for (const opt of Array.from(el.options || [])) {{
                       if (opt.value === targetVal || (opt.text && opt.text.trim() === targetVal)) {{
                         el.value = opt.value;
-                        matched = true;
+                        selectedValue = opt.value;
                         break;
                       }}
                     }}
-                    if (!matched) el.value = targetVal;
+                    if (selectedValue === null) el.value = targetVal;
                     el.dispatchEvent(new Event('input', {{ bubbles: true }}));
                     el.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                    return {{ found: true, kind: 'select', tag }};
+                    return {{ found: true, kind: 'select', tag, matched: el.value === (selectedValue === null ? targetVal : selectedValue) }};
                   }}
                   try {{ window.focus && window.focus(); }} catch (_) {{}}
                   el.focus();
@@ -4544,14 +4623,19 @@ pub fn execute(
                 let click_x = prep.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0) + off_x;
                 let click_y = prep.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0) + off_y;
                 if click_x > 0.0 || click_y > 0.0 {
-                    let _ = dispatch_trusted_click(&mut cdp, click_x, click_y);
-                    let _ = eval_js_in_frame(&mut cdp, active_frame_id.as_deref(), &prep_js);
+                    dispatch_trusted_click(&mut cdp, click_x, click_y)?;
+                    eval_js_in_frame(&mut cdp, active_frame_id.as_deref(), &prep_js)?;
                 }
             }
 
+            if prep["kind"] == "select" && prep["matched"] != true {
+                return Err(Error::Message(
+                    "requested select option was not accepted".into(),
+                ));
+            }
             if prep.get("kind").and_then(|v| v.as_str()) != Some("select") {
                 if prep.get("had_content").and_then(|v| v.as_bool()) == Some(true) {
-                    let _ = cdp.call(
+                    cdp.call(
                         "Input.dispatchKeyEvent",
                         serde_json::json!({
                             "type": "keyDown",
@@ -4560,8 +4644,8 @@ pub fn execute(
                             "windowsVirtualKeyCode": 8,
                             "nativeVirtualKeyCode": 8,
                         }),
-                    );
-                    let _ = cdp.call(
+                    )?;
+                    cdp.call(
                         "Input.dispatchKeyEvent",
                         serde_json::json!({
                             "type": "keyUp",
@@ -4570,7 +4654,7 @@ pub fn execute(
                             "windowsVirtualKeyCode": 8,
                             "nativeVirtualKeyCode": 8,
                         }),
-                    );
+                    )?;
                 }
 
                 // Use per-character hardware `Input.dispatchKeyEvent` for short single-line values
@@ -4579,7 +4663,7 @@ pub fn execute(
                 if text_val.chars().count() <= 128 && !text_val.contains('\n') {
                     for ch in text_val.chars() {
                         let s = ch.to_string();
-                        let _ = cdp.call(
+                        cdp.call(
                             "Input.dispatchKeyEvent",
                             serde_json::json!({
                                 "type": "keyDown",
@@ -4587,29 +4671,43 @@ pub fn execute(
                                 "text": s,
                                 "unmodifiedText": s,
                             }),
-                        );
-                        let _ = cdp.call(
+                        )?;
+                        cdp.call(
                             "Input.dispatchKeyEvent",
                             serde_json::json!({
                                 "type": "keyUp",
                                 "key": s,
                             }),
-                        );
+                        )?;
                     }
                 } else if !text_val.is_empty() {
-                    let _ = cdp.call(
+                    cdp.call(
                         "Input.insertText",
                         serde_json::json!({
                             "text": text_val,
                         }),
-                    );
+                    )?;
                 }
 
                 // Verify and fire `change` event (or apply native setter fallback if a custom control or cross-origin frame missed key events).
                 let finalize_js = format!(
                     r#"(() => {{
                       const el = document.querySelector({sel_json});
-                      if (!el) return;
+                      if (!el) return false;
+                      // Auto-advancing single-cell codes deliberately spread the
+                      // trusted keystrokes across controls; verify the whole group,
+                      // never replace or approve only its first cell.
+                      if (el.maxLength === 1 && Array.from({val_json}).length > 1) {{
+                        const root = el.form || el.parentElement;
+                        if (!root) return false;
+                        const cells = Array.from(root.querySelectorAll('input')).filter(cell =>
+                          cell.maxLength === 1 && !cell.disabled && !cell.readOnly && cell.type !== 'hidden');
+                        const start = cells.indexOf(el);
+                        const group = cells.slice(start, start + Array.from({val_json}).length);
+                        if (start < 0 || group.length !== Array.from({val_json}).length || group.map(cell => cell.value).join('') !== {val_json}) return false;
+                        for (const cell of group) cell.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                        return group.map(cell => cell.value).join('') === {val_json};
+                      }}
                       if (typeof el.value === 'string' && el.value !== {val_json} && (!el.maxLength || el.maxLength < 0 || {val_json}.length <= el.maxLength)) {{
                         const proto = Object.getPrototypeOf(el);
                         const desc = Object.getOwnPropertyDescriptor(proto, 'value')
@@ -4623,13 +4721,18 @@ pub fn execute(
                         el.dispatchEvent(new Event('input', {{ bubbles: true }}));
                       }}
                       el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                      return el.isContentEditable ? el.innerText === {val_json} : (typeof el.value === 'string' && el.value === {val_json});
                     }})()"#
                 );
-                let _ = eval_js_in_frame(&mut cdp, active_frame_id.as_deref(), &finalize_js);
+                if eval_js_in_frame(&mut cdp, active_frame_id.as_deref(), &finalize_js)?.as_bool()
+                    != Some(true)
+                {
+                    return Err(Error::Message("input value verification failed".into()));
+                }
             }
 
             if submit {
-                let _ = cdp.call(
+                cdp.call(
                     "Input.dispatchKeyEvent",
                     serde_json::json!({
                         "type": "keyDown",
@@ -4638,8 +4741,8 @@ pub fn execute(
                         "windowsVirtualKeyCode": 13,
                         "nativeVirtualKeyCode": 13,
                     }),
-                );
-                let _ = cdp.call(
+                )?;
+                cdp.call(
                     "Input.dispatchKeyEvent",
                     serde_json::json!({
                         "type": "keyUp",
@@ -4648,7 +4751,7 @@ pub fn execute(
                         "windowsVirtualKeyCode": 13,
                         "nativeVirtualKeyCode": 13,
                     }),
-                );
+                )?;
                 if active_frame_id.is_some() {
                     let submit_js = format!(
                         r#"(() => {{
@@ -4658,7 +4761,7 @@ pub fn execute(
                           el.dispatchEvent(new KeyboardEvent('keyup', {{ key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }}));
                         }})()"#
                     );
-                    let _ = eval_js_in_frame(&mut cdp, active_frame_id.as_deref(), &submit_js);
+                    eval_js_in_frame(&mut cdp, active_frame_id.as_deref(), &submit_js)?;
                 }
             }
             let mut resp = serde_json::json!({
@@ -4695,10 +4798,16 @@ pub fn execute(
                       if (!el) return false;
                       try {{ window.focus && window.focus(); }} catch (_) {{}}
                       el.focus && el.focus();
-                      return true;
+                      return document.activeElement === el;
                     }})()"#
                 );
-                let _ = eval_js_in_frame(&mut cdp, target_frame_id.as_deref(), &focus_js);
+                if eval_js_in_frame(&mut cdp, target_frame_id.as_deref(), &focus_js)?.as_bool()
+                    != Some(true)
+                {
+                    return Err(Error::Message(format!(
+                        "keyboard target `{raw_sel}` could not be focused"
+                    )));
+                }
             } else {
                 let _ = eval_js(
                     &mut cdp,
@@ -4724,13 +4833,13 @@ pub fn execute(
                     for spec in specs.iter().rev() {
                         dispatch_cdp_key_up(&mut cdp, spec, target_frame_id.as_deref())?;
                     }
-                    let mut remaining = load_held_keys(data, &profile);
+                    let mut remaining = load_held_keys(data, &profile)?;
                     remaining.retain(|held| {
                         !specs
                             .iter()
                             .any(|s| s.code == held.code || s.key == held.key)
                     });
-                    save_held_keys(data, &profile, &remaining);
+                    save_held_keys(data, &profile, &remaining)?;
                     let released_names: Vec<String> = specs.iter().map(|s| s.key.clone()).collect();
                     return Ok(serde_json::json!({
                         "profile": profile,
@@ -4743,7 +4852,7 @@ pub fn execute(
                         "held_keys": remaining.iter().map(|s| s.key.clone()).collect::<Vec<_>>(),
                     }));
                 } else {
-                    let released = release_recorded_held_keys(data, &profile, &mut cdp);
+                    let released = release_recorded_held_keys(data, &profile, &mut cdp)?;
                     return Ok(serde_json::json!({
                         "profile": profile,
                         "released": released,
@@ -4758,9 +4867,8 @@ pub fn execute(
             let code_names: Vec<String> = specs.iter().map(|s| s.code.clone()).collect();
 
             if matches!(action.as_str(), "key_down" | "keydown") {
-                let mut current_held = load_held_keys(data, &profile);
+                let mut current_held = load_held_keys(data, &profile)?;
                 for spec in &specs {
-                    dispatch_cdp_key_down(&mut cdp, spec, false, target_frame_id.as_deref())?;
                     if !current_held
                         .iter()
                         .any(|h| h.code == spec.code && h.key == spec.key)
@@ -4768,7 +4876,10 @@ pub fn execute(
                         current_held.push(spec.clone());
                     }
                 }
-                save_held_keys(data, &profile, &current_held);
+                save_held_keys(data, &profile, &current_held)?;
+                for spec in &specs {
+                    dispatch_cdp_key_down(&mut cdp, spec, false, target_frame_id.as_deref())?;
+                }
                 return Ok(serde_json::json!({
                     "profile": profile,
                     "key_down": if key_names.len() == 1 {
@@ -4783,7 +4894,7 @@ pub fn execute(
             }
 
             // Release any prior unclosed held keys on this profile before starting a new press/hold.
-            let _ = release_recorded_held_keys(data, &profile, &mut cdp);
+            release_recorded_held_keys(data, &profile, &mut cdp)?;
 
             let requested_hold = req.hold_ms.or(req.duration_ms);
             let hold_ms = if action == "hold" {
@@ -4795,7 +4906,7 @@ pub fn execute(
             let repeat = req.repeat.unwrap_or(false);
 
             if hold_ms > 0 {
-                save_held_keys(data, &profile, &specs);
+                save_held_keys(data, &profile, &specs)?;
                 let mut guard = HeldKeyGuard {
                     data,
                     profile: &profile,
@@ -4858,12 +4969,19 @@ pub fn execute(
                     "trusted_input": true,
                 }))
             } else {
+                save_held_keys(data, &profile, &specs)?;
+                let mut guard = HeldKeyGuard {
+                    data,
+                    profile: &profile,
+                    cdp: &mut cdp,
+                    target_frame_id: target_frame_id.clone(),
+                    specs: specs.clone(),
+                    released: false,
+                };
                 for spec in &specs {
-                    dispatch_cdp_key_down(&mut cdp, spec, false, target_frame_id.as_deref())?;
+                    dispatch_cdp_key_down(guard.cdp, spec, false, target_frame_id.as_deref())?;
                 }
-                for spec in specs.iter().rev() {
-                    dispatch_cdp_key_up(&mut cdp, spec, target_frame_id.as_deref())?;
-                }
+                guard.release()?;
                 if let Some(wait_ms) = req.wait_ms
                     && wait_ms > 0
                 {
@@ -5006,7 +5124,7 @@ pub fn execute(
                 } else {
                     format!("https://{raw_url}")
                 };
-                let _ = cdp.call("Page.navigate", serde_json::json!({ "url": url }));
+                navigate_page(&mut cdp, &url)?;
                 std::thread::sleep(Duration::from_millis(800));
             }
             let cap = detect_captcha(&mut cdp);
@@ -5050,7 +5168,7 @@ pub fn execute(
             if let Some(wait_ms) = req.wait_ms
                 && wait_ms > 0
             {
-                let (after_st, after_cap) = wait_for_takeover_completion(data, &profile, wait_ms);
+                let (after_st, after_cap) = wait_for_takeover_completion(data, &profile, wait_ms)?;
                 let completed = after_st.as_ref().is_some_and(|s| s.completed);
                 let snap = capture_snapshot(data, &profile, &mut cdp)?;
                 return Ok(serde_json::json!({
@@ -5107,11 +5225,11 @@ pub fn execute(
                 || req.wait_ms.is_some_and(|w| w > 0);
             let (st, cap) = if should_wait {
                 let wait_ms = req.wait_ms.unwrap_or(60_000);
-                wait_for_takeover_completion(data, &profile, wait_ms)
+                wait_for_takeover_completion(data, &profile, wait_ms)?
             } else {
-                reap_expired_takeover(data, &profile, now_ms());
+                reap_expired_takeover(data, &profile, now_ms())?;
                 (
-                    load_takeover_state(data, &profile),
+                    load_takeover_state(data, &profile)?,
                     detect_captcha(&mut cdp),
                 )
             };
@@ -5141,15 +5259,7 @@ pub fn execute(
                 .unwrap_or("released by agent");
             {
                 let _ownership = takeover_ownership_lock(data, &profile, true)?;
-                let done = complete_takeover_session_owned(data, &profile, Some(note));
-                if done["completed"] != true {
-                    return Err(Error::Message(
-                        done["error"]
-                            .as_str()
-                            .unwrap_or("takeover completion failed")
-                            .into(),
-                    ));
-                }
+                complete_takeover_session_owned(data, &profile, Some(note))?;
                 cleanup_takeover_session_owned(data, &profile)?;
             }
             let snap = capture_snapshot(data, &profile, &mut cdp)?;
@@ -5197,10 +5307,1207 @@ fn decode_base64(input: &str) -> Result<Vec<u8>, Error> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn takeover_entropy_requires_a_complete_read() {
+        let error = super::takeover_token_from_entropy(&[1u8; 15][..]).unwrap_err();
+        assert!(matches!(error, anyagents_core::Error::Io(ref e)
+            if e.kind() == std::io::ErrorKind::UnexpectedEof));
+        let denied =
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "entropy unavailable");
+        struct FailedEntropy(std::io::Error);
+        impl std::io::Read for FailedEntropy {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(self.0.kind(), "entropy unavailable"))
+            }
+        }
+        let error = super::takeover_token_from_entropy(FailedEntropy(denied)).unwrap_err();
+        assert!(matches!(error, anyagents_core::Error::Io(ref e)
+            if e.kind() == std::io::ErrorKind::PermissionDenied));
+        assert_eq!(
+            super::takeover_token_from_entropy(&[0xabu8; 16][..]).unwrap(),
+            "tok_abababababababababababababababab"
+        );
+        assert_eq!(super::generate_takeover_token().unwrap().len(), 36);
+    }
+
     use super::*;
     use anyagents_core::{CredentialStore, FileCredentialStore};
     use std::io::{Read, Write};
     use std::net::TcpListener;
+
+    // A real local HTTP/WebSocket peer exercises the production CDP transport,
+    // including server refusals. No Chromium or process-global env is needed.
+    struct ScriptedBrowser {
+        data: tempfile::TempDir,
+        port: u16,
+        calls: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        worker: Option<std::thread::JoinHandle<()>>,
+    }
+
+    fn cdp_ok_response(request: &serde_json::Value) -> serde_json::Value {
+        use serde_json::json;
+        let result = match request["method"].as_str().unwrap() {
+            "Runtime.evaluate" => {
+                let expression = request["params"]["expression"].as_str().unwrap();
+                let value = if expression.contains("const isVisible") {
+                    json!({"url":"https://example.test/", "title":"Fixture", "text":"hello", "elements":[]})
+                } else if expression.contains("found: false") {
+                    json!({"found":true, "kind":"input", "had_content":true, "x":30, "y":40})
+                } else {
+                    json!(true)
+                };
+                json!({"result":{"value":value}})
+            }
+            "Page.getFrameTree" => json!({"frameTree":{"frame":{"id":"main"}}}),
+            "Page.navigate" => json!({"frameId":"main"}),
+            _ => json!({}),
+        };
+        json!({"result":result})
+    }
+
+    impl ScriptedBrowser {
+        fn new(
+            respond: impl Fn(&serde_json::Value) -> serde_json::Value + Send + Sync + 'static,
+        ) -> Self {
+            use std::sync::{
+                Arc, Mutex,
+                atomic::{AtomicBool, Ordering},
+            };
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            listener.set_nonblocking(true).unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let responder = Arc::new(respond);
+            let worker = {
+                let stop = stop.clone();
+                let calls = calls.clone();
+                std::thread::spawn(move || {
+                    let mut clients = Vec::new();
+                    while !stop.load(Ordering::SeqCst) {
+                        let (mut stream, _) = match listener.accept() {
+                            Ok(pair) => pair,
+                            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                                std::thread::sleep(Duration::from_millis(2));
+                                continue;
+                            }
+                            Err(err) => panic!("fixture accept: {err}"),
+                        };
+                        // macOS inherits O_NONBLOCK from the listener; Linux
+                        // does not. CDP framing below expects blocking reads.
+                        stream.set_nonblocking(false).unwrap();
+                        let calls = calls.clone();
+                        let respond = responder.clone();
+                        clients.push(std::thread::spawn(move || {
+                            stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                            let mut header = Vec::new();
+                            let mut byte = [0];
+                            while !header.ends_with(b"\r\n\r\n") {
+                                if stream.read_exact(&mut byte).is_err() { return; }
+                                header.push(byte[0]);
+                            }
+                            let header = String::from_utf8(header).unwrap();
+                            if header.contains("Upgrade: websocket") {
+                                stream.write_all(b"HTTP/1.1 101 Switching Protocols\r\n\r\n").unwrap();
+                                let mut peer = CdpSession { port, stream, read_buf:Vec::new(), next_id:1, takeover_mouse_owner:None, takeover_cancel_registered:false, takeover_cancel_children:Default::default() };
+                                while let Ok(message) = peer.read_text_message() {
+                                    let request: serde_json::Value = serde_json::from_str(&message).unwrap();
+                                    calls.lock().unwrap().push(request.clone());
+                                    let mut response = respond(&request);
+                                    response["id"] = request["id"].clone();
+                                    if peer.send_text_frame(response.to_string().as_bytes()).is_err() { break; }
+                                }
+                            } else {
+                                let path = header.split_whitespace().nth(1).unwrap();
+                                let (status, body) = if path == "/json/list" {
+                                    ("200 OK", serde_json::json!([{
+                                        "id":"page", "type":"page", "url":"https://example.test/", "title":"Fixture",
+                                        "webSocketDebuggerUrl":format!("ws://127.0.0.1:{port}/devtools/page/page")
+                                    }]).to_string())
+                                } else {
+                                    let request = serde_json::json!({"method":path});
+                                    calls.lock().unwrap().push(request.clone());
+                                    if respond(&request).get("error").is_some() {
+                                        ("404 Not Found", "missing target".into())
+                                    } else { ("200 OK", "acknowledged".into()) }
+                                };
+                                write_http_response(&mut stream, status, "application/json", body.as_bytes()).unwrap();
+                            }
+                        }));
+                    }
+                    for client in clients {
+                        client.join().unwrap();
+                    }
+                })
+            };
+            let data = tempfile::tempdir().unwrap();
+            ensure_fingerprint(data.path(), "fixture").unwrap();
+            save_runtime(
+                data.path(),
+                &BrowserRuntimeState {
+                    profile: "fixture".into(),
+                    pid: std::process::id(),
+                    cdp_port: port,
+                    headless: true,
+                    display_mode: "test".into(),
+                    active_target_id: Some("page".into()),
+                    started_at_ms: now_ms(),
+                    last_used_at_ms: now_ms(),
+                },
+            )
+            .unwrap();
+            Self {
+                data,
+                port,
+                calls,
+                stop,
+                worker: Some(worker),
+            }
+        }
+        fn session(&self) -> CdpSession {
+            CdpSession::connect(
+                self.port,
+                &format!("ws://127.0.0.1:{}/devtools/page/page", self.port),
+            )
+            .unwrap()
+        }
+        fn execute(&self, req: BrowserRequest) -> Result<serde_json::Value, Error> {
+            execute(self.data.path(), "fixture", req)
+        }
+        fn input_calls(&self) -> Vec<serde_json::Value> {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|c| c["method"].as_str().unwrap().starts_with("Input."))
+                .cloned()
+                .collect()
+        }
+    }
+    impl Drop for ScriptedBrowser {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.worker.take().unwrap().join().unwrap();
+        }
+    }
+
+    #[test]
+    fn scripted_cdp_peer_waits_for_a_delayed_command() {
+        let fixture = ScriptedBrowser::new(cdp_ok_response);
+        let mut session = fixture.session();
+        // A nonblocking accepted socket closes before this command arrives.
+        std::thread::sleep(Duration::from_millis(20));
+        session.call("Page.enable", serde_json::json!({})).unwrap();
+        assert_eq!(fixture.calls.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn process_liveness_tracks_owned_child_without_procfs() {
+        assert!(process_alive(std::process::id()));
+        assert!(!process_alive(0));
+        assert!(!process_alive(u32::MAX));
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = startup_test_child(&dir.path().join("child.log"), "exec sleep 30");
+        let pid = child.id();
+        assert!(process_alive(pid));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(!process_alive(pid));
+    }
+
+    #[test]
+    fn takeover_mouse_publication_failure_prevents_native_press() {
+        let fixture = ScriptedBrowser::new(|request| {
+            let result = match request["method"].as_str().unwrap() {
+                "Page.addScriptToEvaluateOnNewDocument" => {
+                    serde_json::json!({"identifier":"guard"})
+                }
+                "Page.createIsolatedWorld" => serde_json::json!({"executionContextId":1}),
+                "Target.getTargets" => serde_json::json!({"targetInfos":[]}),
+                _ => return cdp_ok_response(request),
+            };
+            serde_json::json!({"result":result})
+        });
+        let path = takeover_mouse_path(fixture.data.path(), "fixture");
+        std::fs::create_dir(&path).unwrap();
+        let mut cdp = fixture.session();
+        cdp.takeover_mouse_owner = Some((path.clone(), "page".into()));
+        let payload = serde_json::json!({"type":"mouse","event_type":"mousePressed","x":30,"y":40});
+        let error = dispatch_takeover_cdp_input(&mut cdp, &payload).unwrap_err();
+        assert!(
+            error.to_string().to_ascii_lowercase().contains("directory"),
+            "{error}"
+        );
+        assert!(
+            fixture
+                .input_calls()
+                .iter()
+                .all(|call| call["params"]["type"] != "mousePressed")
+        );
+        std::fs::remove_dir(&path).unwrap();
+        dispatch_takeover_cdp_input(&mut cdp, &payload).unwrap();
+        let retained = read_takeover_mouse(&path).unwrap().unwrap();
+        assert_eq!(retained.port, fixture.port);
+        assert_eq!(retained.target_id, "page");
+        assert_eq!(retained.payload["x"], 30.0);
+        assert_eq!(
+            fixture
+                .input_calls()
+                .iter()
+                .filter(|call| call["params"]["type"] == "mousePressed")
+                .count(),
+            1
+        );
+        cancel_takeover_mouse(&mut cdp, &payload).unwrap();
+        assert!(read_takeover_mouse(&path).unwrap().is_none());
+        assert_eq!(
+            fixture
+                .input_calls()
+                .iter()
+                .filter(|call| call["params"]["type"] == "mouseReleased")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn persistence_distinguishes_missing_corruption_and_io_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(load_runtime(dir.path(), "profile").unwrap().is_none());
+        assert!(
+            load_takeover_state(dir.path(), "profile")
+                .unwrap()
+                .is_none()
+        );
+        assert!(load_held_keys(dir.path(), "profile").unwrap().is_empty());
+        let profile = profile_dir(dir.path(), "profile");
+        std::fs::create_dir_all(profile.join("user-data")).unwrap();
+        let lock = profile.join("user-data/SingletonLock");
+        std::fs::write(&lock, b"retained").unwrap();
+        for file in [
+            "runtime.json",
+            "takeover.json",
+            "held_keys.json",
+            "fingerprint.json",
+        ] {
+            let path = profile.join(file);
+            std::fs::write(&path, b"{corrupt").unwrap();
+            let error = match file {
+                "runtime.json" => {
+                    ensure_browser_running(dir.path(), "profile", Some(true)).unwrap_err()
+                }
+                "takeover.json" => {
+                    check_human_takeover_fence(dir.path(), "profile", "click").unwrap_err()
+                }
+                "held_keys.json" => load_held_keys(dir.path(), "profile").unwrap_err(),
+                _ => ensure_fingerprint(dir.path(), "profile").unwrap_err(),
+            };
+            assert!(error.to_string().contains(file), "{error}");
+            assert_eq!(std::fs::read(&path).unwrap(), b"{corrupt");
+            std::fs::remove_file(&path).unwrap();
+            std::fs::create_dir(&path).unwrap();
+            let error = match file {
+                "runtime.json" => load_runtime(dir.path(), "profile").unwrap_err(),
+                "takeover.json" => load_takeover_state(dir.path(), "profile").unwrap_err(),
+                "held_keys.json" => load_held_keys(dir.path(), "profile").unwrap_err(),
+                _ => ensure_fingerprint(dir.path(), "profile").unwrap_err(),
+            };
+            assert!(error.to_string().contains(file), "{error}");
+            std::fs::remove_dir(&path).unwrap();
+        }
+        assert_eq!(std::fs::read(lock).unwrap(), b"retained");
+        let fp = ensure_fingerprint(dir.path(), "profile").unwrap();
+        assert_eq!(
+            ensure_fingerprint(dir.path(), "profile").unwrap().seed,
+            fp.seed
+        );
+    }
+
+    #[test]
+    fn live_process_without_cdp_is_not_replaced() {
+        let fixture = ScriptedBrowser::new(cdp_ok_response);
+        let mut runtime = load_runtime(fixture.data.path(), "fixture")
+            .unwrap()
+            .unwrap();
+        let port = TcpListener::bind("127.0.0.1:0").unwrap();
+        runtime.cdp_port = port.local_addr().unwrap().port();
+        drop(port);
+        save_runtime(fixture.data.path(), &runtime).unwrap();
+        let err = load_runtime(fixture.data.path(), "fixture").unwrap_err();
+        assert!(
+            err.to_string().contains("alive but CDP is unavailable"),
+            "{err}"
+        );
+        assert!(
+            profile_dir(fixture.data.path(), "fixture")
+                .join("runtime.json")
+                .is_file()
+        );
+    }
+
+    #[test]
+    fn required_profile_publications_propagate_failures() {
+        let fixture = ScriptedBrowser::new(cdp_ok_response);
+        let data = fixture.data.path();
+        let dir = profile_dir(data, "fixture");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let new_profile = profile_dir(data, "cannot-publish-fingerprint");
+            std::fs::create_dir_all(&new_profile).unwrap();
+            std::fs::set_permissions(&new_profile, std::fs::Permissions::from_mode(0o500)).unwrap();
+            let result = ensure_fingerprint(data, "cannot-publish-fingerprint");
+            std::fs::set_permissions(&new_profile, std::fs::Permissions::from_mode(0o700)).unwrap();
+            if unsafe { libc::geteuid() } != 0 {
+                assert!(
+                    result.is_err(),
+                    "unwritable fingerprint must not initialize successfully"
+                );
+                assert!(!new_profile.join("fingerprint.json").exists());
+            }
+        }
+        let runtime = load_runtime(data, "fixture").unwrap().unwrap();
+        std::fs::remove_file(dir.join("runtime.json")).unwrap();
+        std::fs::create_dir(dir.join("runtime.json")).unwrap();
+        assert!(save_runtime(data, &runtime).is_err());
+        std::fs::remove_dir(dir.join("runtime.json")).unwrap();
+        save_runtime(data, &runtime).unwrap();
+        std::fs::create_dir(dir.join("held_keys.json")).unwrap();
+        let err = fixture
+            .execute(BrowserRequest {
+                action: "key_down".into(),
+                key: Some("a".into()),
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("held_keys.json"), "{err}");
+        assert!(
+            fixture.input_calls().is_empty(),
+            "failed ledger admission must precede keyDown"
+        );
+        assert!(save_held_keys(data, "fixture", &[resolve_key_spec("a")]).is_err());
+        std::fs::remove_dir(dir.join("held_keys.json")).unwrap();
+        save_held_keys(data, "fixture", &[resolve_key_spec("a")]).unwrap();
+        assert_eq!(load_held_keys(data, "fixture").unwrap()[0].key, "a");
+        clear_held_keys(data, "fixture").unwrap();
+        std::fs::create_dir(dir.join("refs.json")).unwrap();
+        let err = capture_snapshot(data, "fixture", &mut fixture.session()).unwrap_err();
+        assert!(
+            err.to_string().contains("directory") || err.to_string().contains("Directory"),
+            "{err}"
+        );
+        std::fs::remove_dir(dir.join("refs.json")).unwrap();
+        let snap = capture_snapshot(data, "fixture", &mut fixture.session()).unwrap();
+        assert_eq!(snap["title"], "Fixture");
+        assert_eq!(
+            read_profile_json::<StoredRefs>(&dir.join("refs.json"))
+                .unwrap()
+                .unwrap()
+                .url,
+            "https://example.test/"
+        );
+        let state = start_or_reuse_takeover_session(
+            data,
+            "fixture",
+            None,
+            None,
+            None,
+            Some(false),
+            &CaptchaDetection::default(),
+        )
+        .unwrap();
+        std::fs::remove_file(dir.join("takeover.json")).unwrap();
+        std::fs::create_dir(dir.join("takeover.json")).unwrap();
+        assert!(save_takeover_state(data, &state).is_err());
+        assert!(
+            start_or_reuse_takeover_session(
+                data,
+                "fixture",
+                None,
+                None,
+                None,
+                Some(false),
+                &CaptchaDetection::default()
+            )
+            .is_err()
+        );
+        std::fs::remove_dir(dir.join("takeover.json")).unwrap();
+        // End the fixture's listener through its normal persisted state.
+        let mut state = state;
+        state.completed = true;
+        save_takeover_state(data, &state).unwrap();
+    }
+
+    #[test]
+    fn takeover_http_rejects_malformed_actions_without_mutation() {
+        let fixture = ScriptedBrowser::new(cdp_ok_response);
+        let state = start_or_reuse_takeover_session(
+            fixture.data.path(),
+            "fixture",
+            None,
+            None,
+            None,
+            Some(false),
+            &CaptchaDetection::default(),
+        )
+        .unwrap();
+        let before = std::fs::read(takeover_path(fixture.data.path(), "fixture")).unwrap();
+        for endpoint in ["input", "viewport"] {
+            for body in ["{", "null", "[]", "{}"] {
+                let (status, response) = raw_http_call(
+                    state.port,
+                    "POST",
+                    &format!("/takeover/{}/{endpoint}", state.token),
+                    Some(body),
+                );
+                assert_eq!(
+                    status,
+                    400,
+                    "{endpoint} {body}: {}",
+                    String::from_utf8_lossy(&response)
+                );
+                assert_eq!(
+                    std::fs::read(takeover_path(fixture.data.path(), "fixture")).unwrap(),
+                    before
+                );
+                assert!(fixture.input_calls().is_empty());
+            }
+        }
+        for body in [
+            r#"{"enabled":"false"}"#,
+            r#"{"enabled":true,"width":"bad"}"#,
+        ] {
+            let (status, _) = raw_http_call(
+                state.port,
+                "POST",
+                &format!("/takeover/{}/viewport", state.token),
+                Some(body),
+            );
+            assert_eq!(status, 400);
+            assert_eq!(
+                std::fs::read(takeover_path(fixture.data.path(), "fixture")).unwrap(),
+                before
+            );
+        }
+        let (status, _) = raw_http_call(
+            state.port,
+            "POST",
+            &format!("/takeover/{}/viewport", state.token),
+            Some(r#"{"enabled":false}"#),
+        );
+        assert_eq!(status, 200);
+        let (status, _) = raw_http_call(
+            state.port,
+            "POST",
+            &format!("/takeover/{}/input", state.token),
+            Some(r#"{"type":"click","x":1,"y":2}"#),
+        );
+        assert_eq!(status, 200);
+        assert_eq!(fixture.input_calls().len(), 3);
+        complete_takeover_session(fixture.data.path(), "fixture", None).unwrap();
+    }
+
+    #[test]
+    fn stealth_reports_each_command_and_script_failure() {
+        for method in [
+            "Page.enable",
+            "Runtime.enable",
+            "DOM.enable",
+            "Network.enable",
+            "Emulation.setUserAgentOverride",
+            "Emulation.setTimezoneOverride",
+            "Page.addScriptToEvaluateOnNewDocument",
+            "Runtime.evaluate",
+        ] {
+            let fixture = ScriptedBrowser::new({
+                move |request| {
+                    if request["method"] == method {
+                        serde_json::json!({"error":{"message":"stealth refused"}})
+                    } else {
+                        cdp_ok_response(request)
+                    }
+                }
+            });
+            let fp = ensure_fingerprint(fixture.data.path(), "fixture").unwrap();
+            let result = apply_stealth(&mut fixture.session(), &fp);
+            // CDP calls this method addScriptToEvaluateOnNewDocument.
+            assert!(
+                result.unwrap_err().to_string().contains("stealth refused"),
+                "{method}"
+            );
+        }
+        let fixture = ScriptedBrowser::new(|request| {
+            if request["method"] == "Runtime.evaluate" {
+                serde_json::json!({"result":{"exceptionDetails":{"text":"override rejected"}}})
+            } else {
+                cdp_ok_response(request)
+            }
+        });
+        let fp = ensure_fingerprint(fixture.data.path(), "fixture").unwrap();
+        assert!(
+            apply_stealth(&mut fixture.session(), &fp)
+                .unwrap_err()
+                .to_string()
+                .contains("override rejected")
+        );
+        let fixture = ScriptedBrowser::new(cdp_ok_response);
+        let fp = ensure_fingerprint(fixture.data.path(), "fixture").unwrap();
+        apply_stealth(&mut fixture.session(), &fp).unwrap();
+    }
+
+    #[test]
+    fn chromium_stealth_override_exception_is_observable() {
+        let _browser = browser_fixture_guard();
+        if !Path::new(&chromium_binary()).exists() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (mut runtime, fp) = ensure_browser_running(dir.path(), "override", Some(true)).unwrap();
+        let page = select_page_target(dir.path(), &mut runtime, None).unwrap();
+        let mut session =
+            CdpSession::connect(runtime.cdp_port, page.ws_url.as_deref().unwrap()).unwrap();
+        apply_stealth(&mut session, &fp).unwrap();
+        eval_js(&mut session, "Object.defineProperty(navigator, 'hardwareConcurrency', { value:1, configurable:false }); true").unwrap();
+        let result = apply_stealth(&mut session, &fp);
+        drop(session);
+        stop_profile(dir.path(), "override").unwrap();
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("hardwareConcurrency")
+        );
+    }
+
+    #[test]
+    fn chromium_fill_requires_the_requested_value_or_option() {
+        let _browser = browser_fixture_guard();
+        if !Path::new(&chromium_binary()).exists() {
+            return;
+        }
+        let data = tempfile::tempdir().unwrap();
+        let (mut runtime, _) =
+            ensure_browser_running(data.path(), "input-value", Some(true)).unwrap();
+        let target = select_page_target(data.path(), &mut runtime, None).unwrap();
+        let mut session =
+            CdpSession::connect(runtime.cdp_port, target.ws_url.as_deref().unwrap()).unwrap();
+        eval_js(&mut session, r#"document.body.innerHTML = '<input id="field" maxlength="1"><select id="choice"><option value="a">First option</option><option value="b">Second option</option></select>'; true"#).unwrap();
+        let fill = |selector: &str, value: &str| {
+            execute(
+                data.path(),
+                "input-value",
+                BrowserRequest {
+                    action: "fill".into(),
+                    selector: Some(selector.into()),
+                    text: Some(value.into()),
+                    ..Default::default()
+                },
+            )
+        };
+        assert!(
+            fill("#field", "ab")
+                .unwrap_err()
+                .to_string()
+                .contains("input value verification failed")
+        );
+        assert_eq!(
+            eval_js(&mut session, "document.querySelector('#field').value").unwrap(),
+            "a"
+        );
+        assert!(
+            fill("#choice", "missing option")
+                .unwrap_err()
+                .to_string()
+                .contains("select option was not accepted")
+        );
+        fill("#field", "z").unwrap();
+        fill("#choice", "Second option").unwrap();
+        assert_eq!(
+            eval_js(&mut session, "document.querySelector('#field').value").unwrap(),
+            "z"
+        );
+        assert_eq!(
+            eval_js(&mut session, "document.querySelector('#choice').value").unwrap(),
+            "b"
+        );
+        drop(session);
+        stop_profile(data.path(), "input-value").unwrap();
+    }
+
+    #[test]
+    fn chromium_split_otp_fill_verifies_all_cells_before_submit() {
+        let _browser = browser_fixture_guard();
+        // The default suite permits hosts without Chromium. An explicitly
+        // configured browser remains required, including a broken path.
+        if std::env::var_os("ANYAGENTS_CHROMIUM_BIN").is_none()
+            && !Path::new(&chromium_binary()).exists()
+        {
+            return;
+        }
+        assert!(
+            Path::new(&chromium_binary()).exists(),
+            "Chromium is required for split OTP input verification"
+        );
+        let data = tempfile::tempdir().unwrap();
+        let (mut runtime, _) =
+            ensure_browser_running(data.path(), "split-code", Some(true)).unwrap();
+        let target = select_page_target(data.path(), &mut runtime, None).unwrap();
+        let mut session =
+            CdpSession::connect(runtime.cdp_port, target.ws_url.as_deref().unwrap()).unwrap();
+        let mut outcomes = Vec::new();
+        for (cells, corrupt) in [(6, false), (6, true), (5, false)] {
+            eval_js(
+                &mut session,
+                &format!(
+                    r#"(() => {{
+              document.body.innerHTML = '<form id="code"></form>';
+              const form = document.querySelector('form');
+              window.codeSubmissions = 0;
+              window.trustedCodeInputs = 0;
+              for (let i = 0; i < {cells}; i++) {{
+                const field = document.createElement('input');
+                field.id = 'digit-' + i;
+                field.maxLength = 1;
+                field.inputMode = 'numeric';
+                field.addEventListener('input', event => {{
+                  if (event.isTrusted) window.trustedCodeInputs++;
+                  if ({corrupt} && i === 2) field.value = 'x';
+                  if (field.value && field.nextElementSibling) field.nextElementSibling.focus();
+                }});
+                form.appendChild(field);
+              }}
+              form.addEventListener('keydown', event => {{
+                if (event.key === 'Enter') {{ event.preventDefault(); window.codeSubmissions++; }}
+              }});
+              return true;
+            }})()"#
+                ),
+            )
+            .unwrap();
+            let result = execute(
+                data.path(),
+                "split-code",
+                BrowserRequest {
+                    action: "fill".into(),
+                    selector: Some("#digit-0".into()),
+                    text: Some("123456".into()),
+                    submit: Some(true),
+                    ..Default::default()
+                },
+            );
+            let observed = eval_js(&mut session, r#"({ value: Array.from(document.querySelectorAll('input')).map(el => el.value).join(''), submissions: window.codeSubmissions, trusted: window.trustedCodeInputs })"#).unwrap();
+            outcomes.push((result, observed));
+        }
+        drop(session);
+        stop_profile(data.path(), "split-code").unwrap();
+        let (result, observed) = &outcomes[0];
+        assert!(result.is_ok(), "split code must be accepted: {result:?}");
+        assert_eq!(observed["value"], "123456");
+        assert_eq!(observed["submissions"], 1);
+        assert_eq!(observed["trusted"], 6);
+        for (result, observed) in &outcomes[1..] {
+            assert!(
+                result
+                    .as_ref()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("input value verification failed")
+            );
+            assert_ne!(observed["value"], "123456");
+            assert_eq!(
+                observed["submissions"], 0,
+                "an incomplete or wrong split code cannot submit"
+            );
+        }
+    }
+
+    #[test]
+    fn navigation_and_tab_refusals_do_not_acknowledge_or_change_target() {
+        for action in ["navigate", "reload"] {
+            let fixture = ScriptedBrowser::new(move |request| {
+                if request["method"] == "Page.navigate" || request["method"] == "Page.reload" {
+                    serde_json::json!({"error":{"message":"navigation refused"}})
+                } else {
+                    cdp_ok_response(request)
+                }
+            });
+            let result = dispatch_takeover_input(
+                fixture.data.path(),
+                "fixture",
+                &serde_json::json!({"type":action,"url":"https://example.test/new"}),
+            );
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("navigation refused")
+            );
+            if action == "navigate" {
+                let err = fixture
+                    .execute(BrowserRequest {
+                        action: "takeover".into(),
+                        url: Some("https://example.test/new".into()),
+                        ..Default::default()
+                    })
+                    .unwrap_err();
+                assert!(err.to_string().contains("navigation refused"));
+                assert!(
+                    load_takeover_state(fixture.data.path(), "fixture")
+                        .unwrap()
+                        .is_none()
+                );
+            }
+        }
+        let fixture = ScriptedBrowser::new(|request| {
+            if request["method"] == "Page.navigate" {
+                serde_json::json!({"result":{"errorText":"net::ERR_BLOCKED_BY_CLIENT"}})
+            } else if request["method"].as_str().unwrap().starts_with("/json/") {
+                serde_json::json!({"error":true})
+            } else {
+                cdp_ok_response(request)
+            }
+        });
+        assert!(
+            navigate_page(&mut fixture.session(), "https://example.test")
+                .unwrap_err()
+                .to_string()
+                .contains("ERR_BLOCKED_BY_CLIENT")
+        );
+        for action in ["activate", "close"] {
+            let err = fixture
+                .execute(BrowserRequest {
+                    action: "tabs".into(),
+                    tab_action: Some(action.into()),
+                    target_id: Some("page".into()),
+                    ..Default::default()
+                })
+                .unwrap_err();
+            assert!(err.to_string().contains("status 404"), "{err}");
+            assert_eq!(
+                load_runtime(fixture.data.path(), "fixture")
+                    .unwrap()
+                    .unwrap()
+                    .active_target_id
+                    .as_deref(),
+                Some("page")
+            );
+        }
+        let fixture = ScriptedBrowser::new(cdp_ok_response);
+        dispatch_takeover_input(
+            fixture.data.path(),
+            "fixture",
+            &serde_json::json!({"type":"navigate","url":"https://example.test/new"}),
+        )
+        .unwrap();
+        for action in ["activate", "close"] {
+            fixture
+                .execute(BrowserRequest {
+                    action: "tabs".into(),
+                    tab_action: Some(action.into()),
+                    target_id: Some("page".into()),
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        assert!(
+            load_runtime(fixture.data.path(), "fixture")
+                .unwrap()
+                .unwrap()
+                .active_target_id
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn failed_click_fill_submit_and_focus_do_not_report_success() {
+        let fixture = ScriptedBrowser::new(|request| {
+            if request["method"] == "Input.dispatchMouseEvent" {
+                serde_json::json!({"error":{"message":"pointer refused"}})
+            } else {
+                cdp_ok_response(request)
+            }
+        });
+        assert!(
+            fixture
+                .execute(BrowserRequest {
+                    action: "click".into(),
+                    selector: Some("#button".into()),
+                    ..Default::default()
+                })
+                .unwrap_err()
+                .to_string()
+                .contains("pointer refused")
+        );
+        for failure in [
+            "delete-down",
+            "delete-up",
+            "text-down",
+            "text-up",
+            "insert",
+            "finalize",
+            "submit-down",
+            "submit-up",
+        ] {
+            let fixture = ScriptedBrowser::new(move |request| {
+                let p = &request["params"];
+                let reject = match failure {
+                    "delete-down" => p["key"] == "Backspace" && p["type"] == "keyDown",
+                    "delete-up" => p["key"] == "Backspace" && p["type"] == "keyUp",
+                    "text-down" => p["key"] == "x" && p["type"] == "keyDown",
+                    "text-up" => p["key"] == "x" && p["type"] == "keyUp",
+                    "insert" => request["method"] == "Input.insertText",
+                    "finalize" => p["expression"]
+                        .as_str()
+                        .is_some_and(|s| s.contains("Object.getPrototypeOf(el)")),
+                    "submit-down" => p["key"] == "Enter" && p["type"] == "keyDown",
+                    "submit-up" => p["key"] == "Enter" && p["type"] == "keyUp",
+                    _ => unreachable!(),
+                };
+                if reject {
+                    serde_json::json!({"error":{"message":"input refused"}})
+                } else {
+                    cdp_ok_response(request)
+                }
+            });
+            let err = fixture
+                .execute(BrowserRequest {
+                    action: "fill".into(),
+                    selector: Some("#field".into()),
+                    text: Some(if failure == "insert" {
+                        "x".repeat(129)
+                    } else {
+                        "x".into()
+                    }),
+                    submit: Some(true),
+                    ..Default::default()
+                })
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("input refused"),
+                "{failure}: {err}"
+            );
+        }
+        let fixture = ScriptedBrowser::new(|request| {
+            if request["params"]["expression"]
+                .as_str()
+                .is_some_and(|s| s.contains("document.activeElement === el"))
+            {
+                serde_json::json!({"result":{"result":{"value":false}}})
+            } else {
+                cdp_ok_response(request)
+            }
+        });
+        let err = fixture
+            .execute(BrowserRequest {
+                action: "press".into(),
+                selector: Some("#missing".into()),
+                key: Some("Enter".into()),
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("could not be focused"));
+        assert!(fixture.input_calls().is_empty());
+        let secret_fixture = ScriptedBrowser::new(|request| {
+            if request["method"] == "Input.dispatchKeyEvent" {
+                serde_json::json!({"error":{"message":"synthetic-private-value was refused"}})
+            } else {
+                cdp_ok_response(request)
+            }
+        });
+        FileCredentialStore::new(secret_fixture.data.path())
+            .write("test/value", b"synthetic-private-value")
+            .unwrap();
+        let error = secret_fixture
+            .execute(BrowserRequest {
+                action: "fill".into(),
+                selector: Some("#field".into()),
+                secret_ref: Some("secret://test/value".into()),
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("details withheld"));
+        assert!(!error.to_string().contains("synthetic-private-value"));
+        let error = secret_fixture
+            .execute(BrowserRequest {
+                action: "fill".into(),
+                selector: Some("#field".into()),
+                text: Some(" secret://test/value ".into()),
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("details withheld"));
+        assert!(!error.to_string().contains("synthetic-private-value"));
+        let fixture = ScriptedBrowser::new(cdp_ok_response);
+        fixture
+            .execute(BrowserRequest {
+                action: "fill".into(),
+                selector: Some("#field".into()),
+                text: Some("x".into()),
+                submit: Some(true),
+                ..Default::default()
+            })
+            .unwrap();
+        fixture
+            .execute(BrowserRequest {
+                action: "click".into(),
+                selector: Some("#button".into()),
+                wait_ms: Some(1),
+                ..Default::default()
+            })
+            .unwrap();
+        fixture
+            .execute(BrowserRequest {
+                action: "press".into(),
+                selector: Some("#field".into()),
+                key: Some("Enter".into()),
+                ..Default::default()
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn failed_key_releases_remain_recoverable_including_guard_drop() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let fail = Arc::new(AtomicBool::new(true));
+        let fixture = ScriptedBrowser::new({
+            let fail = fail.clone();
+            move |request| {
+                if fail.load(Ordering::SeqCst)
+                    && request["params"]["type"] == "keyUp"
+                    && request["params"]["key"] == "b"
+                {
+                    serde_json::json!({"error":{"message":"key release refused"}})
+                } else {
+                    cdp_ok_response(request)
+                }
+            }
+        });
+        save_held_keys(
+            fixture.data.path(),
+            "fixture",
+            &[resolve_key_spec("a"), resolve_key_spec("b")],
+        )
+        .unwrap();
+        let err =
+            release_recorded_held_keys(fixture.data.path(), "fixture", &mut fixture.session())
+                .unwrap_err();
+        assert!(err.to_string().contains("key release refused"));
+        let remaining = load_held_keys(fixture.data.path(), "fixture").unwrap();
+        assert_eq!(
+            remaining.iter().map(|s| s.key.as_str()).collect::<Vec<_>>(),
+            ["b"]
+        );
+        {
+            let mut session = fixture.session();
+            let _guard = HeldKeyGuard {
+                data: fixture.data.path(),
+                profile: "fixture",
+                cdp: &mut session,
+                target_frame_id: None,
+                specs: remaining,
+                released: false,
+            };
+        }
+        assert_eq!(
+            load_held_keys(fixture.data.path(), "fixture")
+                .unwrap()
+                .len(),
+            1
+        );
+        fail.store(false, Ordering::SeqCst);
+        assert_eq!(
+            release_recorded_held_keys(fixture.data.path(), "fixture", &mut fixture.session())
+                .unwrap(),
+            ["b"]
+        );
+        assert!(
+            load_held_keys(fixture.data.path(), "fixture")
+                .unwrap()
+                .is_empty()
+        );
+        fixture
+            .execute(BrowserRequest {
+                action: "key_down".into(),
+                key: Some("a".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            load_held_keys(fixture.data.path(), "fixture").unwrap()[0].key,
+            "a"
+        );
+        fixture
+            .execute(BrowserRequest {
+                action: "release_keys".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            load_held_keys(fixture.data.path(), "fixture")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn completion_notification_failure_is_visible_and_retry_is_deduplicated() {
+        let fixture = ScriptedBrowser::new(cdp_ok_response);
+        let store = anyagents_core::Store::open(fixture.data.path().join("state.db")).unwrap();
+        let state = start_or_reuse_takeover_session(
+            fixture.data.path(),
+            "fixture",
+            Some("reader"),
+            None,
+            None,
+            Some(false),
+            &CaptchaDetection::default(),
+        )
+        .unwrap();
+        let err =
+            complete_takeover_session(fixture.data.path(), "fixture", Some("done")).unwrap_err();
+        assert!(
+            err.to_string().contains("owner notification pending"),
+            "{err}"
+        );
+        let pending = load_takeover_state(fixture.data.path(), "fixture")
+            .unwrap()
+            .unwrap();
+        assert!(pending.completed && pending.notification_pending);
+        assert!(
+            wait_for_takeover_completion(fixture.data.path(), "fixture", 100)
+                .unwrap_err()
+                .to_string()
+                .contains("notification pending")
+        );
+        assert!(
+            cleanup_takeover_session(fixture.data.path(), "fixture")
+                .unwrap_err()
+                .to_string()
+                .contains("notification pending")
+        );
+        let agent = store
+            .create_agent(anyagents_core::NewAgent::new("reader", "codex"))
+            .unwrap();
+        let connection = rusqlite::Connection::open(fixture.data.path().join("state.db")).unwrap();
+        connection.execute_batch("CREATE TRIGGER refuse_completion BEFORE INSERT ON messages BEGIN SELECT RAISE(FAIL, 'completion queue refused'); END;").unwrap();
+        let error =
+            complete_takeover_session(fixture.data.path(), "fixture", Some("done")).unwrap_err();
+        assert!(error.to_string().contains("completion queue refused"));
+        assert!(store.inbox(&agent.id, None).unwrap().is_empty());
+        assert!(
+            load_takeover_state(fixture.data.path(), "fixture")
+                .unwrap()
+                .unwrap()
+                .notification_pending
+        );
+        connection
+            .execute_batch("DROP TRIGGER refuse_completion;")
+            .unwrap();
+        for _ in 0..2 {
+            complete_takeover_session(fixture.data.path(), "fixture", Some("done")).unwrap();
+        }
+        assert!(
+            !load_takeover_state(fixture.data.path(), "fixture")
+                .unwrap()
+                .unwrap()
+                .notification_pending
+        );
+        let inbox = store.inbox(&agent.id, None).unwrap();
+        assert_eq!(inbox.len(), 1);
+        assert!(inbox[0].text.contains("Browser Takeover Completed"));
+        assert_eq!(
+            load_takeover_state(fixture.data.path(), "fixture")
+                .unwrap()
+                .unwrap()
+                .started_at_ms,
+            state.started_at_ms
+        );
+    }
+
+    #[test]
+    fn completed_takeover_retries_preserve_owner_lifecycle_and_receipt() {
+        let fixture = ScriptedBrowser::new(cdp_ok_response);
+        let store = anyagents_core::Store::open(fixture.data.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(anyagents_core::NewAgent::new("reader", "codex"))
+            .unwrap();
+        store.set_agent_state(&agent.id, "idle").unwrap();
+        start_or_reuse_takeover_session(
+            fixture.data.path(),
+            "fixture",
+            Some("reader"),
+            None,
+            None,
+            Some(false),
+            &CaptchaDetection::default(),
+        )
+        .unwrap();
+        let initial =
+            complete_takeover_session(fixture.data.path(), "fixture", Some("first completion"))
+                .unwrap();
+        assert_eq!(store.agent_by_name("reader").unwrap().state, "running");
+        store.set_agent_state(&agent.id, "archived").unwrap();
+        let before = std::fs::read(takeover_path(fixture.data.path(), "fixture")).unwrap();
+        let replay =
+            complete_takeover_session(fixture.data.path(), "fixture", Some("repeat completion"))
+                .unwrap();
+        assert_eq!(
+            store.agent_by_name("reader").unwrap().state,
+            "archived",
+            "replayed completion must not wake an archived owner"
+        );
+        assert_eq!(
+            std::fs::read(takeover_path(fixture.data.path(), "fixture")).unwrap(),
+            before
+        );
+        assert_eq!(replay["completed_at_ms"], initial["completed_at_ms"]);
+        // The message can be queued before clearing the pending flag fails. Its
+        // recovery must observe a duplicate receipt without replaying wake effects.
+        let mut pending = load_takeover_state(fixture.data.path(), "fixture")
+            .unwrap()
+            .unwrap();
+        pending.notification_pending = true;
+        save_takeover_state(fixture.data.path(), &pending).unwrap();
+        complete_takeover_session(fixture.data.path(), "fixture", Some("pending recovery"))
+            .unwrap();
+        assert_eq!(store.agent_by_name("reader").unwrap().state, "archived");
+        let recovered = load_takeover_state(fixture.data.path(), "fixture")
+            .unwrap()
+            .unwrap();
+        assert!(!recovered.notification_pending);
+        assert_eq!(recovered.completed_at_ms, pending.completed_at_ms);
+        assert_eq!(recovered.completion_note, pending.completion_note);
+        assert_eq!(store.inbox(&agent.id, None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn provider_configuration_preserves_documented_operator_settings() {
+        let mut command = Command::new("env");
+        command
+            .env_clear()
+            .env("HOME", "/synthetic/home")
+            .env("OP_CONFIG_DIR", "/synthetic/config")
+            .env("OP_SERVICE_ACCOUNT_TOKEN", "synthetic-not-a-credential");
+        configure_op_command(&mut command);
+        let output = command.output().unwrap();
+        assert!(output.status.success());
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let mut settings = stdout.lines().collect::<Vec<_>>();
+        settings.sort();
+        assert_eq!(
+            settings,
+            [
+                "HOME=/synthetic/home",
+                "OP_CONFIG_DIR=/synthetic/config",
+                "OP_SERVICE_ACCOUNT_TOKEN=synthetic-not-a-credential",
+            ]
+        );
+    }
 
     // Each real-browser scenario owns its Chromium processes until teardown.
     // Starting every fixture together can starve CDP startup on a small runner;
@@ -5517,7 +6824,7 @@ mod tests {
         )
         .unwrap();
         let result = (|| -> Result<(), Error> {
-            let mut rt = load_runtime(dir.path(), "guard-navigation").unwrap();
+            let mut rt = load_runtime(dir.path(), "guard-navigation")?.unwrap();
             let ws = select_page_target(dir.path(), &mut rt, None)?
                 .ws_url
                 .unwrap();
@@ -6086,7 +7393,7 @@ mod tests {
             },
         )
         .expect("key_down w");
-        assert_eq!(load_held_keys(dir.path(), "profile-a").len(), 1);
+        assert_eq!(load_held_keys(dir.path(), "profile-a").unwrap().len(), 1);
 
         let _ = execute(
             dir.path(),
@@ -6098,7 +7405,7 @@ mod tests {
             },
         );
         assert!(
-            load_held_keys(dir.path(), "profile-a").is_empty(),
+            load_held_keys(dir.path(), "profile-a").unwrap().is_empty(),
             "closing profile must clear held_keys state"
         );
         let _ = execute(
@@ -6177,6 +7484,10 @@ mod tests {
 
         let port = spawn_html_server("127.0.0.1", html);
         let dir = tempfile::tempdir().expect("tempdir");
+        let store = anyagents_core::Store::open(dir.path().join("state.db")).unwrap();
+        store
+            .create_agent(anyagents_core::NewAgent::new("captcha-prof", "codex"))
+            .unwrap();
 
         let open_res = match execute(
             dir.path(),
@@ -6434,7 +7745,7 @@ mod tests {
         )
         .unwrap();
         let result = (|| -> Result<(), Error> {
-            let mut rt = load_runtime(dir.path(), profile).unwrap();
+            let mut rt = load_runtime(dir.path(), profile)?.unwrap();
             let ws = select_page_target(dir.path(), &mut rt, None)?
                 .ws_url
                 .unwrap();
@@ -6482,7 +7793,7 @@ mod tests {
                     );
                 }
                 "direct" => assert_eq!(
-                    complete_takeover_session(dir.path(), profile, None)["completed"],
+                    complete_takeover_session(dir.path(), profile, None)?["completed"],
                     true
                 ),
                 "reclaim" => {
@@ -6497,13 +7808,13 @@ mod tests {
                     assert_eq!(done["released_takeover"], true);
                 }
                 "captcha" => {
-                    let (done, cap) = wait_for_takeover_completion(dir.path(), profile, 2_000);
+                    let (done, cap) = wait_for_takeover_completion(dir.path(), profile, 2_000)?;
                     assert!(!cap.detected);
                     assert!(done.unwrap().completed);
                 }
                 "timeout" => {
-                    reap_expired_takeover(dir.path(), profile, st.expires_at_ms);
-                    assert!(load_takeover_state(dir.path(), profile).unwrap().completed);
+                    reap_expired_takeover(dir.path(), profile, st.expires_at_ms)?;
+                    assert!(load_takeover_state(dir.path(), profile)?.unwrap().completed);
                 }
                 _ => unreachable!(),
             }
@@ -6515,7 +7826,7 @@ mod tests {
                 "{path} must terminate the press before handing back ownership"
             );
             // All terminal entrypoints converge without a second native release.
-            complete_takeover_session(dir.path(), profile, None);
+            complete_takeover_session(dir.path(), profile, None)?;
             cleanup_takeover_session(dir.path(), profile)?;
             assert_eq!(eval_js(&mut cdp, "window.ups")?, 1);
             Ok(())
@@ -6560,7 +7871,7 @@ mod tests {
         )
         .unwrap();
         let result = (|| -> Result<(), Error> {
-            let mut rt = load_runtime(dir.path(), profile).unwrap();
+            let mut rt = load_runtime(dir.path(), profile)?.unwrap();
             let ws = select_page_target(dir.path(), &mut rt, None)?
                 .ws_url
                 .unwrap();
@@ -6625,7 +7936,7 @@ mod tests {
             },
         )
         .unwrap();
-        let mut rt = load_runtime(dir.path(), "mobile-ui").unwrap();
+        let mut rt = load_runtime(dir.path(), "mobile-ui").unwrap().unwrap();
         let ws = select_page_target(dir.path(), &mut rt, None)
             .unwrap()
             .ws_url
@@ -6684,6 +7995,7 @@ mod tests {
             assert!(
                 !load_takeover_state(dir.path(), "revocation")
                     .unwrap()
+                    .unwrap()
                     .completed
             );
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -6731,6 +8043,7 @@ mod tests {
                 assert!(
                     load_takeover_state(dir.path(), "revocation")
                         .unwrap()
+                        .unwrap()
                         .completed
                 );
             } else if revoked == "missing" {
@@ -6742,7 +8055,7 @@ mod tests {
                     "agent" => state.holder = "agent".into(),
                     _ => unreachable!(),
                 }
-                save_takeover_state(dir.path(), &state);
+                save_takeover_state(dir.path(), &state).unwrap();
             }
             write!(client, "\r\n{body}").unwrap();
             let mut response = String::new();
@@ -6818,7 +8131,7 @@ mod tests {
         let mut reader = std::fs::File::open(takeover_path(dir.path(), "publication")).unwrap();
         let mut next = first.clone();
         next.reason = Some("next".repeat(1024));
-        save_takeover_state(dir.path(), &next);
+        save_takeover_state(dir.path(), &next).unwrap();
         let mut bytes = Vec::new();
         reader.read_to_end(&mut bytes).unwrap();
         let previous: BrowserTakeoverState = serde_json::from_slice(&bytes).unwrap();
@@ -6829,14 +8142,11 @@ mod tests {
         assert_eq!(
             load_takeover_state(dir.path(), "publication")
                 .unwrap()
+                .unwrap()
                 .reason,
             next.reason
         );
-        assert!(is_human_takeover_active(
-            dir.path(),
-            "publication",
-            now_ms()
-        ));
+        assert!(is_human_takeover_active(dir.path(), "publication", now_ms()).unwrap());
         let (code, _) = raw_http_call(
             first.port,
             "GET",
@@ -6865,7 +8175,7 @@ mod tests {
             },
         )
         .unwrap();
-        let mut rt = load_runtime(dir.path(), "viewport").unwrap();
+        let mut rt = load_runtime(dir.path(), "viewport").unwrap().unwrap();
         let ws = select_page_target(dir.path(), &mut rt, None)
             .unwrap()
             .ws_url
@@ -6923,10 +8233,11 @@ mod tests {
         .unwrap();
         assert_restored(&mut cdp);
         enable();
-        complete_takeover_session(dir.path(), "viewport", None);
+        complete_takeover_session(dir.path(), "viewport", None).unwrap();
         assert_restored(&mut cdp);
         assert!(
             load_takeover_state(dir.path(), "viewport")
+                .unwrap()
                 .unwrap()
                 .completed
         );
@@ -6946,41 +8257,43 @@ mod tests {
 
         begin();
         enable();
-        let st = load_takeover_state(dir.path(), "viewport").unwrap();
+        let st = load_takeover_state(dir.path(), "viewport")
+            .unwrap()
+            .unwrap();
         // Advance only the explicit reaper clock, not the stored deadline. The
         // listener's real-time reaper must not race this forced expiry.
-        reap_expired_takeover(dir.path(), "viewport", st.expires_at_ms);
+        reap_expired_takeover(dir.path(), "viewport", st.expires_at_ms).unwrap();
         assert_restored(&mut cdp);
         assert!(
             set_takeover_viewport(dir.path(), "viewport", &serde_json::json!({"enabled":true}))
                 .is_err(),
             "late toggle after reap must be refused"
         );
-        complete_takeover_session(dir.path(), "viewport", None);
+        complete_takeover_session(dir.path(), "viewport", None).unwrap();
         assert_restored(&mut cdp);
 
         begin();
         enable();
-        let st = load_takeover_state(dir.path(), "viewport").unwrap();
+        let st = load_takeover_state(dir.path(), "viewport")
+            .unwrap()
+            .unwrap();
         let heartbeat = st.viewport_heartbeat_ms.unwrap();
-        reap_disconnected_takeover_viewport(dir.path(), "viewport", heartbeat + 10_000);
+        reap_disconnected_takeover_viewport(dir.path(), "viewport", heartbeat + 10_000).unwrap();
         assert!(
             load_takeover_state(dir.path(), "viewport")
+                .unwrap()
                 .unwrap()
                 .original_viewport
                 .is_some(),
             "a live heartbeat must retain phone layout through the lease boundary"
         );
-        reap_expired_takeover(dir.path(), "viewport", heartbeat + 10_001);
-        assert!(is_human_takeover_active(
-            dir.path(),
-            "viewport",
-            heartbeat + 10_001
-        ));
-        reap_disconnected_takeover_viewport(dir.path(), "viewport", heartbeat + 10_001);
+        reap_expired_takeover(dir.path(), "viewport", heartbeat + 10_001).unwrap();
+        assert!(is_human_takeover_active(dir.path(), "viewport", heartbeat + 10_001).unwrap());
+        reap_disconnected_takeover_viewport(dir.path(), "viewport", heartbeat + 10_001).unwrap();
         assert_restored(&mut cdp);
         assert!(
             !load_takeover_state(dir.path(), "viewport")
+                .unwrap()
                 .unwrap()
                 .completed,
             "disconnect restores metrics, not control"
@@ -6998,7 +8311,7 @@ mod tests {
         );
     }
     #[test]
-    #[ignore = "Chromium startup and OOPIF click/focus races; see docs/verification.md; fix owner: lyra-anyagents-takeover-test-race after #91"]
+    #[ignore = "Chromium startup and OOPIF click/focus races; see docs/verification.md"]
     fn takeover_focus_finds_cross_origin_input() {
         let _browser = browser_fixture_guard();
         if !Path::new(&chromium_binary()).exists() {

@@ -342,7 +342,7 @@ struct AgentMcp {
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 struct SendArgs {
-    /// Destinations: agent names or IDs (`sage`, `agent:sage`, `agt_...`, `parent`,
+    /// Destinations: agent names or IDs (`planner`, `agent:planner`, `agt_...`, `parent`,
     /// `children`), internal groups (`group:owners`, `group:<name>`, `group:all`, `all`),
     /// or external channel targets (`telegram:chat:<chat_id>[:<topic_id>]`,
     /// `telegram:user:<user_id>[:<message_id>]`). An authored send addressed to
@@ -444,7 +444,7 @@ struct ConversationArgs {
     /// Optional negative terms — any turn containing any of these substrings is excluded.
     #[serde(default, deserialize_with = "crate::api::deserialize_string_or_vec")]
     exclude: Vec<String>,
-    /// Agent name (`sage`, `volt`, `xenon`, `"all"`) or `agt_...` ID whose complete
+    /// Agent name (`planner`, `builder`, `reviewer`, `"all"`) or `agt_...` ID whose complete
     /// two-way (`in` + `out`) conversation to read or search. Defaults to `"all"` when
     /// searching, or this agent when reading recent chronological turns. Non-admin
     /// callers can read only self and descendants; `all` means that authorized set.
@@ -688,7 +688,7 @@ struct SpawnArgs {
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 struct DescribeArgs {
-    /// Target agent name (`"self"`, `"xenon"`, `"sage"`, `"all"`, or `agt_...` ID). Defaults to `"self"`.
+    /// Target agent name (`"self"`, `"reviewer"`, `"planner"`, `"all"`, or `agt_...` ID). Defaults to `"self"`.
     #[serde(default, alias = "name", alias = "target")]
     agent: Option<String>,
     /// Concise public role/responsibility summary (`description`, Layer 1 — visible to all peers and group rosters).
@@ -1114,7 +1114,7 @@ fn generate_subagent_name(parent_name: &str) -> String {
 #[tool_router]
 impl AgentMcp {
     #[tool(
-        description = "Unified outbound communication and message interaction tool: send a message, media file (`photo`, `video`, `audio`, `music`, `voice`, `document`, `animation`), GPS `location`/venue, interactive `poll`, `checklist`, or Instant View `article` to one or multiple agents (`sage`, `agt_...`, `parent`, `children`), internal groups (`group:<name>`, `group:all`, `all`), or external channel targets (`telegram:chat:<id>[:<topic>]`, `telegram:user:<id>`); OR perform a message interaction (`action`: `\"react\"` | `\"vote\"` | `\"check\"` | `\"uncheck\"` | `\"edit\"` | `\"delete\"` | `\"pin\"` | `\"unpin\"` | `\"stop_poll\"`) on a target message (`target` or `reply_to`: `anyagents:reply:msg_...` or `telegram:chat:<chat_id>:<message_id>`)."
+        description = "Unified outbound communication and message interaction tool: send a message, media file (`photo`, `video`, `audio`, `music`, `voice`, `document`, `animation`), GPS `location`/venue, interactive `poll`, `checklist`, or Instant View `article` to one or multiple agents (`planner`, `agt_...`, `parent`, `children`), internal groups (`group:<name>`, `group:all`, `all`), or external channel targets (`telegram:chat:<id>[:<topic>]`, `telegram:user:<id>`); OR perform a message interaction (`action`: `\"react\"` | `\"vote\"` | `\"check\"` | `\"uncheck\"` | `\"edit\"` | `\"delete\"` | `\"pin\"` | `\"unpin\"` | `\"stop_poll\"`) on a target message (`target` or `reply_to`: `anyagents:reply:msg_...` or `telegram:chat:<chat_id>:<message_id>`)."
     )]
     async fn send(
         &self,
@@ -1210,22 +1210,7 @@ impl AgentMcp {
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty());
-        let (range_from, range_to) = if let Some(r) = args
-            .range
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            let stripped = r.strip_prefix("seq:").unwrap_or(r).trim();
-            if let Some((a, b)) = stripped.split_once('-') {
-                (a.trim().parse::<i64>().ok(), b.trim().parse::<i64>().ok())
-            } else {
-                let single = stripped.parse::<i64>().ok();
-                (single, single)
-            }
-        } else {
-            (None, None)
-        };
+        let (range_from, range_to) = parse_sequence_range(args.range.as_deref())?;
         let from_seq = args.from_seq.or(range_from);
         let to_seq = args.to_seq.or(range_to);
         let has_topic_mutation = args
@@ -1925,7 +1910,7 @@ impl AgentMcp {
     }
 
     #[tool(
-        description = "Spawn a new sub-agent with this agent as its `parent` (supports multi-level sub-agent trees). Pass `repo` (e.g. `\"SylphxAI/spiron\"` or `\"inherit\"` to branch from your current repo, with optional `branch` and `base`) to automatically provision an isolated, lifecycle-managed Git worktree at `<data>/agents/<id>/work` (cleanly reaped on `archive` when pushed, or preserved if dirty). If both `repo` and `workdir` are omitted, defaults to its own isolated `<data>/agents/<id>/work`. Every sub-agent automatically receives the shared `AGENTS.md` and top-level `skills` in its config home."
+        description = "Spawn a new sub-agent with this agent as its `parent` (supports multi-level sub-agent trees). Pass `repo` (e.g. `\"example-org/workspace\"` or `\"inherit\"` to branch from your current repo, with optional `branch` and `base`) to automatically provision an isolated, lifecycle-managed Git worktree at `<data>/agents/<id>/work` (cleanly reaped on `archive` when pushed, or preserved if dirty). If both `repo` and `workdir` are omitted, defaults to its own isolated `<data>/agents/<id>/work`. Every sub-agent automatically receives the shared `AGENTS.md` and top-level `skills` in its config home."
     )]
     async fn spawn(
         &self,
@@ -3783,6 +3768,9 @@ impl AgentMcp {
             String::from_utf8_lossy(&buf).into_owned()
         });
 
+        // Receipts come from the actual host dispatch, never snippet return
+        // values, source text or logs, which can contain invented deliveries.
+        let deliveries = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
         let mut in_flight = tokio::task::JoinSet::new();
         let mut call_count = 0usize;
 
@@ -3817,8 +3805,16 @@ impl AgentMcp {
                             .unwrap_or_else(|| serde_json::json!({}));
                         let mcp = self.clone();
                         let stdin_clone = Arc::clone(&shared_stdin);
+                        let deliveries = Arc::clone(&deliveries);
                         in_flight.spawn(async move {
                             let res = mcp.dispatch_code_tool(&tool_name, tool_args).await;
+                            if tool_name.trim().trim_start_matches("mcp__anyagents__") == "send"
+                                && let Ok(val) = &res
+                                && let Some(items) = val.get("deliveries").and_then(serde_json::Value::as_array)
+                            {
+                                deliveries.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .extend(items.iter().cloned());
+                            }
                             let reply = match res {
                                 Ok(val) => serde_json::json!({
                                     "type": "reply",
@@ -3898,6 +3894,10 @@ impl AgentMcp {
             ));
         }
 
+        let deliveries = deliveries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         let raw_result = done_msg
             .get("result")
             .cloned()
@@ -3916,6 +3916,7 @@ impl AgentMcp {
             );
             return Ok(serde_json::json!({
                 "result": preview,
+                "deliveries": deliveries,
                 "truncated": true,
                 "original_bytes": serialized.len(),
                 "max_bytes": MAX_CODE_RESULT_BYTES,
@@ -3926,6 +3927,7 @@ impl AgentMcp {
 
         Ok(serde_json::json!({
             "result": raw_result,
+            "deliveries": deliveries,
             "truncated": false,
             "logs": logs,
             "duration_ms": duration_ms,
@@ -6188,8 +6190,61 @@ pub(crate) async fn request_naming(
     Ok((status, bytes))
 }
 
+/// Parse an explicit bounded read without turning malformed bounds into absence.
+fn parse_sequence_range(range: Option<&str>) -> Result<(Option<i64>, Option<i64>), String> {
+    let Some(range) = range.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok((None, None));
+    };
+    let range = range.strip_prefix("seq:").unwrap_or(range).trim();
+    let parse = |raw: &str| -> Result<i64, String> {
+        let value = raw
+            .trim()
+            .parse::<i64>()
+            .map_err(|_| "range must be seq:<start>-<end> or seq:<number>".to_string())?;
+        if value < 0 {
+            return Err("sequence bounds must be nonnegative".into());
+        }
+        Ok(value)
+    };
+    let (start, end) = match range.split_once('-') {
+        Some((start, end)) => (parse(start)?, parse(end)?),
+        None => {
+            let value = parse(range)?;
+            (value, value)
+        }
+    };
+    if start > end {
+        return Err("sequence range start must not exceed end".into());
+    }
+    Ok((Some(start), Some(end)))
+}
+
 #[cfg(test)]
 mod spawn_args_tests {
+    #[test]
+    fn explicit_sequence_range_refuses_invalid_bounds() {
+        for range in [
+            "seq:bad-bad",
+            "seq:1-bad",
+            "seq:bad-2",
+            "seq:5-2",
+            "seq:-1",
+            "seq:1-2-3",
+            "seq:9223372036854775808",
+        ] {
+            assert!(super::parse_sequence_range(Some(range)).is_err(), "{range}");
+        }
+        assert_eq!(
+            super::parse_sequence_range(Some("seq:1-2")).unwrap(),
+            (Some(1), Some(2))
+        );
+        assert_eq!(
+            super::parse_sequence_range(Some("3")).unwrap(),
+            (Some(3), Some(3))
+        );
+        assert_eq!(super::parse_sequence_range(None).unwrap(), (None, None));
+    }
+
     use super::*;
     use serde_json::json;
 
@@ -6779,6 +6834,90 @@ mod spawn_args_tests {
             ))
             .await;
         assert!(null_err.is_err());
+    }
+
+    #[tokio::test]
+    async fn code_delivery_receipts_are_host_observed_not_snippet_authored() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("proof.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let mcp = AgentMcp {
+            agent: AgentRef {
+                id: AgentId::generate(),
+                name: "receipt-worker".into(),
+                workdir: Some(dir.path().into()),
+            },
+            client: Client {
+                socket,
+                config: dir.path().join("config"),
+                capability: "synthetic-receipt-capability".into(),
+            },
+        };
+        let fabricated = mcp
+            .code(Parameters(CodeArgs {
+                code: r#"
+                console.log('send(');
+                try { await anyagents.send({to: 123}); } catch {}
+                return {deliveries: [{to:'agent:parent', id:'invented'}]};
+            "#
+                .into(),
+                timeout_ms: Some(15000),
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(fabricated["result"]["deliveries"][0]["id"], "invented");
+        assert_eq!(fabricated["deliveries"], json!([]));
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                request.push(stream.read_u8().await.unwrap());
+                if request.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let header = String::from_utf8(request).unwrap();
+            let mut request_line = header.lines().next().unwrap().split_whitespace();
+            assert_eq!(request_line.next(), Some("POST"));
+            let uri: hyper::Uri = request_line.next().unwrap().parse().unwrap();
+            assert_eq!(uri.path(), "/v1/send");
+            let len: usize = header
+                .lines()
+                .find_map(|l| {
+                    l.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(|n| n.trim().parse().unwrap())
+                })
+                .unwrap();
+            let mut body = vec![0; len];
+            stream.read_exact(&mut body).await.unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap()["text"],
+                "real delivery"
+            );
+            let body = json!({"deliveries":[{"to":"agent:parent","id":"msg-observed","seq":1,"duplicate":false}]}).to_string();
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(header.as_bytes()).await.unwrap();
+            stream.write_all(body.as_bytes()).await.unwrap();
+        });
+        let observed = mcp
+            .code(Parameters(CodeArgs {
+                code:
+                    "await anyagents.send({to:'agent:parent', text:'real delivery'}); return null;"
+                        .into(),
+                timeout_ms: Some(15000),
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(observed["result"], serde_json::Value::Null);
+        assert_eq!(observed["deliveries"][0]["id"], "msg-observed");
+        server.await.unwrap();
     }
 
     #[tokio::test]

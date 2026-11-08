@@ -30,7 +30,9 @@ fn owner_pages(data: &Path, test_mode: bool) -> PathBuf {
     if test_mode {
         data.join("legacy-owner-pages")
     } else {
-        PathBuf::from("/scratch/tmp/owners")
+        std::env::var_os("ANYAGENTS_LEGACY_MEMORY_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| data.join("legacy-memory"))
     }
 }
 
@@ -270,14 +272,14 @@ mod tests {
         fs::create_dir(&data).unwrap();
         let store = Store::open(data.join("state.db")).unwrap();
         let agent = store
-            .create_agent(NewAgent::new("lyra", "claude-code"))
+            .create_agent(NewAgent::new("sample-delta", "claude-code"))
             .unwrap();
         let selected = owner_pages(&data, true);
         let outside = dir.path().join("other-host-owners");
         fs::create_dir(&selected).unwrap();
         fs::create_dir(&outside).unwrap();
-        fs::write(selected.join("lyra.md"), b"synthetic selected page").unwrap();
-        fs::write(outside.join("lyra.md"), b"unrelated host page").unwrap();
+        fs::write(selected.join("sample-delta.md"), b"synthetic selected page").unwrap();
+        fs::write(outside.join("sample-delta.md"), b"unrelated host page").unwrap();
         on_start_from(&store, &selected).unwrap();
         let migration = HostMigration::open(&data).unwrap();
         let pages: Vec<_> = migration
@@ -293,10 +295,10 @@ mod tests {
             b"synthetic selected page"
         );
         assert_eq!(
-            fs::read(outside.join("lyra.md")).unwrap(),
+            fs::read(outside.join("sample-delta.md")).unwrap(),
             b"unrelated host page"
         );
-        assert_eq!(owner_pages(&data, false), Path::new("/scratch/tmp/owners"));
+        assert_ne!(owner_pages(&data, false), outside);
     }
 
     #[test]
@@ -671,5 +673,34 @@ mod tests {
             fs::read(config.join("sylphx-transcript.jsonl")).unwrap(),
             raw
         );
+    }
+    #[test]
+    fn production_migration_root_is_operator_selected_without_host_directory_inference() {
+        let _env = crate::server::tests::env_lock();
+        let key = "ANYAGENTS_LEGACY_MEMORY_ROOT";
+        let old = std::env::var_os(key);
+        let dir = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::remove_var(key);
+        }
+        assert_eq!(
+            owner_pages(dir.path(), false),
+            dir.path().join("legacy-memory")
+        );
+        let selected = dir.path().join("operator-selected");
+        unsafe {
+            std::env::set_var(key, &selected);
+        }
+        assert_eq!(owner_pages(dir.path(), false), selected);
+        assert_eq!(
+            owner_pages(dir.path(), true),
+            dir.path().join("legacy-owner-pages")
+        );
+        unsafe {
+            match old {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
     }
 }

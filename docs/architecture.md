@@ -160,6 +160,12 @@ not initialize seat skills or recreate an empty workdir; runtime preparation on
 wake does that. Credential propagation may independently recreate small auth
 directories, but their existence is not a cleanup trigger.
 
+Online deletion waits up to two seconds for both stopped health and release of
+the process lock. An optimistic stopped-health projection cannot remove identity,
+credentials or files while the worker still holds that lock. If shutdown exceeds
+the deadline, deletion returns a conflict and retains the archived identity and
+resources so a later request can complete.
+
 ### The adapter contract
 
 One adapter per harness. A new harness is an adapter plus a catalog entry; the mailbox, channels, `send` and usage do not change.
@@ -246,14 +252,12 @@ this adapter does not invoke a setter or edit shared service configuration.
 
 ### Managed local checkouts
 
-Repository-backed local agents require `desk-git-hub`; set
-`ANYAGENTS_GIT_HUB_BIN` to its executable when it is not installed under the
-host user's `~/.local/bin` or on `PATH`. Repository slugs and GitHub URLs,
-`repo: "inherit"`, and local repository paths all use that consumer for fetching
-and checkout. Sparse-checkout and hook policy belong to the consumer, not the
-agent manager. Fetch, checkout, and executable-launch failures refuse the spawn
-with the consumer's diagnostic; there is no automatic clone, direct-worktree,
-or non-desk fallback.
+Repository-backed local agents use a caller-configured checkout provider through
+`ANYAGENTS_CHECKOUT_PROVIDER_BIN`. Repository slugs and GitHub URLs, `repo: "inherit"`, and
+local repository paths use that provider for fetching and checkout. The provider
+owns sparse-checkout and hook policy. Fetch, checkout and executable-launch failures
+refuse the spawn with its diagnostic; an unavailable configured provider never
+silently selects a different checkout mechanism.
 
 Explicit `workdir` paths, including `/scratch/wt/...` and `/scratch/tmp/...`, are
 honoured or refused, never replaced by the default directory. Before an agent
@@ -295,12 +299,12 @@ Shared refs remain a same-repository integrity boundary: a child can move anothe
 branch ref. This is not hostile-repository isolation, and AnyAgents does not
 intercept arbitrary harness commit/push commands or provide a branch-tip guard.
 AnyAgents production code never runs `git commit` or `git push`; the supported
-source-publication path uses desk-git-hub and desk-publish. Its Git metadata reads, skill sync and cleanup
+source-publication path belongs to the caller's checkout and publication tools. Its Git metadata reads, skill sync and cleanup
 commands pin `core.hooksPath=/dev/null` and disable fsmonitor. The parent commit
 and its parent-owned hooks-path pin in the three-UID proof belong to the test fixture.
 Shared common and worktree configs refuse `include`/`includeIf` rather than
 following a potentially child-controlled configuration graph.
-Commit identity is set to `Kyle Tse <hi@kylet.se>` in the protected private
+Caller-configured commit identity is set in the protected private
 `config.worktree`, never by replacing the parent's common config. The consumer
 must enable `extensions.worktreeConfig`; otherwise admission refuses. Seat Git
 configuration resets legacy wildcard trust and lists only the seat's exact
@@ -379,7 +383,7 @@ These are invariants with tests (`tests/invariants/`), run against a scripted fa
 
 A channel adapter has an inbound side (a stream of events, each with its source key), an outbound side (post or reply to a target), and an identity (which bot or account it is). The built-in agent bus, which carries `send` between agents on the server, is not a channel adapter; it writes straight to mailboxes.
 
-**Telegram (first version).** One bot per agent, created by the user with BotFather and recorded with `anyagents channels add telegram --agent <name> --token-file <path>`; the token is copied into AnyAgents' own credential store at `secrets/channels/<channel id>` (mode 0600) and never into the database, a log or a command line. `getMe` names the bot once, so the channel shows which bot it is.
+**Telegram (first version).** One bot per agent, created by the user with BotFather and recorded with `anyagents channels add telegram --agent <name> --token-file <path>`; the token is copied into AnyAgents' own credential store at `secrets/channels/<channel id>` (mode 0600) and never into the database, a log or a command line. `getMe` names the bot once, so the channel shows which bot it is. Token replacement keeps the channel ID and writes a fresh reference under `secrets/channel-bindings/<channel id>/`; it preserves the previous credential bytes if a later store update fails. This namespace stays separate from the original `secrets/channels/<channel id>` file.
 
 - **Long polling.** A local server usually has no public URL, so the transport is `getUpdates` long polling, one poll per bot at a time on a thread that stops with the server. A webhook is the option for a server that is reachable; it is not built yet.
 - **What one update becomes.** A typed message, or a media message with a caption, becomes one mailbox message. Its source key is the bot and the update id, so the same update stored twice is one row. `sender` is `telegram:user:<id>:<message id>`. `reply_to` is the target a bare reply goes to: `telegram:chat:<chat id>`, or `telegram:chat:<chat id>:<message thread id>` for a forum topic, so a reply lands in the same chat and the same topic. Stickers, edited messages and membership changes are not delivered.
@@ -407,7 +411,7 @@ AnyAgents separates **session identity** (`mcp-capability`) from the **runtime e
 
 1. **Local host (`local`, default):** When no OS seats are configured, every harness process runs under the server user's own UID and keeps the user's real `HOME` directory. Host CLI tools, SSH keys, kubeconfigs and local hardware/GPUs work out of the box with zero configuration, while each agent's harness state (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `XDG_CONFIG_HOME` / `XDG_DATA_HOME` / `XDG_STATE_HOME`, `AGY_CONFIG_DIR`, `MUSE_CONFIG_HOME`, `PI_CODING_AGENT_DIR`) and `0600` `mcp-capability` are isolated under `<data>/agents/<id>/config`.
 2. **Container (`docker`) and cluster (`k8s`):** Each agent runs as the single user inside its own container or Pod, connects to the switchboard with its `mcp-capability`, and receives external credentials, volumes and GPU devices through standard Docker (`--env-file`, `-v`, `--gpus`) or Kubernetes (`Secret`, `ServiceAccount`, Workload Identity) primitives.
-3. **Multi-seat host (`seat`, opt-in):** When `ANYAGENTS_AGENTS`, `ANYAGENTS_AGENT_UID` or `ANYAGENTS_SOCKET_GID` is configured, every harness starts inside a distinct managed OS seat (`setpriv --reuid <uid> --regid <gid> --groups <gid>,<socket group> --no-new-privs --`). `anyagents agent-run --config <dir> -- <command>` asserts the process's effective UID/GID, `NoNewPrivs = 1`, denial of the server's database/secrets/operator token and peers' config directories, and writability of its own config directory before executing the command.
+3. **Multi-seat host (`seat`, opt-in):** The operator supplies `ANYAGENTS_PRINCIPALS` as JSON keyed by immutable agent ID, with explicit `user`, `uid`, `gid`, and `socket_gid` fields. The UID must differ from root and the server's own UID; neither display names nor existing file owners admit a principal. Register agents before enabling this map and admit each ID before launching it. Legacy numeric seat variables select the boundary but cannot authorize an agent without this map. Every harness then starts inside a distinct managed OS seat (`setpriv --reuid <uid> --regid <gid> --groups <gid>,<socket group> --no-new-privs --`). `anyagents agent-run --config <dir> -- <command>` asserts the process's effective UID/GID, `NoNewPrivs = 1`, denial of the server's database/secrets/operator token and peers' config directories, and writability of its own config directory before executing the command.
 
 ### Native Sylphx workspace placement
 
@@ -572,7 +576,7 @@ index's suffix-only scanner. Hidden owners are neither read nor upgraded.
 Redacted mailbox bodies remain authoritative on retry/restart. Historical
 standalone tool summaries clipped by an older writer have no raw mailbox body to
 recover; they are preserved as-is rather than claiming a reconstructed suffix.
-Reconciled pages under `agents/<id>/history/owners` are indexed as whole historical
+Reconciled pages under `agents/<id>/history/archive` are indexed as whole historical
 documents in `transcripts` scope even when they are Markdown rather than JSONL.
 
 For an indexed filesystem result, the canonical `conversation` tool/HTTP route

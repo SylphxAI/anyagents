@@ -1570,24 +1570,24 @@ mod tests {
 
     #[test]
     fn visible_width_counts_cjk_as_double_width_and_ignores_ansi() {
-        assert_eq!(visible_width("helios"), 6);
+        assert_eq!(visible_width("helper"), 6);
         assert_eq!(visible_width("實作"), 4);
-        assert_eq!(visible_width("helios · 實作 · Building"), 24);
+        assert_eq!(visible_width("helper · 實作 · Building"), 24);
         assert_eq!(
-            visible_width("\x1b[1mhelios\x1b[0m \x1b[2m· 實作\x1b[0m"),
+            visible_width("\x1b[1mhelper\x1b[0m \x1b[2m· 實作\x1b[0m"),
             13
         );
     }
 
     #[test]
     fn truncate_visible_respects_cjk_boundaries_and_resets_ansi() {
-        let s = "香港麻雀大亨Owner | category: 現有遊戲";
+        let s = "範例資料庫Owner | category: 現有遊戲";
         let t = truncate_visible(s, 14);
-        // "香港麻雀大亨" is 12 cols + "O" (1 col) + "…" (1 col) = 14 cols
+        // "範例資料庫" is 10 cols + "Own" (3 cols) + "…" (1 col) = 14 cols
         assert_eq!(visible_width(&t), 14);
         assert!(t.ends_with('…'));
 
-        let styled = "\x1b[2m香港麻雀大亨Owner\x1b[0m";
+        let styled = "\x1b[2m範例工作資料庫Owner\x1b[0m";
         let ts = truncate_visible(styled, 9);
         assert!(visible_width(&ts) <= 9);
         assert!(ts.ends_with("…\x1b[0m"));
@@ -1609,12 +1609,12 @@ mod tests {
     fn clean_description_strips_subagent_boilerplate() {
         assert_eq!(
             clean_agent_description(
-                "Sub-agent of Sage. Outcome: no live Fun, Big2 or HKMT player loses data",
-                "sage-sub-1",
+                "Sub-agent of Coordinator. Outcome: preserve all documents during import",
+                "coordinator-sub-1",
                 None,
                 true
             ),
-            "no live Fun, Big2 or HKMT player loses data"
+            "preserve all documents during import"
         );
     }
 }

@@ -332,36 +332,44 @@ impl OpenCodeHarness {
         // A stored session is resumed unless the service clearly says it does
         // not exist. A transient failure is retried, never read as "gone": a
         // new session there would strand the answers already in the old one.
-        let usable = match &wanted {
-            Some(session) => {
-                let mut state = Missing::Unknown;
-                for _ in 0..5 {
-                    match self.api("GET", &format!("/api/session/{session}"), None) {
-                        Ok(_) => {
-                            state = Missing::Present;
-                            break;
-                        }
-                        Err(err) => {
-                            let text = err.to_string();
-                            state = if text.contains("404")
-                                || text.contains("not found")
-                                || text.contains("NotFound")
-                            {
-                                Missing::Gone
-                            } else {
-                                Missing::Unknown
-                            };
-                            if state == Missing::Gone {
+        let usable =
+            match &wanted {
+                Some(session) => {
+                    let mut state = Missing::Unknown;
+                    for _ in 0..5 {
+                        match self.api("GET", &format!("/api/session/{session}"), None) {
+                            Ok(_) => {
+                                state = Missing::Present;
                                 break;
                             }
-                            std::thread::sleep(Duration::from_millis(300));
+                            Err(err) => {
+                                let text = err.to_string();
+                                state = if text.contains("404")
+                                    || text.contains("not found")
+                                    || text.contains("NotFound")
+                                {
+                                    Missing::Gone
+                                } else {
+                                    Missing::Unknown
+                                };
+                                if state == Missing::Gone {
+                                    break;
+                                }
+                                std::thread::sleep(Duration::from_millis(300));
+                            }
                         }
                     }
+                    match state {
+                        Missing::Present => true,
+                        Missing::Gone => false,
+                        Missing::Unknown => return Err(HarnessError::Failed(
+                            "OpenCode session availability is unknown; refusing a new conversation"
+                                .into(),
+                        )),
+                    }
                 }
-                state == Missing::Present
-            }
-            None => false,
-        };
+                None => false,
+            };
         if !usable {
             if let Some(session) = &wanted {
                 eprintln!(
@@ -369,11 +377,16 @@ impl OpenCodeHarness {
                 );
             }
             let fresh = self.api("POST", "/api/session", Some(json!({})))?;
-            if let Some(id) = fresh.pointer("/data/id").and_then(Value::as_str) {
-                self.lock().session = Some(id.to_string());
-            }
+            let id = fresh
+                .pointer("/data/id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| {
+                    HarnessError::Failed("OpenCode session response missing id".into())
+                })?;
+            self.lock().session = Some(id.to_string());
         }
-        self.remember_session();
+        self.remember_session()?;
         if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none() {
             // OpenCode boots location services and MCP servers lazily on the first
             // directory-scoped call (`GET /api/mcp` or `POST /api/session/<id>/prompt`).
@@ -401,12 +414,17 @@ impl OpenCodeHarness {
 
     /// Keep this agent's session id beside its config, so the next start
     /// resumes this exact conversation.
-    fn remember_session(&self) {
-        let (Some(dir), Some(session)) = (self.config_dir.clone(), self.lock().session.clone())
-        else {
-            return;
-        };
-        let _ = std::fs::write(dir.join("opencode-session-id"), format!("{session}\n"));
+    fn remember_session(&self) -> Result<(), HarnessError> {
+        let session =
+            self.lock().session.clone().ok_or_else(|| {
+                HarnessError::Failed("OpenCode did not supply a session id".into())
+            })?;
+        if let Some(dir) = &self.config_dir {
+            std::fs::write(dir.join("opencode-session-id"), format!("{session}\n")).map_err(
+                |err| HarnessError::Failed(format!("persist OpenCode session id: {err}")),
+            )?;
+        }
+        Ok(())
     }
 
     /// One `opencode api` call. Its own process, so a hung vendor call cannot
@@ -449,7 +467,17 @@ impl OpenCodeHarness {
                     .map_err(|err| HarnessError::Failed(format!("{method} {path}: {err}")))?;
                 if !status.success() {
                     let text = String::from_utf8_lossy(&output.stderr);
-                    let reason = text.lines().next().unwrap_or("no reason").to_string();
+                    let error_body = serde_json::from_slice::<Value>(&output.stdout).ok();
+                    let reason = if error_body
+                        .as_ref()
+                        .and_then(|body| body.pointer("/error/code"))
+                        .and_then(Value::as_u64)
+                        == Some(404)
+                    {
+                        "resource not found (404)".to_string()
+                    } else {
+                        text.lines().next().unwrap_or("no reason").to_string()
+                    };
                     return Err(HarnessError::Failed(format!("{method} {path}: {reason}")));
                 }
                 return serde_json::from_slice(&output.stdout)
@@ -605,7 +633,11 @@ impl Harness for OpenCodeHarness {
     }
 
     fn resume(&mut self, session: &str) -> Result<(), HarnessError> {
-        self.lock().session = Some(session.to_string());
+        let previous = self.lock().session.replace(session.to_string());
+        if let Err(err) = self.remember_session() {
+            self.lock().session = previous;
+            return Err(err);
+        }
         Ok(())
     }
 
@@ -613,11 +645,11 @@ impl Harness for OpenCodeHarness {
         let Some(session) = self.lock().session.clone() else {
             return Ok(());
         };
-        let _ = self.api(
+        self.api(
             "POST",
             &format!("/api/session/{session}/interrupt"),
             Some(json!({})),
-        );
+        )?;
         self.lock().turn_open = false;
         Ok(())
     }
@@ -730,7 +762,9 @@ impl Harness for OpenCodeHarness {
         let Some(queue) = &self.steer else {
             return Ok(None);
         };
-        Ok(queue.take())
+        queue
+            .try_take()
+            .map_err(|err| HarnessError::Failed(format!("steer queue: {err}")))
     }
 
     fn inject(&mut self, message: &OutboundMessage) -> Result<bool, HarnessError> {

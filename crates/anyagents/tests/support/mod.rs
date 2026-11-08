@@ -82,44 +82,27 @@ pub fn operator(data: &Path) -> PathBuf {
         // starts its agents with: the test double that only runs the command.
         std::env::remove_var("ANYAGENTS_FAKE_MODE");
         std::env::set_var("ANYAGENTS_LAUNCHER", fake_launcher(data));
-        std::env::set_var("ANYAGENTS_AGENTS", agents_line());
+        for key in [
+            "ANYAGENTS_AGENTS",
+            "ANYAGENTS_PRINCIPALS",
+            "ANYAGENTS_AGENT_UID",
+            "ANYAGENTS_AGENT_GID",
+            "ANYAGENTS_SOCKET_GID",
+        ] {
+            std::env::remove_var(key);
+        }
+        std::env::set_var("ANYAGENTS_TESTS", "contract-double");
     }
     path
 }
 
-/// The same operator, and the one OS seat this host really has: this test
-/// process's own uid, which keeps the launcher and the server out of root.
-pub fn operator_with_seat(data: &Path) -> PathBuf {
+/// An authenticated single-user protocol fixture. This does not claim managed
+/// UID isolation; that is verified separately with explicit immutable-ID grants.
+pub fn operator_for_contract(data: &Path) -> PathBuf {
     let path = operator(data);
-    // SAFETY: as `operator`.
-    let (uid, gid) = (our_uid(), our_gid());
+    // SAFETY: held under lock(), as operator().
     unsafe {
-        std::env::set_var("ANYAGENTS_AGENT_UID", uid.to_string());
-        std::env::set_var("ANYAGENTS_AGENT_GID", gid.to_string());
-        std::env::set_var("ANYAGENTS_SOCKET_GID", gid.to_string());
-        // A test machine: its host accounts are not an agent's seats, so the
-        // double-shaped seat this process's own uid stands in for them.
         std::env::set_var("ANYAGENTS_FAKE_MODE", "1");
-    }
-    path
-}
-
-/// The operator and a configured seat, with no test double: a deployment that
-/// claims its boundary and whose seat is this machine's own accounts.
-pub fn operator_with_configured_seat(data: &Path) -> PathBuf {
-    let path = operator(data);
-    let (uid, gid) = (our_uid(), our_gid());
-    let launcher = fake_launcher(data);
-    // SAFETY: as `operator`.
-    unsafe {
-        std::env::set_var("ANYAGENTS_AGENT_UID", uid.to_string());
-        std::env::set_var("ANYAGENTS_AGENT_GID", gid.to_string());
-        std::env::set_var("ANYAGENTS_SOCKET_GID", gid.to_string());
-        std::env::set_var("ANYAGENTS_LAUNCHER", launcher);
-        std::env::set_var("ANYAGENTS_AGENTS", agents_line());
-        // A test machine is its own single seat: the deployment gives every
-        // agent the uid this process runs as.
-        std::env::set_var("ANYAGENTS_TESTS", "own-seat");
     }
     path
 }
@@ -157,6 +140,7 @@ pub fn contract_server() -> std::process::Command {
         "ANYAGENTS_AGENT_GID",
         "ANYAGENTS_SOCKET_GID",
         "ANYAGENTS_AGENTS",
+        "ANYAGENTS_PRINCIPALS",
         "ANYAGENTS_LAUNCHER",
         "ANYAGENTS_SEAT_LAUNCH",
         "ANYAGENTS_SEAT_PEERS",
@@ -176,6 +160,10 @@ pub fn clear() {
         std::env::remove_var("ANYAGENTS_AGENT_UID");
         std::env::remove_var("ANYAGENTS_AGENT_GID");
         std::env::remove_var("ANYAGENTS_SOCKET_GID");
+        std::env::remove_var("ANYAGENTS_AGENTS");
+        std::env::remove_var("ANYAGENTS_PRINCIPALS");
+        std::env::remove_var("ANYAGENTS_TESTS");
+        std::env::remove_var("ANYAGENTS_FAKE_MODE");
     }
 }
 

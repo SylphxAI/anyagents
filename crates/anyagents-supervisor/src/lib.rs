@@ -735,12 +735,8 @@ impl<H: Harness + 'static> Session<H> {
                     Boot::Ready(delivery) => {
                         delivery.harness().watch_activity(Arc::clone(&self.notify));
                         self.restart_at = None;
-                        self.pending_recovery = delivery
-                            .store()
-                            .open_turn(&self.id)
-                            .ok()
-                            .flatten()
-                            .is_some();
+                        // Unknown until recover_once reads durable state successfully.
+                        self.pending_recovery = true;
                         self.delivery = Some(*delivery);
                     }
                     Boot::Busy => {
@@ -975,19 +971,16 @@ impl<H: Harness + 'static> Session<H> {
             return;
         }
         // Flush any usage the exited process finished serving before swapping it.
-        self.record_usage();
+        if !self.record_usage() {
+            return;
+        }
         match self.launch_harness() {
             Ok(mut harness) => {
                 harness.watch_activity(Arc::clone(&self.notify));
                 // A quota wait belonged to the process that is gone.
                 harness.clear_quota();
                 if let Some(delivery) = self.delivery.as_mut() {
-                    self.pending_recovery = delivery
-                        .store()
-                        .open_turn(&self.id)
-                        .ok()
-                        .flatten()
-                        .is_some();
+                    self.pending_recovery = true;
                     delivery.replace_harness(harness);
                 }
                 self.served = None;
@@ -1083,7 +1076,14 @@ impl<H: Harness + 'static> Session<H> {
             Ok(RunOutcome::Idle) => {
                 // No message was accepted on this pass (the mailbox may still
                 // contain deferred mail). Record whatever the vendor reported.
-                self.record_usage();
+                if !self.record_usage() {
+                    self.publish();
+                    self.inner.clock.wait(
+                        Some(self.inner.clock.now_ms() + IDLE_REVIEW_MS),
+                        &self.woken,
+                    );
+                    return false;
+                }
                 if self.try_apply_pending_switch() {
                     return false;
                 }
@@ -1179,54 +1179,47 @@ impl<H: Harness + 'static> Session<H> {
     /// Record the usage the harness served since the last row. It is read when
     /// the mailbox has drained, never holds a line back, and adds nothing while
     /// the harness has served nothing new.
-    fn record_usage(&mut self) {
+    fn record_usage(&mut self) -> bool {
         let Some(delivery) = self.delivery.as_ref() else {
-            return;
+            return true;
         };
         let served = delivery.harness().last_usage();
         let before = self.served.clone().unwrap_or_default();
         let turns_served = delivery.harness().turns_served();
-
-        if served == before {
-            let health = delivery.harness().health();
-            if turns_served > self.turns_recorded && health.turn_state == TurnState::Idle {
-                self.turns_recorded = turns_served;
-                if health.sign_in_fault.is_none() {
-                    let _ = delivery.store().note_turn_completed(&self.id);
-                    self.completed_turn_in_session = true;
-                    self.consecutive_turn_errors = 0;
-                    self.last_error = None;
+        let health = delivery.harness().health();
+        let completed = (turns_served > self.turns_recorded || served != before)
+            && health.turn_state == TurnState::Idle
+            && health.sign_in_fault.is_none();
+        // Persist completion before publishing progress or resetting the usage
+        // baseline. On failure the same turn remains eligible for another pass.
+        if completed && let Err(err) = delivery.store().note_turn_completed(&self.id) {
+            self.last_error = Some(format!("persist turn completion: {err}"));
+            return false;
+        }
+        if served != before {
+            let turns = turns_served
+                .saturating_sub(self.turns_recorded)
+                .max(self.written.max(1));
+            let unit = owned_share(served.difference(before), turns);
+            for _ in 0..turns {
+                if unit.input_tokens == 0 && unit.output_tokens == 0 {
+                    break;
+                }
+                if !record_turn(delivery, &self.agent, &self.inner.clock, &unit) {
+                    self.last_error = Some("persist turn usage failed".into());
+                    return false;
                 }
             }
-            return;
-        }
-        // One row for each unit the vendor charged: its turns, or as many as
-        // the lines that were written here.
-        let turns = turns_served
-            .saturating_sub(self.turns_recorded)
-            .max(self.written.max(1));
-        let unit = owned_share(served.difference(before), turns);
-        let mut recorded = true;
-        for _ in 0..turns {
-            if unit.input_tokens == 0 && unit.output_tokens == 0 {
-                break;
-            }
-            recorded &= record_turn(delivery, &self.agent, &self.inner.clock, &unit);
-        }
-        if recorded {
             self.served = Some(served);
             self.written = 0;
-            let health = delivery.harness().health();
-            if health.turn_state == TurnState::Idle {
-                self.turns_recorded = turns_served;
-                if health.sign_in_fault.is_none() {
-                    let _ = delivery.store().note_turn_completed(&self.id);
-                    self.completed_turn_in_session = true;
-                    self.consecutive_turn_errors = 0;
-                    self.last_error = None;
-                }
-            }
         }
+        if completed {
+            self.turns_recorded = turns_served;
+            self.completed_turn_in_session = true;
+            self.consecutive_turn_errors = 0;
+            self.last_error = None;
+        }
+        true
     }
 
     /// Automatically scale any agent to zero (`state = "idle"`)
@@ -1303,8 +1296,19 @@ impl<H: Harness + 'static> Session<H> {
             }
             let open = match delivery.store().open_turn(&self.id) {
                 Ok(Some(open)) => open,
-                Ok(None) | Err(_) => {
+                Ok(None) => {
                     self.pending_recovery = false;
+                    if self
+                        .last_error
+                        .as_deref()
+                        .is_some_and(|error| error.starts_with("read open turn for recovery:"))
+                    {
+                        self.last_error = None;
+                    }
+                    return false;
+                }
+                Err(err) => {
+                    self.last_error = Some(format!("read open turn for recovery: {err}"));
                     return false;
                 }
             };
@@ -1313,6 +1317,7 @@ impl<H: Harness + 'static> Session<H> {
         match outcome {
             Ok(DeliverOutcome::Accepted { .. }) => {
                 self.pending_recovery = false;
+                self.last_error = None;
                 self.written = self.written.saturating_add(1);
                 false
             }
@@ -1345,8 +1350,8 @@ impl<H: Harness + 'static> Session<H> {
                 self.replace_process();
                 true
             }
-            Err(_) => {
-                self.pending_recovery = false;
+            Err(err) => {
+                self.last_error = Some(format!("persist turn recovery: {err}"));
                 false
             }
         }
@@ -1781,5 +1786,344 @@ mod tests {
         assert!(restart_delay_ms(30, 0) <= 60_000);
         assert!(restart_delay_ms(30, 39) <= 60_000);
         assert!(restart_delay_ms(30, 39) >= 1);
+    }
+}
+
+#[cfg(test)]
+mod persistence_tests {
+    use super::*;
+    use anyagents_harness::{FakeHarness, HarnessError, OutboundMessage};
+    use rusqlite::Connection;
+
+    struct UsageHarness {
+        inner: FakeHarness,
+        usage: TurnUsage,
+    }
+
+    impl Harness for UsageHarness {
+        fn deliver(&mut self, message: &OutboundMessage) -> Result<DeliverOutcome, HarnessError> {
+            self.inner.deliver(message)
+        }
+        fn background(&mut self) -> Result<(), HarnessError> {
+            self.inner.background()
+        }
+        fn resume(&mut self, session: &str) -> Result<(), HarnessError> {
+            self.inner.resume(session)
+        }
+        fn cancel(&mut self) -> Result<(), HarnessError> {
+            self.inner.cancel()
+        }
+        fn health(&self) -> anyagents_harness::HarnessHealth {
+            self.inner.health()
+        }
+        fn turns_served(&self) -> u32 {
+            self.inner.turns_served()
+        }
+        fn served_usage(&self) -> TurnUsage {
+            if self.turns_served() > 0 {
+                self.usage.clone()
+            } else {
+                TurnUsage::default()
+            }
+        }
+    }
+
+    fn fixture(usage: TurnUsage) -> (tempfile::TempDir, Session<UsageHarness>, Connection) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        let agent = store
+            .create_agent(anyagents_core::NewAgent::new("worker", "contract"))
+            .unwrap();
+        let paths = AgentPaths::from_store(&store, &agent);
+        let make_harness = move || UsageHarness {
+            inner: FakeHarness::new(DeliveryMode::Steer),
+            usage: usage.clone(),
+        };
+        let harness = make_harness();
+        let inner = Arc::new(Inner {
+            store: Arc::clone(&store),
+            clock: Arc::new(SystemClock::new()),
+            launch: Arc::new(move |_| Ok(make_harness())),
+            extra_env: Vec::new(),
+            board: HealthBoard::default(),
+            stop: AtomicBool::new(false),
+            workers: Mutex::new(HashMap::new()),
+            idle_release_hook: None,
+        });
+        let delivery = DeliveryLoop::start(
+            Store::open(dir.path().join("state.db")).unwrap(),
+            agent.id.clone(),
+            harness,
+        )
+        .unwrap();
+        let mut session = Session {
+            inner,
+            id: agent.id.clone(),
+            agent,
+            paths,
+            notify: Arc::new(|| {}),
+            stop: Arc::new(AtomicBool::new(false)),
+            woken: Arc::new(AtomicBool::new(false)),
+            attempt: 0,
+            restart_at: None,
+            delivery: Some(delivery),
+            served: None,
+            written: 0,
+            turns_recorded: 0,
+            pending_recovery: true,
+            completed_turn_in_session: false,
+            quota_started_at: None,
+            pending_switch_started_at: None,
+            process_started_at: None,
+            process_profile_rotated_ms: 0,
+            last_error: None,
+            consecutive_turn_errors: 0,
+        };
+        store
+            .receive(
+                &session.id,
+                anyagents_core::Incoming::new("finish this work"),
+            )
+            .unwrap();
+        assert!(matches!(
+            session.delivery.as_mut().unwrap().run_once().unwrap(),
+            RunOutcome::Delivered { .. }
+        ));
+        assert!(store.open_turn(&session.id).unwrap().is_some());
+        let connection = Connection::open(dir.path().join("state.db")).unwrap();
+        (dir, session, connection)
+    }
+
+    #[test]
+    fn failed_recovery_read_remains_pending_and_recovers_after_storage_is_repaired() {
+        let (_dir, mut session, sql) = fixture(TurnUsage::default());
+        sql.execute_batch(
+            "ALTER TABLE turn_recovery RENAME TO saved_recovery;
+            CREATE VIEW turn_recovery AS SELECT * FROM unavailable_recovery;",
+        )
+        .unwrap();
+        session.pending_recovery = false;
+        session.replace_process();
+        assert!(
+            session.pending_recovery,
+            "replacement must not mistake unknown for no open turn"
+        );
+        assert!(!session.recover_once());
+        assert!(session.pending_recovery);
+        assert!(
+            session
+                .last_error
+                .as_deref()
+                .unwrap()
+                .contains("read open turn for recovery")
+        );
+        assert!(
+            session
+                .delivery
+                .as_ref()
+                .unwrap()
+                .harness()
+                .inner
+                .written_ids()
+                .is_empty()
+        );
+        sql.execute_batch(
+            "DROP VIEW turn_recovery; ALTER TABLE saved_recovery RENAME TO turn_recovery;",
+        )
+        .unwrap();
+        assert!(!session.recover_once());
+        assert!(!session.pending_recovery);
+        assert_eq!(
+            session
+                .delivery
+                .as_ref()
+                .unwrap()
+                .harness()
+                .inner
+                .written_ids()
+                .len(),
+            1
+        );
+        assert_eq!(
+            session
+                .inner
+                .store
+                .open_turn(&session.id)
+                .unwrap()
+                .unwrap()
+                .recovery_count,
+            1
+        );
+    }
+
+    #[test]
+    fn failed_recovery_persistence_retries_the_same_delivery_without_duplicate_vendor_work() {
+        let (_dir, mut session, sql) = fixture(TurnUsage::default());
+        session.replace_process();
+        sql.execute_batch(
+            "CREATE TRIGGER fail_recovery BEFORE UPDATE OF recovery_count ON turn_recovery
+            BEGIN SELECT RAISE(FAIL, 'recovery injected'); END;",
+        )
+        .unwrap();
+        assert!(!session.recover_once());
+        assert!(session.pending_recovery);
+        assert!(
+            session
+                .last_error
+                .as_deref()
+                .unwrap()
+                .contains("recovery injected")
+        );
+        let written = session
+            .delivery
+            .as_ref()
+            .unwrap()
+            .harness()
+            .inner
+            .written_ids()
+            .to_vec();
+        assert_eq!(written.len(), 1);
+        assert_eq!(
+            session
+                .inner
+                .store
+                .open_turn(&session.id)
+                .unwrap()
+                .unwrap()
+                .recovery_count,
+            0
+        );
+        sql.execute_batch("DROP TRIGGER fail_recovery;").unwrap();
+        assert!(!session.recover_once());
+        assert!(!session.pending_recovery);
+        assert!(session.last_error.is_none());
+        assert_eq!(
+            session
+                .delivery
+                .as_ref()
+                .unwrap()
+                .harness()
+                .inner
+                .written_ids(),
+            written
+        );
+        assert_eq!(
+            session
+                .inner
+                .store
+                .open_turn(&session.id)
+                .unwrap()
+                .unwrap()
+                .recovery_count,
+            1
+        );
+    }
+
+    #[test]
+    fn authoritative_absence_of_an_open_turn_clears_pending_recovery() {
+        let (_dir, mut session, _sql) = fixture(TurnUsage::default());
+        session
+            .inner
+            .store
+            .note_turn_completed(&session.id)
+            .unwrap();
+        session.replace_process();
+        assert!(session.pending_recovery);
+        assert!(!session.recover_once());
+        assert!(!session.pending_recovery);
+        assert!(
+            session
+                .delivery
+                .as_ref()
+                .unwrap()
+                .harness()
+                .inner
+                .written_ids()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn completion_failure_retains_zero_usage_turn_until_durable_retry_succeeds() {
+        assert_completion_retry(TurnUsage::default());
+    }
+
+    #[test]
+    fn completion_failure_retains_usage_baseline_until_durable_retry_succeeds() {
+        assert_completion_retry(TurnUsage {
+            input_tokens: 11,
+            output_tokens: 7,
+            ..TurnUsage::default()
+        });
+    }
+
+    fn assert_completion_retry(usage: TurnUsage) {
+        let (_dir, mut session, sql) = fixture(usage.clone());
+        session
+            .delivery
+            .as_mut()
+            .unwrap()
+            .harness_mut()
+            .inner
+            .complete_turn()
+            .unwrap();
+        sql.execute_batch(
+            "CREATE TRIGGER fail_completion BEFORE UPDATE OF completed_seq ON turn_recovery
+            BEGIN SELECT RAISE(FAIL, 'completion injected'); END;",
+        )
+        .unwrap();
+        assert!(!session.record_usage());
+        assert_eq!(session.turns_recorded, 0);
+        assert!(session.served.is_none());
+        assert!(!session.completed_turn_in_session);
+        assert!(
+            session
+                .last_error
+                .as_deref()
+                .unwrap()
+                .contains("completion injected")
+        );
+        assert!(
+            session
+                .inner
+                .store
+                .open_turn(&session.id)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            session
+                .inner
+                .store
+                .list_usage(Some(&session.id))
+                .unwrap()
+                .is_empty()
+        );
+        session.replace_process();
+        assert_eq!(
+            session.delivery.as_ref().unwrap().harness().turns_served(),
+            1,
+            "failed persistence must not discard the old harness baseline"
+        );
+        sql.execute_batch("DROP TRIGGER fail_completion;").unwrap();
+        assert!(session.record_usage());
+        assert_eq!(session.turns_recorded, 1);
+        assert!(session.completed_turn_in_session);
+        assert!(session.last_error.is_none());
+        assert!(
+            session
+                .inner
+                .store
+                .open_turn(&session.id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(session.record_usage());
+        let rows = session.inner.store.list_usage(Some(&session.id)).unwrap();
+        assert_eq!(rows.len(), usize::from(usage.input_tokens > 0));
+        if let Some(row) = rows.first() {
+            assert_eq!(row.input_tokens, 11);
+            assert_eq!(row.output_tokens, 7);
+        }
     }
 }

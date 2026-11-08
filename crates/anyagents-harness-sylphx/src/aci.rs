@@ -36,7 +36,8 @@ pub(super) fn can_parallelize_tool_batch(calls: &[(String, String, Value)]) -> b
             | "context_edit"
             | "apply_patch"
             | "sandbox"
-            | "code" => {
+            | "code"
+            | "context" => {
                 return false;
             }
             "agents" | "subagents" => {
@@ -111,22 +112,27 @@ pub(super) fn execute_bash_with_timeout(
     timeout_ms: u64,
 ) -> String {
     let bounded_timeout_ms = timeout_ms.clamp(500, 600_000);
-    if !work_dir.exists() {
-        let _ = workspace::create_dir_all(work_dir, env);
-        let _ = std::fs::create_dir_all(work_dir);
+    if !work_dir.exists()
+        && let Err(e) = workspace::create_dir_all(work_dir, env)
+    {
+        return format!(
+            "error creating requested workspace {}: {e}",
+            work_dir.display()
+        );
     }
-    let effective_dir = if work_dir.is_dir() {
-        work_dir
-    } else {
-        Path::new("/tmp")
-    };
+    if !work_dir.is_dir() {
+        return format!(
+            "error: requested workspace is not a directory: {}",
+            work_dir.display()
+        );
+    }
     let mut cmd = match workspace::command(Path::new("bash"), env) {
         Ok(cmd) => cmd,
         Err(e) => return format!("error executing bash: {e}"),
     };
     cmd.arg("-c")
         .arg(cmd_str)
-        .current_dir(effective_dir)
+        .current_dir(work_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
