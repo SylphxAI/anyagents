@@ -114,49 +114,26 @@ pub fn sanitize_claude_settings(config_dir: &Path) -> Result<(), Error> {
             let deny = perms_obj
                 .entry("deny".to_string())
                 .or_insert_with(|| serde_json::json!(["SendFeedback"]));
-            if let Some(deny_arr) = deny.as_array_mut() {
-                if std::env::var_os("ANYAGENTS_ALLOW_NATIVE_SUBAGENTS").is_none() {
-                    for tool in [
-                        "SendFeedback",
-                        "Task",
-                        "Agent",
-                        "TeamCreate",
-                        "TeamDelete",
-                        "SendMessage",
-                        "ScheduleWakeup",
-                        "Monitor",
-                        "CronCreate",
-                        "CronDelete",
-                        "CronList",
-                        "RemoteTrigger",
-                        "PushNotification",
-                    ] {
-                        if !deny_arr.iter().any(|v| v.as_str() == Some(tool)) {
-                            deny_arr.push(serde_json::Value::String(tool.to_string()));
-                        }
-                    }
-                }
-                if !std::env::var("ANYAGENTS_ALLOW_NATIVE_FILE_TOOLS")
-                    .ok()
-                    .is_some_and(|v| v.trim() == "1")
-                {
-                    for tool in [
-                        "Read",
-                        "Write",
-                        "Edit",
-                        "MultiEdit",
-                        "Glob",
-                        "Grep",
-                        "LS",
-                        "NotebookEdit",
-                        "TodoRead",
-                        "TodoWrite",
-                        "WebSearch",
-                        "WebFetch",
-                    ] {
-                        if !deny_arr.iter().any(|v| v.as_str() == Some(tool)) {
-                            deny_arr.push(serde_json::Value::String(tool.to_string()));
-                        }
+            if let Some(deny_arr) = deny.as_array_mut()
+                && std::env::var_os("ANYAGENTS_ALLOW_NATIVE_SUBAGENTS").is_none()
+            {
+                for tool in [
+                    "SendFeedback",
+                    "Task",
+                    "Agent",
+                    "TeamCreate",
+                    "TeamDelete",
+                    "SendMessage",
+                    "ScheduleWakeup",
+                    "Monitor",
+                    "CronCreate",
+                    "CronDelete",
+                    "CronList",
+                    "RemoteTrigger",
+                    "PushNotification",
+                ] {
+                    if !deny_arr.iter().any(|v| v.as_str() == Some(tool)) {
+                        deny_arr.push(serde_json::Value::String(tool.to_string()));
                     }
                 }
             }
@@ -566,6 +543,34 @@ mod tests {
         assert_eq!(cleaned["env"]["OTHER"], "1");
         assert_eq!(cleaned["includeCoAuthoredBy"], false);
         assert_eq!(cleaned["skipDangerousModePermissionPrompt"], true);
+        let denied = cleaned["permissions"]["deny"].as_array().unwrap();
+        for tool in [
+            "Read",
+            "Write",
+            "Edit",
+            "MultiEdit",
+            "Glob",
+            "Grep",
+            "LS",
+            "NotebookEdit",
+            "TodoRead",
+            "TodoWrite",
+            "WebSearch",
+            "WebFetch",
+        ] {
+            assert!(
+                !denied.iter().any(|value| value.as_str() == Some(tool)),
+                "{tool}"
+            );
+        }
+        if std::env::var_os("ANYAGENTS_ALLOW_NATIVE_SUBAGENTS").is_none() {
+            for tool in ["Task", "Agent", "TeamCreate", "TeamDelete", "SendMessage"] {
+                assert!(
+                    denied.iter().any(|value| value.as_str() == Some(tool)),
+                    "{tool}"
+                );
+            }
+        }
     }
     #[test]
     fn malformed_settings_and_non_notfound_reads_preserve_existing_bytes() {

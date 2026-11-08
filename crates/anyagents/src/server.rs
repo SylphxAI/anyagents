@@ -134,8 +134,14 @@ async fn serve(
     let key = capability_key()?;
     store.hold_capability_key(&key)?;
     let agents = store.list_agents()?;
+    // Keep small legacy deployments compatible without walking every archived
+    // seat tree in a large registry. Wake/admission mints a capability on demand.
+    let skip_archived_mint = agents.len() > 32;
     let mut mint_failures = Vec::new();
     for agent in &agents {
+        if skip_archived_mint && agent.state == "archived" {
+            continue;
+        }
         if let Err(err) = crate::operator::ensure(&store, &agent.id) {
             mint_failures.push(format!("{}: {err}", agent.name));
         }
@@ -1123,13 +1129,21 @@ fn reconcile_agent_snapshot(
     };
     if !guard.initialized {
         for agent in &agents {
+            if agent.state == "archived" {
+                continue;
+            }
             let delivered = store.delivered_cursor(&agent.id).unwrap_or(0);
             guard.watermark_seq.insert(agent.id.to_string(), delivered);
         }
         guard.initialized = true;
     }
 
-    let mut ordered_indices: Vec<usize> = (0..agents.len()).collect();
+    let mut ordered_indices: Vec<usize> = (0..agents.len())
+        .filter(|&idx| {
+            agents[idx].state != "archived"
+                || health.get(&agents[idx].id).is_some_and(|l| l.process_alive)
+        })
+        .collect();
     ordered_indices.sort_by_key(|&idx| {
         let a = &agents[idx];
         let last_try = guard
@@ -9930,6 +9944,28 @@ exec '{}' "$@"
         unsafe {
             std::env::remove_var("ANYAGENTS_FAKE_MODE");
         }
+    }
+
+    #[test]
+    fn archived_agents_do_not_seed_reconciliation_watermarks() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(anyagents_core::NewAgent::new("retired", "codex"))
+            .unwrap();
+        store.set_agent_state(&agent.id, "archived").unwrap();
+        let reconcile = Arc::new(Mutex::new(AdminReconcileState::default()));
+        reconcile_agent_snapshot(
+            &store,
+            &HealthBoard::default(),
+            dir.path(),
+            &reconcile,
+            now_ms(),
+            store.list_agents().unwrap(),
+        );
+        let state = reconcile.lock().unwrap();
+        assert!(state.initialized);
+        assert!(state.watermark_seq.is_empty());
     }
 
     #[test]

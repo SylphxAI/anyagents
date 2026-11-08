@@ -735,8 +735,8 @@ pub(crate) fn write_agent_instructions_with_continuity(
         ));
     }
 
-    // Only the host lifecycle allocates a generation. Describe/restart/render
-    // consume its persisted pin without opening live learned-memory files.
+    // A configured harness switch rotates before rendering. Ordinary updates
+    // consume the persisted pin without opening live learned-memory files.
     if let Some(root) = config.parent() {
         if let Some((_, policy)) = agent
             .launch_env
@@ -748,19 +748,18 @@ pub(crate) fn write_agent_instructions_with_continuity(
             doc.push_str(policy);
             doc.push('\n');
         }
-        match anyagents_core::host_session::active(root) {
-            Ok(Some(session)) if session.harness == agent.harness => {
+        match anyagents_core::host_session::prepare_harness_with_source(
+            root,
+            &agent.harness,
+            harness_session_filename(&agent.harness),
+            crate::vendor::memory_source(agent),
+        ) {
+            Ok(Some(session)) => {
                 doc.push('\n');
                 doc.push_str(&session.memory.section);
                 doc.push('\n');
             }
             Ok(None) => (), // First dispatch pins and rerenders before launch.
-            Ok(Some(_)) => {
-                return Err(Error::Message(format!(
-                    "host session harness mismatch for {}",
-                    agent.id
-                )));
-            }
             Err(error) => {
                 return Err(Error::Message(format!(
                     "invalid host memory pin for {}: {error}",
@@ -1651,7 +1650,11 @@ pub(crate) fn seed_harness_credentials(
     if let (Some(bound), Some(primary_profile_root)) =
         (current_bound.clone(), profile_roots.first().cloned())
     {
+        let harvest_peers = all_agents.len() <= 32;
         for other in &all_agents {
+            if !harvest_peers && other.id != agent.id {
+                continue;
+            }
             let other_cfg = agent_config_dir(data, &other.id);
             if bound_profile_name(&other_cfg).as_deref() == Some(bound.as_str()) {
                 for rel in [
@@ -8594,8 +8597,10 @@ mod tests {
         assert!(assembled.contains(&first.memory.section));
         assert!(!assembled.contains("EDITED_SECOND_FACT"));
         agent.harness = "sylphx".into();
-        let switched = host_session::new_session(root, &agent.harness).unwrap();
         write_agent_instructions(&config, &agent, None).unwrap();
+        let switched = host_session::active(root).unwrap().unwrap();
+        assert_eq!(switched.harness, "sylphx");
+        assert_ne!(switched.generation, first.generation);
         for path in paths {
             let text = std::fs::read_to_string(config.join(path)).unwrap();
             assert!(text.contains(&switched.memory.section));
@@ -8701,6 +8706,10 @@ mod tests {
         let cfg = agent_config_dir(data, &owner.id);
         std::fs::create_dir_all(&cfg).unwrap();
         write_profile_marker(&cfg, ".anyagents-profile", "sylphx/default\n").unwrap();
+        let root = cfg.parent().unwrap();
+        let initial_session =
+            anyagents_core::host_session::ensure_active(root, "opencode").unwrap();
+        anyagents_core::host_session::bind_vendor(root, "opencode", "ses_original").unwrap();
         let mut inc = anyagents_core::Incoming::new("Initial owner task");
         inc.sender = Some("agent:sample-parent".to_string());
         let _ = store.receive(&owner.id, inc).unwrap();
@@ -8739,6 +8748,9 @@ mod tests {
         assert_eq!(receipt["profile"], "sylphx/default");
         assert_eq!(receipt["state"], "archived");
         assert_eq!(receipt["cutover_status"], "ready_on_next_wake");
+        let switched_session = anyagents_core::host_session::active(root).unwrap().unwrap();
+        assert_eq!(switched_session.harness, "codex");
+        assert_ne!(switched_session.generation, initial_session.generation);
 
         let after = store.agent(&owner.id).unwrap();
         assert_eq!(after.id, owner.id);
@@ -8782,6 +8794,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(roundtrip["harness"], "opencode");
+        let roundtrip_session = anyagents_core::host_session::active(root).unwrap().unwrap();
+        assert_eq!(roundtrip_session.harness, "opencode");
+        assert_ne!(roundtrip_session.generation, switched_session.generation);
+        // The outgoing generation's pin and alias remain resumable.
+        assert_eq!(
+            anyagents_core::host_session::resume_vendor(root, "opencode", "ses_original").unwrap(),
+            initial_session
+        );
         assert!(!cfg.join("opencode-session-id").exists());
         let agents_md = std::fs::read_to_string(cfg.join("AGENTS.md")).unwrap();
         assert!(agents_md.contains("Completed second turn on Codex"));

@@ -180,6 +180,40 @@ pub fn recover_pending(root: &Path) -> io::Result<()> {
     read_ready(root).map(|_| ())
 }
 
+/// Prepare a configured harness before rendering or dispatch. A harness change
+/// rotates the active generation and retires the destination's native resume
+/// pointer, preserving all old pins, aliases and transcripts. First dispatch
+/// still owns allocation when there is no active session.
+pub fn prepare_harness_with_source(
+    root: &Path,
+    harness: &str,
+    marker: Option<&str>,
+    source: Option<&Path>,
+) -> io::Result<Option<HostSession>> {
+    if harness.trim().is_empty() || marker.is_some_and(|name| !single_filename(name)) {
+        return Err(io::Error::other("invalid harness session identity"));
+    }
+    let _lock = lock(root)?;
+    let mut registry = read_ready(root)?;
+    let Some(old) = registry.active.as_ref() else {
+        return Ok(None);
+    };
+    let previous = materialize(root, old)?;
+    if old.harness == harness {
+        return Ok(Some(previous));
+    }
+    // This marker belongs to the destination harness's historical session,
+    // never to the outgoing generation. Keep its existing alias unchanged.
+    let retired_marker = marker
+        .map(|name| {
+            marker_bytes(&root.join("config").join(name))
+                .map(|bytes| bytes.map(|bytes| (name.to_owned(), sha256(&bytes))))
+        })
+        .transpose()?
+        .flatten();
+    start_reset(root, &mut registry, harness, retired_marker, source).map(Some)
+}
+
 /// Explicit reset of a quiescent agent. Preserve old pins, vendor aliases and
 /// raw/vendor state; retire only the small native resume pointer. The durable
 /// intent makes either side of the pointer rename recoverable after a crash.
@@ -236,17 +270,25 @@ pub fn reset_session_with_source(
             registry.aliases.insert(key, old.clone());
         }
     }
+    let retired_marker = old_marker.map(|(name, bytes)| (name.to_owned(), sha256(&bytes)));
+    start_reset(root, &mut registry, harness, retired_marker, source)
+}
+
+fn start_reset(
+    root: &Path,
+    registry: &mut Registry,
+    harness: &str,
+    marker: Option<(String, String)>,
+    source: Option<&Path>,
+) -> io::Result<HostSession> {
     let session = Session {
         generation: uuid::Uuid::now_v7().to_string(),
         harness: harness.to_owned(),
     };
     pin_session_from_source(root, &session.generation, source)?;
-    registry.pending_reset = Some(PendingReset {
-        session,
-        marker: old_marker.map(|(name, bytes)| (name.to_owned(), sha256(&bytes))),
-    });
-    write(root, &registry)?;
-    complete_reset(root, &mut registry)?;
+    registry.pending_reset = Some(PendingReset { session, marker });
+    write(root, registry)?;
+    complete_reset(root, registry)?;
     materialize(root, registry.active.as_ref().unwrap())
 }
 
@@ -368,6 +410,58 @@ mod tests {
     fn memory(root: &Path, text: &str) {
         fs::create_dir_all(root.join("memory")).unwrap();
         fs::write(root.join("memory/MEMORY.md"), text).unwrap();
+    }
+    #[test]
+    fn preparing_harness_switches_once_and_preserves_history_and_aliases() {
+        let dir = crate::test_tempdir();
+        let root = dir.path();
+        let source = Some(Path::new("memory/MEMORY.md"));
+        assert!(
+            prepare_harness_with_source(root, "opencode", None, source)
+                .unwrap()
+                .is_none()
+        );
+        fs::create_dir_all(root.join("config")).unwrap();
+        memory(root, "original fact");
+        let original = ensure_active(root, "opencode").unwrap();
+        bind_vendor(root, "opencode", "old-opencode").unwrap();
+        fs::write(root.join("config/opencode-session-id"), "old-opencode\n").unwrap();
+        fs::write(root.join("config/history.jsonl"), "retained transcript").unwrap();
+        memory(root, "sylphx fact");
+        let switched = prepare_harness_with_source(root, "sylphx", None, source)
+            .unwrap()
+            .unwrap();
+        assert_ne!(switched.generation, original.generation);
+        assert_eq!(switched.harness, "sylphx");
+        assert!(switched.memory.section.contains("sylphx fact"));
+        memory(root, "roundtrip fact");
+        let roundtrip =
+            prepare_harness_with_source(root, "opencode", Some("opencode-session-id"), source)
+                .unwrap()
+                .unwrap();
+        assert_ne!(roundtrip.generation, switched.generation);
+        assert!(!root.join("config/opencode-session-id").exists());
+        let retired = root.join(format!(
+            "sessions/retired-{}/opencode-session-id",
+            roundtrip.generation
+        ));
+        assert_eq!(fs::read_to_string(retired).unwrap(), "old-opencode\n");
+        assert_eq!(
+            fs::read_to_string(root.join("config/history.jsonl")).unwrap(),
+            "retained transcript"
+        );
+        memory(root, "must not repin");
+        assert_eq!(
+            prepare_harness_with_source(root, "opencode", Some("opencode-session-id"), source)
+                .unwrap()
+                .unwrap(),
+            roundtrip
+        );
+        assert_eq!(active(root).unwrap().unwrap(), roundtrip);
+        assert_eq!(
+            resume_vendor(root, "opencode", "old-opencode").unwrap(),
+            original
+        );
     }
     #[test]
     fn explicit_reset_retires_only_pointer_and_resumes_prepared_intent_without_repin() {
