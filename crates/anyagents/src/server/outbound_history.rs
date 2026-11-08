@@ -104,6 +104,7 @@ fn settle(store: &Store, path: &Path, intent: &Intent) -> Result<(), Error> {
 
 /// The obligation exists before the effect. After acknowledgement its receipt
 /// survives a failed local projection; a keyed retry reuses that receipt.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn deliver<F>(
     store: &Store,
     agent_id: &AgentId,

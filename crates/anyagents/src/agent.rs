@@ -179,8 +179,9 @@ pub fn rename_cmd(data: &Path, agent: &str, new_name: &str) -> Result<(), Error>
                 .into(),
         ));
     }
-    let store = open(data)?;
+    let store = open_with_key(data)?;
     let old = store.agent_by_name(clean_agent)?;
+    crate::operator::ensure(&store, &old.id)?;
     store.record_admin_audit("operator", "agents.rename", &old.name)?;
     let updated = store.rename_agent(&old.id, clean_new)?;
     if old.name != updated.name {
@@ -253,8 +254,9 @@ pub fn role_cmd(data: &Path, agent: &str, role: Option<&str>, clear: bool) -> Re
                 .into(),
         ));
     }
-    let store = open(data)?;
+    let store = open_with_key(data)?;
     let found = store.agent_by_name(clean_agent)?;
+    crate::operator::ensure(&store, &found.id)?;
     store.record_admin_audit("operator", "agents.role", &found.name)?;
     let new_role = if clear { None } else { role };
     let updated = store.set_agent_role(&found.id, new_role)?;
@@ -702,11 +704,12 @@ fn set_state(data: &Path, name: &str, state: &str) -> Result<AgentView, Error> {
             answered.ok_or_else(|| Error::Message("the server answered nothing".to_string()))?;
         return Ok(view);
     }
-    let store = open(data)?;
+    let store = open_with_key(data)?;
     let found = store.agent_by_name(name)?;
     let _lifecycle = store.lock_agent_lifecycle(&found.id)?;
     let found = store.agent(&found.id)?;
     if state == "running" {
+        crate::operator::ensure(&store, &found.id)?;
         let cfg = anyagents_core::agent_config_dir(data, &found.id);
         let work_dir = found
             .workdir

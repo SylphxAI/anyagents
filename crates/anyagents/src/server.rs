@@ -5801,6 +5801,7 @@ fn target_of(destination: &crate::reply::Destination) -> Target {
 
 /// One send, resolved to the destinations it will write, before any of them is
 /// validated or posted.
+#[derive(Debug)]
 struct SendPlan {
     targets: Vec<Target>,
     /// The provider message id a reply answers, when the reply named one.
@@ -5810,6 +5811,7 @@ struct SendPlan {
     principal_id: Option<anyagents_core::AgentId>,
 }
 
+#[derive(Debug)]
 enum Target {
     Agent(String),
     Room(String),
@@ -6079,7 +6081,7 @@ fn can_sender_message_agent(
         )));
     }
     if store.share_any_group_or_chat(&sender.id, &recipient.id)
-        || store.has_messaged(recipient, &sender)
+        || store.has_messaged(recipient, sender)
     {
         return Ok(());
     }
@@ -6906,6 +6908,7 @@ async fn spawn_store<T: Send + 'static>(
     }
 }
 
+#[derive(Debug)]
 struct ApiError {
     status: StatusCode,
     message: String,
@@ -6990,8 +6993,7 @@ pub(crate) mod tests {
                 .unwrap();
                 let error = channels_route(Principal::Operator, State(state.clone()))
                     .await
-                    .err()
-                    .expect("damaged channel state cannot become an empty view");
+                    .expect_err("damaged channel state cannot become an empty view");
                 assert!(error.message.contains("state"), "{}", error.message);
                 let retained: String = db
                     .query_row(
@@ -7038,8 +7040,7 @@ pub(crate) mod tests {
                 AxumPath(agent.name.clone()),
             )
             .await
-            .err()
-            .expect("live process must retain identity");
+            .expect_err("live process must retain identity");
             assert_eq!(refused.status, StatusCode::CONFLICT);
             assert_eq!(state.store.agent(&agent.id).unwrap().state, "archived");
             assert_eq!(
@@ -7055,8 +7056,7 @@ pub(crate) mod tests {
                 AxumPath(agent.name.clone()),
             )
             .await
-            .err()
-            .expect("optimistic health must not revoke process custody");
+            .expect_err("optimistic health must not revoke process custody");
             assert_eq!(refused.status, StatusCode::CONFLICT);
             assert!(state.store.agent(&agent.id).is_ok());
             assert_eq!(
@@ -7064,7 +7064,7 @@ pub(crate) mod tests {
                 "retained state"
             );
             drop(process);
-            delete_agent_route(
+            let _ = delete_agent_route(
                 Principal::Operator,
                 State(state.clone()),
                 AxumPath(agent.name.clone()),
@@ -7116,12 +7116,10 @@ pub(crate) mod tests {
         assert!(can_actor_message_agent(&state.store, &actor, &root).is_ok());
         state.store.delete_agent(&child.id).unwrap();
         let denied = list_agents_sync_for_principal(&state, &principal)
-            .err()
-            .expect("deleted caller must not receive any roster");
+            .expect_err("deleted caller must not receive any roster");
         assert_eq!(denied.status, StatusCode::FORBIDDEN);
         let denied = send_sync(&state.store, &actor, body.clone(), plan, None)
-            .err()
-            .expect("deleted principal must not deliver");
+            .expect_err("deleted principal must not deliver");
         assert_eq!(denied.status, StatusCode::FORBIDDEN);
         assert!(state.store.inbox(&root.id, None).unwrap().is_empty());
         assert!(plan_send(&state.store, &principal, &actor, &body).is_err());
@@ -7131,8 +7129,7 @@ pub(crate) mod tests {
             .create_agent(anyagents_core::NewAgent::new(&child.name, "opencode"))
             .unwrap();
         let denied = plan_send(&state.store, &principal, &actor, &body)
-            .err()
-            .expect("name reuse must not authorize old credentials");
+            .expect_err("name reuse must not authorize old credentials");
         assert_eq!(denied.status, StatusCode::FORBIDDEN);
         let operator = list_agents_sync_for_principal(&state, &Principal::Operator)
             .unwrap_or_else(|e| panic!("{}", e.message));
@@ -7168,7 +7165,7 @@ pub(crate) mod tests {
             .unwrap_or_else(|error| panic!("{}", error.message));
         assert_eq!(plan.sender_id.as_ref(), Some(&original.id));
         assert_ne!(plan.sender_id.as_ref(), Some(&replacement.id));
-        send_sync(&store, &actor, body, plan, None)
+        let _ = send_sync(&store, &actor, body, plan, None)
             .unwrap_or_else(|error| panic!("{}", error.message));
         let received = store.inbox(&receiver.id, None).unwrap();
         assert_eq!(
@@ -7244,6 +7241,9 @@ pub(crate) mod tests {
                 // Release even on a failed observation, so the fixture cannot deadlock.
                 if waiting {
                     if delete {
+                        // Preserve the recipient while removing its parent; the
+                        // production delete path separately refuses live children.
+                        store.set_agent_parent(&recipient.id, None).unwrap();
                         store.delete_agent(&original.id).unwrap();
                     } else {
                         store.rename_agent(&original.id, "renamed").unwrap();
@@ -7258,12 +7258,10 @@ pub(crate) mod tests {
                 drop(lock);
                 let result = sending.join().unwrap();
                 if delete {
-                    let error = result
-                        .err()
-                        .expect("deleted admitted author cannot publish");
+                    let error = result.expect_err("deleted admitted author cannot publish");
                     assert!(error.contains("agent not found"), "{error}");
                 } else {
-                    result.unwrap();
+                    let _ = result.unwrap();
                 }
                 assert!(waiting, "actual journal-lock waiter must be observed");
             });
@@ -7299,6 +7297,7 @@ pub(crate) mod tests {
             .create_agent(anyagents_core::NewAgent::new("second", "opencode"))
             .unwrap();
         for agent in [&sender, &first, &second] {
+            store.set_agent_state(&agent.id, "running").unwrap();
             store.join_group("room", &agent.id).unwrap();
         }
         let db = rusqlite::Connection::open(dir.path().join("state.db")).unwrap();
@@ -7327,7 +7326,7 @@ pub(crate) mod tests {
         db.execute_batch("DROP TRIGGER fail_recipient;").unwrap();
         let plan = SendPlan::parse(&store, &actor, &body)
             .unwrap_or_else(|error| panic!("{}", error.message));
-        send_sync(&store, &actor, body, plan, Some("fanout-call".into()))
+        let _ = send_sync(&store, &actor, body, plan, Some("fanout-call".into()))
             .unwrap_or_else(|error| panic!("{}", error.message));
         assert_eq!(store.inbox(&first.id, None).unwrap().len(), 1);
         assert_eq!(store.inbox(&second.id, None).unwrap().len(), 1);
@@ -7364,8 +7363,7 @@ pub(crate) mod tests {
             .create_agent(anyagents_core::NewAgent::new(&sender.name, "opencode"))
             .unwrap();
         let denied = check_targets(&store, &actor, &body, &plan)
-            .err()
-            .expect("missing actor must not pass room authorization");
+            .expect_err("missing actor must not pass room authorization");
         assert_eq!(denied.status, StatusCode::FORBIDDEN);
         assert!(store.inbox(&recipient.id, None).unwrap().is_empty());
     }
@@ -7701,6 +7699,9 @@ pub(crate) mod tests {
         let _env = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        store
+            .hold_capability_key("test-capability-key-0123456789abcdef")
+            .unwrap();
         let parent = store
             .create_agent(anyagents_core::NewAgent::new("parent", "codex"))
             .unwrap();
@@ -7970,9 +7971,6 @@ pub(crate) mod tests {
             std::env::set_var("ANYAGENTS_OPERATOR_TOKEN_FILE", &token_file);
             // One OS seat is all this host has: this process's own, kept out of
             // root by the launcher check.
-            std::env::set_var("ANYAGENTS_AGENT_UID", libc::getuid().to_string());
-            std::env::set_var("ANYAGENTS_AGENT_GID", libc::getgid().to_string());
-            std::env::set_var("ANYAGENTS_SOCKET_GID", libc::getgid().to_string());
             std::env::set_var("ANYAGENTS_FAKE_MODE", "1");
         }
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
@@ -8063,9 +8061,6 @@ pub(crate) mod tests {
         }
         // SAFETY: as above, for this test's own duration under the lock.
         unsafe {
-            std::env::set_var("ANYAGENTS_AGENT_UID", libc::getuid().to_string());
-            std::env::set_var("ANYAGENTS_AGENT_GID", libc::getgid().to_string());
-            std::env::set_var("ANYAGENTS_SOCKET_GID", libc::getgid().to_string());
             std::env::set_var("ANYAGENTS_FAKE_MODE", "1");
         }
         let store = Store::open(data.path().join("state.db")).unwrap();

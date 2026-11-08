@@ -1570,20 +1570,20 @@ mod tests {
 
     #[test]
     fn visible_width_counts_cjk_as_double_width_and_ignores_ansi() {
-        assert_eq!(visible_width("helios"), 6);
+        assert_eq!(visible_width("helper"), 6);
         assert_eq!(visible_width("實作"), 4);
-        assert_eq!(visible_width("helios · 實作 · Building"), 24);
+        assert_eq!(visible_width("helper · 實作 · Building"), 24);
         assert_eq!(
-            visible_width("\x1b[1mhelios\x1b[0m \x1b[2m· 實作\x1b[0m"),
+            visible_width("\x1b[1mhelper\x1b[0m \x1b[2m· 實作\x1b[0m"),
             13
         );
     }
 
     #[test]
     fn truncate_visible_respects_cjk_boundaries_and_resets_ansi() {
-        let s = "範例工作資料庫Owner | category: 現有遊戲";
+        let s = "範例資料庫Owner | category: 現有遊戲";
         let t = truncate_visible(s, 14);
-        // "範例工作資料庫" is 12 cols + "O" (1 col) + "…" (1 col) = 14 cols
+        // "範例資料庫" is 10 cols + "Own" (3 cols) + "…" (1 col) = 14 cols
         assert_eq!(visible_width(&t), 14);
         assert!(t.ends_with('…'));
 

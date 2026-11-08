@@ -97,7 +97,7 @@ fn owner_authority_is_explicit_live_revocable_and_never_inherited() {
     let dir = support::physical_tempdir();
     let data = dir.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
-    support::operator_with_configured_seat(&data);
+    support::operator_for_contract(&data);
     let server = start_server(&data);
     let coordinator = create(&data, "coordinator");
     let auth = format!("x-anyagents-agent: {}\r\n", capability(&data, &coordinator));
@@ -221,7 +221,7 @@ fn a_session_acts_as_its_own_agent_and_nothing_else() {
     let dir = support::physical_tempdir();
     let data = dir.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
-    support::operator_with_configured_seat(&data);
+    support::operator_for_contract(&data);
     let server = start_server(&data);
     let socket = data.join("anyagents.sock");
     let alpha = create(&data, "alpha");
@@ -250,7 +250,7 @@ fn a_session_acts_as_its_own_agent_and_nothing_else() {
     );
     assert!(beta_inbox.contains("hello"), "{beta_inbox}");
     // The author recorded is the capability's agent, never the body.
-    assert!(beta_inbox.contains("agent:alpha"), "{beta_inbox}");
+    assert!(beta_inbox.contains(&format!("agent:{alpha}")), "{beta_inbox}");
 
     // A body that names another sender is refused, with nothing written.
     let forged = support::call_raw(
@@ -414,7 +414,7 @@ fn each_agents_capability_reads_only_own_mailbox_not_peer_history() {
     let dir = support::physical_tempdir();
     let data = dir.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
-    support::operator_with_configured_seat(&data);
+    support::operator_for_contract(&data);
     let first = start_server(&data);
     let socket = data.join("anyagents.sock");
     let alpha = create(&data, "alpha");
@@ -468,7 +468,7 @@ fn the_capability_file_of_one_agent_never_opens_another() {
     let dir = support::physical_tempdir();
     let data = dir.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
-    support::operator_with_configured_seat(&data);
+    support::operator_for_contract(&data);
     let server = start_server(&data);
     let _ = server;
     let socket = data.join("anyagents.sock");
@@ -660,7 +660,7 @@ fn conversation_reads_are_downward_only_for_every_scope_and_cli_fails_closed() {
     let dir = support::physical_tempdir();
     let data = dir.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
-    support::operator_with_configured_seat(&data);
+    support::operator_for_contract(&data);
     let server = start_server(&data);
     let ids: Vec<_> = ["coordinator", "planner", "reviewer", "runner", "outsider"]
         .into_iter()
@@ -852,7 +852,7 @@ fn migration_failure_and_busy_global_lock_do_not_block_host_sockets() {
         for busy in [false, true] {
             let dir = support::physical_tempdir();
             let data = dir.path();
-            support::operator_with_configured_seat(data);
+            support::operator_for_contract(data);
             let store = Store::open(data.join("state.db")).unwrap();
             let agent = store
                 .create_agent(NewAgent::new("maintenance-only", "sylphx"))
@@ -1090,7 +1090,7 @@ fn group_permissions_bind_ownership_and_refuse_both_reported_payloads_atomically
     let dir = support::physical_tempdir();
     let data = dir.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
-    support::operator_with_configured_seat(&data);
+    support::operator_for_contract(&data);
     let server = start_server(&data);
     let owner = create(&data, "group-owner");
     let member = create(&data, "other-agent");

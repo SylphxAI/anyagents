@@ -2049,7 +2049,7 @@ fn sign_in(data: &Path, target: &str, profile: Option<&str>) -> Result<(), anyag
         })?;
     } else {
         // An offline instance uses the same durable capability rotation mechanism.
-        let store = agent::open(data)?;
+        let store = agent::open_with_key(data)?;
         operator::mint(&store, &rec.id)?;
     }
     println!(

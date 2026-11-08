@@ -8224,7 +8224,7 @@ mod tests {
 - Line D: Unchanged 4
 - Line E: Unchanged 5";
         let mut initial = Incoming::new(v0);
-        initial.sender = Some("agent:helios".to_string());
+        initial.sender = Some("agent:helper".to_string());
         initial.origin = Some(origin);
         initial.source_key = Some("bot-a:1".into());
         let ReceiveOutcome::New(msg0) = store.receive(&root_worker.id, initial).unwrap() else {
@@ -8235,7 +8235,7 @@ mod tests {
         // Edit 1: changes `Status: CI running` -> `Status: Merged (#67)`
         let v1 = v0.replace("Status: CI running", "Status: Merged (#67)");
         let mut edit1 = Incoming::new(format!("[Edited message #88]: {v1}"));
-        edit1.sender = Some("agent:helios".to_string());
+        edit1.sender = Some("agent:helper".to_string());
         edit1.origin = Some(origin);
         edit1.source_key = Some("bot-a:2".into());
         let ReceiveOutcome::New(msg1) = store.receive(&root_worker.id, edit1).unwrap() else {
@@ -8250,7 +8250,7 @@ mod tests {
         // Edit 2: changes `Deploy: pending` -> `Deploy: live` (must diff against v1, not v0!)
         let v2 = v1.replace("Deploy: pending", "Deploy: live");
         let mut edit2 = Incoming::new(format!("[Edited message #88]: {v2}"));
-        edit2.sender = Some("agent:helios".to_string());
+        edit2.sender = Some("agent:helper".to_string());
         edit2.origin = Some(origin);
         edit2.source_key = Some("bot-a:3".into());
         let ReceiveOutcome::New(msg2) = store.receive(&root_worker.id, edit2).unwrap() else {
@@ -8263,7 +8263,7 @@ mod tests {
 
         // Edit 3: no-op edit with identical v2 text must be skipped as Duplicate
         let mut edit3 = Incoming::new(format!("[Edited message #88]: {v2}"));
-        edit3.sender = Some("agent:helios".to_string());
+        edit3.sender = Some("agent:helper".to_string());
         edit3.origin = Some(origin);
         edit3.source_key = Some("bot-a:4".into());
         let out3 = store.receive(&root_worker.id, edit3).unwrap();
@@ -8379,9 +8379,9 @@ mod tests {
                 parent_id: None,
             })
             .unwrap();
-        let helios = store
+        let helper = store
             .create_agent(NewAgent {
-                name: "helios".to_string(),
+                name: "helper".to_string(),
                 role: Some("產品與功能".to_string()),
                 description: None,
                 harness: "agy".to_string(),
@@ -8404,15 +8404,15 @@ mod tests {
             })
             .unwrap();
         assert_eq!(root_worker.scope(), "public");
-        store.set_agent_scope(&helios.id, "siblings").unwrap();
+        store.set_agent_scope(&helper.id, "siblings").unwrap();
         store
             .set_agent_scope(&renamed_worker.id, "siblings")
             .unwrap();
 
-        // 1. First message to helios from root_worker -> emits `<topology event="initial" ... />`
+        // 1. First message to helper from root_worker -> emits `<topology event="initial" ... />`
         let mut m1 = Incoming::new("Start sprint");
         m1.sender = Some("agent:root_worker".to_string());
-        let ReceiveOutcome::New(msg1) = store.receive(&helios.id, m1).unwrap() else {
+        let ReceiveOutcome::New(msg1) = store.receive(&helper.id, m1).unwrap() else {
             panic!("expected new message");
         };
         assert_eq!(msg1.context.sender_rel.as_deref(), Some("parent"));
@@ -8432,7 +8432,7 @@ mod tests {
         // 2. Second message with no topology change -> `topology` is None
         let mut m2 = Incoming::new("Status check");
         m2.sender = Some("agent:renamed_worker".to_string());
-        let ReceiveOutcome::New(msg2) = store.receive(&helios.id, m2).unwrap() else {
+        let ReceiveOutcome::New(msg2) = store.receive(&helper.id, m2).unwrap() else {
             panic!("expected new message");
         };
         assert_eq!(msg2.context.sender_rel.as_deref(), Some("sibling"));
@@ -8441,7 +8441,7 @@ mod tests {
             "no delta expected when unchanged"
         );
 
-        // 3. New standing sibling `reader_worker` added -> next message to helios emits `<topology event="delta" ... />`
+        // 3. New standing sibling `reader_worker` added -> next message to helper emits `<topology event="delta" ... />`
         let reader_worker = store
             .create_agent(NewAgent {
                 name: "reader_worker".to_string(),
@@ -8459,7 +8459,7 @@ mod tests {
             .unwrap();
         let mut m3 = Incoming::new("Design sync");
         m3.sender = Some("agent:root_worker".to_string());
-        let ReceiveOutcome::New(msg3) = store.receive(&helios.id, m3).unwrap() else {
+        let ReceiveOutcome::New(msg3) = store.receive(&helper.id, m3).unwrap() else {
             panic!("expected new message");
         };
         let topo3 = msg3
@@ -8473,13 +8473,13 @@ mod tests {
             "topo3={topo3}"
         );
 
-        // 4. Archive `reader_worker` -> next message to helios emits `-sibling: reader_worker`
+        // 4. Archive `reader_worker` -> next message to helper emits `-sibling: reader_worker`
         store
             .set_agent_state(&reader_worker.id, "archived")
             .unwrap();
         let mut m4 = Incoming::new("After archive");
         m4.sender = Some("agent:root_worker".to_string());
-        let ReceiveOutcome::New(msg4) = store.receive(&helios.id, m4).unwrap() else {
+        let ReceiveOutcome::New(msg4) = store.receive(&helper.id, m4).unwrap() else {
             panic!("expected new message");
         };
         let topo4 = msg4

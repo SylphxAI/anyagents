@@ -265,7 +265,6 @@ fn create(dir: &Path, name: &str) -> String {
         .env("PATH", machine_path(dir))
         .env("ANYAGENTS_CLAUDE_CODE_BIN", "/bin/true")
         .env("ANYAGENTS_LAUNCHER", support::fake_launcher(dir))
-        .env("ANYAGENTS_AGENTS", support::agents_line())
         .env("ANYAGENTS_TESTS", "own-seat")
         .env(
             "ANYAGENTS_OPERATOR_TOKEN_FILE",
@@ -300,7 +299,6 @@ fn add_channel(dir: &Path, agent: &str, bot: i64) {
         .arg("--token-file")
         .arg(&token)
         .env("ANYAGENTS_LAUNCHER", support::fake_launcher(dir))
-        .env("ANYAGENTS_AGENTS", support::agents_line())
         .env("ANYAGENTS_TESTS", "own-seat")
         .env(
             "ANYAGENTS_OPERATOR_TOKEN_FILE",

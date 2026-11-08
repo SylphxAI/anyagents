@@ -3268,9 +3268,22 @@ fn extract_envelope_sender(text: &str) -> Option<String> {
         .then(|| sender.to_string())
 }
 
-fn read_workspace_agents_md(work_dir: &Path) -> Option<String> {
+fn read_workspace_agents_md(work_dir: &Path, shared_path: Option<&Path>) -> Option<String> {
     for dir in work_dir.ancestors() {
         let candidate = dir.join("AGENTS.md");
+        // A shared file reached through workspace ancestry is one source, not
+        // a second instruction scope. Distinct workspace files remain layered
+        // even when their bytes or headings happen to match the shared file.
+        if shared_path.is_some_and(|shared| {
+            candidate == shared
+                || candidate
+                    .canonicalize()
+                    .ok()
+                    .zip(shared.canonicalize().ok())
+                    .is_some_and(|(work, shared)| work == shared)
+        }) {
+            break;
+        }
         if let Ok(text) = std::fs::read_to_string(&candidate)
             && !text.trim().is_empty()
         {
@@ -3306,7 +3319,7 @@ fn extract_embedded_shared_agents_section(sys: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
-fn read_shared_agents_md_for_config(config_dir: &Path) -> Option<String> {
+fn read_shared_agents_md_for_config(config_dir: &Path) -> Option<(PathBuf, String)> {
     let mut candidates = Vec::new();
     if let Some(data_dir) = config_dir
         .parent()
@@ -3327,11 +3340,11 @@ fn read_shared_agents_md_for_config(config_dir: &Path) -> Option<String> {
             }
             if trimmed.starts_with("# AnyAgents Identity & Environment Awareness") {
                 if let Some(extracted) = extract_embedded_shared_agents_section(trimmed) {
-                    return Some(extracted);
+                    return Some((cand, extracted));
                 }
                 continue;
             }
-            return Some(text);
+            return Some((cand, text));
         }
     }
     None
@@ -3362,15 +3375,19 @@ pub fn assemble_system_prompt(config_dir: &Path, work_dir: &Path) -> String {
             parts.push(cleaned);
         }
     }
-    let shared_agents = read_shared_agents_md_for_config(config_dir).filter(|s| {
+    let shared_agents = read_shared_agents_md_for_config(config_dir).filter(|(_, s)| {
         !s.trim().is_empty()
             && !s
                 .trim_start()
                 .starts_with("# AnyAgents Identity & Environment Awareness")
     });
-    let work_agents = read_workspace_agents_md(work_dir).filter(|s| !s.trim().is_empty());
+    let work_agents = read_workspace_agents_md(
+        work_dir,
+        shared_agents.as_ref().map(|(path, _)| path.as_path()),
+    )
+    .filter(|s| !s.trim().is_empty());
 
-    if let Some(shared) = shared_agents {
+    if let Some((_, shared)) = shared_agents {
         parts.push(format!(
             "## 4. Shared Instructions (AGENTS.md)\n\n{}",
             shared.trim()

@@ -8781,7 +8781,7 @@ mod tests {
             &store,
             data,
             CreateRequest {
-                name: "parent-helios".to_string(),
+                name: "parent-helper".to_string(),
                 role: Some("Owner".to_string()),
                 harness: "codex".to_string(),
                 model: Some("sylphx/openai/gpt-5.4#xhigh".to_string()),
@@ -8802,7 +8802,7 @@ mod tests {
             &store,
             data,
             CreateRequest {
-                name: "helios-goal-settlement".to_string(),
+                name: "helper-goal-settlement".to_string(),
                 role: Some("Worker".to_string()),
                 harness: "codex".to_string(),
                 model: Some("sylphx/openai/gpt-5.4#xhigh".to_string()),

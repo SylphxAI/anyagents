@@ -277,11 +277,9 @@ fn create(dir: &Path, name: &str) -> String {
             dir.join(support::TOKEN_FILE),
         )
         .env("ANYAGENTS_LAUNCHER", support::fake_launcher(dir))
-        .env("ANYAGENTS_AGENTS", support::agents_line())
         .arg("--data")
         .arg(dir)
         .env("ANYAGENTS_LAUNCHER", support::fake_launcher(dir))
-        .env("ANYAGENTS_AGENTS", support::agents_line())
         .env("ANYAGENTS_TESTS", "own-seat")
         .args(["agents", "create", name, "--harness", "opencode", "--model"])
         .arg("opencode/big-pickle")
@@ -313,7 +311,6 @@ fn add_channel(dir: &Path, agent: &str, token: &str) -> String {
         )
         .env("ANYAGENTS_TESTS", "own-seat")
         .env("ANYAGENTS_LAUNCHER", support::fake_launcher(dir))
-        .env("ANYAGENTS_AGENTS", support::agents_line())
         .arg("--data")
         .arg(dir)
         .args(["channels", "add", "telegram", "--agent", agent])
@@ -949,7 +946,7 @@ fn a_group_quoted_message_is_answered_in_its_group_and_topic() {
     let fake = FakeTelegram::start(vec![quoting]);
     create(&data, "ada");
     add_channel(&data, "ada", "777:fake-token-not-real");
-    support::operator_with_configured_seat(&data);
+    support::operator_for_contract(&data);
     let server = Server::start(&data, &fake.address);
     let socket = data.join("anyagents.sock");
 

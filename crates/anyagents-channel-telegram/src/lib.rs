@@ -896,11 +896,16 @@ impl Memory {
     /// Parse persisted memory. Only a valid empty object initializes empty memory.
     /// Errors intentionally omit the stored bytes, which can contain private data.
     pub fn try_from_state(state: &str) -> Result<Self, anyagents_core::Error> {
-        serde_json::from_str(state).map_err(|_| {
+        let invalid = || {
             anyagents_core::Error::Message(
                 "corrupt Telegram channel state; preserved without modification".into(),
             )
-        })
+        };
+        let value: serde_json::Value = serde_json::from_str(state).map_err(|_| invalid())?;
+        if !value.is_object() {
+            return Err(invalid());
+        }
+        serde_json::from_value(value).map_err(|_| invalid())
     }
 
     /// Compatibility helper for callers with known-valid state. Runtime readers
@@ -3154,7 +3159,7 @@ mod membership_tests {
               "message_id": 14256,
               "date": 1793798561,
               "chat": { "id": -5290931492, "type": "group", "title": "錢💰" },
-              "from": { "id": 107671190, "is_bot": false, "first_name": "Kyle", "username": "kyletse" },
+              "from": { "id": 107671190, "is_bot": false, "first_name": "Alex", "username": "example_user" },
               "reply_to_message": {
                 "message_id": 11967,
                 "date": 1793790000,
@@ -3175,7 +3180,7 @@ mod membership_tests {
               "message_id": 14257,
               "date": 1793798602,
               "chat": { "id": -5290931492, "type": "group", "title": "錢💰" },
-              "from": { "id": 107671190, "is_bot": false, "first_name": "Kyle", "username": "kyletse" },
+              "from": { "id": 107671190, "is_bot": false, "first_name": "Alex", "username": "example_user" },
               "reply_to_message": {
                 "message_id": 1750,
                 "date": 1793780000,

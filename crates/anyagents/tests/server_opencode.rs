@@ -130,7 +130,7 @@ fn an_opencode_agent_answers_one_line_and_the_answer_is_on_its_mailbox() {
     let dir = support::physical_tempdir();
     let data = dir.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
-    support::operator_with_configured_seat(&data);
+    support::operator_for_contract(&data);
 
     let server = Server::start(&data);
     let created = create(&data, "alpha");
@@ -263,7 +263,7 @@ fn deleting_an_opencode_agent_removes_its_allocation_and_releases_only_its_port(
     let dir = support::physical_tempdir();
     let data = dir.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
-    support::operator_with_configured_seat(&data);
+    support::operator_for_contract(&data);
     let _server = Server::start(&data);
     std::thread::scope(|scope| {
         let a = scope.spawn(|| create(&data, "alpha"));

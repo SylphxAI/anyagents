@@ -1833,6 +1833,9 @@ cat >/dev/null
         let before = snapshot();
         unsafe {
             std::env::set_var("ANYAGENTS_FAKE_MODE", "1");
+            std::env::set_var("ANYAGENTS_PRINCIPALS", serde_json::json!({
+                agent.id.as_str(): {"user":"synthetic-worker", "uid":uid, "gid":gid, "socket_gid":24033}
+            }).to_string());
             std::env::set_var("ANYAGENTS_AGENT_UID", uid.to_string());
             std::env::set_var("ANYAGENTS_AGENT_GID", gid.to_string());
             std::env::set_var("ANYAGENTS_SOCKET_GID", "24033");
