@@ -1338,7 +1338,7 @@ fn reconcile_agent_snapshot(
                         let reconciled = create::reconcile_agent_runtime_config(
                             store, data, agent, &cfg, &work_dir,
                         )
-                        .and_then(|()| {
+                        .and_then(|_| {
                             std::fs::write(
                                 cfg.join(".anyagents-profile-rotated-ms"),
                                 now_ms.to_string(),
@@ -3537,7 +3537,9 @@ pub(crate) fn compute_block_reason(
 fn agent_view(store: &Store, health: &HealthBoard, agent: &Agent) -> Result<AgentView, ApiError> {
     let now = now_ms();
     let lag = store.lag(&agent.id, now).map_err(ApiError::from_store)?;
-    let has_open_turn = store.has_open_turn(&agent.id).unwrap_or(false);
+    let has_open_turn = store
+        .has_open_turn(&agent.id)
+        .map_err(ApiError::from_store)?;
     let cfg = anyagents_core::agent_config_dir(store.data_dir(), &agent.id);
     let rotated_ms = std::fs::read_to_string(cfg.join(".anyagents-profile-rotated-ms"))
         .ok()
@@ -5990,6 +5992,14 @@ fn can_actor_message_agent(
     let sender = store
         .agent_by_name(sender_name)
         .map_err(|_| ApiError::forbidden("sender agent no longer exists"))?;
+    can_sender_message_agent(store, &sender, recipient)
+}
+
+fn can_sender_message_agent(
+    store: &Store,
+    sender: &Agent,
+    recipient: &Agent,
+) -> Result<(), ApiError> {
     if sender.id == recipient.id
         || recipient.parent_id.as_ref() == Some(&sender.id)
         || sender.parent_id.as_ref() == Some(&recipient.id)
@@ -6052,25 +6062,32 @@ fn check_targets(
     body: &SendRequest,
     plan: &SendPlan,
 ) -> Result<(), ApiError> {
-    if let Actor::Agent(name) = actor {
-        store
-            .agent_by_name(name)
-            .map_err(|_| ApiError::forbidden("sender agent no longer exists"))?;
-    }
+    // Authorization uses the immutable identity retained during planning, not
+    // a mutable name that might have been assigned to a replacement agent.
+    let sender =
+        match actor {
+            Actor::Agent(_) => Some(
+                store
+                    .agent(plan.sender_id.as_ref().ok_or_else(|| {
+                        ApiError::forbidden("agent send has no admitted identity")
+                    })?)
+                    .map_err(|_| ApiError::forbidden("sender agent no longer exists"))?,
+            ),
+            Actor::Operator(_) => None,
+        };
     for target in &plan.targets {
         match target {
             Target::Agent(name) => {
                 let recipient = store.agent_by_name(name).map_err(ApiError::from_store)?;
-                can_actor_message_agent(store, actor, &recipient)?;
+                if let Some(sender) = &sender {
+                    can_sender_message_agent(store, sender, &recipient)?;
+                }
             }
             // Counted without writing, so an empty room fails the whole send
             // instead of silently delivering nothing.
             Target::Room(room) => {
                 let clean_room = room.strip_prefix("group:").unwrap_or(room);
-                if let Actor::Agent(sender_name) = actor {
-                    let sender = store
-                        .agent_by_name(sender_name)
-                        .map_err(|_| ApiError::forbidden("sender agent no longer exists"))?;
+                if let Some(sender) = &sender {
                     if clean_room != "all"
                         && clean_room != "peers"
                         && !clean_room.starts_with("telegram:")
@@ -6181,10 +6198,7 @@ fn send_sync(
         ..body
     };
     check_targets(store, actor, &body, &plan)?;
-    let sender_agent_id = match actor {
-        Actor::Agent(name) => Some(store.agent_by_name(name).map_err(ApiError::from_store)?.id),
-        Actor::Operator(_) => None,
-    };
+    let sender_agent_id = plan.sender_id.clone();
     let composed_body = anyagents_core::quote::compose(&body.text, body.quote.as_ref());
     let mut deliveries = Vec::with_capacity(plan.targets.len());
     let mut skipped = Vec::new();
@@ -6913,6 +6927,10 @@ pub(crate) mod tests {
         let plan =
             SendPlan::parse(&store, &actor, &body).unwrap_or_else(|e| panic!("{}", e.message));
         store.delete_agent(&sender.id).unwrap();
+        // A replacement with the same name must not acquire the old plan.
+        store
+            .create_agent(anyagents_core::NewAgent::new(&sender.name, "opencode"))
+            .unwrap();
         let denied = check_targets(&store, &actor, &body, &plan)
             .err()
             .expect("missing actor must not pass room authorization");

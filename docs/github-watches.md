@@ -16,8 +16,8 @@ Merged/closed PR watches and completed check watches settle after delivery.
 ## Dedicated credentials
 
 Set `ANYAGENTS_GITHUB_TOKEN_DIR` in the `serve-admin` environment to an absolute
-directory containing `<owner>.token` files, for example `SylphxAI.token` and
-`Cubeage.token`. Each contains that owner's raw GitHub App installation token
+directory containing `<owner>.token` files, for example `example-org.token` and
+`another-org.token`. Each contains that owner's raw GitHub App installation token
 (an optional trailing newline is accepted). Owner matching is case-insensitive;
 ambiguous filenames are refused. Each file must be a regular, non-symlink file,
 mode **0600**, owned by the daemon's effective user. Files are opened with
@@ -26,7 +26,7 @@ reading, so a FIFO without a writer is refused rather than stopping all probes.
 The daemon re-reads the
 selected file **before every actual HTTP request**, so it can be replaced
 atomically without restarting the daemon. The issuer should refresh it before
-expiry (the desk minter plans 45–60 minutes). The daemon never writes these files.
+expiry (for example, a refresher may renew every 45–60 minutes). The daemon never writes these files.
 
 The dedicated path uses an in-process HTTP client, not `gh`; the token is never
 an argument, cache entry, error string or log field. A configured but missing,
