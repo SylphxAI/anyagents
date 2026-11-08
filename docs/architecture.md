@@ -247,7 +247,7 @@ this adapter does not invoke a setter or edit shared service configuration.
 ### Managed local checkouts
 
 Repository-backed local agents use a caller-configured checkout provider through
-`ANYAGENTS_GIT_HUB_BIN`. Repository slugs and GitHub URLs, `repo: "inherit"`, and
+`ANYAGENTS_CHECKOUT_PROVIDER_BIN`. Repository slugs and GitHub URLs, `repo: "inherit"`, and
 local repository paths use that provider for fetching and checkout. The provider
 owns sparse-checkout and hook policy. Fetch, checkout and executable-launch failures
 refuse the spawn with its diagnostic; an unavailable configured provider never

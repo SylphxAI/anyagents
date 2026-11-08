@@ -237,7 +237,7 @@ enum Command {
     },
     /// Send a message, media file, GPS location/venue, or poll to one or more agents, groups, or channels.
     Send {
-        /// Target(s): `agent:<name>`, bare name, comma-separated names (`planner,forge`), `parent`, `children`, `group:<name>`, `all`, or `telegram:chat:<id>[:<topic>]`.
+        /// Target(s): `agent:<name>`, bare name, comma-separated names (`planner,builder`), `parent`, `children`, `group:<name>`, `all`, or `telegram:chat:<id>[:<topic>]`.
         to: String,
         /// Message text or caption (optional when sending media, location, or poll).
         #[arg(default_value = "")]

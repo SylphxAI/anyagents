@@ -657,7 +657,7 @@ fn conversation_reads_are_downward_only_for_every_scope_and_cli_fails_closed() {
     std::fs::create_dir_all(&data).unwrap();
     support::operator_with_configured_seat(&data);
     let server = start_server(&data);
-    let ids: Vec<_> = ["argus", "lyra", "helios", "runner", "outsider"]
+    let ids: Vec<_> = ["coordinator", "planner", "reviewer", "runner", "outsider"]
         .into_iter()
         .map(|name| create(&data, name))
         .collect();
@@ -674,7 +674,7 @@ fn conversation_reads_are_downward_only_for_every_scope_and_cli_fails_closed() {
                 id,
                 Incoming {
                     text: format!("C private fixture {name}"),
-                    sender: Some("agent:argus".into()),
+                    sender: Some("agent:coordinator".into()),
                     source_time_ms: None,
                     source_key: None,
                     reply_to: None,
@@ -715,8 +715,8 @@ fn conversation_reads_are_downward_only_for_every_scope_and_cli_fails_closed() {
             "effective scope must match the conversation visibility test case"
         );
         for target in [
-            "argus",
-            "helios",
+            "coordinator",
+            "reviewer",
             "outsider",
             ids[0].as_str(),
             ids[2].as_str(),
@@ -738,7 +738,7 @@ fn conversation_reads_are_downward_only_for_every_scope_and_cli_fails_closed() {
             "all",
             "*",
             "self",
-            "lyra",
+            "planner",
             ids[1].as_str(),
             "runner",
             ids[3].as_str(),
@@ -748,14 +748,14 @@ fn conversation_reads_are_downward_only_for_every_scope_and_cli_fails_closed() {
                 "?query=C&radius=10",
                 "?only_tools=true&tool_name=browser",
                 "?from_seq=1&to_seq=1&direction=in",
-                "?query=C&with=argus&sender=argus&direction=in",
+                "?query=C&with=coordinator&sender=coordinator&direction=in",
             ] {
                 let response = as_agent(1, target, suffix);
                 assert!(
                     response.starts_with("HTTP/1.1 200"),
                     "{scope} {target} {suffix}: {response}"
                 );
-                for hidden in ["fixture argus", "fixture helios", "fixture outsider"] {
+                for hidden in ["fixture coordinator", "fixture reviewer", "fixture outsider"] {
                     assert!(
                         !response.contains(hidden),
                         "{scope} {target} {suffix}: {response}"
@@ -768,11 +768,11 @@ fn conversation_reads_are_downward_only_for_every_scope_and_cli_fails_closed() {
     // Grandchildren are visible to ancestors, but neither ancestors nor
     // siblings are visible in the opposite direction.
     assert!(as_agent(0, "runner", "?query=C").contains("private fixture runner"));
-    assert!(as_agent(3, "lyra", "").starts_with("HTTP/1.1 403"));
-    assert!(as_agent(2, "lyra", "").starts_with("HTTP/1.1 403"));
-    assert!(!as_agent(4, "all", "?query=C").contains("fixture lyra"));
+    assert!(as_agent(3, "planner", "").starts_with("HTTP/1.1 403"));
+    assert!(as_agent(2, "planner", "").starts_with("HTTP/1.1 403"));
+    assert!(!as_agent(4, "all", "?query=C").contains("fixture planner"));
     // Party copies in the caller's own mailbox remain readable.
-    assert!(as_agent(1, "self", "?query=C&with=argus").contains("private fixture lyra"));
+    assert!(as_agent(1, "self", "?query=C&with=coordinator").contains("private fixture planner"));
     assert!(!as_agent(1, "all", "?query=C&with=outsider").contains("fixture"));
 
     let cli = |target: &str| {
@@ -789,18 +789,18 @@ fn conversation_reads_are_downward_only_for_every_scope_and_cli_fails_closed() {
             .output()
             .unwrap()
     };
-    let denied = cli("argus");
+    let denied = cli("coordinator");
     assert!(!denied.status.success());
     assert!(denied.stdout.is_empty(), "{denied:?}");
     let allowed = cli("all");
     assert!(allowed.status.success(), "{allowed:?}");
     let text = String::from_utf8(allowed.stdout).unwrap();
     assert!(
-        text.contains("fixture lyra") && text.contains("fixture runner"),
+        text.contains("fixture planner") && text.contains("fixture runner"),
         "{text}"
     );
     assert!(
-        !text.contains("fixture argus") && !text.contains("fixture helios"),
+        !text.contains("fixture coordinator") && !text.contains("fixture reviewer"),
         "{text}"
     );
 
@@ -809,7 +809,7 @@ fn conversation_reads_are_downward_only_for_every_scope_and_cli_fails_closed() {
     assert!(!as_agent(0, "all", "?query=C").contains("fixture outsider"));
     store.set_agent_admin(&aids[0], true).unwrap();
     assert!(as_agent(0, "all", "?query=C").contains("fixture outsider"));
-    assert!(as_agent(0, "self", "?query=C").contains("fixture argus"));
+    assert!(as_agent(0, "self", "?query=C").contains("fixture coordinator"));
     let (status, body) = support::call(
         &server.socket,
         "GET",
@@ -819,13 +819,13 @@ fn conversation_reads_are_downward_only_for_every_scope_and_cli_fails_closed() {
     assert!(status.contains("200"), "{status} {body}");
     assert!(body.to_string().contains("fixture outsider"));
     let db = rusqlite::Connection::open(data.join("state.db")).unwrap();
-    for actor in ["operator", "agent:argus"] {
+    for actor in ["operator", "agent:coordinator"] {
         let count: i64 = db.query_row("SELECT COUNT(*) FROM admin_audit WHERE action = 'conversation.read' AND target = 'all' AND actor = ?1", [actor], |row| row.get(0)).unwrap();
         assert!(count > 0, "{actor} read must have an audit row");
     }
     drop(server);
     // Existing fixture SQLite data must not make a failed socket read succeed.
-    for target in ["all", "argus", "lyra"] {
+    for target in ["all", "coordinator", "planner"] {
         let offline = cli(target);
         assert!(!offline.status.success(), "{offline:?}");
         assert!(offline.stdout.is_empty(), "{offline:?}");

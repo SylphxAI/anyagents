@@ -8255,9 +8255,9 @@ pub(crate) mod tests {
                 .env("GIT_CONFIG_NOSYSTEM", "1")
                 .args([
                     "-c",
-                    "user.name=Kyle Tse",
+                    "user.name=Example Author",
                     "-c",
-                    "user.email=hi@kylet.se",
+                    "user.email=author@example.org",
                     "-C",
                 ])
                 .arg(&work)
