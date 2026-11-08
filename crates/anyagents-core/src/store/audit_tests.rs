@@ -461,3 +461,66 @@ fn concurrent_schedule_claims_publish_exactly_one_searchable_wake() {
     assert_eq!(store.inbox(&agent.id, None).unwrap().len(), 1);
     assert_fts(&store, "concurrenttimerneedle");
 }
+
+#[test]
+fn fts_rebuild_propagates_chunk_decode_errors_without_committing_partial_rows() {
+    let (dir, store, agent) = setup();
+    store
+        .receive(&agent.id, Incoming::new("decodeneedle"))
+        .unwrap();
+    store
+        .conn()
+        .execute("UPDATE rag_chunks SET sender=X'FF'", [])
+        .unwrap();
+    drop(store);
+    let path = dir.path().join("custom-mailbox.sqlite");
+    let error = Store::open(&path).err().unwrap();
+    assert!(
+        matches!(error, Error::Db(rusqlite::Error::InvalidColumnType(..))),
+        "{error:?}"
+    );
+    let conn = Connection::open(&path).unwrap();
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM rag_chunks_fts", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    conn.execute("UPDATE rag_chunks SET sender='unknown'", [])
+        .unwrap();
+    drop(conn);
+    assert_fts(&Store::open(path).unwrap(), "decodeneedle");
+}
+
+#[test]
+fn late_fts_insert_failure_rolls_back_already_inserted_mail_and_chunk() {
+    let (_dir, store, agent) = setup();
+    store
+        .conn()
+        .execute_batch(
+            "DROP TABLE rag_chunks_fts;
+         CREATE TABLE rag_chunks_fts(chunk_id,agent_name,sender,destination,kind,tool_name,text,
+            search_tokens,CONSTRAINT fixture_fts_write CHECK(text != 'lateindexneedle'));",
+        )
+        .unwrap();
+    assert_fault(
+        store
+            .receive(&agent.id, Incoming::new("lateindexneedle"))
+            .unwrap_err(),
+        "fixture_fts_write",
+    );
+    assert!(store.inbox(&agent.id, None).unwrap().is_empty());
+    assert_eq!(count(&store, "rag_chunks"), 0);
+    store
+        .conn()
+        .execute_batch(
+            "DROP TABLE rag_chunks_fts;
+         CREATE VIRTUAL TABLE rag_chunks_fts USING fts5(chunk_id,agent_name,sender,destination,
+             kind,tool_name,text,search_tokens,tokenize='unicode61');",
+        )
+        .unwrap();
+    store
+        .receive(&agent.id, Incoming::new("lateindexneedle"))
+        .unwrap();
+    assert_fts(&store, "lateindexneedle");
+}

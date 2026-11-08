@@ -71,6 +71,16 @@ owner and scope first, repeats validation under its lifecycle lock, checks the
 whole-event digest and gates unresolved redaction before reading. The returned
 window is a bounded read, not a claim that the whole event fits the response.
 
+Outbound effects can retain pending history obligations under `outbound-history`.
+Publication/reconciliation share a barrier with erasure: erasure takes the
+exclusive `.publication.lock` before lifecycle and SQLite locks, so senders can
+finish history settlement without lock inversion. A matching-agent or unknown,
+unreadable, malformed, oversized or linked `.pending` obligation refuses erasure
+before any mutation, including when reusing an earlier receipt. Reconciliation
+owns these recovery records; erasure never edits or replays an external effect.
+Valid foreign obligations do not block a target, and terminal `.done` metadata
+must contain neither body bytes nor their digest.
+
 Native time comes from explicit `timestamp_ms`, including zero, or RFC3339
 `timestamp`. Missing/invalid time stays `null` (CLI: `unknown`); time filters
 exclude unknown times. It is never inferred from filesystem mtime. Learned-file
