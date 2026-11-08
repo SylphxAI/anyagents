@@ -111,6 +111,7 @@ pub(super) fn deliver<F>(
     reply_to: Option<&str>,
     body: &str,
     key: Option<&str>,
+    replay_safe: bool,
     effect: F,
 ) -> Result<Vec<Delivery>, ApiError>
 where
@@ -147,7 +148,7 @@ where
     let existing = load(&path.with_extension("done"))
         .map_err(ApiError::from_store)?
         .or(load(&path).map_err(ApiError::from_store)?);
-    if let Some(intent) = existing {
+    let mut intent = if let Some(intent) = existing {
         if intent.effect_key != effect_key
             || &intent.agent_id != agent_id
             || intent.destination != destination
@@ -161,32 +162,38 @@ where
                 "outbound obligation payload conflict".into(),
             )));
         }
-        let mut receipt = intent.receipt.clone().ok_or_else(|| ApiError::from_store(Error::Message(
-            "outbound effect outcome is unknown; retained obligation prevents an automatic resend".into())))?;
-        if path.exists() {
-            let pending = load(&path).map_err(ApiError::from_store)?.ok_or_else(|| {
-                ApiError::from_store(Error::Message("outbound obligation disappeared".into()))
-            })?;
-            settle(store, &path, &pending).map_err(ApiError::from_store)?;
-        } else if !receipt.is_empty() {
-            // Check the canonical body, including redaction, rather than
-            // retaining a replay copy or restoring an erased body.
-            store
-                .record_outbound_once(&intent.effect_key, agent_id, destination, reply_to, body)
-                .map_err(ApiError::from_store)?;
+        if let Some(mut receipt) = intent.receipt.clone() {
+            if path.exists() {
+                let pending = load(&path).map_err(ApiError::from_store)?.ok_or_else(|| {
+                    ApiError::from_store(Error::Message("outbound obligation disappeared".into()))
+                })?;
+                settle(store, &path, &pending).map_err(ApiError::from_store)?;
+            } else if !receipt.is_empty() {
+                store
+                    .record_outbound_once(&intent.effect_key, agent_id, destination, reply_to, body)
+                    .map_err(ApiError::from_store)?;
+            }
+            for delivery in &mut receipt {
+                delivery.duplicate = true;
+            }
+            return Ok(receipt);
         }
-        for delivery in &mut receipt {
-            delivery.duplicate = true;
+        if !replay_safe || key.is_none() {
+            return Err(ApiError::from_store(Error::Message(
+                "outbound effect outcome is unknown; retained obligation prevents an automatic resend".into())));
         }
-        return Ok(receipt);
-    }
-    let mut intent = Intent {
-        effect_key,
-        agent_id: agent_id.clone(),
-        destination: destination.into(),
-        reply_to: reply_to.map(str::to_owned),
-        body: Some(body.into()),
-        receipt: None,
+        // The caller explicitly supplies a durable per-recipient source key.
+        // A partial local fan-out can finish without repeating accepted rows.
+        intent
+    } else {
+        Intent {
+            effect_key,
+            agent_id: agent_id.clone(),
+            destination: destination.into(),
+            reply_to: reply_to.map(str::to_owned),
+            body: Some(body.into()),
+            receipt: None,
+        }
     };
     write(&path, &intent).map_err(ApiError::from_store)?;
     let receipt = effect()?;
@@ -275,6 +282,7 @@ mod tests {
             None,
             "hello",
             Some("same-call"),
+            false,
             || {
                 effects.set(effects.get() + 1);
                 Ok(delivery())
@@ -292,6 +300,7 @@ mod tests {
             None,
             "hello",
             Some("same-call"),
+            false,
             || {
                 effects.set(effects.get() + 1);
                 Ok(delivery())
@@ -331,6 +340,7 @@ mod tests {
                 None,
                 "changed",
                 Some("same-call"),
+                false,
                 || panic!("conflict must not dispatch")
             )
             .is_err()
@@ -352,6 +362,7 @@ mod tests {
                 None,
                 "hello",
                 Some("unknown-call"),
+                false,
                 || {
                     Err(ApiError::from_store(Error::Message(
                         "lost remote acknowledgement".into(),
@@ -369,6 +380,7 @@ mod tests {
                 None,
                 "hello",
                 Some("unknown-call"),
+                false,
                 || panic!("unknown must not dispatch")
             )
             .is_err()
@@ -402,6 +414,7 @@ mod tests {
                 None,
                 "hello",
                 None,
+                false,
                 || panic!("no durable obligation means no effect")
             )
             .is_err()

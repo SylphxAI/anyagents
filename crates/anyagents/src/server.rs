@@ -3913,6 +3913,7 @@ async fn create_agent_route(
                     None,
                     prompt,
                     None,
+                    false,
                     enqueue,
                 )?;
             } else {
@@ -5240,7 +5241,6 @@ async fn send(
         sender: Some(actor.as_address()),
         ..body
     };
-    let key = send_key(&body);
     let store = Arc::clone(&state.store);
     let principal_for_plan = principal.clone();
     let actor_for_plan = actor.clone();
@@ -5249,6 +5249,15 @@ async fn send(
         plan_send(&store, &principal_for_plan, &actor_for_plan, &body_for_plan)
     })
     .await?;
+    let key_body = SendRequest {
+        sender: plan
+            .sender_id
+            .as_ref()
+            .map(|id| format!("agent:{id}"))
+            .or_else(|| body.sender.clone()),
+        ..body.clone()
+    };
+    let key = send_key(&key_body);
     let store = Arc::clone(&state.store);
     spawn_store(move || send_sync(&store, &actor, body, plan, key)).await
 }
@@ -5643,16 +5652,32 @@ fn plan_send(
     actor: &Actor,
     body: &SendRequest,
 ) -> Result<SendPlan, ApiError> {
-    let principal_id = match principal {
-        Principal::Agent { agent_id, .. } => {
+    let authenticated = match principal {
+        Principal::Agent { agent_id, .. } => Some(
             store
                 .agent(agent_id)
-                .map_err(|_| ApiError::forbidden("authenticated agent no longer exists"))?;
-            Some(agent_id.clone())
-        }
+                .map_err(|_| ApiError::forbidden("authenticated agent no longer exists"))?,
+        ),
         Principal::Operator => None,
     };
-    let mut plan = SendPlan::parse(store, actor, body)?;
+    let principal_id = authenticated.as_ref().map(|agent| agent.id.clone());
+    let own_sender = match (principal, actor, authenticated.as_ref()) {
+        (Principal::Agent { name, .. }, Actor::Agent(actor_name), Some(agent))
+            if actor_name == name
+                || actor_name == &agent.name
+                || store
+                    .agent_by_name(actor_name)
+                    .is_ok_and(|resolved| resolved.id == agent.id) =>
+        {
+            Some(agent)
+        }
+        _ => None,
+    };
+    let mut plan = if let Some(sender) = own_sender {
+        SendPlan::parse_for_sender(store, actor, body, Some(sender.clone()))?
+    } else {
+        SendPlan::parse(store, actor, body)?
+    };
     plan.principal_id = principal_id;
     let has_telegram_target = plan
         .targets
@@ -5780,6 +5805,23 @@ enum Target {
 
 impl SendPlan {
     fn parse(store: &Store, actor: &Actor, body: &SendRequest) -> Result<Self, ApiError> {
+        let sender = match actor {
+            Actor::Agent(name) => Some(
+                store
+                    .agent_by_name(name)
+                    .map_err(|_| ApiError::forbidden("sender agent no longer exists"))?,
+            ),
+            Actor::Operator(_) => None,
+        };
+        Self::parse_for_sender(store, actor, body, sender)
+    }
+
+    fn parse_for_sender(
+        store: &Store,
+        _actor: &Actor,
+        body: &SendRequest,
+        sender: Option<Agent>,
+    ) -> Result<Self, ApiError> {
         if body.to.is_empty() && body.reply_to.is_none() {
             return Err(ApiError::new(
                 StatusCode::BAD_REQUEST,
@@ -5795,8 +5837,7 @@ impl SendPlan {
                 Address::Agent(name)
                     if matches!(name.as_str(), "all" | "peers" | "siblings" | "team") =>
                 {
-                    if let Actor::Agent(sender_name) = actor
-                        && let Ok(sender) = store.agent_by_name(sender_name)
+                    if let Some(sender) = &sender
                         && let Some(ref parent_id) = sender.parent_id
                     {
                         let siblings: Vec<_> = store
@@ -5807,7 +5848,7 @@ impl SendPlan {
                                 c.id != sender.id
                                     && c.state != "archived"
                                     && !is_explicitly_archived(store.data_dir(), c)
-                                    && can_actor_message_agent(store, actor, c).is_ok()
+                                    && can_sender_message_agent(store, sender, c).is_ok()
                             })
                             .collect();
                         if siblings.is_empty() {
@@ -5830,8 +5871,7 @@ impl SendPlan {
                 Address::Group(room)
                     if matches!(room.as_str(), "all" | "peers" | "siblings" | "team") =>
                 {
-                    if let Actor::Agent(sender_name) = actor
-                        && let Ok(sender) = store.agent_by_name(sender_name)
+                    if let Some(sender) = &sender
                         && let Some(ref parent_id) = sender.parent_id
                     {
                         let siblings: Vec<_> = store
@@ -5842,7 +5882,7 @@ impl SendPlan {
                                 c.id != sender.id
                                     && c.state != "archived"
                                     && !is_explicitly_archived(store.data_dir(), c)
-                                    && can_actor_message_agent(store, actor, c).is_ok()
+                                    && can_sender_message_agent(store, sender, c).is_ok()
                             })
                             .collect();
                         if siblings.is_empty() {
@@ -5863,16 +5903,13 @@ impl SendPlan {
                     }
                 }
                 Address::Agent(name) if name == "parent" => {
-                    let Actor::Agent(sender_name) = actor else {
+                    let Some(sender) = &sender else {
                         return Err(ApiError::new(
                             StatusCode::BAD_REQUEST,
                             "only an agent has a parent",
                         ));
                     };
-                    let sender = store
-                        .agent_by_name(sender_name)
-                        .map_err(ApiError::from_store)?;
-                    let parent_id = sender.parent_id.ok_or_else(|| {
+                    let parent_id = sender.parent_id.as_ref().ok_or_else(|| {
                         ApiError::new(StatusCode::BAD_REQUEST, "this agent has no parent")
                     })?;
                     let parent = store
@@ -5881,15 +5918,12 @@ impl SendPlan {
                     targets.push(Target::Agent(parent.name));
                 }
                 Address::Agent(name) if name == "children" => {
-                    let Actor::Agent(sender_name) = actor else {
+                    let Some(sender) = &sender else {
                         return Err(ApiError::new(
                             StatusCode::BAD_REQUEST,
                             "only an agent has children",
                         ));
                     };
-                    let sender = store
-                        .agent_by_name(sender_name)
-                        .map_err(ApiError::from_store)?;
                     let children: Vec<_> = store
                         .children_of(&sender.id)
                         .map_err(ApiError::from_store)?
@@ -5909,15 +5943,12 @@ impl SendPlan {
                     }
                 }
                 Address::Group(room) if room == "children" => {
-                    let Actor::Agent(sender_name) = actor else {
+                    let Some(sender) = &sender else {
                         return Err(ApiError::new(
                             StatusCode::BAD_REQUEST,
                             "only an agent has children",
                         ));
                     };
-                    let sender = store
-                        .agent_by_name(sender_name)
-                        .map_err(ApiError::from_store)?;
                     let children: Vec<_> = store
                         .children_of(&sender.id)
                         .map_err(ApiError::from_store)?
@@ -5962,15 +5993,7 @@ impl SendPlan {
         Ok(Self {
             targets,
             reply: None,
-            sender_id: match actor {
-                Actor::Agent(name) => Some(
-                    store
-                        .agent_by_name(name)
-                        .map_err(|_| ApiError::forbidden("sender agent no longer exists"))?
-                        .id,
-                ),
-                Actor::Operator(_) => None,
-            },
+            sender_id: sender.as_ref().map(|agent| agent.id.clone()),
             principal_id: None,
         })
     }
@@ -6243,6 +6266,7 @@ fn send_sync(
                         body.reply_to.as_deref(),
                         &composed_body,
                         history_key.as_deref(),
+                        true,
                         || {
                             Ok(vec![deliver_agent(
                                 store,
@@ -6278,6 +6302,7 @@ fn send_sync(
                         body.reply_to.as_deref(),
                         &composed_body,
                         history_key.as_deref(),
+                        true,
                         || deliver_room(store, &body, room, key.as_deref()),
                     )?
                 } else {
@@ -6320,6 +6345,7 @@ fn send_sync(
                         body.reply_to.as_deref(),
                         &composed_body,
                         history_key.as_deref(),
+                        false,
                         send,
                     )?
                 } else {
@@ -6961,6 +6987,94 @@ pub(crate) mod tests {
             .unwrap_or_else(|e| panic!("{}", e.message));
         assert!(operator.0.agents.iter().any(|a| a.name == root.name
             && a.instructions.as_deref() == Some("private instruction sentinel")));
+    }
+
+    #[test]
+    fn renamed_authenticated_sender_does_not_acquire_reused_name_identity() {
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let original = store
+            .create_agent(anyagents_core::NewAgent::new("original", "opencode"))
+            .unwrap();
+        let principal = Principal::Agent {
+            agent_id: original.id.clone(),
+            name: original.name.clone(),
+        };
+        let actor = Actor::Agent(original.name.clone());
+        store.rename_agent(&original.id, "renamed").unwrap();
+        let replacement = store
+            .create_agent(anyagents_core::NewAgent::new("original", "opencode"))
+            .unwrap();
+        let receiver = store
+            .create_agent(anyagents_core::NewAgent::new("recipient", "opencode"))
+            .unwrap();
+        let body = SendRequest {
+            to: vec![receiver.name.clone()],
+            text: "identity sentinel".into(),
+            ..Default::default()
+        };
+        let plan = plan_send(&store, &principal, &actor, &body)
+            .unwrap_or_else(|error| panic!("{}", error.message));
+        assert_eq!(plan.sender_id.as_ref(), Some(&original.id));
+        assert_ne!(plan.sender_id.as_ref(), Some(&replacement.id));
+        send_sync(&store, &actor, body, plan, None)
+            .unwrap_or_else(|error| panic!("{}", error.message));
+        let received = store.inbox(&receiver.id, None).unwrap();
+        assert_eq!(received[0].sender.as_deref(), Some("agent:renamed"));
+    }
+
+    #[test]
+    fn keyed_local_fanout_recovers_partial_delivery_without_duplicates() {
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let sender = store
+            .create_agent(anyagents_core::NewAgent::new("sender", "opencode"))
+            .unwrap();
+        let first = store
+            .create_agent(anyagents_core::NewAgent::new("first", "opencode"))
+            .unwrap();
+        let second = store
+            .create_agent(anyagents_core::NewAgent::new("second", "opencode"))
+            .unwrap();
+        for agent in [&sender, &first, &second] {
+            store.join_group("room", &agent.id).unwrap();
+        }
+        let db = rusqlite::Connection::open(dir.path().join("state.db")).unwrap();
+        db.execute_batch(&format!("CREATE TRIGGER fail_recipient BEFORE INSERT ON messages WHEN NEW.agent_id = '{}' BEGIN SELECT RAISE(ABORT, 'injected second recipient failure'); END;", second.id)).unwrap();
+        let actor = Actor::Agent(sender.name.clone());
+        let body = SendRequest {
+            sender: Some(actor.as_address()),
+            to: vec!["group:room".into()],
+            text: "fanout sentinel".into(),
+            ..Default::default()
+        };
+        let plan = SendPlan::parse(&store, &actor, &body)
+            .unwrap_or_else(|error| panic!("{}", error.message));
+        assert!(
+            send_sync(
+                &store,
+                &actor,
+                body.clone(),
+                plan,
+                Some("fanout-call".into())
+            )
+            .is_err()
+        );
+        assert_eq!(store.inbox(&first.id, None).unwrap().len(), 1);
+        assert!(store.inbox(&second.id, None).unwrap().is_empty());
+        db.execute_batch("DROP TRIGGER fail_recipient;").unwrap();
+        let plan = SendPlan::parse(&store, &actor, &body)
+            .unwrap_or_else(|error| panic!("{}", error.message));
+        send_sync(&store, &actor, body, plan, Some("fanout-call".into()))
+            .unwrap_or_else(|error| panic!("{}", error.message));
+        assert_eq!(store.inbox(&first.id, None).unwrap().len(), 1);
+        assert_eq!(store.inbox(&second.id, None).unwrap().len(), 1);
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM outbound_messages", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
     }
 
     #[test]
