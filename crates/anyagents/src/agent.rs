@@ -1018,8 +1018,9 @@ pub fn reconcile_and_enrich_views(data: &Path, views: &mut [AgentView]) {
             if view.aliases.is_empty() {
                 view.aliases = store.agent_aliases(&id).unwrap_or_default();
             }
-            if let Some((u, uid, gid, _)) =
-                crate::create::resolved_agent_seat_info(&store, &agent_rec)
+            if (view.seat_user.is_none() || view.seat_uid.is_none() || view.seat_gid.is_none())
+                && let Some((u, uid, gid, _)) =
+                    crate::create::resolved_agent_seat_info(&store, &agent_rec)
             {
                 view.seat_user = Some(u);
                 view.seat_uid = Some(uid);
@@ -1082,8 +1083,15 @@ pub fn reconcile_and_enrich_views(data: &Path, views: &mut [AgentView]) {
             view.quota_reset_at_ms = None;
             view.last_error = None;
         }
-        let (persisted_q, persisted_err) =
-            anyagents_harness_agy::detect_agy_session_quota_and_error(&cfg, now);
+        let (persisted_q, persisted_err) = if view.harness == "agy" {
+            anyagents_harness_agy::detect_agy_session_quota_and_error(&cfg, now)
+        } else {
+            match crate::vendor::read_persisted_last_error(&cfg) {
+                Some((err, Some(reset_ms))) if reset_ms > now => (Some(reset_ms), err),
+                Some((err, None)) => (None, err),
+                _ => (None, None),
+            }
+        };
         if view.quota_reset_at_ms.is_none() && view.harness == "claude-code" {
             view.quota_reset_at_ms =
                 anyagents_harness_claude::detect_session_quota_reset_ms(&cfg, now).or(persisted_q);

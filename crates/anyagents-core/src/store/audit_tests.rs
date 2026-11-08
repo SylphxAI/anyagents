@@ -43,6 +43,46 @@ fn assert_fts(store: &Store, term: &str) {
 }
 
 #[test]
+fn current_schema_reopens_while_another_connection_holds_the_writer_lock() {
+    let (dir, store, agent) = setup();
+    store
+        .receive(&agent.id, Incoming::new("indexedneedle"))
+        .unwrap();
+    let writer = Connection::open(dir.path().join("custom-mailbox.sqlite")).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let reopened = Store::open(dir.path().join("custom-mailbox.sqlite")).unwrap();
+    assert_fts(&reopened, "indexedneedle");
+    writer.execute_batch("ROLLBACK").unwrap();
+}
+
+#[test]
+fn only_pre_23_schemas_probe_and_backfill_fts_on_open() {
+    for baseline in [22, 23] {
+        let dir = crate::test_tempdir();
+        let path = dir.path().join("state.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at_ms INTEGER NOT NULL);",
+        ).unwrap();
+        for (version, sql) in migrate::MIGRATIONS.iter().filter(|(v, _)| *v <= baseline) {
+            conn.execute_batch(sql).unwrap();
+            conn.execute("INSERT INTO schema_migrations VALUES (?1, 0)", [version])
+                .unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO rag_chunks(chunk_id,agent_id,agent_name,direction,sender,destination,timestamp_ms,content_hash,text)
+             VALUES ('legacy','agent','worker','in','peer','worker',0,'legacy','legacyftsneedle');",
+        ).unwrap();
+        drop(conn);
+        let store = Store::open(&path).unwrap();
+        assert_eq!(count(&store, "rag_chunks_fts"), i64::from(baseline < 23));
+        if baseline < 23 {
+            assert_fts(&store, "legacyftsneedle");
+        }
+    }
+}
+
+#[test]
 fn group_column_upgrade_is_idempotent_and_unexpected_ddl_failure_is_visible() {
     let (dir, store, _) = setup();
     store.set_group_public("shared", true).unwrap();
@@ -72,9 +112,9 @@ fn group_column_upgrade_is_idempotent_and_unexpected_ddl_failure_is_visible() {
 }
 
 #[test]
-fn reopen_repairs_partial_duplicate_orphan_and_stale_fts_generations() {
+fn legacy_backfill_repairs_partial_duplicate_orphan_and_stale_fts_generations() {
     for fault in ["partial", "duplicate", "orphan", "stale"] {
-        let (dir, store, agent) = setup();
+        let (_dir, store, agent) = setup();
         store
             .receive(&agent.id, Incoming::new("ftsneedlefirst"))
             .unwrap();
@@ -110,8 +150,7 @@ fn reopen_repairs_partial_duplicate_orphan_and_stale_fts_generations() {
             _ => unreachable!(),
         }
         drop(conn);
-        drop(store);
-        let store = Store::open(dir.path().join("custom-mailbox.sqlite")).unwrap();
+        ensure_lexical_fts_backfilled(&mut store.conn()).unwrap();
         assert_eq!(count(&store, "rag_chunks_fts"), 2, "{fault}");
         assert_fts(&store, "ftsneedlefirst");
         assert_fts(&store, "ftsneedlesecond");
@@ -119,7 +158,7 @@ fn reopen_repairs_partial_duplicate_orphan_and_stale_fts_generations() {
 }
 
 #[test]
-fn failed_fts_rebuild_rolls_back_and_reopen_retries_the_generation() {
+fn failed_legacy_fts_backfill_rolls_back_and_retries_the_generation() {
     let (dir, store, agent) = setup();
     store
         .receive(&agent.id, Incoming::new("ftsneedlefirst"))
@@ -135,9 +174,12 @@ fn failed_fts_rebuild_rolls_back_and_reopen_retries_the_generation() {
          INSERT INTO rag_chunks_fts SELECT chunk_id,agent_name,sender,destination,kind,tool_name,text,text
              FROM rag_chunks WHERE text='ftsneedlefirst';",
     ).unwrap();
+    assert_fault(
+        ensure_lexical_fts_backfilled(&mut store.conn()).unwrap_err(),
+        "fixture_fts_write",
+    );
     drop(store);
     let path = dir.path().join("custom-mailbox.sqlite");
-    assert_fault(Store::open(&path).err().unwrap(), "fixture_fts_write");
     let conn = Connection::open(&path).unwrap();
     assert_eq!(
         conn.query_row("SELECT count(*) FROM rag_chunks_fts", [], |r| r
@@ -153,6 +195,7 @@ fn failed_fts_rebuild_rolls_back_and_reopen_retries_the_generation() {
     .unwrap();
     drop(conn);
     let store = Store::open(&path).unwrap();
+    ensure_lexical_fts_backfilled(&mut store.conn()).unwrap();
     assert_fts(&store, "ftsneedlefirst");
     assert_fts(&store, "ftsneedlesecond");
 }
@@ -474,7 +517,8 @@ fn fts_rebuild_propagates_chunk_decode_errors_without_committing_partial_rows() 
         .unwrap();
     drop(store);
     let path = dir.path().join("custom-mailbox.sqlite");
-    let error = Store::open(&path).err().unwrap();
+    let store = Store::open(&path).unwrap();
+    let error = ensure_lexical_fts_backfilled(&mut store.conn()).unwrap_err();
     assert!(
         matches!(error, Error::Db(rusqlite::Error::InvalidColumnType(..))),
         "{error:?}"
