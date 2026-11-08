@@ -1524,29 +1524,35 @@ fn agy_rpc_is_running(
     session_id: &str,
 ) -> Result<(String, bool), String> {
     let resp = agy_rpc_post(port, csrf_token, "GetAllCascadeTrajectories", &json!({}))?;
-    let Some(summaries) = resp.get("trajectorySummaries").and_then(Value::as_object) else {
-        return Ok((session_id.to_string(), false));
-    };
-    if let Some(entry) = summaries.get(session_id) {
-        let status = entry
-            .get("status")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        return Ok((
-            session_id.to_string(),
-            status == "CASCADE_RUN_STATUS_RUNNING",
-        ));
+    agy_running_status(&resp, session_id)
+}
+
+fn agy_running_status(resp: &Value, session_id: &str) -> Result<(String, bool), String> {
+    let summaries = resp
+        .get("trajectorySummaries")
+        .and_then(Value::as_object)
+        .ok_or("GetAllCascadeTrajectories missing trajectorySummaries")?;
+    // Validate every candidate before inferring that no cascade is running.
+    let statuses: Result<Vec<_>, String> = summaries
+        .iter()
+        .map(|(cid, entry)| {
+            let running = match entry.get("status").and_then(Value::as_str) {
+                Some("CASCADE_RUN_STATUS_RUNNING") => true,
+                Some("CASCADE_RUN_STATUS_IDLE") => false,
+                _ => return Err(format!("invalid cascade run status for {cid}")),
+            };
+            Ok((cid.clone(), running))
+        })
+        .collect();
+    let statuses = statuses?;
+    if let Some(entry) = statuses.iter().find(|(cid, _)| cid == session_id) {
+        return Ok(entry.clone());
     }
-    if let Some((cid, _)) = summaries.iter().find(|(_, v)| {
-        v.get("status").and_then(Value::as_str) == Some("CASCADE_RUN_STATUS_RUNNING")
-    }) {
-        return Ok((cid.clone(), true));
+    if let Some(entry) = statuses.iter().find(|(_, running)| *running) {
+        return Ok(entry.clone());
     }
-    if summaries.len() == 1
-        && let Some((cid, v)) = summaries.iter().next()
-    {
-        let status = v.get("status").and_then(Value::as_str).unwrap_or_default();
-        return Ok((cid.clone(), status == "CASCADE_RUN_STATUS_RUNNING"));
+    if let [entry] = statuses.as_slice() {
+        return Ok(entry.clone());
     }
     Ok((session_id.to_string(), false))
 }
@@ -1582,12 +1588,25 @@ fn agy_rpc_is_latest_step_quota_error(
     else {
         return Ok(true);
     };
-    let step_type = last_step.get("type").and_then(Value::as_str).unwrap_or("");
+    agy_step_quota_error(last_step)
+}
+
+fn agy_step_quota_error(last_step: &Value) -> Result<bool, String> {
+    let step_type = last_step
+        .get("type")
+        .and_then(Value::as_str)
+        .filter(|kind| {
+            kind.starts_with("CORTEX_STEP_TYPE_") && kind.len() > "CORTEX_STEP_TYPE_".len()
+        })
+        .ok_or("latest cascade step missing valid type")?;
+    if step_type != "CORTEX_STEP_TYPE_ERROR_MESSAGE" {
+        return Ok(false);
+    }
     let status = last_step
         .get("status")
         .and_then(Value::as_str)
-        .unwrap_or("");
-    if step_type != "CORTEX_STEP_TYPE_ERROR_MESSAGE" || status == "CORTEX_STEP_STATUS_CLEARED" {
+        .ok_or("latest cascade error step missing status")?;
+    if status == "CORTEX_STEP_STATUS_CLEARED" {
         return Ok(false);
     }
     let raw = last_step.to_string().to_ascii_lowercase();

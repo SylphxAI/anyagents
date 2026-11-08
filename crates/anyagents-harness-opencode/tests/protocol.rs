@@ -558,3 +558,107 @@ fn a_transient_bind_collision_is_retried_even_after_the_holder_releases_it() {
         drop(harness);
     });
 }
+
+#[test]
+fn startup_reports_session_identity_persistence_failure() {
+    let dir = TempDir::new().unwrap();
+    let config = dir.path().join("config");
+    std::fs::create_dir_all(config.join("opencode-session-id")).unwrap();
+    let log = dir.path().join("log");
+    let result = OpenCodeHarness::start_in_config(
+        scripted_opencode(),
+        Some("ses_fake"),
+        &[
+            ("ANYAGENTS_FAKE_MODE", "hold"),
+            ("ANYAGENTS_FAKE_LOG", log.to_str().unwrap()),
+            ("ANYAGENTS_FAKE_STATE", dir.path().to_str().unwrap()),
+        ],
+        None,
+        &config,
+    );
+    let error = result
+        .err()
+        .expect("an unwritable session path must fail startup")
+        .to_string();
+    assert!(error.contains("persist OpenCode session id"), "{error}");
+    assert!(!log_of(&dir).contains("api:POST /api/session "));
+}
+
+#[test]
+fn resume_persists_identity_and_rolls_back_when_the_write_fails() {
+    let dir = TempDir::new().unwrap();
+    let config = dir.path().join("config");
+    std::fs::create_dir_all(&config).unwrap();
+    let mut harness = start_with_config(&dir, "hold", &config);
+    harness.resume("ses_resumed").unwrap();
+    assert_eq!(
+        std::fs::read_to_string(config.join("opencode-session-id")).unwrap(),
+        "ses_resumed\n"
+    );
+    std::fs::remove_file(config.join("opencode-session-id")).unwrap();
+    std::fs::create_dir(config.join("opencode-session-id")).unwrap();
+    let error = harness.resume("ses_other").unwrap_err().to_string();
+    assert!(error.contains("persist OpenCode session id"), "{error}");
+    assert_eq!(harness.session_id().as_deref(), Some("ses_resumed"));
+}
+
+#[test]
+fn failed_interrupt_keeps_the_turn_open_while_accepted_interrupt_closes_it() {
+    for (mode, succeeds) in [("hold", true), ("interrupt-failed", false)] {
+        let dir = TempDir::new().unwrap();
+        let mut harness = start(&dir, mode);
+        harness.deliver(&msg("m1")).unwrap();
+        assert_eq!(harness.health().turn_state, TurnState::InTurn);
+        let result = harness.cancel();
+        if succeeds {
+            result.unwrap();
+            assert_eq!(harness.health().turn_state, TurnState::Idle);
+        } else {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("interruption refused (503)")
+            );
+            assert_eq!(harness.health().turn_state, TurnState::InTurn);
+        }
+        assert_eq!(
+            log_of(&dir)
+                .matches("api:POST /api/session/ses_fake/interrupt")
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn unavailable_session_is_not_replaced_by_a_new_conversation() {
+    let dir = TempDir::new().unwrap();
+    let config = dir.path().join("config");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(config.join("opencode-session-id"), "ses_fake\n").unwrap();
+    let log = dir.path().join("log");
+    let result = OpenCodeHarness::start_in_config(
+        scripted_opencode(),
+        Some("ses_fake"),
+        &[
+            ("ANYAGENTS_FAKE_MODE", "session-unavailable"),
+            ("ANYAGENTS_FAKE_LOG", log.to_str().unwrap()),
+            ("ANYAGENTS_FAKE_STATE", dir.path().to_str().unwrap()),
+        ],
+        None,
+        &config,
+    );
+    assert!(
+        result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("availability is unknown")
+    );
+    assert!(!log_of(&dir).contains("api:POST /api/session "));
+    assert_eq!(
+        std::fs::read_to_string(config.join("opencode-session-id")).unwrap(),
+        "ses_fake\n"
+    );
+}

@@ -16,6 +16,7 @@ serde_json = "1"
 
 
 [dev-dependencies]
+rusqlite = { version = "0.37", features = ["bundled"] }
 anyagents-agent = { path = "../anyagents-agent" }
 anyagents-core = { path = "../anyagents-core" }
 anyagents-harness = { path = "../anyagents-harness" }

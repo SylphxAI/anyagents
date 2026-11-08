@@ -634,3 +634,144 @@ sys.stdin.read()
     assert!(reset > 0);
     assert!(!harness.wait_finished("m-quota", Duration::from_millis(100)));
 }
+
+#[test]
+fn cascade_run_status_requires_authoritative_running_or_idle_values() {
+    use super::agy_running_status;
+    for (status, running) in [
+        ("CASCADE_RUN_STATUS_RUNNING", true),
+        ("CASCADE_RUN_STATUS_IDLE", false),
+    ] {
+        assert_eq!(
+            agy_running_status(
+                &json!({"trajectorySummaries": {"s1": {"status": status}}}),
+                "s1"
+            )
+            .unwrap(),
+            ("s1".into(), running)
+        );
+    }
+    for entry in [
+        json!({}),
+        json!({"status": null}),
+        json!({"status": 1}),
+        json!({"status": "unknown"}),
+    ] {
+        for requested in ["s1", "missing"] {
+            let error =
+                agy_running_status(&json!({"trajectorySummaries": {"s1": entry}}), requested)
+                    .unwrap_err();
+            assert!(error.contains("invalid cascade run status"));
+        }
+    }
+    assert!(
+        agy_running_status(&json!({}), "s1")
+            .unwrap_err()
+            .contains("trajectorySummaries")
+    );
+    assert_eq!(
+        agy_running_status(&json!({"trajectorySummaries": {}}), "s1").unwrap(),
+        ("s1".into(), false)
+    );
+}
+
+#[test]
+fn malformed_latest_step_cannot_clear_an_observed_quota_error() {
+    use super::agy_step_quota_error;
+    for step in [
+        json!({}),
+        json!({"type": null}),
+        json!({"type": 7}),
+        json!({"type": ""}),
+        json!({"type": "CORTEX_STEP_TYPE_ERROR_MESSAGE"}),
+    ] {
+        assert!(agy_step_quota_error(&step).is_err(), "{step}");
+    }
+    assert!(agy_step_quota_error(&json!({"type": "CORTEX_STEP_TYPE_ERROR_MESSAGE", "status": "CORTEX_STEP_STATUS_FINISHED", "error": "RESOURCE_EXHAUSTED"})).unwrap());
+    assert!(!agy_step_quota_error(&json!({"type": "CORTEX_STEP_TYPE_ERROR_MESSAGE", "status": "CORTEX_STEP_STATUS_CLEARED", "error": "RESOURCE_EXHAUSTED"})).unwrap());
+    assert!(!agy_step_quota_error(&json!({"type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE"})).unwrap());
+}
+
+fn agy_rpc_fixture(responses: Vec<serde_json::Value>) -> (u16, std::thread::JoinHandle<()>) {
+    use std::io::{BufRead, Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        for response in responses {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut length = None;
+            loop {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).unwrap() > 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.strip_prefix("Content-Length: ") {
+                    length = Some(value.trim().parse::<usize>().unwrap());
+                }
+            }
+            let mut body = vec![0; length.unwrap()];
+            reader.read_exact(&mut body).unwrap();
+            let _: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let body = response.to_string();
+            write!(
+                stream,
+                "HTTP/1.0 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        }
+    });
+    (port, server)
+}
+
+#[test]
+fn malformed_run_status_is_refused_through_the_language_server_rpc() {
+    for (entry, expected) in [
+        (json!({"status": "CASCADE_RUN_STATUS_RUNNING"}), Some(true)),
+        (json!({"status": "CASCADE_RUN_STATUS_IDLE"}), Some(false)),
+        (json!({}), None),
+    ] {
+        let (port, server) = agy_rpc_fixture(vec![json!({"trajectorySummaries": {"s1": entry}})]);
+        let outcome = super::agy_rpc_is_running(port, "test-csrf", "s1");
+        server.join().unwrap();
+        match expected {
+            Some(running) => assert_eq!(outcome.unwrap(), ("s1".into(), running)),
+            None => assert!(outcome.unwrap_err().contains("invalid cascade run status")),
+        }
+    }
+}
+
+#[test]
+fn missing_step_type_is_unknown_not_quota_clearance_through_rpc() {
+    for (step, expected) in [
+        (json!({"status": "CORTEX_STEP_STATUS_FINISHED"}), None),
+        (
+            json!({"type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE"}),
+            Some(false),
+        ),
+        (
+            json!({"type": "CORTEX_STEP_TYPE_ERROR_MESSAGE", "status": "CORTEX_STEP_STATUS_FINISHED", "error": "RESOURCE_EXHAUSTED"}),
+            Some(true),
+        ),
+    ] {
+        let (port, server) = agy_rpc_fixture(vec![
+            json!({"trajectorySummaries": {"s1": {"stepCount": 3}}}),
+            json!({"steps": [step]}),
+        ]);
+        let outcome = super::agy_rpc_is_latest_step_quota_error(port, "test-csrf", "s1");
+        server.join().unwrap();
+        match expected {
+            Some(quota) => assert_eq!(outcome.unwrap(), quota),
+            None => assert!(
+                outcome
+                    .unwrap_err()
+                    .contains("latest cascade step missing valid type")
+            ),
+        }
+    }
+}
