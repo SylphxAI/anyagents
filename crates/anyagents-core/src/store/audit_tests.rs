@@ -83,7 +83,7 @@ fn only_pre_23_schemas_probe_and_backfill_fts_on_open() {
 }
 
 #[test]
-fn current_schema_search_repairs_empty_partial_and_missing_mailbox_indexes() {
+fn background_upkeep_repairs_empty_partial_and_missing_mailbox_indexes() {
     for fault in ["empty", "partial", "chunks"] {
         let (dir, store, agent) = setup();
         store
@@ -107,6 +107,8 @@ fn current_schema_search_repairs_empty_partial_and_missing_mailbox_indexes() {
             count(&reopened, "rag_chunks_fts"),
             i64::from(fault == "partial")
         );
+        reopened.repair_lexical_index_if_incomplete().unwrap();
+        while reopened.advance_history_backfill(1).unwrap() {}
         for term in ["repairfirstneedle", "repairsecondneedle"] {
             let hits = reopened
                 .search_history(&HistorySearchQuery {
@@ -340,6 +342,7 @@ fn authorized_repair_enumerates_missing_chunks_without_indexing_hidden_bodies() 
         .unwrap();
     drop(store);
     let store = Store::open(dir.path().join("custom-mailbox.sqlite")).unwrap();
+    while store.advance_history_backfill(1).unwrap() {}
     for term in [
         "missinginboundneedle",
         "missingoutboundneedle",
@@ -354,9 +357,45 @@ fn authorized_repair_enumerates_missing_chunks_without_indexing_hidden_bodies() 
             .unwrap();
         assert_eq!(result.len(), usize::from(term != "hiddenmissingneedle"));
     }
-    assert_eq!(count(&store, "rag_chunks"), 2);
+    assert_eq!(count(&store, "rag_chunks"), 3);
     assert_fts(&store, "missinginboundneedle");
     assert_fts(&store, "missingoutboundneedle");
+}
+
+#[test]
+fn a_partial_search_index_is_rebuilt_without_duplicates_and_keeps_rows_written_meanwhile() {
+    let (_dir, store, own) = setup();
+    for term in ["rebuildfirstneedle", "rebuildsecondneedle"] {
+        store.receive(&own.id, Incoming::new(term)).unwrap();
+    }
+    assert!(!store.repair_lexical_index_if_incomplete().unwrap());
+    store
+        .conn()
+        .execute_batch("DELETE FROM rag_chunks_fts WHERE text='rebuildsecondneedle';")
+        .unwrap();
+    assert!(store.repair_lexical_index_if_incomplete().unwrap());
+    assert_eq!(count(&store, "rag_chunks"), count(&store, "rag_chunks_fts"));
+    assert_fts(&store, "rebuildfirstneedle");
+    assert_fts(&store, "rebuildsecondneedle");
+    assert!(!store.repair_lexical_index_if_incomplete().unwrap());
+}
+
+#[test]
+fn search_never_takes_the_write_connection() {
+    let (_dir, store, own) = setup();
+    store
+        .receive(&own.id, Incoming::new("readonlysearchneedle"))
+        .unwrap();
+    let writer = store.conn();
+    let found = store
+        .search_history(&HistorySearchQuery {
+            query: Some("readonlysearchneedle".into()),
+            visible_agent_ids: Some(vec![own.id.to_string()]),
+            ..Default::default()
+        })
+        .unwrap();
+    drop(writer);
+    assert_eq!(found.len(), 1);
 }
 
 #[test]

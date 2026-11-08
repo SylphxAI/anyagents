@@ -1485,6 +1485,28 @@ fn acquire_admin_lock(data: &Path) -> Result<std::fs::File, Error> {
     Ok(file)
 }
 
+/// Keeps the search index current away from any request, one short batch at a
+/// time, so index upkeep can never stop mail or other writes.
+fn spawn_search_index_upkeep(store: Arc<Store>) {
+    const BATCH: i64 = 100;
+    const PACE: std::time::Duration = std::time::Duration::from_millis(250);
+    std::thread::spawn(move || {
+        if let Err(err) = store.repair_lexical_index_if_incomplete() {
+            eprintln!("Search index repair failed: {err}");
+        }
+        loop {
+            match store.advance_history_backfill(BATCH) {
+                Ok(true) => std::thread::sleep(PACE),
+                Ok(false) => break,
+                Err(err) => {
+                    eprintln!("Search history backfill failed: {err}");
+                    break;
+                }
+            }
+        }
+    });
+}
+
 /// Both intervals tick immediately at startup. Each loop owns its blocking
 /// pass, so an in-flight external request cannot hold the next local tick.
 fn start_schedule_loops(
@@ -1492,6 +1514,7 @@ fn start_schedule_loops(
     health: HealthBoard,
     defer_to_admin: bool,
 ) -> (tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>) {
+    spawn_search_index_upkeep(Arc::clone(&store));
     let local = spawn_schedule_loop(
         Arc::clone(&store),
         health.clone(),

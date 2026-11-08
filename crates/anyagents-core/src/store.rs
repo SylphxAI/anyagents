@@ -602,6 +602,14 @@ pub struct Store {
     data_dir: PathBuf,
     wakes: Mutex<Vec<Sender<Wake>>>,
     capabilities: Mutex<Option<String>>,
+    history_backfill: Mutex<HistoryBackfillCursor>,
+}
+
+/// How far the background upgrade of older mailbox rows has walked.
+#[derive(Default)]
+struct HistoryBackfillCursor {
+    outbound: bool,
+    after: String,
 }
 
 enum ReadConn<'a> {
@@ -758,6 +766,7 @@ impl Store {
             data_dir: data_dir_for(path),
             wakes: Mutex::new(Vec::new()),
             capabilities: Mutex::new(None),
+            history_backfill: Mutex::new(HistoryBackfillCursor::default()),
         })
     }
 
@@ -2855,97 +2864,190 @@ impl Store {
     /// standalone tool summaries have no recoverable raw mailbox body: preserve
     /// them exactly rather than inventing the clipped-away suffix. New tools use
     /// the full-text policy. Redacted mailbox bodies are the authoritative input.
-    fn backfill_full_mailbox_history(&self, visible: Option<&[String]>) -> Result<(), Error> {
+    /// Upgrades one short batch of older mailbox rows into the search index and
+    /// returns whether more may remain.
+    ///
+    /// The server calls this from a background thread. The scan runs on a read
+    /// connection and each batch commits on its own, so writers only ever wait
+    /// for one small transaction.
+    pub fn advance_history_backfill(&self, limit: i64) -> Result<bool, Error> {
+        struct Chunk {
+            id: String,
+            owner: String,
+            name: String,
+            direction: String,
+            sender: String,
+            destination: String,
+            timestamp: i64,
+            text: String,
+            kind: Option<String>,
+            tool: Option<String>,
+            seq: i64,
+        }
+        let mut cursor = self
+            .history_backfill
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let chunks = {
+            let conn = self.read_conn();
+            let sql = if cursor.outbound {
+                "SELECT o.id,o.agent_id,a.name,'out','agent:' || a.name,
+                        COALESCE(o.destination,'agent:' || a.name),o.sent_at_ms,o.body,
+                        c.kind,c.tool_name,
+                        COALESCE(c.seq,(SELECT max(seq) FROM messages WHERE agent_id=o.agent_id),0)
+                 FROM outbound_messages o JOIN agents a ON a.id=o.agent_id
+                 LEFT JOIN rag_chunks c ON c.agent_id=o.agent_id AND c.chunk_id=o.id
+                 WHERE o.id > ?1 AND (c.chunk_id IS NULL OR c.text_format<2)
+                 ORDER BY o.id LIMIT ?2"
+            } else {
+                "SELECT m.id,m.agent_id,a.name,'in',COALESCE(m.sender,'unknown'),
+                        COALESCE(m.reply_to,'agent:' || a.name),m.received_at_ms,m.body,
+                        c.kind,c.tool_name,COALESCE(c.seq,m.seq)
+                 FROM messages m JOIN agents a ON a.id=m.agent_id
+                 LEFT JOIN rag_chunks c ON c.agent_id=m.agent_id AND c.chunk_id=m.id
+                 WHERE m.id > ?1 AND (c.chunk_id IS NULL OR c.text_format<2)
+                 ORDER BY m.id LIMIT ?2"
+            };
+            let mut select = conn.prepare(sql)?;
+            select
+                .query_map(params![cursor.after, limit], |r| {
+                    Ok(Chunk {
+                        id: r.get(0)?,
+                        owner: r.get(1)?,
+                        name: r.get(2)?,
+                        direction: r.get(3)?,
+                        sender: r.get(4)?,
+                        destination: r.get(5)?,
+                        timestamp: r.get(6)?,
+                        text: r.get(7)?,
+                        kind: r.get(8)?,
+                        tool: r.get(9)?,
+                        seq: r.get(10)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let Some(last) = chunks.last() else {
+            if cursor.outbound {
+                *cursor = HistoryBackfillCursor::default();
+                return Ok(false);
+            }
+            cursor.outbound = true;
+            cursor.after.clear();
+            return Ok(true);
+        };
+        cursor.after = last.id.clone();
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut after = String::new();
-        loop {
-            let visibility = visible_agent_ids_sql("r.agent_id", visible, 2);
-            let mut select = tx.prepare(&format!(
-                "WITH raw AS (
-                    SELECT id,agent_id,'in' AS direction,COALESCE(sender,'unknown') AS sender,
-                           reply_to AS destination,received_at_ms AS timestamp_ms,body,seq FROM messages
-                    UNION ALL
-                    SELECT o.id,o.agent_id,'out','agent:' || a.name,o.destination,o.sent_at_ms,o.body,
-                           COALESCE((SELECT max(seq) FROM messages WHERE agent_id=o.agent_id),0)
-                    FROM outbound_messages o JOIN agents a ON a.id=o.agent_id
-                 )
-                 SELECT r.id,r.agent_id,a.name,r.direction,r.sender,
-                        COALESCE(r.destination,'agent:' || a.name),r.timestamp_ms,
-                        r.body,c.kind,c.tool_name,COALESCE(c.seq,r.seq)
-                 FROM raw r JOIN agents a ON a.id=r.agent_id
-                 LEFT JOIN rag_chunks c ON c.agent_id=r.agent_id AND c.chunk_id=r.id
-                 WHERE r.id > ?1 AND (c.chunk_id IS NULL OR c.text_format<2){visibility}
-                 ORDER BY r.id LIMIT 32"
-            ))?;
-            struct Chunk {
-                id: String,
-                owner: String,
-                name: String,
-                direction: String,
-                sender: String,
-                destination: String,
-                timestamp: i64,
-                text: String,
-                kind: Option<String>,
-                tool: Option<String>,
-                seq: i64,
-            }
-            let chunks = select
-                .query_map(
-                    rusqlite::params_from_iter(scoped_params(&[&after], visible)),
-                    |r| {
-                        Ok(Chunk {
-                            id: r.get(0)?,
-                            owner: r.get(1)?,
-                            name: r.get(2)?,
-                            direction: r.get(3)?,
-                            sender: r.get(4)?,
-                            destination: r.get(5)?,
-                            timestamp: r.get(6)?,
-                            text: r.get(7)?,
-                            kind: r.get(8)?,
-                            tool: r.get(9)?,
-                            seq: r.get(10)?,
-                        })
-                    },
-                )?
-                .collect::<Result<Vec<_>, _>>()?;
-            if chunks.is_empty() {
-                break;
-            }
-            for chunk in chunks {
-                after = chunk.id.clone();
-                if clean_rag_text(&chunk.text).chars().count() < 2 {
-                    tx.execute("DELETE FROM rag_chunks_fts WHERE chunk_id=?1", [&chunk.id])?;
-                    tx.execute(
-                        "DELETE FROM rag_chunks WHERE chunk_id=?1 AND agent_id=?2",
-                        params![chunk.id, chunk.owner],
-                    )?;
-                    continue;
-                }
-                index_rag_chunk(
-                    &tx,
-                    &chunk.id,
-                    &chunk.owner,
-                    &chunk.name,
-                    &chunk.direction,
-                    &chunk.sender,
-                    &chunk.destination,
-                    chunk.timestamp,
-                    &chunk.text,
-                    chunk.kind.as_deref(),
-                    chunk.tool.as_deref(),
-                    chunk.seq,
-                )?;
-                tx.execute(
-                    "UPDATE rag_chunks SET text_format=2 WHERE chunk_id=?1 AND agent_id=?2",
+        for chunk in chunks {
+            if clean_rag_text(&chunk.text).chars().count() < 2 {
+                // Too short to index, and usually never indexed. FTS has no
+                // index on this column, so only pay for the delete when a row
+                // really existed.
+                let removed = tx.execute(
+                    "DELETE FROM rag_chunks WHERE chunk_id=?1 AND agent_id=?2",
                     params![chunk.id, chunk.owner],
                 )?;
+                if removed > 0 {
+                    tx.execute("DELETE FROM rag_chunks_fts WHERE chunk_id=?1", [&chunk.id])?;
+                }
+                continue;
             }
+            index_rag_chunk(
+                &tx,
+                &chunk.id,
+                &chunk.owner,
+                &chunk.name,
+                &chunk.direction,
+                &chunk.sender,
+                &chunk.destination,
+                chunk.timestamp,
+                &chunk.text,
+                chunk.kind.as_deref(),
+                chunk.tool.as_deref(),
+                chunk.seq,
+            )?;
+            tx.execute(
+                "UPDATE rag_chunks SET text_format=2 WHERE chunk_id=?1 AND agent_id=?2",
+                params![chunk.id, chunk.owner],
+            )?;
         }
         tx.commit()?;
-        Ok(())
+        Ok(true)
+    }
+
+    /// Rebuilds the derivative search index if it no longer matches its source,
+    /// in short transactions so writers keep moving. Rows written during the
+    /// rebuild reach both tables on their own and sit above the snapshot.
+    pub fn repair_lexical_index_if_incomplete(&self) -> Result<bool, Error> {
+        const BATCH: i64 = 500;
+        let complete: bool = self.read_conn().query_row(
+            "SELECT (SELECT count(*) FROM rag_chunks) = (SELECT count(*) FROM rag_chunks_fts)",
+            [],
+            |r| r.get(0),
+        )?;
+        if complete {
+            return Ok(false);
+        }
+        let (max_source, max_index): (i64, i64) = {
+            let mut conn = self.conn();
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let bounds = tx.query_row(
+                "SELECT (SELECT COALESCE(max(rowid),0) FROM rag_chunks),
+                        (SELECT COALESCE(max(rowid),0) FROM rag_chunks_fts)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            tx.commit()?;
+            bounds
+        };
+        loop {
+            let deleted = self.conn().execute(
+                "DELETE FROM rag_chunks_fts WHERE rowid IN
+                    (SELECT rowid FROM rag_chunks_fts WHERE rowid <= ?1 LIMIT ?2)",
+                params![max_index, BATCH],
+            )?;
+            if deleted == 0 {
+                break;
+            }
+        }
+        let mut after = 0_i64;
+        while after < max_source {
+            let mut conn = self.conn();
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let mut last = None;
+            {
+                let mut select = tx.prepare(
+                    "SELECT rowid,chunk_id,agent_name,sender,destination,kind,tool_name,text
+                     FROM rag_chunks WHERE rowid > ?1 AND rowid <= ?2 ORDER BY rowid LIMIT ?3",
+                )?;
+                let mut insert = tx.prepare(
+                    "INSERT INTO rag_chunks_fts (
+                        chunk_id, agent_name, sender, destination, kind, tool_name, text, search_tokens
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                )?;
+                let mut rows = select.query(params![after, max_source, BATCH])?;
+                while let Some(row) = rows.next()? {
+                    last = Some(row.get::<_, i64>(0)?);
+                    let text: String = row.get(7)?;
+                    let search_tokens = tokenize_hybrid_search_tokens(&text).join(" ");
+                    insert.execute(params![
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        text,
+                        search_tokens,
+                    ])?;
+                }
+            }
+            tx.commit()?;
+            let Some(last) = last else { break };
+            after = last;
+        }
+        Ok(true)
     }
 
     /// Zero-Embedding Lossless Lexical + Structured Agentic History Search (`Raw-RAG`).
@@ -2957,10 +3059,8 @@ impl Store {
     /// `from_seq`, `to_seq`), ordering (`Relevance`, `Newest`, `Oldest`), and contiguous episode
     /// context expansion (`radius`).
     pub fn search_history(&self, req: &HistorySearchQuery) -> Result<Vec<ConversationTurn>, Error> {
-        self.backfill_full_mailbox_history(req.visible_agent_ids.as_deref())?;
-        // Search, not startup, owns derivative-index validation. This repairs
-        // empty/partial current-schema indexes without scanning on Store::open.
-        ensure_lexical_fts_backfilled(&mut self.conn())?;
+        // Search only reads. Index upkeep runs in the background so that a
+        // search can never stop mail, sends, or any other write.
         let conn = self.read_conn();
         let limit = req.limit.clamp(1, 200);
         let radius = req.radius.min(10);
@@ -7851,7 +7951,7 @@ mod tests {
     }
 
     #[test]
-    fn full_mailbox_tails_upgrade_only_authorized_chunks_and_survive_redaction_restart() {
+    fn full_mailbox_tails_upgrade_in_the_background_and_survive_redaction_restart() {
         let (dir, store) = setup();
         let own = agent(&store, "tail-owner");
         let hidden = agent(&store, "tail-hidden");
@@ -7917,6 +8017,7 @@ mod tests {
             conn.execute("DELETE FROM rag_chunks_fts", []).unwrap();
             conn.execute("INSERT INTO rag_chunks_fts(chunk_id,agent_name,sender,destination,kind,tool_name,text,search_tokens) SELECT chunk_id,agent_name,sender,destination,kind,tool_name,text,text FROM rag_chunks", []).unwrap();
         }
+        while store.advance_history_backfill(2).unwrap() {}
         assert_eq!(
             store
                 .search_history(&query("firsttailneedle"))
@@ -7931,6 +8032,13 @@ mod tests {
                 .len(),
             1
         );
+        assert!(
+            store
+                .search_history(&query("hiddentailneedle"))
+                .unwrap()
+                .is_empty(),
+            "search still filters by what the caller may see"
+        );
         let hidden_format: i64 = store
             .conn()
             .query_row(
@@ -7939,10 +8047,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(
-            hidden_format, 1,
-            "hidden bodies must not be read/backfilled"
-        );
+        assert_eq!(hidden_format, 2, "upkeep covers every agent");
         let message = store
             .inbox(&own.id, None)
             .unwrap()
