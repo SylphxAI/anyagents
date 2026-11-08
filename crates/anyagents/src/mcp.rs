@@ -332,7 +332,7 @@ struct AgentMcp {
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 struct SendArgs {
-    /// Destinations: agent names or IDs (`sage`, `agent:sage`, `agt_...`, `parent`,
+    /// Destinations: agent names or IDs (`planner`, `agent:planner`, `agt_...`, `parent`,
     /// `children`), internal groups (`group:owners`, `group:<name>`, `group:all`, `all`),
     /// or external channel targets (`telegram:chat:<chat_id>[:<topic_id>]`,
     /// `telegram:user:<user_id>[:<message_id>]`). An authored send addressed to
@@ -420,7 +420,7 @@ struct ConversationArgs {
     /// Optional negative terms — any turn containing any of these substrings is excluded.
     #[serde(default, deserialize_with = "crate::api::deserialize_string_or_vec")]
     exclude: Vec<String>,
-    /// Agent name (`sage`, `volt`, `xenon`, `"all"`) or `agt_...` ID whose complete
+    /// Agent name (`planner`, `builder`, `reviewer`, `"all"`) or `agt_...` ID whose complete
     /// two-way (`in` + `out`) conversation to read or search. Defaults to `"all"` when
     /// searching, or this agent when reading recent chronological turns. Non-admin
     /// callers can read only self and descendants; `all` means that authorized set.
@@ -664,7 +664,7 @@ struct SpawnArgs {
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 struct DescribeArgs {
-    /// Target agent name (`"self"`, `"xenon"`, `"sage"`, `"all"`, or `agt_...` ID). Defaults to `"self"`.
+    /// Target agent name (`"self"`, `"reviewer"`, `"planner"`, `"all"`, or `agt_...` ID). Defaults to `"self"`.
     #[serde(default, alias = "name", alias = "target")]
     agent: Option<String>,
     /// Concise public role/responsibility summary (`description`, Layer 1 — visible to all peers and group rosters).
@@ -905,7 +905,7 @@ fn generate_subagent_name(parent_name: &str) -> String {
 #[tool_router]
 impl AgentMcp {
     #[tool(
-        description = "Unified outbound communication and message interaction tool: send a message, media file (`photo`, `video`, `audio`, `music`, `voice`, `document`, `animation`), GPS `location`/venue, interactive `poll`, `checklist`, or Instant View `article` to one or multiple agents (`sage`, `agt_...`, `parent`, `children`), internal groups (`group:<name>`, `group:all`, `all`), or external channel targets (`telegram:chat:<id>[:<topic>]`, `telegram:user:<id>`); OR perform a message interaction (`action`: `\"react\"` | `\"vote\"` | `\"check\"` | `\"uncheck\"` | `\"edit\"` | `\"delete\"` | `\"pin\"` | `\"unpin\"` | `\"stop_poll\"`) on a target message (`target` or `reply_to`: `anyagents:reply:msg_...` or `telegram:chat:<chat_id>:<message_id>`)."
+        description = "Unified outbound communication and message interaction tool: send a message, media file (`photo`, `video`, `audio`, `music`, `voice`, `document`, `animation`), GPS `location`/venue, interactive `poll`, `checklist`, or Instant View `article` to one or multiple agents (`planner`, `agt_...`, `parent`, `children`), internal groups (`group:<name>`, `group:all`, `all`), or external channel targets (`telegram:chat:<id>[:<topic>]`, `telegram:user:<id>`); OR perform a message interaction (`action`: `\"react\"` | `\"vote\"` | `\"check\"` | `\"uncheck\"` | `\"edit\"` | `\"delete\"` | `\"pin\"` | `\"unpin\"` | `\"stop_poll\"`) on a target message (`target` or `reply_to`: `anyagents:reply:msg_...` or `telegram:chat:<chat_id>:<message_id>`)."
     )]
     async fn send(
         &self,
@@ -1001,22 +1001,7 @@ impl AgentMcp {
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty());
-        let (range_from, range_to) = if let Some(r) = args
-            .range
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            let stripped = r.strip_prefix("seq:").unwrap_or(r).trim();
-            if let Some((a, b)) = stripped.split_once('-') {
-                (a.trim().parse::<i64>().ok(), b.trim().parse::<i64>().ok())
-            } else {
-                let single = stripped.parse::<i64>().ok();
-                (single, single)
-            }
-        } else {
-            (None, None)
-        };
+        let (range_from, range_to) = parse_sequence_range(args.range.as_deref())?;
         let from_seq = args.from_seq.or(range_from);
         let to_seq = args.to_seq.or(range_to);
         let is_search_mode = args.raw_id.is_some()
@@ -1686,7 +1671,7 @@ impl AgentMcp {
     }
 
     #[tool(
-        description = "Spawn a new sub-agent with this agent as its `parent` (supports multi-level sub-agent trees). Pass `repo` (e.g. `\"SylphxAI/spiron\"` or `\"inherit\"` to branch from your current repo, with optional `branch` and `base`) to automatically provision an isolated, lifecycle-managed Git worktree at `<data>/agents/<id>/work` (cleanly reaped on `archive` when pushed, or preserved if dirty). If both `repo` and `workdir` are omitted, defaults to its own isolated `<data>/agents/<id>/work`. Every sub-agent automatically receives the shared `AGENTS.md` and top-level `skills` in its config home."
+        description = "Spawn a new sub-agent with this agent as its `parent` (supports multi-level sub-agent trees). Pass `repo` (e.g. `\"example-org/workspace\"` or `\"inherit\"` to branch from your current repo, with optional `branch` and `base`) to automatically provision an isolated, lifecycle-managed Git worktree at `<data>/agents/<id>/work` (cleanly reaped on `archive` when pushed, or preserved if dirty). If both `repo` and `workdir` are omitted, defaults to its own isolated `<data>/agents/<id>/work`. Every sub-agent automatically receives the shared `AGENTS.md` and top-level `skills` in its config home."
     )]
     async fn spawn(
         &self,
@@ -2572,8 +2557,61 @@ pub(crate) async fn request_naming(
     Ok((status, bytes))
 }
 
+/// Parse an explicit bounded read without turning malformed bounds into absence.
+fn parse_sequence_range(range: Option<&str>) -> Result<(Option<i64>, Option<i64>), String> {
+    let Some(range) = range.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok((None, None));
+    };
+    let range = range.strip_prefix("seq:").unwrap_or(range).trim();
+    let parse = |raw: &str| -> Result<i64, String> {
+        let value = raw
+            .trim()
+            .parse::<i64>()
+            .map_err(|_| "range must be seq:<start>-<end> or seq:<number>".to_string())?;
+        if value < 0 {
+            return Err("sequence bounds must be nonnegative".into());
+        }
+        Ok(value)
+    };
+    let (start, end) = match range.split_once('-') {
+        Some((start, end)) => (parse(start)?, parse(end)?),
+        None => {
+            let value = parse(range)?;
+            (value, value)
+        }
+    };
+    if start > end {
+        return Err("sequence range start must not exceed end".into());
+    }
+    Ok((Some(start), Some(end)))
+}
+
 #[cfg(test)]
 mod spawn_args_tests {
+    #[test]
+    fn explicit_sequence_range_refuses_invalid_bounds() {
+        for range in [
+            "seq:bad-bad",
+            "seq:1-bad",
+            "seq:bad-2",
+            "seq:5-2",
+            "seq:-1",
+            "seq:1-2-3",
+            "seq:9223372036854775808",
+        ] {
+            assert!(super::parse_sequence_range(Some(range)).is_err(), "{range}");
+        }
+        assert_eq!(
+            super::parse_sequence_range(Some("seq:1-2")).unwrap(),
+            (Some(1), Some(2))
+        );
+        assert_eq!(
+            super::parse_sequence_range(Some("3")).unwrap(),
+            (Some(3), Some(3))
+        );
+        assert_eq!(super::parse_sequence_range(None).unwrap(), (None, None));
+    }
+
     use super::*;
     use serde_json::json;
 

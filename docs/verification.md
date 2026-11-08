@@ -354,7 +354,7 @@ write or unlink/replace its `config.worktree`, or alter `commondir`; C can use
 its own checkout but cannot read B's HEAD/index, nor can B read C's metadata.
 B's ordinary status, commit and local bare-remote push use its generated seat
 config, with no `-c user.*` or author/committer environment overrides; the commit
-records the exact Kyle author and committer. A's common config retains its owner,
+records the exact caller-configured author and committer. A's common config retains its owner,
 inode, content and owner read access during adoption. Parent config, remote-add
 and `git push -u` each replace the target inode while retaining the managed link;
 both active child UIDs must immediately read common config and run status, with

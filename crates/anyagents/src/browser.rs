@@ -1790,21 +1790,19 @@ fn dispatch_takeover_key(cdp: &mut CdpSession, payload: &serde_json::Value) -> R
     Ok(())
 }
 
-fn generate_takeover_token() -> String {
+fn generate_takeover_token() -> Result<String, Error> {
+    takeover_token_from_entropy(std::fs::File::open("/dev/urandom")?)
+}
+
+fn takeover_token_from_entropy(mut entropy: impl Read) -> Result<String, Error> {
     let mut bytes = [0u8; 16];
-    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-        let _ = f.read_exact(&mut bytes);
-    } else {
-        let seed = deterministic_profile_seed(&format!("takeover-{}", now_ms()));
-        bytes[..8].copy_from_slice(&seed.to_le_bytes());
-        bytes[8..].copy_from_slice(&seed.rotate_left(19).to_le_bytes());
-    }
+    entropy.read_exact(&mut bytes)?;
     let mut out = String::with_capacity(36);
     out.push_str("tok_");
     for b in bytes {
         out.push_str(&format!("{b:02x}"));
     }
-    out
+    Ok(out)
 }
 
 fn constant_time_eq(a: &str, b: &str) -> bool {
@@ -2689,7 +2687,7 @@ fn start_or_reuse_takeover_session(
     let listener = TcpListener::bind("0.0.0.0:0").or_else(|_| TcpListener::bind("127.0.0.1:0"))?;
     let port = listener.local_addr()?.port();
     let _ = listener.set_nonblocking(true);
-    let token = generate_takeover_token();
+    let token = generate_takeover_token()?;
     let local_url = format!("http://127.0.0.1:{port}/takeover/{token}");
 
     let allow_tunnel = want_tunnel.unwrap_or_else(|| {
@@ -4620,6 +4618,29 @@ fn decode_base64(input: &str) -> Result<Vec<u8>, Error> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn takeover_entropy_requires_a_complete_read() {
+        let error = super::takeover_token_from_entropy(&[1u8; 15][..]).unwrap_err();
+        assert!(matches!(error, anyagents_core::Error::Io(ref e)
+            if e.kind() == std::io::ErrorKind::UnexpectedEof));
+        let denied =
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "entropy unavailable");
+        struct FailedEntropy(std::io::Error);
+        impl std::io::Read for FailedEntropy {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(self.0.kind(), "entropy unavailable"))
+            }
+        }
+        let error = super::takeover_token_from_entropy(FailedEntropy(denied)).unwrap_err();
+        assert!(matches!(error, anyagents_core::Error::Io(ref e)
+            if e.kind() == std::io::ErrorKind::PermissionDenied));
+        assert_eq!(
+            super::takeover_token_from_entropy(&[0xabu8; 16][..]).unwrap(),
+            "tok_abababababababababababababababab"
+        );
+        assert_eq!(super::generate_takeover_token().unwrap().len(), 36);
+    }
+
     use super::*;
     use anyagents_core::{CredentialStore, FileCredentialStore};
     use std::io::{Read, Write};

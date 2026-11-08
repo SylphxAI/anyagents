@@ -246,14 +246,12 @@ this adapter does not invoke a setter or edit shared service configuration.
 
 ### Managed local checkouts
 
-Repository-backed local agents require `desk-git-hub`; set
-`ANYAGENTS_GIT_HUB_BIN` to its executable when it is not installed under the
-host user's `~/.local/bin` or on `PATH`. Repository slugs and GitHub URLs,
-`repo: "inherit"`, and local repository paths all use that consumer for fetching
-and checkout. Sparse-checkout and hook policy belong to the consumer, not the
-agent manager. Fetch, checkout, and executable-launch failures refuse the spawn
-with the consumer's diagnostic; there is no automatic clone, direct-worktree,
-or non-desk fallback.
+Repository-backed local agents use a caller-configured checkout provider through
+`ANYAGENTS_GIT_HUB_BIN`. Repository slugs and GitHub URLs, `repo: "inherit"`, and
+local repository paths use that provider for fetching and checkout. The provider
+owns sparse-checkout and hook policy. Fetch, checkout and executable-launch failures
+refuse the spawn with its diagnostic; an unavailable configured provider never
+silently selects a different checkout mechanism.
 
 Explicit `workdir` paths, including `/scratch/wt/...` and `/scratch/tmp/...`, are
 honoured or refused, never replaced by the default directory. Before an agent
@@ -295,12 +293,12 @@ Shared refs remain a same-repository integrity boundary: a child can move anothe
 branch ref. This is not hostile-repository isolation, and AnyAgents does not
 intercept arbitrary harness commit/push commands or provide a branch-tip guard.
 AnyAgents production code never runs `git commit` or `git push`; the supported
-source-publication path uses desk-git-hub and desk-publish. Its Git metadata reads, skill sync and cleanup
+source-publication path belongs to the caller's checkout and publication tools. Its Git metadata reads, skill sync and cleanup
 commands pin `core.hooksPath=/dev/null` and disable fsmonitor. The parent commit
 and its parent-owned hooks-path pin in the three-UID proof belong to the test fixture.
 Shared common and worktree configs refuse `include`/`includeIf` rather than
 following a potentially child-controlled configuration graph.
-Commit identity is set to `Kyle Tse <hi@kylet.se>` in the protected private
+Caller-configured commit identity is set in the protected private
 `config.worktree`, never by replacing the parent's common config. The consumer
 must enable `extensions.worktreeConfig`; otherwise admission refuses. Seat Git
 configuration resets legacy wildcard trust and lists only the seat's exact
@@ -572,7 +570,7 @@ index's suffix-only scanner. Hidden owners are neither read nor upgraded.
 Redacted mailbox bodies remain authoritative on retry/restart. Historical
 standalone tool summaries clipped by an older writer have no raw mailbox body to
 recover; they are preserved as-is rather than claiming a reconstructed suffix.
-Reconciled pages under `agents/<id>/history/owners` are indexed as whole historical
+Reconciled pages under `agents/<id>/history/archive` are indexed as whole historical
 documents in `transcripts` scope even when they are Markdown rather than JSONL.
 
 For an indexed filesystem result, the canonical `conversation` tool/HTTP route

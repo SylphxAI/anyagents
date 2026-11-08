@@ -203,7 +203,7 @@ pub fn rename_cmd(data: &Path, agent: &str, new_name: &str) -> Result<(), Error>
         .as_deref()
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| anyagents_core::agent_work_dir(data, &updated.id));
-    let _ = crate::create::reconcile_agent_runtime_config(&store, data, &updated, &cfg, &work_dir);
+    crate::create::reconcile_agent_runtime_config(&store, data, &updated, &cfg, &work_dir)?;
     crate::telegram::sync_agent_telegram_bot_name(&store, data, &updated);
     let aliases = store.agent_aliases(&updated.id).unwrap_or_default();
     println!(
@@ -264,7 +264,7 @@ pub fn role_cmd(data: &Path, agent: &str, role: Option<&str>, clear: bool) -> Re
         .as_deref()
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| anyagents_core::agent_work_dir(data, &updated.id));
-    let _ = crate::create::reconcile_agent_runtime_config(&store, data, &updated, &cfg, &work_dir);
+    crate::create::reconcile_agent_runtime_config(&store, data, &updated, &cfg, &work_dir)?;
     crate::telegram::sync_agent_telegram_bot_name(&store, data, &updated);
     println!(
         "{}\t{}\t{}",
@@ -873,7 +873,9 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        let _ = store.receive(&agent.id, anyagents_core::Incoming::new(prompt));
+        store
+            .receive(&agent.id, anyagents_core::Incoming::new(prompt))
+            .map_err(|e| e.to_string())?;
     }
     let lag = store
         .lag(&agent.id, anyagents_core::now_ms())
@@ -939,8 +941,7 @@ fn set_admin(data: &Path, agent: &str, admin: bool) -> Result<(), Error> {
     }
     let store = open(data)?;
     let rec = store.agent_by_name(agent)?;
-    store.set_agent_admin(&rec.id, admin)?;
-    let _ = store.record_admin_audit(
+    store.record_admin_audit(
         "operator",
         if admin {
             "agents.grant_admin"
@@ -948,7 +949,8 @@ fn set_admin(data: &Path, agent: &str, admin: bool) -> Result<(), Error> {
             "agents.revoke_admin"
         },
         &rec.name,
-    );
+    )?;
+    store.set_agent_admin(&rec.id, admin)?;
     println!("{}", serde_json::json!({"agent": rec.name, "admin": admin}));
     Ok(())
 }
@@ -1121,7 +1123,14 @@ pub fn reconcile_and_enrich_views(data: &Path, views: &mut [AgentView]) {
                 view.last_error = None;
             }
         }
-        let mut open_turn = store.has_open_turn(&id).unwrap_or(false);
+        let mut open_turn = match store.has_open_turn(&id) {
+            Ok(value) => value,
+            Err(error) => {
+                view.last_error = Some(format!("cannot read durable turn state: {error}"));
+                view.turn_state = "unknown".into();
+                continue;
+            }
+        };
         if view.state == "running" && view.process == "alive" {
             if open_turn
                 && view.harness == "agy"
@@ -1129,16 +1138,27 @@ pub fn reconcile_and_enrich_views(data: &Path, views: &mut [AgentView]) {
                 && view.quota_reset_at_ms.is_none()
                 && view.last_error.is_none()
             {
-                let opened_at_ms = store
-                    .open_turn(&id)
-                    .ok()
-                    .flatten()
-                    .map(|o| o.opened_at_ms)
-                    .unwrap_or(0);
-                if is_agy_turn_settled_on_disk(&cfg, opened_at_ms, now) {
-                    let _ = store.note_turn_completed(&id);
-                    open_turn = false;
-                    view.turn_state = "idle".to_string();
+                match store.open_turn(&id) {
+                    Ok(Some(open)) if is_agy_turn_settled_on_disk(&cfg, open.opened_at_ms, now) => {
+                        match store.note_turn_completed(&id) {
+                            Ok(()) => {
+                                open_turn = false;
+                                view.turn_state = "idle".to_string();
+                            }
+                            Err(error) => {
+                                view.last_error =
+                                    Some(format!("cannot persist turn completion: {error}"));
+                                view.turn_state = "unknown".into();
+                                continue;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        view.last_error = Some(format!("cannot read open turn: {error}"));
+                        view.turn_state = "unknown".into();
+                        continue;
+                    }
+                    _ => {}
                 }
             }
             if view.quota_reset_at_ms.is_some_and(|ms| ms > now) {

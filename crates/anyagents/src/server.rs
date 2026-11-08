@@ -494,8 +494,8 @@ fn spawn_admin_sylphx_delivery(
                 last_error: None,
             },
         );
-        {
-            let _ = std::fs::create_dir_all(&work_dir);
+        let delivery_result = (|| -> Result<(), Error> {
+            std::fs::create_dir_all(&work_dir)?;
             // Creation and explicit wakes own grants; never follow a child's
             // editable .git pointer to expand them during a harness launch.
             let req = anyagents_supervisor::LaunchRequest {
@@ -510,33 +510,33 @@ fn spawn_admin_sylphx_delivery(
                     let mut had_err = false;
                     let mut completed_any = false;
                     let mut recorded_usage = anyagents_harness::TurnUsage::default();
-                    let flush_harness_usage =
-                        |harness: &crate::vendor::VendorHarness,
-                         recorded: &mut anyagents_harness::TurnUsage| {
-                            let served = anyagents_harness::Harness::last_usage(harness);
-                            let diff = served.difference(recorded.clone());
-                            if diff.input_tokens > 0 || diff.output_tokens > 0 {
-                                let _ = store.record_usage(anyagents_core::NewUsage {
-                                    agent_id: agent.id.clone(),
-                                    harness: agent.harness.clone(),
-                                    model: agent.model.clone(),
-                                    input_tokens: i64::try_from(diff.input_tokens)
-                                        .unwrap_or(i64::MAX),
-                                    output_tokens: i64::try_from(diff.output_tokens)
-                                        .unwrap_or(i64::MAX),
-                                    cache_read_tokens: i64::try_from(diff.cache_read_tokens)
-                                        .unwrap_or(i64::MAX),
-                                    cache_write_tokens: i64::try_from(diff.cache_write_tokens)
-                                        .unwrap_or(i64::MAX),
-                                    reported_cost_micros: diff.reported_cost_micros,
-                                    estimated_cost_micros: None,
-                                    billing_mode: anyagents_core::BillingMode::Subscription,
-                                    quota_state: None,
-                                    day: anyagents_core::utc_day(now_ms()),
-                                });
-                                *recorded = served;
-                            }
-                        };
+                    let flush_harness_usage = |harness: &crate::vendor::VendorHarness,
+                                               recorded: &mut anyagents_harness::TurnUsage|
+                     -> Result<(), Error> {
+                        let served = anyagents_harness::Harness::last_usage(harness);
+                        let diff = served.difference(recorded.clone());
+                        if diff.input_tokens > 0 || diff.output_tokens > 0 {
+                            store.record_usage(anyagents_core::NewUsage {
+                                agent_id: agent.id.clone(),
+                                harness: agent.harness.clone(),
+                                model: agent.model.clone(),
+                                input_tokens: i64::try_from(diff.input_tokens).unwrap_or(i64::MAX),
+                                output_tokens: i64::try_from(diff.output_tokens)
+                                    .unwrap_or(i64::MAX),
+                                cache_read_tokens: i64::try_from(diff.cache_read_tokens)
+                                    .unwrap_or(i64::MAX),
+                                cache_write_tokens: i64::try_from(diff.cache_write_tokens)
+                                    .unwrap_or(i64::MAX),
+                                reported_cost_micros: diff.reported_cost_micros,
+                                estimated_cost_micros: None,
+                                billing_mode: anyagents_core::BillingMode::Subscription,
+                                quota_state: None,
+                                day: anyagents_core::utc_day(now_ms()),
+                            })?;
+                            *recorded = served;
+                        }
+                        Ok(())
+                    };
                     while store.has_actionable_undelivered(&agent.id).unwrap_or(false) {
                         let Ok(Some(message)) = store.next_undelivered(&agent.id) else {
                             break;
@@ -552,7 +552,7 @@ fn spawn_admin_sylphx_delivery(
                         };
                         match anyagents_harness::Harness::deliver(&mut harness, &outbound) {
                             Ok(anyagents_harness::DeliverOutcome::Accepted { turn_finished }) => {
-                                let _ = store.note_delivered(&agent.id, message.seq);
+                                store.note_delivered(&agent.id, message.seq)?;
                                 if !turn_finished {
                                     while anyagents_harness::Harness::health(&harness).turn_state
                                         == anyagents_harness::TurnState::InTurn
@@ -574,14 +574,13 @@ fn spawn_admin_sylphx_delivery(
                                             )
                                             .is_ok()
                                             {
-                                                let _ =
-                                                    store.note_delivered(&agent.id, steered.seq);
+                                                store.note_delivered(&agent.id, steered.seq)?;
                                             }
                                         }
                                         std::thread::sleep(std::time::Duration::from_millis(100));
                                     }
                                 }
-                                flush_harness_usage(&harness, &mut recorded_usage);
+                                flush_harness_usage(&harness, &mut recorded_usage)?;
                                 let turn_err = anyagents_harness::Harness::health(&harness)
                                     .sign_in_fault
                                     .or_else(|| {
@@ -606,13 +605,13 @@ fn spawn_admin_sylphx_delivery(
                                     }
                                     break;
                                 }
-                                let _ = store.note_turn_completed(&agent.id);
+                                store.note_turn_completed(&agent.id)?;
                                 completed_any = true;
                                 crate::vendor::persist_last_error(&cfg, None, None);
                             }
                             Ok(_) => {
-                                flush_harness_usage(&harness, &mut recorded_usage);
-                                let _ = store.note_turn_completed(&agent.id);
+                                flush_harness_usage(&harness, &mut recorded_usage)?;
+                                store.note_turn_completed(&agent.id)?;
                                 break;
                             }
                             Err(err) => {
@@ -639,7 +638,7 @@ fn spawn_admin_sylphx_delivery(
                         let outbound = anyagents_supervisor::recovery_outbound(&open);
                         match anyagents_harness::Harness::deliver(&mut harness, &outbound) {
                             Ok(anyagents_harness::DeliverOutcome::Accepted { turn_finished }) => {
-                                let _ = store.note_turn_recovered(&agent.id, open.opened_seq);
+                                store.note_turn_recovered(&agent.id, open.opened_seq)?;
                                 if !turn_finished {
                                     while anyagents_harness::Harness::health(&harness).turn_state
                                         == anyagents_harness::TurnState::InTurn
@@ -661,14 +660,13 @@ fn spawn_admin_sylphx_delivery(
                                             )
                                             .is_ok()
                                             {
-                                                let _ =
-                                                    store.note_delivered(&agent.id, steered.seq);
+                                                store.note_delivered(&agent.id, steered.seq)?;
                                             }
                                         }
                                         std::thread::sleep(std::time::Duration::from_millis(100));
                                     }
                                 }
-                                flush_harness_usage(&harness, &mut recorded_usage);
+                                flush_harness_usage(&harness, &mut recorded_usage)?;
                                 let turn_err = anyagents_harness::Harness::health(&harness)
                                     .sign_in_fault
                                     .or_else(|| {
@@ -692,13 +690,13 @@ fn spawn_admin_sylphx_delivery(
                                         );
                                     }
                                 } else {
-                                    let _ = store.note_turn_completed(&agent.id);
+                                    store.note_turn_completed(&agent.id)?;
                                     completed_any = true;
                                     crate::vendor::persist_last_error(&cfg, None, None);
                                 }
                             }
                             Ok(_) => {
-                                flush_harness_usage(&harness, &mut recorded_usage);
+                                flush_harness_usage(&harness, &mut recorded_usage)?;
                             }
                             Err(err) => {
                                 had_err = true;
@@ -716,7 +714,7 @@ fn spawn_admin_sylphx_delivery(
                             }
                         }
                     }
-                    flush_harness_usage(&harness, &mut recorded_usage);
+                    flush_harness_usage(&harness, &mut recorded_usage)?;
                     if completed_any && !had_err {
                         let _ = store.complete_idle_agent(&agent.id);
                     }
@@ -726,6 +724,12 @@ fn spawn_admin_sylphx_delivery(
                     create::maybe_notify_parent_on_error(&store, &agent, &cfg, &reason);
                 }
             }
+            Ok(())
+        })();
+        if let Err(error) = delivery_result {
+            let message = format!("durable delivery transition failed: {error}");
+            eprintln!("{message}");
+            crate::vendor::persist_last_error(&cfg, Some(&message), None);
         }
         let persisted_err = crate::vendor::read_persisted_last_error(&cfg).and_then(|(e, _)| e);
         let (still_running, has_pending_work) = Store::open(data.join("state.db"))
@@ -1300,9 +1304,6 @@ fn reconcile_agent_snapshot(
                     };
                     if ready_to_spawn {
                         guard.watermark_seq.insert(agent.id.to_string(), max_seq);
-                        guard
-                            .last_backoff_reset_ms
-                            .insert(agent.id.to_string(), now_ms);
                         guard.flushing_sylphx.insert(agent.id.to_string());
                         spawn_admin_sylphx_delivery(
                             data.to_path_buf(),
@@ -1329,21 +1330,28 @@ fn reconcile_agent_snapshot(
                         .copied()
                         .unwrap_or(0);
                     if now_ms.saturating_sub(last_reset) >= 60_000 {
-                        guard
-                            .last_backoff_reset_ms
-                            .insert(agent.id.to_string(), now_ms);
                         let work_dir = agent
                             .workdir
                             .as_deref()
                             .map(PathBuf::from)
                             .unwrap_or_else(|| anyagents_core::agent_work_dir(data, &agent.id));
-                        let _ = create::reconcile_agent_runtime_config(
+                        let reconciled = create::reconcile_agent_runtime_config(
                             store, data, agent, &cfg, &work_dir,
-                        );
-                        let _ = std::fs::write(
-                            cfg.join(".anyagents-profile-rotated-ms"),
-                            now_ms.to_string(),
-                        );
+                        )
+                        .and_then(|()| {
+                            std::fs::write(
+                                cfg.join(".anyagents-profile-rotated-ms"),
+                                now_ms.to_string(),
+                            )
+                            .map_err(Error::from)
+                        });
+                        if let Err(error) = reconciled {
+                            eprintln!("runtime reconciliation failed for {}: {error}", agent.id);
+                            continue;
+                        }
+                        guard
+                            .last_backoff_reset_ms
+                            .insert(agent.id.to_string(), now_ms);
                         create::poke_agent_wake_socket(data, &agent.id);
                         create::poke_agent_wake_socket_mail(data, &agent.id);
                         continue;
@@ -2042,7 +2050,7 @@ async fn transfer_agent_route(
         if let Some(ref np) = new_parent {
             env_pairs.push(("ANYAGENTS_PARENT_NAME".to_string(), np.name.clone()));
         }
-        let _ = state.store.set_agent_launch_env(&updated.id, &env_pairs);
+        state.store.set_agent_launch_env(&updated.id, &env_pairs).map_err(ApiError::from_store)?;
 
         let config = anyagents_core::agent_config_dir(state.store.data_dir(), &updated.id);
         let work_dir = updated
@@ -2057,13 +2065,13 @@ async fn transfer_agent_route(
                     .join(updated.id.as_str())
                     .join("work")
             });
-        let _ = create::reconcile_agent_runtime_config(
+        create::reconcile_agent_runtime_config(
             &state.store,
             state.store.data_dir(),
             &updated,
             &config,
             &work_dir,
-        );
+        ).map_err(ApiError::from_store)?;
 
         let reason_suffix = body
             .reason
@@ -2081,7 +2089,7 @@ async fn transfer_agent_route(
             );
             let mut incoming = Incoming::new(notice);
             incoming.sender = Some(format!("agent:{actor}"));
-            let _ = state.store.receive(&updated.id, incoming);
+            state.store.receive(&updated.id, incoming).map_err(ApiError::from_store)?;
         }
 
         let mut view =
@@ -2574,13 +2582,8 @@ async fn rename_agent_route(
             .as_deref()
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| anyagents_core::agent_work_dir(data_dir, &updated.id));
-        let _ = create::reconcile_agent_runtime_config(
-            &state.store,
-            data_dir,
-            &updated,
-            &cfg,
-            &work_dir,
-        );
+        create::reconcile_agent_runtime_config(&state.store, data_dir, &updated, &cfg, &work_dir)
+            .map_err(ApiError::from_store)?;
         crate::telegram::sync_agent_telegram_bot_name(&state.store, data_dir, &updated);
         Ok(Json(agent_view(&state.store, &state.health, &updated)?))
     })
@@ -2623,13 +2626,8 @@ async fn role_agent_route(
             .as_deref()
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| anyagents_core::agent_work_dir(data_dir, &updated.id));
-        let _ = create::reconcile_agent_runtime_config(
-            &state.store,
-            data_dir,
-            &updated,
-            &cfg,
-            &work_dir,
-        );
+        create::reconcile_agent_runtime_config(&state.store, data_dir, &updated, &cfg, &work_dir)
+            .map_err(ApiError::from_store)?;
         crate::telegram::sync_agent_telegram_bot_name(&state.store, data_dir, &updated);
         Ok(Json(agent_view(&state.store, &state.health, &updated)?))
     })
@@ -3197,7 +3195,12 @@ async fn add_channel_route(
             .agent_by_name(target_clean)
             .map_err(ApiError::from_store)?;
         let caller_agent = match &principal {
-            Principal::Agent { agent_id, .. } => state.store.agent(agent_id).ok(),
+            Principal::Agent { agent_id, .. } => Some(
+                state
+                    .store
+                    .agent(agent_id)
+                    .map_err(|_| ApiError::forbidden("authenticated agent no longer exists"))?,
+            ),
             Principal::Operator => None,
         };
         let authorized_by_lineage = match &principal {
@@ -3465,7 +3468,12 @@ fn list_agents_sync_for_principal(
 ) -> Result<Json<AgentsResponse>, ApiError> {
     let caller_agent = match principal {
         Principal::Operator => None,
-        Principal::Agent { agent_id, .. } => state.store.agent(agent_id).ok(),
+        Principal::Agent { agent_id, .. } => Some(
+            state
+                .store
+                .agent(agent_id)
+                .map_err(|_| ApiError::forbidden("authenticated agent no longer exists"))?,
+        ),
     };
     let mut agents = Vec::new();
     for agent in state.store.list_agents().map_err(ApiError::from_store)? {
@@ -3883,12 +3891,10 @@ async fn create_agent_route(
                 )
                 .map_err(ApiError::from_store)?;
             if let Some((ref caller_id, _)) = caller_agent {
-                let _ = state.store.record_outbound(
-                    caller_id,
-                    &format!("agent:{}", agent.name),
-                    None,
-                    prompt,
-                );
+                state
+                    .store
+                    .record_outbound(caller_id, &format!("agent:{}", agent.name), None, prompt)
+                    .map_err(ApiError::from_store)?;
             }
         }
         if has_prompt {
@@ -4401,7 +4407,10 @@ async fn delete_agent_route(
         ) {
             require_admin_or_operator(&state.store, &principal, "agents.delete", &found.name)?;
         }
-        let _ = state.store.set_agent_state(&found.id, "archived");
+        state
+            .store
+            .set_agent_state(&found.id, "archived")
+            .map_err(ApiError::from_store)?;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while std::time::Instant::now() < deadline {
             if state
@@ -5337,7 +5346,9 @@ fn interact_sync(
                     let mut incoming = Incoming::new(summary.clone());
                     incoming.sender = Some(format!("agent:{actor_name}"));
                     incoming.reply_to = msg.reply_to.clone();
-                    let _ = store.receive(&peer.id, incoming);
+                    store
+                        .receive(&peer.id, incoming)
+                        .map_err(ApiError::from_store)?;
                 }
                 Ok(Json(InteractResponse {
                     ok: true,
@@ -5411,7 +5422,9 @@ fn interact_sync(
                     let mut incoming = Incoming::new(ballot.clone());
                     incoming.sender = Some(format!("agent:{actor_name}"));
                     incoming.reply_to = msg.reply_to.clone();
-                    let _ = store.receive(&peer.id, incoming);
+                    store
+                        .receive(&peer.id, incoming)
+                        .map_err(ApiError::from_store)?;
                 }
                 Ok(Json(InteractResponse {
                     ok: true,
@@ -5437,9 +5450,10 @@ fn interact_sync(
             if let Some(ref msg) = stored_msg {
                 let updated = toggle_checklist_items(&msg.text, &body.options, mark_done);
                 if let Some((chat_id, message_id, thread_id)) = tg_coords {
-                    let _ = crate::telegram::edit_message(
+                    crate::telegram::edit_message(
                         store, data_dir, actor_name, chat_id, message_id, &updated, thread_id,
-                    );
+                    )
+                    .map_err(ApiError::from_store)?;
                 }
                 Ok(Json(InteractResponse {
                     ok: true,
@@ -5607,7 +5621,17 @@ fn plan_send(
     actor: &Actor,
     body: &SendRequest,
 ) -> Result<SendPlan, ApiError> {
+    let principal_id = match principal {
+        Principal::Agent { agent_id, .. } => {
+            store
+                .agent(agent_id)
+                .map_err(|_| ApiError::forbidden("authenticated agent no longer exists"))?;
+            Some(agent_id.clone())
+        }
+        Principal::Operator => None,
+    };
     let mut plan = SendPlan::parse(store, actor, body)?;
+    plan.principal_id = principal_id;
     let has_telegram_target = plan
         .targets
         .iter()
@@ -5716,6 +5740,9 @@ struct SendPlan {
     targets: Vec<Target>,
     /// The provider message id a reply answers, when the reply named one.
     reply: Option<String>,
+    /// Immutable identity admitted at planning; a reused display name is not authority.
+    sender_id: Option<anyagents_core::AgentId>,
+    principal_id: Option<anyagents_core::AgentId>,
 }
 
 enum Target {
@@ -5913,6 +5940,16 @@ impl SendPlan {
         Ok(Self {
             targets,
             reply: None,
+            sender_id: match actor {
+                Actor::Agent(name) => Some(
+                    store
+                        .agent_by_name(name)
+                        .map_err(|_| ApiError::forbidden("sender agent no longer exists"))?
+                        .id,
+                ),
+                Actor::Operator(_) => None,
+            },
+            principal_id: None,
         })
     }
 }
@@ -5950,9 +5987,9 @@ fn can_actor_message_agent(
     let Actor::Agent(sender_name) = actor else {
         return Ok(());
     };
-    let Ok(sender) = store.agent_by_name(sender_name) else {
-        return Ok(());
-    };
+    let sender = store
+        .agent_by_name(sender_name)
+        .map_err(|_| ApiError::forbidden("sender agent no longer exists"))?;
     if sender.id == recipient.id
         || recipient.parent_id.as_ref() == Some(&sender.id)
         || sender.parent_id.as_ref() == Some(&recipient.id)
@@ -6015,6 +6052,11 @@ fn check_targets(
     body: &SendRequest,
     plan: &SendPlan,
 ) -> Result<(), ApiError> {
+    if let Actor::Agent(name) = actor {
+        store
+            .agent_by_name(name)
+            .map_err(|_| ApiError::forbidden("sender agent no longer exists"))?;
+    }
     for target in &plan.targets {
         match target {
             Target::Agent(name) => {
@@ -6025,9 +6067,10 @@ fn check_targets(
             // instead of silently delivering nothing.
             Target::Room(room) => {
                 let clean_room = room.strip_prefix("group:").unwrap_or(room);
-                if let Actor::Agent(sender_name) = actor
-                    && let Ok(sender) = store.agent_by_name(sender_name)
-                {
+                if let Actor::Agent(sender_name) = actor {
+                    let sender = store
+                        .agent_by_name(sender_name)
+                        .map_err(|_| ApiError::forbidden("sender agent no longer exists"))?;
                     if clean_room != "all"
                         && clean_room != "peers"
                         && !clean_room.starts_with("telegram:")
@@ -6094,6 +6137,26 @@ fn send_sync(
     plan: SendPlan,
     key: Option<String>,
 ) -> Result<Json<SendResponse>, ApiError> {
+    // Reauthorize the immutable identities before replay, target checks or effects.
+    if let Some(id) = &plan.principal_id {
+        store
+            .agent(id)
+            .map_err(|_| ApiError::forbidden("authenticated agent no longer exists"))?;
+    }
+    let resolved_actor = match &plan.sender_id {
+        Some(id) => Actor::Agent(
+            store
+                .agent(id)
+                .map_err(|_| ApiError::forbidden("sender agent no longer exists"))?
+                .name,
+        ),
+        None => actor.clone(),
+    };
+    let actor = &resolved_actor;
+    let body = SendRequest {
+        sender: Some(actor.as_address()),
+        ..body
+    };
     // A call repeated after its answer was lost is the same delivery: the
     // receipt it already produced comes back unchanged.
     if let Some(key) = key.as_deref()
@@ -6119,7 +6182,7 @@ fn send_sync(
     };
     check_targets(store, actor, &body, &plan)?;
     let sender_agent_id = match actor {
-        Actor::Agent(name) => store.agent_by_name(name).ok().map(|a| a.id),
+        Actor::Agent(name) => Some(store.agent_by_name(name).map_err(ApiError::from_store)?.id),
         Actor::Operator(_) => None,
     };
     let composed_body = anyagents_core::quote::compose(&body.text, body.quote.as_ref());
@@ -6141,8 +6204,9 @@ fn send_sync(
                 if let Some(ref sid) = sender_agent_id
                     && !d.duplicate
                 {
-                    let _ =
-                        store.record_outbound(sid, &d.to, body.reply_to.as_deref(), &composed_body);
+                    store
+                        .record_outbound(sid, &d.to, body.reply_to.as_deref(), &composed_body)
+                        .map_err(ApiError::from_store)?;
                 }
                 deliveries.push(d);
             }
@@ -6157,8 +6221,9 @@ fn send_sync(
                     } else {
                         format!("group:{room}")
                     };
-                    let _ =
-                        store.record_outbound(sid, &dest, body.reply_to.as_deref(), &composed_body);
+                    store
+                        .record_outbound(sid, &dest, body.reply_to.as_deref(), &composed_body)
+                        .map_err(ApiError::from_store)?;
                 }
                 deliveries.append(&mut all);
                 for s in room_skip.drain(..) {
@@ -6186,8 +6251,9 @@ fn send_sync(
                     address_reply.as_deref().or(reply.as_deref()),
                 )?;
                 if let Some(ref sid) = sender_agent_id {
-                    let _ =
-                        store.record_outbound(sid, &d.to, body.reply_to.as_deref(), &composed_body);
+                    store
+                        .record_outbound(sid, &d.to, body.reply_to.as_deref(), &composed_body)
+                        .map_err(ApiError::from_store)?;
                 }
                 deliveries.push(d);
             }
@@ -6762,6 +6828,97 @@ pub(crate) mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::sync::MutexGuard;
+
+    #[test]
+    fn deleted_authenticated_agent_cannot_read_roster_or_send() {
+        let dir = crate::test_tempdir();
+        let state = archetype_validation_state(dir.path());
+        let root = state
+            .store
+            .create_agent(anyagents_core::NewAgent::new("private-root", "opencode"))
+            .unwrap();
+        state
+            .store
+            .set_agent_instructions(&root.id, Some("private instruction sentinel"))
+            .unwrap();
+        let mut new_child = anyagents_core::NewAgent::new("deleted-caller", "opencode");
+        new_child.parent_id = Some(root.id.clone());
+        let child = state.store.create_agent(new_child).unwrap();
+        let principal = Principal::Agent {
+            agent_id: child.id.clone(),
+            name: child.name.clone(),
+        };
+        let actor = Actor::Agent(child.name.clone());
+        let body = SendRequest {
+            to: vec![root.name.clone()],
+            text: "must not arrive".into(),
+            ..Default::default()
+        };
+        let plan = plan_send(&state.store, &principal, &actor, &body)
+            .unwrap_or_else(|e| panic!("{}", e.message));
+        // Positive controls use the same authenticated handler and plan path.
+        let visible = list_agents_sync_for_principal(&state, &principal)
+            .unwrap_or_else(|e| panic!("{}", e.message));
+        assert!(
+            visible
+                .0
+                .agents
+                .iter()
+                .all(|a| a.name != root.name || a.instructions.is_none())
+        );
+        assert!(can_actor_message_agent(&state.store, &actor, &root).is_ok());
+        state.store.delete_agent(&child.id).unwrap();
+        let denied = list_agents_sync_for_principal(&state, &principal)
+            .err()
+            .expect("deleted caller must not receive any roster");
+        assert_eq!(denied.status, StatusCode::FORBIDDEN);
+        let denied = send_sync(&state.store, &actor, body.clone(), plan, None)
+            .err()
+            .expect("deleted principal must not deliver");
+        assert_eq!(denied.status, StatusCode::FORBIDDEN);
+        assert!(state.store.inbox(&root.id, None).unwrap().is_empty());
+        assert!(plan_send(&state.store, &principal, &actor, &body).is_err());
+        // Reusing the mutable display name does not restore the old principal.
+        state
+            .store
+            .create_agent(anyagents_core::NewAgent::new(&child.name, "opencode"))
+            .unwrap();
+        let denied = plan_send(&state.store, &principal, &actor, &body)
+            .err()
+            .expect("name reuse must not authorize old credentials");
+        assert_eq!(denied.status, StatusCode::FORBIDDEN);
+        let operator = list_agents_sync_for_principal(&state, &Principal::Operator)
+            .unwrap_or_else(|e| panic!("{}", e.message));
+        assert!(operator.0.agents.iter().any(|a| a.name == root.name
+            && a.instructions.as_deref() == Some("private instruction sentinel")));
+    }
+
+    #[test]
+    fn missing_sender_cannot_bypass_private_room_checks() {
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let sender = store
+            .create_agent(anyagents_core::NewAgent::new("sender", "opencode"))
+            .unwrap();
+        let recipient = store
+            .create_agent(anyagents_core::NewAgent::new("recipient", "opencode"))
+            .unwrap();
+        store.join_group("private-room", &recipient.id).unwrap();
+        let actor = Actor::Agent(sender.name.clone());
+        let body = SendRequest {
+            to: vec!["group:private-room".into()],
+            text: "blocked".into(),
+            ..Default::default()
+        };
+        let plan =
+            SendPlan::parse(&store, &actor, &body).unwrap_or_else(|e| panic!("{}", e.message));
+        store.delete_agent(&sender.id).unwrap();
+        let denied = check_targets(&store, &actor, &body, &plan)
+            .err()
+            .expect("missing actor must not pass room authorization");
+        assert_eq!(denied.status, StatusCode::FORBIDDEN);
+        assert!(store.inbox(&recipient.id, None).unwrap().is_empty());
+    }
 
     #[test]
     fn reset_session_requires_management_authority_and_quiescence_before_any_pin_change() {
