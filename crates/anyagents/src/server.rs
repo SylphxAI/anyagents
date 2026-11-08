@@ -267,24 +267,8 @@ async fn serve(
                 .await;
             }
         });
-        let sched_store = Arc::clone(&store);
-        let sched_health = state.health.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
-            loop {
-                interval.tick().await;
-                let st = Arc::clone(&sched_store);
-                let hb = sched_health.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    let dd = st.data_dir();
-                    if dd.join("admin.sock").exists() || dd.join("admin.lock").exists() {
-                        return;
-                    }
-                    crate::schedule::tick_schedules_once(&st, &hb, now_ms());
-                })
-                .await;
-            }
-        });
+        // The primary serves scheduling only when no administrative scheduler owns it.
+        start_schedule_loops(Arc::clone(&store), state.health.clone(), true);
     }
     if let Some(addr) = webhook_listen_addr() {
         match tokio::net::TcpListener::bind(&addr).await {
@@ -1434,6 +1418,61 @@ fn acquire_admin_lock(data: &Path) -> Result<std::fs::File, Error> {
     Ok(file)
 }
 
+/// Both intervals tick immediately at startup. Each loop owns its blocking
+/// pass, so an in-flight external request cannot hold the next local tick.
+fn start_schedule_loops(
+    store: Arc<Store>,
+    health: HealthBoard,
+    defer_to_admin: bool,
+) -> (tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>) {
+    let local = spawn_schedule_loop(
+        Arc::clone(&store),
+        health.clone(),
+        defer_to_admin,
+        std::time::Duration::from_secs(1),
+        crate::schedule::tick_local_schedules_once,
+    );
+    let external = spawn_schedule_loop(
+        store,
+        health,
+        defer_to_admin,
+        std::time::Duration::from_secs(3),
+        crate::schedule::tick_external_watches_once,
+    );
+    (local, external)
+}
+
+fn spawn_schedule_loop(
+    store: Arc<Store>,
+    health: HealthBoard,
+    defer_to_admin: bool,
+    period: std::time::Duration,
+    tick: fn(&Store, &HealthBoard, i64) -> usize,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(period);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let st = Arc::clone(&store);
+            let hb = health.clone();
+            if let Err(err) = tokio::task::spawn_blocking(move || {
+                let data = st.data_dir();
+                if defer_to_admin
+                    && (data.join("admin.sock").exists() || data.join("admin.lock").exists())
+                {
+                    return 0;
+                }
+                tick(&st, &hb, now_ms())
+            })
+            .await
+            {
+                eprintln!("Schedule pass failed: {err}");
+            }
+        }
+    })
+}
+
 pub fn run_admin(data: &Path) -> Result<(), Error> {
     let identity = Arc::new(ServingIdentity::capture());
     let _admin_lock = acquire_admin_lock(data)?;
@@ -1490,21 +1529,8 @@ pub fn run_admin(data: &Path) -> Result<(), Error> {
                 .await;
             }
         });
-        let sched_store = Arc::clone(&store);
-        let sched_health = health.clone();
-        let sched_handle = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3));
-            loop {
-                interval.tick().await;
-                let st = Arc::clone(&sched_store);
-                let hb = sched_health.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    let now = now_ms();
-                    crate::schedule::tick_schedules_once(&st, &hb, now);
-                })
-                .await;
-            }
-        });
+        let (local_sched_handle, external_sched_handle) =
+            start_schedule_loops(Arc::clone(&store), health.clone(), false);
         let reaper_handle = if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none()
             && !crate::sandbox::is_isolated_test_env()
         {
@@ -1608,7 +1634,8 @@ pub fn run_admin(data: &Path) -> Result<(), Error> {
             })
             .await;
         reconcile_handle.abort();
-        sched_handle.abort();
+        local_sched_handle.abort();
+        external_sched_handle.abort();
         if let Some(h) = reaper_handle {
             h.abort();
         }
@@ -7821,10 +7848,219 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn local_scheduler_keeps_ticking_while_external_probe_is_blocked() {
+        use anyagents_core::{NewAgent, NewSchedule};
+        use std::time::{Duration, Instant};
+        if single_test_worker("local_scheduler_keeps_ticking_while_external_probe_is_blocked") {
+            return;
+        }
+        let _env = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        let external = store
+            .create_agent(NewAgent::new("external", "codex"))
+            .unwrap();
+        let watch = store
+            .create_schedule(NewSchedule {
+                agent_id: external.id.clone(),
+                kind: "watch".into(),
+                spec: "github:pr:example-org/project#1".into(),
+                prompt: "external".into(),
+                interval_ms: None,
+                next_fire_at_ms: None,
+                watch_baseline: Some("pending".into()),
+            })
+            .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let previous = std::env::var_os("ANYAGENTS_GITHUB_API_BASE");
+        struct RestoreApi(Option<std::ffi::OsString>);
+        impl Drop for RestoreApi {
+            fn drop(&mut self) {
+                // SAFETY: the server fixture and its external worker have stopped.
+                unsafe {
+                    if let Some(value) = &self.0 {
+                        std::env::set_var("ANYAGENTS_GITHUB_API_BASE", value);
+                    } else {
+                        std::env::remove_var("ANYAGENTS_GITHUB_API_BASE");
+                    }
+                }
+            }
+        }
+        let _api = RestoreApi(previous);
+        // SAFETY: process-global API overrides are serialized by env_lock.
+        unsafe {
+            std::env::set_var("ANYAGENTS_GITHUB_API_BASE", format!("http://{address}"));
+        }
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (entered, mut received) = tokio::sync::oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let peer = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = [0; 4096];
+            assert!(stream.read(&mut request).unwrap() > 0);
+            entered.send(()).unwrap();
+            // Keep the real external HTTP request in flight across later local ticks.
+            let _ = blocked.recv_timeout(Duration::from_secs(15));
+            stream
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                )
+                .unwrap();
+        });
+        struct Release(Option<std::sync::mpsc::Sender<()>>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                let _ = self.0.take().unwrap().send(());
+            }
+        }
+        let release = Release(Some(release));
+        runtime.block_on(async {
+            let (local, network) =
+                start_schedule_loops(Arc::clone(&store), HealthBoard::default(), false);
+            let deadline = Instant::now() + Duration::from_secs(8);
+            loop {
+                match received.try_recv() {
+                    Ok(()) => break,
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+                    Err(err) => panic!("external probe did not start: {err}"),
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "external loop did not start on its first tick"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            // These schedules did not exist when the first local pass ran.
+            let target = store
+                .create_agent(NewAgent::new("idle-target", "codex"))
+                .unwrap();
+            let mut child = std::process::Command::new("/bin/sh")
+                .args(["-c", "exit 0"])
+                .spawn()
+                .unwrap();
+            let pid = child.id();
+            assert!(child.wait().unwrap().success());
+            let file = dir.path().join("completion");
+            let due = now_ms() + 100;
+            let mut owners = Vec::new();
+            for (name, kind, spec) in [
+                ("at-owner", "at", "due".into()),
+                ("every-owner", "every", "1s".into()),
+                ("file-owner", "watch", format!("file:{}", file.display())),
+                ("pid-owner", "watch", format!("pid:{pid}")),
+                ("idle-owner", "watch", format!("agent:idle:{}", target.name)),
+            ] {
+                let owner = store.create_agent(NewAgent::new(name, "codex")).unwrap();
+                store
+                    .create_schedule(NewSchedule {
+                        agent_id: owner.id.clone(),
+                        kind: kind.into(),
+                        spec,
+                        prompt: name.into(),
+                        interval_ms: (kind == "every").then_some(1000),
+                        next_fire_at_ms: (kind != "watch").then_some(due),
+                        watch_baseline: (name == "file-owner").then(|| "missing".into()),
+                    })
+                    .unwrap();
+                owners.push(owner.id);
+            }
+            std::fs::write(file, "complete").unwrap();
+            let future = store
+                .create_agent(NewAgent::new("future-owner", "codex"))
+                .unwrap();
+            store
+                .create_schedule(NewSchedule {
+                    agent_id: future.id.clone(),
+                    kind: "at".into(),
+                    spec: "future".into(),
+                    prompt: "not due".into(),
+                    interval_ms: None,
+                    next_fire_at_ms: Some(due + 60_000),
+                    watch_baseline: None,
+                })
+                .unwrap();
+            loop {
+                if owners
+                    .iter()
+                    .all(|id| store.inbox(id, None).unwrap().len() == 1)
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "local schedules waited for external probe"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(store.inbox(&future.id, None).unwrap().is_empty());
+            assert!(store.inbox(&external.id, None).unwrap().is_empty());
+            let active = store.list_schedules(Some(&external.id), true).unwrap();
+            assert_eq!(active[0].id, watch.id);
+            assert_eq!(active[0].last_observed, None);
+            // All five admissions are proven before releasing the external response.
+            local.abort();
+            network.abort();
+        });
+        drop(release);
+        peer.join().unwrap();
+        runtime.shutdown_timeout(Duration::from_secs(5));
+    }
+
+    struct SingleUidEnvironment(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl SingleUidEnvironment {
+        /// Call only while env_lock is held, before starting the fixture server.
+        fn new() -> Self {
+            let keys = [
+                "ANYAGENTS_PRINCIPALS",
+                "ANYAGENTS_PRINCIPAL_REGISTRY",
+                "ANYAGENTS_AGENTS",
+                "ANYAGENTS_AGENT_UID",
+                "ANYAGENTS_AGENT_GID",
+                "ANYAGENTS_SOCKET_GID",
+            ];
+            let saved = keys
+                .iter()
+                .map(|key| (*key, std::env::var_os(key)))
+                .collect();
+            for key in keys {
+                // SAFETY: these server fixtures hold env_lock through shutdown.
+                unsafe { std::env::remove_var(key) };
+            }
+            assert!(!crate::sandbox::seats_configured());
+            assert!(crate::sandbox::launch_boundary(&[]));
+            Self(saved)
+        }
+    }
+
+    impl Drop for SingleUidEnvironment {
+        fn drop(&mut self) {
+            for (key, value) in &self.0 {
+                // SAFETY: the fixture server has stopped and env_lock is held.
+                unsafe {
+                    if let Some(value) = value {
+                        std::env::set_var(key, value);
+                    } else {
+                        std::env::remove_var(key);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn readiness_answers_while_the_once_only_image_hash_is_blocked() {
+        if single_test_worker("readiness_answers_while_the_once_only_image_hash_is_blocked") {
+            return;
+        }
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::time::{Duration, Instant};
         let _env = env_lock();
+        let _single_uid = SingleUidEnvironment::new();
         let data = tempfile::tempdir().unwrap();
         let token = data.path().join("operator-token");
         std::fs::write(&token, "an-operator-token-0123456789abcdef\n").unwrap();
@@ -7832,12 +8068,6 @@ pub(crate) mod tests {
             (
                 "ANYAGENTS_OPERATOR_TOKEN_FILE",
                 token.to_string_lossy().into_owned(),
-            ),
-            ("ANYAGENTS_AGENT_UID", unsafe { libc::getuid() }.to_string()),
-            ("ANYAGENTS_AGENT_GID", unsafe { libc::getgid() }.to_string()),
-            (
-                "ANYAGENTS_SOCKET_GID",
-                unsafe { libc::getgid() }.to_string(),
             ),
             ("ANYAGENTS_FAKE_MODE", "1".into()),
         ];
@@ -7954,7 +8184,11 @@ pub(crate) mod tests {
 
     #[test]
     fn a_sign_in_streams_the_link_before_the_outcome() {
+        if single_test_worker("a_sign_in_streams_the_link_before_the_outcome") {
+            return;
+        }
         let _env = env_lock();
+        let _single_uid = SingleUidEnvironment::new();
         let data = tempfile::tempdir().unwrap();
         let socket = socket_path(data.path());
         let dir = Arc::new(Mutex::new(None));
@@ -7969,8 +8203,7 @@ pub(crate) mod tests {
         // them, and sets them for its own duration only.
         unsafe {
             std::env::set_var("ANYAGENTS_OPERATOR_TOKEN_FILE", &token_file);
-            // One OS seat is all this host has: this process's own, kept out of
-            // root by the launcher check.
+            // Authentication is independent of optional multi-UID seats.
             std::env::set_var("ANYAGENTS_FAKE_MODE", "1");
         }
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
@@ -8040,7 +8273,11 @@ pub(crate) mod tests {
     /// command runs.
     #[test]
     fn an_agent_capability_cannot_sign_a_harness_in() {
+        if single_test_worker("an_agent_capability_cannot_sign_a_harness_in") {
+            return;
+        }
         let _env = env_lock();
+        let _single_uid = SingleUidEnvironment::new();
         let data = tempfile::tempdir().unwrap();
         let socket = socket_path(data.path());
         let dir = Arc::new(Mutex::new(None));

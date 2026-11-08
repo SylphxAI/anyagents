@@ -649,34 +649,55 @@ pub fn is_agent_busy(store: &Store, health: &HealthBoard, agent: &Agent, now: i6
     false
 }
 
-/// Evaluate all active schedules once at timestamp `now`.
-/// Returns the number of wakes delivered.
-pub fn tick_schedules_once(store: &Store, health: &HealthBoard, now: i64) -> usize {
+/// Evaluate local timers and watches without issuing any external probe.
+/// This is called on its own one-second loop, including the startup tick.
+pub fn tick_local_schedules_once(store: &Store, health: &HealthBoard, now: i64) -> usize {
     if let Err(err) = store.restore_skipped_at_schedules(now.saturating_sub(3_600_000)) {
         eprintln!("Schedule recovery unavailable: {err}");
         return 0;
     }
-    let schedules = match store.list_schedules(None, true) {
-        Ok(schedules) => schedules,
+    tick_schedule_partition(store, health, now, false)
+}
+
+/// Evaluate network-backed watches on a separate loop. Slow external services
+/// cannot delay a later local tick or consume a timer's due transition.
+pub fn tick_external_watches_once(store: &Store, health: &HealthBoard, now: i64) -> usize {
+    tick_schedule_partition(store, health, now, true)
+}
+
+fn is_external_watch(sched: &AgentSchedule) -> bool {
+    sched.kind == "watch"
+        && matches!(
+            parse_watch_spec(&sched.spec),
+            Ok(WatchTarget::GitHubPr { .. }
+                | WatchTarget::GitHubCheck { .. }
+                | WatchTarget::SpironPromise { .. })
+        )
+}
+
+// Retain the complete single-pass fixture for existing cross-class contracts;
+// production never serializes the two partitions through this helper.
+#[cfg(test)]
+fn tick_schedules_once(store: &Store, health: &HealthBoard, now: i64) -> usize {
+    tick_local_schedules_once(store, health, now) + tick_external_watches_once(store, health, now)
+}
+
+fn tick_schedule_partition(store: &Store, health: &HealthBoard, now: i64, external: bool) -> usize {
+    let schedules: Vec<_> = match store.list_schedules(None, true) {
+        Ok(schedules) => schedules
+            .into_iter()
+            .filter(|sched| is_external_watch(sched) == external)
+            .collect(),
         Err(err) => {
             eprintln!("Schedule census unavailable: {err}");
             return 0;
         }
     };
-    github::begin_cycle(&schedules, now);
-    // Local observations must be admitted before any external probe can block
-    // on a subprocess or network timeout. Preserve order inside each phase.
-    let (external, local): (Vec<_>, Vec<_>) = schedules.into_iter().partition(|sched| {
-        sched.kind == "watch"
-            && matches!(
-                parse_watch_spec(&sched.spec),
-                Ok(WatchTarget::GitHubPr { .. }
-                    | WatchTarget::GitHubCheck { .. }
-                    | WatchTarget::SpironPromise { .. })
-            )
-    });
+    if external {
+        github::begin_cycle(&schedules, now);
+    }
     let mut fired_count = 0;
-    for sched in local.into_iter().chain(external) {
+    for sched in schedules {
         if (sched.kind == "at" || sched.kind == "every")
             && sched.next_fire_at_ms.is_none_or(|due| now < due)
         {
@@ -710,9 +731,19 @@ pub fn tick_schedules_once(store: &Store, health: &HealthBoard, now: i64) -> usi
                 if now < due {
                     continue;
                 }
-                if block.is_some() {
-                    // Defer one-shot timer wakes while the owning agent is busy, paused, or
-                    // quota-blocked so the wake is delivered as soon as the agent becomes idle.
+                if let Some(reason) = block {
+                    // Preserve the due time and make the outstanding hold visible. A later
+                    // local tick delivers exactly once as soon as the owner is eligible.
+                    let observed = format!("deferred:{reason}");
+                    if sched.last_observed.as_deref() != Some(observed.as_str())
+                        && let Err(err) = store.update_schedule_watch_observation(
+                            &sched.id,
+                            sched.watch_baseline.as_deref(),
+                            Some(&observed),
+                        )
+                    {
+                        eprintln!("Schedule {} deferral write failed: {err}", sched.id);
+                    }
                     continue;
                 }
                 if deliver_scheduled_wake(
@@ -1452,6 +1483,116 @@ mod tests {
         assert_eq!(counts_at_external_start, vec![1; 5]);
         for owner in owners {
             assert_eq!(store.inbox(&owner, None).unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn overdue_at_delivers_on_first_local_tick_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("state.db");
+        let store = Store::open(&db).unwrap();
+        let owner = store
+            .create_agent(NewAgent::new("restart-owner", "codex"))
+            .unwrap();
+        let now = anyagents_core::now_ms();
+        let sched = store
+            .create_schedule(NewSchedule {
+                agent_id: owner.id.clone(),
+                kind: "at".into(),
+                spec: "past".into(),
+                prompt: "restart wake".into(),
+                interval_ms: None,
+                next_fire_at_ms: Some(now - 86_400_000),
+                watch_baseline: None,
+            })
+            .unwrap();
+        drop(store);
+        let restarted = Store::open(&db).unwrap();
+        let health = HealthBoard::default();
+        assert_eq!(tick_local_schedules_once(&restarted, &health, now), 1);
+        let inbox = restarted.inbox(&owner.id, None).unwrap();
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].text, "restart wake");
+        let saved = restarted.list_schedules(Some(&owner.id), false).unwrap();
+        assert_eq!(saved[0].id, sched.id);
+        assert_eq!(saved[0].state, "fired");
+        assert_eq!(saved[0].last_observed.as_deref(), Some("fired"));
+        assert_eq!(
+            tick_local_schedules_once(&restarted, &health, now + 1000),
+            0
+        );
+        assert_eq!(restarted.inbox(&owner.id, None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn overdue_at_records_busy_and_paused_deferrals_until_fired() {
+        for reason in ["busy", "paused"] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("state.db");
+            let store = Store::open(&db).unwrap();
+            let owner = store
+                .create_agent(NewAgent::new("deferred-owner", "codex"))
+                .unwrap();
+            let now = anyagents_core::now_ms();
+            let due = now - 1000;
+            store
+                .create_schedule(NewSchedule {
+                    agent_id: owner.id.clone(),
+                    kind: "at".into(),
+                    spec: "past".into(),
+                    prompt: "deferred wake".into(),
+                    interval_ms: None,
+                    next_fire_at_ms: Some(due),
+                    watch_baseline: None,
+                })
+                .unwrap();
+            let health = HealthBoard::default();
+            if reason == "paused" {
+                store.set_agent_state(&owner.id, "paused").unwrap();
+            } else {
+                health.publish(
+                    &owner.id,
+                    LiveState {
+                        process_alive: true,
+                        turn_state: TurnState::InTurn,
+                        delivery_mode: DeliveryMode::Steer,
+                        steer_support: SteerSupport::Yes,
+                        quota_reset_at_ms: None,
+                        restart_at_ms: None,
+                        pid: None,
+                        live_harness: Some("codex".into()),
+                        live_model: None,
+                        process_started_at_ms: Some(now),
+                        last_error: None,
+                    },
+                );
+            }
+            for at in [now, now + 1000] {
+                assert_eq!(tick_local_schedules_once(&store, &health, at), 0);
+                let saved = store.list_schedules(Some(&owner.id), false).unwrap();
+                assert_eq!(saved[0].state, "active");
+                assert_eq!(saved[0].next_fire_at_ms, Some(due));
+                assert_eq!(saved[0].last_fired_at_ms, None);
+                assert_eq!(saved[0].last_observed, Some(format!("deferred:{reason}")));
+                assert!(store.inbox(&owner.id, None).unwrap().is_empty());
+            }
+            // The visible reason is durable; an independent store sees it too.
+            drop(store);
+            let store = Store::open(&db).unwrap();
+            assert_eq!(
+                store.list_schedules(Some(&owner.id), false).unwrap()[0].last_observed,
+                Some(format!("deferred:{reason}"))
+            );
+            store.set_agent_running(&owner.id, "/work").unwrap();
+            let idle = HealthBoard::default();
+            assert_eq!(tick_local_schedules_once(&store, &idle, now + 2000), 1);
+            let saved = store.list_schedules(Some(&owner.id), false).unwrap();
+            assert_eq!(saved[0].state, "fired");
+            assert_eq!(saved[0].last_observed.as_deref(), Some("fired"));
+            assert_eq!(saved[0].last_fired_at_ms, Some(now + 2000));
+            assert_eq!(store.inbox(&owner.id, None).unwrap().len(), 1);
+            assert_eq!(tick_local_schedules_once(&store, &idle, now + 3000), 0);
+            assert_eq!(store.inbox(&owner.id, None).unwrap().len(), 1);
         }
     }
 

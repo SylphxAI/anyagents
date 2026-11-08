@@ -479,7 +479,14 @@ pub fn share_worktree_with_seat(
 
 fn protected_roots() -> Vec<PathBuf> {
     std::env::var_os("ANYAGENTS_PROTECTED_ROOTS")
-        .map(|raw| std::env::split_paths(&raw).collect())
+        .map(|raw| {
+            std::env::split_paths(&raw)
+                // Match the canonical target against the canonical protected
+                // tree, including macOS /var and /tmp aliases. Missing roots
+                // retain their declared path until they can be resolved.
+                .map(|root| std::fs::canonicalize(&root).unwrap_or(root))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -960,13 +967,31 @@ mod tests {
         unsafe {
             std::env::set_var(key, std::env::join_paths([&selected]).unwrap());
         }
-        assert_eq!(protected_roots(), vec![selected.clone()]);
+        assert_eq!(protected_roots(), vec![selected.canonicalize().unwrap()]);
+        let alias = dir.path().join("selected-alias");
+        std::os::unix::fs::symlink(&selected, &alias).unwrap();
+        // An explicit alias protects the same tree, not only its spelling.
+        unsafe {
+            std::env::set_var(key, std::env::join_paths([&alias]).unwrap());
+        }
+        assert_eq!(protected_roots(), vec![selected.canonicalize().unwrap()]);
         assert!(
             share_worktree_with_seat(
                 &selected,
                 server_uid(),
                 server_gid(),
                 &dir.path().join("refused.json")
+            )
+            .is_err()
+        );
+        let nested = selected.join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        assert!(
+            share_worktree_with_seat(
+                &nested,
+                server_uid(),
+                server_gid(),
+                &dir.path().join("nested-refused.json")
             )
             .is_err()
         );
