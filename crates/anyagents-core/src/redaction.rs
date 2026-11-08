@@ -327,9 +327,9 @@ fn lock_history_publication(data: &Path) -> std::io::Result<(File, File)> {
     Ok((file, dir))
 }
 
-/// Pending effects remain the sender's recovery authority. Never rewrite or
-/// replay them during erasure. Unknown ownership/content is uncertainty, not
-/// evidence that a local copy is absent. Bound inspection independently of body
+/// Pending effects and crashed writers' temporary copies remain the sender's
+/// recovery authority. Never rewrite or replay them during erasure. Unknown
+/// ownership/content is uncertainty, not evidence that a local copy is absent. Bound inspection independently of body
 /// size; oversized records conservatively refuse erasure rather than allocate.
 fn unresolved_history(data: &Path, dir: &File, target: &AgentId) -> std::io::Result<bool> {
     const LIMIT: u64 = 1024 * 1024;
@@ -338,7 +338,7 @@ fn unresolved_history(data: &Path, dir: &File, target: &AgentId) -> std::io::Res
         let entry = entry?;
         if !Path::new(&entry.file_name())
             .extension()
-            .is_some_and(|ext| ext == "pending")
+            .is_some_and(|ext| ext == "pending" || ext == "tmp")
         {
             continue;
         }

@@ -1369,23 +1369,22 @@ impl Store {
         incoming: Incoming,
     ) -> Result<Vec<(Agent, ReceiveOutcome)>, Error> {
         let sender = incoming.sender.clone();
-        // A sender may name itself `alpha` or `agent:alpha`; both are the author.
-        let author = sender
-            .as_deref()
-            .map(|value| value.strip_prefix("agent:").unwrap_or(value).to_string());
-        let author_id = author
-            .as_deref()
-            .and_then(|a| self.agent_by_name(a).ok().map(|ag| ag.id));
+        // Immutable IDs never fall back to a same-spelled display name. Legacy
+        // names (with or without agent:) retain their existing alias lookup.
+        let author_id = sender.as_deref().and_then(|value| {
+            let reference = value.strip_prefix("agent:").unwrap_or(value);
+            match AgentId::parse(reference) {
+                Ok(id) => Some(id),
+                Err(_) => self.agent_by_name(reference).ok().map(|agent| agent.id),
+            }
+        });
         let members = self.room_members(room)?;
         let mut delivered = Vec::new();
         for agent in self.list_agents()? {
             if agent.state == "archived" || agent.state == "paused" {
                 continue;
             }
-            if author.as_deref() == Some(agent.name.as_str())
-                || author.as_deref() == Some(agent.id.as_str())
-                || author_id.as_ref() == Some(&agent.id)
-            {
+            if author_id.as_ref() == Some(&agent.id) {
                 continue;
             }
             if let Some(members) = &members
@@ -1767,6 +1766,18 @@ impl Store {
         let received_at_ms = incoming.received_at_ms.unwrap_or_else(now_ms);
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Author validity shares the write transaction with delivery. A sender
+        // deleted while waiting for publication cannot borrow a same-spelled
+        // display name or produce a stale-principal mailbox/context receipt.
+        if let Some(author) = incoming
+            .sender
+            .as_deref()
+            .map(str::trim)
+            .and_then(|sender| sender.strip_prefix("agent:"))
+            .and_then(|reference| AgentId::parse(reference).ok())
+        {
+            agent_by_id(&tx, &author)?;
+        }
         if !admit(&tx)? {
             return Ok(None);
         }
@@ -5994,21 +6005,28 @@ fn resolve_sender_relationship_and_role(
     if sender_raw == "operator" {
         return (None, Some("operator".to_string()));
     }
-    let Some(sender_name) = sender_raw.strip_prefix("agent:") else {
+    let Some(sender_reference) = sender_raw.strip_prefix("agent:") else {
         return (None, None);
     };
-    let Some(sender_id_str) = conn
-        .query_row(
-            "SELECT id FROM agents WHERE name = ?1",
-            [sender_name],
-            |r| r.get::<_, String>(0),
-        )
-        .ok()
-    else {
-        return (None, None);
-    };
-    let Ok(sender_id) = AgentId::parse(&sender_id_str) else {
-        return (None, None);
+    // An admitted immutable sender cannot change identity while waiting for
+    // publication. Syntactically valid IDs are never resolved as display names,
+    // even if their exact ID is absent. Non-ID legacy senders keep name lookup.
+    let sender_id = match AgentId::parse(sender_reference) {
+        Ok(id) => id,
+        Err(_) => {
+            let Some(id) = conn
+                .query_row(
+                    "SELECT id FROM agents WHERE name = ?1",
+                    [sender_reference],
+                    |r| r.get::<_, String>(0),
+                )
+                .ok()
+                .and_then(|id| AgentId::parse(&id).ok())
+            else {
+                return (None, None);
+            };
+            id
+        }
     };
     let Ok(sender_agent) = agent_by_id(conn, &sender_id) else {
         return (None, None);

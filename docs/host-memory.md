@@ -75,9 +75,11 @@ Outbound effects can retain pending history obligations under `outbound-history`
 Publication/reconciliation share a barrier with erasure: erasure takes the
 exclusive `.publication.lock` before lifecycle and SQLite locks, so senders can
 finish history settlement without lock inversion. A matching-agent or unknown,
-unreadable, malformed, oversized or linked `.pending` obligation refuses erasure
-before any mutation, including when reusing an earlier receipt. Reconciliation
-owns these recovery records; erasure never edits or replays an external effect.
+unreadable, malformed, oversized or linked `.pending` obligation or `.tmp` copy
+refuses erasure before any mutation, including when reusing an earlier receipt.
+A settled named obligation does not prove that a crashed writer's synced
+pre-rename temporary is absent; those copies remain in the same census.
+Reconciliation owns these recovery records; erasure never edits or replays an external effect.
 Valid foreign obligations do not block a target, and terminal `.done` metadata
 must contain neither body bytes nor their digest.
 

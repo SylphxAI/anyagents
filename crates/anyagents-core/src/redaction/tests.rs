@@ -1806,3 +1806,83 @@ fn outbound_effect_history_replay_cannot_restore_erased_canonical_text() {
             .is_empty()
     );
 }
+
+#[test]
+fn orphaned_outbound_temporaries_refuse_erasure_after_history_settlement() {
+    for shape in ["matching", "malformed", "missing-owner", "invalid-owner"] {
+        let f = Fixture::new();
+        let message = f.message("orphanedtemporarycanary");
+        let journal = f.dir.path().join("outbound-history");
+        std::fs::create_dir_all(&journal).unwrap();
+        // A retry can finish the named obligation without owning an earlier
+        // crashed writer's synced temporary. Terminal state is not a census.
+        std::fs::write(journal.join("effect.done"), b"{\"receipt\":\"settled\"}").unwrap();
+        let temporary = journal.join(format!(".{}.tmp", crate::MessageId::generate()));
+        let mut record = json!({"effect_key":"effect-1", "agent_id":f.target.id.as_str(),
+            "destination":"peer", "reply_to":null, "body":"orphanedtemporarycanary", "receipt":null});
+        let bytes = match shape {
+            "malformed" => b"{\"body\":\"orphanedtemporarycanary\"".to_vec(),
+            "missing-owner" => {
+                record.as_object_mut().unwrap().remove("agent_id");
+                serde_json::to_vec(&record).unwrap()
+            }
+            "invalid-owner" => {
+                record["agent_id"] = json!("unknown");
+                serde_json::to_vec(&record).unwrap()
+            }
+            _ => serde_json::to_vec(&record).unwrap(),
+        };
+        std::fs::write(&temporary, &bytes).unwrap();
+        let error = f.redact(&request(message.id.as_str(), None)).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unresolved or unreadable obligations"),
+            "{shape}: {error:?}"
+        );
+        assert_eq!(
+            f.store.inbox(&f.target.id, None).unwrap()[0].text,
+            "orphanedtemporarycanary"
+        );
+        assert_eq!(std::fs::read(&temporary).unwrap(), bytes);
+        // The recovery authority retires the copy; only then can erase finish.
+        std::fs::remove_file(&temporary).unwrap();
+        assert!(
+            f.redact(&request(message.id.as_str(), None))
+                .unwrap()
+                .full_scrub
+        );
+    }
+}
+
+#[test]
+fn orphaned_outbound_temporaries_recheck_receipt_replay_and_allow_foreign_owner() {
+    let f = Fixture::new();
+    let message = f.message("replayedtemporarycanary");
+    let req = request(message.id.as_str(), None);
+    assert!(f.redact(&req).unwrap().full_scrub);
+    let journal = f.dir.path().join("outbound-history");
+    let temporary = journal.join(format!(".{}.tmp", crate::MessageId::generate()));
+    let mut record = json!({"effect_key":"effect-1", "agent_id":f.target.id.as_str(),
+        "destination":"peer", "reply_to":null, "body":"replayedtemporarycanary", "receipt":null});
+    for bytes in [serde_json::to_vec(&record).unwrap(), b"{broken".to_vec()] {
+        std::fs::write(&temporary, &bytes).unwrap();
+        let error = f.redact(&req).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unresolved or unreadable obligations"),
+            "{error:?}"
+        );
+        assert_eq!(std::fs::read(&temporary).unwrap(), bytes);
+        assert_eq!(
+            f.store.inbox(&f.target.id, None).unwrap()[0].text,
+            TOMBSTONE
+        );
+    }
+    record["agent_id"] = json!(f.peer.id.as_str());
+    let foreign = serde_json::to_vec(&record).unwrap();
+    std::fs::write(&temporary, &foreign).unwrap();
+    assert!(f.redact(&req).unwrap().full_scrub);
+    assert_eq!(std::fs::read(&temporary).unwrap(), foreign);
+}

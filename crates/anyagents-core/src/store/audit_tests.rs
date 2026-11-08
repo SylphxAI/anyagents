@@ -524,3 +524,173 @@ fn late_fts_insert_failure_rolls_back_already_inserted_mail_and_chunk() {
         .unwrap();
     assert_fts(&store, "lateindexneedle");
 }
+
+#[test]
+fn immutable_sender_metadata_survives_id_name_collision_rename_and_reuse() {
+    let (dir, store, _) = setup();
+    let mut source = NewAgent::new("sender-original", "test");
+    source.role = Some("Source capability".into());
+    let source = store.create_agent(source).unwrap();
+    let mut child = NewAgent::new("recipient-child", "test");
+    child.parent_id = Some(source.id.clone());
+    let child = store.create_agent(child).unwrap();
+    let mut impostor = NewAgent::new(source.id.as_str(), "test");
+    impostor.role = Some("Impostor capability".into());
+    store.create_agent(impostor).unwrap();
+    let send = |store: &Store, from: &str, text: &str, role: Option<&str>, rel: Option<&str>| {
+        let mut incoming = Incoming::new(text);
+        incoming.sender = Some(format!("agent:{from}"));
+        let ReceiveOutcome::New(message) = store.receive(&child.id, incoming).unwrap() else {
+            panic!("new metadata fixture message");
+        };
+        assert_eq!(message.context.sender_role.as_deref(), role, "{from}");
+        assert_eq!(message.context.sender_rel.as_deref(), rel, "{from}");
+    };
+    send(
+        &store,
+        source.id.as_str(),
+        "before rename",
+        Some("Source capability"),
+        Some("parent"),
+    );
+    store.rename_agent(&source.id, "sender-renamed").unwrap();
+    let mut reused = NewAgent::new("sender-original", "test");
+    reused.role = Some("Reused name capability".into());
+    store.create_agent(reused).unwrap();
+    drop(store);
+    let store = Store::open(dir.path().join("custom-mailbox.sqlite")).unwrap();
+    send(
+        &store,
+        source.id.as_str(),
+        "after rename and reopen",
+        Some("Source capability"),
+        Some("parent"),
+    );
+    send(
+        &store,
+        "sender-original",
+        "legacy current name",
+        Some("Reused name capability"),
+        Some("peer"),
+    );
+    send(
+        &store,
+        "sender-renamed",
+        "legacy renamed name",
+        Some("Source capability"),
+        Some("parent"),
+    );
+    let missing = AgentId::generate();
+    let mut named_like_missing = NewAgent::new(missing.as_str(), "test");
+    named_like_missing.role = Some("Not an ID owner".into());
+    store.create_agent(named_like_missing).unwrap();
+    let before = store.inbox(&child.id, None).unwrap();
+    let mut incoming = Incoming::new("unknown ID never falls back to a display name");
+    incoming.sender = Some(format!("agent:{missing}"));
+    let error = store.receive(&child.id, incoming).unwrap_err();
+    assert!(
+        matches!(error, Error::AgentNotFound(ref id) if id == missing.as_str()),
+        "{error:?}"
+    );
+    assert_eq!(store.inbox(&child.id, None).unwrap(), before);
+}
+
+#[test]
+fn room_author_exclusion_uses_immutable_id_without_display_name_collision() {
+    let (_dir, store, source) = setup();
+    let collision = store
+        .create_agent(NewAgent::new(source.id.as_str(), "test"))
+        .unwrap();
+    let peer = store
+        .create_agent(NewAgent::new("room-peer", "test"))
+        .unwrap();
+    for member in [&source, &collision, &peer] {
+        store.join_group("room-fixture", &member.id).unwrap();
+    }
+    let send = |from: &str, text: &str| {
+        let mut incoming = Incoming::new(text);
+        incoming.sender = Some(format!("agent:{from}"));
+        store
+            .receive_room("group:room-fixture", incoming)
+            .unwrap()
+            .into_iter()
+            .map(|(agent, _)| agent.id.to_string())
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let mut expected =
+        std::collections::BTreeSet::from([collision.id.to_string(), peer.id.to_string()]);
+    assert_eq!(send(source.id.as_str(), "ID room message"), expected);
+    store
+        .rename_agent(&source.id, "room-author-renamed")
+        .unwrap();
+    let reused = store
+        .create_agent(NewAgent::new(&source.name, "test"))
+        .unwrap();
+    store.join_group("room-fixture", &reused.id).unwrap();
+    expected.insert(reused.id.to_string());
+    assert_eq!(send(source.id.as_str(), "ID after rename"), expected);
+    assert_eq!(send("room-author-renamed", "legacy name control"), expected);
+    let missing = AgentId::generate();
+    let named_like_missing = store
+        .create_agent(NewAgent::new(missing.as_str(), "test"))
+        .unwrap();
+    store
+        .join_group("room-fixture", &named_like_missing.id)
+        .unwrap();
+    let before = count(&store, "messages");
+    let mut incoming = Incoming::new("missing ID excludes no display-name owner");
+    incoming.sender = Some(format!("agent:{missing}"));
+    let error = store.receive_room("room-fixture", incoming).unwrap_err();
+    assert!(
+        matches!(error, Error::AgentNotFound(ref id) if id == missing.as_str()),
+        "{error:?}"
+    );
+    assert_eq!(count(&store, "messages"), before);
+}
+
+#[test]
+fn deleted_immutable_sender_refuses_receive_before_wake_mail_or_index_mutation() {
+    let (_dir, store, recipient) = setup();
+    let source = store
+        .create_agent(NewAgent::new("sender-to-delete", "test"))
+        .unwrap();
+    // The display-name lookalike must not substitute for the deleted identity.
+    store
+        .create_agent(NewAgent::new(source.id.as_str(), "test"))
+        .unwrap();
+    let mut incoming = Incoming::new("liveauthorneedle");
+    incoming.sender = Some(format!("agent:{}", source.id));
+    incoming.source_key = Some("live-author".into());
+    assert!(matches!(
+        store.receive(&recipient.id, incoming.clone()).unwrap(),
+        ReceiveOutcome::New(_)
+    ));
+    store.delete_agent(&source.id).unwrap();
+    store.set_agent_state(&recipient.id, "idle").unwrap();
+    let before = store.inbox(&recipient.id, None).unwrap();
+    let chunks = count(&store, "rag_chunks");
+    for source_key in ["new-after-delete", "live-author"] {
+        incoming.text = "deletedauthorneedle".into();
+        incoming.source_key = Some(source_key.into());
+        let error = store.receive(&recipient.id, incoming.clone()).unwrap_err();
+        assert!(
+            matches!(error, Error::AgentNotFound(ref id) if id == source.id.as_str()),
+            "{error:?}"
+        );
+        assert_eq!(store.inbox(&recipient.id, None).unwrap(), before);
+        assert_eq!(store.agent(&recipient.id).unwrap().state, "idle");
+        assert_eq!(count(&store, "rag_chunks"), chunks);
+    }
+    // An absent synthetic name was never an immutable principal. Preserve the
+    // legacy ingestion contract instead of broadening this check to all names.
+    incoming.sender = Some("agent:legacy-synthetic-name".into());
+    incoming.source_key = Some("legacy-name".into());
+    assert!(matches!(
+        store.receive(&recipient.id, incoming).unwrap(),
+        ReceiveOutcome::New(_)
+    ));
+    assert_eq!(
+        store.inbox(&recipient.id, None).unwrap().len(),
+        before.len() + 1
+    );
+}
