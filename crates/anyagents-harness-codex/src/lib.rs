@@ -1235,10 +1235,12 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 mod protocol_write_tests {
     use super::*;
 
-    fn reader_fixture(script: &str, retry: bool) -> CodexHarness {
+    // Failed-write cases have no input pipe before the reader starts, rather
+    // than depending on the child shell closing it before a protocol write.
+    fn reader_fixture(script: &str, retry: bool, input: Stdio) -> CodexHarness {
         let mut child = std::process::Command::new("/bin/sh")
             .args(["-c", script])
-            .stdin(Stdio::piped())
+            .stdin(input)
             .stdout(Stdio::piped())
             .spawn()
             .unwrap();
@@ -1267,8 +1269,9 @@ mod protocol_write_tests {
     #[test]
     fn failed_required_approval_reply_marks_the_protocol_dead_without_finishing_work() {
         let harness = reader_fixture(
-            "exec 0<&-; printf '%s\n' '{\"id\":99,\"method\":\"approval/request\"}'; exec sleep 30",
+            "printf '%s\n' '{\"id\":99,\"method\":\"approval/request\"}'; exec sleep 30",
             false,
+            Stdio::null(),
         );
         assert!(harness.wait_pred(Duration::from_secs(5), |state| !state.alive));
         assert!(!harness.is_finished("m1"));
@@ -1277,8 +1280,9 @@ mod protocol_write_tests {
     #[test]
     fn successful_required_approval_reply_preserves_protocol_progress() {
         let harness = reader_fixture(
-            "printf '%s\n' '{\"id\":99,\"method\":\"approval/request\"}'; IFS= read -r reply; printf '%s\n' '{\"method\":\"turn/started\",\"params\":{\"turnId\":\"reply-received\"}}'; exec cat >/dev/null",
+            "printf '%s\n' '{\"id\":99,\"method\":\"approval/request\"}'; IFS= read -r reply; printf '%s\n' '{\"method\":\"turn/started\",\"params\":{\"turnId\":\"reply-received\"}}'; exec sleep 30",
             false,
+            Stdio::piped(),
         );
         assert!(
             harness.wait_pred(Duration::from_secs(5), |state| state.turn_id.as_deref()
@@ -1290,8 +1294,9 @@ mod protocol_write_tests {
     #[test]
     fn failed_retry_write_does_not_count_a_turn_that_was_never_sent() {
         let harness = reader_fixture(
-            "exec 0<&-; printf '%s\n' '{\"method\":\"ready\"}'; exec sleep 30",
+            "printf '%s\n' '{\"method\":\"ready\"}'; exec sleep 30",
             true,
+            Stdio::null(),
         );
         assert!(harness.wait_pred(Duration::from_secs(5), |state| !state.alive));
         assert_eq!(harness.turns_started(), 0);
@@ -1301,8 +1306,9 @@ mod protocol_write_tests {
     #[test]
     fn successful_retry_write_is_counted_and_reaches_the_vendor() {
         let harness = reader_fixture(
-            "printf '%s\n' '{\"method\":\"ready\"}'; IFS= read -r retry; printf '%s\n' '{\"method\":\"turn/started\",\"params\":{\"turnId\":\"retry-received\"}}'; exec cat >/dev/null",
+            "printf '%s\n' '{\"method\":\"ready\"}'; IFS= read -r retry; printf '%s\n' '{\"method\":\"turn/started\",\"params\":{\"turnId\":\"retry-received\"}}'; exec sleep 30",
             true,
+            Stdio::piped(),
         );
         assert!(
             harness.wait_pred(Duration::from_secs(5), |state| state.turn_id.as_deref()

@@ -53,6 +53,10 @@ impl FakeTelegram {
             while !*shared_stop.lock().unwrap() {
                 match listener.accept() {
                     Ok((stream, _)) => {
+                        // BSD/macOS accept inherits the listener's O_NONBLOCK.
+                        // The request reader must wait for the client body, not
+                        // mistake WouldBlock for EOF and close the connection.
+                        stream.set_nonblocking(false).unwrap();
                         let asked = Arc::clone(&shared_asked);
                         let pending = Arc::clone(&shared_pending);
                         thread::spawn(move || serve(stream, asked, pending));

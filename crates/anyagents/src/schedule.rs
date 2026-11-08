@@ -7,9 +7,10 @@
 //! Wakes fire only when the owning agent is idle and not quota-blocked.
 //! A missed wake never fires twice, and cancelling a schedule takes effect immediately.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
-use anyagents_core::{Agent, AgentSchedule, Incoming, NewSchedule, Store};
+use anyagents_core::{Agent, AgentId, AgentSchedule, Incoming, NewSchedule, Store};
 use anyagents_supervisor::HealthBoard;
 
 use crate::api::ScheduleView;
@@ -697,6 +698,7 @@ fn tick_schedule_partition(store: &Store, health: &HealthBoard, now: i64, extern
         github::begin_cycle(&schedules, now);
     }
     let mut fired_count = 0;
+    let mut wake_blocks: HashMap<AgentId, Option<&'static str>> = HashMap::new();
     for sched in schedules {
         if (sched.kind == "at" || sched.kind == "every")
             && sched.next_fire_at_ms.is_none_or(|due| now < due)
@@ -722,7 +724,11 @@ fn tick_schedule_partition(store: &Store, health: &HealthBoard, now: i64, extern
             }
             continue;
         }
-        let block = agent_wake_block_reason(store, health, &agent, now);
+        // Wakes admitted in this pass must not make later schedules for the
+        // same initially idle agent appear busy because of our own mailbox writes.
+        let block = *wake_blocks
+            .entry(agent.id.clone())
+            .or_insert_with(|| agent_wake_block_reason(store, health, &agent, now));
         match sched.kind.as_str() {
             "at" => {
                 let Some(due) = sched.next_fire_at_ms else {
@@ -1483,6 +1489,63 @@ mod tests {
         assert_eq!(counts_at_external_start, vec![1; 5]);
         for owner in owners {
             assert_eq!(store.inbox(&owner, None).unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn same_agent_ready_local_watches_fire_together_unless_initially_blocked() {
+        for blocked in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store::open(dir.path().join("state.db")).unwrap();
+            let health = HealthBoard::default();
+            let owner = store.create_agent(NewAgent::new("owner", "codex")).unwrap();
+            let target = store
+                .create_agent(NewAgent::new("target", "codex"))
+                .unwrap();
+            let path = dir.path().join("ready");
+            std::fs::write(&path, "ready").unwrap();
+            let mut child = std::process::Command::new("/bin/sh")
+                .args(["-c", "exit 0"])
+                .spawn()
+                .unwrap();
+            let pid = child.id();
+            assert!(child.wait().unwrap().success());
+            for (spec, baseline) in [
+                (format!("file:{}", path.display()), Some("missing".into())),
+                (format!("pid:{pid}"), None),
+                (format!("agent:idle:{}", target.name), None),
+            ] {
+                store
+                    .create_schedule(NewSchedule {
+                        agent_id: owner.id.clone(),
+                        kind: "watch".into(),
+                        spec,
+                        prompt: "wake".into(),
+                        interval_ms: None,
+                        next_fire_at_ms: None,
+                        watch_baseline: baseline,
+                    })
+                    .unwrap();
+            }
+            if blocked {
+                store.set_agent_state(&owner.id, "paused").unwrap();
+            }
+            let fired = tick_local_schedules_once(&store, &health, anyagents_core::now_ms());
+            assert_eq!(fired, if blocked { 0 } else { 3 });
+            let inbox = store.inbox(&owner.id, None).unwrap();
+            assert_eq!(inbox.len(), fired);
+            let schedules = store.list_schedules(Some(&owner.id), false).unwrap();
+            assert_eq!(schedules.len(), 3);
+            assert!(
+                schedules
+                    .iter()
+                    .all(|s| s.state == if blocked { "active" } else { "fired" })
+            );
+            assert_eq!(
+                tick_local_schedules_once(&store, &health, anyagents_core::now_ms()),
+                0
+            );
+            assert_eq!(store.inbox(&owner.id, None).unwrap().len(), fired);
         }
     }
 
