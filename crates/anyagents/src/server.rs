@@ -133,6 +133,9 @@ async fn serve(
     let agents = store.list_agents()?;
     let mut mint_failures = Vec::new();
     for agent in &agents {
+        if agent.state == "archived" {
+            continue;
+        }
         if let Err(err) = crate::operator::ensure(&store, &agent.id) {
             mint_failures.push(format!("{}: {err}", agent.name));
         }
@@ -1134,6 +1137,9 @@ fn reconcile_agent_snapshot(
     };
     if !guard.initialized {
         for agent in &agents {
+            if agent.state == "archived" {
+                continue;
+            }
             let delivered = store.delivered_cursor(&agent.id).unwrap_or(0);
             guard.watermark_seq.insert(agent.id.to_string(), delivered);
         }
@@ -1152,6 +1158,11 @@ fn reconcile_agent_snapshot(
     });
 
     for idx in ordered_indices {
+        if agents[idx].state == "archived"
+            && !health.get(&agents[idx].id).is_some_and(|l| l.process_alive)
+        {
+            continue;
+        }
         let Ok(current) = store.agent(&agents[idx].id) else {
             continue;
         };

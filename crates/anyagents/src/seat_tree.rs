@@ -84,6 +84,9 @@ fn grant(file: &File, uid: u32, gid: u32, capability: bool) -> io::Result<()> {
     if meta.uid() == uid && meta.is_dir() && meta.mode() & 0o700 == 0o700 {
         return Ok(());
     }
+    if meta.uid() == uid && !meta.is_dir() && !capability && meta.mode() & 0o600 == 0o600 {
+        return Ok(());
+    }
     let mode = if meta.is_dir() {
         0o2770
     } else if capability {
@@ -93,6 +96,9 @@ fn grant(file: &File, uid: u32, gid: u32, capability: bool) -> io::Result<()> {
     } else {
         0o660
     };
+    if meta.gid() == gid && (meta.mode() & 0o7777) == mode {
+        return Ok(());
+    }
     let fd = file.as_raw_fd();
     let group_ok = meta.gid() == gid || unsafe { libc::fchown(fd, u32::MAX, gid) } == 0;
     let mode_ok = unsafe { libc::fchmod(fd, mode) } == 0;
@@ -376,9 +382,19 @@ fn share_open(
                 | "target"
                 | ".git"
                 | "cache-home"
+                | "data-home"
+                | "state-home"
                 | "tmp"
                 | ".cargo"
                 | ".rustup"
+                | "brain"
+                | ".system_generated"
+                | "plugins"
+                | "sessions"
+                | "shell-snapshots"
+                | "telemetry"
+                | "statsig"
+                | "__pycache__"
         ) || (text == "op" && path.ends_with(".config"))
         {
             continue;

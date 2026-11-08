@@ -41,9 +41,12 @@ pub fn start(data: &Path) -> Result<(), Error> {
     }
     let (port, listener) = crate::server::listen_on_loopback()?;
     let routes = MemoryRoutes::new();
-    for agent in Store::open(data.join("state.db"))?.list_agents()? {
+    let store = Store::open(data.join("state.db"))?;
+    let mut provider_agents = Vec::new();
+    for agent in store.list_agents()? {
         if let Some(image) = ProviderImage::load(data, &agent.id)? {
             routes.insert(token(data, &agent.id)?, image.route(&agent.name));
+            provider_agents.push(agent.id);
         }
     }
     let usage = anyagents_gateway::MemoryUsage::new();
@@ -52,14 +55,10 @@ pub fn start(data: &Path) -> Result<(), Error> {
     // The port is this process's, so every agent pointed at the gateway is
     // repointed now: a recorded origin from an earlier start no longer answers.
     let origin = format!("http://127.0.0.1:{port}");
-    let store = Store::open(data.join("state.db"))?;
-    for agent in store.list_agents()? {
-        if ProviderImage::load(data, &agent.id)?.is_none() {
-            continue;
-        }
-        let env = env_for(data, &agent.id, &origin);
+    for agent_id in provider_agents {
+        let env = env_for(data, &agent_id, &origin);
         if !env.is_empty() {
-            store.set_agent_launch_env(&agent.id, &env)?;
+            store.set_agent_launch_env(&agent_id, &env)?;
         }
     }
     drop(guard);
