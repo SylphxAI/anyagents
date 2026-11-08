@@ -1899,7 +1899,7 @@ fn profiles_cmd(
             Ok(())
         }
         Some("refresh") | Some("reset") => {
-            create::force_refresh_provider_profiles(data, target);
+            create::force_refresh_provider_profiles(data, target)?;
             list_profiles_cmd(data, target)
         }
         Some("models") | Some("catalog") => {
@@ -2015,7 +2015,7 @@ fn sign_in(data: &Path, target: &str, profile: Option<&str>) -> Result<(), anyag
             .ok()
             .is_some_and(|entries| entries.flatten().any(|e| e.file_name() != "profile.json"));
         if has_stored_creds && let Ok(store) = anyagents_core::Store::open(data.join("state.db")) {
-            create::seed_harness_credentials(&store, data, &rec, &cfg);
+            create::seed_harness_credentials(&store, data, &rec, &cfg)?;
             if let Some((_, uid, gid, _)) = crate::sandbox::seat_for_agent(&rec.name) {
                 crate::sandbox::share_config_with_seat_uid(&cfg, uid, gid);
             }
@@ -2032,7 +2032,7 @@ fn sign_in(data: &Path, target: &str, profile: Option<&str>) -> Result<(), anyag
             "{target} is not signed in: the vendor command finished without reporting a sign-in (install: {hint})"
         )));
     }
-    create::finalize_agent_signin(data, &rec);
+    create::finalize_agent_signin(data, &rec)?;
     println!(
         "signed in\t{target}\t{harness}\t{}",
         outcome.account.as_deref().unwrap_or("-")

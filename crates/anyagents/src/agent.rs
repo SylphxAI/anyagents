@@ -380,7 +380,7 @@ pub fn describe_cmd(
             && !clear
         {
             if let Ok(store) = Store::open(data.join("state.db")) {
-                crate::create::sync_all_agent_instructions(&store, data);
+                crate::create::sync_all_agent_instructions(&store, data)?;
             }
             let listed = client::call::<AgentsResponse>(
                 data,
@@ -463,7 +463,7 @@ pub fn describe_cmd(
     }
     let store = Store::open(data.join("state.db"))?;
     if target_name == "all" {
-        crate::create::sync_all_agent_instructions(&store, data);
+        crate::create::sync_all_agent_instructions(&store, data)?;
         println!("synced\tall");
         return Ok(());
     }
@@ -501,10 +501,10 @@ pub fn describe_cmd(
         }
     }
     if rec.parent_id.is_none() {
-        crate::create::sync_all_agent_instructions(&store, data);
+        crate::create::sync_all_agent_instructions(&store, data)?;
     } else {
         let cfg = anyagents_core::agent_config_dir(data, &rec.id);
-        crate::create::sync_agent_description_files(&store, &rec, &cfg);
+        crate::create::sync_agent_description_files(&store, &rec, &cfg)?;
     }
     let pub_desc = rec.public_description();
     if new_desc.is_some() || instructions.is_some() || role.is_some() || clear {
@@ -857,13 +857,13 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
             .set_agent_scope_as(&agent.id, scope_val, "operator")
             .map_err(|err| err.to_string())?;
         let cfg = anyagents_core::agent_config_dir(data, &agent.id);
-        crate::create::sync_agent_description_files(&store, &agent, &cfg);
+        crate::create::sync_agent_description_files(&store, &agent, &cfg).map_err(|error| error.to_string())?;
     } else if let Some(pub_val) = parsed.public {
         agent = store
             .set_agent_public_as(&agent.id, pub_val, "operator")
             .map_err(|err| err.to_string())?;
         let cfg = anyagents_core::agent_config_dir(data, &agent.id);
-        crate::create::sync_agent_description_files(&store, &agent, &cfg);
+        crate::create::sync_agent_description_files(&store, &agent, &cfg).map_err(|error| error.to_string())?;
     }
     // A create is a new instance: its capability is minted so its harness
     // starts with one.

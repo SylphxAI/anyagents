@@ -2843,7 +2843,7 @@ async fn set_description_route(
             && !body.clear.unwrap_or(false)
         {
             require_admin_or_operator(&state.store, &principal, "agents.sync_instructions", "all")?;
-            create::sync_all_agent_instructions(&state.store, state.store.data_dir());
+            create::sync_all_agent_instructions(&state.store, state.store.data_dir()).map_err(ApiError::from_store)?;
             return Ok(Json(serde_json::json!({
                 "synced": "all",
             })));
@@ -2971,7 +2971,7 @@ async fn set_description_route(
             }
         }
         let cfg = anyagents_core::agent_config_dir(state.store.data_dir(), &rec.id);
-        create::sync_agent_description_files(&state.store, &rec, &cfg);
+        create::sync_agent_description_files(&state.store, &rec, &cfg).map_err(ApiError::from_store)?;
         let aliases = state.store.agent_aliases(&rec.id).unwrap_or_default();
         Ok(Json(serde_json::json!({
             "id": rec.id.as_str(),
@@ -3851,7 +3851,7 @@ async fn create_agent_route(
         }
         if scope_changed {
             let cfg = anyagents_core::agent_config_dir(state.store.data_dir(), &agent.id);
-            create::sync_agent_description_files(&state.store, &agent, &cfg);
+            create::sync_agent_description_files(&state.store, &agent, &cfg).map_err(ApiError::from_store)?;
         }
         if !requested_group_names.is_empty() {
             let mut targets = vec![agent.id.clone()];
