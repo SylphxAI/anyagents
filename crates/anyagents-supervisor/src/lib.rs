@@ -453,6 +453,9 @@ fn route<H: Harness + 'static>(inner: Arc<Inner<H>>, events: Receiver<Wake>) {
     if let Ok(agents) = inner.store.list_agents() {
         for agent in agents {
             if agent.state == "running" && !(skip_sylphx && agent.harness == "sylphx") {
+                if inner.store.complete_idle_agent(&agent.id).unwrap_or(false) {
+                    continue;
+                }
                 ensure(&inner, agent.id);
             }
         }
@@ -1232,7 +1235,7 @@ impl<H: Harness + 'static> Session<H> {
     /// Its config directory and session are preserved so sending any future message
     /// to the agent automatically wakes and resumes it.
     fn try_release_idle_agent(&mut self) -> bool {
-        if !self.completed_turn_in_session || self.last_error.is_some() {
+        if self.last_error.is_some() {
             return false;
         }
         let scaled = {

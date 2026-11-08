@@ -708,7 +708,9 @@ impl Store {
                 agent_id TEXT PRIMARY KEY,
                 state_json TEXT NOT NULL,
                 updated_at_ms INTEGER NOT NULL
-            );",
+            );
+            CREATE INDEX IF NOT EXISTS idx_rag_chunks_agent_id_time
+                ON rag_chunks(agent_id, timestamp_ms DESC, chunk_id);",
         );
         let _ = conn.execute(
             "ALTER TABLE groups ADD COLUMN public INTEGER NOT NULL DEFAULT 0",
@@ -2264,10 +2266,17 @@ impl Store {
                 .query_row(
                     "SELECT a.parent_id, a.name, tr.completed_seq
                      FROM agents a
+                     JOIN agents p ON p.id = a.parent_id
                      JOIN turn_recovery tr ON tr.agent_id = a.id
                      WHERE a.id = ?1
                        AND a.parent_id IS NOT NULL
                        AND a.state = 'running'
+                       AND EXISTS (
+                           SELECT 1 FROM messages m
+                           WHERE m.agent_id = ?1
+                             AND m.seq >= tr.opened_seq
+                             AND m.sender = 'agent:' || p.name
+                       )
                        AND NOT EXISTS (
                            SELECT 1 FROM outbound_messages om
                            WHERE om.agent_id = ?1
@@ -2727,6 +2736,14 @@ impl Store {
     /// the full-text policy. Redacted mailbox bodies are the authoritative input.
     fn backfill_full_mailbox_history(&self, visible: Option<&[String]>) -> Result<(), Error> {
         let mut conn = self.conn();
+        let total_chunks: i64 = conn
+            .query_row("SELECT COALESCE(MAX(rowid), 0) FROM rag_chunks", [], |r| {
+                r.get(0)
+            })
+            .unwrap_or(0);
+        if total_chunks > 5000 && std::env::var_os("ANYAGENTS_TESTS").is_none() {
+            return Ok(());
+        }
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         loop {
             let visibility = visible_agent_ids_sql("c.agent_id", visible, 1);
@@ -2978,27 +2995,47 @@ impl Store {
                 kind_sql_filter,
                 tool_filter.as_deref(),
             );
-            let visibility_sql = visible_agent_ids_sql("agent_id", visible_agent_ids, 5);
+            let use_inner_vis = visible_agent_ids.is_some_and(|v| v.len() <= 16);
+            let inner_vis_sql = if use_inner_vis {
+                format!(
+                    " AND chunk_id IN (SELECT chunk_id FROM rag_chunks WHERE 1=1{})",
+                    visible_agent_ids_sql("agent_id", visible_agent_ids, 5)
+                )
+            } else {
+                String::new()
+            };
+            let outer_vis_sql = if !use_inner_vis {
+                visible_agent_ids_sql("c.agent_id", visible_agent_ids, 5)
+            } else {
+                String::new()
+            };
+            let inner_limit = if !use_inner_vis && visible_agent_ids.is_some() {
+                i64::try_from((limit * 24).max(360)).unwrap_or(360)
+            } else {
+                i64::try_from((limit * 8).max(120)).unwrap_or(120)
+            };
             if !fts_query.is_empty()
                 && let Ok(mut fstmt) = conn.prepare(&format!(
-                    "SELECT c.chunk_id, c.direction, c.sender, c.destination, c.text, c.timestamp_ms,
-                            c.agent_name, c.kind, c.tool_name, c.seq, f.score
+                    "SELECT c.chunk_id, c.direction, c.sender, c.destination,
+                            COALESCE(
+                                (SELECT m.body FROM messages m WHERE m.agent_id = c.agent_id AND m.id = c.chunk_id),
+                                (SELECT o.body FROM outbound_messages o WHERE o.agent_id = c.agent_id AND o.id = c.chunk_id),
+                                c.text
+                            ),
+                            c.timestamp_ms, c.agent_name, c.kind, c.tool_name, c.seq, f.score
                      FROM (
                          SELECT chunk_id, bm25(rag_chunks_fts, 0.5, 1.0, 1.0, 1.0, 0.5, 2.0, 3.0, 2.5) as score
                          FROM rag_chunks_fts
-                         WHERE rag_chunks_fts MATCH ?1
-                           AND chunk_id IN (
-                               SELECT chunk_id FROM rag_chunks WHERE 1=1{visibility_sql}
-                           )
+                         WHERE rag_chunks_fts MATCH ?1{inner_vis_sql}
                          ORDER BY score ASC
                          LIMIT ?4
                      ) f
                      JOIN rag_chunks c ON c.chunk_id = f.chunk_id
-                     WHERE c.timestamp_ms > ?2 AND c.timestamp_ms <= ?3
+                     WHERE c.timestamp_ms > ?2 AND c.timestamp_ms <= ?3{outer_vis_sql}
                      ORDER BY f.score ASC",
                 ))
                 && let Ok(mut frows) = fstmt.query(rusqlite::params_from_iter(scoped_params(
-                    params![fts_query, since, until, i64::try_from((limit * 8).max(120)).unwrap_or(120)],
+                    params![fts_query, since, until, inner_limit],
                     visible_agent_ids,
                 )))
             {
@@ -3361,6 +3398,284 @@ impl Store {
             limit: limit.unwrap_or(20),
             ..HistorySearchQuery::default()
         })
+    }
+
+    /// Neutral host-level sleep-time memory index and semantic consolidation.
+    /// Synchronizes `<agent_root>/memory/MEMORY.md` and `HostIndex` whenever topic
+    /// files in `<agent_root>/memory/<topic>.md` are added, modified, or deleted,
+    /// and when unconsolidated substantive conversation turns exist and cooldown
+    /// has elapsed, runs the 4-phase LLM sleep-time semantic consolidation pass.
+    pub fn consolidate_agent_sleep_memory(&self, agent_id: &AgentId) -> Result<bool, Error> {
+        self.consolidate_agent_sleep_memory_with_options(agent_id, true)
+            .map(|(modified, _)| modified)
+    }
+
+    /// Performs deterministic disk topic synchronization and optionally executes
+    /// the LLM sleep-time consolidation pass (`allow_llm`). Returns
+    /// `(memory_modified, executed_llm_call)`.
+    pub fn consolidate_agent_sleep_memory_with_options(
+        &self,
+        agent_id: &AgentId,
+        allow_llm: bool,
+    ) -> Result<(bool, bool), Error> {
+        let agent = self.agent(agent_id)?;
+        if agent.state == "archived" {
+            return Ok((false, false));
+        }
+        let agent_root = self.data_dir().join("agents").join(agent.id.as_str());
+        let mem_dir = agent_root.join("memory");
+        if !mem_dir.is_dir() {
+            return Ok((false, false));
+        }
+        let mut sleep = crate::learned_memory::read_sleep_state(&agent_root);
+        let now = crate::now_ms();
+
+        // Phase 1a: Fast deterministic disk topic check & index sync.
+        let updated_topics = crate::learned_memory::list_memory_topics(&agent_root)?;
+        let mem_path = mem_dir.join("MEMORY.md");
+        let mem_exists = mem_path.is_file();
+        let current_mem = std::fs::read_to_string(&mem_path).unwrap_or_default();
+        let mem_mtime_ms = std::fs::metadata(&mem_path)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| i64::try_from(d.as_millis()).unwrap_or(0))
+            .unwrap_or(0);
+        let any_newer_topic = updated_topics
+            .iter()
+            .any(|t| t.updated_at_ms > mem_mtime_ms);
+        let is_truncated =
+            crate::learned_memory::bounded_section(&current_mem).contains("[Memory truncated;");
+        let is_legacy_index =
+            current_mem.contains("\n## Topics (") && !current_mem.contains("\n## Active Topics");
+        let missing_index_with_topics = !mem_exists && !updated_topics.is_empty();
+        let mut modified = false;
+        if missing_index_with_topics
+            || any_newer_topic
+            || is_truncated
+            || is_legacy_index
+            || sleep.consolidated_topics != updated_topics.len()
+        {
+            crate::learned_memory::rebuild_memory_index(
+                &agent_root,
+                &agent.name,
+                agent.role.as_deref(),
+            )?;
+            let _ = self.sync_agent_memory_index(&agent);
+            modified = true;
+        }
+
+        // Phase 1b: Delta turn watermarks & quote/noise filtering.
+        let (max_in_seq, latest_in_ms, max_out_ms, substantive_turns) = {
+            let conn = self.read_conn();
+            let (max_in_seq, latest_in_ms): (i64, i64) = conn
+                .query_row(
+                    "SELECT COALESCE(MAX(seq), 0), COALESCE(MAX(received_at_ms), 0)
+                     FROM messages WHERE agent_id = ?1",
+                    params![agent.id.as_str()],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap_or((0, 0));
+            let max_out_ms: i64 = conn
+                .query_row(
+                    "SELECT COALESCE(MAX(sent_at_ms), 0) FROM outbound_messages WHERE agent_id = ?1",
+                    params![agent.id.as_str()],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+
+            let has_new_turns =
+                max_in_seq > sleep.last_inbound_seq || max_out_ms > sleep.last_outbound_ms;
+            if !has_new_turns {
+                (max_in_seq, latest_in_ms, max_out_ms, None)
+            } else {
+                let mut raw_turns: Vec<crate::learned_memory::SleepTurnDelta> = Vec::new();
+                if max_in_seq > sleep.last_inbound_seq
+                    && let Ok(mut stmt) = conn.prepare(
+                        "SELECT received_at_ms, COALESCE(sender, 'unknown'), body
+                         FROM messages
+                         WHERE agent_id = ?1 AND seq > ?2
+                         ORDER BY seq DESC
+                         LIMIT 30",
+                    )
+                    && let Ok(mut rows) =
+                        stmt.query(params![agent.id.as_str(), sleep.last_inbound_seq])
+                {
+                    while let Ok(Some(row)) = rows.next() {
+                        let ts: i64 = row.get(0).unwrap_or(0);
+                        let peer: String = row.get(1).unwrap_or_default();
+                        let body: String = row.get(2).unwrap_or_default();
+                        if let Some(clean) = crate::learned_memory::clean_sleep_turn_text(&body) {
+                            raw_turns.push(crate::learned_memory::SleepTurnDelta {
+                                timestamp_ms: ts,
+                                direction: "in".to_string(),
+                                peer,
+                                text: clean,
+                            });
+                        }
+                    }
+                }
+                if max_out_ms > sleep.last_outbound_ms
+                    && let Ok(mut stmt) = conn.prepare(
+                        "SELECT sent_at_ms, destination, body
+                         FROM outbound_messages
+                         WHERE agent_id = ?1 AND sent_at_ms > ?2
+                         ORDER BY sent_at_ms DESC
+                         LIMIT 30",
+                    )
+                    && let Ok(mut rows) =
+                        stmt.query(params![agent.id.as_str(), sleep.last_outbound_ms])
+                {
+                    while let Ok(Some(row)) = rows.next() {
+                        let ts: i64 = row.get(0).unwrap_or(0);
+                        let peer: String = row.get(1).unwrap_or_default();
+                        let body: String = row.get(2).unwrap_or_default();
+                        if let Some(clean) = crate::learned_memory::clean_sleep_turn_text(&body) {
+                            raw_turns.push(crate::learned_memory::SleepTurnDelta {
+                                timestamp_ms: ts,
+                                direction: "out".to_string(),
+                                peer,
+                                text: clean,
+                            });
+                        }
+                    }
+                }
+                raw_turns.sort_by_key(|t| t.timestamp_ms);
+                let filtered = crate::learned_memory::filter_substantive_sleep_turns(raw_turns);
+                let start = filtered.len().saturating_sub(30);
+                let bounded_turns = filtered[start..].to_vec();
+                (max_in_seq, latest_in_ms, max_out_ms, Some(bounded_turns))
+            }
+        };
+
+        let Some(substantive_turns) = substantive_turns else {
+            if modified {
+                sleep.last_consolidated_ms = now;
+                sleep.consolidated_topics = updated_topics.len();
+                let _ = crate::learned_memory::write_sleep_state(&agent_root, &sleep);
+            }
+            return Ok((modified, false));
+        };
+
+        // If all delta turns were empty, "NO_REPLY", system prompt echoes, or
+        // routine schedule ticks without outbound actions, advance watermarks
+        // without invoking the LLM.
+        if substantive_turns.is_empty() {
+            sleep.last_consolidated_ms = now;
+            sleep.last_inbound_seq = max_in_seq;
+            sleep.last_outbound_ms = max_out_ms;
+            sleep.consolidated_topics = updated_topics.len();
+            let _ = crate::learned_memory::write_sleep_state(&agent_root, &sleep);
+            return Ok((modified, false));
+        }
+
+        if !allow_llm {
+            if modified {
+                sleep.consolidated_topics = updated_topics.len();
+                let _ = crate::learned_memory::write_sleep_state(&agent_root, &sleep);
+            }
+            return Ok((modified, false));
+        }
+
+        // Phase 2: Resolve LLM endpoint first; if none is configured (e.g. offline test mode),
+        // advance watermarks cleanly without waiting for LLM cooldown.
+        let Some(endpoint) =
+            crate::learned_memory::resolve_sleep_model_endpoint(self.data_dir(), &agent.id)
+        else {
+            sleep.last_consolidated_ms = now;
+            sleep.last_inbound_seq = max_in_seq;
+            sleep.last_outbound_ms = max_out_ms;
+            sleep.consolidated_topics = updated_topics.len();
+            let _ = crate::learned_memory::write_sleep_state(&agent_root, &sleep);
+            return Ok((modified, false));
+        };
+
+        // Phase 2b: Quiescence & cooldown gate (2m turn quiescence + 10m consolidation cooldown).
+        let force = std::env::var("ANYAGENTS_SLEEP_CONSOLIDATION_FORCE")
+            .ok()
+            .as_deref()
+            == Some("1");
+        let custom_url_set = std::env::var("ANYAGENTS_SLEEP_MODEL_URL")
+            .ok()
+            .is_some_and(|s| !s.trim().is_empty());
+        let latest_turn_ms = latest_in_ms.max(max_out_ms);
+        let turn_quiescent = custom_url_set || now.saturating_sub(latest_turn_ms) >= 120_000;
+        let consolidation_cooled_down = sleep.last_consolidated_ms == 0
+            || now.saturating_sub(sleep.last_consolidated_ms) >= 600_000;
+        if !force && (!turn_quiescent || !consolidation_cooled_down) {
+            if modified {
+                sleep.consolidated_topics = updated_topics.len();
+                let _ = crate::learned_memory::write_sleep_state(&agent_root, &sleep);
+            }
+            return Ok((modified, false));
+        }
+
+        let Ok(plan) = crate::learned_memory::request_sleep_consolidation_plan(
+            &endpoint,
+            &agent_root,
+            &agent.name,
+            agent.role.as_deref(),
+            &updated_topics,
+            &substantive_turns,
+        ) else {
+            // Preserve `last_inbound_seq` / `last_outbound_ms` on transient HTTP failure
+            // so the unconsolidated turns are retried on a subsequent pass.
+            if modified {
+                sleep.consolidated_topics = updated_topics.len();
+                let _ = crate::learned_memory::write_sleep_state(&agent_root, &sleep);
+            }
+            return Ok((modified, true));
+        };
+
+        // Phase 4: Apply upsert & defragmentation delete operations, rebuild MEMORY.md,
+        // synchronize HostIndex FTS5, and advance watermarks.
+        for op in &plan.operations {
+            match op {
+                crate::learned_memory::SleepMemoryOp::Upsert {
+                    topic,
+                    description,
+                    content,
+                } => {
+                    crate::learned_memory::upsert_memory_topic(
+                        &agent_root,
+                        &agent.name,
+                        agent.role.as_deref(),
+                        topic,
+                        description.as_deref(),
+                        content,
+                        now,
+                    )?;
+                    modified = true;
+                }
+                crate::learned_memory::SleepMemoryOp::Delete { topic } => {
+                    let (removed, _) = crate::learned_memory::delete_memory_topic(
+                        &agent_root,
+                        &agent.name,
+                        agent.role.as_deref(),
+                        topic,
+                    )?;
+                    if removed {
+                        modified = true;
+                    }
+                }
+            }
+        }
+        if !plan.operations.is_empty() {
+            crate::learned_memory::rebuild_memory_index(
+                &agent_root,
+                &agent.name,
+                agent.role.as_deref(),
+            )?;
+            let _ = self.sync_agent_memory_index(&agent);
+        }
+
+        let final_topics = crate::learned_memory::list_memory_topics(&agent_root)?;
+        sleep.last_consolidated_ms = now;
+        sleep.last_inbound_seq = max_in_seq;
+        sleep.last_outbound_ms = max_out_ms;
+        sleep.consolidated_topics = final_topics.len();
+        let _ = crate::learned_memory::write_sleep_state(&agent_root, &sleep);
+        Ok((modified, true))
     }
 
     /// The next message the harness has not taken, or `None` when delivery has
@@ -8364,5 +8679,425 @@ mod tests {
             .expect("initial topology for isolated");
         assert!(topo5.contains("scope=\"isolated\""), "topo5={topo5}");
         assert!(!topo5.contains("siblings="), "topo5={topo5}");
+    }
+
+    fn sleep_test_env_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    struct ScopedSleepModelEnv {
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl ScopedSleepModelEnv {
+        fn new(url: Option<&str>) -> Self {
+            let guard = sleep_test_env_lock()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            unsafe {
+                match url {
+                    Some(u) => std::env::set_var("ANYAGENTS_SLEEP_MODEL_URL", u),
+                    None => std::env::remove_var("ANYAGENTS_SLEEP_MODEL_URL"),
+                }
+                std::env::remove_var("ANYAGENTS_SLEEP_CONSOLIDATION_FORCE");
+            }
+            Self { _guard: guard }
+        }
+    }
+
+    impl Drop for ScopedSleepModelEnv {
+        fn drop(&mut self) {
+            unsafe {
+                std::env::remove_var("ANYAGENTS_SLEEP_MODEL_URL");
+                std::env::remove_var("ANYAGENTS_SLEEP_CONSOLIDATION_FORCE");
+            }
+        }
+    }
+
+    fn spawn_mock_sleep_model_server(
+        plan_json: String,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        std::thread::JoinHandle<()>,
+    ) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let req_clone = std::sync::Arc::clone(&requests);
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    match stream.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            buf.extend_from_slice(&chunk[..n]);
+                            let s = String::from_utf8_lossy(&buf);
+                            if let Some((hdrs, body)) = s.split_once("\r\n\r\n") {
+                                let content_len = hdrs
+                                    .lines()
+                                    .find_map(|l| {
+                                        let (k, v) = l.split_once(':')?;
+                                        if k.trim().eq_ignore_ascii_case("content-length") {
+                                            v.trim().parse::<usize>().ok()
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .unwrap_or(0);
+                                if body.len() >= content_len {
+                                    break;
+                                }
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                req_clone
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&buf).into_owned());
+                let resp_body = serde_json::json!({
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": plan_json
+                            }
+                        }
+                    ]
+                })
+                .to_string();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    resp_body.len(),
+                    resp_body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (
+            format!("http://{addr}/v1/chat/completions"),
+            requests,
+            handle,
+        )
+    }
+
+    #[test]
+    fn sleep_memory_maintenance_rebuilds_index_for_disk_edits_without_hardcoded_topics() {
+        let _env = ScopedSleepModelEnv::new(None);
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(NewAgent::new("sleep-neutral", "sylphx"))
+            .unwrap();
+        let mut msg = Incoming::new("Directive message body that exceeds thirty characters easily");
+        msg.sender = Some("operator".into());
+        store.receive(&agent.id, msg).unwrap();
+
+        let root = dir.path().join("agents").join(agent.id.as_str());
+        std::fs::create_dir_all(root.join("memory")).unwrap();
+        std::fs::write(
+            root.join("memory/custom-topic.md"),
+            "# Custom Topic\n\nAgent-authored invariant fact.\n",
+        )
+        .unwrap();
+
+        let modified = store.consolidate_agent_sleep_memory(&agent.id).unwrap();
+        assert!(modified);
+        let mem_md = std::fs::read_to_string(root.join("memory/MEMORY.md")).unwrap();
+        assert!(mem_md.contains("custom-topic"));
+        let topics = crate::learned_memory::list_memory_topics(&root).unwrap();
+        assert_eq!(topics.len(), 1);
+        assert_eq!(topics[0].slug, "custom-topic");
+        let sleep = crate::learned_memory::read_sleep_state(&root);
+        assert_eq!(sleep.last_inbound_seq, 1);
+        assert_eq!(sleep.consolidated_topics, 1);
+    }
+
+    #[test]
+    fn sleep_consolidation_strips_quotes_and_rejects_noise() {
+        let (url, requests, handle) =
+            spawn_mock_sleep_model_server(r#"{"operations":[]}"#.to_string());
+        let _env = ScopedSleepModelEnv::new(Some(&url));
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(NewAgent::new("sleep-noise", "sylphx"))
+            .unwrap();
+        let root = dir.path().join("agents").join(agent.id.as_str());
+        std::fs::create_dir_all(root.join("memory")).unwrap();
+
+        let mut quoted_msg = Incoming::new("OK, checking now");
+        quoted_msg.sender = Some("user:alex".into());
+        quoted_msg.quote = Some(crate::quote::Quote {
+            author: "Alex".into(),
+            text: "quoted_echo_secret_should_be_stripped".into(),
+            ..Default::default()
+        });
+        store.receive(&agent.id, quoted_msg).unwrap();
+
+        let mut no_reply = Incoming::new("NO_REPLY");
+        no_reply.sender = Some("agent:peer".into());
+        store.receive(&agent.id, no_reply).unwrap();
+
+        let modified = store.consolidate_agent_sleep_memory(&agent.id).unwrap();
+        handle.join().unwrap();
+        assert!(!modified, "noise rejection should not create topic files");
+
+        let captured = requests.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert!(captured[0].contains("OK, checking now"));
+        assert!(
+            !captured[0].contains("quoted_echo_secret_should_be_stripped"),
+            "quoted block must be stripped before LLM consolidation"
+        );
+        assert!(
+            !captured[0].contains("NO_REPLY"),
+            "NO_REPLY turns must be filtered out"
+        );
+
+        let topics = crate::learned_memory::list_memory_topics(&root).unwrap();
+        assert!(topics.is_empty());
+        let sleep = crate::learned_memory::read_sleep_state(&root);
+        assert_eq!(sleep.last_inbound_seq, 2);
+        assert_eq!(sleep.consolidated_topics, 0);
+    }
+
+    #[test]
+    fn sleep_consolidation_upserts_existing_topic_in_place_and_resolves_conflicts() {
+        let plan = serde_json::json!({
+            "operations": [
+                {
+                    "op": "upsert",
+                    "topic": "service-endpoint",
+                    "description": "Primary API endpoint migrated to port 9090 (replaced 8080)",
+                    "content": "# Service Endpoint\n\nPrimary API endpoint runs on port 9090 in production."
+                }
+            ]
+        })
+        .to_string();
+        let (url, requests, handle) = spawn_mock_sleep_model_server(plan);
+        let _env = ScopedSleepModelEnv::new(Some(&url));
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(NewAgent::new("sleep-upsert", "sylphx"))
+            .unwrap();
+        let root = dir.path().join("agents").join(agent.id.as_str());
+        crate::learned_memory::upsert_memory_topic(
+            &root,
+            &agent.name,
+            None,
+            "service-endpoint",
+            Some("Primary API endpoint on port 8080"),
+            "# Service Endpoint\n\nPrimary API endpoint runs on port 8080.",
+            1700000000000,
+        )
+        .unwrap();
+
+        let mut msg = Incoming::new("We migrated the service-endpoint port from 8080 to 9090.");
+        msg.sender = Some("operator".into());
+        store.receive(&agent.id, msg).unwrap();
+
+        let modified = store.consolidate_agent_sleep_memory(&agent.id).unwrap();
+        handle.join().unwrap();
+        assert!(modified);
+
+        let captured = requests.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert!(
+            captured[0].contains("Primary API endpoint runs on port 8080."),
+            "existing topic body must be included in consolidation prompt"
+        );
+
+        let topics = crate::learned_memory::list_memory_topics(&root).unwrap();
+        assert_eq!(
+            topics.len(),
+            1,
+            "must update topic in place without duplicating"
+        );
+        assert_eq!(topics[0].slug, "service-endpoint");
+        assert_eq!(
+            topics[0].description,
+            "Primary API endpoint migrated to port 9090 (replaced 8080)"
+        );
+        assert!(topics[0].updated_at_ms > 1700000000000);
+
+        let on_disk = std::fs::read_to_string(root.join("memory/service-endpoint.md")).unwrap();
+        assert!(on_disk.contains("created_at_ms: 1700000000000"));
+        assert!(on_disk.contains("port 9090 in production"));
+        assert!(!on_disk.contains("runs on port 8080"));
+    }
+
+    #[test]
+    fn sleep_consolidation_defragments_duplicate_topics_and_syncs_fts5() {
+        let plan = serde_json::json!({
+            "operations": [
+                {
+                    "op": "upsert",
+                    "topic": "cache-ttl",
+                    "description": "Unified cache TTL policy (300s L1, 3600s L2)",
+                    "content": "# Unified Cache TTL\n\nCanonical merged token unifiedcachetoken."
+                },
+                {
+                    "op": "delete",
+                    "topic": "cache-ttl-v1"
+                },
+                {
+                    "op": "delete",
+                    "topic": "cache-ttl-v2"
+                }
+            ]
+        })
+        .to_string();
+        let (url, _requests, handle) = spawn_mock_sleep_model_server(plan);
+        let _env = ScopedSleepModelEnv::new(Some(&url));
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(NewAgent::new("sleep-defrag", "sylphx"))
+            .unwrap();
+        let root = dir.path().join("agents").join(agent.id.as_str());
+        crate::learned_memory::upsert_memory_topic(
+            &root,
+            &agent.name,
+            None,
+            "cache-ttl-v1",
+            Some("Legacy L1 cache TTL"),
+            "Fragment one oldfragmenttoken",
+            1700000000000,
+        )
+        .unwrap();
+        crate::learned_memory::upsert_memory_topic(
+            &root,
+            &agent.name,
+            None,
+            "cache-ttl-v2",
+            Some("Legacy L2 cache TTL"),
+            "Fragment two secondfragmenttoken",
+            1700000001000,
+        )
+        .unwrap();
+        store.sync_agent_memory_index(&agent).unwrap();
+
+        let mut msg = Incoming::new("Consolidate cache TTL notes into a single topic.");
+        msg.sender = Some("operator".into());
+        store.receive(&agent.id, msg).unwrap();
+
+        let modified = store.consolidate_agent_sleep_memory(&agent.id).unwrap();
+        handle.join().unwrap();
+        assert!(modified);
+
+        let topics = crate::learned_memory::list_memory_topics(&root).unwrap();
+        assert_eq!(topics.len(), 1);
+        assert_eq!(topics[0].slug, "cache-ttl");
+        let mem_md = std::fs::read_to_string(root.join("memory/MEMORY.md")).unwrap();
+        assert!(mem_md.contains("cache-ttl"));
+        assert!(!mem_md.contains("cache-ttl-v1"));
+        assert!(!mem_md.contains("cache-ttl-v2"));
+
+        let ids = [agent.id.to_string()];
+        let merged_hits = store
+            .search_host_files(
+                &ids,
+                crate::host_index::MemoryScope::Memory,
+                &HistorySearchQuery {
+                    query: Some("unifiedcachetoken".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(merged_hits.len(), 1);
+        let old_hits = store
+            .search_host_files(
+                &ids,
+                crate::host_index::MemoryScope::Memory,
+                &HistorySearchQuery {
+                    query: Some("oldfragmenttoken".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            old_hits.is_empty(),
+            "deleted fragmented topic must be evicted from HostIndex FTS5"
+        );
+    }
+
+    #[test]
+    fn sleep_consolidation_defers_turns_during_cooldown_without_data_loss() {
+        let plan = serde_json::json!({
+            "operations": [
+                {
+                    "op": "upsert",
+                    "topic": "deferred-fact",
+                    "description": "Fact consolidated after cooldown expiry",
+                    "content": "Durable fact body after cooldown."
+                }
+            ]
+        })
+        .to_string();
+        let (url, requests, handle) = spawn_mock_sleep_model_server(plan);
+        let _env = ScopedSleepModelEnv::new(Some(&url));
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(NewAgent::new("sleep-cooldown", "sylphx"))
+            .unwrap();
+        let root = dir.path().join("agents").join(agent.id.as_str());
+        std::fs::create_dir_all(root.join("memory")).unwrap();
+
+        // Simulate a consolidation that just ran at `now_ms()`.
+        let now = crate::now_ms();
+        crate::learned_memory::write_sleep_state(
+            &root,
+            &crate::learned_memory::SleepState {
+                last_consolidated_ms: now,
+                last_inbound_seq: 0,
+                last_outbound_ms: 0,
+                consolidated_topics: 0,
+            },
+        )
+        .unwrap();
+
+        let mut msg = Incoming::new("Durable fact arriving during the 10-minute cooldown window.");
+        msg.sender = Some("operator".into());
+        store.receive(&agent.id, msg).unwrap();
+
+        // First call during cooldown: must defer LLM call and preserve last_inbound_seq = 0.
+        let modified_in_cooldown = store.consolidate_agent_sleep_memory(&agent.id).unwrap();
+        assert!(!modified_in_cooldown);
+        assert!(requests.lock().unwrap().is_empty());
+        let sleep_during = crate::learned_memory::read_sleep_state(&root);
+        assert_eq!(
+            sleep_during.last_inbound_seq, 0,
+            "must not advance watermark while deferred by cooldown"
+        );
+
+        // Expire the 10-minute cooldown and run again: now it consolidates and advances watermark.
+        crate::learned_memory::write_sleep_state(
+            &root,
+            &crate::learned_memory::SleepState {
+                last_consolidated_ms: now - 605_000,
+                last_inbound_seq: 0,
+                last_outbound_ms: 0,
+                consolidated_topics: 0,
+            },
+        )
+        .unwrap();
+        let modified_after = store.consolidate_agent_sleep_memory(&agent.id).unwrap();
+        handle.join().unwrap();
+        assert!(modified_after);
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        let sleep_after = crate::learned_memory::read_sleep_state(&root);
+        assert_eq!(sleep_after.last_inbound_seq, 1);
+        assert_eq!(sleep_after.consolidated_topics, 1);
     }
 }

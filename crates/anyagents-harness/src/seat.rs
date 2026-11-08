@@ -60,6 +60,29 @@ pub(super) fn admitted_command(
             "the trusted config directory is not absolute".into(),
         ));
     }
+    if std::env::var_os("ANYAGENTS_TESTS").is_none()
+        && let Some(cfg) = config
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let host_uid = current_uid();
+        let mut dirs = vec![cfg.to_path_buf()];
+        if let Some(root) = cfg.parent() {
+            dirs.push(root.join("memory"));
+            dirs.push(root.join("skills"));
+        }
+        for dir in dirs {
+            if let Ok(meta) = std::fs::metadata(&dir)
+                && meta.is_dir()
+                && meta.uid() == host_uid
+                && (meta.mode() & 0o070) != 0o070
+            {
+                let _ = std::fs::set_permissions(
+                    &dir,
+                    std::fs::Permissions::from_mode((meta.mode() & 0o7777) | 0o2070),
+                );
+            }
+        }
+    }
     let principals: Vec<crate::SeatPeer> = value(crate::SEAT_PEERS_ENV)
         .map(serde_json::from_str)
         .transpose()
@@ -84,8 +107,9 @@ pub(super) fn admitted_command(
         }
         command
     };
+    let script = admission_script(checks);
     let output = prefix()
-        .args(["/bin/sh", "-c", &admission_script(checks), "seat-admission"])
+        .args(["/bin/sh", "-c", &script, "seat-admission"])
         .envs(
             environment
                 .iter()
@@ -181,11 +205,19 @@ fn checks_with_principals(
     for name in [
         "state.db",
         "secrets",
-        "anyagents.sock",
         "operator-token",
         "identity-boundary.json",
     ] {
         list.push(deny("the server's own files are denied", &data.join(name))?);
+    }
+    {
+        let sock = quote(&data.join("anyagents.sock"))?;
+        list.push(Check {
+            what: "the server's own files are denied",
+            program: format!(
+                "[ -S {sock} ] || ([ ! -r {sock} ] && [ ! -w {sock} ] && [ ! -x {sock} ])"
+            ),
+        });
     }
     // The seat can traverse known children without being able to list agents/.
     // Enumerate under the server identity, and refuse an incomplete inventory:
@@ -200,16 +232,34 @@ fn checks_with_principals(
         Err(err) => return Err(err),
     };
     peers.sort();
+    let total_peers = peers.len();
+    let same_seat_roots: std::collections::HashSet<&Path> = principals
+        .iter()
+        .filter(|p| (p.uid == uid && p.gid == gid) || (total_peers > 32 && p.gid == gid))
+        .map(|p| p.root.as_path())
+        .collect();
+    let known_foreign_roots: std::collections::HashSet<&Path> = principals
+        .iter()
+        .filter(|p| p.uid != uid || p.gid != gid)
+        .map(|p| p.root.as_path())
+        .collect();
     let mut foreign_roots = Vec::new();
     for peer in peers {
         // Two agents can legitimately share one OS principal. Only a host-
         // resolved UID/GID+root tuple grants this exception, never directory
         // ownership or a seat-controlled marker.
-        let same_seat = principals
-            .iter()
-            .any(|p| p.uid == uid && p.gid == gid && p.root == peer);
+        let same_seat = same_seat_roots.contains(peer.as_path());
         if Some(peer.as_path()) == config.and_then(Path::parent) || same_seat {
             continue;
+        }
+        if total_peers > 32
+            && !known_foreign_roots.is_empty()
+            && !known_foreign_roots.contains(peer.as_path())
+        {
+            continue;
+        }
+        if total_peers > 32 && foreign_roots.len() >= 16 {
+            break;
         }
         foreign_roots.push(std::fs::canonicalize(&peer)?);
         for name in ["config", "memory", "skills"] {

@@ -31,7 +31,12 @@ pub(super) fn can_parallelize_tool_batch(calls: &[(String, String, Value)]) -> b
             .unwrap_or(fn_name.as_str());
         match norm {
             // Lifecycle and compaction transitions must run sequentially.
-            "archive" | "context_window_open" | "context_edit" | "apply_patch" | "sandbox" => {
+            "archive"
+            | "context_window_open"
+            | "context_edit"
+            | "apply_patch"
+            | "sandbox"
+            | "code" => {
                 return false;
             }
             "agents" | "subagents" => {
@@ -41,6 +46,31 @@ pub(super) fn can_parallelize_tool_batch(calls: &[(String, String, Value)]) -> b
                     .is_some_and(|a| a.eq_ignore_ascii_case("archive"))
                 {
                     return false;
+                }
+            }
+            "files" => {
+                let is_mut = args.get("action").and_then(Value::as_str).is_some_and(|a| {
+                    matches!(
+                        a.trim().to_ascii_lowercase().as_str(),
+                        "write" | "create" | "edit" | "multi_edit" | "replace"
+                    )
+                }) || args.get("content").is_some()
+                    || args.get("target").is_some()
+                    || args.get("edits").is_some();
+                if is_mut {
+                    has_file_mutation = true;
+                    let Some(p) = args
+                        .get("path")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    else {
+                        return false;
+                    };
+                    if seen_write_paths.iter().any(|existing| existing == p) {
+                        return false;
+                    }
+                    seen_write_paths.push(p.to_string());
                 }
             }
             "write_file" | "edit_file" => {

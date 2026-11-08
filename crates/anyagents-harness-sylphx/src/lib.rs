@@ -782,7 +782,7 @@ fn is_cloud_client_coordination_tool(name: &str) -> bool {
 }
 
 fn build_cloud_agent_client_tools() -> Vec<Value> {
-    build_tool_definitions()
+    build_legacy_tool_definitions()
         .into_iter()
         .filter_map(|t| {
             let func = t.get("function")?;
@@ -2803,12 +2803,21 @@ pub(crate) fn run_native_gateway_turn(
                 let parsed_args: Value =
                     serde_json::from_str(raw_args).unwrap_or_else(|_| json!({}));
                 let norm_fn = fn_name.strip_prefix("mcp__anyagents__").unwrap_or(&fn_name);
-                if norm_fn == "send"
-                    && send_args_satisfy_target(&parsed_args, unanswered_reply_target.as_deref())
+                if (norm_fn == "send"
+                    && send_args_satisfy_target(&parsed_args, unanswered_reply_target.as_deref()))
+                    || (norm_fn == "code"
+                        && parsed_args
+                            .get("code")
+                            .and_then(Value::as_str)
+                            .is_some_and(|c| c.contains("send(")))
                 {
                     unanswered_reply_target = None;
                 }
-                if matches!(norm_fn, "context_edit" | "context_prune") {
+                if matches!(norm_fn, "context_edit" | "context_prune")
+                    || (norm_fn == "context"
+                        && (parsed_args.get("action").and_then(Value::as_str) == Some("edit")
+                            || parsed_args.get("edits").is_some()))
+                {
                     did_context_edit = true;
                 }
                 parsed_calls.push((call_id, fn_name, parsed_args));
@@ -2856,7 +2865,11 @@ pub(crate) fn run_native_gateway_turn(
                         break;
                     }
                     let norm_fn = fn_name.strip_prefix("mcp__anyagents__").unwrap_or(&fn_name);
-                    if norm_fn == "context_window_open"
+                    if (norm_fn == "context_window_open"
+                        || (norm_fn == "context"
+                            && (parsed_args.get("action").and_then(Value::as_str)
+                                == Some("compact")
+                                || parsed_args.get("handoff").is_some())))
                         && let Some(h) = parsed_args
                             .get("handoff")
                             .and_then(Value::as_str)
@@ -3717,6 +3730,99 @@ fn build_tool_definitions() -> Vec<Value> {
         json!({
             "type": "function",
             "function": {
+                "name": "code",
+                "description": "Unified AnyAgents Code Mode & Workspace/Coordination SDK. Executes an async TypeScript/JavaScript snippet in an isolated capability sandbox with `anyagents.{memory,conversation,send,agents,schedule,groups,browser,web,computer,device,media,files}` (alias `tools.anyagents`), `web.{search,fetch}` (alias `tools.web`), `computer.*` (alias `tools.computer`), `device.*` (alias `tools.device`), `media.*` (alias `tools.media`), and `workspace.{read,write,edit,multi_edit,patch,glob,grep,list,exec}` (alias `tools.workspace`). Always use `code` for file reads/edits/patches/searches, learned memory, episodic recall, web search/fetch, computer/device/media actions, agent spawning, schedules, and sending messages.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "code": {
+                            "type": "string",
+                            "description": "Async TypeScript / JavaScript snippet body to execute."
+                        },
+                        "timeout_ms": {
+                            "type": "integer",
+                            "description": "Optional execution timeout in milliseconds (default 30000, max 120000)."
+                        }
+                    },
+                    "required": ["code"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "description": "Execute a bash command (`git`, `cargo`, `npm`, `kubectl`, `op`, etc.) in your working directory, or switch workspace placement (`placement`: `\"local\" | \"cloud\"`).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "Shell command string to execute."
+                        },
+                        "timeout_ms": {
+                            "type": "integer",
+                            "description": "Optional timeout in milliseconds (default 120000)."
+                        },
+                        "placement": {
+                            "type": "string",
+                            "enum": ["local", "cloud"],
+                            "description": "Optional workspace placement switch (`\"local\"` | `\"cloud\"`)."
+                        }
+                    },
+                    "required": ["command"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "context",
+                "description": "Manage your active context window, session goals, and progressive skill disclosure (`action`: `\"status\"` | `\"edit\"` | `\"compact\"` | `\"goal\"` | `\"skill\"`).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": ["status", "edit", "compact", "goal", "skill"],
+                            "description": "`\"status\"` (context budget), `\"edit\"` (replace/prune old transcript ranges), `\"compact\"` (open a fresh context window with `handoff`), `\"goal\"` (manage session goal), or `\"skill\"` (activate `SKILL.md` or `references/*.md`)."
+                        },
+                        "edits": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "range": { "type": "string" },
+                                    "with": { "type": "string" }
+                                },
+                                "required": ["range", "with"]
+                            }
+                        },
+                        "handoff": {
+                            "type": "string",
+                            "description": "Structured handoff (`Goal`, `Verified Facts`, `Decisions`, `Next Action`) when `action = \"compact\"`."
+                        },
+                        "goal_action": {
+                            "type": "string",
+                            "enum": ["create", "update", "complete", "pause", "cancel", "status"]
+                        },
+                        "title": { "type": "string" },
+                        "acceptance_criteria": { "type": "array", "items": { "type": "string" } },
+                        "progress": { "type": "string" },
+                        "name": { "type": "string", "description": "Skill name when `action = \"skill\"`." },
+                        "reference": { "type": "string", "description": "Optional reference filename under `references/` when `action = \"skill\"`." }
+                    }
+                }
+            }
+        }),
+    ]
+}
+
+fn build_legacy_tool_definitions() -> Vec<Value> {
+    vec![
+        json!({
+            "type": "function",
+            "function": {
                 "name": "send",
                 "description": "Send message or perform interaction (`react`, `vote`, `edit`, `delete`, `pin`, `unpin`, `stop_poll`) to agent(s), group(s), or channel(s).",
                 "parameters": {
@@ -4191,10 +4297,12 @@ fn execute_sylphx_tool(
     // attachments and native recall retain their own structured representations.
     let limits = match normalized {
         "agents" | "subagents" | "send" | "conversation" | "search" | "groups" | "schedule"
-        | "browser" | "describe" | "archive" | "wake" | "spawn" | "interact" => {
-            Some((24_000, 11_000, 11_000))
+        | "browser" | "describe" | "archive" | "wake" | "spawn" | "interact" | "memory" | "web"
+        | "computer" | "device" | "media" | "files" => Some((24_000, 11_000, 11_000)),
+        "code" => Some((48_000, 22_000, 22_000)),
+        "bash" | "shell" | "code_mode" | "grep" | "glob" | "context" => {
+            Some((30_000, 14_000, 14_000))
         }
-        "bash" | "shell" | "code_mode" | "grep" | "glob" => Some((30_000, 14_000, 14_000)),
         "list_dir" if workspace::delegated(env) => Some((30_000, 14_000, 14_000)),
         "read_file"
             if args
@@ -4224,9 +4332,90 @@ fn execute_sylphx_tool_raw(
 ) -> String {
     let normalized = name.strip_prefix("mcp__anyagents__").unwrap_or(name);
     match normalized {
-        "agents" | "subagents" | "send" | "conversation" | "search" | "groups" | "schedule"
-        | "browser" | "describe" | "archive" | "wake" | "spawn" | "interact" => {
+        "code" | "agents" | "subagents" | "send" | "conversation" | "search" | "groups"
+        | "schedule" | "browser" | "describe" | "archive" | "wake" | "spawn" | "interact"
+        | "memory" | "web" | "computer" | "device" | "media" | "files" => {
             call_anyagents_mcp_tool(mcp_command, mcp_args, env, normalized, args)
+        }
+        "context" => {
+            let action = args
+                .get("action")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| {
+                    if args.get("handoff").is_some() {
+                        "compact"
+                    } else if args.get("edits").is_some() {
+                        "edit"
+                    } else if args.get("name").is_some() {
+                        "skill"
+                    } else if args.get("goal_action").is_some()
+                        || args.get("title").is_some()
+                        || args.get("acceptance_criteria").is_some()
+                    {
+                        "goal"
+                    } else {
+                        "status"
+                    }
+                });
+            match action {
+                "edit" | "prune" => execute_sylphx_tool_raw(
+                    "context_edit",
+                    args,
+                    config_dir,
+                    work_dir,
+                    env,
+                    mcp_command,
+                    mcp_args,
+                ),
+                "compact" | "window_open" => execute_sylphx_tool_raw(
+                    "context_window_open",
+                    args,
+                    config_dir,
+                    work_dir,
+                    env,
+                    mcp_command,
+                    mcp_args,
+                ),
+                "goal" => {
+                    let mut goal_args = args.clone();
+                    if let Some(ga) = args.get("goal_action").cloned()
+                        && let Some(obj) = goal_args.as_object_mut()
+                    {
+                        obj.insert("action".to_string(), ga);
+                    } else if let Some(obj) = goal_args.as_object_mut() {
+                        obj.insert("action".to_string(), json!("status"));
+                    }
+                    execute_sylphx_tool_raw(
+                        "goal",
+                        &goal_args,
+                        config_dir,
+                        work_dir,
+                        env,
+                        mcp_command,
+                        mcp_args,
+                    )
+                }
+                "skill" | "activate_skill" => execute_sylphx_tool_raw(
+                    "activate_skill",
+                    args,
+                    config_dir,
+                    work_dir,
+                    env,
+                    mcp_command,
+                    mcp_args,
+                ),
+                _ => execute_sylphx_tool_raw(
+                    "context_budget_read",
+                    args,
+                    config_dir,
+                    work_dir,
+                    env,
+                    mcp_command,
+                    mcp_args,
+                ),
+            }
         }
         "memory_recall" | "mind_recall" => {
             execute_memory_recall(&config_dir.join("sylphx-transcript.jsonl"), args)
@@ -4559,6 +4748,29 @@ fn execute_sylphx_tool_raw(
             )
         }
         "bash" | "shell" => {
+            if let Some(placement) = args
+                .get("placement")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                let switch_res = execute_sylphx_tool_raw(
+                    "sandbox",
+                    &json!({ "action": "placement", "placement": placement }),
+                    config_dir,
+                    work_dir,
+                    env,
+                    mcp_command,
+                    mcp_args,
+                );
+                if args
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .is_none_or(|c| c.trim().is_empty())
+                {
+                    return switch_res;
+                }
+            }
             let Some(cmd_str) = args.get("command").and_then(Value::as_str) else {
                 return "error: missing `command`".to_string();
             };
@@ -5057,9 +5269,7 @@ mod tests {
         assert!(tools[0]["parameters"].is_object());
         assert!(tools[0].get("function").is_none());
         let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
-        assert!(names.contains(&"memory_recall"));
-        assert!(names.contains(&"context_budget_read"));
-        assert!(names.contains(&"context_window_open"));
+        assert_eq!(names, vec!["code", "bash", "context"]);
     }
 
     #[test]
@@ -6607,7 +6817,7 @@ if [[ ${WORKSPACE_TEST_REFUSE:-0} == 1 ]]; then
 fi
 # This unit double proves routing only. The required native-UID fixture
 # executes the admission script with real setpriv instead.
-if [[ "$1" == /bin/sh && "${2:-}" == -c ]]; then exit 0; fi
+if [[ "$1" == /bin/sh && ( "${2:-}" == -c || "${2:-}" == -s ) ]]; then exit 0; fi
 exec "$@"
 "#,
         )
@@ -7204,5 +7414,43 @@ exec "$@"
             &json!({ "action": "spawn", "system_prompt": "Custom prompt." }),
         );
         assert_eq!(norm2["instructions"], "Custom prompt.");
+
+        let defs = build_tool_definitions();
+        let names: Vec<&str> = defs
+            .iter()
+            .filter_map(|t| t.pointer("/function/name").and_then(Value::as_str))
+            .collect();
+        assert_eq!(names, vec!["code", "bash", "context"]);
+
+        let empty_env = workspace::Environment::default();
+        let ctx_goal = execute_sylphx_tool(
+            "context",
+            &json!({
+                "action": "goal",
+                "goal_action": "create",
+                "title": "Ship Pure Code Mode",
+                "acceptance_criteria": ["CANONICAL_MCP_TOOLS = [\"code\"]"]
+            }),
+            &cfg,
+            &work,
+            &empty_env,
+            Path::new("unused-mcp"),
+            &[],
+        );
+        assert!(ctx_goal.contains("Ship Pure Code Mode"), "{ctx_goal}");
+
+        let ctx_compact = execute_sylphx_tool(
+            "context",
+            &json!({
+                "action": "compact",
+                "handoff": "Goal: verify compact window."
+            }),
+            &cfg,
+            &work,
+            &empty_env,
+            Path::new("unused-mcp"),
+            &[],
+        );
+        assert!(ctx_compact.contains("window_opened"), "{ctx_compact}");
     }
 }

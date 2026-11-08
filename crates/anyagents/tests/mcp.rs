@@ -365,15 +365,8 @@ async fn mcp_tools_use_the_server_socket() {
     let names: Vec<_> = tools.iter().map(|tool| tool.name.to_string()).collect();
     assert_eq!(
         names,
-        vec![
-            "agents".to_string(),
-            "browser".to_string(),
-            "conversation".to_string(),
-            "groups".to_string(),
-            "schedule".to_string(),
-            "send".to_string(),
-        ],
-        "expected consolidated 6 canonical orthogonal MCP tools, got {names:?}"
+        vec!["code".to_string()],
+        "expected Pure Code Mode (`CANONICAL_MCP_TOOLS = &[\"code\"]`), got {names:?}"
     );
 
     let listed: AgentsResponse = ok_json(call(&alpha, "agents", serde_json::json!({})).await);
@@ -1461,6 +1454,119 @@ async fn history_search_defaults_and_all_never_escape_a_private_childs_tree() {
             );
         }
     }
+    client.cancel().await.unwrap();
+    drop(server);
+}
+
+#[tokio::test]
+async fn code_mode_supports_memory_sdk_workspace_patch_list_exec_and_computer_snapshot_refs() {
+    let dir = support::physical_tempdir();
+    let created = bin()
+        .env("PATH", machine_path(dir.path()))
+        .arg("--data")
+        .arg(dir.path())
+        .args(["agents", "create", "sage"])
+        .output()
+        .unwrap();
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let server = start_server(dir.path());
+    let client = connect(dir.path(), "sage").await;
+
+    let code_res: serde_json::Value = ok_json(
+        call(
+            &client,
+            "code",
+            serde_json::json!({
+                "code": r##"
+                // 1. First-class anyagents.memory SDK
+                const w = await anyagents.memory.write({
+                    topic: "arch-decisions",
+                    description: "Pure Code Mode architecture",
+                    content: "# Pure Code Mode\nOnly `code` is exposed in list_tools."
+                });
+                const r = await anyagents.memory.read("arch-decisions");
+                const list = await anyagents.memory.list();
+                const search = await anyagents.memory.search("Pure Code Mode");
+                const del = await anyagents.memory.delete("arch-decisions");
+
+                // 2. Enhanced workspace SDK: write, 4-stage edit, patch, list, exec
+                await workspace.write("src/demo.rs", "fn main() {\n    let x = 1;\n    println!(\"{}\", x);\n}\n");
+                // Indentation-different edit (stage 3)
+                const edited = await workspace.edit({
+                    path: "src/demo.rs",
+                    target: "let x = 1;\nprintln!(\"{}\", x);",
+                    replacement: "let x = 42;\n    println!(\"val={}\", x);"
+                });
+                // V4A patch
+                const patched = await workspace.patch([
+                    "*** Begin Patch",
+                    "*** Update File: src/demo.rs",
+                    "@@",
+                    "-    let x = 42;",
+                    "+    let x = 99;",
+                    "*** Add File: src/extra.txt",
+                    "+hello patch",
+                    "*** End Patch"
+                ].join("\n"));
+                const listed = await workspace.list("src");
+                const execOut = await workspace.exec({ cmd: "printf 'exec-ok'" });
+
+                // 3. Semantic Accessibility Snapshot & STALE_REF guard on tools.computer
+                const snap = await tools.computer.snapshot();
+                let staleCaught = false;
+                try {
+                    await tools.computer.click("@e1");
+                } catch (err: any) {
+                    staleCaught = String(err).includes("STALE_REF") && String(err).includes("stale_ref");
+                }
+
+                return {
+                    memTopic: r.topic,
+                    memHasContent: r.content.includes("Only `code` is exposed"),
+                    memCountBeforeDelete: list.count,
+                    memSearchCount: search.count,
+                    memDeleted: del.deleted,
+                    editReplacements: edited.replacements_made,
+                    patchCount: patched.count,
+                    listCount: listed.count,
+                    execStdout: execOut.stdout,
+                    snapshotIdPrefix: snap.snapshot_id.startsWith("s"),
+                    firstRef: snap.elements[0]?.ref_id,
+                    staleCaught,
+                };
+            "##
+            }),
+        )
+        .await,
+    );
+
+    let res = &code_res["result"];
+    assert_eq!(res["memTopic"], "arch-decisions", "{code_res:?}");
+    assert_eq!(res["memHasContent"], true, "{code_res:?}");
+    assert!(
+        res["memCountBeforeDelete"].as_u64().unwrap_or(0) >= 1,
+        "{code_res:?}"
+    );
+    assert!(
+        res["memSearchCount"].as_u64().unwrap_or(0) >= 1,
+        "{code_res:?}"
+    );
+    assert_eq!(res["memDeleted"], true, "{code_res:?}");
+    assert_eq!(res["editReplacements"], 1, "{code_res:?}");
+    assert_eq!(res["patchCount"], 2, "{code_res:?}");
+    assert_eq!(res["listCount"], 2, "{code_res:?}");
+    assert_eq!(res["execStdout"], "exec-ok", "{code_res:?}");
+    assert_eq!(res["snapshotIdPrefix"], true, "{code_res:?}");
+    assert!(
+        res["firstRef"].as_str().unwrap_or("").contains(":e1"),
+        "{code_res:?}"
+    );
+    assert_eq!(res["staleCaught"], true, "{code_res:?}");
+
     client.cancel().await.unwrap();
     drop(server);
 }

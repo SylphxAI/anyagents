@@ -12,6 +12,7 @@ mod auth;
 mod browser;
 mod channel;
 mod client;
+mod computer;
 mod create;
 mod data;
 mod dsh;
@@ -37,6 +38,7 @@ mod sylphx;
 mod telegram;
 mod ui;
 mod vendor;
+mod web;
 mod worktree;
 mod worktree_access;
 
@@ -364,6 +366,9 @@ enum Command {
         /// Optional lexical + structured search query (SQLite FTS5 BM25 + CJK bigram + exact phrase boost).
         #[arg(short = 'q', long)]
         query: Option<String>,
+        /// Optional scope filter (`all`, `memory`, `transcripts`).
+        #[arg(long)]
+        scope: Option<String>,
         /// Optional peer filter (e.g. `alice`, `agent:beta`, `group:crew`, `telegram:chat:-1001234567890`).
         #[arg(long)]
         with: Option<String>,
@@ -401,6 +406,9 @@ enum Command {
         /// Optional agent filter (`sage`, `volt`, `xenon`, or `all`; defaults to `all`).
         #[arg(long)]
         agent: Option<String>,
+        /// Optional scope filter (`all`, `memory`, `transcripts`).
+        #[arg(long)]
+        scope: Option<String>,
         /// Optional peer filter.
         #[arg(long)]
         with: Option<String>,
@@ -1126,6 +1134,7 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
         Command::Conversation {
             agent,
             query,
+            scope,
             with,
             since_ms,
             limit,
@@ -1136,6 +1145,7 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
             since_ms,
             limit,
             query.as_deref(),
+            scope.as_deref(),
         ),
         Command::Redact {
             agent,
@@ -1179,6 +1189,7 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
         Command::Search {
             query,
             agent,
+            scope,
             with,
             since_ms,
             limit,
@@ -1189,6 +1200,7 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
             since_ms,
             Some(limit.unwrap_or(20)),
             Some(&query),
+            scope.as_deref(),
         ),
         Command::Usage { agent, by } => agent::usage(&data, agent.as_deref(), by.as_deref())
             .map_err(|err| match err {
@@ -1898,6 +1910,9 @@ fn profiles_cmd(
         }
         Some("refresh") | Some("reset") => {
             create::force_refresh_provider_profiles(data, target);
+            if let Ok(store) = anyagents_core::Store::open(data.join("state.db")) {
+                let _ = create::sync_and_list_provider_profiles(&store, data);
+            }
             list_profiles_cmd(data, target)
         }
         Some("models") | Some("catalog") => {
@@ -2220,7 +2235,7 @@ fn list_profiles_cmd(data: &Path, filter: Option<&str>) -> Result<(), anyagents_
             && !t.eq_ignore_ascii_case("reset")
     });
     let mut entries = if let Ok(store) = anyagents_core::Store::open(data.join("state.db")) {
-        create::sync_and_list_provider_profiles(&store, data)
+        create::list_provider_profiles_fast(&store, data)
     } else if client::can_call_server(data) {
         match client::call::<Vec<create::ProviderProfileEntry>>(
             data,
@@ -2239,9 +2254,11 @@ fn list_profiles_cmd(data: &Path, filter: Option<&str>) -> Result<(), anyagents_
         }
     } else {
         let store = anyagents_core::Store::open(data.join("state.db"))?;
-        create::sync_and_list_provider_profiles(&store, data)
+        create::list_provider_profiles_fast(&store, data)
     };
-    create::enrich_profiles_usage(data, &mut entries);
+    if entries.iter().any(|e| e.usage.is_none()) {
+        create::enrich_profiles_usage(data, &mut entries);
+    }
     let matches_filter = |e: &create::ProviderProfileEntry, f_trimmed: &str| -> bool {
         e.provider == f_trimmed
             || e.profile == f_trimmed

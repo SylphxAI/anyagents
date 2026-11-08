@@ -37,7 +37,21 @@ fn owner_pages(data: &Path, test_mode: bool) -> PathBuf {
 /// The caller owns this agent's process lock and has not started a vendor yet.
 /// The global migration lock serializes receipt publication across agents.
 pub(crate) fn before_launch(data: &Path, agent: &AgentId) -> Result<(), Error> {
-    before_launch_from(data, agent, &owner_pages(data, explicit_test_mode()))
+    if !explicit_test_mode()
+        && data
+            .join("host-memory-migration/population-v1.json")
+            .is_file()
+    {
+        return Ok(());
+    }
+    match before_launch_from(data, agent, &owner_pages(data, explicit_test_mode())) {
+        Ok(()) => Ok(()),
+        Err(err) if !explicit_test_mode() => {
+            eprintln!("warning: host memory before_launch deferred for {agent}: {err}");
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
 }
 fn before_launch_from(data: &Path, agent: &AgentId, owners_pages: &Path) -> Result<(), Error> {
     let store = Store::open(data.join("state.db"))?;
@@ -78,6 +92,14 @@ fn before_launch_from(data: &Path, agent: &AgentId, owners_pages: &Path) -> Resu
 /// archived identities that will never launch. Process locks, not SQL state,
 /// establish quiescence; live or busy identities are explicitly deferred.
 pub(crate) fn on_start(store: &Store) {
+    if !explicit_test_mode()
+        && store
+            .data_dir()
+            .join("host-memory-migration/population-v1.json")
+            .is_file()
+    {
+        return;
+    }
     // Migration is maintenance, never a prerequisite for binding host sockets.
     // Failed integrity checks preserve their sources; keep a retryable receipt
     // and allow authorized non-migration operations to remain available.
