@@ -525,6 +525,18 @@ mod tests {
         script: String,
         on_line: Arc<dyn Fn(&Value) -> NotificationEffect + Send + Sync>,
     ) -> RpcChild {
+        launch_with_request_handler(
+            script,
+            on_line,
+            Arc::new(|_, _| Some(json!({"approved": true}))),
+        )
+    }
+
+    fn launch_with_request_handler(
+        script: String,
+        on_line: Arc<dyn Fn(&Value) -> NotificationEffect + Send + Sync>,
+        on_request: RequestHandler,
+    ) -> RpcChild {
         RpcChild::launch(
             RpcLaunch {
                 name: "rpc-fixture".into(),
@@ -534,7 +546,7 @@ mod tests {
                 work_dir: None,
             },
             on_line,
-            Arc::new(|_, _| Some(json!({"approved": true}))),
+            on_request,
         )
         .unwrap()
     }
@@ -601,8 +613,22 @@ mod tests {
 
     #[test]
     fn required_reply_write_failure_marks_child_dead_and_wakes_pending_request() {
-        let child = launch("IFS= read -r request; exec 0<&-; printf '%s\n' '{\"id\":99,\"method\":\"approval/request\"}'; exec sleep 30".into(),
-            Arc::new(|_| NotificationEffect::default()));
+        let (stdin_tx, stdin_rx) =
+            std::sync::mpsc::sync_channel::<Arc<Mutex<Option<ChildStdin>>>>(1);
+        let stdin_rx = Mutex::new(stdin_rx);
+        let child = launch_with_request_handler(
+            "IFS= read -r request; printf '%s\n' '{\"id\":99,\"method\":\"approval/request\"}'; exec sleep 30".into(),
+            Arc::new(|_| NotificationEffect::default()),
+            Arc::new(move |_, _| {
+                // Close the host writer while handling the vendor's request.
+                // A shell closing fd 0 does not guarantee EPIPE while another
+                // process still holds an inherited copy of the pipe's read end.
+                let stdin = lock(&stdin_rx).recv_timeout(Duration::from_secs(5)).unwrap();
+                *lock(&stdin) = None;
+                Some(json!({"approved": true}))
+            }),
+        );
+        stdin_tx.send(Arc::clone(&child.stdin)).unwrap();
         assert!(matches!(
             child.request("turn", json!({}), Duration::from_secs(5)),
             Err(RpcFail::Dead)

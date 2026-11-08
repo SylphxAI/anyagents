@@ -391,7 +391,7 @@ pub fn persist_last_error(config_dir: &Path, error: Option<&str>, quota_reset_at
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
     vendor_launch_authorized(request, None)
 }
