@@ -5,7 +5,7 @@ import vm from 'node:vm';
 
 // Execute the shipped handlers, with deterministic frame, clock and HTTP edges.
 // Real trusted input and remote DOM effects are also covered by the Chromium suite.
-async function mount({ frameOk = true } = {}) {
+async function mount({ frameOk = true, readText = async () => 'native paste' } = {}) {
   class Target {
     listeners = new Map(); style = {}; dataset = {}; value = ''; hidden = false;
     clientWidth = 390; clientHeight = 844; width = 1280; height = 800;
@@ -32,7 +32,7 @@ async function mount({ frameOk = true } = {}) {
     cancelAnimationFrame: id => timers.delete(id),
     setTimeout: (fn, ms) => { const id = ++nextTimer; timers.set(id, { fn, ms, due: clock + ms }); return id; },
     clearTimeout: id => timers.delete(id),
-    addEventListener() {}, navigator: { clipboard: { readText: async () => 'native paste' } },
+    addEventListener() {}, navigator: { clipboard: { readText } },
     createImageBitmap: async () => ({ width: 1280, height: 800, close() {} }),
     fetch: async (url, options) => {
       if (url.includes('/frame.jpg') && !frameOk) throw new Error('capture unavailable');
@@ -43,6 +43,7 @@ async function mount({ frameOk = true } = {}) {
       return { ok: true, json: async () => ({ ok: true, focus }), blob: async () => ({}), headers: { get: name => ({ 'X-Remote-Width': '1280', 'X-Remote-Height': '800', 'X-Remote-Dpr': '1' })[name] } };
     },
   };
+  context.addEventListener = context.window.addEventListener.bind(context.window);
   const source = await readFile(new URL('../crates/anyagents/src/browser_takeover.js', import.meta.url), 'utf8');
   vm.runInNewContext(source.replace(/^export /gm, ''), context);
   const settle = async () => { for (let i = 0; i < 30; i++) await Promise.resolve(); };
@@ -208,4 +209,81 @@ test('frame capture schedules immediately on success and backs off on failure', 
   const failed = await mount({ frameOk: false });
   assert.ok([...failed.timers.values()].some(timer => timer.ms === 100));
   assert.equal([...failed.timers.values()].some(timer => timer.ms === 0), false);
+});
+
+
+function beginPaste(ui) {
+  const prior = new Set(ui.timers.keys()), target = ui.element('keyboard-proxy'); target.focus();
+  ui.window.emit('keydown', {target,key:'v',ctrlKey:true});
+  const timer = [...ui.timers].find(([id,t]) => !prior.has(id) && t.ms === 0);
+  return timer?.[1].fn();
+}
+const terminal = ui => ui.inputs.filter(p => p.type === 'mouseCancel' || p.event_type === 'mouseReleased');
+test('committed touch pointercancel must not become a normal click release', async () => {
+  const ui=await mount(); ui.pointer('pointerdown',1,100,400); await ui.advance(600);
+  ui.pointer('pointercancel',1,100,400); await ui.settle();
+  assert.equal(ui.inputs.some(p=>p.event_type==='mouseReleased'),false);
+});
+test('zero-sized viewport terminates an already committed drag with finite coordinates',async()=>{
+  const ui=await mount();ui.pointer('pointerdown',1,100,400);ui.pointer('pointermove',1,116,400);await ui.settle();
+  ui.element('stage').clientWidth=0;ui.element('stage').clientHeight=0;ui.window.emit('resize');await ui.settle();
+  assert.equal(terminal(ui).length,ui.inputs.some(p=>p.event_type==='mousePressed')?1:0,'collapse must end any remote press without waiting for an up');
+});
+test('pointerup after zero-sized viewport does not serialize NaN as null',async()=>{
+  const ui=await mount();ui.pointer('pointerdown',1,100,400);ui.pointer('pointermove',1,116,400);await ui.settle();
+  ui.element('stage').clientWidth=0;ui.element('stage').clientHeight=0;ui.window.emit('resize');
+  ui.pointer('pointerup',1,0,0);await ui.settle();
+  assert.ok(ui.inputs.every(p=>p.x!==null&&p.y!==null),'all remote coordinates must be numbers');
+});
+test('visibility loss without window blur terminates a committed touch',async()=>{
+  const ui=await mount();ui.pointer('pointerdown',1,100,400);await ui.advance(600);
+  ui.document.hidden=true;ui.document.visibilityState='hidden';ui.document.emit('visibilitychange');await ui.settle();
+  assert.equal(terminal(ui).length,ui.inputs.some(p=>p.event_type==='mousePressed')?1:0);
+});
+test('clipboard fallback must not send after focus transfers to local HUD',async()=>{
+  let resolve;const read=new Promise(r=>resolve=r),ui=await mount({readText:()=>read});
+  const running=beginPaste(ui);ui.element('type-input').focus();resolve('old remote secret');await running;await ui.settle();
+  assert.deepEqual(ui.inputs.filter(p=>p.type==='paste'),[]);
+});
+test('blurred fallback cannot paste text read in another application',async()=>{
+  let resolve;const read=new Promise(r=>resolve=r),ui=await mount({readText:()=>read});
+  const running=beginPaste(ui);ui.window.emit('blur');resolve('clipboard from other application');await running;await ui.settle();
+  assert.deepEqual(ui.inputs.filter(p=>p.type==='paste'),[]);
+});
+test('new native paste supersedes previous unfinished fallback turn',async()=>{
+  const resolves=[],ui=await mount({readText:()=>new Promise(r=>resolves.push(r))});
+  const running=beginPaste(ui),target=ui.element('keyboard-proxy');
+  ui.window.emit('keyup',{target,key:'v',ctrlKey:true});
+  ui.window.emit('keydown',{target,key:'v',ctrlKey:true});
+  ui.document.emit('paste',{target,clipboardData:{getData:()=>'new paste'}});await ui.settle();
+  resolves[0]?.('stale paste');await running;await ui.settle();
+  assert.deepEqual(ui.inputs.filter(p=>p.type==='paste').map(p=>p.text),['new paste']);
+});
+
+test('prearmed cancellation guard preserves terminal pointerup and subsequent ordinary/modified clicks', async () => {
+  const listeners = new Map(), window = {
+    addEventListener(type, listener) { const list = listeners.get(type) || []; list.push(listener); listeners.set(type, list); },
+  };
+  const source = await readFile(new URL('../crates/anyagents/src/browser_takeover_cancel.js', import.meta.url), 'utf8');
+  assert.equal(vm.runInNewContext(source, { window }), true);
+  const emit = (type, modifiers = false, trusted = true) => {
+    const e = { type, isTrusted: trusted, pointerType: 'mouse', altKey: modifiers, ctrlKey: modifiers,
+      metaKey: modifiers, shiftKey: modifiers, prevented: false, stopped: false,
+      preventDefault() { this.prevented = true; }, stopImmediatePropagation() { this.stopped = true; } };
+    for (const fn of listeners.get(type) || []) fn(e);
+    return e;
+  };
+  // No compatibility mousedown/mouseup: pointerdown.preventDefault controls
+  // still receive terminal native pointerup and only their click is suppressed.
+  emit('pointerdown');
+  assert.equal(emit('pointerup', true).stopped, false);
+  assert.equal(emit('click', true).prevented, true);
+  for (const modified of [false, true]) {
+    emit('pointerdown', modified); emit('pointerup', modified);
+    assert.equal(emit('click', modified).prevented, false);
+  }
+  emit('pointerdown'); emit('pointerup', true);
+  assert.equal(emit('click', true, false).prevented, false, 'page-script events are not consumed');
+  emit('pointerdown'); emit('pointerup');
+  assert.equal(emit('click').prevented, false, 'no-click cancellation cannot poison a later press');
 });

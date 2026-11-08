@@ -11,11 +11,11 @@ export async function interactionAcceptance({ viewer, remote, url, output, until
     fixture.innerHTML='<button id="signin" style="position:fixed;left:400px;top:30px;width:200px;height:50px">Sign in</button><button id="hold-button" style="position:fixed;left:400px;top:110px;width:200px;height:50px">Press and hold</button><div id="paint-marker" style="position:fixed;left:650px;top:30px;width:60px;height:60px;background:rgb(240,0,240)"></div><div id="track" style="position:fixed;left:400px;top:200px;width:320px;height:50px;background:#aaa"><div id="slider" style="width:40px;height:50px;background:#06c;position:absolute;left:0"></div></div><div id="scrollbox" style="position:fixed;left:400px;top:320px;width:320px;height:120px;overflow:auto;background:#fff"><div style="height:2000px"><button id="scroll-button" style="width:320px;height:60px">Scroll starting here</button></div></div>';
     document.body.append(fixture);
     window.nativeClicks=0;window.addEventListener('click',()=>window.nativeClicks++,{capture:true});
-    window.signins=0;window.trajectory=[];window.remoteInputs=0;window.wheelHistory=[];window.scrollButtonClicks=0;window.scrollButtonDowns=0;window.signinEvents=[];window.holdButtonEvents=[];
+    window.signins=0;window.trajectory=[];window.remoteInputs=0;window.wheelHistory=[];window.scrollButtonClicks=0;window.scrollButtonDowns=0;window.scrollButtonHeld=false;window.signinEvents=[];window.holdButtonEvents=[];
     document.querySelector('#scroll-button').onclick=()=>window.scrollButtonClicks++;
     // Pointer capture must not defeat cancellation of a committed hold.
-    document.querySelector('#scroll-button').onpointerdown=e=>e.target.setPointerCapture(e.pointerId);
-    document.querySelector('#scroll-button').onmousedown=()=>window.scrollButtonDowns++;
+    document.querySelector('#scroll-button').onpointerdown=e=>{window.scrollButtonDowns++;window.scrollButtonHeld=true;window.scrollButtonPointer=e.pointerId;e.target.setPointerCapture(e.pointerId);if(window.preventMouseCompatibility)e.preventDefault()};
+    document.querySelector('#scroll-button').onpointerup=()=>window.scrollButtonHeld=false;
     for(const type of ['mousedown','mouseup'])document.querySelector('#hold-button').addEventListener(type,e=>window.holdButtonEvents.push({type:e.type,trusted:e.isTrusted,time:performance.now(),epoch:Date.now()}));
     for(const type of ['mousedown','mouseup'])document.querySelector('#signin').addEventListener(type,e=>window.signinEvents.push({type:e.type,trusted:e.isTrusted}));
     document.addEventListener('wheel',e=>window.wheelHistory.push({x:e.clientX,y:e.clientY,dy:e.deltaY,target:e.target.id,trusted:e.isTrusted}));
@@ -154,7 +154,7 @@ export async function interactionAcceptance({ viewer, remote, url, output, until
     if(mobile) {
       const button=await localPoint(540,350);
       for(const delay of [0,250,600]) {
-        await remote.eval('window.scrollButtonClicks=0;window.scrollButtonDowns=0;document.querySelector("#scrollbox").scrollTop=0');
+        await remote.eval(`window.preventMouseCompatibility=${delay===600};window.scrollButtonClicks=0;window.scrollButtonDowns=0;window.scrollButtonHeld=false;document.querySelector("#scrollbox").scrollTop=0`);
         await touch('touchStart',[[button.x-12,button.y]]);
         if(delay) {
           await viewer.eval(`new Promise(resolve=>setTimeout(resolve,${delay}))`);
@@ -165,6 +165,8 @@ export async function interactionAcceptance({ viewer, remote, url, output, until
         await touch('touchEnd',[]);
         await until(()=>remote.eval(`document.querySelector('#scrollbox').scrollTop>0`),'two-finger scroll after '+delay+'ms');
         assert.equal(await remote.eval('window.scrollButtonClicks'),0,'two-finger scroll starting on a button must not click after '+delay+'ms');
+        assert.equal(await remote.eval('window.scrollButtonHeld'),false,'cancellation delivers terminal pointerup, including prevented compatibility events');
+        if(delay) assert.equal(await remote.eval('document.querySelector("#scroll-button").hasPointerCapture(window.scrollButtonPointer)'),false,'terminal release clears native capture');
         await remote.eval('document.querySelector("#scrollbox").scrollTop=0');
         await viewer.eval('new Promise(resolve=>setTimeout(resolve,500))');
         await touch('touchStart',[[button.x,button.y]]); await touch('touchEnd',[]);
@@ -172,7 +174,7 @@ export async function interactionAcceptance({ viewer, remote, url, output, until
       }
       // A disabled target emits no native click at cancellation. Cleanup must
       // still leave the next intentional tap intact, with no page-world globals.
-      await remote.eval('window.scrollButtonClicks=0;window.nativeClicks=0;document.querySelector("#scrollbox").scrollTop=0;document.querySelector("#scroll-button").disabled=true');
+      await remote.eval('window.preventMouseCompatibility=false;window.scrollButtonClicks=0;window.nativeClicks=0;document.querySelector("#scrollbox").scrollTop=0;document.querySelector("#scroll-button").disabled=true');
       await touch('touchStart',[[button.x-12,button.y]]);
       await viewer.eval('new Promise(resolve=>setTimeout(resolve,250))');
       await touch('touchStart',[[button.x-12,button.y],[button.x+12,button.y]]);
@@ -182,10 +184,10 @@ export async function interactionAcceptance({ viewer, remote, url, output, until
       assert.equal(await remote.eval('window.nativeClicks'),0,'disabled-target cancellation emits no native click event');
       await remote.eval('document.querySelector("#scroll-button").disabled=false;document.querySelector("#scrollbox").scrollTop=0');
       await viewer.eval('new Promise(resolve=>setTimeout(resolve,500))');
-      assert.equal(await remote.eval("Object.getOwnPropertySymbols(window).some(s=>Symbol.keyFor(s)==='anyagents.takeover.cancelClick')"),false,'cancellation has no page-world global');
+      assert.equal(await remote.eval("Object.getOwnPropertySymbols(window).some(s=>Symbol.keyFor(s)==='anyagents.takeover.cancelMouse')"),false,'cancellation has no page-world global');
       await touch('touchStart',[[button.x,button.y]]); await touch('touchEnd',[]);
       await until(()=>remote.eval('window.scrollButtonClicks===1'),'tap after no-click cancellation remains usable');
-      await remote.eval('window.scrollButtonClicks=0;window.scrollButtonDowns=0;document.querySelector("#scrollbox").scrollTop=0');
+      await remote.eval('window.scrollButtonClicks=0;window.scrollButtonDowns=0;window.scrollButtonHeld=false;document.querySelector("#scrollbox").scrollTop=0');
       const beforePinch=await viewer.eval(`document.querySelector('#screen').getBoundingClientRect().width`);
       await touch('touchStart',[[button.x-12,button.y]]);
       await viewer.eval('new Promise(resolve=>setTimeout(resolve,250))');

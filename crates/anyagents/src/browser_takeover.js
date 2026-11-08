@@ -73,9 +73,12 @@ if (typeof document !== 'undefined') {
   document.addEventListener('focusout', e => { if (e.relatedTarget !== proxy) focusSequence++; });
   const size = () => ({ width: stage.clientWidth, height: stage.clientHeight });
   const extent = () => remoteExtent(canvas.width, canvas.height, metrics);
-  const fitScale = () => Math.min(size().width / extent().width, size().height / extent().height);
+  const surfaceAvailable = () => !document.hidden && size().width > 0 && size().height > 0 &&
+    stage.checkVisibility?.({ checkVisibilityCSS: true }) !== false;
+  const fitScale = () => surfaceAvailable() ? Math.min(size().width / extent().width, size().height / extent().height) : view.scale;
   const point = (x, y) => remotePoint(x, y, view, canvas.width, canvas.height, metrics);
   function paintView() {
+    if (!surfaceAvailable()) { cancelInteraction(); return; }
     const s = size(), r = extent();
     view = boundedView(view, s.width, s.height, r.width, r.height);
     canvas.style.width = r.width + 'px'; canvas.style.height = r.height + 'px';
@@ -176,7 +179,7 @@ if (typeof document !== 'undefined') {
     sendInput({ type: 'mouse', event_type: 'mousePressed', ...pressed.point, button: pressed.button, buttons: pressed.buttons }).catch(reconnect);
   }
   stage.addEventListener('pointerdown', e => {
-    if (!ready || completed) return;
+    if (!ready || completed || !surfaceAvailable()) return;
     e.preventDefault();
     stage.setPointerCapture(e.pointerId);
     pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
@@ -212,6 +215,7 @@ if (typeof document !== 'undefined') {
   }
   stage.addEventListener('pointermove', e => {
     if (!pointers.has(e.pointerId)) return;
+    if (!surfaceAvailable()) { cancelInteraction(); return; }
     e.preventDefault(); pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
     if (pointers.size >= 2 && gesture?.kind === 'pair') {
       // Pointer Events deliver each finger separately. Evaluate one native
@@ -230,19 +234,31 @@ if (typeof document !== 'undefined') {
   function endPointer(e) {
     if (!pointers.has(e.pointerId)) return;
     cancelTouchTimer(); flushPairMotion();
-    if (!pressed && gesture?.kind === 'single' && !touchPan && e.type === 'pointerup') pressPointer(gesture);
-    if (pressed) pressed.point = point(e.clientX, e.clientY);
-    releasePointer(); pointers.delete(e.pointerId);
+    if (!pressed && gesture?.kind === 'single' && !touchPan && e.type === 'pointerup' && surfaceAvailable()) pressPointer(gesture);
+    if (e.type === 'pointerup' && surfaceAvailable()) {
+      if (pressed) pressed.point = point(e.clientX, e.clientY);
+      releasePointer();
+    } else cancelPointer();
+    pointers.delete(e.pointerId);
     // The remaining finger after a two-finger gesture cannot click/drag.
     gesture = null;
   }
   stage.addEventListener('pointerup', endPointer);
   stage.addEventListener('pointercancel', endPointer);
   stage.addEventListener('lostpointercapture', endPointer);
-  addEventListener('blur', () => { focusSequence++; cancelTouchTimer(); flushPairMotion(); releasePointer(); pointers.clear(); gesture = null; });
+  function cancelInteraction() {
+    cancelTouchTimer(); cancelAnimationFrame(pairFrame); pairFrame = 0;
+    cancelPointer(); pointers.clear(); gesture = null;
+  }
+  addEventListener('blur', () => { focusSequence++; cancelInteraction(); });
+  document.addEventListener('visibilitychange', () => { if (document.hidden) { focusSequence++; cancelInteraction(); } });
+  if (typeof ResizeObserver !== 'undefined') new ResizeObserver(() => {
+    if (!surfaceAvailable()) cancelInteraction();
+  }).observe(stage);
   stage.addEventListener('contextmenu', e => e.preventDefault());
   stage.addEventListener('wheel', e => {
     e.preventDefault();
+    if (!surfaceAvailable()) return;
     if (e.ctrlKey || e.metaKey) zoom(view.scale * Math.exp(-e.deltaY * .01), e.clientX, e.clientY);
     else sendInput({ type: 'wheel', ...point(e.clientX, e.clientY), delta_x: e.deltaX, delta_y: e.deltaY }).catch(reconnect);
   }, { passive: false });
@@ -275,13 +291,17 @@ if (typeof document !== 'undefined') {
     $('clipboard-status').textContent = '';
     return sendWithFocus({ type: 'paste', text });
   }
-  let pendingPaste = null;
+  let pendingPaste = null, pasteSequence = 0;
+  function invalidatePaste() { pendingPaste = null; pasteSequence++; }
+  const ownsPaste = attempt => !completed && !document.hidden && attempt.sequence === pasteSequence &&
+    attempt.focus === focusSequence && remoteTarget(document.activeElement);
   document.addEventListener('paste', e => {
     if (!remoteTarget(e.target) || completed) return;
     e.preventDefault();
     // One native paste consumes one shortcut turn, regardless of trust.
     // Later Paste-menu actions must not be swallowed by a timing window.
     const attempt = pendingPaste; pendingPaste = null;
+    if (!attempt) pasteSequence++;
     if (attempt) {
       if (attempt.inserted) return;
       attempt.inserted = true;
@@ -296,24 +316,25 @@ if (typeof document !== 'undefined') {
     if (e.isComposing || composing || completed || !remoteTarget(e.target)) return;
     const shortcut = e.ctrlKey || e.metaKey, key = e.key.toLowerCase();
     // These belong to the viewer's browser, never the remote page.
-    if (shortcut && ['w', 't', 'l'].includes(key)) return;
+    if (shortcut && ['w', 't', 'l'].includes(key)) { invalidatePaste(); return; }
     // The paste event carries the real local clipboard. Forwarding keydown
     // as well would insert twice or type a literal 'v'.
     if (shortcut && key === 'v') {
-      const attempt = pendingPaste = { inserted: false };
+      const attempt = pendingPaste = { inserted: false, sequence: ++pasteSequence, focus: focusSequence };
       // Begin the permission-sensitive read inside the gesture, but let the
       // native paste event win. Neither path may insert a second time.
       const read = navigator.clipboard?.readText?.().then(text => ({ text }), error => ({ error }));
       setTimeout(async () => {
-        if (attempt.inserted || !read) return;
+        if (attempt.inserted || !read || !ownsPaste(attempt)) return;
         const result = await read;
-        if (attempt.inserted) return;
+        if (attempt.inserted || !ownsPaste(attempt)) return;
         if (result.error) { clipboardError(result.error); return; }
         attempt.inserted = true;
         pasteText(result.text).catch(reconnect);
       }, 0);
       return;
     }
+    if (!['Control', 'Meta', 'Shift', 'Alt'].includes(e.key)) invalidatePaste();
     if (shortcut && ['c', 'x'].includes(key)) { e.preventDefault(); clipboardOut(key === 'x' ? 'cut' : 'copy'); return; }
     if (e.target === proxy && !shortcut && e.key.length === 1) return;
     if (['Control', 'Meta', 'Shift', 'Alt'].includes(e.key)) return;
@@ -324,7 +345,7 @@ if (typeof document !== 'undefined') {
   // Native shortcut paste fires before keyup. End an unmatched fallback turn
   // here too, so a later OS/menu paste remains an independent action.
   window.addEventListener('keyup', e => { if (e.key.toLowerCase() === 'v') pendingPaste = null; });
-  window.addEventListener('blur', () => { pendingPaste = null; });
+  window.addEventListener('blur', invalidatePaste);
   canvas.focus({ preventScroll: true });
   proxy.addEventListener('compositionstart', () => { composing = true; });
   function commit() {
@@ -340,7 +361,11 @@ if (typeof document !== 'undefined') {
     $(id).addEventListener('pointerdown', e => e.preventDefault());
   }
   $('paste-btn').onclick = async () => {
-    try { await pasteText(await navigator.clipboard.readText()); } catch (_) { clipboardError(); }
+    const attempt = { sequence: ++pasteSequence, focus: focusSequence }; pendingPaste = null;
+    try {
+      const text = await navigator.clipboard.readText();
+      if (ownsPaste(attempt)) await pasteText(text);
+    } catch (_) { if (ownsPaste(attempt)) clipboardError(); }
   };
   $('copy-btn').onclick = () => clipboardOut();
   $('select-all-btn').onclick = () => sendInput({ type: 'key', key: 'a', modifiers: 2, commands: ['selectAll'] }).catch(reconnect);
@@ -376,12 +401,12 @@ if (typeof document !== 'undefined') {
   function finish() { completed = true; proxy.blur(); $('done-overlay').hidden = false; }
   $('done-btn').onclick = async () => {
     $('done-btn').disabled = true;
-    try { await dispatcher.idle(); await request('/complete', { note: 'completed by user in takeover UI' }); finish(); }
+    try { cancelInteraction(); invalidatePaste(); await dispatcher.idle(); await request('/complete', { note: 'completed by user in takeover UI' }); finish(); }
     catch (_) { reconnect(); $('done-btn').disabled = false; }
   };
   // A normal navigation restores immediately; an abrupt disconnect uses the server's heartbeat lease.
   addEventListener('pagehide', () => { if (phone && !completed) navigator.sendBeacon(BASE + '/viewport', new Blob([JSON.stringify({ enabled: false })], { type: 'application/json' })); });
-  addEventListener('resize', () => { if (ready) { if (fitMode) reset(); else paintView(); } });
+  addEventListener('resize', () => { if (!surfaceAvailable()) cancelInteraction(); if (ready) { if (fitMode) reset(); else paintView(); } });
   if (window.visualViewport) visualViewport.addEventListener('resize', () => {
     const vv = visualViewport;
     $('hud').style.bottom = `calc(${Math.max(0, innerHeight - vv.height - vv.offsetTop) + 10}px + env(safe-area-inset-bottom))`;

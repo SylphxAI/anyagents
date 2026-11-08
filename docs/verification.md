@@ -215,16 +215,28 @@ must press within 200 ms, remain held remotely for at least 4800 ms and release
 only at lift. Immediate two-finger gestures send no mouse events; pairs after
 250 or 600 ms cancel a committed press before scrolling or pinching, without
 clicking the original button, including when it holds native pointer capture.
-Cancellation installs one-shot window capture listeners in CDP isolated worlds
-for every frame before releasing; failed installation or a 200 ms setup timeout
-withholds the release. Each listener removes itself on its first click or after
-250 ms, and explicit cleanup also runs after dispatch. The fixture checks the
-next tap after 500 ms, including cancellation over a disabled/no-click target,
-and verifies the page main world has no cancellation global. Resource-free CDP
-protocol tests verify a complete frame-tree/OOPIF census and every frame's
-installation acknowledgement precede release; failed or malformed discovery and
-failed/slow installation produce no release. Deterministic shipped
-handlers also check the held-button lifetime and committed-drag cancellation.
+Cancellation guards are installed and acknowledged in isolated worlds for
+all frames/OOPIFs **before admitting the native press**. Persistent root and
+per-OOPIF CDP connections retain new-document script registrations; temporary
+connections would lose them on disconnect. A real Chromium regression replaces
+the root document after admission but before native press and requires zero
+target clicks plus terminal pointerup/capture release. Failed discovery or
+installation therefore prevents an uncommitted press, not its terminal release.
+The persistent guard observes trusted mouse pointerdown/pointerup (including
+controls preventing compatibility mouse events). Viewer mouse events use no
+keyboard modifiers; cancellation reserves all four modifier bits on its native
+release. The guard suppresses only that cancelled sequence's click/default
+activation, never terminal pointerup/mouseup. Cancellation performs no discovery,
+installation, deadline check or cleanup round-trip. The next ordinary click and
+an intentionally four-modifier click remain usable; page-world globals are not
+introduced. Protocol tests reject incomplete/failed prepress admission, allow
+slow successful admission, and require exactly one native release even when all
+discovery/script operations would fail slowly. Deterministic shipped-handler
+regressions cover committed pointer cancellation, hidden/zero-size surfaces and
+finite last coordinates, plus obsolete clipboard reads after local focus, blur
+or a newer paste turn. Accepted HTTP workers recheck the live token, holder,
+completion and expiry after reading; completion drains admitted dispatch, and
+an unfinished old-token request cannot dispatch after completion or replacement.
 Emulated touch is not a physical iPhone Safari receipt.
 `npm test` checks bounded move/wheel queues and no replay on input failure. The
 resource-free Rust regression holds an incomplete frame HTTP request open while

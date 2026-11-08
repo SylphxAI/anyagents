@@ -11,7 +11,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use anyagents_core::{Error, now_ms};
@@ -934,6 +934,10 @@ struct CdpSession {
     stream: TcpStream,
     read_buf: Vec<u8>,
     next_id: u64,
+    takeover_cancel_registered: bool,
+    // New-document scripts belong to their CDP connection. Keep OOPIF
+    // registrations alive for as long as the takeover input connection.
+    takeover_cancel_children: std::collections::HashMap<String, CdpSession>,
 }
 
 impl CdpSession {
@@ -989,6 +993,8 @@ impl CdpSession {
             stream,
             read_buf: leftover,
             next_id: 1,
+            takeover_cancel_registered: false,
+            takeover_cancel_children: Default::default(),
         })
     }
 
@@ -2270,6 +2276,31 @@ fn takeover_page_session<'a>(
     Ok(&mut session.as_mut().unwrap().cdp)
 }
 
+// Register before admitting input, not after a press. A persistent CDP
+// registration installs the guard before scripts in replacement documents too.
+fn register_takeover_cancel(cdp: &mut CdpSession) -> Result<(), Error> {
+    if !cdp.takeover_cancel_registered {
+        // Chromium acknowledges registration while Page is disabled, but does
+        // not run it in replacement documents until this session enables Page.
+        cdp.call("Page.enable", serde_json::json!({}))?;
+        let result = cdp.call(
+            "Page.addScriptToEvaluateOnNewDocument",
+            serde_json::json!({
+                "source": include_str!("browser_takeover_cancel.js"),
+                "worldName": "anyagents-takeover-cancel",
+                "runImmediately": true,
+            }),
+        )?;
+        if result["identifier"].as_str().is_none_or(str::is_empty) {
+            return Err(Error::Message(
+                "cancellation registration not acknowledged".into(),
+            ));
+        }
+        cdp.takeover_cancel_registered = true;
+    }
+    Ok(())
+}
+
 // Cancellation code stays in a separate world, including in cross-origin frames.
 // Its capture listener shares DOM event propagation but no page globals.
 fn eval_takeover_cancel_js(
@@ -2291,22 +2322,30 @@ fn eval_takeover_cancel_js(
             .ok_or_else(|| Error::Message("missing cancellation world".into()))?;
         eval_js_with_session(cdp, None, Some(context), expression)
     }
-    match evaluate(cdp, frame_id, expression) {
-        Ok(value) => Ok(value),
-        Err(_) => {
-            let mut child = CdpSession::connect(cdp.port, &format!("/devtools/page/{frame_id}"))?;
-            evaluate(&mut child, frame_id, expression)
+    if !cdp.takeover_cancel_children.contains_key(frame_id) {
+        match evaluate(cdp, frame_id, expression) {
+            Ok(value) => return Ok(value),
+            Err(_) => {
+                let mut child =
+                    CdpSession::connect(cdp.port, &format!("/devtools/page/{frame_id}"))?;
+                register_takeover_cancel(&mut child)?;
+                cdp.takeover_cancel_children
+                    .insert(frame_id.to_string(), child);
+            }
         }
     }
+    evaluate(
+        cdp.takeover_cancel_children.get_mut(frame_id).unwrap(),
+        frame_id,
+        expression,
+    )
 }
 
-// CDP has no mouse-cancel event. Off-viewport release still clicks a pointer-
-// capturing target, and clickCount:0 on release does not stop Chromium's click.
-// Intercept just this release's native click before it reaches its target.
-fn cancel_takeover_mouse(
-    cdp: &mut CdpSession,
-    payload: &serde_json::Value,
-) -> Result<serde_json::Value, Error> {
+// CDP has no mouse-cancel event. Admit a press only after every live frame
+// acknowledges a persistent isolated guard. A later cancellation must never
+// depend on frame discovery, script installation or an expiring listener.
+fn prepare_takeover_mouse(cdp: &mut CdpSession) -> Result<(), Error> {
+    register_takeover_cancel(cdp)?;
     // Snapshot both the frame tree and out-of-process iframe targets. Unlike
     // geometry discovery, cancellation cannot treat a failed census as empty.
     fn collect(node: &serde_json::Value, frames: &mut Vec<String>) -> Result<(), Error> {
@@ -2344,59 +2383,45 @@ fn cancel_takeover_mouse(
             if !frames.iter().any(|frame| frame == id) {
                 frames.push(id.to_string());
             }
-        }
-    }
-    release_cancelled_takeover_mouse(cdp, payload, &frames)
-}
-
-fn release_cancelled_takeover_mouse(
-    cdp: &mut CdpSession,
-    payload: &serde_json::Value,
-    frames: &[String],
-) -> Result<serde_json::Value, Error> {
-    let install = r#"(() => {
-        const key = Symbol.for('anyagents.takeover.cancelClick');
-        if (window[key]) { window[key].controller.abort(); clearTimeout(window[key].timer); }
-        const state = {controller: new AbortController()};
-        const clear = () => { state.controller.abort(); clearTimeout(state.timer); if (window[key] === state) delete window[key]; };
-        window[key] = state;
-        window.addEventListener('click', e => { clear(); e.preventDefault(); e.stopImmediatePropagation(); }, {capture:true, once:true, signal:state.controller.signal});
-        state.timer = setTimeout(clear, 250);
-        return true;
-    })()"#;
-    let cleanup = r#"(() => {
-        const key = Symbol.for('anyagents.takeover.cancelClick'), state = window[key];
-        if (state) { state.controller.abort(); clearTimeout(state.timer); delete window[key]; }
-    })()"#;
-    let started = std::time::Instant::now();
-    let result = (|| {
-        for frame in frames {
-            if eval_takeover_cancel_js(cdp, frame, install)? != serde_json::json!(true) {
-                return Err(Error::Message("cancellation listener not installed".into()));
+            if !cdp.takeover_cancel_children.contains_key(id) {
+                let mut child = CdpSession::connect(cdp.port, &format!("/devtools/page/{id}"))?;
+                register_takeover_cancel(&mut child)?;
+                cdp.takeover_cancel_children.insert(id.to_string(), child);
             }
         }
-        // Never send a bare release after a slow/failed installation. Leave
-        // margin before the earliest listener's 250ms self-cleanup deadline.
-        if started.elapsed() >= Duration::from_millis(200) {
-            return Err(Error::Message("cancellation installation timed out".into()));
-        }
-        cdp.call(
-            "Input.dispatchMouseEvent",
-            serde_json::json!({
-                "type": "mouseReleased",
-                "x": payload["x"].as_f64().unwrap_or(0.0),
-                "y": payload["y"].as_f64().unwrap_or(0.0),
-                "button": payload["button"].as_str().unwrap_or("left"),
-                "buttons": 0,
-                "clickCount": 1,
-            }),
-        )?;
-        Ok(serde_json::json!({"ok": true, "type": "mouseCancel"}))
-    })();
-    for frame in frames {
-        let _ = eval_takeover_cancel_js(cdp, frame, cleanup);
     }
-    result
+    cdp.takeover_cancel_children
+        .retain(|id, _| frames.contains(id));
+    for frame in frames {
+        if eval_takeover_cancel_js(cdp, &frame, include_str!("browser_takeover_cancel.js"))?
+            != serde_json::json!(true)
+        {
+            return Err(Error::Message("cancellation listener not installed".into()));
+        }
+    }
+    Ok(())
+}
+
+fn cancel_takeover_mouse(
+    cdp: &mut CdpSession,
+    payload: &serde_json::Value,
+) -> Result<serde_json::Value, Error> {
+    // Viewer mouse events carry no keyboard modifiers. All four modifier bits
+    // are reserved for this terminal release, which the prearmed guard observes
+    // without consuming pointerup/mouseup or depending on clickCount heuristics.
+    cdp.call(
+        "Input.dispatchMouseEvent",
+        serde_json::json!({
+            "type": "mouseReleased",
+            "x": payload["x"].as_f64().unwrap_or(0.0),
+            "y": payload["y"].as_f64().unwrap_or(0.0),
+            "button": payload["button"].as_str().unwrap_or("left"),
+            "buttons": 0,
+            "clickCount": 1,
+            "modifiers": 15,
+        }),
+    )?;
+    Ok(serde_json::json!({"ok": true, "type": "mouseCancel"}))
 }
 
 fn dispatch_takeover_cdp_input(
@@ -2432,6 +2457,7 @@ fn dispatch_takeover_cdp_input(
                 .and_then(|v| v.as_u64())
                 .unwrap_or(if event_type == "mouseReleased" { 0 } else { 1 });
             if event_type == "mousePressed" {
+                prepare_takeover_mouse(cdp)?;
                 // The viewer can receive its first down before any hover event.
                 // Establish the pointer's target widget as a native move would,
                 // without releasing other buttons already held during a chord.
@@ -2629,6 +2655,9 @@ struct TakeoverServerShared {
     last_frame: Mutex<Option<TakeoverFrameSize>>,
     input: Mutex<Option<TakeoverPageSession>>,
     frame: Mutex<Option<TakeoverPageSession>>,
+    // Readers (frame/state/input) remain concurrent, but completion drains
+    // admitted requests before revoking control. Slow HTTP readers hold no lock.
+    dispatch: RwLock<()>,
     // Serialize read-modify-publish of viewport/heartbeat/completion only.
     control: Mutex<()>,
 }
@@ -2666,6 +2695,15 @@ fn spawn_takeover_client(
     if result.is_err() {
         active.fetch_sub(1, Ordering::AcqRel);
     }
+}
+
+fn takeover_request_active(data: &Path, profile: &str, token: &str) -> bool {
+    load_takeover_state(data, profile).is_some_and(|state| {
+        constant_time_eq(&state.token, token)
+            && state.holder == "human"
+            && !state.completed
+            && now_ms() < state.expires_at_ms
+    })
 }
 
 fn handle_takeover_http_client(
@@ -2748,6 +2786,21 @@ fn handle_takeover_http_client(
             ""
         }
     };
+
+    // Accepting TCP or recognizing a captured URL is not admission. A worker
+    // may have waited on headers while this takeover completed or was replaced.
+    let completing = method == "POST" && subpath == "/complete";
+    let _completion = completing.then(|| shared.dispatch.write().unwrap());
+    let _dispatch = (!completing).then(|| shared.dispatch.read().unwrap());
+    if !takeover_request_active(data, profile, expected_token) {
+        let _ = write_http_response(
+            &mut stream,
+            "403 Forbidden",
+            "application/json",
+            b"{\"error\":\"takeover session is no longer active\"}",
+        );
+        return false;
+    }
 
     match (method, subpath) {
         ("GET", "" | "/") => {
@@ -2898,6 +2951,15 @@ fn handle_takeover_http_client(
             let payload: serde_json::Value =
                 serde_json::from_slice(body_bytes).unwrap_or_else(|_| serde_json::json!({}));
             let mut session = shared.input.lock().unwrap();
+            if !takeover_request_active(data, profile, expected_token) {
+                let _ = write_http_response(
+                    &mut stream,
+                    "403 Forbidden",
+                    "application/json",
+                    b"{\"error\":\"takeover session is no longer active\"}",
+                );
+                return false;
+            }
             match dispatch_takeover_input_session(data, profile, &payload, &mut session) {
                 Ok(res) => {
                     let bytes = serde_json::to_vec(&res).unwrap_or_default();
@@ -4995,7 +5057,7 @@ mod tests {
     }
 
     #[test]
-    fn cancelled_mouse_release_requires_complete_frame_census() {
+    fn takeover_mouse_press_requires_complete_frame_census() {
         for mode in [
             "ready",
             "targets-failed",
@@ -5017,6 +5079,8 @@ mod tests {
                     stream,
                     read_buf: Vec::new(),
                     next_id: 1,
+                    takeover_cancel_registered: false,
+                    takeover_cancel_children: Default::default(),
                 };
                 let mut calls = Vec::new();
                 while let Ok(text) = server.read_text_message() {
@@ -5035,14 +5099,17 @@ mod tests {
                         };
                     } else if method == "Target.getTargets" {
                         response["result"] = if mode == "ready" {
-                            serde_json::json!({"targetInfos":[{"type":"iframe","targetId":"oop"},{"type":"iframe","targetId":"child"}]})
+                            serde_json::json!({"targetInfos":[]})
                         } else {
                             serde_json::json!({"targetInfos":[{"type":"iframe"}]})
                         };
+                    } else if method == "Page.addScriptToEvaluateOnNewDocument" {
+                        response["result"] = serde_json::json!({"identifier":"guard"});
                     } else if method == "Page.createIsolatedWorld" {
                         response["result"] = serde_json::json!({"executionContextId":1});
                     } else if method == "Runtime.evaluate" {
-                        response["result"] = serde_json::json!({"result":{"value":true}});
+                        response["result"] =
+                            serde_json::json!({"result":{"value":mode != "unacknowledged"}});
                     }
                     calls.push(call);
                     server
@@ -5056,8 +5123,13 @@ mod tests {
                 stream,
                 read_buf: Vec::new(),
                 next_id: 1,
+                takeover_cancel_registered: false,
+                takeover_cancel_children: Default::default(),
             };
-            let result = cancel_takeover_mouse(&mut cdp, &serde_json::json!({"x":100,"y":400}));
+            let result = dispatch_takeover_cdp_input(
+                &mut cdp,
+                &serde_json::json!({"type":"mouse","event_type":"mousePressed","x":100,"y":400}),
+            );
             drop(cdp);
             let calls = endpoint.join().unwrap();
             if mode == "ready" {
@@ -5073,25 +5145,28 @@ mod tests {
                     .collect();
                 assert_eq!(
                     installed,
-                    ["main", "child", "oop"],
-                    "deduplicate frames and cover out-of-process targets"
+                    ["main", "child"],
+                    "all live in-process frames are acknowledged"
                 );
-                assert_eq!(release, 8, "all three installs acknowledged before release");
+                assert_eq!(
+                    release, 8,
+                    "Page enable, registration and both installs acknowledged before any native mouse event"
+                );
             } else {
                 assert!(result.is_err(), "{mode}: incomplete frame census must fail");
                 assert!(
                     !calls
                         .iter()
                         .any(|c| c["method"] == "Input.dispatchMouseEvent"),
-                    "{mode}: no bare release"
+                    "{mode}: no press before complete admission"
                 );
             }
         }
     }
 
     #[test]
-    fn cancelled_mouse_release_requires_every_isolated_listener_acknowledgement() {
-        for mode in ["ready", "failed", "slow"] {
+    fn takeover_mouse_press_requires_every_isolated_listener_acknowledgement() {
+        for mode in ["ready", "failed", "unacknowledged", "slow"] {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
             stream.set_nodelay(true).unwrap();
@@ -5106,6 +5181,8 @@ mod tests {
                     stream,
                     read_buf: Vec::new(),
                     next_id: 1,
+                    takeover_cancel_registered: false,
+                    takeover_cancel_children: Default::default(),
                 };
                 let mut calls = Vec::new();
                 let mut installs = 0;
@@ -5113,7 +5190,13 @@ mod tests {
                     let call: serde_json::Value = serde_json::from_str(&text).unwrap();
                     let method = call["method"].as_str().unwrap();
                     let mut response = serde_json::json!({"id": call["id"], "result": {}});
-                    if method == "Page.createIsolatedWorld" {
+                    if method == "Page.getFrameTree" {
+                        response["result"] = serde_json::json!({"frameTree":{"frame":{"id":"main"},"childFrames":[{"frame":{"id":"child"}}]}});
+                    } else if method == "Target.getTargets" {
+                        response["result"] = serde_json::json!({"targetInfos":[]});
+                    } else if method == "Page.addScriptToEvaluateOnNewDocument" {
+                        response["result"] = serde_json::json!({"identifier":"guard"});
+                    } else if method == "Page.createIsolatedWorld" {
                         assert_eq!(call["params"]["worldName"], "anyagents-takeover-cancel");
                         response["result"] = serde_json::json!({"executionContextId": if call["params"]["frameId"] == "main" {1} else {2}});
                         if mode == "failed" && call["params"]["frameId"] == "child" {
@@ -5125,7 +5208,8 @@ mod tests {
                         if mode == "slow" && installs == 1 {
                             std::thread::sleep(Duration::from_millis(210));
                         }
-                        response["result"] = serde_json::json!({"result":{"value":true}});
+                        response["result"] =
+                            serde_json::json!({"result":{"value":mode != "unacknowledged"}});
                     }
                     calls.push(call);
                     server
@@ -5139,13 +5223,14 @@ mod tests {
                 stream,
                 read_buf: Vec::new(),
                 next_id: 1,
+                takeover_cancel_registered: false,
+                takeover_cancel_children: Default::default(),
             };
-            let result = release_cancelled_takeover_mouse(
+            let result = dispatch_takeover_cdp_input(
                 &mut cdp,
-                &serde_json::json!({"x":100,"y":400,"button":"left"}),
-                &["main".into(), "child".into()],
+                &serde_json::json!({"type":"mouse","event_type":"mousePressed","x":100,"y":400,"button":"left"}),
             );
-            assert_eq!(result.is_ok(), mode == "ready");
+            assert_eq!(result.is_ok(), matches!(mode, "ready" | "slow"));
             drop(cdp);
             let calls = endpoint.join().unwrap();
             let releases: Vec<_> = calls
@@ -5153,20 +5238,175 @@ mod tests {
                 .enumerate()
                 .filter(|(_, c)| c["method"] == "Input.dispatchMouseEvent")
                 .collect();
-            if mode == "ready" {
-                assert_eq!(releases.len(), 1);
+            if matches!(mode, "ready" | "slow") {
+                assert_eq!(releases.len(), 2);
                 assert_eq!(
-                    releases[0].0, 4,
-                    "both isolated installs are acknowledged before release"
+                    releases[0].0, 8,
+                    "both isolated installs are acknowledged before press"
                 );
-                assert_eq!(releases[0].1["params"]["type"], "mouseReleased");
+                assert_eq!(releases[0].1["params"]["type"], "mouseMoved");
+                assert_eq!(releases[1].1["params"]["type"], "mousePressed");
             } else {
                 assert!(
                     releases.is_empty(),
-                    "failed/slow installation must withhold release"
+                    "failed installation must withhold the uncommitted press"
                 );
             }
         }
+    }
+
+    #[test]
+    fn cancelled_mouse_always_dispatches_terminal_release_without_discovery() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        stream.set_nodelay(true).unwrap();
+        let endpoint = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream.set_nodelay(true).unwrap();
+            let mut server = CdpSession {
+                port: 0,
+                stream,
+                read_buf: Vec::new(),
+                next_id: 1,
+                takeover_cancel_registered: false,
+                takeover_cancel_children: Default::default(),
+            };
+            let mut calls = Vec::new();
+            while let Ok(text) = server.read_text_message() {
+                let call: serde_json::Value = serde_json::from_str(&text).unwrap();
+                // The page and native input remain alive, but every discovery
+                // or script operation fails slowly, as in the reviewed fault.
+                let response = if call["method"] == "Input.dispatchMouseEvent" {
+                    serde_json::json!({"id":call["id"],"result":{}})
+                } else {
+                    std::thread::sleep(Duration::from_millis(210));
+                    serde_json::json!({"id":call["id"],"error":{"message":"discovery unavailable"}})
+                };
+                calls.push(call);
+                server
+                    .send_text_frame(response.to_string().as_bytes())
+                    .unwrap();
+            }
+            calls
+        });
+        let mut cdp = CdpSession {
+            port: 0,
+            stream,
+            read_buf: Vec::new(),
+            next_id: 1,
+            takeover_cancel_registered: false,
+            takeover_cancel_children: Default::default(),
+        };
+        let result = cancel_takeover_mouse(
+            &mut cdp,
+            &serde_json::json!({"x":100,"y":400,"button":"left"}),
+        );
+        drop(cdp);
+        let calls = endpoint.join().unwrap();
+        assert_eq!(
+            calls.len(),
+            1,
+            "terminal release has no discovery/install dependency"
+        );
+        assert_eq!(calls[0]["method"], "Input.dispatchMouseEvent");
+        assert_eq!(
+            calls[0]["params"],
+            serde_json::json!({"type":"mouseReleased","x":100.0,"y":400.0,"button":"left","buttons":0,"clickCount":1,"modifiers":15})
+        );
+        result.unwrap();
+    }
+
+    #[test]
+    fn takeover_prearmed_guard_survives_navigation_before_native_press() {
+        let _browser = browser_fixture_guard();
+        if !Path::new(&chromium_binary()).exists() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let html = r#"<!doctype html><button id="target" style="position:fixed;left:50px;top:50px;width:200px;height:100px">Hold</button>
+        <script>window.clicks=0;window.held=false;window.pointer=0;const target=document.querySelector('#target');
+        target.onpointerdown=e=>{window.pointer=e.pointerId;window.held=true;target.setPointerCapture(e.pointerId);e.preventDefault()};
+        target.onpointerup=()=>window.held=false;target.onclick=()=>window.clicks++;</script>"#.to_string();
+        let port = spawn_html_server("127.0.0.1", html);
+        let url = format!("http://127.0.0.1:{port}/");
+        execute(
+            dir.path(),
+            "guard-navigation",
+            BrowserRequest {
+                action: "open".into(),
+                headless: Some(true),
+                url: Some(url.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let result = (|| -> Result<(), Error> {
+            let mut rt = load_runtime(dir.path(), "guard-navigation").unwrap();
+            let ws = select_page_target(dir.path(), &mut rt, None)?
+                .ws_url
+                .unwrap();
+            let mut cdp = CdpSession::connect(rt.cdp_port, &ws)?;
+            prepare_takeover_mouse(&mut cdp)?;
+            // Deliberately replace the acknowledged document at the exact gap
+            // between admission and native press; do not prepare again.
+            cdp.call(
+                "Page.navigate",
+                serde_json::json!({"url": format!("{url}?replacement")}),
+            )?;
+            let ready = std::time::Instant::now();
+            loop {
+                if eval_js(
+                    &mut cdp,
+                    "location.search==='?replacement' && window.clicks===0 && !!document.querySelector('#target')",
+                )
+                .ok()
+                    == Some(serde_json::json!(true))
+                {
+                    break;
+                }
+                assert!(
+                    ready.elapsed() < Duration::from_secs(5),
+                    "replacement document did not become ready"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            cdp.call(
+                "Input.dispatchMouseEvent",
+                serde_json::json!({"type":"mouseMoved","x":100,"y":100,"buttons":0}),
+            )?;
+            cdp.call("Input.dispatchMouseEvent", serde_json::json!({"type":"mousePressed","x":100,"y":100,"button":"left","buttons":1,"clickCount":1}))?;
+            cdp.call("Input.dispatchMouseEvent", serde_json::json!({"type":"mouseMoved","x":101,"y":100,"button":"left","buttons":1}))?;
+            assert_eq!(
+                eval_js(
+                    &mut cdp,
+                    "window.held && document.querySelector('#target').hasPointerCapture(window.pointer)"
+                )?,
+                serde_json::json!(true)
+            );
+            cancel_takeover_mouse(
+                &mut cdp,
+                &serde_json::json!({"x":101,"y":100,"button":"left"}),
+            )?;
+            assert_eq!(
+                eval_js(
+                    &mut cdp,
+                    "({clicks:window.clicks,held:window.held,captured:document.querySelector('#target').hasPointerCapture(window.pointer)})"
+                )?,
+                serde_json::json!({"clicks":0,"held":false,"captured":false})
+            );
+            dispatch_trusted_click(&mut cdp, 100.0, 100.0)?;
+            assert_eq!(eval_js(&mut cdp, "window.clicks")?, serde_json::json!(1));
+            Ok(())
+        })();
+        let _ = execute(
+            dir.path(),
+            "guard-navigation",
+            BrowserRequest {
+                action: "close".into(),
+                ..Default::default()
+            },
+        );
+        result.unwrap();
     }
 
     #[test]
@@ -6034,6 +6274,99 @@ mod tests {
             "mobile takeover acceptance failed; captures: {output}"
         );
     }
+    #[test]
+    fn accepted_takeover_request_is_fenced_after_completion_or_replacement() {
+        for revoked in ["completed", "replaced", "expired", "agent", "missing"] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut state = start_or_reuse_takeover_session(
+                dir.path(),
+                "revocation",
+                None,
+                None,
+                Some(30_000),
+                Some(false),
+                &CaptchaDetection::default(),
+            )
+            .unwrap();
+            assert!(
+                !load_takeover_state(dir.path(), "revocation")
+                    .unwrap()
+                    .completed
+            );
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let (accepted, ready) = std::sync::mpsc::channel();
+            let data = dir.path().to_path_buf();
+            let token = state.token.clone();
+            let worker = std::thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                accepted.send(()).unwrap();
+                handle_takeover_http_client(
+                    stream,
+                    &data,
+                    "revocation",
+                    &token,
+                    &TakeoverServerShared::default(),
+                )
+            });
+            let body = r#"{"type":"clipboard","action":"copy"}"#;
+            write!(
+                client,
+                "POST /takeover/{}/input HTTP/1.1\r\nContent-Length: {}\r\n",
+                state.token,
+                body.len()
+            )
+            .unwrap();
+            ready.recv_timeout(Duration::from_secs(2)).unwrap();
+            if revoked == "completed" {
+                let mut complete = TcpStream::connect(("127.0.0.1", state.port)).unwrap();
+                complete
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                write!(
+                    complete,
+                    "POST /takeover/{}/complete HTTP/1.1\r\nContent-Length: 2\r\n\r\n{{}}",
+                    state.token
+                )
+                .unwrap();
+                let mut response = String::new();
+                complete.read_to_string(&mut response).unwrap();
+                assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+                assert!(
+                    load_takeover_state(dir.path(), "revocation")
+                        .unwrap()
+                        .completed
+                );
+            } else if revoked == "missing" {
+                cleanup_takeover_session(dir.path(), "revocation").unwrap();
+            } else {
+                match revoked {
+                    "replaced" => state.token = "replacement-token".into(),
+                    "expired" => state.expires_at_ms = now_ms() - 1,
+                    "agent" => state.holder = "agent".into(),
+                    _ => unreachable!(),
+                }
+                save_takeover_state(dir.path(), &state);
+            }
+            write!(client, "\r\n{body}").unwrap();
+            let mut response = String::new();
+            client.read_to_string(&mut response).unwrap();
+            assert!(
+                response.starts_with("HTTP/1.1 403 Forbidden"),
+                "{revoked}: {response}"
+            );
+            assert!(
+                response.contains("takeover session is no longer active"),
+                "{response}"
+            );
+            assert!(!worker.join().unwrap());
+            cleanup_takeover_session(dir.path(), "revocation").unwrap();
+        }
+    }
+
     #[test]
     fn takeover_input_is_not_blocked_by_a_slow_frame_client() {
         let dir = tempfile::tempdir().unwrap();
