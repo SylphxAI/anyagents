@@ -516,6 +516,24 @@ fn process_alive(pid: u32) -> bool {
     }
     #[cfg(unix)]
     {
+        // Signal 0 also succeeds for unreaped zombies. Reap our own exited
+        // child first; Linux can additionally classify non-child runtime PIDs.
+        if unsafe { libc::waitpid(pid as i32, std::ptr::null_mut(), libc::WNOHANG) } == pid as i32 {
+            return false;
+        }
+    }
+    process_alive_without_reaping(pid)
+}
+
+fn process_alive_without_reaping(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        #[cfg(target_os = "linux")]
+        if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            && matches!(linux_process_state(&stat), Some('Z' | 'X' | 'x'))
+        {
+            return false;
+        }
         // /proc is not mounted on macOS. Signal 0 checks existence without
         // changing the process; lack of permission still proves it is alive.
         let exists = unsafe { libc::kill(pid as i32, 0) == 0 };
@@ -523,6 +541,18 @@ fn process_alive(pid: u32) -> bool {
     }
     #[cfg(not(unix))]
     Path::new(&format!("/proc/{pid}")).exists()
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_state(stat: &str) -> Option<char> {
+    stat.rsplit_once(") ")
+        .and_then(|(_, rest)| rest.chars().next())
+}
+
+fn reap_browser_child(mut child: std::process::Child) {
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
 }
 
 fn cdp_port_alive(port: u16) -> bool {
@@ -682,6 +712,9 @@ fn ensure_browser_running(
         &dir.join("browser.log"),
         Duration::from_secs(12),
     )?;
+    // Once startup has captured its diagnostics, retain process custody until
+    // exit even though later requests recover the runtime from disk.
+    reap_browser_child(child);
 
     let now = now_ms();
     let state = BrowserRuntimeState {
@@ -812,7 +845,9 @@ fn stop_process_group(pid: u32) {
         libc::kill(pid as i32, libc::SIGTERM);
     }
     for _ in 0..20 {
-        if !process_alive(pid) {
+        // Callers can still own a Child handle for startup diagnostics/cleanup.
+        // Do not steal its exit status while waiting for group termination.
+        if !process_alive_without_reaping(pid) {
             return;
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -5515,6 +5550,106 @@ mod tests {
         child.kill().unwrap();
         child.wait().unwrap();
         assert!(!process_alive(pid));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn zombie_runtime_is_reaped_and_removed_without_losing_persistent_profile() {
+        assert_eq!(
+            linux_process_state("123 (browser ) wrapper) Z 1 2 3"),
+            Some('Z')
+        );
+        for state in ['Z', 'X', 'x'] {
+            assert!(matches!(
+                linux_process_state(&format!("123 (wrapper) {state} 1 2")),
+                Some('Z' | 'X' | 'x')
+            ));
+        }
+        assert_eq!(linux_process_state("123 (wrapper) S 1 2"), Some('S'));
+        let dir = crate::test_tempdir();
+        let profile = profile_dir(dir.path(), "fixture");
+        std::fs::create_dir_all(profile.join("user-data")).unwrap();
+        std::fs::write(
+            profile.join("user-data/retained"),
+            "persistent login fixture",
+        )
+        .unwrap();
+        let mut child = startup_test_child(&dir.path().join("child.log"), "exit 0");
+        let pid = child.id();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .as_deref()
+            .and_then(linux_process_state)
+            != Some('Z')
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child did not reach zombie state"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            unsafe { libc::kill(pid as i32, 0) },
+            0,
+            "signal-zero control sees the zombie"
+        );
+        save_runtime(
+            dir.path(),
+            &BrowserRuntimeState {
+                profile: "fixture".into(),
+                pid,
+                cdp_port: 1,
+                headless: true,
+                display_mode: "fixture".into(),
+                active_target_id: None,
+                started_at_ms: 0,
+                last_used_at_ms: 0,
+            },
+        )
+        .unwrap();
+        assert!(load_runtime(dir.path(), "fixture").unwrap().is_none());
+        assert!(!profile.join("runtime.json").exists());
+        assert!(!process_alive(pid));
+        assert_eq!(
+            std::fs::read_to_string(profile.join("user-data/retained")).unwrap(),
+            "persistent login fixture"
+        );
+        let _ = child.wait();
+        // A fresh process can now replace the retired runtime metadata.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        save_runtime(
+            dir.path(),
+            &BrowserRuntimeState {
+                profile: "fixture".into(),
+                pid: std::process::id(),
+                cdp_port: listener.local_addr().unwrap().port(),
+                headless: true,
+                display_mode: "replacement".into(),
+                active_target_id: None,
+                started_at_ms: 1,
+                last_used_at_ms: 1,
+            },
+        )
+        .unwrap();
+        assert!(load_runtime(dir.path(), "fixture").unwrap().is_some());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn browser_background_reaper_removes_exited_child_without_a_liveness_probe() {
+        let dir = crate::test_tempdir();
+        let child = startup_test_child(&dir.path().join("child.log"), "exit 0");
+        let pid = child.id();
+        reap_browser_child(child);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while Path::new(&format!("/proc/{pid}")).exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "background reaper left an exited child"
+            );
+            std::thread::yield_now();
+        }
     }
 
     #[test]

@@ -116,6 +116,13 @@ fixtures alone cannot establish its cause.
 
 ## Boundaries and live acceptance
 
+Browser liveness distinguishes a running process from an unreaped zombie. On
+Unix, owned exited children are reaped; on Linux, zombie/dead procfs states are
+not live. Stale runtime metadata is retired without deleting the persistent
+profile, while a genuinely live process with unavailable CDP still refuses
+replacement. After successful startup, a background waiter retains child-reaping
+custody without changing the startup diagnostic path.
+
 Named conversation reads select only the authorized target's immutable ID,
 including operator and admin callers. An `all` query retains the caller's full
 authorized population. Host search loads tool membership after ranking and
