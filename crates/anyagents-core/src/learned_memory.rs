@@ -10,7 +10,7 @@ use std::{
 
 pub const MAX_BYTES: usize = 4096;
 pub const MAX_LINES: usize = 150;
-const MARKER: &str = "[Memory truncated; use conversation scope=memory for full text.]\n";
+const MARKER: &str = "[Memory truncated; consult the configured source for full text.]\n";
 const FOOTER: &str = "</learned_memory>\n";
 
 pub fn sha256(bytes: &[u8]) -> String {
@@ -116,9 +116,20 @@ pub fn read_pin(agent_root: &Path, session_id: &str) -> io::Result<MemoryPin> {
     Ok(pin)
 }
 
-/// Must run serialized with host session creation. Repeated calls/restarts for
-/// the same ID read only the persisted pin; they do not open MEMORY.md at all.
+/// Compatibility default for callers choosing the conventional memory index.
 pub fn pin_session(agent_root: &Path, session_id: &str) -> io::Result<MemoryPin> {
+    pin_session_from_source(agent_root, session_id, Some(Path::new("memory/MEMORY.md")))
+}
+
+/// Snapshot a caller-selected file, or no source at all. Relative paths resolve
+/// against the agent root. Missing files produce an empty snapshot; unreadable
+/// or malformed files fail. Must run serialized with host session creation.
+/// Reusing an ID reads only its persisted pin, even if source selection changes.
+pub fn pin_session_from_source(
+    agent_root: &Path,
+    session_id: &str,
+    source: Option<&Path>,
+) -> io::Result<MemoryPin> {
     if session_id.trim().is_empty() {
         return Err(io::Error::other("empty host session identity"));
     }
@@ -131,15 +142,15 @@ pub fn pin_session(agent_root: &Path, session_id: &str) -> io::Result<MemoryPin>
         .join("sessions")
         .join(sha256(session_id.as_bytes()))
         .join("memory-pin.json");
-    fs::create_dir_all(agent_root.join("memory"))?;
     // Only enough input for the bounded prompt. Full raw bytes remain on disk.
-    let input = match fs::File::open(agent_root.join("memory/MEMORY.md")) {
-        Ok(file) => {
+    let input = match source.map(|source| fs::File::open(agent_root.join(source))) {
+        None => String::new(),
+        Some(Ok(file)) => {
             let mut bytes = Vec::new();
             file.take((MAX_BYTES + 4) as u64).read_to_end(&mut bytes)?;
             match std::str::from_utf8(&bytes) {
                 Ok(text) => text.to_owned(),
-                Err(error) if error.error_len().is_none() => {
+                Err(error) if error.error_len().is_none() && bytes.len() == MAX_BYTES + 4 => {
                     std::str::from_utf8(&bytes[..error.valid_up_to()])
                         .unwrap()
                         .to_owned()
@@ -147,8 +158,8 @@ pub fn pin_session(agent_root: &Path, session_id: &str) -> io::Result<MemoryPin>
                 Err(error) => return Err(io::Error::new(io::ErrorKind::InvalidData, error)),
             }
         }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(e),
+        Some(Err(e)) if e.kind() == io::ErrorKind::NotFound => String::new(),
+        Some(Err(e)) => return Err(e),
     };
     let section = bounded_section(&input);
     let pin = MemoryPin {
@@ -220,5 +231,60 @@ mod tests {
             .join("memory-pin.json");
         fs::write(path, b"{}").unwrap();
         assert!(pin_session(root.path(), "one").is_err());
+    }
+    #[test]
+    fn selected_relative_absolute_and_disabled_sources_preserve_pin_identity() {
+        let root = crate::test_tempdir();
+        let external = crate::test_tempdir();
+        fs::write(root.path().join("facts.md"), "relative fact").unwrap();
+        fs::write(external.path().join("facts.md"), "absolute fact").unwrap();
+        let relative =
+            pin_session_from_source(root.path(), "relative", Some(Path::new("facts.md"))).unwrap();
+        assert!(relative.section.contains("relative fact"));
+        let absolute = pin_session_from_source(
+            root.path(),
+            "absolute",
+            Some(&external.path().join("facts.md")),
+        )
+        .unwrap();
+        assert!(absolute.section.contains("absolute fact"));
+        assert_eq!(
+            pin_session_from_source(root.path(), "relative", None).unwrap(),
+            relative
+        );
+        let disabled = pin_session_from_source(root.path(), "disabled", None).unwrap();
+        assert_eq!(disabled.section, bounded_section(""));
+        assert!(!root.path().join("memory").exists());
+        assert_eq!(
+            pin_session_from_source(root.path(), "disabled", Some(Path::new("facts.md"))).unwrap(),
+            disabled
+        );
+        let missing =
+            pin_session_from_source(root.path(), "missing", Some(Path::new("absent.md"))).unwrap();
+        assert_eq!(missing.section, bounded_section(""));
+    }
+
+    #[test]
+    fn invalid_selected_source_never_publishes_a_pin_and_disabled_source_does_not_open_it() {
+        let root = crate::test_tempdir();
+        fs::write(root.path().join("invalid.md"), [0xe5]).unwrap();
+        let error =
+            pin_session_from_source(root.path(), "bad", Some(Path::new("invalid.md"))).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            read_pin(root.path(), "bad").unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        fs::create_dir(root.path().join("directory")).unwrap();
+        assert!(
+            pin_session_from_source(root.path(), "directory", Some(Path::new("directory")))
+                .is_err()
+        );
+        assert_eq!(
+            pin_session_from_source(root.path(), "bad", None)
+                .unwrap()
+                .section,
+            bounded_section("")
+        );
     }
 }

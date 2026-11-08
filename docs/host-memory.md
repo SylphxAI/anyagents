@@ -9,10 +9,10 @@ there is no dense model, embedding dependency or background inference service.
 
 | Agent-root path | Purpose |
 | --- | --- |
-| `memory/MEMORY.md` | Learned-memory index, included only when a new host session is pinned |
+| `memory/MEMORY.md` (default) | Caller-selectable learned-memory index, included only when a new host session is pinned |
 | `memory/**` | Learned facts, preserving original bytes and Claude frontmatter |
 | `skills/**` | Agent-authored overlay; shared global skills remain read-only |
-| `history/owners/**` | Reconciled progress pages; searchable history, never prompt memory |
+| `history/archive/**` | Reconciled progress pages; searchable history, never prompt memory |
 | `sessions/**` | Host generation, saved memory pins and vendor session aliases |
 | `config/*transcript*.jsonl`, retained transcript paths | Native history indexed in place; existing writer keeps ownership |
 
@@ -34,9 +34,16 @@ the current pointer; it does not delete old pins, aliases, raw history or vendor
 SQLite databases. An OpenCode session-start marker binds to the already-pinned
 host generation, rather than reading memory again after dispatch.
 
-Claude launches force `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1` after caller-supplied
-environment so the host owns learned-memory projection. Renderer and scripted
-harness tests establish this integration; they are not vendor-runtime proof.
+The host pin API accepts an optional source path independently of harness-native
+memory. Relative paths resolve against the agent root; absolute paths select an
+operator-authorized file. A missing source yields an empty snapshot, while
+unreadable or invalid UTF-8 input fails session creation. Selecting no source
+pins an empty section without creating or reading a memory directory. Existing
+pins remain immutable even when source selection changes. Conventional wrappers
+retain `memory/MEMORY.md` as a compatibility default; launch configuration can
+select another source or disable host prompt memory. Native memory is separately
+controlled by the caller's harness configuration, not by the pinning mechanism.
+Renderer and scripted harness tests are not vendor-runtime proof.
 
 ## Conversation and raw reads
 
@@ -49,7 +56,8 @@ boundary. Authorization applies before file access and result limits.
 Lexical search uses full mailbox bodies and bounded host-file FTS windows.
 The host SQLite index stores metadata, cursors, call correlation and a
 contentless FTS index; authoritative host-file payloads stay in filesystem
-sources. Window coordinates identify segment, byte offset, length, SHA256 and
+sources. Archive retrieval also reads the historical pre-upgrade directory
+spelling; new migrations write only `history/archive`. Window coordinates identify segment, byte offset, length, SHA256 and
 sequence. A pre-upgrade mailbox prefix is repaired from its full authorized body
 at runtime, inside an IMMEDIATE transaction; no state backfill lives in the SQL
 schema migration. Broadcast deduplication hashes the full message, so equal
@@ -90,7 +98,7 @@ there is no immediate full-history integrity guarantee on the fast path. Source
 cursor, document membership and call correlation publish atomically.
 
 Only daemon authority migrates data. Stable registry ownership and aliases map
-known per-agent Claude memory and owner progress pages. The resumable manifest
+known per-agent Claude memory and caller-selected progress pages. The resumable manifest
 at `host-memory-migration/manifest-v1.json` records paths, counts, lengths,
 checksums, statuses and readback receipts, not source contents. Verified
 same-filesystem moves are atomic; staged recovery retains prepared evidence.

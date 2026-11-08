@@ -158,7 +158,7 @@ impl Store {
             MemoryScope::Memory => regular_files(&root.join("memory"), true)?,
             MemoryScope::Transcripts => {
                 let mut paths = native_transcripts(&root)?;
-                paths.extend(regular_files(&root.join("history/owners"), true)?);
+                paths.extend(history_archives(&root)?);
                 paths
             }
             MemoryScope::All => return Ok(None),
@@ -247,9 +247,9 @@ impl Store {
                     }
                     ids.extend(refresh_native(&mut index, agent, &path)?.documents);
                 }
-                // Reconciled owner pages are lossless historical documents,
+                // Reconciled archive pages are lossless historical documents,
                 // not necessarily JSONL. Their entire text remains searchable.
-                for path in regular_files(&root.join("history/owners"), true)? {
+                for path in history_archives(&root)? {
                     if unresolved.iter().any(|blocked| path.starts_with(blocked)) {
                         continue;
                     }
@@ -517,6 +517,15 @@ fn document_coordinate(path: &Path) -> io::Result<RawCoordinate> {
         seq: 1,
     })
 }
+/// Read both the generic archive and the historical directory spelling so an
+/// upgrade never makes already-migrated documents disappear. New migrations
+/// only write the generic location.
+fn history_archives(root: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut paths = regular_files(&root.join("history/archive"), true)?;
+    paths.extend(regular_files(&root.join("history").join("owners"), true)?);
+    Ok(paths)
+}
+
 fn regular_files(root: &Path, recursive: bool) -> io::Result<Vec<PathBuf>> {
     let meta = match fs::symlink_metadata(root) {
         Ok(m) => m,
@@ -880,7 +889,7 @@ mod tests {
                 .path()
                 .join("agents")
                 .join(agent.id.as_str())
-                .join("history/owners/pagehash");
+                .join("history/archive/pagehash");
             fs::create_dir_all(&root).unwrap();
             let path = root.join("history.md");
             fs::write(
@@ -1688,5 +1697,53 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+    #[test]
+    fn generic_and_legacy_archives_remain_scoped_and_raw_readable_after_reopen() {
+        let dir = crate::test_tempdir();
+        let path = dir.path().join("state.db");
+        let store = Store::open(&path).unwrap();
+        let own = store
+            .create_agent(NewAgent::new("archive-reader", "test"))
+            .unwrap();
+        let hidden = store
+            .create_agent(NewAgent::new("archive-hidden", "test"))
+            .unwrap();
+        for agent in [&own, &hidden] {
+            let root = dir.path().join("agents").join(agent.id.as_str());
+            for folder in [
+                root.join("history/archive"),
+                root.join("history").join("owners"),
+            ] {
+                fs::create_dir_all(&folder).unwrap();
+                fs::write(
+                    folder.join("page.md"),
+                    format!("archiveneedle {} {:?}", agent.name, folder),
+                )
+                .unwrap();
+            }
+        }
+        let query = HistorySearchQuery {
+            query: Some("archiveneedle".into()),
+            ..Default::default()
+        };
+        let ids = [own.id.to_string()];
+        for store in [store, Store::open(&path).unwrap()] {
+            let hits = store
+                .search_host_files(&ids, MemoryScope::Transcripts, &query)
+                .unwrap();
+            assert_eq!(hits.len(), 2);
+            for (hit, bytes) in hits {
+                assert_eq!(hit.metadata.agent_id, own.id.as_str());
+                assert_eq!(read_raw(&hit.raw).unwrap(), bytes);
+                assert!(String::from_utf8_lossy(&bytes).contains("archive-reader"));
+            }
+            assert!(
+                store
+                    .search_host_files(&[], MemoryScope::Transcripts, &query)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
     }
 }
