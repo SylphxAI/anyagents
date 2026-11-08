@@ -9352,7 +9352,7 @@ exec '{}' "$@"
     #[test]
     fn memory_topic_upsert_syncs_index_and_supports_direct_o1_topic_read() {
         let _env = env_lock();
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let state = archetype_validation_state(dir.path());
         let vulcan = state
             .store
