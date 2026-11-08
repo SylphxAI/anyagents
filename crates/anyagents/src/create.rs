@@ -654,7 +654,12 @@ pub(crate) fn write_agent_instructions(
     agent: &Agent,
     parent_name: Option<&str>,
 ) -> Result<(), Error> {
-    let cached_bridge = std::fs::read_to_string(config.join(".anyagents-session-bridge.json"))
+    let cached_bridge = cached_instruction_bridge(config, agent);
+    write_agent_instructions_with_continuity(config, agent, parent_name, cached_bridge.as_deref())
+}
+
+fn cached_instruction_bridge(config: &Path, agent: &Agent) -> Option<String> {
+    std::fs::read_to_string(config.join(".anyagents-session-bridge.json"))
         .ok()
         .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
         .and_then(|v| {
@@ -665,11 +670,59 @@ pub(crate) fn write_agent_instructions(
             v.get("summary")
                 .and_then(|x| x.as_str())
                 .map(str::to_string)
-        });
-    write_agent_instructions_with_continuity(config, agent, parent_name, cached_bridge.as_deref())
+        })
+}
+
+pub(crate) fn write_current_agent_instructions(
+    store: &Store,
+    config: &Path,
+    id: &AgentId,
+) -> Result<(), Error> {
+    let _projection = lock_instruction_projection(config)?;
+    // Launch snapshots can predate a completed describe request. Re-read under
+    // the projection lock so startup never restores stale caller-owned fields.
+    let agent = store.agent(id)?;
+    let parent = agent
+        .parent_id
+        .as_ref()
+        .map(|id| store.agent(id))
+        .transpose()?;
+    let bridge = cached_instruction_bridge(config, &agent);
+    write_agent_instructions_unlocked(
+        config,
+        &agent,
+        parent.as_ref().map(|a| a.name.as_str()),
+        bridge.as_deref(),
+    )
 }
 
 pub(crate) fn write_agent_instructions_with_continuity(
+    config: &Path,
+    agent: &Agent,
+    parent_name: Option<&str>,
+    continuity: Option<&str>,
+) -> Result<(), Error> {
+    let _projection = lock_instruction_projection(config)?;
+    write_agent_instructions_unlocked(config, agent, parent_name, continuity)
+}
+
+fn lock_instruction_projection(config: &Path) -> Result<std::fs::File, Error> {
+    let root = config
+        .parent()
+        .ok_or_else(|| Error::Message("agent root missing".into()))?;
+    let sessions = root.join("sessions");
+    std::fs::create_dir_all(&sessions)?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(sessions.join("instructions.lock"))?;
+    file.lock()?;
+    Ok(file)
+}
+
+fn write_agent_instructions_unlocked(
     config: &Path,
     agent: &Agent,
     parent_name: Option<&str>,
@@ -8282,6 +8335,52 @@ pub(crate) fn resolve_subagent_defaults(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn instruction_projections_serialize_before_any_mirror_is_replaced() {
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let first = store
+            .create_agent(anyagents_core::NewAgent::new("worker", "opencode"))
+            .unwrap();
+        let config = agent_config_dir(dir.path(), &first.id);
+        std::fs::create_dir_all(&config).unwrap();
+        let held = lock_instruction_projection(&config).unwrap();
+        let mut newer = first.clone();
+        newer.description = Some("newer projection".into());
+        let (started, observed) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(|| {
+                started.send(()).unwrap();
+                write_agent_instructions(&config, &newer, None).unwrap();
+            });
+            observed.recv().unwrap();
+            write_agent_instructions_unlocked(&config, &first, None, None).unwrap();
+            assert!(
+                !std::fs::read_to_string(config.join("SYSTEM_PROMPT.md"))
+                    .unwrap()
+                    .contains("newer projection")
+            );
+            drop(held);
+            writer.join().unwrap();
+        });
+        for name in ["SYSTEM_PROMPT.md", "AGENTS.md", "CLAUDE.md"] {
+            assert!(
+                std::fs::read_to_string(config.join(name))
+                    .unwrap()
+                    .contains("newer projection")
+            );
+        }
+        store
+            .set_agent_description(&first.id, Some("authoritative current description"))
+            .unwrap();
+        write_current_agent_instructions(&store, &config, &first.id).unwrap();
+        assert!(
+            std::fs::read_to_string(config.join("SYSTEM_PROMPT.md"))
+                .unwrap()
+                .contains("authoritative current description")
+        );
+    }
 
     #[test]
     fn harness_continuity_uses_newest_completed_turns_in_chronological_order() {

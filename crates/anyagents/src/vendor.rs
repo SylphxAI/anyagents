@@ -421,13 +421,19 @@ fn vendor_launch_authorized(
             _ => format!("host migration failed: {error}"),
         }
     })?;
-    prepare_host_session(&request)?;
+    prepare_host_session_with_store(&request, store)?;
     let config_dir = request.config_dir.clone();
     let agent = request.agent.clone();
+    let generation_before = anyagents_core::host_session::active(config_dir.parent().unwrap())
+        .map_err(|error| error.to_string())?;
     let res = vendor_launch_inner(request, store);
-    if res.is_ok() {
+    if res.is_ok()
+        && anyagents_core::host_session::active(config_dir.parent().unwrap())
+            .map_err(|error| error.to_string())?
+            != generation_before
+    {
         // Native startup may have resumed an earlier generation from its DB.
-        crate::create::write_agent_instructions(&config_dir, &agent, None)
+        render_launch_instructions(store, &config_dir, &agent)
             .map_err(|error| error.to_string())?;
     }
     if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none() {
@@ -496,7 +502,26 @@ fn retire_poisoned_agy_session(config_dir: &Path, now_ms: i64) -> Result<bool, S
     Ok(true)
 }
 
+#[cfg(test)]
 fn prepare_host_session(request: &LaunchRequest) -> Result<(), String> {
+    prepare_host_session_with_store(request, None)
+}
+
+fn render_launch_instructions(
+    store: Option<&anyagents_core::Store>,
+    config: &Path,
+    agent: &anyagents_core::Agent,
+) -> Result<(), anyagents_core::Error> {
+    match store {
+        Some(store) => crate::create::write_current_agent_instructions(store, config, &agent.id),
+        None => crate::create::write_agent_instructions(config, agent, None),
+    }
+}
+
+fn prepare_host_session_with_store(
+    request: &LaunchRequest,
+    store: Option<&anyagents_core::Store>,
+) -> Result<(), String> {
     let root = request.config_dir.parent().ok_or("agent root missing")?;
     let source = memory_source(&request.agent);
     let prepared = anyagents_core::host_session::prepare_harness_with_source(
@@ -521,7 +546,7 @@ fn prepare_host_session(request: &LaunchRequest) -> Result<(), String> {
             .map_err(|e| format!("host session alias failed: {e}"))?;
     }
     // Also render in contract-test mode, exercising the shipping launch boundary.
-    crate::create::write_agent_instructions(&request.config_dir, &request.agent, None)
+    render_launch_instructions(store, &request.config_dir, &request.agent)
         .map_err(|err| err.to_string())?;
     Ok(())
 }
