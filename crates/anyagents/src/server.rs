@@ -6176,9 +6176,12 @@ fn check_targets(
                 reply,
                 ..
             } => {
+                let channel_actor = plan.sender_id.as_ref()
+                    .map(|id| Actor::Agent(id.to_string()))
+                    .unwrap_or_else(|| actor.clone());
                 prepare_telegram(
                     store,
-                    actor,
+                    &channel_actor,
                     body,
                     chat,
                     thread.as_deref(),
@@ -6325,10 +6328,13 @@ fn send_sync(
                 thread,
                 reply: address_reply,
             } => {
+                let channel_actor = sender_agent_id.as_ref()
+                    .map(|id| Actor::Agent(id.to_string()))
+                    .unwrap_or_else(|| actor.clone());
                 let send = || {
                     deliver_telegram(
                         store,
-                        actor,
+                        &channel_actor,
                         &body,
                         address,
                         chat,
