@@ -3466,6 +3466,27 @@ pub(crate) fn deduplicate_same_account_profiles(data: &Path) {
 ///    - Uses `explicit_profile` if specified and not already occupied by a different account;
 ///    - Otherwise uses `default` if `default` does not yet hold a different account;
 ///    - Otherwise creates a new profile named after the account's email handle.
+fn has_credential_material(value: &serde_json::Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    object.iter().any(|(key, value)| {
+        (matches!(
+            key.as_str(),
+            "access_token"
+                | "accessToken"
+                | "refresh_token"
+                | "refreshToken"
+                | "api_key"
+                | "apiKey"
+                | "OPENAI_API_KEY"
+                | "key"
+                | "token"
+        ) && value.as_str().is_some_and(|text| !text.trim().is_empty()))
+            || has_credential_material(value)
+    })
+}
+
 fn validate_staged_credentials(stage: &Path, provider: &str) -> Result<(), Error> {
     let candidates: &[&str] = match provider {
         "anthropic" => &[".credentials.json", ".claude/.credentials.json"],
@@ -3489,12 +3510,21 @@ fn validate_staged_credentials(stage: &Path, provider: &str) -> Result<(), Error
         if bytes.is_empty() {
             return Err(Error::Message(format!("empty staged credential: {rel}")));
         }
-        if rel.ends_with(".json") {
+        // AGY also accepts an operator-provided plaintext refresh token. Other
+        // providers use JSON credential stores; metadata alone is not a login.
+        let plaintext_agy_token = provider == "google-antigravity"
+            && std::str::from_utf8(&bytes).is_ok_and(|text| {
+                let token = text.trim();
+                !token.is_empty()
+                    && !token.contains(char::is_whitespace)
+                    && !token.starts_with(['{', '[', '"'])
+            });
+        if !plaintext_agy_token {
             let value: serde_json::Value = serde_json::from_slice(&bytes)
                 .map_err(|err| Error::Message(format!("invalid staged credential {rel}: {err}")))?;
-            if !value.as_object().is_some_and(|map| !map.is_empty()) {
+            if !has_credential_material(&value) {
                 return Err(Error::Message(format!(
-                    "invalid staged credential object: {rel}"
+                    "no usable credential material in staged file: {rel}"
                 )));
             }
         }
@@ -6062,8 +6092,7 @@ pub(crate) fn probe_one_profile_usage(
                     {
                         let f = qi
                             .get("remainingFraction")
-                            .and_then(serde_json::Value::as_f64)
-                            .unwrap_or(0.0);
+                            .and_then(serde_json::Value::as_f64)?;
                         return Some((f * 100.0).clamp(0.0, 100.0).round() as i64);
                     }
                 }
@@ -6101,14 +6130,14 @@ pub(crate) fn probe_one_profile_usage(
                 ((1.0 - ratio) * 100.0).clamp(0.0, 100.0).round() as i64
             } else {
                 let l5 = parse_num("/limits/0/detail/limit")?.max(1.0);
-                let r5 = parse_num("/limits/0/detail/remaining").unwrap_or(0.0);
+                let r5 = parse_num("/limits/0/detail/remaining")?;
                 (r5 / l5 * 100.0).clamp(0.0, 100.0).round() as i64
             };
             let pct_mo = if let Some(ratio) = parse_num("/usages/limit_month_total/used_ratio") {
                 ((1.0 - ratio) * 100.0).clamp(0.0, 100.0).round() as i64
             } else {
                 let lm = parse_num("/usage/limit")?.max(1.0);
-                let rm = parse_num("/usage/remaining").unwrap_or(0.0);
+                let rm = parse_num("/usage/remaining")?;
                 (rm / lm * 100.0).clamp(0.0, 100.0).round() as i64
             };
             let eta_5h = (pct_5h < 100)
@@ -6162,8 +6191,7 @@ pub(crate) fn probe_one_profile_usage(
                     .max(1.0);
                 let rem_5h = m0
                     .get("current_interval_usage_count")
-                    .and_then(serde_json::Value::as_f64)
-                    .unwrap_or(0.0);
+                    .and_then(serde_json::Value::as_f64)?;
                 (rem_5h / tot_5h * 100.0).clamp(0.0, 100.0).round() as i64
             };
             let pct_7d = if let Some(p) = m0
@@ -6178,8 +6206,7 @@ pub(crate) fn probe_one_profile_usage(
                     .max(1.0);
                 let rem_7d = m0
                     .get("current_weekly_usage_count")
-                    .and_then(serde_json::Value::as_f64)
-                    .unwrap_or(0.0);
+                    .and_then(serde_json::Value::as_f64)?;
                 (rem_7d / tot_7d * 100.0).clamp(0.0, 100.0).round() as i64
             };
             let eta_5h = (pct_5h < 100)
@@ -6267,8 +6294,7 @@ pub(crate) fn probe_one_profile_usage(
                 let bal = info
                     .get("total_balance")
                     .and_then(serde_json::Value::as_str)
-                    .and_then(|s| s.parse::<f64>().ok())
-                    .unwrap_or(0.0);
+                    .and_then(|s| s.parse::<f64>().ok())?;
                 let cur = info
                     .get("currency")
                     .and_then(serde_json::Value::as_str)
@@ -6297,8 +6323,7 @@ pub(crate) fn probe_one_profile_usage(
                 .and_then(serde_json::Value::as_f64)?;
             let used = val
                 .pointer("/data/total_usage")
-                .and_then(serde_json::Value::as_f64)
-                .unwrap_or(0.0);
+                .and_then(serde_json::Value::as_f64)?;
             let rem = (total - used).max(0.0);
             Some(format!("${rem:.2} left (${used:.0} / ${total:.0})"))
         }
@@ -6341,23 +6366,15 @@ pub(crate) fn probe_one_profile_usage(
                 None => return None,
             };
             let plan = val.pointer("/individualUsage/plan")?;
-            let limit_cents = plan
-                .get("limit")
-                .and_then(serde_json::Value::as_f64)
-                .unwrap_or(0.0);
-            let rem_cents = plan
-                .get("remaining")
-                .and_then(serde_json::Value::as_f64)
-                .unwrap_or(0.0);
-            let used_pct = plan
+            let limit_cents = plan.get("limit").and_then(serde_json::Value::as_f64)?;
+            let rem_cents = plan.get("remaining").and_then(serde_json::Value::as_f64)?;
+            let rem_pct = plan
                 .get("totalPercentUsed")
-                .and_then(serde_json::Value::as_f64)
-                .unwrap_or(0.0);
-            let rem_pct = (100.0 - used_pct).clamp(0.0, 100.0).round() as i64;
+                .and_then(observed_remaining_pct)?;
             let tier = val
                 .get("membershipType")
                 .and_then(serde_json::Value::as_str)
-                .unwrap_or("pro");
+                .unwrap_or("unknown");
             if limit_cents > 0.0 {
                 let rem_usd = (rem_cents / 100.0).round() as i64;
                 let lim_usd = (limit_cents / 100.0).round() as i64;
@@ -10159,9 +10176,9 @@ git -c safe.directory="$5" -C "$5" status --porcelain
         let tmp = tempfile::tempdir().unwrap();
         let data = tmp.path();
         let def_dir = data.join("profiles/anthropic/default");
-        let vul_dir = data.join("profiles/anthropic/vulcan");
+        let secondary_dir = data.join("profiles/anthropic/secondary");
         std::fs::create_dir_all(&def_dir).unwrap();
-        std::fs::create_dir_all(&vul_dir).unwrap();
+        std::fs::create_dir_all(&secondary_dir).unwrap();
 
         let now_ms = anyagents_core::now_ms();
         let def_cred = serde_json::json!({
@@ -10172,29 +10189,33 @@ git -c safe.directory="$5" -C "$5" status --porcelain
                 "accountUuid": "acct-default-uuid"
             }
         });
-        let vul_cred = serde_json::json!({
+        let secondary_cred = serde_json::json!({
             "claudeAiOauth": {
-                "accessToken": "mock-oat-vulcan-expired",
-                "refreshToken": "mock-ort-vulcan-refresh",
+                "accessToken": "mock-oat-secondary-expired",
+                "refreshToken": "mock-ort-secondary-refresh",
                 "expiresAt": now_ms - 60_000,
-                "accountUuid": "acct-vulcan-uuid"
+                "accountUuid": "acct-secondary-uuid"
             }
         });
         std::fs::write(def_dir.join(".credentials.json"), def_cred.to_string()).unwrap();
-        std::fs::write(vul_dir.join(".credentials.json"), vul_cred.to_string()).unwrap();
+        std::fs::write(
+            secondary_dir.join(".credentials.json"),
+            secondary_cred.to_string(),
+        )
+        .unwrap();
 
         sync_fresher_bound_agent_credentials(data);
 
-        let after_vul: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(vul_dir.join(".credentials.json")).unwrap(),
+        let after_secondary: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(secondary_dir.join(".credentials.json")).unwrap(),
         )
         .unwrap();
         assert_eq!(
-            after_vul
+            after_secondary
                 .pointer("/claudeAiOauth/refreshToken")
                 .and_then(serde_json::Value::as_str),
-            Some("mock-ort-vulcan-refresh"),
-            "vulcan profile must never be overwritten by default profile credentials"
+            Some("mock-ort-secondary-refresh"),
+            "secondary profile must never be overwritten by default profile credentials"
         );
     }
 
@@ -10203,29 +10224,37 @@ git -c safe.directory="$5" -C "$5" status --porcelain
         let tmp = tempfile::tempdir().unwrap();
         let data = tmp.path();
         let def_dir = data.join("profiles/anthropic/default");
-        let vul_dir = data.join("profiles/anthropic/vulcan");
-        let agent_cfg = data.join("agents/vulcan-id/config");
+        let secondary_dir = data.join("profiles/anthropic/secondary");
+        let agent_cfg = data.join("agents/secondary-id/config");
         std::fs::create_dir_all(&def_dir).unwrap();
-        std::fs::create_dir_all(&vul_dir).unwrap();
+        std::fs::create_dir_all(&secondary_dir).unwrap();
         std::fs::create_dir_all(&agent_cfg).unwrap();
-        std::fs::write(agent_cfg.join(".anyagents-profile"), "anthropic/vulcan\n").unwrap();
+        std::fs::write(
+            agent_cfg.join(".anyagents-profile"),
+            "anthropic/secondary\n",
+        )
+        .unwrap();
 
         let dup_cred = serde_json::json!({
             "claudeAiOauth": {
                 "accessToken": "",
-                "refreshToken": "rtok-stanley",
-                "accountUuid": "uuid-stanley",
-                "email": "stanleylau_ex@hotmail.com"
+                "refreshToken": "rtok-account-one",
+                "accountUuid": "uuid-account-one",
+                "email": "account-one@example.test"
             }
         });
         std::fs::write(def_dir.join(".credentials.json"), dup_cred.to_string()).unwrap();
-        std::fs::write(vul_dir.join(".credentials.json"), dup_cred.to_string()).unwrap();
+        std::fs::write(
+            secondary_dir.join(".credentials.json"),
+            dup_cred.to_string(),
+        )
+        .unwrap();
 
-        // Deduplicating same-email profiles merges `vulcan` into `default` and updates bound agents.
+        // Deduplicating same-email profiles merges `secondary` into `default` and updates bound agents.
         deduplicate_same_account_profiles(data);
         assert!(def_dir.is_dir());
         assert!(
-            !vul_dir.exists(),
+            !secondary_dir.exists(),
             "duplicate profile for the same email must be removed"
         );
         assert_eq!(
@@ -10233,8 +10262,8 @@ git -c safe.directory="$5" -C "$5" status --porcelain
             Some("anthropic/default")
         );
 
-        // Signing in a new account (`ritaleewoonyee@gmail.com`) without `--profile`
-        // creates its own distinct profile (`ritaleewoonyee`) without touching `default`.
+        // Signing in a new account (`account-two@example.test`) without `--profile`
+        // creates its own distinct profile (`account-two`) without touching `default`.
         let stage1 = data.join("profiles/anthropic/.signin-staging-test1");
         std::fs::create_dir_all(&stage1).unwrap();
         std::fs::write(
@@ -10242,33 +10271,33 @@ git -c safe.directory="$5" -C "$5" status --porcelain
             serde_json::json!({
                 "claudeAiOauth": {
                     "accessToken": "",
-                    "refreshToken": "rtok-rita",
-                    "accountUuid": "uuid-rita",
-                    "email": "ritaleewoonyee@gmail.com"
+                    "refreshToken": "rtok-account-two",
+                    "accountUuid": "uuid-account-two",
+                    "email": "account-two@example.test"
                 }
             })
             .to_string(),
         )
         .unwrap();
 
-        let (prof1, rita_dir, acct1) =
+        let (prof1, second_dir, acct1) =
             resolve_and_commit_staged_signin(data, "anthropic", &stage1, None).unwrap();
-        assert_eq!(prof1, "ritaleewoonyee");
-        assert_eq!(acct1.as_deref(), Some("ritaleewoonyee@gmail.com"));
+        assert_eq!(prof1, "account-two");
+        assert_eq!(acct1.as_deref(), Some("account-two@example.test"));
         assert_eq!(
             extract_profile_account_identity(&def_dir, "anthropic")
                 .0
                 .as_deref(),
-            Some("stanleylau_ex@hotmail.com")
+            Some("account-one@example.test")
         );
         assert_eq!(
-            extract_profile_account_identity(&rita_dir, "anthropic")
+            extract_profile_account_identity(&second_dir, "anthropic")
                 .0
                 .as_deref(),
-            Some("ritaleewoonyee@gmail.com")
+            Some("account-two@example.test")
         );
 
-        // Re-signing in `stanleylau_ex@hotmail.com` (even with an explicit `--profile extra`)
+        // Re-signing in `account-one@example.test` (even with an explicit `--profile extra`)
         // updates its existing `default` profile rather than creating a duplicate email profile.
         let stage2 = data.join("profiles/anthropic/.signin-staging-test2");
         std::fs::create_dir_all(&stage2).unwrap();
@@ -10277,9 +10306,9 @@ git -c safe.directory="$5" -C "$5" status --porcelain
             serde_json::json!({
                 "claudeAiOauth": {
                     "accessToken": "",
-                    "refreshToken": "rtok-stanley-2",
-                    "accountUuid": "uuid-stanley",
-                    "email": "stanleylau_ex@hotmail.com"
+                    "refreshToken": "rtok-account-one-2",
+                    "accountUuid": "uuid-account-one",
+                    "email": "account-one@example.test"
                 }
             })
             .to_string(),
@@ -10288,7 +10317,7 @@ git -c safe.directory="$5" -C "$5" status --porcelain
         let (prof2, _, acct2) =
             resolve_and_commit_staged_signin(data, "anthropic", &stage2, Some("extra")).unwrap();
         assert_eq!(prof2, "default");
-        assert_eq!(acct2.as_deref(), Some("stanleylau_ex@hotmail.com"));
+        assert_eq!(acct2.as_deref(), Some("account-one@example.test"));
         assert!(!data.join("profiles/anthropic/extra").exists());
     }
 
@@ -10333,8 +10362,8 @@ git -c safe.directory="$5" -C "$5" status --porcelain
                     "accessToken": "old-access",
                     "refreshToken": "old-refresh-token",
                     "expiresAt": now_ms - 10_000,
-                    "email": "ritaleewoonyee@gmail.com",
-                    "accountUuid": "uuid-rita"
+                    "email": "account-two@example.test",
+                    "accountUuid": "uuid-account-two"
                 }
             })
             .to_string(),
@@ -10372,13 +10401,13 @@ git -c safe.directory="$5" -C "$5" status --porcelain
             synced
                 .pointer("/claudeAiOauth/email")
                 .and_then(serde_json::Value::as_str),
-            Some("ritaleewoonyee@gmail.com")
+            Some("account-two@example.test")
         );
         assert_eq!(
             synced
                 .pointer("/claudeAiOauth/accountUuid")
                 .and_then(serde_json::Value::as_str),
-            Some("uuid-rita")
+            Some("uuid-account-two")
         );
     }
 
@@ -10733,6 +10762,12 @@ mod archetype_tests {
             "{error}"
         );
     }
+}
+
+#[cfg(test)]
+mod runtime_config_tests {
+    use super::*;
+
     #[test]
     fn required_writes_markers_and_refresh_recovery_report_destination_failures() {
         let dir = tempfile::tempdir().unwrap();
@@ -11019,6 +11054,51 @@ mod archetype_tests {
     }
 
     #[test]
+    fn staged_credential_validation_accepts_each_provider_and_refuses_non_credentials() {
+        for (provider, rel, bytes) in [
+            (
+                "anthropic",
+                ".credentials.json",
+                br#"{"claudeAiOauth":{"refreshToken":"fixture-token"}}"#.as_slice(),
+            ),
+            (
+                "openai",
+                "auth.json",
+                br#"{"OPENAI_API_KEY":"fixture-token"}"#,
+            ),
+            (
+                "google-antigravity",
+                ".gemini/antigravity-cli/antigravity-oauth-token",
+                br#"{"access_token":"fixture-token"}"#,
+            ),
+            (
+                "google-antigravity",
+                ".gemini/antigravity-cli/antigravity-oauth-token",
+                b"fixture-refresh-token\n",
+            ),
+            ("muse", "muse/auth.json", br#"{"token":"fixture-token"}"#),
+            ("xai", ".grok/auth.json", br#"{"apiKey":"fixture-token"}"#),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            assert!(validate_staged_credentials(dir.path(), provider).is_err());
+            let path = dir.path().join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, bytes).unwrap();
+            validate_staged_credentials(dir.path(), provider).unwrap();
+            for invalid in [
+                b"{}".as_slice(),
+                b"{invalid",
+                br#"{"account_id":"metadata-only"}"#,
+                br#"{"access_token":" "}"#,
+            ] {
+                std::fs::write(&path, invalid).unwrap();
+                assert!(validate_staged_credentials(dir.path(), provider).is_err());
+                assert_eq!(std::fs::read(&path).unwrap(), invalid);
+            }
+        }
+    }
+
+    #[test]
     fn finalization_without_usable_credentials_never_marks_agent_seeded() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("state.db")).unwrap();
@@ -11036,6 +11116,15 @@ mod archetype_tests {
         assert!(finalize_agent_signin(dir.path(), &agent).is_err());
         assert_eq!(std::fs::read(cfg.join("auth.json")).unwrap(), b"{malformed");
         assert!(!cfg.join(".anyagents-seeded-profile").exists());
+        for invalid in [
+            br#"{"account_id":"metadata-only"}"#.as_slice(),
+            br#"{"tokens":{"access_token":" "}}"#,
+        ] {
+            std::fs::write(cfg.join("auth.json"), invalid).unwrap();
+            assert!(finalize_agent_signin(dir.path(), &agent).is_err());
+            assert_eq!(std::fs::read(cfg.join("auth.json")).unwrap(), invalid);
+            assert!(!cfg.join(".anyagents-seeded-profile").exists());
+        }
     }
 
     #[test]

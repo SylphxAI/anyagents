@@ -244,7 +244,6 @@ pub(crate) mod tests {
     pub(crate) struct Fixture {
         pub consumer: Consumer,
         pub source: PathBuf,
-        pub remote: PathBuf,
         pub log: PathBuf,
         pub fail: PathBuf,
     }
@@ -356,7 +355,6 @@ esac
             Self {
                 consumer: Consumer { executable },
                 source,
-                remote,
                 log,
                 fail,
             }

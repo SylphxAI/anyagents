@@ -230,23 +230,6 @@ fn admitted_principal(raw: &str, agent_id: &str) -> Option<(String, u32, u32, u3
     ))
 }
 
-fn server_has_gid(target_gid: u32) -> bool {
-    if server_gid() == target_gid {
-        return true;
-    }
-    // SAFETY: getgroups(0, null) returns the supplementary group count.
-    let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
-    if count > 0 {
-        let mut gids = vec![0 as libc::gid_t; count as usize];
-        // SAFETY: `gids` has capacity `count`.
-        let read = unsafe { libc::getgroups(count, gids.as_mut_ptr()) };
-        if read > 0 && gids[..read as usize].contains(&target_gid) {
-            return true;
-        }
-    }
-    !is_isolated_test_env() && server_user_in_group_db(target_gid) && launcher().is_file()
-}
-
 fn server_user_in_group_db(target_gid: u32) -> bool {
     let me = current_uid();
     let Some(my_name) = lookup_user_name(me) else {
@@ -406,10 +389,10 @@ pub fn share_config_with_seat_uid(config_dir: &Path, uid: u32, gid: u32) {
         Some((_, existing_uid, existing_gid, _)) => (existing_uid, existing_gid),
         None => (uid, gid),
     };
-    if config_dir.is_dir() {
-        if let Err(err) = give_tree(config_dir, eff_uid, eff_gid) {
-            eprintln!("seat: cannot share {}: {err}", config_dir.display());
-        }
+    if config_dir.is_dir()
+        && let Err(err) = give_tree(config_dir, eff_uid, eff_gid)
+    {
+        eprintln!("seat: cannot share {}: {err}", config_dir.display());
     }
     // Learned facts and agent-authored skills are the only writable host
     // authority outside config/work. Session pins, raw history and migration
@@ -499,6 +482,10 @@ pub fn share_socket_with_seats(path: &Path) {
 /// Ensure an operator CLI or server invocation running in a pre-existing login
 /// shell inherits every supplementary `seat-*` / `anyagents-sock` group granted
 /// to the operator user in `/etc/group`.
+fn operator_may_hydrate(uid: u32, admitted: Option<u32>) -> bool {
+    uid != 0 && admitted == Some(uid)
+}
+
 pub fn hydrate_operator_groups_if_needed() {
     #[cfg(unix)]
     {
@@ -510,12 +497,12 @@ pub fn hydrate_operator_groups_if_needed() {
             return;
         }
         let me = current_uid();
-        if me == 0
-            || std::env::var("ANYAGENTS_OPERATOR_UID")
+        if !operator_may_hydrate(
+            me,
+            std::env::var("ANYAGENTS_OPERATOR_UID")
                 .ok()
-                .and_then(|v| v.parse::<u32>().ok())
-                != Some(me)
-        {
+                .and_then(|v| v.parse().ok()),
+        ) {
             return;
         }
         let Some(my_name) = lookup_user_name(me) else {
@@ -794,6 +781,57 @@ mod tests {
             std::env::remove_var("ANYAGENTS_AGENT_UID");
             std::env::remove_var("ANYAGENTS_AGENT_GID");
             std::env::remove_var("ANYAGENTS_SOCKET_GID");
+        }
+    }
+    #[test]
+    fn operator_hydration_requires_explicit_identity_not_a_uid_range() {
+        for uid in [1000, 2100, 42001, u32::MAX] {
+            assert!(operator_may_hydrate(uid, Some(uid)));
+            assert!(!operator_may_hydrate(uid, None));
+            assert!(!operator_may_hydrate(uid, Some(uid - 1)));
+        }
+        assert!(!operator_may_hydrate(0, Some(0)));
+    }
+
+    #[test]
+    fn protected_roots_are_explicit_and_refuse_only_the_selected_tree() {
+        let _env = crate::server::tests::env_lock();
+        let key = "ANYAGENTS_PROTECTED_ROOTS";
+        let old = std::env::var_os(key);
+        let dir = tempfile::tempdir().unwrap();
+        let selected = dir.path().join("selected");
+        let allowed = dir.path().join("allowed");
+        std::fs::create_dir(&selected).unwrap();
+        std::fs::create_dir(&allowed).unwrap();
+        unsafe {
+            std::env::remove_var(key);
+        }
+        assert!(protected_roots().is_empty());
+        unsafe {
+            std::env::set_var(key, std::env::join_paths([&selected]).unwrap());
+        }
+        assert_eq!(protected_roots(), vec![selected.clone()]);
+        assert!(
+            share_worktree_with_seat(
+                &selected,
+                server_uid(),
+                server_gid(),
+                &dir.path().join("refused.json")
+            )
+            .is_err()
+        );
+        share_worktree_with_seat(
+            &allowed,
+            server_uid(),
+            server_gid(),
+            &dir.path().join("allowed.json"),
+        )
+        .unwrap();
+        unsafe {
+            match old {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
         }
     }
 }

@@ -1127,7 +1127,7 @@ pub(crate) fn ensure_agy_steering_settings(
     std::fs::create_dir_all(&dir)?;
     {
         let path = dir.join("settings.json");
-        let mut root = crate::mcp_config::read_candidates(&[path.clone()])?;
+        let mut root = crate::mcp_config::read_candidates(std::slice::from_ref(&path))?;
         let map = root.as_object_mut().ok_or_else(|| {
             anyagents_core::Error::Message("AGY settings is not an object".into())
         })?;

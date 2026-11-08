@@ -498,7 +498,11 @@ mod tests {
     #[test]
     fn sanitize_claude_settings_strips_host_gateway_and_hooks_for_oauth_profile() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join(".anyagents-profile"), "anthropic/vulcan\n").unwrap();
+        std::fs::write(
+            dir.path().join(".anyagents-profile"),
+            "anthropic/secondary\n",
+        )
+        .unwrap();
         std::fs::write(
             dir.path().join("settings.json"),
             r#"{
