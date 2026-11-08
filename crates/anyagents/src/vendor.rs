@@ -1860,7 +1860,8 @@ cat >/dev/null
         unsafe {
             std::env::set_var("ANYAGENTS_FAKE_MODE", "1");
             std::env::set_var("ANYAGENTS_PRINCIPALS", serde_json::json!({
-                agent.id.as_str(): {"user":"synthetic-worker", "uid":uid, "gid":gid, "socket_gid":24033}
+                agent.id.as_str(): {"user":"synthetic-worker", "uid":uid, "gid":gid, "socket_gid":24033},
+                colocated.id.as_str(): {"user":"synthetic-worker", "uid":uid, "gid":gid, "socket_gid":24033}
             }).to_string());
             std::env::set_var("ANYAGENTS_AGENT_UID", uid.to_string());
             std::env::set_var("ANYAGENTS_AGENT_GID", gid.to_string());
@@ -1884,6 +1885,16 @@ cat >/dev/null
             crate::install::program(&data, "claude-code"),
             probe,
             "the actual resolver must select the synthetic native probe"
+        );
+        // The same-seat exception requires the host registry, never fixture
+        // ownership alone. Keep this positive control on the production resolver.
+        let peers: Vec<anyagents_harness::SeatPeer> =
+            serde_json::from_str(&crate::sandbox::peer_principals(&store).unwrap()).unwrap();
+        assert_eq!(peers.len(), 2);
+        assert!(
+            peers
+                .iter()
+                .any(|peer| { peer.root == colocated_root && peer.uid == uid && peer.gid == gid })
         );
         let harness = launch().unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(10);

@@ -160,6 +160,12 @@ not initialize seat skills or recreate an empty workdir; runtime preparation on
 wake does that. Credential propagation may independently recreate small auth
 directories, but their existence is not a cleanup trigger.
 
+Online deletion waits up to two seconds for both stopped health and release of
+the process lock. An optimistic stopped-health projection cannot remove identity,
+credentials or files while the worker still holds that lock. If shutdown exceeds
+the deadline, deletion returns a conflict and retains the archived identity and
+resources so a later request can complete.
+
 ### The adapter contract
 
 One adapter per harness. A new harness is an adapter plus a catalog entry; the mailbox, channels, `send` and usage do not change.
@@ -377,7 +383,7 @@ These are invariants with tests (`tests/invariants/`), run against a scripted fa
 
 A channel adapter has an inbound side (a stream of events, each with its source key), an outbound side (post or reply to a target), and an identity (which bot or account it is). The built-in agent bus, which carries `send` between agents on the server, is not a channel adapter; it writes straight to mailboxes.
 
-**Telegram (first version).** One bot per agent, created by the user with BotFather and recorded with `anyagents channels add telegram --agent <name> --token-file <path>`; the token is copied into AnyAgents' own credential store at `secrets/channels/<channel id>` (mode 0600) and never into the database, a log or a command line. `getMe` names the bot once, so the channel shows which bot it is.
+**Telegram (first version).** One bot per agent, created by the user with BotFather and recorded with `anyagents channels add telegram --agent <name> --token-file <path>`; the token is copied into AnyAgents' own credential store at `secrets/channels/<channel id>` (mode 0600) and never into the database, a log or a command line. `getMe` names the bot once, so the channel shows which bot it is. Token replacement keeps the channel ID and writes a fresh reference under `secrets/channel-bindings/<channel id>/`; it preserves the previous credential bytes if a later store update fails. This namespace stays separate from the original `secrets/channels/<channel id>` file.
 
 - **Long polling.** A local server usually has no public URL, so the transport is `getUpdates` long polling, one poll per bot at a time on a thread that stops with the server. A webhook is the option for a server that is reachable; it is not built yet.
 - **What one update becomes.** A typed message, or a media message with a caption, becomes one mailbox message. Its source key is the bot and the update id, so the same update stored twice is one row. `sender` is `telegram:user:<id>:<message id>`. `reply_to` is the target a bare reply goes to: `telegram:chat:<chat id>`, or `telegram:chat:<chat id>:<message thread id>` for a forum topic, so a reply lands in the same chat and the same topic. Stickers, edited messages and membership changes are not delivered.

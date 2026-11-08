@@ -1729,9 +1729,10 @@ pub fn bind_agent_telegram_token(
                 store.detach_channel_agent(&other.id, &target_agent.id)?;
             }
         }
-        // Keep the previous credential bytes recoverable on a partial replacement.
+        // Legacy credentials can be files at `channels/<id>`. Keep replacements
+        // in a separate namespace, preserving the old bytes on partial failure.
         let cred_ref = format!(
-            "channels/{}/bindings/{}",
+            "channel-bindings/{}/{}",
             ch.id,
             anyagents_core::MessageId::generate()
         );
@@ -1942,7 +1943,7 @@ fn handle_managed_bot_event(
         })?,
     };
     let mut mem = Memory::try_from_state(&ch.state)?;
-    let cred_ref = format!("channels/{}/managed-{}", ch.id, event.update_id);
+    let cred_ref = format!("channel-bindings/{}/managed-{}", ch.id, event.update_id);
     let secrets = FileCredentialStore::new(store.data_dir());
     secrets.write(&cred_ref, new_bot_token.as_bytes())?;
     store.set_credential_ref(&ch.id, &cred_ref)?;
@@ -4598,6 +4599,92 @@ pub(crate) mod tests {
                 "777:old-token"
             );
         }
+    }
+
+    #[test]
+    fn token_rotation_preserves_channel_id_credential() {
+        let _env = env_lock();
+        let _fake = EnvRestore::set("ANYAGENTS_FAKE_MODE", "1");
+        let (dir, store, agent, original) = custody_fixture();
+        let secrets = FileCredentialStore::new(dir.path());
+        // This is the exact reference produced by the first successful bind.
+        let legacy_ref = format!("channels/{}", original.id);
+        secrets.write(&legacy_ref, b"777:old-token").unwrap();
+        store.set_credential_ref(&original.id, &legacy_ref).unwrap();
+        let mut retained = vec![(legacy_ref, "777:old-token".to_string())];
+        for (id, token) in [(999, "999:new-token"), (1000, "1000:next-token")] {
+            let result =
+                bind_agent_telegram_token(&store, dir.path(), &agent, token, Some((id, "new_bot")))
+                    .expect("rotation must preserve a channel-ID credential file");
+            assert_eq!(result["status"], "bound");
+            let reopened = Store::open(dir.path().join("state.db")).unwrap();
+            let current = channel_for(&reopened, &agent.name).unwrap();
+            assert_eq!(current.id, original.id);
+            assert_eq!(reopened.list_channels().unwrap().len(), 1);
+            let current_ref = current.credential_ref.unwrap();
+            assert_eq!(token_of(&secrets, &current_ref).unwrap(), token);
+            for (reference, old_token) in &retained {
+                assert_ne!(&current_ref, reference);
+                assert_eq!(token_of(&secrets, reference).unwrap(), *old_token);
+            }
+            retained.push((current_ref, token.to_string()));
+        }
+    }
+
+    #[test]
+    fn managed_rotation_preserves_channel_id_credential() {
+        let _env = env_lock();
+        let _fake = EnvRestore::set("ANYAGENTS_FAKE_MODE", "1");
+        let (dir, store, agent, manager) = custody_fixture();
+        let spare = store
+            .create_channel(anyagents_core::NewChannel {
+                kind: "telegram".into(),
+                identity: Some("new_bot".into()),
+                config: "{}".into(),
+                credential_ref: None,
+            })
+            .unwrap();
+        let legacy_ref = format!("channels/{}", spare.id);
+        let secrets = FileCredentialStore::new(dir.path());
+        secrets.write(&legacy_ref, b"999:old-token").unwrap();
+        store.set_credential_ref(&spare.id, &legacy_ref).unwrap();
+        let spare_memory = Memory {
+            bot: Some("999:new_bot".into()),
+            ..Memory::default()
+        };
+        store
+            .set_channel_state(&spare.id, &spare_memory.to_state())
+            .unwrap();
+        let (base, task) = provider_response(200, r#"{"ok":true,"result":"999:new-token"}"#);
+        let _api = EnvRestore::set("ANYAGENTS_TELEGRAM_API", &base);
+        let body = serde_json::json!([{"update_id":12,"managed_bot":{"user":{"id":42,"first_name":"Alex"},"bot":{"id":999,"is_bot":true,"username":"new_bot"}}}]).to_string();
+        let mut memory = Memory::try_from_state(&manager.state).unwrap();
+        let result = ingest_updates(
+            &store,
+            &manager,
+            &agent.id,
+            "manager-token",
+            &mut memory,
+            &body,
+            "getUpdates",
+        );
+        task.join().unwrap();
+        result.expect("managed rotation must preserve a channel-ID credential file");
+        assert_eq!(memory.offset, 13);
+        let reopened = Store::open(dir.path().join("state.db")).unwrap();
+        let current = reopened
+            .list_channels()
+            .unwrap()
+            .into_iter()
+            .find(|ch| ch.id == spare.id)
+            .unwrap();
+        assert!(current.agents.is_empty());
+        assert_eq!(reopened.list_channels().unwrap().len(), 2);
+        assert_eq!(
+            token_of(&secrets, current.credential_ref.as_deref().unwrap()).unwrap(),
+            "999:new-token"
+        );
+        assert_eq!(token_of(&secrets, &legacy_ref).unwrap(), "999:old-token");
     }
 
     #[test]

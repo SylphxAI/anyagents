@@ -4470,26 +4470,29 @@ async fn delete_agent_route(
             .set_agent_state(&found.id, "archived")
             .map_err(ApiError::from_store)?;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while std::time::Instant::now() < deadline {
+        // Health is a projection: the supervisor may publish stopped before
+        // its worker exits. Allow that normal shutdown to release actual
+        // process custody within the same deadline, retaining the guard to commit.
+        let _process = loop {
             if state
                 .health
                 .get(&found.id)
                 .is_none_or(|live| !live.process_alive)
             {
-                break;
+                match state.store.try_lock_agent(&found.id) {
+                    Ok(process) => break process,
+                    Err(anyagents_core::Error::AgentBusy) => {}
+                    Err(error) => return Err(ApiError::from_store(error)),
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(ApiError::new(
+                    StatusCode::CONFLICT,
+                    "agent is archived but its process has not stopped; identity and resources are retained",
+                ));
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        if state.health.get(&found.id).is_some_and(|live| live.process_alive) {
-            return Err(ApiError::new(
-                StatusCode::CONFLICT,
-                "agent is archived but its process has not stopped; identity and resources are retained",
-            ));
-        }
-        // Health is a projection: the supervisor may publish stopped before
-        // its worker exits. Actual process custody must be released before any
-        // grant, identity or resource is removed; retain the guard to commit.
-        let _process = state.store.try_lock_agent(&found.id).map_err(ApiError::from_store)?;
+        };
         crate::worktree_access::revoke_recorded(state.store.data_dir(), &found.id)
             .map_err(ApiError::from_store)?;
         let deleted = state
@@ -7098,6 +7101,51 @@ pub(crate) mod tests {
             )
             .await
             .unwrap_or_else(|error| panic!("{}", error.message));
+            assert!(state.store.agent(&agent.id).is_err());
+            assert!(!config.exists());
+        });
+    }
+
+    #[test]
+    fn deletion_waits_for_process_custody_after_optimistic_stopped_health() {
+        let dir = crate::test_tempdir();
+        let state = archetype_validation_state(dir.path());
+        let agent = state
+            .store
+            .create_agent(anyagents_core::NewAgent::new("stopping", "opencode"))
+            .unwrap();
+        state.store.set_agent_running(&agent.id, "/work").unwrap();
+        let config = anyagents_core::agent_config_dir(dir.path(), &agent.id);
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(config.join("preserve"), "retained state").unwrap();
+        let process = state.store.try_lock_agent(&agent.id).unwrap();
+        // An absent health row is the same optimistic stopped projection used
+        // during supervisor shutdown; actual process custody remains occupied.
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let deleting = tokio::spawn(delete_agent_route(
+                Principal::Operator,
+                State(state.clone()),
+                AxumPath(agent.name.clone()),
+            ));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while state.store.agent(&agent.id).unwrap().state != "archived" {
+                assert!(std::time::Instant::now() < deadline);
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            assert!(
+                !deleting.is_finished(),
+                "shutdown must wait for actual custody"
+            );
+            assert_eq!(
+                std::fs::read_to_string(config.join("preserve")).unwrap(),
+                "retained state"
+            );
+            drop(process);
+            let _ = deleting
+                .await
+                .unwrap()
+                .unwrap_or_else(|error| panic!("{}", error.message));
             assert!(state.store.agent(&agent.id).is_err());
             assert!(!config.exists());
         });
