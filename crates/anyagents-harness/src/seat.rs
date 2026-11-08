@@ -122,7 +122,9 @@ pub(super) fn admitted_command(
                 let _ = stdin.write_all(&bytes);
             });
         }
-        child.wait_with_output().map_err(|e| refuse(e.to_string()))?
+        child
+            .wait_with_output()
+            .map_err(|e| refuse(e.to_string()))?
     };
     if !output.status.success() {
         let why = String::from_utf8_lossy(&output.stderr);
