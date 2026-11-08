@@ -9074,6 +9074,10 @@ mod tests {
                     "--nocapture",
                 ])
                 .env("ANYAGENTS_PRIVILEGED_WORKER", "1")
+                // This proof selects a private identity independently of A's
+                // common config; an unset override deliberately preserves A's.
+                .env("ANYAGENTS_GIT_AUTHOR_NAME", "Example Author")
+                .env("ANYAGENTS_GIT_AUTHOR_EMAIL", "author@example.test")
                 .env("GIT_CONFIG_COUNT", "1")
                 .env("GIT_CONFIG_KEY_0", "safe.directory")
                 .env("GIT_CONFIG_VALUE_0", "*")
