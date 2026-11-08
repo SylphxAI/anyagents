@@ -85,17 +85,45 @@ pub(super) fn admitted_command(
         command
     };
     let script = admission_script(checks);
-    let output = prefix()
-        .args(["/bin/sh", "-c", &script, "seat-admission"])
-        .envs(
-            environment
-                .iter()
-                .filter(|(k, _)| !crate::SERVER_ONLY_ENV.contains(&k.as_str()))
-                .map(|(k, v)| (k, v)),
-        )
-        .env_remove(crate::SEAT_LAUNCH_ENV)
-        .output()
-        .map_err(|e| refuse(e.to_string()))?;
+    // Linux `MAX_ARG_STRLEN` caps any single `argv` entry at 131,072 bytes (`PAGE_SIZE * 32`).
+    // Use `-c` when the script fits within `MAX_ARG_STRLEN`, and stream via `-s` stdin when
+    // large peer inventories exceed that single-argument ceiling.
+    let output = if script.len() < 120_000 {
+        prefix()
+            .args(["/bin/sh", "-c", &script, "seat-admission"])
+            .envs(
+                environment
+                    .iter()
+                    .filter(|(k, _)| !crate::SERVER_ONLY_ENV.contains(&k.as_str()))
+                    .map(|(k, v)| (k, v)),
+            )
+            .env_remove(crate::SEAT_LAUNCH_ENV)
+            .output()
+            .map_err(|e| refuse(e.to_string()))?
+    } else {
+        let mut child = prefix()
+            .args(["/bin/sh", "-s", "seat-admission"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .envs(
+                environment
+                    .iter()
+                    .filter(|(k, _)| !crate::SERVER_ONLY_ENV.contains(&k.as_str()))
+                    .map(|(k, v)| (k, v)),
+            )
+            .env_remove(crate::SEAT_LAUNCH_ENV)
+            .spawn()
+            .map_err(|e| refuse(e.to_string()))?;
+        if let Some(mut stdin) = child.stdin.take() {
+            let bytes = script.into_bytes();
+            std::thread::spawn(move || {
+                use std::io::Write as _;
+                let _ = stdin.write_all(&bytes);
+            });
+        }
+        child.wait_with_output().map_err(|e| refuse(e.to_string()))?
+    };
     if !output.status.success() {
         let why = String::from_utf8_lossy(&output.stderr);
         return Err(refuse(
@@ -124,10 +152,15 @@ fn admission_script(checks: impl IntoIterator<Item = Check>) -> String {
     for check in checks {
         // Labels are static diagnostic text, never a path, capability or command output.
         let label = check.what.replace('\'', "'\\''");
-        // A failing left operand of `&&` is exempt from errexit. Make the
-        // complete check a standalone command so its nonzero result must fail;
-        // do not put it in an if/|| context that disables inner errexit.
-        script.push_str(&format!("check='{label}'\n(\n{}\n)\n", check.program));
+        // A failing left operand of `&&` is exempt from errexit. Wrap checks
+        // containing `&&` or `||` in a subshell so a nonzero compound result
+        // fails immediately; run simple single-command/semicolon checks
+        // in-process under `set -e` to avoid tens of thousands of forks.
+        if check.program.contains("&&") || check.program.contains("||") {
+            script.push_str(&format!("check='{label}'\n(\n{}\n)\n", check.program));
+        } else {
+            script.push_str(&format!("check='{label}'\n{}\n", check.program));
+        }
     }
     script
 }
@@ -158,7 +191,7 @@ fn checks_with_principals(
         let path = quote(path)?;
         Ok(Check {
             what,
-            program: format!("[ ! -r {path} ] && [ ! -w {path} ] && [ ! -x {path} ]"),
+            program: format!("[ ! -r {path} ]; [ ! -w {path} ]; [ ! -x {path} ]"),
         })
     };
     let mut list = vec![
@@ -210,14 +243,17 @@ fn checks_with_principals(
         Err(err) => return Err(err),
     };
     peers.sort();
+    let same_seat_roots: std::collections::HashSet<&Path> = principals
+        .iter()
+        .filter(|p| p.uid == uid && p.gid == gid)
+        .map(|p| p.root.as_path())
+        .collect();
     let mut foreign_roots = Vec::new();
     for peer in peers {
         // Two agents can legitimately share one OS principal. Only a host-
         // resolved UID/GID+root tuple grants this exception, never directory
         // ownership or a seat-controlled marker.
-        let same_seat = principals
-            .iter()
-            .any(|p| p.uid == uid && p.gid == gid && p.root == peer);
+        let same_seat = same_seat_roots.contains(peer.as_path());
         if Some(peer.as_path()) == config.and_then(Path::parent) || same_seat {
             continue;
         }

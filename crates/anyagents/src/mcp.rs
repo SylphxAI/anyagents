@@ -3040,8 +3040,15 @@ fn find_js_runtime() -> Option<(PathBuf, bool)> {
             if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
                 dirs.push(home.join(".local/opt/node/bin"));
                 dirs.push(home.join(".local/opt/bun/bin"));
+                if let Some(host_home) = crate::sandbox::host_home_dir() {
+                    dirs.push(host_home.join(".local/opt/node/bin"));
+                    dirs.push(host_home.join(".local/opt/bun/bin"));
+                }
                 dirs.push(home.join(".local/bin"));
                 dirs.push(home.join(".bun/bin"));
+            } else if let Some(host_home) = crate::sandbox::host_home_dir() {
+                dirs.push(host_home.join(".local/opt/node/bin"));
+                dirs.push(host_home.join(".local/opt/bun/bin"));
             }
             if let Some(path_os) = std::env::var_os("PATH") {
                 dirs.extend(std::env::split_paths(&path_os));

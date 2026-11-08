@@ -991,6 +991,14 @@ pub(crate) fn ensure_seat_environment(target_config: &Path, workdir: &Path) -> R
             }
         }
         if let Some(host_home) = host_home {
+            let host_local_opt = host_home.join(".local/opt");
+            let dst_local_opt = target_config.join(".local/opt");
+            if host_local_opt.exists() && !dst_local_opt.exists() {
+                if let Some(parent) = dst_local_opt.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = std::os::unix::fs::symlink(&host_local_opt, &dst_local_opt);
+            }
             ensure_seat_skills(target_config, &host_home);
         }
     }

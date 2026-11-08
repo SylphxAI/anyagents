@@ -907,4 +907,50 @@ fn transcript_validation_recovers_crash_spliced_lines_and_local_switch_clears_re
         503,
         r#"{"error":{"type":"service_unavailable","code":"service_unavailable","message":"Durable spend authorization is unavailable."},"retryable":false}"#,
     ));
+
+    // When `:submitToolResult` returns HTTP 400 because the remote turn already settled
+    // (`state: "idle"`), `flush_cloud_tool_receipt` reconciles `last_seq` and clears the receipt.
+    save_persisted_cloud_session(cfg, &binding()).unwrap();
+    let settled_rcpt = json!({
+        "session_path": cloud_session_resource_path(&binding().env_slug, &binding().session_id),
+        "call_id": "call-settled",
+        "event_sequence": 9,
+        "state": "completed",
+        "output": "ok",
+        "error": false
+    });
+    std::fs::write(&rcpt, settled_rcpt.to_string()).unwrap();
+    let (base, server) = serve(vec![
+        (
+            400,
+            json!({"error":{"message":"The turn ended before the client result was accepted."}}),
+        ),
+        (200, json!({"state":"idle","last_event_sequence":9})),
+    ]);
+    flush_cloud_tool_receipt(cfg, &base, "fixture-key").unwrap();
+    server.join().unwrap();
+    assert!(!rcpt.exists());
+    assert_eq!(
+        load_persisted_cloud_session(cfg).unwrap().unwrap().last_seq,
+        9
+    );
+
+    // `call_anyagents_mcp_tool` strips `SERVER_ONLY_ENV` (`ANYAGENTS_SEAT_PEERS` > 128 KiB
+    // Linux `MAX_ARG_STRLEN`) so spawning the MCP child never fails with `E2BIG`.
+    let oversize_peers = "x".repeat(200_000);
+    let mcp_out = call_anyagents_mcp_tool(
+        Path::new("/bin/sh"),
+        &[
+            "-c".to_string(),
+            "printf '{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{}}\n{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"content\":[{\"text\":\"mcp-ok\"}]}}\n'"
+                .to_string(),
+        ],
+        &[(
+            anyagents_harness::SEAT_PEERS_ENV.to_string(),
+            oversize_peers,
+        )],
+        "code",
+        &json!({"code":"return 1;"}),
+    );
+    assert_eq!(mcp_out, "mcp-ok");
 }
