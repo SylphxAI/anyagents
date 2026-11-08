@@ -783,7 +783,7 @@ fn set_state(data: &Path, name: &str, state: &str) -> Result<AgentView, Error> {
         seat_uid: seat_info.as_ref().map(|(_, uid, _, _)| *uid),
         seat_gid: seat_info.as_ref().map(|(_, _, gid, _)| *gid),
         schedules: crate::schedule::list_agent_schedules(&store, &agent.id, false)
-            .map_err(|e| Error::Message(e))?,
+            .map_err(Error::Message)?,
     })
 }
 
@@ -917,8 +917,7 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
         seat_user: seat_info.as_ref().map(|(u, _, _, _)| u.clone()),
         seat_uid: seat_info.as_ref().map(|(_, uid, _, _)| *uid),
         seat_gid: seat_info.as_ref().map(|(_, _, gid, _)| *gid),
-        schedules: crate::schedule::list_agent_schedules(&store, &agent.id, false)
-            .map_err(|e| Error::Message(e))?,
+        schedules: crate::schedule::list_agent_schedules(&store, &agent.id, false)?,
     })
 }
 
@@ -1438,7 +1437,7 @@ fn list_filtered(
                 seat_uid: seat_info.as_ref().map(|(_, uid, _, _)| *uid),
                 seat_gid: seat_info.as_ref().map(|(_, _, gid, _)| *gid),
                 schedules: crate::schedule::list_agent_schedules(&store, &agent.id, false)
-                    .map_err(|e| Error::Message(e))?,
+                    .map_err(Error::Message)?,
             });
             continue;
         }
