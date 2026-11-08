@@ -1938,6 +1938,23 @@ fn build_chat_completions_request(
                             "type": "image_url",
                             "image_url": { "url": u }
                         }));
+                    } else if ptype == "input_audio"
+                        && let Some(aud) = p.get("input_audio")
+                    {
+                        parts.push(json!({
+                            "type": "input_audio",
+                            "input_audio": aud
+                        }));
+                    } else if ptype == "input_file"
+                        && let Some(fd) = p.get("file_data").and_then(Value::as_str)
+                    {
+                        parts.push(json!({
+                            "type": "file",
+                            "file": {
+                                "filename": p.get("filename").and_then(Value::as_str).unwrap_or("document.pdf"),
+                                "file_data": fd,
+                            }
+                        }));
                     }
                 }
                 if parts.len() == 1 && parts[0].get("type").and_then(Value::as_str) == Some("text")
@@ -2091,14 +2108,68 @@ fn format_image_read_output(path: &str, mime: &str, bytes: &[u8]) -> String {
     )
 }
 
-fn extract_attached_image_marker(output: &str) -> (String, Option<String>) {
-    if let Some((clean, data_url)) = output.split_once(ATTACHED_IMAGE_MARKER_PREFIX) {
-        let trimmed = data_url.trim();
-        if trimmed.starts_with("data:image/") {
-            return (clean.to_string(), Some(trimmed.to_string()));
+fn extract_attached_media_markers(output: &str) -> (String, Vec<String>) {
+    let mut segments = output.split(ATTACHED_IMAGE_MARKER_PREFIX);
+    let clean = segments.next().unwrap_or(output).to_string();
+    let mut media_urls = Vec::new();
+    for seg in segments {
+        let trimmed = seg.trim();
+        if trimmed.starts_with("data:") {
+            media_urls.push(trimmed.to_string());
         }
     }
-    (output.to_string(), None)
+    (clean, media_urls)
+}
+
+fn build_multimodal_user_item(fn_name: &str, data_urls: &[String]) -> Option<Value> {
+    if data_urls.is_empty() {
+        return None;
+    }
+    let all_images = data_urls.iter().all(|u| u.starts_with("data:image/"));
+    let label = if all_images {
+        format!("[Image loaded by `{fn_name}`]")
+    } else {
+        format!("[Multimedia loaded by `{fn_name}`]")
+    };
+    let mut content = vec![json!({
+        "type": "input_text",
+        "text": label,
+    })];
+    for data_url in data_urls {
+        if data_url.starts_with("data:image/") {
+            content.push(json!({
+                "type": "input_image",
+                "image_url": data_url,
+            }));
+        } else if data_url.starts_with("data:application/pdf;base64,") {
+            content.push(json!({
+                "type": "input_file",
+                "filename": "document.pdf",
+                "file_data": data_url,
+            }));
+        } else if let Some(rest) = data_url.strip_prefix("data:audio/")
+            && let Some((sub, b64)) = rest.split_once(";base64,")
+        {
+            let fmt = if sub.contains("wav") { "wav" } else { "mp3" };
+            content.push(json!({
+                "type": "input_audio",
+                "input_audio": {
+                    "data": b64,
+                    "format": fmt,
+                },
+            }));
+        } else {
+            content.push(json!({
+                "type": "input_file",
+                "filename": "attachment.bin",
+                "file_data": data_url,
+            }));
+        }
+    }
+    Some(json!({
+        "role": "user",
+        "content": content,
+    }))
 }
 
 fn close_dangling_function_calls(
@@ -2748,14 +2819,23 @@ pub(crate) fn run_native_gateway_turn(
                     {
                         unanswered_reply_target = None;
                     }
+                    let (clean_output, attached_media_urls) =
+                        extract_attached_media_markers(&output);
                     let tool_out_item = json!({
                         "type": "function_call_output",
                         "call_id": call_id,
-                        "output": output,
+                        "output": clean_output,
                     });
                     let tool_out_item =
                         append_transcript_message(&transcript_path, &tool_out_item)?;
                     input_items.push(tool_out_item);
+                    if let Some(media_item) =
+                        build_multimodal_user_item(&fn_name, &attached_media_urls)
+                    {
+                        let media_item =
+                            append_transcript_message(&transcript_path, &media_item)?;
+                        input_items.push(media_item);
+                    }
                 }
             } else {
                 for (call_id, fn_name, parsed_args) in parsed_calls {
@@ -2831,8 +2911,8 @@ pub(crate) fn run_native_gateway_turn(
                     {
                         unanswered_reply_target = None;
                     }
-                    let (clean_output, attached_image_data_url) =
-                        extract_attached_image_marker(&output);
+                    let (clean_output, attached_media_urls) =
+                        extract_attached_media_markers(&output);
                     let tool_out_item = json!({
                         "type": "function_call_output",
                         "call_id": call_id,
@@ -2841,22 +2921,12 @@ pub(crate) fn run_native_gateway_turn(
                     let tool_out_item =
                         append_transcript_message(&transcript_path, &tool_out_item)?;
                     input_items.push(tool_out_item);
-                    if let Some(data_url) = attached_image_data_url {
-                        let image_item = json!({
-                            "role": "user",
-                            "content": [
-                                {
-                                    "type": "input_text",
-                                    "text": format!("[Image loaded by `{fn_name}`]"),
-                                },
-                                {
-                                    "type": "input_image",
-                                    "image_url": data_url,
-                                }
-                            ]
-                        });
-                        append_transcript_message(&transcript_path, &image_item)?;
-                        input_items.push(image_item);
+                    if let Some(media_item) =
+                        build_multimodal_user_item(&fn_name, &attached_media_urls)
+                    {
+                        let media_item =
+                            append_transcript_message(&transcript_path, &media_item)?;
+                        input_items.push(media_item);
                     }
                 }
             }
@@ -4181,9 +4251,13 @@ fn execute_sylphx_tool(
         return format!("error: {e}");
     }
     let raw = execute_sylphx_tool_raw(name, args, config_dir, work_dir, env, mcp_command, mcp_args);
-    let masked = anyagents_core::masking::mask_known_secrets(&raw).into_owned();
+    let (raw_text, media_suffix) = match raw.find(ATTACHED_IMAGE_MARKER_PREFIX) {
+        Some(idx) => (&raw[..idx], Some(&raw[idx..])),
+        None => (raw.as_str(), None),
+    };
+    let masked = anyagents_core::masking::mask_known_secrets(raw_text).into_owned();
     let normalized = name.strip_prefix("mcp__anyagents__").unwrap_or(name);
-    // Preserve the existing producer-specific observation bounds. Binary image
+    // Preserve the existing producer-specific observation bounds. Binary image/audio/PDF
     // attachments and native recall retain their own structured representations.
     let limits = match normalized {
         "agents" | "subagents" | "send" | "conversation" | "search" | "groups" | "schedule"
@@ -4205,10 +4279,14 @@ fn execute_sylphx_tool(
         }
         _ => None,
     };
-    match limits {
+    let mut bounded = match limits {
         Some((max, head, tail)) => truncate_tool_output_middle_utf8(masked, max, head, tail),
         None => masked,
+    };
+    if let Some(suffix) = media_suffix {
+        bounded.push_str(suffix);
     }
+    bounded
 }
 
 fn execute_sylphx_tool_raw(
@@ -4951,11 +5029,62 @@ fn call_anyagents_mcp_tool(
                 if let Some(err) = value.pointer("/error/message").and_then(Value::as_str) {
                     return format!("error: {err}");
                 }
-                let output = value
+                let mut output = value
                     .pointer("/result/content/0/text")
                     .and_then(Value::as_str)
                     .map(str::to_string)
                     .unwrap_or_else(|| value.to_string());
+                if let Some(items) = value.pointer("/result/content").and_then(Value::as_array) {
+                    for block in items.iter().skip(1) {
+                        let btype = block.get("type").and_then(Value::as_str).unwrap_or("");
+                        match btype {
+                            "image" => {
+                                let mime = block
+                                    .get("mimeType")
+                                    .or_else(|| block.get("mime_type"))
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("image/png");
+                                if let Some(data) = block.get("data").and_then(Value::as_str)
+                                    && !data.is_empty()
+                                {
+                                    output.push_str(&format!(
+                                        "{ATTACHED_IMAGE_MARKER_PREFIX}data:{mime};base64,{data}"
+                                    ));
+                                }
+                            }
+                            "audio" => {
+                                let mime = block
+                                    .get("mimeType")
+                                    .or_else(|| block.get("mime_type"))
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("audio/wav");
+                                if let Some(data) = block.get("data").and_then(Value::as_str)
+                                    && !data.is_empty()
+                                {
+                                    output.push_str(&format!(
+                                        "{ATTACHED_IMAGE_MARKER_PREFIX}data:{mime};base64,{data}"
+                                    ));
+                                }
+                            }
+                            "resource" => {
+                                let mime = block
+                                    .pointer("/resource/mimeType")
+                                    .or_else(|| block.pointer("/resource/mime_type"))
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("application/octet-stream");
+                                if let Some(blob) =
+                                    block.pointer("/resource/blob").and_then(Value::as_str)
+                                    && !blob.is_empty()
+                                {
+                                    output.push_str(&format!(
+                                        "{ATTACHED_IMAGE_MARKER_PREFIX}data:{mime};base64,{blob}"
+                                    ));
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 return output;
             }
             Err(err) => {
