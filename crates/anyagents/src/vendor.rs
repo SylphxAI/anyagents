@@ -391,6 +391,7 @@ pub fn persist_last_error(config_dir: &Path, error: Option<&str>, quota_reset_at
     }
 }
 
+#[allow(dead_code)]
 pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
     vendor_launch_authorized(request, None)
 }
@@ -770,7 +771,21 @@ fn vendor_launch_inner(
                 );
             }
         }
+        let _ = crate::create::ensure_seat_environment(&request.config_dir, &request.work_dir);
         crate::create::ensure_seat_op_config(&request.config_dir, seat_launch);
+        if let Some(host_home) = crate::sandbox::host_home_dir() {
+            env.push((
+                "ANYAGENTS_HOST_HOME".to_string(),
+                host_home.display().to_string(),
+            ));
+            let node_bin = host_home.join(".local/opt/node/bin");
+            if node_bin.is_dir() {
+                env.push((
+                    "DESK_NODE_DEFAULT_DIR".to_string(),
+                    node_bin.display().to_string(),
+                ));
+            }
+        }
         env.push(("HOME".to_string(), request.config_dir.display().to_string()));
         env.push(("USER".to_string(), seat_user.clone()));
         env.push(("LOGNAME".to_string(), seat_user.clone()));

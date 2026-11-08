@@ -3067,7 +3067,16 @@ fn find_js_runtime() -> Option<(PathBuf, bool)> {
                 dirs.push(host_home.join(".local/opt/bun/bin"));
             }
             if let Some(path_os) = std::env::var_os("PATH") {
-                dirs.extend(std::env::split_paths(&path_os));
+                let path_dirs: Vec<PathBuf> = std::env::split_paths(&path_os).collect();
+                for dir in &path_dirs {
+                    if dir.ends_with(".local/bin")
+                        && let Some(local_root) = dir.parent()
+                    {
+                        dirs.push(local_root.join("opt/node/bin"));
+                        dirs.push(local_root.join("opt/bun/bin"));
+                    }
+                }
+                dirs.extend(path_dirs);
             }
             dirs.push(PathBuf::from("/usr/local/bin"));
             dirs.push(PathBuf::from("/usr/bin"));
@@ -3719,6 +3728,17 @@ impl AgentMcp {
             .env("NODE_NO_WARNINGS", "1");
         if let Some(home) = std::env::var_os("HOME") {
             cmd.env("HOME", home);
+        }
+        if let Some(host_home) = std::env::var_os("ANYAGENTS_HOST_HOME") {
+            cmd.env("ANYAGENTS_HOST_HOME", &host_home);
+        }
+        if let Some(node_dir) = std::env::var_os("DESK_NODE_DEFAULT_DIR") {
+            cmd.env("DESK_NODE_DEFAULT_DIR", node_dir);
+        } else if let Some(host_home) = crate::sandbox::host_home_dir() {
+            let opt_node = host_home.join(".local/opt/node/bin");
+            if opt_node.is_dir() {
+                cmd.env("DESK_NODE_DEFAULT_DIR", opt_node);
+            }
         }
         if is_node {
             cmd.arg("--no-warnings");

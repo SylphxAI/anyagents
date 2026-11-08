@@ -438,23 +438,27 @@ fn is_transient_sylphx_turn_error(err: &str) -> bool {
 }
 
 fn spawn_admin_sylphx_delivery(
+    parent_store: &Store,
     data: PathBuf,
     agent: Agent,
     health: HealthBoard,
     reconcile: Arc<std::sync::Mutex<AdminReconcileState>>,
 ) {
+    let store = match Store::open(data.join("state.db")) {
+        Ok(s) => {
+            s.copy_capability_key_from(parent_store);
+            s
+        }
+        Err(_) => {
+            let mut guard = match reconcile.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.flushing_sylphx.remove(agent.id.as_str());
+            return;
+        }
+    };
     std::thread::spawn(move || {
-        let store = match Store::open(data.join("state.db")) {
-            Ok(s) => s,
-            Err(_) => {
-                let mut guard = match reconcile.lock() {
-                    Ok(g) => g,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
-                guard.flushing_sylphx.remove(agent.id.as_str());
-                return;
-            }
-        };
         let _agent_lock = match store.try_lock_agent(&agent.id) {
             Ok(lock) => lock,
             Err(_) => {
@@ -500,7 +504,7 @@ fn spawn_admin_sylphx_delivery(
                 work_dir,
                 extra_env: Vec::new(),
             };
-            match crate::vendor::vendor_launch(req) {
+            match crate::vendor::vendor_launch_with_store(req, &store) {
                 Ok(mut harness) => {
                     let mut had_err = false;
                     let mut completed_any = false;
@@ -1248,6 +1252,7 @@ fn reconcile_agent_snapshot(
                                         .insert(agent.id.to_string(), now_ms);
                                     guard.flushing_sylphx.insert(agent.id.to_string());
                                     spawn_admin_sylphx_delivery(
+                                        store,
                                         data.to_path_buf(),
                                         running_agent,
                                         health.clone(),
@@ -1344,6 +1349,7 @@ fn reconcile_agent_snapshot(
                         guard.watermark_seq.insert(agent.id.to_string(), max_seq);
                         guard.flushing_sylphx.insert(agent.id.to_string());
                         spawn_admin_sylphx_delivery(
+                            store,
                             data.to_path_buf(),
                             agent.clone(),
                             health.clone(),
@@ -1526,7 +1532,10 @@ pub fn run_admin(data: &Path) -> Result<(), Error> {
     crate::worktree_access::recover_inspections(data)?;
     let runtime = tokio::runtime::Runtime::new()?;
     let store = Arc::new(Store::open(data.join("state.db"))?);
-    if let Ok(key) = capability_key() {
+    if (std::env::var("ANYAGENTS_CAPABILITY_KEY").is_ok_and(|v| v.len() >= 32)
+        || !data.join("anyagents.sock").exists())
+        && let Ok(key) = capability_key()
+    {
         let _ = store.hold_capability_key(&key);
     }
     crate::host_memory::on_start(&store);

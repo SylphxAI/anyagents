@@ -744,6 +744,20 @@ impl Store {
         Ok(())
     }
 
+    pub fn copy_capability_key_from(&self, other: &Store) {
+        let cloned = other
+            .capabilities
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone();
+        if cloned.is_some() {
+            *self
+                .capabilities
+                .lock()
+                .unwrap_or_else(|err| err.into_inner()) = cloned;
+        }
+    }
+
     pub(crate) fn database_path(&self) -> &Path {
         &self.db_path
     }
@@ -4021,7 +4035,7 @@ impl Store {
         let Some((opened_seq, completed_seq, recovery_count, opened_at_ms)) = row else {
             return Ok(None);
         };
-        if opened_seq <= completed_seq {
+        if opened_seq <= completed_seq || recovery_count >= MAX_RECOVERY_ATTEMPTS {
             return Ok(None);
         }
         let delivered = cursor(&conn, agent_id)?;

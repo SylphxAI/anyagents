@@ -2118,31 +2118,50 @@ pub(crate) fn reconcile_agent_runtime_config(
                 .map(|(_, v)| v.clone())
         });
     ensure_seat_environment(config, work_dir)?;
+    let goal_file = config.join("sylphx-goal.json");
+    if let Ok(raw_goal) = std::fs::read_to_string(&goal_file)
+        && raw_goal.trim().is_empty()
+    {
+        let _ = std::fs::remove_file(&goal_file);
+    }
     seed_harness_credentials(store, data, agent, config)?;
-    if !config.join("mcp-capability").is_file()
+    let needs_capability_repair = std::fs::read_to_string(config.join("mcp-capability"))
+        .ok()
+        .is_none_or(|raw| {
+            crate::operator::verify_capability(store, &agent.id, raw.trim()).is_err()
+        });
+    if needs_capability_repair
         && let Err(mint_error) = crate::operator::ensure(store, &agent.id)
     {
         let mut repaired = false;
         #[cfg(unix)]
-        if let Some(op_tok) = crate::operator::operator_token(data)
-            && let Ok(mut stream) =
-                std::os::unix::net::UnixStream::connect(data.join("anyagents.sock"))
-        {
-            use std::io::{Read as _, Write as _};
-            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
-            let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(2)));
-            let req = format!(
-                "POST /v1/operator/agents/{}/capability HTTP/1.1\r\nHost: localhost\r\n{}: {op_tok}\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}",
-                agent.id,
-                crate::operator::HEADER
-            );
-            stream.write_all(req.as_bytes())?;
-            let mut buf = String::new();
-            stream.read_to_string(&mut buf)?;
-            if !buf.starts_with("HTTP/1.1 200 ") && !buf.starts_with("HTTP/1.1 201 ") {
+        if let Some(op_tok) = crate::operator::operator_token(data) {
+            for target_ref in [agent.name.as_str(), agent.id.as_str()] {
+                if let Ok(mut stream) =
+                    std::os::unix::net::UnixStream::connect(data.join("anyagents.sock"))
+                {
+                    use std::io::{Read as _, Write as _};
+                    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+                    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(2)));
+                    let req = format!(
+                        "POST /v1/operator/agents/{target_ref}/capability HTTP/1.1\r\nHost: localhost\r\n{}: {op_tok}\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}",
+                        crate::operator::HEADER
+                    );
+                    if stream.write_all(req.as_bytes()).is_ok() {
+                        let mut buf = String::new();
+                        if stream.read_to_string(&mut buf).is_ok()
+                            && (buf.starts_with("HTTP/1.1 200 ")
+                                || buf.starts_with("HTTP/1.1 201 "))
+                        {
+                            repaired = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if !repaired && data.join("anyagents.sock").exists() {
                 return Err(Error::Message("capability repair refused".into()));
             }
-            repaired = true;
         }
         if !repaired {
             return Err(mint_error);

@@ -1425,6 +1425,29 @@ If a task requires deployment-provided host-only capabilities, call `sandbox` wi
                 .and_then(Value::as_array)
         {
             for ev in events {
+                if let Some(tr) = ev.get("tool_result").or_else(|| ev.get("toolResult"))
+                    && let Some(cid) = tr
+                        .get("id")
+                        .or_else(|| tr.get("call_id"))
+                        .or_else(|| tr.get("tool_call_id"))
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.trim().is_empty())
+                {
+                    handled_call_ids.insert(cid.to_string());
+                } else if ev
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|t| t.eq_ignore_ascii_case("TOOL_RESULT"))
+                    && let Some(cid) = ev
+                        .get("call_id")
+                        .or_else(|| ev.get("tool_call_id"))
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.trim().is_empty())
+                {
+                    handled_call_ids.insert(cid.to_string());
+                }
+            }
+            for ev in events {
                 let seq = sequence(ev.get("sequence"), false)?;
                 if seq > 0 && seq <= last_seq {
                     continue;
@@ -3580,6 +3603,12 @@ fn discover_skills_index(work_dir: &Path, config_dir: &Path) -> String {
 
 fn load_active_goal_continuation_prompt(config_dir: &Path) -> Result<Option<String>, String> {
     let goal_path = config_dir.join("sylphx-goal.json");
+    if let Ok(raw) = std::fs::read_to_string(&goal_path)
+        && raw.trim().is_empty()
+    {
+        let _ = remove_optional(&goal_path);
+        return Ok(None);
+    }
     let Some(mut val) = read_json(&goal_path)? else {
         return Ok(None);
     };
@@ -4533,6 +4562,11 @@ fn execute_sylphx_tool_raw(
                     .trim(),
             };
             let goal_path = config_dir.join("sylphx-goal.json");
+            if let Ok(raw) = std::fs::read_to_string(&goal_path)
+                && raw.trim().is_empty()
+            {
+                let _ = remove_optional(&goal_path);
+            }
             let mut current = match read_json(&goal_path) {
                 Ok(Some(value)) => {
                     if let Err(e) = validate_goal(&value) {
@@ -7514,7 +7548,7 @@ fn flush_cloud_tool_receipt(config_dir: &Path, base: &str, key: &str) -> Result<
             key,
             &json!({"call_id":call_id,"output":output,"error":is_error}),
         ) {
-            if err.contains("HTTP 400") || err.contains("HTTP 409") {
+            if err.contains("HTTP 400") || err.contains("HTTP 404") || err.contains("HTTP 409") {
                 if output.contains("Switched workspace execution to host-local") {
                     return remove_optional(&path);
                 }
@@ -7541,7 +7575,9 @@ fn flush_cloud_tool_receipt(config_dir: &Path, base: &str, key: &str) -> Result<
                                 | "failed"
                                 | "session_state_failed"
                                 | "errored"
-                        ) {
+                        ) || err.contains("failed to submit tool result")
+                            || err.contains("The turn ended")
+                        {
                             binding.last_seq = binding.last_seq.max(seq);
                             save_persisted_cloud_session(config_dir, &binding)?;
                             return remove_optional(&path);
@@ -7557,12 +7593,15 @@ fn flush_cloud_tool_receipt(config_dir: &Path, base: &str, key: &str) -> Result<
         || output.contains("Switched workspace execution to host-local")
     {
         return remove_optional(&path);
-    } else {
-        post_required(
-            &format!("{base}/v1/{session}:submitToolResult"),
-            key,
-            &json!({"call_id":call_id,"output":output,"error":is_error}),
-        )?;
+    } else if let Err(err) = post_required(
+        &format!("{base}/v1/{session}:submitToolResult"),
+        key,
+        &json!({"call_id":call_id,"output":output,"error":is_error}),
+    ) {
+        if err.contains("HTTP 400") || err.contains("HTTP 404") || err.contains("HTTP 409") {
+            return remove_optional(&path);
+        }
+        return Err(err);
     }
     remove_optional(&path)
 }
