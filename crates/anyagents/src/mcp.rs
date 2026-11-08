@@ -2531,6 +2531,15 @@ impl AgentMcp {
     async fn files(
         &self,
         Parameters(args): Parameters<FilesArgs>,
+    ) -> Result<rmcp::model::CallToolResult, String> {
+        let value = self.files_value(Parameters(args)).await?.0;
+        let images = file_image(&value).into_iter().collect();
+        multimodal_tool_result(value, images)
+    }
+
+    async fn files_value(
+        &self,
+        Parameters(args): Parameters<FilesArgs>,
     ) -> Result<rmcp::handler::server::wrapper::Json<serde_json::Value>, String> {
         let base_dir = self.resolve_workdir();
         let val = tokio::task::spawn_blocking(move || execute_files_tool(&base_dir, args))
@@ -2543,6 +2552,22 @@ impl AgentMcp {
         description = "Unified Cross-Harness Code Mode / Programmatic Tool Calling (`code`, optional `timeout_ms` default 30000, max 120000). Executes an async TypeScript / JavaScript snippet in an isolated capability sandbox (`process.env`, `require`, `child_process`, and raw `fs` are unavailable) with `anyagents.{memory,conversation,send,agents,schedule,groups,browser,web,computer,device,media,files}` (alias `tools.anyagents`), `web.{search,fetch}` (alias `tools.web`), `computer.{snapshot,list_windows,focus_window,clipboard_get,clipboard_set,screenshot,cursor_position,move,click,mouse_down,mouse_up,drag,scroll,type,key,hold_key,wait,zoom,action}` (alias `tools.computer`), `device.{screenshot,tap,swipe,type,press,install_app,launch_app,terminate_app,open_url,rotate}` (alias `tools.device`), `media.{image_generate,speech,transcribe}` (alias `tools.media`), and `workspace.{read,write,edit,multi_edit,patch,glob,grep,list,exec}` (alias `tools.workspace`). Compose parallel multi-tool queries with `await Promise.all([...])`, filter/aggregate intermediate data in memory, log diagnostics via `console.log`, and `return` only the compact result `{ result, logs, duration_ms }`."
     )]
     async fn code(
+        &self,
+        Parameters(args): Parameters<CodeArgs>,
+    ) -> Result<rmcp::model::CallToolResult, String> {
+        let value = self.execute_code_tool(args).await?;
+        let images = value
+            .get("images")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(file_image)
+            .collect();
+        multimodal_tool_result(value, images)
+    }
+
+    #[cfg(test)]
+    async fn code_value(
         &self,
         Parameters(args): Parameters<CodeArgs>,
     ) -> Result<rmcp::handler::server::wrapper::Json<serde_json::Value>, String> {
@@ -2603,6 +2628,31 @@ const DEFAULT_CODE_TIMEOUT_MS: u64 = 30_000;
 const MAX_CODE_TIMEOUT_MS: u64 = 120_000;
 const MAX_CODE_RESULT_BYTES: usize = 48 * 1024;
 const MAX_CODE_TOOL_CALLS: usize = 256;
+const MAX_READ_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+const MAX_CODE_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+
+fn file_image(value: &serde_json::Value) -> Option<rmcp::model::ContentBlock> {
+    if value.get("action")?.as_str()? != "read" || value.get("encoding")?.as_str()? != "base64" {
+        return None;
+    }
+    Some(rmcp::model::ContentBlock::image(
+        value.get("data_base64")?.as_str()?,
+        value.get("mime_type")?.as_str()?,
+    ))
+}
+
+fn multimodal_tool_result(
+    value: serde_json::Value,
+    images: Vec<rmcp::model::ContentBlock>,
+) -> Result<rmcp::model::CallToolResult, String> {
+    let mut content = vec![rmcp::model::ContentBlock::text(
+        serde_json::to_string(&value).map_err(|error| error.to_string())?,
+    )];
+    content.extend(images);
+    let mut result = rmcp::model::CallToolResult::success(content);
+    result.structured_content = Some(value);
+    Ok(result)
+}
 
 const DEFAULT_IGNORED_DIRS: &[&str] = &[
     ".git",
@@ -3530,7 +3580,7 @@ impl AgentMcp {
             "files" => {
                 let parsed: FilesArgs = serde_json::from_value(args)
                     .map_err(|e| format!("invalid `files` arguments: {e}"))?;
-                Ok(self.files(Parameters(parsed)).await?.0)
+                Ok(self.files_value(Parameters(parsed)).await?.0)
             }
             "subagents" => {
                 let parsed: SubagentsArgs = serde_json::from_value(args)
@@ -3680,6 +3730,11 @@ impl AgentMcp {
         // Receipts come from the actual host dispatch, never snippet return
         // values, source text or logs, which can contain invented deliveries.
         let deliveries = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let send_completions = Arc::new(Mutex::new(Vec::<bool>::new()));
+        let mut send_calls = 0usize;
+        // Only actual host file reads can publish native image blocks. A snippet
+        // returning a lookalike object cannot fabricate a successful read.
+        let images = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
         let mut in_flight = tokio::task::JoinSet::new();
         let mut call_count = 0usize;
 
@@ -3689,6 +3744,10 @@ impl AgentMcp {
                 match msg_type {
                     "call" => {
                         call_count += 1;
+                        if msg.get("tool").and_then(serde_json::Value::as_str)
+                            .is_some_and(|tool| tool.trim().trim_start_matches("mcp__anyagents__") == "send") {
+                            send_calls += 1;
+                        }
                         let id = msg.get("id").and_then(serde_json::Value::as_u64).unwrap_or(0);
                         if call_count > MAX_CODE_TOOL_CALLS {
                             let reply = serde_json::json!({
@@ -3715,14 +3774,33 @@ impl AgentMcp {
                         let mcp = self.clone();
                         let stdin_clone = Arc::clone(&shared_stdin);
                         let deliveries = Arc::clone(&deliveries);
+                        let send_completions = Arc::clone(&send_completions);
+                        let images = Arc::clone(&images);
                         in_flight.spawn(async move {
-                            let res = mcp.dispatch_code_tool(&tool_name, tool_args).await;
+                            let mut res = mcp.dispatch_code_tool(&tool_name, tool_args).await;
+                            if tool_name.trim().trim_start_matches("mcp__anyagents__") == "files"
+                                && let Ok(value) = &res
+                                && file_image(value).is_some()
+                            {
+                                let mut captured = images.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                                let used: usize = captured.iter().filter_map(|image| image.get("byte_length").and_then(serde_json::Value::as_u64)).map(|n| n as usize).sum();
+                                let bytes = value["byte_length"].as_u64().unwrap_or(0) as usize;
+                                if used.saturating_add(bytes) > MAX_CODE_IMAGE_BYTES {
+                                    res = Err(format!("image reads exceed {MAX_CODE_IMAGE_BYTES} byte code-call budget"));
+                                } else {
+                                    captured.push(value.clone());
+                                }
+                            }
                             if tool_name.trim().trim_start_matches("mcp__anyagents__") == "send"
                                 && let Ok(val) = &res
-                                && let Some(items) = val.get("deliveries").and_then(serde_json::Value::as_array)
+                                && val.get("turn_complete_hint").and_then(serde_json::Value::as_str).is_some()
                             {
-                                deliveries.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-                                    .extend(items.iter().cloned());
+                                send_completions.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .push(val.get("status").and_then(serde_json::Value::as_str) == Some("turn_complete_no_reply_sent"));
+                                if let Some(items) = val.get("deliveries").and_then(serde_json::Value::as_array) {
+                                    deliveries.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                                        .extend(items.iter().cloned());
+                                }
                             }
                             let reply = match res {
                                 Ok(val) => serde_json::json!({
@@ -3811,6 +3889,10 @@ impl AgentMcp {
             .get("result")
             .cloned()
             .unwrap_or(serde_json::Value::Null);
+        let images = images
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         let serialized = serde_json::to_string(&raw_result).unwrap_or_default();
         if serialized.len() > MAX_CODE_RESULT_BYTES {
             let head_end = floor_char_boundary_str(&serialized, 36 * 1024);
@@ -3823,24 +3905,59 @@ impl AgentMcp {
                 MAX_CODE_RESULT_BYTES,
                 &serialized[tail_start..]
             );
-            return Ok(serde_json::json!({
+            let mut result = serde_json::json!({
                 "result": preview,
+                "images": images,
                 "deliveries": deliveries,
                 "truncated": true,
                 "original_bytes": serialized.len(),
                 "max_bytes": MAX_CODE_RESULT_BYTES,
                 "logs": logs,
                 "duration_ms": duration_ms,
-            }));
+            });
+            project_send_completion(
+                &mut result,
+                send_calls,
+                &send_completions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+            return Ok(result);
         }
 
-        Ok(serde_json::json!({
+        let mut result = serde_json::json!({
             "result": raw_result,
+            "images": images,
             "deliveries": deliveries,
             "truncated": false,
             "logs": logs,
             "duration_ms": duration_ms,
-        }))
+        });
+        project_send_completion(
+            &mut result,
+            send_calls,
+            &send_completions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        Ok(result)
+    }
+}
+
+fn project_send_completion(result: &mut serde_json::Value, calls: usize, completions: &[bool]) {
+    if completions.is_empty() {
+        return;
+    }
+    let closing = completions.len() == calls && completions.iter().all(|closing| *closing);
+    if closing {
+        result["status"] = serde_json::json!("turn_complete_no_reply_sent");
+        result["turn_complete_hint"] = serde_json::json!(
+            "No message was sent. End this turn immediately. Do not call send or any other tool again."
+        );
+    } else {
+        result["turn_complete_hint"] = serde_json::json!(
+            "The send request is complete. If your work is finished, end this turn without calling send again for a closing token."
+        );
     }
 }
 
@@ -3969,10 +4086,41 @@ fn execute_files_tool(base_dir: &Path, args: FilesArgs) -> Result<serde_json::Va
                     resolved.display()
                 ));
             }
-            let full_bytes = std::fs::read(&resolved)
+            use std::io::{Read, Seek, SeekFrom};
+            let mut file = std::fs::File::open(&resolved)
                 .map_err(|e| format!("cannot read {}: {e}", resolved.display()))?;
+            let mut prefix = Vec::new();
+            file.by_ref()
+                .take(12)
+                .read_to_end(&mut prefix)
+                .map_err(|e| e.to_string())?;
+            file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+            let image = image_mime_type(&resolved, &prefix);
+            let mut full_bytes = Vec::new();
+            if image.is_some() {
+                file.take((MAX_READ_IMAGE_BYTES + 1) as u64)
+                    .read_to_end(&mut full_bytes)
+                    .map_err(|e| e.to_string())?;
+            } else {
+                file.read_to_end(&mut full_bytes)
+                    .map_err(|e| e.to_string())?;
+            }
             let sha256 = sha256_hex(&full_bytes);
             let total_bytes = full_bytes.len();
+            if let Some(mime_type) = image {
+                if total_bytes > MAX_READ_IMAGE_BYTES {
+                    return Err(format!(
+                        "image {} exceeds {MAX_READ_IMAGE_BYTES} byte limit",
+                        resolved.display()
+                    ));
+                }
+                return Ok(serde_json::json!({
+                    "action":"read", "path":resolved.display().to_string(),
+                    "mime_type":mime_type, "byte_length":total_bytes,
+                    "encoding":"base64", "data_base64":crate::computer::base64_encode(&full_bytes),
+                    "sha256":sha256, "truncated":false,
+                }));
+            }
             let text = String::from_utf8_lossy(&full_bytes);
             let all_lines: Vec<&str> = text.lines().collect();
             let total_lines = all_lines.len();
@@ -4533,6 +4681,28 @@ fn execute_files_tool(base_dir: &Path, args: FilesArgs) -> Result<serde_json::Va
         other => Err(format!(
             "unknown `files` action `{other}`; expected `read`, `write`, `edit`, `multi_edit`, `patch`, `list`, `glob`, `grep`, or `exec`"
         )),
+    }
+}
+
+fn image_mime_type(path: &Path, bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\xff\xd8\xff") {
+        return Some("image/jpeg");
+    }
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Some("image/png");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
+        return Some("image/webp");
+    }
+    match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "png" => Some("image/png"),
+        "webp" => Some("image/webp"),
+        "gif" => Some("image/gif"),
+        _ => None,
     }
 }
 
@@ -6237,11 +6407,13 @@ mod spawn_args_tests {
                     text: text.into(),
                     ..Default::default()
                 }
-                .is_turn_closing_sentinel(),
-                "{text:?}"
+                .is_turn_closing_sentinel()
             );
         }
         for text in [
+            "Stop",
+            "stop!",
+            "Done",
             " End. ",
             "end",
             "停止。",
@@ -6249,11 +6421,21 @@ mod spawn_args_tests {
             "No more.",
             "NO MORE",
             "。",
+            "。。。",
             "Done.",
             "done",
             "終了。",
+            "終了",
             "Final!",
             "done...",
+        ] {
+            let request = SendRequest {
+                text: text.into(),
+                ..Default::default()
+            };
+            assert!(!request.is_turn_closing_sentinel(), "{text:?}");
+        }
+        for text in [
             "",
             " ",
             "End of report.",
@@ -6729,6 +6911,110 @@ mod spawn_args_tests {
     }
 
     #[tokio::test]
+    async fn files_images_are_lossless_native_blocks_and_code_captures_host_reads() {
+        use rmcp::model::ContentBlock;
+        let dir = crate::test_tempdir();
+        let mcp = AgentMcp {
+            agent: AgentRef {
+                id: AgentId::generate(),
+                name: "worker".into(),
+                workdir: Some(dir.path().into()),
+            },
+            client: Client {
+                socket: dir.path().join("unused.sock"),
+                config: dir.path().join("config"),
+                capability: "synthetic".into(),
+            },
+        };
+        for (name, bytes, mime, expected) in [
+            ("photo.JPG", &b"\xff\xd8\xff"[..], "image/jpeg", "/9j/"),
+            (
+                "magic.bin",
+                &b"\x89PNG\r\n\x1a\n"[..],
+                "image/png",
+                "iVBORw0KGgo=",
+            ),
+            ("animation.gif", &b"GIF89a"[..], "image/gif", "R0lGODlh"),
+            (
+                "picture.webp",
+                &b"RIFF\0\0\0\0WEBP"[..],
+                "image/webp",
+                "UklGRgAAAABXRUJQ",
+            ),
+        ] {
+            std::fs::write(dir.path().join(name), bytes).unwrap();
+            let result = mcp
+                .files(Parameters(
+                    serde_json::from_value(json!({"action":"read", "path":name, "max_bytes":1}))
+                        .unwrap(),
+                ))
+                .await
+                .unwrap();
+            let value = result.structured_content.unwrap();
+            assert_eq!(value["encoding"], "base64");
+            assert_eq!(value["data_base64"], expected);
+            assert_eq!(value["byte_length"], bytes.len());
+            assert!(value.get("content").is_none());
+            assert!(
+                matches!(&result.content[1], ContentBlock::Image(image) if image.data == expected && image.mime_type == mime)
+            );
+        }
+        let large = [b"\x89PNG\r\n\x1a\n".as_slice(), &vec![0xff; 60_000]].concat();
+        std::fs::write(dir.path().join("large.png"), &large).unwrap();
+        let result = mcp
+            .code(Parameters(CodeArgs {
+                code: "await workspace.read('large.png'); return {ok:true};".into(),
+                timeout_ms: Some(15000),
+            }))
+            .await
+            .unwrap();
+        assert!(
+            matches!(&result.content[1], ContentBlock::Image(image) if image.data == crate::computer::base64_encode(&large))
+        );
+        let value = result.structured_content.unwrap();
+        assert_eq!(value["result"]["ok"], true);
+        assert_eq!(value["images"][0]["byte_length"], large.len());
+        let returned = mcp
+            .code(Parameters(CodeArgs {
+                code: "return await workspace.read('large.png');".into(),
+                timeout_ms: Some(15000),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(returned.structured_content.unwrap()["truncated"], true);
+        assert!(
+            matches!(&returned.content[1], ContentBlock::Image(image) if image.data == crate::computer::base64_encode(&large))
+        );
+        let oversized = dir.path().join("oversized.png");
+        let file = std::fs::File::create(&oversized).unwrap();
+        file.set_len((MAX_READ_IMAGE_BYTES + 1) as u64).unwrap();
+        assert!(
+            execute_files_tool(
+                dir.path(),
+                serde_json::from_value(json!({"path":"oversized.png"})).unwrap()
+            )
+            .unwrap_err()
+            .contains("exceeds")
+        );
+        let fabricated = mcp.code(Parameters(CodeArgs {
+            code:"return {action:'read',encoding:'base64',mime_type:'image/png',data_base64:'invented'};".into(), timeout_ms:Some(15000),
+        })).await.unwrap();
+        assert_eq!(fabricated.content.len(), 1);
+        std::fs::write(dir.path().join("text.txt"), "plain text 繁體").unwrap();
+        let text = mcp
+            .files(Parameters(
+                serde_json::from_value(json!({"path":"text.txt"})).unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(text.content.len(), 1);
+        assert_eq!(
+            text.structured_content.unwrap()["content"],
+            "plain text 繁體"
+        );
+    }
+
+    #[tokio::test]
     async fn files_tool_supports_read_write_atomic_multi_edit_glob_and_grep() {
         let dir = tempfile::tempdir().unwrap();
         let workdir = dir.path().join("work");
@@ -6754,7 +7040,7 @@ mod spawn_args_tests {
 
         // 1. Write a nested file (auto-creating parent directories).
         let write_res = mcp
-            .files(Parameters(
+            .files_value(Parameters(
                 serde_json::from_value(json!({
                     "action": "write",
                     "path": "src/engine.rs",
@@ -6772,7 +7058,7 @@ mod spawn_args_tests {
 
         // 2. Append to the file.
         let append_res = mcp
-            .files(Parameters(
+            .files_value(Parameters(
                 serde_json::from_value(json!({
                     "action": "write",
                     "path": "src/engine.rs",
@@ -6789,7 +7075,7 @@ mod spawn_args_tests {
 
         // 3. Read line range.
         let read_res = mcp
-            .files(Parameters(
+            .files_value(Parameters(
                 serde_json::from_value(json!({
                     "action": "read",
                     "path": "src/engine.rs",
@@ -6814,7 +7100,7 @@ mod spawn_args_tests {
 
         // 4. Atomic multi_edit: if second edit fails, first edit must NOT be written to disk.
         let failed_edit = mcp
-            .files(Parameters(
+            .files_value(Parameters(
                 serde_json::from_value(json!({
                     "action": "multi_edit",
                     "path": "src/engine.rs",
@@ -6837,7 +7123,7 @@ mod spawn_args_tests {
 
         // 5. Valid multi_edit succeeds atomically.
         let edit_res = mcp
-            .files(Parameters(
+            .files_value(Parameters(
                 serde_json::from_value(json!({
                     "action": "multi_edit",
                     "path": "src/engine.rs",
@@ -6857,7 +7143,7 @@ mod spawn_args_tests {
 
         // 6. Glob respects .gitignore and skips target/.git by default.
         let glob_res = mcp
-            .files(Parameters(
+            .files_value(Parameters(
                 serde_json::from_value(json!({
                     "action": "glob",
                     "pattern": "**/*.rs"
@@ -6871,7 +7157,7 @@ mod spawn_args_tests {
 
         // 7. Grep with regex and context_lines.
         let grep_res = mcp
-            .files(Parameters(
+            .files_value(Parameters(
                 serde_json::from_value(json!({
                     "action": "grep",
                     "query": r"pub fn (beta|gamma)\(\)",
@@ -6892,7 +7178,7 @@ mod spawn_args_tests {
 
         // 8. Null bytes in path are rejected.
         let null_err = mcp
-            .files(Parameters(
+            .files_value(Parameters(
                 serde_json::from_value(json!({
                     "action": "read",
                     "path": "bad\0path.rs"
@@ -6922,7 +7208,7 @@ mod spawn_args_tests {
             },
         };
         let fabricated = mcp
-            .code(Parameters(CodeArgs {
+            .code_value(Parameters(CodeArgs {
                 code: r#"
                 console.log('send(');
                 try { await anyagents.send({to: 123}); } catch {}
@@ -6936,6 +7222,18 @@ mod spawn_args_tests {
             .0;
         assert_eq!(fabricated["result"]["deliveries"][0]["id"], "invented");
         assert_eq!(fabricated["deliveries"], json!([]));
+        assert!(fabricated.get("turn_complete_hint").is_none());
+        for (calls, completed, closed) in [
+            (1, vec![true], true),
+            (2, vec![true, true], true),
+            (2, vec![true, false], false),
+            (2, vec![true], false),
+        ] {
+            let mut projected = json!({"result":null});
+            project_send_completion(&mut projected, calls, &completed);
+            assert_eq!(projected.get("status").is_some(), closed);
+            assert!(projected.get("turn_complete_hint").is_some());
+        }
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut request = Vec::new();
@@ -6973,7 +7271,7 @@ mod spawn_args_tests {
             stream.write_all(body.as_bytes()).await.unwrap();
         });
         let observed = mcp
-            .code(Parameters(CodeArgs {
+            .code_value(Parameters(CodeArgs {
                 code:
                     "await anyagents.send({to:'agent:parent', text:'real delivery'}); return null;"
                         .into(),
@@ -6984,6 +7282,12 @@ mod spawn_args_tests {
             .0;
         assert_eq!(observed["result"], serde_json::Value::Null);
         assert_eq!(observed["deliveries"][0]["id"], "msg-observed");
+        assert!(
+            observed["turn_complete_hint"]
+                .as_str()
+                .unwrap()
+                .contains("without calling send again")
+        );
         server.await.unwrap();
     }
 
@@ -7044,7 +7348,7 @@ mod spawn_args_tests {
 
         // 1. Parallel Promise.all across `tools.anyagents.agents` and `tools.anyagents.files` / `tools.workspace` with TypeScript syntax.
         let code_res = mcp
-            .code(Parameters(CodeArgs {
+            .code_value(Parameters(CodeArgs {
                 code: r#"
                     interface Summary {
                         activeAgents: string[];
@@ -7082,7 +7386,7 @@ mod spawn_args_tests {
 
         // 2. Verify capability sandbox blocks `process`, `process.env`, `require`, `child_process`, `fs`, `fetch`, and Function constructor escapes.
         let sandbox_probe = mcp
-            .code(Parameters(CodeArgs {
+            .code_value(Parameters(CodeArgs {
                 code: r#"
                     let constructorEscapeBlocked = false;
                     try {
@@ -7134,7 +7438,7 @@ mod spawn_args_tests {
             r#"return process.env.PATH;"#,
         ] {
             let res = mcp
-                .code(Parameters(CodeArgs {
+                .code_value(Parameters(CodeArgs {
                     code: forbidden_snippet.to_string(),
                     timeout_ms: Some(5_000),
                 }))
@@ -7147,7 +7451,7 @@ mod spawn_args_tests {
 
         // 4. Oversized return payloads (>48 KB) are safely truncated with `truncated: true`.
         let huge_res = mcp
-            .code(Parameters(CodeArgs {
+            .code_value(Parameters(CodeArgs {
                 code: r#"return "x".repeat(60000);"#.to_string(),
                 timeout_ms: Some(10_000),
             }))
@@ -7172,7 +7476,7 @@ mod spawn_args_tests {
         .unwrap();
 
         let evo_res = mcp
-            .code(Parameters(CodeArgs {
+            .code_value(Parameters(CodeArgs {
                 code: r##"
                     await anyagents.memory.write({
                         topic: "build-invariants",

@@ -33,6 +33,69 @@ fn state(store: Arc<Store>, data: &Path) -> AppState {
 }
 
 #[test]
+#[ignore = "synthetic specific-agent latency measurement; explicit opt-in and owned artifact directory"]
+fn specific_agent_history_latency_with_large_registry() {
+    assert_eq!(
+        std::env::var("ANYAGENTS_HISTORY_BENCHMARK").as_deref(),
+        Ok("1")
+    );
+    let base = std::env::var("ANYAGENTS_HISTORY_BENCHMARK_DIR").unwrap();
+    let dir = tempfile::tempdir_in(base).unwrap();
+    let db = dir.path().join("state.db");
+    let store = Arc::new(Store::open(&db).unwrap());
+    let agent = store
+        .create_agent(anyagents_core::NewAgent::new("selected", "test"))
+        .unwrap();
+    let mut conn = rusqlite::Connection::open(&db).unwrap();
+    let tx = conn.transaction().unwrap();
+    for n in 0..6660 {
+        tx.execute("INSERT INTO agents(id,name,harness,state,created_at_ms) VALUES(?1,?2,'test','archived',0)",
+            rusqlite::params![anyagents_core::AgentId::generate().as_str(), format!("unrelated-{n}")]).unwrap();
+    }
+    tx.commit().unwrap();
+    let config = anyagents_core::agent_config_dir(dir.path(), &agent.id);
+    std::fs::create_dir_all(&config).unwrap();
+    let mut transcript = std::fs::File::create(config.join("sylphx-transcript.jsonl")).unwrap();
+    for n in 0..256 {
+        writeln!(
+            transcript,
+            "{}",
+            serde_json::json!({"role":"user", "timestamp_ms":n,
+            "content":format!("{} specificneedle{n:04}", "payload ".repeat(1000))})
+        )
+        .unwrap();
+    }
+    drop(transcript);
+    let app = state(store, dir.path());
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let mut measurements = Vec::new();
+    for n in 0..11 {
+        let query = serde_json::from_value(
+            serde_json::json!({"scope":"transcripts", "query":format!("specificneedle{n:04}")}),
+        )
+        .unwrap();
+        let started = Instant::now();
+        let Json(response) = runtime
+            .block_on(conversation_route(
+                Principal::Operator,
+                State(app.clone()),
+                AxumPath(agent.name.clone()),
+                Query(query),
+            ))
+            .unwrap_or_else(|e| panic!("{}", e.message));
+        assert_eq!(response.turns.len(), 1);
+        measurements.push(started.elapsed().as_secs_f64() * 1000.0);
+    }
+    println!(
+        "SPECIFIC_HISTORY_BENCHMARK {}",
+        serde_json::json!({
+            "registry_agents":6661, "selected_transcript_records":256, "cold_ms":measurements[0], "steady_ms":&measurements[1..],
+            "profile":if cfg!(debug_assertions) {"debug"} else {"release"}, "scope":"synthetic canonical route, not live population latency"
+        })
+    );
+}
+
+#[test]
 #[ignore = "synthetic latency/CPU/RSS measurement; explicit opt-in and owned artifact directory"]
 fn canonical_history_latency() {
     assert_eq!(

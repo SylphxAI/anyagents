@@ -16,7 +16,6 @@ pub(crate) struct FileStamp {
     device: u64,
     inode: u64,
     modified: (i64, i64),
-    changed: (i64, i64),
 }
 impl FileStamp {
     pub fn read(file: &File) -> io::Result<Self> {
@@ -27,11 +26,43 @@ impl FileStamp {
             device: m.dev(),
             inode: m.ino(),
             modified: (m.mtime(), m.mtime_nsec()),
-            changed: (m.ctime(), m.ctime_nsec()),
         })
     }
     pub fn same_file(&self, other: &Self) -> bool {
         self.device == other.device && self.inode == other.inode
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn permission_changes_preserve_stamp_but_content_and_inode_changes_do_not() {
+        let dir = crate::test_tempdir();
+        let path = dir.path().join("transcript.jsonl");
+        std::fs::write(&path, b"{\"content\":\"initial\"}\n").unwrap();
+        let before = FileStamp::read(&File::open(&path).unwrap()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let after_mode = FileStamp::read(&File::open(&path).unwrap()).unwrap();
+        assert_eq!(before, after_mode);
+        // Old serialized cursors remain readable; their obsolete ctime is ignored.
+        let mut legacy = serde_json::to_value(&before).unwrap();
+        legacy["changed"] = serde_json::json!([1, 2]);
+        assert_eq!(
+            serde_json::from_value::<FileStamp>(legacy).unwrap(),
+            after_mode
+        );
+        std::fs::write(&path, b"{\"content\":\"new larger input\"}\n").unwrap();
+        assert_ne!(
+            before,
+            FileStamp::read(&File::open(&path).unwrap()).unwrap()
+        );
+        let replacement = dir.path().join("replacement");
+        std::fs::write(&replacement, b"{\"content\":\"initial\"}\n").unwrap();
+        std::fs::rename(replacement, &path).unwrap();
+        assert!(!before.same_file(&FileStamp::read(&File::open(&path).unwrap()).unwrap()));
     }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]

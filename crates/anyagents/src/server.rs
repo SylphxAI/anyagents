@@ -3240,12 +3240,20 @@ fn conversation_visibility(
     requested: &str,
 ) -> Result<(String, Option<Vec<String>>), ApiError> {
     let requested = requested.trim();
+    let is_all = requested.eq_ignore_ascii_case("all") || requested == "*";
     match principal {
         Principal::Operator => {
             store
                 .record_admin_audit("operator", "conversation.read", requested)
                 .map_err(ApiError::from_store)?;
-            Ok((requested.to_string(), None))
+            if is_all {
+                Ok(("all".into(), None))
+            } else {
+                let target = store
+                    .agent_by_name(requested)
+                    .map_err(ApiError::from_store)?;
+                Ok((target.name, Some(vec![target.id.to_string()])))
+            }
         }
         Principal::Agent { agent_id, .. } => {
             let caller = store.agent(agent_id).map_err(ApiError::from_store)?;
@@ -3263,7 +3271,30 @@ fn conversation_visibility(
                         requested,
                     )
                     .map_err(ApiError::from_store)?;
-                return Ok((requested.to_string(), None));
+                return if is_all {
+                    Ok(("all".into(), None))
+                } else {
+                    let target = store
+                        .agent_by_name(requested)
+                        .map_err(ApiError::from_store)?;
+                    Ok((target.name, Some(vec![target.id.to_string()])))
+                };
+            }
+
+            if requested.eq_ignore_ascii_case("self") {
+                return Ok((caller.name, Some(vec![caller.id.to_string()])));
+            }
+            if !is_all {
+                let target = store
+                    .agent_by_name(requested)
+                    .map_err(ApiError::from_store)?;
+                if !is_self_or_ancestor(store, &caller.id, &target) {
+                    return Err(ApiError::forbidden(format!(
+                        "agent `{}` cannot read private conversation history of `{}`",
+                        caller.name, target.name
+                    )));
+                }
+                return Ok((target.name, Some(vec![target.id.to_string()])));
             }
 
             let agents = store.list_agents().map_err(ApiError::from_store)?;
@@ -3283,23 +3314,7 @@ fn conversation_visibility(
             let visible_agent_ids: Vec<String> =
                 visible_ids.iter().map(ToString::to_string).collect();
 
-            if requested.eq_ignore_ascii_case("self") {
-                return Ok((caller.name, Some(vec![caller.id.to_string()])));
-            }
-            if requested.eq_ignore_ascii_case("all") || requested == "*" {
-                return Ok(("all".to_string(), Some(visible_agent_ids)));
-            }
-
-            let target = store
-                .agent_by_name(requested)
-                .map_err(ApiError::from_store)?;
-            if !visible_ids.contains(&target.id) {
-                return Err(ApiError::forbidden(format!(
-                    "agent `{}` cannot read private conversation history of `{}`",
-                    caller.name, target.name
-                )));
-            }
-            Ok((target.name, Some(vec![target.id.to_string()])))
+            Ok(("all".to_string(), Some(visible_agent_ids)))
         }
     }
 }
@@ -8239,6 +8254,62 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn specific_conversation_selection_never_expands_admin_or_ancestor_visibility() {
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let parent = store
+            .create_agent(anyagents_core::NewAgent::new("parent", "test"))
+            .unwrap();
+        let mut new = anyagents_core::NewAgent::new("child", "test");
+        new.parent_id = Some(parent.id.clone());
+        let child = store.create_agent(new).unwrap();
+        let peer = store
+            .create_agent(anyagents_core::NewAgent::new("peer", "test"))
+            .unwrap();
+        let principal = || Principal::Agent {
+            agent_id: parent.id.clone(),
+            name: parent.name.clone(),
+        };
+        for selector in [child.name.as_str(), child.id.as_str()] {
+            for caller in [Principal::Operator, principal()] {
+                let (name, visible) = conversation_visibility(&store, &caller, selector).unwrap();
+                assert_eq!(name, child.name);
+                assert_eq!(visible.unwrap(), [child.id.to_string()]);
+            }
+        }
+        assert!(conversation_visibility(&store, &principal(), &peer.name).is_err());
+        let (_, descendants) = conversation_visibility(&store, &principal(), "all").unwrap();
+        let descendants = descendants.unwrap();
+        assert_eq!(descendants.len(), 2);
+        assert!(
+            descendants.contains(&parent.id.to_string())
+                && descendants.contains(&child.id.to_string())
+        );
+        store.set_agent_admin(&parent.id, true).unwrap();
+        for selector in ["self", parent.name.as_str(), parent.id.as_str()] {
+            assert_eq!(
+                conversation_visibility(&store, &principal(), selector)
+                    .unwrap()
+                    .1
+                    .unwrap(),
+                [parent.id.to_string()]
+            );
+        }
+        assert!(
+            conversation_visibility(&store, &principal(), "all")
+                .unwrap()
+                .1
+                .is_none()
+        );
+        assert!(
+            conversation_visibility(&store, &Principal::Operator, "all")
+                .unwrap()
+                .1
+                .is_none()
+        );
+    }
+
+    #[test]
     fn canonical_conversation_scopes_files_under_real_ancestor_authority() {
         let dir = crate::test_tempdir();
         let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
@@ -9796,7 +9867,16 @@ exec '{}' "$@"
         );
         assert_eq!(response.deliveries.len(), 1);
         assert_eq!(store.inbox(&target.id, None).unwrap().len(), 1);
-        for (n, text) in ["停止", "Done", "End", "Final!", "。"].iter().enumerate() {
+        for (n, text) in [
+            "停止服務之後再檢查",
+            "Done. The build passed.",
+            "End of report.",
+            "Final version is ready.",
+            "。後面仲有內容",
+        ]
+        .iter()
+        .enumerate()
+        {
             let response = authored_send(
                 &store,
                 &actor,
@@ -9807,6 +9887,63 @@ exec '{}' "$@"
             assert_eq!(response.deliveries.len(), 1, "{text}");
         }
         assert_eq!(store.inbox(&target.id, None).unwrap().len(), 6);
+    }
+
+    #[test]
+    fn natural_language_messages_are_delivered_even_after_a_report_in_the_same_turn() {
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let sender = store
+            .create_agent(anyagents_core::NewAgent::new("sender", "test"))
+            .unwrap();
+        let target = store
+            .create_agent(anyagents_core::NewAgent::new("target", "test"))
+            .unwrap();
+        let other = store
+            .create_agent(anyagents_core::NewAgent::new("other", "test"))
+            .unwrap();
+        let actor = Actor::Agent(sender.name.clone());
+        store
+            .receive(&sender.id, Incoming::new("new task"))
+            .unwrap();
+        let message = store.next_undelivered(&sender.id).unwrap().unwrap();
+        store.note_delivered(&sender.id, message.seq).unwrap();
+        let report = authored_send(
+            &store,
+            &actor,
+            "agent:target",
+            "Substantive completed report",
+            "report",
+        );
+        assert_eq!(report.deliveries.len(), 1);
+        assert_eq!(
+            authored_send(&store, &actor, "agent:other", "Stop", "cancel-other")
+                .deliveries
+                .len(),
+            1
+        );
+        assert_eq!(
+            authored_send(&store, &actor, "agent:target", "Done", "answer-second")
+                .deliveries
+                .len(),
+            1
+        );
+        assert_eq!(
+            authored_send(&store, &actor, "agent:target", "NO_REPLY", "no-reply")
+                .deliveries
+                .len(),
+            0
+        );
+        assert_eq!(
+            store
+                .inbox(&target.id, None)
+                .unwrap()
+                .iter()
+                .map(|m| m.text.as_str())
+                .collect::<Vec<_>>(),
+            ["Substantive completed report", "Done"]
+        );
+        assert_eq!(store.inbox(&other.id, None).unwrap()[0].text, "Stop");
     }
 
     #[test]

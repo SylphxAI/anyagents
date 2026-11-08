@@ -251,13 +251,22 @@ impl Store {
             .map(|s| self.agent_by_name(s).map(|a| a.id))
             .transpose()
             .map_err(|e| io::Error::other(e.to_string()))?;
-        let mut agents: Vec<Agent> = self
-            .list_agents()
-            .map_err(|e| io::Error::other(e.to_string()))?
-            .into_iter()
-            .filter(|a| authorized.contains(&a.id.to_string()))
-            .filter(|a| selected.as_ref().is_none_or(|id| id == &a.id))
-            .collect();
+        let mut agents: Vec<Agent> = if let Some(id) = selected {
+            if authorized.contains(&id.to_string()) {
+                vec![
+                    self.agent(&id)
+                        .map_err(|e| io::Error::other(e.to_string()))?,
+                ]
+            } else {
+                Vec::new()
+            }
+        } else {
+            self.list_agents()
+                .map_err(|e| io::Error::other(e.to_string()))?
+                .into_iter()
+                .filter(|a| authorized.contains(&a.id.to_string()))
+                .collect()
+        };
         agents.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
         let mut guards = Vec::new();
         for a in &agents {
@@ -1514,6 +1523,17 @@ mod tests {
             (0, 0, 0)
         );
         assert_eq!(warm.documents.len(), 2);
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        let permissions_only = refresh_native(&mut index, &agent, &path).unwrap();
+        assert_eq!(
+            (
+                permissions_only.prefix_verified_bytes,
+                permissions_only.suffix_scanned_bytes,
+                permissions_only.indexed_records
+            ),
+            (0, 0, 0)
+        );
         let suffix = b"needle\"}\n{\"role\":\"user\",\"content\":\"newneedle\"}\n";
         fs::OpenOptions::new()
             .append(true)

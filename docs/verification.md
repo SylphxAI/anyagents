@@ -116,6 +116,25 @@ fixtures alone cannot establish its cause.
 
 ## Boundaries and live acceptance
 
+Named conversation reads select only the authorized target's immutable ID,
+including operator and admin callers. An `all` query retains the caller's full
+authorized population. Host search loads tool membership after ranking and
+document deduplication, and permission-only inode changes do not invalidate an
+unchanged transcript cursor; append/edit/replacement and raw SHA checks remain.
+
+`files.read` returns JPEG, PNG, WebP and GIF bytes losslessly as base64 metadata
+and a native MCP image block. Code-mode workspace reads retain host-observed image
+blocks even when the snippet returns only a summary or exceeds its text-result
+cap. Synthetic lookalike return values cannot invent a successful image read.
+Images are refused above 10 MiB each or 20 MiB across one code call, never
+truncated into an undecodable image; ordinary text reads keep their existing
+line and byte continuation behavior.
+
+`NO_REPLY` alone closes without sending. Natural-language messages such as `Stop`
+or `Done` remain deliverable even after another report in the same turn, whether
+to the same recipient or another one. Code Mode preserves host-observed send
+completion hints at the top level even when a snippet returns no send result.
+
 Session continuity checks cover native session reuse after an explicit harness
 round-trip without deleting historical aliases, OS aliases above the trusted
 agent root while refusing symlinks below it, and Claude steers echoed before a

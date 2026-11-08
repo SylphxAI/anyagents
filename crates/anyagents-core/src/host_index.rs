@@ -77,6 +77,8 @@ fn decode_tool_names(value: String) -> rusqlite::Result<Vec<String>> {
 
 pub struct HostIndex {
     conn: Connection,
+    #[cfg(test)]
+    tool_lookups: std::cell::Cell<usize>,
 }
 impl HostIndex {
     pub fn open(path: &Path) -> Result<Self, IndexError> {
@@ -113,7 +115,12 @@ impl HostIndex {
                 .unwrap_or(None)
                 .unwrap_or(false);
         if already_initialized {
-            return Ok(Self { conn });
+            Self::ensure_segment_index(&conn)?;
+            return Ok(Self {
+                conn,
+                #[cfg(test)]
+                tool_lookups: std::cell::Cell::new(0),
+            });
         }
         if old_required_time {
             // Serialize and recheck the disposable-schema upgrade: another
@@ -151,6 +158,7 @@ impl HostIndex {
                 agent_id TEXT NOT NULL, segment TEXT NOT NULL, cursor TEXT NOT NULL,
                 PRIMARY KEY(agent_id,segment));
             CREATE INDEX IF NOT EXISTS host_documents_owner ON host_documents(agent_id,source,timestamp_ms);
+            CREATE INDEX IF NOT EXISTS idx_host_documents_agent_segment ON host_documents(agent_id,segment);
             CREATE TABLE IF NOT EXISTS host_windows (
                 id INTEGER PRIMARY KEY, document_id TEXT NOT NULL REFERENCES host_documents(id) ON DELETE CASCADE,
                 offset INTEGER NOT NULL, length INTEGER NOT NULL, sha256 TEXT NOT NULL);
@@ -166,7 +174,22 @@ impl HostIndex {
         if old_required_time {
             conn.execute_batch("COMMIT; PRAGMA wal_checkpoint(TRUNCATE);")?;
         }
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            #[cfg(test)]
+            tool_lookups: std::cell::Cell::new(0),
+        })
+    }
+
+    fn ensure_segment_index(conn: &Connection) -> Result<(), rusqlite::Error> {
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_host_documents_agent_segment')",
+            [], |row| row.get(0),
+        )?;
+        if !exists {
+            conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_host_documents_agent_segment ON host_documents(agent_id,segment)")?;
+        }
+        Ok(())
     }
 
     /// Delete stale filesystem coordinates after a complete authorized scan.
@@ -319,6 +342,8 @@ impl HostIndex {
         Ok(())
     }
     fn document_tools(&self, document: &str) -> Result<Vec<String>, rusqlite::Error> {
+        #[cfg(test)]
+        self.tool_lookups.set(self.tool_lookups.get() + 1);
         self.conn
             .prepare("SELECT name FROM host_document_tools WHERE document_id=?1 ORDER BY name")?
             .query_map([document], |r| r.get(0))?
@@ -690,8 +715,7 @@ impl HostIndex {
             ""
         };
         let sql = format!("SELECT d.id,d.agent_id,d.source,d.timestamp_ms,d.direction,d.sender,d.destination,d.tool_name,d.role,
-            d.segment,d.offset,d.length,d.sha256,d.seq,w.offset,w.length,w.sha256,{score} AS score,
-            (SELECT json_group_array(name) FROM (SELECT name FROM host_document_tools WHERE document_id=d.id ORDER BY name))
+            d.segment,d.offset,d.length,d.sha256,d.seq,w.offset,w.length,w.sha256,{score} AS score
             FROM host_documents d JOIN host_windows w ON w.document_id=d.id {join}
             WHERE {where_sql} ORDER BY {order}");
         let mut statement = self.conn.prepare(&sql)?;
@@ -713,6 +737,7 @@ impl HostIndex {
             if has_excluded_text(&raw, &query.exclude)? {
                 continue;
             }
+            let tool_names = self.document_tools(&id)?;
             hits.push(IndexHit {
                 id,
                 metadata: IndexMetadata {
@@ -726,7 +751,7 @@ impl HostIndex {
                     sender: row.get(5)?,
                     destination: row.get(6)?,
                     tool_name: row.get(7)?,
-                    tool_names: decode_tool_names(row.get(18)?)?,
+                    tool_names,
                     role: row.get(8)?,
                 },
                 window: RawCoordinate {
@@ -928,6 +953,58 @@ fn has_excluded_text(raw: &RawCoordinate, excludes: &[String]) -> io::Result<boo
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn search_loads_tool_membership_only_for_deduplicated_winners_and_upgrades_segment_index() {
+        let dir = crate::test_tempdir();
+        let path = dir.path().join("index.db");
+        let mut index = HostIndex::open(&path).unwrap();
+        let segment = RawSegment::open(&dir.path().join("events.raw")).unwrap();
+        for n in 0..60 {
+            let mut meta = metadata("worker", MemoryScope::Transcripts, n);
+            meta.tool_names = vec!["files".into(), "shell".into()];
+            let raw = segment
+                .append("searchneedle padding ".repeat(1800).as_bytes())
+                .unwrap();
+            index.index(&format!("event-{n}"), &meta, &raw).unwrap();
+        }
+        index.tool_lookups.set(0);
+        let hits = index
+            .search(
+                &["worker".into()],
+                MemoryScope::Transcripts,
+                &HistorySearchQuery {
+                    query: Some("searchneedle".into()),
+                    include_tools: true,
+                    limit: 3,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(hits.len(), 3);
+        assert_eq!(index.tool_lookups.get(), 3);
+        assert!(
+            hits.iter()
+                .all(|hit| hit.metadata.tool_names == ["files", "shell"])
+        );
+        index
+            .conn
+            .execute_batch("DROP INDEX idx_host_documents_agent_segment")
+            .unwrap();
+        drop(index);
+        let index = HostIndex::open(&path).unwrap();
+        let plan: String = index
+            .conn
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT id FROM host_documents WHERE agent_id=?1 AND segment=?2",
+            )
+            .unwrap()
+            .query_row(
+                params!["worker", dir.path().join("events.raw").to_string_lossy()],
+                |row| row.get(3),
+            )
+            .unwrap();
+        assert!(plan.contains("idx_host_documents_agent_segment"), "{plan}");
+    }
     use crate::raw_segment::{RawSegment, read_raw};
     fn metadata(owner: &str, source: MemoryScope, time: i64) -> IndexMetadata {
         IndexMetadata {

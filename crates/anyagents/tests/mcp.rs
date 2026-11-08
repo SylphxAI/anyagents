@@ -1480,6 +1480,91 @@ async fn history_search_defaults_and_all_never_escape_a_private_childs_tree() {
 }
 
 #[tokio::test]
+async fn image_reads_cross_native_mcp_and_code_workspace_boundaries_losslessly() {
+    let dir = support::physical_tempdir();
+    let created = bin()
+        .env("PATH", machine_path(dir.path()))
+        .arg("--data")
+        .arg(dir.path())
+        .args(["agents", "create", "image-worker"])
+        .output()
+        .unwrap();
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let server = start_server(dir.path());
+    let client = connect(dir.path(), "image-worker").await;
+    let image = dir.path().join("image.png");
+    // Valid 1x1 PNG, specified independently of the production encoder.
+    let data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aG1cAAAAASUVORK5CYII=";
+    let bytes = [
+        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 4,
+        0, 0, 0, 181, 28, 12, 2, 0, 0, 0, 11, 73, 68, 65, 84, 120, 218, 99, 252, 255, 31, 0, 3, 3,
+        2, 0, 239, 154, 27, 87, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+    ];
+    std::fs::write(&image, bytes).unwrap();
+    for tool in ["files", "code"] {
+        let arguments = if tool == "files" {
+            serde_json::json!({"action":"read", "path":image, "max_bytes":1})
+        } else {
+            serde_json::json!({"code":format!("const image = await workspace.read({}); return {{mime:image.mime_type,bytes:image.byte_length}};", serde_json::to_string(&image).unwrap())})
+        };
+        let result = call(&client, tool, arguments).await;
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        let images: Vec<_> = result
+            .content
+            .iter()
+            .filter_map(|content| match content {
+                ContentBlock::Image(image) => Some(image),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(images.len(), 1, "{result:?}");
+        assert_eq!(images[0].mime_type, "image/png");
+        assert_eq!(images[0].data, data);
+        let value = result.structured_content.unwrap();
+        let metadata = if tool == "files" {
+            &value
+        } else {
+            &value["images"][0]
+        };
+        assert_eq!(metadata["byte_length"], bytes.len());
+        assert_eq!(metadata["data_base64"], data);
+        assert!(matches!(
+            result.content.first(),
+            Some(ContentBlock::Text(_))
+        ));
+    }
+    for (code, closing) in [
+        (
+            "await anyagents.send({to:'agent:image-worker',text:'NO_REPLY'}); return null;",
+            true,
+        ),
+        (
+            "await anyagents.send({to:'agent:image-worker',text:'Done'}); return null;",
+            false,
+        ),
+        (
+            "await anyagents.send({to:'agent:image-worker',text:'Stop'}); await anyagents.send({to:'agent:image-worker',text:'NO_REPLY'}); return null;",
+            false,
+        ),
+    ] {
+        let result: serde_json::Value =
+            ok_json(call(&client, "code", serde_json::json!({"code":code})).await);
+        assert!(result["turn_complete_hint"].as_str().is_some());
+        assert_eq!(result.get("status").is_some(), closing, "{result}");
+        assert_eq!(
+            result["deliveries"].as_array().unwrap().len(),
+            usize::from(!closing)
+        );
+    }
+    client.cancel().await.unwrap();
+    drop(server);
+}
+
+#[tokio::test]
 async fn code_mode_supports_memory_sdk_workspace_patch_list_exec_and_computer_snapshot_refs() {
     let dir = support::physical_tempdir();
     let created = bin()
