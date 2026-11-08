@@ -332,7 +332,7 @@ fn inject_error(err: HarnessError) -> Error {
 mod recovery_tests {
     use super::*;
     use anyagents_core::{Incoming, NewAgent};
-    use anyagents_harness::fake::FakeHarness;
+    use anyagents_harness::FakeHarness;
 
     #[test]
     fn interrupted_steer_only_restarts_inside_recovery_envelope() {

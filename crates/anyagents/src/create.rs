@@ -8313,12 +8313,14 @@ mod tests {
         let templates = data.join(".agents/agents");
         std::fs::create_dir_all(&templates).unwrap();
         std::fs::write(templates.join("worker.md"), "---\nharness: sylphx\nmodel: template-model\nprofile: template/default\n---\nTemplate instructions\n").unwrap();
-        let mut defaults = SubagentDefaultsConfig::default();
-        defaults.default = SubagentDefaultSpec {
-            mode: "preset".into(),
-            harness: Some("opencode".into()),
-            model: Some("preset-model".into()),
-            profile: None,
+        let defaults = SubagentDefaultsConfig {
+            default: SubagentDefaultSpec {
+                mode: "preset".into(),
+                harness: Some("opencode".into()),
+                model: Some("preset-model".into()),
+                profile: None,
+            },
+            ..Default::default()
         };
         save_subagent_defaults(data, &defaults).unwrap();
         for explicit in [false, true] {

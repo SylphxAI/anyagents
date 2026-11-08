@@ -793,7 +793,7 @@ mod tests {
             "{\"role\":\"user\",\"content\":\"hiddenneedle\"}\n",
         )
         .unwrap();
-        fs::set_permissions(&denied, fs::Permissions::from_mode(0)).unwrap();
+        fs::set_permissions(&denied, fs::Permissions::from_mode(0o0)).unwrap();
         assert_eq!(
             fs::read_dir(&denied).unwrap_err().kind(),
             io::ErrorKind::PermissionDenied

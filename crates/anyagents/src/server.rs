@@ -8315,7 +8315,7 @@ pub(crate) mod tests {
             "{\"role\":\"user\",\"content\":\"combinedneedle readable\"}\n",
         )
         .unwrap();
-        std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0)).unwrap();
+        std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o0)).unwrap();
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let Json(result) = conversation_route(
                 Principal::Operator,
