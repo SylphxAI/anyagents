@@ -49,6 +49,10 @@ struct Bot {
     handle: JoinHandle<()>,
 }
 
+fn should_replace_worker(id: &str, wanted: &[String], bot: &Bot) -> bool {
+    !wanted.iter().any(|wanted| wanted == id) || bot.handle.is_finished()
+}
+
 impl Poller {
     pub fn start(store: Arc<Store>, data_dir: std::path::PathBuf) -> Result<Self, String> {
         let stop = Arc::new(AtomicBool::new(false));
@@ -100,7 +104,17 @@ fn supervise(
     bots: Arc<Mutex<HashMap<String, Bot>>>,
 ) {
     while !stop.load(Ordering::SeqCst) {
-        let channels = channels_to_poll(&store);
+        if let Err(err) = super::channel::replay_local_receipts(&store) {
+            eprintln!("Telegram local receipt replay pending: {err}");
+        }
+        let channels = match channels_to_poll(&store) {
+            Ok(channels) => channels,
+            Err(err) => {
+                eprintln!("Telegram channel census unavailable: {err}");
+                sleep_for(&stop, &stop, RECONCILE_EVERY);
+                continue;
+            }
+        };
         let wanted: Vec<String> = channels.iter().map(|c| c.id.to_string()).collect();
 
         // Stop a channel that is gone: it is not in the store any more.
@@ -108,7 +122,11 @@ fn supervise(
             let running = lock(&bots);
             running
                 .keys()
-                .filter(|id| !wanted.contains(id))
+                .filter(|id| {
+                    running
+                        .get(*id)
+                        .is_some_and(|bot| should_replace_worker(id, &wanted, bot))
+                })
                 .cloned()
                 .collect()
         };
@@ -221,15 +239,28 @@ fn run_channel(
         // The channel is re-read each pass: its saved offset and chats are what
         // this thread's own writes produced, so a stale copy would write an old
         // state back over them.
-        let channel = store
-            .list_channels()
-            .unwrap_or_default()
-            .into_iter()
-            .find(|channel| channel.id.to_string() == id);
+        let channel = match store.list_channels() {
+            Ok(channels) => channels
+                .into_iter()
+                .find(|channel| channel.id.to_string() == id),
+            Err(err) => {
+                eprintln!("Telegram channel read unavailable: {err}");
+                sleep_a_moment(&stop, &global_stop);
+                continue;
+            }
+        };
         let Some(channel) = channel else {
             return;
         };
-        if !channel_has_running_agent(&store, &channel) {
+        let active = match channel_has_running_agent(&store, &channel) {
+            Ok(active) => active,
+            Err(err) => {
+                eprintln!("Telegram agent lifecycle unavailable: {err}");
+                sleep_a_moment(&stop, &global_stop);
+                continue;
+            }
+        };
+        if !active {
             if webhook_registered_for.take().is_some() {
                 let _ = delete_webhook(&secrets, &channel);
             }
@@ -278,9 +309,8 @@ fn run_channel(
         }
     }
     if webhook_registered_for.is_some()
-        && let Some(channel) = store
-            .list_channels()
-            .unwrap_or_default()
+        && let Ok(channels) = store.list_channels()
+        && let Some(channel) = channels
             .into_iter()
             .find(|channel| channel.id.to_string() == id)
     {
@@ -305,11 +335,11 @@ pub fn release_every_bot(
     {
         return Ok(());
     }
-    let channels = channels_to_poll(store);
+    let channels = channels_to_poll(store).map_err(|err| err.to_string())?;
     let (done_tx, done_rx) = mpsc::channel();
     let mut waiting = 0;
     for channel in channels {
-        if !channel_has_running_agent(store, &channel) {
+        if !channel_has_running_agent(store, &channel).map_err(|err| err.to_string())? {
             continue;
         }
         let secrets = FileCredentialStore::new(data_dir);
@@ -351,43 +381,40 @@ pub fn release_every_bot(
     Ok(())
 }
 
-fn channel_has_running_agent(store: &Store, channel: &Channel) -> bool {
-    channel.agents.is_empty()
-        || channel.agents.iter().any(|agent_id| {
-            store
-                .agent(agent_id)
-                .map(|agent| agent.state != "paused" && agent.state != "archived")
-                .unwrap_or(false)
-        })
+fn channel_has_running_agent(
+    store: &Store,
+    channel: &Channel,
+) -> Result<bool, anyagents_core::Error> {
+    channel_has_eligible_agent(store, channel, false)
 }
 
-/// The channels this server should manage: every non-archived Telegram channel
-/// with a credential when a webhook origin is configured, or only channels with
-/// a running agent when long-polling.
-fn channels_to_poll(store: &Store) -> Vec<Channel> {
-    let webhook_configured = configured_webhook_base().is_some();
-    store
-        .list_channels()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|channel| {
-            channel.kind == "telegram"
-                && channel.credential_ref.is_some()
-                && (channel.agents.is_empty()
-                    || channel.agents.iter().any(|agent_id| {
-                        store
-                            .agent(agent_id)
-                            .map(|agent| {
-                                if webhook_configured {
-                                    agent.state != "archived"
-                                } else {
-                                    agent.state != "paused" && agent.state != "archived"
-                                }
-                            })
-                            .unwrap_or(false)
-                    }))
-        })
-        .collect()
+fn channel_has_eligible_agent(
+    store: &Store,
+    channel: &Channel,
+    webhook: bool,
+) -> Result<bool, anyagents_core::Error> {
+    let mut active = channel.agents.is_empty();
+    // A partial lifecycle population cannot authorize removal of any worker.
+    for id in &channel.agents {
+        let agent = store.agent(id)?;
+        active |= agent.state != "archived" && (webhook || agent.state != "paused");
+    }
+    Ok(active)
+}
+
+/// A census is authoritative only when every required read succeeds.
+fn channels_to_poll(store: &Store) -> Result<Vec<Channel>, anyagents_core::Error> {
+    let webhook = configured_webhook_base().is_some();
+    let mut channels = Vec::new();
+    for channel in store.list_channels()? {
+        if channel.kind == "telegram"
+            && channel.credential_ref.is_some()
+            && channel_has_eligible_agent(store, &channel, webhook)?
+        {
+            channels.push(channel);
+        }
+    }
+    Ok(channels)
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -405,5 +432,76 @@ fn sleep_for(flag: &AtomicBool, global_stop: &AtomicBool, duration: Duration) {
             return;
         }
         std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn fixture() -> (tempfile::TempDir, Store, Channel, anyagents_core::Agent) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(anyagents_core::NewAgent::new("helper", "codex"))
+            .unwrap();
+        let channel = store
+            .create_channel(anyagents_core::NewChannel {
+                kind: "telegram".into(),
+                identity: None,
+                config: "{}".into(),
+                credential_ref: Some("channels/helper".into()),
+            })
+            .unwrap();
+        store.attach_channel(&channel.id, &agent.id).unwrap();
+        let channel = store.list_channels().unwrap().remove(0);
+        (dir, store, channel, agent)
+    }
+    #[test]
+    fn failed_census_is_not_an_empty_population() {
+        let (dir, store, _, _) = fixture();
+        assert_eq!(channels_to_poll(&store).unwrap().len(), 1);
+        let conn = rusqlite::Connection::open(dir.path().join("state.db")).unwrap();
+        conn.execute_batch("ALTER TABLE channels RENAME TO hidden_channels")
+            .unwrap();
+        assert!(channels_to_poll(&store).is_err());
+        conn.execute_batch("ALTER TABLE hidden_channels RENAME TO channels")
+            .unwrap();
+        assert_eq!(channels_to_poll(&store).unwrap().len(), 1);
+        conn.execute_batch("DELETE FROM channel_agents; DELETE FROM channels")
+            .unwrap();
+        assert!(channels_to_poll(&store).unwrap().is_empty());
+    }
+    #[test]
+    fn lifecycle_read_error_cannot_confirm_inactivity() {
+        let (dir, store, channel, agent) = fixture();
+        assert!(channel_has_running_agent(&store, &channel).unwrap());
+        store.set_agent_state(&agent.id, "paused").unwrap();
+        assert!(!channel_has_running_agent(&store, &channel).unwrap());
+        store.set_agent_state(&agent.id, "running").unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("state.db")).unwrap();
+        conn.execute_batch("ALTER TABLE agents RENAME TO hidden_agents")
+            .unwrap();
+        assert!(channel_has_running_agent(&store, &channel).is_err());
+        assert!(channels_to_poll(&store).is_err());
+    }
+    #[test]
+    fn completed_worker_is_replaced_and_live_wanted_worker_is_preserved() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let bot = Bot {
+            stop: Arc::new(AtomicBool::new(false)),
+            handle: std::thread::spawn(move || {
+                rx.recv().unwrap();
+            }),
+        };
+        let wanted = vec!["channel".to_string()];
+        assert!(!should_replace_worker("channel", &wanted, &bot));
+        assert!(should_replace_worker("removed", &wanted, &bot));
+        tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !bot.handle.is_finished() && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(should_replace_worker("channel", &wanted, &bot));
+        bot.handle.join().unwrap();
     }
 }

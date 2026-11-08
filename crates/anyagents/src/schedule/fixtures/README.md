@@ -3,8 +3,8 @@
 Read on 2026-11-07 at 02:52 UTC from existing, recorded REST responses;
 no new GitHub API request was made to prepare these fixtures.
 
-- `completed-check-runs.json`: `/scratch/tmp/volt-arm-5146-ce005e12-20261107/checks.json`
-- `pending-check-runs.json`: `/scratch/tmp/lyra-cloud16125-poll-71aL6L/checks.json`
+- `completed-check-runs.json`: a recorded completed-check response
+- `pending-check-runs.json`: a recorded pending-check response
 
 Only Check Run IDs, names, statuses and conclusions are retained. The 3,000-check
 pagination test scales these recorded shapes with distinct synthetic IDs and puts
