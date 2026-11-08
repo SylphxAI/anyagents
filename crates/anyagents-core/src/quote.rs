@@ -135,6 +135,13 @@ pub fn starts_quote(line: &str) -> bool {
     line.trim_end() == QUOTE_FENCE
 }
 
+/// Returns the message text before any fenced [`QUOTE_FENCE`] tail.
+pub fn strip_quoted_tail(text: &str) -> &str {
+    text.split_once(QUOTE_FENCE)
+        .map_or(text, |(head, _)| head)
+        .trim()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

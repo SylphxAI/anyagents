@@ -1387,7 +1387,7 @@ pub(super) fn execute_memory_recall(transcript_path: &Path, args: &Value) -> Str
         .take_while(|item| item.index < snapshot)
         .collect();
     let active = load_transcript_indexed_items_before(transcript_path, snapshot);
-    let output = render_memory_recall(&all_items, &active, args);
+    let output = render_memory_recall(transcript_path, &all_items, &active, args);
     if offset == 0 && output.len() <= MEMORY_RECALL_MAX_BYTES {
         return output;
     }
@@ -1422,6 +1422,7 @@ pub(super) fn execute_memory_recall(transcript_path: &Path, args: &Value) -> Str
 }
 
 fn render_memory_recall(
+    transcript_path: &Path,
     all_items: &[RawTranscriptItem],
     active: &[(usize, Value)],
     args: &Value,
@@ -1787,11 +1788,64 @@ fn render_memory_recall(
         }));
     }
 
+    let mut memory_file_hits: Vec<Value> = Vec::new();
+    if let Some(config_dir) = transcript_path.parent()
+        && let Some(agent_root) = config_dir.parent()
+    {
+        let mem_dir = agent_root.join("memory");
+        if let Ok(entries) = std::fs::read_dir(&mem_dir) {
+            let mut md_paths: Vec<std::path::PathBuf> = entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("md") && p.is_file())
+                .collect();
+            md_paths.sort();
+            for md_path in md_paths {
+                let Ok(text) = std::fs::read_to_string(&md_path) else {
+                    continue;
+                };
+                let text_l = text.to_lowercase();
+                let matched_tokens = q_tokens
+                    .iter()
+                    .filter(|qt| !qt.is_empty() && text_l.contains(qt.as_str()))
+                    .count();
+                let exact_matches = queries_lower
+                    .iter()
+                    .filter(|ql| !ql.is_empty() && text_l.contains(ql.as_str()))
+                    .count();
+                if matched_tokens > 0 || exact_matches > 0 {
+                    let matching_lines: Vec<String> = text
+                        .lines()
+                        .enumerate()
+                        .filter(|(_, line)| {
+                            let ll = line.to_lowercase();
+                            queries_lower
+                                .iter()
+                                .any(|ql| !ql.is_empty() && ll.contains(ql.as_str()))
+                                || q_tokens
+                                    .iter()
+                                    .any(|qt| !qt.is_empty() && ll.contains(qt.as_str()))
+                        })
+                        .take(12)
+                        .map(|(ln, line)| format!("L{}: {}", ln + 1, line))
+                        .collect();
+                    memory_file_hits.push(json!({
+                        "file": md_path.display().to_string(),
+                        "matched_tokens": matched_tokens,
+                        "exact_matches": exact_matches,
+                        "matching_lines": matching_lines,
+                    }));
+                }
+            }
+        }
+    }
+
     serde_json::to_string_pretty(&json!({
         "mode": "query",
         "query": all_queries.join(" | "),
         "total_raw_items": all_items.len(),
         "hits": hits,
+        "learned_memory_hits": memory_file_hits,
     }))
     .unwrap_or_default()
 }

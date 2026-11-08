@@ -187,7 +187,7 @@ pub fn launch_boundary(agents: &[String]) -> bool {
 
 /// The socket group: the configured one, else the host's `anyagents-sock`
 /// when running outside isolated tests.
-fn sock_gid_for() -> Option<u32> {
+pub(crate) fn sock_gid_for() -> Option<u32> {
     number("ANYAGENTS_SOCKET_GID").or_else(|| {
         (!is_isolated_test_env())
             .then(|| lookup_group("anyagents-sock"))
@@ -443,6 +443,16 @@ pub fn share_config_with_seat_uid(config_dir: &Path, uid: u32, gid: u32) {
         }
         if let Err(error) = give_tree(&path, eff_uid, eff_gid) {
             eprintln!("seat: cannot share {}: {error}", path.display());
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        for host_only in ["sessions", "transcripts"] {
+            let p = config_dir.with_file_name(host_only);
+            if p.is_dir() {
+                let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700));
+            }
         }
     }
 }

@@ -81,7 +81,7 @@ pub struct HostIndex {
 impl HostIndex {
     pub fn open(path: &Path) -> Result<Self, IndexError> {
         let conn = Connection::open(path)?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.busy_timeout(std::time::Duration::from_secs(30))?;
         conn.execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON;",
         )?;
@@ -94,6 +94,27 @@ impl HostIndex {
             .collect::<Result<Vec<_>, _>>()?
             .into_iter()
             .any(|(name, required)| name == "timestamp_ms" && required != 0);
+        let already_initialized = !old_required_time
+            && conn
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='host_fts'",
+                    [],
+                    |_| Ok(true),
+                )
+                .optional()?
+                .unwrap_or(false)
+            && conn
+                .query_row(
+                    "SELECT 1 FROM host_fts_config WHERE k='secure-delete' AND v=1",
+                    [],
+                    |_| Ok(true),
+                )
+                .optional()
+                .unwrap_or(None)
+                .unwrap_or(false);
+        if already_initialized {
+            return Ok(Self { conn });
+        }
         if old_required_time {
             // Serialize and recheck the disposable-schema upgrade: another
             // process may have rebuilt it after the first metadata read.
@@ -171,11 +192,20 @@ impl HostIndex {
             )?
             .query_map(params![owner, scope.source()], |r| r.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
-        let tx = self.conn.transaction()?;
-        for id in ids {
-            if !keep.contains(&id) {
-                tx.execute("DELETE FROM host_documents WHERE id=?1", [id])?;
+        let stale: Vec<String> = ids.into_iter().filter(|id| !keep.contains(id)).collect();
+        if stale.is_empty() {
+            let has_orphan_source: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM host_sources WHERE agent_id=?1 AND segment NOT IN (SELECT segment FROM host_documents WHERE agent_id=?1))",
+                [owner],
+                |r| r.get(0),
+            )?;
+            if !has_orphan_source {
+                return Ok(());
             }
+        }
+        let tx = self.conn.transaction()?;
+        for id in stale {
+            tx.execute("DELETE FROM host_documents WHERE id=?1", [id])?;
         }
         tx.execute(
             "DELETE FROM host_sources WHERE agent_id=?1 AND segment NOT IN

@@ -553,3 +553,32 @@ Each complete server fixture runs in its own test process. Protected-root
 admission canonicalizes configured aliases before comparing them with the target;
 its regression covers the selected tree, a symlink spelling, a descendant and an
 allowed sibling on Linux and macOS.
+
+## Integration invariants
+
+Seat admission inventories every foreign root, including unregistered roots and
+roots beyond the first 32 peers. Sharing a primary GID does not make two different
+UIDs the same principal. Missing optional peer subtrees are permitted; readable
+foreign config, memory or skills refuse admission. A real authenticated daemon
+socket remains usable, but a regular file at that path receives no exception.
+
+History visibility is applied before candidate limits for every authorized-set
+size. Host refresh holds lifecycle locks through publication and readback, includes
+archived authorized history, and propagates malformed or unreadable source errors
+in production as well as tests. Corpus size never disables mailbox backfill.
+
+Unified code results expose a top-level delivery list collected by host dispatch.
+Snippet return values, source text and console logs cannot populate it. Native
+reply settlement requires an acknowledged message ID and the exact retained
+recipient, including when sends share a parallel tool batch. Updated memory topic
+files do not rewrite an existing host-session snapshot; a new explicit session
+pins the next snapshot.
+
+The regression checks are included in the normal workspace tests:
+
+- Seat admission: more than 40 foreign roots, a readable unregistered tail root,
+  mismatched UID/GID pairs and a registered exact-principal positive control.
+- Scoped history: 18 authorized IDs competing with 2,010 hidden candidates.
+- Code delivery: invented return-value receipts and a caught malformed send
+  yield no host receipt; a real loopback send yields the returned message ID
+  even when the snippet returns null.

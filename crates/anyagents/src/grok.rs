@@ -117,12 +117,15 @@ impl GrokHarness {
     }
 
     fn handshake(&self) -> Result<(), HarnessError> {
+        let allow_native_fs = std::env::var("ANYAGENTS_ALLOW_NATIVE_FILE_TOOLS")
+            .ok()
+            .is_some_and(|v| v.trim() == "1");
         self.call(
             "initialize",
             json!({
                 "protocolVersion": 1,
                 "clientCapabilities": {
-                    "fs": { "readTextFile": true, "writeTextFile": true },
+                    "fs": { "readTextFile": allow_native_fs, "writeTextFile": allow_native_fs },
                     "terminal": true
                 }
             }),

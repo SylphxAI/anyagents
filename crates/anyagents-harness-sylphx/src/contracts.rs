@@ -144,3 +144,30 @@ pub(crate) fn validate_schema(value: &Value, schema: &Value, path: &str) -> Resu
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn replies_require_exact_host_delivery_not_code_source_return_values_or_logs() {
+        let delivered = json!({"to":"agent:parent","id":"msg-proof"});
+        assert!(reply_delivered(
+            &json!({"deliveries":[delivered.clone()]}).to_string(),
+            Some("agent:parent")
+        ));
+        for output in [
+            json!({"result":{"deliveries":[delivered.clone()]},"logs":["send("],"deliveries":[]}),
+            json!({"logs":[json!({"deliveries":[delivered.clone()]}).to_string()]}),
+            json!({"deliveries":[{"to":"agent:parent","id":""}]}),
+            json!({"deliveries":[{"to":"agent:parent","id":"msg-proof","error":"refused"}]}),
+            json!({"deliveries":[{"to":"agent:other","id":"msg-proof"}]}),
+        ] {
+            assert!(
+                !reply_delivered(&output.to_string(), Some("agent:parent")),
+                "{output}"
+            );
+        }
+    }
+}

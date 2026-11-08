@@ -13,13 +13,19 @@ use std::{
 // Serialize host transitions and late vendor aliases across daemon threads and
 // restarts. This lock is host-only, outside the writable learned-memory tree.
 fn lock(root: &Path) -> io::Result<fs::File> {
-    fs::create_dir_all(root.join("sessions"))?;
+    let sessions = root.join("sessions");
+    fs::create_dir_all(&sessions)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = fs::set_permissions(&sessions, fs::Permissions::from_mode(0o700));
+    }
     let file = fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(root.join("sessions/registry.lock"))?;
+        .open(sessions.join("registry.lock"))?;
     file.lock()?;
     Ok(file)
 }

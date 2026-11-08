@@ -84,8 +84,9 @@ pub(super) fn admitted_command(
         }
         command
     };
+    let script = admission_script(checks);
     let output = prefix()
-        .args(["/bin/sh", "-c", &admission_script(checks), "seat-admission"])
+        .args(["/bin/sh", "-c", &script, "seat-admission"])
         .envs(
             environment
                 .iter()
@@ -181,12 +182,20 @@ fn checks_with_principals(
     for name in [
         "state.db",
         "secrets",
-        "anyagents.sock",
         "operator-token",
         "identity-boundary.json",
         "execution-principals.json",
     ] {
         list.push(deny("the server's own files are denied", &data.join(name))?);
+    }
+    {
+        let sock = quote(&data.join("anyagents.sock"))?;
+        list.push(Check {
+            what: "the server's own files are denied",
+            program: format!(
+                "[ -S {sock} ] || ([ ! -r {sock} ] && [ ! -w {sock} ] && [ ! -x {sock} ])"
+            ),
+        });
     }
     // The seat can traverse known children without being able to list agents/.
     // Enumerate under the server identity, and refuse an incomplete inventory:
@@ -588,6 +597,10 @@ mod tests {
         for name in ["memory", "skills", "config"] {
             std::fs::create_dir_all(peer.join(name)).unwrap();
         }
+        // Population size never widens a same-seat grant to another UID.
+        for n in 0..40 {
+            std::fs::create_dir_all(dir.path().join(format!("agents/padding-{n:02}"))).unwrap();
+        }
         let run = |principals: Vec<crate::SeatPeer>| {
             let checks =
                 checks_with_principals(Some(&config), dir.path(), 24031, 24032, &principals)
@@ -638,6 +651,50 @@ mod tests {
                 "boundary check failed: peer seats' private trees are denied\n"
             );
         }
+    }
+
+    #[test]
+    fn large_peer_inventory_checks_unregistered_tail_after_known_foreign_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("agents/own/config");
+        std::fs::create_dir_all(&config).unwrap();
+        let mut principals = Vec::new();
+        for n in 0..40 {
+            let root = dir.path().join(format!("agents/peer-{n:02}"));
+            std::fs::create_dir_all(&root).unwrap();
+            principals.push(crate::SeatPeer {
+                root,
+                uid: 25000 + n,
+                gid: 26000 + n,
+            });
+        }
+        let tail = dir.path().join("agents/zzz-unregistered/memory");
+        std::fs::create_dir_all(&tail).unwrap();
+        let run = || {
+            let checks =
+                checks_with_principals(Some(&config), dir.path(), 24031, 24032, &principals)
+                    .unwrap();
+            std::process::Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    &admission_script(
+                        checks
+                            .into_iter()
+                            .filter(|c| c.what == "peer seats' private trees are denied"),
+                    ),
+                ])
+                .output()
+                .unwrap()
+        };
+        assert!(
+            !run().status.success(),
+            "the 41st foreign root must still be checked"
+        );
+        std::fs::remove_dir(&tail).unwrap();
+        assert!(
+            run().status.success(),
+            "absent optional subtrees remain permitted"
+        );
     }
 
     #[test]

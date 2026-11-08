@@ -98,6 +98,11 @@ pub fn write(data_dir: &Path) -> Result<Boundary, Error> {
         serde_json::to_string_pretty(&boundary).map_err(|err| Error::Message(err.to_string()))?;
     let path = data.join(BOUNDARY_FILE);
     std::fs::write(&path, text)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
     let back = std::fs::read_to_string(&path)?;
     let read: Boundary =
         serde_json::from_str(&back).map_err(|err| Error::Message(err.to_string()))?;

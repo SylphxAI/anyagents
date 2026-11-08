@@ -85,6 +85,16 @@ pub fn sanitize_claude_settings(config_dir: &Path) -> Result<(), Error> {
                 env_obj.remove("ANTHROPIC_API_KEY");
             }
         }
+        let env_val = obj
+            .entry("env".to_string())
+            .or_insert_with(|| serde_json::json!({}));
+        if let Some(env_obj) = env_val.as_object_mut() {
+            env_obj.insert(
+                "CLAUDE_CODE_DISABLE_AUTO_MEMORY".to_string(),
+                serde_json::Value::String("1".to_string()),
+            );
+        }
+        obj.insert("autoMemoryEnabled".to_string(), serde_json::json!(false));
         obj.insert("includeCoAuthoredBy".to_string(), serde_json::json!(false));
         obj.insert(
             "attribution".to_string(),
@@ -104,26 +114,49 @@ pub fn sanitize_claude_settings(config_dir: &Path) -> Result<(), Error> {
             let deny = perms_obj
                 .entry("deny".to_string())
                 .or_insert_with(|| serde_json::json!(["SendFeedback"]));
-            if let Some(deny_arr) = deny.as_array_mut()
-                && std::env::var_os("ANYAGENTS_ALLOW_NATIVE_SUBAGENTS").is_none()
-            {
-                for tool in [
-                    "SendFeedback",
-                    "Task",
-                    "Agent",
-                    "TeamCreate",
-                    "TeamDelete",
-                    "SendMessage",
-                    "ScheduleWakeup",
-                    "Monitor",
-                    "CronCreate",
-                    "CronDelete",
-                    "CronList",
-                    "RemoteTrigger",
-                    "PushNotification",
-                ] {
-                    if !deny_arr.iter().any(|v| v.as_str() == Some(tool)) {
-                        deny_arr.push(serde_json::Value::String(tool.to_string()));
+            if let Some(deny_arr) = deny.as_array_mut() {
+                if std::env::var_os("ANYAGENTS_ALLOW_NATIVE_SUBAGENTS").is_none() {
+                    for tool in [
+                        "SendFeedback",
+                        "Task",
+                        "Agent",
+                        "TeamCreate",
+                        "TeamDelete",
+                        "SendMessage",
+                        "ScheduleWakeup",
+                        "Monitor",
+                        "CronCreate",
+                        "CronDelete",
+                        "CronList",
+                        "RemoteTrigger",
+                        "PushNotification",
+                    ] {
+                        if !deny_arr.iter().any(|v| v.as_str() == Some(tool)) {
+                            deny_arr.push(serde_json::Value::String(tool.to_string()));
+                        }
+                    }
+                }
+                if !std::env::var("ANYAGENTS_ALLOW_NATIVE_FILE_TOOLS")
+                    .ok()
+                    .is_some_and(|v| v.trim() == "1")
+                {
+                    for tool in [
+                        "Read",
+                        "Write",
+                        "Edit",
+                        "MultiEdit",
+                        "Glob",
+                        "Grep",
+                        "LS",
+                        "NotebookEdit",
+                        "TodoRead",
+                        "TodoWrite",
+                        "WebSearch",
+                        "WebFetch",
+                    ] {
+                        if !deny_arr.iter().any(|v| v.as_str() == Some(tool)) {
+                            deny_arr.push(serde_json::Value::String(tool.to_string()));
+                        }
                     }
                 }
             }
@@ -231,6 +264,12 @@ pub fn write_codex_with_model(
     if !existing.contains("project_doc_max_bytes") {
         existing = upsert_top_key(&existing, "project_doc_max_bytes", "131072");
     }
+    if !std::env::var("ANYAGENTS_ALLOW_NATIVE_FILE_TOOLS")
+        .ok()
+        .is_some_and(|v| v.trim() == "1")
+    {
+        existing = upsert_top_key(&existing, "web_search", "\"disabled\"");
+    }
     let mut updated = upsert_table(&existing, &body);
     if use_sylphx {
         let (base_url, api_key) = resolve_sylphx_codex_provider(config_dir);
@@ -253,12 +292,11 @@ pub fn write_codex_with_model(
         }
         updated.push_str("\n[projects.\"/\"]\ntrust_level = \"trusted\"\n");
     }
-    if !updated.contains("[memories]") {
-        if !updated.ends_with('\n') {
-            updated.push('\n');
-        }
-        updated.push_str("\n[memories]\ngenerate_memories = false\nuse_memories = false\n");
-    }
+    updated = upsert_named_table(
+        &updated,
+        "[memories]",
+        "[memories]\ngenerate_memories = false\nuse_memories = false\n",
+    );
     if std::env::var_os("ANYAGENTS_ALLOW_NATIVE_SUBAGENTS").is_none() {
         updated = upsert_named_table(
             &updated,

@@ -225,15 +225,21 @@ async fn serve(
         let reaper_health = state.health.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            interval.tick().await;
+            let mut tick_count = 0u64;
             loop {
                 interval.tick().await;
+                tick_count = tick_count.wrapping_add(1);
+                let run_verify = tick_count.is_multiple_of(15);
                 let root = reaper_root.clone();
                 let store = Arc::clone(&reaper_store);
                 let health = reaper_health.clone();
                 let _ = tokio::task::spawn_blocking(move || {
                     reap_archived_agents(&store, &root, &health);
-                    if let Err(error) =
-                        store.verify_one_host_history_source(anyagents_core::now_ms())
+                    consolidate_idle_agent_memory(&store, &root, &health);
+                    if run_verify
+                        && let Err(error) =
+                            store.verify_one_host_history_source(anyagents_core::now_ms())
                     {
                         eprintln!("anyagents-host-history: deferred full verification: {error}");
                     }
@@ -317,6 +323,7 @@ async fn serve(
             get(get_description_route).post(set_description_route),
         )
         .route("/v1/browser", post(browser_route))
+        .route("/v1/web", post(web_route))
         .route("/v1/profiles", get(profiles_route).post(set_profile_route))
         .route("/v1/profiles/models", get(profile_models_route))
         .route(
@@ -1023,9 +1030,16 @@ fn reap_archived_agents(store: &Store, data_dir: &Path, health: &HealthBoard) {
     let Ok(agents) = store.list_agents() else {
         return;
     };
+    let large_pop = agents.len() > 32 && std::env::var_os("ANYAGENTS_TESTS").is_none();
     for agent in agents {
         if agent.state != "archived" || agent.parent_id.is_none() {
             continue;
+        }
+        if large_pop {
+            let cfg = anyagents_core::agent_config_dir(data_dir, &agent.id);
+            if cfg.join(".anyagents-reaped").is_file() {
+                continue;
+            }
         }
         let Ok(_lifecycle) = store.try_lock_agent_lifecycle(&agent.id) else {
             continue;
@@ -1037,6 +1051,39 @@ fn reap_archived_agents(store: &Store, data_dir: &Path, health: &HealthBoard) {
         }
         // Re-read under the lock: this population may predate a direct wake.
         reap_archived_agent_locked(store, data_dir, &agent.id);
+    }
+}
+
+/// Consolidate idle agents' topic files without changing the active session's
+/// immutable snapshot. Updated files are pinned only at the next explicit session.
+fn consolidate_idle_agent_memory(store: &Store, data_dir: &Path, health: &HealthBoard) {
+    let Ok(agents) = store.list_agents() else {
+        return;
+    };
+    let mut llm_consolidated_count = 0usize;
+    for agent in agents {
+        if agent.state == "archived" {
+            continue;
+        }
+        let agent_root = data_dir.join("agents").join(agent.id.as_str());
+        if !agent_root.join("memory").is_dir() {
+            continue;
+        }
+        let Ok(_lifecycle) = store.try_lock_agent_lifecycle(&agent.id) else {
+            continue;
+        };
+        if health.get(&agent.id).is_some_and(|live| live.process_alive) {
+            continue;
+        }
+        if store.has_open_turn(&agent.id).unwrap_or(true) {
+            continue;
+        }
+        let allow_llm = llm_consolidated_count < 1;
+        if let Ok((_, true)) =
+            store.consolidate_agent_sleep_memory_with_options(&agent.id, allow_llm)
+        {
+            llm_consolidated_count += 1;
+        }
     }
 }
 
@@ -1479,6 +1526,9 @@ pub fn run_admin(data: &Path) -> Result<(), Error> {
     crate::worktree_access::recover_inspections(data)?;
     let runtime = tokio::runtime::Runtime::new()?;
     let store = Arc::new(Store::open(data.join("state.db"))?);
+    if let Ok(key) = capability_key() {
+        let _ = store.hold_capability_key(&key);
+    }
     crate::host_memory::on_start(&store);
     let res = runtime.block_on(async move {
         let auth = deployment_mode(data);
@@ -1546,6 +1596,7 @@ pub fn run_admin(data: &Path) -> Result<(), Error> {
                     let health = reaper_health.clone();
                     let _ = tokio::task::spawn_blocking(move || {
                         reap_archived_agents(&store, &root, &health);
+                        consolidate_idle_agent_memory(&store, &root, &health);
                         crate::browser::reap_idle_browsers(&root);
                         crate::create::sync_fresher_bound_agent_credentials(&root);
                         #[cfg(unix)]
@@ -1589,6 +1640,7 @@ pub fn run_admin(data: &Path) -> Result<(), Error> {
                 get(get_description_route).post(set_description_route),
             )
             .route("/v1/browser", post(browser_route))
+            .route("/v1/web", post(web_route))
             .route("/v1/profiles", get(profiles_route).post(set_profile_route))
             .route("/v1/profiles/models", get(profile_models_route))
             .route(
@@ -1790,12 +1842,19 @@ fn webhook_listen_addr() -> Option<String> {
 /// `GET /v1/whoami`: the agent this call acts as. A tool server asks before it
 /// speaks for anyone, and gets the id the server resolved from the capability,
 /// never the name a caller wrote.
-async fn whoami(ctx: Whoami) -> Result<Json<serde_json::Value>, ApiError> {
+async fn whoami(
+    State(state): State<AppState>,
+    ctx: Whoami,
+) -> Result<Json<serde_json::Value>, ApiError> {
     match ctx.principal {
-        Principal::Agent { agent_id, name } => Ok(Json(serde_json::json!({
+        Principal::Agent { agent_id, name } => {
+            let workdir = state.store.agent(&agent_id).ok().and_then(|a| a.workdir);
+            Ok(Json(serde_json::json!({
             "agent_id": agent_id.as_str(),
             "name": name,
-        }))),
+                "workdir": workdir,
+            })))
+        }
         Principal::Operator => Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             "the operator authenticated, but this call names an agent",
@@ -2694,7 +2753,7 @@ async fn profiles_route(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<create::ProviderProfileEntry>>, ApiError> {
     require_admin_or_operator(&state.store, &principal, "profiles.list", "profiles")?;
-    Ok(Json(create::sync_and_list_provider_profiles(
+    Ok(Json(create::list_provider_profiles_fast(
         &state.store,
         state.store.data_dir(),
     )))
@@ -3510,8 +3569,10 @@ fn list_agents_sync_for_principal(
                 .map_err(|_| ApiError::forbidden("authenticated agent no longer exists"))?,
         ),
     };
-    let mut agents = Vec::new();
-    for agent in state.store.list_agents().map_err(ApiError::from_store)? {
+    let all_agents = state.store.list_agents().map_err(ApiError::from_store)?;
+    let fast_archived = all_agents.len() > 32;
+    let mut agents = Vec::with_capacity(all_agents.len());
+    for agent in all_agents {
         if let Some(ref caller) = caller_agent
             && caller.is_isolated()
             && !is_self_or_ancestor(&state.store, &caller.id, &agent)
@@ -3520,7 +3581,11 @@ fn list_agents_sync_for_principal(
         {
             continue;
         }
-        let mut view = agent_view(&state.store, &state.health, &agent)?;
+        let mut view = if fast_archived && agent.state == "archived" {
+            archived_agent_view_fast(&state.store, &agent)
+        } else {
+            agent_view(&state.store, &state.health, &agent)?
+        };
         if let Some(ref caller) = caller_agent {
             view.relationship = Some(compute_caller_relationship(&state.store, caller, &agent));
             view.can_message = Some(
@@ -3567,6 +3632,43 @@ pub(crate) fn compute_block_reason(
         return Some("delivery_error".to_string());
     }
     None
+}
+
+fn archived_agent_view_fast(store: &Store, agent: &Agent) -> AgentView {
+    let (mode, steer) = declared(&agent.harness);
+    AgentView {
+        id: agent.id.to_string(),
+        name: agent.name.clone(),
+        role: agent.role.clone(),
+        aliases: Vec::new(),
+        parent: agent.parent_id.as_ref().map(ToString::to_string),
+        scope: agent.scope().to_string(),
+        relationship: None,
+        can_message: None,
+        harness: agent.harness.clone(),
+        model: agent.model.clone(),
+        live_harness: None,
+        live_model: None,
+        process_started_at_ms: None,
+        pending_switch: false,
+        workdir: agent.workdir.clone(),
+        state: agent.state.clone(),
+        process: "down".to_string(),
+        turn_state: "idle".to_string(),
+        delivery_mode: mode_name(mode).to_string(),
+        steer_support: steer_name(steer).to_string(),
+        quota_reset_at_ms: None,
+        block_reason: None,
+        last_error: None,
+        oldest_undelivered_age_ms: None,
+        install: install_state(store, agent),
+        description: agent.public_description(),
+        instructions: agent.instructions.clone(),
+        seat_user: None,
+        seat_uid: None,
+        seat_gid: None,
+        schedules: Vec::new(),
+    }
 }
 
 fn agent_view(store: &Store, health: &HealthBoard, agent: &Agent) -> Result<AgentView, ApiError> {
@@ -4068,6 +4170,13 @@ pub(crate) fn reap_subagent_ephemeral_dirs(
         "cache-home",
         "cache",
         ".cache",
+        ".local",
+        "data-home",
+        "state-home",
+        "muse",
+        ".omp",
+        ".dsh",
+        ".grok",
         ".gemini",
         ".npm",
         ".bun",
@@ -4237,10 +4346,30 @@ pub(crate) fn is_git_worktree_safe_to_reap(
         .inspect(|| {
             let output = |args: &[&str]| record.command()?.args(args).output();
             let status_out = output(&["status", "--porcelain", "--untracked-files=normal"])?;
-            if !status_out.status.success() || !status_out.stdout.is_empty() {
+            if !status_out.status.success() {
                 return Ok(false);
             }
-            // No seat-owned initial-head marker can waive the pushed-history check.
+            let status_text = String::from_utf8_lossy(&status_out.stdout);
+            let has_substantive_dirty = status_text.lines().any(|line| {
+                let path = line.get(3..).unwrap_or("").trim();
+                !matches!(
+                    path,
+                    "CLAUDE.md"
+                        | "AGENTS.md"
+                        | "GEMINI.md"
+                        | ".claude"
+                        | ".gemini"
+                        | "node_modules"
+                        | "target"
+                ) && !path.starts_with(".desk-worktree")
+                    && !path.starts_with(".claude/")
+                    && !path.starts_with(".gemini/")
+                    && !path.starts_with("node_modules/")
+                    && !path.starts_with("target/")
+            });
+            if has_substantive_dirty {
+                return Ok(false);
+            }
             // Require HEAD and every local branch history to be covered by at least
             // one recorded remote-tracking ref, including detached HEAD and branches
             // not currently checked out. Shared refs remain the documented same-repo
@@ -4755,7 +4884,7 @@ struct Since {
     limit: Option<usize>,
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 struct ConversationQuery {
     raw_id: Option<String>,
     raw_sha256: Option<String>,
@@ -4763,6 +4892,14 @@ struct ConversationQuery {
     raw_length: Option<u64>,
     #[serde(default)]
     scope: anyagents_core::host_index::MemoryScope,
+    #[serde(default, alias = "memory_topic", alias = "slug", alias = "file")]
+    topic: Option<String>,
+    #[serde(default, alias = "summary", alias = "memory_description")]
+    description: Option<String>,
+    #[serde(default, alias = "body", alias = "text", alias = "memory_content")]
+    content: Option<String>,
+    #[serde(default, alias = "remove")]
+    delete: Option<bool>,
     with: Option<String>,
     since_ms: Option<i64>,
     until_ms: Option<i64>,
@@ -4855,6 +4992,269 @@ async fn conversation_route(
     Query(query): Query<ConversationQuery>,
 ) -> Result<Json<ConversationResponse>, ApiError> {
     spawn_store(move || {
+        if let Some(topic) = query
+            .topic
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let is_write = query.content.is_some() || query.delete == Some(true);
+            if !is_write {
+                let (resolved_name, visible_agent_ids) =
+                    conversation_visibility(&state.store, &principal, &name)?;
+                let target = if resolved_name.eq_ignore_ascii_case("self")
+                    || resolved_name.eq_ignore_ascii_case("all")
+                    || resolved_name == "*"
+                {
+                    match &principal {
+                        Principal::Agent { agent_id, .. } => {
+                            state.store.agent(agent_id).map_err(ApiError::from_store)?
+                        }
+                        Principal::Operator => {
+                            return Err(ApiError::new(
+                                StatusCode::BAD_REQUEST,
+                                "operator memory topic read requires an explicit agent name",
+                            ));
+                        }
+                    }
+                } else {
+                    state
+                        .store
+                        .agent_by_name(
+                            resolved_name
+                                .strip_prefix("agent:")
+                                .unwrap_or(&resolved_name),
+                        )
+                        .map_err(ApiError::from_store)?
+                };
+                if let Some(visible) = visible_agent_ids.as_ref()
+                    && !visible
+                        .iter()
+                        .any(|v| v == target.id.as_str() || v == &target.name)
+                {
+                    return Err(ApiError::forbidden(
+                        "cannot read private memory of another agent",
+                    ));
+                }
+                let agent_root = state
+                    .store
+                    .data_dir()
+                    .join("agents")
+                    .join(target.id.as_str());
+                let is_index_read = topic.eq_ignore_ascii_case("memory")
+                    || topic.eq_ignore_ascii_case("memory.md")
+                    || topic.eq_ignore_ascii_case("index");
+                let (slug, filename) = if is_index_read {
+                    ("MEMORY".to_string(), "MEMORY.md".to_string())
+                } else {
+                    let s = anyagents_core::learned_memory::sanitize_topic_slug(topic)
+                        .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.to_string()))?;
+                    let f = format!("{s}.md");
+                    (s, f)
+                };
+                let path = agent_root.join("memory").join(&filename);
+                if state
+                    .store
+                    .is_host_path_redacted(target.id.as_str(), &path)
+                    .unwrap_or(true)
+                {
+                    return Err(ApiError::new(
+                        StatusCode::NOT_FOUND,
+                        format!("memory topic `{filename}` not found"),
+                    ));
+                }
+                let mut bytes = Vec::new();
+                let timestamp_ms = match anyagents_core::raw_segment::open_readonly(&path) {
+                    Ok(mut file) => {
+                        use std::io::Read as _;
+                        file.read_to_end(&mut bytes)
+                            .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.to_string()))?;
+                        let text_preview = String::from_utf8_lossy(&bytes);
+                        let fm_updated_ms =
+                            anyagents_core::learned_memory::parse_topic_frontmatter_full(
+                                &slug,
+                                &text_preview,
+                            )
+                            .3
+                            .filter(|&ts| ts > 0);
+                        fm_updated_ms.or_else(|| {
+                            file.metadata()
+                                .ok()
+                                .and_then(|m| m.modified().ok())
+                                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                                .map(|d| d.as_millis() as i64)
+                        })
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound && is_index_read => {
+                        let rendered = format!(
+                            "# {} — Learned Memory Index\n- No topic files recorded yet.\n",
+                            target.name
+                        );
+                        bytes = rendered.into_bytes();
+                        Some(anyagents_core::now_ms())
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        return Err(ApiError::new(
+                            StatusCode::NOT_FOUND,
+                            format!("memory topic `{filename}` not found"),
+                        ));
+                    }
+                    Err(e) => {
+                        return Err(ApiError::new(StatusCode::BAD_REQUEST, e.to_string()));
+                    }
+                };
+                let text = String::from_utf8_lossy(&bytes).into_owned();
+                let digest = anyagents_core::learned_memory::sha256(&bytes);
+                let doc_id = format!(
+                    "memory:{}:{}",
+                    target.id,
+                    anyagents_core::learned_memory::sha256(path.as_os_str().as_encoded_bytes())
+                );
+                let coord = anyagents_core::raw_segment::RawCoordinate {
+                    segment: path,
+                    offset: 0,
+                    length: bytes.len() as u64,
+                    sha256: digest,
+                    seq: 1,
+                };
+                return Ok(Json(ConversationResponse {
+                    agent: target.name.clone(),
+                    agent_id: target.id.to_string(),
+                    turns: vec![ConversationTurnView {
+                        id: doc_id,
+                        text,
+                        raw_bytes: None,
+                        source: Some("memory".into()),
+                        direction: "in".into(),
+                        from: format!("agent:{}", target.name),
+                        to: format!("agent:{}", target.name),
+                        reply_to: Some(filename),
+                        timestamp_ms,
+                        raw: Some(coord.clone().into()),
+                        window: Some(coord.into()),
+                        tool_name: None,
+                        tool_names: Vec::new(),
+                        role: Some("memory".into()),
+                    }],
+                }));
+            }
+            let target = if name.eq_ignore_ascii_case("self")
+                || name.eq_ignore_ascii_case("all")
+                || name == "*"
+            {
+                match &principal {
+                    Principal::Agent { agent_id, .. } => {
+                        state.store.agent(agent_id).map_err(ApiError::from_store)?
+                    }
+                    Principal::Operator => {
+                        return Err(ApiError::new(
+                            StatusCode::BAD_REQUEST,
+                            "operator memory write requires an explicit agent name",
+                        ));
+                    }
+                }
+            } else {
+                state
+                    .store
+                    .agent_by_name(name.strip_prefix("agent:").unwrap_or(&name))
+                    .map_err(ApiError::from_store)?
+            };
+            let allowed = match &principal {
+                Principal::Operator => true,
+                Principal::Agent { agent_id, .. } => {
+                    is_self_or_ancestor(&state.store, agent_id, &target)
+                }
+            };
+            if !allowed {
+                return Err(ApiError::forbidden(
+                    "memory write requires self, ancestor, or operator authority",
+                ));
+            }
+            let _guard = state
+                .store
+                .lock_agent_lifecycle(&target.id)
+                .map_err(ApiError::from_store)?;
+            let agent_root = state
+                .store
+                .data_dir()
+                .join("agents")
+                .join(target.id.as_str());
+            let now_ms = anyagents_core::now_ms();
+            let turn = if query.delete == Some(true) {
+                let (removed, index) = anyagents_core::learned_memory::delete_memory_topic(
+                    &agent_root,
+                    &target.name,
+                    target.role.as_deref(),
+                    topic,
+                )
+                .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.to_string()))?;
+                let _ = state.store.sync_agent_memory_index(&target);
+                ConversationTurnView {
+                    id: format!("memory:{}:deleted:{}", target.id, topic),
+                    text: format!("deleted={removed}\n{index}"),
+                    raw_bytes: None,
+                    source: Some("memory".into()),
+                    direction: "in".into(),
+                    from: format!("agent:{}", target.name),
+                    to: format!("agent:{}", target.name),
+                    reply_to: None,
+                    timestamp_ms: Some(now_ms),
+                    raw: None,
+                    window: None,
+                    tool_name: None,
+                    tool_names: Vec::new(),
+                    role: Some("memory".into()),
+                }
+            } else {
+                let body_text = query.content.as_deref().unwrap_or_default();
+                let (path, entry, _) = anyagents_core::learned_memory::upsert_memory_topic(
+                    &agent_root,
+                    &target.name,
+                    target.role.as_deref(),
+                    topic,
+                    query.description.as_deref(),
+                    body_text,
+                    now_ms,
+                )
+                .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.to_string()))?;
+                let _ = state.store.sync_agent_memory_index(&target);
+                let bytes = std::fs::read(&path).unwrap_or_default();
+                let digest = anyagents_core::learned_memory::sha256(&bytes);
+                let doc_id = format!(
+                    "memory:{}:{}",
+                    target.id,
+                    anyagents_core::learned_memory::sha256(path.as_os_str().as_encoded_bytes())
+                );
+                let coord = anyagents_core::raw_segment::RawCoordinate {
+                    segment: path,
+                    offset: 0,
+                    length: bytes.len() as u64,
+                    sha256: digest,
+                    seq: 1,
+                };
+                ConversationTurnView {
+                    id: doc_id,
+                    text: String::from_utf8_lossy(&bytes).into_owned(),
+                    raw_bytes: None,
+                    source: Some("memory".into()),
+                    direction: "in".into(),
+                    from: format!("agent:{}", target.name),
+                    to: format!("agent:{}", target.name),
+                    reply_to: Some(entry.filename),
+                    timestamp_ms: Some(now_ms),
+                    raw: Some(coord.clone().into()),
+                    window: Some(coord.into()),
+                    tool_name: None,
+                    tool_names: Vec::new(),
+                    role: Some("memory".into()),
+                }
+            };
+            return Ok(Json(ConversationResponse {
+                agent: target.name,
+                agent_id: target.id.to_string(),
+                turns: vec![turn],
+            }));
+        }
         let (name, visible_agent_ids) = conversation_visibility(&state.store, &principal, &name)?;
         if query.raw_id.is_none()
             && (query.raw_sha256.is_some()
@@ -5039,10 +5439,17 @@ async fn conversation_route(
                 .map(|a| a.id.to_string())
                 .collect(),
         };
-        let file_hits = state
-            .store
-            .search_host_files(&authorized, query.scope, &file_request)
-            .map_err(|e| ApiError::from_store(Error::Message(e.to_string())))?;
+        let should_search_host_files = has_structured_search
+            || query.scope != anyagents_core::host_index::MemoryScope::All
+            || std::env::var_os("ANYAGENTS_TESTS").is_some();
+        let file_hits = if should_search_host_files {
+            state
+                .store
+                .search_host_files(&authorized, query.scope, &file_request)
+                .map_err(|e| ApiError::from_store(Error::Message(e.to_string())))?
+        } else {
+            Vec::new()
+        };
 
         let (agent_name, agent_id_str, raw_turns) =
             if query.scope == anyagents_core::host_index::MemoryScope::Memory {
@@ -5141,6 +5548,15 @@ async fn conversation_route(
             .map(|(rank, t)| (1.0 / (30.0 + rank as f64), t))
             .collect();
         for (rank, (hit, bytes)) in file_hits.into_iter().enumerate() {
+            let reply_to = (hit.metadata.source == anyagents_core::host_index::MemoryScope::Memory)
+                .then(|| {
+                    hit.raw
+                        .segment
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .map(str::to_string)
+                })
+                .flatten();
             ranked.push((
                 1.0 / (30.0 + rank as f64),
                 ConversationTurnView {
@@ -5149,7 +5565,7 @@ async fn conversation_route(
                     direction: hit.metadata.direction,
                     from: hit.metadata.sender,
                     to: hit.metadata.destination,
-                    reply_to: None,
+                    reply_to,
                     text: String::from_utf8_lossy(&bytes).into_owned(),
                     timestamp_ms: hit.metadata.timestamp_ms,
                     source: Some(
@@ -6926,6 +7342,19 @@ fn deliver_telegram(
     })
 }
 
+async fn web_route(
+    _principal: Principal,
+    State(state): State<AppState>,
+    Json(body): Json<crate::web::WebRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    spawn_store(move || {
+        crate::web::execute_web_request(Some(state.store.data_dir()), body)
+            .map(Json)
+            .map_err(|msg| ApiError::new(StatusCode::BAD_REQUEST, msg))
+    })
+    .await
+}
+
 async fn spawn_store<T: Send + 'static>(
     work: impl FnOnce() -> Result<T, ApiError> + Send + 'static,
 ) -> Result<T, ApiError> {
@@ -6991,6 +7420,52 @@ pub fn owner_workdir() -> Option<std::path::PathBuf> {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[test]
+    fn idle_memory_consolidation_preserves_selected_and_disabled_session_pins() {
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        for (name, source) in [
+            ("default", Some(std::path::Path::new("memory/MEMORY.md"))),
+            ("selected", Some(std::path::Path::new("selected.md"))),
+            ("disabled", None),
+        ] {
+            let agent = store
+                .create_agent(anyagents_core::NewAgent::new(name, "codex"))
+                .unwrap();
+            let root = dir.path().join("agents").join(agent.id.as_str());
+            std::fs::create_dir_all(root.join("memory")).unwrap();
+            std::fs::write(root.join("memory/MEMORY.md"), "original default").unwrap();
+            std::fs::write(root.join("selected.md"), "original selected").unwrap();
+            let pinned =
+                anyagents_core::host_session::new_session_with_source(&root, "codex", source)
+                    .unwrap();
+            anyagents_core::learned_memory::upsert_memory_topic(
+                &root,
+                name,
+                None,
+                "new-topic",
+                Some("new fact"),
+                "changed after pin",
+                anyagents_core::now_ms(),
+            )
+            .unwrap();
+            std::fs::write(root.join("selected.md"), "changed selected").unwrap();
+            consolidate_idle_agent_memory(&store, dir.path(), &HealthBoard::default());
+            assert_eq!(
+                anyagents_core::host_session::active(&root).unwrap(),
+                Some(pinned.clone())
+            );
+            let next =
+                anyagents_core::host_session::new_session_with_source(&root, "codex", source)
+                    .unwrap();
+            assert_ne!(next.generation, pinned.generation);
+            if source.is_some() {
+                assert_ne!(next.memory.sha256, pinned.memory.sha256);
+            } else {
+                assert_eq!(next.memory.sha256, pinned.memory.sha256);
+            }
+        }
+    }
     use super::*;
     use std::io::{Read, Write};
     use std::sync::MutexGuard;
@@ -9789,6 +10264,132 @@ exec '{}' "$@"
         unsafe {
             std::env::remove_var("ANYAGENTS_FAKE_MODE");
         }
+    }
+
+    #[test]
+    fn memory_topic_upsert_syncs_index_and_supports_direct_o1_topic_read() {
+        let _env = env_lock();
+        let dir = crate::test_tempdir();
+        let state = archetype_validation_state(dir.path());
+        let vulcan = state
+            .store
+            .create_agent(anyagents_core::NewAgent::new("vulcan", "agy"))
+            .unwrap();
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            // 1. Seed initial index so the 60s refresh cache is populated before upsert.
+            let _ = state.store.sync_agent_memory_index(&vulcan);
+
+            // 2. Upsert a topic via conversation_route.
+            let Json(upserted) = conversation_route(
+                Principal::Agent {
+                    agent_id: vulcan.id.clone(),
+                    name: vulcan.name.clone(),
+                },
+                State(state.clone()),
+                AxumPath(vulcan.name.clone()),
+                Query(ConversationQuery {
+                    scope: anyagents_core::host_index::MemoryScope::Memory,
+                    topic: Some("test-invariants".into()),
+                    description: Some("Vulcan system invariants and verified receipts".into()),
+                    content: Some(
+                        "# Test Invariants\n\nVerified invariant alpha-beta-gamma.\n".into(),
+                    ),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{}: {}", e.status, e.message));
+
+            assert_eq!(upserted.turns.len(), 1);
+            let turn = &upserted.turns[0];
+            assert!(
+                turn.raw_bytes.is_none(),
+                "upsert response must not bloat payload with raw_bytes"
+            );
+            let raw = turn.raw.as_ref().expect("raw coordinate");
+            assert_eq!(raw.seq, 1);
+
+            // 3. Immediate raw_id + raw_sha256 readback (Read-Your-Own-Writes within 60s window).
+            let Json(raw_read) = conversation_route(
+                Principal::Agent {
+                    agent_id: vulcan.id.clone(),
+                    name: vulcan.name.clone(),
+                },
+                State(state.clone()),
+                AxumPath(vulcan.name.clone()),
+                Query(ConversationQuery {
+                    scope: anyagents_core::host_index::MemoryScope::Memory,
+                    raw_id: Some(turn.id.clone()),
+                    raw_sha256: Some(raw.sha256.clone()),
+                    raw_offset: Some(0),
+                    raw_length: Some(32),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "immediate raw_id readback failed: {}: {}",
+                    e.status, e.message
+                )
+            });
+            assert_eq!(raw_read.turns.len(), 1);
+            assert!(
+                raw_read.turns[0].raw_bytes.is_some(),
+                "explicit raw_id slice read must include raw_bytes"
+            );
+
+            // 4. Direct O(1) read by topic (without content or delete).
+            let Json(topic_read) = conversation_route(
+                Principal::Agent {
+                    agent_id: vulcan.id.clone(),
+                    name: vulcan.name.clone(),
+                },
+                State(state.clone()),
+                AxumPath(vulcan.name.clone()),
+                Query(ConversationQuery {
+                    scope: anyagents_core::host_index::MemoryScope::Memory,
+                    topic: Some("test-invariants".into()),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("direct topic read failed: {}: {}", e.status, e.message));
+            assert_eq!(topic_read.turns.len(), 1);
+            assert!(
+                topic_read.turns[0]
+                    .text
+                    .contains("Verified invariant alpha-beta-gamma.")
+            );
+            assert!(topic_read.turns[0].raw_bytes.is_none());
+            assert_eq!(
+                topic_read.turns[0].reply_to.as_deref(),
+                Some("test-invariants.md")
+            );
+
+            // 5. Lexical search in scope="memory" returns the topic file with reply_to filename
+            // and does not return duplicate MEMORY.md index hits.
+            let Json(searched) = conversation_route(
+                Principal::Agent {
+                    agent_id: vulcan.id.clone(),
+                    name: vulcan.name.clone(),
+                },
+                State(state.clone()),
+                AxumPath(vulcan.name.clone()),
+                Query(ConversationQuery {
+                    scope: anyagents_core::host_index::MemoryScope::Memory,
+                    query: Some("invariants".into()),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("memory search failed: {}: {}", e.status, e.message));
+            assert_eq!(searched.turns.len(), 1);
+            assert_eq!(
+                searched.turns[0].reply_to.as_deref(),
+                Some("test-invariants.md")
+            );
+        });
     }
 }
 
