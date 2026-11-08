@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 
 use super::{SharedState, execute_sylphx_tool, run_cloud_session_turn, run_native_gateway_turn};
 
-fn next_http_request(listener: &TcpListener) -> (TcpStream, String, Value) {
+pub(super) fn next_http_request(listener: &TcpListener) -> (TcpStream, String, Value) {
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut stream = loop {
         match listener.accept() {
@@ -65,7 +65,7 @@ fn next_request(listener: &TcpListener) -> (TcpStream, Value) {
     (stream, value)
 }
 
-fn respond(mut stream: TcpStream, body: Value) {
+pub(super) fn respond(mut stream: TcpStream, body: Value) {
     let body = body.to_string();
     write!(
         stream,
@@ -253,7 +253,7 @@ fn masked_results_keep_observation_limits_and_unrecognized_diagnostics() {
 }
 
 #[test]
-fn cloud_bridge_submits_only_the_masked_tool_result() {
+fn cloud_session_never_reads_local_skills_or_submits_client_tool_results() {
     let tmp = tempfile::tempdir().unwrap();
     let cfg = tmp.path().join("cfg");
     let work = tmp.path().join("work");
@@ -295,23 +295,12 @@ fn cloud_bridge_submits_only_the_masked_tool_result() {
             stream,
             json!({"session_events":[{"sequence":1,"turn":1,"type":"TOOL_CALL","tool_call":{"id":"cloud_call","tool":"activate_skill","input":{"name":"masking-fixture"}}}]}),
         );
-        let (stream, route, body) = next_http_request(&listener);
-        assert!(route.contains(":submittoolresult "), "{route}");
-        // Always answer before asserting, so a failing regression cannot hang the client.
-        respond(stream, json!({}));
         let (stream, route, _) = next_http_request(&listener);
+        respond(stream, json!({"state":"completed","last_event_sequence":1}));
         assert!(
             route.starts_with("get /v1/environments/masking/agent_sessions/s "),
-            "{route}"
+            "unexpected callback request: {route}"
         );
-        respond(stream, json!({"state":"completed","last_event_sequence":1}));
-        assert_eq!(body["call_id"], "cloud_call");
-        assert_eq!(body["error"], false);
-        assert_eq!(
-            body["output"],
-            "password=[redacted]\nnovel cloud diagnostic 測試🙂"
-        );
-        assert!(!body.to_string().contains("cloudbridgecanary"));
     });
     let state = Arc::new(Mutex::new(SharedState {
         cloud_agent_id: Some("environments/masking/agents/a".into()),
@@ -337,5 +326,7 @@ fn cloud_bridge_submits_only_the_masked_tool_result() {
     result.unwrap();
     let stored = std::fs::read_to_string(cfg.join("sylphx-transcript.jsonl")).unwrap();
     assert!(!stored.contains("cloudbridgecanary"));
-    assert!(stored.contains("novel cloud diagnostic 測試🙂"));
+    assert!(!stored.contains("novel cloud diagnostic 測試🙂"));
+    assert!(!stored.contains("function_call"));
+    assert!(!cfg.join("sylphx-cloud-tool-receipt.json").exists());
 }

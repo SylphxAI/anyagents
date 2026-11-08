@@ -11,8 +11,8 @@
 //!    - **Sylphx Agents BaaS mode (`SYLPHX_AGENT_ENV`)**: Connects to
 //!      `https://api.sylphx.com/v1/{env}/agent_sessions` (`sylphx.agents.v1`), passing
 //!      a declarative `EnvironmentSpec` (`shape: "linux-xs"`, `template: "template:agent"`,
-//!      `repo: { uri, revision }`) and bridging AnyAgents coordination tools via
-//!      `:submitToolResult`.
+//!      `repo: { uri, revision }`) and executing entirely in the cloud with
+//!      built-in shell and file tools.
 //!    - **Native Sylphx AI + Sylphx Sandboxes mode**: Multi-step tool loop against
 //!      `https://api.sylphx.com/v1/responses` with local or Cloud Kata microVM Sandbox
 //!      worktrees (`cloud` submodule), KV-cache pinned append-only context windows,
@@ -684,55 +684,12 @@ fn cloud_session_resource_path(env_slug: &str, sess_id: &str) -> String {
     }
 }
 
-/// Returns true only for AnyAgents multi-agent coordination / local takeover tools that
-/// must be bridged to the local AnyAgents daemon via `:submitToolResult`.
-///
-/// Workspace execution (`bash`/`shell`, `read_file`/`write_file`/`edit_file`/`apply_patch`,
-/// `grep`, `glob`, `list_dir`, `code_mode`, `sandbox`) and in-session context tools
-/// (`memory_recall`, `context_budget_read`, `context_edit`, `context_window_open`,
-/// `activate_skill`) are already provided natively by the Cloud Agent Runtime and Sandbox
-/// (`builtin: {id: "shell"}`, `builtin: {id: "files"}`), so they are never duplicated as
-/// client tools.
-fn is_cloud_client_coordination_tool(name: &str) -> bool {
-    matches!(
-        name,
-        "send"
-            | "describe"
-            | "archive"
-            | "agents"
-            | "conversation"
-            | "groups"
-            | "schedule"
-            | "browser"
-            | "goal"
-            | "sandbox"
-            | "activate_skill"
-    )
-}
-
-fn build_cloud_agent_client_tools() -> Vec<Value> {
-    build_legacy_tool_definitions()
-        .into_iter()
-        .filter_map(|t| {
-            let func = t.get("function")?;
-            let name = func.get("name")?.as_str()?;
-            if !is_cloud_client_coordination_tool(name) {
-                return None;
-            }
-            Some(json!({
-                "name": name,
-                "description": func.get("description").cloned().unwrap_or(Value::String(String::new())),
-                "input_schema": func.get("parameters").cloned().unwrap_or_else(|| json!({"type": "object", "properties": {}})),
-                "client": {
-                    "timeout": "600s"
-                },
-            }))
-        })
-        .collect()
-}
-
+/// Cloud sessions execute exclusively with tools provided by the cloud runtime.
 fn build_cloud_agent_tools() -> Vec<Value> {
-    build_cloud_agent_client_tools()
+    vec![
+        json!({ "builtin": { "id": "shell" } }),
+        json!({ "builtin": { "id": "files" } }),
+    ]
 }
 
 fn format_rfc3339_utc_plus_secs(offset_secs: u64) -> String {
@@ -850,12 +807,6 @@ fn capture_cloud_turn_execution(
     })))
 }
 
-/// Runs a turn against the remote Sylphx Cloud Agents BaaS (`/v1/{env}/agent_sessions`),
-/// passing a declarative `EnvironmentSpec` (`shape: "linux-s"`, `template: "template:agent"`,
-/// `idle_standby: "1800s"`), native cloud `builtin` tools (`shell`, `files`), and bridging
-/// only AnyAgents coordination client tool calls (`send`, `agents`, `conversation`, `groups`,
-/// `schedule`, `browser`, `describe`, `archive`, `goal`) via `:submitToolResult`.
-#[allow(clippy::too_many_arguments)]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 pub struct PersistedCloudSession {
     pub agent_id: String,
@@ -1007,6 +958,7 @@ pub fn build_prior_transcript_continuity_block(transcript_path: &Path) -> Option
     ))
 }
 
+/// Runs a turn entirely in the cloud, recording the final assistant output and usage.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_cloud_session_turn(
     state: &Arc<Mutex<SharedState>>,
@@ -1015,8 +967,8 @@ pub(crate) fn run_cloud_session_turn(
     work_dir: &Path,
     model: Option<&str>,
     env: &workspace::Environment,
-    mcp_command: &Path,
-    mcp_args: &[String],
+    _mcp_command: &Path,
+    _mcp_args: &[String],
     env_slug: &str,
     user_message: &str,
 ) -> Result<TurnUsage, String> {
@@ -1036,8 +988,8 @@ pub(crate) fn run_cloud_session_turn(
         let g = state.lock().unwrap_or_else(PoisonError::into_inner);
         (g.cloud_agent_id.clone(), g.cloud_session_id.clone())
     };
-    // Reconcile retained local effects before interrupting/reusing a remote session.
-    flush_cloud_tool_receipt(config_dir, &base, &api_key)?;
+    // Retain legacy receipts for operator reconciliation without replaying host effects.
+    reject_legacy_cloud_tool_receipt(config_dir)?;
     if let Some(pending) = read_json(&config_dir.join("sylphx-cloud-turn-pending.json"))? {
         if pending.get("state").and_then(Value::as_str) == Some("accepted") {
             remove_optional(&config_dir.join("sylphx-cloud-turn-pending.json"))?;
@@ -1213,22 +1165,19 @@ pub(crate) fn run_cloud_session_turn(
         })
         .unwrap_or_else(|| "google/gemini-3-flash".to_string());
     let agent_short_name = resolve_agent_short_name(config_dir, env);
-    let mut system_prompt = assemble_system_prompt(config_dir, work_dir);
-    let mut initial_session_context = String::new();
-    if let Some(prior_block) = build_prior_transcript_continuity_block(&transcript_path) {
-        initial_session_context.push_str(&prior_block);
-    }
-    initial_session_context.push_str(&load_explicit_context(config_dir, work_dir)?);
+    // Local identity, coordination instructions, skills, and tool history do not
+    // belong to the cloud runtime. Only explicitly configured task context is sent.
+    let initial_session_context = load_explicit_context(config_dir, work_dir)?;
     let environment_spec = build_cloud_environment_spec(config_dir, Some(work_dir), env);
-    system_prompt.push_str(&format!(
-        "\n\n<cloud_workspace>\nYou are running on a general-purpose Linux computer (workspace `{CLOUD_WORKSPACE_DIR}`) whose files persist across turns.\n\
+    let system_prompt = format!(
+        "You are a Sylphx Cloud Agent. Complete the user's task entirely in your cloud workspace using the built-in shell and file tools. Return your final answer as assistant text.\n\n\
+<cloud_workspace>\nYou are running on a general-purpose Linux computer (workspace `{CLOUD_WORKSPACE_DIR}`) whose files persist across turns.\n\
 Standard tools (`python3`, `node`, `git`, `gh`, `sylphx`, `curl`) are pre-installed and pre-authenticated.\n\
 Clone any Git repository you need directly (`git clone` / `gh repo clone`).\n\
-The local VM is lightweight (`1 vCPU / 2 GiB RAM`); whenever you need to run a CPU- or memory-intensive command of any kind, you can execute it on an on-demand 16-vCPU / 32-GiB remote machine and sync output files back via:\n\
+The VM is lightweight (`1 vCPU / 2 GiB RAM`); whenever you need to run a CPU- or memory-intensive command, execute it on an on-demand 16-vCPU / 32-GiB remote machine and sync output files back via:\n\
 `sylphx build run --size large [--artifact \"<glob>\" --out .] -- <command>`\n\
-If a task requires deployment-provided host-only capabilities, call `sandbox` with `action: \"placement\"` and `placement: \"local\"` to switch this session seamlessly to the local Sylphx harness.\n\
 </cloud_workspace>"
-    ));
+    );
 
     let current_fp = compute_instructions_fingerprint(&agent_short_name, &system_prompt);
     let fp_path = config_dir.join(".sylphx-cloud-instructions-fingerprint");
@@ -1292,7 +1241,7 @@ If a task requires deployment-provided host-only capabilities, call `sandbox` wi
             .ok_or("cloud creation missing agent identity")?;
         let body = json!({
             "agent": agent_ref,
-            "title": "AnyAgents Session",
+            "title": "Sylphx Cloud Session",
             "environment": environment_spec,
         });
         let (st, raw) = auth::post_cloud_json(&create_sess_url, Some(&api_key), &body)?;
@@ -1386,11 +1335,8 @@ If a task requires deployment-provided host-only capabilities, call `sandbox` wi
 
     let sess_url = format!("{base}/v1/{sess_path}");
     let events_url = format!("{base}/v1/{sess_path}/session_events");
-    let mut handled_call_ids = std::collections::HashSet::new();
     let mut last_seq: i64 = initial_last_seq;
     let baseline_seq: i64 = initial_last_seq;
-    let mut sent_any_reply = false;
-    let mut self_archived = false;
     let mut assistant_texts: Vec<String> = Vec::new();
     let mut turn_in_tok: u64 = 0;
     let mut turn_out_tok: u64 = 0;
@@ -1406,11 +1352,12 @@ If a task requires deployment-provided host-only capabilities, call `sandbox` wi
         })
         .unwrap_or(180_000);
     let mut last_progress = Instant::now();
+    let mut turn_completed = false;
 
     while !cancel_flag.load(Ordering::SeqCst) {
         std::thread::sleep(Duration::from_millis(1_200));
 
-        // Poll session_events for client tool calls and assistant messages
+        // Observe cloud progress and output; tool execution stays in the cloud runtime.
         let poll_events_url = if last_seq > 0 {
             format!("{events_url}?filter=sequence%20%3E%20{last_seq}")
         } else {
@@ -1450,130 +1397,16 @@ If a task requires deployment-provided host-only capabilities, call `sandbox` wi
                     .get("type")
                     .and_then(Value::as_str)
                     .unwrap_or("")
-                    .to_ascii_uppercase();
+                    .to_ascii_uppercase()
+                    .replace('.', "_");
 
-                if let Some(tc) = ev.get("tool_call").or_else(|| ev.get("toolCall")) {
+                if matches!(
+                    ev_type.as_str(),
+                    "SESSION_IDLE" | "TURN_COMPLETED" | "SESSION_COMPLETED"
+                ) {
+                    turn_completed = true;
+                } else if ev.get("tool_call").or_else(|| ev.get("toolCall")).is_some() {
                     last_progress = Instant::now();
-                    let call_id = tc
-                        .get("id")
-                        .or_else(|| tc.get("call_id"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
-                    let tool_name = tc
-                        .get("tool")
-                        .or_else(|| tc.get("name"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("");
-                    let norm_fn = tool_name
-                        .strip_prefix("mcp__anyagents__")
-                        .unwrap_or(tool_name);
-                    let is_client = is_cloud_client_coordination_tool(norm_fn)
-                        && tc.get("client").and_then(Value::as_bool).unwrap_or(true);
-                    if is_client && call_id.trim().is_empty() {
-                        return Err("missing cloud tool call id".into());
-                    }
-                    if is_client && handled_call_ids.insert(call_id.clone()) {
-                        let input_val = tc
-                            .get("input")
-                            .or_else(|| tc.get("arguments"))
-                            .cloned()
-                            .ok_or("missing cloud tool arguments")?;
-                        let parsed_args = if let Some(s) = input_val.as_str() {
-                            tool_arguments(s)?
-                        } else {
-                            input_val
-                        };
-                        if !parsed_args.is_object() {
-                            return Err("cloud tool arguments must be an object".into());
-                        }
-                        let norm_fn = tool_name
-                            .strip_prefix("mcp__anyagents__")
-                            .unwrap_or(tool_name);
-                        if norm_fn == "archive"
-                            && parsed_args
-                                .get("agent")
-                                .or_else(|| parsed_args.get("name"))
-                                .and_then(Value::as_str)
-                                .is_none_or(|s| {
-                                    s.trim().is_empty() || s.eq_ignore_ascii_case("self")
-                                })
-                        {
-                            self_archived = true;
-                        }
-                        append_transcript_message(
-                            &transcript_path,
-                            &json!({
-                                "type": "function_call",
-                                "call_id": call_id,
-                                "name": tool_name,
-                                "arguments": serde_json::to_string(&parsed_args).unwrap_or_else(|_| "{}".to_string()),
-                            }),
-                        )?;
-                        let receipt_path = config_dir.join("sylphx-cloud-tool-receipt.json");
-                        write_atomic(&receipt_path, json!({"session_path": sess_path, "call_id": call_id, "state": "executing", "event_sequence": seq}).to_string().as_bytes())?;
-                        let output = execute_sylphx_tool(
-                            tool_name,
-                            &parsed_args,
-                            config_dir,
-                            work_dir,
-                            env,
-                            mcp_command,
-                            mcp_args,
-                        );
-                        append_transcript_message(
-                            &transcript_path,
-                            &json!({
-                                "type": "function_call_output",
-                                "call_id": call_id,
-                                "output": output,
-                            }),
-                        )?;
-                        if matches!(norm_fn, "send" | "code")
-                            && reply_delivered(
-                                &output,
-                                extract_envelope_sender(user_message).as_deref(),
-                            )
-                        {
-                            sent_any_reply = true;
-                        }
-                        let is_err = output.starts_with("error:");
-                        if norm_fn == "sandbox"
-                            && !is_err
-                            && resolve_cloud_agent_environment(config_dir, env)?.is_none()
-                        {
-                            // The placement tool already settled and durably pulled the cloud session.
-                            remove_optional(&receipt_path)?;
-                            {
-                                let mut g = state.lock().unwrap_or_else(PoisonError::into_inner);
-                                g.cloud_agent_id = None;
-                                g.cloud_session_id = None;
-                            }
-                            let local_usage = run_native_gateway_turn(
-                                state,
-                                cancel_flag,
-                                config_dir,
-                                work_dir,
-                                model,
-                                env,
-                                mcp_command,
-                                mcp_args,
-                                user_message,
-                            )?;
-                            return Ok(TurnUsage {
-                                input_tokens: turn_in_tok.saturating_add(local_usage.input_tokens),
-                                output_tokens: turn_out_tok
-                                    .saturating_add(local_usage.output_tokens),
-                                cache_read_tokens: turn_cache_read_tok
-                                    .saturating_add(local_usage.cache_read_tokens),
-                                cache_write_tokens: local_usage.cache_write_tokens,
-                                ..TurnUsage::default()
-                            });
-                        }
-                        write_atomic(&receipt_path, json!({"session_path": sess_path, "call_id": call_id, "state": "completed", "event_sequence": seq, "output": output, "error": is_err}).to_string().as_bytes())?;
-                        flush_cloud_tool_receipt(config_dir, &base, &api_key)?;
-                        last_progress = Instant::now();
-                    }
                 } else if ev_type == "USAGE" {
                     let parse_u64 = |ptr: &str| -> u64 {
                         ev.pointer(ptr)
@@ -1651,9 +1484,13 @@ If a task requires deployment-provided host-only capabilities, call `sandbox` wi
                     } else {
                         Some(serde_json::to_string(ev).unwrap_or_default())
                     };
-                    if let Some(ev_str) = err_candidate
-                        && is_recoverable_cloud_session_lease_error(&ev_str)
-                    {
+                    if let Some(ev_str) = err_candidate {
+                        if !is_recoverable_cloud_session_lease_error(&ev_str) {
+                            if ev_type == "ERROR" {
+                                return Err(format!("cloud session turn error: {ev_str}"));
+                            }
+                            continue;
+                        }
                         if ev_str.contains("Pinned repository preparation failed") {
                             let _ = std::fs::write(
                                 config_dir.join(".anyagents-skip-pinned-repo"),
@@ -1671,26 +1508,36 @@ If a task requires deployment-provided host-only capabilities, call `sandbox` wi
             }
         }
 
-        if self_archived {
-            break;
-        }
-
-        if let Ok((st_poll, raw_poll)) = curl_get(&sess_url, Some(&api_key))
-            && (200..300).contains(&st_poll)
-            && let Ok(val) = serde_json::from_str::<Value>(&raw_poll)
-        {
+        let session = curl_get(&sess_url, Some(&api_key))
+            .ok()
+            .filter(|(status, _)| (200..300).contains(status))
+            .and_then(|(_, raw)| serde_json::from_str::<Value>(&raw).ok());
+        if turn_completed || session.is_some() {
+            let val = session.unwrap_or_else(|| json!({}));
             let status = val
                 .get("state")
                 .or_else(|| val.get("status"))
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_ascii_lowercase();
-            if status == "idle" || status == "session_state_idle" || status == "completed" {
-                let session_last_seq = sequence(
-                    val.get("last_event_sequence")
-                        .or_else(|| val.get("lastEventSequence")),
-                    true,
-                )?;
+            if matches!(
+                status.as_str(),
+                "failed" | "session_state_failed" | "terminated" | "errored"
+            ) {
+                clear_persisted_cloud_session(config_dir)?;
+                return Err(format!("cloud session ended with status `{status}`"));
+            }
+            if turn_completed
+                || matches!(status.as_str(), "idle" | "session_state_idle" | "completed")
+            {
+                let session_sequence = val
+                    .get("last_event_sequence")
+                    .or_else(|| val.get("lastEventSequence"));
+                let session_last_seq = if turn_completed && session_sequence.is_none() {
+                    last_seq
+                } else {
+                    sequence(session_sequence, true)?
+                };
                 if session_last_seq > last_seq {
                     continue;
                 }
@@ -1714,32 +1561,6 @@ If a task requires deployment-provided host-only capabilities, call `sandbox` wi
                             "content": [{ "type": "output_text", "text": content_text.trim() }],
                         }),
                     )?;
-                }
-                if !sent_any_reply
-                    && !content_text.trim().is_empty()
-                    && !content_text.trim().eq_ignore_ascii_case("NO_REPLY")
-                    && let Some(reply_to) = extract_envelope_sender(user_message)
-                {
-                    let reply_receipt = call_anyagents_mcp_tool(
-                        mcp_command,
-                        mcp_args,
-                        env,
-                        "send",
-                        &json!({
-                            "to": reply_to,
-                            "text": content_text.trim(),
-                        }),
-                    );
-                    if !reply_delivered(
-                        &reply_receipt,
-                        extract_envelope_sender(user_message).as_deref(),
-                    ) {
-                        remove_optional(&pending_cloud_turn)?;
-                        return Err(
-                            "automatic reply delivery was not acknowledged; pending reply retained"
-                                .into(),
-                        );
-                    }
                 }
                 let in_tok = if turn_in_tok > 0 {
                     turn_in_tok
@@ -1780,17 +1601,8 @@ If a task requires deployment-provided host-only capabilities, call `sandbox` wi
                     ..TurnUsage::default()
                 });
             }
-            if status == "failed"
-                || status == "session_state_failed"
-                || status == "terminated"
-                || status == "errored"
-            {
-                clear_persisted_cloud_session(config_dir)?;
-                return Err(format!("cloud session ended with status `{status}`"));
-            }
             if last_seq <= baseline_seq + 2
                 && assistant_texts.is_empty()
-                && handled_call_ids.is_empty()
                 && last_progress.elapsed() >= Duration::from_millis(stall_timeout_ms)
             {
                 interrupt_and_settle(&base, &sess_path, &api_key)?;
@@ -3653,7 +3465,7 @@ fn build_tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "bash",
-                "description": "Execute a bash command (`git`, `cargo`, `npm`, `kubectl`, `op`, etc.) in your working directory, or switch workspace placement (`placement`: `\"local\" | \"cloud\"`).",
+                "description": "Execute a bash command (`git`, `cargo`, `npm`, `kubectl`, `op`, etc.) in your working directory.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -3664,11 +3476,6 @@ fn build_tool_definitions() -> Vec<Value> {
                         "timeout_ms": {
                             "type": "integer",
                             "description": "Optional timeout in milliseconds (default 120000)."
-                        },
-                        "placement": {
-                            "type": "string",
-                            "enum": ["local", "cloud"],
-                            "description": "Optional workspace placement switch (`\"local\"` | `\"cloud\"`)."
                         }
                     },
                     "required": ["command"]
@@ -3911,13 +3718,13 @@ fn build_legacy_tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "sandbox",
-                "description": "Inspect or switch workspace execution placement (`action`: `\"placement\"` | `\"status\"`, `placement`: `\"local\"` | `\"cloud\"`). Use local placement for capabilities explicitly provided by the host deployment.",
+                "description": "Inspect the current workspace execution placement.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "action": { "type": "string", "enum": ["placement", "status"], "description": "`\"placement\"` to switch placement or `\"status\"` to inspect current placement." },
-                        "placement": { "type": "string", "enum": ["local", "cloud"], "description": "Target execution placement (`\"local\"` for host Sylphx harness, `\"cloud\"` for Sylphx Cloud Sandbox)." }
-                    }
+                        "action": { "type": "string", "enum": ["status"], "description": "Inspect current placement." }
+                    },
+                    "additionalProperties": false
                 }
             }
         }),
@@ -4180,7 +3987,7 @@ fn build_legacy_tool_definitions() -> Vec<Value> {
 }
 
 /// The sole tool-result ingress: every execution route yields complete text here.
-/// Mask before any size projection, then expose only this value to local/cloud
+/// Mask before any size projection, then expose only this value to native harness
 /// consumers. Producers must not truncate text before returning to this boundary.
 fn execute_sylphx_tool(
     name: &str,
@@ -4348,110 +4155,24 @@ fn execute_sylphx_tool_raw(
             .unwrap_or_default()
         }
         "sandbox" => {
-            let action = args
-                .get("action")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .unwrap_or(if args.get("placement").is_some() {
-                    "placement"
-                } else {
-                    "status"
-                });
-            let allowed_raw = env
-                .iter()
-                .find(|(k, _)| k == "SYLPHX_WORKSPACE_PLACEMENTS")
-                .map(|(_, v)| v.clone())
-                .or_else(|| std::env::var("SYLPHX_WORKSPACE_PLACEMENTS").ok())
-                .unwrap_or_else(|| "local,cloud".to_string());
-            let allowed: Vec<String> = allowed_raw
-                .split(',')
-                .map(|s| s.trim().to_ascii_lowercase())
-                .filter(|s| !s.is_empty())
-                .collect();
-            let placement_path = config_dir.join("sylphx-workspace-placement.json");
-            match action {
-                "placement" | "switch" | "set" => {
-                    let Some(target) = args
-                        .get("placement")
-                        .and_then(Value::as_str)
-                        .map(|s| s.trim().to_ascii_lowercase())
-                        .filter(|s| !s.is_empty())
-                    else {
-                        return "error: `sandbox` with `action: \"placement\"` requires `placement: \"local\" | \"cloud\"`"
-                            .to_string();
-                    };
-                    if !matches!(target.as_str(), "local" | "cloud") {
-                        return format!(
-                            "error: unsupported placement `{target}` (expected `\"local\"` or `\"cloud\"`)"
-                        );
-                    }
-                    if !allowed.is_empty() && !allowed.iter().any(|a| a == &target) {
-                        return format!(
-                            "error: workspace placement `{target}` is not permitted by SYLPHX_WORKSPACE_PLACEMENTS (`{allowed_raw}`)"
-                        );
-                    }
-                    if target == "local" {
-                        if let Err(e) = sdk::pull_session_from_cloud(config_dir, env) {
-                            return format!("error: {e}");
-                        }
-                    } else {
-                        if let Err(e) = resolve_cloud_agent_environment(config_dir, env) {
-                            return format!("error: {e}");
-                        }
-                    }
-                    let doc = json!({
-                        "placement": target,
-                        "updated_at_ms": anyagents_core::now_ms(),
-                    });
-                    if let Err(e) = write_atomic(&placement_path, doc.to_string().as_bytes()) {
-                        return format!("error persisting workspace placement: {e}");
-                    }
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt as _;
-                        let _ = std::fs::set_permissions(
-                            &placement_path,
-                            std::fs::Permissions::from_mode(0o660),
-                        );
-                    }
-                    if target == "local" {
-                        let _ = std::fs::remove_file(config_dir.join("sylphx-sandbox-lease.json"));
-                        let _ =
-                            std::fs::remove_file(config_dir.join("sylphx-cloud-tool-receipt.json"));
-                        let _ =
-                            std::fs::remove_file(config_dir.join("sylphx-cloud-turn-pending.json"));
-                    }
-                    serde_json::to_string_pretty(&json!({
-                        "status": "ok",
-                        "placement": target,
-                        "work_dir": work_dir.display().to_string(),
-                        "note": if target == "local" {
-                            "Switched workspace execution to host-local Sylphx harness (`work_dir`). Subsequent `bash`, `read_file`, `write_file`, `edit_file`, `grep`, `glob`, and `code_mode` calls execute directly on the host workspace."
-                        } else {
-                            "Switched workspace execution to Sylphx Cloud Sandbox."
-                        }
-                    }))
-                    .unwrap_or_default()
-                }
-                _ => {
-                    let current = if match resolve_cloud_agent_environment(config_dir, env) {
-                        Ok(value) => value.is_some(),
-                        Err(e) => return format!("error: {e}"),
-                    } {
-                        "cloud"
-                    } else {
-                        "local"
-                    };
-                    serde_json::to_string_pretty(&json!({
-                        "status": "ok",
-                        "placement": current,
-                        "allowed_placements": allowed,
-                        "work_dir": work_dir.display().to_string(),
-                    }))
-                    .unwrap_or_default()
-                }
+            if args.get("placement").is_some()
+                || args
+                    .get("action")
+                    .is_some_and(|action| action.as_str() != Some("status"))
+            {
+                return "error: sandbox only supports `action: \"status\"`; execution placement is configured by the host".into();
             }
+            let current = match resolve_cloud_agent_environment(config_dir, env) {
+                Ok(Some(_)) => "cloud",
+                Ok(None) => "local",
+                Err(e) => return format!("error: {e}"),
+            };
+            serde_json::to_string_pretty(&json!({
+                "status": "ok",
+                "placement": current,
+                "work_dir": work_dir.display().to_string(),
+            }))
+            .unwrap_or_default()
         }
         "activate_skill" | "skill" => {
             let Some(skill_name) = args.get("name").and_then(Value::as_str).map(str::trim) else {
@@ -4692,28 +4413,8 @@ fn execute_sylphx_tool_raw(
             )
         }
         "bash" | "shell" => {
-            if let Some(placement) = args
-                .get("placement")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-            {
-                let switch_res = execute_sylphx_tool_raw(
-                    "sandbox",
-                    &json!({ "action": "placement", "placement": placement }),
-                    config_dir,
-                    work_dir,
-                    env,
-                    mcp_command,
-                    mcp_args,
-                );
-                if args
-                    .get("command")
-                    .and_then(Value::as_str)
-                    .is_none_or(|c| c.trim().is_empty())
-                {
-                    return switch_res;
-                }
+            if args.get("placement").is_some() {
+                return "error: execution placement is configured by the host".into();
             }
             let Some(cmd_str) = args.get("command").and_then(Value::as_str) else {
                 return "error: missing `command`".to_string();
@@ -6591,56 +6292,206 @@ mod tests {
     }
 
     #[test]
-    fn cloud_agent_tools_separate_builtin_workspace_from_client_coordination_tools() {
-        let client_tools = build_cloud_agent_client_tools();
-        let client_names: Vec<&str> = client_tools
-            .iter()
-            .filter_map(|t| t["name"].as_str())
-            .collect();
-        // Coordination & local takeover tools ARE bridged as client tools:
-        for expected in [
-            "send",
-            "describe",
-            "archive",
-            "agents",
-            "conversation",
-            "groups",
-            "schedule",
-            "browser",
-            "goal",
-            "sandbox",
-            "activate_skill",
-        ] {
-            assert!(
-                client_names.contains(&expected),
-                "missing expected client coordination tool `{expected}`"
-            );
-        }
-        // Workspace & local context tools are NEVER duplicated as client tools:
-        for forbidden in [
-            "bash",
-            "read_file",
-            "write_file",
-            "edit_file",
-            "apply_patch",
-            "grep",
-            "glob",
-            "list_dir",
-            "code_mode",
-            "memory_recall",
-            "context_budget_read",
-            "context_edit",
-            "context_window_open",
-        ] {
-            assert!(
-                !client_names.contains(&forbidden),
-                "cloud client tools must not duplicate workspace/context tool `{forbidden}`"
-            );
-        }
+    fn cloud_agent_tools_are_only_builtin_shell_and_files() {
+        assert_eq!(
+            build_cloud_agent_tools(),
+            vec![
+                json!({"builtin": {"id": "shell"}}),
+                json!({"builtin": {"id": "files"}}),
+            ]
+        );
+    }
 
-        let all_cloud_tools = build_cloud_agent_tools();
-        assert_eq!(all_cloud_tools.len(), client_tools.len());
-        assert_eq!(all_cloud_tools[0]["client"]["timeout"], "600s");
+    #[test]
+    fn cloud_sessions_observe_completion_and_errors_without_host_callbacks() {
+        use crate::masking_tests::{next_http_request, respond};
+        use std::net::TcpListener;
+
+        for (terminal, session_status, response_only, fails) in [
+            ("", "idle", false, false),
+            ("", "completed", true, false),
+            ("session.idle", "running", false, false),
+            ("turn.completed", "running", false, false),
+            ("session.completed", "running", false, false),
+            ("ERROR", "failed", false, true),
+            ("RESPONSE", "failed", true, true),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let cfg = tmp.path().join("cfg");
+            let work = tmp.path().join("work");
+            std::fs::create_dir_all(&cfg).unwrap();
+            std::fs::create_dir_all(&work).unwrap();
+            std::fs::write(
+                cfg.join("SYSTEM_PROMPT.md"),
+                "LOCAL_ONLY_IDENTITY: use send and sandbox placement.",
+            )
+            .unwrap();
+            std::fs::write(work.join("AGENTS.md"), "LOCAL_ONLY_INSTRUCTIONS").unwrap();
+            std::fs::write(work.join("task.txt"), "Explicit task reference.").unwrap();
+            std::fs::write(
+                cfg.join("sylphx-agent.json"),
+                r#"{"context_sources":["task.txt"]}"#,
+            )
+            .unwrap();
+            let transcript = cfg.join("sylphx-transcript.jsonl");
+            append_transcript_message(
+                &transcript,
+                &json!({"role":"assistant", "content":"LOCAL_ONLY_HISTORY"}),
+            )
+            .unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let server = std::thread::spawn(move || {
+                let (stream, route, body) = next_http_request(&listener);
+                respond(stream, json!({"name":"org/proj/dev/agents/a"}));
+                assert!(
+                    route.starts_with("post /v1/org/proj/dev/agents "),
+                    "{route}"
+                );
+                assert_eq!(
+                    body["spec"]["tools"],
+                    json!([
+                        {"builtin":{"id":"shell"}}, {"builtin":{"id":"files"}}
+                    ])
+                );
+                let instructions = body["spec"]["instructions"].as_str().unwrap();
+                for forbidden in [
+                    "AnyAgents",
+                    "LOCAL_ONLY_",
+                    "send`",
+                    "placement",
+                    "memory_recall",
+                    "activate_skill",
+                ] {
+                    assert!(!instructions.contains(forbidden), "{instructions}");
+                }
+                let (stream, route, _) = next_http_request(&listener);
+                respond(stream, json!({"name":"org/proj/dev/agent_sessions/s"}));
+                assert!(
+                    route.starts_with("post /v1/org/proj/dev/agent_sessions "),
+                    "{route}"
+                );
+                let (mut stream, route, _) = next_http_request(&listener);
+                write!(
+                    stream,
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+                )
+                .unwrap();
+                drop(stream);
+                assert!(route.contains("/agents:capture-credential "), "{route}");
+                let (stream, route, body) = next_http_request(&listener);
+                respond(stream, json!({}));
+                assert!(route.contains(":send "), "{route}");
+                let text = body["message"]["parts"][0]["text"].as_str().unwrap();
+                assert!(text.contains("Explicit task reference."));
+                assert!(text.contains("Complete the cloud task."));
+                assert!(!text.contains("LOCAL_ONLY_"));
+
+                let calls = json!([
+                    {"sequence":1,"turn":1,"type":"TOOL_CALL","tool_call":{"tool":"shell","client":false,"input":{"command":"touch cloud-callback-ran"}}},
+                    {"sequence":2,"turn":1,"type":"TOOL_CALL","tool_call":{"tool":"send","client":true}},
+                    {"sequence":3,"turn":1,"type":"TOOL_CALL","tool_call":{"id":"placement","tool":"sandbox","client":true,"input":{"action":"placement","placement":"local"}}},
+                    {"sequence":4,"turn":1,"type":"TOOL_CALL","toolCall":{"id":"archive","tool":"archive","client":true,"input":{"agent":"self"}}}
+                ]);
+                let (stream, route, _) = next_http_request(&listener);
+                respond(stream, json!({"session_events":calls}));
+                assert!(route.contains("/session_events "), "{route}");
+                let (stream, route, _) = next_http_request(&listener);
+                // Idle state may be observed before its final output page is read.
+                respond(
+                    stream,
+                    json!({"state":if terminal.is_empty() {"idle"} else {"running"},"last_event_sequence":if terminal.is_empty() {6} else {4}}),
+                );
+                assert!(
+                    route.starts_with("get /v1/org/proj/dev/agent_sessions/s "),
+                    "unexpected host callback: {route}"
+                );
+
+                let message = if response_only {
+                    json!({"sequence":5,"turn":1,"type":"RESPONSE","response":{"text":"Cloud result 測試🙂","is_error":false}})
+                } else {
+                    json!({"sequence":5,"turn":1,"type":"AGENT_MESSAGE","message":{"parts":[{"text":"Cloud result 測試🙂"}]}})
+                };
+                let mut events = vec![
+                    // A repeated event must not execute or duplicate output.
+                    calls[3].clone(),
+                    message,
+                    json!({"sequence":6,"turn":1,"type":"USAGE","usage":{"input_tokens":"12","output_tokens":7,"cached_tokens":2}}),
+                ];
+                if !terminal.is_empty() {
+                    events.push(if fails && response_only {
+                        json!({"sequence":7,"turn":1,"type":"RESPONSE","response":{"is_error":true,"text":"cloud fixture failure"}})
+                    } else if fails {
+                        json!({"sequence":7,"turn":1,"type":"ERROR","error":{"message":"cloud fixture failure"}})
+                    } else {
+                        json!({"sequence":7,"turn":1,"type":terminal})
+                    });
+                }
+                let (stream, route, _) = next_http_request(&listener);
+                respond(stream, json!({"sessionEvents":events}));
+                assert!(route.contains("sequence%20%3e%204"), "{route}");
+                if !fails {
+                    let (stream, route, _) = next_http_request(&listener);
+                    respond(
+                        stream,
+                        json!({"state":session_status,"last_event_sequence":if terminal.is_empty() {6} else {7}}),
+                    );
+                    assert!(
+                        route.starts_with("get /v1/org/proj/dev/agent_sessions/s "),
+                        "{route}"
+                    );
+                }
+            });
+            let env = vec![
+                ("SYLPHX_API_URL".into(), base),
+                ("SYLPHX_API_KEY".into(), "fixture-key".into()),
+            ]
+            .into();
+            let result = run_cloud_session_turn(
+                &Arc::new(Mutex::new(SharedState::default())),
+                &Arc::new(AtomicBool::new(false)),
+                &cfg,
+                &work,
+                Some("cloud-fixture/model"),
+                &env,
+                Path::new("unused-mcp"),
+                &[],
+                "org/proj/dev",
+                "Complete the cloud task.",
+            );
+            server.join().unwrap();
+            assert!(!work.join("cloud-callback-ran").exists());
+            assert!(!cfg.join("sylphx-workspace-placement.json").exists());
+            assert!(!cfg.join("sylphx-cloud-tool-receipt.json").exists());
+            let stored = std::fs::read_to_string(&transcript).unwrap();
+            assert!(!stored.contains("function_call"));
+            if fails {
+                assert!(result.unwrap_err().contains("cloud fixture failure"));
+            } else {
+                let usage = result.unwrap();
+                assert_eq!(
+                    (
+                        usage.input_tokens,
+                        usage.output_tokens,
+                        usage.cache_read_tokens
+                    ),
+                    (12, 7, 2)
+                );
+                let items = load_transcript_input_items(&transcript);
+                let output = items.last().unwrap();
+                assert_eq!(output["role"], "assistant");
+                assert_eq!(output["content"][0]["text"], "Cloud result 測試🙂");
+                assert!(!cfg.join("sylphx-cloud-turn-pending.json").exists());
+                assert_eq!(
+                    load_persisted_cloud_session(&cfg)
+                        .unwrap()
+                        .unwrap()
+                        .last_seq,
+                    if terminal.is_empty() { 6 } else { 7 }
+                );
+            }
+        }
     }
 
     #[test]
@@ -6671,40 +6522,88 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_tool_switches_placement_between_cloud_and_local() {
+    fn sandbox_and_shell_tools_cannot_switch_execution_placement() {
         let tmp = tempfile::tempdir().unwrap();
         let cfg = tmp.path().join("cfg");
         let work = tmp.path().join("work");
         std::fs::create_dir_all(&cfg).unwrap();
         std::fs::create_dir_all(&work).unwrap();
-        let env = vec![
+        let env: workspace::Environment = vec![
             ("SYLPHX_API_KEY".to_string(), "sylphx_sk_test".to_string()),
             ("SYLPHX_AGENT_ENV".to_string(), "org/proj/dev".to_string()),
-        ];
-        assert_eq!(
-            resolve_cloud_agent_environment(&cfg, &env)
-                .unwrap()
-                .as_deref(),
-            Some("org/proj/dev")
-        );
-
-        let out = execute_sylphx_tool(
-            "sandbox",
-            &json!({ "action": "placement", "placement": "local" }),
-            &cfg,
-            &work,
-            &env.clone().into(),
-            Path::new("anyagents"),
-            &[],
-        );
-        let parsed: Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(parsed["status"], "ok");
-        assert_eq!(parsed["placement"], "local");
+        ]
+        .into();
+        let definitions = build_legacy_tool_definitions();
+        let schema = &definitions
+            .iter()
+            .find(|tool| tool["function"]["name"] == "sandbox")
+            .unwrap()["function"]["parameters"];
+        assert_eq!(schema["properties"]["action"]["enum"], json!(["status"]));
+        assert!(schema["properties"].get("placement").is_none());
+        let bash = build_tool_definitions()
+            .into_iter()
+            .find(|tool| tool["function"]["name"] == "bash")
+            .unwrap();
         assert!(
-            resolve_cloud_agent_environment(&cfg, &env)
-                .unwrap()
+            bash["function"]["parameters"]["properties"]
+                .get("placement")
                 .is_none()
         );
+
+        for initial_placement in ["cloud", "local"] {
+            let placement_path = cfg.join("sylphx-workspace-placement.json");
+            let original = json!({"placement": initial_placement}).to_string();
+            std::fs::write(&placement_path, &original).unwrap();
+            let status = execute_sylphx_tool(
+                "sandbox",
+                &json!({"action":"status"}),
+                &cfg,
+                &work,
+                &env,
+                Path::new("unused-mcp"),
+                &[],
+            );
+            assert_eq!(
+                serde_json::from_str::<Value>(&status).unwrap()["placement"],
+                initial_placement
+            );
+            for target in ["local", "cloud"] {
+                for args in [
+                    json!({"action":"placement", "placement":target}),
+                    json!({"action":"switch", "placement":target}),
+                    json!({"action":"set", "placement":target}),
+                    json!({"placement":target}),
+                    json!({"action":"status", "placement":target}),
+                ] {
+                    for execute in [execute_sylphx_tool, execute_sylphx_tool_raw] {
+                        let out = execute(
+                            "sandbox",
+                            &args,
+                            &cfg,
+                            &work,
+                            &env,
+                            Path::new("unused-mcp"),
+                            &[],
+                        );
+                        assert!(out.starts_with("error:"), "{args}: {out}");
+                    }
+                }
+                for name in ["bash", "shell"] {
+                    let out = execute_sylphx_tool(
+                        name,
+                        &json!({"command":"touch should-not-execute", "placement":target}),
+                        &cfg,
+                        &work,
+                        &env,
+                        Path::new("unused-mcp"),
+                        &[],
+                    );
+                    assert!(out.starts_with("error:"), "{out}");
+                }
+            }
+            assert_eq!(std::fs::read_to_string(&placement_path).unwrap(), original);
+            assert!(!work.join("should-not-execute").exists());
+        }
     }
 
     #[test]
@@ -7486,85 +7385,11 @@ fn validate_tool_input(name: &str, args: &Value) -> Result<(), String> {
     Ok(())
 }
 
-fn flush_cloud_tool_receipt(config_dir: &Path, base: &str, key: &str) -> Result<(), String> {
-    let path = config_dir.join("sylphx-cloud-tool-receipt.json");
-    let Some(receipt) = read_json(&path)? else {
-        return Ok(());
-    };
-    if required_text(&receipt, "state")? != "completed" {
-        return Err("cloud tool effect unresolved; retained execution receipt requires reconciliation, not replay".into());
+fn reject_legacy_cloud_tool_receipt(config_dir: &Path) -> Result<(), String> {
+    if read_json(&config_dir.join("sylphx-cloud-tool-receipt.json"))?.is_some() {
+        return Err("legacy cloud client-tool receipt requires operator reconciliation; host tool callbacks are no longer supported".into());
     }
-    let session = required_text(&receipt, "session_path")?;
-    let call_id = required_text(&receipt, "call_id")?;
-    let output = receipt
-        .get("output")
-        .and_then(Value::as_str)
-        .ok_or("invalid retained cloud tool output")?;
-    let is_error = receipt
-        .get("error")
-        .and_then(Value::as_bool)
-        .ok_or("invalid retained cloud tool status")?;
-    if let Some(mut binding) = load_persisted_cloud_session(config_dir)? {
-        let seq = sequence(receipt.get("event_sequence"), false)?;
-        if cloud_session_resource_path(&binding.env_slug, &binding.session_id) != session {
-            return Err("cloud tool receipt does not belong to retained binding".into());
-        }
-        if let Err(err) = post_required(
-            &format!("{base}/v1/{session}:submitToolResult"),
-            key,
-            &json!({"call_id":call_id,"output":output,"error":is_error}),
-        ) {
-            if err.contains("HTTP 400") || err.contains("HTTP 409") {
-                if output.contains("Switched workspace execution to host-local") {
-                    return remove_optional(&path);
-                }
-                if let Ok((st, raw)) = curl_get(&format!("{base}/v1/{session}"), Some(key)) {
-                    if st == 404 {
-                        return remove_optional(&path);
-                    }
-                    if (200..300).contains(&st)
-                        && let Ok(val) = serde_json::from_str::<Value>(&raw)
-                    {
-                        let status = val
-                            .get("state")
-                            .or_else(|| val.get("status"))
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_ascii_lowercase();
-                        if matches!(
-                            status.as_str(),
-                            "idle"
-                                | "session_state_idle"
-                                | "completed"
-                                | "interrupted"
-                                | "terminated"
-                                | "failed"
-                                | "session_state_failed"
-                                | "errored"
-                        ) {
-                            binding.last_seq = binding.last_seq.max(seq);
-                            save_persisted_cloud_session(config_dir, &binding)?;
-                            return remove_optional(&path);
-                        }
-                    }
-                }
-            }
-            return Err(err);
-        }
-        binding.last_seq = binding.last_seq.max(seq);
-        save_persisted_cloud_session(config_dir, &binding)?;
-    } else if resolve_cloud_agent_environment(config_dir, &[])?.is_none()
-        || output.contains("Switched workspace execution to host-local")
-    {
-        return remove_optional(&path);
-    } else {
-        post_required(
-            &format!("{base}/v1/{session}:submitToolResult"),
-            key,
-            &json!({"call_id":call_id,"output":output,"error":is_error}),
-        )?;
-    }
-    remove_optional(&path)
+    Ok(())
 }
 
 fn write_terminal_frame(out: &mut impl std::io::Write, frame: &Value) -> std::io::Result<()> {
