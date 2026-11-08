@@ -6284,6 +6284,7 @@ mod spawn_args_tests {
             "NO MORE",
             "。",
             "Done.",
+            "done",
             "終了。",
             "Final!",
             "done...",
