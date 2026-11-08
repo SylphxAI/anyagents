@@ -231,8 +231,9 @@ pub fn seat_for_agent_with_hint(
         return admitted_principal(raw.to_str()?, agent_name);
     }
     let path = std::env::var_os("ANYAGENTS_PRINCIPAL_REGISTRY")?;
-    let raw = principals::read_principal_registry(Path::new(&path).parent()?).ok()??;
-    admitted_principal(&raw, agent_name)
+    principals::read_admitted_principal(Path::new(&path).parent()?, agent_name)
+        .ok()
+        .flatten()
 }
 
 /// Operator-owned map keyed by immutable agent ID, never inferred from names or files.
@@ -623,65 +624,76 @@ pub fn hydrate_operator_groups_if_needed() {
     }
 }
 
-fn config_root_already_shared(config: &Path, gid: u32) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-        std::fs::symlink_metadata(config).is_ok_and(|meta| {
-            meta.is_dir() && meta.gid() == gid && (meta.mode() & 0o7777) == 0o2770
+fn is_peer_boundary_shared(config: &Path, gid: u32) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    let check_dir = |p: &Path| -> bool {
+        std::fs::symlink_metadata(p).is_ok_and(|m| {
+            m.is_dir() && !m.file_type().is_symlink() && m.gid() == gid && (m.mode() & 0o007) == 0
         })
-    }
-    #[cfg(not(unix))]
+    };
+    if !check_dir(config)
+        || !check_dir(&config.with_file_name("memory"))
+        || !check_dir(&config.with_file_name("skills"))
     {
-        let _ = (config, gid);
-        false
+        return false;
     }
+    let cap = config.join("mcp-capability");
+    if let Ok(m) = std::fs::symlink_metadata(&cap)
+        && (m.gid() != gid || (m.mode() & 0o007) != 0)
+    {
+        return false;
+    }
+    true
 }
 
 /// Registered root-to-principal resolution is the same authority used by vendor
 /// launch. Unregistered directories remain foreign in the shared inventory.
 pub(crate) fn peer_principals(store: &anyagents_core::Store) -> Result<String, Error> {
-    let parsed_registry: Option<serde_json::Value> =
-        if let Some(raw) = std::env::var_os("ANYAGENTS_PRINCIPALS") {
-            raw.to_str().and_then(|s| serde_json::from_str(s).ok())
-        } else if let Some(path) = std::env::var_os("ANYAGENTS_PRINCIPAL_REGISTRY") {
-            Path::new(&path)
-                .parent()
-                .and_then(|p| principals::read_principal_registry(p).ok().flatten())
-                .and_then(|raw| serde_json::from_str(&raw).ok())
-        } else {
-            None
-        };
+    use std::sync::{Mutex, OnceLock};
+    type CachedPeers = (std::time::Instant, PathBuf, usize, String);
+    static PEERS_CACHE: OnceLock<Mutex<Option<CachedPeers>>> = OnceLock::new();
+
+    let agents = store.list_agents()?;
+    let cacheable = !is_isolated_test_env() && std::env::var_os("ANYAGENTS_PRINCIPALS").is_none();
+    if cacheable
+        && let Ok(guard) = PEERS_CACHE.get_or_init(|| Mutex::new(None)).lock()
+        && let Some((at, ref dir, count, ref json)) = *guard
+        && dir == store.data_dir()
+        && count == agents.len()
+        && at.elapsed() < std::time::Duration::from_secs(15)
+    {
+        return Ok(json.clone());
+    }
+
     let mut peers = Vec::new();
-    for agent in store.list_agents()? {
-        let resolved = if let Some(ref reg) = parsed_registry {
-            reg.get(agent.id.as_str())
-                .and_then(admitted_principal_entry)
-                .map(|(u, uid, gid, _)| (u, uid, gid, None))
-        } else {
-            crate::create::resolved_agent_seat_info(store, &agent)
-        };
-        if let Some((_, uid, gid, _)) = resolved {
+    for agent in agents.iter() {
+        if let Some((_, uid, gid, _)) = crate::create::resolved_agent_seat_info(store, agent) {
             let config = anyagents_core::agent_config_dir(store.data_dir(), &agent.id);
+            let root = config.parent().unwrap().to_owned();
+            if !root.exists() {
+                continue;
+            }
             // The immutable-ID grant, not historical ownership, authorizes this
             // projection. Reconcile created peers before another seat probes them.
             if config.is_dir()
                 && existing_config_seat(&config).is_none()
-                && !config_root_already_shared(&config, gid)
+                && !is_peer_boundary_shared(&config, gid)
             {
                 share_config_with_seat_uid(&config, uid, gid);
             }
-            peers.push(anyagents_harness::SeatPeer {
-                root: anyagents_core::agent_config_dir(store.data_dir(), &agent.id)
-                    .parent()
-                    .unwrap()
-                    .to_owned(),
-                uid,
-                gid,
-            });
+            peers.push(anyagents_harness::SeatPeer { root, uid, gid });
         }
     }
-    serde_json::to_string(&peers).map_err(|e| Error::Message(e.to_string()))
+    let json = serde_json::to_string(&peers).map_err(|e| Error::Message(e.to_string()))?;
+    if cacheable && let Ok(mut guard) = PEERS_CACHE.get_or_init(|| Mutex::new(None)).lock() {
+        *guard = Some((
+            std::time::Instant::now(),
+            store.data_dir().to_path_buf(),
+            agents.len(),
+            json.clone(),
+        ));
+    }
+    Ok(json)
 }
 
 pub(super) fn descriptor_launcher() -> Option<PathBuf> {
