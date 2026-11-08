@@ -83,6 +83,73 @@ fn only_pre_23_schemas_probe_and_backfill_fts_on_open() {
 }
 
 #[test]
+fn current_schema_search_repairs_empty_partial_and_missing_mailbox_indexes() {
+    for fault in ["empty", "partial", "chunks"] {
+        let (dir, store, agent) = setup();
+        store
+            .receive(&agent.id, Incoming::new("repairfirstneedle"))
+            .unwrap();
+        store
+            .receive(&agent.id, Incoming::new("repairsecondneedle"))
+            .unwrap();
+        store
+            .conn()
+            .execute_batch(match fault {
+                "partial" => "DELETE FROM rag_chunks_fts WHERE text='repairsecondneedle'",
+                "chunks" => "DELETE FROM rag_chunks; DELETE FROM rag_chunks_fts",
+                _ => "DELETE FROM rag_chunks_fts",
+            })
+            .unwrap();
+        drop(store);
+        let reopened = Store::open(dir.path().join("custom-mailbox.sqlite")).unwrap();
+        // Opening remains read-only even with broken derivative state.
+        assert_eq!(
+            count(&reopened, "rag_chunks_fts"),
+            i64::from(fault == "partial")
+        );
+        for term in ["repairfirstneedle", "repairsecondneedle"] {
+            let hits = reopened
+                .search_history(&HistorySearchQuery {
+                    query: Some(term.into()),
+                    ..Default::default()
+                })
+                .unwrap();
+            assert_eq!(hits.len(), 1, "{fault}: {term}");
+        }
+    }
+}
+
+#[test]
+fn midturn_steers_after_outbound_preserve_the_whole_recovery_envelope() {
+    let (dir, store, agent) = setup();
+    store
+        .receive(&agent.id, Incoming::new("initial work"))
+        .unwrap();
+    let first = store.next_undelivered(&agent.id).unwrap().unwrap();
+    store.note_delivered(&agent.id, first.seq).unwrap();
+    let opened_at = store.open_turn(&agent.id).unwrap().unwrap().opened_at_ms;
+    store
+        .record_outbound(&agent.id, "agent:peer", None, "progress, not completion")
+        .unwrap();
+    store
+        .receive(&agent.id, Incoming::new("midturn update"))
+        .unwrap();
+    let steer = store.next_undelivered(&agent.id).unwrap().unwrap();
+    store.note_delivered(&agent.id, steer.seq).unwrap();
+    drop(store);
+    let store = Store::open(dir.path().join("custom-mailbox.sqlite")).unwrap();
+    assert!(store.next_undelivered(&agent.id).unwrap().is_none());
+    let open = store.open_turn(&agent.id).unwrap().unwrap();
+    assert_eq!(open.messages.len(), 2);
+    assert_eq!(open.opened_at_ms, opened_at);
+    store.note_turn_completed(&agent.id).unwrap();
+    drop(store);
+    let store = Store::open(dir.path().join("custom-mailbox.sqlite")).unwrap();
+    assert!(store.open_turn(&agent.id).unwrap().is_none());
+    assert!(store.next_undelivered(&agent.id).unwrap().is_none());
+}
+
+#[test]
 fn group_column_upgrade_is_idempotent_and_unexpected_ddl_failure_is_visible() {
     let (dir, store, _) = setup();
     store.set_group_public("shared", true).unwrap();

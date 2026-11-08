@@ -76,7 +76,7 @@ impl VendorHarness {
                         _ => unreachable!(),
                     };
                     if let Err(error) =
-                        anyagents_core::host_session::bind_vendor(root, harness, trimmed)
+                        anyagents_core::host_session::bind_or_resume_vendor(root, harness, trimmed)
                     {
                         return Err(format!("host session alias refused: {error}"));
                     }
@@ -423,7 +423,13 @@ fn vendor_launch_authorized(
     })?;
     prepare_host_session(&request)?;
     let config_dir = request.config_dir.clone();
+    let agent = request.agent.clone();
     let res = vendor_launch_inner(request, store);
+    if res.is_ok() {
+        // Native startup may have resumed an earlier generation from its DB.
+        crate::create::write_agent_instructions(&config_dir, &agent, None)
+            .map_err(|error| error.to_string())?;
+    }
     if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none() {
         match &res {
             Ok(vh) => {
@@ -511,7 +517,7 @@ fn prepare_host_session(request: &LaunchRequest) -> Result<(), String> {
     if let Some(file) = crate::create::harness_session_filename(&request.agent.harness)
         && let Some(id) = session_from_file(&request.config_dir, file)?
     {
-        anyagents_core::host_session::bind_vendor(root, &request.agent.harness, &id)
+        anyagents_core::host_session::bind_or_resume_vendor(root, &request.agent.harness, &id)
             .map_err(|e| format!("host session alias failed: {e}"))?;
     }
     // Also render in contract-test mode, exercising the shipping launch boundary.
@@ -2329,6 +2335,47 @@ done
         );
         prepare_host_session(&request(agent)).unwrap();
         assert_eq!(host_session::active(root).unwrap().unwrap(), next);
+    }
+
+    #[test]
+    fn shipping_roundtrip_resumes_vendor_reported_prior_native_id_and_renders_original_pin() {
+        use anyagents_core::{NewAgent, Store, host_session};
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let mut agent = store
+            .create_agent(NewAgent::new("worker", "opencode"))
+            .unwrap();
+        let config = anyagents_core::agent_config_dir(dir.path(), &agent.id);
+        std::fs::create_dir_all(&config).unwrap();
+        let root = config.parent().unwrap();
+        std::fs::create_dir_all(root.join("memory")).unwrap();
+        std::fs::write(root.join("memory/MEMORY.md"), "original opencode snapshot").unwrap();
+        let request = |agent| LaunchRequest {
+            agent,
+            data_dir: dir.path().into(),
+            config_dir: config.clone(),
+            work_dir: root.join("work"),
+            extra_env: vec![],
+        };
+        prepare_host_session(&request(agent.clone())).unwrap();
+        let first = host_session::active(root).unwrap().unwrap();
+        host_session::bind_vendor(root, "opencode", "native-s1").unwrap();
+        agent.harness = "sylphx".into();
+        prepare_host_session(&request(agent.clone())).unwrap();
+        host_session::bind_vendor(root, "sylphx", "native-s2").unwrap();
+        agent.harness = "opencode".into();
+        prepare_host_session(&request(agent.clone())).unwrap();
+        // The native service/DB persists S1 despite marker retirement. Exercise
+        // the same alias boundary used by sync_session, then the real renderer.
+        host_session::bind_or_resume_vendor(root, "opencode", "native-s1").unwrap();
+        crate::create::write_agent_instructions(&config, &agent, None).unwrap();
+        assert_eq!(host_session::active(root).unwrap().unwrap(), first);
+        assert!(
+            std::fs::read_to_string(config.join("AGENTS.md"))
+                .unwrap()
+                .contains(&first.memory.section)
+        );
+        assert!(host_session::resume_vendor(root, "sylphx", "native-s2").is_ok());
     }
 
     #[test]

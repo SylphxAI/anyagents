@@ -449,6 +449,58 @@ fn cloud_interrupt_requires_http_ack_and_settled_readback() {
 }
 
 #[test]
+fn retained_submission_settlement_observes_without_replaying_effects() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = tmp.path();
+    save_persisted_cloud_session(cfg, &binding()).unwrap();
+    let path = cfg.join("sylphx-cloud-turn-pending.json");
+    let pending = json!({"session_path":cloud_session_resource_path(&binding().env_slug, &binding().session_id),
+        "message":"original message", "state":"submitting"});
+    for remote in [
+        json!({"state":"running"}),
+        json!({}),
+        json!({"state":"idle"}),
+    ] {
+        std::fs::write(&path, pending.to_string()).unwrap();
+        let (base, peer) = serve(vec![(200, remote.clone())]);
+        let result = reconcile_cloud_submission(cfg, &base, "fixture-key", "original message");
+        let requests = peer.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("GET "));
+        if remote["state"] == "idle" {
+            assert!(result.unwrap());
+            assert!(!path.exists());
+            // Queued work is now dispatchable, and repeated reconciliation does
+            // no network operation or replay of the settled request.
+            assert!(
+                !reconcile_cloud_submission(
+                    cfg,
+                    "http://127.0.0.1:1",
+                    "fixture-key",
+                    "queued message"
+                )
+                .unwrap()
+            );
+        } else {
+            assert!(result.is_err());
+            assert_eq!(read_json(&path).unwrap().unwrap(), pending);
+        }
+    }
+    std::fs::write(&path, pending.to_string()).unwrap();
+    let (base, peer) = serve(vec![(200, json!({"state":"idle"}))]);
+    assert!(
+        !reconcile_cloud_submission(cfg, &base, "fixture-key", "different queued message").unwrap()
+    );
+    assert_eq!(peer.join().unwrap().len(), 1);
+    assert!(std::fs::read_dir(cfg).unwrap().any(|e| {
+        e.unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("sylphx-cloud-submission-settled-")
+    }));
+}
+
+#[test]
 fn legacy_cloud_tool_receipts_require_reconciliation_without_submission_or_execution() {
     let tmp = tempfile::tempdir().unwrap();
     let cfg = tmp.path();
@@ -831,7 +883,10 @@ fn retained_cloud_submission_refuses_a_second_dispatch_without_losing_input() {
         "retained input",
     )
     .unwrap_err();
-    assert!(error.contains("unresolved retained submission"), "{error}");
+    assert!(
+        error.contains("retained cloud submission has no binding"),
+        "{error}"
+    );
     assert_eq!(read_json(&pending).unwrap().unwrap(), receipt);
     assert_eq!(
         listener.accept().unwrap_err().kind(),

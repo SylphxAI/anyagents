@@ -990,12 +990,10 @@ pub(crate) fn run_cloud_session_turn(
     };
     // Retain legacy receipts for operator reconciliation without replaying host effects.
     reject_legacy_cloud_tool_receipt(config_dir)?;
-    if let Some(pending) = read_json(&config_dir.join("sylphx-cloud-turn-pending.json"))? {
-        if pending.get("state").and_then(Value::as_str) == Some("accepted") {
-            remove_optional(&config_dir.join("sylphx-cloud-turn-pending.json"))?;
-        } else {
-            return Err("cloud turn has an unresolved retained submission; pull/reconcile before another dispatch".into());
-        }
+    if reconcile_cloud_submission(config_dir, &base, &api_key, user_message)? {
+        // The same uncertain submission has already settled remotely. Do not
+        // send it again merely because its HTTP acknowledgement was lost.
+        return Ok(TurnUsage::default());
     }
     let mut initial_last_seq: i64 = 0;
     let mut next_turn: i64 = 1;
@@ -1371,29 +1369,6 @@ The VM is lightweight (`1 vCPU / 2 GiB RAM`); whenever you need to run a CPU- or
                 .or_else(|| ev_doc.get("events"))
                 .and_then(Value::as_array)
         {
-            for ev in events {
-                if let Some(tr) = ev.get("tool_result").or_else(|| ev.get("toolResult"))
-                    && let Some(cid) = tr
-                        .get("id")
-                        .or_else(|| tr.get("call_id"))
-                        .or_else(|| tr.get("tool_call_id"))
-                        .and_then(Value::as_str)
-                        .filter(|s| !s.trim().is_empty())
-                {
-                    handled_call_ids.insert(cid.to_string());
-                } else if ev
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .is_some_and(|t| t.eq_ignore_ascii_case("TOOL_RESULT"))
-                    && let Some(cid) = ev
-                        .get("call_id")
-                        .or_else(|| ev.get("tool_call_id"))
-                        .and_then(Value::as_str)
-                        .filter(|s| !s.trim().is_empty())
-                {
-                    handled_call_ids.insert(cid.to_string());
-                }
-            }
             for ev in events {
                 let seq = sequence(ev.get("sequence"), false)?;
                 if seq > 0 && seq <= last_seq {
@@ -6376,7 +6351,39 @@ mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
             let base = format!("http://{}", listener.local_addr().unwrap());
+            let stale_submission = terminal.is_empty() && session_status == "idle";
+            if stale_submission {
+                let binding = PersistedCloudSession {
+                    agent_id: "old-agent".into(),
+                    session_id: "old-session".into(),
+                    model_id: "old-model".into(),
+                    env_slug: "org/proj/dev".into(),
+                    last_seq: 0,
+                };
+                save_persisted_cloud_session(&cfg, &binding).unwrap();
+                write_atomic(&cfg.join("sylphx-cloud-turn-pending.json"), json!({
+                    "session_path":cloud_session_resource_path(&binding.env_slug, &binding.session_id),
+                    "message":"already settled work", "state":"submitting"
+                }).to_string().as_bytes()).unwrap();
+            }
             let server = std::thread::spawn(move || {
+                if stale_submission {
+                    let (stream, route, _) = next_http_request(&listener);
+                    assert!(
+                        route.starts_with("get ") && route.contains("old-session"),
+                        "{route}"
+                    );
+                    respond(stream, json!({"state":"idle"}));
+                    let (stream, route, _) = next_http_request(&listener);
+                    assert!(route.contains("old-session:interrupt"), "{route}");
+                    respond(stream, json!({}));
+                    let (stream, route, _) = next_http_request(&listener);
+                    assert!(
+                        route.starts_with("get ") && route.contains("old-session"),
+                        "{route}"
+                    );
+                    respond(stream, json!({"state":"idle"}));
+                }
                 let (stream, route, body) = next_http_request(&listener);
                 respond(stream, json!({"name":"org/proj/dev/agents/a"}));
                 assert!(
@@ -6420,6 +6427,7 @@ mod tests {
                 let text = body["message"]["parts"][0]["text"].as_str().unwrap();
                 assert!(text.contains("Explicit task reference."));
                 assert!(text.contains("Complete the cloud task."));
+                assert!(!text.contains("already settled work"));
                 assert!(!text.contains("LOCAL_ONLY_"));
 
                 let calls = json!([
@@ -6840,12 +6848,13 @@ exec "$@"
                 r#"#!/bin/sh
 set -eu
 shift 8
-if [ "$1" = /bin/sh ] && [ "$2" = -c ]; then
+if [ "$1" = /bin/sh ] && [ "$2" = -s ]; then
     prefix='id() {{ case "$1" in -u) echo {uid};; -g) echo {gid};; esac; }}
 awk() {{ echo 1; }}
 stat() {{ echo 640; }}
 '
-    exec /bin/sh -c "$prefix$3"
+    script=$(cat)
+    exec /bin/sh -c "$prefix$script"
 fi
 exec "$@"
 "#
@@ -6910,13 +6919,16 @@ exec "$@"
             run(&turn_env).contains("admitted"),
             "refresh must reach an already-running turn"
         );
-        for wrong_principal in [(uid + 1, gid), (uid, gid + 1)] {
+        for shared_principal in [(uid + 1, gid), (uid, gid + 1)] {
             let mut list = peers.lock().unwrap();
-            list[0].uid = wrong_principal.0;
-            list[0].gid = wrong_principal.1;
+            list[0].uid = shared_principal.0;
+            list[0].gid = shared_principal.1;
             drop(list);
-            assert!(run(&turn_env).contains("peer seats' private trees are denied"));
+            assert!(run(&turn_env).contains("admitted"));
         }
+        peers.lock().unwrap()[0].uid = uid + 1;
+        peers.lock().unwrap()[0].gid = gid + 1;
+        assert!(run(&turn_env).contains("peer seats' private trees are denied"));
         peers.lock().unwrap()[0] = anyagents_harness::SeatPeer {
             root: child,
             uid,
@@ -7424,6 +7436,69 @@ fn reject_legacy_cloud_tool_receipt(config_dir: &Path) -> Result<(), String> {
         return Err("legacy cloud client-tool receipt requires operator reconciliation; host tool callbacks are no longer supported".into());
     }
     Ok(())
+}
+
+fn reconcile_cloud_submission(
+    config_dir: &Path,
+    base: &str,
+    key: &str,
+    message: &str,
+) -> Result<bool, String> {
+    let path = config_dir.join("sylphx-cloud-turn-pending.json");
+    let Some(pending) = read_json(&path)? else {
+        return Ok(false);
+    };
+    let state = required_text(&pending, "state")?;
+    if !matches!(state, "submitting" | "accepted") {
+        return Err("invalid retained cloud submission state; receipt retained".into());
+    }
+    let session = required_text(&pending, "session_path")?;
+    let binding = load_persisted_cloud_session(config_dir)?
+        .ok_or("retained cloud submission has no binding")?;
+    if cloud_session_resource_path(&binding.env_slug, &binding.session_id) != session {
+        return Err("retained cloud submission belongs to a different session".into());
+    }
+    let (status, raw) = curl_get(&format!("{base}/v1/{session}"), Some(key))?;
+    if !(200..300).contains(&status) {
+        return Err(format!(
+            "cloud submission reconciliation HTTP {status}; receipt retained"
+        ));
+    }
+    let remote: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    let settled = remote
+        .get("state")
+        .or_else(|| remote.get("status"))
+        .and_then(Value::as_str)
+        .is_some_and(|s| {
+            matches!(
+                s.to_ascii_lowercase().as_str(),
+                "idle"
+                    | "session_state_idle"
+                    | "completed"
+                    | "interrupted"
+                    | "terminated"
+                    | "failed"
+                    | "session_state_failed"
+            )
+        });
+    if !settled {
+        return Err(
+            "cloud turn has an unresolved retained submission; remote session is not settled"
+                .into(),
+        );
+    }
+    // Preserve the original request and readback as an audit/recovery receipt.
+    // This path only observes; it never replays a send, tool result or host effect.
+    let same_message = required_text(&pending, "message")? == message;
+    let digest = anyagents_core::learned_memory::sha256(pending.to_string().as_bytes());
+    write_atomic(
+        &config_dir.join(format!("sylphx-cloud-submission-settled-{digest}.json")),
+        json!({"submission":pending, "remote":remote})
+            .to_string()
+            .as_bytes(),
+    )?;
+    remove_optional(&path)?;
+    Ok(same_message)
 }
 
 fn write_terminal_frame(out: &mut impl std::io::Write, frame: &Value) -> std::io::Result<()> {

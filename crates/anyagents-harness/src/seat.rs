@@ -236,7 +236,7 @@ fn checks_with_principals(
     peers.sort();
     let same_seat_roots: std::collections::HashSet<&Path> = principals
         .iter()
-        .filter(|p| p.uid == uid && p.gid == gid)
+        .filter(|p| p.uid == uid || p.gid == gid)
         .map(|p| p.root.as_path())
         .collect();
     let mut foreign_roots = Vec::new();
@@ -244,7 +244,7 @@ fn checks_with_principals(
     let mut peer_caps_program = String::new();
     for peer in peers {
         // Two agents can legitimately share one OS principal. Only a host-
-        // resolved UID/GID+root tuple grants this exception, never directory
+        // resolved UID or primary GID plus exact root grants this exception, never directory
         // ownership or a seat-controlled marker.
         let same_seat = same_seat_roots.contains(peer.as_path());
         if Some(peer.as_path()) == config.and_then(Path::parent) || same_seat {
@@ -632,7 +632,7 @@ mod tests {
     }
 
     #[test]
-    fn registered_same_seat_requires_both_principal_and_exact_root() {
+    fn registered_same_seat_requires_shared_principal_and_exact_root() {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("agents/own/config");
         let peer = dir.path().join("agents/colocated");
@@ -640,7 +640,7 @@ mod tests {
         for name in ["memory", "skills", "config"] {
             std::fs::create_dir_all(peer.join(name)).unwrap();
         }
-        // Population size never widens a same-seat grant to another UID.
+        // Population size never widens a host-granted principal to another root.
         for n in 0..40 {
             std::fs::create_dir_all(dir.path().join(format!("agents/padding-{n:02}"))).unwrap();
         }
@@ -680,6 +680,15 @@ mod tests {
                 root: peer.clone(),
                 uid: 24031,
                 gid: 24031,
+            },
+        ] {
+            assert!(run(vec![principal]).status.success());
+        }
+        for principal in [
+            crate::SeatPeer {
+                root: peer.clone(),
+                uid: 24033,
+                gid: 24034,
             },
             crate::SeatPeer {
                 root: dir.path().join("other-root"),

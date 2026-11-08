@@ -74,17 +74,22 @@ fn names(directory: &File) -> io::Result<Vec<std::ffi::OsString>> {
     Ok(out)
 }
 
-fn grant(file: &File, uid: u32, gid: u32, capability: bool) -> io::Result<()> {
+fn grant(file: &File, uid: u32, gid: u32, capability: bool, host_readable: bool) -> io::Result<()> {
     let meta = file.metadata()?;
     if !meta.is_dir() && (!meta.is_file() || meta.nlink() != 1) {
         return Err(io::Error::other(
             "seat sharing requires a directory or single-link regular file",
         ));
     }
-    if meta.uid() == uid && meta.is_dir() && meta.mode() & 0o700 == 0o700 {
+    if !host_readable && meta.uid() == uid && meta.is_dir() && meta.mode() & 0o700 == 0o700 {
         return Ok(());
     }
-    if meta.uid() == uid && !meta.is_dir() && !capability && meta.mode() & 0o600 == 0o600 {
+    if !host_readable
+        && meta.uid() == uid
+        && !meta.is_dir()
+        && !capability
+        && meta.mode() & 0o600 == 0o600
+    {
         return Ok(());
     }
     let mode: libc::mode_t = if meta.is_dir() {
@@ -142,7 +147,12 @@ fn grant(file: &File, uid: u32, gid: u32, capability: bool) -> io::Result<()> {
     }
     // Seat-owned objects with the intended effective grant need no mutation.
     let after = file.metadata()?;
-    if after.uid() == uid && after.gid() == gid && after.mode() & 0o700 == 0o700 && meta.is_dir() {
+    if !host_readable
+        && after.uid() == uid
+        && after.gid() == gid
+        && after.mode() & 0o700 == 0o700
+        && meta.is_dir()
+    {
         return Ok(());
     }
     Err(io::Error::other("cannot grant the opened seat inode"))
@@ -157,6 +167,7 @@ fn inaccessible_child(
     uid: u32,
     gid: u32,
     expected: &libc::stat,
+    host_readable: bool,
 ) -> io::Result<Option<File>> {
     let name = CString::new(name.as_bytes()).map_err(io::Error::other)?;
     let fd = unsafe {
@@ -176,7 +187,8 @@ fn inaccessible_child(
             "seat tree inode changed before owner repair",
         ));
     }
-    if meta.uid() == uid
+    if !host_readable
+        && meta.uid() == uid
         && ((meta.is_dir() && meta.mode() & 0o700 == 0o700)
             || (!meta.is_dir()
                 && name.as_bytes() != b"mcp-capability"
@@ -186,7 +198,13 @@ fn inaccessible_child(
         // grant. Do not widen it just to reopen as the daemon.
         return Ok(None);
     }
-    grant(&bound, uid, gid, name.as_bytes() == b"mcp-capability")?;
+    grant(
+        &bound,
+        uid,
+        gid,
+        name.as_bytes() == b"mcp-capability",
+        host_readable,
+    )?;
     Ok(Some(File::open(format!("/dev/fd/{fd}"))?))
 }
 #[cfg(not(target_os = "linux"))]
@@ -196,6 +214,7 @@ fn inaccessible_child(
     _uid: u32,
     _gid: u32,
     _expected: &libc::stat,
+    _host_readable: bool,
 ) -> io::Result<Option<File>> {
     Err(io::Error::from(io::ErrorKind::PermissionDenied))
 }
@@ -373,7 +392,15 @@ fn share_open(
     gid: u32,
     before_open: &mut impl FnMut(&Path, &OsStr),
 ) -> io::Result<()> {
-    grant(&directory, uid, gid, false)?;
+    let host_readable = path
+        .ancestors()
+        .any(|p| p.ends_with("config/projects") || p.ends_with("config/.claude/projects"));
+    let gid = if host_readable {
+        super::sandbox::sock_gid_for().unwrap_or(gid)
+    } else {
+        gid
+    };
+    grant(&directory, uid, gid, false, host_readable)?;
     for name in names(&directory)? {
         let child_path = path.join(&name);
         let text = name.to_string_lossy();
@@ -438,7 +465,15 @@ fn share_open(
             Ok(child) => child,
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
-                match inaccessible_child(&directory, &name, uid, gid, &stat) {
+                let transcript = host_readable
+                    || child_path.ends_with("config/projects")
+                    || child_path.ends_with("config/.claude/projects");
+                let child_gid = if transcript {
+                    super::sandbox::sock_gid_for().unwrap_or(gid)
+                } else {
+                    gid
+                };
+                match inaccessible_child(&directory, &name, uid, child_gid, &stat, transcript) {
                     Ok(Some(child)) => child,
                     Ok(None) => continue,
                     Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
@@ -465,7 +500,7 @@ fn share_open(
                 Err(e) => return Err(e),
             }
         } else {
-            grant(&child, uid, gid, text == "mcp-capability")?;
+            grant(&child, uid, gid, text == "mcp-capability", host_readable)?;
             if !text.starts_with(".seat-")
                 && (text.starts_with("opencode.db")
                     || text == "serve-exit.jsonl"
@@ -486,6 +521,41 @@ fn share_open(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_project_transcripts_are_shared_but_unrelated_vendor_private_files_stay_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_tempdir();
+        let config = dir.path().join("config");
+        let project = config.join("projects/session");
+        let private = config.join("private");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&private).unwrap();
+        std::fs::write(project.join("history.jsonl"), "retained").unwrap();
+        std::fs::write(private.join("secret"), "private").unwrap();
+        for path in [&project, &private] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        for path in [project.join("history.jsonl"), private.join("secret")] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        share(&config, unsafe { libc::geteuid() }, unsafe {
+            libc::getegid()
+        })
+        .unwrap();
+        assert_eq!(std::fs::metadata(&project).unwrap().mode() & 0o7777, 0o2770);
+        assert_eq!(
+            std::fs::metadata(project.join("history.jsonl"))
+                .unwrap()
+                .mode()
+                & 0o777,
+            0o660
+        );
+        assert_eq!(std::fs::metadata(&private).unwrap().mode() & 0o777, 0o700);
+        assert_eq!(
+            std::fs::metadata(private.join("secret")).unwrap().mode() & 0o777,
+            0o600
+        );
+    }
     #[test]
     fn planted_directory_to_symlink_swap_preserves_peer_inode_and_bytes() {
         let temp = crate::test_tempdir();

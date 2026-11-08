@@ -58,7 +58,7 @@ fn main() {
     for line in io::stdin().lock().lines() {
         let Ok(line) = line else { break };
         log(&log_path, &line);
-        if mode == "steer" {
+        if mode == "steer" || mode == "steer_finish" {
             if let Ok(value) = serde_json::from_str::<Value>(&line)
                 && value.get("type").and_then(Value::as_str) == Some("user")
             {
@@ -77,6 +77,10 @@ fn main() {
                 });
                 let _ = writeln!(stdout, "{echo}");
                 let _ = stdout.flush();
+                if mode == "steer_finish" && users == 2 {
+                    let _ = writeln!(stdout, "{RESULT}");
+                    let _ = stdout.flush();
+                }
             }
             continue;
         }

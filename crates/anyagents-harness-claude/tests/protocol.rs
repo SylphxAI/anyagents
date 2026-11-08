@@ -134,6 +134,33 @@ fn batch_promotes_the_followup() {
 }
 
 #[test]
+fn echoed_midturn_steer_finishes_with_its_turn_without_phantom_followup() {
+    let dir = TempDir::new().unwrap();
+    let mut harness = start(&dir, "steer_finish", None);
+    harness.deliver(&msg("first")).unwrap();
+    assert!(harness.wait_seen("first", Duration::from_secs(5)));
+    harness.deliver(&msg("steered")).unwrap();
+    assert!(harness.wait_finished("steered", Duration::from_secs(5)));
+    assert!(harness.is_finished("first"));
+    assert_eq!(harness.health().turn_state, TurnState::Idle);
+    assert_eq!(harness.turns_started(), 1);
+    assert_eq!(harness.served_usage().input_tokens, 11);
+    assert_eq!(harness.served_usage().output_tokens, 7);
+    assert!(matches!(
+        harness.deliver(&msg("steered")).unwrap(),
+        DeliverOutcome::Accepted {
+            turn_finished: true
+        }
+    ));
+    assert_eq!(
+        read_log(&log_path(&dir))
+            .matches("anyagents-message:steered")
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn quota_blocks_before_write() {
     let dir = TempDir::new().unwrap();
     let mut harness = start(&dir, "quota", None);

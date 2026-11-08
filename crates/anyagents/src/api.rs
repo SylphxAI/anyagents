@@ -297,6 +297,8 @@ pub struct ConversationResponse {
     pub agent: String,
     pub agent_id: String,
     pub turns: Vec<ConversationTurnView>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -437,10 +439,7 @@ impl SendRequest {
         let token = text.trim_matches(|c: char| {
             c.is_whitespace() || matches!(c, '.' | '。' | '!' | '！' | '?' | '？')
         });
-        matches!(
-            token.to_ascii_lowercase().as_str(),
-            "no_reply" | "done" | "end" | "停止" | "no more" | "終了" | "final"
-        ) || (!text.is_empty() && text.chars().all(|c| c == '。'))
+        token.eq_ignore_ascii_case("NO_REPLY")
     }
 }
 

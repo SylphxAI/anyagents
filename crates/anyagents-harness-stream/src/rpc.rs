@@ -245,7 +245,13 @@ impl RpcChild {
                     return Err(RpcFail::Failed(error));
                 }
                 Some(Answer::Waiting) | Some(Answer::Async) => {}
-                None => return Err(RpcFail::TimedOut),
+                None => {
+                    return Err(if state.alive {
+                        RpcFail::TimedOut
+                    } else {
+                        RpcFail::Dead
+                    });
+                }
             }
             if !state.alive {
                 state.pending.remove(&id);
@@ -422,6 +428,9 @@ fn read_stdout(
                 if let Some(result) = on_request(method, &value) {
                     let answer = json!({"jsonrpc": "2.0", "id": id, "result": result});
                     if write_stdin(&stdin, &answer).is_err() {
+                        // Publish the terminal transition before waking any waiter.
+                        lock(&shared).alive = false;
+                        wake.notify_all();
                         break;
                     }
                 }
@@ -601,12 +610,27 @@ mod tests {
 
     #[test]
     fn required_reply_write_failure_marks_child_dead_and_wakes_pending_request() {
-        let child = launch("IFS= read -r request; exec 0<&-; printf '%s\n' '{\"id\":99,\"method\":\"approval/request\"}'; exec sleep 30".into(),
-            Arc::new(|_| NotificationEffect::default()));
-        assert!(matches!(
-            child.request("turn", json!({}), Duration::from_secs(5)),
-            Err(RpcFail::Dead)
-        ));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let child = RpcChild::launch(RpcLaunch {
+            name: "required-reply-fixture".into(), program: "/bin/sh".into(),
+            args: vec!["-c".into(), "IFS= read -r request; printf '%s\n' '{\"id\":99,\"method\":\"approval/request\"}'; exec cat >/dev/null".into()],
+            environment: Vec::new(), work_dir: None,
+        }, Arc::new(|_| NotificationEffect::default()), Arc::new(move |_, _| {
+            entered_tx.send(()).unwrap();
+            lock(&release_rx).recv_timeout(Duration::from_secs(5)).unwrap();
+            Some(json!({"approved":true}))
+        })).unwrap();
+        std::thread::scope(|scope| {
+            let request = scope.spawn(|| child.request("turn", json!({}), Duration::from_secs(5)));
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            // Close exactly the writer used for the required reply. No shell
+            // descriptor inheritance or parallel child can keep it writable.
+            *lock(&child.stdin) = None;
+            release_tx.send(()).unwrap();
+            assert!(matches!(request.join().unwrap(), Err(RpcFail::Dead)));
+        });
         assert!(!child.alive());
     }
 

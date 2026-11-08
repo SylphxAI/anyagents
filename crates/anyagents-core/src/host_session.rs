@@ -34,6 +34,9 @@ fn lock(root: &Path) -> io::Result<fs::File> {
 struct Session {
     generation: String,
     harness: String,
+    /// Only a deliberate harness round-trip may resume an earlier native alias.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    resume_native: bool,
 }
 #[derive(Default, Serialize, Deserialize)]
 struct Registry {
@@ -97,8 +100,11 @@ pub fn active(root: &Path) -> io::Result<Option<HostSession>> {
         .transpose()
 }
 
-fn marker_bytes(path: &Path) -> io::Result<Option<Vec<u8>>> {
-    let file = match crate::raw_segment::open_readonly(path) {
+fn marker_bytes(root: &Path, relative: &Path) -> io::Result<Option<Vec<u8>>> {
+    // The host-selected agent root can live below an OS alias (macOS /var).
+    // Resolve that trusted prefix only; config and all descendants stay no-follow.
+    let path = fs::canonicalize(root)?.join(relative);
+    let file = match crate::raw_segment::open_readonly(&path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
@@ -141,8 +147,8 @@ fn complete_reset(root: &Path, registry: &mut Registry) -> io::Result<()> {
             .join("sessions")
             .join(format!("retired-{}", pending.session.generation));
         let retired = retired_dir.join(name);
-        let old = marker_bytes(&source)?;
-        let saved = marker_bytes(&retired)?;
+        let old = marker_bytes(root, source.strip_prefix(root).unwrap())?;
+        let saved = marker_bytes(root, retired.strip_prefix(root).unwrap())?;
         match (old, saved) {
             (Some(bytes), None) if sha256(&bytes) == *expected => {
                 fs::create_dir_all(&retired_dir)?;
@@ -156,7 +162,9 @@ fn complete_reset(root: &Path, registry: &mut Registry) -> io::Result<()> {
                 ));
             }
         }
-        if marker_bytes(&retired)?.is_none_or(|bytes| sha256(&bytes) != *expected) {
+        if marker_bytes(root, retired.strip_prefix(root).unwrap())?
+            .is_none_or(|bytes| sha256(&bytes) != *expected)
+        {
             return Err(io::Error::other(
                 "retired resume pointer verification failed",
             ));
@@ -206,12 +214,12 @@ pub fn prepare_harness_with_source(
     // never to the outgoing generation. Keep its existing alias unchanged.
     let retired_marker = marker
         .map(|name| {
-            marker_bytes(&root.join("config").join(name))
+            marker_bytes(root, &Path::new("config").join(name))
                 .map(|bytes| bytes.map(|bytes| (name.to_owned(), sha256(&bytes))))
         })
         .transpose()?
         .flatten();
-    start_reset(root, &mut registry, harness, retired_marker, source).map(Some)
+    start_reset(root, &mut registry, harness, retired_marker, source, true).map(Some)
 }
 
 /// Explicit reset of a quiescent agent. Preserve old pins, vendor aliases and
@@ -243,7 +251,7 @@ pub fn reset_session_with_source(
     }
     let old_marker = marker
         .map(|name| {
-            marker_bytes(&root.join("config").join(name))
+            marker_bytes(root, &Path::new("config").join(name))
                 .map(|bytes| bytes.map(|bytes| (name, bytes)))
         })
         .transpose()?
@@ -271,7 +279,7 @@ pub fn reset_session_with_source(
         }
     }
     let retired_marker = old_marker.map(|(name, bytes)| (name.to_owned(), sha256(&bytes)));
-    start_reset(root, &mut registry, harness, retired_marker, source)
+    start_reset(root, &mut registry, harness, retired_marker, source, false)
 }
 
 fn start_reset(
@@ -280,10 +288,12 @@ fn start_reset(
     harness: &str,
     marker: Option<(String, String)>,
     source: Option<&Path>,
+    resume_native: bool,
 ) -> io::Result<HostSession> {
     let session = Session {
         generation: uuid::Uuid::now_v7().to_string(),
         harness: harness.to_owned(),
+        resume_native,
     };
     pin_session_from_source(root, &session.generation, source)?;
     registry.pending_reset = Some(PendingReset { session, marker });
@@ -343,6 +353,7 @@ fn new_session_unlocked(
     let session = Session {
         generation: uuid::Uuid::now_v7().to_string(),
         harness: harness.to_owned(),
+        resume_native: false,
     };
     // Persist the complete pin before publishing its generation. A crash here
     // can leave an orphan pin but can never expose an unpinned active session.
@@ -360,6 +371,25 @@ fn new_session_unlocked(
 /// Bind a late vendor marker to the ALREADY pinned generation. A marker change
 /// is only a new alias and does not start or refresh the host session.
 pub fn bind_vendor(root: &Path, harness: &str, vendor_id: &str) -> io::Result<HostSession> {
+    bind_vendor_inner(root, harness, vendor_id, false)
+}
+
+/// Reuse a known native session only during a recorded harness cutover. Explicit
+/// resets still refuse old aliases, and unreadable registries/pins never refresh.
+pub fn bind_or_resume_vendor(
+    root: &Path,
+    harness: &str,
+    vendor_id: &str,
+) -> io::Result<HostSession> {
+    bind_vendor_inner(root, harness, vendor_id, true)
+}
+
+fn bind_vendor_inner(
+    root: &Path,
+    harness: &str,
+    vendor_id: &str,
+    allow_resume: bool,
+) -> io::Result<HostSession> {
     let _lock = lock(root)?;
     let mut registry = read_ready(root)?;
     let session = registry
@@ -371,6 +401,14 @@ pub fn bind_vendor(root: &Path, harness: &str, vendor_id: &str) -> io::Result<Ho
     if let Some(previous) = registry.aliases.get(&key)
         && previous.generation != session.generation
     {
+        if allow_resume && session.resume_native {
+            let mut resumed = previous.clone();
+            resumed.resume_native = false;
+            let result = materialize(root, &resumed)?;
+            registry.active = Some(resumed);
+            write(root, &registry)?;
+            return Ok(result);
+        }
         return Err(io::Error::other(
             "vendor session is already bound to a different generation",
         ));
@@ -383,6 +421,9 @@ pub fn bind_vendor(root: &Path, harness: &str, vendor_id: &str) -> io::Result<Ho
     {
         return Ok(result); // frequent health checks never rewrite the registry
     }
+    let mut session = session;
+    session.resume_native = false;
+    registry.active = Some(session.clone());
     registry.aliases.insert(key, session);
     write(root, &registry)?;
     Ok(result)
@@ -410,6 +451,44 @@ mod tests {
     fn memory(root: &Path, text: &str) {
         fs::create_dir_all(root.join("memory")).unwrap();
         fs::write(root.join("memory/MEMORY.md"), text).unwrap();
+    }
+    #[test]
+    fn roundtrip_native_reuse_resumes_original_pin_without_losing_aliases() {
+        let dir = crate::test_tempdir();
+        let root = dir.path();
+        fs::create_dir_all(root.join("config")).unwrap();
+        memory(root, "original snapshot");
+        let first = ensure_active(root, "opencode").unwrap();
+        bind_vendor(root, "opencode", "native-s1").unwrap();
+        prepare_harness_with_source(root, "sylphx", None, None).unwrap();
+        bind_vendor(root, "sylphx", "native-s2").unwrap();
+        memory(root, "must not replace resumed snapshot");
+        prepare_harness_with_source(root, "opencode", Some("opencode-session-id"), None).unwrap();
+        // The vendor DB reports S1 even though the pointer is absent.
+        assert_eq!(
+            bind_or_resume_vendor(root, "opencode", "native-s1").unwrap(),
+            first
+        );
+        assert_eq!(read(root).unwrap().aliases.len(), 2);
+        let reset = reset_session(root, "opencode", None).unwrap();
+        assert!(bind_or_resume_vendor(root, "opencode", "native-s1").is_err());
+        assert_eq!(active(root).unwrap().unwrap(), reset);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn host_root_os_alias_is_allowed_but_native_pointer_ancestors_are_not() {
+        let dir = crate::test_tempdir();
+        let root = dir.path().join("real");
+        fs::create_dir_all(root.join("config")).unwrap();
+        let alias = dir.path().join("os-alias");
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        ensure_active(&alias, "opencode").unwrap();
+        fs::write(root.join("config/opencode-session-id"), "native-s1").unwrap();
+        reset_session(&alias, "opencode", Some("opencode-session-id")).unwrap();
+        fs::rename(root.join("config"), root.join("retained-config")).unwrap();
+        std::os::unix::fs::symlink(root.join("retained-config"), root.join("config")).unwrap();
+        assert!(reset_session(&alias, "opencode", Some("opencode-session-id")).is_err());
     }
     #[test]
     fn preparing_harness_switches_once_and_preserves_history_and_aliases() {
@@ -498,6 +577,7 @@ mod tests {
             let session = Session {
                 generation: uuid::Uuid::now_v7().to_string(),
                 harness: "opencode".into(),
+                resume_native: false,
             };
             memory(root, "prepared fact");
             let expected = pin_session(root, &session.generation).unwrap();
@@ -548,6 +628,7 @@ mod tests {
             session: Session {
                 generation: uuid::Uuid::now_v7().to_string(),
                 harness: "opencode".into(),
+                resume_native: false,
             },
             marker: Some(("../foreign".into(), "0".repeat(64))),
         });

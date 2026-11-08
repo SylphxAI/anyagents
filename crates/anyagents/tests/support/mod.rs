@@ -141,6 +141,7 @@ pub fn contract_server() -> std::process::Command {
         "ANYAGENTS_SOCKET_GID",
         "ANYAGENTS_AGENTS",
         "ANYAGENTS_PRINCIPALS",
+        "ANYAGENTS_PRINCIPAL_REGISTRY",
         "ANYAGENTS_LAUNCHER",
         "ANYAGENTS_SEAT_LAUNCH",
         "ANYAGENTS_SEAT_PEERS",

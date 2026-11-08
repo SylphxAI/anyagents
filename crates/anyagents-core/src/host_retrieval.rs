@@ -233,6 +233,16 @@ impl Store {
         scope: MemoryScope,
         query: &HistorySearchQuery,
     ) -> Result<Vec<(IndexHit, Vec<u8>)>, IndexError> {
+        self.search_host_files_with_warnings(authorized, scope, query, &mut Vec::new())
+    }
+
+    pub fn search_host_files_with_warnings(
+        &self,
+        authorized: &[String],
+        scope: MemoryScope,
+        query: &HistorySearchQuery,
+        warnings: &mut Vec<String>,
+    ) -> Result<Vec<(IndexHit, Vec<u8>)>, IndexError> {
         let selected = query
             .agent
             .as_deref()
@@ -294,11 +304,15 @@ impl Store {
                 }
             }
             if scope != MemoryScope::Memory {
-                for path in native_transcripts(&root)? {
+                for path in native_transcripts_with_warnings(&root, warnings)? {
                     if unresolved.iter().any(|blocked| path.starts_with(blocked)) {
                         continue;
                     }
-                    ids.extend(refresh_native(&mut index, agent, &path)?.documents);
+                    match refresh_native(&mut index, agent, &path) {
+                        Ok(stats) => ids.extend(stats.documents),
+                        Err(IndexError::Io(error)) if skip_unreadable(&path, &error, warnings) => {}
+                        Err(error) => return Err(error),
+                    }
                 }
                 // Reconciled archive pages are lossless historical documents,
                 // not necessarily JSONL. Their entire text remains searchable.
@@ -333,11 +347,14 @@ impl Store {
         request.agent = None;
         let hits = index.search(&visible, scope, &request)?;
         hits.into_iter()
-            .map(|hit| {
+            .filter_map(|hit| {
                 // Return the matching bounded window, not an unbounded tool payload.
                 // The whole-event coordinate remains available for explicit readback.
-                let bytes = read_raw(&hit.window)?;
-                Ok((hit, bytes))
+                match read_raw(&hit.window) {
+                    Ok(bytes) => Some(Ok((hit, bytes))),
+                    Err(error) if skip_unreadable(&hit.raw.segment, &error, warnings) => None,
+                    Err(error) => Some(Err(error.into())),
+                }
             })
             .collect()
     }
@@ -630,7 +647,52 @@ fn regular_files(root: &Path, recursive: bool) -> io::Result<Vec<PathBuf>> {
     Ok(result)
 }
 fn native_transcripts(root: &Path) -> io::Result<Vec<PathBuf>> {
-    let mut result = regular_files(&root.join("transcripts"), true)?;
+    native_transcripts_with_warnings(root, &mut Vec::new())
+}
+
+fn skip_unreadable(path: &Path, error: &io::Error, warnings: &mut Vec<String>) -> bool {
+    if error.kind() != io::ErrorKind::PermissionDenied {
+        return false;
+    }
+    let warning = format!("unreadable transcript segment {}: {error}", path.display());
+    eprintln!("{warning}");
+    warnings.push(warning);
+    true
+}
+
+fn readable_files(root: &Path, warnings: &mut Vec<String>) -> io::Result<Vec<PathBuf>> {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) if skip_unreadable(root, &error, warnings) => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut files = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) if skip_unreadable(root, &error, warnings) => continue,
+            Err(error) => return Err(error),
+        };
+        let kind = entry.file_type()?;
+        if kind.is_file() {
+            files.push(entry.path());
+        } else if kind.is_dir() {
+            files.extend(readable_files(&entry.path(), warnings)?);
+        }
+    }
+    Ok(files)
+}
+
+fn native_transcripts_with_warnings(
+    root: &Path,
+    warnings: &mut Vec<String>,
+) -> io::Result<Vec<PathBuf>> {
+    let mut result = if safe_components(root, &root.join("transcripts"))? {
+        readable_files(&root.join("transcripts"), warnings)?
+    } else {
+        Vec::new()
+    };
     let config = root.join("config");
     if !safe_components(root, &config)? {
         return Ok(result);
@@ -641,20 +703,17 @@ fn native_transcripts(root: &Path) -> io::Result<Vec<PathBuf>> {
     }
     for projects in [config.join("projects"), config.join(".claude/projects")] {
         // No guessed personal home or Codex SQLite discovery.
-        if safe_components(root, &projects)?
-            && fs::symlink_metadata(&projects)
-                .is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
-        {
-            for entry in fs::read_dir(projects)? {
-                let entry = entry?;
-                if entry.file_type()?.is_dir() {
-                    result.extend(
-                        regular_files(&entry.path(), false)?
-                            .into_iter()
-                            .filter(|p| p.extension().is_some_and(|e| e == "jsonl")),
-                    );
-                }
-            }
+        let safe = match safe_components(root, &projects) {
+            Ok(safe) => safe,
+            Err(error) if skip_unreadable(&projects, &error, warnings) => continue,
+            Err(error) => return Err(error),
+        };
+        if safe {
+            result.extend(
+                readable_files(&projects, warnings)?
+                    .into_iter()
+                    .filter(|p| p.extension().is_some_and(|e| e == "jsonl")),
+            );
         }
     }
     result.sort();
@@ -704,6 +763,76 @@ fn event_metadata(agent: &Agent, value: &EventHeader) -> IndexMetadata {
 mod tests {
     use super::*;
     use crate::NewAgent;
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_native_directory_warns_without_hiding_readable_or_mailbox_hits() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("permission fixture requires an unprivileged executor");
+            return;
+        }
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(NewAgent::new("worker", "claude-code"))
+            .unwrap();
+        store
+            .receive(&agent.id, crate::Incoming::new("mailboxneedle"))
+            .unwrap();
+        let root = dir.path().join("agents").join(agent.id.as_str());
+        let denied = root.join("config/projects/private");
+        fs::create_dir_all(&denied).unwrap();
+        fs::create_dir_all(root.join("transcripts")).unwrap();
+        fs::write(
+            root.join("transcripts/readable.jsonl"),
+            "{\"role\":\"user\",\"content\":\"readableneedle\"}\n",
+        )
+        .unwrap();
+        fs::write(
+            denied.join("private.jsonl"),
+            "{\"role\":\"user\",\"content\":\"hiddenneedle\"}\n",
+        )
+        .unwrap();
+        fs::set_permissions(&denied, fs::Permissions::from_mode(0)).unwrap();
+        assert_eq!(
+            fs::read_dir(&denied).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        let mut warnings = Vec::new();
+        let hits = store
+            .search_host_files_with_warnings(
+                &[agent.id.to_string()],
+                MemoryScope::Transcripts,
+                &HistorySearchQuery {
+                    query: Some("readableneedle".into()),
+                    ..Default::default()
+                },
+                &mut warnings,
+            )
+            .unwrap();
+        fs::set_permissions(&denied, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains(denied.to_str().unwrap()))
+        );
+        assert_eq!(
+            store
+                .search_history(&HistorySearchQuery {
+                    query: Some("mailboxneedle".into()),
+                    ..Default::default()
+                })
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            native_transcripts(&root)
+                .unwrap()
+                .contains(&denied.join("private.jsonl"))
+        );
+    }
     #[test]
     fn native_tool_correlation_survives_reopen_and_is_scoped_atomic_and_rebuildable() {
         use std::io::Write;

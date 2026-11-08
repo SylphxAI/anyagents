@@ -645,6 +645,7 @@ fn finish_open(state: &mut State, usage: TurnUsage) {
         return;
     }
     state.sign_in_fault = None;
+    attach_echoed_followups(state);
     for (idx, id) in state.open.drain(..).enumerate() {
         state.finished.insert(id.clone());
         let item_usage = if idx == 0 {
@@ -657,7 +658,21 @@ fn finish_open(state: &mut State, usage: TurnUsage) {
     promote_followups(state);
 }
 
-/// Messages written while a turn was open start the next turn when it ends.
+fn attach_echoed_followups(state: &mut State) {
+    // A replay echo before this result proves the stream consumed the steer in
+    // this turn. Only unacknowledged followups can belong to a later turn.
+    let mut waiting = Vec::new();
+    for id in state.followups.drain(..) {
+        if state.echoed.contains(&id) {
+            state.open.push(id);
+        } else {
+            waiting.push(id);
+        }
+    }
+    state.followups = waiting;
+}
+
+/// Only messages not echoed before the result start a later turn.
 fn promote_followups(state: &mut State) {
     if !state.followups.is_empty() {
         state.turns_started += 1;
@@ -741,6 +756,7 @@ fn apply_result(state: &mut State, value: &Value) {
     // An errored result (a sign-in failure, a vendor error) is not a successful
     // turn: its ids finish, but with the vendor's own reason instead of usage.
     if let Some(reason) = result_error(value) {
+        attach_echoed_followups(state);
         let is_oauth_expired = reason.contains("OAuth session expired")
             || reason.contains("Failed to authenticate: OAuth")
             || reason.contains("Not logged in")

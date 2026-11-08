@@ -2128,11 +2128,18 @@ pub(crate) fn reconcile_agent_runtime_config(
         let _ = std::fs::remove_file(&goal_file);
     }
     seed_harness_credentials(store, data, agent, config)?;
-    let needs_capability_repair = std::fs::read_to_string(config.join("mcp-capability"))
-        .ok()
-        .is_none_or(|raw| {
-            crate::operator::verify_capability(store, &agent.id, raw.trim()).is_err()
-        });
+    let needs_capability_repair = match std::fs::read_to_string(config.join("mcp-capability")) {
+        Ok(raw) => match store.authenticate_capability(raw.trim()) {
+            Ok(owner) if owner != agent.id => {
+                return Err(Error::Message(
+                    "mailbox capability belongs to another agent".into(),
+                ));
+            }
+            _ => crate::operator::verify_capability(store, &agent.id, raw.trim()).is_err(),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(error) => return Err(error.into()),
+    };
     if needs_capability_repair && let Err(mint_error) = crate::operator::ensure(store, &agent.id) {
         let mut repaired = false;
         #[cfg(unix)]
@@ -8000,7 +8007,7 @@ pub(crate) fn apply_archetype_defaults(
     } else {
         None
     };
-    let Some(tpl) = tpl else {
+    let Some(mut tpl) = tpl else {
         return Ok(());
     };
 
@@ -8036,6 +8043,35 @@ pub(crate) fn apply_archetype_defaults(
         && let Some(wd) = tpl.workdir
     {
         body.workdir = Some(wd);
+    }
+    // Deployment presets outrank static template defaults, but never explicit
+    // caller fields. Fill the preset before considering the template tuple.
+    if let Some(parent) = parent {
+        let config = load_subagent_defaults(data_dir);
+        let spec = config.agents.get(&parent.name).unwrap_or(&config.default);
+        if spec.mode.eq_ignore_ascii_case("preset")
+            && spec
+                .harness
+                .as_deref()
+                .is_some_and(|h| !h.trim().is_empty())
+        {
+            if body.harness.as_deref().is_none_or(|h| h.trim().is_empty()) {
+                body.harness = spec.harness.clone();
+                if body.model.as_deref().is_none_or(|m| m.trim().is_empty()) {
+                    body.model = spec.model.clone();
+                }
+                if body.profile.as_deref().is_none_or(|p| p.trim().is_empty()) {
+                    body.profile = spec.profile.clone();
+                }
+            }
+            // A preset tuple can deliberately omit model/profile. Do not fill
+            // those omissions from another harness's static template.
+            if body.harness == spec.harness {
+                tpl.harness = None;
+                tpl.model = None;
+                tpl.profile = None;
+            }
+        }
     }
     if body.harness.as_deref().is_none_or(|h| h.trim().is_empty())
         && let Some(h) = tpl.harness
@@ -8246,6 +8282,71 @@ pub(crate) fn resolve_subagent_defaults(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn harness_continuity_uses_newest_completed_turns_in_chronological_order() {
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(anyagents_core::NewAgent::new("worker", "opencode"))
+            .unwrap();
+        for n in 0..20 {
+            store
+                .record_outbound(&agent.id, "agent:peer", None, &format!("completed-{n:02}"))
+                .unwrap();
+        }
+        let summary =
+            build_harness_continuity_summary(&store, &agent, Some("opencode"), "sylphx").unwrap();
+        assert!(!summary.contains("completed-09"));
+        assert!(summary.contains("completed-10"));
+        assert!(summary.find("completed-10").unwrap() < summary.find("completed-19").unwrap());
+    }
+
+    #[test]
+    fn configured_subagent_preset_overrides_template_but_not_explicit_request() {
+        let dir = crate::test_tempdir();
+        let data = dir.path();
+        let store = Store::open(data.join("state.db")).unwrap();
+        let parent = store
+            .create_agent(anyagents_core::NewAgent::new("parent", "claude-code"))
+            .unwrap();
+        let templates = data.join(".agents/agents");
+        std::fs::create_dir_all(&templates).unwrap();
+        std::fs::write(templates.join("worker.md"), "---\nharness: sylphx\nmodel: template-model\nprofile: template/default\n---\nTemplate instructions\n").unwrap();
+        let mut defaults = SubagentDefaultsConfig::default();
+        defaults.default = SubagentDefaultSpec {
+            mode: "preset".into(),
+            harness: Some("opencode".into()),
+            model: Some("preset-model".into()),
+            profile: None,
+        };
+        save_subagent_defaults(data, &defaults).unwrap();
+        for explicit in [false, true] {
+            let mut body: crate::api::CreateAgentRequest = serde_json::from_value(serde_json::json!({
+                "name":"child", "archetype":"worker", "harness": if explicit { Some("codex") } else { None },
+                "model": if explicit { Some("explicit-model") } else { None },
+                "profile": if explicit { Some("openai/explicit") } else { None }
+            })).unwrap();
+            apply_archetype_defaults(data, Some(&parent), &mut body).unwrap();
+            let (harness, model, _) = resolve_subagent_defaults(
+                data,
+                Some(&parent),
+                body.harness.as_deref().unwrap_or(""),
+                body.model,
+                body.profile,
+            );
+            assert_eq!(harness, if explicit { "codex" } else { "opencode" });
+            assert_eq!(
+                model.as_deref(),
+                Some(if explicit {
+                    "explicit-model"
+                } else {
+                    "preset-model"
+                })
+            );
+            assert!(body.instructions.unwrap().contains("Template instructions"));
+        }
+    }
 
     fn rebalance_test_profiles(data: &Path, busy_pct: i64) -> Vec<ProviderProfileEntry> {
         [("busy", busy_pct), ("healthy", 80)]

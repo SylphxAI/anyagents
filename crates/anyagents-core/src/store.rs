@@ -2958,6 +2958,9 @@ impl Store {
     /// context expansion (`radius`).
     pub fn search_history(&self, req: &HistorySearchQuery) -> Result<Vec<ConversationTurn>, Error> {
         self.backfill_full_mailbox_history(req.visible_agent_ids.as_deref())?;
+        // Search, not startup, owns derivative-index validation. This repairs
+        // empty/partial current-schema indexes without scanning on Store::open.
+        ensure_lexical_fts_backfilled(&mut self.conn())?;
         let conn = self.read_conn();
         let limit = req.limit.clamp(1, 200);
         let radius = req.radius.min(10);
@@ -3886,20 +3889,10 @@ impl Store {
              ON CONFLICT(agent_id) DO UPDATE SET
                  completed_seq = CASE
                      WHEN turn_recovery.completed_seq >= turn_recovery.opened_seq THEN ?3
-                     WHEN EXISTS (
-                         SELECT 1 FROM outbound_messages
-                         WHERE outbound_messages.agent_id = ?1
-                           AND outbound_messages.sent_at_ms >= turn_recovery.opened_at_ms
-                     ) THEN ?3
                      ELSE turn_recovery.completed_seq
                  END,
                  opened_at_ms = CASE
                      WHEN turn_recovery.completed_seq >= turn_recovery.opened_seq THEN excluded.opened_at_ms
-                     WHEN EXISTS (
-                         SELECT 1 FROM outbound_messages
-                         WHERE outbound_messages.agent_id = ?1
-                           AND outbound_messages.sent_at_ms >= turn_recovery.opened_at_ms
-                     ) THEN excluded.opened_at_ms
                      ELSE turn_recovery.opened_at_ms
                  END,
                  opened_seq = excluded.opened_seq,

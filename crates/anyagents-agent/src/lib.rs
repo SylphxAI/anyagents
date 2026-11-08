@@ -328,6 +328,56 @@ fn inject_error(err: HarnessError) -> Error {
     }
 }
 
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    use anyagents_core::{Incoming, NewAgent};
+    use anyagents_harness::fake::FakeHarness;
+
+    #[test]
+    fn interrupted_steer_only_restarts_inside_recovery_envelope() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let store = Store::open(&path).unwrap();
+        let agent = store.create_agent(NewAgent::new("worker", "test")).unwrap();
+        store
+            .receive(&agent.id, Incoming::new("initial task"))
+            .unwrap();
+        let mut delivery = DeliveryLoop::start(
+            store,
+            agent.id.clone(),
+            FakeHarness::new(DeliveryMode::Steer),
+        )
+        .unwrap();
+        delivery.run_once().unwrap();
+        delivery
+            .store()
+            .record_outbound(&agent.id, "agent:peer", None, "progress only")
+            .unwrap();
+        delivery
+            .store()
+            .receive(&agent.id, Incoming::new("steered task"))
+            .unwrap();
+        delivery.run_once().unwrap();
+        drop(delivery);
+        let store = Store::open(&path).unwrap();
+        let open = store.open_turn(&agent.id).unwrap().unwrap();
+        let recovery = recovery_outbound(&open);
+        assert!(recovery.id.starts_with("recovery_"));
+        assert!(recovery.text.contains("steered task"));
+        assert!(store.next_undelivered(&agent.id).unwrap().is_none());
+        let mut harness = FakeHarness::new(DeliveryMode::Steer);
+        harness.set_auto_finish(true);
+        let mut resumed = DeliveryLoop::start(store, agent.id.clone(), harness).unwrap();
+        resumed.recover_open_turn(&open).unwrap();
+        assert_eq!(resumed.harness().written_ids(), &[recovery.id]);
+        drop(resumed);
+        let store = Store::open(path).unwrap();
+        assert!(store.open_turn(&agent.id).unwrap().is_none());
+        assert!(store.next_undelivered(&agent.id).unwrap().is_none());
+    }
+}
+
 pub(crate) fn outbound(message: &Message) -> OutboundMessage {
     OutboundMessage {
         id: message.id.as_str().to_string(),

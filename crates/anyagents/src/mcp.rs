@@ -1729,6 +1729,7 @@ impl AgentMcp {
                         .unwrap_or(ConversationResponse {
                             agent_id: view.id.clone(),
                             agent: view.name.clone(),
+                            warnings: Vec::new(),
                             turns: Vec::new(),
                         });
                 let schedules = view.schedules.clone();
@@ -1942,6 +1943,7 @@ impl AgentMcp {
                         .unwrap_or(ConversationResponse {
                             agent_id: view.id.clone(),
                             agent: view.name.clone(),
+                            warnings: Vec::new(),
                             turns: Vec::new(),
                         });
                 let schedules = view.schedules.clone();
@@ -6229,8 +6231,17 @@ mod spawn_args_tests {
 
     #[test]
     fn send_closing_sentinels_are_exact_text_only_tokens() {
+        for text in ["NO_REPLY", " \nNO_REPLY。 \n"] {
+            assert!(
+                SendRequest {
+                    text: text.into(),
+                    ..Default::default()
+                }
+                .is_turn_closing_sentinel(),
+                "{text:?}"
+            );
+        }
         for text in [
-            "NO_REPLY",
             " End. ",
             "end",
             "停止。",
@@ -6243,18 +6254,6 @@ mod spawn_args_tests {
             "終了。",
             "Final!",
             "done...",
-            " \nNO_REPLY。 \n",
-        ] {
-            assert!(
-                SendRequest {
-                    text: text.into(),
-                    ..Default::default()
-                }
-                .is_turn_closing_sentinel(),
-                "{text:?}"
-            );
-        }
-        for text in [
             "",
             " ",
             "End of report.",
@@ -6283,7 +6282,7 @@ mod spawn_args_tests {
             json!({"quote":{"text":"real quoted content"}}),
         ] {
             let mut value = attachment;
-            value["text"] = json!("End.");
+            value["text"] = json!("NO_REPLY");
             let request: SendRequest = serde_json::from_value(value).unwrap();
             assert!(!request.is_turn_closing_sentinel());
         }

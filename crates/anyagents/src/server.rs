@@ -3961,7 +3961,7 @@ async fn create_agent_route(
         let (harness, model, profile) = create::resolve_subagent_defaults(
             state.store.data_dir(),
             parent_agent.as_ref(),
-            body.harness.as_deref().unwrap_or("claude-code"),
+            body.harness.as_deref().unwrap_or(""),
             body.model,
             body.profile,
         );
@@ -5148,6 +5148,7 @@ async fn conversation_route(
                 return Ok(Json(ConversationResponse {
                     agent: target.name.clone(),
                     agent_id: target.id.to_string(),
+                    warnings: Vec::new(),
                     turns: vec![ConversationTurnView {
                         id: doc_id,
                         text,
@@ -5280,6 +5281,7 @@ async fn conversation_route(
             return Ok(Json(ConversationResponse {
                 agent: target.name,
                 agent_id: target.id.to_string(),
+                warnings: Vec::new(),
                 turns: vec![turn],
             }));
         }
@@ -5370,6 +5372,7 @@ async fn conversation_route(
             return Ok(Json(ConversationResponse {
                 agent: agent.name,
                 agent_id: agent.id.to_string(),
+                warnings: Vec::new(),
                 turns: vec![ConversationTurnView {
                     id: hit.id,
                     text: String::from_utf8_lossy(&bytes).into_owned(),
@@ -5470,10 +5473,16 @@ async fn conversation_route(
         let should_search_host_files = has_structured_search
             || query.scope != anyagents_core::host_index::MemoryScope::All
             || std::env::var_os("ANYAGENTS_TESTS").is_some();
+        let mut warnings = Vec::new();
         let file_hits = if should_search_host_files {
             state
                 .store
-                .search_host_files(&authorized, query.scope, &file_request)
+                .search_host_files_with_warnings(
+                    &authorized,
+                    query.scope,
+                    &file_request,
+                    &mut warnings,
+                )
                 .map_err(|e| ApiError::from_store(Error::Message(e.to_string())))?
         } else {
             Vec::new()
@@ -5639,6 +5648,7 @@ async fn conversation_route(
             agent: agent_name,
             agent_id: agent_id_str,
             turns,
+            warnings,
         }))
     })
     .await
@@ -8277,6 +8287,60 @@ pub(crate) mod tests {
         });
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn conversation_unreadable_transcript_keeps_mailbox_and_readable_hits_with_warning() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = crate::test_tempdir();
+        let state = archetype_validation_state(dir.path());
+        let agent = state
+            .store
+            .create_agent(anyagents_core::NewAgent::new("worker", "claude-code"))
+            .unwrap();
+        state
+            .store
+            .receive(
+                &agent.id,
+                anyagents_core::Incoming::new("combinedneedle mailbox"),
+            )
+            .unwrap();
+        let config = anyagents_core::agent_config_dir(dir.path(), &agent.id);
+        let denied = config.join("projects/private");
+        std::fs::create_dir_all(&denied).unwrap();
+        std::fs::write(
+            config.join("sylphx-transcript.jsonl"),
+            "{\"role\":\"user\",\"content\":\"combinedneedle readable\"}\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0)).unwrap();
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let Json(result) = conversation_route(
+                Principal::Operator,
+                State(state),
+                AxumPath(agent.name),
+                Query(
+                    serde_json::from_value(
+                        serde_json::json!({"query":"combinedneedle", "scope":"all"}),
+                    )
+                    .unwrap(),
+                ),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{}", e.message));
+            assert_eq!(result.turns.len(), 2);
+            assert!(
+                result
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains(denied.to_str().unwrap()))
+            );
+        });
+        std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
     /// Answers one sign-in with two lines and records where it ran.
     struct Scripted {
         dir: Arc<Mutex<Option<PathBuf>>>,
@@ -9682,16 +9746,7 @@ exec '{}' "$@"
         let target = store.create_agent(new).unwrap();
         store.set_agent_state(&target.id, "archived").unwrap();
         let actor = Actor::Agent(sender.name.clone());
-        for text in [
-            "NO_REPLY",
-            "End.",
-            "停止。",
-            "No more.",
-            "。",
-            "Done.",
-            "終了。",
-            "Final!",
-        ] {
+        for text in ["NO_REPLY", " NO_REPLY。 "] {
             let response = authored_send(&store, &actor, "agent:target", text, "closing-only");
             assert!(response.deliveries.is_empty());
             assert!(response.skipped.is_empty());
@@ -9718,6 +9773,17 @@ exec '{}' "$@"
         );
         assert_eq!(response.deliveries.len(), 1);
         assert_eq!(store.inbox(&target.id, None).unwrap().len(), 1);
+        for (n, text) in ["停止", "Done", "End", "Final!", "。"].iter().enumerate() {
+            let response = authored_send(
+                &store,
+                &actor,
+                "agent:target",
+                text,
+                &format!("real-closing-word-{n}"),
+            );
+            assert_eq!(response.deliveries.len(), 1, "{text}");
+        }
+        assert_eq!(store.inbox(&target.id, None).unwrap().len(), 6);
     }
 
     #[test]
@@ -10184,8 +10250,8 @@ exec '{}' "$@"
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             for (name, parent_ref, harness, role, expected) in [
                 ("root-default", "root", None, None, "claude-code"),
-                ("child-default", parent.id.as_str(), None, None, "claude-code"),
-                ("unmatched-label", parent.id.as_str(), None, Some("nonexistent-display-label-134"), "claude-code"),
+                ("child-default", parent.id.as_str(), None, None, "opencode"),
+                ("unmatched-label", parent.id.as_str(), None, Some("nonexistent-display-label-134"), "opencode"),
                 ("child-empty", parent.id.as_str(), Some(""), None, "opencode"),
                 ("child-inherit", parent.id.as_str(), Some("inherit"), None, "opencode"),
                 ("child-explicit", parent.id.as_str(), Some("codex"), None, "codex"),
@@ -10199,6 +10265,46 @@ exec '{}' "$@"
                 assert_eq!(status, StatusCode::CREATED);
                 assert_eq!(created.harness, expected, "{name}");
                 assert_eq!(created.scope, "siblings");
+            }
+        });
+        unsafe {
+            std::env::remove_var("ANYAGENTS_FAKE_MODE");
+        }
+    }
+
+    #[test]
+    fn archetype_spawn_uses_preset_runtime_unless_caller_selects_one() {
+        let _env = env_lock();
+        let dir = crate::test_tempdir();
+        let state = archetype_validation_state(dir.path());
+        let parent = state
+            .store
+            .create_agent(anyagents_core::NewAgent::new("parent", "claude-code"))
+            .unwrap();
+        std::fs::create_dir_all(dir.path().join(".agents/agents")).unwrap();
+        std::fs::write(
+            dir.path().join(".agents/agents/worker.md"),
+            "---\nharness: sylphx\nmodel: template-model\n---\nTemplate instructions\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("subagent-defaults.json"),
+            r#"{"default":{"mode":"preset","harness":"opencode","model":"preset-model"}}"#,
+        )
+        .unwrap();
+        unsafe {
+            std::env::set_var("ANYAGENTS_FAKE_MODE", "1");
+        }
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            for explicit in [false, true] {
+                let mut body = serde_json::json!({"name":if explicit {"explicit-child"} else {"preset-child"}, "parent":parent.id.as_str(), "archetype":"worker"});
+                if explicit { body["harness"] = serde_json::json!("claude-code"); body["model"] = serde_json::json!("explicit-model"); }
+                let (_, Json(created)) = create_agent_route(Principal::Operator, State(state.clone()), Json(serde_json::from_value(body).unwrap()))
+                    .await.unwrap_or_else(|e| panic!("{}", e.message));
+                assert_eq!(created.harness, if explicit { "claude-code" } else { "opencode" });
+                assert_eq!(created.model.as_deref(), Some(if explicit { "explicit-model" } else { "preset-model" }));
+                let stored = state.store.agent_by_name(&created.name).unwrap();
+                assert!(std::path::Path::new(stored.workdir.as_deref().unwrap()).is_dir());
             }
         });
         unsafe {

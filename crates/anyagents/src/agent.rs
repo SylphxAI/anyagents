@@ -831,7 +831,7 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
     let (harness, model, profile) = crate::create::resolve_subagent_defaults(
         data,
         parent_agent.as_ref(),
-        parsed.harness.as_deref().unwrap_or("claude-code"),
+        parsed.harness.as_deref().unwrap_or(""),
         parsed.model,
         parsed.profile,
     );

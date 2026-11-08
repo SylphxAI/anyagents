@@ -116,6 +116,24 @@ fixtures alone cannot establish its cause.
 
 ## Boundaries and live acceptance
 
+Session continuity checks cover native session reuse after an explicit harness
+round-trip without deleting historical aliases, OS aliases above the trusted
+agent root while refusing symlinks below it, and Claude steers echoed before a
+result completing in that same turn. Outbound progress is not turn completion.
+Interrupted steers remain delivered and resume only in a recovery envelope.
+
+History search repairs current-schema derivative FTS state on demand, keeping
+store open free of history scans. Unreadable native transcript segments appear
+in conversation `warnings` without suppressing readable or mailbox results.
+Seat admission resolves current principals for every command; only host-granted
+shared UID or primary GID plus the exact root admits a colocated peer.
+Cloud submission recovery observes settled state and preserves an audit receipt;
+it never replays a retained send or reintroduces host client-tool callbacks.
+
+When running these tests inside an agent, remove inherited agent identity,
+principal-registry and data-directory overrides from the test subprocess. Use
+synthetic fixture state, not the running daemon's registry or credentials.
+
 Scripted processes verify our implementation against fixtures, not whether a
 new release of a vendor still implements those protocols. Before claiming a
 particular dev machine is connected, separately check the installed version of
