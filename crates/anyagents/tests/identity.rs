@@ -99,8 +99,8 @@ fn owner_authority_is_explicit_live_revocable_and_never_inherited() {
     std::fs::create_dir_all(&data).unwrap();
     support::operator_with_configured_seat(&data);
     let server = start_server(&data);
-    let sage = create(&data, "sage");
-    let auth = format!("x-anyagents-agent: {}\r\n", capability(&data, &sage));
+    let coordinator = create(&data, "coordinator");
+    let auth = format!("x-anyagents-agent: {}\r\n", capability(&data, &coordinator));
     let request = |method: &str, path: &str, body: Value| {
         support::call_raw(&server.socket, method, path, &body.to_string(), &auth)
     };
@@ -108,30 +108,35 @@ fn owner_authority_is_explicit_live_revocable_and_never_inherited() {
     let (status, _) = support::call(
         &server.socket,
         "POST",
-        "/v1/agents/sage/admin",
+        "/v1/agents/coordinator/admin",
         r#"{"admin":true}"#,
     );
     assert!(status.contains("200"), "{status}");
     assert!(
-        request("POST", "/v1/agents/sage/admin", json!({"admin":true})).starts_with("HTTP/1.1 403")
+        request(
+            "POST",
+            "/v1/agents/coordinator/admin",
+            json!({"admin":true})
+        )
+        .starts_with("HTTP/1.1 403")
     );
     let root = request(
         "POST",
         "/v1/agents",
-        json!({"name":"rhea", "harness":"claude-code", "parent":"root"}),
+        json!({"name":"builder", "harness":"claude-code", "parent":"root"}),
     );
     assert!(root.starts_with("HTTP/1.1 201"), "{root}");
     let store = anyagents_core::Store::open(data.join("state.db")).unwrap();
-    let rhea = store.agent_by_name("rhea").unwrap();
-    assert!(rhea.parent_id.is_none());
-    assert!(!rhea.is_admin);
-    let rhea_auth = format!(
+    let builder = store.agent_by_name("builder").unwrap();
+    assert!(builder.parent_id.is_none());
+    assert!(!builder.is_admin);
+    let builder_auth = format!(
         "x-anyagents-agent: {}\r\n",
-        capability(&data, rhea.id.as_str())
+        capability(&data, builder.id.as_str())
     );
     for path in ["/v1/channels", "/v1/profiles"] {
         assert!(
-            support::call_raw(&server.socket, "GET", path, "", &rhea_auth)
+            support::call_raw(&server.socket, "GET", path, "", &builder_auth)
                 .starts_with("HTTP/1.1 403")
         );
     }
@@ -150,13 +155,13 @@ fn owner_authority_is_explicit_live_revocable_and_never_inherited() {
     let mut responses = Vec::new();
     responses.push(request(
         "POST",
-        "/v1/agents/rhea/model",
+        "/v1/agents/builder/model",
         json!({"model":"test-model", "base_url":"https://api.example.test", "key":key}),
     ));
     responses.push(request(
         "POST",
         "/v1/channels",
-        json!({"kind":"telegram", "agent":"rhea", "token":token}),
+        json!({"kind":"telegram", "agent":"builder", "token":token}),
     ));
     for response in &responses {
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
@@ -166,19 +171,19 @@ fn owner_authority_is_explicit_live_revocable_and_never_inherited() {
     // Unknown path fields are rejected rather than read in the daemon's seat.
     let rejected = request(
         "POST",
-        "/v1/agents/rhea/model",
+        "/v1/agents/builder/model",
         json!({"model":"test", "key_file":"/etc/passwd"}),
     );
     assert!(rejected.starts_with("HTTP/1.1 422"), "{rejected}");
     responses.push(request(
         "POST",
         "/v1/channels",
-        json!({"kind":"invalid", "agent":"rhea", "token":token}),
+        json!({"kind":"invalid", "agent":"builder", "token":token}),
     ));
     let (status, _) = support::call(
         &server.socket,
         "POST",
-        "/v1/agents/sage/admin",
+        "/v1/agents/coordinator/admin",
         r#"{"admin":false}"#,
     );
     assert!(status.contains("200"));
@@ -197,12 +202,12 @@ fn owner_authority_is_explicit_live_revocable_and_never_inherited() {
     assert!(
         audit
             .iter()
-            .any(|r| r == "agent:sage:agents.create_root:rhea")
+            .any(|r| r == "agent:coordinator:agents.create_root:builder")
     );
     assert!(
         audit
             .iter()
-            .any(|r| r == "operator:agents.revoke_admin:sage")
+            .any(|r| r == "operator:agents.revoke_admin:coordinator")
     );
     for text in responses.iter().chain(audit.iter()) {
         assert!(!text.contains(key));
@@ -349,7 +354,7 @@ fn a_session_acts_as_its_own_agent_and_nothing_else() {
         &socket,
         "POST",
         "/v1/send",
-        &json!({"to": ["gamma"], "text": "message while archived"}).to_string(),
+        &json!({"to": ["gamma"], "text": "mescoordinator while archived"}).to_string(),
         &alpha_auth,
     );
     assert!(
@@ -755,7 +760,11 @@ fn conversation_reads_are_downward_only_for_every_scope_and_cli_fails_closed() {
                     response.starts_with("HTTP/1.1 200"),
                     "{scope} {target} {suffix}: {response}"
                 );
-                for hidden in ["fixture coordinator", "fixture reviewer", "fixture outsider"] {
+                for hidden in [
+                    "fixture coordinator",
+                    "fixture reviewer",
+                    "fixture outsider",
+                ] {
                     assert!(
                         !response.contains(hidden),
                         "{scope} {target} {suffix}: {response}"

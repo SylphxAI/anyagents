@@ -225,7 +225,10 @@ fn an_opencode_agent_answers_one_line_and_the_answer_is_on_its_mailbox() {
         std::thread::sleep(Duration::from_millis(50));
     };
     let author = store.agent_by_name("alpha").unwrap();
-    assert_eq!(reply.sender.as_deref(), Some(format!("agent:{}", author.id).as_str()));
+    assert_eq!(
+        reply.sender.as_deref(),
+        Some(format!("agent:{}", author.id).as_str())
+    );
     assert!(reply.text.contains("pong from opencode"), "{}", reply.text);
     // Exercise the shared-log case deterministically: the reply also becomes
     // a prompt in the owner's session, but must not echo back to alpha.

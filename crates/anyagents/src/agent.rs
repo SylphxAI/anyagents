@@ -857,13 +857,15 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
             .set_agent_scope_as(&agent.id, scope_val, "operator")
             .map_err(|err| err.to_string())?;
         let cfg = anyagents_core::agent_config_dir(data, &agent.id);
-        crate::create::sync_agent_description_files(&store, &agent, &cfg).map_err(|error| error.to_string())?;
+        crate::create::sync_agent_description_files(&store, &agent, &cfg)
+            .map_err(|error| error.to_string())?;
     } else if let Some(pub_val) = parsed.public {
         agent = store
             .set_agent_public_as(&agent.id, pub_val, "operator")
             .map_err(|err| err.to_string())?;
         let cfg = anyagents_core::agent_config_dir(data, &agent.id);
-        crate::create::sync_agent_description_files(&store, &agent, &cfg).map_err(|error| error.to_string())?;
+        crate::create::sync_agent_description_files(&store, &agent, &cfg)
+            .map_err(|error| error.to_string())?;
     }
     // A create is a new instance: its capability is minted so its harness
     // starts with one.

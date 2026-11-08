@@ -2029,7 +2029,9 @@ fn notify_agent_takeover_completed(
         },
     )?;
     // Receipt replay must not replay lifecycle effects after a later archive.
-    if matches!(outcome, anyagents_core::ReceiveOutcome::Duplicate(_)) { return Ok(()); }
+    if matches!(outcome, anyagents_core::ReceiveOutcome::Duplicate(_)) {
+        return Ok(());
+    }
     if agent.state == "idle" || agent.state == "archived" {
         store.set_agent_state(&agent.id, "running")?;
     }
@@ -2729,19 +2731,32 @@ fn complete_takeover_session(
     if let Some(mut st) = load_takeover_state(data, profile)? {
         if !st.completed {
             restore_takeover_viewport(&mut st)?;
-            if let Some(tpid) = st.tunnel_pid.take() { stop_process_group(tpid); }
+            if let Some(tpid) = st.tunnel_pid.take() {
+                stop_process_group(tpid);
+            }
             st.holder = "agent".to_string();
             st.completed = true;
             st.notification_pending = true;
             st.completed_at_ms = Some(now);
-            st.completion_note = note.map(str::to_string)
+            st.completion_note = note
+                .map(str::to_string)
                 .or_else(|| Some("completed by user".to_string()));
             save_takeover_state(data, &st)?;
         }
         if st.notification_pending {
-            notify_agent_takeover_completed(data, st.owner_agent.as_deref(), profile,
-                &current_url, st.completion_note.as_deref(), st.started_at_ms)
-                .map_err(|err| Error::Message(format!("takeover completed; owner notification pending: {err}")))?;
+            notify_agent_takeover_completed(
+                data,
+                st.owner_agent.as_deref(),
+                profile,
+                &current_url,
+                st.completion_note.as_deref(),
+                st.started_at_ms,
+            )
+            .map_err(|err| {
+                Error::Message(format!(
+                    "takeover completed; owner notification pending: {err}"
+                ))
+            })?;
             st.notification_pending = false;
             save_takeover_state(data, &st)?;
         }
@@ -6788,7 +6803,7 @@ mod tests {
         );
     }
     #[test]
-    #[ignore = "Chromium startup and OOPIF click/focus races; see docs/verification.md; fix owner: lyra-anyagents-takeover-test-race after #91"]
+    #[ignore = "Chromium startup and OOPIF click/focus races; see docs/verification.md"]
     fn takeover_focus_finds_cross_origin_input() {
         if !Path::new(&chromium_binary()).exists() {
             return;

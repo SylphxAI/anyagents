@@ -1581,13 +1581,13 @@ mod tests {
 
     #[test]
     fn truncate_visible_respects_cjk_boundaries_and_resets_ansi() {
-        let s = "香港麻雀大亨Owner | category: 現有遊戲";
+        let s = "範例工作資料庫Owner | category: 現有遊戲";
         let t = truncate_visible(s, 14);
-        // "香港麻雀大亨" is 12 cols + "O" (1 col) + "…" (1 col) = 14 cols
+        // "範例工作資料庫" is 12 cols + "O" (1 col) + "…" (1 col) = 14 cols
         assert_eq!(visible_width(&t), 14);
         assert!(t.ends_with('…'));
 
-        let styled = "\x1b[2m香港麻雀大亨Owner\x1b[0m";
+        let styled = "\x1b[2m範例工作資料庫Owner\x1b[0m";
         let ts = truncate_visible(styled, 9);
         assert!(visible_width(&ts) <= 9);
         assert!(ts.ends_with("…\x1b[0m"));
@@ -1609,12 +1609,12 @@ mod tests {
     fn clean_description_strips_subagent_boilerplate() {
         assert_eq!(
             clean_agent_description(
-                "Sub-agent of Sage. Outcome: no live Fun, Big2 or HKMT player loses data",
-                "sage-sub-1",
+                "Sub-agent of Coordinator. Outcome: preserve all documents during import",
+                "coordinator-sub-1",
                 None,
                 true
             ),
-            "no live Fun, Big2 or HKMT player loses data"
+            "preserve all documents during import"
         );
     }
 }

@@ -2843,7 +2843,8 @@ async fn set_description_route(
             && !body.clear.unwrap_or(false)
         {
             require_admin_or_operator(&state.store, &principal, "agents.sync_instructions", "all")?;
-            create::sync_all_agent_instructions(&state.store, state.store.data_dir()).map_err(ApiError::from_store)?;
+            create::sync_all_agent_instructions(&state.store, state.store.data_dir())
+                .map_err(ApiError::from_store)?;
             return Ok(Json(serde_json::json!({
                 "synced": "all",
             })));
@@ -2971,7 +2972,8 @@ async fn set_description_route(
             }
         }
         let cfg = anyagents_core::agent_config_dir(state.store.data_dir(), &rec.id);
-        create::sync_agent_description_files(&state.store, &rec, &cfg).map_err(ApiError::from_store)?;
+        create::sync_agent_description_files(&state.store, &rec, &cfg)
+            .map_err(ApiError::from_store)?;
         let aliases = state.store.agent_aliases(&rec.id).unwrap_or_default();
         Ok(Json(serde_json::json!({
             "id": rec.id.as_str(),
@@ -3016,7 +3018,8 @@ async fn channels_route(
         .map_err(ApiError::from_store)?
         .into_iter()
         .map(|c| {
-            let mem = anyagents_channel_telegram::Memory::from_state(&c.state);
+            let mem = anyagents_channel_telegram::Memory::try_from_state(&c.state)
+                .map_err(ApiError::from_store)?;
             let bot_username = c
                 .identity
                 .clone()
@@ -3034,15 +3037,15 @@ async fn channels_route(
                 .iter()
                 .filter_map(|id| state.store.agent(id).ok().map(|a| a.name))
                 .collect();
-            serde_json::json!({
+            Ok(serde_json::json!({
                 "id": c.id.to_string(),
                 "kind": c.kind,
                 "bot": bot_username,
                 "agents": agents,
                 "pending_managed_bots": mem.pending_managed_bots,
-            })
+            }))
         })
-        .collect();
+        .collect::<Result<Vec<_>, ApiError>>()?;
     Ok(Json(serde_json::json!({"channels": channels})))
 }
 
@@ -3851,7 +3854,8 @@ async fn create_agent_route(
         }
         if scope_changed {
             let cfg = anyagents_core::agent_config_dir(state.store.data_dir(), &agent.id);
-            create::sync_agent_description_files(&state.store, &agent, &cfg).map_err(ApiError::from_store)?;
+            create::sync_agent_description_files(&state.store, &agent, &cfg)
+                .map_err(ApiError::from_store)?;
         }
         if !requested_group_names.is_empty() {
             let mut targets = vec![agent.id.clone()];
@@ -6186,7 +6190,9 @@ fn check_targets(
                 reply,
                 ..
             } => {
-                let channel_actor = plan.sender_id.as_ref()
+                let channel_actor = plan
+                    .sender_id
+                    .as_ref()
                     .map(|id| Actor::Agent(id.to_string()))
                     .unwrap_or_else(|| actor.clone());
                 prepare_telegram(
@@ -6229,9 +6235,12 @@ fn send_sync(
     let body = SendRequest {
         // A display name may be reassigned while a journal lock is held. Carry
         // the admitted identity through mailbox storage and trusted context.
-        sender: Some(plan.sender_id.as_ref()
-            .map(|id| format!("agent:{id}"))
-            .unwrap_or_else(|| actor.as_address())),
+        sender: Some(
+            plan.sender_id
+                .as_ref()
+                .map(|id| format!("agent:{id}"))
+                .unwrap_or_else(|| actor.as_address()),
+        ),
         ..body
     };
     // A call repeated after its answer was lost is the same delivery: the
@@ -6342,7 +6351,8 @@ fn send_sync(
                 thread,
                 reply: address_reply,
             } => {
-                let channel_actor = sender_agent_id.as_ref()
+                let channel_actor = sender_agent_id
+                    .as_ref()
                     .map(|id| Actor::Agent(id.to_string()))
                     .unwrap_or_else(|| actor.clone());
                 let send = || {
@@ -6461,7 +6471,9 @@ impl Actor {
 /// Everyone a room message will reach, without writing anything: the room's
 /// members (its chat, when it names one) minus the sender.
 fn body_author_is(body: &SendRequest, agent: &Agent) -> bool {
-    let Some(sender) = body.sender.as_deref() else { return false; };
+    let Some(sender) = body.sender.as_deref() else {
+        return false;
+    };
     let sender = sender.strip_prefix("agent:").unwrap_or(sender);
     match anyagents_core::AgentId::parse(sender) {
         Ok(id) => id == agent.id,
@@ -6947,10 +6959,56 @@ pub(crate) mod tests {
     use std::sync::MutexGuard;
 
     #[test]
+    fn channel_roster_refuses_corrupt_persisted_state_without_mutation() {
+        let dir = crate::test_tempdir();
+        let state = archetype_validation_state(dir.path());
+        let channel = state
+            .store
+            .create_channel(anyagents_core::NewChannel {
+                kind: "telegram".into(),
+                identity: Some("example_bot".into()),
+                config: "{}".into(),
+                credential_ref: None,
+            })
+            .unwrap();
+        let db = rusqlite::Connection::open(dir.path().join("state.db")).unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let Json(valid) = channels_route(Principal::Operator, State(state.clone()))
+                .await
+                .unwrap_or_else(|error| panic!("{}", error.message));
+            assert_eq!(valid["channels"].as_array().unwrap().len(), 1);
+            for invalid in ["{", "[]", "null"] {
+                db.execute(
+                    "UPDATE channels SET state = ?1 WHERE id = ?2",
+                    rusqlite::params![invalid, channel.id.as_str()],
+                )
+                .unwrap();
+                let error = channels_route(Principal::Operator, State(state.clone()))
+                    .await
+                    .err()
+                    .expect("damaged channel state cannot become an empty view");
+                assert!(error.message.contains("state"), "{}", error.message);
+                let retained: String = db
+                    .query_row(
+                        "SELECT state FROM channels WHERE id = ?1",
+                        [channel.id.as_str()],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(retained, invalid);
+            }
+        });
+    }
+
+    #[test]
     fn deletion_retains_identity_and_resources_until_process_stop() {
         let dir = crate::test_tempdir();
         let state = archetype_validation_state(dir.path());
-        let agent = state.store.create_agent(anyagents_core::NewAgent::new("busy", "opencode")).unwrap();
+        let agent = state
+            .store
+            .create_agent(anyagents_core::NewAgent::new("busy", "opencode"))
+            .unwrap();
         let config = anyagents_core::agent_config_dir(dir.path(), &agent.id);
         std::fs::create_dir_all(&config).unwrap();
         std::fs::write(config.join("preserve"), "retained state").unwrap();
@@ -6970,19 +7028,45 @@ pub(crate) mod tests {
         };
         state.health.publish(&agent.id, live.clone());
         tokio::runtime::Runtime::new().unwrap().block_on(async {
-            let refused = delete_agent_route(Principal::Operator, State(state.clone()), AxumPath(agent.name.clone())).await.err().expect("live process must retain identity");
+            let refused = delete_agent_route(
+                Principal::Operator,
+                State(state.clone()),
+                AxumPath(agent.name.clone()),
+            )
+            .await
+            .err()
+            .expect("live process must retain identity");
             assert_eq!(refused.status, StatusCode::CONFLICT);
             assert_eq!(state.store.agent(&agent.id).unwrap().state, "archived");
-            assert_eq!(std::fs::read_to_string(config.join("preserve")).unwrap(), "retained state");
+            assert_eq!(
+                std::fs::read_to_string(config.join("preserve")).unwrap(),
+                "retained state"
+            );
             let process = state.store.try_lock_agent(&agent.id).unwrap();
             live.process_alive = false;
             state.health.publish(&agent.id, live);
-            let refused = delete_agent_route(Principal::Operator, State(state.clone()), AxumPath(agent.name.clone())).await.err().expect("optimistic health must not revoke process custody");
+            let refused = delete_agent_route(
+                Principal::Operator,
+                State(state.clone()),
+                AxumPath(agent.name.clone()),
+            )
+            .await
+            .err()
+            .expect("optimistic health must not revoke process custody");
             assert_eq!(refused.status, StatusCode::CONFLICT);
             assert!(state.store.agent(&agent.id).is_ok());
-            assert_eq!(std::fs::read_to_string(config.join("preserve")).unwrap(), "retained state");
+            assert_eq!(
+                std::fs::read_to_string(config.join("preserve")).unwrap(),
+                "retained state"
+            );
             drop(process);
-            delete_agent_route(Principal::Operator, State(state.clone()), AxumPath(agent.name.clone())).await.unwrap_or_else(|error| panic!("{}", error.message));
+            delete_agent_route(
+                Principal::Operator,
+                State(state.clone()),
+                AxumPath(agent.name.clone()),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{}", error.message));
             assert!(state.store.agent(&agent.id).is_err());
             assert!(!config.exists());
         });
@@ -7083,7 +7167,10 @@ pub(crate) mod tests {
         send_sync(&store, &actor, body, plan, None)
             .unwrap_or_else(|error| panic!("{}", error.message));
         let received = store.inbox(&receiver.id, None).unwrap();
-        assert_eq!(received[0].sender.as_deref(), Some(format!("agent:{}", original.id).as_str()));
+        assert_eq!(
+            received[0].sender.as_deref(),
+            Some(format!("agent:{}", original.id).as_str())
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -7092,52 +7179,105 @@ pub(crate) mod tests {
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
         use std::time::{Duration, Instant};
         for delete in [false, true] {
-        let dir = crate::test_tempdir();
-        let store = Store::open(dir.path().join("state.db")).unwrap();
-        let original = store.create_agent(anyagents_core::NewAgent::new("author", "opencode")).unwrap();
-        store.set_agent_role(&original.id, Some("admitted role")).unwrap();
-        let mut child = anyagents_core::NewAgent::new("recipient", "opencode");
-        child.parent_id = Some(original.id.clone());
-        let recipient = store.create_agent(child).unwrap();
-        let actor = Actor::Agent(original.name.clone());
-        let body = SendRequest { to: vec![recipient.name.clone()], text: "queued identity sentinel".into(), ..Default::default() };
-        let plan = SendPlan::parse(&store, &actor, &body).unwrap_or_else(|e| panic!("{}", e.message));
-        let key = "identity-lock-test";
-        let filename: String = format!("{key}:0").as_bytes().iter().map(|b| format!("{b:02x}")).collect();
-        let journal = dir.path().join("outbound-history");
-        std::fs::create_dir_all(&journal).unwrap();
-        let lock = std::fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(journal.join(format!("{filename}.lock"))).unwrap();
-        lock.lock().unwrap();
-        let inode = lock.metadata().unwrap().ino();
-        std::thread::scope(|scope| {
-            let sending = scope.spawn(|| send_sync(&store, &actor, body, plan, Some(key.into())).map_err(|e| e.message));
-            let deadline = Instant::now() + Duration::from_secs(10);
-            let waiting = loop {
-                let waiting = std::fs::read_to_string("/proc/locks").unwrap().lines().any(|line| line.contains("-> FLOCK") && line.contains("WRITE") && line.split_whitespace().any(|field| field.ends_with(&format!(":{inode}"))));
-                if waiting || Instant::now() >= deadline { break waiting; }
-                std::thread::sleep(Duration::from_millis(5));
+            let dir = crate::test_tempdir();
+            let store = Store::open(dir.path().join("state.db")).unwrap();
+            let original = store
+                .create_agent(anyagents_core::NewAgent::new("author", "opencode"))
+                .unwrap();
+            store
+                .set_agent_role(&original.id, Some("admitted role"))
+                .unwrap();
+            let mut child = anyagents_core::NewAgent::new("recipient", "opencode");
+            child.parent_id = Some(original.id.clone());
+            let recipient = store.create_agent(child).unwrap();
+            let actor = Actor::Agent(original.name.clone());
+            let body = SendRequest {
+                to: vec![recipient.name.clone()],
+                text: "queued identity sentinel".into(),
+                ..Default::default()
             };
-            // Release even on a failed observation, so the fixture cannot deadlock.
-            if waiting {
-                if delete { store.delete_agent(&original.id).unwrap(); }
-                else { store.rename_agent(&original.id, "renamed").unwrap(); }
-                let replacement = store.create_agent(anyagents_core::NewAgent::new("author", "opencode")).unwrap();
-                store.set_agent_role(&replacement.id, Some("wrong role")).unwrap();
-            }
-            drop(lock);
-            let result = sending.join().unwrap();
+            let plan =
+                SendPlan::parse(&store, &actor, &body).unwrap_or_else(|e| panic!("{}", e.message));
+            let key = "identity-lock-test";
+            let filename: String = format!("{key}:0")
+                .as_bytes()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            let journal = dir.path().join("outbound-history");
+            std::fs::create_dir_all(&journal).unwrap();
+            let lock = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(journal.join(format!("{filename}.lock")))
+                .unwrap();
+            lock.lock().unwrap();
+            let inode = lock.metadata().unwrap().ino();
+            std::thread::scope(|scope| {
+                let sending = scope.spawn(|| {
+                    send_sync(&store, &actor, body, plan, Some(key.into())).map_err(|e| e.message)
+                });
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let waiting = loop {
+                    let waiting =
+                        std::fs::read_to_string("/proc/locks")
+                            .unwrap()
+                            .lines()
+                            .any(|line| {
+                                line.contains("-> FLOCK")
+                                    && line.contains("WRITE")
+                                    && line
+                                        .split_whitespace()
+                                        .any(|field| field.ends_with(&format!(":{inode}")))
+                            });
+                    if waiting || Instant::now() >= deadline {
+                        break waiting;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                };
+                // Release even on a failed observation, so the fixture cannot deadlock.
+                if waiting {
+                    if delete {
+                        store.delete_agent(&original.id).unwrap();
+                    } else {
+                        store.rename_agent(&original.id, "renamed").unwrap();
+                    }
+                    let replacement = store
+                        .create_agent(anyagents_core::NewAgent::new("author", "opencode"))
+                        .unwrap();
+                    store
+                        .set_agent_role(&replacement.id, Some("wrong role"))
+                        .unwrap();
+                }
+                drop(lock);
+                let result = sending.join().unwrap();
+                if delete {
+                    let error = result
+                        .err()
+                        .expect("deleted admitted author cannot publish");
+                    assert!(error.contains("agent not found"), "{error}");
+                } else {
+                    result.unwrap();
+                }
+                assert!(waiting, "actual journal-lock waiter must be observed");
+            });
+            let inbox = store.inbox(&recipient.id, None).unwrap();
             if delete {
-                let error = result.err().expect("deleted admitted author cannot publish");
-                assert!(error.contains("agent not found"), "{error}");
-            } else { result.unwrap(); }
-            assert!(waiting, "actual journal-lock waiter must be observed");
-        });
-        let inbox = store.inbox(&recipient.id, None).unwrap();
-        if delete { assert!(inbox.is_empty()); continue; }
-        assert_eq!(inbox.len(), 1);
-        assert_eq!(inbox[0].sender.as_deref(), Some(format!("agent:{}", original.id).as_str()));
-        assert_eq!(inbox[0].context.sender_role.as_deref(), Some("admitted role"));
-        assert_eq!(inbox[0].context.sender_rel.as_deref(), Some("parent"));
+                assert!(inbox.is_empty());
+                continue;
+            }
+            assert_eq!(inbox.len(), 1);
+            assert_eq!(
+                inbox[0].sender.as_deref(),
+                Some(format!("agent:{}", original.id).as_str())
+            );
+            assert_eq!(
+                inbox[0].context.sender_role.as_deref(),
+                Some("admitted role")
+            );
+            assert_eq!(inbox[0].context.sender_rel.as_deref(), Some("parent"));
         }
     }
 

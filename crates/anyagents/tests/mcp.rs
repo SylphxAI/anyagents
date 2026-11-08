@@ -1357,9 +1357,15 @@ async fn history_search_defaults_and_all_never_escape_a_private_childs_tree() {
     let planner = store.agent_by_name("planner").unwrap();
     let reviewer = store.agent_by_name("reviewer").unwrap();
     let runner = store.agent_by_name("runner").unwrap();
-    store.set_agent_parent(&planner.id, Some(&coordinator.id)).unwrap();
-    store.set_agent_parent(&reviewer.id, Some(&coordinator.id)).unwrap();
-    store.set_agent_parent(&runner.id, Some(&planner.id)).unwrap();
+    store
+        .set_agent_parent(&planner.id, Some(&coordinator.id))
+        .unwrap();
+    store
+        .set_agent_parent(&reviewer.id, Some(&coordinator.id))
+        .unwrap();
+    store
+        .set_agent_parent(&runner.id, Some(&planner.id))
+        .unwrap();
     // Synthetic bodies only. These identifiers reproduce the reported search
     // shape without importing any production conversation content.
     for (id, text) in [
@@ -1447,7 +1453,12 @@ async fn history_search_defaults_and_all_never_escape_a_private_childs_tree() {
             response.turns
         );
     }
-    for target in ["coordinator", "reviewer", coordinator.id.as_str(), reviewer.id.as_str()] {
+    for target in [
+        "coordinator",
+        "reviewer",
+        coordinator.id.as_str(),
+        reviewer.id.as_str(),
+    ] {
         for tool in ["conversation", "search"] {
             let denied = call(
                 &client,
