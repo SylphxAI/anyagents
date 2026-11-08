@@ -26,9 +26,14 @@ use anyagents_harness::{
 /// messages are held back in SQLite (never steered into the retiring process)
 /// so continuous incoming messages cannot extend the old turn indefinitely.
 /// Once the turn finishes or this drain window expires, the process is replaced.
-/// Profile rotations instead wait for the active turn to finish, without a
-/// deadline that could kill ongoing work.
+/// This is the only reason mail ever waits behind a live process. A credential
+/// or profile change holds nothing: mail keeps flowing to the running process,
+/// which moves to the new profile at its next natural boundary.
 const PENDING_SWITCH_DRAIN_MS: i64 = 15_000;
+
+/// After a replacement fails to launch, the old process keeps serving mail for
+/// this long before the next attempt.
+const SWITCH_RETRY_MS: i64 = 5_000;
 
 /// Time source. Production uses the wall clock. Tests advance a manual clock.
 pub trait Clock: Send + Sync {
@@ -646,6 +651,7 @@ fn run_agent<H: Harness + 'static>(
         completed_turn_in_session: false,
         quota_started_at: None,
         pending_switch_started_at: None,
+        switch_retry_at: 0,
         process_started_at: None,
         process_profile_rotated_ms: 0,
         last_error: None,
@@ -715,6 +721,8 @@ struct Session<H: Harness> {
     /// can clear the quota hold before `reset_at`.
     quota_started_at: Option<i64>,
     pending_switch_started_at: Option<i64>,
+    /// No replacement is attempted before this clock time (see `SWITCH_RETRY_MS`).
+    switch_retry_at: i64,
     process_started_at: Option<i64>,
     process_profile_rotated_ms: i64,
     last_error: Option<String>,
@@ -802,6 +810,8 @@ impl<H: Harness + 'static> Session<H> {
     }
 
     fn launch_harness(&mut self) -> Result<H, String> {
+        // The running process keeps this identity unless a replacement starts.
+        let serving = self.agent.clone();
         if let Ok(fresh) = self.inner.store.agent(&self.id) {
             self.paths = AgentPaths::from_store(&self.inner.store, &fresh);
             self.agent = fresh;
@@ -836,6 +846,7 @@ impl<H: Harness + 'static> Session<H> {
             }
             Err(err) => {
                 self.last_error = Some(err.clone());
+                self.agent = serving;
             }
         }
         res
@@ -957,22 +968,30 @@ impl<H: Harness + 'static> Session<H> {
             })
     }
 
-    fn replace_process(&mut self) {
+    /// The harness or model this agent is configured for differs from the one
+    /// its process runs.
+    fn runtime_switch_pending(&self) -> bool {
+        self.inner.store.agent(&self.id).is_ok_and(|fresh| {
+            fresh.harness != self.agent.harness || fresh.model != self.agent.model
+        })
+    }
+
+    /// Returns whether a new process took over.
+    fn replace_process(&mut self) -> bool {
         // Every replacement path (including quota recovery) must preserve an
-        // active child when a profile refresh is pending. A dead child can
-        // still be recovered immediately.
-        if self.profile_rotation_waits_for_turn() {
-            self.pending_switch_started_at
-                .get_or_insert(self.inner.clock.now_ms());
-            return;
+        // active child when only a profile refresh is pending. A dead child can
+        // still be recovered immediately, and an explicit harness or model
+        // switch has already had its bounded drain.
+        if self.profile_rotation_waits_for_turn() && !self.runtime_switch_pending() {
+            return false;
         }
         if self.delivery.is_none() {
             self.restart_at = None;
-            return;
+            return false;
         }
         // Flush any usage the exited process finished serving before swapping it.
         if !self.record_usage() {
-            return;
+            return false;
         }
         match self.launch_harness() {
             Ok(mut harness) => {
@@ -986,8 +1005,12 @@ impl<H: Harness + 'static> Session<H> {
                 self.served = None;
                 self.turns_recorded = 0;
                 self.restart_at = None;
+                true
             }
-            Err(_) => self.restart_at = None,
+            Err(_) => {
+                self.restart_at = None;
+                false
+            }
         }
     }
 
@@ -1037,18 +1060,16 @@ impl<H: Harness + 'static> Session<H> {
     /// `true` when a second loop already holds the agent.
     fn deliver_once(&mut self) -> bool {
         if let Some(switch_started_at) = self.pending_switch_started_at {
-            // A harness, model, or profile switch is pending while the old
+            // An explicit harness or model switch is pending while the old
             // process is mid-turn: hold new mailbox messages in SQLite for the
             // replacement process instead of steering them into the old turn,
-            // and cut over at the turn boundary for profile rotations, or at
-            // the drain deadline for an explicit harness/model switch.
+            // and cut over at the turn boundary or at the drain deadline.
             let deadline = switch_started_at.saturating_add(PENDING_SWITCH_DRAIN_MS);
             let now = self.inner.clock.now_ms();
+            // Never busy-loop on a wait whose deadline is already past.
             let wait_until = if deadline > now {
                 deadline.min(now + 1_000)
             } else {
-                // A deferred profile rotation may outlive the drain deadline.
-                // Never busy-loop on a wait whose deadline is already past.
                 now + 1_000
             };
             self.inner.clock.wait(Some(wait_until), &self.woken);
@@ -1134,12 +1155,14 @@ impl<H: Harness + 'static> Session<H> {
         }
     }
 
-    /// When a running agent's configured harness, model, or profile changed,
-    /// hold new incoming mailbox messages at the gate so they cannot extend
-    /// an active turn on the retiring process, and replace the live process
-    /// immediately when idle or faulted, or once `PENDING_SWITCH_DRAIN_MS`
-    /// expires. A profile rotation never preempts a live `InTurn` child; it
-    /// remains pending until that turn finishes (or the child exits).
+    /// When a running agent's configured harness or model changed, hold new
+    /// incoming mailbox messages at the gate so they cannot extend an active
+    /// turn on the retiring process, and replace the live process immediately
+    /// when idle or faulted, or once `PENDING_SWITCH_DRAIN_MS` expires.
+    ///
+    /// A profile change holds no mail and never preempts a live `InTurn` child:
+    /// the process keeps working and is replaced when it is next idle or faulted.
+    /// A replacement that fails to launch leaves the old process serving mail.
     fn try_apply_pending_switch(&mut self) -> bool {
         let replaceable = {
             let Some(delivery) = self.delivery.as_ref() else {
@@ -1155,25 +1178,38 @@ impl<H: Harness + 'static> Session<H> {
         let Ok(fresh) = self.inner.store.agent(&self.id) else {
             return false;
         };
-        let config_changed = fresh.harness != self.agent.harness
-            || fresh.model != self.agent.model
-            || self.profile_rotation_pending();
-        if !config_changed {
+        let now = self.inner.clock.now_ms();
+        if now < self.switch_retry_at {
             self.pending_switch_started_at = None;
             return false;
         }
-        let now = self.inner.clock.now_ms();
-        let started_at = *self.pending_switch_started_at.get_or_insert(now);
-        if self.profile_rotation_waits_for_turn() {
-            return false;
+        let runtime_changed =
+            fresh.harness != self.agent.harness || fresh.model != self.agent.model;
+        if !runtime_changed {
+            self.pending_switch_started_at = None;
+            if !replaceable
+                || !self.profile_rotation_pending()
+                || self.profile_rotation_waits_for_turn()
+            {
+                return false;
+            }
+            return self.finish_switch(now);
         }
+        let started_at = *self.pending_switch_started_at.get_or_insert(now);
         let drain_expired = now.saturating_sub(started_at) >= PENDING_SWITCH_DRAIN_MS;
         if !replaceable && !drain_expired {
             return false;
         }
         self.pending_switch_started_at = None;
-        self.replace_process();
-        true
+        self.finish_switch(now)
+    }
+
+    fn finish_switch(&mut self, now: i64) -> bool {
+        if self.replace_process() {
+            return true;
+        }
+        self.switch_retry_at = now.saturating_add(SWITCH_RETRY_MS);
+        false
     }
 
     /// Record the usage the harness served since the last row. It is read when
@@ -1874,6 +1910,7 @@ mod persistence_tests {
             completed_turn_in_session: false,
             quota_started_at: None,
             pending_switch_started_at: None,
+            switch_retry_at: 0,
             process_started_at: None,
             process_profile_rotated_ms: 0,
             last_error: None,
