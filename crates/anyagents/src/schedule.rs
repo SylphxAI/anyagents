@@ -1528,7 +1528,7 @@ mod tests {
                     .unwrap();
             }
             if blocked {
-                store.set_agent_paused(&owner.id).unwrap();
+                store.set_agent_state(set_agent_paused(&owner.id)owner.id, "paused").unwrap();
             }
             let fired = tick_local_schedules_once(&store, &health, anyagents_core::now_ms());
             assert_eq!(fired, if blocked { 0 } else { 3 });
