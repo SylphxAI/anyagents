@@ -864,6 +864,7 @@ pub(super) fn append_transcript_message(
     anyagents_core::masking::mask_json_strings(&mut msg);
     let line = serde_json::to_string(&msg).map_err(|e| e.to_string())?;
     let opened = std::fs::OpenOptions::new()
+        .read(true)
         .create(true)
         .append(true)
         .open(transcript_path);
@@ -889,7 +890,7 @@ pub(super) fn append_transcript_message(
             .unwrap_or_else(|| "/usr/local/bin/anyagents-setpriv".into());
         let mut command = Command::new(launcher);
         command.args(["--reuid", &metadata.uid().to_string(), "--regid", &metadata.gid().to_string(), "--groups", &metadata.gid().to_string(), "--no-new-privs", "--", "python3", "-c",
-            "import os,sys; f=open(sys.argv[1],'ab'); f.write(sys.stdin.buffer.read()); f.flush(); os.fchmod(f.fileno(),0o660); os.fsync(f.fileno())"]).arg(transcript_path).stdin(Stdio::piped());
+            "import fcntl,os,sys; f=open(sys.argv[1],'a+b'); fcntl.flock(f,fcntl.LOCK_EX); f.seek(0,os.SEEK_END); sz=f.tell(); (f.seek(sz-1,os.SEEK_SET) or (f.read(1)!=b'\\n' and f.write(b'\\n'))) if sz>0 else None; f.write(sys.stdin.buffer.read()); f.flush(); os.fchmod(f.fileno(),0o660); os.fsync(f.fileno())"]).arg(transcript_path).stdin(Stdio::piped());
         let result = crate::workspace::output(command, format!("{line}\n").as_bytes())?;
         if !result.status.success() {
             return Err(format!(
@@ -904,18 +905,36 @@ pub(super) fn append_transcript_message(
         opened.map_err(|e| format!("opening transcript {}: {e}", transcript_path.display()))?;
     #[cfg(unix)]
     {
+        use std::os::fd::AsRawFd as _;
         use std::os::unix::fs::PermissionsExt as _;
-        let mode = file
+        let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        let meta = file
             .metadata()
-            .map_err(|e| format!("transcript metadata: {e}"))?
-            .permissions()
-            .mode();
+            .map_err(|e| format!("transcript metadata: {e}"))?;
+        let mode = meta.permissions().mode();
         if mode & 0o060 != 0o060 {
             file.set_permissions(std::fs::Permissions::from_mode(0o660))
                 .map_err(|e| format!("transcript sharing permissions: {e}"))?;
         }
+        if meta.len() > 0 {
+            use std::io::{Read as _, Seek as _, SeekFrom};
+            let mut last = [0u8; 1];
+            if file.seek(SeekFrom::End(-1)).is_ok()
+                && file.read_exact(&mut last).is_ok()
+                && last[0] != b'\n'
+            {
+                let payload = format!("\n{line}\n");
+                file.write_all(payload.as_bytes())
+                    .and_then(|()| file.sync_data())
+                    .map_err(|e| {
+                        format!("appending transcript {}: {e}", transcript_path.display())
+                    })?;
+                return Ok(msg);
+            }
+        }
     }
-    writeln!(file, "{line}")
+    let payload = format!("{line}\n");
+    file.write_all(payload.as_bytes())
         .and_then(|()| file.sync_data())
         .map_err(|e| format!("appending transcript {}: {e}", transcript_path.display()))?;
     Ok(msg)
@@ -923,9 +942,57 @@ pub(super) fn append_transcript_message(
 
 /// Validate retained payloads before any paid inference or session transfer.
 pub(super) fn validate_transcript(path: &Path) -> Result<(), String> {
-    let Some(raw) = crate::contracts::read_optional(path)? else {
+    let Some(mut raw) = crate::contracts::read_optional(path)? else {
         return Ok(());
     };
+    if raw
+        .lines()
+        .any(|line| !line.trim().is_empty() && serde_json::from_str::<Value>(line).is_err())
+    {
+        let mut repaired = Vec::new();
+        let mut recovered_any = false;
+        let mut unrecoverable = false;
+        for line in raw.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                recovered_any = true;
+                continue;
+            }
+            if serde_json::from_str::<Value>(trimmed).is_ok() {
+                repaired.push(trimmed.to_string());
+                continue;
+            }
+            if !trimmed.starts_with('{') {
+                unrecoverable = true;
+                break;
+            }
+            recovered_any = true;
+            for marker in ["{\"role\":", "{\"type\":"] {
+                if let Some(pos) = trimmed.rfind(marker)
+                    && pos > 0
+                {
+                    let tail = &trimmed[pos..];
+                    if serde_json::from_str::<Value>(tail).is_ok() {
+                        repaired.push(tail.to_string());
+                        break;
+                    }
+                }
+            }
+        }
+        if recovered_any && !unrecoverable {
+            let mut next = repaired.join("\n");
+            if !next.is_empty() {
+                next.push('\n');
+            }
+            let _ = crate::contracts::write_atomic(path, next.as_bytes());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660));
+            }
+            raw = next;
+        }
+    }
     for (index, line) in raw.lines().enumerate() {
         let value: Value = serde_json::from_str(line)
             .map_err(|e| format!("corrupt transcript line {index}: {e}"))?;

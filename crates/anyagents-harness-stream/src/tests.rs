@@ -775,3 +775,74 @@ fn missing_step_type_is_unknown_not_quota_clearance_through_rpc() {
         }
     }
 }
+
+#[test]
+#[cfg(unix)]
+fn poisoned_agy_result_retires_the_session_without_acknowledging_the_turn() {
+    use std::time::Duration;
+    for (program, error, poisoned) in [
+        (
+            "agy",
+            "invalid_argument (CODE 400): Request contains an invalid argument",
+            true,
+        ),
+        ("agy", "temporary server error", false),
+        (
+            "omp",
+            "INVALID_ARGUMENT (code 400): Request contains an invalid argument",
+            false,
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let pointer = dir.path().join("agy-session-id");
+        std::fs::write(&pointer, "selected").unwrap();
+        let spec = StreamSpec::for_program(program);
+        let result = json!({"type":"result","session_id":"selected","error":{"message":error}});
+        let script = format!("read line; printf '%s\\n' '{}'; exec sleep 30", result);
+        let mut harness = super::StreamHarness::launch_with_agy_rpc(
+            super::Launch {
+                spec: spec.clone(),
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), script],
+                environment: vec![],
+                work_dir: None,
+                session_id: Some("selected".into()),
+                mode: anyagents_harness::DeliveryMode::Followup,
+                steer: anyagents_harness::SteerSupport::Unproven,
+            },
+            Some(super::AgyRpcConfig {
+                config_dir: dir.path().into(),
+                csrf_token: "fixture".into(),
+                port_override: None,
+            }),
+        )
+        .unwrap();
+        let message = anyagents_harness::OutboundMessage {
+            id: "input".into(),
+            seq: 1,
+            text: "work".into(),
+            sender: None,
+            reply_to: None,
+            source_time_ms: None,
+            context: anyagents_harness::Context::default(),
+        };
+        let line = super::message_line(&spec, &message);
+        assert!(matches!(
+            harness.deliver(&message, &line).unwrap(),
+            anyagents_harness::DeliverOutcome::Accepted { .. }
+        ));
+        assert!(harness.wait_pred(Duration::from_secs(3), |state| state.epoch > 0));
+        assert_eq!(harness.health().process_alive, !poisoned);
+        assert_eq!(pointer.exists(), !poisoned);
+        if poisoned {
+            assert_eq!(harness.session_id(), None);
+            assert_eq!(harness.turns_served(), 0);
+            assert!(harness.health().sign_in_fault.unwrap().contains("CODE 400"));
+            let (_, persisted) = super::detect_agy_session_quota_and_error(dir.path(), i64::MAX);
+            assert_eq!(persisted.as_deref(), Some(error));
+        } else {
+            assert_eq!(harness.session_id().as_deref(), Some("selected"));
+        }
+        // Drop kills this test's child even though stdout deliberately stays open.
+    }
+}

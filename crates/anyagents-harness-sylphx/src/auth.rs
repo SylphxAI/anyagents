@@ -1004,18 +1004,24 @@ fn shared_http_agent() -> &'static ureq::Agent {
 
 pub(super) fn is_transient_gateway_failure(status: u16, body: &str) -> bool {
     let lower = body.to_ascii_lowercase();
-    if lower.contains("\"retryable\":false") || lower.contains("\"retryable\": false") {
-        return false;
-    }
     let is_hard_quota = lower.contains("insufficient_quota")
         || lower.contains("credit balance is too low")
         || lower.contains("out of credits")
         || lower.contains("quota exceeded");
-    if matches!(status, 408 | 409 | 425 | 500 | 502 | 503 | 504 | 520..=529) {
+    if is_hard_quota {
+        return false;
+    }
+    if matches!(status, 408 | 409 | 425 | 500 | 502 | 503 | 504 | 520..=529)
+        || lower.contains("service_unavailable")
+        || lower.contains("durable spend authorization is unavailable")
+    {
         return true;
     }
+    if lower.contains("\"retryable\":false") || lower.contains("\"retryable\": false") {
+        return false;
+    }
     if status == 429 {
-        return !is_hard_quota;
+        return true;
     }
     if !(200..300).contains(&status) {
         return lower.contains("model_unavailable")

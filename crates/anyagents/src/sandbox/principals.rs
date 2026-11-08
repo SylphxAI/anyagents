@@ -59,8 +59,8 @@ pub(super) fn read_principal_registry(data: &Path) -> Result<Option<String>, Err
     let entries = value
         .as_object()
         .ok_or_else(|| Error::Message("execution principal registry must be an object".into()))?;
-    for id in entries.keys() {
-        if AgentId::parse(id).is_err() || super::admitted_principal(&raw, id).is_none() {
+    for (id, entry) in entries {
+        if AgentId::parse(id).is_err() || super::admitted_principal_entry(entry).is_none() {
             return Err(Error::Message(
                 "execution principal registry contains an invalid identity or grant".into(),
             ));

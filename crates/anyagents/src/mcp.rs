@@ -1111,6 +1111,21 @@ fn generate_subagent_name(parent_name: &str) -> String {
     format!("{parent_name}-sub-{short}")
 }
 
+fn send_turn_result(response: SendResponse, closing: bool) -> Result<serde_json::Value, String> {
+    let mut result = serde_json::to_value(response).map_err(|e| e.to_string())?;
+    if closing {
+        result["status"] = serde_json::json!("turn_complete_no_reply_sent");
+        result["turn_complete_hint"] = serde_json::json!(
+            "No message was sent. End this turn immediately. Do not call send or any other tool again."
+        );
+    } else {
+        result["turn_complete_hint"] = serde_json::json!(
+            "The send request is complete. If your work is finished, end this turn without calling send again for a closing token."
+        );
+    }
+    Ok(result)
+}
+
 #[tool_router]
 impl AgentMcp {
     #[tool(
@@ -1186,6 +1201,7 @@ impl AgentMcp {
             article: args.article,
             idempotency_key: args.idempotency_key,
         };
+        let closing = body.is_turn_closing_sentinel();
         let response: SendResponse = self
             .client
             .get(
@@ -1193,9 +1209,9 @@ impl AgentMcp {
                 Some(serde_json::to_vec(&body).map_err(|err| err.to_string())?),
             )
             .await?;
-        Ok(rmcp::handler::server::wrapper::Json(
-            serde_json::to_value(response).map_err(|e| e.to_string())?,
-        ))
+        Ok(rmcp::handler::server::wrapper::Json(send_turn_result(
+            response, closing,
+        )?))
     }
 
     #[tool(
@@ -3040,8 +3056,15 @@ fn find_js_runtime() -> Option<(PathBuf, bool)> {
             if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
                 dirs.push(home.join(".local/opt/node/bin"));
                 dirs.push(home.join(".local/opt/bun/bin"));
+                if let Some(host_home) = crate::sandbox::host_home_dir() {
+                    dirs.push(host_home.join(".local/opt/node/bin"));
+                    dirs.push(host_home.join(".local/opt/bun/bin"));
+                }
                 dirs.push(home.join(".local/bin"));
                 dirs.push(home.join(".bun/bin"));
+            } else if let Some(host_home) = crate::sandbox::host_home_dir() {
+                dirs.push(host_home.join(".local/opt/node/bin"));
+                dirs.push(host_home.join(".local/opt/bun/bin"));
             }
             if let Some(path_os) = std::env::var_os("PATH") {
                 dirs.extend(std::env::split_paths(&path_os));
@@ -6221,6 +6244,103 @@ fn parse_sequence_range(range: Option<&str>) -> Result<(Option<i64>, Option<i64>
 
 #[cfg(test)]
 mod spawn_args_tests {
+    #[test]
+    fn send_turn_result_ends_closing_tokens_without_an_interrupt_failure() {
+        let closed = send_turn_result(
+            SendResponse {
+                deliveries: vec![],
+                skipped: vec![],
+            },
+            true,
+        )
+        .unwrap();
+        assert_eq!(closed["status"], "turn_complete_no_reply_sent");
+        assert!(
+            closed["turn_complete_hint"]
+                .as_str()
+                .unwrap()
+                .contains("Do not call send or any other tool again")
+        );
+        let normal = send_turn_result(
+            SendResponse {
+                deliveries: vec![],
+                skipped: vec![],
+            },
+            false,
+        )
+        .unwrap();
+        assert!(normal.get("status").is_none());
+        assert!(
+            normal["turn_complete_hint"]
+                .as_str()
+                .unwrap()
+                .contains("without calling send again")
+        );
+        assert_eq!(normal["deliveries"], json!([]));
+    }
+
+    #[test]
+    fn send_closing_sentinels_are_exact_text_only_tokens() {
+        for text in [
+            "NO_REPLY",
+            " End. ",
+            "end",
+            "停止。",
+            "停止",
+            "No more.",
+            "NO MORE",
+            "。",
+            "Done.",
+            "done",
+            "終了。",
+            "Final!",
+            "done...",
+            " \nNO_REPLY。 \n",
+        ] {
+            assert!(
+                SendRequest {
+                    text: text.into(),
+                    ..Default::default()
+                }
+                .is_turn_closing_sentinel(),
+                "{text:?}"
+            );
+        }
+        for text in [
+            "",
+            " ",
+            "End of report.",
+            "Done. The build passed.",
+            "NO_REPLY is a token",
+            "Final version",
+            "Stopping",
+            "!",
+            ".",
+        ] {
+            assert!(
+                !SendRequest {
+                    text: text.into(),
+                    ..Default::default()
+                }
+                .is_turn_closing_sentinel(),
+                "{text:?}"
+            );
+        }
+        for attachment in [
+            json!({"media":{"kind":"photo","source":"fixture.png"}}),
+            json!({"location":{"latitude":1.0,"longitude":2.0}}),
+            json!({"poll":{"question":"End?","options":["yes","no"]}}),
+            json!({"checklist":{"title":"End","tasks":["finish"]}}),
+            json!({"article":{"title":"End","content":"report"}}),
+            json!({"quote":{"text":"real quoted content"}}),
+        ] {
+            let mut value = attachment;
+            value["text"] = json!("End.");
+            let request: SendRequest = serde_json::from_value(value).unwrap();
+            assert!(!request.is_turn_closing_sentinel());
+        }
+    }
+
     #[test]
     fn explicit_sequence_range_refuses_invalid_bounds() {
         for range in [

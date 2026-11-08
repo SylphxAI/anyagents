@@ -513,8 +513,15 @@ impl Harness for SylphxHarness {
                             g.sign_in_fault = Some(err_msg.clone());
                         } else {
                             g.sign_in_fault = Some(err_msg.clone());
-                            let non_retryable = lower.contains("\"retryable\":false")
-                                || lower.contains("\"retryable\": false");
+                            let is_service_unavailable = lower.contains("http 500")
+                                || lower.contains("http 502")
+                                || lower.contains("http 503")
+                                || lower.contains("http 504")
+                                || lower.contains("service_unavailable")
+                                || lower.contains("durable spend authorization is unavailable");
+                            let non_retryable = !is_service_unavailable
+                                && (lower.contains("\"retryable\":false")
+                                    || lower.contains("\"retryable\": false"));
                             if !non_retryable && consecutive <= 3 {
                                 g.dead_reason = Some(err_msg.clone());
                             }
@@ -1031,8 +1038,12 @@ pub(crate) fn run_cloud_session_turn(
     };
     // Reconcile retained local effects before interrupting/reusing a remote session.
     flush_cloud_tool_receipt(config_dir, &base, &api_key)?;
-    if read_json(&config_dir.join("sylphx-cloud-turn-pending.json"))?.is_some() {
-        return Err("cloud turn has an unresolved retained submission; pull/reconcile before another dispatch".into());
+    if let Some(pending) = read_json(&config_dir.join("sylphx-cloud-turn-pending.json"))? {
+        if pending.get("state").and_then(Value::as_str) == Some("accepted") {
+            remove_optional(&config_dir.join("sylphx-cloud-turn-pending.json"))?;
+        } else {
+            return Err("cloud turn has an unresolved retained submission; pull/reconcile before another dispatch".into());
+        }
     }
     let mut initial_last_seq: i64 = 0;
     let mut next_turn: i64 = 1;
@@ -1518,7 +1529,7 @@ If a task requires deployment-provided host-only capabilities, call `sandbox` wi
                                 "output": output,
                             }),
                         )?;
-                        if norm_fn == "send"
+                        if matches!(norm_fn, "send" | "code")
                             && reply_delivered(
                                 &output,
                                 extract_envelope_sender(user_message).as_deref(),
@@ -1527,14 +1538,12 @@ If a task requires deployment-provided host-only capabilities, call `sandbox` wi
                             sent_any_reply = true;
                         }
                         let is_err = output.starts_with("error:");
-                        write_atomic(&receipt_path, json!({"session_path": sess_path, "call_id": call_id, "state": "completed", "event_sequence": seq, "output": output, "error": is_err}).to_string().as_bytes())?;
-                        flush_cloud_tool_receipt(config_dir, &base, &api_key)?;
-                        last_progress = Instant::now();
                         if norm_fn == "sandbox"
                             && !is_err
                             && resolve_cloud_agent_environment(config_dir, env)?.is_none()
                         {
                             // The placement tool already settled and durably pulled the cloud session.
+                            remove_optional(&receipt_path)?;
                             {
                                 let mut g = state.lock().unwrap_or_else(PoisonError::into_inner);
                                 g.cloud_agent_id = None;
@@ -1561,6 +1570,9 @@ If a task requires deployment-provided host-only capabilities, call `sandbox` wi
                                 ..TurnUsage::default()
                             });
                         }
+                        write_atomic(&receipt_path, json!({"session_path": sess_path, "call_id": call_id, "state": "completed", "event_sequence": seq, "output": output, "error": is_err}).to_string().as_bytes())?;
+                        flush_cloud_tool_receipt(config_dir, &base, &api_key)?;
+                        last_progress = Instant::now();
                     }
                 } else if ev_type == "USAGE" {
                     let parse_u64 = |ptr: &str| -> u64 {
@@ -1705,6 +1717,7 @@ If a task requires deployment-provided host-only capabilities, call `sandbox` wi
                 }
                 if !sent_any_reply
                     && !content_text.trim().is_empty()
+                    && !content_text.trim().eq_ignore_ascii_case("NO_REPLY")
                     && let Some(reply_to) = extract_envelope_sender(user_message)
                 {
                     let reply_receipt = call_anyagents_mcp_tool(
@@ -1721,6 +1734,7 @@ If a task requires deployment-provided host-only capabilities, call `sandbox` wi
                         &reply_receipt,
                         extract_envelope_sender(user_message).as_deref(),
                     ) {
+                        remove_optional(&pending_cloud_turn)?;
                         return Err(
                             "automatic reply delivery was not acknowledged; pending reply retained"
                                 .into(),
@@ -4393,8 +4407,20 @@ fn execute_sylphx_tool_raw(
                     if let Err(e) = write_atomic(&placement_path, doc.to_string().as_bytes()) {
                         return format!("error persisting workspace placement: {e}");
                     }
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt as _;
+                        let _ = std::fs::set_permissions(
+                            &placement_path,
+                            std::fs::Permissions::from_mode(0o660),
+                        );
+                    }
                     if target == "local" {
                         let _ = std::fs::remove_file(config_dir.join("sylphx-sandbox-lease.json"));
+                        let _ =
+                            std::fs::remove_file(config_dir.join("sylphx-cloud-tool-receipt.json"));
+                        let _ =
+                            std::fs::remove_file(config_dir.join("sylphx-cloud-turn-pending.json"));
                     }
                     serde_json::to_string_pretty(&json!({
                         "status": "ok",
@@ -4885,10 +4911,19 @@ fn call_anyagents_mcp_tool(
             // pipe while we wait for the tool's stdout response.
             .stderr(Stdio::null());
         for (k, v) in env {
-            cmd.env(k, v);
+            if !anyagents_harness::SERVER_ONLY_ENV.contains(&k.as_str()) {
+                cmd.env(k, v);
+            }
         }
-        let Ok(mut child) = cmd.spawn() else {
-            return format!("error: failed to spawn anyagents mcp for `{tool_name}`");
+        for key in anyagents_harness::SERVER_ONLY_ENV {
+            cmd.env_remove(key);
+        }
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(err) => {
+                last_err = format!("failed to spawn anyagents mcp for `{tool_name}`: {err}");
+                continue;
+            }
         };
         let init_req = json!({
             "jsonrpc": "2.0",
@@ -7474,13 +7509,54 @@ fn flush_cloud_tool_receipt(config_dir: &Path, base: &str, key: &str) -> Result<
         if cloud_session_resource_path(&binding.env_slug, &binding.session_id) != session {
             return Err("cloud tool receipt does not belong to retained binding".into());
         }
-        post_required(
+        if let Err(err) = post_required(
             &format!("{base}/v1/{session}:submitToolResult"),
             key,
             &json!({"call_id":call_id,"output":output,"error":is_error}),
-        )?;
+        ) {
+            if err.contains("HTTP 400") || err.contains("HTTP 409") {
+                if output.contains("Switched workspace execution to host-local") {
+                    return remove_optional(&path);
+                }
+                if let Ok((st, raw)) = curl_get(&format!("{base}/v1/{session}"), Some(key)) {
+                    if st == 404 {
+                        return remove_optional(&path);
+                    }
+                    if (200..300).contains(&st)
+                        && let Ok(val) = serde_json::from_str::<Value>(&raw)
+                    {
+                        let status = val
+                            .get("state")
+                            .or_else(|| val.get("status"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_ascii_lowercase();
+                        if matches!(
+                            status.as_str(),
+                            "idle"
+                                | "session_state_idle"
+                                | "completed"
+                                | "interrupted"
+                                | "terminated"
+                                | "failed"
+                                | "session_state_failed"
+                                | "errored"
+                        ) {
+                            binding.last_seq = binding.last_seq.max(seq);
+                            save_persisted_cloud_session(config_dir, &binding)?;
+                            return remove_optional(&path);
+                        }
+                    }
+                }
+            }
+            return Err(err);
+        }
         binding.last_seq = binding.last_seq.max(seq);
         save_persisted_cloud_session(config_dir, &binding)?;
+    } else if resolve_cloud_agent_environment(config_dir, &[])?.is_none()
+        || output.contains("Switched workspace execution to host-local")
+    {
+        return remove_optional(&path);
     } else {
         post_required(
             &format!("{base}/v1/{session}:submitToolResult"),

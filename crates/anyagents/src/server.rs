@@ -6695,6 +6695,14 @@ fn send_sync(
         ),
         ..body
     };
+    // A model's closing token is not a message and must not wake its target.
+    // Keep this after identity reauthorization, including for replayed calls.
+    if body.is_turn_closing_sentinel() {
+        return Ok(Json(SendResponse {
+            deliveries: Vec::new(),
+            skipped: Vec::new(),
+        }));
+    }
     // A call repeated after its answer was lost is the same delivery: the
     // receipt it already produced comes back unchanged.
     if let Some(key) = key.as_deref()
@@ -9582,6 +9590,56 @@ exec '{}' "$@"
         send_sync(store, actor, body, plan, key)
             .unwrap_or_else(|e| panic!("{}", e.message))
             .0
+    }
+
+    #[test]
+    fn closing_sends_do_not_store_messages_receipts_or_wake_archived_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let sender = store
+            .create_agent(anyagents_core::NewAgent::new("sender", "opencode"))
+            .unwrap();
+        let mut new = anyagents_core::NewAgent::new("target", "opencode");
+        new.parent_id = Some(sender.id.clone());
+        let target = store.create_agent(new).unwrap();
+        store.set_agent_state(&target.id, "archived").unwrap();
+        let actor = Actor::Agent(sender.name.clone());
+        for text in [
+            "NO_REPLY",
+            "End.",
+            "停止。",
+            "No more.",
+            "。",
+            "Done.",
+            "終了。",
+            "Final!",
+        ] {
+            let response = authored_send(&store, &actor, "agent:target", text, "closing-only");
+            assert!(response.deliveries.is_empty());
+            assert!(response.skipped.is_empty());
+            assert!(store.inbox(&target.id, None).unwrap().is_empty());
+            let key = send_key(&SendRequest {
+                sender: Some(actor.as_address()),
+                to: vec!["agent:target".into()],
+                text: text.into(),
+                idempotency_key: Some("closing-only".into()),
+                ..Default::default()
+            })
+            .unwrap();
+            assert!(store.send_receipt(&key).unwrap().is_none());
+            assert_eq!(store.agent(&target.id).unwrap().state, "archived");
+        }
+        // A real message containing a closing word must still be delivered.
+        store.set_agent_state(&target.id, "running").unwrap();
+        let response = authored_send(
+            &store,
+            &actor,
+            "agent:target",
+            "Done. Build passed.",
+            "real-message",
+        );
+        assert_eq!(response.deliveries.len(), 1);
+        assert_eq!(store.inbox(&target.id, None).unwrap().len(), 1);
     }
 
     #[test]
