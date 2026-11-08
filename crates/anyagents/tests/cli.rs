@@ -440,7 +440,33 @@ fn add_telegram_copies_the_token_and_lists_no_secret() {
     );
     let token_file = dir.path().join("token");
     std::fs::write(&token_file, b"123456:ABC\n").unwrap();
+    // Token custody is tested through the real CLI, but identity lookup is
+    // always local, independent of test-runner environment heuristics.
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let api = format!("http://{}", listener.local_addr().unwrap());
+    let provider = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            let mut byte = [0];
+            socket.read_exact(&mut byte).unwrap();
+            request.push(byte[0]);
+        }
+        assert!(
+            String::from_utf8_lossy(&request).starts_with("POST /bot123456:ABC/getMe HTTP/1.1\r\n")
+        );
+        let body =
+            r#"{"ok":true,"result":{"id":123456,"is_bot":true,"username":"alpha_fixture_bot"}}"#;
+        write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+    });
     let added = bin()
+        .env("ANYAGENTS_TELEGRAM_API", api)
+        .env("ANYAGENTS_FAKE_MODE", "1")
+        .env_remove("ANYAGENTS_TELEGRAM_WEBHOOK_URL")
         .arg("--data")
         .arg(dir.path())
         .args([
@@ -459,6 +485,7 @@ fn add_telegram_copies_the_token_and_lists_no_secret() {
         "{}",
         String::from_utf8_lossy(&added.stderr)
     );
+    provider.join().unwrap();
     let line = String::from_utf8(added.stdout).unwrap();
     assert!(!line.contains("123456"), "{line}");
     let id = line.split('\t').next().unwrap().trim();

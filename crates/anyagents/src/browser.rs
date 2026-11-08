@@ -5394,6 +5394,9 @@ mod tests {
                             }
                             Err(err) => panic!("fixture accept: {err}"),
                         };
+                        // macOS inherits O_NONBLOCK from the listener; Linux
+                        // does not. CDP framing below expects blocking reads.
+                        stream.set_nonblocking(false).unwrap();
                         let calls = calls.clone();
                         let respond = responder.clone();
                         clients.push(std::thread::spawn(move || {
@@ -5487,6 +5490,16 @@ mod tests {
             self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
             self.worker.take().unwrap().join().unwrap();
         }
+    }
+
+    #[test]
+    fn scripted_cdp_peer_waits_for_a_delayed_command() {
+        let fixture = ScriptedBrowser::new(cdp_ok_response);
+        let mut session = fixture.session();
+        // A nonblocking accepted socket closes before this command arrives.
+        std::thread::sleep(Duration::from_millis(20));
+        session.call("Page.enable", serde_json::json!({})).unwrap();
+        assert_eq!(fixture.calls.lock().unwrap().len(), 1);
     }
 
     #[test]

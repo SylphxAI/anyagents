@@ -2548,8 +2548,35 @@ mod tests {
         recovery_quarantines_hostile_entry("symlink");
     }
 
+    // Author overrides are process-global: a lock cannot protect readers in
+    // other modules. Each identity scenario gets its own environment instead.
+    fn identity_test_worker(name: &str) -> bool {
+        let name = format!("worktree_access::tests::{name}");
+        if std::env::var("ANYAGENTS_WORKTREE_IDENTITY_TEST").as_deref() == Ok(name.as_str()) {
+            return false;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &name, "--nocapture"])
+            .env("ANYAGENTS_WORKTREE_IDENTITY_TEST", &name)
+            .env_remove("ANYAGENTS_GIT_AUTHOR_NAME")
+            .env_remove("ANYAGENTS_GIT_AUTHOR_EMAIL")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+        true
+    }
+
     #[test]
     fn private_identity_preserves_common_config_and_requires_extension() {
+        if identity_test_worker("private_identity_preserves_common_config_and_requires_extension") {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let f = crate::worktree::tests::Fixture::new(dir.path());
         let target = dir.path().join("child");
@@ -3588,6 +3615,11 @@ mod tests {
     }
     #[test]
     fn explicit_author_configuration_is_local_and_partial_configuration_refuses() {
+        if identity_test_worker(
+            "explicit_author_configuration_is_local_and_partial_configuration_refuses",
+        ) {
+            return;
+        }
         let _env = crate::server::tests::env_lock();
         let keys = ["ANYAGENTS_GIT_AUTHOR_NAME", "ANYAGENTS_GIT_AUTHOR_EMAIL"];
         let old = keys.map(std::env::var_os);
