@@ -85,47 +85,36 @@ pub(super) fn admitted_command(
         command
     };
     let script = admission_script(checks);
-    // Linux `MAX_ARG_STRLEN` caps any single `argv` entry at 131,072 bytes (`PAGE_SIZE * 32`).
-    // Use `-c` when the script fits within `MAX_ARG_STRLEN`, and stream via `-s` stdin when
-    // large peer inventories exceed that single-argument ceiling.
-    let output = if script.len() < 120_000 {
-        prefix()
-            .args(["/bin/sh", "-c", &script, "seat-admission"])
-            .envs(
-                environment
-                    .iter()
-                    .filter(|(k, _)| !crate::SERVER_ONLY_ENV.contains(&k.as_str()))
-                    .map(|(k, v)| (k, v)),
-            )
-            .env_remove(crate::SEAT_LAUNCH_ENV)
-            .output()
-            .map_err(|e| refuse(e.to_string()))?
-    } else {
-        let mut child = prefix()
-            .args(["/bin/sh", "-s", "seat-admission"])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .envs(
-                environment
-                    .iter()
-                    .filter(|(k, _)| !crate::SERVER_ONLY_ENV.contains(&k.as_str()))
-                    .map(|(k, v)| (k, v)),
-            )
-            .env_remove(crate::SEAT_LAUNCH_ENV)
-            .spawn()
-            .map_err(|e| refuse(e.to_string()))?;
-        if let Some(mut stdin) = child.stdin.take() {
-            let bytes = script.into_bytes();
-            std::thread::spawn(move || {
-                use std::io::Write as _;
-                let _ = stdin.write_all(&bytes);
-            });
-        }
-        child
-            .wait_with_output()
-            .map_err(|e| refuse(e.to_string()))?
-    };
+    let mut child = prefix()
+        .args(["/bin/sh", "-s", "seat-admission"])
+        .envs(
+            environment
+                .iter()
+                .filter(|(k, _)| !crate::SERVER_ONLY_ENV.contains(&k.as_str()))
+                .map(|(k, v)| (k, v)),
+        )
+        .env_remove(crate::SEAT_LAUNCH_ENV)
+        .env_remove(crate::SEAT_PEERS_ENV)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| refuse(e.to_string()))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| refuse("missing admission shell stdin".into()))?;
+    let output = std::thread::scope(|scope| {
+        let script_bytes = script.as_bytes();
+        let writer = scope.spawn(move || {
+            use std::io::Write as _;
+            let _ = stdin.write_all(script_bytes);
+        });
+        let result = child.wait_with_output();
+        let _ = writer.join();
+        result
+    })
+    .map_err(|e| refuse(e.to_string()))?;
     if !output.status.success() {
         let why = String::from_utf8_lossy(&output.stderr);
         return Err(refuse(
@@ -251,6 +240,8 @@ fn checks_with_principals(
         .map(|p| p.root.as_path())
         .collect();
     let mut foreign_roots = Vec::new();
+    let mut peer_trees_program = String::new();
+    let mut peer_caps_program = String::new();
     for peer in peers {
         // Two agents can legitimately share one OS principal. Only a host-
         // resolved UID/GID+root tuple grants this exception, never directory
@@ -261,15 +252,27 @@ fn checks_with_principals(
         }
         foreign_roots.push(std::fs::canonicalize(&peer)?);
         for name in ["config", "memory", "skills"] {
-            list.push(deny(
-                "peer seats' private trees are denied",
-                &peer.join(name),
-            )?);
+            let p = quote(&peer.join(name))?;
+            peer_trees_program.push_str(&format!(
+                "{{ [ ! -r {p} ] && [ ! -w {p} ] && [ ! -x {p} ]; }} || exit 1\n"
+            ));
         }
-        list.push(deny(
-            "peer capabilities are denied",
-            &peer.join("config/mcp-capability"),
-        )?);
+        let cap = quote(&peer.join("config/mcp-capability"))?;
+        peer_caps_program.push_str(&format!(
+            "{{ [ ! -r {cap} ] && [ ! -w {cap} ] && [ ! -x {cap} ]; }} || exit 1\n"
+        ));
+    }
+    if !peer_trees_program.is_empty() {
+        list.push(Check {
+            what: "peer seats' private trees are denied",
+            program: peer_trees_program,
+        });
+    }
+    if !peer_caps_program.is_empty() {
+        list.push(Check {
+            what: "peer capabilities are denied",
+            program: peer_caps_program,
+        });
     }
     if let Some(config) = config {
         let mine = quote(config)?;
@@ -310,11 +313,13 @@ fn checks_with_principals(
                 program.push_str(&format!(
                     "if [ -L {path} ]{managed}; then resolved=$(CDPATH= cd -P {path} 2>/dev/null && pwd -P) || exit 1;\n"
                 ));
-                for peer in &foreign_roots {
-                    let peer = quote(peer)?;
-                    program.push_str(&format!(
-                        "case \"$resolved\" in {peer}|{peer}/*) exit 1;; esac\n"
-                    ));
+                if !foreign_roots.is_empty() {
+                    program.push_str("case \"$resolved\" in\n");
+                    for peer in &foreign_roots {
+                        let peer = quote(peer)?;
+                        program.push_str(&format!("{peer}|{peer}/*) exit 1;;\n"));
+                    }
+                    program.push_str("esac\n");
                 }
                 program.push_str("fi\n");
             }

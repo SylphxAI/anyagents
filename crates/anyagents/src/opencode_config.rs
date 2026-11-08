@@ -65,64 +65,18 @@ pub fn write(
             }
         });
     }
-    let allow_native_subagents = std::env::var_os("ANYAGENTS_ALLOW_NATIVE_SUBAGENTS").is_some();
-    let allow_native_file_tools = std::env::var("ANYAGENTS_ALLOW_NATIVE_FILE_TOOLS")
-        .ok()
-        .is_some_and(|v| v.trim() == "1");
-    if !allow_native_subagents || !allow_native_file_tools {
+    if std::env::var_os("ANYAGENTS_ALLOW_NATIVE_SUBAGENTS").is_none() {
         if !root.get("tools").is_some_and(|v| v.is_object()) {
             root["tools"] = serde_json::json!({});
         }
-        if !allow_native_subagents {
-            root["tools"]["task"] = serde_json::Value::Bool(false);
-        }
-        if !allow_native_file_tools {
-            for tool in [
-                "read",
-                "write",
-                "edit",
-                "multiedit",
-                "patch",
-                "glob",
-                "grep",
-                "list",
-                "todowrite",
-                "todoread",
-                "webfetch",
-                "websearch",
-                "task",
-            ] {
-                root["tools"][tool] = serde_json::Value::Bool(false);
-            }
-        }
+        root["tools"]["task"] = serde_json::Value::Bool(false);
         if let Some(build) = root.get_mut("agent").and_then(|a| a.get_mut("build"))
             && build.is_object()
         {
             if !build.get("tools").is_some_and(|v| v.is_object()) {
                 build["tools"] = serde_json::json!({});
             }
-            if !allow_native_subagents {
-                build["tools"]["task"] = serde_json::Value::Bool(false);
-            }
-            if !allow_native_file_tools {
-                for tool in [
-                    "read",
-                    "write",
-                    "edit",
-                    "multiedit",
-                    "patch",
-                    "glob",
-                    "grep",
-                    "list",
-                    "todowrite",
-                    "todoread",
-                    "webfetch",
-                    "websearch",
-                    "task",
-                ] {
-                    build["tools"][tool] = serde_json::Value::Bool(false);
-                }
-            }
+            build["tools"]["task"] = serde_json::Value::Bool(false);
         }
     }
     root["mcp"] = serde_json::json!({
@@ -248,6 +202,30 @@ mod tests {
         assert_eq!(server["type"], "local");
         assert_eq!(server["command"][0], "/bin/anyagents");
         assert_eq!(server["command"][3], "mcp");
+        for tools in [&parsed["tools"], &parsed["agent"]["build"]["tools"]] {
+            assert_eq!(
+                tools.get("task").and_then(serde_json::Value::as_bool),
+                std::env::var_os("ANYAGENTS_ALLOW_NATIVE_SUBAGENTS")
+                    .is_none()
+                    .then_some(false)
+            );
+            for tool in [
+                "read",
+                "write",
+                "edit",
+                "multiedit",
+                "patch",
+                "glob",
+                "grep",
+                "list",
+                "todowrite",
+                "todoread",
+                "webfetch",
+                "websearch",
+            ] {
+                assert!(tools.get(tool).is_none(), "{tool}: {tools}");
+            }
+        }
     }
 
     #[test]

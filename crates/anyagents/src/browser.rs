@@ -5096,6 +5096,8 @@ fn execute_inner(
                 "profile": profile,
                 "path": final_path.display().to_string(),
                 "bytes": png_bytes.len(),
+                "mime_type": "image/png",
+                "image_base64": b64,
             }))
         }
         "cookies" => {

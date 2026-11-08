@@ -669,12 +669,35 @@ pub(crate) fn write_agent_instructions(
     write_agent_instructions_with_continuity(config, agent, parent_name, cached_bridge.as_deref())
 }
 
+fn lock_instruction_mirrors(config: &Path) -> std::io::Result<std::fs::File> {
+    let root = config
+        .parent()
+        .ok_or_else(|| std::io::Error::other("agent root missing"))?;
+    let sessions = root.join("sessions");
+    create_private_config_dir(&sessions)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).truncate(false).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let file = options.open(sessions.join("instructions.lock"))?;
+    file.lock()?;
+    Ok(file)
+}
+
 pub(crate) fn write_agent_instructions_with_continuity(
     config: &Path,
     agent: &Agent,
     parent_name: Option<&str>,
     continuity: Option<&str>,
 ) -> Result<(), Error> {
+    // Launch preparation and description/config updates can render concurrently,
+    // including from different server processes. Hold a host-owned lock through
+    // all mirrors and their readbacks so writers cannot replace each other's
+    // verified output or leave mirrors from different snapshots.
+    let _instructions_lock = lock_instruction_mirrors(config)?;
     let _ = std::fs::remove_file(config.join(".anyagents-harness-continuity.md"));
     let mut doc = format!(
         "# AnyAgents Identity & Environment Awareness\n\n\
@@ -735,8 +758,8 @@ pub(crate) fn write_agent_instructions_with_continuity(
         ));
     }
 
-    // Only the host lifecycle allocates a generation. Describe/restart/render
-    // consume its persisted pin without opening live learned-memory files.
+    // A configured harness switch rotates before rendering. Ordinary updates
+    // consume the persisted pin without opening live learned-memory files.
     if let Some(root) = config.parent() {
         if let Some((_, policy)) = agent
             .launch_env
@@ -748,19 +771,18 @@ pub(crate) fn write_agent_instructions_with_continuity(
             doc.push_str(policy);
             doc.push('\n');
         }
-        match anyagents_core::host_session::active(root) {
-            Ok(Some(session)) if session.harness == agent.harness => {
+        match anyagents_core::host_session::prepare_harness_with_source(
+            root,
+            &agent.harness,
+            harness_session_filename(&agent.harness),
+            crate::vendor::memory_source(agent),
+        ) {
+            Ok(Some(session)) => {
                 doc.push('\n');
                 doc.push_str(&session.memory.section);
                 doc.push('\n');
             }
             Ok(None) => (), // First dispatch pins and rerenders before launch.
-            Ok(Some(_)) => {
-                return Err(Error::Message(format!(
-                    "host session harness mismatch for {}",
-                    agent.id
-                )));
-            }
             Err(error) => {
                 return Err(Error::Message(format!(
                     "invalid host memory pin for {}: {error}",
@@ -1651,7 +1673,11 @@ pub(crate) fn seed_harness_credentials(
     if let (Some(bound), Some(primary_profile_root)) =
         (current_bound.clone(), profile_roots.first().cloned())
     {
+        let harvest_peers = all_agents.len() <= 32;
         for other in &all_agents {
+            if !harvest_peers && other.id != agent.id {
+                continue;
+            }
             let other_cfg = agent_config_dir(data, &other.id);
             if bound_profile_name(&other_cfg).as_deref() == Some(bound.as_str()) {
                 for rel in [
@@ -8551,7 +8577,8 @@ mod tests {
     #[test]
     fn instruction_mirrors_share_one_pinned_snapshot_across_harnesses() {
         use anyagents_core::host_session;
-        let tmp = tempfile::tempdir().unwrap();
+        // Resume-pointer reads reject symlinked ancestors, including macOS /var.
+        let tmp = crate::test_tempdir();
         let data = tmp.path();
         let store = Store::open(data.join("state.db")).unwrap();
         store
@@ -8594,8 +8621,10 @@ mod tests {
         assert!(assembled.contains(&first.memory.section));
         assert!(!assembled.contains("EDITED_SECOND_FACT"));
         agent.harness = "sylphx".into();
-        let switched = host_session::new_session(root, &agent.harness).unwrap();
         write_agent_instructions(&config, &agent, None).unwrap();
+        let switched = host_session::active(root).unwrap().unwrap();
+        assert_eq!(switched.harness, "sylphx");
+        assert_ne!(switched.generation, first.generation);
         for path in paths {
             let text = std::fs::read_to_string(config.join(path)).unwrap();
             assert!(text.contains(&switched.memory.section));
@@ -8665,7 +8694,7 @@ mod tests {
 
     #[test]
     fn set_agent_harness_preserves_identity_history_and_refuses_incompatible() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_tempdir();
         let data = tmp.path();
         let owner_workdir = data.join("owner-workdir");
         std::fs::create_dir(&owner_workdir).unwrap();
@@ -8701,6 +8730,10 @@ mod tests {
         let cfg = agent_config_dir(data, &owner.id);
         std::fs::create_dir_all(&cfg).unwrap();
         write_profile_marker(&cfg, ".anyagents-profile", "sylphx/default\n").unwrap();
+        let root = cfg.parent().unwrap();
+        let initial_session =
+            anyagents_core::host_session::ensure_active(root, "opencode").unwrap();
+        anyagents_core::host_session::bind_vendor(root, "opencode", "ses_original").unwrap();
         let mut inc = anyagents_core::Incoming::new("Initial owner task");
         inc.sender = Some("agent:sample-parent".to_string());
         let _ = store.receive(&owner.id, inc).unwrap();
@@ -8739,6 +8772,9 @@ mod tests {
         assert_eq!(receipt["profile"], "sylphx/default");
         assert_eq!(receipt["state"], "archived");
         assert_eq!(receipt["cutover_status"], "ready_on_next_wake");
+        let switched_session = anyagents_core::host_session::active(root).unwrap().unwrap();
+        assert_eq!(switched_session.harness, "codex");
+        assert_ne!(switched_session.generation, initial_session.generation);
 
         let after = store.agent(&owner.id).unwrap();
         assert_eq!(after.id, owner.id);
@@ -8782,6 +8818,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(roundtrip["harness"], "opencode");
+        let roundtrip_session = anyagents_core::host_session::active(root).unwrap().unwrap();
+        assert_eq!(roundtrip_session.harness, "opencode");
+        assert_ne!(roundtrip_session.generation, switched_session.generation);
+        // The outgoing generation's pin and alias remain resumable.
+        assert_eq!(
+            anyagents_core::host_session::resume_vendor(root, "opencode", "ses_original").unwrap(),
+            initial_session
+        );
         assert!(!cfg.join("opencode-session-id").exists());
         let agents_md = std::fs::read_to_string(cfg.join("AGENTS.md")).unwrap();
         assert!(agents_md.contains("Completed second turn on Codex"));
@@ -11090,6 +11134,59 @@ mod runtime_config_tests {
                 .join(".anyagents-pending-credentials.json")
                 .exists()
         );
+    }
+
+    #[test]
+    fn concurrent_instruction_renders_publish_one_complete_set_of_mirrors() {
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        store
+            .hold_capability_key("0123456789abcdef0123456789abcdef")
+            .unwrap();
+        let agent = store
+            .create_agent(anyagents_core::NewAgent::new(
+                "concurrent-render",
+                "claude-code",
+            ))
+            .unwrap();
+        let config = agent_config_dir(dir.path(), &agent.id);
+        let barrier = std::sync::Barrier::new(4);
+        std::thread::scope(|scope| {
+            for writer in 0..4 {
+                let mut agent = agent.clone();
+                agent.description = Some(format!("CONCURRENT_RENDER_{writer}"));
+                let config = &config;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    for _ in 0..8 {
+                        write_agent_instructions(config, &agent, None).unwrap();
+                    }
+                });
+            }
+        });
+        let system = std::fs::read_to_string(config.join("SYSTEM_PROMPT.md")).unwrap();
+        let last = (0..4)
+            .map(|writer| format!("CONCURRENT_RENDER_{writer}"))
+            .find(|marker| system.contains(marker))
+            .unwrap();
+        for name in [
+            "AGENTS.md",
+            "CLAUDE.md",
+            ".claude/CLAUDE.md",
+            "opencode/AGENTS.md",
+            ".config/opencode/AGENTS.md",
+            ".gemini/config/GEMINI.md",
+            "muse/AGENTS.md",
+            ".config/muse/AGENTS.md",
+            ".omp/agent/APPEND_SYSTEM.md",
+            ".omp/agent/AGENTS.md",
+            ".dsh/AGENTS.md",
+            ".grok/AGENTS.md",
+        ] {
+            let mirror = std::fs::read_to_string(config.join(name)).unwrap();
+            assert!(mirror.contains(&last), "{name} contains another render");
+        }
     }
 
     #[test]
