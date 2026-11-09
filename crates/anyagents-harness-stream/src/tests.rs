@@ -675,21 +675,14 @@ fn partial_stderr_prefix_is_withheld_until_eof_and_uncertainty_keeps_exit_diagno
 
 #[cfg(unix)]
 fn immediate_receipt_harness() -> super::StreamHarness {
-    super::StreamHarness::launch(super::Launch {
-        spec: StreamSpec {
-            name: "immediate-receipt".into(),
-            args: vec![],
-            resume_flag: "--session",
-            start_line: "user",
-            cancel: "cancel",
-            protocol: LineProtocol::AcknowledgedResult,
-        },
-        program: "/usr/bin/python3".into(),
-        args: vec![
-            "-u".into(),
-            "-c".into(),
-            r#"
-import json,sys
+    immediate_receipt_fixture(IMMEDIATE_RECEIPT_SCRIPT, 0).unwrap()
+}
+
+#[cfg(unix)]
+const IMMEDIATE_RECEIPT_SCRIPT: &str = r#"
+import json,sys,time
+time.sleep(int(sys.argv[1])/1000)
+print(json.dumps({'type':'ready','session_id':'fixture-ready'}),flush=True)
 first=None
 for line in sys.stdin:
  m=json.loads(line)
@@ -704,8 +697,28 @@ for line in sys.stdin:
   print(json.dumps({'type':'accepted','request_id':first}),flush=True)
  else:
   print(json.dumps({'type':'steer_ack','request_id':m['request_id'],'accepted':True,'turn_id':first}),flush=True)
-"#
-            .into(),
+"#;
+
+#[cfg(unix)]
+fn immediate_receipt_fixture(
+    script: &str,
+    startup_delay_ms: u64,
+) -> Result<super::StreamHarness, String> {
+    let harness = super::StreamHarness::launch(super::Launch {
+        spec: StreamSpec {
+            name: "immediate-receipt".into(),
+            args: vec![],
+            resume_flag: "--session",
+            start_line: "user",
+            cancel: "cancel",
+            protocol: LineProtocol::AcknowledgedResult,
+        },
+        program: "/usr/bin/python3".into(),
+        args: vec![
+            "-u".into(),
+            "-c".into(),
+            script.into(),
+            startup_delay_ms.to_string(),
         ],
         environment: vec![],
         work_dir: None,
@@ -713,7 +726,24 @@ for line in sys.stdin:
         mode: anyagents_harness::DeliveryMode::Steer,
         steer: anyagents_harness::SteerSupport::Yes,
     })
-    .unwrap()
+    .map_err(|error| error.to_string())?;
+    // Cold interpreter/module setup is not the receipt-ordering contract. Wait
+    // for a frame processed by the real stdout reader before arming its 3s bound.
+    harness.wait_pred(std::time::Duration::from_secs(15), |state| {
+        state.session_id.as_deref() == Some("fixture-ready") || !state.alive
+    });
+    {
+        let state = super::lock(&harness.shared);
+        if !state.alive || state.session_id.as_deref() != Some("fixture-ready") {
+            return Err(format!(
+                "receipt fixture did not become ready: alive={}, failure={:?}, stderr={}",
+                state.alive,
+                state.failure(),
+                state.stderr.masked(state.stderr_done)
+            ));
+        }
+    }
+    Ok(harness)
 }
 
 #[cfg(unix)]
@@ -734,7 +764,10 @@ fn await_receipt_before_post_write(
             .unwrap();
         assert!(
             received(&state),
-            "peer receipt was not processed before post-write decision"
+            "peer receipt was not processed before post-write decision: alive={}, failure={:?}, stderr={}",
+            state.alive,
+            state.failure(),
+            state.stderr.masked(state.stderr_done)
         );
     }));
 }
@@ -845,6 +878,39 @@ fn immediate_self_ack_cannot_release_an_input_behind_an_open_turn() {
     assert_eq!(harness.deliver(&message, &line).unwrap(), Deferred);
     assert_eq!(harness.deliver(&message, &line).unwrap(), Deferred);
     assert_eq!(harness.written_ids(), ["first", "self-ack"]);
+}
+
+#[test]
+#[cfg(unix)]
+fn immediate_receipt_setup_does_not_consume_the_post_write_deadline() {
+    let start = std::time::Instant::now();
+    // Longer than the unchanged 3s post-write bound: the old fixture failed
+    // here before reaching any receipt or custody assertion.
+    let mut harness = immediate_receipt_fixture(IMMEDIATE_RECEIPT_SCRIPT, 3_200).unwrap();
+    assert!(start.elapsed() >= std::time::Duration::from_secs(3));
+    await_receipt_before_post_write(&mut harness, |state| state.acknowledged.contains("first"));
+    assert_eq!(
+        harness
+            .deliver(
+                &receipt_message("first"),
+                &json!({"type":"user","request_id":"first"})
+            )
+            .unwrap(),
+        anyagents_harness::DeliverOutcome::Accepted {
+            turn_finished: false
+        }
+    );
+    assert_eq!(harness.written_ids(), ["first"]);
+}
+
+#[test]
+#[cfg(unix)]
+fn immediate_receipt_setup_reports_peer_exit_before_readiness() {
+    let error = immediate_receipt_fixture("raise RuntimeError('fixture startup failure')", 0)
+        .err()
+        .expect("an exited peer cannot satisfy readiness");
+    assert!(error.contains("did not become ready"), "{error}");
+    assert!(error.contains("fixture startup failure"), "{error}");
 }
 
 #[test]
