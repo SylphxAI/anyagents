@@ -11104,19 +11104,16 @@ mod archetype_tests {
                 "siblings",
                 "Manager template body.",
             ),
-            (
-                "外部聯絡專屬助理",
-                "isolated",
-                "Assistant template body.",
-            ),
+            ("外部聯絡專屬助理", "isolated", "Assistant template body."),
             ("專員 / Worker", "private", "Worker template body."),
         ] {
-            let mut req: crate::api::CreateAgentRequest = serde_json::from_value(serde_json::json!({
-                "name": "sample-agent",
-                "role": role_label,
-                "instructions": "Custom assignment instructions."
-            }))
-            .unwrap();
+            let mut req: crate::api::CreateAgentRequest =
+                serde_json::from_value(serde_json::json!({
+                    "name": "sample-agent",
+                    "role": role_label,
+                    "instructions": "Custom assignment instructions."
+                }))
+                .unwrap();
             apply_archetype_defaults(dir.path(), None, &mut req).unwrap();
             assert_eq!(req.role.as_deref(), Some(role_label));
             assert_eq!(req.scope.as_deref(), Some(expected_scope));
