@@ -232,6 +232,7 @@ echo REAL_UID_FIXTURE_TRAVERSAL_OK
                        'NATIVE_CODEX_PRESERVED_FOREIGN_PARENT_LAUNCH_OK',
                        'NATIVE_CODEX_PRESERVED_FOREIGN_MOUNT_LAUNCH_OK',
                        'NATIVE_VENDOR_LEGACY_SQLITE_OWNER_AND_BYTES_RETAINED',
+                       'NATIVE_AGY_GROUP_DEFAULTS_AND_PRIVATE_REPLACEMENT_REPAIRED',
                        'NATIVE_VENDOR_PROTECTED_BEFORE_EQUALS_AFTER', 'NATIVE_VENDOR_FIXTURE_REMOVED',
                        '1 passed; 0 failed']:
             if marker not in vendor.stdout:

@@ -719,6 +719,10 @@ fn vendor_launch_inner(
             request.agent.id
         ));
     }
+    if let Some((_, uid, gid, _)) = resolved_seat.as_ref() {
+        crate::sandbox::prepare_config_with_seat_uid(&request.config_dir, *uid, *gid)
+            .map_err(|error| error.to_string())?;
+    }
     if request.agent.harness == "agy" {
         ensure_agy_steering_settings(&request.config_dir, &request.work_dir)
             .map_err(|err| err.to_string())?;
@@ -2058,8 +2062,8 @@ cat >/dev/null
         );
         assert_eq!(
             std::fs::metadata(config.join(".agy")).unwrap().mode() & 0o777,
-            0o700,
-            "sharing must retain the existing owner-private vendor parent"
+            0o770,
+            "config preparation must restore the admitted daemon group's access"
         );
         println!("NATIVE_VENDOR_LEGACY_SQLITE_OWNER_AND_BYTES_RETAINED");
         let evidence = std::fs::read_to_string(&report).unwrap_or_else(|error| {
@@ -2082,6 +2086,106 @@ cat >/dev/null
         println!("{evidence}");
         drop(harness);
         std::fs::remove_file(&report).unwrap();
+        // A real admitted child inherits group-writable defaults even when the
+        // daemon inherited 077. Explicit 0600 replacements still need the next
+        // pre-read config repair; a umask cannot add permissions to such files.
+        let agy_probe = fixture.join("agy-config-probe.sh");
+        file(
+            &agy_probe,
+            r#"#!/bin/sh
+set -eu
+[ "$(umask)" = 0007 ]
+base="$ANYAGENTS_AGENT_CONFIG/.gemini/antigravity-cli"
+grep -q 'send-immediately' "$base/settings.json"
+cp "$base/settings.json" "$ANYAGENTS_AGENT_CONFIG/agy-before-start.json"
+mkdir -p "$base/builtin" "$base/conversations"
+printf default > "$base/conversations/default"
+printf '{"queuedMessages":"queued","retained":"synthetic"}' > "$base/settings.new"
+chmod 600 "$base/settings.new"
+mv "$base/settings.new" "$base/settings.json"
+printf ready > "$ANYAGENTS_AGENT_CONFIG/agy-config-ready"
+cat >/dev/null
+"#,
+            0o555,
+            0,
+        );
+        let mut agy_agent = agent.clone();
+        agy_agent.harness = "agy".into();
+        unsafe {
+            std::env::set_var("ANYAGENTS_AGY_BIN", &agy_probe);
+        }
+        let old_mask = unsafe { libc::umask(0o077) };
+        let agy_launch = vendor_launch_with_store(
+            LaunchRequest {
+                agent: agy_agent.clone(),
+                data_dir: data.clone(),
+                config_dir: config.clone(),
+                work_dir: root.join("work"),
+                extra_env: vec![],
+            },
+            &store,
+        );
+        unsafe {
+            libc::umask(old_mask);
+        }
+        let agy_harness = agy_launch.unwrap();
+        let ready = config.join("agy-config-ready");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !ready.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(ready.exists(), "admitted AGY fixture did not complete");
+        drop(agy_harness);
+        let vendor_dir = config.join(".gemini/antigravity-cli");
+        let settings = vendor_dir.join("settings.json");
+        assert_eq!(
+            std::fs::metadata(vendor_dir.join("conversations"))
+                .unwrap()
+                .mode()
+                & 0o7777,
+            0o2770
+        );
+        assert_eq!(
+            std::fs::metadata(vendor_dir.join("conversations/default"))
+                .unwrap()
+                .mode()
+                & 0o777,
+            0o660
+        );
+        assert_eq!(
+            std::fs::read(&settings).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert!(ensure_agy_steering_settings(&config, &root.join("work")).is_err());
+        // Relaunch with the inaccessible replacement still in place. This
+        // exercises actual pre-read preparation, not a helper-only repair.
+        std::fs::remove_file(&ready).unwrap();
+        let relaunched = vendor_launch_with_store(
+            LaunchRequest {
+                agent: agy_agent,
+                data_dir: data.clone(),
+                config_dir: config.clone(),
+                work_dir: root.join("work"),
+                extra_env: vec![],
+            },
+            &store,
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !ready.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(ready.exists(), "AGY relaunch refused before config repair");
+        drop(relaunched);
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(config.join("agy-before-start.json")).unwrap())
+                .unwrap();
+        assert_eq!(value["retained"], "synthetic");
+        assert_eq!(value["queuedMessages"], "send-immediately");
+        crate::sandbox::prepare_config_with_seat_uid(&config, uid, gid).unwrap();
+        ensure_agy_steering_settings(&config, &root.join("work")).unwrap();
+        assert_eq!(std::fs::metadata(&settings).unwrap().mode() & 0o060, 0o060);
+        println!("NATIVE_AGY_GROUP_DEFAULTS_AND_PRIVATE_REPLACEMENT_REPAIRED");
         for name in ["memory", "skills", "config"] {
             std::fs::set_permissions(peer.join(name), std::fs::Permissions::from_mode(0o777))
                 .unwrap();
