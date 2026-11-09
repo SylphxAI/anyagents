@@ -1447,11 +1447,37 @@ fn harness_has_inflight_processes(root_pid: Option<u32>) -> bool {
     }
 }
 
-fn reap_ephemeral_dirs(config_dir: &std::path::Path, _managed_work: &std::path::Path) {
+fn reap_ephemeral_dirs(config_dir: &std::path::Path, managed_work: &std::path::Path) {
     let seat_ids = detect_seat_ids(config_dir);
-    for rel in ["cache-home", "tmp", ".rustup", ".cargo"] {
+    for rel in [
+        "cache-home",
+        "tmp",
+        ".tmp",
+        ".rustup",
+        ".cargo",
+        ".gemini/tmp",
+        ".cache",
+        "cache",
+    ] {
         let target = config_dir.join(rel);
         remove_path_with_seat(&target, seat_ids);
+    }
+    const BUILD_DIRS: &[&str] = &["target", "node_modules", ".next", ".turbo", "dist"];
+    for rel in BUILD_DIRS {
+        remove_path_with_seat(&managed_work.join(rel), seat_ids);
+    }
+    for container in ["apps", "packages", "crates", "services"] {
+        let Ok(entries) = fs::read_dir(managed_work.join(container)) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                for rel in BUILD_DIRS {
+                    remove_path_with_seat(&path.join(rel), seat_ids);
+                }
+            }
+        }
     }
 }
 

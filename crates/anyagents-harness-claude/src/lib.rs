@@ -690,6 +690,18 @@ fn read_stdout(stdout: ChildStdout, shared: Arc<Mutex<State>>, wake: Arc<Condvar
                     state.failures.push((id, "rate_limit".to_string()));
                 }
             }
+            if let Some(reason) = synthetic_auth_error_from_claude(&value) {
+                if let Some(id) = value.get("session_id").and_then(Value::as_str)
+                    && !id.is_empty()
+                {
+                    state.session_id = Some(id.to_string());
+                }
+                fail_oauth_turn(&mut state, reason);
+                state.epoch = state.epoch.wrapping_add(1);
+                drop(state);
+                wake.notify_all();
+                break;
+            }
             if value.get("type").and_then(Value::as_str) == Some("result") {
                 apply_result(&mut state, &value);
             }
@@ -729,6 +741,101 @@ fn watch_child(shared: Arc<Mutex<State>>, wake: Arc<Condvar>, notify: Arc<dyn Fn
         });
 }
 
+fn is_oauth_auth_error_text(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    text.contains("OAuth session expired")
+        || text.contains("OAuth access token has expired")
+        || text.contains("Failed to authenticate")
+        || text.contains("Not logged in")
+        || text.contains("authentication_failed")
+        || text.contains("authentication_error")
+        || (lower.contains("401")
+            && (lower.contains("oauth")
+                || lower.contains("authenticate")
+                || lower.contains("authentication")
+                || lower.contains("access token")))
+}
+
+fn collect_text_fields(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::String(s) if !s.trim().is_empty() => out.push(s.clone()),
+        Value::Array(items) => {
+            for item in items {
+                collect_text_fields(item, out);
+            }
+        }
+        Value::Object(map) => {
+            if let Some(Value::String(text)) = map.get("text") {
+                if !text.trim().is_empty() {
+                    out.push(text.clone());
+                }
+            } else {
+                for (k, v) in map {
+                    if matches!(
+                        k.as_str(),
+                        "content" | "message" | "error" | "result" | "delta"
+                    ) {
+                        collect_text_fields(v, out);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+pub fn synthetic_auth_error_from_claude(value: &Value) -> Option<String> {
+    let kind = value
+        .get("type")
+        .or_else(|| value.get("event"))
+        .and_then(Value::as_str);
+    let model = value
+        .pointer("/message/model")
+        .or_else(|| value.get("model"))
+        .and_then(Value::as_str);
+    if model == Some("<synthetic>") {
+        let mut texts = Vec::new();
+        collect_text_fields(
+            value.pointer("/message/content").unwrap_or(value),
+            &mut texts,
+        );
+        let joined = texts.join("\n");
+        if is_oauth_auth_error_text(&joined) {
+            return Some(joined.trim().to_string());
+        }
+    }
+    if kind == Some("result")
+        && let Some(text) = value.get("result").and_then(Value::as_str)
+    {
+        let trimmed = text.trim();
+        let is_synthetic_prefix = trimmed.starts_with("Failed to authenticate")
+            || trimmed.starts_with("API Error: 401")
+            || trimmed.starts_with("OAuth access token has expired")
+            || trimmed.starts_with("OAuth session expired")
+            || trimmed.starts_with("Not logged in");
+        if is_synthetic_prefix && is_oauth_auth_error_text(trimmed) {
+            return Some(trimmed.to_string());
+        }
+    }
+    None
+}
+
+fn fail_oauth_turn(state: &mut State, reason: String) {
+    let mut ids = std::mem::take(&mut state.open);
+    ids.append(&mut state.followups);
+    for id in ids {
+        state.seen.remove(&id);
+        state.echoed.remove(&id);
+        state.finished.remove(&id);
+        state.failures.push((id, reason.clone()));
+    }
+    state.sign_in_fault = Some(reason);
+    if let Some(child) = state.child.as_mut() {
+        let _ = child.kill();
+    }
+    state.alive = false;
+}
+
 fn apply_result(state: &mut State, value: &Value) {
     if let Some(id) = value.get("session_id").and_then(Value::as_str)
         && !id.is_empty()
@@ -741,28 +848,14 @@ fn apply_result(state: &mut State, value: &Value) {
     // An errored result (a sign-in failure, a vendor error) is not a successful
     // turn: its ids finish, but with the vendor's own reason instead of usage.
     if let Some(reason) = result_error(value) {
-        let is_oauth_expired = reason.contains("OAuth session expired")
-            || reason.contains("Failed to authenticate: OAuth")
-            || reason.contains("Not logged in")
-            || reason.contains("authentication_failed");
+        if is_oauth_auth_error_text(&reason) {
+            fail_oauth_turn(state, reason);
+            return;
+        }
         let ids = std::mem::take(&mut state.open);
         for id in ids {
-            if is_oauth_expired {
-                state.seen.remove(&id);
-                state.echoed.remove(&id);
-                state.finished.remove(&id);
-            } else {
-                state.finished.insert(id.clone());
-            }
+            state.finished.insert(id.clone());
             state.failures.push((id, reason.clone()));
-        }
-        if is_oauth_expired {
-            state.sign_in_fault = Some(reason);
-            if let Some(child) = state.child.as_mut() {
-                let _ = child.kill();
-            }
-            state.alive = false;
-            return;
         }
         promote_followups(state);
         return;

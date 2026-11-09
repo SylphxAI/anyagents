@@ -481,3 +481,60 @@ fn stderr_is_drained_bounded_and_classified_without_publishing_vendor_secrets() 
         "relaunch drains stderr independently"
     );
 }
+
+#[test]
+fn synthetic_401_auth_error_fails_turn_and_stops_process_without_recording_usage() {
+    use anyagents_harness_claude::synthetic_auth_error_from_claude;
+    use serde_json::json;
+
+    let synthetic_assistant = json!({
+        "type": "assistant",
+        "message": {
+            "model": "<synthetic>",
+            "role": "assistant",
+            "content": [{
+                "type": "text",
+                "text": "Failed to authenticate. API Error: 401 {\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\"message\":\"OAuth access token has expired.\"}}"
+            }]
+        }
+    });
+    assert!(
+        synthetic_auth_error_from_claude(&synthetic_assistant)
+            .unwrap()
+            .contains("OAuth access token has expired")
+    );
+
+    let normal_assistant = json!({
+        "type": "assistant",
+        "message": {
+            "model": "claude-opus-4-6",
+            "role": "assistant",
+            "content": [{
+                "type": "text",
+                "text": "Investigating: Failed to authenticate. API Error: 401 OAuth access token has expired"
+            }]
+        }
+    });
+    assert!(synthetic_auth_error_from_claude(&normal_assistant).is_none());
+
+    let dir = TempDir::new().unwrap();
+    let mut harness = start(&dir, "synthetic_401", None);
+    harness.deliver(&msg("m1")).unwrap();
+    assert!(
+        harness.wait_dead(Duration::from_secs(5)),
+        "synthetic 401 must terminate the child so the supervisor recycles and recovers the turn"
+    );
+    assert!(!harness.is_finished("m1"));
+    assert!(harness.usage_for("m1").is_none());
+    assert_eq!(harness.turns_served(), 0);
+    let fault = harness
+        .health()
+        .sign_in_fault
+        .expect("sign_in_fault recorded");
+    assert!(fault.contains("401"), "{fault}");
+    let failure = harness.failure_for("m1").expect("failure recorded for m1");
+    assert!(
+        failure.contains("OAuth access token has expired"),
+        "{failure}"
+    );
+}

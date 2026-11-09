@@ -1403,10 +1403,18 @@ fn persist_refreshed_credentials(root: &Path, rels: &[&str], bytes: &[u8]) -> Re
 }
 
 fn post_anthropic_oauth_refresh(http: &ureq::Agent, req_body: &str) -> Option<serde_json::Value> {
-    for url in [
-        "https://api.anthropic.com/v1/oauth/token",
-        "https://platform.claude.com/v1/oauth/token",
-    ] {
+    let custom_url = std::env::var("ANYAGENTS_ANTHROPIC_OAUTH_TOKEN_URL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let urls: Vec<&str> = match custom_url.as_deref() {
+        Some(u) => vec![u],
+        None => vec![
+            "https://api.anthropic.com/v1/oauth/token",
+            "https://platform.claude.com/v1/oauth/token",
+        ],
+    };
+    for url in urls {
         if let Ok(rresp) = http
             .post(url)
             .header("content-type", "application/json")
@@ -1426,7 +1434,9 @@ fn post_anthropic_oauth_refresh(http: &ureq::Agent, req_body: &str) -> Option<se
 }
 
 fn seat_sanitized_anthropic_credentials(src_bytes: &[u8], now_ms: i64) -> Vec<u8> {
-    if crate::sandbox::is_isolated_test_env() {
+    if crate::sandbox::is_isolated_test_env()
+        && std::env::var_os("ANYAGENTS_ANTHROPIC_OAUTH_TOKEN_URL").is_none()
+    {
         return src_bytes.to_vec();
     }
     let Ok(mut val) = serde_json::from_slice::<serde_json::Value>(src_bytes) else {
@@ -1456,7 +1466,9 @@ fn seat_sanitized_anthropic_credentials(src_bytes: &[u8], now_ms: i64) -> Vec<u8
 }
 
 fn refresh_anthropic_profile_oauth_if_due(data: &Path, profile_root: &Path) -> Result<(), Error> {
-    if crate::sandbox::is_isolated_test_env() {
+    if crate::sandbox::is_isolated_test_env()
+        && std::env::var_os("ANYAGENTS_ANTHROPIC_OAUTH_TOKEN_URL").is_none()
+    {
         return Ok(());
     }
     let cred_path = profile_root.join(".credentials.json");
@@ -1482,7 +1494,12 @@ fn refresh_anthropic_profile_oauth_if_due(data: &Path, profile_root: &Path) -> R
         .ok()
         .and_then(|s| s.trim().parse::<i64>().ok())
         .unwrap_or(0);
-    if now_ms.saturating_sub(last_attempt_ms) < 300_000 {
+    let min_retry_ms = if expires_at <= now_ms.saturating_add(30 * 60 * 1_000) {
+        60_000
+    } else {
+        300_000
+    };
+    if now_ms.saturating_sub(last_attempt_ms) < min_retry_ms {
         return Ok(());
     }
     let Some(rtok) = cred
@@ -1541,23 +1558,125 @@ fn refresh_anthropic_profile_oauth_if_due(data: &Path, profile_root: &Path) -> R
             );
         }
         if let Ok(updated) = serde_json::to_string(&cred) {
-            persist_refreshed_credentials(
+            if let Err(err) = persist_refreshed_credentials(
                 profile_root,
                 &[".credentials.json", ".claude/.credentials.json"],
                 updated.as_bytes(),
-            )?;
+            ) {
+                let _ = std::fs::remove_file(&attempt_path);
+                return Err(err);
+            }
             let _ = std::fs::remove_file(profile_root.join(".anyagents-usage-backoff-until-ms"));
             if let Some(profile_name) = profile_root.file_name().and_then(|n| n.to_str()) {
-                propagate_profile_files_to_bound_agents(
+                if let Err(err) = propagate_profile_files_to_bound_agents(
                     data,
                     "anthropic",
                     profile_name,
                     &[".credentials.json", ".claude/.credentials.json"],
-                )?;
+                ) {
+                    let _ = std::fs::remove_file(&attempt_path);
+                    return Err(err);
+                }
             }
         }
     }
     Ok(())
+}
+
+fn heal_mcp_config_file(path: &Path) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    let needs_heal = match std::fs::read(path) {
+        Ok(bytes) => {
+            bytes.is_empty()
+                || !serde_json::from_slice::<serde_json::Value>(&bytes)
+                    .is_ok_and(|val| val.is_object())
+        }
+        Err(_) => false,
+    };
+    if needs_heal {
+        write_seat_shared_file(path, b"{\"mcpServers\":{}}\n", 0o660)
+    } else {
+        false
+    }
+}
+
+pub(crate) fn ensure_agy_mcp_config(profile_roots: &[PathBuf], target_config: &Path) {
+    for profile_root in profile_roots {
+        let _ = heal_mcp_config_file(&profile_root.join(".gemini/config/mcp_config.json"));
+        let _ = heal_mcp_config_file(&profile_root.join("mcp_config.json"));
+    }
+    let _ = heal_mcp_config_file(&target_config.join(".gemini/config/mcp_config.json"));
+    let _ = heal_mcp_config_file(&target_config.join("mcp_config.json"));
+}
+
+pub(crate) fn sync_anthropic_agent_credentials_from_profile(
+    store: Option<&Store>,
+    data: &Path,
+    agent: &Agent,
+    target_config: &Path,
+    profile_root: &Path,
+) {
+    if !target_config.is_dir() || !profile_root.is_dir() {
+        return;
+    }
+    let _ = refresh_anthropic_profile_oauth_if_due(data, profile_root);
+    let src = if profile_root.join(".credentials.json").is_file() {
+        profile_root.join(".credentials.json")
+    } else if profile_root.join(".claude/.credentials.json").is_file() {
+        profile_root.join(".claude/.credentials.json")
+    } else {
+        return;
+    };
+    let Ok(raw_src_bytes) = std::fs::read(&src) else {
+        return;
+    };
+    let now_ms = anyagents_core::now_ms();
+    let Some(src_exp) = json_oauth_expires_at(&raw_src_bytes) else {
+        return;
+    };
+    if src_exp <= now_ms {
+        return;
+    }
+    let sanitized = seat_sanitized_anthropic_credentials(&raw_src_bytes, now_ms);
+    let mut rewrote_any = false;
+    for rel in [".credentials.json", ".claude/.credentials.json"] {
+        let dst = target_config.join(rel);
+        let needs_rewrite = match std::fs::read(&dst) {
+            Ok(dst_bytes) => {
+                if dst_bytes == sanitized {
+                    false
+                } else {
+                    let dst_exp = json_oauth_expires_at(&dst_bytes).unwrap_or(0);
+                    dst_bytes.is_empty()
+                        || dst_exp <= now_ms.saturating_add(30 * 60 * 1_000)
+                        || src_exp > dst_exp
+                }
+            }
+            Err(_) => !dst.is_dir(),
+        };
+        if needs_rewrite && write_seat_shared_file(&dst, &sanitized, 0o660) {
+            rewrote_any = true;
+        }
+    }
+    if rewrote_any && let Some(s) = store {
+        if let Some((_, uid, gid, _)) = resolved_agent_seat_info(s, agent) {
+            crate::sandbox::share_config_with_seat_uid(target_config, uid, gid);
+        }
+        if !s.has_open_turn(&agent.id).unwrap_or(false) {
+            let _ = write_profile_marker(
+                target_config,
+                ".anyagents-profile-rotated-ms",
+                &format!("{now_ms}\n"),
+            );
+            let _ = std::fs::remove_file(target_config.join(".anyagents-last-error.json"));
+            poke_agent_wake_socket(data, &agent.id);
+        }
+    }
 }
 
 pub(crate) fn seed_harness_credentials(
@@ -1706,6 +1825,7 @@ pub(crate) fn seed_harness_credentials(
             refresh_anthropic_profile_oauth_if_due(data, &primary_profile_root)?;
         }
     }
+    ensure_agy_mcp_config(&profile_roots, target_config);
 
     for profile_root in &profile_roots {
         for candidate in [
@@ -5029,6 +5149,15 @@ pub(crate) fn sync_fresher_bound_agent_credentials(data: &Path) {
         return;
     }
     let _ = std::fs::write(&sync_stamp, format!("{now_ms}\n"));
+    if let Ok(entries) = std::fs::read_dir(profiles_root.join("google-antigravity")) {
+        for entry in entries.flatten() {
+            let prof_path = entry.path();
+            if prof_path.is_dir() {
+                let _ = heal_mcp_config_file(&prof_path.join(".gemini/config/mcp_config.json"));
+                let _ = heal_mcp_config_file(&prof_path.join("mcp_config.json"));
+            }
+        }
+    }
     if let Ok(store) = Store::open(data.join("state.db"))
         && let Ok(agents) = store.list_agents()
     {
@@ -5056,6 +5185,7 @@ pub(crate) fn sync_fresher_bound_agent_credentials(data: &Path) {
                 })
                 .unwrap_or_else(|| "default".to_string());
             let profile_dir = profiles_root.join(&provider).join(&prof_name);
+            ensure_agy_mcp_config(std::slice::from_ref(&profile_dir), &cfg);
             let rels: &[&str] = match provider.as_str() {
                 "anthropic" => &[".credentials.json", ".claude/.credentials.json"],
                 "openai" => &["auth.json", ".codex/auth.json"],
@@ -5076,6 +5206,14 @@ pub(crate) fn sync_fresher_bound_agent_credentials(data: &Path) {
             if updated_any {
                 propagate_profile_files_to_bound_agents(data, &provider, &prof_name, rels)
                     .unwrap_or_else(|err| eprintln!("runtime persistence failed: {err}"));
+            } else if provider == "anthropic" {
+                sync_anthropic_agent_credentials_from_profile(
+                    Some(&store),
+                    data,
+                    agent,
+                    &cfg,
+                    &profile_dir,
+                );
             }
         }
     }
@@ -11700,6 +11838,200 @@ mod runtime_config_tests {
                     None => std::env::remove_var(key),
                 }
             }
+        }
+    }
+
+    #[test]
+    fn zero_byte_and_corrupted_mcp_configs_are_self_healed_across_profile_and_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        store
+            .hold_capability_key("0123456789abcdef0123456789abcdef")
+            .unwrap();
+        let agent = store
+            .create_agent(anyagents_core::NewAgent::new("agy-sample", "agy"))
+            .unwrap();
+        let profile = dir.path().join("profiles/google-antigravity/default");
+        std::fs::create_dir_all(profile.join(".gemini/config")).unwrap();
+        std::fs::create_dir_all(profile.join(".gemini/antigravity-cli")).unwrap();
+        std::fs::write(
+            profile.join(".gemini/antigravity-cli/antigravity-oauth-token"),
+            br#"{"access_token":"fixture-token"}"#,
+        )
+        .unwrap();
+        let profile_mcp = profile.join(".gemini/config/mcp_config.json");
+        std::fs::write(&profile_mcp, b"").unwrap();
+
+        let cfg = agent_config_dir(dir.path(), &agent.id);
+        std::fs::create_dir_all(cfg.join(".gemini/config")).unwrap();
+        write_profile_marker(&cfg, ".anyagents-profile", "google-antigravity/default\n").unwrap();
+        let agent_mcp = cfg.join(".gemini/config/mcp_config.json");
+        std::fs::write(&agent_mcp, b"").unwrap();
+
+        seed_harness_credentials(&store, dir.path(), &agent, &cfg).unwrap();
+        let parsed_profile: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&profile_mcp).unwrap()).unwrap();
+        assert!(parsed_profile.get("mcpServers").unwrap().is_object());
+        let parsed_agent: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&agent_mcp).unwrap()).unwrap();
+        assert!(parsed_agent.get("mcpServers").unwrap().is_object());
+
+        // Truncate again and verify reconcile_agent_runtime_config self-heals
+        // 0-byte or truncated JSON and writes the agent's MCP capability config.
+        std::fs::write(&profile_mcp, b"{truncated").unwrap();
+        std::fs::write(&agent_mcp, b"").unwrap();
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        reconcile_agent_runtime_config(&store, dir.path(), &agent, &cfg, &work).unwrap();
+        let healed_profile: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&profile_mcp).unwrap()).unwrap();
+        assert!(healed_profile.get("mcpServers").unwrap().is_object());
+        let healed_agent: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&agent_mcp).unwrap()).unwrap();
+        assert!(
+            healed_agent
+                .pointer("/mcpServers/anyagents/command")
+                .and_then(serde_json::Value::as_str)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn mid_session_anthropic_oauth_refresh_updates_profile_and_sanitized_agent_credentials() {
+        const WORKER: &str = "ANYAGENTS_ANTHROPIC_REFRESH_TEST";
+        if std::env::var_os(WORKER).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "create::runtime_config_tests::mid_session_anthropic_oauth_refresh_updates_profile_and_sanitized_agent_credentials",
+                    "--nocapture",
+                ])
+                .env(WORKER, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+            return;
+        }
+
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let body = r#"{"access_token":"fresh-access-token","refresh_token":"fresh-refresh-token","expires_in":28800}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        let token_url = format!("http://{addr}/v1/oauth/token");
+        unsafe {
+            std::env::set_var("ANYAGENTS_ANTHROPIC_OAUTH_TOKEN_URL", &token_url);
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        store
+            .hold_capability_key("0123456789abcdef0123456789abcdef")
+            .unwrap();
+        let agent = store
+            .create_agent(anyagents_core::NewAgent::new(
+                "claude-sample",
+                "claude-code",
+            ))
+            .unwrap();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        // Expiring in 10 minutes (< 30 minute proactive refresh threshold).
+        let expiring_soon = now_ms + 10 * 60 * 1000;
+        let profile = dir.path().join("profiles/anthropic/default");
+        std::fs::create_dir_all(profile.join(".claude")).unwrap();
+        let initial_profile_creds = serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "old-access-token",
+                "refreshToken": "old-refresh-token",
+                "expiresAt": expiring_soon,
+                "subscriptionType": "max"
+            }
+        });
+        let raw_initial = serde_json::to_vec(&initial_profile_creds).unwrap();
+        std::fs::write(profile.join(".credentials.json"), &raw_initial).unwrap();
+        std::fs::write(profile.join(".claude/.credentials.json"), &raw_initial).unwrap();
+
+        let cfg = agent_config_dir(dir.path(), &agent.id);
+        std::fs::create_dir_all(cfg.join(".claude")).unwrap();
+        write_profile_marker(&cfg, ".anyagents-profile", "anthropic/default\n").unwrap();
+        let stale_agent_creds = serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "old-access-token",
+                "refreshToken": null,
+                "expiresAt": expiring_soon,
+                "subscriptionType": "max"
+            }
+        });
+        let raw_stale = serde_json::to_vec(&stale_agent_creds).unwrap();
+        std::fs::write(cfg.join(".credentials.json"), &raw_stale).unwrap();
+        std::fs::write(cfg.join(".claude/.credentials.json"), &raw_stale).unwrap();
+
+        sync_fresher_bound_agent_credentials(dir.path());
+        server.join().unwrap();
+
+        for rel in [".credentials.json", ".claude/.credentials.json"] {
+            let prof_val: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(profile.join(rel)).unwrap()).unwrap();
+            assert_eq!(
+                prof_val
+                    .pointer("/claudeAiOauth/accessToken")
+                    .and_then(serde_json::Value::as_str),
+                Some("fresh-access-token")
+            );
+            assert_eq!(
+                prof_val
+                    .pointer("/claudeAiOauth/refreshToken")
+                    .and_then(serde_json::Value::as_str),
+                Some("fresh-refresh-token")
+            );
+
+            let agent_val: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(cfg.join(rel)).unwrap()).unwrap();
+            assert_eq!(
+                agent_val
+                    .pointer("/claudeAiOauth/accessToken")
+                    .and_then(serde_json::Value::as_str),
+                Some("fresh-access-token")
+            );
+            assert!(
+                agent_val
+                    .pointer("/claudeAiOauth/refreshToken")
+                    .is_some_and(serde_json::Value::is_null),
+                "seat credentials must strip refreshToken: {agent_val}"
+            );
+            assert!(
+                agent_val
+                    .pointer("/claudeAiOauth/expiresAt")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap()
+                    > expiring_soon
+            );
+        }
+
+        unsafe {
+            std::env::remove_var("ANYAGENTS_ANTHROPIC_OAUTH_TOKEN_URL");
         }
     }
 }

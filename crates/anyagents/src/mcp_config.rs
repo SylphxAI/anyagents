@@ -30,7 +30,12 @@ pub(crate) fn read_candidates(paths: &[std::path::PathBuf]) -> Result<serde_json
 }
 
 pub fn write_claude(path: &Path, command: &Path, args: &[String]) -> Result<(), Error> {
-    let mut root = read_json(path)?;
+    let mut root = match read_json(path) {
+        Ok(val) if val.is_object() => val,
+        Ok(_) | Err(_) if path.is_file() => serde_json::json!({}),
+        Err(err) => return Err(err),
+        Ok(_) => return Err(Error::Message("claude config is not an object".into())),
+    };
     let servers = root
         .as_object_mut()
         .ok_or_else(|| Error::Message("claude config is not an object".into()))?
@@ -595,5 +600,28 @@ mod tests {
         std::fs::write(&path, br#"{"theme":"night"}"#).unwrap();
         sanitize_claude_settings(dir.path()).unwrap();
         assert_eq!(read_json(&path).unwrap()["theme"], "night");
+    }
+
+    #[test]
+    fn write_claude_self_heals_empty_or_corrupted_mcp_config_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let mcp_path = dir.path().join(".gemini/config/mcp_config.json");
+        std::fs::create_dir_all(mcp_path.parent().unwrap()).unwrap();
+        for initial in [b"".as_slice(), b"{truncated", b"[]"] {
+            std::fs::write(&mcp_path, initial).unwrap();
+            write_claude(
+                &mcp_path,
+                Path::new("/usr/local/bin/anyagents"),
+                &["mcp".to_string()],
+            )
+            .unwrap();
+            let parsed = read_json(&mcp_path).unwrap();
+            assert_eq!(
+                parsed
+                    .pointer("/mcpServers/anyagents/command")
+                    .and_then(serde_json::Value::as_str),
+                Some("/usr/local/bin/anyagents")
+            );
+        }
     }
 }
