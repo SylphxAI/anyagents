@@ -745,12 +745,31 @@ impl Store {
                     ON rag_chunks(agent_id, timestamp_ms DESC, chunk_id);",
             )?;
         }
-        conn.execute_batch(
-            "CREATE INDEX IF NOT EXISTS idx_messages_agent_seq ON messages(agent_id, seq DESC);
-             CREATE INDEX IF NOT EXISTS idx_schedules_active_agent ON agent_schedules(agent_id, created_at_ms, id) WHERE state = 'active';
-             CREATE INDEX IF NOT EXISTS idx_messages_agent_time ON messages(agent_id, received_at_ms DESC, seq DESC);
-             CREATE INDEX IF NOT EXISTS idx_outbound_agent_time ON outbound_messages(agent_id, sent_at_ms DESC, id DESC);",
-        )?;
+        // UNIQUE(agent_id, seq) already supports reverse mailbox sequence scans.
+        // Avoid even idempotent DDL on ordinary opens: it needs the writer lock.
+        for (name, sql) in [
+            (
+                "idx_schedules_active_agent",
+                "CREATE INDEX IF NOT EXISTS idx_schedules_active_agent ON agent_schedules(agent_id, created_at_ms, id) WHERE state = 'active'",
+            ),
+            (
+                "idx_messages_agent_time",
+                "CREATE INDEX IF NOT EXISTS idx_messages_agent_time ON messages(agent_id, received_at_ms DESC, seq DESC)",
+            ),
+            (
+                "idx_outbound_agent_time",
+                "CREATE INDEX IF NOT EXISTS idx_outbound_agent_time ON outbound_messages(agent_id, sent_at_ms DESC, id DESC)",
+            ),
+        ] {
+            let exists: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1)",
+                [name],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                conn.execute_batch(sql)?;
+            }
+        }
         // Older databases may already have this column from an earlier runtime.
         // Presence, not an arbitrary failed ALTER, is the idempotency condition.
         let has_public: bool = conn.query_row(
@@ -842,7 +861,7 @@ impl Store {
     pub fn authenticate_capability(&self, token: &str) -> Result<AgentId, Error> {
         let key = self.capability_key()?;
         let digest = hash(&key, token);
-        let conn = self.conn();
+        let conn = self.read_conn();
         let found = conn
             .query_row(
                 "SELECT agent_id FROM agent_capabilities
@@ -1129,7 +1148,7 @@ impl Store {
     }
 
     pub fn agent(&self, id: &AgentId) -> Result<Agent, Error> {
-        agent_by_id(&self.conn(), id)
+        agent_by_id(&self.read_conn(), id)
     }
 
     pub fn set_agent_admin(&self, agent_id: &AgentId, is_admin: bool) -> Result<(), Error> {
@@ -1291,7 +1310,7 @@ impl Store {
 
     /// Former names recorded for this agent via `rename_agent`.
     pub fn agent_aliases(&self, id: &AgentId) -> Result<Vec<String>, Error> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT alias FROM agent_aliases WHERE agent_id = ?1 ORDER BY created_at_ms DESC",
         )?;
@@ -1354,7 +1373,7 @@ impl Store {
 
     pub fn agent_by_name(&self, name: &str) -> Result<Agent, Error> {
         let lookup = name.strip_prefix("agent:").unwrap_or(name);
-        let conn = self.conn();
+        let conn = self.read_conn();
         let found = conn
             .query_row(
                 &format!("SELECT {AGENT_COLS} FROM agents WHERE name = ?1 OR id = ?1"),
@@ -1380,7 +1399,7 @@ impl Store {
     }
 
     pub fn list_agents(&self) -> Result<Vec<Agent>, Error> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let mut stmt = conn.prepare(&format!("SELECT {AGENT_COLS} FROM agents ORDER BY name"))?;
         let mut rows = stmt.query([])?;
         let mut agents = Vec::new();
@@ -1395,7 +1414,7 @@ impl Store {
     pub fn agent_query_metadata(&self) -> Result<AgentQueryMetadata, Error> {
         let mut metadata = AgentQueryMetadata::default();
         {
-            let conn = self.conn();
+            let conn = self.read_conn();
             let mut stmt =
                 conn.prepare("SELECT agent_id, alias FROM agent_aliases ORDER BY alias")?;
             for row in
@@ -1443,7 +1462,7 @@ impl Store {
     }
 
     pub fn children_of(&self, parent_id: &AgentId) -> Result<Vec<Agent>, Error> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let mut stmt = conn.prepare(&format!(
             "SELECT {AGENT_COLS} FROM agents WHERE parent_id = ?1 ORDER BY created_at_ms, name"
         ))?;
@@ -1728,7 +1747,7 @@ impl Store {
 
     /// Every channel, with the agents attached to it. No secret is in the rows.
     pub fn list_channels(&self) -> Result<Vec<Channel>, Error> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT id, kind, identity, config, credential_ref, created_at_ms, state FROM channels
              ORDER BY created_at_ms",
@@ -2563,7 +2582,7 @@ impl Store {
         unread_only: bool,
         sender: Option<&str>,
     ) -> Result<Vec<Message>, Error> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         agent_by_id(&conn, agent_id)?;
         let delivered = cursor(&conn, agent_id)?;
         let mut stmt = conn.prepare(&format!(
@@ -2752,7 +2771,7 @@ impl Store {
         limit: Option<usize>,
         visible_agent_ids: Option<&[String]>,
     ) -> Result<Vec<ConversationTurn>, Error> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let agent = agent_by_id(&conn, agent_id)?;
         if let Some(visible) = visible_agent_ids
             && !visible.iter().any(|name| name == agent.id.as_str())
@@ -2894,7 +2913,7 @@ impl Store {
         limit: Option<usize>,
         visible_agent_ids: Option<&[String]>,
     ) -> Result<Vec<ConversationTurn>, Error> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let since = since_ms.unwrap_or(0);
         let lim = limit
             .map(|n| i64::try_from(n).unwrap_or(i64::MAX))
@@ -2959,32 +2978,46 @@ impl Store {
         Ok(turns)
     }
 
-    /// Repair missing and legacy authorized derivative chunks, in bounded batches. Old
-    /// standalone tool summaries have no recoverable raw mailbox body: preserve
-    /// them exactly rather than inventing the clipped-away suffix. New tools use
-    /// the full-text policy. Redacted mailbox bodies are the authoritative input.
+    /// Upgrade only legacy authorized derivative chunks, in bounded transactions.
+    /// The format index makes current history a read-only no-op, independent of
+    /// mailbox size. Standalone tool summaries retain their available text;
+    /// redacted mailbox bodies remain the authoritative input when present.
     fn backfill_full_mailbox_history(&self, visible: Option<&[String]>) -> Result<(), Error> {
-        let mut conn = self.conn();
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        {
+            let conn = self.read_conn();
+            let visibility = visible_agent_ids_sql("c.agent_id", visible, 1);
+            let pending = conn
+                .query_row(
+                    &format!(
+                        "SELECT 1 FROM rag_chunks c INDEXED BY idx_rag_chunks_format
+                         WHERE c.text_format < 2 {visibility} LIMIT 1"
+                    ),
+                    rusqlite::params_from_iter(scoped_params(&[], visible)),
+                    |_| Ok(()),
+                )
+                .optional()?;
+            if pending.is_none() {
+                return Ok(());
+            }
+        }
         let mut after = String::new();
         loop {
-            let visibility = visible_agent_ids_sql("r.agent_id", visible, 2);
+            let mut conn = self.conn();
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let visibility = visible_agent_ids_sql("c.agent_id", visible, 2);
             let mut select = tx.prepare(&format!(
-                "WITH raw AS (
-                    SELECT id,agent_id,'in' AS direction,COALESCE(sender,'unknown') AS sender,
-                           reply_to AS destination,received_at_ms AS timestamp_ms,body,seq FROM messages
-                    UNION ALL
-                    SELECT o.id,o.agent_id,'out','agent:' || a.name,o.destination,o.sent_at_ms,o.body,
-                           COALESCE((SELECT max(seq) FROM messages WHERE agent_id=o.agent_id),0)
-                    FROM outbound_messages o JOIN agents a ON a.id=o.agent_id
-                 )
-                 SELECT r.id,r.agent_id,a.name,r.direction,r.sender,
-                        COALESCE(r.destination,'agent:' || a.name),r.timestamp_ms,
-                        r.body,c.kind,c.tool_name,COALESCE(c.seq,r.seq)
-                 FROM raw r JOIN agents a ON a.id=r.agent_id
-                 LEFT JOIN rag_chunks c ON c.agent_id=r.agent_id AND c.chunk_id=r.id
-                 WHERE r.id > ?1 AND (c.chunk_id IS NULL OR c.text_format<2){visibility}
-                 ORDER BY r.id LIMIT 32"
+                "SELECT c.chunk_id, c.agent_id, a.name, c.direction,
+                        COALESCE(m.sender, CASE WHEN o.id IS NOT NULL THEN 'agent:' || a.name ELSE c.sender END),
+                        COALESCE(m.reply_to, o.destination, c.destination, 'agent:' || a.name),
+                        COALESCE(m.received_at_ms, o.sent_at_ms, c.timestamp_ms),
+                        COALESCE(m.body, o.body, c.text), c.kind, c.tool_name,
+                        COALESCE(m.seq, c.seq)
+                 FROM rag_chunks c INDEXED BY idx_rag_chunks_format
+                 JOIN agents a ON a.id = c.agent_id
+                 LEFT JOIN messages m ON m.id = c.chunk_id AND m.agent_id = c.agent_id
+                 LEFT JOIN outbound_messages o ON o.id = c.chunk_id AND o.agent_id = c.agent_id
+                 WHERE c.text_format < 2 AND c.chunk_id > ?1 {visibility}
+                 ORDER BY c.chunk_id LIMIT 64"
             ))?;
             struct Chunk {
                 id: String,
@@ -3019,13 +3052,17 @@ impl Store {
                     },
                 )?
                 .collect::<Result<Vec<_>, _>>()?;
+            drop(select);
             if chunks.is_empty() {
                 break;
             }
             for chunk in chunks {
                 after = chunk.id.clone();
                 if clean_rag_text(&chunk.text).chars().count() < 2 {
-                    tx.execute("DELETE FROM rag_chunks_fts WHERE chunk_id=?1", [&chunk.id])?;
+                    tx.execute(
+                        "DELETE FROM rag_chunks_fts WHERE chunk_id MATCH ?1",
+                        [format!("\"{}\"", chunk.id.replace('"', "\"\""))],
+                    )?;
                     tx.execute(
                         "DELETE FROM rag_chunks WHERE chunk_id=?1 AND agent_id=?2",
                         params![chunk.id, chunk.owner],
@@ -3046,13 +3083,9 @@ impl Store {
                     chunk.tool.as_deref(),
                     chunk.seq,
                 )?;
-                tx.execute(
-                    "UPDATE rag_chunks SET text_format=2 WHERE chunk_id=?1 AND agent_id=?2",
-                    params![chunk.id, chunk.owner],
-                )?;
             }
+            tx.commit()?;
         }
-        tx.commit()?;
         Ok(())
     }
 
@@ -3957,7 +3990,7 @@ impl Store {
 
     /// The one delivery cursor: the last sequence the harness took.
     pub fn delivered_cursor(&self, agent_id: &AgentId) -> Result<i64, Error> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         agent_by_id(&conn, agent_id)?;
         cursor(&conn, agent_id)
     }
@@ -4074,7 +4107,7 @@ impl Store {
     /// internal virtual group (`group_agents`) or attached to the same Telegram chat.
     pub fn share_any_group_or_chat(&self, agent_a: &AgentId, agent_b: &AgentId) -> bool {
         let shares_group = {
-            let conn = self.conn();
+            let conn = self.read_conn();
             conn.query_row(
                 "SELECT EXISTS(
                      SELECT 1 FROM group_agents g1
@@ -4116,7 +4149,7 @@ impl Store {
     /// message to `to_agent`, allowing `to_agent` to reply back even if `from_agent` is `public: false`.
     pub fn has_messaged(&self, from_agent: &Agent, to_agent: &Agent) -> bool {
         let dest_name = format!("agent:{}", to_agent.name);
-        let conn = self.conn();
+        let conn = self.read_conn();
         conn.query_row(
             "SELECT EXISTS(
                  SELECT 1 FROM outbound_messages
@@ -4157,7 +4190,7 @@ impl Store {
 
     /// Return `true` when the agent currently has an open turn (`opened_seq > completed_seq`).
     pub fn has_open_turn(&self, agent_id: &AgentId) -> Result<bool, Error> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let row: Option<(i64, i64)> = conn
             .query_row(
                 "SELECT opened_seq, completed_seq FROM turn_recovery WHERE agent_id = ?1",
@@ -4171,7 +4204,7 @@ impl Store {
     /// Return the agent's open turn (`opened_seq > completed_seq`) when it is
     /// eligible for automatic mid-turn recovery.
     pub fn open_turn(&self, agent_id: &AgentId) -> Result<Option<OpenTurn>, Error> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         agent_by_id(&conn, agent_id)?;
         let row: Option<(i64, i64, i64, i64)> = conn
             .query_row(
@@ -4339,7 +4372,7 @@ impl Store {
     }
 
     fn age_at(&self, agent_id: &AgentId, seq: i64, now_ms: i64) -> Result<Option<i64>, Error> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT received_at_ms, context FROM messages WHERE agent_id = ?1 AND seq >= ?2 ORDER BY seq ASC",
         )?;
@@ -4438,7 +4471,7 @@ impl Store {
         agent_id: Option<&AgentId>,
         active_only: bool,
     ) -> Result<Vec<AgentSchedule>, Error> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let mut out = Vec::new();
         match (agent_id, active_only) {
             (Some(aid), true) => {
@@ -8104,6 +8137,125 @@ mod tests {
             .unwrap();
         assert_eq!(tools.len(), 1, "{tools:?}");
         assert!(tools[0].text.ends_with("own browser"));
+    }
+
+    #[test]
+    fn read_endpoints_and_current_history_do_not_wait_for_writer() {
+        let (dir, store) = setup();
+        let own = agent(&store, "reader");
+        store.hold_capability_key(&"a".repeat(64)).unwrap();
+        let token = store.issue_capability(&own.id).unwrap();
+        let hidden = agent(&store, "legacy-hidden");
+        store
+            .record_tool_event(&hidden.id, "browser", "old tool")
+            .unwrap();
+        store
+            .conn()
+            .execute(
+                "UPDATE rag_chunks SET text_format=1 WHERE agent_id=?1",
+                [hidden.id.as_str()],
+            )
+            .unwrap();
+        std::thread::scope(|scope| {
+            let mut writer = store.conn();
+            let tx = writer
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            tx.execute(
+                "UPDATE agents SET description='uncommitted' WHERE id=?1",
+                [own.id.as_str()],
+            )
+            .unwrap();
+            let (send, receive) = std::sync::mpsc::channel();
+            let store = &store;
+            let id = &own.id;
+            let db = dir.path().join("state.db");
+            scope.spawn(move || {
+                let result = (|| -> Result<(), Error> {
+                    assert_eq!(store.agent(id)?.description, None);
+                    store.agent_by_name("reader")?;
+                    assert_eq!(store.authenticate_capability(&token)?, *id);
+                    store.list_agents()?;
+                    store.children_of(id)?;
+                    store.list_channels()?;
+                    store.share_any_group_or_chat(id, id);
+                    store.has_messaged(&store.agent(id)?, &store.agent(id)?);
+                    store.agent_query_metadata()?;
+                    store.agent_aliases(id)?;
+                    store.list_schedules(Some(id), true)?;
+                    store.inbox_query_filtered(id, None, Some(5), false, None)?;
+                    store.conversation_scoped(id, None, None, Some(5), None)?;
+                    store.conversation_all_scoped(None, None, Some(5), None)?;
+                    store.lag(id, now_ms())?;
+                    store.has_open_turn(id)?;
+                    store.open_turn(id)?;
+                    // No legacy chunks at all, then only invisible legacy chunks:
+                    // neither case may acquire the writer mutex or transaction.
+                    store.backfill_full_mailbox_history(Some(&[]))?;
+                    store.search_history(&HistorySearchQuery {
+                        visible_agent_ids: Some(vec![id.to_string()]),
+                        ..Default::default()
+                    })?;
+                    Store::open(db)?.list_agents()?;
+                    Ok(())
+                })();
+                send.send(result).unwrap();
+            });
+            let result = receive.recv_timeout(Duration::from_secs(2));
+            // Release before asserting so a regression cannot hang the test join.
+            drop(tx);
+            drop(writer);
+            result
+                .expect("read endpoint blocked on the writer")
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn full_mailbox_history_upgrade_and_redaction() {
+        let (_dir, store) = setup();
+        let own = agent(&store, "batch-owner");
+        // Cross multiple 64-row batches, retaining standalone tools as well.
+        for n in 0..130 {
+            store
+                .record_outbound(&own.id, "agent:peer", None, &format!("full body {n}"))
+                .unwrap();
+        }
+        store
+            .record_tool_event(&own.id, "browser", "legacy tool summary")
+            .unwrap();
+        {
+            let conn = store.conn();
+            conn.execute(
+                "UPDATE rag_chunks SET text='clipped',text_format=1 WHERE kind='message'",
+                [],
+            )
+            .unwrap();
+            conn.execute("UPDATE rag_chunks SET text_format=1 WHERE kind='tool'", [])
+                .unwrap();
+            // A redacted/short authoritative body removes its stale derivative.
+            conn.execute("UPDATE outbound_messages SET body='x' WHERE id=(SELECT min(id) FROM outbound_messages)", []).unwrap();
+        }
+        store.backfill_full_mailbox_history(None).unwrap();
+        let conn = store.read_conn();
+        let (old, messages, tools): (i64, i64, i64) = conn.query_row(
+            "SELECT count(*) FILTER (WHERE text_format<2), count(*) FILTER (WHERE kind='message'), count(*) FILTER (WHERE kind='tool') FROM rag_chunks",
+            [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        ).unwrap();
+        assert_eq!((old, messages, tools), (0, 129, 1));
+        let stale: i64 = conn.query_row("SELECT count(*) FROM rag_chunks_fts WHERE text='clipped' OR chunk_id IN (SELECT id FROM outbound_messages WHERE body='x')", [], |r| r.get(0)).unwrap();
+        assert_eq!(stale, 0);
+        let mut stmt = conn.prepare("EXPLAIN QUERY PLAN SELECT 1 FROM rag_chunks c INDEXED BY idx_rag_chunks_format WHERE c.text_format<2 LIMIT 1").unwrap();
+        let plan = stmt
+            .query_map([], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .join("\n");
+        assert!(
+            plan.contains("COVERING INDEX idx_rag_chunks_format"),
+            "{plan}"
+        );
     }
 
     #[test]

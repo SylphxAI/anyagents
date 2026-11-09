@@ -254,29 +254,33 @@ fn incoming_outgoing_and_tool_index_failures_refuse_receipts_and_roll_back() {
 }
 
 #[test]
-fn authorized_repair_enumerates_missing_chunks_without_indexing_hidden_bodies() {
+fn authorized_upgrade_reads_only_legacy_chunks_without_indexing_hidden_bodies() {
     let (dir, store, own) = setup();
     let hidden = store.create_agent(NewAgent::new("hidden", "test")).unwrap();
     store
-        .receive(&own.id, Incoming::new("missinginboundneedle"))
+        .receive(&own.id, Incoming::new("legacyinboundneedle"))
         .unwrap();
     store
-        .record_outbound(&own.id, "peer", None, "missingoutboundneedle")
+        .record_outbound(&own.id, "peer", None, "legacyoutboundneedle")
         .unwrap();
     store.receive(&own.id, Incoming::new("x")).unwrap();
     store
-        .receive(&hidden.id, Incoming::new("hiddenmissingneedle"))
+        .receive(&hidden.id, Incoming::new("hiddenlegacyneedle"))
         .unwrap();
     store
         .conn()
-        .execute_batch("DELETE FROM rag_chunks; DELETE FROM rag_chunks_fts;")
+        // Ingress maintains chunk membership transactionally. Only legacy text
+        // needs repair; searching must not enumerate the entire raw mailbox.
+        .execute_batch(
+            "UPDATE rag_chunks SET text='legacy prefix',text_format=1; DELETE FROM rag_chunks_fts;",
+        )
         .unwrap();
     drop(store);
     let store = Store::open(dir.path().join("custom-mailbox.sqlite")).unwrap();
     for term in [
-        "missinginboundneedle",
-        "missingoutboundneedle",
-        "hiddenmissingneedle",
+        "legacyinboundneedle",
+        "legacyoutboundneedle",
+        "hiddenlegacyneedle",
     ] {
         let result = store
             .search_history(&HistorySearchQuery {
@@ -285,11 +289,20 @@ fn authorized_repair_enumerates_missing_chunks_without_indexing_hidden_bodies() 
                 ..Default::default()
             })
             .unwrap();
-        assert_eq!(result.len(), usize::from(term != "hiddenmissingneedle"));
+        assert_eq!(result.len(), usize::from(term != "hiddenlegacyneedle"));
     }
-    assert_eq!(count(&store, "rag_chunks"), 2);
-    assert_fts(&store, "missinginboundneedle");
-    assert_fts(&store, "missingoutboundneedle");
+    assert_eq!(count(&store, "rag_chunks"), 3);
+    let hidden_format: i64 = store
+        .conn()
+        .query_row(
+            "SELECT text_format FROM rag_chunks WHERE agent_id=?1",
+            [hidden.id.as_str()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(hidden_format, 1);
+    assert_fts(&store, "legacyinboundneedle");
+    assert_fts(&store, "legacyoutboundneedle");
 }
 
 #[test]

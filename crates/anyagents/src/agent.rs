@@ -1096,12 +1096,9 @@ fn list_filtered(
     let path = state_filter
         .map(|s| format!("/v1/agents?state={s}"))
         .unwrap_or_else(|| "/v1/agents".into());
-    let mut listed = if client::can_call_server(data) {
-        client::call::<AgentsResponse>(data, "GET", &path, None, &client::authority(data))
-            .map_err(Error::Message)?
-            .ok_or_else(|| Error::Message("the server answered nothing".into()))?
-    } else {
-        offline_roster(data, &query)?
+    let mut listed = match client::get::<AgentsResponse>(data, &path).map_err(Error::Message)? {
+        Some(listed) => listed,
+        None => offline_roster(data, &query)?,
     };
     let only_with_subagents =
         apply_parent_filter_for_views(&mut listed.agents, parent_filter, pretty);
@@ -1174,16 +1171,13 @@ pub fn offline_roster(
 }
 
 pub fn view_named(data: &Path, target: &str) -> Result<AgentView, Error> {
-    if client::can_call_server(data) {
-        return client::call::<AgentView>(
-            data,
-            "GET",
-            &format!("/v1/agents/{}", crate::channel::urlencoding_simple(target)),
-            None,
-            &client::authority(data),
-        )
-        .map_err(Error::Message)?
-        .ok_or_else(|| Error::Message("the server answered nothing".into()));
+    if let Some(view) = client::get::<AgentView>(
+        data,
+        &format!("/v1/agents/{}", crate::channel::urlencoding_simple(target)),
+    )
+    .map_err(Error::Message)?
+    {
+        return Ok(view);
     }
     if client::agent_identity().is_some() {
         return Err(Error::Message(

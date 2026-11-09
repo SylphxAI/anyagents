@@ -274,7 +274,7 @@ pub fn inbox(data: &Path, args: InboxArgs) -> Result<(), Error> {
         } else {
             Some(args.limit.unwrap_or(20))
         };
-        let read = if client::can_call_server(data) {
+        let remote = if client::can_call_server(data) {
             let mut params = vec![format!("unread={}", args.unread)];
             if let Some(since) = since {
                 params.push(format!("since={since}"));
@@ -285,19 +285,20 @@ pub fn inbox(data: &Path, args: InboxArgs) -> Result<(), Error> {
             if let Some(sender) = &args.sender {
                 params.push(format!("sender={}", urlencoding_simple(sender)));
             }
-            client::call::<InboxResponse>(
+            client::get::<InboxResponse>(
                 data,
-                "GET",
                 &format!(
                     "/v1/agents/{}/inbox?{}",
                     urlencoding_simple(&target),
                     params.join("&")
                 ),
-                None,
-                &client::authority(data),
             )
             .map_err(Error::Message)?
-            .ok_or_else(|| Error::Message("the server answered nothing".into()))?
+        } else {
+            None
+        };
+        let read = if let Some(read) = remote {
+            read
         } else {
             if client::agent_identity().is_some() {
                 return Err(Error::Message(
@@ -525,19 +526,18 @@ pub fn read_conversation(
         if options.only_tools {
             params.push("only_tools=true".into());
         }
-        return client::call::<ConversationResponse>(
+        if let Some(read) = client::get::<ConversationResponse>(
             data,
-            "GET",
             &format!(
                 "/v1/agents/{}/conversation?{}",
                 urlencoding_simple(target),
                 params.join("&")
             ),
-            None,
-            &client::authority(data),
         )
         .map_err(Error::Message)?
-        .ok_or_else(|| Error::Message("the server answered nothing".into()));
+        {
+            return Ok(read);
+        }
     }
     if client::agent_identity().is_some() {
         return Err(Error::Message(

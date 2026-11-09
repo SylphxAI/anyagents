@@ -55,6 +55,39 @@ pub(crate) fn agent_identity() -> Option<AgentId> {
     AgentId::parse(raw.trim()).ok()
 }
 
+/// Read through the authenticated server when available. Only a host operator
+/// may use the caller's offline read path after a transport failure; HTTP and
+/// decoding errors must remain errors, never an authorization bypass.
+pub(crate) fn get<T: serde::de::DeserializeOwned>(
+    data: &Path,
+    path: &str,
+) -> Result<Option<T>, String> {
+    if !can_call_server(data) {
+        return Ok(None);
+    }
+    match call_inner(data, "GET", path, None, &authority(data)) {
+        Err(err) if may_read_offline(&err, agent_identity().is_some()) => Ok(None),
+        result => result.map_err(CallError::message),
+    }
+}
+
+enum CallError {
+    Transport(String),
+    Response(String),
+}
+
+impl CallError {
+    fn message(self) -> String {
+        match self {
+            Self::Transport(message) | Self::Response(message) => message,
+        }
+    }
+}
+
+fn may_read_offline(error: &CallError, is_agent: bool) -> bool {
+    !is_agent && matches!(error, CallError::Transport(_))
+}
+
 fn capability(data: &Path, id: &AgentId) -> Option<String> {
     let dir = std::env::var_os("ANYAGENTS_AGENT_CONFIG")
         .filter(|v| !v.is_empty())
@@ -77,6 +110,16 @@ pub(crate) fn call<T: serde::de::DeserializeOwned>(
     body: Option<Vec<u8>>,
     authority: &Authority,
 ) -> Result<Option<T>, String> {
+    call_inner(data, method, path, body, authority).map_err(CallError::message)
+}
+
+fn call_inner<T: serde::de::DeserializeOwned>(
+    data: &Path,
+    method: &str,
+    path: &str,
+    body: Option<Vec<u8>>,
+    authority: &Authority,
+) -> Result<Option<T>, CallError> {
     let (agent_token, operator_token) = match authority {
         Authority::Operator => (None, crate::operator::operator_token(data)),
         Authority::Agent(id) => (capability(data, id), None),
@@ -88,7 +131,7 @@ pub(crate) fn call<T: serde::de::DeserializeOwned>(
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| CallError::Response(err.to_string()))?;
     let (status, bytes) = runtime.block_on(async {
         tokio::time::timeout(
             TIMEOUT,
@@ -102,19 +145,20 @@ pub(crate) fn call<T: serde::de::DeserializeOwned>(
             ),
         )
         .await
-        .map_err(|_| "the server did not answer".to_string())?
+        .map_err(|_| CallError::Transport("the server did not answer".into()))?
+        .map_err(CallError::Transport)
     })?;
     if !status.is_success() {
         let msg = error_message(&bytes);
-        return Err(if msg.is_empty() {
+        return Err(CallError::Response(if msg.is_empty() {
             format!("http {}", status.as_u16())
         } else {
             msg
-        });
+        }));
     }
     serde_json::from_slice(&bytes)
         .map(Some)
-        .map_err(|err| err.to_string())
+        .map_err(|err| CallError::Response(err.to_string()))
 }
 
 /// The error a refused call reported, without a secret or a presented token.
@@ -128,4 +172,35 @@ fn error_message(bytes: &[u8]) -> String {
                 .map(str::to_string)
         })
         .unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn offline_reads_require_operator_and_transport_failure() {
+        for error in [
+            "the server did not answer",
+            "cannot reach the server: Connection refused (os error 111)",
+            "cannot reach the server: connection closed before message completed",
+            "cannot reach the server: error reading a body from connection",
+        ] {
+            let failure = CallError::Transport(error.into());
+            assert!(may_read_offline(&failure, false), "{error}");
+            assert!(!may_read_offline(&failure, true), "{error}");
+        }
+        for error in [
+            "forbidden",
+            "http 403",
+            "primary refused",
+            "invalid JSON",
+            "the server did not answer",
+            "cannot reach the server: forbidden",
+        ] {
+            let failure = CallError::Response(error.into());
+            assert!(!may_read_offline(&failure, false), "{error}");
+            assert!(!may_read_offline(&failure, true), "{error}");
+        }
+    }
 }

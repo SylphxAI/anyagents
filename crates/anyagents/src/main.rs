@@ -918,6 +918,12 @@ enum AgentsCommand {
 }
 
 fn main() -> ExitCode {
+    // Rust ignores SIGPIPE by default. Restore normal Unix pipeline behavior
+    // before any output so a closed reader exits quietly instead of panicking.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     sandbox::hydrate_operator_groups_if_needed();
     let cli = Cli::parse();
     match run(cli) {
@@ -2427,11 +2433,8 @@ fn interact_cmd(
 
 fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> {
     let sock = server::socket_path(data);
-    let authority = client::authority(data);
-    let live_agents =
-        client::call::<api::AgentsResponse>(data, "GET", "/v1/agents", None, &authority)
-            .ok()
-            .flatten();
+    let live_agents = client::get::<api::AgentsResponse>(data, "/v1/agents")
+        .map_err(anyagents_core::Error::Message)?;
     let server_up = live_agents.is_some();
     let webhook_addr = std::fs::read_to_string(data.join("webhook.addr"))
         .ok()
