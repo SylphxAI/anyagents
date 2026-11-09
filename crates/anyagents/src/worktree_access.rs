@@ -177,23 +177,33 @@ pub(crate) fn configure_seat_git(config: &Path, workdir: &Path) -> Result<(), Er
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
         .open(config)?;
-    let fd = unsafe {
-        libc::openat(
-            directory.as_raw_fd(),
-            c".gitconfig".as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
     let mut bytes = Vec::new();
-    if fd >= 0 {
-        let mut old = unsafe { std::fs::File::from_raw_fd(fd) };
-        let meta = old.metadata()?;
-        if !meta.is_file() || meta.nlink() != 1 || meta.len() > 1024 * 1024 {
-            return Err(refusal(config, "unsafe or oversized .gitconfig"));
+    for attempt in 0..8 {
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                c".gitconfig".as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd >= 0 {
+            let mut old = unsafe { std::fs::File::from_raw_fd(fd) };
+            let meta = old.metadata()?;
+            if meta.is_file() && meta.nlink() == 0 && attempt < 7 {
+                // Another thread atomically replaced `.gitconfig` via `renameat`
+                // between `openat` and `fstat`; reopen the current inode.
+                continue;
+            }
+            if !meta.is_file() || meta.nlink() != 1 || meta.len() > 1024 * 1024 {
+                return Err(refusal(config, "unsafe or oversized .gitconfig"));
+            }
+            old.read_to_end(&mut bytes)?;
+            break;
+        } else if std::io::Error::last_os_error().kind() != std::io::ErrorKind::NotFound {
+            return Err(refusal(config, std::io::Error::last_os_error()));
+        } else {
+            break;
         }
-        old.read_to_end(&mut bytes)?;
-    } else if std::io::Error::last_os_error().kind() != std::io::ErrorKind::NotFound {
-        return Err(refusal(config, std::io::Error::last_os_error()));
     }
     // Harness fixtures can deliberately omit system tools from PATH. Preserve
     // their configured precedence, then include the OS Git used for parsing.

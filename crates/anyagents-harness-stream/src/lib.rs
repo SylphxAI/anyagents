@@ -1379,7 +1379,8 @@ fn read_stdout(
                     .to_ascii_lowercase()
                     .contains("invalid_argument (code 400)")
             });
-        if poisoned_agy {
+        let synthetic_401 = synthetic_auth_error(&value);
+        if poisoned_agy || synthetic_401.is_some() {
             effect.finishes_turn = false;
         }
         if let Some(ref rpc) = agy_rpc {
@@ -1539,6 +1540,19 @@ fn read_stdout(
                 } else {
                     finish_open(&mut state, usage);
                 }
+            } else if let Some(ref synth_err) = synthetic_401 {
+                let mut rejected_ids = std::mem::take(&mut state.open);
+                rejected_ids.append(&mut state.followups);
+                for id in rejected_ids {
+                    state.seen.remove(&id);
+                    state.acknowledged.remove(&id);
+                    state.finished.remove(&id);
+                }
+                state.sign_in_fault = Some(synth_err.clone());
+                if let Some(child) = state.child.as_mut() {
+                    let _ = child.kill();
+                }
+                state.alive = false;
             } else if correlated
                 && (poisoned_agy || effect.quota_reset_at_ms.is_none())
                 && matches!(kind, Some("done") | Some("result"))
@@ -1567,7 +1581,7 @@ fn read_stdout(
             state.epoch = state.epoch.wrapping_add(1);
         }
         wake.notify_all();
-        if poisoned_agy {
+        if poisoned_agy || synthetic_401.is_some() {
             break;
         }
     }
@@ -1592,6 +1606,85 @@ fn read_stdout(
     state.refresh_exit_fault();
     state.epoch = state.epoch.wrapping_add(1);
     wake.notify_all();
+}
+
+fn is_oauth_auth_error_text(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    text.contains("OAuth session expired")
+        || text.contains("OAuth access token has expired")
+        || text.contains("Failed to authenticate")
+        || text.contains("Not logged in")
+        || text.contains("authentication_failed")
+        || text.contains("authentication_error")
+        || (lower.contains("401")
+            && (lower.contains("oauth")
+                || lower.contains("authenticate")
+                || lower.contains("authentication")
+                || lower.contains("access token")))
+}
+
+fn collect_text_fields(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::String(s) if !s.trim().is_empty() => out.push(s.clone()),
+        Value::Array(items) => {
+            for item in items {
+                collect_text_fields(item, out);
+            }
+        }
+        Value::Object(map) => {
+            if let Some(Value::String(text)) = map.get("text") {
+                if !text.trim().is_empty() {
+                    out.push(text.clone());
+                }
+            } else {
+                for (k, v) in map {
+                    if matches!(
+                        k.as_str(),
+                        "content" | "message" | "error" | "result" | "delta"
+                    ) {
+                        collect_text_fields(v, out);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+pub fn synthetic_auth_error(value: &Value) -> Option<String> {
+    let kind = value
+        .get("type")
+        .or_else(|| value.get("event"))
+        .and_then(Value::as_str);
+    let model = value
+        .pointer("/message/model")
+        .or_else(|| value.get("model"))
+        .and_then(Value::as_str);
+    if model == Some("<synthetic>") {
+        let mut texts = Vec::new();
+        collect_text_fields(
+            value.pointer("/message/content").unwrap_or(value),
+            &mut texts,
+        );
+        let joined = texts.join("\n");
+        if is_oauth_auth_error_text(&joined) {
+            return Some(joined.trim().to_string());
+        }
+    }
+    if kind == Some("result")
+        && let Some(text) = value.get("result").and_then(Value::as_str)
+    {
+        let trimmed = text.trim();
+        let is_synthetic_prefix = trimmed.starts_with("Failed to authenticate")
+            || trimmed.starts_with("API Error: 401")
+            || trimmed.starts_with("OAuth access token has expired")
+            || trimmed.starts_with("OAuth session expired")
+            || trimmed.starts_with("Not logged in");
+        if is_synthetic_prefix && is_oauth_auth_error_text(trimmed) {
+            return Some(trimmed.to_string());
+        }
+    }
+    None
 }
 
 /// A harness that streams without a closing result line ends its turn here:

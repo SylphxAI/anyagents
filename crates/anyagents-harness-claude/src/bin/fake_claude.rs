@@ -20,6 +20,8 @@ use serde_json::{Value, json};
 const RESULT: &str = r#"{"type":"result","subtype":"success","session_id":"sess-from-vendor","total_cost_usd":0.5,"usage":{"input_tokens":11,"output_tokens":7,"cache_read_input_tokens":3,"cache_creation_input_tokens":2}}"#;
 const QUOTA: &str = r#"{"type":"system","subtype":"api_retry","category":"rate_limit","resets_at_ms":1700000000000}"#;
 const FAILED: &str = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":"sess-from-vendor","result":"Invalid API key · Please run /login","usage":{"input_tokens":0,"output_tokens":0}}"#;
+const SYNTHETIC_401_ASSISTANT: &str = r#"{"type":"assistant","session_id":"sess-from-vendor","message":{"model":"<synthetic>","role":"assistant","content":[{"type":"text","text":"Failed to authenticate. API Error: 401 {\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\"message\":\"OAuth access token has expired.\"}}"}]}}"#;
+const SYNTHETIC_401_RESULT: &str = r#"{"type":"result","subtype":"success","is_error":false,"session_id":"sess-from-vendor","result":"Failed to authenticate. API Error: 401 OAuth access token has expired","usage":{"input_tokens":0,"output_tokens":0}}"#;
 const ECHO: &str = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"anyagents-message:echoed\nprior"}]}}"#;
 
 fn main() {
@@ -90,6 +92,11 @@ fn main() {
         }
         if mode == "failed_turn" && users == 1 {
             let _ = writeln!(stdout, "{FAILED}");
+            let _ = stdout.flush();
+        }
+        if mode == "synthetic_401" && users == 1 {
+            let _ = writeln!(stdout, "{SYNTHETIC_401_ASSISTANT}");
+            let _ = writeln!(stdout, "{SYNTHETIC_401_RESULT}");
             let _ = stdout.flush();
         }
         if mode == "finish" && users == 1 {

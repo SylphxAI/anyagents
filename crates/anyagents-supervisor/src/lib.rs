@@ -926,7 +926,10 @@ impl<H: Harness + 'static> Session<H> {
                     .ok()
                     .and_then(|s| s.trim().parse::<i64>().ok())
                     .is_some_and(|ms| ms >= started_at);
-            if rotated {
+            let config_switched = self.inner.store.agent(&self.id).is_ok_and(|fresh| {
+                fresh.harness != self.agent.harness || fresh.model != self.agent.model
+            });
+            if rotated || config_switched {
                 self.attempt = 0;
                 break;
             }
@@ -1030,6 +1033,9 @@ impl<H: Harness + 'static> Session<H> {
     ///
     /// `true` when a second loop already holds the agent.
     fn deliver_once(&mut self) -> bool {
+        if self.try_apply_pending_switch() {
+            return false;
+        }
         if let Some(switch_started_at) = self.pending_switch_started_at {
             // A harness, model, or profile switch is pending while the old
             // process is mid-turn: hold new mailbox messages in SQLite for the
@@ -1447,11 +1453,37 @@ fn harness_has_inflight_processes(root_pid: Option<u32>) -> bool {
     }
 }
 
-fn reap_ephemeral_dirs(config_dir: &std::path::Path, _managed_work: &std::path::Path) {
+fn reap_ephemeral_dirs(config_dir: &std::path::Path, managed_work: &std::path::Path) {
     let seat_ids = detect_seat_ids(config_dir);
-    for rel in ["cache-home", "tmp", ".rustup", ".cargo"] {
+    for rel in [
+        "cache-home",
+        "tmp",
+        ".tmp",
+        ".rustup",
+        ".cargo",
+        ".gemini/tmp",
+        ".cache",
+        "cache",
+    ] {
         let target = config_dir.join(rel);
         remove_path_with_seat(&target, seat_ids);
+    }
+    const BUILD_DIRS: &[&str] = &["target", "node_modules", ".next", ".turbo", "dist"];
+    for rel in BUILD_DIRS {
+        remove_path_with_seat(&managed_work.join(rel), seat_ids);
+    }
+    for container in ["apps", "packages", "crates", "services"] {
+        let Ok(entries) = fs::read_dir(managed_work.join(container)) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                for rel in BUILD_DIRS {
+                    remove_path_with_seat(&path.join(rel), seat_ids);
+                }
+            }
+        }
     }
 }
 

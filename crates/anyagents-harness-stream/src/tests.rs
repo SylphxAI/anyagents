@@ -1124,3 +1124,87 @@ fn poisoned_agy_result_retires_the_session_without_acknowledging_the_turn() {
         // Drop kills this test's child even though stdout deliberately stays open.
     }
 }
+
+#[test]
+#[cfg(unix)]
+fn synthetic_401_claude_turn_fails_and_stops_stream_without_completing_turn() {
+    use std::time::Duration;
+
+    let synthetic = json!({
+        "type": "assistant",
+        "session_id": "sess-1",
+        "message": {
+            "model": "<synthetic>",
+            "role": "assistant",
+            "content": [{
+                "type": "text",
+                "text": "Failed to authenticate. API Error: 401 {\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\"message\":\"OAuth access token has expired.\"}}"
+            }]
+        }
+    });
+    assert!(
+        super::synthetic_auth_error(&synthetic)
+            .unwrap()
+            .contains("OAuth access token has expired")
+    );
+    let real_reply = json!({
+        "type": "assistant",
+        "message": {
+            "model": "claude-opus-4-6",
+            "role": "assistant",
+            "content": [{
+                "type": "text",
+                "text": "Quoting error: Failed to authenticate. API Error: 401 OAuth access token has expired"
+            }]
+        }
+    });
+    assert!(super::synthetic_auth_error(&real_reply).is_none());
+
+    let spec = StreamSpec::for_program("claude");
+    let result = json!({
+        "type": "result",
+        "subtype": "success",
+        "session_id": "sess-1",
+        "result": "Failed to authenticate. API Error: 401 OAuth access token has expired"
+    });
+    let script = format!(
+        "read line; printf '%s\\n' '{}' '{}'; exec sleep 30",
+        synthetic, result
+    );
+    let mut harness = super::StreamHarness::launch(super::Launch {
+        spec: spec.clone(),
+        program: "/bin/sh".into(),
+        args: vec!["-c".into(), script],
+        environment: vec![],
+        work_dir: None,
+        session_id: Some("sess-1".into()),
+        mode: anyagents_harness::DeliveryMode::Steer,
+        steer: anyagents_harness::SteerSupport::Yes,
+    })
+    .unwrap();
+    let message = anyagents_harness::OutboundMessage {
+        id: "input".into(),
+        seq: 1,
+        text: "work".into(),
+        sender: None,
+        reply_to: None,
+        source_time_ms: None,
+        context: anyagents_harness::Context::default(),
+    };
+    let line = super::message_line(&spec, &message);
+    assert!(matches!(
+        harness.deliver(&message, &line).unwrap(),
+        anyagents_harness::DeliverOutcome::Accepted { .. }
+    ));
+    assert!(harness.wait_pred(Duration::from_secs(3), |state| !state.alive));
+    assert!(!harness.health().process_alive);
+    assert_eq!(harness.turns_served(), 0);
+    assert!(!harness.wait_finished("input", Duration::from_millis(10)));
+    assert!(
+        harness
+            .health()
+            .sign_in_fault
+            .unwrap()
+            .contains("OAuth access token has expired")
+    );
+}
