@@ -122,6 +122,15 @@ fn acquire_server_lock(data: &Path) -> Result<std::fs::File, Error> {
     Ok(file)
 }
 
+fn active_seat_ids(store: &Store) -> Result<Vec<String>, Error> {
+    Ok(store
+        .list_agents()?
+        .into_iter()
+        .filter(|agent| agent.state != "archived")
+        .map(|agent| agent.id.to_string())
+        .collect())
+}
+
 async fn serve(
     data: &Path,
     sign_in: Arc<Mutex<dyn CommandRunner + Send>>,
@@ -163,11 +172,7 @@ async fn serve(
     // An operator token is the identity boundary; it holds only when every
     // harness it starts is in its own OS seat. Otherwise the boundary contract
     // says so, and no run claims it.
-    let seats: Vec<String> = store
-        .list_agents()?
-        .into_iter()
-        .map(|agent| agent.id.to_string())
-        .collect();
+    let seats = active_seat_ids(&store)?;
     if operator::operator_token(data).is_some() && !crate::sandbox::launch_boundary(&seats) {
         return Err(Error::Message(
             "this server has an operator token, so it is the identity boundary, but no OS seat is \
@@ -9675,6 +9680,21 @@ exec '{}' "$@"
                 Some("test-invariants.md")
             );
         });
+    }
+
+    #[test]
+    fn active_seat_ids_excludes_archived_agents_from_startup_boundary() {
+        let data = crate::test_tempdir();
+        let store = Store::open(data.path().join("state.db")).unwrap();
+        let active = store
+            .create_agent(anyagents_core::NewAgent::new("active-root", "codex"))
+            .unwrap();
+        let archived = store
+            .create_agent(anyagents_core::NewAgent::new("archived-root", "codex"))
+            .unwrap();
+        store.set_agent_state(&archived.id, "archived").unwrap();
+        let seats = active_seat_ids(&store).unwrap();
+        assert_eq!(seats, vec![active.id.to_string()]);
     }
 }
 
