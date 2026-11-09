@@ -926,7 +926,10 @@ impl<H: Harness + 'static> Session<H> {
                     .ok()
                     .and_then(|s| s.trim().parse::<i64>().ok())
                     .is_some_and(|ms| ms >= started_at);
-            if rotated {
+            let config_switched = self.inner.store.agent(&self.id).is_ok_and(|fresh| {
+                fresh.harness != self.agent.harness || fresh.model != self.agent.model
+            });
+            if rotated || config_switched {
                 self.attempt = 0;
                 break;
             }
