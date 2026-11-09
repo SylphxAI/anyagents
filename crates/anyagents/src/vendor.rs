@@ -2426,6 +2426,12 @@ done
         std::fs::rename(config.join(".claude-host-held"), config.join(".claude")).unwrap();
         assert_eq!(snapshot(), before, "protected bytes or permissions changed");
         println!("NATIVE_VENDOR_PROTECTED_BEFORE_EQUALS_AFTER");
+        // The protected foreign-owner controls are empty leaves created only
+        // by this fixture. Unlink them through the admitted writable parent;
+        // never widen their private mode merely to perform teardown.
+        for name in ["cache-home", "tmp"] {
+            std::fs::remove_dir(config.join(name).join("foreign-private")).unwrap();
+        }
         // Native launch also creates a private op leaf. Prove that the reduced-
         // DAC daemon cannot enumerate it before its actual owner removes only
         // known token links and the empty directory. Do not widen private modes
