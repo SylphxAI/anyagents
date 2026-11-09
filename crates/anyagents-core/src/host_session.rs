@@ -388,6 +388,27 @@ pub fn bind_vendor(root: &Path, harness: &str, vendor_id: &str) -> io::Result<Ho
     Ok(result)
 }
 
+/// Read an already-bound vendor alias without changing the active generation.
+/// Legacy-pointer adoption uses this positive evidence to avoid reviving a
+/// historical session after an explicit reset.
+pub fn bound_vendor(
+    root: &Path,
+    harness: &str,
+    vendor_id: &str,
+) -> io::Result<Option<HostSession>> {
+    let registry = read(root)?;
+    if registry.pending_reset.is_some() {
+        return Err(io::Error::other(
+            "host session reset pending; retry lifecycle",
+        ));
+    }
+    registry
+        .aliases
+        .get(&alias(harness, vendor_id)?)
+        .map(|session| materialize(root, session))
+        .transpose()
+}
+
 /// An explicit resume reuses the original pin, including after a harness switch.
 pub fn resume_vendor(root: &Path, harness: &str, vendor_id: &str) -> io::Result<HostSession> {
     let _lock = lock(root)?;

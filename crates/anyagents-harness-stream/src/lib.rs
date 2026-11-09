@@ -12,10 +12,10 @@ mod rpc;
 
 pub use rpc::{NotificationEffect, RequestHandler, RpcChild, RpcFail, RpcLaunch};
 
-use std::collections::HashSet;
-use std::io::{BufRead, BufReader, Write};
+use std::collections::{HashMap, HashSet};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -51,6 +51,9 @@ pub enum LineProtocol {
     /// `result` closes the turn with usage and an optional `cost_micros`; a
     /// `text` line is answer text.
     ResultWithCost,
+    /// A persistent controller acknowledges each correlated input before the
+    /// mailbox releases custody. `result` is the only terminal frame.
+    AcknowledgedResult,
 }
 
 /// One harness's catalog entry, as the launch needs it.
@@ -134,6 +137,7 @@ impl StreamSpec {
         let quota_reset_at_ms = quota_of(value);
         let finishes = quota_reset_at_ms.is_none()
             && match self.protocol {
+                LineProtocol::AcknowledgedResult => kind == Some("result"),
                 LineProtocol::Result | LineProtocol::ResultWithCost => {
                     kind == Some("result") && (!is_error || self.name == "anyagents-agy")
                 }
@@ -171,9 +175,12 @@ impl StreamSpec {
         TurnUsage {
             input_tokens: number(usage, "input_tokens").max(number(usage, "input")),
             output_tokens: number(usage, "output_tokens").max(number(usage, "output")),
-            cache_read_tokens: number(usage, "cache_read_tokens").max(number(usage, "cacheRead")),
+            cache_read_tokens: number(usage, "cache_read_tokens")
+                .max(number(usage, "cacheRead"))
+                .max(number(usage, "cache_read_input_tokens")),
             cache_write_tokens: number(usage, "cache_write_tokens")
-                .max(number(usage, "cacheWrite")),
+                .max(number(usage, "cacheWrite"))
+                .max(number(usage, "cache_creation_input_tokens")),
             reported_cost_micros: match self.protocol {
                 LineProtocol::ResultWithCost => value.get("cost_micros").and_then(Value::as_i64),
                 _ => None,
@@ -184,10 +191,17 @@ impl StreamSpec {
     /// Only a vendor that streams an answer without a closing result line has
     /// answer text: a `text` line, or the text on the closing line itself.
     fn text_of(&self, value: &Value, finishes: bool) -> Option<String> {
+        let kind = value.get("type").and_then(Value::as_str);
+        if self.protocol == LineProtocol::AcknowledgedResult {
+            return (kind == Some("text_delta"))
+                .then(|| value.get("text").or_else(|| value.get("delta")))
+                .flatten()
+                .and_then(Value::as_str)
+                .map(str::to_string);
+        }
         if self.protocol != LineProtocol::ResultWithCost {
             return None;
         }
-        let kind = value.get("type").and_then(Value::as_str);
         if !(finishes || kind == Some("text")) {
             return None;
         }
@@ -233,7 +247,10 @@ pub struct StreamHarness {
     stdin: Arc<Mutex<Option<ChildStdin>>>,
     wake: Arc<Condvar>,
     reader: Option<JoinHandle<()>>,
+    stderr_reader: Option<JoinHandle<()>>,
     pending: Option<PendingWrite>,
+    #[cfg(test)]
+    after_write: Option<Box<dyn FnOnce() + Send>>,
     #[cfg(target_os = "linux")]
     readiness: Option<JoinHandle<()>>,
 }
@@ -250,6 +267,12 @@ struct PendingWrite {
 /// Shared by every harness over one child: the owner and any reader.
 struct State {
     child: Option<Child>,
+    stderr: BoundedStderr,
+    stderr_done: bool,
+    exit_status: Option<ExitStatus>,
+    exit_fault: Option<String>,
+    state_dir: Option<PathBuf>,
+    unconfirmed: bool,
     alive: bool,
     epoch: u64,
     generation: u64,
@@ -260,6 +283,9 @@ struct State {
     planner_config: Option<Value>,
     http_port: Option<u16>,
     seen: HashSet<String>,
+    acknowledged: HashSet<String>,
+    input_turns: HashMap<String, String>,
+    rejected: HashMap<String, String>,
     written: Vec<String>,
     open: Vec<String>,
     followups: Vec<String>,
@@ -301,7 +327,10 @@ impl StreamHarness {
             stdin: Arc::new(Mutex::new(None)),
             wake: Arc::new(Condvar::new()),
             reader: None,
+            stderr_reader: None,
             pending: None,
+            #[cfg(test)]
+            after_write: None,
             #[cfg(target_os = "linux")]
             readiness: None,
         };
@@ -328,6 +357,19 @@ impl StreamHarness {
             mode: DeliveryMode::Followup,
             steer: SteerSupport::Unproven,
         })
+    }
+
+    /// Persist transport failures and unconfirmed steering custody for the
+    /// external adapter. A terminal uncertainty hold is never an auto-retry.
+    pub fn set_state_dir(&self, dir: &Path) {
+        let mut state = lock(&self.shared);
+        state.state_dir = Some(dir.to_path_buf());
+        state.unconfirmed |= dir
+            .join("spiron-unconfirmed-steers.json")
+            .try_exists()
+            .unwrap_or(true);
+        state.refresh_exit_fault();
+        state.persist_failure();
     }
 
     pub fn program(&self) -> &Path {
@@ -434,11 +476,22 @@ impl StreamHarness {
     /// be open, so the answer may still grow.
     pub fn text_for(&self, id: &str) -> Option<String> {
         let state = lock(&self.shared);
+        if self.spec.protocol == LineProtocol::AcknowledgedResult && !state.finished.contains(id) {
+            return None;
+        }
         state
             .text
             .as_ref()
             .filter(|(owner, _)| owner == id)
-            .map(|(_, lines)| lines.join("\n"))
+            .map(|(_, lines)| {
+                let joined =
+                    lines.join(if self.spec.protocol == LineProtocol::AcknowledgedResult {
+                        ""
+                    } else {
+                        "\n"
+                    });
+                anyagents_harness::masking::mask_known_secrets(&joined).into_owned()
+            })
     }
 
     /// Write one line for `message`, unless that id was already written or echoed.
@@ -508,8 +561,10 @@ impl StreamHarness {
             self.wake.notify_all();
             return Err(HarnessError::Dead);
         }
-        state.open.clear();
-        state.followups.clear();
+        if self.spec.protocol != LineProtocol::AcknowledgedResult {
+            state.open.clear();
+            state.followups.clear();
+        }
         state.turn_user_inputs = 0;
         state.last_turn_step_type = None;
         state.idle_since = None;
@@ -518,15 +573,12 @@ impl StreamHarness {
 
     pub fn health(&self) -> HarnessHealth {
         let mut state = lock(&self.shared);
-        if !state.alive
-            && let Some(child) = state.child.as_mut()
-            && matches!(child.try_wait(), Ok(Some(_)))
-        {
-            state.child = None;
+        if !state.alive {
+            state.reap_child();
         }
         HarnessHealth {
             process_alive: state.alive,
-            turn_state: if state.open.is_empty() {
+            turn_state: if state.open.is_empty() && !state.unconfirmed {
                 TurnState::Idle
             } else {
                 TurnState::InTurn
@@ -534,7 +586,7 @@ impl StreamHarness {
             delivery_mode: self.mode,
             steer_support: self.steer,
             quota_reset_at_ms: state.quota_reset_at_ms,
-            sign_in_fault: state.sign_in_fault.clone(),
+            sign_in_fault: state.failure(),
         }
     }
 
@@ -546,11 +598,8 @@ impl StreamHarness {
 
     pub fn process_id(&self) -> Option<u32> {
         let mut state = lock(&self.shared);
-        if !state.alive
-            && let Some(child) = state.child.as_mut()
-            && matches!(child.try_wait(), Ok(Some(_)))
-        {
-            state.child = None;
+        if !state.alive {
+            state.reap_child();
         }
         state.child.as_ref().map(Child::id)
     }
@@ -568,6 +617,9 @@ impl StreamHarness {
         let mut agy_steer_ctx = None;
         {
             let mut state = lock(&self.shared);
+            if state.unconfirmed {
+                return Ok(DeliverOutcome::Deferred);
+            }
             if !state.alive {
                 return Err(HarnessError::Dead);
             }
@@ -581,10 +633,11 @@ impl StreamHarness {
                 {
                     return Ok(DeliverOutcome::Quota { reset_at_ms });
                 }
+                if let Some(reason) = state.rejected.get(&message.id) {
+                    return Err(HarnessError::Failed(reason.clone()));
+                }
                 if state.seen.contains(&message.id) {
-                    return Ok(DeliverOutcome::Accepted {
-                        turn_finished: state.finished.contains(&message.id),
-                    });
+                    return state.written_outcome(self.spec.protocol, &message.id);
                 }
                 if let Some(reset_at_ms) = state.quota_reset_at_ms {
                     return Ok(DeliverOutcome::Quota { reset_at_ms });
@@ -614,6 +667,25 @@ impl StreamHarness {
                         generation,
                     ));
                 } else {
+                    if self.spec.protocol == LineProtocol::AcknowledgedResult
+                        && let Some(dir) = &state.state_dir
+                    {
+                        // Record uncertainty BEFORE exposing any bytes. If this
+                        // fails, the mailbox still owns a provably unsent input.
+                        let turn = state.open.first().unwrap_or(&message.id);
+                        let mut ids: Vec<_> = state.open.iter().collect();
+                        ids.push(&message.id);
+                        if let Err(error) = std::fs::write(
+                            dir.join("spiron-unconfirmed-steers.json"),
+                            json!({"turn_id": turn, "request_ids": ids}).to_string(),
+                        ) {
+                            let reason = format!(
+                                "cannot persist Spiron input hold before dispatch: {error}"
+                            );
+                            state.sign_in_fault = Some(reason.clone());
+                            return Err(HarnessError::Failed(reason));
+                        }
+                    }
                     // Associate even an immediate result with its owner before the
                     // first byte is visible to the child. This is not acceptance.
                     if state.open.is_empty() {
@@ -769,6 +841,12 @@ impl StreamHarness {
         // nonblocking: backpressure returns custody to the mailbox immediately.
         let pending = self.pending.as_mut().expect("reserved above");
         let result = write_pending(&self.stdin, pending);
+        // Tests can hold the writer here until the real stdout reader has
+        // processed a receipt, making the earliest-receipt interleaving exact.
+        #[cfg(test)]
+        if let Some(after_write) = self.after_write.take() {
+            after_write();
+        }
         let mut state = lock(&self.shared);
         if state.generation != pending.generation || !state.alive {
             return Err(HarnessError::Dead);
@@ -784,9 +862,7 @@ impl StreamHarness {
                 let pending = self.pending.take().expect("completed write");
                 state.seen.insert(pending.id.clone());
                 state.written.push(pending.id);
-                Ok(DeliverOutcome::Accepted {
-                    turn_finished: state.finished.contains(&message.id),
-                })
+                state.written_outcome(self.spec.protocol, &message.id)
             }
             Err(_) => {
                 state.alive = false;
@@ -798,7 +874,7 @@ impl StreamHarness {
 
     pub fn input_ready(&self) -> bool {
         let state = lock(&self.shared);
-        if state.input_blocked {
+        if state.input_blocked || state.unconfirmed {
             return false;
         }
         if self.agy_rpc.is_some()
@@ -848,7 +924,7 @@ impl StreamHarness {
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
         if let Some(dir) = &self.work_dir {
             command.current_dir(dir);
         }
@@ -865,6 +941,11 @@ impl StreamHarness {
             let _ = child.wait();
             return Err(HarnessError::Failed("child stdout missing".into()));
         };
+        let Some(stderr) = child.stderr.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(HarnessError::Failed("child stderr missing".into()));
+        };
         if let Err(err) = nonblocking_stdin(&child_stdin) {
             anyagents_harness::kill_child(&mut child, &self.environment);
             let _ = child.wait();
@@ -876,12 +957,25 @@ impl StreamHarness {
             // Pipe acceptance belongs to this process, never its replacement.
             state.input_blocked = false;
             state.seen.clear();
+            state.acknowledged.clear();
+            state.input_turns.clear();
+            state.rejected.clear();
             state.written.clear();
             state.finished.clear();
             state.finished_quiet.clear();
             state.usages.clear();
             state.quota_reset_at_ms = None;
             state.sign_in_fault = None;
+            if let Some(dir) = &state.state_dir {
+                state.unconfirmed = dir
+                    .join("spiron-unconfirmed-steers.json")
+                    .try_exists()
+                    .unwrap_or(true);
+            }
+            state.stderr = BoundedStderr::default();
+            state.stderr_done = false;
+            state.exit_status = None;
+            state.exit_fault = None;
             state.child = Some(child);
             state.alive = true;
             state.open.clear();
@@ -924,6 +1018,41 @@ impl StreamHarness {
         *lock(&self.stdin) = Some(child_stdin);
         let shared = Arc::clone(&self.shared);
         let wake = Arc::clone(&self.wake);
+        self.stderr_reader = match thread::Builder::new()
+            .name(format!("{}-stderr", self.spec.name))
+            .spawn(move || {
+                let mut stderr = stderr;
+                let mut bytes = [0; 4096];
+                loop {
+                    match stderr.read(&mut bytes) {
+                        Ok(0) => break,
+                        Ok(count) => {
+                            let mut state = lock(&shared);
+                            if state.generation != generation {
+                                return;
+                            }
+                            state.stderr.push(&bytes[..count]);
+                        }
+                        Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(_) => break,
+                    }
+                }
+                let mut state = lock(&shared);
+                if state.generation == generation {
+                    state.stderr_done = true;
+                    state.refresh_exit_fault();
+                    state.epoch = state.epoch.wrapping_add(1);
+                }
+                wake.notify_all();
+            }) {
+            Ok(handle) => Some(handle),
+            Err(err) => {
+                self.stop_child();
+                return Err(HarnessError::Failed(err.to_string()));
+            }
+        };
+        let shared = Arc::clone(&self.shared);
+        let wake = Arc::clone(&self.wake);
         let spec = self.spec.clone();
         let agy_rpc = self.agy_rpc.clone();
         match thread::Builder::new()
@@ -953,6 +1082,9 @@ impl StreamHarness {
             let _ = child.wait();
         }
         if let Some(handle) = self.reader.take() {
+            let _ = handle.join();
+        }
+        if let Some(handle) = self.stderr_reader.take() {
             let _ = handle.join();
         }
         #[cfg(target_os = "linux")]
@@ -1000,15 +1132,150 @@ impl Drop for StreamHarness {
     }
 }
 
+// Retain at most 16 KiB while draining the entire pipe. If retention cuts a
+// line, withhold that partial line rather than publishing a credential prefix.
+const STDERR_LIMIT: usize = 16 * 1024;
+const UNCONFIRMED_STEERS: &str = "Spiron reported unconfirmed steering input; mailbox custody retained. Reconcile spiron-unconfirmed-steers.json before resuming; do not blindly replay.";
+
+#[derive(Default)]
+struct BoundedStderr {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+impl BoundedStderr {
+    fn push(&mut self, bytes: &[u8]) {
+        let retain = bytes.len().min(STDERR_LIMIT - self.bytes.len());
+        self.bytes.extend_from_slice(&bytes[..retain]);
+        self.truncated |= retain < bytes.len();
+    }
+
+    fn masked(&self, complete: bool) -> String {
+        let bytes = if self.truncated || !complete {
+            let end = self
+                .bytes
+                .iter()
+                .rposition(|b| *b == b'\n')
+                .map_or(0, |pos| pos + 1);
+            &self.bytes[..end]
+        } else {
+            &self.bytes[..]
+        };
+        let text = String::from_utf8_lossy(bytes);
+        let mut masked = anyagents_harness::masking::mask_known_secrets(&text).into_owned();
+        if self.truncated {
+            masked.push_str("\n[stderr truncated; incomplete line withheld]");
+        }
+        masked
+    }
+}
+
 impl State {
+    // Both a fresh pipe write and an already-written retry consult the same
+    // receipt state. Transport acknowledgement alone never commits a busy steer.
+    fn written_outcome(
+        &self,
+        protocol: LineProtocol,
+        id: &str,
+    ) -> Result<DeliverOutcome, HarnessError> {
+        if self.unconfirmed {
+            return Ok(DeliverOutcome::Deferred);
+        }
+        if let Some(reset_at_ms) = self.quota_reset_at_ms
+            && !self.finished.contains(id)
+        {
+            return Ok(DeliverOutcome::Quota { reset_at_ms });
+        }
+        if let Some(reason) = self.rejected.get(id) {
+            return Err(HarnessError::Failed(reason.clone()));
+        }
+        let finished = self.finished.contains(id);
+        if protocol == LineProtocol::AcknowledgedResult
+            && (!self.acknowledged.contains(id)
+                || ((self.input_turns.get(id).is_some_and(|turn| turn != id)
+                    || self.open.first().is_some_and(|turn| turn != id))
+                    && !finished))
+        {
+            return Ok(DeliverOutcome::Deferred);
+        }
+        Ok(DeliverOutcome::Accepted {
+            turn_finished: finished,
+        })
+    }
+
+    fn failure(&self) -> Option<String> {
+        let diagnostic = self
+            .exit_fault
+            .clone()
+            .or_else(|| self.sign_in_fault.clone());
+        if self.unconfirmed {
+            Some(match diagnostic {
+                Some(error) => format!("{UNCONFIRMED_STEERS}; {error}"),
+                None => UNCONFIRMED_STEERS.to_string(),
+            })
+        } else {
+            diagnostic
+        }
+    }
+
+    fn persist_failure(&self) {
+        if let (Some(dir), Some(error)) = (&self.state_dir, self.failure()) {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |time| time.as_millis());
+            let _ = std::fs::write(dir.join(".anyagents-last-error.json"), json!({
+                "error": error, "timestamp_ms": now, "quota_reset_at_ms": self.quota_reset_at_ms,
+            }).to_string());
+        }
+    }
+
+    fn reap_child(&mut self) {
+        if let Some(child) = self.child.as_mut()
+            && let Ok(Some(status)) = child.try_wait()
+        {
+            self.child = None;
+            self.exit_status = Some(status);
+            self.refresh_exit_fault();
+        }
+    }
+
+    fn refresh_exit_fault(&mut self) {
+        if let Some(status) = self.exit_status
+            && !status.success()
+        {
+            let stderr = self.stderr.masked(self.stderr_done);
+            self.exit_fault = Some(format!(
+                "harness exited with {status}{}{}{}{}",
+                self.sign_in_fault.as_ref().map_or("", |_| ": "),
+                self.sign_in_fault.as_deref().unwrap_or(""),
+                if stderr.trim().is_empty() {
+                    ""
+                } else {
+                    "; stderr: "
+                },
+                stderr.trim()
+            ));
+            self.persist_failure();
+        }
+    }
+
     fn new(session_id: Option<&str>) -> Self {
         Self {
             child: None,
+            stderr: BoundedStderr::default(),
+            stderr_done: false,
+            exit_status: None,
+            exit_fault: None,
+            state_dir: None,
+            unconfirmed: false,
             alive: false,
             epoch: 0,
             generation: 0,
             input_blocked: false,
             seen: HashSet::new(),
+            acknowledged: HashSet::new(),
+            input_turns: HashMap::new(),
+            rejected: HashMap::new(),
             written: Vec::new(),
             open: Vec::new(),
             followups: Vec::new(),
@@ -1042,10 +1309,17 @@ fn read_stdout(
         if line.trim().is_empty() {
             continue;
         }
-        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+        let Ok(mut value) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
+        let raw_text = (spec.protocol == LineProtocol::AcknowledgedResult)
+            .then(|| spec.text_of(&value, false))
+            .flatten();
+        anyagents_harness::masking::mask_json_strings(&mut value);
         let mut effect = spec.effect(&value);
+        if raw_text.is_some() {
+            effect.text = raw_text;
+        }
         let kind = value
             .get("type")
             .or_else(|| value.get("event"))
@@ -1151,6 +1425,44 @@ fn read_stdout(
             }
             state.idle_since = None;
             note_markers(&mut state, &value);
+            if spec.protocol == LineProtocol::AcknowledgedResult
+                && let Some(id) = value.get("request_id").and_then(Value::as_str)
+                && state
+                    .open
+                    .iter()
+                    .chain(&state.followups)
+                    .any(|open| open == id)
+            {
+                match kind {
+                    Some("accepted") => {
+                        state.acknowledged.insert(id.to_string());
+                        state.input_turns.insert(id.to_string(), id.to_string());
+                    }
+                    Some("steer_ack")
+                        if value.get("accepted").and_then(Value::as_bool) == Some(true)
+                            && value.get("turn_id").and_then(Value::as_str).is_some() =>
+                    {
+                        state.acknowledged.insert(id.to_string());
+                        state.input_turns.insert(
+                            id.to_string(),
+                            value["turn_id"].as_str().unwrap().to_string(),
+                        );
+                    }
+                    Some("rejected") => {
+                        state.rejected.insert(
+                            id.to_string(),
+                            format!(
+                                "controller rejected input: {}",
+                                value
+                                    .get("code")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("unknown")
+                            ),
+                        );
+                    }
+                    _ => {}
+                }
+            }
             if let Some(step_type) = value
                 .pointer("/step_update/step_type")
                 .and_then(Value::as_str)
@@ -1180,11 +1492,55 @@ fn read_stdout(
                     other => *other = Some((id, vec![text])),
                 }
             }
-            if effect.finishes_turn {
+            let correlated = spec.protocol != LineProtocol::AcknowledgedResult
+                || value
+                    .get("request_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| state.input_turns.values().any(|owner| owner == id));
+            if effect.finishes_turn && correlated {
+                if spec.protocol == LineProtocol::AcknowledgedResult
+                    && let Some((_, lines)) = &mut state.text
+                {
+                    *lines = vec![
+                        anyagents_harness::masking::mask_known_secrets(&lines.concat())
+                            .into_owned(),
+                    ];
+                }
                 state.sign_in_fault = None;
+                if spec.protocol == LineProtocol::AcknowledgedResult {
+                    let error = value
+                        .get("error")
+                        .and_then(|error| {
+                            error
+                                .as_str()
+                                .or_else(|| error.get("message").and_then(Value::as_str))
+                        })
+                        .map(str::trim)
+                        .filter(|error| !error.is_empty());
+                    if value.get("is_error").and_then(Value::as_bool) == Some(true)
+                        || value.get("status").and_then(Value::as_str) == Some("failed")
+                        || error.is_some()
+                    {
+                        state.sign_in_fault =
+                            Some(error.unwrap_or("harness turn failed").to_string());
+                    }
+                }
                 let usage = effect.usage.unwrap_or_default();
-                finish_open(&mut state, usage);
-            } else if (poisoned_agy || effect.quota_reset_at_ms.is_none())
+                if spec.protocol == LineProtocol::AcknowledgedResult {
+                    let unconfirmed = value.get("undelivered_steers").is_some_and(|items| {
+                        items.as_array().is_none_or(|items| !items.is_empty())
+                    });
+                    finish_correlated(
+                        &mut state,
+                        value["request_id"].as_str().unwrap(),
+                        usage,
+                        unconfirmed,
+                    );
+                } else {
+                    finish_open(&mut state, usage);
+                }
+            } else if correlated
+                && (poisoned_agy || effect.quota_reset_at_ms.is_none())
                 && matches!(kind, Some("done") | Some("result"))
                 && let Some(err_str) = error
             {
@@ -1200,6 +1556,14 @@ fn read_stdout(
                 state.open.clear();
                 state.followups.clear();
             }
+            if effect.finishes_turn
+                && correlated
+                && state.failure().is_none()
+                && let Some(dir) = &state.state_dir
+            {
+                let _ = std::fs::remove_file(dir.join(".anyagents-last-error.json"));
+            }
+            state.persist_failure();
             state.epoch = state.epoch.wrapping_add(1);
         }
         wake.notify_all();
@@ -1207,35 +1571,27 @@ fn read_stdout(
             break;
         }
     }
-    {
-        let mut state = lock(&shared);
+    // EOF can race waitpid and the independent stderr drainer. Collect both
+    // before publishing a normal exit, with the old bounded reap grace period.
+    let deadline = Instant::now() + Duration::from_millis(250);
+    let mut state = lock(&shared);
+    loop {
         if state.generation != generation {
             return;
         }
-        state.alive = false;
-        if let Some(child) = state.child.as_mut()
-            && matches!(child.try_wait(), Ok(Some(_)))
-        {
-            state.child = None;
+        state.reap_child();
+        if (state.child.is_none() && state.stderr_done) || Instant::now() >= deadline {
+            break;
         }
-        state.epoch = state.epoch.wrapping_add(1);
+        let (guard, _) = wake
+            .wait_timeout(state, Duration::from_millis(10))
+            .unwrap_or_else(|err| err.into_inner());
+        state = guard;
     }
+    state.alive = false;
+    state.refresh_exit_fault();
+    state.epoch = state.epoch.wrapping_add(1);
     wake.notify_all();
-    for _ in 0..10 {
-        {
-            let mut state = lock(&shared);
-            if state.generation != generation || state.child.is_none() {
-                break;
-            }
-            if let Some(child) = state.child.as_mut()
-                && matches!(child.try_wait(), Ok(Some(_)))
-            {
-                state.child = None;
-                break;
-            }
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
 }
 
 /// A harness that streams without a closing result line ends its turn here:
@@ -1283,6 +1639,52 @@ fn finish_open(state: &mut State, usage: TurnUsage) {
     if !state.followups.is_empty() {
         state.turns_started += 1;
         state.open.append(&mut state.followups);
+    }
+}
+
+fn finish_correlated(state: &mut State, turn: &str, usage: TurnUsage, unconfirmed: bool) {
+    let ids: Vec<String> = state
+        .open
+        .iter()
+        .chain(&state.followups)
+        .filter(|id| {
+            state
+                .input_turns
+                .get(*id)
+                .is_some_and(|owner| owner == turn)
+        })
+        .cloned()
+        .collect();
+    if unconfirmed {
+        state.unconfirmed = true;
+        // The pre-dispatch hold already exists. No terminal write (which could
+        // fail after effects became uncertain) is required to retain custody.
+    }
+    for id in ids {
+        if unconfirmed && id != turn {
+            continue;
+        }
+        state.open.retain(|open| open != &id);
+        state.followups.retain(|open| open != &id);
+        state.finished.insert(id.clone());
+        state.usages.push((
+            id.clone(),
+            if id == turn {
+                usage.clone()
+            } else {
+                TurnUsage::default()
+            },
+        ));
+    }
+    if !state.unconfirmed
+        && state.open.is_empty()
+        && state.followups.is_empty()
+        && let Some(dir) = &state.state_dir
+        && let Err(error) = std::fs::remove_file(dir.join("spiron-unconfirmed-steers.json"))
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        state.unconfirmed = true;
+        state.sign_in_fault = Some(format!("cannot clear confirmed Spiron input hold: {error}"));
     }
 }
 

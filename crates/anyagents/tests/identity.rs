@@ -1362,6 +1362,13 @@ fn offline_session_reset_refuses_agent_self_and_peer_but_allows_operator() {
             "old-offline-vendor\n",
         )
         .unwrap();
+        // External Spiron owns the canonical pointer; retained legacy bytes
+        // are history, never a pointer the reset is allowed to resurrect.
+        std::fs::write(
+            root.join("config/spiron-session-id"),
+            "old-offline-vendor\n",
+        )
+        .unwrap();
         std::fs::write(
             root.join("config/sylphx-transcript.jsonl"),
             "retained raw bytes",
@@ -1401,6 +1408,10 @@ fn offline_session_reset_refuses_agent_self_and_peer_but_allows_operator() {
             std::fs::read(root.join("config/sylphx-session-id")).unwrap(),
             b"old-offline-vendor\n"
         );
+        assert_eq!(
+            std::fs::read(root.join("config/spiron-session-id")).unwrap(),
+            b"old-offline-vendor\n"
+        );
         assert_eq!(host_session::active(&root).unwrap().unwrap(), first);
 
         let accepted = Command::new(env!("CARGO_BIN_EXE_anyagents"))
@@ -1417,7 +1428,18 @@ fn offline_session_reset_refuses_agent_self_and_peer_but_allows_operator() {
         assert_eq!(value["generation"], next.generation);
         assert_ne!(next.generation, first.generation);
         assert!(next.memory.section.contains("new offline pin"));
-        assert!(!root.join("config/sylphx-session-id").exists());
+        assert!(!root.join("config/spiron-session-id").exists());
+        assert_eq!(
+            std::fs::read(root.join("config/sylphx-session-id")).unwrap(),
+            b"old-offline-vendor\n"
+        );
+        assert_eq!(
+            host_session::bound_vendor(&root, "sylphx", "old-offline-vendor")
+                .unwrap()
+                .unwrap(),
+            first
+        );
+        assert_eq!(host_session::active(&root).unwrap().unwrap(), next);
         assert_eq!(
             std::fs::read(root.join("config/sylphx-transcript.jsonl")).unwrap(),
             b"retained raw bytes"

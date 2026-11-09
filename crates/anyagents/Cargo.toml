@@ -19,7 +19,6 @@ anyagents-harness-stream = { path = "../anyagents-harness-stream" }
 anyagents-harness-muse = { path = "../anyagents-harness-muse" }
 anyagents-harness-codex = { path = "../anyagents-harness-codex" }
 anyagents-harness-opencode = { path = "../anyagents-harness-opencode" }
-anyagents-harness-sylphx = { path = "../anyagents-harness-sylphx" }
 anyagents-supervisor = { path = "../anyagents-supervisor" }
 axum = { version = "0.8", features = ["json"] }
 bytes = "1"
@@ -48,6 +47,7 @@ ureq = { version = "3", features = ["json"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 
 [dev-dependencies]
+anyagents-agent = { path = "../anyagents-agent" }
 anyagents-core = { path = "../anyagents-core" }
 
 anyagents-harness-agy = { path = "../anyagents-harness-agy" }
