@@ -116,6 +116,19 @@ diagnostic. A deliberately slow startup exceeds the receipt bound but still
 reaches the ordering assertion; an exited peer cannot satisfy readiness. These
 checks retain busy-steer custody, typed rejection and no-replay assertions.
 
+## Shared harness configuration
+
+An admitted seat starts its program with `umask 0007`, after the UID/GID boundary
+and without changing the daemon's process-wide mask. Config preparation grants
+the admitted group read/write/search and setgid directories before any daemon
+settings read, including existing vendor-created `0600` files. Umask cannot add
+group rights to explicit `0600` replacements, so every launch repeats that repair.
+The descriptor-bound walk refuses linked regular files and never follows symlinks;
+capabilities remain `0640`, while unrelated host history and peer trees remain
+private. The Linux managed-UID CI proof runs the actual AGY adapter twice with
+restrictive settings replacements, verifies daemon writeback and retains peer
+denial controls. Ordinary unit tests do not claim that privileged cross-UID proof.
+
 ## Sylphx transcript projection contract
 
 Raw transcript history is append-only. Projection may prune or summarize context,

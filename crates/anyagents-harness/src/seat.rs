@@ -125,8 +125,16 @@ pub(super) fn admitted_command(
         ));
     }
     let mut command = prefix();
-    command.arg(program);
+    seat_program(&mut command, program);
     Ok(command)
+}
+
+fn seat_program(command: &mut Command, program: &Path) {
+    // Set the mask only after dropping to the admitted principal. A daemon's
+    // process-wide umask must not change while other threads write private data.
+    command
+        .args(["/bin/sh", "-c", "umask 0007; exec \"$@\"", "seat-program"])
+        .arg(program);
 }
 
 /// One thing the boundary promises, as a shell program.
@@ -426,6 +434,48 @@ mod tests {
             "symlink is not a capability grant"
         );
         assert_eq!(std::fs::read_to_string(outside).unwrap(), "unchanged");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn seat_program_uses_group_writable_defaults_and_preserves_literal_arguments() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o2770)).unwrap();
+        let payload = "literal ' quote; $(false)";
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "umask 0077; exec \"$@\"", "restrictive-parent"]);
+        seat_program(&mut command, Path::new("/bin/sh"));
+        let output = command
+            .args([
+                "-c",
+                "mkdir nested; printf '%s' \"$1\" > nested/value",
+                "fixture",
+                payload,
+            ])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("nested/value")).unwrap(),
+            payload
+        );
+        assert_eq!(
+            std::fs::metadata(dir.path().join("nested")).unwrap().mode() & 0o7777,
+            if cfg!(target_os = "linux") {
+                0o2770
+            } else {
+                0o770
+            }
+        );
+        assert_eq!(
+            std::fs::metadata(dir.path().join("nested/value"))
+                .unwrap()
+                .mode()
+                & 0o777,
+            0o660
+        );
     }
 
     #[test]

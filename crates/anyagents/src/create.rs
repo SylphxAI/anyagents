@@ -2120,6 +2120,9 @@ pub(crate) fn reconcile_agent_runtime_config(
             .map(|m| m.permissions().mode() & 0o7777)
     };
     create_private_config_dir(config)?;
+    if let Some((_, uid, gid, _)) = resolved_agent_seat_info(store, agent) {
+        crate::sandbox::prepare_config_with_seat_uid(config, uid, gid)?;
+    }
     #[cfg(unix)]
     if let Some(base_mode) = pre_existing_mode {
         use std::os::unix::fs::PermissionsExt as _;

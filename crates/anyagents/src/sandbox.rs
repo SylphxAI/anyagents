@@ -422,7 +422,7 @@ pub fn share_config_with_seat_uid(config_dir: &Path, uid: u32, gid: u32) {
         None => (uid, gid),
     };
     if config_dir.is_dir()
-        && let Err(err) = give_tree(config_dir, eff_uid, eff_gid)
+        && let Err(err) = crate::seat_tree::share_config(config_dir, eff_uid, eff_gid)
     {
         eprintln!("seat: cannot share {}: {err}", config_dir.display());
     }
@@ -461,6 +461,13 @@ pub fn share_config_with_seat_uid(config_dir: &Path, uid: u32, gid: u32) {
             }
         }
     }
+}
+
+pub(crate) fn prepare_config_with_seat_uid(config: &Path, uid: u32, gid: u32) -> Result<(), Error> {
+    crate::seat_tree::share_config(config, uid, gid).map_err(|error| Error::WorkdirPermission {
+        path: config.display().to_string(),
+        message: format!("cannot prepare shared harness configuration: {error}"),
+    })
 }
 
 /// Share a working directory and both per-worktree and common Git metadata.
