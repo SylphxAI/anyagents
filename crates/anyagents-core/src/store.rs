@@ -13,6 +13,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
+use anyagents_harness::normalize_harness_name;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::error::Error;
@@ -710,6 +711,19 @@ impl Store {
         if migrate::current_version(&conn)? < 1 {
             return Err(Error::Message("migrations did not apply".into()));
         }
+        // Read first so ordinary opens of current stores do not take the writer
+        // lock. The UPDATE is idempotent and changes only the harness selector.
+        let has_legacy_harness: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM agents WHERE harness IN ('sylphx', 'sylphx-agent', 'sylphx_agent', 'sylphx/default'))",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_legacy_harness {
+            conn.execute(
+                "UPDATE agents SET harness = 'spiron' WHERE harness IN ('sylphx', 'sylphx-agent', 'sylphx_agent', 'sylphx/default')",
+                [],
+            )?;
+        }
         let has_legacy_state: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM agents WHERE state NOT IN ('created', 'running', 'idle', 'paused', 'archived'))",
             [],
@@ -1080,7 +1094,8 @@ impl Store {
 
     pub fn create_agent(&self, new: NewAgent) -> Result<Agent, Error> {
         validate_token(&new.name, "agent name")?;
-        if new.harness.is_empty() {
+        let harness = normalize_harness_name(&new.harness);
+        if harness.is_empty() {
             return Err(Error::Message("harness is empty".into()));
         }
         let clean_role = new
@@ -1111,7 +1126,7 @@ impl Store {
             name: new.name,
             role: clean_role,
             description: clean_description,
-            harness: new.harness,
+            harness: harness.to_string(),
             model: new.model,
             workdir: new.workdir,
             instructions: new.instructions,
@@ -1191,7 +1206,7 @@ impl Store {
     }
 
     pub fn set_agent_harness(&self, agent_id: &AgentId, harness: &str) -> Result<Agent, Error> {
-        let clean = harness.trim();
+        let clean = normalize_harness_name(harness);
         if clean.is_empty() {
             return Err(Error::Message("harness is empty".into()));
         }
@@ -7025,6 +7040,96 @@ mod tests {
     }
 
     #[test]
+    fn legacy_harness_rows_migrate_idempotently_without_changing_agent_state() {
+        let (dir, store) = setup();
+        let parent = agent(&store, "parent");
+        let mut expected = Vec::new();
+        for (index, legacy) in ["sylphx", "sylphx-agent", "sylphx_agent", "sylphx/default"]
+            .into_iter()
+            .enumerate()
+        {
+            let mut new = NewAgent::new(format!("legacy-{index}"), "spiron");
+            new.parent_id = Some(parent.id.clone());
+            new.model = Some("sylphx/openai/gpt-6.1-sol#medium".into());
+            new.workdir = Some(format!("/work/legacy-{index}"));
+            new.instructions = Some("preserve instructions".into());
+            let created = store.create_agent(new).unwrap();
+            store.set_agent_state(&created.id, "paused").unwrap();
+            store
+                .receive(&created.id, Incoming::new("delivered"))
+                .unwrap();
+            store.note_delivered(&created.id, 1).unwrap();
+            store
+                .receive(&created.id, Incoming::new("pending"))
+                .unwrap();
+            let schedule = store
+                .create_schedule(NewSchedule {
+                    agent_id: created.id.clone(),
+                    kind: "at".into(),
+                    spec: "2099-01-01T00:00:00Z".into(),
+                    prompt: "preserve schedule".into(),
+                    interval_ms: None,
+                    next_fire_at_ms: Some(4_070_908_800_000),
+                    watch_baseline: None,
+                })
+                .unwrap();
+            let before = store.agent(&created.id).unwrap();
+            // Simulate an existing database, bypassing canonical writes.
+            store
+                .conn()
+                .execute(
+                    "UPDATE agents SET harness = ?1 WHERE id = ?2",
+                    params![legacy, created.id.as_str()],
+                )
+                .unwrap();
+            expected.push((before, schedule));
+        }
+        let mut third_party = NewAgent::new("gateway-codex", "codex");
+        third_party.model = Some("sylphx/openai/gpt-6.1-sol#xhigh".into());
+        let third_party = store.create_agent(third_party).unwrap();
+        drop(store);
+
+        for _ in 0..2 {
+            let reopened = Store::open(dir.path().join("state.db")).unwrap();
+            assert_eq!(reopened.agent(&parent.id).unwrap(), parent);
+            assert_eq!(reopened.agent(&third_party.id).unwrap(), third_party);
+            for (before, schedule) in &expected {
+                assert_eq!(&reopened.agent(&before.id).unwrap(), before);
+                assert_eq!(reopened.delivered_cursor(&before.id).unwrap(), 1);
+                assert_eq!(
+                    reopened.next_undelivered(&before.id).unwrap().unwrap().text,
+                    "pending"
+                );
+                assert_eq!(
+                    reopened.get_schedule(&schedule.id).unwrap().as_ref(),
+                    Some(schedule)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_harness_writes_are_canonical_and_gateway_models_are_unchanged() {
+        let (_dir, store) = setup();
+        for (index, legacy) in ["sylphx", "sylphx-agent", "sylphx_agent", "sylphx/default"]
+            .into_iter()
+            .enumerate()
+        {
+            let mut new = NewAgent::new(format!("alias-{index}"), legacy);
+            new.model = Some("sylphx/openai/gpt-6.1-sol#medium".into());
+            let created = store.create_agent(new).unwrap();
+            assert_eq!(created.harness, "spiron");
+            assert_eq!(
+                created.model.as_deref(),
+                Some("sylphx/openai/gpt-6.1-sol#medium")
+            );
+            store.set_agent_harness(&created.id, "codex").unwrap();
+            let switched = store.set_agent_harness(&created.id, legacy).unwrap();
+            assert_eq!(switched, created);
+        }
+    }
+
+    #[test]
     fn inbox_query_limits_unread_and_sender_before_materializing() {
         let (_dir, store) = setup();
         let own = agent(&store, "limited");
@@ -9387,7 +9492,7 @@ mod tests {
         let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let agent = store
-            .create_agent(NewAgent::new("sleep-neutral", "sylphx"))
+            .create_agent(NewAgent::new("sleep-neutral", "spiron"))
             .unwrap();
         let mut msg = Incoming::new("Directive message body that exceeds thirty characters easily");
         msg.sender = Some("operator".into());
@@ -9421,7 +9526,7 @@ mod tests {
         let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let agent = store
-            .create_agent(NewAgent::new("sleep-noise", "sylphx"))
+            .create_agent(NewAgent::new("sleep-noise", "spiron"))
             .unwrap();
         let root = dir.path().join("agents").join(agent.id.as_str());
         std::fs::create_dir_all(root.join("memory")).unwrap();
@@ -9480,7 +9585,7 @@ mod tests {
         let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let agent = store
-            .create_agent(NewAgent::new("sleep-upsert", "sylphx"))
+            .create_agent(NewAgent::new("sleep-upsert", "spiron"))
             .unwrap();
         let root = dir.path().join("agents").join(agent.id.as_str());
         crate::learned_memory::upsert_memory_topic(
@@ -9554,7 +9659,7 @@ mod tests {
         let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let agent = store
-            .create_agent(NewAgent::new("sleep-defrag", "sylphx"))
+            .create_agent(NewAgent::new("sleep-defrag", "spiron"))
             .unwrap();
         let root = dir.path().join("agents").join(agent.id.as_str());
         crate::learned_memory::upsert_memory_topic(
@@ -9641,7 +9746,7 @@ mod tests {
         let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let agent = store
-            .create_agent(NewAgent::new("sleep-cooldown", "sylphx"))
+            .create_agent(NewAgent::new("sleep-cooldown", "spiron"))
             .unwrap();
         let root = dir.path().join("agents").join(agent.id.as_str());
         std::fs::create_dir_all(root.join("memory")).unwrap();

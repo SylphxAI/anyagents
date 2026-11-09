@@ -1337,11 +1337,7 @@ fn start_claude(
 /// alias.  They launch the external `spiron` process and never enter a local
 /// model/tool loop.
 pub(crate) fn is_spiron_harness(harness: &str) -> bool {
-    harness == "spiron"
-        || harness == "sylphx"
-        || harness == "sylphx-agent"
-        || harness == "sylphx_agent"
-        || harness.starts_with("sylphx/")
+    anyagents_harness::normalize_harness_name(harness) == "spiron"
 }
 
 fn start_spiron(
@@ -2674,7 +2670,7 @@ done
                 if let Some(prior) = prior {
                     assert_eq!(first, prior);
                 }
-                assert_eq!(first.harness, selector);
+                assert_eq!(first.harness, "spiron");
                 assert_eq!(
                     std::fs::read(config.join("spiron-session-id")).unwrap(),
                     legacy

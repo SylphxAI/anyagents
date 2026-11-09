@@ -103,7 +103,7 @@ fn operator_read_commands_fall_back_on_socket_failure_but_agents_do_not() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path().join("state.db")).unwrap();
     let own = store
-        .create_agent(NewAgent::new("fallback", "sylphx"))
+        .create_agent(NewAgent::new("fallback", "spiron"))
         .unwrap();
     store
         .receive(
@@ -177,7 +177,7 @@ fn operator_read_fallback_handles_disconnect_without_hiding_http_refusals() {
     let dir = tempfile::tempdir().unwrap();
     Store::open(dir.path().join("state.db"))
         .unwrap()
-        .create_agent(anyagents_core::NewAgent::new("socket-reader", "sylphx"))
+        .create_agent(anyagents_core::NewAgent::new("socket-reader", "spiron"))
         .unwrap();
     let token = dir.path().join("operator-token");
     std::fs::write(&token, "fixture-token").unwrap();
@@ -260,7 +260,7 @@ fn closed_stdout_uses_sigpipe_without_panicking() {
     let dir = tempfile::tempdir().unwrap();
     Store::open(dir.path().join("state.db"))
         .unwrap()
-        .create_agent(anyagents_core::NewAgent::new("pipeline", "sylphx"))
+        .create_agent(anyagents_core::NewAgent::new("pipeline", "spiron"))
         .unwrap();
     let mut child = bin()
         .env("ANYAGENTS_TESTS", "1")

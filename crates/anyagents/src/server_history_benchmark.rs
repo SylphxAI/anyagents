@@ -46,13 +46,13 @@ fn canonical_history_latency() {
     let db = dir.path().join("state.db");
     let store = Arc::new(Store::open(&db).unwrap());
     let parent = store
-        .create_agent(anyagents_core::NewAgent::new("bench-parent", "sylphx"))
+        .create_agent(anyagents_core::NewAgent::new("bench-parent", "spiron"))
         .unwrap();
-    let mut new = anyagents_core::NewAgent::new("bench-child", "sylphx");
+    let mut new = anyagents_core::NewAgent::new("bench-child", "spiron");
     new.parent_id = Some(parent.id.clone());
     let child = store.create_agent(new).unwrap();
     let hidden = store
-        .create_agent(anyagents_core::NewAgent::new("bench-hidden", "sylphx"))
+        .create_agent(anyagents_core::NewAgent::new("bench-hidden", "spiron"))
         .unwrap();
     let mut conn = rusqlite::Connection::open(&db).unwrap();
     let tx = conn.transaction().unwrap();

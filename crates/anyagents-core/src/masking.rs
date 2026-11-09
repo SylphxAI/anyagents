@@ -10,7 +10,7 @@ mod persistence_tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let agent = store
-            .create_agent(NewAgent::new("mask-test", "sylphx"))
+            .create_agent(NewAgent::new("mask-test", "spiron"))
             .unwrap();
         let raw = "password=fixturecanarypersistence";
         store.record_tool_event(&agent.id, "bash", raw).unwrap();

@@ -1105,12 +1105,12 @@ async fn redaction_mcp_and_cli_share_authenticated_audited_api() {
     let dir = support::physical_tempdir();
     let store = Store::open(dir.path().join("state.db")).unwrap();
     let root = store
-        .create_agent(NewAgent::new("redaction-root", "sylphx"))
+        .create_agent(NewAgent::new("redaction-root", "spiron"))
         .unwrap();
     let peer = store
-        .create_agent(NewAgent::new("redaction-peer", "sylphx"))
+        .create_agent(NewAgent::new("redaction-peer", "spiron"))
         .unwrap();
-    let mut input = NewAgent::new("redaction-child", "sylphx");
+    let mut input = NewAgent::new("redaction-child", "spiron");
     input.parent_id = Some(root.id.clone());
     let child = store.create_agent(input).unwrap();
     for agent in [&root, &peer, &child] {
@@ -1194,12 +1194,12 @@ async fn session_reset_mcp_and_cli_share_quiescent_authorized_api() {
     let dir = support::physical_tempdir();
     let store = Store::open(dir.path().join("state.db")).unwrap();
     let parent = store
-        .create_agent(NewAgent::new("session-parent", "sylphx"))
+        .create_agent(NewAgent::new("session-parent", "spiron"))
         .unwrap();
     let peer = store
-        .create_agent(NewAgent::new("session-peer", "sylphx"))
+        .create_agent(NewAgent::new("session-peer", "spiron"))
         .unwrap();
-    let mut input = NewAgent::new("session-child", "sylphx");
+    let mut input = NewAgent::new("session-child", "spiron");
     input.parent_id = Some(parent.id.clone());
     let child = store.create_agent(input).unwrap();
     for agent in [&parent, &peer, &child] {
@@ -1209,7 +1209,7 @@ async fn session_reset_mcp_and_cli_share_quiescent_authorized_api() {
     std::fs::create_dir_all(root.join("config")).unwrap();
     std::fs::create_dir_all(root.join("memory")).unwrap();
     std::fs::write(root.join("memory/MEMORY.md"), "first pin").unwrap();
-    let old = host_session::ensure_active(&root, "sylphx").unwrap();
+    let old = host_session::ensure_active(&root, "spiron").unwrap();
     std::fs::write(root.join("config/sylphx-session-id"), "old-vendor\n").unwrap();
     std::fs::write(root.join("config/spiron-session-id"), "old-vendor\n").unwrap();
     std::fs::write(
@@ -1293,7 +1293,7 @@ async fn session_reset_mcp_and_cli_share_quiescent_authorized_api() {
         b"retained raw bytes"
     );
     assert_eq!(
-        host_session::resume_vendor(&root, "sylphx", "old-vendor").unwrap(),
+        host_session::resume_vendor(&root, "spiron", "old-vendor").unwrap(),
         old
     );
     parent_mcp.cancel().await.unwrap();

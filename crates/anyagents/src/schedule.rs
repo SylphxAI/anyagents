@@ -621,8 +621,9 @@ pub fn agent_wake_block_reason(
 }
 
 pub fn is_agent_busy(store: &Store, health: &HealthBoard, agent: &Agent, now: i64) -> bool {
-    // Local DeliveryLoops hold this lock while idle; Sylphx locks only per turn.
-    if agent.harness == "sylphx" && store.try_lock_agent(&agent.id).is_err() {
+    // Check first-party turn ownership even before health has been published.
+    if crate::vendor::is_spiron_harness(&agent.harness) && store.try_lock_agent(&agent.id).is_err()
+    {
         return true;
     }
     match store.has_open_turn(&agent.id) {
@@ -1724,19 +1725,28 @@ mod tests {
     }
 
     #[test]
-    fn sylphx_schedule_owner_is_busy_while_turn_lock_is_held() {
+    fn spiron_schedule_owner_is_busy_while_turn_lock_is_held() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let health = HealthBoard::default();
-        let owner = store
-            .create_agent(NewAgent::new("owner", "sylphx"))
+        let mut owner = store
+            .create_agent(NewAgent::new("owner", "spiron"))
             .unwrap();
         let now = anyagents_core::now_ms();
-        assert!(!is_agent_busy(&store, &health, &owner, now));
-        let lock = store.try_lock_agent(&owner.id).unwrap();
-        assert!(is_agent_busy(&store, &health, &owner, now));
-        drop(lock);
-        assert!(!is_agent_busy(&store, &health, &owner, now));
+        for selector in [
+            "spiron",
+            "sylphx",
+            "sylphx-agent",
+            "sylphx_agent",
+            "sylphx/default",
+        ] {
+            owner.harness = selector.into();
+            assert!(!is_agent_busy(&store, &health, &owner, now));
+            let lock = store.try_lock_agent(&owner.id).unwrap();
+            assert!(is_agent_busy(&store, &health, &owner, now));
+            drop(lock);
+            assert!(!is_agent_busy(&store, &health, &owner, now));
+        }
     }
 
     #[test]

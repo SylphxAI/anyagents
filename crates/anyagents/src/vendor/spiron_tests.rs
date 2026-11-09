@@ -105,7 +105,13 @@ for line in sys.stdin:
         ("ANYAGENTS_SPIRON_BIN", probe.as_os_str()),
         ("ANYAGENTS_FAKE_MODE", std::ffi::OsStr::new("1")),
     ]);
-    for harness_name in ["spiron", "sylphx", "sylphx/default"] {
+    for harness_name in [
+        "spiron",
+        "sylphx",
+        "sylphx-agent",
+        "sylphx_agent",
+        "sylphx/default",
+    ] {
         let data = temp.path().join(harness_name.replace('/', "-"));
         std::fs::create_dir_all(&data).unwrap();
         let store = Store::open(data.join("state.db")).unwrap();
@@ -122,6 +128,7 @@ for line in sys.stdin:
         spec.workdir = Some(work.display().to_string());
         spec.instructions = Some("preserve this identity".into());
         let agent = store.create_agent(spec).unwrap();
+        assert_eq!(agent.harness, "spiron", "{harness_name}");
         let agent = store
             .set_agent_running(&agent.id, &work.display().to_string())
             .unwrap();
@@ -176,11 +183,11 @@ for line in sys.stdin:
         let host_pin = anyagents_core::host_session::active(&data)
             .unwrap()
             .unwrap();
-        assert_eq!(host_pin.harness, harness_name);
+        assert_eq!(host_pin.harness, "spiron");
         assert!(host_pin.memory.section.contains("PINNED_EXTERNAL_FACT"));
         std::fs::write(data.join("memory/MEMORY.md"), "EDITED_LATER_FACT").unwrap();
         assert_eq!(
-            anyagents_core::host_session::bound_vendor(&data, harness_name, "legacy-session")
+            anyagents_core::host_session::bound_vendor(&data, "spiron", "legacy-session")
                 .unwrap()
                 .unwrap(),
             host_pin,

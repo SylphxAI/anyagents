@@ -188,7 +188,7 @@ size limit. HTTP refusals retain their status and response body.
 
 | Harness | Mode | How a line reaches it |
 | --- | --- | --- |
-| `spiron` / `sylphx` | `steer` | External `spiron --headless --json` process. Correlated `user` JSONL receives `accepted` (new turn) or `steer_ack` (active turn) before mailbox acceptance. Only the matching terminal `result` closes a turn; `cancel_ack` alone does not. |
+| `spiron` (legacy `sylphx` alias) | `steer` | External `spiron --headless --json` process. Correlated `user` JSONL receives `accepted` (new turn) or `steer_ack` (active turn) before mailbox acceptance. Only the matching terminal `result` closes a turn; `cancel_ack` alone does not. |
 | `opencode` | `steer` | `POST /api/session/{id}/prompt` with `delivery: "steer"`; the session's own inbox decides whether it joins the running turn or starts the next one. Accepted when the prompt API answers with `data`. |
 | `codex` | `steer` | `turn/start`, with `ifBusy: "steer"` while a turn is open. |
 | `claude-code` | `steer` | Idle: a stream-json `user` message. Active turn: an SDK `PreToolUse` callback returns pending lines as `additionalContext` in the current transcript before the tool proceeds; stdin replay alone is not evidence of mid-turn delivery. |
@@ -413,9 +413,9 @@ AnyAgents separates **session identity** (`mcp-capability`) from the **runtime e
 2. **Container (`docker`) and cluster (`k8s`):** Each agent runs as the single user inside its own container or Pod, connects to the switchboard with its `mcp-capability`, and receives external credentials, volumes and GPU devices through standard Docker (`--env-file`, `-v`, `--gpus`) or Kubernetes (`Secret`, `ServiceAccount`, Workload Identity) primitives.
 3. **Multi-seat host (`seat`, opt-in):** The operator supplies `ANYAGENTS_PRINCIPALS` as JSON keyed by immutable agent ID, with explicit `user`, `uid`, `gid`, and `socket_gid` fields. The UID must differ from root and the server's own UID; neither display names nor existing file owners admit a principal. Register agents before enabling this map and admit each ID before launching it. Legacy numeric seat variables select the boundary but cannot authorize an agent without this map. Every harness then starts inside a distinct managed OS seat (`setpriv --reuid <uid> --regid <gid> --groups <gid>,<socket group> --no-new-privs --`). `anyagents agent-run --config <dir> -- <command>` asserts the process's effective UID/GID, `NoNewPrivs = 1`, denial of the server's database/secrets/operator token and peers' config directories, and writability of its own config directory before executing the command.
 
-### Native Sylphx workspace placement
+### Legacy first-party workspace placement
 
-The native Sylphx harness exposes `sandbox(action="placement")` to read its own
+The legacy first-party harness exposed `sandbox(action="placement")` to read its own
 workspace routing, or `sandbox(action="placement", placement="local" | "cloud")`
 to persist a choice for the next workspace tool. Readback names the effective
 surface and worktree. This changes only the session's

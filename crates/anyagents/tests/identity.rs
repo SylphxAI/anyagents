@@ -824,7 +824,7 @@ fn migration_failure_and_busy_global_lock_do_not_block_host_socket() {
         support::operator_for_contract(data);
         let store = Store::open(data.join("state.db")).unwrap();
         let agent = store
-            .create_agent(NewAgent::new("maintenance-only", "sylphx"))
+            .create_agent(NewAgent::new("maintenance-only", "spiron"))
             .unwrap();
         store.set_agent_state(&agent.id, "archived").unwrap();
         let memory = data
@@ -1345,10 +1345,10 @@ fn offline_session_reset_refuses_agent_self_and_peer_but_allows_operator() {
     let data = dir.path();
     let store = Store::open(data.join("state.db")).unwrap();
     let own = store
-        .create_agent(NewAgent::new("offline-reset-own", "sylphx"))
+        .create_agent(NewAgent::new("offline-reset-own", "spiron"))
         .unwrap();
     let peer = store
-        .create_agent(NewAgent::new("offline-reset-peer", "sylphx"))
+        .create_agent(NewAgent::new("offline-reset-peer", "spiron"))
         .unwrap();
     for target in [&own, &peer] {
         store.set_agent_state(&target.id, "paused").unwrap();
@@ -1356,7 +1356,7 @@ fn offline_session_reset_refuses_agent_self_and_peer_but_allows_operator() {
         std::fs::create_dir_all(root.join("config")).unwrap();
         std::fs::create_dir_all(root.join("memory")).unwrap();
         std::fs::write(root.join("memory/MEMORY.md"), "old offline pin").unwrap();
-        let first = host_session::ensure_active(&root, "sylphx").unwrap();
+        let first = host_session::ensure_active(&root, "spiron").unwrap();
         std::fs::write(
             root.join("config/sylphx-session-id"),
             "old-offline-vendor\n",
@@ -1434,7 +1434,7 @@ fn offline_session_reset_refuses_agent_self_and_peer_but_allows_operator() {
             b"old-offline-vendor\n"
         );
         assert_eq!(
-            host_session::bound_vendor(&root, "sylphx", "old-offline-vendor")
+            host_session::bound_vendor(&root, "spiron", "old-offline-vendor")
                 .unwrap()
                 .unwrap(),
             first

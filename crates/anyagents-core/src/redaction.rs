@@ -43,7 +43,7 @@ pub struct Span {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Request {
-    /// Inbound/outbound/tool id, or `transcript:<zero-based-line>` for Sylphx.
+    /// Inbound/outbound/tool id, or `transcript:<zero-based-line>` for legacy first-party transcripts.
     pub message_id: Option<String>,
     /// A mailbox sequence, mutually exclusive with message_id.
     pub seq: Option<i64>,
@@ -635,7 +635,7 @@ impl Store {
             let (_, file) = sessions
                 .iter_mut()
                 .find(|(p, _)| p == &path)
-                .ok_or_else(|| invalid("managed Sylphx transcript is inaccessible"))?;
+                .ok_or_else(|| invalid("managed legacy first-party transcript is inaccessible"))?;
             let mut text = String::new();
             file.read_to_string(&mut text)?;
             file.rewind()?;

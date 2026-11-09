@@ -7,6 +7,7 @@ rust-version = "1.98"
 description = "Harness catalog, lazy install and sign-in"
 
 [dependencies]
+anyagents-harness = { path = "../anyagents-harness" }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 

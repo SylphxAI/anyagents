@@ -15,6 +15,7 @@ use anyagents_installer::{
 
 /// Which harnesses this client can sign in.
 pub fn signable(harness: &str) -> bool {
+    let harness = anyagents_harness::normalize_harness_name(harness);
     builtin_catalog().iter().any(|entry| entry.id == harness)
 }
 
@@ -26,6 +27,7 @@ pub fn config_variable(harness: &str) -> Option<&'static str> {
 /// How the vendor tool is installed. Printed so the client knows what is missing
 /// when the program is not on the machine.
 pub fn install_hint(harness: &str) -> Option<String> {
+    let harness = anyagents_harness::normalize_harness_name(harness);
     builtin_catalog()
         .into_iter()
         .find(|entry| entry.id == harness)

@@ -241,6 +241,7 @@ dependencies = [
 name = "anyagents-installer"
 version = "0.1.3"
 dependencies = [
+ "anyagents-harness",
  "serde",
  "tempfile",
  "thiserror",
