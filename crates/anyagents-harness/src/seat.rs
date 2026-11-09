@@ -372,7 +372,11 @@ fn checks_with_principals(
         let capability = quote(&config.join("mcp-capability"))?;
         list.push(Check {
             what: "its capability is readable by its own seat only",
-            program: format!("m=$(stat -c %a {capability}); [ \"$m\" = 640 ] || [ \"$m\" = 600 ]"),
+            program: format!(
+                "[ -f {capability} ] && [ ! -L {capability} ] && [ -r {capability} ] && \
+                 [ \"$(stat -c %g {capability})\" = \"{gid}\" ] && \
+                 {{ m=$(stat -c %a {capability}); [ \"$m\" = 640 ] || [ \"$m\" = 660 ] || [ \"$m\" = 600 ]; }}"
+            ),
         });
     }
     Ok(list)
@@ -381,6 +385,49 @@ fn checks_with_principals(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn capability_modes_require_the_exact_seat_group_and_no_outside_access() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("agents/own/config");
+        std::fs::create_dir_all(&config).unwrap();
+        let cap = config.join("mcp-capability");
+        std::fs::write(&cap, "synthetic-capability").unwrap();
+        let gid = std::fs::metadata(&cap).unwrap().gid();
+        let run = |group| {
+            let script = admission_script(
+                checks(Some(&config), dir.path(), current_uid(), group)
+                    .unwrap()
+                    .into_iter()
+                    .filter(|c| c.what == "its capability is readable by its own seat only"),
+            );
+            std::process::Command::new("/bin/sh")
+                .args(["-c", &script])
+                .output()
+                .unwrap()
+        };
+        for mode in [0o600, 0o640, 0o660] {
+            std::fs::set_permissions(&cap, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert!(run(gid).status.success(), "allowed mode {mode:o}");
+            assert!(!run(gid.wrapping_add(1)).status.success(), "wrong group");
+        }
+        for mode in [0o604, 0o644, 0o664, 0o666, 0o670, 0o6400] {
+            std::fs::set_permissions(&cap, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert!(!run(gid).status.success(), "unsafe mode {mode:o}");
+        }
+        std::fs::remove_file(&cap).unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::write(&outside, "unchanged").unwrap();
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o640)).unwrap();
+        std::os::unix::fs::symlink(&outside, &cap).unwrap();
+        assert!(
+            !run(gid).status.success(),
+            "symlink is not a capability grant"
+        );
+        assert_eq!(std::fs::read_to_string(outside).unwrap(), "unchanged");
+    }
+
     #[test]
     fn admission_failure_names_its_check_without_running_later_commands() {
         for program in ["false", "true; exit 9", "false && true", "false\ntrue"] {

@@ -363,7 +363,7 @@ fn migrate_open_file(
 }
 
 pub(super) fn share(path: &Path, uid: u32, gid: u32) -> io::Result<()> {
-    share_open(open_root(path)?, path, uid, gid, &mut |_, _| {})
+    share_open(open_root(path)?, path, uid, gid, false, &mut |_, _| {})
 }
 
 fn share_open(
@@ -371,6 +371,7 @@ fn share_open(
     path: &Path,
     uid: u32,
     gid: u32,
+    owner_only: bool,
     before_open: &mut impl FnMut(&Path, &OsStr),
 ) -> io::Result<()> {
     grant(&directory, uid, gid, false)?;
@@ -390,10 +391,8 @@ fn share_open(
                 | ".next"
                 | "target"
                 | ".git"
-                | "cache-home"
                 | "data-home"
                 | "state-home"
-                | "tmp"
                 | ".cargo"
                 | ".rustup"
                 | "brain"
@@ -426,6 +425,12 @@ fn share_open(
             return Err(err);
         }
         let stat = unsafe { stat.assume_init() };
+        // Runtime scratch/cache trees need the same admitted seat grant after
+        // an execution-identity handoff. Do not mutate a foreign owner's tree.
+        let owner_only = owner_only || matches!(text.as_ref(), "cache-home" | "tmp");
+        if owner_only && stat.st_uid != super::sandbox::server_uid() && stat.st_uid != uid {
+            continue;
+        }
         let kind = stat.st_mode & libc::S_IFMT;
         if kind == libc::S_IFLNK || kind == libc::S_IFSOCK || kind == libc::S_IFIFO {
             continue;
@@ -459,7 +464,7 @@ fn share_open(
             ));
         }
         if kind == libc::S_IFDIR {
-            match share_open(child, &child_path, uid, gid, before_open) {
+            match share_open(child, &child_path, uid, gid, owner_only, before_open) {
                 Ok(()) => (),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
                 Err(e) => return Err(e),
@@ -487,6 +492,73 @@ fn share_open(
 mod tests {
     use super::*;
     #[test]
+    fn capability_group_write_is_normalized_for_current_and_distinct_seat_owners() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = crate::test_tempdir();
+        let own = temp.path().join("config");
+        std::fs::create_dir(&own).unwrap();
+        let cap = own.join(crate::operator::CAPABILITY_FILE);
+        std::fs::write(&cap, "synthetic-capability").unwrap();
+        let me = super::super::sandbox::server_uid();
+        let gid = super::super::sandbox::server_gid();
+        for seat_uid in [me, if me == 42001 { 42002 } else { 42001 }] {
+            std::fs::set_permissions(&cap, std::fs::Permissions::from_mode(0o660)).unwrap();
+            share(&own, seat_uid, gid).unwrap();
+            let meta = cap.metadata().unwrap();
+            assert_eq!(meta.mode() & 0o7777, 0o640);
+            assert_eq!(meta.gid(), gid);
+            assert_eq!(
+                std::fs::read_to_string(&cap).unwrap(),
+                "synthetic-capability"
+            );
+        }
+    }
+
+    #[test]
+    fn server_owned_cache_and_tmp_descendants_receive_the_admitted_group_grant() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = crate::test_tempdir();
+        let own = temp.path().join("config");
+        let me = super::super::sandbox::server_uid();
+        let seat_uid = if me == 42001 { 42002 } else { 42001 };
+        let gid = super::super::sandbox::server_gid();
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let before = outside.metadata().unwrap();
+        for name in ["cache-home", "tmp"] {
+            let nested = own.join(name).join("nested/deep");
+            std::fs::create_dir_all(&nested).unwrap();
+            std::fs::write(nested.join("retained"), "preserved").unwrap();
+            for p in [
+                own.join(name),
+                own.join(name).join("nested"),
+                nested.clone(),
+            ] {
+                std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            std::os::unix::fs::symlink(&outside, own.join(name).join("foreign-link")).unwrap();
+        }
+        share(&own, seat_uid, gid).unwrap();
+        for name in ["cache-home", "tmp"] {
+            for suffix in ["", "nested", "nested/deep"] {
+                let meta = own.join(name).join(suffix).metadata().unwrap();
+                assert_eq!(meta.gid(), gid);
+                assert_eq!(meta.mode() & 0o7777, 0o2770);
+            }
+            assert_eq!(
+                std::fs::read_to_string(own.join(name).join("nested/deep/retained")).unwrap(),
+                "preserved"
+            );
+        }
+        let after = outside.metadata().unwrap();
+        assert_eq!(
+            (before.dev(), before.ino(), before.mode(), before.gid()),
+            (after.dev(), after.ino(), after.mode(), after.gid())
+        );
+    }
+
+    #[test]
     fn planted_directory_to_symlink_swap_preserves_peer_inode_and_bytes() {
         let temp = crate::test_tempdir();
         let own = temp.path().join("own");
@@ -502,6 +574,7 @@ mod tests {
             &own,
             super::super::sandbox::server_uid(),
             super::super::sandbox::server_gid(),
+            false,
             &mut |parent, name| {
                 if name == "nested" {
                     std::fs::rename(parent.join(name), parent.join("held")).unwrap();
