@@ -220,7 +220,8 @@ async fn connect(
             // The single-user route: this deployment has no operator token, so
             // its own agent route names the agent. The server still resolves
             // the name itself, and a tool call never sends as anyone else.
-            cmd.env("ANYAGENTS_AGENT_ROUTE", data)
+            cmd.env("ANYAGENTS_TESTS", "1")
+                .env("ANYAGENTS_AGENT_ROUTE", data)
                 .env("ANYAGENTS_DATA", data)
                 .env("ANYAGENTS_AGENT_ID", &id)
                 .arg("--data")
@@ -1546,6 +1547,7 @@ async fn code_mode_supports_memory_sdk_workspace_patch_list_exec_and_computer_sn
 
                 // 3. Semantic Accessibility Snapshot & STALE_REF guard on tools.computer
                 const snap = await tools.computer.snapshot();
+                const windows = await tools.computer.list_windows();
                 let staleCaught = false;
                 try {
                     await tools.computer.click("@e1");
@@ -1565,6 +1567,8 @@ async fn code_mode_supports_memory_sdk_workspace_patch_list_exec_and_computer_sn
                     execStdout: execOut.stdout,
                     snapshotIdPrefix: snap.snapshot_id.startsWith("s"),
                     firstRef: snap.elements[0]?.ref_id,
+                    snapshotRole: snap.elements[0]?.role,
+                    windowCount: windows.count,
                     staleCaught,
                 };
             "##
@@ -1594,6 +1598,8 @@ async fn code_mode_supports_memory_sdk_workspace_patch_list_exec_and_computer_sn
         res["firstRef"].as_str().unwrap_or("").contains(":e1"),
         "{code_res:?}"
     );
+    assert_eq!(res["snapshotRole"], "desktop", "{code_res:?}");
+    assert_eq!(res["windowCount"], 0, "{code_res:?}");
     assert_eq!(res["staleCaught"], true, "{code_res:?}");
 
     client.cancel().await.unwrap();

@@ -15,7 +15,8 @@ pub(super) fn checked_output(out: std::process::Output, backend: &str) -> Result
 
 async fn script(platform: DesktopPlatform, req: &Value) -> Result<Value, String> {
     let (program, args, source) = script_command(platform, req)?;
-    let out = run_cmd_with_stdin(program, &args, &[], source.as_bytes(), 30_000).await?;
+    // Permission prompts (notably macOS TCC) can wait forever on headless hosts.
+    let out = run_cmd_with_stdin(program, &args, &[], source.as_bytes(), 3_000).await?;
     let bytes = checked_output(out, program)?;
     serde_json::from_slice(&bytes).map_err(|e| format!("invalid {program} desktop response: {e}"))
 }

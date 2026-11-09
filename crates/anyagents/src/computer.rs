@@ -52,6 +52,13 @@ impl DesktopPlatform {
     }
 }
 
+fn skip_host_desktop_queries(req: &Value) -> bool {
+    // Tests must not query the host desktop or trigger headless permission prompts.
+    // An explicit platform/os still opts into exercising that backend.
+    crate::sandbox::is_isolated_test_env()
+        && req.get("platform").or_else(|| req.get("os")).is_none()
+}
+
 const B64_ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 pub(crate) fn base64_encode(data: &[u8]) -> String {
@@ -1449,6 +1456,14 @@ async fn collect_local_a11y_nodes(
     window_filter: Option<&str>,
 ) -> Vec<RawA11yNode> {
     let windows = list_local_windows(envs).await.unwrap_or_default();
+    a11y_nodes_from_windows(windows, app_filter, window_filter)
+}
+
+fn a11y_nodes_from_windows(
+    windows: Vec<Value>,
+    app_filter: Option<&str>,
+    window_filter: Option<&str>,
+) -> Vec<RawA11yNode> {
     let mut nodes = Vec::new();
     for w in windows {
         let wid = w
@@ -1693,17 +1708,17 @@ async fn execute_computer_request_inner(
             Err(format!("cloud computer sandbox returned {status}: {body}"))
         };
     }
-    let platform = DesktopPlatform::detect(
-        if payload
-            .get("platform")
-            .or_else(|| payload.get("os"))
-            .is_some()
-        {
-            &payload
-        } else {
-            &req
-        },
-    )?;
+    let platform_req = if payload
+        .get("platform")
+        .or_else(|| payload.get("os"))
+        .is_some()
+    {
+        &payload
+    } else {
+        &req
+    };
+    let platform = DesktopPlatform::detect(platform_req)?;
+    let skip_host_queries = skip_host_desktop_queries(platform_req);
     if platform == DesktopPlatform::ChromeOs {
         if raw_action == "open_url" {
             let url = payload
@@ -1761,11 +1776,15 @@ async fn execute_computer_request_inner(
             };
 
             let snapshot_id = generate_snapshot_id();
-            let mut raw_nodes = match platform {
-                DesktopPlatform::MacOs | DesktopPlatform::Windows => {
-                    desktop::collect_nodes(platform, &payload).await?
+            let mut raw_nodes = if skip_host_queries {
+                a11y_nodes_from_windows(Vec::new(), app_filter, window_filter)
+            } else {
+                match platform {
+                    DesktopPlatform::MacOs | DesktopPlatform::Windows => {
+                        desktop::collect_nodes(platform, &payload).await?
+                    }
+                    _ => collect_local_a11y_nodes(&envs, app_filter, window_filter).await,
                 }
-                _ => collect_local_a11y_nodes(&envs, app_filter, window_filter).await,
             };
             if let Some(ref root_entry) = resolved_root {
                 raw_nodes = filter_a11y_subtree_by_ref(raw_nodes, root_entry);
@@ -1783,11 +1802,15 @@ async fn execute_computer_request_inner(
             }));
         }
         "list_windows" | "windows" => {
-            let windows = match platform {
-                DesktopPlatform::MacOs | DesktopPlatform::Windows => {
-                    desktop::list_windows(platform).await?
+            let windows = if skip_host_queries {
+                Vec::new()
+            } else {
+                match platform {
+                    DesktopPlatform::MacOs | DesktopPlatform::Windows => {
+                        desktop::list_windows(platform).await?
+                    }
+                    _ => list_local_windows(&envs).await?,
                 }
-                _ => list_local_windows(&envs).await?,
             };
             return Ok(json!({
                 "action": "list_windows",
@@ -2949,6 +2972,64 @@ mod tests {
             DesktopPlatform::MacOs
         );
         assert!(DesktopPlatform::from_environment(Some("unsupported"), "linux", false).is_err());
+    }
+
+    #[test]
+    fn isolated_desktop_queries_require_an_explicit_platform() {
+        assert!(skip_host_desktop_queries(&json!({"action": "snapshot"})));
+        for key in ["platform", "os"] {
+            for platform in ["linux", "macos", "windows", "chromeos"] {
+                let mut req = json!({"action": "snapshot"});
+                req[key] = json!(platform);
+                assert!(!skip_host_desktop_queries(&req), "{req}");
+            }
+        }
+    }
+
+    #[test]
+    fn isolated_desktop_snapshot_and_window_list_complete_without_subprocesses() {
+        use futures::FutureExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        for req in [
+            json!({"action": "snapshot"}),
+            json!({"action_json": {"action": "snapshot"}}),
+            json!({"payload": {"action": "snapshot"}}),
+        ] {
+            // No runtime is needed: isolated snapshots must complete on the first poll,
+            // without spawning desktop backends or awaiting a permission prompt.
+            let snap = execute_computer_request(None, dir.path(), req)
+                .now_or_never()
+                .expect("isolated snapshot must not wait for host desktop queries")
+                .unwrap();
+            assert_eq!(snap["element_count"], 1);
+            assert_eq!(snap["elements"][0]["role"], "desktop");
+            let map = load_ref_map(dir.path());
+            let entry = resolve_snapshot_ref(&map, snap["elements"][0]["ref_id"].as_str().unwrap())
+                .unwrap();
+            assert_eq!(entry.window_id.as_deref(), Some("root"));
+        }
+        for action in ["list_windows", "windows"] {
+            let windows = execute_computer_request(None, dir.path(), json!({"action": action}))
+                .now_or_never()
+                .expect("isolated window lists must not wait for host desktop queries")
+                .unwrap();
+            assert_eq!(windows["count"], 0);
+            assert_eq!(windows["windows"], json!([]));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn subprocess_timeout_covers_blocked_stdin_and_output() {
+        // More than a pipe buffer ensures the timeout also covers a blocked write.
+        let input = vec![b'x'; 1024 * 1024];
+        let started = std::time::Instant::now();
+        let err = run_cmd_with_stdin("/bin/sh", &["-c", "exec /bin/sleep 30"], &[], &input, 25)
+            .await
+            .unwrap_err();
+        assert!(err.contains("timed out after 25ms"), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(3));
     }
 
     #[test]
