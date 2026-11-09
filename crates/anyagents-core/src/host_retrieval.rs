@@ -1963,8 +1963,10 @@ mod tests {
         });
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut first_refreshed = false;
+        let mut first_released = false;
         while Instant::now() < deadline {
-            if index_path.exists()
+            if !first_refreshed
+                && index_path.exists()
                 && HostIndex::open(&index_path)
                     .ok()
                     .and_then(|idx| idx.source_cursor(first.id.as_str(), &first_mem).ok())
@@ -1972,7 +1974,13 @@ mod tests {
                     .is_some()
             {
                 first_refreshed = true;
-                break;
+            }
+            if first_refreshed {
+                if let Ok(probe_first) = store.try_lock_agent_lifecycle(&first.id) {
+                    drop(probe_first);
+                    first_released = true;
+                    break;
+                }
             }
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -1982,12 +1990,10 @@ mod tests {
         );
         // While search_host_files is waiting on `second.id`, `first.id`'s lifecycle lock
         // must already be released so at most one `.lifecycle` lock is held at a time.
-        let probe_first = store.try_lock_agent_lifecycle(&first.id);
         assert!(
-            probe_first.is_ok(),
+            first_released,
             "first agent lifecycle lock remained held while acquiring second"
         );
-        drop(probe_first);
         drop(second_lock);
         let hits = handle.join().unwrap();
         assert_eq!(hits.len(), 2);
