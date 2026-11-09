@@ -48,6 +48,16 @@ claim a real cross-UID launch.
 
 ## Seat Git configuration
 
+The required Linux managed-UID lane also exercises runtime-directory handoff.
+It starts with daemon-owned `0700` cache/tmp directories and retained files;
+the admitted seat must read and update those files and create children inside
+nested cache directories. Foreign-owned descendants and peer symlink targets
+retain their original permissions. Capability files are normalized to `0640`
+for both daemon and seat ownership. Direct admission accepts `0600`, `0640` and
+`0660` only for a readable regular non-symlink file in the exact admitted seat
+group; outside-readable modes and a mismatched group refuse before execution.
+The existing `verify-host-memory-seat.py` lane requires all of these receipts.
+
 Seat Git configuration runs file-only edits in daemon-owned staging, with
 `GIT_DIR=/dev/null` and inherited Git repository/parameter routing removed.
 An absolute `git config --file` argument alone still allows Git to inspect the

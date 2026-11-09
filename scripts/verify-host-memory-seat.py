@@ -232,6 +232,8 @@ echo REAL_UID_FIXTURE_TRAVERSAL_OK
                        'NATIVE_CODEX_PRESERVED_FOREIGN_PARENT_LAUNCH_OK',
                        'NATIVE_CODEX_PRESERVED_FOREIGN_MOUNT_LAUNCH_OK',
                        'NATIVE_VENDOR_LEGACY_SQLITE_OWNER_AND_BYTES_RETAINED',
+                       'NATIVE_VENDOR_RUNTIME_CACHE_TMP_HANDOFF_AND_CAPABILITY_NORMALIZATION_OK',
+                       'NATIVE_VENDOR_SEAT_OWNED_CAPABILITY_NORMALIZED_OK',
                        'NATIVE_AGY_GROUP_DEFAULTS_AND_PRIVATE_REPLACEMENT_REPAIRED',
                        'NATIVE_VENDOR_PROTECTED_BEFORE_EQUALS_AFTER', 'NATIVE_VENDOR_FIXTURE_REMOVED',
                        '1 passed; 0 failed']:
@@ -239,6 +241,20 @@ echo REAL_UID_FIXTURE_TRAVERSAL_OK
                 raise RuntimeError(f'actual vendor launch missing {marker}')
         public_test.unlink()
         run_case('real-uid-positive-and-denial-controls', True)
+        capability = config / 'mcp-capability'
+        for mode in (0o640, 0o660, 0o600):
+            capability.chmod(mode)
+            run_case(f'exact-seat-capability-mode-{mode:o}', True)
+        for mode in (0o644, 0o664, 0o666):
+            capability.chmod(mode)
+            run_case(f'outside-readable-capability-mode-{mode:o}', False,
+                     'its capability is readable by its own seat only')
+        capability.chmod(0o640)
+        os.chown(capability, args.uid, args.socket_gid)
+        run_case('foreign-group-capability-refuses', False,
+                 'its capability is readable by its own seat only')
+        os.chown(capability, args.uid, args.gid)
+        capability.chmod(0o600)
         if (memory / 'MEMORY.md').read_text() != 'synthetic-memory-after\n':
             raise RuntimeError('host memory readback mismatch')
         memory.rename(mine / 'memory-held')

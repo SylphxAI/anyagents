@@ -1954,6 +1954,30 @@ rmdir -- "$1"
             0o600,
             gid,
         );
+        // Reproduce a daemon-to-seat handoff with old private runtime trees.
+        // No pre-grant: production sharing must repair every owned descendant.
+        for name in ["cache-home", "tmp"] {
+            directory(&config.join(name), 0o700, 0, 0);
+            directory(&config.join(name).join("nested"), 0o700, 0, 0);
+            directory(&config.join(name).join("nested/__pycache__"), 0o700, 0, 0);
+            file(
+                &config.join(name).join("nested/retained"),
+                "retained-runtime-bytes\n",
+                0o600,
+                0,
+            );
+            let foreign = config.join(name).join("foreign-private");
+            directory(&foreign, 0o700, uid + 1, gid + 1);
+            protected.push(foreign);
+            std::os::unix::fs::symlink(&peer, config.join(name).join("peer-link")).unwrap();
+        }
+        // A recursive group-write operation must not make a valid capability
+        // permanently fail its own seat's admission.
+        std::fs::set_permissions(
+            config.join("mcp-capability"),
+            std::fs::Permissions::from_mode(0o660),
+        )
+        .unwrap();
         let report = config.join("native-vendor-report");
         let probe = fixture.join("vendor-probe.sh");
         file(
@@ -1970,6 +1994,15 @@ trust=$(/usr/bin/git config --no-includes --file "$ANYAGENTS_AGENT_CONFIG/.gitco
 for mirror in .claude .agents .agy; do
   grep -qx '# global preserved' "$ANYAGENTS_AGENT_CONFIG/$mirror/skills/global/SKILL.md"
   grep -qx '# local' "$ANYAGENTS_AGENT_CONFIG/$mirror/skills/local/SKILL.md"
+done
+for name in cache-home tmp; do
+  runtime="$ANYAGENTS_AGENT_CONFIG/$name"
+  grep -qxE '(retained-runtime-bytes|changed-runtime-bytes)' "$runtime/nested/retained"
+  printf changed-runtime-bytes > "$runtime/nested/retained"
+  printf created > "$runtime/nested/__pycache__/created"
+  rm "$runtime/nested/__pycache__/created"
+  [ ! -r "$runtime/foreign-private" ]; [ ! -x "$runtime/foreign-private" ]
+  [ ! -r "$runtime/peer-link/config/private" ]
 done
 printf synthetic-memory-after > "$ANYAGENTS_AGENT_CONFIG/../memory/MEMORY.md"
 printf authored > "$ANYAGENTS_AGENT_CONFIG/../skills/authored"
@@ -2083,9 +2116,69 @@ cat >/dev/null
             "synthetic-memory-after"
         );
         assert!(evidence.contains("GIT_TRUST_EXACT"), "{evidence}");
+        assert_eq!(
+            std::fs::metadata(config.join("mcp-capability"))
+                .unwrap()
+                .mode()
+                & 0o777,
+            0o640
+        );
+        for name in ["cache-home", "tmp"] {
+            assert_eq!(
+                std::fs::read(config.join(name).join("nested/retained")).unwrap(),
+                b"changed-runtime-bytes"
+            );
+            for suffix in ["", "nested", "nested/__pycache__"] {
+                let meta = std::fs::metadata(config.join(name).join(suffix)).unwrap();
+                assert_eq!(
+                    (meta.uid(), meta.gid(), meta.mode() & 0o7777),
+                    (0, gid, 0o2770)
+                );
+            }
+        }
+        println!("NATIVE_VENDOR_RUNTIME_CACHE_TMP_HANDOFF_AND_CAPABILITY_NORMALIZATION_OK");
         println!("{evidence}");
         drop(harness);
         std::fs::remove_file(&report).unwrap();
+        // Cover the other historical ownership branch without host DAC override.
+        let capability = config.join("mcp-capability");
+        let c_cap = std::ffi::CString::new(capability.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::chown(c_cap.as_ptr(), uid, gid) }, 0);
+        let changed = std::process::Command::new("/usr/bin/setpriv")
+            .args([
+                "--reuid",
+                &uid.to_string(),
+                "--regid",
+                &gid.to_string(),
+                "--clear-groups",
+                "--no-new-privs",
+                "--",
+                "/bin/chmod",
+                "660",
+            ])
+            .arg(&capability)
+            .status()
+            .unwrap();
+        assert!(changed.success());
+        let seat_owned_harness = launch().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !report.is_file() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            std::fs::read_to_string(&report).is_ok_and(
+                |text| text.contains("REAL_MOUNTS_UMASK077_OWNER_FALLBACK_OK SAME_SEAT_OK")
+            ),
+            "seat-owned capability must admit the actual vendor command"
+        );
+        assert_eq!(
+            std::fs::metadata(&capability).unwrap().mode() & 0o777,
+            0o640
+        );
+        drop(seat_owned_harness);
+        // The second command was observed through its real report before stop.
+        let _ = std::fs::remove_file(&report);
+        println!("NATIVE_VENDOR_SEAT_OWNED_CAPABILITY_NORMALIZED_OK");
         // A real admitted child inherits group-writable defaults even when the
         // daemon inherited 077. Explicit 0600 replacements still need the next
         // pre-read config repair; a umask cannot add permissions to such files.
@@ -2437,6 +2530,12 @@ done
         std::fs::rename(config.join(".claude-host-held"), config.join(".claude")).unwrap();
         assert_eq!(snapshot(), before, "protected bytes or permissions changed");
         println!("NATIVE_VENDOR_PROTECTED_BEFORE_EQUALS_AFTER");
+        // The protected foreign-owner controls are empty leaves created only
+        // by this fixture. Unlink them through the admitted writable parent;
+        // never widen their private mode merely to perform teardown.
+        for name in ["cache-home", "tmp"] {
+            std::fs::remove_dir(config.join(name).join("foreign-private")).unwrap();
+        }
         // Native launch also creates a private op leaf. Prove that the reduced-
         // DAC daemon cannot enumerate it before its actual owner removes only
         // known token links and the empty directory. Do not widen private modes
