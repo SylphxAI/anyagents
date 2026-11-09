@@ -106,6 +106,18 @@ diagnostic. A deliberately slow startup exceeds the receipt bound but still
 reaches the ordering assertion; an exited peer cannot satisfy readiness. These
 checks retain busy-steer custody, typed rejection and no-replay assertions.
 
+## Follow-ups queued before the latest reply
+
+Immediately before delivery, the mailbox compares the input's provider time
+(or its receive time when provider time is absent) with settled outbound history
+for the same agent and exact chat/topic or recipient. An earlier input receives
+`queued_before_last_reply="true"` and `last_reply_at_ms` in the shared XML
+envelope. The hint is computed again after restart and is not persisted as
+ingress truth. Equal/later inputs, different topics, different recipients and
+unconfirmed send attempts do not qualify. Delivery order, body and cursor
+semantics remain unchanged: the agent decides whether its last reply answered
+the follow-up; the runtime never drops the input on that assumption.
+
 ## Sylphx transcript projection contract
 
 Raw transcript history is append-only. Projection may prune or summarize context,

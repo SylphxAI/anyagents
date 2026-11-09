@@ -2079,6 +2079,7 @@ impl Store {
             mentions,
             participants,
             topology,
+            last_reply_at_ms: None,
         };
         let message = Message {
             id: MessageId::generate(),
@@ -3777,7 +3778,10 @@ impl Store {
     pub fn next_undelivered(&self, agent_id: &AgentId) -> Result<Option<Message>, Error> {
         let delivered = self.delivered_cursor(agent_id)?;
         let next = delivered + 1;
-        if let Some(message) = self.message_at(agent_id, next)? {
+        if let Some(mut message) = self.message_at(agent_id, next)? {
+            // A follow-up may have been queued during investigation, before the
+            // reply was sent. Resolve fresh delivery metadata, not ingress state.
+            self.annotate_prior_reply(&mut message)?;
             return Ok(Some(message));
         }
         let received = self.received_cursor(agent_id)?;
@@ -3787,6 +3791,46 @@ impl Store {
             )));
         }
         Ok(None)
+    }
+
+    fn annotate_prior_reply(&self, message: &mut Message) -> Result<(), Error> {
+        message.context.last_reply_at_ms = None;
+        let input_at = message.source_time_ms.unwrap_or(message.received_at_ms);
+        if input_at <= 0 {
+            return Ok(());
+        }
+        let destination = if let Some(origin) = message.origin
+            && let Some(chat) = origin.chat_id
+        {
+            Some(match origin.thread_id {
+                Some(topic) => format!("telegram:chat:{chat}:{topic}"),
+                None => format!("telegram:chat:{chat}"),
+            })
+        } else {
+            message
+                .context
+                .destination
+                .as_deref()
+                .filter(|target| {
+                    target.starts_with("agent:")
+                        || target.starts_with("group:")
+                        || target.starts_with("telegram:chat:")
+                })
+                .map(str::to_string)
+        };
+        let Some(destination) = destination else {
+            return Ok(());
+        };
+        let conn = self.conn();
+        // Only settled outbound history is evidence. Pending intents, tool
+        // events, another agent's replies and another topic are not replies here.
+        let latest: Option<i64> = conn.query_row(
+            "SELECT MAX(sent_at_ms) FROM outbound_messages WHERE agent_id=?1 AND destination=?2",
+            params![message.agent_id.as_str(), destination],
+            |row| row.get(0),
+        )?;
+        message.context.last_reply_at_ms = latest.filter(|sent_at| *sent_at > input_at);
+        Ok(())
     }
 
     /// True if there is at least one undelivered message that should wake an idle

@@ -8,6 +8,160 @@ fn setup() -> (tempfile::TempDir, Store, Agent) {
     (dir, store, agent)
 }
 
+#[test]
+fn queued_before_reply_metadata_is_resolved_at_delivery_and_survives_restart() {
+    let (dir, store, agent) = setup();
+    let mut incoming = Incoming::new("follow-up while investigation runs");
+    incoming.source_time_ms = Some(100);
+    incoming.received_at_ms = Some(200);
+    incoming.sender = Some("telegram:user:42:8".into());
+    incoming.origin = Some(Origin {
+        chat_id: Some(42),
+        thread_id: Some(7),
+        message_id: Some(8),
+    });
+    let message = store.receive(&agent.id, incoming).unwrap();
+    let id = match message {
+        ReceiveOutcome::New(message) => message.id,
+        _ => unreachable!(),
+    };
+    assert_eq!(
+        store
+            .next_undelivered(&agent.id)
+            .unwrap()
+            .unwrap()
+            .context
+            .last_reply_at_ms,
+        None
+    );
+    let reply = store
+        .record_outbound(
+            &agent.id,
+            "telegram:chat:42:7",
+            Some("7"),
+            "answer already sent",
+        )
+        .unwrap();
+    store
+        .conn()
+        .execute(
+            "UPDATE outbound_messages SET sent_at_ms=300 WHERE id=?1",
+            [&reply],
+        )
+        .unwrap();
+    drop(store);
+    let store = Store::open(dir.path().join("custom-mailbox.sqlite")).unwrap();
+    let delivered = store.next_undelivered(&agent.id).unwrap().unwrap();
+    assert_eq!(delivered.id, id);
+    assert_eq!(delivered.context.last_reply_at_ms, Some(300));
+    let xml = anyagents_harness::compose_message(
+        delivered.id.as_str(),
+        &delivered.context,
+        &delivered.text,
+    );
+    assert!(xml.contains("queued_before_last_reply=\"true\" last_reply_at_ms=\"300\""));
+    assert!(xml.contains("follow-up while investigation runs"));
+    assert_eq!(
+        store.delivered_cursor(&agent.id).unwrap(),
+        0,
+        "annotation does not drop or acknowledge input"
+    );
+    assert_eq!(
+        store
+            .message(&agent.id, id.as_str())
+            .unwrap()
+            .unwrap()
+            .context
+            .last_reply_at_ms,
+        None,
+        "delivery hints must not become stale persisted ingress state"
+    );
+}
+
+#[test]
+fn prior_reply_requires_exact_agent_conversation_and_strictly_earlier_input() {
+    for (reply_agent, reply_destination, source, received, expected) in [
+        ("own", "telegram:chat:42:7", Some(100), 200, Some(300)),
+        ("other", "telegram:chat:42:7", Some(100), 200, None),
+        ("own", "telegram:chat:43:7", Some(100), 200, None),
+        ("own", "telegram:chat:42:8", Some(100), 200, None),
+        ("own", "telegram:chat:42", Some(100), 200, None),
+        ("own", "telegram:chat:42:7", Some(300), 200, None),
+        ("own", "telegram:chat:42:7", Some(400), 200, None),
+        ("own", "telegram:chat:42:7", None, 200, Some(300)),
+        ("own", "telegram:chat:42:7", None, 400, None),
+        ("own", "telegram:chat:42:7", Some(0), 200, None),
+    ] {
+        let (_dir, store, agent) = setup();
+        let other = store.create_agent(NewAgent::new("other", "test")).unwrap();
+        let mut incoming = Incoming::new("follow-up");
+        incoming.source_time_ms = source;
+        incoming.received_at_ms = Some(received);
+        incoming.origin = Some(Origin {
+            chat_id: Some(42),
+            thread_id: Some(7),
+            message_id: Some(8),
+        });
+        store.receive(&agent.id, incoming).unwrap();
+        let sender = if reply_agent == "own" {
+            &agent.id
+        } else {
+            &other.id
+        };
+        let reply = store
+            .record_outbound(sender, reply_destination, None, "answer")
+            .unwrap();
+        store
+            .conn()
+            .execute(
+                "UPDATE outbound_messages SET sent_at_ms=300 WHERE id=?1",
+                [&reply],
+            )
+            .unwrap();
+        let message = store.next_undelivered(&agent.id).unwrap().unwrap();
+        assert_eq!(
+            message.context.last_reply_at_ms, expected,
+            "{reply_agent} {reply_destination} source={source:?} received={received}"
+        );
+    }
+}
+
+#[test]
+fn direct_agent_reply_metadata_ignores_other_recipients_and_tool_events() {
+    let (_dir, store, agent) = setup();
+    let mut incoming = Incoming::new("direct follow-up");
+    incoming.sender = Some("agent:peer".into());
+    incoming.source_time_ms = Some(100);
+    store.receive(&agent.id, incoming).unwrap();
+    store
+        .record_tool_event(&agent.id, "send", "attempt only, no confirmed reply")
+        .unwrap();
+    store
+        .record_outbound(&agent.id, "agent:other", None, "different recipient")
+        .unwrap();
+    assert_eq!(
+        store
+            .next_undelivered(&agent.id)
+            .unwrap()
+            .unwrap()
+            .context
+            .last_reply_at_ms,
+        None
+    );
+    store
+        .record_outbound(&agent.id, "agent:peer", None, "confirmed reply")
+        .unwrap();
+    assert!(
+        store
+            .next_undelivered(&agent.id)
+            .unwrap()
+            .unwrap()
+            .context
+            .last_reply_at_ms
+            .is_some()
+    );
+}
+
 fn assert_fault(error: Error, needle: &str) {
     assert!(matches!(&error, Error::Db(_)), "{error:?}");
     assert!(error.to_string().contains(needle), "{error:?}");

@@ -179,6 +179,10 @@ pub struct Context {
     /// when peers, siblings, children, or groups change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub topology: Option<String>,
+    /// Confirmed outbound time in this exact conversation, later than this
+    /// input's source/receive time. A delivery-time hint, never a drop decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_reply_at_ms: Option<i64>,
 }
 
 impl Context {
@@ -252,6 +256,11 @@ impl Context {
         ));
         if let Some(destination) = &self.destination {
             out.push_str(&format!(" answer_to=\"{}\"", xml_attr_escape(destination)));
+        }
+        if let Some(last_reply) = self.last_reply_at_ms {
+            out.push_str(&format!(
+                " queued_before_last_reply=\"true\" last_reply_at_ms=\"{last_reply}\""
+            ));
         }
         out.push('>');
         out
@@ -793,6 +802,24 @@ pub fn mentions_marker(value: &Value, id: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn queued_reply_metadata_is_optional_and_legacy_context_stays_readable() {
+        let mut context: super::Context = serde_json::from_str("{}").unwrap();
+        assert!(
+            !context
+                .open_tag("fixture")
+                .contains("queued_before_last_reply")
+        );
+        context.last_reply_at_ms = Some(300);
+        let encoded = serde_json::to_value(&context).unwrap();
+        let restored: super::Context = serde_json::from_value(encoded).unwrap();
+        assert!(
+            restored
+                .open_tag("fixture")
+                .contains("queued_before_last_reply=\"true\" last_reply_at_ms=\"300\"")
+        );
+    }
+
     use super::*;
 
     #[test]
