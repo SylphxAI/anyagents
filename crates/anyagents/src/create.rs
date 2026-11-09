@@ -1567,16 +1567,16 @@ fn refresh_anthropic_profile_oauth_if_due(data: &Path, profile_root: &Path) -> R
                 return Err(err);
             }
             let _ = std::fs::remove_file(profile_root.join(".anyagents-usage-backoff-until-ms"));
-            if let Some(profile_name) = profile_root.file_name().and_then(|n| n.to_str()) {
-                if let Err(err) = propagate_profile_files_to_bound_agents(
+            if let Some(profile_name) = profile_root.file_name().and_then(|n| n.to_str())
+                && let Err(err) = propagate_profile_files_to_bound_agents(
                     data,
                     "anthropic",
                     profile_name,
                     &[".credentials.json", ".claude/.credentials.json"],
-                ) {
-                    let _ = std::fs::remove_file(&attempt_path);
-                    return Err(err);
-                }
+                )
+            {
+                let _ = std::fs::remove_file(&attempt_path);
+                return Err(err);
             }
         }
     }
