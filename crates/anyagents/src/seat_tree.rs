@@ -381,29 +381,30 @@ fn share_open(
         if text.starts_with(".seat-") {
             continue;
         }
-        if matches!(
-            text.as_ref(),
-            ".ssh"
-                | ".gnupg"
-                | "node_modules"
-                | ".bun"
-                | ".turbo"
-                | ".next"
-                | "target"
-                | ".git"
-                | "data-home"
-                | "state-home"
-                | ".cargo"
-                | ".rustup"
-                | "brain"
-                | ".system_generated"
-                | "plugins"
-                | "sessions"
-                | "shell-snapshots"
-                | "telemetry"
-                | "statsig"
-                | "__pycache__"
-        ) || (text == "op" && path.ends_with(".config"))
+        if !owner_only
+            && (matches!(
+                text.as_ref(),
+                ".ssh"
+                    | ".gnupg"
+                    | "node_modules"
+                    | ".bun"
+                    | ".turbo"
+                    | ".next"
+                    | "target"
+                    | ".git"
+                    | "data-home"
+                    | "state-home"
+                    | ".cargo"
+                    | ".rustup"
+                    | "brain"
+                    | ".system_generated"
+                    | "plugins"
+                    | "sessions"
+                    | "shell-snapshots"
+                    | "telemetry"
+                    | "statsig"
+                    | "__pycache__"
+            ) || (text == "op" && path.ends_with(".config")))
         {
             continue;
         }
