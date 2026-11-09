@@ -98,6 +98,57 @@ fn mcp_without_a_server_fails() {
 }
 
 #[test]
+fn plain_log_tail_keeps_the_bounded_conversation_route() {
+    use std::io::{Read, Write};
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("operator-token"), "fixture-token").unwrap();
+    let listener =
+        std::os::unix::net::UnixListener::bind(dir.path().join("anyagents.sock")).unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut header = Vec::new();
+        while !header.ends_with(b"\r\n\r\n") {
+            let mut byte = [0];
+            stream.read_exact(&mut byte).unwrap();
+            header.push(byte[0]);
+        }
+        let header = String::from_utf8(header).unwrap();
+        let line = header.lines().next().unwrap();
+        assert!(
+            line.contains("/v1/agents/vulcan/conversation?limit=5"),
+            "{line}"
+        );
+        assert!(
+            !line.contains("include_tools"),
+            "plain tails must not select indexed/native transcript search: {line}"
+        );
+        let body = r#"{"agent":"vulcan","agent_id":"fixture","turns":[]}"#;
+        write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).unwrap();
+    });
+    let output = bin()
+        .env(
+            "ANYAGENTS_OPERATOR_TOKEN_FILE",
+            dir.path().join("operator-token"),
+        )
+        .arg("--data")
+        .arg(dir.path())
+        .args(["logs", "vulcan", "-n", "5", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(value["turns"].as_array().unwrap().is_empty());
+    server.join().unwrap();
+}
+
+#[test]
 fn create_send_inbox_and_usage() {
     let dir = tempfile::tempdir().unwrap();
     let create = bin_in(dir.path())

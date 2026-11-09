@@ -467,6 +467,18 @@ pub fn read_conversation(
     } else {
         Some(options.limit.unwrap_or(20))
     };
+    let structured = query.is_some()
+        || direction.is_some()
+        || options.sender.is_some()
+        || options.until.is_some()
+        || options.from_seq.is_some()
+        || options.to_seq.is_some()
+        || options.tools
+        || options.only_tools
+        || options.tool.is_some()
+        || options.sort.is_some()
+        || options.radius.is_some()
+        || options.exclude.is_some();
     if client::can_call_server(data) {
         let mut params = Vec::new();
         for (key, value) in [
@@ -504,7 +516,10 @@ pub fn read_conversation(
         }
         if options.tools || options.only_tools || options.tool.is_some() {
             params.push("include_tools=true".into());
-        } else {
+        } else if structured || options.scope.as_deref().is_some_and(|s| s != "all") {
+            // Plain per-agent logs already read only the mailbox/outbound tables.
+            // Sending this flag there would select full structured/indexed search,
+            // including unrelated native transcript parsing, for a five-row tail.
             params.push("include_tools=false".into());
         }
         if options.only_tools {
@@ -530,18 +545,6 @@ pub fn read_conversation(
         ));
     }
     let store = open(data)?;
-    let structured = query.is_some()
-        || direction.is_some()
-        || options.sender.is_some()
-        || options.until.is_some()
-        || options.from_seq.is_some()
-        || options.to_seq.is_some()
-        || options.tools
-        || options.only_tools
-        || options.tool.is_some()
-        || options.sort.is_some()
-        || options.radius.is_some()
-        || options.exclude.is_some();
     let canonical = if matches!(target, "all" | "*") {
         None
     } else {
