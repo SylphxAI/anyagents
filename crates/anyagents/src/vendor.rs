@@ -2096,6 +2096,8 @@ cat >/dev/null
 set -eu
 [ "$(umask)" = 0007 ]
 base="$ANYAGENTS_AGENT_CONFIG/.gemini/antigravity-cli"
+grep -q 'send-immediately' "$base/settings.json"
+cp "$base/settings.json" "$ANYAGENTS_AGENT_CONFIG/agy-before-start.json"
 mkdir -p "$base/builtin" "$base/conversations"
 printf default > "$base/conversations/default"
 printf '{"queuedMessages":"queued","retained":"synthetic"}' > "$base/settings.new"
@@ -2155,15 +2157,8 @@ cat >/dev/null
             std::io::ErrorKind::PermissionDenied
         );
         assert!(ensure_agy_steering_settings(&config, &root.join("work")).is_err());
-        // Repeat the exact vendor-launch preparation, but stop before the probe
-        // makes its next restrictive replacement, to inspect daemon writeback.
-        crate::sandbox::prepare_config_with_seat_uid(&config, uid, gid).unwrap();
-        ensure_agy_steering_settings(&config, &root.join("work")).unwrap();
-        let value: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&settings).unwrap()).unwrap();
-        assert_eq!(value["retained"], "synthetic");
-        assert_eq!(value["queuedMessages"], "send-immediately");
-        assert_eq!(std::fs::metadata(&settings).unwrap().mode() & 0o060, 0o060);
+        // Relaunch with the inaccessible replacement still in place. This
+        // exercises actual pre-read preparation, not a helper-only repair.
         std::fs::remove_file(&ready).unwrap();
         let relaunched = vendor_launch_with_store(
             LaunchRequest {
@@ -2182,6 +2177,14 @@ cat >/dev/null
         }
         assert!(ready.exists(), "AGY relaunch refused before config repair");
         drop(relaunched);
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(config.join("agy-before-start.json")).unwrap())
+                .unwrap();
+        assert_eq!(value["retained"], "synthetic");
+        assert_eq!(value["queuedMessages"], "send-immediately");
+        crate::sandbox::prepare_config_with_seat_uid(&config, uid, gid).unwrap();
+        ensure_agy_steering_settings(&config, &root.join("work")).unwrap();
+        assert_eq!(std::fs::metadata(&settings).unwrap().mode() & 0o060, 0o060);
         println!("NATIVE_AGY_GROUP_DEFAULTS_AND_PRIVATE_REPLACEMENT_REPAIRED");
         for name in ["memory", "skills", "config"] {
             std::fs::set_permissions(peer.join(name), std::fs::Permissions::from_mode(0o777))

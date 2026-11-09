@@ -416,7 +416,11 @@ mod tests {
         );
         assert_eq!(
             std::fs::metadata(dir.path().join("nested")).unwrap().mode() & 0o7777,
-            0o2770
+            if cfg!(target_os = "linux") {
+                0o2770
+            } else {
+                0o770
+            }
         );
         assert_eq!(
             std::fs::metadata(dir.path().join("nested/value"))
