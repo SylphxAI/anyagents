@@ -71,7 +71,7 @@ enum Command {
     /// Sign an agent's harness or a server master profile in through the vendor's own command.
     #[command(visible_alias = "signin", alias = "login")]
     SignIn {
-        /// Agent name, `<provider>/<profile>`, or harness ID (`sylphx`, `claude-code`, `codex`, `opencode`, `agy`, `muse`, `omp`, `dsh`, `grok`).
+        /// Agent name, `<provider>/<profile>`, or harness ID (`spiron`, `claude-code`, `codex`, `opencode`, `agy`, `muse`, `omp`, `dsh`, `grok`).
         agent: String,
         /// Optional master profile name (e.g. `acct-1`, `acct-2`, `default`).
         #[arg(long)]
@@ -136,7 +136,7 @@ enum Command {
         /// Set sub-agent default to inherit parent's harness, model, and profile (`subagents default --inherit`).
         #[arg(long)]
         inherit: bool,
-        /// Set sub-agent default harness (`subagents default --harness sylphx`).
+        /// Set sub-agent default harness (`subagents default --harness spiron`).
         #[arg(long)]
         harness: Option<String>,
         /// Set sub-agent default model (`subagents default --model sylphx/openai/gpt-6.1-sol#xhigh`).
@@ -2063,8 +2063,7 @@ fn sign_in(data: &Path, target: &str, profile: Option<&str>) -> Result<(), anyag
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .or(split_prof);
-    let target = match split_target {
-        "sylphx-agent" | "sylphx_agent" => "sylphx",
+    let target = match anyagents_harness::normalize_harness_name(split_target) {
         "anthropic" => "claude-code",
         "openai" => "codex",
         "google-antigravity" => "agy",
@@ -2312,6 +2311,7 @@ fn apply_local_subagent_default(
         harness: harness
             .map(str::trim)
             .filter(|s| !s.is_empty())
+            .map(anyagents_harness::normalize_harness_name)
             .map(str::to_string),
         model: model
             .map(str::trim)

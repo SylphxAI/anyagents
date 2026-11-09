@@ -1297,7 +1297,7 @@ fn switch_at_dispatch(state: &str, retiring: RetiringTurn, model_only: bool) {
 
     let dir = short_dir();
     let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
-    let mut spec = NewAgent::new("switch-target", "sylphx");
+    let mut spec = NewAgent::new("switch-target", "spiron");
     spec.model = Some("old-model".into());
     spec.instructions = Some("preserve these instructions".into());
     let agent = store.create_agent(spec).unwrap();
@@ -1400,7 +1400,7 @@ fn switch_at_dispatch(state: &str, retiring: RetiringTurn, model_only: bool) {
     }
     assert!(wait_until(|| supervisor.live(&agent.id).is_some_and(|l| {
         l.live_model.as_deref() == Some("new-model")
-            && l.live_harness.as_deref() == Some(if model_only { "sylphx" } else { "codex" })
+            && l.live_harness.as_deref() == Some(if model_only { "spiron" } else { "codex" })
     })));
     // No manual-clock advance: an errored turn must not wait for the drain.
     assert_eq!(clock.now_ms(), 1_700_000_000_000);

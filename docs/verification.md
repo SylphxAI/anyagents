@@ -16,7 +16,7 @@ temporary data directories rather than your existing AnyAgents state.
 
 | Layer | Evidence |
 | --- | --- |
-| External Spiron protocol | `cargo test -p anyagents spiron_external --locked` launches a synthetic `ANYAGENTS_SPIRON_BIN` executable for `spiron`, legacy `sylphx` and `sylphx/default`. It checks MCP/workspace/skills/model/identity/state paths, correlated acceptance before mailbox release, busy steering, unrelated results, cancellation and wake/resume, usage and unchanged stored identity/mail/history/schedules/legacy files. Real Spiron authentication, model calls and legacy-state import are upstream integration requirements, not certified by this probe. |
+| External Spiron protocol | `cargo test -p anyagents spiron_external --locked` launches a synthetic `ANYAGENTS_SPIRON_BIN` executable for `spiron` and the legacy selectors `sylphx`, `sylphx-agent`, `sylphx_agent` and `sylphx/default`. It checks canonical `spiron` agent records, MCP/workspace/skills/model/identity/state paths, correlated acceptance before mailbox release, busy steering, unrelated results, cancellation and wake/resume, usage and unchanged stored identity/mail/history/schedules/legacy files. Real Spiron authentication, model calls and legacy-state import are upstream integration requirements, not certified by this probe. |
 | Native protocols | Each of Claude Code, Codex, OpenCode, agy, Muse and omp has an adapter `protocol` suite using scripted vendor processes. These exercise the native launch and wire contracts, turn completion, retries, and the adapter's steering or buffering behavior. |
 | Shared transport | `anyagents-harness-stream` tests the shared stream/RPC machinery used by adapters, including dsh and grok. This is not a dedicated live dsh/grok compatibility check. |
 | Server round trips | `server_harnesses` creates agents for all eight catalog harnesses and checks two successive correlated mailbox replies per harness through the real server, supervisor and MCP tool server. It substitutes a common contract double: passing does **not** prove native vendor protocol compatibility. |
@@ -457,7 +457,7 @@ ancestor makes its ordinary `RUNNER_TEMP` inaccessible to the distinct UID.
 The receipt remains in `RUNNER_TEMP`, read only by the invoking CI process.
 No account, ACL, real agent directory or daemon is changed.
 
-An already-started native Sylphx harness refreshes the embedding host's registered
+The legacy first-party harness refreshed the embedding host's registered
 peer principal inventory before every local workspace command. A child or sibling
 created mid-turn in the same seat is admitted by its resolved UID, GID and exact
 agent root, not directory group or mode. The unit regression creates a `02770`

@@ -1631,7 +1631,12 @@ async fn set_subagent_defaults_route(
     } else {
         let spec = create::SubagentDefaultSpec {
             mode: body.mode,
-            harness: body.harness.filter(|s| !s.trim().is_empty()),
+            harness: body
+                .harness
+                .as_deref()
+                .map(anyagents_harness::normalize_harness_name)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
             model: body.model.filter(|s| !s.trim().is_empty()),
             profile: body.profile.filter(|s| !s.trim().is_empty()),
         };
@@ -2709,7 +2714,7 @@ fn agent_view_preloaded(
         pending_switch,
         mut last_error,
     ) = match health.get(&agent.id) {
-        Some(live) if agent.harness != "sylphx" || live.process_alive => {
+        Some(live) if !crate::vendor::is_spiron_harness(&agent.harness) || live.process_alive => {
             let effective_quota = live.quota_reset_at_ms.or(session_quota);
             let effective_err = live.last_error.clone().or(session_error);
             let working = live.process_alive
@@ -2746,7 +2751,7 @@ fn agent_view_preloaded(
         }
         _ => {
             let (mode, steer) = declared(&agent.harness);
-            let lock_busy = agent.harness == "sylphx"
+            let lock_busy = crate::vendor::is_spiron_harness(&agent.harness)
                 && matches!(
                     store.try_lock_agent(&agent.id),
                     Err(anyagents_core::Error::AgentBusy)
@@ -6715,7 +6720,7 @@ pub(crate) mod tests {
             "opencode",
             "muse",
             "omp",
-            "sylphx",
+            "spiron",
         ] {
             let agent = store
                 .create_agent(anyagents_core::NewAgent::new(harness, harness))
@@ -6749,6 +6754,53 @@ pub(crate) mod tests {
             view.last_error = None;
             view = crate::agent::view_named(dir.path(), &agent.name).unwrap();
             assert_eq!(view.last_error.as_deref(), Some("current harness failed"));
+        }
+    }
+
+    #[test]
+    fn spiron_agent_view_uses_turn_lock_with_missing_or_stale_health() {
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let health = HealthBoard::default();
+        let mut agent = store
+            .create_agent(anyagents_core::NewAgent::new("lock-owner", "spiron"))
+            .unwrap();
+        for selector in [
+            "spiron",
+            "sylphx",
+            "sylphx-agent",
+            "sylphx_agent",
+            "sylphx/default",
+        ] {
+            // Exercise legacy in-memory records as well as canonical stored rows.
+            agent.harness = selector.into();
+            assert_eq!(agent_view(&store, &health, &agent).unwrap().process, "down");
+            let lock = store.try_lock_agent(&agent.id).unwrap();
+            let busy = agent_view(&store, &health, &agent).unwrap();
+            assert_eq!(busy.process, "alive", "{selector}");
+            assert_eq!(busy.turn_state, "working", "{selector}");
+            health.publish(
+                &agent.id,
+                anyagents_supervisor::LiveState {
+                    process_alive: false,
+                    turn_state: anyagents_harness::TurnState::Idle,
+                    delivery_mode: anyagents_harness::DeliveryMode::Steer,
+                    steer_support: anyagents_harness::SteerSupport::Yes,
+                    quota_reset_at_ms: None,
+                    restart_at_ms: None,
+                    pid: None,
+                    live_harness: Some("spiron".into()),
+                    live_model: None,
+                    process_started_at_ms: None,
+                    last_error: None,
+                },
+            );
+            assert_eq!(
+                agent_view(&store, &health, &agent).unwrap().turn_state,
+                "working"
+            );
+            drop(lock);
+            assert_eq!(agent_view(&store, &health, &agent).unwrap().process, "down");
         }
     }
 
@@ -7326,13 +7378,13 @@ pub(crate) mod tests {
         let dir = crate::test_tempdir();
         let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
         let parent = store
-            .create_agent(anyagents_core::NewAgent::new("range-parent", "sylphx"))
+            .create_agent(anyagents_core::NewAgent::new("range-parent", "spiron"))
             .unwrap();
-        let mut new = anyagents_core::NewAgent::new("range-child", "sylphx");
+        let mut new = anyagents_core::NewAgent::new("range-child", "spiron");
         new.parent_id = Some(parent.id.clone());
         let child = store.create_agent(new).unwrap();
         let peer = store
-            .create_agent(anyagents_core::NewAgent::new("range-peer", "sylphx"))
+            .create_agent(anyagents_core::NewAgent::new("range-peer", "spiron"))
             .unwrap();
         let bytes: Vec<u8> = [
             b"rangeneedle ".as_slice(),
@@ -7412,13 +7464,13 @@ pub(crate) mod tests {
         let dir = crate::test_tempdir();
         let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
         let parent = store
-            .create_agent(anyagents_core::NewAgent::new("history-parent", "sylphx"))
+            .create_agent(anyagents_core::NewAgent::new("history-parent", "spiron"))
             .unwrap();
-        let mut new = anyagents_core::NewAgent::new("history-child", "sylphx");
+        let mut new = anyagents_core::NewAgent::new("history-child", "spiron");
         new.parent_id = Some(parent.id.clone());
         let child = store.create_agent(new).unwrap();
         let peer = store
-            .create_agent(anyagents_core::NewAgent::new("history-peer", "sylphx"))
+            .create_agent(anyagents_core::NewAgent::new("history-peer", "spiron"))
             .unwrap();
         for a in [&parent, &child, &peer] {
             let root = dir.path().join("agents").join(a.id.as_str());

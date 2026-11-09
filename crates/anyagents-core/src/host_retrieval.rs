@@ -711,10 +711,10 @@ mod tests {
         let db = dir.path().join("state.db");
         let store = Store::open(&db).unwrap();
         let own = store
-            .create_agent(NewAgent::new("tool-owner", "sylphx"))
+            .create_agent(NewAgent::new("tool-owner", "spiron"))
             .unwrap();
         let peer = store
-            .create_agent(NewAgent::new("tool-peer", "sylphx"))
+            .create_agent(NewAgent::new("tool-peer", "spiron"))
             .unwrap();
         let path = |agent: &Agent| {
             dir.path()
@@ -888,7 +888,7 @@ mod tests {
         let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let agent = store
-            .create_agent(NewAgent::new("native-time", "sylphx"))
+            .create_agent(NewAgent::new("native-time", "spiron"))
             .unwrap();
         let path = dir
             .path()
@@ -959,10 +959,10 @@ mod tests {
         let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let own = store
-            .create_agent(NewAgent::new("page-owner", "sylphx"))
+            .create_agent(NewAgent::new("page-owner", "spiron"))
             .unwrap();
         let hidden = store
-            .create_agent(NewAgent::new("page-hidden", "sylphx"))
+            .create_agent(NewAgent::new("page-hidden", "spiron"))
             .unwrap();
         let mut own_path = PathBuf::new();
         for agent in [&own, &hidden] {
@@ -1021,7 +1021,7 @@ mod tests {
         let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let agent = store
-            .create_agent(NewAgent::new("boundary-owner", "sylphx"))
+            .create_agent(NewAgent::new("boundary-owner", "spiron"))
             .unwrap();
         let root = dir.path().join("agents").join(agent.id.as_str());
         fs::create_dir_all(root.join("config")).unwrap();
@@ -1149,7 +1149,7 @@ mod tests {
         let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let agent = store
-            .create_agent(NewAgent::new("verifier-owner", "sylphx"))
+            .create_agent(NewAgent::new("verifier-owner", "spiron"))
             .unwrap();
         let root = dir
             .path()
@@ -1289,7 +1289,7 @@ mod tests {
         let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let agent = store
-            .create_agent(NewAgent::new("scoped-owner", "sylphx"))
+            .create_agent(NewAgent::new("scoped-owner", "spiron"))
             .unwrap();
         let root = dir.path().join("agents").join(agent.id.as_str());
         fs::create_dir_all(root.join("memory")).unwrap();
@@ -1350,7 +1350,7 @@ mod tests {
         let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let agent = store
-            .create_agent(NewAgent::new("cursor-owner", "sylphx"))
+            .create_agent(NewAgent::new("cursor-owner", "spiron"))
             .unwrap();
         let path = dir.path().join("native.jsonl");
         let prefix = b"{\"role\":\"user\",\"content\":\"originalneedle\"}\n{\"role\":\"assistant\",\"content\":\"secondneedle\"}\n";
@@ -1490,7 +1490,7 @@ mod tests {
         let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let agent = store
-            .create_agent(NewAgent::new("redaction-owner", "sylphx"))
+            .create_agent(NewAgent::new("redaction-owner", "spiron"))
             .unwrap();
         store.set_agent_state(&agent.id, "archived").unwrap();
         let root = dir.path().join("agents").join(agent.id.as_str());
@@ -1659,7 +1659,7 @@ mod tests {
         let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let agent = store
-            .create_agent(NewAgent::new("old-name", "sylphx"))
+            .create_agent(NewAgent::new("old-name", "spiron"))
             .unwrap();
         store.rename_agent(&agent.id, "new-name").unwrap();
         let root = dir
@@ -1705,9 +1705,9 @@ mod tests {
     fn authorized_full_text_native_in_place_and_memory_share_filters() {
         let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
-        let own = store.create_agent(NewAgent::new("own", "sylphx")).unwrap();
+        let own = store.create_agent(NewAgent::new("own", "spiron")).unwrap();
         let hidden = store
-            .create_agent(NewAgent::new("hidden", "sylphx"))
+            .create_agent(NewAgent::new("hidden", "spiron"))
             .unwrap();
         for agent in [&own, &hidden] {
             let root = dir.path().join("agents").join(agent.id.as_str());
@@ -1833,7 +1833,7 @@ mod tests {
         let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let agent = store
-            .create_agent(NewAgent::new("topic-owner", "sylphx"))
+            .create_agent(NewAgent::new("topic-owner", "spiron"))
             .unwrap();
         let root = dir.path().join("agents").join(agent.id.as_str());
         crate::learned_memory::write_sleep_state(

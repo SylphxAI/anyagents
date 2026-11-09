@@ -370,9 +370,9 @@ mod tests {
         };
         let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
-        let active = store.create_agent(NewAgent::new("live", "sylphx")).unwrap();
+        let active = store.create_agent(NewAgent::new("live", "spiron")).unwrap();
         let selected = store
-            .create_agent(NewAgent::new("selected", "sylphx"))
+            .create_agent(NewAgent::new("selected", "spiron"))
             .unwrap();
         let root = |id: &AgentId| dir.path().join("agents").join(id.as_str());
         let active_config = root(&active.id).join("config");
@@ -463,10 +463,10 @@ mod tests {
             let dir = crate::test_tempdir();
             let store = Store::open(dir.path().join("state.db")).unwrap();
             let bad = store
-                .create_agent(NewAgent::new("unreadable", "sylphx"))
+                .create_agent(NewAgent::new("unreadable", "spiron"))
                 .unwrap();
             let good = store
-                .create_agent(NewAgent::new("healthy", "sylphx"))
+                .create_agent(NewAgent::new("healthy", "spiron"))
                 .unwrap();
             let root = |id: &AgentId| dir.path().join("agents").join(id.as_str());
             for agent in [&bad, &good] {
@@ -544,7 +544,7 @@ mod tests {
         let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let agent = store
-            .create_agent(NewAgent::new("selected", "sylphx"))
+            .create_agent(NewAgent::new("selected", "spiron"))
             .unwrap();
         let memory = dir
             .path()
@@ -617,7 +617,7 @@ mod tests {
         let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let agent = store
-            .create_agent(NewAgent::new("known-owner", "sylphx"))
+            .create_agent(NewAgent::new("known-owner", "spiron"))
             .unwrap();
         let root = dir.path().join("agents").join(agent.id.as_str());
         let config = root.join("config");

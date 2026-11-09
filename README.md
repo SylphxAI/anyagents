@@ -2,7 +2,7 @@
 
 Run coding agent harnesses as long-lived agents on your own machine, container or cluster. AnyAgents orchestrates external **Spiron** (`--harness spiron`), Claude Code (`claude-code`), Codex (`codex`), OpenCode (`opencode`), Antigravity (`agy`), Muse (`muse`), Oh My Pi (`omp`), DeepSeek Harness (`dsh`) and Grok CLI (`grok`). It owns durable mailboxes, supervision, groups, schedules, channel delivery, MCP access and usage accounting. Each external harness owns its model/tool loop, context windows and memory policy.
 
-The legacy `sylphx` harness name selects the same external `spiron` adapter. Existing agent IDs, worktrees, mailbox cursors, conversations and schedules do not change. Install a Spiron release supporting `spiron.headless/v1` on `PATH`, or set `ANYAGENTS_SPIRON_BIN` to that executable. AnyAgents does not bundle an LLM harness. The design is in [docs/](docs/).
+The legacy harness names `sylphx`, `sylphx-agent`, `sylphx_agent` and `sylphx/default` resolve to `spiron`; opening an existing `state.db` automatically migrates those agent harness selectors. Existing agent IDs, worktrees, mailbox cursors, conversations and schedules do not change. Sylphx model provider IDs and credential profiles (such as `sylphx/openai/gpt-6.1-sol#medium` and `sylphx/default`) remain unchanged. Install a Spiron release supporting `spiron.headless/v1` on `PATH`, or set `ANYAGENTS_SPIRON_BIN` to that executable. AnyAgents does not bundle an LLM harness. The design is in [docs/](docs/).
 
 ## Install
 

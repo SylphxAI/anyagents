@@ -250,11 +250,9 @@ impl HealthBoard {
 /// turn to end. AGY's stream input also starts a turn per line; its hook helpers
 /// have no wired, confirmed consumption acknowledgement.
 pub fn declared(harness: &str) -> (DeliveryMode, SteerSupport) {
-    match harness {
+    match anyagents_harness::normalize_harness_name(harness) {
         "codex" | "claude-code" | "opencode" | "muse" | "agy" | "omp" | "dsh" | "grok"
-        | "spiron" | "sylphx" | "sylphx-agent" | "sylphx_agent" | "sylphx/default" => {
-            (DeliveryMode::Steer, SteerSupport::Yes)
-        }
+        | "spiron" => (DeliveryMode::Steer, SteerSupport::Yes),
         _ => (DeliveryMode::Followup, SteerSupport::Unproven),
     }
 }
@@ -1608,7 +1606,11 @@ mod tests {
             "omp",
             "dsh",
             "grok",
+            "spiron",
             "sylphx",
+            "sylphx-agent",
+            "sylphx_agent",
+            "sylphx/default",
         ] {
             assert_eq!(
                 super::declared(harness),
@@ -1625,13 +1627,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn legacy_admin_files_do_not_disable_sylphx_supervision() {
+    fn legacy_admin_files_do_not_disable_spiron_supervision() {
         let dir = tempfile::tempdir().unwrap();
         for legacy in ["admin.sock", "admin.lock"] {
             fs::write(dir.path().join(legacy), b"stale").unwrap();
         }
         let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
-        let mut new = anyagents_core::NewAgent::new("cloud-worker", "sylphx");
+        let mut new = anyagents_core::NewAgent::new("cloud-worker", "spiron");
         new.role = Some("Worker".into());
         let agent = store.create_agent(new).unwrap();
         store.set_agent_state(&agent.id, "running").unwrap();

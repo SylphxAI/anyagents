@@ -387,7 +387,7 @@ struct AgentsArgs {
     #[serde(default)]
     action: Option<String>,
     /// Target body id when action = "redact"; `transcript:<zero-based-line>` addresses
-    /// a Sylphx output/content string in config/sylphx-transcript.jsonl.
+    /// a legacy first-party output/content string in config/sylphx-transcript.jsonl.
     #[serde(default)]
     message_id: Option<String>,
     /// Mailbox sequence instead of message_id when action = "redact".
@@ -431,7 +431,7 @@ struct AgentsArgs {
     /// Set `true` to clear the description or role label when `action` is `"describe"` or `"role"`.
     #[serde(default)]
     clear: Option<bool>,
-    /// Harness catalog ID when `action` is `"spawn"`, `"create"`, or `"harness"` (`sylphx`, `opencode`, `codex`, `claude-code`, `agy`, `muse`, `omp`, `dsh`, `grok`, or `"inherit"`).
+    /// Harness catalog ID when `action` is `"spawn"`, `"create"`, or `"harness"` (`spiron`, `opencode`, `codex`, `claude-code`, `agy`, `muse`, `omp`, `dsh`, `grok`, or `"inherit"`).
     #[serde(default)]
     harness: Option<String>,
     /// Optional model override when `action` is `"spawn"`, `"create"`, or `"harness"`.

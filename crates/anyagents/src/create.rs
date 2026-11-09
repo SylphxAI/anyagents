@@ -5,6 +5,7 @@
 use std::path::{Path, PathBuf};
 
 use anyagents_core::{Agent, AgentId, Error, NewAgent, Store, agent_config_dir, agent_work_dir};
+use anyagents_harness::normalize_harness_name;
 
 use crate::{install, mcp_config, muse_config, opencode_config};
 
@@ -72,10 +73,7 @@ fn create_with_seat(
     consumer: &crate::worktree::Consumer,
     seat_override: Option<WorkdirSeat>,
 ) -> Result<Agent, Error> {
-    let normalized_harness = match request.harness.trim() {
-        "sylphx-agent" | "sylphx_agent" | "sylphx/default" => "sylphx".to_string(),
-        other => other.to_string(),
-    };
+    let normalized_harness = normalize_harness_name(&request.harness).to_string();
     // A harness is installed only if an adapter can start it.
     install::adapter(&normalized_harness)?;
     let mut new = NewAgent::new(request.name, normalized_harness.clone());
@@ -85,7 +83,7 @@ fn create_with_seat(
         .map(|m| m.trim().to_string())
         .filter(|m| !m.is_empty())
         .or_else(|| {
-            matches!(normalized_harness.as_str(), "spiron" | "sylphx")
+            (normalized_harness == "spiron")
                 .then(|| crate::spiron::DEFAULT_SPIRON_MODEL.to_string())
         });
     new.description = request
@@ -198,7 +196,10 @@ fn create_with_seat(
             explicit_workdir.as_ref().is_some_and(|p| !p.exists()) || effective_repo.is_some();
         let managed_abs = std::path::absolute(&managed)?;
         let cwd = if let Some(repo_raw) = effective_repo {
-            if agent.harness == "sylphx" && is_cloud_agent_mode && explicit_workdir.is_none() {
+            if crate::vendor::is_spiron_harness(&agent.harness)
+                && is_cloud_agent_mode
+                && explicit_workdir.is_none()
+            {
                 provision_cloud_sandbox_worktree_marker(
                     store,
                     &agent,
@@ -227,7 +228,7 @@ fn create_with_seat(
                 target_wt
             }
         } else if wd_is_private_keyword {
-            if agent.harness == "sylphx" && is_cloud_agent_mode {
+            if crate::vendor::is_spiron_harness(&agent.harness) && is_cloud_agent_mode {
                 provision_cloud_sandbox_worktree_marker(
                     store,
                     &agent,
@@ -274,7 +275,7 @@ fn create_with_seat(
                 }
                 None => {
                     if agent.parent_id.is_some() {
-                        if agent.harness == "sylphx" && is_cloud_agent_mode {
+                        if crate::vendor::is_spiron_harness(&agent.harness) && is_cloud_agent_mode {
                             provision_cloud_sandbox_worktree_marker(
                                 store,
                                 &agent,
@@ -792,7 +793,7 @@ pub(crate) fn write_agent_instructions_with_continuity(
         }
     }
 
-    // Sylphx assembles the shared layer independently. Native harnesses load
+    // Spiron assembles the shared layer independently. Other harnesses load
     // their global AGENTS.md / CLAUDE.md / GEMINI.md instead, so those files
     // must retain the shared layer even though SYSTEM_PROMPT.md stays compact.
     let mut native_doc = doc.clone();
@@ -1570,7 +1571,7 @@ pub(crate) fn seed_harness_credentials(
         all_agents.retain(|a| a.state != "archived");
     }
     let provider = upstream_provider_of(&agent.harness, agent.model.as_deref());
-    let static_rel_paths: &[&str] = match agent.harness.as_str() {
+    let static_rel_paths: &[&str] = match normalize_harness_name(&agent.harness) {
         "claude-code" => &[".credentials.json", ".claude/.credentials.json"],
         "codex" if provider == "openai" => &[
             "auth.json",
@@ -1631,7 +1632,7 @@ pub(crate) fn seed_harness_credentials(
             ".grok/models_cache.json",
             ".grok/settings_cache.json",
         ],
-        "spiron" | "sylphx" => &[
+        "spiron" => &[
             ".config/sylphx/credentials.json",
             ".config/sylphx/context.json",
             ".config/sylphx/key",
@@ -1979,9 +1980,9 @@ pub(crate) fn compute_live_session_continuity(
         "omp",
         "dsh",
         "grok",
-        "sylphx",
+        "spiron",
     ] {
-        if candidate == agent.harness {
+        if candidate == normalize_harness_name(&agent.harness) {
             continue;
         }
         if let Some(fname) = harness_session_filename(candidate) {
@@ -2214,7 +2215,7 @@ pub(crate) fn reconcile_agent_runtime_config(
                 let _ = std::fs::remove_file(config.join(stale_file));
             }
         }
-        match agent.harness.as_str() {
+        match normalize_harness_name(&agent.harness) {
             "codex" => {
                 let codex_toml = config.join("config.toml");
                 mcp_config::write_codex_with_model(
@@ -2249,7 +2250,7 @@ pub(crate) fn reconcile_agent_runtime_config(
             "grok" => {
                 crate::grok::write_grok_config(config, agent.model.as_deref(), &command, &args)?;
             }
-            "spiron" | "sylphx" => {
+            "spiron" => {
                 crate::spiron::write_spiron_config(
                     config,
                     agent.model.as_deref(),
@@ -2465,10 +2466,10 @@ pub(crate) fn verify_harness_runtime_config(
                 ));
             }
         }
-        "spiron" | "sylphx" => {
+        selector if crate::vendor::is_spiron_harness(selector) => {
             let path = config.join("spiron-mcp.json");
             let text = std::fs::read_to_string(&path).map_err(|_| {
-                Error::Message(format!("sylphx runtime config missing: {}", path.display()))
+                Error::Message(format!("spiron runtime config missing: {}", path.display()))
             })?;
             if !text.contains("\"anyagents\"") {
                 return Err(Error::Message(
@@ -2601,9 +2602,8 @@ pub(crate) fn configure_agent_runtime(
     let config = agent_config_dir(data, &existing.id);
     let target_harness = match harness.map(str::trim) {
         Some("") => return Err(Error::Message("harness is empty".into())),
-        Some("sylphx-agent" | "sylphx_agent") => "sylphx".to_string(),
-        Some(h) => h.to_string(),
-        None => existing.harness.clone(),
+        Some(h) => normalize_harness_name(h).to_string(),
+        None => normalize_harness_name(&existing.harness).to_string(),
     };
     crate::install::adapter(&target_harness)?;
     if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none()
@@ -2671,7 +2671,7 @@ pub(crate) fn configure_agent_runtime(
             .map(|arr| {
                 let mut v: Vec<String> = arr
                     .into_iter()
-                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .filter_map(|x| x.as_str().map(normalize_harness_name).map(str::to_string))
                     .collect();
                 for d in &default_compat {
                     if !v.iter().any(|x| x == d) {
@@ -4061,31 +4061,25 @@ pub(crate) fn upstream_provider_of(harness: &str, model: Option<&str>) -> String
             _ => {}
         }
     }
-    match harness {
+    match normalize_harness_name(harness) {
         "claude-code" => "anthropic".to_string(),
         "codex" => "openai".to_string(),
         "agy" => "google-antigravity".to_string(),
         "muse" => "muse".to_string(),
         "dsh" => "deepseek".to_string(),
         "grok" => "xai".to_string(),
-        "spiron" | "sylphx" | "opencode" | "omp" => "sylphx".to_string(),
+        "spiron" | "opencode" | "omp" => "sylphx".to_string(),
         other => other.to_string(),
     }
 }
 
 pub(crate) fn default_kind_and_harnesses(provider: &str) -> (&'static str, Vec<String>) {
-    let harnesses = |list: &[&str]| {
-        let mut values: Vec<String> = list.iter().map(|s| (*s).to_string()).collect();
-        if list.contains(&"sylphx") {
-            values.push("spiron".to_string());
-        }
-        values
-    };
+    let harnesses = |list: &[&str]| list.iter().map(|s| (*s).to_string()).collect();
     match provider {
         "sylphx" => (
             "api-key",
             harnesses(&[
-                "sylphx",
+                "spiron",
                 "opencode",
                 "omp",
                 "claude-code",
@@ -4109,7 +4103,7 @@ pub(crate) fn default_kind_and_harnesses(provider: &str) -> (&'static str, Vec<S
         ),
         "qwen-token-plan" | "kimi-code-plan" | "glm-code-plan" | "minimax-code-plan" => (
             "coding-plan",
-            harnesses(&["sylphx", "opencode", "omp", "claude-code", "codex", "dsh"]),
+            harnesses(&["spiron", "opencode", "omp", "claude-code", "codex", "dsh"]),
         ),
         "anthropic" => (
             "subscription",
@@ -4534,7 +4528,9 @@ fn sync_and_list_provider_profiles_inner(
                     {
                         let parsed: Vec<String> = arr
                             .iter()
-                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .filter_map(|v| {
+                                v.as_str().map(normalize_harness_name).map(str::to_string)
+                            })
                             .collect();
                         if !parsed.is_empty() {
                             compatible_harnesses = parsed;
@@ -4549,15 +4545,12 @@ fn sync_and_list_provider_profiles_inner(
                         | "glm-code-plan"
                         | "minimax-code-plan"
                         | "openrouter"
-                ) && !compatible_harnesses.iter().any(|h| h == "sylphx")
+                ) && !compatible_harnesses.iter().any(|h| h == "spiron")
                 {
-                    compatible_harnesses.insert(0, "sylphx".to_string());
+                    compatible_harnesses.insert(0, "spiron".to_string());
                 }
-                if compatible_harnesses.iter().any(|h| h == "sylphx")
-                    && !compatible_harnesses.iter().any(|h| h == "spiron")
-                {
-                    compatible_harnesses.push("spiron".to_string());
-                }
+                let mut seen = std::collections::HashSet::new();
+                compatible_harnesses.retain(|h| seen.insert(h.clone()));
                 let (acct_email, acct_id) = extract_profile_account_identity(&prof_path, &provider);
                 entries.push(ProviderProfileEntry {
                     provider: provider.clone(),
@@ -7656,10 +7649,20 @@ impl Default for SubagentDefaultsConfig {
 
 pub(crate) fn load_subagent_defaults(data: &Path) -> SubagentDefaultsConfig {
     let path = data.join("subagent-defaults.json");
-    std::fs::read_to_string(&path)
+    let mut cfg = std::fs::read_to_string(&path)
         .ok()
         .and_then(|text| serde_json::from_str::<SubagentDefaultsConfig>(&text).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    normalize_subagent_harnesses(&mut cfg);
+    cfg
+}
+
+fn normalize_subagent_harnesses(cfg: &mut SubagentDefaultsConfig) {
+    for spec in std::iter::once(&mut cfg.default).chain(cfg.agents.values_mut()) {
+        if let Some(harness) = spec.harness.as_mut() {
+            *harness = normalize_harness_name(harness).to_string();
+        }
+    }
 }
 
 pub(crate) fn save_subagent_defaults(
@@ -7667,7 +7670,9 @@ pub(crate) fn save_subagent_defaults(
     cfg: &SubagentDefaultsConfig,
 ) -> Result<(), Error> {
     let path = data.join("subagent-defaults.json");
-    let text = serde_json::to_string_pretty(cfg).map_err(|err| Error::Message(err.to_string()))?;
+    let mut cfg = cfg.clone();
+    normalize_subagent_harnesses(&mut cfg);
+    let text = serde_json::to_string_pretty(&cfg).map_err(|err| Error::Message(err.to_string()))?;
     std::fs::write(path, format!("{text}\n"))?;
     Ok(())
 }
@@ -7747,7 +7752,7 @@ pub(crate) fn parse_archetype_markdown(raw: &str) -> Result<ArchetypeTemplate, E
                 "description" | "summary" => tpl.description = Some(value.to_string()),
                 "scope" => tpl.scope = Some(anyagents_core::parse_agent_scope(value)?.to_string()),
                 "workdir" | "workspace" => tpl.workdir = Some(value.to_string()),
-                "harness" => tpl.harness = Some(value.to_string()),
+                "harness" => tpl.harness = Some(normalize_harness_name(value).to_string()),
                 "model" => tpl.model = Some(value.to_string()),
                 "role" => tpl.role = Some(value.to_string()),
                 "profile" => tpl.profile = Some(value.to_string()),
@@ -8116,7 +8121,7 @@ pub(crate) fn resolve_subagent_defaults(
     raw_model: Option<String>,
     raw_profile: Option<String>,
 ) -> (String, Option<String>, Option<String>) {
-    let h_trim = raw_harness.trim();
+    let h_trim = normalize_harness_name(raw_harness);
     let m_trim = raw_model
         .as_deref()
         .map(str::trim)
@@ -8136,11 +8141,7 @@ pub(crate) fn resolve_subagent_defaults(
             .filter(|m| !m.eq_ignore_ascii_case("inherit"))
             .map(str::to_string)
             .or_else(|| {
-                matches!(
-                    harness.as_str(),
-                    "spiron" | "sylphx" | "sylphx-agent" | "sylphx_agent"
-                )
-                .then(|| crate::spiron::DEFAULT_SPIRON_MODEL.to_string())
+                (harness == "spiron").then(|| crate::spiron::DEFAULT_SPIRON_MODEL.to_string())
             });
         let profile = p_trim
             .filter(|p| !p.eq_ignore_ascii_case("inherit"))
@@ -8155,9 +8156,9 @@ pub(crate) fn resolve_subagent_defaults(
 
     let inherit_harness = || {
         if parent_agent.harness == "agy" {
-            "sylphx".to_string()
+            "spiron".to_string()
         } else {
-            parent_agent.harness.clone()
+            normalize_harness_name(&parent_agent.harness).to_string()
         }
     };
 
@@ -8208,11 +8209,7 @@ pub(crate) fn resolve_subagent_defaults(
         None
     }
     .or_else(|| {
-        matches!(
-            resolved_harness.as_str(),
-            "spiron" | "sylphx" | "sylphx-agent" | "sylphx_agent"
-        )
-        .then(|| {
+        (resolved_harness == "spiron").then(|| {
             spec.model
                 .as_deref()
                 .map(str::trim)
@@ -8266,6 +8263,108 @@ pub(crate) fn resolve_subagent_defaults(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_harness_selectors_create_and_switch_to_spiron_without_renaming_gateway() {
+        let dir = crate::test_tempdir();
+        let data = dir.path();
+        let store = Store::open(data.join("state.db")).unwrap();
+        store
+            .hold_capability_key("0123456789abcdef0123456789abcdef")
+            .unwrap();
+        let model = crate::spiron::DEFAULT_SPIRON_MODEL;
+        for (index, legacy) in ["sylphx", "sylphx-agent", "sylphx_agent", "sylphx/default"]
+            .into_iter()
+            .enumerate()
+        {
+            let (harness, resolved_model, profile) =
+                resolve_subagent_defaults(data, None, legacy, None, Some("sylphx/default".into()));
+            assert_eq!(harness, "spiron");
+            assert_eq!(resolved_model.as_deref(), Some(model));
+            assert_eq!(profile.as_deref(), Some("sylphx/default"));
+            let created = create(
+                &store,
+                data,
+                CreateRequest {
+                    name: format!("legacy-{index}"),
+                    role: None,
+                    harness: legacy.into(),
+                    model: None,
+                    profile: Some("sylphx/default".into()),
+                    repo: None,
+                    branch: None,
+                    base: None,
+                    workdir: None,
+                    workdir_default: None,
+                    description: None,
+                    instructions: None,
+                    parent_id: None,
+                },
+            )
+            .unwrap();
+            assert_eq!(created.harness, "spiron");
+            assert_eq!(created.model.as_deref(), Some(model));
+            assert_eq!(upstream_provider_of(legacy, None), "sylphx");
+            let switched =
+                set_agent_harness(&store, data, "operator", &created.name, legacy, None, None)
+                    .unwrap();
+            assert_eq!(switched["harness"], "spiron");
+            assert_eq!(switched["model"], model);
+            assert_eq!(switched["profile"], "sylphx/default");
+        }
+    }
+
+    #[test]
+    fn legacy_profile_compatibility_lists_expose_only_canonical_harnesses() {
+        let dir = crate::test_tempdir();
+        let profile = dir.path().join("profiles/sylphx/default");
+        std::fs::create_dir_all(&profile).unwrap();
+        std::fs::write(profile.join("profile.json"), serde_json::json!({
+            "compatible_harnesses": ["sylphx", "sylphx-agent", "sylphx_agent", "sylphx/default", "spiron", "codex"]
+        }).to_string()).unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let profiles = sync_and_list_provider_profiles_inner(&store, dir.path(), false, false);
+        let entry = profiles
+            .iter()
+            .find(|entry| entry.provider == "sylphx")
+            .unwrap();
+        assert_eq!(entry.compatible_harnesses, ["spiron", "codex"]);
+        for provider in [
+            "sylphx",
+            "qwen-token-plan",
+            "kimi-code-plan",
+            "glm-code-plan",
+            "minimax-code-plan",
+        ] {
+            let (_, harnesses) = default_kind_and_harnesses(provider);
+            assert_eq!(harnesses.iter().filter(|h| *h == "spiron").count(), 1);
+            assert!(!harnesses.iter().any(|h| h.starts_with("sylphx")));
+        }
+    }
+
+    #[test]
+    fn legacy_subagent_defaults_are_canonical_but_provider_profiles_are_preserved() {
+        let dir = crate::test_tempdir();
+        std::fs::write(dir.path().join("subagent-defaults.json"), serde_json::json!({
+            "default": {"mode": "custom", "harness": "sylphx/default", "model": "sylphx/openai/gpt-6.1-sol#medium", "profile": "sylphx/default"},
+            "agents": {"parent": {"mode": "custom", "harness": "sylphx-agent", "profile": "sylphx/default"}}
+        }).to_string()).unwrap();
+        let cfg = load_subagent_defaults(dir.path());
+        assert_eq!(cfg.default.harness.as_deref(), Some("spiron"));
+        assert_eq!(cfg.agents["parent"].harness.as_deref(), Some("spiron"));
+        assert_eq!(cfg.default.profile.as_deref(), Some("sylphx/default"));
+        assert_eq!(
+            cfg.default.model.as_deref(),
+            Some(crate::spiron::DEFAULT_SPIRON_MODEL)
+        );
+        save_subagent_defaults(dir.path(), &cfg).unwrap();
+        let saved: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(dir.path().join("subagent-defaults.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(saved["default"]["harness"], "spiron");
+        assert_eq!(saved["default"]["profile"], "sylphx/default");
+    }
 
     fn rebalance_test_profiles(data: &Path, busy_pct: i64) -> Vec<ProviderProfileEntry> {
         [("busy", busy_pct), ("healthy", 80)]
@@ -8565,7 +8664,7 @@ mod tests {
         let root = config.parent().unwrap();
         std::fs::create_dir_all(root.join("memory")).unwrap();
         std::fs::write(root.join("memory/MEMORY.md"), "繁體長記憶".repeat(3000)).unwrap();
-        for harness in ["claude-code", "sylphx"] {
+        for harness in ["claude-code", "spiron"] {
             agent.harness = harness.into();
             let pin = anyagents_core::host_session::new_session(root, harness).unwrap();
             write_agent_instructions(&config, &agent, None).unwrap();
@@ -8631,10 +8730,10 @@ mod tests {
         assert!(!rerender.contains("EDITED_SECOND_FACT"));
         // External CLI consumption of this mirror is exercised by the real-pipe
         // Spiron launch/wake probe; AnyAgents no longer assembles model prompts.
-        agent.harness = "sylphx".into();
+        agent.harness = "spiron".into();
         write_agent_instructions(&config, &agent, None).unwrap();
         let switched = host_session::active(root).unwrap().unwrap();
-        assert_eq!(switched.harness, "sylphx");
+        assert_eq!(switched.harness, "spiron");
         assert_ne!(switched.generation, first.generation);
         for path in paths {
             let text = std::fs::read_to_string(config.join(path)).unwrap();
@@ -10336,7 +10435,7 @@ git -c safe.directory="$5" -C "$5" status --porcelain
             2
         );
 
-        // 6. Sylphx identity stays compact at every depth, while native
+        // 6. Spiron identity stays compact at every depth, while other
         // harness entrypoints retain the shared company instructions.
         for (ag, expected_desc) in [
             (&root, "Root owner role description."),
@@ -10708,7 +10807,7 @@ git -c safe.directory="$5" -C "$5" status --porcelain
         .unwrap();
         let shared = "# Example/shared-instructions\nSHARED_ONLY_RULE 繁體\n";
 
-        for harness in ["agy", "claude-code", "codex", "sylphx"] {
+        for harness in ["agy", "claude-code", "codex", "spiron"] {
             std::fs::write(&shared_path, shared).unwrap();
             let agent = store
                 .create_agent(anyagents_core::NewAgent::new(harness, harness))

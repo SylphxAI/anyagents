@@ -13,11 +13,11 @@ impl Fixture {
     fn new() -> Self {
         let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
-        let root = store.create_agent(NewAgent::new("root", "sylphx")).unwrap();
-        let mut child = NewAgent::new("child", "sylphx");
+        let root = store.create_agent(NewAgent::new("root", "spiron")).unwrap();
+        let mut child = NewAgent::new("child", "spiron");
         child.parent_id = Some(root.id.clone());
         let target = store.create_agent(child).unwrap();
-        let peer = store.create_agent(NewAgent::new("peer", "sylphx")).unwrap();
+        let peer = store.create_agent(NewAgent::new("peer", "spiron")).unwrap();
         Self {
             dir,
             store,
@@ -1254,7 +1254,7 @@ fn admin_operator_and_deep_ancestor_are_authorized() {
     let f = Fixture::new();
     let mut ancestor = f.root.clone();
     for i in 0..20 {
-        let mut input = NewAgent::new(format!("depth-{i}"), "sylphx");
+        let mut input = NewAgent::new(format!("depth-{i}"), "spiron");
         input.parent_id = Some(ancestor.id.clone());
         ancestor = f.store.create_agent(input).unwrap();
     }

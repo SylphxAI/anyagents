@@ -105,7 +105,7 @@ reader prevents WAL truncation, `full_scrub=false` and the WAL path records the
 residual window: old bytes may remain until that reader releases its snapshot
 and a successful `wal_checkpoint(TRUNCATE)` completes. Logical SELECT/search
 erasure alone is not a physical-erasure receipt. This release supports local JSONL
-session stores, including Sylphx and Claude Code, not binary/remote harness stores.
+session stores, including legacy first-party transcripts and Claude Code, not binary/remote harness stores.
 External providers, OS/filesystem snapshots, backups and copies outside the
 target's managed config directory are outside the local erasure guarantee.
 
