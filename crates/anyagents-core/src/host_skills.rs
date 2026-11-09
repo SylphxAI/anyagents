@@ -26,7 +26,22 @@ pub fn mount_with_fallback(
 ) -> io::Result<()> {
     let overlay = agent_root.join("skills");
     let view = agent_root.join("skills-view");
-    fs::create_dir_all(&overlay)?;
+    fs::create_dir_all(agent_root)?;
+    {
+        use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        builder.create(&overlay)?;
+        let meta = fs::symlink_metadata(&overlay)?;
+        if !meta.file_type().is_symlink() && (meta.mode() & 0o007) != 0 {
+            let safe_mode = if meta.uid() == meta.gid() {
+                0o700
+            } else {
+                meta.mode() & 0o7770
+            };
+            fs::set_permissions(&overlay, fs::Permissions::from_mode(safe_mode))?;
+        }
+    }
     fs::create_dir_all(&view)?;
     // The host publishes this read-only projection, not a seat-private overlay.
     // Explicit mode is required even when the daemon starts with umask 077.
