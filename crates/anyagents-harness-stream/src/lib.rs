@@ -280,6 +280,7 @@ struct State {
     turn_user_inputs: usize,
     last_turn_step_type: Option<String>,
     idle_since: Option<Instant>,
+    last_rpc_health_poll: Option<Instant>,
     planner_config: Option<Value>,
     http_port: Option<u16>,
     seen: HashSet<String>,
@@ -572,6 +573,79 @@ impl StreamHarness {
     }
 
     pub fn health(&self) -> HarnessHealth {
+        if let Some(ref rpc) = self.agy_rpc {
+            let poll_ctx = {
+                let mut state = lock(&self.shared);
+                if state.alive
+                    && !state.open.is_empty()
+                    && state.turn_user_inputs > 0
+                    && state
+                        .last_rpc_health_poll
+                        .is_none_or(|t| t.elapsed() >= Duration::from_secs(1))
+                {
+                    state.last_rpc_health_poll = Some(Instant::now());
+                    state.session_id.clone().map(|sid| {
+                        (
+                            state.generation,
+                            sid,
+                            state.child.as_ref().map(Child::id),
+                            state.http_port,
+                        )
+                    })
+                } else {
+                    None
+                }
+            };
+            if let Some((generation, session_id, child_pid, cached_port)) = poll_ctx
+                && let Some(port) = resolve_agy_http_port(rpc, cached_port, child_pid)
+            {
+                {
+                    let mut state = lock(&self.shared);
+                    if state.generation == generation && state.alive {
+                        state.http_port = Some(port);
+                    }
+                }
+                if let Ok((resolved_sid, running)) =
+                    agy_rpc_is_running(port, &rpc.csrf_token, &session_id)
+                {
+                    let mut state = lock(&self.shared);
+                    if state.generation == generation && state.alive && !state.open.is_empty() {
+                        if resolved_sid != session_id {
+                            state.session_id = Some(resolved_sid);
+                        }
+                        if running {
+                            state.idle_since = None;
+                        } else {
+                            let now = Instant::now();
+                            let first_idle = state.idle_since.is_none();
+                            let idle_since = *state.idle_since.get_or_insert(now);
+                            if now.duration_since(idle_since) >= AGY_TURN_CLOSE_GRACE {
+                                finish_open(&mut state, TurnUsage::default());
+                                state.turn_user_inputs = 1;
+                                state.epoch = state.epoch.wrapping_add(1);
+                                drop(state);
+                                self.wake.notify_all();
+                            } else if first_idle {
+                                let remain = AGY_TURN_CLOSE_GRACE
+                                    .saturating_sub(now.duration_since(idle_since));
+                                drop(state);
+                                let shared = Arc::clone(&self.shared);
+                                let wake = Arc::clone(&self.wake);
+                                let _ = thread::spawn(move || {
+                                    thread::sleep(remain);
+                                    let mut st = lock(&shared);
+                                    if st.generation == generation && st.alive {
+                                        st.epoch = st.epoch.wrapping_add(1);
+                                    }
+                                    drop(st);
+                                    wake.notify_all();
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let mut state = lock(&self.shared);
         if !state.alive {
             state.reap_child();
@@ -642,7 +716,7 @@ impl StreamHarness {
                 if let Some(reset_at_ms) = state.quota_reset_at_ms {
                     return Ok(DeliverOutcome::Quota { reset_at_ms });
                 }
-                if !state.open.is_empty()
+                if (!state.open.is_empty() || state.turn_user_inputs > 0)
                     && let Some(ref rpc) = self.agy_rpc
                 {
                     if state
@@ -747,31 +821,33 @@ impl StreamHarness {
                 if state.generation != generation || !state.alive {
                     return Err(HarnessError::Dead);
                 }
-                if state.open.is_empty() {
+                if state.open.is_empty() && state.turn_user_inputs == 0 {
                     state.idle_since = None;
                     return Ok(DeliverOutcome::Deferred);
                 }
-                let now = Instant::now();
-                let first_idle = state.idle_since.is_none();
-                let idle_since = *state.idle_since.get_or_insert(now);
-                if now.duration_since(idle_since) < AGY_TURN_CLOSE_GRACE {
-                    let remain =
-                        AGY_TURN_CLOSE_GRACE.saturating_sub(now.duration_since(idle_since));
-                    drop(state);
-                    if first_idle {
-                        let shared = Arc::clone(&self.shared);
-                        let wake = Arc::clone(&self.wake);
-                        let _ = thread::spawn(move || {
-                            thread::sleep(remain);
-                            let mut st = lock(&shared);
-                            if st.generation == generation && st.alive {
-                                st.epoch = st.epoch.wrapping_add(1);
-                            }
-                            drop(st);
-                            wake.notify_all();
-                        });
+                if !state.open.is_empty() {
+                    let now = Instant::now();
+                    let first_idle = state.idle_since.is_none();
+                    let idle_since = *state.idle_since.get_or_insert(now);
+                    if now.duration_since(idle_since) < AGY_TURN_CLOSE_GRACE {
+                        let remain =
+                            AGY_TURN_CLOSE_GRACE.saturating_sub(now.duration_since(idle_since));
+                        drop(state);
+                        if first_idle {
+                            let shared = Arc::clone(&self.shared);
+                            let wake = Arc::clone(&self.wake);
+                            let _ = thread::spawn(move || {
+                                thread::sleep(remain);
+                                let mut st = lock(&shared);
+                                if st.generation == generation && st.alive {
+                                    st.epoch = st.epoch.wrapping_add(1);
+                                }
+                                drop(st);
+                                wake.notify_all();
+                            });
+                        }
+                        return Ok(DeliverOutcome::Deferred);
                     }
-                    return Ok(DeliverOutcome::Deferred);
                 }
                 drop(state);
                 if planner_config.is_none() {
@@ -788,26 +864,30 @@ impl StreamHarness {
                 }
             }
             let composed = compose_message(&message.id, &message.context, &message.text);
-            {
+            let had_open_before_rpc = {
                 let mut state = lock(&self.shared);
                 if state.generation != generation || !state.alive {
                     return Err(HarnessError::Dead);
                 }
-                if state.open.is_empty() {
+                if state.open.is_empty() && state.turn_user_inputs == 0 {
                     return Ok(DeliverOutcome::Deferred);
                 }
-                if !running {
+                let had_open = !state.open.is_empty();
+                if !running && had_open {
                     // The previous turn in `agy` already finished (`CASCADE_RUN_STATUS_IDLE`)
                     // while held open by a background task. Close those open messages now
                     // so `turn_recovery.completed_seq` advances and never replays stale
                     // completed turns on restart.
                     finish_open(&mut state, TurnUsage::default());
                     state.turns_started += 1;
+                } else if !had_open {
+                    state.turns_started += 1;
                 }
                 if !state.open.contains(&message.id) {
                     state.open.push(message.id.clone());
                 }
-            }
+                had_open
+            };
             if let Err(err) = agy_rpc_send_steer(
                 port,
                 &rpc.csrf_token,
@@ -834,7 +914,8 @@ impl StreamHarness {
             state.seen.insert(message.id.clone());
             state.written.push(message.id.clone());
             return Ok(DeliverOutcome::Accepted {
-                turn_finished: !running || state.finished.contains(&message.id),
+                turn_finished: (!running && had_open_before_rpc)
+                    || state.finished.contains(&message.id),
             });
         }
         // Never hold shared state across pipe I/O. On Linux stdin is
@@ -983,6 +1064,7 @@ impl StreamHarness {
             state.turn_user_inputs = 0;
             state.last_turn_step_type = None;
             state.idle_since = None;
+            state.last_rpc_health_poll = None;
             state.planner_config = None;
             state.http_port = self.agy_rpc.as_ref().and_then(|r| r.port_override);
             state.text = None;
@@ -1097,6 +1179,7 @@ impl StreamHarness {
         state.turn_user_inputs = 0;
         state.last_turn_step_type = None;
         state.idle_since = None;
+        state.last_rpc_health_poll = None;
         state.planner_config = None;
         state.http_port = None;
         state.text = None;
@@ -1282,6 +1365,7 @@ impl State {
             turn_user_inputs: 0,
             last_turn_step_type: None,
             idle_since: None,
+            last_rpc_health_poll: None,
             planner_config: None,
             http_port: None,
             finished: HashSet::new(),
