@@ -421,7 +421,7 @@ struct AgentsArgs {
     /// New agent name when `action = "rename"`.
     #[serde(default, alias = "to")]
     new_name: Option<String>,
-    /// Optional archetype template name (`.agents/agents/<archetype>.md`, e.g. `"writer"`, `"reviewer"`, `"mind"`) when `action` is `"spawn"` or `"create"`.
+    /// Optional archetype template name (`.agents/agents/<archetype>.md`, e.g. `"worker"`) when `action` is `"spawn"` or `"create"`.
     #[serde(default, alias = "type", alias = "template", alias = "preset")]
     archetype: Option<String>,
     /// Optional display-only role label (for example, `"Researcher"`); never selects lifecycle or scope.
@@ -505,7 +505,7 @@ struct SpawnArgs {
         alias = "target"
     )]
     name: Option<String>,
-    /// Optional archetype template name (`.agents/agents/<archetype>.md`, e.g. `"writer"`, `"reviewer"`, `"mind"`).
+    /// Optional archetype template name (`.agents/agents/<archetype>.md`, e.g. `"worker"`).
     #[serde(default, alias = "type", alias = "template", alias = "preset")]
     archetype: Option<String>,
     /// Optional display-only role label; no effect on lifecycle, scope or prompts.
@@ -608,7 +608,7 @@ struct SubagentsArgs {
     /// Optional case-insensitive multi-token search query for `list`.
     #[serde(default, alias = "search", alias = "filter", alias = "q")]
     query: Option<String>,
-    /// Optional archetype template name (`.agents/agents/<archetype>.md`, e.g. `"writer"`, `"reviewer"`, `"mind"`) when `action = "spawn"`.
+    /// Optional archetype template name (`.agents/agents/<archetype>.md`, e.g. `"worker"`) when `action = "spawn"`.
     #[serde(default, alias = "type", alias = "template", alias = "preset")]
     archetype: Option<String>,
     /// Harness catalog ID when `action = "spawn"` (`opencode`, `codex`, `claude-code`, `agy`, `muse`, `omp`, `dsh`, `grok`).
