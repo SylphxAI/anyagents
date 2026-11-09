@@ -3,6 +3,7 @@
 //! used to order delivery. The delivery cursor moves only over a contiguous
 //! prefix.
 
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read};
 use std::os::unix::io::AsRawFd;
@@ -69,6 +70,15 @@ fn scope_env(agent: &Agent, scope: &str) -> Vec<(String, String)> {
         env.push(("ANYAGENTS_PUBLIC".to_string(), "1".to_string()));
     }
     env
+}
+
+/// Batched roster metadata. Archived agents never need runtime diagnostics.
+#[derive(Default)]
+pub struct AgentQueryMetadata {
+    pub aliases: HashMap<String, Vec<String>>,
+    pub oldest_undelivered: HashMap<String, i64>,
+    pub open_turns: HashMap<String, i64>,
+    pub schedules: HashMap<String, Vec<AgentSchedule>>,
 }
 
 /// One agent row.
@@ -369,6 +379,8 @@ pub enum ReceiveOutcome {
 /// One turn in an agent's bidirectional conversation timeline (`in` or `out`).
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ConversationTurn {
+    #[serde(default)]
+    pub seq: i64,
     pub id: String,
     /// `"in"` when received by this agent; `"out"` when sent by this agent.
     pub direction: String,
@@ -733,6 +745,12 @@ impl Store {
                     ON rag_chunks(agent_id, timestamp_ms DESC, chunk_id);",
             )?;
         }
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_messages_agent_seq ON messages(agent_id, seq DESC);
+             CREATE INDEX IF NOT EXISTS idx_schedules_active_agent ON agent_schedules(agent_id, created_at_ms, id) WHERE state = 'active';
+             CREATE INDEX IF NOT EXISTS idx_messages_agent_time ON messages(agent_id, received_at_ms DESC, seq DESC);
+             CREATE INDEX IF NOT EXISTS idx_outbound_agent_time ON outbound_messages(agent_id, sent_at_ms DESC, id DESC);",
+        )?;
         // Older databases may already have this column from an earlier runtime.
         // Presence, not an arbitrary failed ALTER, is the idempotency condition.
         let has_public: bool = conn.query_row(
@@ -1370,6 +1388,58 @@ impl Store {
             agents.push(agent_from_row(row)?);
         }
         Ok(agents)
+    }
+
+    /// Load roster metadata with a fixed number of SQL statements. Indexed range
+    /// seeks avoid scanning the message history of archived agents.
+    pub fn agent_query_metadata(&self) -> Result<AgentQueryMetadata, Error> {
+        let mut metadata = AgentQueryMetadata::default();
+        {
+            let conn = self.conn();
+            let mut stmt =
+                conn.prepare("SELECT agent_id, alias FROM agent_aliases ORDER BY alias")?;
+            for row in
+                stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            {
+                let (id, alias) = row?;
+                metadata.aliases.entry(id).or_default().push(alias);
+            }
+            let mut stmt = conn.prepare(
+                "SELECT a.id, (SELECT m.received_at_ms FROM messages m
+                   WHERE m.agent_id = a.id AND m.seq > COALESCE(d.delivered_seq, 0)
+                     AND (CASE WHEN json_valid(m.context) THEN json_extract(m.context, '$.event') END) IS NOT 'reaction_passive'
+                   ORDER BY m.seq LIMIT 1)
+                 FROM agents a LEFT JOIN mailbox_cursors d ON d.agent_id = a.id
+                 WHERE a.state != 'archived'",
+            )?;
+            for row in stmt.query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?))
+            })? {
+                let (id, timestamp) = row?;
+                if let Some(timestamp) = timestamp {
+                    metadata.oldest_undelivered.insert(id, timestamp);
+                }
+            }
+            let mut stmt = conn.prepare(
+                "SELECT t.agent_id, COALESCE((SELECT m.received_at_ms FROM messages m
+                    WHERE m.agent_id = t.agent_id AND m.seq > t.completed_seq AND m.seq <= t.opened_seq
+                    ORDER BY m.seq LIMIT 1), t.opened_at_ms)
+                 FROM turn_recovery t JOIN agents a ON a.id = t.agent_id
+                 WHERE t.opened_seq > t.completed_seq AND a.state != 'archived'",
+            )?;
+            for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))? {
+                let (id, timestamp) = row?;
+                metadata.open_turns.insert(id, timestamp);
+            }
+        }
+        for schedule in self.list_schedules(None, true)? {
+            metadata
+                .schedules
+                .entry(schedule.agent_id.to_string())
+                .or_default()
+                .push(schedule);
+        }
+        Ok(metadata)
     }
 
     pub fn children_of(&self, parent_id: &AgentId) -> Result<Vec<Agent>, Error> {
@@ -2474,6 +2544,53 @@ impl Store {
         Ok(messages)
     }
 
+    /// Latest matching messages, limited in SQLite and returned in sequence order.
+    pub fn inbox_query(
+        &self,
+        agent_id: &AgentId,
+        since: Option<i64>,
+        limit: Option<usize>,
+        unread_only: bool,
+    ) -> Result<Vec<Message>, Error> {
+        self.inbox_query_filtered(agent_id, since, limit, unread_only, None)
+    }
+
+    pub fn inbox_query_filtered(
+        &self,
+        agent_id: &AgentId,
+        since: Option<i64>,
+        limit: Option<usize>,
+        unread_only: bool,
+        sender: Option<&str>,
+    ) -> Result<Vec<Message>, Error> {
+        let conn = self.conn();
+        agent_by_id(&conn, agent_id)?;
+        let delivered = cursor(&conn, agent_id)?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {MESSAGE_COLS} FROM messages
+             WHERE agent_id = ?1 AND seq > ?2
+               AND (?3 IS NULL OR sender = ?3)
+             ORDER BY seq DESC LIMIT ?4"
+        ))?;
+        let lower = since
+            .unwrap_or(i64::MIN)
+            .max(if unread_only { delivered } else { i64::MIN });
+        let mut rows = stmt.query(params![
+            agent_id.as_str(),
+            lower,
+            sender,
+            limit
+                .map(|n| i64::try_from(n).unwrap_or(i64::MAX))
+                .unwrap_or(-1)
+        ])?;
+        let mut messages = Vec::new();
+        while let Some(row) = rows.next()? {
+            messages.push(message_from_row_with_cursor(row, delivered)?);
+        }
+        messages.reverse();
+        Ok(messages)
+    }
+
     /// Record an outbound message sent by `agent_id` to `destination` (a user,
     /// a channel chat/topic, a group, or another agent) so the agent's full
     /// two-way conversation can be read by authorized supervising agents.
@@ -2688,6 +2805,7 @@ impl Store {
                 .filter(|r| r.starts_with("telegram:chat:") || r.starts_with("group:"))
                 .unwrap_or_else(|| self_addr.clone());
             turns.push(ConversationTurn {
+                seq: msg.seq,
                 id: msg.id.to_string(),
                 direction: "in".to_string(),
                 from,
@@ -2701,17 +2819,17 @@ impl Store {
         // 2. Outbound messages sent by this agent.
         let out_sql = match (sql_limit, since_ms.is_none()) {
             (Some(_), true) => {
-                "SELECT id, destination, reply_to, body, sent_at_ms
+                "SELECT id, destination, reply_to, body, sent_at_ms, COALESCE((SELECT seq FROM rag_chunks c WHERE c.chunk_id = outbound_messages.id), 0)
                  FROM outbound_messages WHERE agent_id = ?1 AND sent_at_ms > ?2
                  ORDER BY sent_at_ms DESC, id DESC LIMIT ?3"
             }
             (Some(_), false) => {
-                "SELECT id, destination, reply_to, body, sent_at_ms
+                "SELECT id, destination, reply_to, body, sent_at_ms, COALESCE((SELECT seq FROM rag_chunks c WHERE c.chunk_id = outbound_messages.id), 0)
                  FROM outbound_messages WHERE agent_id = ?1 AND sent_at_ms > ?2
                  ORDER BY sent_at_ms ASC, id ASC LIMIT ?3"
             }
             (None, _) => {
-                "SELECT id, destination, reply_to, body, sent_at_ms
+                "SELECT id, destination, reply_to, body, sent_at_ms, COALESCE((SELECT seq FROM rag_chunks c WHERE c.chunk_id = outbound_messages.id), 0)
                  FROM outbound_messages WHERE agent_id = ?1 AND sent_at_ms > ?2
                  ORDER BY sent_at_ms, id"
             }
@@ -2724,6 +2842,7 @@ impl Store {
         };
         while let Some(row) = out_rows.next()? {
             turns.push(ConversationTurn {
+                seq: row.get(5)?,
                 id: row.get(0)?,
                 direction: "out".to_string(),
                 from: self_addr.clone(),
@@ -2777,7 +2896,9 @@ impl Store {
     ) -> Result<Vec<ConversationTurn>, Error> {
         let conn = self.conn();
         let since = since_ms.unwrap_or(0);
-        let lim = i64::try_from(limit.unwrap_or(50).max(1)).unwrap_or(50);
+        let lim = limit
+            .map(|n| i64::try_from(n).unwrap_or(i64::MAX))
+            .unwrap_or(i64::MAX / 8);
         let peer_filter = with_peer.map(str::trim).filter(|s| !s.is_empty());
         let fetch_limit = if peer_filter.is_some() {
             lim.saturating_mul(4)
@@ -2787,7 +2908,7 @@ impl Store {
         let visibility_sql = visible_agent_ids_sql("agent_id", visible_agent_ids, 3);
         let sql = if since_ms.is_some() {
             format!(
-                "SELECT chunk_id, direction, sender, destination, text, timestamp_ms
+                "SELECT chunk_id, direction, sender, destination, text, timestamp_ms, seq
                  FROM rag_chunks
                  WHERE timestamp_ms > ?1 {visibility_sql}
                  ORDER BY timestamp_ms ASC, chunk_id ASC
@@ -2795,7 +2916,7 @@ impl Store {
             )
         } else {
             format!(
-                "SELECT chunk_id, direction, sender, destination, text, timestamp_ms
+                "SELECT chunk_id, direction, sender, destination, text, timestamp_ms, seq
                  FROM rag_chunks
                  WHERE timestamp_ms > ?1 {visibility_sql}
                  ORDER BY timestamp_ms DESC, chunk_id DESC
@@ -2810,6 +2931,7 @@ impl Store {
         )))?;
         while let Some(row) = rows.next()? {
             turns.push(ConversationTurn {
+                seq: row.get(6)?,
                 id: row.get(0)?,
                 direction: row.get(1)?,
                 from: row.get(2)?,
@@ -2945,7 +3067,11 @@ impl Store {
     pub fn search_history(&self, req: &HistorySearchQuery) -> Result<Vec<ConversationTurn>, Error> {
         self.backfill_full_mailbox_history(req.visible_agent_ids.as_deref())?;
         let conn = self.read_conn();
-        let limit = req.limit.clamp(1, 200);
+        let limit = if req.limit == 0 {
+            (i64::MAX / 16) as usize
+        } else {
+            req.limit
+        };
         let radius = req.radius.min(10);
         let since = req.since_ms.unwrap_or(0);
         let until = req.until_ms.unwrap_or(i64::MAX);
@@ -3142,6 +3268,7 @@ impl Store {
                     let seq: i64 = row.get(9)?;
                     let bm25_raw: f64 = row.get(10).unwrap_or(0.0);
                     let turn = ConversationTurn {
+                        seq,
                         id: cid.clone(),
                         direction: row.get(1)?,
                         from: row.get(2)?,
@@ -3232,6 +3359,7 @@ impl Store {
                         let tool_name: String = row.get(8)?;
                         let seq: i64 = row.get(9)?;
                         let turn = ConversationTurn {
+                            seq,
                             id: cid.clone(),
                             direction: row.get(1)?,
                             from: row.get(2)?,
@@ -3294,6 +3422,7 @@ impl Store {
                 let tool_name: String = row.get(8)?;
                 let seq: i64 = row.get(9)?;
                 let turn = ConversationTurn {
+                    seq,
                     id: cid.clone(),
                     direction: row.get(1)?,
                     from: row.get(2)?,
@@ -3395,6 +3524,7 @@ impl Store {
                     }
                     let seq: i64 = r.get(7)?;
                     let turn = ConversationTurn {
+                        seq,
                         id: r.get(0)?,
                         direction: r.get(1)?,
                         from: r.get(2)?,
@@ -3450,6 +3580,7 @@ impl Store {
                     }
                     let seq: i64 = r.get(7)?;
                     let turn = ConversationTurn {
+                        seq,
                         id: r.get(0)?,
                         direction: r.get(1)?,
                         from: r.get(2)?,
@@ -6848,6 +6979,138 @@ mod tests {
         store
             .create_agent(NewAgent::new(name, "claude-code"))
             .unwrap()
+    }
+
+    #[test]
+    fn inbox_query_limits_unread_and_sender_before_materializing() {
+        let (_dir, store) = setup();
+        let own = agent(&store, "limited");
+        for i in 1..=12 {
+            let mut incoming = Incoming::new(format!("message {i}\nsecond line"));
+            incoming.sender = Some(
+                if i % 2 == 0 {
+                    "agent:even"
+                } else {
+                    "agent:odd"
+                }
+                .into(),
+            );
+            store.receive(&own.id, incoming).unwrap();
+        }
+        for seq in 1..=8 {
+            store.note_delivered(&own.id, seq).unwrap();
+        }
+        let seqs = |rows: Vec<Message>| rows.into_iter().map(|m| m.seq).collect::<Vec<_>>();
+        assert_eq!(
+            seqs(store.inbox_query(&own.id, None, Some(3), false).unwrap()),
+            vec![10, 11, 12]
+        );
+        assert_eq!(
+            seqs(store.inbox_query(&own.id, None, None, true).unwrap()),
+            vec![9, 10, 11, 12]
+        );
+        assert_eq!(
+            seqs(
+                store
+                    .inbox_query(&own.id, Some(10), Some(20), true)
+                    .unwrap()
+            ),
+            vec![11, 12]
+        );
+        assert_eq!(
+            seqs(
+                store
+                    .inbox_query_filtered(&own.id, None, Some(2), true, Some("agent:odd"))
+                    .unwrap()
+            ),
+            vec![9, 11]
+        );
+        assert!(
+            store
+                .inbox_query(&own.id, None, Some(0), false)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store.inbox_query(&own.id, None, None, false).unwrap().len(),
+            12
+        );
+        let conn = store.conn();
+        let plan: String = conn.query_row("EXPLAIN QUERY PLAN SELECT seq FROM messages WHERE agent_id = ?1 AND seq > 8 ORDER BY seq DESC LIMIT 3", [own.id.as_str()], |r| r.get(3)).unwrap();
+        assert!(
+            plan.contains("SEARCH") && plan.contains("agent_id"),
+            "{plan}"
+        );
+    }
+
+    #[test]
+    fn batch_metadata_matches_single_agent_queries() {
+        let (_dir, store) = setup();
+        let own = agent(&store, "before-rename");
+        let own = store.rename_agent(&own.id, "after-rename").unwrap();
+        for i in 0..3 {
+            store
+                .receive(&own.id, Incoming::new(format!("batch {i}")))
+                .unwrap();
+        }
+        let metadata = store.agent_query_metadata().unwrap();
+        assert_eq!(
+            metadata.aliases.get(own.id.as_str()).unwrap(),
+            &store.agent_aliases(&own.id).unwrap()
+        );
+        assert_eq!(
+            metadata
+                .oldest_undelivered
+                .get(own.id.as_str())
+                .map(|t| 123456789_i64.saturating_sub(*t).max(0)),
+            store
+                .lag(&own.id, 123456789)
+                .unwrap()
+                .oldest_undelivered_age_ms
+        );
+        assert_eq!(
+            metadata.open_turns.contains_key(own.id.as_str()),
+            store.has_open_turn(&own.id).unwrap()
+        );
+        // Batched lag must skip passive reactions just like the single-agent path.
+        store
+            .conn()
+            .execute(
+                "UPDATE messages SET context = ?1 WHERE agent_id = ?2 AND seq = 1",
+                params![r#"{"event":"reaction_passive"}"#, own.id.as_str()],
+            )
+            .unwrap();
+        let now = crate::now_ms();
+        let metadata = store.agent_query_metadata().unwrap();
+        assert_eq!(
+            metadata
+                .oldest_undelivered
+                .get(own.id.as_str())
+                .map(|t| now.saturating_sub(*t).max(0)),
+            store.lag(&own.id, now).unwrap().oldest_undelivered_age_ms
+        );
+        for seq in 1..=3 {
+            store.note_delivered(&own.id, seq).unwrap();
+        }
+        let metadata = store.agent_query_metadata().unwrap();
+        assert!(!metadata.oldest_undelivered.contains_key(own.id.as_str()));
+        assert!(metadata.open_turns.contains_key(own.id.as_str()));
+        store.note_turn_completed(&own.id).unwrap();
+        assert!(
+            !store
+                .agent_query_metadata()
+                .unwrap()
+                .open_turns
+                .contains_key(own.id.as_str())
+        );
+        store.set_agent_state(&own.id, "archived").unwrap();
+        assert!(
+            !store
+                .agent_query_metadata()
+                .unwrap()
+                .oldest_undelivered
+                .contains_key(own.id.as_str())
+        );
     }
 
     #[test]

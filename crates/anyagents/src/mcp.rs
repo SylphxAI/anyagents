@@ -2506,7 +2506,7 @@ impl AgentMcp {
     }
 
     #[tool(
-        description = "Android / iOS Mobile Device Control tool (`action`: `\"screenshot\"` | `\"tap\"` | `\"swipe\"` | `\"type\"` | `\"press\"` | `\"install_app\"` | `\"launch_app\"` | `\"terminate_app\"` | `\"open_url\"` | `\"rotate\"`)."
+        description = "Android (adb, including ChromeOS ARC) / iOS (simctl + idb or WebDriverAgent wda_url) control. Select platform: android|ios and serial|udid|wda_url. Actions: snapshot (pruned semantic tree with @<snapshot_id>:e<N> refs), screenshot, tap, swipe, type, press, install_app, launch_app, terminate_app, open_url, rotate. tap/type accept ref with STALE_REF validation. iOS app installs use app_path (.app/.ipa); set backend:idb for physical devices. WDA install_app also requires udid + idb."
     )]
     async fn device(
         &self,
@@ -2799,12 +2799,14 @@ rl.on("line", async (line) => {
         computerFn.hold_key = (opts = {}) => callTool("computer", { ...opts, action: "hold_key" });
         computerFn.wait = (msOrObj = {}) => callTool("computer", typeof msOrObj === "number" ? { action: "wait", duration_ms: msOrObj } : { ...msOrObj, action: "wait" });
         computerFn.zoom = (opts = {}) => callTool("computer", { ...opts, action: "zoom" });
+        computerFn.open_url = (opts = {}) => callTool("computer", typeof opts === "string" ? { action: "open_url", url: opts } : { ...opts, action: "open_url" });
         computerFn.action = (actionJson = {}) => callTool("computer", actionJson);
         Object.freeze(computerFn);
 
         const deviceFn = (req = {}) => callTool("device", typeof req === "string" ? { action: req } : req);
+        deviceFn.snapshot = (opts = {}) => callTool("device", { ...opts, action: "snapshot" });
         deviceFn.screenshot = (opts = {}) => callTool("device", { ...opts, action: "screenshot" });
-        deviceFn.tap = (opts = {}) => callTool("device", { ...opts, action: "tap" });
+        deviceFn.tap = (opts = {}) => callTool("device", typeof opts === "string" ? { action: "tap", ref: opts } : { ...opts, action: "tap" });
         deviceFn.swipe = (opts = {}) => callTool("device", { ...opts, action: "swipe" });
         deviceFn.type = (textOrObj = {}) => callTool("device", typeof textOrObj === "string" ? { action: "type", text: textOrObj } : { ...textOrObj, action: "type" });
         deviceFn.press = (btnOrObj = {}) => callTool("device", typeof btnOrObj === "string" ? { action: "press", button: btnOrObj } : { ...btnOrObj, action: "press" });
@@ -6974,6 +6976,8 @@ mod spawn_args_tests {
         description: Option<&str>,
     ) -> AgentView {
         AgentView {
+            has_open_turn: false,
+            profile: None,
             id: id.to_string(),
             name: name.to_string(),
             role: None,
@@ -7231,6 +7235,7 @@ mod spawn_args_tests {
             a.parent = Some(parent_id.to_string());
         }
         let body = serde_json::to_vec(&AgentsResponse {
+            archived_count: 0,
             agents: population,
             gateway: None,
         })
@@ -7627,6 +7632,7 @@ mod spawn_args_tests {
             dummy_agent_view("agt_2", "beta-worker", "idle", "idle", Some("Second")),
         ];
         let body = serde_json::to_vec(&AgentsResponse {
+            archived_count: 0,
             agents: population,
             gateway: None,
         })

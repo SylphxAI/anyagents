@@ -56,6 +56,7 @@ anyagents --version
 - [Architecture](docs/architecture.md): state, the three axes, harnesses, the mailbox and its guarantees, runtime boundaries, channels, the gateway, usage.
 - [Verification](docs/verification.md): reproducible scripted harness checks, coverage and live-acceptance boundaries.
 - [Serving identity](docs/serving-identity.md): read back the version, source, binary hash and PID on both server sockets.
+- [Desktop and mobile control](docs/computer-and-device.md): OS backends, Android/iOS setup, semantic snapshots and stale-ref handling.
 - [Decisions](docs/adr/): [0001](docs/adr/0001-server-first-one-binary.md) (server-first single binary) and [0002](docs/adr/0002-runtime-drivers-and-capability-identity.md) (capability identity and runtime boundaries).
 
 ## Licence

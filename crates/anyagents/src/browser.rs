@@ -92,6 +92,8 @@ pub struct InteractiveRef {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct StoredRefs {
+    #[serde(default)]
+    pub snapshot_id: String,
     pub url: String,
     pub captured_at_ms: i64,
     pub elements: Vec<InteractiveRef>,
@@ -144,7 +146,8 @@ pub struct BrowserRequest {
     /// URL to open when `action` is `"open"` or `"goto"` (or when opening a new tab).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
-    /// Target element reference (`"@e1"`, `"@e2"` from `snapshot`) or CSS selector for `"click"`, `"fill"`, `"type"`.
+    /// Target snapshot-qualified reference (`"@<snapshot_id>:e1"`), active short ref (`"@e1"`),
+    /// or CSS selector for `"click"`, `"fill"`, `"type"`. Old snapshot IDs return `STALE_REF`.
     #[serde(
         default,
         alias = "ref",
@@ -3617,7 +3620,9 @@ fn capture_snapshot(
 
     let captcha = detect_captcha(cdp);
     val["text"] = serde_json::Value::String(combined_text);
-    val["elements"] = serde_json::to_value(&all_elements).unwrap_or_default();
+    let snapshot_id = crate::computer::generate_snapshot_id();
+    val["snapshot_id"] = serde_json::json!(snapshot_id);
+    val["elements"] = qualified_elements(&snapshot_id, &all_elements);
     val["captcha_detected"] = serde_json::Value::Bool(captcha.detected);
     if let Some(kind) = captcha.kind {
         val["captcha_kind"] = serde_json::Value::String(kind);
@@ -3632,6 +3637,7 @@ fn capture_snapshot(
     }
 
     let stored = StoredRefs {
+        snapshot_id,
         url: val
             .get("url")
             .and_then(|v| v.as_str())
@@ -3644,37 +3650,69 @@ fn capture_snapshot(
     Ok(val)
 }
 
+fn qualified_elements(snapshot_id: &str, elements: &[InteractiveRef]) -> serde_json::Value {
+    let mut value = serde_json::to_value(elements).unwrap_or_default();
+    if let Some(elements) = value.as_array_mut() {
+        for el in elements {
+            let short_ref = el["ref"]
+                .as_str()
+                .unwrap_or_default()
+                .trim_start_matches('@');
+            el["qualified_ref"] = serde_json::json!(format!("@{snapshot_id}:{short_ref}"));
+        }
+    }
+    value
+}
+
+#[derive(Debug)]
 struct ResolvedTarget {
     css_selector: String,
     fallback_xy: Option<(f64, f64)>,
     frame_id: Option<String>,
 }
 
-fn resolve_selector(data: &Path, profile: &str, raw_target: &str) -> ResolvedTarget {
+fn resolve_selector(data: &Path, profile: &str, raw_target: &str) -> Result<ResolvedTarget, Error> {
     let trimmed = raw_target.trim();
-    if trimmed.starts_with("@e") {
-        let refs_path = profile_dir(data, profile).join("refs.json");
-        if let Ok(bytes) = std::fs::read(&refs_path)
-            && let Ok(stored) = serde_json::from_slice::<StoredRefs>(&bytes)
-            && let Some(found) = stored.elements.iter().find(|e| e.r#ref == trimmed)
-        {
-            return ResolvedTarget {
-                css_selector: format!("[data-anyagents-ref=\"{}\"], {}", trimmed, found.selector),
-                fallback_xy: Some((found.x, found.y)),
-                frame_id: found.frame_id.clone(),
-            };
-        }
-        return ResolvedTarget {
-            css_selector: format!("[data-anyagents-ref=\"{trimmed}\"]"),
-            fallback_xy: None,
-            frame_id: None,
+    if let Some(raw_ref) = trimmed.strip_prefix('@') {
+        let stale = |reason: &str| {
+            Error::Message(format!(
+                "STALE_REF: {reason}; call tools.browser({{action: 'snapshot'}}) for fresh @<snapshot_id>:e<N> refs"
+            ))
         };
+        let refs_path = profile_dir(data, profile).join("refs.json");
+        let stored = read_profile_json::<StoredRefs>(&refs_path)?
+            .ok_or_else(|| stale("no active browser snapshot"))?;
+        let element = if let Some((snapshot_id, element)) = raw_ref.split_once(':') {
+            if snapshot_id.is_empty() || snapshot_id != stored.snapshot_id {
+                return Err(stale("reference belongs to an older or different snapshot"));
+            }
+            element
+        } else {
+            raw_ref
+        };
+        if !element
+            .strip_prefix('e')
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        {
+            return Err(stale("malformed element reference"));
+        }
+        let short_ref = format!("@{element}");
+        let found = stored
+            .elements
+            .iter()
+            .find(|e| e.r#ref == short_ref)
+            .ok_or_else(|| stale("element is absent from the active snapshot"))?;
+        return Ok(ResolvedTarget {
+            css_selector: format!("[data-anyagents-ref=\"{}\"], {}", short_ref, found.selector),
+            fallback_xy: Some((found.x, found.y)),
+            frame_id: found.frame_id.clone(),
+        });
     }
-    ResolvedTarget {
+    Ok(ResolvedTarget {
         css_selector: trimmed.to_string(),
         fallback_xy: None,
         frame_id: None,
-    }
+    })
 }
 
 /// Inherit the provider's documented HOME, OP_CONFIG_DIR and
@@ -4213,13 +4251,40 @@ pub fn execute(
             let s = s.trim();
             s.starts_with("op://") || s.starts_with("op-otp://") || s.starts_with("secret://")
         });
-    execute_inner(data, default_profile, req).map_err(|err| {
+    execute_inner(data, default_profile, req).map_err(|err| browser_error(err, secret))
+}
+
+fn browser_error(err: Error, secret: bool) -> Error {
+    use crate::computer::{ErrorDisposition, format_computer_error};
+    let message = err.to_string();
+    let lower = message.to_ascii_lowercase();
+    let disposition = if lower.contains("stale_ref") {
+        ErrorDisposition::stale_ref("Call tools.browser({action: 'snapshot'}) to refresh refs.")
+    } else if lower.contains("not found") || lower.contains("no such") {
+        ErrorDisposition::settled_absence(
+            "Inspect the page with a new browser snapshot before acting.",
+        )
+    } else if lower.contains("timeout")
+        || lower.contains("timed out")
+        || lower.contains("temporarily unavailable")
+        || lower.contains("429")
+        || lower.contains("503")
+    {
+        ErrorDisposition::retryable(
+            "Transient browser failure; retry once or inspect browser status.",
+        )
+    } else {
+        ErrorDisposition::terminal("Check browser input, environment, and human takeover status.")
+    };
+    // Keep actionable disposition metadata without exposing provider/page details for secrets.
+    Error::Message(format_computer_error(
         if secret {
-            Error::Message("browser secret input failed (provider/page details withheld)".into())
+            "browser secret input failed (provider/page details withheld)"
         } else {
-            err
-        }
-    })
+            &message
+        },
+        disposition,
+    ))
 }
 
 fn execute_inner(
@@ -4278,6 +4343,15 @@ fn execute_inner(
     }
 
     check_human_takeover_fence(data, &profile, &action)?;
+
+    // Reject stale refs before launching a browser, connecting CDP, or resolving secrets.
+    if let Some(selector) = req
+        .selector
+        .as_deref()
+        .filter(|s| s.trim().starts_with('@'))
+    {
+        resolve_selector(data, &profile, selector)?;
+    }
 
     let (mut rt, fp) = ensure_browser_running(data, &profile, req.headless)?;
 
@@ -4402,6 +4476,7 @@ fn execute_inner(
                 "title": snap.get("title").cloned().unwrap_or_default(),
                 "text_preview": snap.get("text").and_then(|v| v.as_str()).map(|s| s.chars().take(1500).collect::<String>()).unwrap_or_default(),
                 "interactive_elements": snap.get("elements").cloned().unwrap_or_default(),
+                "snapshot_id": snap.get("snapshot_id").cloned().unwrap_or_default(),
                 "captcha_detected": snap.get("captcha_detected").and_then(|v| v.as_bool()).unwrap_or(false),
             });
             if let Some(kind) = snap.get("captcha_kind").cloned() {
@@ -4420,6 +4495,7 @@ fn execute_inner(
                 "title": snap.get("title").cloned().unwrap_or_default(),
                 "text": snap.get("text").cloned().unwrap_or_default(),
                 "elements": snap.get("elements").cloned().unwrap_or_default(),
+                "snapshot_id": snap.get("snapshot_id").cloned().unwrap_or_default(),
                 "captcha_detected": snap.get("captcha_detected").and_then(|v| v.as_bool()).unwrap_or(false),
             });
             if action == "html"
@@ -4452,7 +4528,7 @@ fn execute_inner(
                         "browser click requires `selector` (e.g. `@e1` or CSS selector)".into(),
                     )
                 })?;
-            let resolved = resolve_selector(data, &profile, raw_sel);
+            let resolved = resolve_selector(data, &profile, raw_sel)?;
             let sel_json =
                 serde_json::to_string(&resolved.css_selector).unwrap_or_else(|_| "\"body\"".into());
             let prep_js = format!(
@@ -4530,9 +4606,9 @@ fn execute_inner(
                         "browser fill requires `selector` (e.g. `@e1` or CSS selector)".into(),
                     )
                 })?;
+            let resolved = resolve_selector(data, &profile, raw_sel)?;
             let (text_val, secret_source) =
                 resolve_fill_value(data, req.text.as_deref(), req.secret_ref.as_deref())?;
-            let resolved = resolve_selector(data, &profile, raw_sel);
             let sel_json = serde_json::to_string(&resolved.css_selector)
                 .unwrap_or_else(|_| "\"input\"".into());
             let val_json = serde_json::to_string(&text_val).unwrap_or_else(|_| "\"\"".into());
@@ -4788,7 +4864,7 @@ fn execute_inner(
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
             {
-                let resolved = resolve_selector(data, &profile, raw_sel);
+                let resolved = resolve_selector(data, &profile, raw_sel)?;
                 target_frame_id = resolved.frame_id.clone();
                 let sel_json = serde_json::to_string(&resolved.css_selector)
                     .unwrap_or_else(|_| "\"body\"".into());
@@ -5309,6 +5385,89 @@ fn decode_base64(input: &str) -> Result<Vec<u8>, Error> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn snapshot_refs_are_qualified_scoped_and_backward_compatible() {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let element: InteractiveRef = serde_json::from_value(serde_json::json!({
+            "ref":"@e1", "tag":"button", "text":"Save", "selector":"#save", "x":30.0, "y":40.0, "width":50.0, "height":20.0
+        })).unwrap();
+        let refs = StoredRefs {
+            snapshot_id: "sfirst".into(),
+            elements: vec![element.clone()],
+            ..Default::default()
+        };
+        let path = profile_dir(dir.path(), "default").join("refs.json");
+        write_profile_json(&path, &refs).unwrap();
+        assert_eq!(
+            qualified_elements("sfirst", &[element])[0]["qualified_ref"],
+            "@sfirst:e1"
+        );
+        for target in ["@e1", "@sfirst:e1"] {
+            let resolved = resolve_selector(dir.path(), "default", target).unwrap();
+            assert!(resolved.css_selector.contains("@e1"));
+            assert_eq!(resolved.fallback_xy, Some((30.0, 40.0)));
+        }
+        assert_eq!(
+            resolve_selector(dir.path(), "default", "#save")
+                .unwrap()
+                .css_selector,
+            "#save"
+        );
+        for target in ["@old:e1", "@sfirst:e99", "@sfirst:evil", "@e1\"]"] {
+            assert!(
+                resolve_selector(dir.path(), "default", target)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("STALE_REF")
+            );
+        }
+        assert!(resolve_selector(dir.path(), "other", "@sfirst:e1").is_err());
+        write_profile_json(
+            &path,
+            &StoredRefs {
+                snapshot_id: "ssecond".into(),
+                ..refs
+            },
+        )
+        .unwrap();
+        assert!(resolve_selector(dir.path(), "default", "@sfirst:e1").is_err());
+        assert!(resolve_selector(dir.path(), "default", "@e1").is_ok());
+    }
+
+    #[test]
+    fn browser_errors_have_four_dispositions_and_preserve_secret_redaction() {
+        use super::*;
+        for (message, kind) in [
+            ("STALE_REF old snapshot", "stale_ref"),
+            ("element not found", "settled_absence"),
+            ("CDP timed out", "retryable_failure"),
+            ("invalid selector", "terminal_failure"),
+        ] {
+            let err = browser_error(Error::Message(message.into()), false).to_string();
+            assert!(err.contains(kind), "{err}");
+            let secret = browser_error(Error::Message(format!("{message}: sensitive-value")), true)
+                .to_string();
+            assert!(secret.contains(kind));
+            assert!(!secret.contains("sensitive-value"));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let err = execute(
+            dir.path(),
+            "default",
+            BrowserRequest {
+                action: "fill".into(),
+                selector: Some("@old:e1".into()),
+                secret_ref: Some("op://vault/item/password".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("STALE_REF"));
+        assert!(!err.contains("vault"));
+    }
+
     #[test]
     fn takeover_entropy_requires_a_complete_read() {
         let error = super::takeover_token_from_entropy(&[1u8; 15][..]).unwrap_err();

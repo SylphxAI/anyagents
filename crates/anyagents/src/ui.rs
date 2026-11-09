@@ -290,7 +290,7 @@ pub fn format_timestamp_ms(ms: i64) -> String {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = if m <= 2 { y + 1 } else { y };
-    format!("{year:04}-{m:02}-{d:02} {hour:02}:{min:02}:{sec:02}")
+    format!("{year:04}-{m:02}-{d:02} {hour:02}:{min:02}:{sec:02}Z")
 }
 
 /// Format token counts with thousands separators (`1,234,567` or `1.2M`).
@@ -454,6 +454,7 @@ fn state_rank(state: &str, process: &str, turn_state: &str) -> u8 {
 #[derive(Clone, Copy, Debug)]
 pub struct AgentsTableOptions {
     pub include_archived: bool,
+    pub archived_count: Option<usize>,
     /// Maximum sub-agent tree depth to expand (`Some(0)` = roots only with subtree summary;
     /// `Some(n)` = expand up to `n` levels deep; `None` = expand all levels).
     pub max_depth: Option<usize>,
@@ -467,6 +468,7 @@ impl Default for AgentsTableOptions {
     fn default() -> Self {
         Self {
             include_archived: false,
+            archived_count: None,
             max_depth: Some(0),
             only_with_subagents: false,
             wide: false,
@@ -772,7 +774,9 @@ pub fn print_agents_table_with_options(
     let idle = running.saturating_sub(working).saturating_sub(quota_count);
     let scaled_idle = agents.iter().filter(|a| a.state == "idle").count();
     let paused = agents.iter().filter(|a| a.state == "paused").count();
-    let archived = agents.iter().filter(|a| a.state == "archived").count();
+    let archived = options
+        .archived_count
+        .unwrap_or_else(|| agents.iter().filter(|a| a.state == "archived").count());
 
     let all_by_id: HashMap<&str, &AgentView> = agents.iter().map(|a| (a.id.as_str(), a)).collect();
     let mut visible_ids: std::collections::HashSet<&str> = agents
@@ -1515,7 +1519,7 @@ pub fn print_inbox_pretty(agent_name: &str, messages: &[MessageView]) {
         ("MESSAGE", false),
     ]);
     for m in messages {
-        let seq = dim(&format!("#{}", m.seq));
+        let seq = dim(&format!("[#{}]", m.seq));
         let ack = match m.ack.as_str() {
             "delivered" => green("✓ delivered"),
             "received" => yellow("● queued"),
@@ -1556,7 +1560,7 @@ pub fn print_conversation_pretty(
         };
         let route = format!("{} {} {}", bold(&turn.from), dim("→"), bold(&turn.to));
         let id = dim(&format!("[{}]", turn.id));
-        println!("  {ts}  {dir}  {route}  {id}");
+        println!("  [#{}] {ts}  {dir}  {route}  {id}", turn.seq);
         for line in turn.text.lines() {
             println!("      {line}");
         }

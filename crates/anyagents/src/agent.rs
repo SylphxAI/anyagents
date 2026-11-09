@@ -74,10 +74,36 @@ pub fn agents(data: &Path, action: AgentsCommand) -> Result<(), Error> {
             let view = set_state(data, &name, "paused")?;
             println!("{}\t{}\t{}", view.id, view.name, view.state);
         }
-        AgentsCommand::Wake { name } => {
-            let view = set_state(data, &name, "running")?;
-            println!("{}\t{}\t{}", view.id, view.name, view.state);
+        AgentsCommand::Resume { name, prompt } => resume_cmd(data, &name, prompt)?,
+        AgentsCommand::Inspect { agent, limit, json } => {
+            crate::inspect_cmd(data, agent, limit, json)?
         }
+        AgentsCommand::Inbox(args) => crate::channel::inbox(data, args)?,
+        AgentsCommand::Logs(args) => crate::channel::conversation(data, args)?,
+        AgentsCommand::Send { to, text, from } => crate::channel::send_with_options(
+            data,
+            crate::channel::SendOptions {
+                to,
+                text,
+                from,
+                source_key: None,
+                source_time_ms: None,
+                reply_to: None,
+                quote: None,
+                media: None,
+                location: None,
+                poll: None,
+                checklist: None,
+                article: None,
+            },
+        )?,
+        AgentsCommand::Describe {
+            agent,
+            description,
+            instructions,
+            role,
+            clear,
+        } => describe_cmd(data, agent, description, instructions, role, clear)?,
         AgentsCommand::ResetSession { name } => {
             reset_session_cmd(data, &name)?;
         }
@@ -755,6 +781,8 @@ fn set_state(data: &Path, name: &str, state: &str) -> Result<AgentView, Error> {
     let public_desc = agent.public_description();
     let scope_val = agent.scope().to_string();
     Ok(AgentView {
+        has_open_turn: false,
+        profile: None,
         id: agent.id.to_string(),
         name: agent.name,
         role: agent.role,
@@ -892,6 +920,8 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
     let public_desc = agent.public_description();
     let scope_val = agent.scope().to_string();
     Ok(AgentView {
+        has_open_turn: false,
+        profile: None,
         id: agent.id.to_string(),
         name: agent.name,
         role: agent.role,
@@ -959,273 +989,6 @@ fn set_admin(data: &Path, agent: &str, admin: bool) -> Result<(), Error> {
     store.set_agent_admin(&rec.id, admin)?;
     println!("{}", serde_json::json!({"agent": rec.name, "admin": admin}));
     Ok(())
-}
-
-fn is_agy_turn_settled_on_disk(config_dir: &Path, opened_at_ms: i64, now_ms: i64) -> bool {
-    if now_ms.saturating_sub(opened_at_ms) < 45_000 {
-        return false;
-    }
-    let conv_dir = config_dir
-        .join(".gemini")
-        .join("antigravity-cli")
-        .join("conversations");
-    let Ok(entries) = std::fs::read_dir(&conv_dir) else {
-        return false;
-    };
-    let mut latest_ms: Option<i64> = None;
-    for entry in entries.flatten() {
-        if let Ok(meta) = entry.metadata()
-            && let Ok(modified) = meta.modified()
-            && let Ok(dur) = modified.duration_since(std::time::UNIX_EPOCH)
-        {
-            let ms = i64::try_from(dur.as_millis()).unwrap_or(0);
-            latest_ms = Some(latest_ms.map_or(ms, |prev| prev.max(ms)));
-        }
-    }
-    latest_ms.is_some_and(|ms| now_ms.saturating_sub(ms) > 45_000)
-}
-
-/// Enrich `AgentView` rows from the authoritative SQLite `turn_recovery` table
-/// (`has_open_turn`).
-pub fn reconcile_and_enrich_views(data: &Path, views: &mut [AgentView]) {
-    let Ok(store) = open(data) else {
-        return;
-    };
-    let now = anyagents_core::now_ms();
-    for view in views.iter_mut() {
-        if view.state == "archived" {
-            if view.harness == "sylphx" {
-                view.install = "installed".to_string();
-                view.delivery_mode = "steer".to_string();
-                view.steer_support = "yes".to_string();
-                if view
-                    .last_error
-                    .as_deref()
-                    .is_some_and(|e| e.contains("unknown harness: sylphx"))
-                {
-                    view.last_error = None;
-                }
-            }
-            continue;
-        }
-        let Ok(id) = AgentId::parse(&view.id) else {
-            continue;
-        };
-        if let Ok(agent_rec) = store.agent(&id) {
-            if view.role.is_none() {
-                view.role = agent_rec.role.clone();
-            }
-            if view.aliases.is_empty() {
-                view.aliases = store.agent_aliases(&id).unwrap_or_default();
-            }
-            if (view.seat_user.is_none() || view.seat_uid.is_none() || view.seat_gid.is_none())
-                && let Some((u, uid, gid, _)) =
-                    crate::create::resolved_agent_seat_info(&store, &agent_rec)
-            {
-                view.seat_user = Some(u);
-                view.seat_uid = Some(uid);
-                view.seat_gid = Some(gid);
-            }
-            if view.schedules.is_empty() {
-                match crate::schedule::list_agent_schedules(&store, &id, false) {
-                    Ok(schedules) => view.schedules = schedules,
-                    Err(error) => {
-                        view.last_error = Some(format!("cannot read schedules: {error}"));
-                    }
-                }
-            }
-        }
-        let cfg = anyagents_core::agent_config_dir(data, &id);
-        if view.harness == "sylphx" {
-            view.install = "installed".to_string();
-            view.delivery_mode = "steer".to_string();
-            view.steer_support = "yes".to_string();
-            if view
-                .last_error
-                .as_deref()
-                .is_some_and(|e| e.contains("unknown harness: sylphx"))
-            {
-                view.last_error =
-                    crate::vendor::read_persisted_last_error(&cfg).and_then(|(e, _)| e);
-            }
-            let lock_busy = matches!(
-                store.try_lock_agent(&id),
-                Err(anyagents_core::Error::AgentBusy)
-            );
-            if lock_busy {
-                view.process = "alive".to_string();
-                view.turn_state = "working".to_string();
-            }
-        } else if view.state == "running"
-            && view.process != "alive"
-            && crate::server::socket_path(data).exists()
-            && matches!(
-                store.try_lock_agent(&id),
-                Err(anyagents_core::Error::AgentBusy)
-            )
-        {
-            view.process = "alive".to_string();
-        }
-        let rotated_ms = std::fs::read_to_string(cfg.join(".anyagents-profile-rotated-ms"))
-            .ok()
-            .and_then(|s| s.trim().parse::<i64>().ok())
-            .unwrap_or(0);
-        let cleared_ms = std::fs::read_to_string(cfg.join(".anyagents-quota-cleared-ms"))
-            .ok()
-            .and_then(|s| s.trim().parse::<i64>().ok())
-            .unwrap_or(0)
-            .max(rotated_ms);
-        if cleared_ms > 0
-            && view
-                .process_started_at_ms
-                .is_none_or(|started| started < cleared_ms)
-        {
-            view.quota_reset_at_ms = None;
-            view.last_error = None;
-        }
-        let (persisted_q, persisted_err) = if view.harness == "agy" {
-            anyagents_harness_agy::detect_agy_session_quota_and_error(&cfg, now)
-        } else {
-            match crate::vendor::read_persisted_last_error(&cfg) {
-                Some((err, Some(reset_ms))) if reset_ms > now => (Some(reset_ms), err),
-                Some((err, None)) => (None, err),
-                _ => (None, None),
-            }
-        };
-        if view.quota_reset_at_ms.is_none() && view.harness == "claude-code" {
-            view.quota_reset_at_ms =
-                anyagents_harness_claude::detect_session_quota_reset_ms(&cfg, now).or(persisted_q);
-        } else if view.quota_reset_at_ms.is_none() {
-            view.quota_reset_at_ms = persisted_q;
-        }
-        if view.quota_reset_at_ms.is_none()
-            && let Ok(agent_rec) = store.agent(&id)
-        {
-            let prov =
-                crate::create::upstream_provider_of(&agent_rec.harness, agent_rec.model.as_deref());
-            let prof = crate::create::bound_profile_name(&cfg)
-                .and_then(|b| b.split_once('/').map(|(_, p)| p.to_string()).or(Some(b)))
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "default".to_string());
-            let prof_dir = data.join("profiles").join(&prov).join(&prof);
-            if let Ok(usage_txt) =
-                std::fs::read_to_string(prof_dir.join(".anyagents-last-usage.txt"))
-                && crate::create::parse_remaining_pct_from_usage(
-                    &usage_txt,
-                    agent_rec.model.as_deref(),
-                ) == Some(0)
-                && let Ok(raw_ms) =
-                    std::fs::read_to_string(prof_dir.join(".anyagents-quota-reset-ms"))
-                && let Ok(ms) = raw_ms.trim().parse::<i64>()
-                && ms > now
-            {
-                view.quota_reset_at_ms = Some(ms);
-            }
-        }
-        if view.last_error.is_none() {
-            view.last_error = persisted_err;
-        }
-        if view.last_error.is_none() && view.harness == "codex" {
-            view.last_error = crate::vendor::detect_codex_session_turn_error(&cfg, rotated_ms);
-        }
-        if let Some(reset_ms) = view.quota_reset_at_ms.filter(|&ms| ms > now)
-            && let Ok(agent_rec) = store.agent(&id)
-        {
-            crate::create::record_profile_quota_reset(data, &agent_rec, reset_ms);
-            if crate::create::try_rotate_exhausted_profile(&store, data, &agent_rec, true).is_some()
-            {
-                view.quota_reset_at_ms = None;
-                view.last_error = None;
-            }
-        }
-        let mut open_turn = match store.has_open_turn(&id) {
-            Ok(value) => value,
-            Err(error) => {
-                view.last_error = Some(format!("cannot read durable turn state: {error}"));
-                view.turn_state = "unknown".into();
-                continue;
-            }
-        };
-        if view.state == "running" && view.process == "alive" {
-            if open_turn
-                && view.harness == "agy"
-                && view.oldest_undelivered_age_ms.is_none()
-                && view.quota_reset_at_ms.is_none()
-                && view.last_error.is_none()
-            {
-                match store.open_turn(&id) {
-                    Ok(Some(open)) if is_agy_turn_settled_on_disk(&cfg, open.opened_at_ms, now) => {
-                        match store.note_turn_completed(&id) {
-                            Ok(()) => {
-                                open_turn = false;
-                                view.turn_state = "idle".to_string();
-                            }
-                            Err(error) => {
-                                view.last_error =
-                                    Some(format!("cannot persist turn completion: {error}"));
-                                view.turn_state = "unknown".into();
-                                continue;
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        view.last_error = Some(format!("cannot read open turn: {error}"));
-                        view.turn_state = "unknown".into();
-                        continue;
-                    }
-                    _ => {}
-                }
-            }
-            if view.quota_reset_at_ms.is_some_and(|ms| ms > now) {
-                view.turn_state = "idle".to_string();
-            } else if open_turn && view.quota_reset_at_ms.is_none() && view.last_error.is_none() {
-                view.turn_state = "working".to_string();
-            } else if view.turn_state.is_empty() {
-                view.turn_state = "idle".to_string();
-            }
-        } else if view.turn_state.is_empty() {
-            view.turn_state = "idle".to_string();
-        }
-        if (view.state == "running" || view.state == "idle")
-            && view.quota_reset_at_ms.is_none_or(|ms| ms <= now)
-        {
-            if let Some(ref err_msg) = view.last_error {
-                view.turn_state = if crate::host_memory::is_migration_wait(err_msg) {
-                    "idle"
-                } else {
-                    "errored"
-                }
-                .to_owned();
-                if let Ok(agent_rec) = store.agent(&id) {
-                    crate::create::maybe_notify_parent_on_error(&store, &agent_rec, &cfg, err_msg);
-                }
-            } else {
-                let _ = std::fs::remove_file(cfg.join(".anyagents-notified-parent-error.json"));
-            }
-        }
-        view.block_reason =
-            server::compute_block_reason(view.quota_reset_at_ms, view.last_error.as_deref(), now);
-        let real_lag = store
-            .lag(&id, now)
-            .ok()
-            .and_then(|l| l.oldest_undelivered_age_ms);
-        view.oldest_undelivered_age_ms = match real_lag {
-            Some(age) => Some(age),
-            None if open_turn
-                && (view.quota_reset_at_ms.is_some()
-                    || view.last_error.is_some()
-                    || view.turn_state != "working") =>
-            {
-                store.open_turn(&id).ok().flatten().map(|open| {
-                    open.messages
-                        .first()
-                        .map(|m| now.saturating_sub(m.received_at_ms))
-                        .unwrap_or_else(|| now.saturating_sub(open.opened_at_ms))
-                })
-            }
-            None => None,
-        };
-    }
 }
 
 fn apply_parent_filter_for_views(
@@ -1324,181 +1087,117 @@ fn list_filtered(
         Some(0)
     };
 
-    if client::can_call_server(data) {
-        let mut params = Vec::new();
-        if let Some(s) = state_filter.map(str::trim).filter(|s| !s.is_empty()) {
-            params.push(format!("state={s}"));
-        }
-        if let Some(p) = parent_filter.map(str::trim).filter(|s| !s.is_empty()) {
-            params.push(format!("parent={p}"));
-        }
-        let path = if params.is_empty() {
-            "/v1/agents".to_string()
-        } else {
-            format!("/v1/agents?{}", params.join("&"))
-        };
-        let listed =
-            client::call::<AgentsResponse>(data, "GET", &path, None, &client::authority(data))
-                .map_err(Error::Message)?;
-        if let Some(mut listed) = listed {
-            reconcile_and_enrich_views(data, &mut listed.agents);
-            if let Some(sf) = state_filter
-                .map(str::trim)
-                .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("all"))
-            {
-                listed.agents.retain(|a| a.state.eq_ignore_ascii_case(sf));
-            }
-            let only_with_subagents =
-                apply_parent_filter_for_views(&mut listed.agents, parent_filter, pretty);
-            let include_archived = state_filter.is_some_and(|sf| {
-                let sf = sf.trim();
-                sf.eq_ignore_ascii_case("all") || sf.eq_ignore_ascii_case("archived")
-            });
-            if pretty {
-                crate::ui::print_agents_table_with_options(
-                    &listed.agents,
-                    None,
-                    crate::ui::AgentsTableOptions {
-                        include_archived,
-                        max_depth: effective_max_depth,
-                        only_with_subagents,
-                        wide,
-                    },
-                );
-                return Ok(());
-            }
-            for agent in listed.agents {
-                if show_parent {
-                    println!(
-                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                        agent.id,
-                        agent.name,
-                        agent.parent.as_deref().unwrap_or("-"),
-                        agent.harness,
-                        agent.model.as_deref().unwrap_or("-"),
-                        agent.state,
-                        agent.process,
-                        show_optional(agent.oldest_undelivered_age_ms),
-                    );
-                } else {
-                    print_agent(AgentLine {
-                        id: &agent.id,
-                        name: &agent.name,
-                        harness: &agent.harness,
-                        state: &agent.state,
-                        process: &agent.process,
-                        mode: &agent.delivery_mode,
-                        steer: &agent.steer_support,
-                        undelivered: agent.oldest_undelivered_age_ms,
-                        quota: agent.quota_reset_at_ms,
-                    });
-                }
-            }
-            return Ok(());
-        }
-    }
-    let store = open(data)?;
-    let now = anyagents_core::now_ms();
-    let mut fallback_views = Vec::new();
-    for agent in store.list_agents()? {
-        if let Some(sf) = state_filter
-            && sf != "all"
-            && agent.state != sf
-        {
-            continue;
-        }
-        let lag = store.lag(&agent.id, now)?;
-        let (mode, steer) = declared(&agent.harness);
-        let aliases = store.agent_aliases(&agent.id).unwrap_or_default();
-        let seat_info = crate::create::resolved_agent_seat_info(&store, &agent);
-        if pretty {
-            let public_desc = agent.public_description();
-            let scope_val = agent.scope().to_string();
-            fallback_views.push(AgentView {
-                id: agent.id.to_string(),
-                name: agent.name,
-                role: agent.role,
-                aliases,
-                parent: agent.parent_id.as_ref().map(ToString::to_string),
-                scope: scope_val,
-                relationship: None,
-                can_message: None,
-                harness: agent.harness,
-                model: agent.model,
-                live_harness: None,
-                live_model: None,
-                process_started_at_ms: None,
-                pending_switch: false,
-                workdir: agent.workdir,
-                state: agent.state,
-                process: "down".to_string(),
-                turn_state: "idle".to_string(),
-                delivery_mode: mode_name(mode).to_string(),
-                steer_support: steer_name(steer).to_string(),
-                quota_reset_at_ms: None,
-                block_reason: None,
-                last_error: None,
-                oldest_undelivered_age_ms: lag.oldest_undelivered_age_ms,
-                install: "-".to_string(),
-                description: public_desc,
-                instructions: agent.instructions,
-                seat_user: seat_info.as_ref().map(|(u, _, _, _)| u.clone()),
-                seat_uid: seat_info.as_ref().map(|(_, uid, _, _)| *uid),
-                seat_gid: seat_info.as_ref().map(|(_, _, gid, _)| *gid),
-                schedules: crate::schedule::list_agent_schedules(&store, &agent.id, false)
-                    .map_err(Error::Message)?,
-            });
-            continue;
-        }
-        if show_parent {
-            println!(
-                "{}\t{}\t{}\t{}\t{}\t{}\tdown\t{}",
-                agent.id,
-                agent.name,
-                agent
-                    .parent_id
-                    .as_ref()
-                    .map(ToString::to_string)
-                    .as_deref()
-                    .unwrap_or("-"),
-                agent.harness,
-                agent.model.as_deref().unwrap_or("-"),
-                agent.state,
-                show_optional(lag.oldest_undelivered_age_ms),
-            );
-        } else {
-            print_agent(AgentLine {
-                id: agent.id.as_str(),
-                name: &agent.name,
-                harness: &agent.harness,
-                state: &agent.state,
-                process: "down",
-                mode: mode_name(mode),
-                steer: steer_name(steer),
-                undelivered: lag.oldest_undelivered_age_ms,
-                quota: None,
-            });
-        }
-    }
+    let query = server::ListAgentsQuery {
+        state: state_filter.map(str::to_string),
+        // Parent filtering below preserves the CLI's subtree/depth semantics.
+        parent: None,
+        name: None,
+    };
+    let path = state_filter
+        .map(|s| format!("/v1/agents?state={s}"))
+        .unwrap_or_else(|| "/v1/agents".into());
+    let mut listed = if client::can_call_server(data) {
+        client::call::<AgentsResponse>(data, "GET", &path, None, &client::authority(data))
+            .map_err(Error::Message)?
+            .ok_or_else(|| Error::Message("the server answered nothing".into()))?
+    } else {
+        offline_roster(data, &query)?
+    };
+    let only_with_subagents =
+        apply_parent_filter_for_views(&mut listed.agents, parent_filter, pretty);
+    let include_archived = state_filter.is_some_and(|s| matches!(s, "all" | "archived"));
     if pretty {
-        let only_with_subagents =
-            apply_parent_filter_for_views(&mut fallback_views, parent_filter, true);
-        let include_archived = state_filter.is_some_and(|sf| {
-            let sf = sf.trim();
-            sf.eq_ignore_ascii_case("all") || sf.eq_ignore_ascii_case("archived")
-        });
         crate::ui::print_agents_table_with_options(
-            &fallback_views,
+            &listed.agents,
             None,
             crate::ui::AgentsTableOptions {
                 include_archived,
+                archived_count: Some(listed.archived_count),
                 max_depth: effective_max_depth,
                 only_with_subagents,
                 wide,
             },
         );
+    } else {
+        for agent in listed
+            .agents
+            .iter()
+            .filter(|a| include_archived || a.state != "archived")
+        {
+            if show_parent {
+                println!(
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    agent.id,
+                    agent.name,
+                    agent.parent.as_deref().unwrap_or("-"),
+                    agent.harness,
+                    agent.model.as_deref().unwrap_or("-"),
+                    agent.state,
+                    agent.process,
+                    show_optional(agent.oldest_undelivered_age_ms)
+                );
+            } else {
+                print_agent(AgentLine {
+                    id: &agent.id,
+                    name: &agent.name,
+                    harness: &agent.harness,
+                    state: &agent.state,
+                    process: &agent.process,
+                    mode: &agent.delivery_mode,
+                    steer: &agent.steer_support,
+                    undelivered: agent.oldest_undelivered_age_ms,
+                    quota: agent.quota_reset_at_ms,
+                });
+            }
+        }
     }
     Ok(())
+}
+
+pub fn offline_roster(
+    data: &Path,
+    query: &server::ListAgentsQuery,
+) -> Result<AgentsResponse, Error> {
+    if client::agent_identity().is_some() {
+        return Err(Error::Message(
+            "agent roster reads require the authenticated server".into(),
+        ));
+    }
+    let store = open(data)?;
+    server::roster_views(
+        &store,
+        &anyagents_supervisor::HealthBoard::default(),
+        store.list_agents()?,
+        query,
+    )
+    .map_err(|e| Error::Message(e.message))
+}
+
+pub fn view_named(data: &Path, target: &str) -> Result<AgentView, Error> {
+    if client::can_call_server(data) {
+        return client::call::<AgentView>(
+            data,
+            "GET",
+            &format!("/v1/agents/{}", crate::channel::urlencoding_simple(target)),
+            None,
+            &client::authority(data),
+        )
+        .map_err(Error::Message)?
+        .ok_or_else(|| Error::Message("the server answered nothing".into()));
+    }
+    if client::agent_identity().is_some() {
+        return Err(Error::Message(
+            "agent reads require the authenticated server".into(),
+        ));
+    }
+    let store = open(data)?;
+    let agent = store.agent_by_name(target)?;
+    server::agent_view(
+        &store,
+        &anyagents_supervisor::HealthBoard::default(),
+        &agent,
+    )
+    .map_err(|e| Error::Message(e.message))
 }
 
 /// The store, holding a capability key: the one this process was given, else a
@@ -1529,40 +1228,25 @@ pub fn open(data: &Path) -> Result<Store, Error> {
 
 /// One agent by name, from the socket when the server is there.
 pub fn named(data: &Path, agent: &str) -> Result<Agent, Error> {
-    if client::can_call_server(data) {
-        let listed = client::call::<AgentsResponse>(
-            data,
-            "GET",
-            "/v1/agents",
-            None,
-            &client::authority(data),
-        )
-        .map_err(Error::Message)?;
-        if let Some(listed) = listed
-            && let Some(found) = listed.agents.into_iter().find(|row| {
-                row.name == agent
-                    || row.id == agent
-                    || row.aliases.iter().any(|al| al.eq_ignore_ascii_case(agent))
-            })
-        {
-            return Ok(Agent {
-                is_admin: false,
-                id: AgentId::parse(&found.id)?,
-                name: found.name,
-                role: found.role,
-                parent_id: found.parent.and_then(|p| AgentId::parse(&p).ok()),
-                harness: found.harness,
-                model: found.model,
-                workdir: found.workdir,
-                description: found.description,
-                instructions: found.instructions,
-                state: found.state,
-                created_at_ms: 0,
-                launch_env: Vec::new(),
-            });
-        }
+    if !client::can_call_server(data) && client::agent_identity().is_none() {
+        return open(data)?.agent_by_name(agent);
     }
-    open(data)?.agent_by_name(agent)
+    let found = view_named(data, agent)?;
+    Ok(Agent {
+        is_admin: false,
+        id: AgentId::parse(&found.id)?,
+        name: found.name,
+        role: found.role,
+        parent_id: found.parent.and_then(|p| AgentId::parse(&p).ok()),
+        harness: found.harness,
+        model: found.model,
+        workdir: found.workdir,
+        description: found.description,
+        instructions: found.instructions,
+        state: found.state,
+        created_at_ms: 0,
+        launch_env: Vec::new(),
+    })
 }
 
 pub fn list_groups(data: &Path) -> Result<Vec<(String, Vec<String>)>, Error> {

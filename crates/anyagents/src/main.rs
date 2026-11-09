@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyagents_core::Error;
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
 mod agent;
 mod api;
@@ -93,11 +93,13 @@ enum Command {
         key_file: Option<PathBuf>,
     },
     /// Create and list agents.
+    #[command(visible_alias = "agent")]
     Agents {
         #[command(subcommand)]
         action: AgentsCommand,
     },
     /// List all agents and sub-agents with their parent, harness, model, state, and process health.
+    #[command(visible_aliases = ["ls", "ps"])]
     Peers {
         /// Optional state filter: `running`, `archived`, or `all`.
         #[arg(short = 's', long)]
@@ -346,36 +348,11 @@ enum Command {
         from: Option<String>,
     },
     /// Read an agent's incoming mailbox.
-    Inbox {
-        /// Agent name or `agt_...` id (defaults to this agent when run inside an agent).
-        agent: Option<String>,
-        /// Exclusive sequence cursor. Omit to read from the start.
-        #[arg(long)]
-        since: Option<i64>,
-        /// Maximum number of messages to return.
-        #[arg(long)]
-        limit: Option<usize>,
-    },
-    /// Read or search (`--query`) authorized agents' full two-way (`in` + `out`) conversation across users, channels, groups, and peers.
-    Conversation {
-        /// Agent name (`planner`, `builder`, `reviewer`, `all`) or `agt_...` id (defaults to this agent, or `all` when `--query` is set).
-        agent: Option<String>,
-        /// Optional lexical + structured search query (SQLite FTS5 BM25 + CJK bigram + exact phrase boost).
-        #[arg(short = 'q', long)]
-        query: Option<String>,
-        /// Optional scope filter (`all`, `memory`, `transcripts`).
-        #[arg(long)]
-        scope: Option<String>,
-        /// Optional peer filter (e.g. `alice`, `agent:beta`, `group:crew`, `telegram:chat:-1001234567890`).
-        #[arg(long)]
-        with: Option<String>,
-        /// Exclusive timestamp cursor in milliseconds.
-        #[arg(long = "since-ms")]
-        since_ms: Option<i64>,
-        /// Maximum number of turns to return (default 50, or 20 with `--query`).
-        #[arg(long)]
-        limit: Option<usize>,
-    },
+    #[command(visible_alias = "mail")]
+    Inbox(InboxArgs),
+    /// Read, search, or follow an agent's full conversation.
+    #[command(visible_aliases = ["logs", "messages", "msg"], aliases = ["conv", "history", "tail"])]
+    Conversation(ConversationArgs),
     /// Audited erasure (conversation.redact): ancestors/admin only; target must be quiescent.
     Redact {
         agent: String,
@@ -397,25 +374,7 @@ enum Command {
         reason: String,
     },
     /// Zero-Embedding Lexical + Structured search across historical and live conversations.
-    Search {
-        /// Search query (matched via SQLite FTS5 BM25 with hybrid ASCII + CJK bigrams and exact substring boost).
-        query: String,
-        /// Optional agent filter (`planner`, `builder`, `reviewer`, or `all`; defaults to `all`).
-        #[arg(long)]
-        agent: Option<String>,
-        /// Optional scope filter (`all`, `memory`, `transcripts`).
-        #[arg(long)]
-        scope: Option<String>,
-        /// Optional peer filter.
-        #[arg(long)]
-        with: Option<String>,
-        /// Exclusive timestamp cursor in milliseconds.
-        #[arg(long = "since-ms")]
-        since_ms: Option<i64>,
-        /// Maximum number of turns to return (default 20).
-        #[arg(long)]
-        limit: Option<usize>,
-    },
+    Search(SearchArgs),
     /// List recorded usage.
     Usage {
         #[arg(long)]
@@ -568,6 +527,7 @@ enum Command {
         headless: Option<bool>,
     },
     /// Schedule one-off (`--at`), recurring (`--every`), or event-watch (`--watch`) wakes, or list/cancel (`--cancel`) schedules.
+    #[command(visible_alias = "schedules", alias = "cron")]
     Schedule {
         /// Optional target agent name or `agt_...` id (defaults to this agent when run inside an agent).
         agent: Option<String>,
@@ -677,8 +637,176 @@ enum ChannelsCommand {
     List,
 }
 
+/// Options shared by message browsing and lexical search.
+#[derive(Args, Clone, Debug, Default)]
+struct HistoryOptions {
+    #[arg(long)]
+    with: Option<String>,
+    #[arg(long)]
+    scope: Option<String>,
+    #[arg(long, alias = "from")]
+    sender: Option<String>,
+    #[arg(long = "in", conflicts_with_all = ["outbound", "direction"])]
+    inbound: bool,
+    #[arg(long = "out", conflicts_with_all = ["inbound", "direction"])]
+    outbound: bool,
+    #[arg(long, value_parser = ["in", "out", "all"])]
+    direction: Option<String>,
+    #[arg(long, alias = "include-tools")]
+    tools: bool,
+    #[arg(long)]
+    only_tools: bool,
+    #[arg(long)]
+    tool: Option<String>,
+    /// Relative duration (10m, 2h, 7d), RFC3339 timestamp, or epoch milliseconds.
+    #[arg(long, alias = "since-ms", value_parser = parse_time)]
+    since: Option<i64>,
+    #[arg(long, alias = "until-ms", value_parser = parse_time)]
+    until: Option<i64>,
+    #[arg(long)]
+    from_seq: Option<i64>,
+    #[arg(long)]
+    to_seq: Option<i64>,
+    /// Number of entries (default: 20).
+    #[arg(short = 'n', long, conflicts_with = "all")]
+    limit: Option<usize>,
+    /// Fetch every matching entry.
+    #[arg(long)]
+    all: bool,
+    #[arg(long, value_parser = ["oldest", "newest", "relevance"])]
+    sort: Option<String>,
+    #[arg(long)]
+    radius: Option<usize>,
+    #[arg(long)]
+    exclude: Option<String>,
+    #[arg(long)]
+    full: bool,
+    #[arg(long)]
+    json: bool,
+    #[arg(short = 'f', long, conflicts_with = "until")]
+    follow: bool,
+}
+
+#[derive(Args, Clone, Debug)]
+struct ConversationArgs {
+    agent: Option<String>,
+    /// Optional search text; --query is also accepted.
+    #[arg(conflicts_with = "query")]
+    text: Option<String>,
+    #[arg(short = 'q', long)]
+    query: Option<String>,
+    #[command(flatten)]
+    options: HistoryOptions,
+}
+
+#[derive(Args, Clone, Debug)]
+struct SearchArgs {
+    query: String,
+    #[arg(long)]
+    agent: Option<String>,
+    #[command(flatten)]
+    options: HistoryOptions,
+}
+
+#[derive(Args, Clone, Debug)]
+struct InboxArgs {
+    agent: Option<String>,
+    /// Exclusive mailbox sequence cursor.
+    #[arg(long)]
+    since: Option<i64>,
+    /// Number of messages (default: 20).
+    #[arg(short = 'n', long, conflicts_with = "all")]
+    limit: Option<usize>,
+    #[arg(long)]
+    all: bool,
+    #[arg(long, alias = "undelivered")]
+    unread: bool,
+    #[arg(long, alias = "from")]
+    sender: Option<String>,
+    #[arg(long)]
+    full: bool,
+    #[arg(long)]
+    json: bool,
+    #[arg(short = 'f', long)]
+    follow: bool,
+}
+
+fn parse_time(raw: &str) -> Result<i64, String> {
+    parse_time_at(raw, anyagents_core::now_ms())
+}
+
+fn parse_time_at(raw: &str, now: i64) -> Result<i64, String> {
+    if let Ok(ms) = raw.parse::<i64>() {
+        return Ok(ms);
+    }
+    if let Some((amount, multiplier)) = [
+        ("ms", 1_i64),
+        ("s", 1_000),
+        ("m", 60_000),
+        ("h", 3_600_000),
+        ("d", 86_400_000),
+    ]
+    .into_iter()
+    .find_map(|(unit, scale)| raw.strip_suffix(unit).map(|n| (n, scale)))
+    {
+        let duration = amount
+            .parse::<i64>()
+            .ok()
+            .filter(|n| *n >= 0)
+            .and_then(|n| n.checked_mul(multiplier));
+        return duration
+            .and_then(|d| now.checked_sub(d))
+            .ok_or_else(|| format!("invalid duration: {raw}"));
+    }
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .map(|t| t.timestamp_millis())
+        .map_err(|_| {
+            format!(
+                "invalid time `{raw}`; use 10m, 2h, 7d, an RFC3339 timestamp, or epoch milliseconds"
+            )
+        })
+}
+
 #[derive(Subcommand)]
 enum AgentsCommand {
+    /// Inspect one agent and its recent conversation.
+    Inspect {
+        agent: Option<String>,
+        #[arg(short = 'n', long, default_value_t = 10)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Read the incoming mailbox.
+    Inbox(InboxArgs),
+    /// Read, search, or follow conversation history.
+    #[command(visible_aliases = ["conversation", "messages", "msg"], alias = "tail")]
+    Logs(ConversationArgs),
+    /// Send a text message.
+    Send {
+        to: String,
+        text: String,
+        #[arg(long)]
+        from: Option<String>,
+    },
+    /// Resume an archived or paused agent.
+    #[command(visible_alias = "wake")]
+    Resume {
+        name: String,
+        #[arg(long)]
+        prompt: Option<String>,
+    },
+    /// View or update the agent description.
+    Describe {
+        agent: Option<String>,
+        description: Option<String>,
+        #[arg(long)]
+        instructions: Option<String>,
+        #[arg(long)]
+        role: Option<String>,
+        #[arg(long)]
+        clear: bool,
+    },
     /// Grant administrative authority to a root agent (operator only).
     GrantAdmin { agent: String },
     /// Revoke administrative authority immediately (operator only).
@@ -738,7 +866,6 @@ enum AgentsCommand {
     /// Pause an agent (`state = paused`), stopping its process, channel polling, and group wakes until resumed.
     Pause { name: String },
     /// Wake and resume an archived or paused agent (`state = running`).
-    Wake { name: String },
     /// Start a new logical session for a quiescent agent; retain all old history and pins.
     #[command(alias = "new-session")]
     ResetSession { name: String },
@@ -1122,27 +1249,8 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
             text,
             from,
         } => interact_cmd(&data, action, target, emoji, options, text, from),
-        Command::Inbox {
-            agent,
-            since,
-            limit,
-        } => channel::inbox(&data, agent.as_deref(), since, limit),
-        Command::Conversation {
-            agent,
-            query,
-            scope,
-            with,
-            since_ms,
-            limit,
-        } => channel::conversation(
-            &data,
-            agent.as_deref(),
-            with.as_deref(),
-            since_ms,
-            limit,
-            query.as_deref(),
-            scope.as_deref(),
-        ),
+        Command::Inbox(args) => channel::inbox(&data, args),
+        Command::Conversation(args) => channel::conversation(&data, args),
         Command::Redact {
             agent,
             message_id,
@@ -1182,21 +1290,14 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
             );
             Ok(())
         }
-        Command::Search {
-            query,
-            agent,
-            scope,
-            with,
-            since_ms,
-            limit,
-        } => channel::conversation(
+        Command::Search(args) => channel::conversation(
             &data,
-            Some(agent.as_deref().unwrap_or("all")),
-            with.as_deref(),
-            since_ms,
-            Some(limit.unwrap_or(20)),
-            Some(&query),
-            scope.as_deref(),
+            ConversationArgs {
+                agent: Some(args.agent.unwrap_or_else(|| "all".into())),
+                text: None,
+                query: Some(args.query),
+                options: args.options,
+            },
         ),
         Command::Usage { agent, by } => agent::usage(&data, agent.as_deref(), by.as_deref())
             .map_err(|err| match err {
@@ -1407,81 +1508,60 @@ fn schedule_cmd(
     Ok(())
 }
 
-fn inspect_cmd(
-    data: &Path,
-    agent: Option<String>,
-    limit: usize,
-    _json: bool,
-) -> Result<(), anyagents_core::Error> {
+fn inspect_cmd(data: &Path, agent: Option<String>, limit: usize, json: bool) -> Result<(), Error> {
+    use std::io::IsTerminal;
     let target = agent
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|s| s.strip_prefix("agent:").unwrap_or(s).to_string())
         .or_else(|| client::agent_identity().map(|id| id.to_string()))
-        .ok_or_else(|| {
-            anyagents_core::Error::Message("inspect requires an agent name or id".into())
-        })?;
-    if client::can_call_server(data)
-        && let Ok(Some(mut listed)) = client::call::<api::AgentsResponse>(
-            data,
-            "GET",
-            "/v1/agents",
-            None,
-            &client::authority(data),
-        )
-    {
-        agent::reconcile_and_enrich_views(data, &mut listed.agents);
-        if let Some(view) = listed.agents.into_iter().find(|a| {
-            a.name.eq_ignore_ascii_case(&target)
-                || a.id == target
-                || a.aliases.iter().any(|al| al.eq_ignore_ascii_case(&target))
-        }) {
-            let conv_path = format!("/v1/agents/{}/conversation?limit={limit}", view.id);
-            let conv = client::call::<api::ConversationResponse>(
-                data,
-                "GET",
-                &conv_path,
-                None,
-                &client::authority(data),
-            )
-            .ok()
-            .flatten();
-            let schedules = view.schedules.clone();
-            let out = serde_json::json!({
-                "agent": view,
-                "schedules": schedules,
-                "recent_turns": conv.map(|c| c.turns).unwrap_or_default(),
-            });
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&out)
-                    .map_err(|e| anyagents_core::Error::Message(e.to_string()))?
-            );
-            return Ok(());
-        }
-    }
-    let store = anyagents_core::Store::open(data.join("state.db"))?;
-    let rec = store.agent_by_name(&target)?;
-    let schedules = schedule::list_agent_schedules(&store, &rec.id, false)
-        .map_err(anyagents_core::Error::Message)?;
-    let out = serde_json::json!({
-        "agent": {
-            "id": rec.id.to_string(),
-            "name": rec.name,
-            "role": rec.role,
-            "harness": rec.harness,
-            "model": rec.model,
-            "state": rec.state,
-            "schedules": schedules,
+        .ok_or_else(|| Error::Message("inspect requires an agent name or id".into()))?;
+    let view = agent::view_named(data, &target)?;
+    let turns = channel::read_conversation(
+        data,
+        &view.id,
+        None,
+        &HistoryOptions {
+            limit: Some(limit),
+            ..Default::default()
         },
-        "schedules": schedules,
-    });
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&out)
-            .map_err(|e| anyagents_core::Error::Message(e.to_string()))?
-    );
+    )?
+    .turns;
+    if json || !std::io::stdout().is_terminal() {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "agent": view, "schedules": view.schedules, "recent_turns": turns,
+            }))
+            .map_err(|e| Error::Message(e.to_string()))?
+        );
+    } else {
+        println!(
+            "{}  ({})\nState: {}   Process: {}   Turn: {}\nLag: {} ms   Block: {}\nRuntime: {}   Model: {}\nWorkdir: {}\nSeat: {}\nSchedules: {}",
+            view.name,
+            view.id,
+            view.state,
+            view.process,
+            view.turn_state,
+            view.oldest_undelivered_age_ms
+                .map_or_else(|| "-".into(), |n| n.to_string()),
+            view.block_reason.as_deref().unwrap_or("-"),
+            view.harness,
+            view.model.as_deref().unwrap_or("default"),
+            view.workdir.as_deref().unwrap_or("-"),
+            view.seat_user.as_deref().unwrap_or("-"),
+            view.schedules.len()
+        );
+        println!(
+            "Open turn: {}   Profile: {}",
+            view.has_open_turn,
+            view.profile.as_deref().unwrap_or("default")
+        );
+        for schedule in &view.schedules {
+            println!("  {} {}: {}", schedule.kind, schedule.spec, schedule.prompt);
+        }
+        if let Some(error) = &view.last_error {
+            println!("Error: {error}");
+        }
+        channel::emit_turns(&turns, true, false)?;
+    }
     Ok(())
 }
 
@@ -2369,7 +2449,7 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
     for entry in anyagents_installer::builtin_catalog() {
         let bin_path = install::program(data, &entry.id);
         let present = bin_path.is_file() || anyagents_installer::machine_has(&entry.id);
-        let version = install::detect_version(data, &entry.id);
+        let version = install::recorded_version(data, &entry.id);
         let (mode, steer) = anyagents_supervisor::declared(&entry.id);
         let profiles: Vec<String> = provider_profiles
             .iter()
@@ -2387,62 +2467,12 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
         }));
     }
 
-    let agents_list = match live_agents {
-        Some(ref resp) => {
-            let mut list = resp.agents.clone();
-            agent::reconcile_and_enrich_views(data, &mut list);
-            list
-        }
-        None => {
-            let mut fallback = Vec::new();
-            if let Ok(store) = anyagents_core::Store::open(data.join("state.db"))
-                && let Ok(rows) = store.list_agents()
-            {
-                for a in rows {
-                    let (mode, steer) = anyagents_supervisor::declared(&a.harness);
-                    let seat_info = create::resolved_agent_seat_info(&store, &a);
-                    let aliases = store.agent_aliases(&a.id).unwrap_or_default();
-                    let public_desc = a.public_description();
-                    let scope_val = a.scope().to_string();
-                    fallback.push(api::AgentView {
-                        id: a.id.to_string(),
-                        name: a.name,
-                        role: a.role,
-                        aliases,
-                        parent: a.parent_id.map(|p| p.to_string()),
-                        scope: scope_val,
-                        relationship: None,
-                        can_message: None,
-                        harness: a.harness,
-                        model: a.model,
-                        live_harness: None,
-                        live_model: None,
-                        process_started_at_ms: None,
-                        pending_switch: false,
-                        workdir: a.workdir,
-                        state: a.state,
-                        process: "offline".to_string(),
-                        turn_state: "idle".to_string(),
-                        delivery_mode: anyagents_supervisor::mode_name(mode).to_string(),
-                        steer_support: anyagents_supervisor::steer_name(steer).to_string(),
-                        quota_reset_at_ms: None,
-                        block_reason: None,
-                        last_error: None,
-                        oldest_undelivered_age_ms: None,
-                        install: "recorded".to_string(),
-                        description: public_desc,
-                        instructions: a.instructions,
-                        seat_user: seat_info.as_ref().map(|(u, _, _, _)| u.clone()),
-                        seat_uid: seat_info.as_ref().map(|(_, uid, _, _)| *uid),
-                        seat_gid: seat_info.as_ref().map(|(_, _, gid, _)| *gid),
-                        schedules: schedule::list_agent_schedules(&store, &a.id, false)
-                            .map_err(anyagents_core::Error::Message)?,
-                    });
-                }
-            }
-            fallback
-        }
+    let listed = match live_agents {
+        Some(resp) => resp,
+        None => agent::offline_roster(data, &server::ListAgentsQuery::default())?,
     };
+    let archived_count = listed.archived_count;
+    let agents_list = listed.agents;
 
     if json_out {
         let doc = serde_json::json!({
@@ -2453,6 +2483,7 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
             "boundary": boundary,
             "harnesses": harness_rows,
             "agents": agents_list,
+            "archived_count": archived_count,
         });
         println!(
             "{}",
@@ -2720,4 +2751,119 @@ pub(crate) fn test_tempdir() -> tempfile::TempDir {
             .expect("physical temporary root"),
     )
     .expect("owned temporary fixture")
+}
+
+#[cfg(test)]
+mod cli_query_tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn command_tree_and_message_aliases_parse() {
+        Cli::command().debug_assert();
+        for alias in [
+            "conversation",
+            "logs",
+            "messages",
+            "msg",
+            "tail",
+            "conv",
+            "history",
+        ] {
+            assert!(matches!(
+                Cli::try_parse_from(["anyagents", alias, "vulcan", "-n", "10"])
+                    .unwrap()
+                    .command,
+                Command::Conversation(_)
+            ));
+        }
+        assert!(matches!(
+            Cli::try_parse_from(["anyagents", "mail", "vulcan", "--unread"])
+                .unwrap()
+                .command,
+            Command::Inbox(_)
+        ));
+        for alias in ["ls", "ps"] {
+            assert!(matches!(
+                Cli::try_parse_from(["anyagents", alias]).unwrap().command,
+                Command::Peers { .. }
+            ));
+        }
+        for subcommand in [
+            "logs",
+            "messages",
+            "conversation",
+            "inbox",
+            "inspect",
+            "describe",
+            "resume",
+            "wake",
+        ] {
+            Cli::try_parse_from(["anyagents", "agent", subcommand, "vulcan"]).unwrap();
+        }
+        let cli = Cli::try_parse_from([
+            "anyagents",
+            "logs",
+            "vulcan",
+            "--sender",
+            "alice",
+            "--in",
+            "--only-tools",
+            "--tool",
+            "bash",
+            "--since",
+            "10m",
+            "--until",
+            "2026-11-09T00:00:00Z",
+            "--from-seq",
+            "3",
+            "--to-seq",
+            "8",
+            "--sort",
+            "oldest",
+            "--radius",
+            "2",
+            "--exclude",
+            "noise",
+            "--full",
+            "--json",
+        ])
+        .unwrap();
+        let Command::Conversation(args) = cli.command else {
+            panic!()
+        };
+        assert!(args.options.inbound && args.options.full && args.options.json);
+        assert_eq!(args.options.from_seq, Some(3));
+        assert!(Cli::try_parse_from(["anyagents", "logs", "vulcan", "--in", "--out"]).is_err());
+        assert!(Cli::try_parse_from(["anyagents", "mail", "vulcan", "--all", "-n", "2"]).is_err());
+    }
+
+    #[test]
+    fn relative_and_absolute_time_parsing() {
+        let now = 1_800_000_000_000;
+        assert_eq!(parse_time_at("10m", now).unwrap(), now - 600_000);
+        assert_eq!(parse_time_at("2h", now).unwrap(), now - 7_200_000);
+        assert_eq!(parse_time_at("30s", now).unwrap(), now - 30_000);
+        assert_eq!(parse_time_at("7d", now).unwrap(), now - 604_800_000);
+        assert_eq!(
+            parse_time_at("2026-11-09T00:00:00Z", now).unwrap(),
+            1_794_182_400_000
+        );
+        assert_eq!(
+            parse_time_at("2026-11-09T02:00:00+02:00", now).unwrap(),
+            1_794_182_400_000
+        );
+        assert_eq!(
+            parse_time_at("1794182400000", now).unwrap(),
+            1_794_182_400_000
+        );
+        for invalid in [
+            "nope",
+            "-2h",
+            "9999999999999999999d",
+            "2026-13-01T00:00:00Z",
+        ] {
+            assert!(parse_time_at(invalid, now).is_err(), "{invalid}");
+        }
+    }
 }

@@ -1078,7 +1078,7 @@ async fn mcp_tools_use_the_server_socket() {
     let inbox = bin()
         .arg("--data")
         .arg(dir.path())
-        .args(["inbox", "beta"])
+        .args(["inbox", "beta", "--json"])
         .output()
         .unwrap();
     assert!(
@@ -1088,7 +1088,12 @@ async fn mcp_tools_use_the_server_socket() {
     );
     // Two addressed lines, the room line, and the three `all` broadcast lines, each readable from the CLI too.
     let listed = String::from_utf8(inbox.stdout).unwrap();
-    assert_eq!(listed.lines().count(), 6, "{listed}");
+    let response: serde_json::Value = serde_json::from_str(&listed).unwrap();
+    assert_eq!(
+        response["messages"].as_array().unwrap().len(),
+        6,
+        "{listed}"
+    );
     assert!(listed.contains("room line"), "{listed}");
     assert!(listed.contains("broadcast to active"), "{listed}");
 }

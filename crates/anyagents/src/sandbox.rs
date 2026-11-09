@@ -257,6 +257,21 @@ pub(super) fn admitted_principal_entry(
     ))
 }
 
+/// Resolve immutable-ID seat labels once for a roster response. Parent names
+/// are display metadata and never confer execution authority.
+pub(crate) fn roster_seats() -> std::collections::HashMap<String, (String, u32, u32, u32)> {
+    if let Ok(raw) = std::env::var("ANYAGENTS_PRINCIPALS") {
+        return serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&raw)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(id, entry)| admitted_principal_entry(&entry).map(|seat| (id, seat)))
+            .collect();
+    }
+    std::env::var_os("ANYAGENTS_PRINCIPAL_REGISTRY")
+        .and_then(|path| principals::read_admitted_principals(Path::new(&path).parent()?).ok())
+        .unwrap_or_default()
+}
+
 fn admitted_principal(raw: &str, agent_id: &str) -> Option<(String, u32, u32, u32)> {
     let values: serde_json::Value = serde_json::from_str(raw).ok()?;
     admitted_principal_entry(values.get(agent_id)?)
