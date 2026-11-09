@@ -225,6 +225,35 @@ fn operator_read_fallback_handles_disconnect_without_hiding_http_refusals() {
 }
 
 #[test]
+fn daemon_survives_sigpipe_from_closed_child_pipes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut child = bin()
+        .env("ANYAGENTS_TESTS", "1")
+        .arg("--data")
+        .arg(dir.path())
+        .arg("serve")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !dir.path().join("anyagents.sock").exists() {
+        if child.try_wait().unwrap().is_some() || std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("fixture daemon never listened");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGPIPE) }, 0);
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let status = child.try_wait().unwrap();
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(status.is_none(), "SIGPIPE terminated daemon: {status:?}");
+}
+
+#[test]
 fn closed_stdout_uses_sigpipe_without_panicking() {
     use std::os::unix::process::ExitStatusExt;
     use std::process::Stdio;

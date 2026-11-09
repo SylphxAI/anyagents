@@ -813,6 +813,16 @@ impl Store {
         Ok(())
     }
 
+    /// Whether this process can decide capability validity authoritatively.
+    /// Helpers without the key may ask the daemon; the daemon must never ask
+    /// its own socket again after rejecting a capability.
+    pub fn holds_capability_key(&self) -> bool {
+        self.capabilities
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .is_some()
+    }
+
     pub(crate) fn database_path(&self) -> &Path {
         &self.db_path
     }

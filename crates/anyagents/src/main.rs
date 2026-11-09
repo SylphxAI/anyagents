@@ -926,6 +926,15 @@ fn main() -> ExitCode {
     }
     sandbox::hydrate_operator_groups_if_needed();
     let cli = Cli::parse();
+    // The daemon also writes child stdin pipes and must handle their closure as
+    // an I/O error, not terminate the entire service. Only operator output uses
+    // the default pipeline disposition installed above.
+    #[cfg(unix)]
+    if matches!(cli.command, Command::Serve) {
+        unsafe {
+            libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+        }
+    }
     match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
