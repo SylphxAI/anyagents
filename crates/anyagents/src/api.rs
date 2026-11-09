@@ -6,6 +6,10 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct AgentView {
+    #[serde(default)]
+    pub has_open_turn: bool,
+    #[serde(default)]
+    pub profile: Option<String>,
     pub id: String,
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -214,6 +218,8 @@ pub struct GroupActionRequest {
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct AgentsResponse {
+    #[serde(default)]
+    pub archived_count: usize,
     pub agents: Vec<AgentView>,
     /// The origin a harness points at for provider traffic, when the gateway is
     /// running. A client stores a key against it so the agent reaches the
@@ -265,6 +271,8 @@ impl From<anyagents_core::raw_segment::RawCoordinate> for RawCoordinateView {
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct ConversationTurnView {
+    #[serde(default)]
+    pub seq: i64,
     pub id: String,
     /// Exact bytes for an explicit bounded raw-range read; `text` is a lossy preview.
     #[serde(default, skip_serializing_if = "Option::is_none")]

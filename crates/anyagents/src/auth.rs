@@ -199,7 +199,9 @@ pub fn agent_for_capability(store: &Store, token: &str) -> Result<Principal, Aut
         return Ok(Principal::Agent { agent_id, name });
     }
     #[cfg(unix)]
-    if let Some(principal) = verify_capability_via_primary_socket(store.data_dir(), token) {
+    if !store.holds_capability_key()
+        && let Some(principal) = verify_capability_via_primary_socket(store.data_dir(), token)
+    {
         return Ok(principal);
     }
     Err(AuthError::Unauthenticated(
@@ -318,6 +320,25 @@ mod tests {
         assert!(!digest.contains("0123456789abcdef0123456789abcdef"));
         assert_eq!(digest.len(), 16);
         assert_ne!(digest, operator_digest("0123456789abcdef0123456789abcdee"));
+    }
+
+    #[test]
+    fn daemon_rejects_revoked_capability_without_calling_its_own_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        store.hold_capability_key(&"a".repeat(64)).unwrap();
+        let agent = store
+            .create_agent(anyagents_core::NewAgent::new("auth-reader", "test"))
+            .unwrap();
+        let revoked = store.issue_capability(&agent.id).unwrap();
+        store.issue_capability(&agent.id).unwrap();
+        let listener =
+            std::os::unix::net::UnixListener::bind(dir.path().join("anyagents.sock")).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        assert!(agent_for_capability(&store, &revoked).is_err());
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
     }
 
     #[test]

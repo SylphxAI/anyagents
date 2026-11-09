@@ -35,6 +35,15 @@ pub(crate) fn load_principal_registry(data: &Path) -> Result<(), Error> {
     Ok(())
 }
 
+/// A trusted display snapshot. Launch authorization still reads fresh grants.
+pub(super) fn read_admitted_principals(
+    data: &Path,
+) -> Result<HashMap<String, PrincipalTuple>, Error> {
+    Ok(read_principal_registry_parsed(data)?
+        .map(|(_, map)| map)
+        .unwrap_or_default())
+}
+
 pub(super) fn read_admitted_principal(
     data: &Path,
     agent_id: &str,

@@ -6,11 +6,15 @@
 //! no server to ask for a channel secret, and the store is the one place the
 //! message can land.
 
+use std::collections::HashSet;
+use std::io::{IsTerminal, Write};
 use std::path::Path;
+
+use crate::{ConversationArgs, HistoryOptions, InboxArgs};
 
 use anyagents_core::{Address, Error, Incoming, Quote};
 
-use crate::agent::{named, open};
+use crate::agent::open;
 use crate::api::{
     ConversationResponse, InboxResponse, SendArticle, SendChecklist, SendLocation, SendMedia,
     SendPoll, SendRequest, SendResponse,
@@ -255,214 +259,381 @@ fn parse_id(raw: &str, what: &'static str) -> Result<i64, Error> {
     raw.parse().map_err(|_| Error::Message(what.into()))
 }
 
-pub fn inbox(
-    data: &Path,
-    agent: Option<&str>,
-    since: Option<i64>,
-    limit: Option<usize>,
-) -> Result<(), Error> {
-    let target = match agent.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(a) => a.to_string(),
-        None => client::agent_identity()
-            .map(|id| id.to_string())
-            .ok_or_else(|| Error::Message("inbox needs an agent name or id".into()))?,
-    };
-    if client::can_call_server(data) {
-        let who = named(data, &target)?.id;
-        let mut params = Vec::new();
-        if let Some(s) = since {
-            params.push(format!("since={s}"));
-        }
-        if let Some(l) = limit {
-            params.push(format!("limit={l}"));
-        }
-        let path = if params.is_empty() {
-            format!("/v1/agents/{who}/inbox")
+pub fn inbox(data: &Path, args: InboxArgs) -> Result<(), Error> {
+    let target = args
+        .agent
+        .clone()
+        .or_else(|| client::agent_identity().map(|id| id.to_string()))
+        .ok_or_else(|| Error::Message("inbox needs an agent name or id".into()))?;
+    let mut since = args.since;
+    let mut initial = true;
+    loop {
+        // Once following, drain the complete new range before advancing the cursor.
+        let limit = if args.all || !initial {
+            None
         } else {
-            format!("/v1/agents/{who}/inbox?{}", params.join("&"))
+            Some(args.limit.unwrap_or(20))
         };
-        let read =
-            client::call::<InboxResponse>(data, "GET", &path, None, &client::authority(data))
-                .map_err(Error::Message)?;
-        if let Some(read) = read {
-            print_messages(&target, read);
+        let remote = if client::can_call_server(data) {
+            let mut params = vec![format!("unread={}", args.unread)];
+            if let Some(since) = since {
+                params.push(format!("since={since}"));
+            }
+            if let Some(limit) = limit {
+                params.push(format!("limit={limit}"));
+            }
+            if let Some(sender) = &args.sender {
+                params.push(format!("sender={}", urlencoding_simple(sender)));
+            }
+            client::get::<InboxResponse>(
+                data,
+                &format!(
+                    "/v1/agents/{}/inbox?{}",
+                    urlencoding_simple(&target),
+                    params.join("&")
+                ),
+            )
+            .map_err(Error::Message)?
+        } else {
+            None
+        };
+        let read = if let Some(read) = remote {
+            read
+        } else {
+            if client::agent_identity().is_some() {
+                return Err(Error::Message(
+                    "agent inbox reads require the authenticated server".into(),
+                ));
+            }
+            let store = open(data)?;
+            let agent = store.agent_by_name(&target)?;
+            InboxResponse {
+                messages: store
+                    .inbox_query_filtered(
+                        &agent.id,
+                        since,
+                        limit,
+                        args.unread,
+                        args.sender.as_deref(),
+                    )?
+                    .into_iter()
+                    .map(|m| crate::api::MessageView {
+                        id: m.id.to_string(),
+                        seq: m.seq,
+                        text: m.text,
+                        sender: m.sender,
+                        reply_to: m.reply_to,
+                        source_time_ms: m.source_time_ms,
+                        received_at_ms: m.received_at_ms,
+                        ack: m.ack.to_string(),
+                        delivered_at_ms: m.delivered_at_ms,
+                    })
+                    .collect(),
+            }
+        };
+        if let Some(last) = read.messages.last() {
+            since = Some(last.seq);
+        }
+        if args.json {
+            if args.follow {
+                for message in &read.messages {
+                    println!(
+                        "{}",
+                        serde_json::to_string(message)
+                            .map_err(|e| Error::Message(e.to_string()))?
+                    );
+                }
+            } else {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&read)
+                        .map_err(|e| Error::Message(e.to_string()))?
+                );
+            }
+        } else if args.full || !std::io::stdout().is_terminal() {
+            for m in &read.messages {
+                println!(
+                    "[#{}] {}  IN   {} -> {}  ({})\n{}\n",
+                    m.seq,
+                    crate::ui::format_timestamp_ms(m.received_at_ms),
+                    m.sender.as_deref().unwrap_or("unknown"),
+                    target,
+                    m.ack,
+                    m.text
+                );
+            }
+        } else {
+            crate::ui::print_inbox_pretty(&target, &read.messages);
+        }
+        if !args.follow {
             return Ok(());
         }
+        std::io::stdout().flush()?;
+        initial = false;
+        std::thread::sleep(std::time::Duration::from_secs(1));
     }
-    let store = open(data)?;
-    let agent = store.agent_by_name(&target)?;
-    let mut rows = store.inbox(&agent.id, since)?;
-    if let Some(limit) = limit {
-        if since.is_none() && rows.len() > limit {
-            rows.drain(..rows.len() - limit);
-        } else if rows.len() > limit {
-            rows.truncate(limit);
+}
+
+pub fn emit_turns(
+    turns: &[crate::api::ConversationTurnView],
+    full: bool,
+    json: bool,
+) -> Result<(), Error> {
+    if json {
+        for turn in turns {
+            println!(
+                "{}",
+                serde_json::to_string(turn).map_err(|e| Error::Message(e.to_string()))?
+            );
         }
+    } else if full || !std::io::stdout().is_terminal() {
+        for t in turns {
+            println!(
+                "[#{}] {}  {:<4} {} -> {}\n{}\n",
+                t.seq,
+                t.timestamp_ms
+                    .map_or_else(|| "unknown".into(), crate::ui::format_timestamp_ms),
+                t.direction.to_uppercase(),
+                t.from,
+                t.to,
+                t.text
+            );
+        }
+    } else {
+        crate::ui::print_conversation_pretty("", None, turns);
     }
-    print_messages(
-        &target,
-        InboxResponse {
-            messages: rows
-                .into_iter()
-                .map(|message| crate::api::MessageView {
-                    id: message.id.to_string(),
-                    seq: message.seq,
-                    text: message.text,
-                    sender: message.sender,
-                    reply_to: message.reply_to,
-                    source_time_ms: message.source_time_ms,
-                    received_at_ms: message.received_at_ms,
-                    ack: message.ack.to_string(),
-                    delivered_at_ms: message.delivered_at_ms,
-                })
-                .collect(),
-        },
-    );
     Ok(())
 }
 
-fn emit_turns(target: &str, query: Option<&str>, turns: Vec<crate::api::ConversationTurnView>) {
-    if crate::ui::is_pretty() {
-        crate::ui::print_conversation_pretty(target, query, &turns);
-        return;
-    }
-    for turn in turns {
-        println!(
-            "{}\t{}\t{}\t{}\t{}\t{}",
-            turn.timestamp_ms
-                .map_or_else(|| "unknown".into(), |ms| ms.to_string()),
-            turn.direction,
-            turn.id,
-            turn.from,
-            turn.to,
-            turn.text.replace('\n', "\\n"),
-        );
+pub fn conversation(data: &Path, args: ConversationArgs) -> Result<(), Error> {
+    let query = args.query.as_deref().or(args.text.as_deref());
+    let target = args
+        .agent
+        .clone()
+        .or_else(|| {
+            if query.is_some() {
+                Some("all".into())
+            } else {
+                client::agent_identity().map(|id| id.to_string())
+            }
+        })
+        .ok_or_else(|| Error::Message("conversation needs an agent name or id".into()))?;
+    let mut options = args.options;
+    let mut seen = HashSet::new();
+    loop {
+        let read = read_conversation(data, &target, query, &options)?;
+        let turns: Vec<_> = read
+            .turns
+            .into_iter()
+            .filter(|t| seen.insert(t.id.clone()))
+            .collect();
+        if options.json && !options.follow {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&ConversationResponse { turns, ..read })
+                    .map_err(|e| Error::Message(e.to_string()))?
+            );
+            return Ok(());
+        }
+        emit_turns(&turns, options.full, options.json)?;
+        if !options.follow {
+            return Ok(());
+        }
+        // Outbound replies share the current inbound sequence. Re-read the
+        // boundary and deduplicate IDs so replies at that sequence cannot vanish.
+        if let Some(seq) = turns.iter().map(|t| t.seq).max() {
+            options.from_seq = Some(options.from_seq.unwrap_or(seq).max(seq));
+        }
+        options.all = true;
+        std::io::stdout().flush()?;
+        std::thread::sleep(std::time::Duration::from_secs(1));
     }
 }
 
-pub fn conversation(
+pub fn read_conversation(
     data: &Path,
-    agent: Option<&str>,
-    with: Option<&str>,
-    since_ms: Option<i64>,
-    limit: Option<usize>,
+    target: &str,
     query: Option<&str>,
-    scope: Option<&str>,
-) -> Result<(), Error> {
-    let clean_query = query.map(str::trim).filter(|s| !s.is_empty());
-    let clean_scope = scope.map(str::trim).filter(|s| !s.is_empty());
-    let target = match agent.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(a) => a.to_string(),
-        None => {
-            if clean_query.is_some() {
-                "all".to_string()
-            } else {
-                client::agent_identity()
-                    .map(|id| id.to_string())
-                    .ok_or_else(|| {
-                        Error::Message("conversation needs an agent name or id".into())
-                    })?
-            }
-        }
+    options: &HistoryOptions,
+) -> Result<ConversationResponse, Error> {
+    let direction = if options.inbound {
+        Some("in")
+    } else if options.outbound {
+        Some("out")
+    } else {
+        options.direction.as_deref()
     };
+    let limit = if options.all {
+        None
+    } else {
+        Some(options.limit.unwrap_or(20))
+    };
+    let structured = query.is_some()
+        || direction.is_some()
+        || options.sender.is_some()
+        || options.until.is_some()
+        || options.from_seq.is_some()
+        || options.to_seq.is_some()
+        || options.tools
+        || options.only_tools
+        || options.tool.is_some()
+        || options.sort.is_some()
+        || options.radius.is_some()
+        || options.exclude.is_some();
     if client::can_call_server(data) {
         let mut params = Vec::new();
-        if let Some(w) = with.map(str::trim).filter(|s| !s.is_empty()) {
-            params.push(format!("with={}", urlencoding_simple(w)));
+        for (key, value) in [
+            ("query", query),
+            ("scope", options.scope.as_deref()),
+            ("with", options.with.as_deref()),
+            ("sender", options.sender.as_deref()),
+            ("direction", direction),
+            ("tool_name", options.tool.as_deref()),
+            ("sort", options.sort.as_deref()),
+            ("exclude", options.exclude.as_deref()),
+        ] {
+            if let Some(value) = value {
+                params.push(format!("{key}={}", urlencoding_simple(value)));
+            }
         }
-        if let Some(s) = since_ms {
-            params.push(format!("since_ms={s}"));
+        for (key, value) in [
+            ("since_ms", options.since),
+            ("until_ms", options.until),
+            ("from_seq", options.from_seq),
+            ("to_seq", options.to_seq),
+        ] {
+            if let Some(value) = value {
+                params.push(format!("{key}={value}"));
+            }
         }
-        if let Some(l) = limit {
-            params.push(format!("limit={l}"));
+        if let Some(limit) = limit {
+            params.push(format!("limit={limit}"));
         }
-        if let Some(q) = clean_query {
-            params.push(format!("query={}", urlencoding_simple(q)));
+        if options.all {
+            params.push("all=true".into());
         }
-        if let Some(sc) = clean_scope {
-            params.push(format!("scope={}", urlencoding_simple(sc)));
+        if let Some(radius) = options.radius {
+            params.push(format!("radius={radius}"));
         }
-        let path = if params.is_empty() {
-            format!("/v1/agents/{target}/conversation")
-        } else {
-            format!("/v1/agents/{target}/conversation?{}", params.join("&"))
-        };
-        let read = client::call::<ConversationResponse>(
+        if options.tools || options.only_tools || options.tool.is_some() {
+            params.push("include_tools=true".into());
+        } else if structured || options.scope.as_deref().is_some_and(|s| s != "all") {
+            // Plain per-agent logs already read only the mailbox/outbound tables.
+            // Sending this flag there would select full structured/indexed search,
+            // including unrelated native transcript parsing, for a five-row tail.
+            params.push("include_tools=false".into());
+        }
+        if options.only_tools {
+            params.push("only_tools=true".into());
+        }
+        if let Some(read) = client::get::<ConversationResponse>(
             data,
-            "GET",
-            &path,
-            None,
-            &client::authority(data),
+            &format!(
+                "/v1/agents/{}/conversation?{}",
+                urlencoding_simple(target),
+                params.join("&")
+            ),
         )
-        .map_err(Error::Message)?;
-        if let Some(read) = read {
-            emit_turns(&target, clean_query, read.turns);
-            return Ok(());
+        .map_err(Error::Message)?
+        {
+            return Ok(read);
         }
     }
-    // An agent never bypasses server authorization by opening SQLite, even
-    // when the socket is unavailable. Offline reads are an operator path only.
     if client::agent_identity().is_some() {
         return Err(Error::Message(
-            "agent conversation reads require the authenticated server".to_string(),
+            "agent conversation reads require the authenticated server".into(),
         ));
     }
     let store = open(data)?;
-    let turns = if let Some(q) = clean_query {
-        store.search_conversation(Some(&target), with, since_ms, limit, q)?
-    } else if target.eq_ignore_ascii_case("all") || target == "*" {
-        store.conversation_all(with, since_ms, limit)?
+    let canonical = if matches!(target, "all" | "*") {
+        None
     } else {
-        let found = store.agent_by_name(&target)?;
-        store.conversation(&found.id, with, since_ms, limit)?
+        Some(store.agent_by_name(target)?)
     };
-    let views = turns
-        .into_iter()
-        .map(|t| crate::api::ConversationTurnView {
-            raw_bytes: None,
-            source: None,
-            raw: None,
-            window: None,
-            tool_name: None,
-            tool_names: Vec::new(),
-            role: None,
-            id: t.id,
-            direction: t.direction,
-            from: t.from,
-            to: t.to,
-            text: t.text,
-            reply_to: t.reply_to,
-            timestamp_ms: Some(t.timestamp_ms),
-        })
-        .collect();
-    emit_turns(&target, clean_query, views);
-    Ok(())
+    let turns = if options.scope.as_deref().is_some_and(|scope| scope != "all") {
+        return Err(Error::Message(
+            "offline memory/transcript scope reads require the server".into(),
+        ));
+    } else if structured {
+        store.search_history(&anyagents_core::HistorySearchQuery {
+            agent: Some(
+                canonical
+                    .as_ref()
+                    .map_or(target, |a| a.name.as_str())
+                    .to_string(),
+            ),
+            query: query.map(str::to_string),
+            with_peer: options.with.clone(),
+            direction: direction.map(str::to_string),
+            sender: options.sender.clone(),
+            include_tools: options.tools || options.only_tools || options.tool.is_some(),
+            only_tools: options.only_tools,
+            tool_name: options.tool.clone(),
+            since_ms: options.since,
+            until_ms: options.until,
+            from_seq: options.from_seq,
+            to_seq: options.to_seq,
+            sort: anyagents_core::HistorySort::parse(options.sort.as_deref()),
+            radius: options.radius.unwrap_or(0),
+            limit: limit.unwrap_or(0),
+            exclude: options
+                .exclude
+                .as_deref()
+                .unwrap_or_default()
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect(),
+            ..Default::default()
+        })?
+    } else if let Some(agent) = &canonical {
+        store.conversation(&agent.id, options.with.as_deref(), options.since, limit)?
+    } else {
+        store.conversation_all(options.with.as_deref(), options.since, limit)?
+    };
+    Ok(ConversationResponse {
+        agent: canonical
+            .as_ref()
+            .map_or(target, |a| a.name.as_str())
+            .to_string(),
+        agent_id: canonical
+            .as_ref()
+            .map(|a| a.id.to_string())
+            .unwrap_or_else(|| "all".into()),
+        turns: turns
+            .into_iter()
+            .map(|t| crate::api::ConversationTurnView {
+                seq: t.seq,
+                id: t.id,
+                direction: t.direction,
+                from: t.from,
+                to: t.to,
+                text: t.text,
+                reply_to: t.reply_to,
+                timestamp_ms: Some(t.timestamp_ms),
+                raw_bytes: None,
+                source: None,
+                raw: None,
+                window: None,
+                tool_name: None,
+                tool_names: Vec::new(),
+                role: None,
+            })
+            .collect(),
+    })
 }
 
-fn urlencoding_simple(s: &str) -> String {
+pub(crate) fn urlencoding_simple(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for byte in s.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':' | b'@') {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'@') {
             out.push(char::from(byte));
         } else {
             out.push_str(&format!("%{byte:02X}"));
         }
     }
     out
-}
-
-fn print_messages(target: &str, read: InboxResponse) {
-    if crate::ui::is_pretty() {
-        crate::ui::print_inbox_pretty(target, &read.messages);
-        return;
-    }
-    for message in read.messages {
-        let ack = message.ack.clone();
-        println!(
-            "{}\t{}\t{}\t{}",
-            message.seq, ack, message.received_at_ms, message.text
-        );
-    }
 }
 
 /// `channels add`, `channels request-bot`, and `channels list`.

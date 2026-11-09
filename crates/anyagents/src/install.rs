@@ -96,7 +96,7 @@ fn version_sort_key(path: &Path) -> (u64, u64, u64, String) {
 }
 
 /// Detect the currently active version string of `harness`.
-pub fn detect_version(root: &Path, harness: &str) -> String {
+pub fn recorded_version(root: &Path, harness: &str) -> String {
     let dirs = root.join("harnesses").join(harness);
     if let Ok(versions) = std::fs::read_dir(&dirs) {
         let mut installed: Vec<PathBuf> = versions
@@ -114,6 +114,14 @@ pub fn detect_version(root: &Path, harness: &str) -> String {
                 return ver.to_string();
             }
         }
+    }
+    "-".to_string()
+}
+
+pub fn detect_version(root: &Path, harness: &str) -> String {
+    let recorded = recorded_version(root, harness);
+    if recorded != "-" {
+        return recorded;
     }
     let bin = program(root, harness);
     if let Ok(out) = Command::new(&bin)

@@ -5,6 +5,7 @@
 //! its own token. A sender, an inbox, a bot or an agent name in a body is a
 //! destination, never an identity.
 
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
@@ -306,6 +307,7 @@ async fn serve(
     }
     let app = Router::new()
         .route("/v1/agents", get(list_agents).post(create_agent_route))
+        .route("/v1/agents/{name}", get(get_agent))
         .route("/v1/agents/{name}/admin", post(set_admin_route))
         .route("/v1/agents/{name}/rename", post(rename_agent_route))
         .route("/v1/agents/{name}/role", post(role_agent_route))
@@ -812,7 +814,17 @@ async fn operator_inbox(
         .store
         .agent_by_name(&name)
         .map_err(ApiError::from_store)?;
-    spawn_store(move || inbox_of(&state.store, &agent.id, query.since, query.limit)).await
+    spawn_store(move || {
+        inbox_of(
+            &state.store,
+            &agent.id,
+            query.since,
+            query.limit,
+            query.unread.unwrap_or(false),
+            query.sender.as_deref(),
+        )
+    })
+    .await
 }
 
 /// Only the operator administers the deployment.
@@ -2314,13 +2326,69 @@ impl CommandRunner for ProcessRunner {
     }
 }
 
+#[derive(Default, Deserialize)]
+pub(crate) struct ListAgentsQuery {
+    pub state: Option<String>,
+    pub parent: Option<String>,
+    pub name: Option<String>,
+}
+
+async fn get_agent(
+    principal: Principal,
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+) -> Result<Json<AgentView>, ApiError> {
+    spawn_store(move || {
+        let caller = match &principal {
+            Principal::Operator => None,
+            Principal::Agent { agent_id, .. } => Some(
+                state
+                    .store
+                    .agent(agent_id)
+                    .map_err(|_| ApiError::forbidden("authenticated agent no longer exists"))?,
+            ),
+        };
+        let name = if name == "self" {
+            caller.as_ref().map(|a| a.id.as_str()).unwrap_or(&name)
+        } else {
+            &name
+        };
+        let agent = state
+            .store
+            .agent_by_name(name)
+            .map_err(ApiError::from_store)?;
+        if let Some(caller) = &caller
+            && caller.is_isolated()
+            && !is_self_or_ancestor(&state.store, &caller.id, &agent)
+            && caller.parent_id.as_ref() != Some(&agent.id)
+            && !state.store.share_any_group_or_chat(&caller.id, &agent.id)
+        {
+            return Err(ApiError::forbidden("agent is outside the caller's scope"));
+        }
+        let mut view = agent_view(&state.store, &state.health, &agent)?;
+        if let Some(caller) = &caller {
+            view.relationship = Some(compute_caller_relationship(&state.store, caller, &agent));
+            view.can_message = Some(
+                can_actor_message_agent(&state.store, &Actor::Agent(caller.name.clone()), &agent)
+                    .is_ok(),
+            );
+            if !can_actor_read_agent_private(&state.store, &principal, &agent) {
+                view.instructions = None;
+            }
+        }
+        Ok(Json(view))
+    })
+    .await
+}
+
 async fn list_agents(
     principal: Principal,
     State(state): State<AppState>,
+    Query(query): Query<ListAgentsQuery>,
 ) -> Result<Json<AgentsResponse>, ApiError> {
     let operator = principal.is_operator();
     spawn_store(move || {
-        let mut listed = list_agents_sync_for_principal(&state, &principal)?;
+        let mut listed = list_agents_sync_for_principal(&state, &principal, &query)?;
         if !operator {
             listed.0.gateway = None;
         }
@@ -2352,6 +2420,7 @@ fn compute_caller_relationship(store: &Store, caller: &Agent, target: &Agent) ->
 fn list_agents_sync_for_principal(
     state: &AppState,
     principal: &Principal,
+    query: &ListAgentsQuery,
 ) -> Result<Json<AgentsResponse>, ApiError> {
     let caller_agent = match principal {
         Principal::Operator => None,
@@ -2363,38 +2432,128 @@ fn list_agents_sync_for_principal(
         ),
     };
     let all_agents = state.store.list_agents().map_err(ApiError::from_store)?;
-    let fast_archived = all_agents.len() > 32;
-    let mut agents = Vec::with_capacity(all_agents.len());
-    for agent in all_agents {
-        if let Some(ref caller) = caller_agent
-            && caller.is_isolated()
-            && !is_self_or_ancestor(&state.store, &caller.id, &agent)
-            && caller.parent_id.as_ref() != Some(&agent.id)
-            && !state.store.share_any_group_or_chat(&caller.id, &agent.id)
-        {
+    let all_agents: Vec<_> = all_agents
+        .into_iter()
+        .filter(|agent| {
+            !caller_agent.as_ref().is_some_and(|caller| {
+                caller.is_isolated()
+                    && !is_self_or_ancestor(&state.store, &caller.id, agent)
+                    && caller.parent_id.as_ref() != Some(&agent.id)
+                    && !state.store.share_any_group_or_chat(&caller.id, &agent.id)
+            })
+        })
+        .collect();
+    let mut listed = roster_views(&state.store, &state.health, all_agents, query)?;
+    for view in &mut listed.agents {
+        let Some(ref caller) = caller_agent else {
             continue;
-        }
-        let mut view = if fast_archived && agent.state == "archived" {
-            archived_agent_view_fast(&state.store, &agent)
-        } else {
-            agent_view(&state.store, &state.health, &agent)?
         };
-        if let Some(ref caller) = caller_agent {
-            view.relationship = Some(compute_caller_relationship(&state.store, caller, &agent));
-            view.can_message = Some(
-                can_actor_message_agent(&state.store, &Actor::Agent(caller.name.clone()), &agent)
-                    .is_ok(),
-            );
-            if !can_actor_read_agent_private(&state.store, principal, &agent) {
-                view.instructions = None;
+        let agent = state
+            .store
+            .agent_by_name(&view.id)
+            .map_err(ApiError::from_store)?;
+        view.relationship = Some(compute_caller_relationship(&state.store, caller, &agent));
+        view.can_message = Some(
+            can_actor_message_agent(&state.store, &Actor::Agent(caller.name.clone()), &agent)
+                .is_ok(),
+        );
+        if !can_actor_read_agent_private(&state.store, principal, &agent) {
+            view.instructions = None;
+        }
+    }
+    Ok(Json(listed))
+}
+
+/// Shared by the daemon and offline operator CLI. Filter before runtime reads.
+pub(crate) fn roster_views(
+    store: &Store,
+    health: &HealthBoard,
+    all_agents: Vec<Agent>,
+    query: &ListAgentsQuery,
+) -> Result<AgentsResponse, ApiError> {
+    if let Some(state) = query.state.as_deref()
+        && !matches!(
+            state,
+            "all" | "archived" | "running" | "idle" | "paused" | "created"
+        )
+    {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid agent state",
+        ));
+    }
+    let by_id: HashMap<_, _> = all_agents.iter().map(|a| (a.id.as_str(), a)).collect();
+    let archived_count = all_agents.iter().filter(|a| a.state == "archived").count();
+    let selected_name = query
+        .name
+        .as_deref()
+        .map(|name| store.agent_by_name(name))
+        .transpose()
+        .map_err(ApiError::from_store)?;
+    let parent = query
+        .parent
+        .as_deref()
+        .filter(|p| !matches!(*p, "root" | "none" | "all" | "subagents"))
+        .map(|p| store.agent_by_name(p))
+        .transpose()
+        .map_err(ApiError::from_store)?;
+    let mut selected = HashSet::new();
+    for agent in &all_agents {
+        let state_matches = match query.state.as_deref() {
+            Some("all") => true,
+            Some(state) => agent.state == state,
+            None => agent.state != "archived",
+        };
+        let parent_matches = match query.parent.as_deref() {
+            Some("root" | "none") => agent.parent_id.is_none(),
+            _ => parent
+                .as_ref()
+                .is_none_or(|p| agent.parent_id.as_ref() == Some(&p.id)),
+        };
+        if state_matches
+            && parent_matches
+            && selected_name.as_ref().is_none_or(|a| a.id == agent.id)
+        {
+            selected.insert(agent.id.as_str());
+        }
+    }
+    // Retain ancestor nodes for tree rendering without serializing the archive.
+    if query
+        .state
+        .as_deref()
+        .is_none_or(|s| !matches!(s, "all" | "archived"))
+    {
+        let initial: Vec<_> = selected.iter().copied().collect();
+        for id in initial {
+            let mut cursor = by_id.get(id).and_then(|a| a.parent_id.as_ref());
+            let mut visited = HashSet::new();
+            while let Some(parent) = cursor {
+                if !visited.insert(parent.as_str()) {
+                    break;
+                }
+                let Some(agent) = by_id.get(parent.as_str()) else {
+                    break;
+                };
+                selected.insert(agent.id.as_str());
+                cursor = agent.parent_id.as_ref();
             }
         }
+    }
+    let mut metadata = store.agent_query_metadata().map_err(ApiError::from_store)?;
+    let seats = crate::sandbox::roster_seats();
+    let mut agents = Vec::with_capacity(selected.len());
+    for agent in &all_agents {
+        if !selected.contains(agent.id.as_str()) {
+            continue;
+        }
+        let view = agent_view_preloaded(store, health, agent, Some(&mut metadata), Some(&seats))?;
         agents.push(view);
     }
-    Ok(Json(AgentsResponse {
+    Ok(AgentsResponse {
         agents,
+        archived_count,
         gateway: crate::gateway::origin(),
-    }))
+    })
 }
 
 pub(crate) fn compute_block_reason(
@@ -2427,9 +2586,11 @@ pub(crate) fn compute_block_reason(
     None
 }
 
-fn archived_agent_view_fast(store: &Store, agent: &Agent) -> AgentView {
+fn archived_agent_view_fast(agent: &Agent) -> AgentView {
     let (mode, steer) = declared(&agent.harness);
     AgentView {
+        has_open_turn: false,
+        profile: None,
         id: agent.id.to_string(),
         name: agent.name.clone(),
         role: agent.role.clone(),
@@ -2454,7 +2615,7 @@ fn archived_agent_view_fast(store: &Store, agent: &Agent) -> AgentView {
         block_reason: None,
         last_error: None,
         oldest_undelivered_age_ms: None,
-        install: install_state(store, agent),
+        install: "archived".to_string(),
         description: agent.public_description(),
         instructions: agent.instructions.clone(),
         seat_user: None,
@@ -2464,12 +2625,53 @@ fn archived_agent_view_fast(store: &Store, agent: &Agent) -> AgentView {
     }
 }
 
-fn agent_view(store: &Store, health: &HealthBoard, agent: &Agent) -> Result<AgentView, ApiError> {
+pub(crate) fn agent_view(
+    store: &Store,
+    health: &HealthBoard,
+    agent: &Agent,
+) -> Result<AgentView, ApiError> {
+    agent_view_preloaded(store, health, agent, None, None)
+}
+
+type RosterSeats = HashMap<String, (String, u32, u32, u32)>;
+
+fn agent_view_preloaded(
+    store: &Store,
+    health: &HealthBoard,
+    agent: &Agent,
+    mut metadata: Option<&mut anyagents_core::AgentQueryMetadata>,
+    seats: Option<&RosterSeats>,
+) -> Result<AgentView, ApiError> {
+    if agent.state == "archived" {
+        let mut view = archived_agent_view_fast(agent);
+        if let Some(metadata) = metadata {
+            view.aliases = metadata
+                .aliases
+                .remove(agent.id.as_str())
+                .unwrap_or_default();
+        } else {
+            view.aliases = store.agent_aliases(&agent.id).unwrap_or_default();
+        }
+        return Ok(view);
+    }
     let now = now_ms();
-    let lag = store.lag(&agent.id, now).map_err(ApiError::from_store)?;
-    let has_open_turn = store
-        .has_open_turn(&agent.id)
-        .map_err(ApiError::from_store)?;
+    let lag = if let Some(metadata) = metadata.as_ref() {
+        anyagents_core::Lag {
+            oldest_undelivered_age_ms: metadata
+                .oldest_undelivered
+                .get(agent.id.as_str())
+                .map(|ms| now.saturating_sub(*ms).max(0)),
+        }
+    } else {
+        store.lag(&agent.id, now).map_err(ApiError::from_store)?
+    };
+    let has_open_turn = if let Some(metadata) = metadata.as_ref() {
+        metadata.open_turns.contains_key(agent.id.as_str())
+    } else {
+        store
+            .has_open_turn(&agent.id)
+            .map_err(ApiError::from_store)?
+    };
     let cfg = anyagents_core::agent_config_dir(store.data_dir(), &agent.id);
     let rotated_ms = std::fs::read_to_string(cfg.join(".anyagents-profile-rotated-ms"))
         .ok()
@@ -2598,24 +2800,53 @@ fn agent_view(store: &Store, health: &HealthBoard, agent: &Agent) -> Result<Agen
         None if has_open_turn
             && (quota.is_some() || last_error.is_some() || turn_state != "working") =>
         {
-            store.open_turn(&agent.id).ok().flatten().map(|open| {
-                open.messages
-                    .first()
-                    .map(|m| now.saturating_sub(m.received_at_ms))
-                    .unwrap_or_else(|| now.saturating_sub(open.opened_at_ms))
-            })
+            if let Some(metadata) = metadata.as_ref() {
+                metadata
+                    .open_turns
+                    .get(agent.id.as_str())
+                    .map(|ms| now.saturating_sub(*ms))
+            } else {
+                store.open_turn(&agent.id).ok().flatten().map(|open| {
+                    open.messages
+                        .first()
+                        .map(|m| now.saturating_sub(m.received_at_ms))
+                        .unwrap_or_else(|| now.saturating_sub(open.opened_at_ms))
+                })
+            }
         }
         None => None,
     };
-    let aliases = store.agent_aliases(&agent.id).unwrap_or_default();
-    let seat_info = create::resolved_agent_seat_info(store, agent);
-    let schedules = store
-        .list_schedules(Some(&agent.id), true)
-        .unwrap_or_default()
-        .into_iter()
-        .map(crate::api::ScheduleView::from)
-        .collect();
+    let aliases = if let Some(metadata) = metadata.as_mut() {
+        metadata
+            .aliases
+            .remove(agent.id.as_str())
+            .unwrap_or_default()
+    } else {
+        store.agent_aliases(&agent.id).unwrap_or_default()
+    };
+    let seat_info = if let Some(seats) = seats {
+        seats
+            .get(agent.id.as_str())
+            .map(|(user, uid, gid, _)| (user.clone(), *uid, *gid, None))
+    } else {
+        create::resolved_agent_seat_info(store, agent)
+    };
+    let schedules = if let Some(metadata) = metadata.as_mut() {
+        metadata
+            .schedules
+            .remove(agent.id.as_str())
+            .unwrap_or_default()
+    } else {
+        store
+            .list_schedules(Some(&agent.id), true)
+            .unwrap_or_default()
+    }
+    .into_iter()
+    .map(crate::api::ScheduleView::from)
+    .collect();
     Ok(AgentView {
+        has_open_turn,
+        profile: create::bound_profile_name(&cfg),
         id: agent.id.to_string(),
         name: agent.name.clone(),
         role: agent.role.clone(),
@@ -3672,10 +3903,13 @@ async fn group_action_route(
 struct Since {
     since: Option<i64>,
     limit: Option<usize>,
+    unread: Option<bool>,
+    sender: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
 struct ConversationQuery {
+    all: Option<bool>,
     raw_id: Option<String>,
     raw_sha256: Option<String>,
     raw_offset: Option<u64>,
@@ -3732,7 +3966,8 @@ async fn inbox(
             agent_id,
             name: own_name,
         } => {
-            let matches_self = name == agent_id.as_str()
+            let matches_self = name == "self"
+                || name == agent_id.as_str()
                 || name == own_name.as_str()
                 || state
                     .store
@@ -3746,7 +3981,17 @@ async fn inbox(
             agent_id.clone()
         }
     };
-    spawn_store(move || inbox_of(&state.store, &agent_id, query.since, query.limit)).await
+    spawn_store(move || {
+        inbox_of(
+            &state.store,
+            &agent_id,
+            query.since,
+            query.limit,
+            query.unread.unwrap_or(false),
+            query.sender.as_deref(),
+        )
+    })
+    .await
 }
 
 /// `conversation.redact`: authenticated ancestors and admins only. The store
@@ -3779,8 +4024,11 @@ async fn conversation_route(
     principal: Principal,
     State(state): State<AppState>,
     AxumPath(name): AxumPath<String>,
-    Query(query): Query<ConversationQuery>,
+    Query(mut query): Query<ConversationQuery>,
 ) -> Result<Json<ConversationResponse>, ApiError> {
+    if query.all == Some(true) {
+        query.limit = None;
+    }
     spawn_store(move || {
         if let Some(topic) = query
             .topic
@@ -3911,6 +4159,7 @@ async fn conversation_route(
                     agent: target.name.clone(),
                     agent_id: target.id.to_string(),
                     turns: vec![ConversationTurnView {
+                        seq: 0,
                         id: doc_id,
                         text,
                         raw_bytes: None,
@@ -3980,6 +4229,7 @@ async fn conversation_route(
                 .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.to_string()))?;
                 let _ = state.store.sync_agent_memory_index(&target);
                 ConversationTurnView {
+                    seq: 0,
                     id: format!("memory:{}:deleted:{}", target.id, topic),
                     text: format!("deleted={removed}\n{index}"),
                     raw_bytes: None,
@@ -4023,6 +4273,7 @@ async fn conversation_route(
                     seq: 1,
                 };
                 ConversationTurnView {
+                    seq: 0,
                     id: doc_id,
                     text: String::from_utf8_lossy(&bytes).into_owned(),
                     raw_bytes: None,
@@ -4133,6 +4384,7 @@ async fn conversation_route(
                 agent: agent.name,
                 agent_id: agent.id.to_string(),
                 turns: vec![ConversationTurnView {
+                    seq: hit.raw.seq as i64,
                     id: hit.id,
                     text: String::from_utf8_lossy(&bytes).into_owned(),
                     raw_bytes: Some(bytes),
@@ -4216,7 +4468,7 @@ async fn conversation_route(
             limit: query
                 .limit
                 .unwrap_or(if has_structured_search { 20 } else { 50 })
-                .clamp(1, 200),
+                .max(1),
             visible_agent_ids: visible_agent_ids.clone(),
         };
         let authorized = match visible_agent_ids.as_ref() {
@@ -4270,7 +4522,11 @@ async fn conversation_route(
                     to_seq: query.to_seq,
                     sort: anyagents_core::HistorySort::parse(query.sort.as_deref()),
                     radius: query.radius.unwrap_or(0),
-                    limit: query.limit.unwrap_or(20),
+                    limit: if query.all == Some(true) {
+                        0
+                    } else {
+                        query.limit.unwrap_or(20)
+                    },
                     visible_agent_ids: visible_agent_ids.clone(),
                 };
                 let turns = state
@@ -4316,6 +4572,7 @@ async fn conversation_route(
         let turns: Vec<_> = raw_turns
             .into_iter()
             .map(|t| ConversationTurnView {
+                seq: t.seq,
                 raw_bytes: None,
                 source: Some("transcripts".into()),
                 raw: None,
@@ -4350,6 +4607,7 @@ async fn conversation_route(
             ranked.push((
                 1.0 / (30.0 + rank as f64),
                 ConversationTurnView {
+                    seq: 0,
                     raw_bytes: None,
                     id: hit.id,
                     direction: hit.metadata.direction,
@@ -4389,7 +4647,8 @@ async fn conversation_route(
                 ranked.reverse();
             }
         }
-        if file_request.radius == 0 && ranked.len() > file_request.limit {
+        if query.all != Some(true) && file_request.radius == 0 && ranked.len() > file_request.limit
+        {
             if !lexical && file_request.sort == anyagents_core::HistorySort::Relevance {
                 ranked.drain(..ranked.len() - file_request.limit);
             } else {
@@ -4412,15 +4671,12 @@ fn inbox_of(
     agent_id: &anyagents_core::AgentId,
     since: Option<i64>,
     limit: Option<usize>,
+    unread: bool,
+    sender: Option<&str>,
 ) -> Result<Json<InboxResponse>, ApiError> {
-    let mut rows = store.inbox(agent_id, since).map_err(ApiError::from_store)?;
-    if let Some(limit) = limit {
-        if since.is_none() && rows.len() > limit {
-            rows.drain(..rows.len() - limit);
-        } else if rows.len() > limit {
-            rows.truncate(limit);
-        }
-    }
+    let rows = store
+        .inbox_query_filtered(agent_id, since, limit, unread, sender)
+        .map_err(ApiError::from_store)?;
     let messages = rows
         .into_iter()
         .map(|message| MessageView {
@@ -6166,9 +6422,9 @@ async fn spawn_store<T: Send + 'static>(
 }
 
 #[derive(Debug)]
-struct ApiError {
+pub(crate) struct ApiError {
     status: StatusCode,
-    message: String,
+    pub(crate) message: String,
 }
 
 impl ApiError {
@@ -6268,6 +6524,184 @@ pub(crate) mod tests {
     use std::io::{Read, Write};
     use std::sync::MutexGuard;
 
+    #[tokio::test]
+    async fn single_agent_endpoint_resolves_identity_alias_and_enforces_scope() {
+        let dir = crate::test_tempdir();
+        let state = archetype_validation_state(dir.path());
+        let root = state
+            .store
+            .create_agent(anyagents_core::NewAgent::new("root", "opencode"))
+            .unwrap();
+        let renamed = state.store.rename_agent(&root.id, "renamed").unwrap();
+        for name in ["root", "renamed", renamed.id.as_str()] {
+            let Json(view) = get_agent(
+                Principal::Operator,
+                State(state.clone()),
+                AxumPath(name.to_string()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(view.id, root.id.as_str());
+            assert!(view.aliases.contains(&"root".into()));
+        }
+        let mut child = anyagents_core::NewAgent::new("isolated-child", "opencode");
+        child.parent_id = Some(root.id.clone());
+        let child = state.store.create_agent(child).unwrap();
+        state.store.set_agent_scope(&child.id, "isolated").unwrap();
+        let principal = Principal::Agent {
+            agent_id: child.id.clone(),
+            name: child.name.clone(),
+        };
+        let Json(own) = get_agent(
+            principal.clone(),
+            State(state.clone()),
+            AxumPath("self".into()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(own.id, child.id.as_str());
+        let peer = state
+            .store
+            .create_agent(anyagents_core::NewAgent::new("peer", "opencode"))
+            .unwrap();
+        assert_eq!(
+            get_agent(principal.clone(), State(state.clone()), AxumPath(peer.name))
+                .await
+                .unwrap_err()
+                .status,
+            StatusCode::FORBIDDEN
+        );
+        state.store.delete_agent(&child.id).unwrap();
+        assert_eq!(
+            get_agent(principal, State(state), AxumPath("self".into()))
+                .await
+                .unwrap_err()
+                .status,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn roster_omits_archive_except_ancestors_and_reports_count() {
+        let dir = crate::test_tempdir();
+        let state = archetype_validation_state(dir.path());
+        let root = state
+            .store
+            .create_agent(anyagents_core::NewAgent::new("archived-parent", "opencode"))
+            .unwrap();
+        let mut child = anyagents_core::NewAgent::new("live-child", "opencode");
+        child.parent_id = Some(root.id.clone());
+        state.store.create_agent(child).unwrap();
+        state.store.set_agent_state(&root.id, "archived").unwrap();
+        for i in 0..40 {
+            let a = state
+                .store
+                .create_agent(anyagents_core::NewAgent::new(
+                    format!("old-{i}"),
+                    "opencode",
+                ))
+                .unwrap();
+            state.store.set_agent_state(&a.id, "archived").unwrap();
+        }
+        // A poisoned diagnostic path would fail if archived views read it.
+        let cfg = anyagents_core::agent_config_dir(dir.path(), &root.id);
+        std::fs::create_dir_all(cfg.join(".anyagents-profile-rotated-ms")).unwrap();
+        let Json(default) = list_agents(
+            Principal::Operator,
+            State(state.clone()),
+            Query(ListAgentsQuery::default()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(default.archived_count, 41);
+        assert_eq!(default.agents.len(), 2);
+        let archived = default
+            .agents
+            .iter()
+            .find(|a| a.id == root.id.as_str())
+            .unwrap();
+        assert_eq!(archived.install, "archived");
+        assert!(archived.schedules.is_empty() && archived.oldest_undelivered_age_ms.is_none());
+        for (filter, expected) in [("all", 42), ("archived", 41)] {
+            let Json(list) = list_agents(
+                Principal::Operator,
+                State(state.clone()),
+                Query(ListAgentsQuery {
+                    state: Some(filter.into()),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(list.agents.len(), expected);
+            assert_eq!(list.archived_count, 41);
+        }
+        let Json(list) = list_agents(
+            Principal::Operator,
+            State(state.clone()),
+            Query(ListAgentsQuery {
+                parent: Some("archived-parent".into()),
+                name: Some("live-child".into()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(list.agents.iter().any(|a| a.name == "live-child"));
+        assert_eq!(list.agents.len(), 2);
+    }
+
+    #[test]
+    #[ignore = "manual benchmark against an isolated production snapshot"]
+    fn production_roster_query_benchmark() {
+        let path = std::env::var("ANYAGENTS_BENCH_DB").expect("isolated snapshot path");
+        let start = std::time::Instant::now();
+        let store = Store::open(path).unwrap();
+        eprintln!(
+            "store_open_ms={:.3}",
+            start.elapsed().as_secs_f64() * 1000.0
+        );
+        let health = HealthBoard::default();
+        let mut times = Vec::new();
+        for _ in 0..20 {
+            let start = std::time::Instant::now();
+            let views = roster_views(
+                &store,
+                &health,
+                store.list_agents().unwrap(),
+                &ListAgentsQuery::default(),
+            )
+            .unwrap();
+            let bytes = serde_json::to_vec(&views).unwrap();
+            times.push(start.elapsed().as_secs_f64() * 1000.0);
+            assert!(bytes.len() > 10);
+        }
+        times.sort_by(f64::total_cmp);
+        eprintln!(
+            "roster_ms min={:.3} median={:.3} max={:.3}",
+            times[0], times[10], times[19]
+        );
+        let target = store.agent_by_name("vulcan").unwrap();
+        let start = std::time::Instant::now();
+        for _ in 0..100 {
+            store
+                .inbox_query(&target.id, None, Some(20), false)
+                .unwrap();
+        }
+        eprintln!(
+            "inbox20_mean_ms={:.3}",
+            start.elapsed().as_secs_f64() * 10.0
+        );
+        let start = std::time::Instant::now();
+        for _ in 0..100 {
+            agent_view(&store, &health, &store.agent_by_name("vulcan").unwrap()).unwrap();
+        }
+        eprintln!(
+            "single_agent_mean_ms={:.3}",
+            start.elapsed().as_secs_f64() * 10.0
+        );
+    }
+
     #[test]
     fn agent_views_only_read_agy_logs_for_the_agy_harness() {
         let _env = env_lock();
@@ -6298,7 +6732,7 @@ pub(crate) mod tests {
             let expected = (harness == "agy").then_some("previous agy session failed");
             assert_eq!(view.last_error.as_deref(), expected, "server: {harness}");
             view.last_error = None;
-            crate::agent::reconcile_and_enrich_views(dir.path(), std::slice::from_mut(&mut view));
+            view = crate::agent::view_named(dir.path(), &agent.name).unwrap();
             assert_eq!(view.last_error.as_deref(), expected, "client: {harness}");
 
             std::fs::write(
@@ -6313,7 +6747,7 @@ pub(crate) mod tests {
             view = agent_view(&store, &health, &agent).unwrap();
             assert_eq!(view.last_error.as_deref(), Some("current harness failed"));
             view.last_error = None;
-            crate::agent::reconcile_and_enrich_views(dir.path(), std::slice::from_mut(&mut view));
+            view = crate::agent::view_named(dir.path(), &agent.name).unwrap();
             assert_eq!(view.last_error.as_deref(), Some("current harness failed"));
         }
     }
@@ -6502,8 +6936,9 @@ pub(crate) mod tests {
         let plan = plan_send(&state.store, &principal, &actor, &body)
             .unwrap_or_else(|e| panic!("{}", e.message));
         // Positive controls use the same authenticated handler and plan path.
-        let visible = list_agents_sync_for_principal(&state, &principal)
-            .unwrap_or_else(|e| panic!("{}", e.message));
+        let visible =
+            list_agents_sync_for_principal(&state, &principal, &ListAgentsQuery::default())
+                .unwrap_or_else(|e| panic!("{}", e.message));
         assert!(
             visible
                 .0
@@ -6513,8 +6948,9 @@ pub(crate) mod tests {
         );
         assert!(can_actor_message_agent(&state.store, &actor, &root).is_ok());
         state.store.delete_agent(&child.id).unwrap();
-        let denied = list_agents_sync_for_principal(&state, &principal)
-            .expect_err("deleted caller must not receive any roster");
+        let denied =
+            list_agents_sync_for_principal(&state, &principal, &ListAgentsQuery::default())
+                .expect_err("deleted caller must not receive any roster");
         assert_eq!(denied.status, StatusCode::FORBIDDEN);
         let denied = send_sync(&state.store, &actor, body.clone(), plan, None)
             .expect_err("deleted principal must not deliver");
@@ -6529,8 +6965,12 @@ pub(crate) mod tests {
         let denied = plan_send(&state.store, &principal, &actor, &body)
             .expect_err("name reuse must not authorize old credentials");
         assert_eq!(denied.status, StatusCode::FORBIDDEN);
-        let operator = list_agents_sync_for_principal(&state, &Principal::Operator)
-            .unwrap_or_else(|e| panic!("{}", e.message));
+        let operator = list_agents_sync_for_principal(
+            &state,
+            &Principal::Operator,
+            &ListAgentsQuery::default(),
+        )
+        .unwrap_or_else(|e| panic!("{}", e.message));
         assert!(operator.0.agents.iter().any(|a| a.name == root.name
             && a.instructions.as_deref() == Some("private instruction sentinel")));
     }
@@ -8864,9 +9304,13 @@ exec '{}' "$@"
         assert!(error.message.contains(expected_error), "{}", error.message);
         assert!(!error.message.contains("OUTSIDE_TEMPLATE_SENTINEL"));
         assert!(state.store.list_agents().unwrap().is_empty());
-        let Json(listed) = list_agents(Principal::Operator, State(state.clone()))
-            .await
-            .unwrap_or_else(|error| panic!("{}", error.message));
+        let Json(listed) = list_agents(
+            Principal::Operator,
+            State(state.clone()),
+            Query(ListAgentsQuery::default()),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{}", error.message));
         assert!(listed.agents.is_empty());
         assert!(
             !serde_json::to_string(&listed)

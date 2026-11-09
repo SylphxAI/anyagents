@@ -9149,43 +9149,29 @@ mod tests {
             .unwrap();
         rollout.set_modified(rotated_at).unwrap();
 
-        let mut views = vec![crate::api::AgentView {
-            id: child.id.to_string(),
-            name: child.name.clone(),
-            role: child.role.clone(),
-            aliases: Vec::new(),
-            parent: Some(parent.id.to_string()),
-            harness: child.harness.clone(),
-            model: child.model.clone(),
-            live_harness: Some(child.harness.clone()),
-            live_model: child.model.clone(),
-            process_started_at_ms: Some(anyagents_core::now_ms()),
-            pending_switch: false,
-            workdir: child.workdir.clone(),
-            state: "running".to_string(),
-            process: "alive".to_string(),
-            turn_state: "working".to_string(),
-            delivery_mode: "steer".to_string(),
-            steer_support: "yes".to_string(),
-            quota_reset_at_ms: None,
-            block_reason: None,
-            last_error: None,
-            oldest_undelivered_age_ms: None,
-            install: "installed".to_string(),
-            description: child.public_description(),
-            instructions: child.instructions.clone(),
-            seat_user: None,
-            seat_uid: None,
-            seat_gid: None,
-            scope: child.scope().to_string(),
-            relationship: None,
-            can_message: None,
-            schedules: Vec::new(),
-        }];
+        let health = anyagents_supervisor::HealthBoard::default();
+        let (delivery_mode, steer_support) = anyagents_supervisor::declared(&child.harness);
+        health.publish(
+            &child.id,
+            anyagents_supervisor::LiveState {
+                process_alive: true,
+                turn_state: anyagents_harness::TurnState::InTurn,
+                delivery_mode,
+                steer_support,
+                quota_reset_at_ms: None,
+                restart_at_ms: None,
+                pid: None,
+                live_harness: Some(child.harness.clone()),
+                live_model: child.model.clone(),
+                process_started_at_ms: Some(anyagents_core::now_ms()),
+                last_error: None,
+            },
+        );
+        let mut views;
 
         // A rollout at the rotation boundary is stale, even if it contains an
         // error. Do not let wall-clock or filesystem precision decide freshness.
-        crate::agent::reconcile_and_enrich_views(data, &mut views);
+        views = vec![crate::server::agent_view(&store, &health, &child).unwrap()];
         assert_eq!(views[0].turn_state, "working");
         assert!(views[0].last_error.is_none());
         assert!(store.next_undelivered(&parent.id).unwrap().is_none());
@@ -9193,7 +9179,7 @@ mod tests {
         rollout
             .set_modified(rotated_at + std::time::Duration::from_secs(1))
             .unwrap();
-        crate::agent::reconcile_and_enrich_views(data, &mut views);
+        views = vec![crate::server::agent_view(&store, &health, &child).unwrap()];
         assert_eq!(views[0].turn_state, "errored");
         assert_eq!(
             views[0].last_error.as_deref(),
@@ -9214,7 +9200,7 @@ mod tests {
         store.note_delivered(&parent.id, first_msg.seq).unwrap();
 
         // Second check must not re-notify parent for the same error.
-        crate::agent::reconcile_and_enrich_views(data, &mut views);
+        let _ = crate::server::agent_view(&store, &health, &child).unwrap();
         assert!(
             store.next_undelivered(&parent.id).unwrap().is_none(),
             "parent should only be notified once per error"
