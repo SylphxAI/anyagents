@@ -463,6 +463,9 @@ fn share_open(
                 "seat tree inode changed during enumeration",
             ));
         }
+        if owner_only && opened.uid() != super::sandbox::server_uid() && opened.uid() != uid {
+            continue;
+        }
         if kind == libc::S_IFDIR {
             match share_open(child, &child_path, uid, gid, owner_only, before_open) {
                 Ok(()) => (),
@@ -502,15 +505,17 @@ mod tests {
         let me = super::super::sandbox::server_uid();
         let gid = super::super::sandbox::server_gid();
         for seat_uid in [me, if me == 42001 { 42002 } else { 42001 }] {
-            std::fs::set_permissions(&cap, std::fs::Permissions::from_mode(0o660)).unwrap();
-            share(&own, seat_uid, gid).unwrap();
-            let meta = cap.metadata().unwrap();
-            assert_eq!(meta.mode() & 0o7777, 0o640);
-            assert_eq!(meta.gid(), gid);
-            assert_eq!(
-                std::fs::read_to_string(&cap).unwrap(),
-                "synthetic-capability"
-            );
+            for mode in [0o600, 0o660, 0o664] {
+                std::fs::set_permissions(&cap, std::fs::Permissions::from_mode(mode)).unwrap();
+                share(&own, seat_uid, gid).unwrap();
+                let meta = cap.metadata().unwrap();
+                assert_eq!(meta.mode() & 0o7777, 0o640);
+                assert_eq!(meta.gid(), gid);
+                assert_eq!(
+                    std::fs::read_to_string(&cap).unwrap(),
+                    "synthetic-capability"
+                );
+            }
         }
     }
 
@@ -551,6 +556,44 @@ mod tests {
                 "preserved"
             );
         }
+        let after = outside.metadata().unwrap();
+        assert_eq!(
+            (before.dev(), before.ino(), before.mode(), before.gid()),
+            (after.dev(), after.ino(), after.mode(), after.gid())
+        );
+    }
+
+    #[test]
+    fn cache_directory_swap_refuses_without_changing_the_outside_inode() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = crate::test_tempdir();
+        let config = temp.path().join("config");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(config.join("cache-home/nested")).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let before = outside.metadata().unwrap();
+        let mut swapped = false;
+        let result = share_open(
+            open_root(&config).unwrap(),
+            &config,
+            if super::super::sandbox::server_uid() == 42001 {
+                42002
+            } else {
+                42001
+            },
+            super::super::sandbox::server_gid(),
+            false,
+            &mut |parent, name| {
+                if parent.ends_with("cache-home") && name == "nested" {
+                    std::fs::rename(parent.join(name), parent.join("held")).unwrap();
+                    std::os::unix::fs::symlink(&outside, parent.join(name)).unwrap();
+                    swapped = true;
+                }
+            },
+        );
+        assert!(swapped);
+        assert!(result.is_err());
         let after = outside.metadata().unwrap();
         assert_eq!(
             (before.dev(), before.ino(), before.mode(), before.gid()),
