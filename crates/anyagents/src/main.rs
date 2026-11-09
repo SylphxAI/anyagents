@@ -555,7 +555,7 @@ enum Command {
         /// Agent name or `agt_...` ID (defaults to `self` inside an agent).
         agent: Option<String>,
         /// Number of recent turns to include (default 10).
-        #[arg(long, default_value_t = 10)]
+        #[arg(short = 'n', long, default_value_t = 10)]
         limit: usize,
         /// Output machine-readable JSON.
         #[arg(long)]
@@ -2789,6 +2789,11 @@ mod cli_query_tests {
                 Command::Peers { .. }
             ));
         }
+        let inspected = Cli::try_parse_from(["anyagents", "inspect", "vulcan", "-n", "5"]).unwrap();
+        assert!(matches!(
+            inspected.command,
+            Command::Inspect { limit: 5, .. }
+        ));
         for subcommand in [
             "logs",
             "messages",
