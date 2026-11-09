@@ -104,9 +104,22 @@ fn api(args: &[String]) {
             print!("{{\"data\":{{\"id\":\"ses_fake\",\"title\":\"fake\"}}}}");
         }
         ("POST", "/api/session") => {
-            print!("{{\"data\":{{\"id\":\"ses_fake\"}}}}");
+            let log_has_stale_404 = env::var_os("ANYAGENTS_FAKE_LOG")
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .is_some_and(|text| text.contains("api:POST /api/session/ses_stale/prompt"));
+            let id = if log_has_stale_404 {
+                "ses_recovered"
+            } else {
+                "ses_fake"
+            };
+            print!("{{\"data\":{{\"id\":\"{id}\"}}}}");
         }
         ("POST", p) if p.ends_with("/prompt") => {
+            if p == "/api/session/ses_stale/prompt" {
+                eprintln!("HTTP 404 Not Found");
+                print!("{{\"error\":{{\"code\":404,\"message\":\"session not found\"}}}}");
+                exit(1);
+            }
             let steered = body.contains("\"delivery\":\"steer\"");
             let text = prompt_text(&body);
             if mode == "steer" && steered {
