@@ -1149,7 +1149,7 @@ fn vendor_launch_inner(
             if std::env::var_os("ANYAGENTS_ALLOW_NATIVE_SUBAGENTS").is_none() {
                 args.push("--disallowedTools".to_string());
                 args.push(
-                    "Task,Agent,TeamCreate,TeamDelete,SendMessage,ScheduleWakeup,Monitor,CronCreate,CronDelete,CronList,RemoteTrigger,PushNotification"
+                    "Task,Agent,TeamCreate,TeamDelete,SendMessage,ScheduleWakeup,Monitor,CronCreate,CronDelete,CronList,RemoteTrigger,PushNotification,WebSearch,WebFetch"
                         .to_string(),
                 );
             }
