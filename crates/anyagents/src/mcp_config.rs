@@ -136,6 +136,8 @@ pub fn sanitize_claude_settings(config_dir: &Path) -> Result<(), Error> {
                     "CronList",
                     "RemoteTrigger",
                     "PushNotification",
+                    "WebSearch",
+                    "WebFetch",
                 ] {
                     if !deny_arr.iter().any(|v| v.as_str() == Some(tool)) {
                         deny_arr.push(serde_json::Value::String(tool.to_string()));
@@ -560,8 +562,6 @@ mod tests {
             "NotebookEdit",
             "TodoRead",
             "TodoWrite",
-            "WebSearch",
-            "WebFetch",
         ] {
             assert!(
                 !denied.iter().any(|value| value.as_str() == Some(tool)),
@@ -569,7 +569,15 @@ mod tests {
             );
         }
         if std::env::var_os("ANYAGENTS_ALLOW_NATIVE_SUBAGENTS").is_none() {
-            for tool in ["Task", "Agent", "TeamCreate", "TeamDelete", "SendMessage"] {
+            for tool in [
+                "Task",
+                "Agent",
+                "TeamCreate",
+                "TeamDelete",
+                "SendMessage",
+                "WebSearch",
+                "WebFetch",
+            ] {
                 assert!(
                     denied.iter().any(|value| value.as_str() == Some(tool)),
                     "{tool}"

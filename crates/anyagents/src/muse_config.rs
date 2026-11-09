@@ -88,6 +88,43 @@ pub fn write(
         "default_profile": ":unrestricted",
         "schema_version": 1,
     });
+    if std::env::var_os("ANYAGENTS_ALLOW_NATIVE_SUBAGENTS").is_none() {
+        root["local_session_messaging"] = serde_json::json!({
+            "enabled": false,
+        });
+        root["tools"] = serde_json::json!({
+            "web_search": { "mode": "off" },
+            "web_fetch": { "enabled": false },
+        });
+        root["run"] = serde_json::json!({
+            "subagent_delegation_mode": "off",
+            "workflow_trigger_mode": "off",
+            "context_slimming": {
+                "excluded_tool_names": [
+                    "web_search",
+                    "web_fetch",
+                    "read_memory",
+                    "add_memory",
+                    "edit_memory",
+                    "list_peer_sessions",
+                    "send_session_message",
+                    "monitor",
+                    "cron_create",
+                    "cron_delete",
+                    "cron_list",
+                    "create_goal",
+                    "update_goal",
+                    "report_progress",
+                    "subagent_spawn",
+                    "subagent_status",
+                    "subagent_send_message",
+                    "subagent_wait",
+                    "subagent_read_result",
+                    "subagent_cancel"
+                ]
+            }
+        });
+    }
     let mut all = Vec::with_capacity(args.len() + 1);
     let clean_cmd = command.display().to_string();
     let clean_cmd = clean_cmd
@@ -410,6 +447,22 @@ mod tests {
         assert_eq!(parsed["tui"]["x"], true);
         assert_eq!(parsed["permissions"]["default_profile"], ":unrestricted");
         assert_eq!(parsed["contributor_mode_enabled"], false);
+        if std::env::var_os("ANYAGENTS_ALLOW_NATIVE_SUBAGENTS").is_none() {
+            assert_eq!(parsed["local_session_messaging"]["enabled"], false);
+            assert_eq!(parsed["tools"]["web_search"]["mode"], "off");
+            assert_eq!(parsed["tools"]["web_fetch"]["enabled"], false);
+            assert_eq!(parsed["run"]["subagent_delegation_mode"], "off");
+            assert_eq!(parsed["run"]["workflow_trigger_mode"], "off");
+            let excluded = parsed["run"]["context_slimming"]["excluded_tool_names"]
+                .as_array()
+                .unwrap();
+            for tool in ["web_search", "web_fetch", "subagent_spawn", "read_memory"] {
+                assert!(
+                    excluded.iter().any(|v| v.as_str() == Some(tool)),
+                    "{tool}: {excluded:?}"
+                );
+            }
+        }
         let server = &parsed["mcpServers"]["anyagents"];
         assert_eq!(server["command"], "/bin/anyagents");
         assert_eq!(server["args"][2], "mcp");
