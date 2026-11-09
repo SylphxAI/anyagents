@@ -252,7 +252,9 @@ impl HealthBoard {
 pub fn declared(harness: &str) -> (DeliveryMode, SteerSupport) {
     match harness {
         "codex" | "claude-code" | "opencode" | "muse" | "agy" | "omp" | "dsh" | "grok"
-        | "sylphx" => (DeliveryMode::Steer, SteerSupport::Yes),
+        | "spiron" | "sylphx" | "sylphx-agent" | "sylphx_agent" | "sylphx/default" => {
+            (DeliveryMode::Steer, SteerSupport::Yes)
+        }
         _ => (DeliveryMode::Followup, SteerSupport::Unproven),
     }
 }

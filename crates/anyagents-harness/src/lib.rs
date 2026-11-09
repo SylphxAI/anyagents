@@ -5,6 +5,7 @@
 //! the mailbox id on the first line of the user text as `anyagents-message:<id>`.
 
 mod fake;
+pub mod masking;
 mod seat;
 
 use std::sync::atomic::{AtomicU64, Ordering};

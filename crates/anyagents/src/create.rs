@@ -73,7 +73,7 @@ fn create_with_seat(
     seat_override: Option<WorkdirSeat>,
 ) -> Result<Agent, Error> {
     let normalized_harness = match request.harness.trim() {
-        "sylphx-agent" | "sylphx_agent" => "sylphx".to_string(),
+        "sylphx-agent" | "sylphx_agent" | "sylphx/default" => "sylphx".to_string(),
         other => other.to_string(),
     };
     // A harness is installed only if an adapter can start it.
@@ -85,8 +85,8 @@ fn create_with_seat(
         .map(|m| m.trim().to_string())
         .filter(|m| !m.is_empty())
         .or_else(|| {
-            (normalized_harness == "sylphx")
-                .then(|| crate::sylphx::DEFAULT_SYLPHX_MODEL.to_string())
+            matches!(normalized_harness.as_str(), "spiron" | "sylphx")
+                .then(|| crate::spiron::DEFAULT_SPIRON_MODEL.to_string())
         });
     new.description = request
         .description
@@ -557,7 +557,7 @@ fn provision_cloud_sandbox_worktree_marker(
     }
 
     let payload = serde_json::json!({
-        "path": crate::sylphx::CLOUD_WORKSPACE_DIR,
+        "path": crate::spiron::CLOUD_WORKSPACE_DIR,
         "cloud_sandbox": true,
         "repo": resolved_repo,
         "branch": branch,
@@ -1631,7 +1631,7 @@ pub(crate) fn seed_harness_credentials(
             ".grok/models_cache.json",
             ".grok/settings_cache.json",
         ],
-        "sylphx" => &[
+        "spiron" | "sylphx" => &[
             ".config/sylphx/credentials.json",
             ".config/sylphx/context.json",
             ".config/sylphx/key",
@@ -1644,7 +1644,6 @@ pub(crate) fn seed_harness_credentials(
             ".config/opencode/minimax-code-plan.key",
             ".config/opencode/openrouter.key",
             ".config/opencode/opencode.json",
-            "sylphx-agent.json",
         ],
         _ => &[],
     };
@@ -1878,7 +1877,7 @@ pub(crate) fn harness_session_filename(harness: &str) -> Option<&'static str> {
         "omp" => Some("omp-session-id"),
         "dsh" => Some("dsh-session-id"),
         "grok" => Some("grok-session-id"),
-        "sylphx" => Some("sylphx-session-id"),
+        selector if crate::vendor::is_spiron_harness(selector) => Some("spiron-session-id"),
         _ => None,
     }
 }
@@ -2207,7 +2206,6 @@ pub(crate) fn reconcile_agent_runtime_config(
             ("muse", "settings.json"),
             ("claude-code", ".claude.json"),
             ("claude-code", "mcp.json"),
-            ("sylphx", "sylphx-agent.json"),
         ] {
             if agent.harness != other_harness {
                 let _ = std::fs::remove_file(config.join(stale_file));
@@ -2248,8 +2246,8 @@ pub(crate) fn reconcile_agent_runtime_config(
             "grok" => {
                 crate::grok::write_grok_config(config, agent.model.as_deref(), &command, &args)?;
             }
-            "sylphx" => {
-                crate::sylphx::write_sylphx_config(
+            "spiron" | "sylphx" => {
+                crate::spiron::write_spiron_config(
                     config,
                     agent.model.as_deref(),
                     &command,
@@ -2464,14 +2462,14 @@ pub(crate) fn verify_harness_runtime_config(
                 ));
             }
         }
-        "sylphx" => {
-            let path = config.join("sylphx-agent.json");
+        "spiron" | "sylphx" => {
+            let path = config.join("spiron-mcp.json");
             let text = std::fs::read_to_string(&path).map_err(|_| {
                 Error::Message(format!("sylphx runtime config missing: {}", path.display()))
             })?;
             if !text.contains("\"anyagents\"") {
                 return Err(Error::Message(
-                    "sylphx-agent.json missing anyagents MCP server".into(),
+                    "spiron-mcp.json missing anyagents MCP server".into(),
                 ));
             }
         }
@@ -4067,13 +4065,19 @@ pub(crate) fn upstream_provider_of(harness: &str, model: Option<&str>) -> String
         "muse" => "muse".to_string(),
         "dsh" => "deepseek".to_string(),
         "grok" => "xai".to_string(),
-        "sylphx" | "opencode" | "omp" => "sylphx".to_string(),
+        "spiron" | "sylphx" | "opencode" | "omp" => "sylphx".to_string(),
         other => other.to_string(),
     }
 }
 
 pub(crate) fn default_kind_and_harnesses(provider: &str) -> (&'static str, Vec<String>) {
-    let harnesses = |list: &[&str]| list.iter().map(|s| (*s).to_string()).collect();
+    let harnesses = |list: &[&str]| {
+        let mut values: Vec<String> = list.iter().map(|s| (*s).to_string()).collect();
+        if list.contains(&"sylphx") {
+            values.push("spiron".to_string());
+        }
+        values
+    };
     match provider {
         "sylphx" => (
             "api-key",
@@ -4545,6 +4549,11 @@ fn sync_and_list_provider_profiles_inner(
                 ) && !compatible_harnesses.iter().any(|h| h == "sylphx")
                 {
                     compatible_harnesses.insert(0, "sylphx".to_string());
+                }
+                if compatible_harnesses.iter().any(|h| h == "sylphx")
+                    && !compatible_harnesses.iter().any(|h| h == "spiron")
+                {
+                    compatible_harnesses.push("spiron".to_string());
                 }
                 let (acct_email, acct_id) = extract_profile_account_identity(&prof_path, &provider);
                 entries.push(ProviderProfileEntry {
@@ -6796,7 +6805,6 @@ pub(crate) fn probe_one_profile_usage(
                 Some(format!("active ({count} models)"))
             }
             "sylphx" => {
-                let _key = crate::sylphx::read_sylphx_key_from_dir(&prof_dir)?;
                 let resp = http.get("https://api.sylphx.com/health").call().ok()?;
                 let body = resp.into_body().read_to_string().ok()?;
                 let val: serde_json::Value = serde_json::from_str(&body).ok()?;
@@ -8125,8 +8133,11 @@ pub(crate) fn resolve_subagent_defaults(
             .filter(|m| !m.eq_ignore_ascii_case("inherit"))
             .map(str::to_string)
             .or_else(|| {
-                matches!(harness.as_str(), "sylphx" | "sylphx-agent" | "sylphx_agent")
-                    .then(|| crate::sylphx::DEFAULT_SYLPHX_MODEL.to_string())
+                matches!(
+                    harness.as_str(),
+                    "spiron" | "sylphx" | "sylphx-agent" | "sylphx_agent"
+                )
+                .then(|| crate::spiron::DEFAULT_SPIRON_MODEL.to_string())
             });
         let profile = p_trim
             .filter(|p| !p.eq_ignore_ascii_case("inherit"))
@@ -8196,7 +8207,7 @@ pub(crate) fn resolve_subagent_defaults(
     .or_else(|| {
         matches!(
             resolved_harness.as_str(),
-            "sylphx" | "sylphx-agent" | "sylphx_agent"
+            "spiron" | "sylphx" | "sylphx-agent" | "sylphx_agent"
         )
         .then(|| {
             spec.model
@@ -8204,7 +8215,7 @@ pub(crate) fn resolve_subagent_defaults(
                 .map(str::trim)
                 .filter(|m| m.starts_with("sylphx/"))
                 .map(str::to_string)
-                .unwrap_or_else(|| crate::sylphx::DEFAULT_SYLPHX_MODEL.to_string())
+                .unwrap_or_else(|| crate::spiron::DEFAULT_SPIRON_MODEL.to_string())
         })
     });
 
@@ -8615,11 +8626,8 @@ mod tests {
         let rerender = std::fs::read_to_string(config.join("SYSTEM_PROMPT.md")).unwrap();
         assert!(rerender.contains("PINNED_FIRST_FACT"));
         assert!(!rerender.contains("EDITED_SECOND_FACT"));
-        // Launch assembly consumes the actual mirror, not an isolated formatter.
-        let assembled =
-            anyagents_harness_sylphx::assemble_system_prompt(&config, &data.join("workspace"));
-        assert!(assembled.contains(&first.memory.section));
-        assert!(!assembled.contains("EDITED_SECOND_FACT"));
+        // External CLI consumption of this mirror is exercised by the real-pipe
+        // Spiron launch/wake probe; AnyAgents no longer assembles model prompts.
         agent.harness = "sylphx".into();
         write_agent_instructions(&config, &agent, None).unwrap();
         let switched = host_session::active(root).unwrap().unwrap();
@@ -10372,16 +10380,6 @@ git -c safe.directory="$5" -C "$5" status --porcelain
                 let parent = store.agent(parent_id).unwrap();
                 assert!(prompt.contains(&format!("Direct parent: `agent:{}`", parent.name)));
             }
-            let assembled = anyagents_harness_sylphx::assemble_system_prompt(
-                &cfg,
-                Path::new(ag.workdir.as_deref().unwrap()),
-            );
-            assert_eq!(
-                assembled
-                    .matches("# ExampleOrg Shared Constitution")
-                    .count(),
-                1
-            );
             let toml = std::fs::read_to_string(cfg.join("config.toml")).unwrap();
             assert!(toml.contains("project_doc_max_bytes = 131072"));
         }
@@ -10704,7 +10702,7 @@ git -c safe.directory="$5" -C "$5" status --porcelain
     }
 
     #[test]
-    fn shared_agents_md_reaches_native_aliases_and_sylphx_assembly_exactly_once() {
+    fn shared_agents_md_reaches_native_aliases_exactly_once() {
         let dir = tempfile::tempdir().unwrap();
         let data = dir.path();
         let store = Store::open(data.join("state.db")).unwrap();
@@ -10757,33 +10755,6 @@ git -c safe.directory="$5" -C "$5" status --porcelain
             }
             assert!(!config.join(".gemini/config/AGENTS.md").exists());
             assert!(!config.join(".gemini/config/rules/AGENTS.md").exists());
-
-            // Sylphx's native-gateway and cloud paths share this real assembler.
-            // It must read current shared rules, not also load the native alias.
-            let assembled = anyagents_harness_sylphx::assemble_system_prompt(&config, &work);
-            assert_eq!(
-                assembled.matches("SHARED_ONLY_RULE").count(),
-                1,
-                "{harness}"
-            );
-            assert_eq!(assembled.matches("LOCAL_ONLY_RULE").count(), 1, "{harness}");
-            assert_eq!(assembled.matches("# AnyAgents Identity").count(), 1);
-            std::fs::write(
-                &shared_path,
-                "# Example/shared-instructions\nUPDATED_SHARED_RULE\n",
-            )
-            .unwrap();
-            let updated = anyagents_harness_sylphx::assemble_system_prompt(&config, &work);
-            assert_eq!(updated.matches("UPDATED_SHARED_RULE").count(), 1);
-            assert!(!updated.contains("SHARED_ONLY_RULE"));
-
-            // If the global mount is unavailable, recover the shared layer
-            // from config/AGENTS.md without copying the identity layer twice.
-            std::fs::remove_file(&shared_path).unwrap();
-            let fallback = anyagents_harness_sylphx::assemble_system_prompt(&config, &work);
-            assert_eq!(fallback.matches("SHARED_ONLY_RULE").count(), 1, "{harness}");
-            assert_eq!(fallback.matches("LOCAL_ONLY_RULE").count(), 1, "{harness}");
-            assert_eq!(fallback.matches("# AnyAgents Identity").count(), 1);
         }
     }
 
@@ -10924,14 +10895,6 @@ git -c safe.directory="$5" -C "$5" status --porcelain
             native_prompt.len() < 24_000,
             "{} bytes",
             native_prompt.len()
-        );
-        let assembled = anyagents_harness_sylphx::assemble_system_prompt(
-            &cfg,
-            Path::new(agent.workdir.as_deref().unwrap()),
-        );
-        assert_eq!(
-            assembled.matches("# Example/shared-instructions").count(),
-            1
         );
         assert!(!gemini_agents.exists());
         assert!(!gemini_rules_agents.exists());

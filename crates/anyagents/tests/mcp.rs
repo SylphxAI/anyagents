@@ -1205,6 +1205,7 @@ async fn session_reset_mcp_and_cli_share_quiescent_authorized_api() {
     std::fs::write(root.join("memory/MEMORY.md"), "first pin").unwrap();
     let old = host_session::ensure_active(&root, "sylphx").unwrap();
     std::fs::write(root.join("config/sylphx-session-id"), "old-vendor\n").unwrap();
+    std::fs::write(root.join("config/spiron-session-id"), "old-vendor\n").unwrap();
     std::fs::write(
         root.join("config/sylphx-transcript.jsonl"),
         "retained raw bytes",
@@ -1242,6 +1243,10 @@ async fn session_reset_mcp_and_cli_share_quiescent_authorized_api() {
         std::fs::read(root.join("config/sylphx-session-id")).unwrap(),
         b"old-vendor\n"
     );
+    assert_eq!(
+        std::fs::read(root.join("config/spiron-session-id")).unwrap(),
+        b"old-vendor\n"
+    );
     drop(process);
     let result: serde_json::Value = ok_json(
         call(
@@ -1255,6 +1260,11 @@ async fn session_reset_mcp_and_cli_share_quiescent_authorized_api() {
     assert_eq!(result["generation"], second.generation);
     assert_ne!(second.generation, old.generation);
     assert!(second.memory.section.contains("second pin"));
+    assert!(!root.join("config/spiron-session-id").exists());
+    assert_eq!(
+        std::fs::read(root.join("config/sylphx-session-id")).unwrap(),
+        b"old-vendor\n"
+    );
     std::fs::write(root.join("memory/MEMORY.md"), "third pin").unwrap();
     let cli = bin()
         .arg("--data")

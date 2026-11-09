@@ -34,7 +34,7 @@ mod schedule;
 mod seat_tree;
 mod server;
 mod signin;
-mod sylphx;
+mod spiron;
 mod telegram;
 mod ui;
 mod vendor;
