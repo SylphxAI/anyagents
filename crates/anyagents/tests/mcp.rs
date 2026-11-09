@@ -1345,7 +1345,7 @@ async fn describe_preserves_config_permissions_without_vendor_restart_writers() 
 async fn history_search_defaults_and_all_never_escape_a_private_childs_tree() {
     use anyagents_core::{Incoming, Store};
     let dir = support::physical_tempdir();
-    for name in ["coordinator", "planner", "reviewer", "runner"] {
+    for name in ["coordinator", "planner", "tester", "builder"] {
         let created = bin()
             .env("PATH", machine_path(dir.path()))
             .arg("--data")
@@ -1358,16 +1358,16 @@ async fn history_search_defaults_and_all_never_escape_a_private_childs_tree() {
     let store = Store::open(dir.path().join("state.db")).unwrap();
     let coordinator = store.agent_by_name("coordinator").unwrap();
     let planner = store.agent_by_name("planner").unwrap();
-    let reviewer = store.agent_by_name("reviewer").unwrap();
-    let runner = store.agent_by_name("runner").unwrap();
+    let tester = store.agent_by_name("tester").unwrap();
+    let builder = store.agent_by_name("builder").unwrap();
     store
         .set_agent_parent(&planner.id, Some(&coordinator.id))
         .unwrap();
     store
-        .set_agent_parent(&reviewer.id, Some(&coordinator.id))
+        .set_agent_parent(&tester.id, Some(&coordinator.id))
         .unwrap();
     store
-        .set_agent_parent(&runner.id, Some(&planner.id))
+        .set_agent_parent(&builder.id, Some(&planner.id))
         .unwrap();
     // Synthetic bodies only. These identifiers reproduce the reported search
     // shape without importing any production conversation content.
@@ -1377,11 +1377,11 @@ async fn history_search_defaults_and_all_never_escape_a_private_childs_tree() {
             "C msg_01m6svh4znevfapf3mmpsnk0a4 #2291 private parent",
         ),
         (
-            &reviewer.id,
+            &tester.id,
             "C msg_01m6svrywtez39wvnttdvz53xf #2291 private sibling",
         ),
         (&planner.id, "C #2291 authorized own mailbox"),
-        (&runner.id, "C #2291 authorized descendant"),
+        (&builder.id, "C #2291 authorized descendant"),
     ] {
         store
             .receive(
@@ -1418,7 +1418,7 @@ async fn history_search_defaults_and_all_never_escape_a_private_childs_tree() {
         )
         .unwrap();
     // Keep synthetic history stable while exercising the real API and MCP path.
-    for agent in [&coordinator, &planner, &reviewer, &runner] {
+    for agent in [&coordinator, &planner, &tester, &builder] {
         store.set_agent_state(&agent.id, "paused").unwrap();
     }
     let server = start_server(dir.path());
@@ -1461,9 +1461,9 @@ async fn history_search_defaults_and_all_never_escape_a_private_childs_tree() {
     }
     for target in [
         "coordinator",
-        "reviewer",
+        "tester",
         coordinator.id.as_str(),
-        reviewer.id.as_str(),
+        tester.id.as_str(),
     ] {
         for tool in ["conversation", "search"] {
             let denied = call(

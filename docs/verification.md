@@ -97,6 +97,15 @@ and maintenance paths, so unit tests alone do not cover that production branch.
 These disposable fixtures do not certify adoption by an existing running daemon
 or attribute a historical mailbox delay.
 
+## Immediate stream receipts
+
+The acknowledged-result fixtures wait for a ready frame processed by the real
+stdout reader before arming the unchanged three-second post-write receipt bound.
+Interpreter startup and imports have a separate setup deadline and failure
+diagnostic. A deliberately slow startup exceeds the receipt bound but still
+reaches the ordering assertion; an exited peer cannot satisfy readiness. These
+checks retain busy-steer custody, typed rejection and no-replay assertions.
+
 ## Sylphx transcript projection contract
 
 Raw transcript history is append-only. Projection may prune or summarize context,
