@@ -4461,7 +4461,7 @@ pub(crate) fn sync_and_list_provider_profiles(
 }
 
 pub(crate) fn list_provider_profiles_fast(store: &Store, data: &Path) -> Vec<ProviderProfileEntry> {
-    sync_and_list_provider_profiles_inner(store, data, true, false)
+    sync_and_list_provider_profiles_inner(store, data, true, true)
 }
 
 pub(crate) fn sync_and_list_provider_profiles_with_options(
