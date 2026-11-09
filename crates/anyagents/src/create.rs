@@ -8149,10 +8149,17 @@ pub(crate) fn apply_archetype_defaults(
         } else {
             None
         };
-        if direct.is_some() {
+        let resolved = if direct.is_some() {
             direct
         } else if valid_template_stem(&slugified) {
             resolve_archetype_template(&slugified, explicit_wd.as_deref(), parent_wd, data_dir)?
+        } else {
+            None
+        };
+        if resolved.is_some() {
+            resolved
+        } else if let Some(fallback_slug) = fallback_archetype_slug_from_role(role) {
+            resolve_archetype_template(fallback_slug, explicit_wd.as_deref(), parent_wd, data_dir)?
         } else {
             // A display label is not required to be a template stem.
             None
@@ -8241,6 +8248,21 @@ pub(crate) fn apply_archetype_defaults(
         };
     }
     Ok(())
+}
+
+fn fallback_archetype_slug_from_role(role: &str) -> Option<&'static str> {
+    let lower = role.to_ascii_lowercase();
+    if lower.contains("director") || role.contains("總監") || role.contains("總管") {
+        Some("director")
+    } else if lower.contains("manager") || role.contains("主管") {
+        Some("manager")
+    } else if lower.contains("assistant") || role.contains("專屬助理") {
+        Some("assistant")
+    } else if lower.contains("worker") || role.contains("專員") {
+        Some("worker")
+    } else {
+        None
+    }
 }
 
 fn valid_template_stem(value: &str) -> bool {
@@ -11186,6 +11208,58 @@ mod archetype_tests {
         assert!(
             parse_archetype_markdown("---\nname: worker\nunknown: rejected\n---\nBody.").is_err()
         );
+    }
+
+    #[test]
+    fn composite_role_labels_resolve_fallback_archetype_templates() {
+        let dir = tempfile::tempdir().unwrap();
+        let templates_dir = dir.path().join(".agents/agents");
+        std::fs::create_dir_all(&templates_dir).unwrap();
+        for (slug, scope, body_text) in [
+            ("director", "public", "Director template body."),
+            ("manager", "siblings", "Manager template body."),
+            ("assistant", "isolated", "Assistant template body."),
+            ("worker", "private", "Worker template body."),
+        ] {
+            std::fs::write(
+                templates_dir.join(format!("{slug}.md")),
+                format!(
+                    "---\nname: {slug}\nscope: {scope}\ndescription: Default {slug}\n---\n{body_text}"
+                ),
+            )
+            .unwrap();
+        }
+
+        for (role_label, expected_scope, expected_body) in [
+            (
+                "工作總監 (Work Director)",
+                "public",
+                "Director template body.",
+            ),
+            ("項目總管", "public", "Director template body."),
+            (
+                "商業化與數值經濟主管 (Monetization & Economy Manager)",
+                "siblings",
+                "Manager template body.",
+            ),
+            ("外部聯絡專屬助理", "isolated", "Assistant template body."),
+            ("專員 / Worker", "private", "Worker template body."),
+        ] {
+            let mut req: crate::api::CreateAgentRequest =
+                serde_json::from_value(serde_json::json!({
+                    "name": "sample-agent",
+                    "role": role_label,
+                    "instructions": "Custom assignment instructions."
+                }))
+                .unwrap();
+            apply_archetype_defaults(dir.path(), None, &mut req).unwrap();
+            assert_eq!(req.role.as_deref(), Some(role_label));
+            assert_eq!(req.scope.as_deref(), Some(expected_scope));
+            assert_eq!(
+                req.instructions.as_deref(),
+                Some(format!("{expected_body}\n\nCustom assignment instructions.").as_str())
+            );
+        }
     }
 
     #[test]
