@@ -911,7 +911,9 @@ fn claim_and_deliver_scheduled_wake(
 ) -> bool {
     let result = (|| -> Result<bool, anyagents_core::Error> {
         // Fresh lifecycle and external retirement are serialized with archive.
-        let _lifecycle = store.lock_agent_lifecycle(&agent.id)?;
+        let Ok(_lifecycle) = store.try_lock_agent_lifecycle(&agent.id) else {
+            return Ok(false);
+        };
         let agent = store.agent(&agent.id)?;
         if agent.state == "paused"
             || agent.state == "archived"
@@ -2330,5 +2332,115 @@ mod tests {
         }
         assert!(!evaluate_spiron_observation(Some("pending"), "pending".into()).triggered);
         assert!(evaluate_spiron_observation(Some("running"), "completed".into()).triggered);
+    }
+
+    #[test]
+    fn held_lifecycle_lock_defers_only_that_agent_without_blocking_other_schedules() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let health = HealthBoard::default();
+        let blocked = store
+            .create_agent(NewAgent::new("blocked-owner", "codex"))
+            .unwrap();
+        let ready = store
+            .create_agent(NewAgent::new("ready-owner", "codex"))
+            .unwrap();
+        let idle_target = store
+            .create_agent(NewAgent::new("idle-target", "codex"))
+            .unwrap();
+        let now = anyagents_core::now_ms();
+        let blocked_timer = store
+            .create_schedule(NewSchedule {
+                agent_id: blocked.id.clone(),
+                kind: "at".into(),
+                spec: "now".into(),
+                prompt: "blocked timer".into(),
+                interval_ms: None,
+                next_fire_at_ms: Some(now),
+                watch_baseline: None,
+            })
+            .unwrap();
+        let blocked_watch = store
+            .create_schedule(NewSchedule {
+                agent_id: blocked.id.clone(),
+                kind: "watch".into(),
+                spec: format!("agent:idle:{}", idle_target.name),
+                prompt: "blocked watch".into(),
+                interval_ms: None,
+                next_fire_at_ms: None,
+                watch_baseline: None,
+            })
+            .unwrap();
+        let ready_timer = store
+            .create_schedule(NewSchedule {
+                agent_id: ready.id.clone(),
+                kind: "at".into(),
+                spec: "now".into(),
+                prompt: "ready timer".into(),
+                interval_ms: None,
+                next_fire_at_ms: Some(now),
+                watch_baseline: None,
+            })
+            .unwrap();
+        let ready_watch = store
+            .create_schedule(NewSchedule {
+                agent_id: ready.id.clone(),
+                kind: "watch".into(),
+                spec: format!("agent:idle:{}", idle_target.name),
+                prompt: "ready watch".into(),
+                interval_ms: None,
+                next_fire_at_ms: None,
+                watch_baseline: None,
+            })
+            .unwrap();
+
+        let held = store.lock_agent_lifecycle(&blocked.id).unwrap();
+        assert_eq!(tick_schedules_once(&store, &health, now), 2);
+        assert!(store.inbox(&blocked.id, None).unwrap().is_empty());
+        assert_eq!(
+            store
+                .get_schedule(&blocked_timer.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            "active"
+        );
+        assert_eq!(
+            store
+                .get_schedule(&blocked_watch.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            "active"
+        );
+        assert_eq!(store.inbox(&ready.id, None).unwrap().len(), 2);
+        assert_eq!(
+            store.get_schedule(&ready_timer.id).unwrap().unwrap().state,
+            "fired"
+        );
+        assert_eq!(
+            store.get_schedule(&ready_watch.id).unwrap().unwrap().state,
+            "fired"
+        );
+
+        drop(held);
+        assert_eq!(tick_schedules_once(&store, &health, now + 1), 2);
+        assert_eq!(store.inbox(&blocked.id, None).unwrap().len(), 2);
+        assert_eq!(
+            store
+                .get_schedule(&blocked_timer.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            "fired"
+        );
+        assert_eq!(
+            store
+                .get_schedule(&blocked_watch.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            "fired"
+        );
     }
 }

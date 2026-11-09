@@ -430,7 +430,7 @@ pub(crate) fn mark_explicitly_archived_locked(
             {
                 if seen.insert(child.id.clone()) {
                     queue.push_back(child.id.clone());
-                    let Ok(_child_lifecycle) = store.lock_agent_lifecycle(&child.id) else {
+                    let Ok(_child_lifecycle) = store.try_lock_agent_lifecycle(&child.id) else {
                         continue;
                     };
                     let Ok(child) = store.set_agent_state(&child.id, "archived") else {
@@ -3670,7 +3670,11 @@ async fn delete_agent_route(
             seat_ids,
         );
         reap_subagent_ephemeral_dirs(state.store.data_dir(), &deleted.id);
-        remove_path_with_seat(&agent_dir.join("config"), seat_ids);
+        for private_tree in ["config", "memory", "skills"] {
+            let tree_path = agent_dir.join(private_tree);
+            remove_path_with_seat(&tree_path, seat_ids);
+            let _ = std::fs::remove_dir_all(&tree_path);
+        }
         if !agent_dir.join("work").exists() {
             remove_path_with_seat(&agent_dir, seat_ids);
             let _ = std::fs::remove_dir_all(&agent_dir);
@@ -3741,10 +3745,14 @@ fn prepare_agent_wake(store: &Store, found: &Agent) -> Result<(), ApiError> {
     }
     let _ = std::fs::remove_file(cfg.join(".anyagents-last-error.json"));
     let _ = std::fs::remove_file(cfg.join(".anyagents-notified-parent-error.json"));
-    let _ = std::fs::write(
-        cfg.join(".anyagents-profile-rotated-ms"),
-        format!("{}\n", now_ms()),
-    );
+    let now = now_ms();
+    let _ = std::fs::write(cfg.join(".anyagents-quota-cleared-ms"), format!("{now}\n"));
+    if !store.has_open_turn(&found.id).unwrap_or(false) {
+        let _ = std::fs::write(
+            cfg.join(".anyagents-profile-rotated-ms"),
+            format!("{now}\n"),
+        );
+    }
     crate::worktree_access::restore_recorded(store.data_dir(), &found.id)
         .map_err(ApiError::from_store)?;
     clear_explicitly_archived(store.data_dir(), &found.id);

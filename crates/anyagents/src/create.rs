@@ -2893,17 +2893,20 @@ pub(crate) fn configure_agent_runtime(
             Ok(())
         }
         copy_files(&profile_dir, &config)?;
+    }
+    let now_rot = anyagents_core::now_ms();
+    let _ = write_profile_marker(
+        &config,
+        ".anyagents-quota-cleared-ms",
+        &format!("{now_rot}\n"),
+    );
+    if !in_progress_turn || current_bound.as_deref() != Some(normalized_profile.as_str()) {
         write_profile_marker(
             &config,
             ".anyagents-profile-rotated-ms",
-            &format!("{}\n", anyagents_core::now_ms()),
+            &format!("{now_rot}\n"),
         )?;
     }
-    write_profile_marker(
-        &config,
-        ".anyagents-profile-rotated-ms",
-        &format!("{}\n", anyagents_core::now_ms()),
-    )?;
     write_profile_marker(
         &config,
         ".anyagents-profile",
@@ -3149,11 +3152,22 @@ pub(crate) fn propagate_profile_files_to_bound_agents(
             ".anyagents-seeded-profile",
             &format!("{target_tag}\n"),
         )?;
-        write_profile_marker(
+        let now_prop = anyagents_core::now_ms();
+        let _ = write_profile_marker(
             &cfg,
-            ".anyagents-profile-rotated-ms",
-            &format!("{}\n", anyagents_core::now_ms()),
-        )?;
+            ".anyagents-quota-cleared-ms",
+            &format!("{now_prop}\n"),
+        );
+        let has_open = store_opt
+            .as_ref()
+            .is_some_and(|s| s.has_open_turn(&agent_rec.id).unwrap_or(false));
+        if !has_open {
+            write_profile_marker(
+                &cfg,
+                ".anyagents-profile-rotated-ms",
+                &format!("{now_prop}\n"),
+            )?;
+        }
         let _ = std::fs::remove_file(cfg.join(".anyagents-last-error.json"));
         if let Some(s) = store_opt.as_ref() {
             if let Some((_, uid, gid, _)) = resolved_agent_seat_info(s, agent_rec) {
@@ -4461,7 +4475,7 @@ pub(crate) fn sync_and_list_provider_profiles(
 }
 
 pub(crate) fn list_provider_profiles_fast(store: &Store, data: &Path) -> Vec<ProviderProfileEntry> {
-    sync_and_list_provider_profiles_inner(store, data, true, false)
+    sync_and_list_provider_profiles_inner(store, data, true, true)
 }
 
 pub(crate) fn sync_and_list_provider_profiles_with_options(
@@ -8752,6 +8766,45 @@ mod tests {
                 agent.name
             );
         }
+    }
+
+    #[test]
+    fn propagate_profile_files_defers_rotated_marker_during_open_turn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path();
+        let store = Store::open(data.join("state.db")).unwrap();
+        store
+            .hold_capability_key("0123456789abcdef0123456789abcdef")
+            .unwrap();
+        let _entries = rebalance_test_profiles(data, 80);
+        let idle = rebalance_test_agent(&store, "idle-seat", None);
+        let working = rebalance_test_agent(&store, "working-seat", None);
+        store
+            .receive(&working.id, anyagents_core::Incoming::new("active turn"))
+            .unwrap();
+        let message = store.next_undelivered(&working.id).unwrap().unwrap();
+        store.note_delivered(&working.id, message.seq).unwrap();
+        assert!(store.has_open_turn(&working.id).unwrap());
+
+        let idle_cfg = agent_config_dir(data, &idle.id);
+        let working_cfg = agent_config_dir(data, &working.id);
+        let _ = std::fs::remove_file(idle_cfg.join(".anyagents-profile-rotated-ms"));
+        let _ = std::fs::remove_file(working_cfg.join(".anyagents-profile-rotated-ms"));
+
+        propagate_profile_files_to_bound_agents(data, "openai", "busy", &[]).unwrap();
+
+        assert!(
+            idle_cfg.join(".anyagents-profile-rotated-ms").exists(),
+            "idle seat should receive rotated marker on credential refresh"
+        );
+        assert!(
+            !working_cfg.join(".anyagents-profile-rotated-ms").exists(),
+            "working seat with open turn must not receive rotated marker mid-turn"
+        );
+        assert!(
+            working_cfg.join(".anyagents-quota-cleared-ms").exists(),
+            "working seat should still receive quota-cleared marker"
+        );
     }
 
     #[test]
