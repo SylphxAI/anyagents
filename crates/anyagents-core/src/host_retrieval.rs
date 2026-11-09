@@ -1975,12 +1975,10 @@ mod tests {
             {
                 first_refreshed = true;
             }
-            if first_refreshed {
-                if let Ok(probe_first) = store.try_lock_agent_lifecycle(&first.id) {
-                    drop(probe_first);
-                    first_released = true;
-                    break;
-                }
+            if first_refreshed && let Ok(probe_first) = store.try_lock_agent_lifecycle(&first.id) {
+                drop(probe_first);
+                first_released = true;
+                break;
             }
             std::thread::sleep(Duration::from_millis(5));
         }
