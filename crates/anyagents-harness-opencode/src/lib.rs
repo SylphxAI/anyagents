@@ -57,12 +57,28 @@ pub struct OpenCodeHarness {
     steer: Option<SteerQueue>,
 }
 
+#[derive(Clone, Debug)]
+struct PriorPrompt {
+    id: String,
+    sender: Option<String>,
+    text: String,
+}
+
 #[derive(Default)]
 struct State {
     session: Option<String>,
     alive: bool,
     /// Ids the prompt API took, in the order they were written.
     written: Vec<String>,
+    /// Prior messages accepted in this adapter session, used to restore
+    /// conversation context if the OpenCode session later returns HTTP 404.
+    history: Vec<PriorPrompt>,
+    /// Initial `<topology>` snapshot seen on this adapter instance so a
+    /// replacement session created after a 404 retains topology awareness.
+    initial_topology: Option<String>,
+    /// Stale session ID replaced after an HTTP 404, pending context
+    /// restoration on the first prompt delivered to the replacement session.
+    recovered_from_session: Option<String>,
     /// Turns the session reported failed, by message id.
     failures: Vec<(String, String)>,
     /// The service this adapter started, and the password it printed. A
@@ -343,11 +359,7 @@ impl OpenCodeHarness {
                                 break;
                             }
                             Err(err) => {
-                                let text = err.to_string();
-                                state = if text.contains("404")
-                                    || text.contains("not found")
-                                    || text.contains("NotFound")
-                                {
+                                state = if is_session_not_found(&err) {
                                     Missing::Gone
                                 } else {
                                     Missing::Unknown
@@ -371,22 +383,10 @@ impl OpenCodeHarness {
                 None => false,
             };
         if !usable {
-            if let Some(session) = &wanted {
-                eprintln!(
-                    "anyagents-opencode: session {session} is gone from this agent's store; starting a new one"
-                );
-            }
-            let fresh = self.api("POST", "/api/session", Some(json!({})))?;
-            let id = fresh
-                .pointer("/data/id")
-                .and_then(Value::as_str)
-                .filter(|id| !id.is_empty())
-                .ok_or_else(|| {
-                    HarnessError::Failed("OpenCode session response missing id".into())
-                })?;
-            self.lock().session = Some(id.to_string());
+            self.recreate_session(wanted.as_deref())?;
+        } else {
+            self.remember_session()?;
         }
-        self.remember_session()?;
         if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none() {
             // OpenCode boots location services and MCP servers lazily on the first
             // directory-scoped call (`GET /api/mcp` or `POST /api/session/<id>/prompt`).
@@ -425,6 +425,232 @@ impl OpenCodeHarness {
             )?;
         }
         Ok(())
+    }
+
+    /// Create a fresh OpenCode session, persist its id to `opencode-session-id`,
+    /// and mark recovery context to be seeded when replacing a missing session.
+    fn recreate_session(&mut self, stale_session: Option<&str>) -> Result<String, HarnessError> {
+        if let Some(session) = stale_session {
+            eprintln!(
+                "anyagents-opencode: session {session} is gone from this agent's store; starting a new one"
+            );
+        }
+        let fresh = self.api("POST", "/api/session", Some(json!({})))?;
+        let id = fresh
+            .pointer("/data/id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| HarnessError::Failed("OpenCode session response missing id".into()))?
+            .to_string();
+        let previous = self.lock().session.replace(id.clone());
+        if let Err(err) = self.remember_session() {
+            self.lock().session = previous;
+            return Err(err);
+        }
+        if let Some(stale) = stale_session {
+            self.sync_config_recovery_instructions();
+            let mut state = self.lock();
+            if state.recovered_from_session.is_none() {
+                state.recovered_from_session = Some(stale.to_string());
+            }
+            state.turn_open = false;
+        }
+        Ok(id)
+    }
+
+    fn sync_config_recovery_instructions(&self) {
+        let Some(dir) = self.config_dir.as_deref() else {
+            return;
+        };
+        let Ok(summary) = std::fs::read_to_string(dir.join(".anyagents-session-recovery.md"))
+        else {
+            return;
+        };
+        let trimmed = summary.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let bridge = json!({
+            "harness": "opencode",
+            "previous_harness": Value::Null,
+            "summary": trimmed,
+        });
+        if let Ok(bytes) = serde_json::to_vec_pretty(&bridge) {
+            let _ = std::fs::write(dir.join(".anyagents-session-bridge.json"), bytes);
+        }
+        const MAX_DOC_BYTES: usize = 23_200;
+        for rel in [
+            "SYSTEM_PROMPT.md",
+            "AGENTS.md",
+            "opencode/AGENTS.md",
+            ".config/opencode/AGENTS.md",
+        ] {
+            let path = dir.join(rel);
+            let Ok(mut doc) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            if doc.contains("Cross-Harness Session Continuity") {
+                continue;
+            }
+            let remaining = MAX_DOC_BYTES.saturating_sub(doc.len() + 2);
+            if remaining >= 256 {
+                doc.push('\n');
+                if trimmed.len() <= remaining {
+                    doc.push_str(trimmed);
+                } else {
+                    let mut cut = remaining;
+                    while cut > 0 && !trimmed.is_char_boundary(cut) {
+                        cut -= 1;
+                    }
+                    if let Some(nl) = trimmed[..cut].rfind('\n')
+                        && nl > 0
+                    {
+                        cut = nl;
+                    }
+                    doc.push_str(&trimmed[..cut]);
+                }
+                doc.push('\n');
+                let _ = std::fs::write(&path, doc);
+            }
+        }
+    }
+
+    fn read_recovery_context(&self) -> Option<String> {
+        let dir = self.config_dir.as_deref()?;
+        if let Ok(recovery) = std::fs::read_to_string(dir.join(".anyagents-session-recovery.md"))
+            && !recovery.trim().is_empty()
+        {
+            return Some(recovery.trim().to_string());
+        }
+        if let Ok(bridge) = std::fs::read_to_string(dir.join(".anyagents-session-bridge.json"))
+            && let Ok(val) = serde_json::from_str::<Value>(&bridge)
+            && let Some(summary) = val
+                .get("summary")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        {
+            return Some(summary.to_string());
+        }
+        for candidate in ["SYSTEM_PROMPT.md", "opencode/AGENTS.md", "AGENTS.md"] {
+            if let Ok(text) = std::fs::read_to_string(dir.join(candidate))
+                && !text.trim().is_empty()
+            {
+                return Some(text.trim().to_string());
+            }
+        }
+        None
+    }
+
+    fn compose_prompt(
+        &self,
+        message: &OutboundMessage,
+        recovery_from: Option<(&str, &str)>,
+    ) -> String {
+        let composed = compose_message(&message.id, &message.context, &message.text);
+        let Some((old_session, new_session)) = recovery_from else {
+            return composed;
+        };
+        let (first_line, rest) = composed.split_once('\n').unwrap_or((composed.as_str(), ""));
+        let mut recovery_lines = vec![
+            format!(
+                "<session_recovery stale_session=\"{}\" new_session=\"{}\">",
+                old_session, new_session
+            ),
+            format!(
+                "[Recovery] Session {old_session} was not found (HTTP 404); resumed on new session {new_session}."
+            ),
+        ];
+        if let Some(config_context) = self.read_recovery_context() {
+            recovery_lines.push(String::new());
+            recovery_lines.push(config_context);
+        }
+        let (prior_history, saved_topology) = {
+            let state = self.lock();
+            (state.history.clone(), state.initial_topology.clone())
+        };
+        if !prior_history.is_empty() {
+            recovery_lines.push(String::new());
+            recovery_lines
+                .push("The message(s) in the previous session before recovery:".to_string());
+            for prev in &prior_history {
+                let from = prev.sender.as_deref().unwrap_or("unknown");
+                recovery_lines.push(format!("- message {} (from {from}):", prev.id));
+                for line in prev.text.lines() {
+                    recovery_lines.push(format!("  > {line}"));
+                }
+            }
+        }
+        recovery_lines.push("</session_recovery>".to_string());
+        let mut out = format!("{first_line}\n{}", recovery_lines.join("\n"));
+        if message.context.topology.is_none()
+            && let Some(topo) = saved_topology
+        {
+            out.push('\n');
+            out.push_str(&topo);
+        }
+        if !rest.is_empty() {
+            out.push('\n');
+            out.push_str(rest);
+        }
+        out
+    }
+
+    fn send_prompt(&mut self, message: &OutboundMessage) -> Result<Value, HarnessError> {
+        let Some(session) = self.lock().session.clone() else {
+            return Err(HarnessError::Failed("no session".into()));
+        };
+        let pending_recovery = self.lock().recovered_from_session.clone();
+        let initial_text = match pending_recovery.as_deref() {
+            Some(stale) => self.compose_prompt(message, Some((stale, &session))),
+            None => self.compose_prompt(message, None),
+        };
+        let body = json!({
+            "text": initial_text,
+            "delivery": "steer",
+        });
+        match self.api(
+            "POST",
+            &format!("/api/session/{session}/prompt"),
+            Some(body),
+        ) {
+            Ok(answer) => Ok(answer),
+            Err(err) if is_session_not_found(&err) => {
+                let stale = pending_recovery.unwrap_or_else(|| session.clone());
+                let new_session = self.recreate_session(Some(&stale))?;
+                let retry_body = json!({
+                    "text": self.compose_prompt(message, Some((&stale, &new_session))),
+                    "delivery": "steer",
+                });
+                self.api(
+                    "POST",
+                    &format!("/api/session/{new_session}/prompt"),
+                    Some(retry_body),
+                )
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    fn record_prompt_accepted(&self, message: &OutboundMessage) {
+        let mut state = self.lock();
+        if state.initial_topology.is_none()
+            && let Some(topo) = &message.context.topology
+        {
+            state.initial_topology = Some(topo.clone());
+        }
+        state.recovered_from_session = None;
+        state.history.push(PriorPrompt {
+            id: message.id.clone(),
+            sender: message
+                .sender
+                .clone()
+                .or_else(|| message.context.sender.clone()),
+            text: message.text.clone(),
+        });
+        state.written.push(message.id.clone());
+        state.turn_open = true;
+        state.last_prompt_at = Some(Instant::now());
     }
 
     /// One `opencode api` call. Its own process, so a hung vendor call cannot
@@ -470,13 +696,35 @@ impl OpenCodeHarness {
                     let error_body = serde_json::from_slice::<Value>(&output.stdout).ok();
                     let reason = if error_body
                         .as_ref()
-                        .and_then(|body| body.pointer("/error/code"))
+                        .and_then(|body| body.pointer("/error/code").or_else(|| body.get("code")))
                         .and_then(Value::as_u64)
                         == Some(404)
+                        || error_body
+                            .as_ref()
+                            .and_then(|body| body.get("name"))
+                            .and_then(Value::as_str)
+                            == Some("NotFoundError")
                     {
                         "resource not found (404)".to_string()
+                    } else if let Some(line) = text.lines().map(str::trim).find(|l| !l.is_empty()) {
+                        line.to_string()
+                    } else if let Some(body) = &error_body {
+                        let code = body
+                            .pointer("/error/code")
+                            .or_else(|| body.get("code"))
+                            .and_then(Value::as_u64);
+                        let msg = body
+                            .pointer("/error/message")
+                            .or_else(|| body.get("message"))
+                            .or_else(|| body.get("error"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("request failed");
+                        match code {
+                            Some(code) => format!("{msg} ({code})"),
+                            None => msg.to_string(),
+                        }
                     } else {
-                        text.lines().next().unwrap_or("no reason").to_string()
+                        "no reason".to_string()
                     };
                     return Err(HarnessError::Failed(format!("{method} {path}: {reason}")));
                 }
@@ -600,29 +848,13 @@ impl Harness for OpenCodeHarness {
                 turn_finished: false,
             });
         }
-        let Some(session) = self.lock().session.clone() else {
-            return Err(HarnessError::Failed("no session".into()));
-        };
-        let body = json!({
-            "text": compose_message(&message.id, &message.context, &message.text),
-            "delivery": "steer",
-        });
-        let answer = self.api(
-            "POST",
-            &format!("/api/session/{session}/prompt"),
-            Some(body),
-        )?;
+        let answer = self.send_prompt(message)?;
         if answer.get("data").is_none() {
             return Err(HarnessError::Failed(format!(
                 "prompt was not taken: {answer}"
             )));
         }
-        {
-            let mut state = self.lock();
-            state.written.push(message.id.clone());
-            state.turn_open = true;
-            state.last_prompt_at = Some(Instant::now());
-        }
+        self.record_prompt_accepted(message);
         Ok(DeliverOutcome::Accepted {
             turn_finished: false,
         })
@@ -776,25 +1008,14 @@ impl Harness for OpenCodeHarness {
         if !self.lock().alive {
             return Err(HarnessError::Dead);
         }
-        let Some(session) = self.lock().session.clone() else {
+        if self.lock().session.is_none() {
             return Ok(false);
-        };
+        }
         // The same prompt `deliver` writes: the session decides where it goes.
-        let body = json!({
-            "text": compose_message(&message.id, &message.context, &message.text),
-            "delivery": "steer"
-        });
-        match self.api(
-            "POST",
-            &format!("/api/session/{session}/prompt"),
-            Some(body),
-        ) {
+        match self.send_prompt(message) {
             Ok(answer) => {
                 if answer.get("data").is_some() {
-                    let mut state = self.lock();
-                    state.written.push(message.id.clone());
-                    state.turn_open = true;
-                    state.last_prompt_at = Some(Instant::now());
+                    self.record_prompt_accepted(message);
                     Ok(true)
                 } else {
                     Ok(false)
@@ -850,6 +1071,15 @@ enum Missing {
     Present,
     Gone,
     Unknown,
+}
+
+fn is_session_not_found(err: &HarnessError) -> bool {
+    let text = err.to_string();
+    let reason = text
+        .split_once(": ")
+        .map_or(text.as_str(), |(_, reason)| reason);
+    let lower = reason.to_ascii_lowercase();
+    reason.contains("404") || lower.contains("not found") || reason.contains("NotFound")
 }
 
 /// The answer the session holds for one mailbox id: the assistant text created

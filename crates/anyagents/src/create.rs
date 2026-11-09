@@ -1955,10 +1955,19 @@ pub(crate) fn compute_live_session_continuity(
 ) -> Option<String> {
     let _ = std::fs::remove_file(config.join(".anyagents-harness-continuity.md"));
     let bridge_cache_path = config.join(".anyagents-session-bridge.json");
+    let recovery_cache_path = config.join(".anyagents-session-recovery.md");
     let turns = store.conversation(&agent.id, None, None, Some(10)).ok()?;
     if turns.is_empty() {
         let _ = std::fs::remove_file(&bridge_cache_path);
+        let _ = std::fs::remove_file(&recovery_cache_path);
         return None;
+    }
+    if let Some(recovery_summary) =
+        build_harness_continuity_summary(store, agent, None, &agent.harness)
+    {
+        let _ = write_seat_shared_file(&recovery_cache_path, recovery_summary.as_bytes(), 0o664);
+    } else {
+        let _ = std::fs::remove_file(&recovery_cache_path);
     }
 
     let active_sess_file = harness_session_filename(&agent.harness).map(|f| config.join(f));

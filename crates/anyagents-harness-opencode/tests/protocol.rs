@@ -662,3 +662,189 @@ fn unavailable_session_is_not_replaced_by_a_new_conversation() {
         "ses_fake\n"
     );
 }
+
+#[test]
+fn prompt_404_creates_new_session_restores_context_retries_once_and_persists_session_id() {
+    for mode in ["prompt-404", "prompt-404-stderr"] {
+        let dir = TempDir::new().unwrap();
+        let config = dir.path().join("config");
+        std::fs::create_dir_all(config.join("opencode")).unwrap();
+        std::fs::write(config.join("opencode-session-id"), "ses_fake\n").unwrap();
+        std::fs::write(
+            config.join("SYSTEM_PROMPT.md"),
+            "# Agent Identity\n- **Agent Name**: `alpha`\n",
+        )
+        .unwrap();
+        std::fs::write(
+            config.join("opencode/AGENTS.md"),
+            "# Agent Identity\n- **Agent Name**: `alpha`\n",
+        )
+        .unwrap();
+        std::fs::write(
+            config.join(".anyagents-session-recovery.md"),
+            "## 4. Cross-Harness Session Continuity (`state.db` -> `opencode`)\n\n### Recent Completed Two-Way Turns (`state.db`)\n\n- `[OUT (already sent/completed)]` `msg_prev`: Prior turn completed.\n",
+        )
+        .unwrap();
+
+        let mut harness = start_with_config(&dir, mode, &config);
+        assert_eq!(harness.session_id().as_deref(), Some("ses_fake"));
+
+        let mut first = msg("m1");
+        first.text = "resume work after restart".to_string();
+        assert_eq!(harness.deliver(&first).unwrap(), accepted());
+        assert_eq!(harness.session_id().as_deref(), Some("ses_fresh"));
+        assert_eq!(
+            std::fs::read_to_string(config.join("opencode-session-id")).unwrap(),
+            "ses_fresh\n"
+        );
+        assert!(
+            std::fs::read_to_string(config.join("opencode/AGENTS.md"))
+                .unwrap()
+                .contains("Cross-Harness Session Continuity")
+        );
+        let recovered_prompt = std::fs::read_to_string(dir.path().join("last-prompt")).unwrap();
+        assert!(
+            recovered_prompt.starts_with("anyagents-message:m1\n"),
+            "{recovered_prompt}"
+        );
+        assert!(
+            recovered_prompt.contains(
+                "<session_recovery stale_session=\"ses_fake\" new_session=\"ses_fresh\">"
+            ),
+            "{recovered_prompt}"
+        );
+        assert!(
+            recovered_prompt.contains("Prior turn completed."),
+            "{recovered_prompt}"
+        );
+        assert!(
+            recovered_prompt.contains("resume work after restart"),
+            "{recovered_prompt}"
+        );
+        assert!(harness.wait_answered("m1", Duration::from_secs(5)));
+        assert_eq!(harness.answer("m1").as_deref(), Some("pong from opencode"));
+
+        // Subsequent wake/turn uses `ses_fresh` directly without hitting `ses_fake`.
+        let mut second = msg("m2");
+        second.text = "follow-up wake".to_string();
+        assert_eq!(harness.deliver(&second).unwrap(), accepted());
+        let second_prompt = std::fs::read_to_string(dir.path().join("last-prompt")).unwrap();
+        assert!(
+            !second_prompt.contains("<session_recovery"),
+            "recovery block is only seeded once on the new session: {second_prompt}"
+        );
+        let log = log_of(&dir);
+        assert_eq!(
+            log.matches("api:POST /api/session/ses_fake/prompt").count(),
+            1,
+            "stale session must not be reused after 404 recovery: {log}"
+        );
+        assert_eq!(
+            log.matches("api:POST /api/session ").count(),
+            1,
+            "exactly one replacement session is created: {log}"
+        );
+        assert_eq!(
+            log.matches("api:POST /api/session/ses_fresh/prompt")
+                .count(),
+            2,
+            "retried prompt and subsequent wake both target the new session: {log}"
+        );
+    }
+}
+
+#[test]
+fn prompt_404_after_prior_turn_restores_in_memory_history_and_topology_on_new_session() {
+    let dir = TempDir::new().unwrap();
+    let config = dir.path().join("config");
+    std::fs::create_dir_all(&config).unwrap();
+    let mut harness = start_with_config(&dir, "prompt-404-after-first", &config);
+
+    let mut first = msg("m1");
+    first.text = "initial assignment context".to_string();
+    first.context.topology =
+        Some("<topology event=\"initial\" self=\"alpha\" scope=\"private\" />".to_string());
+    assert_eq!(harness.deliver(&first).unwrap(), accepted());
+    assert_eq!(harness.session_id().as_deref(), Some("ses_fake"));
+
+    let mut second = msg("m2");
+    second.text = "second wake after service restart".to_string();
+    assert_eq!(harness.deliver(&second).unwrap(), accepted());
+    assert_eq!(harness.session_id().as_deref(), Some("ses_fresh"));
+    assert_eq!(
+        std::fs::read_to_string(config.join("opencode-session-id")).unwrap(),
+        "ses_fresh\n"
+    );
+    let recovered_prompt = std::fs::read_to_string(dir.path().join("last-prompt")).unwrap();
+    assert!(
+        recovered_prompt
+            .contains("<session_recovery stale_session=\"ses_fake\" new_session=\"ses_fresh\">"),
+        "{recovered_prompt}"
+    );
+    assert!(
+        recovered_prompt.contains("initial assignment context"),
+        "{recovered_prompt}"
+    );
+    assert!(
+        recovered_prompt
+            .contains("<topology event=\"initial\" self=\"alpha\" scope=\"private\" />"),
+        "{recovered_prompt}"
+    );
+    assert!(
+        recovered_prompt.contains("second wake after service restart"),
+        "{recovered_prompt}"
+    );
+}
+
+#[test]
+fn non_404_prompt_errors_and_repeated_404_fail_closed_without_minting_duplicate_sessions() {
+    for (mode, expected_status) in [("prompt-500", "500"), ("prompt-400", "400")] {
+        let dir = TempDir::new().unwrap();
+        let config = dir.path().join("config");
+        std::fs::create_dir_all(&config).unwrap();
+        let log = dir.path().join("log");
+        // Session ID intentionally contains "404" to verify status detection
+        // inspects the error reason rather than matching digits in the URL path.
+        let mut harness = OpenCodeHarness::start_in_config(
+            scripted_opencode(),
+            Some("ses_404_keep"),
+            &[
+                ("ANYAGENTS_FAKE_MODE", mode),
+                ("ANYAGENTS_FAKE_LOG", log.to_str().unwrap()),
+                ("ANYAGENTS_FAKE_STATE", dir.path().to_str().unwrap()),
+            ],
+            None,
+            &config,
+        )
+        .unwrap();
+
+        let err = harness.deliver(&msg("m1")).unwrap_err().to_string();
+        assert!(err.contains(expected_status), "{err}");
+        assert_eq!(harness.session_id().as_deref(), Some("ses_404_keep"));
+        assert_eq!(
+            std::fs::read_to_string(config.join("opencode-session-id")).unwrap(),
+            "ses_404_keep\n"
+        );
+        assert!(harness.written_ids().is_empty());
+        let text = log_of(&dir);
+        assert_eq!(
+            text.matches("api:POST /api/session ").count(),
+            0,
+            "non-404 error must never mint a new session: {text}"
+        );
+    }
+
+    // If the replacement session also returns 404, retry happens at most once.
+    let dir = TempDir::new().unwrap();
+    let config = dir.path().join("config");
+    std::fs::create_dir_all(&config).unwrap();
+    let mut harness = start_with_config(&dir, "prompt-404-always", &config);
+    let err = harness.deliver(&msg("m1")).unwrap_err().to_string();
+    assert!(err.contains("404"), "{err}");
+    let text = log_of(&dir);
+    assert_eq!(
+        text.matches("api:POST /api/session ").count(),
+        1,
+        "404 recovery must retry only once and not loop: {text}"
+    );
+}
