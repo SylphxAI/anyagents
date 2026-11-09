@@ -311,7 +311,7 @@ struct ConversationArgs {
     /// Optional negative terms — any turn containing any of these substrings is excluded.
     #[serde(default, deserialize_with = "crate::api::deserialize_string_or_vec")]
     exclude: Vec<String>,
-    /// Agent name (`planner`, `builder`, `reviewer`, `"all"`) or `agt_...` ID whose complete
+    /// Agent name (`planner`, `builder`, `tester`, `"all"`) or `agt_...` ID whose complete
     /// two-way (`in` + `out`) conversation to read or search. Defaults to `"all"` when
     /// searching, or this agent when reading recent chronological turns. Non-admin
     /// callers can read only self and descendants; `all` means that authorized set.
@@ -421,7 +421,7 @@ struct AgentsArgs {
     /// New agent name when `action = "rename"`.
     #[serde(default, alias = "to")]
     new_name: Option<String>,
-    /// Optional archetype template name (`.agents/agents/<archetype>.md`, e.g. `"writer"`, `"reviewer"`, `"mind"`) when `action` is `"spawn"` or `"create"`.
+    /// Optional archetype template name (`.agents/agents/<archetype>.md`, e.g. `"planner"`, `"builder"`, `"tester"`) when `action` is `"spawn"` or `"create"`.
     #[serde(default, alias = "type", alias = "template", alias = "preset")]
     archetype: Option<String>,
     /// Optional display-only role label (for example, `"Researcher"`); never selects lifecycle or scope.
@@ -505,7 +505,7 @@ struct SpawnArgs {
         alias = "target"
     )]
     name: Option<String>,
-    /// Optional archetype template name (`.agents/agents/<archetype>.md`, e.g. `"writer"`, `"reviewer"`, `"mind"`).
+    /// Optional archetype template name (`.agents/agents/<archetype>.md`, e.g. `"planner"`, `"builder"`, `"tester"`).
     #[serde(default, alias = "type", alias = "template", alias = "preset")]
     archetype: Option<String>,
     /// Optional display-only role label; no effect on lifecycle, scope or prompts.
@@ -555,7 +555,7 @@ struct SpawnArgs {
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 struct DescribeArgs {
-    /// Target agent name (`"self"`, `"reviewer"`, `"planner"`, `"all"`, or `agt_...` ID). Defaults to `"self"`.
+    /// Target agent name (`"self"`, `"tester"`, `"planner"`, `"all"`, or `agt_...` ID). Defaults to `"self"`.
     #[serde(default, alias = "name", alias = "target")]
     agent: Option<String>,
     /// Concise public role/responsibility summary (`description`, Layer 1 — visible to all peers and group rosters).
@@ -608,7 +608,7 @@ struct SubagentsArgs {
     /// Optional case-insensitive multi-token search query for `list`.
     #[serde(default, alias = "search", alias = "filter", alias = "q")]
     query: Option<String>,
-    /// Optional archetype template name (`.agents/agents/<archetype>.md`, e.g. `"writer"`, `"reviewer"`, `"mind"`) when `action = "spawn"`.
+    /// Optional archetype template name (`.agents/agents/<archetype>.md`, e.g. `"planner"`, `"builder"`, `"tester"`) when `action = "spawn"`.
     #[serde(default, alias = "type", alias = "template", alias = "preset")]
     archetype: Option<String>,
     /// Harness catalog ID when `action = "spawn"` (`opencode`, `codex`, `claude-code`, `agy`, `muse`, `omp`, `dsh`, `grok`).
@@ -6936,6 +6936,29 @@ mod spawn_args_tests {
     use serde_json::json;
 
     #[test]
+    fn archetype_schemas_offer_neutral_examples_without_restricting_templates() {
+        for schema in [
+            schemars::schema_for!(AgentsArgs),
+            schemars::schema_for!(SpawnArgs),
+            schemars::schema_for!(SubagentsArgs),
+        ] {
+            let value = serde_json::to_value(schema).unwrap();
+            let archetype = &value["properties"]["archetype"];
+            let description = archetype["description"].as_str().unwrap();
+            assert!(description.contains("`.agents/agents/<archetype>.md`"));
+            assert!(description.contains("`\"planner\"`, `\"builder\"`, `\"tester\"`"));
+            assert!(archetype.get("enum").is_none());
+        }
+        let input = json!({"archetype": "custom-template"});
+        let agents: AgentsArgs = serde_json::from_value(input.clone()).unwrap();
+        let spawn: SpawnArgs = serde_json::from_value(input.clone()).unwrap();
+        let subagents: SubagentsArgs = serde_json::from_value(input).unwrap();
+        for archetype in [agents.archetype, spawn.archetype, subagents.archetype] {
+            assert_eq!(archetype.as_deref(), Some("custom-template"));
+        }
+    }
+
+    #[test]
     fn spawn_routes_accept_separate_description_and_instructions() {
         let input = json!({
             "action": "spawn",
@@ -7022,24 +7045,24 @@ mod spawn_args_tests {
         }
         agents.push(dummy_agent_view(
             "agt_work_1",
-            "active-writer",
+            "active-builder",
             "running",
             "working",
             Some("Implementing archetype parser"),
         ));
         agents.push(dummy_agent_view(
             "agt_err_1",
-            "broken-runner",
+            "failed-tester",
             "running",
             "errored",
             Some("OOM failure"),
         ));
         agents.push(dummy_agent_view(
             "agt_run_idle_1",
-            "standing-mind",
+            "idle-planner",
             "running",
             "idle",
-            Some("Domain mind"),
+            Some("Planning tasks"),
         ));
 
         let mut default_capped = agents.clone();
@@ -7053,9 +7076,9 @@ mod spawn_args_tests {
         assert_eq!(summary["scaled_to_zero"], 120);
         assert_eq!(summary["idle"], 121);
         assert_eq!(default_capped.len(), 100);
-        assert!(default_capped.iter().any(|a| a.name == "active-writer"));
-        assert!(default_capped.iter().any(|a| a.name == "broken-runner"));
-        assert!(default_capped.iter().any(|a| a.name == "standing-mind"));
+        assert!(default_capped.iter().any(|a| a.name == "active-builder"));
+        assert!(default_capped.iter().any(|a| a.name == "failed-tester"));
+        assert!(default_capped.iter().any(|a| a.name == "idle-planner"));
 
         let mut queried = agents.clone();
         let q_summary =
@@ -7065,7 +7088,7 @@ mod spawn_args_tests {
         assert_eq!(q_summary["idle"], 121);
         assert_eq!(q_summary["running"], 3);
         assert_eq!(q_summary["returned"], 1);
-        assert_eq!(queried[0].name, "active-writer");
+        assert_eq!(queried[0].name, "active-builder");
 
         let mut limited = agents.clone();
         let limited_summary =
