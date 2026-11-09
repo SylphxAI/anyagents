@@ -430,7 +430,7 @@ pub(crate) fn mark_explicitly_archived_locked(
             {
                 if seen.insert(child.id.clone()) {
                     queue.push_back(child.id.clone());
-                    let Ok(_child_lifecycle) = store.lock_agent_lifecycle(&child.id) else {
+                    let Ok(_child_lifecycle) = store.try_lock_agent_lifecycle(&child.id) else {
                         continue;
                     };
                     let Ok(child) = store.set_agent_state(&child.id, "archived") else {

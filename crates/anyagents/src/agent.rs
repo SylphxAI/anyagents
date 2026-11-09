@@ -769,7 +769,7 @@ fn set_state(data: &Path, name: &str, state: &str) -> Result<AgentView, Error> {
         for id in archived {
             if id == agent.id {
                 server::reap_archived_agent_locked(&store, data, &id);
-            } else if let Ok(_child_lifecycle) = store.lock_agent_lifecycle(&id) {
+            } else if let Ok(_child_lifecycle) = store.try_lock_agent_lifecycle(&id) {
                 server::reap_archived_agent_locked(&store, data, &id);
             }
         }
