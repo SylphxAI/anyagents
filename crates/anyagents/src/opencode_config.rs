@@ -69,14 +69,18 @@ pub fn write(
         if !root.get("tools").is_some_and(|v| v.is_object()) {
             root["tools"] = serde_json::json!({});
         }
-        root["tools"]["task"] = serde_json::Value::Bool(false);
+        for tool in ["task", "webfetch", "websearch"] {
+            root["tools"][tool] = serde_json::Value::Bool(false);
+        }
         if let Some(build) = root.get_mut("agent").and_then(|a| a.get_mut("build"))
             && build.is_object()
         {
             if !build.get("tools").is_some_and(|v| v.is_object()) {
                 build["tools"] = serde_json::json!({});
             }
-            build["tools"]["task"] = serde_json::Value::Bool(false);
+            for tool in ["task", "webfetch", "websearch"] {
+                build["tools"][tool] = serde_json::Value::Bool(false);
+            }
         }
     }
     root["mcp"] = serde_json::json!({
@@ -203,12 +207,15 @@ mod tests {
         assert_eq!(server["command"][0], "/bin/anyagents");
         assert_eq!(server["command"][3], "mcp");
         for tools in [&parsed["tools"], &parsed["agent"]["build"]["tools"]] {
-            assert_eq!(
-                tools.get("task").and_then(serde_json::Value::as_bool),
-                std::env::var_os("ANYAGENTS_ALLOW_NATIVE_SUBAGENTS")
-                    .is_none()
-                    .then_some(false)
-            );
+            for disabled in ["task", "webfetch", "websearch"] {
+                assert_eq!(
+                    tools.get(disabled).and_then(serde_json::Value::as_bool),
+                    std::env::var_os("ANYAGENTS_ALLOW_NATIVE_SUBAGENTS")
+                        .is_none()
+                        .then_some(false),
+                    "{disabled}: {tools}"
+                );
+            }
             for tool in [
                 "read",
                 "write",
@@ -220,8 +227,6 @@ mod tests {
                 "list",
                 "todowrite",
                 "todoread",
-                "webfetch",
-                "websearch",
             ] {
                 assert!(tools.get(tool).is_none(), "{tool}: {tools}");
             }

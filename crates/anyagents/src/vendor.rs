@@ -909,7 +909,7 @@ fn vendor_launch_inner(
                 .filter(|m| !m.is_empty())
                 .unwrap_or("muse-wonder-1.0")
                 .to_string();
-            vec![
+            let mut args = vec![
                 "--provider".to_string(),
                 "meta".to_string(),
                 "--model".to_string(),
@@ -921,7 +921,20 @@ fn vendor_launch_inner(
                 "context.foreign_personal_rules=false".to_string(),
                 "-c".to_string(),
                 "context.foreign_personal_skills=false".to_string(),
-            ]
+            ];
+            if std::env::var_os("ANYAGENTS_ALLOW_NATIVE_SUBAGENTS").is_none() {
+                for override_kv in [
+                    "local_session_messaging.enabled=false",
+                    "tools.web_search.mode=\"off\"",
+                    "tools.web_fetch.enabled=false",
+                    "run.subagent_delegation_mode=\"off\"",
+                    "run.workflow_trigger_mode=\"off\"",
+                ] {
+                    args.push("-c".to_string());
+                    args.push(override_kv.to_string());
+                }
+            }
+            args
         };
         let harness = MuseHarness::start_in_with_args(
             &program,
@@ -970,6 +983,13 @@ fn vendor_launch_inner(
             {
                 spec.args.push("--model".to_string());
                 spec.args.push(model.to_string());
+            }
+            if std::env::var_os("ANYAGENTS_ALLOW_NATIVE_SUBAGENTS").is_none() {
+                let policy_path = crate::grok::ensure_omp_policy(&omp_agent_dir)
+                    .map_err(|err| err.to_string())?;
+                spec.args.push("--config".to_string());
+                spec.args.push(policy_path.display().to_string());
+                spec.args.push("--no-extensions".to_string());
             }
             let sys_prompt = request.config_dir.join("SYSTEM_PROMPT.md");
             if sys_prompt.is_file() {
@@ -1251,32 +1271,43 @@ pub(crate) fn ensure_agy_steering_settings(
                 changed = true;
             }
             if let Some(deny_arr) = deny.as_array_mut() {
+                const AGY_DENIED_NATIVE_TOOLS: &[&str] = &[
+                    "invoke_subagent",
+                    "define_subagent",
+                    "manage_subagents",
+                    "send_message",
+                    "schedule",
+                    "search_web",
+                    "read_url_content",
+                    "browser_subagent",
+                    "open_browser_url",
+                    "run_command",
+                    "manage_task",
+                    "read_file",
+                    "write_file",
+                    "edit_file",
+                    "view_file",
+                    "grep_search",
+                    "find_by_name",
+                    "list_dir",
+                    "command(*)",
+                    "read_file(*)",
+                    "write_file(*)",
+                    "read_url(*)",
+                    "execute_url(*)",
+                ];
                 if std::env::var_os("ANYAGENTS_ALLOW_NATIVE_SUBAGENTS").is_none() {
-                    for tool in [
-                        "invoke_subagent",
-                        "define_subagent",
-                        "manage_subagents",
-                        "send_message",
-                        "schedule",
-                    ] {
-                        if !deny_arr.iter().any(|v| v.as_str() == Some(tool)) {
-                            deny_arr.push(serde_json::Value::String(tool.to_string()));
+                    for tool in AGY_DENIED_NATIVE_TOOLS {
+                        if !deny_arr.iter().any(|v| v.as_str() == Some(*tool)) {
+                            deny_arr.push(serde_json::Value::String((*tool).to_string()));
                             changed = true;
                         }
                     }
                 } else {
                     let before = deny_arr.len();
                     deny_arr.retain(|v| {
-                        !matches!(
-                            v.as_str(),
-                            Some(
-                                "invoke_subagent"
-                                    | "define_subagent"
-                                    | "manage_subagents"
-                                    | "send_message"
-                                    | "schedule"
-                            )
-                        )
+                        !v.as_str()
+                            .is_some_and(|s| AGY_DENIED_NATIVE_TOOLS.contains(&s))
                     });
                     if deny_arr.len() != before {
                         changed = true;
@@ -1309,19 +1340,50 @@ pub(crate) fn ensure_agy_steering_settings(
         }
     }
     let hook_dir = config_dir.join(".gemini").join("config");
+    std::fs::create_dir_all(&hook_dir)?;
     let _ = std::fs::remove_file(hook_dir.join("anyagents-steer-hook.sh"));
     let _ = std::fs::remove_file(hook_dir.join("steer.jsonl"));
     let hooks_path = hook_dir.join("hooks.json");
-    if let Ok(text) = std::fs::read_to_string(&hooks_path)
-        && let Ok(mut hooks_map) =
-            serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&text)
-        && hooks_map.remove("anyagents-steer").is_some()
-    {
+    let mut hooks_root = if hooks_path.exists() {
+        crate::mcp_config::read_candidates(std::slice::from_ref(&hooks_path))?
+    } else {
+        serde_json::json!({})
+    };
+    let hooks_map = hooks_root
+        .as_object_mut()
+        .ok_or_else(|| anyagents_core::Error::Message("AGY hooks.json is not an object".into()))?;
+    let mut hooks_changed = hooks_map.remove("anyagents-steer").is_some();
+    if std::env::var_os("ANYAGENTS_ALLOW_NATIVE_SUBAGENTS").is_none() {
+        let desired_guard = serde_json::json!({
+            "enabled": true,
+            "PreToolUse": [
+                {
+                    "matcher": "^(invoke_subagent|define_subagent|manage_subagents|send_message|schedule|search_web|read_url_content|browser_subagent|open_browser_url|browser_.*|run_command|manage_task|send_command_input|command_status|shell_exec|read_file|write_file|edit_file|view_file|view_file_outline|view_code_item|view_content_chunk|code_action|grep_search|find_by_name|find|list_dir|list_directory)$",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": "printf '%s\\n' '{\"decision\":\"deny\",\"reason\":\"Native built-in tools are disabled under AnyAgents; use the anyagents MCP code tool (workspace.*, web.*, anyagents.*) instead.\"}'",
+                            "timeout": 5
+                        }
+                    ]
+                }
+            ]
+        });
+        if hooks_map.get("anyagents-native-tool-guard") != Some(&desired_guard) {
+            hooks_map.insert("anyagents-native-tool-guard".to_string(), desired_guard);
+            hooks_changed = true;
+        }
+    } else if hooks_map.remove("anyagents-native-tool-guard").is_some() {
+        hooks_changed = true;
+    }
+    if hooks_changed {
         if hooks_map.is_empty() {
             let _ = std::fs::remove_file(&hooks_path);
-        } else if let Ok(body) = serde_json::to_string_pretty(&serde_json::Value::Object(hooks_map))
-        {
-            let _ = std::fs::write(&hooks_path, format!("{body}\n"));
+        } else {
+            let mut body = serde_json::to_vec_pretty(&hooks_root)
+                .map_err(|err| anyagents_core::Error::Message(err.to_string()))?;
+            body.push(b'\n');
+            crate::create::write_required_file(&hooks_path, &body, 0o664)?;
         }
     }
     Ok(())
@@ -2795,19 +2857,62 @@ done
                 "define_subagent",
                 "manage_subagents",
                 "send_message",
-                "schedule"
+                "schedule",
+                "search_web",
+                "read_url_content",
+                "browser_subagent",
+                "open_browser_url",
+                "run_command",
+                "manage_task",
+                "read_file",
+                "write_file",
+                "edit_file",
+                "view_file",
+                "grep_search",
+                "find_by_name",
+                "list_dir",
+                "command(*)",
+                "read_file(*)",
+                "write_file(*)",
+                "read_url(*)",
+                "execute_url(*)"
             ])
         );
         assert_eq!(
             json["trustedWorkspaces"],
             serde_json::json!([work_dir.display().to_string()])
         );
+        let hooks_path = config_dir.join(".gemini").join("config").join("hooks.json");
+        let hooks_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&hooks_path).unwrap()).unwrap();
+        assert_eq!(
+            hooks_json["anyagents-native-tool-guard"]["enabled"],
+            serde_json::json!(true)
+        );
+        let matcher = hooks_json["anyagents-native-tool-guard"]["PreToolUse"][0]["matcher"]
+            .as_str()
+            .unwrap();
+        for blocked in [
+            "invoke_subagent",
+            "define_subagent",
+            "manage_subagents",
+            "search_web",
+            "run_command",
+            "read_file",
+            "write_file",
+            "edit_file",
+        ] {
+            assert!(matcher.contains(blocked), "matcher missing {blocked}");
+        }
 
         // Calling a second time is idempotent and does not duplicate entries.
         ensure_agy_steering_settings(&config_dir, &work_dir).unwrap();
         let text2 = std::fs::read_to_string(&settings_path).unwrap();
         let json2: serde_json::Value = serde_json::from_str(&text2).unwrap();
         assert_eq!(json2, json);
+        let hooks_json2: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&hooks_path).unwrap()).unwrap();
+        assert_eq!(hooks_json2, hooks_json);
     }
     #[test]
     fn poisoned_agy_session_retires_only_the_pointer_and_stale_error() {

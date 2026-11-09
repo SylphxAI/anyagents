@@ -377,6 +377,40 @@ pub fn write_grok_config(
     Ok(())
 }
 
+pub const OMP_NATIVE_TOOL_POLICY_YAML: &str = "\
+mcp:
+  enableProjectConfig: false
+web_search:
+  enabled: false
+task:
+  maxRecursionDepth: 0
+memory:
+  backend: \"off\"
+hindsight:
+  autoRecall: false
+  mentalModelAutoSeed: false
+  mentalModelsEnabled: false
+mnemopi:
+  autoRecall: false
+  autoRetain: false
+ask:
+  enabled: false
+";
+
+pub fn ensure_omp_policy(omp_dir: &Path) -> Result<std::path::PathBuf, anyagents_core::Error> {
+    std::fs::create_dir_all(omp_dir)?;
+    let policy_path = omp_dir.join("anyagents-policy.yml");
+    let tmp = policy_path.with_extension("yml.new");
+    std::fs::write(&tmp, OMP_NATIVE_TOOL_POLICY_YAML)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o664));
+    }
+    std::fs::rename(&tmp, &policy_path)?;
+    Ok(policy_path)
+}
+
 pub fn write_omp_mcp_config(
     config_dir: &Path,
     command: &Path,
@@ -384,6 +418,9 @@ pub fn write_omp_mcp_config(
 ) -> Result<(), anyagents_core::Error> {
     let omp_dir = config_dir.join(".omp").join("agent");
     std::fs::create_dir_all(&omp_dir)?;
+    if std::env::var_os("ANYAGENTS_ALLOW_NATIVE_SUBAGENTS").is_none() {
+        ensure_omp_policy(&omp_dir)?;
+    }
     crate::mcp_config::write_claude(&omp_dir.join("mcp.json"), command, args)
 }
 
@@ -523,6 +560,28 @@ mod tests {
                 Some(value) => std::env::set_var("ANYAGENTS_GROK_PERMISSION_KIND", value),
                 None => std::env::remove_var("ANYAGENTS_GROK_PERMISSION_KIND"),
             }
+        }
+    }
+
+    #[test]
+    fn write_omp_mcp_config_writes_native_tool_policy_and_mcp_json() {
+        let dir = tempfile::tempdir().unwrap();
+        write_omp_mcp_config(
+            dir.path(),
+            Path::new("/opt/bin/anyagents"),
+            &["mcp".to_string()],
+        )
+        .unwrap();
+        let mcp_path = dir.path().join(".omp/agent/mcp.json");
+        assert!(mcp_path.is_file());
+        if std::env::var_os("ANYAGENTS_ALLOW_NATIVE_SUBAGENTS").is_none() {
+            let policy =
+                std::fs::read_to_string(dir.path().join(".omp/agent/anyagents-policy.yml"))
+                    .unwrap();
+            assert!(policy.contains("enableProjectConfig: false"), "{policy}");
+            assert!(policy.contains("web_search:\n  enabled: false"), "{policy}");
+            assert!(policy.contains("maxRecursionDepth: 0"), "{policy}");
+            assert!(policy.contains("backend: \"off\""), "{policy}");
         }
     }
 }
