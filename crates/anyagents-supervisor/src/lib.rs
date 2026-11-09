@@ -1030,6 +1030,9 @@ impl<H: Harness + 'static> Session<H> {
     ///
     /// `true` when a second loop already holds the agent.
     fn deliver_once(&mut self) -> bool {
+        if self.try_apply_pending_switch() {
+            return false;
+        }
         if let Some(switch_started_at) = self.pending_switch_started_at {
             // A harness, model, or profile switch is pending while the old
             // process is mid-turn: hold new mailbox messages in SQLite for the
