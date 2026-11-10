@@ -99,7 +99,8 @@ def cut_version(read, subject, source="HEAD"):
             "release version must increase")
     for ref, wanted in ((source, version), (parent_ref, parent["version"])):
         cargo = tomllib.loads(read(ref, "Cargo.toml"))
-        require(cargo["workspace"]["package"]["version"] == wanted,
+        allowed_cargo = (wanted,) if ref == source else (wanted, version)
+        require(cargo["workspace"]["package"]["version"] in allowed_cargo,
                 "Cargo/npm version mismatch")
         launcher = json.loads(read(ref, "packages/anyagents/package.json"))
         require(launcher["name"] == PACKAGE, "launcher name mismatch")
