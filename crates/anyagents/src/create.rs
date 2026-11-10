@@ -1146,20 +1146,37 @@ fn install_skill_projection_as_owner(
         }
         rel
     };
-    let owner = target
-        .parent()
-        .into_iter()
-        .flat_map(Path::ancestors)
-        .take_while(|p| p.starts_with(root))
-        .find_map(|p| std::fs::symlink_metadata(p).ok().filter(|m| m.is_dir()));
-    let owner = owner.ok_or_else(|| std::io::Error::other("skill projection owner missing"))?;
-    // UID and primary GID are independent OS identities.
-    let (eff_uid, eff_gid) = (owner.uid(), owner.gid());
-    if eff_uid == crate::sandbox::server_uid() {
-        return Err(std::io::Error::other(
-            "skill projection is not owned by another seat",
-        ));
+    let srv_uid = crate::sandbox::server_uid();
+    let candidates = std::iter::once(target)
+        .chain(std::iter::once(overlay))
+        .chain(
+            target
+                .parent()
+                .into_iter()
+                .flat_map(Path::ancestors)
+                .take_while(|p| p.starts_with(root)),
+        )
+        .chain(std::iter::once(config));
+    let mut any_dir = false;
+    let mut seat_owner = None;
+    for path in candidates {
+        if let Ok(meta) = std::fs::symlink_metadata(path)
+            && meta.is_dir()
+        {
+            any_dir = true;
+            if meta.uid() != srv_uid {
+                seat_owner = Some((meta.uid(), meta.gid()));
+                break;
+            }
+        }
     }
+    if !any_dir {
+        return Err(std::io::Error::other("skill projection owner missing"));
+    }
+    // UID and primary GID are independent OS identities.
+    let (eff_uid, eff_gid) = seat_owner.ok_or_else(|| {
+        std::io::Error::other("skill projection is not owned by another seat")
+    })?;
     let launcher = crate::sandbox::descriptor_launcher()
         .ok_or_else(|| std::io::Error::other("skill projection launcher missing"))?;
     let groups = match crate::sandbox::sock_gid_for() {
@@ -1173,8 +1190,8 @@ fn install_skill_projection_as_owner(
 config=$1; relative=$2; view=$3; global=$4; overlay=$5
 if [ "$relative" = "skills-view" ]; then
   if [ -L "$overlay" ] || [ -L "$view" ]; then exit 1; fi
-  mkdir -p -m 0700 "$overlay"
-  chmod 0700 "$overlay"
+  mkdir -p -m 02770 "$overlay"
+  chmod 02770 "$overlay"
   mkdir -p "$view"
   chmod 0755 "$view"
   for item in "$view"/*; do
