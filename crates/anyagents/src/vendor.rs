@@ -792,6 +792,9 @@ fn vendor_launch_inner(
         }) {
             crate::sandbox::share_config_with_seat_uid(&request.config_dir, uid, gid);
             let managed_work = anyagents_core::agent_work_dir(&request.data_dir, &request.agent.id);
+            if request.work_dir == managed_work && !managed_work.exists() {
+                let _ = crate::sandbox::ensure_seat_dir_as_owner(&managed_work, uid, gid, 0o2770);
+            }
             if request.work_dir == managed_work
                 && managed_work.is_dir()
                 && !managed_work.join(".git").exists()

@@ -455,7 +455,7 @@ pub fn share_config_with_seat_uid(config_dir: &Path, uid: u32, gid: u32) {
                 continue;
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                if std::fs::create_dir_all(&path).is_err() {
+                if ensure_seat_dir_as_owner(&path, eff_uid, eff_gid, 0o2770).is_err() {
                     continue;
                 }
             }
@@ -476,6 +476,61 @@ pub fn share_config_with_seat_uid(config_dir: &Path, uid: u32, gid: u32) {
             }
         }
     }
+}
+
+pub(crate) fn ensure_seat_dir_as_owner(
+    path: &Path,
+    uid: u32,
+    gid: u32,
+    mode: u32,
+) -> std::io::Result<()> {
+    if std::fs::create_dir_all(path).is_ok() {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let owner = path
+            .parent()
+            .into_iter()
+            .flat_map(Path::ancestors)
+            .find_map(|p| std::fs::symlink_metadata(p).ok().filter(|m| m.is_dir()));
+        let (eff_uid, eff_gid) = owner.map(|m| (m.uid(), m.gid())).unwrap_or((uid, gid));
+        if eff_uid != server_uid()
+            && let Some(launcher) = descriptor_launcher()
+        {
+            let groups = match sock_gid_for() {
+                Some(sg) if sg != eff_gid && sg != 0 => format!("{eff_gid},{sg}"),
+                _ => eff_gid.to_string(),
+            };
+            let mode_str = format!("{mode:04o}");
+            let status = std::process::Command::new(launcher)
+                .args([
+                    "--reuid",
+                    &eff_uid.to_string(),
+                    "--regid",
+                    &eff_gid.to_string(),
+                    "--groups",
+                    &groups,
+                    "--no-new-privs",
+                    "--",
+                    "/bin/sh",
+                    "-c",
+                    r#"if [ -L "$1" ]; then exit 1; fi; mkdir -p -m "$2" "$1" && chmod "$2" "$1""#,
+                    "seat-mkdir-owner",
+                ])
+                .arg(path.as_os_str())
+                .arg(&mode_str)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()?;
+            if status.success() {
+                return Ok(());
+            }
+        }
+    }
+    Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
 }
 
 pub(crate) fn prepare_config_with_seat_uid(config: &Path, uid: u32, gid: u32) -> Result<(), Error> {

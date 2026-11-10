@@ -1133,18 +1133,24 @@ fn install_skill_projection_as_owner(
     overlay: &Path,
 ) -> std::io::Result<()> {
     use std::os::unix::fs::MetadataExt as _;
-    let relative = target.strip_prefix(config).map_err(std::io::Error::other)?;
-    if relative
-        .components()
-        .any(|c| !matches!(c, std::path::Component::Normal(_)))
-    {
-        return Err(std::io::Error::other("invalid skill projection path"));
-    }
+    let root = view.parent().unwrap_or(config);
+    let relative = if target == view {
+        Path::new("skills-view")
+    } else {
+        let rel = target.strip_prefix(config).map_err(std::io::Error::other)?;
+        if rel
+            .components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        {
+            return Err(std::io::Error::other("invalid skill projection path"));
+        }
+        rel
+    };
     let owner = target
         .parent()
         .into_iter()
         .flat_map(Path::ancestors)
-        .take_while(|p| p.starts_with(config))
+        .take_while(|p| p.starts_with(root))
         .find_map(|p| std::fs::symlink_metadata(p).ok().filter(|m| m.is_dir()));
     let owner = owner.ok_or_else(|| std::io::Error::other("skill projection owner missing"))?;
     // UID and primary GID are independent OS identities.
@@ -1165,6 +1171,39 @@ fn install_skill_projection_as_owner(
         "--groups", &groups, "--no-new-privs", "--", "/bin/sh", "-c",
         r#"set -eu
 config=$1; relative=$2; view=$3; global=$4; overlay=$5
+if [ "$relative" = "skills-view" ]; then
+  if [ -L "$overlay" ] || [ -L "$view" ]; then exit 1; fi
+  mkdir -p -m 0700 "$overlay"
+  chmod 0700 "$overlay"
+  mkdir -p "$view"
+  chmod 0755 "$view"
+  for item in "$view"/*; do
+    [ -L "$item" ] || continue
+    old=$(readlink "$item"); source_parent=${old%/*}; name=${item##*/}
+    if [ "$source_parent" = "$global" ] || [ "$source_parent" = "$overlay" ]; then
+      if [ -d "$overlay/$name" ]; then expected="$overlay/$name"
+      elif [ -d "$global/$name" ]; then expected="$global/$name"
+      else expected=""; fi
+      if [ "$old" != "$expected" ]; then rm "$item"; fi
+    fi
+  done
+  for src_root in "$global" "$overlay"; do
+    [ -d "$src_root" ] || continue
+    for item in "$src_root"/*; do
+      [ -d "$item" ] || continue
+      name=${item##*/}; link="$view/$name"
+      if [ -d "$overlay/$name" ]; then desired="$overlay/$name"; else desired="$item"; fi
+      if [ -L "$link" ]; then
+        old=$(readlink "$link"); source_parent=${old%/*}
+        if [ "$source_parent" != "$global" ] && [ "$source_parent" != "$overlay" ]; then continue; fi
+        if [ "$old" = "$desired" ]; then continue; fi
+        rm "$link"
+      elif [ -e "$link" ]; then continue; fi
+      ln -s "$desired" "$link"
+    done
+  done
+  exit 0
+fi
 # Every existing component is inspected by its actual owner, not the daemon
 # which was denied traversal. Foreign parent links are preserved untouched.
 parent=$config

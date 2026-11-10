@@ -2370,9 +2370,35 @@ mod tests {
         let handle = std::thread::spawn(move || {
             for idx in 0..3 {
                 let (mut stream, _) = listener.accept().expect("accept");
-                let mut buf = [0u8; 4096];
-                let n = stream.read(&mut buf).unwrap_or(0);
-                let req_str = String::from_utf8_lossy(&buf[..n]);
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                let mut data = Vec::new();
+                let mut chunk = [0u8; 1024];
+                loop {
+                    match stream.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            data.extend_from_slice(&chunk[..n]);
+                            if let Some(hdr_end) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                                let body_start = hdr_end + 4;
+                                let hdr_str = String::from_utf8_lossy(&data[..hdr_end]);
+                                let content_len = hdr_str
+                                    .lines()
+                                    .find_map(|line| {
+                                        let (k, v) = line.split_once(':')?;
+                                        k.trim()
+                                            .eq_ignore_ascii_case("content-length")
+                                            .then(|| v.trim().parse::<usize>().ok())
+                                            .flatten()
+                                    })
+                                    .unwrap_or(0);
+                                if data.len() >= body_start + content_len {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                let req_str = String::from_utf8_lossy(&data);
                 let response = match idx {
                     0 => {
                         assert!(req_str.starts_with("POST /v1/tools/web_search "));
@@ -2432,6 +2458,7 @@ mod tests {
                 };
                 let _ = stream.write_all(response.as_bytes());
                 let _ = stream.flush();
+                let _ = stream.shutdown(std::net::Shutdown::Write);
             }
         });
 

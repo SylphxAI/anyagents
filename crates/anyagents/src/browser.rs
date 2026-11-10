@@ -683,7 +683,7 @@ fn ensure_browser_running(
         &mut child,
         port,
         &dir.join("browser.log"),
-        Duration::from_secs(12),
+        Duration::from_secs(30),
     )?;
 
     let now = now_ms();
