@@ -572,10 +572,11 @@ fn format_subtree_breakdown(stats: &SubtreeStats) -> String {
 pub fn short_model_name(raw: &str) -> std::borrow::Cow<'_, str> {
     let s = raw.trim();
     if let Some((first, rest)) = s.split_once('/') {
-        if let Some((_vendor, leaf)) = rest.split_once('/') {
-            if !first.is_empty() && !leaf.is_empty() {
-                return std::borrow::Cow::Owned(format!("{first}/{leaf}"));
-            }
+        if let Some((_vendor, leaf)) = rest.split_once('/')
+            && !first.is_empty()
+            && !leaf.is_empty()
+        {
+            return std::borrow::Cow::Owned(format!("{first}/{leaf}"));
         }
         if matches!(
             first,
