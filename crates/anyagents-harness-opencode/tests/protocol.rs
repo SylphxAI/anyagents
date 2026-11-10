@@ -848,3 +848,34 @@ fn non_404_prompt_errors_and_repeated_404_fail_closed_without_minting_duplicate_
         "404 recovery must retry only once and not loop: {text}"
     );
 }
+
+#[test]
+fn begin_reaps_prior_service_pid_and_reclaims_stable_port() {
+    let dir = TempDir::new().unwrap();
+    let config = dir.path().join("config");
+    std::fs::create_dir_all(&config).unwrap();
+    let first = start_with_config(&dir, "hold", &config);
+    let first_port = port_of(&config);
+    let first_pid: u32 = std::fs::read_to_string(config.join("opencode-service-pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(first_pid > 1);
+    // Simulate a daemon crash where Drop did not run and the previous service
+    // kept holding the port and opencode-service-pid.
+    std::mem::forget(first);
+    assert!(std::net::TcpListener::bind(("127.0.0.1", first_port)).is_err());
+
+    let second = start_with_config(&dir, "hold", &config);
+    let second_port = port_of(&config);
+    let second_pid: u32 = std::fs::read_to_string(config.join("opencode-service-pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(second_port, first_port);
+    assert_ne!(second_pid, first_pid);
+    drop(second);
+    assert!(!config.join("opencode-service-pid").exists());
+}

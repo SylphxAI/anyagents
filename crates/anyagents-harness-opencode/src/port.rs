@@ -98,6 +98,25 @@ impl PortLease {
     pub fn handoff(&mut self) {
         self.reservation.take();
     }
+
+    pub fn release_stored(config: Option<&Path>) {
+        let Some(port) = config.and_then(|dir| {
+            std::fs::read_to_string(dir.join(FILENAME))
+                .ok()?
+                .trim()
+                .parse::<u16>()
+                .ok()
+        }) else {
+            return;
+        };
+        if let Some(ports) = LEASED
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .as_mut()
+        {
+            ports.remove(&port);
+        }
+    }
 }
 
 impl Drop for PortLease {
