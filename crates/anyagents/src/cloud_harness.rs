@@ -8,6 +8,11 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
+use std::time::Duration;
 
 use anyagents_core::Error;
 use anyagents_harness::normalize_harness_name;
@@ -73,6 +78,16 @@ pub fn try_parse_from_raw_argv(argv: &[String]) -> Option<CloudHarnessArgs> {
 }
 
 pub fn run(args: CloudHarnessArgs) -> Result<(), Error> {
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    run_with_io(args, BufReader::new(stdin.lock()), stdout)
+}
+
+pub fn run_with_io<R: BufRead, W: Write + Send + 'static>(
+    args: CloudHarnessArgs,
+    reader: R,
+    writer: W,
+) -> Result<(), Error> {
     let config = args
         .config
         .or_else(|| std::env::var_os("ANYAGENTS_AGENT_CONFIG").map(PathBuf::from))
@@ -84,15 +99,21 @@ pub fn run(args: CloudHarnessArgs) -> Result<(), Error> {
     let harness = normalize_harness_name(&raw_harness).to_string();
     let model = args.model.filter(|m| !m.trim().is_empty());
 
-    let mut session_id = args
-        .resume
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| read_persisted_session_id(&config, &harness));
+    let session_id = Arc::new(Mutex::new(
+        args.resume
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| read_persisted_session_id(&config, &harness)),
+    ));
+    let writer = Arc::new(Mutex::new(writer));
 
-    let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout();
+    type ActiveTurn = (
+        Arc<AtomicBool>,
+        Arc<Mutex<Option<String>>>,
+        std::thread::JoinHandle<()>,
+    );
+    let mut active_turn: Option<ActiveTurn> = None;
 
-    for line in BufReader::new(stdin.lock()).lines() {
+    for line in reader.lines() {
         let Ok(line) = line else { break };
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -102,69 +123,119 @@ pub fn run(args: CloudHarnessArgs) -> Result<(), Error> {
             continue;
         };
         let event_type = event.get("type").and_then(Value::as_str).unwrap_or("");
+        if event_type == "control_request" || event_type == "cancel" {
+            let is_interrupt = event_type == "cancel"
+                || event
+                    .pointer("/request/subtype")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| s == "interrupt" || s == "cancel");
+            if is_interrupt && let Some((cancel_flag, active_job_id, handle)) = active_turn.take() {
+                cancel_flag.store(true, Ordering::SeqCst);
+                if let Some(job_id) = active_job_id.lock().unwrap().clone() {
+                    let base_url = resolve_cloud_base_url(&config, &harness);
+                    let auth_token = resolve_cloud_auth_token(&config, &harness);
+                    let _ = cancel_cloud_turn(&base_url, &harness, auth_token.as_deref(), &job_id);
+                }
+                let _ = handle.join();
+            }
+            continue;
+        }
         if event_type != "user" {
             continue;
         }
 
+        if let Some((_, _, prev_handle)) = active_turn.take() {
+            let _ = prev_handle.join();
+        }
+
         // Echo the user message back immediately so `ClaudeHarness` records the
         // message marker as echoed (`note_echo` / `note_markers`).
-        writeln!(stdout, "{trimmed}")?;
-        stdout.flush()?;
+        {
+            let mut out = writer.lock().unwrap();
+            writeln!(out, "{trimmed}")?;
+            out.flush()?;
+        }
 
         let prompt_text = extract_user_prompt(&event);
-        match dispatch_cloud_turn(
-            &config,
-            &harness,
-            model.as_deref(),
-            session_id.as_deref(),
-            &prompt_text,
-        ) {
-            Ok(outcome) => {
-                session_id = Some(outcome.session_id.clone());
-                persist_session_id(&config, &harness, &outcome.session_id);
-                let assistant_event = json!({
-                    "type": "assistant",
-                    "session_id": outcome.session_id,
-                    "message": {
-                        "role": "assistant",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": outcome.reply_text,
-                            }
-                        ]
-                    }
-                });
-                writeln!(stdout, "{assistant_event}")?;
-                let result_event = json!({
-                    "type": "result",
-                    "subtype": "success",
-                    "is_error": false,
-                    "session_id": outcome.session_id,
-                    "result": outcome.reply_text,
-                    "usage": {
-                        "input_tokens": outcome.input_tokens,
-                        "output_tokens": outcome.output_tokens,
-                    }
-                });
-                writeln!(stdout, "{result_event}")?;
-                stdout.flush()?;
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let active_job_id = Arc::new(Mutex::new(None));
+
+        let cfg_clone = config.clone();
+        let harness_clone = harness.clone();
+        let model_clone = model.clone();
+        let sid_shared = Arc::clone(&session_id);
+        let writer_shared = Arc::clone(&writer);
+        let cancel_clone = Arc::clone(&cancel_flag);
+        let job_clone = Arc::clone(&active_job_id);
+
+        let handle = std::thread::spawn(move || {
+            let current_sid = sid_shared.lock().unwrap().clone();
+            match dispatch_cloud_turn_with_cancel(
+                &cfg_clone,
+                &harness_clone,
+                model_clone.as_deref(),
+                current_sid.as_deref(),
+                &prompt_text,
+                &cancel_clone,
+                &job_clone,
+            ) {
+                Ok(outcome) => {
+                    *sid_shared.lock().unwrap() = Some(outcome.session_id.clone());
+                    persist_session_id(&cfg_clone, &harness_clone, &outcome.session_id);
+                    let assistant_event = json!({
+                        "type": "assistant",
+                        "session_id": outcome.session_id,
+                        "message": {
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": outcome.reply_text,
+                                }
+                            ]
+                        }
+                    });
+                    let result_event = json!({
+                        "type": "result",
+                        "subtype": "success",
+                        "is_error": false,
+                        "session_id": outcome.session_id,
+                        "result": outcome.reply_text,
+                        "usage": {
+                            "input_tokens": outcome.input_tokens,
+                            "output_tokens": outcome.output_tokens,
+                        }
+                    });
+                    let mut out = writer_shared.lock().unwrap();
+                    let _ = writeln!(out, "{assistant_event}");
+                    let _ = writeln!(out, "{result_event}");
+                    let _ = out.flush();
+                }
+                Err(err_msg) => {
+                    let fallback_sid = sid_shared
+                        .lock()
+                        .unwrap()
+                        .clone()
+                        .unwrap_or_else(|| format!("{harness_clone}-session"));
+                    let result_event = json!({
+                        "type": "result",
+                        "subtype": "error",
+                        "is_error": true,
+                        "session_id": fallback_sid,
+                        "result": err_msg,
+                    });
+                    let mut out = writer_shared.lock().unwrap();
+                    let _ = writeln!(out, "{result_event}");
+                    let _ = out.flush();
+                }
             }
-            Err(err_msg) => {
-                let fallback_sid = session_id
-                    .clone()
-                    .unwrap_or_else(|| format!("{harness}-session"));
-                let result_event = json!({
-                    "type": "result",
-                    "subtype": "error",
-                    "is_error": true,
-                    "session_id": fallback_sid,
-                    "result": err_msg,
-                });
-                writeln!(stdout, "{result_event}")?;
-                stdout.flush()?;
-            }
-        }
+        });
+
+        active_turn = Some((cancel_flag, active_job_id, handle));
+    }
+
+    if let Some((_, _, handle)) = active_turn.take() {
+        let _ = handle.join();
     }
 
     Ok(())
@@ -445,6 +516,7 @@ fn resolve_cloud_auth_token(config: &Path, harness: &str) -> Option<String> {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn dispatch_cloud_turn(
     config: &Path,
     harness: &str,
@@ -452,6 +524,32 @@ pub fn dispatch_cloud_turn(
     session_id: Option<&str>,
     prompt_text: &str,
 ) -> Result<CloudTurnOutcome, String> {
+    let cancel_flag = AtomicBool::new(false);
+    let active_job_id = Mutex::new(None);
+    dispatch_cloud_turn_with_cancel(
+        config,
+        harness,
+        model,
+        session_id,
+        prompt_text,
+        &cancel_flag,
+        &active_job_id,
+    )
+}
+
+pub fn dispatch_cloud_turn_with_cancel(
+    config: &Path,
+    harness: &str,
+    model: Option<&str>,
+    session_id: Option<&str>,
+    prompt_text: &str,
+    cancel_flag: &AtomicBool,
+    active_job_id: &Mutex<Option<String>>,
+) -> Result<CloudTurnOutcome, String> {
+    if cancel_flag.load(Ordering::SeqCst) {
+        return Err("cancelled by supervisor interrupt".to_string());
+    }
+
     let capability = resolve_capability_token(config)?;
     let mcp_base_url = resolve_public_mcp_url(config);
     let base_url = resolve_cloud_base_url(config, harness);
@@ -542,7 +640,7 @@ pub fn dispatch_cloud_turn(
     };
 
     let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_global(Some(std::time::Duration::from_secs(300)))
+        .timeout_global(Some(Duration::from_secs(300)))
         .http_status_as_error(false)
         .build()
         .into();
@@ -566,6 +664,12 @@ pub fn dispatch_cloud_turn(
         .send_json(&payload)
         .map_err(|e| format!("cloud harness `{canonical}` request to {endpoint} failed: {e}"))?;
     let status = resp.status().as_u16();
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
     let raw_body = resp
         .body_mut()
         .read_to_string()
@@ -578,18 +682,37 @@ pub fn dispatch_cloud_turn(
         ));
     }
 
-    let parsed: Value = serde_json::from_str(&raw_body).map_err(|e| {
+    let trimmed_body = raw_body.trim_start();
+    if content_type.contains("text/event-stream")
+        || trimmed_body.starts_with("event:")
+        || trimmed_body.starts_with("data:")
+    {
+        return parse_sse_cloud_response(&raw_body, canonical, session_id);
+    }
+
+    let mut parsed: Value = serde_json::from_str(&raw_body).map_err(|e| {
         format!("cloud harness `{canonical}` returned invalid JSON from {endpoint}: {e}")
     })?;
 
-    let resolved_session_id = parsed
-        .get("session_id")
-        .or_else(|| parsed.get("response_id"))
-        .or_else(|| parsed.get("id"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
+    if let Some(initial_status) = parsed.get("status").and_then(Value::as_str)
+        && matches!(
+            initial_status.trim().to_ascii_lowercase().as_str(),
+            "queued" | "running" | "in_progress" | "pending"
+        )
+        && let Some(job_id) = extract_cloud_job_id(&parsed)
+    {
+        *active_job_id.lock().unwrap() = Some(job_id.clone());
+        parsed = poll_cloud_job_until_done(
+            &agent,
+            &base_url,
+            canonical,
+            auth_token.as_deref(),
+            &job_id,
+            cancel_flag,
+        )?;
+    }
+
+    let resolved_session_id = extract_cloud_job_id(&parsed)
         .or_else(|| session_id.map(str::to_string))
         .unwrap_or_else(|| format!("{canonical}-session-1"));
 
@@ -605,6 +728,264 @@ pub fn dispatch_cloud_turn(
 
     Ok(CloudTurnOutcome {
         session_id: resolved_session_id,
+        reply_text,
+        input_tokens,
+        output_tokens,
+    })
+}
+
+fn extract_cloud_job_id(parsed: &Value) -> Option<String> {
+    parsed
+        .get("session_id")
+        .or_else(|| parsed.get("run_id"))
+        .or_else(|| parsed.get("response_id"))
+        .or_else(|| parsed.get("id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+pub fn cloud_job_status_url(base_url: &str, harness: &str, job_id: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    match normalize_harness_name(harness) {
+        "spiron-cloud" => format!("{base}/api/agent-runs/{job_id}"),
+        "claude-cloud" => format!("{base}/v1/messages/{job_id}"),
+        "openai-cloud" => format!("{base}/v1/responses/{job_id}"),
+        "cursor-cloud" => format!("{base}/v0/agents/{job_id}"),
+        _ => format!("{base}/api/agent-runs/{job_id}"),
+    }
+}
+
+pub fn cancel_cloud_turn(
+    base_url: &str,
+    harness: &str,
+    auth_token: Option<&str>,
+    job_id: &str,
+) -> Result<(), String> {
+    let status_url = cloud_job_status_url(base_url, harness, job_id);
+    let cancel_url = format!("{status_url}/cancel");
+    let canonical = normalize_harness_name(harness);
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(15)))
+        .http_status_as_error(false)
+        .build()
+        .into();
+    let mut req = agent
+        .post(&cancel_url)
+        .header("content-type", "application/json");
+    if let Some(tok) = auth_token {
+        req = req.header("authorization", &format!("Bearer {tok}"));
+        if canonical == "claude-cloud" {
+            req = req.header("x-api-key", tok);
+        }
+    }
+    let mut resp = req
+        .send_json(json!({ "action": "cancel" }))
+        .map_err(|e| format!("cancel request to {cancel_url} failed: {e}"))?;
+    let status = resp.status().as_u16();
+    if !(200..300).contains(&status) {
+        let body = resp.body_mut().read_to_string().unwrap_or_default();
+        return Err(format!("cancel returned HTTP {status}: {}", body.trim()));
+    }
+    Ok(())
+}
+
+fn poll_cloud_job_until_done(
+    agent: &ureq::Agent,
+    base_url: &str,
+    canonical: &str,
+    auth_token: Option<&str>,
+    job_id: &str,
+    cancel_flag: &AtomicBool,
+) -> Result<Value, String> {
+    let status_url = cloud_job_status_url(base_url, canonical, job_id);
+    let poll_ms = std::env::var("ANYAGENTS_CLOUD_POLL_INTERVAL_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(50)
+        .clamp(10, 5_000);
+
+    for _ in 0..6_000 {
+        if cancel_flag.load(Ordering::SeqCst) {
+            let _ = cancel_cloud_turn(base_url, canonical, auth_token, job_id);
+            return Err("cancelled by supervisor interrupt".to_string());
+        }
+        std::thread::sleep(Duration::from_millis(poll_ms));
+        if cancel_flag.load(Ordering::SeqCst) {
+            let _ = cancel_cloud_turn(base_url, canonical, auth_token, job_id);
+            return Err("cancelled by supervisor interrupt".to_string());
+        }
+
+        let mut req = agent.get(&status_url);
+        if let Some(tok) = auth_token {
+            req = req.header("authorization", &format!("Bearer {tok}"));
+            if canonical == "claude-cloud" {
+                req = req.header("x-api-key", tok);
+            }
+        }
+        if canonical == "claude-cloud" {
+            req = req
+                .header("anthropic-version", "2023-06-01")
+                .header("anthropic-beta", "mcp-client-2025-04-04");
+        }
+        let mut resp = req
+            .call()
+            .map_err(|e| format!("cloud job poll to {status_url} failed: {e}"))?;
+        let status_code = resp.status().as_u16();
+        let body = resp
+            .body_mut()
+            .read_to_string()
+            .map_err(|e| format!("failed reading poll body from {status_url}: {e}"))?;
+        if !(200..300).contains(&status_code) {
+            return Err(format!(
+                "cloud job poll `{canonical}` returned HTTP {status_code}: {}",
+                body.trim()
+            ));
+        }
+        let poll_val: Value = serde_json::from_str(&body)
+            .map_err(|e| format!("invalid JSON from cloud job poll {status_url}: {e}"))?;
+        let st = poll_val
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("completed")
+            .trim()
+            .to_ascii_lowercase();
+        match st.as_str() {
+            "queued" | "running" | "in_progress" | "pending" => continue,
+            "failed" | "cancelled" | "canceled" | "error" => {
+                let msg = poll_val
+                    .get("error")
+                    .and_then(|e| {
+                        e.get("message")
+                            .and_then(Value::as_str)
+                            .or_else(|| e.as_str())
+                    })
+                    .or_else(|| poll_val.get("result").and_then(Value::as_str))
+                    .unwrap_or("cloud job failed");
+                return Err(format!("cloud job {job_id} {st}: {msg}"));
+            }
+            _ => return Ok(poll_val),
+        }
+    }
+    Err(format!(
+        "cloud job {job_id} timed out waiting for completion"
+    ))
+}
+
+pub fn parse_sse_cloud_response(
+    raw_sse: &str,
+    canonical: &str,
+    fallback_session_id: Option<&str>,
+) -> Result<CloudTurnOutcome, String> {
+    let mut current_event = String::new();
+    let mut resolved_sid: Option<String> = None;
+    let mut delta_chunks = String::new();
+    let mut full_reply: Option<String> = None;
+    let mut input_tokens = 0u64;
+    let mut output_tokens = 0u64;
+
+    for raw_line in raw_sse.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            current_event.clear();
+            continue;
+        }
+        if let Some(ev) = line.strip_prefix("event:") {
+            current_event = ev.trim().to_string();
+            continue;
+        }
+        let Some(data_str) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let data_trimmed = data_str.trim();
+        if data_trimmed.is_empty() || data_trimmed == "[DONE]" {
+            continue;
+        }
+        let Ok(val) = serde_json::from_str::<Value>(data_trimmed) else {
+            continue;
+        };
+
+        // Extract session/message/response ID
+        if let Some(sid) = extract_cloud_job_id(&val).or_else(|| {
+            val.pointer("/message/id")
+                .or_else(|| val.pointer("/response/id"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        }) {
+            resolved_sid = Some(sid);
+        }
+
+        let ev_type = val
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or(current_event.as_str());
+
+        match ev_type {
+            "content_block_delta" => {
+                if let Some(t) = val.pointer("/delta/text").and_then(Value::as_str) {
+                    delta_chunks.push_str(t);
+                }
+            }
+            "response.output_text.delta" => {
+                if let Some(t) = val.get("delta").and_then(Value::as_str) {
+                    delta_chunks.push_str(t);
+                }
+            }
+            _ => {
+                if let Some(t) = val.pointer("/delta/text").and_then(Value::as_str) {
+                    delta_chunks.push_str(t);
+                } else if let Some(t) = val.get("delta").and_then(Value::as_str) {
+                    delta_chunks.push_str(t);
+                } else if let Some(t) = val.get("text").and_then(Value::as_str) {
+                    delta_chunks.push_str(t);
+                }
+                for key in ["result", "output_text", "reply"] {
+                    if let Some(r) = val.get(key).and_then(Value::as_str)
+                        && !r.trim().is_empty()
+                    {
+                        full_reply = Some(r.to_string());
+                    }
+                }
+            }
+        }
+
+        for ptr in [
+            "/usage/input_tokens",
+            "/message/usage/input_tokens",
+            "/response/usage/input_tokens",
+        ] {
+            if let Some(tok) = val.pointer(ptr).and_then(Value::as_u64) {
+                input_tokens = tok;
+            }
+        }
+        for ptr in [
+            "/usage/output_tokens",
+            "/message/usage/output_tokens",
+            "/response/usage/output_tokens",
+        ] {
+            if let Some(tok) = val.pointer(ptr).and_then(Value::as_u64) {
+                output_tokens = tok;
+            }
+        }
+    }
+
+    let reply_text = if !delta_chunks.is_empty() {
+        delta_chunks
+    } else if let Some(r) = full_reply {
+        r
+    } else {
+        "completed".to_string()
+    };
+
+    let session_id = resolved_sid
+        .or_else(|| fallback_session_id.map(str::to_string))
+        .unwrap_or_else(|| format!("{canonical}-session-1"));
+
+    Ok(CloudTurnOutcome {
+        session_id,
         reply_text,
         input_tokens,
         output_tokens,
@@ -908,6 +1289,277 @@ mod tests {
             );
             assert_eq!(calls[0]["mcp_servers"][0]["bearer_token"], "cap-secret-xyz");
         }
+
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn cloud_harness_supports_sse_streaming_async_job_polling_and_interrupt_cancel() {
+        use axum::routing::get;
+        use std::sync::atomic::AtomicUsize;
+
+        let poll_count = Arc::new(AtomicUsize::new(0));
+        let cancel_recorded = Arc::new(Mutex::new(Vec::<String>::new()));
+
+        let app = Router::new()
+            // 1. Anthropic SSE stream on `/v1/messages`
+            .route(
+                "/v1/messages",
+                post(|| async move {
+                    let sse = concat!(
+                        "event: message_start\n",
+                        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_sse_101\",\"usage\":{\"input_tokens\":14}}}\n\n",
+                        "event: content_block_delta\n",
+                        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello \"}}\n\n",
+                        "event: content_block_delta\n",
+                        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"SSE World\"}}\n\n",
+                        "event: message_delta\n",
+                        "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":28}}\n\n"
+                    );
+                    (
+                        StatusCode::OK,
+                        [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                        sse,
+                    )
+                }),
+            )
+            // 2. OpenAI SSE stream on `/v1/responses`
+            .route(
+                "/v1/responses",
+                post(|| async move {
+                    let sse = concat!(
+                        "event: response.created\n",
+                        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_sse_202\"}}\n\n",
+                        "event: response.output_text.delta\n",
+                        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"OpenAI \"}\n\n",
+                        "event: response.output_text.delta\n",
+                        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Stream OK\"}\n\n",
+                        "event: response.completed\n",
+                        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_sse_202\",\"usage\":{\"input_tokens\":9,\"output_tokens\":18}}}\n\n",
+                        "data: [DONE]\n\n"
+                    );
+                    (
+                        StatusCode::OK,
+                        [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                        sse,
+                    )
+                }),
+            )
+            // 3. Spiron async job polling (`queued` -> `running` -> `completed`) & cancel (`POST /api/agent-runs/{id}/cancel`)
+            .route(
+                "/api/agent-runs",
+                post(|axum::Json(payload): axum::Json<Value>| async move {
+                    let prompt = payload.get("prompt").and_then(Value::as_str).unwrap_or("");
+                    if prompt.contains("slow-cancel") {
+                        (
+                            StatusCode::ACCEPTED,
+                            axum::Json(json!({
+                                "id": "run_cancel_55",
+                                "status": "running"
+                            })),
+                        )
+                    } else {
+                        (
+                            StatusCode::ACCEPTED,
+                            axum::Json(json!({
+                                "id": "run_poll_44",
+                                "status": "queued"
+                            })),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/api/agent-runs/run_poll_44",
+                get({
+                    let pc = Arc::clone(&poll_count);
+                    move || {
+                        let pc = Arc::clone(&pc);
+                        async move {
+                            let step = pc.fetch_add(1, Ordering::SeqCst);
+                            if step == 0 {
+                                (
+                                    StatusCode::OK,
+                                    axum::Json(json!({
+                                        "id": "run_poll_44",
+                                        "status": "running"
+                                    })),
+                                )
+                            } else {
+                                (
+                                    StatusCode::OK,
+                                    axum::Json(json!({
+                                        "id": "run_poll_44",
+                                        "session_id": "spiron-polled-sess-44",
+                                        "status": "completed",
+                                        "result": "async polled result ok",
+                                        "usage": { "input_tokens": 33, "output_tokens": 44 }
+                                    })),
+                                )
+                            }
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/api/agent-runs/run_cancel_55",
+                get(|| async move {
+                    (
+                        StatusCode::OK,
+                        axum::Json(json!({
+                            "id": "run_cancel_55",
+                            "status": "running"
+                        })),
+                    )
+                }),
+            )
+            .route(
+                "/api/agent-runs/run_cancel_55/cancel",
+                post({
+                    let cr = Arc::clone(&cancel_recorded);
+                    move || {
+                        let cr = Arc::clone(&cr);
+                        async move {
+                            cr.lock().unwrap().push("run_cancel_55".into());
+                            (
+                                StatusCode::OK,
+                                axum::Json(json!({
+                                    "id": "run_cancel_55",
+                                    "status": "cancelled"
+                                })),
+                            )
+                        }
+                    }
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("agent-cfg");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::write(cfg.join("mcp-capability"), "cap-sse-tok\n").unwrap();
+        std::fs::write(
+            cfg.join(".anyagents-mcp-url"),
+            "https://mcp.example.test/mcp\n",
+        )
+        .unwrap();
+        std::fs::write(
+            cfg.join("cloud.json"),
+            serde_json::to_vec(&json!({
+                "base_url": format!("http://{addr}"),
+                "api_key": "upstream-key"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        // 1. Verify Anthropic SSE streaming
+        let cfg_clone = cfg.clone();
+        let claude_sse = tokio::task::spawn_blocking(move || {
+            dispatch_cloud_turn(&cfg_clone, "claude-cloud", None, None, "sse test").unwrap()
+        })
+        .await
+        .unwrap();
+        assert_eq!(claude_sse.session_id, "msg_sse_101");
+        assert_eq!(claude_sse.reply_text, "Hello SSE World");
+        assert_eq!(claude_sse.input_tokens, 14);
+        assert_eq!(claude_sse.output_tokens, 28);
+
+        // 2. Verify OpenAI Responses SSE streaming
+        let cfg_clone = cfg.clone();
+        let openai_sse = tokio::task::spawn_blocking(move || {
+            dispatch_cloud_turn(&cfg_clone, "openai-cloud", None, None, "sse test").unwrap()
+        })
+        .await
+        .unwrap();
+        assert_eq!(openai_sse.session_id, "resp_sse_202");
+        assert_eq!(openai_sse.reply_text, "OpenAI Stream OK");
+        assert_eq!(openai_sse.input_tokens, 9);
+        assert_eq!(openai_sse.output_tokens, 18);
+
+        // 3. Verify Async Job Polling (`queued` -> `running` -> `completed`)
+        let cfg_clone = cfg.clone();
+        let polled = tokio::task::spawn_blocking(move || {
+            dispatch_cloud_turn(&cfg_clone, "spiron-cloud", None, None, "poll test").unwrap()
+        })
+        .await
+        .unwrap();
+        assert_eq!(polled.session_id, "spiron-polled-sess-44");
+        assert_eq!(polled.reply_text, "async polled result ok");
+        assert_eq!(polled.input_tokens, 33);
+        assert_eq!(polled.output_tokens, 44);
+        assert!(poll_count.load(Ordering::SeqCst) >= 2);
+
+        // 4. Verify concurrent `control_request` `interrupt` mid-turn cancellation
+        #[derive(Clone, Default)]
+        struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+        impl Write for SharedBuf {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        struct DelayedInterruptReader {
+            step: usize,
+        }
+        impl std::io::Read for DelayedInterruptReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let line = match self.step {
+                    0 => {
+                        self.step = 1;
+                        b"{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"slow-cancel task\"}]}}\n" as &[u8]
+                    }
+                    1 => {
+                        self.step = 2;
+                        std::thread::sleep(Duration::from_millis(80));
+                        b"{\"type\":\"control_request\",\"request_id\":\"1\",\"request\":{\"subtype\":\"interrupt\"}}\n" as &[u8]
+                    }
+                    _ => return Ok(0),
+                };
+                let n = line.len().min(buf.len());
+                buf[..n].copy_from_slice(&line[..n]);
+                Ok(n)
+            }
+        }
+
+        let out_buf = SharedBuf::default();
+        let out_clone = out_buf.clone();
+        let cfg_clone = cfg.clone();
+        tokio::task::spawn_blocking(move || {
+            run_with_io(
+                CloudHarnessArgs {
+                    config: Some(cfg_clone),
+                    harness: Some("spiron-cloud".into()),
+                    model: None,
+                    resume: None,
+                },
+                BufReader::new(DelayedInterruptReader { step: 0 }),
+                out_clone,
+            )
+            .unwrap();
+        })
+        .await
+        .unwrap();
+
+        let recorded_cancels = cancel_recorded.lock().unwrap().clone();
+        assert!(
+            recorded_cancels.contains(&"run_cancel_55".to_string()),
+            "expected POST /api/agent-runs/run_cancel_55/cancel to be invoked, got {recorded_cancels:?}"
+        );
+        let stdout_str = String::from_utf8(out_buf.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            stdout_str.contains("\"is_error\":true") && stdout_str.contains("cancelled"),
+            "expected error result event on interrupt, got: {stdout_str}"
+        );
 
         server_handle.abort();
     }

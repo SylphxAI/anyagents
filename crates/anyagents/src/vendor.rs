@@ -70,6 +70,14 @@ impl VendorHarness {
                             Some("claude-cloud-session-id") => "claude-cloud",
                             Some("openai-cloud-session-id") => "openai-cloud",
                             Some("cursor-cloud-session-id") => "cursor-cloud",
+                            Some("codex-session-id") => "codex",
+                            Some("opencode-session-id") => "opencode",
+                            Some("agy-session-id") => "agy",
+                            Some("muse-session-id") => "muse",
+                            Some("omp-session-id") => "omp",
+                            Some("dsh-session-id") => "dsh",
+                            Some("grok-session-id") => "grok",
+                            Some("spiron-session-id") => "spiron",
                             _ => "claude-code",
                         },
                         Self::Codex(..) => "codex",
@@ -858,6 +866,43 @@ fn vendor_launch_inner(
         )
         .map_err(|err| err.to_string())?;
         return Ok(VendorHarness::Contract(Box::new(harness)));
+    }
+    if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none()
+        && !is_cloud_harness(&request.agent.harness)
+        && anyagents_tools::SandboxConfig::resolve(Some(&request.config_dir))
+            .is_some_and(|cfg| cfg.remote_spawn)
+    {
+        let canonical = anyagents_harness::normalize_harness_name(&request.agent.harness);
+        let session_file = format!("{canonical}-session-id");
+        let session = session_from_file(&request.config_dir, &session_file)?.or(
+            match crate::create::harness_session_filename(canonical) {
+                Some(alt) if alt != session_file => session_from_file(&request.config_dir, alt)?,
+                _ => None,
+            },
+        );
+        let target_program = crate::install::program(&root, canonical);
+        let exe = std::env::current_exe()
+            .or_else(|_| crate::data::current_exe_clean())
+            .unwrap_or_else(|_| PathBuf::from("anyagents"));
+        let extra_args = vec![
+            "sandbox-exec".to_string(),
+            "--config".to_string(),
+            request.config_dir.display().to_string(),
+            "--harness".to_string(),
+            canonical.to_string(),
+            "--program".to_string(),
+            target_program.display().to_string(),
+        ];
+        let harness = start_claude(
+            &exe.display().to_string(),
+            &extra_args,
+            session.as_deref(),
+            &env,
+            &request.work_dir,
+        )?;
+        let vh = VendorHarness::Claude(Box::new(harness), request.config_dir.join(&session_file));
+        vh.sync_session()?;
+        return Ok(vh);
     }
     if request.agent.harness == "agy" {
         retire_poisoned_agy_session(&request.config_dir, anyagents_core::now_ms())?;
