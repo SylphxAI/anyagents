@@ -208,11 +208,22 @@ fn live_registry_same_seat_roots(data: &Path, uid: u32, gid: u32) -> Vec<std::pa
         entries
             .iter()
             .filter_map(|(id, entry)| {
-                if id.is_empty() || id == "." || id == ".." || id.contains('/') || id.contains(char::from(0)) {
+                if id.is_empty()
+                    || id == "."
+                    || id == ".."
+                    || id.contains('/')
+                    || id.contains(char::from(0))
+                {
                     return None;
                 }
-                let entry_uid = entry.get("uid")?.as_u64().and_then(|n| u32::try_from(n).ok())?;
-                let entry_gid = entry.get("gid")?.as_u64().and_then(|n| u32::try_from(n).ok())?;
+                let entry_uid = entry
+                    .get("uid")?
+                    .as_u64()
+                    .and_then(|n| u32::try_from(n).ok())?;
+                let entry_gid = entry
+                    .get("gid")?
+                    .as_u64()
+                    .and_then(|n| u32::try_from(n).ok())?;
                 (entry_uid == uid && entry_gid == gid).then(|| agents_dir.join(id))
             })
             .collect()
