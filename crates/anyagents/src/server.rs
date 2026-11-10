@@ -10274,11 +10274,15 @@ exec '{}' "$@"
 
         assert_eq!(
             crate::create::compatible_harnesses_for("spiron"),
-            &["spiron", "sylphx"]
+            &["spiron", "spiron-cloud", "sylphx"]
+        );
+        assert_eq!(
+            crate::create::compatible_harnesses_for("spiron-cloud"),
+            &["spiron", "spiron-cloud", "sylphx"]
         );
         assert_eq!(
             crate::create::compatible_harnesses_for("sylphx"),
-            &["spiron", "sylphx"]
+            &["spiron", "spiron-cloud", "sylphx"]
         );
 
         let agent = store
