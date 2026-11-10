@@ -1535,7 +1535,8 @@ fn start_spiron(
         .map(str::trim)
         .filter(|model| !model.is_empty())
     {
-        args.extend(["--model".to_string(), model.to_string()]);
+        let normalized = crate::spiron::strip_coding_plan_prefix(model);
+        args.extend(["--model".to_string(), normalized.to_string()]);
     }
     let base_args = args.clone();
     if let Some(session) = session {

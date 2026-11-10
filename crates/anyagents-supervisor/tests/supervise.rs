@@ -1060,10 +1060,18 @@ done
         format!("{}\n", clock.now_ms() + 1),
     )
     .unwrap();
+    store.poke(Wake::Agent {
+        agent_id: agent.id.clone(),
+    });
+    loop {
+        let (now, deadline) = rx.recv_timeout(WAIT_CEILING).unwrap();
+        if deadline == Some(now + 1_000) {
+            break;
+        }
+    }
     store
         .receive(&agent.id, Incoming::new("queued-for-new-profile"))
         .unwrap();
-    // Pending rotation uses the 1s review wait, rather than the 250ms idle wait.
     loop {
         let (now, deadline) = rx.recv_timeout(WAIT_CEILING).unwrap();
         if deadline == Some(now + 1_000) {

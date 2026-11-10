@@ -516,6 +516,147 @@ fn resolve_cloud_auth_token(config: &Path, harness: &str) -> Option<String> {
     }
 }
 
+pub fn disable_builtin_tools_flag(config: &Path) -> bool {
+    if std::env::var("ANYAGENTS_CLOUD_DISABLE_BUILTIN_TOOLS")
+        .ok()
+        .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true"))
+    {
+        return true;
+    }
+    read_cloud_json(config)
+        .and_then(|v| v.get("disable_builtin_tools").and_then(Value::as_bool))
+        .unwrap_or(false)
+}
+
+pub fn resolve_cloud_disabled_tools(config: &Path) -> Vec<String> {
+    if let Some(cloud_cfg) = read_cloud_json(config)
+        && let Some(arr) = cloud_cfg.get("disabled_tools").and_then(Value::as_array)
+    {
+        let explicit: Vec<String> = arr
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        if !explicit.is_empty() {
+            return explicit;
+        }
+    }
+    if disable_builtin_tools_flag(config) {
+        return vec![
+            "bash".to_string(),
+            "read".to_string(),
+            "write".to_string(),
+            "edit".to_string(),
+            "glob".to_string(),
+            "grep".to_string(),
+            "web_search".to_string(),
+            "web_fetch".to_string(),
+            "memory".to_string(),
+            "skills".to_string(),
+            "browser".to_string(),
+            "computer".to_string(),
+        ];
+    }
+    Vec::new()
+}
+
+pub fn collect_agent_skills_catalog(config: &Path) -> Vec<(String, String)> {
+    let mut dirs_to_scan = Vec::new();
+    if let Some(root) = config.parent() {
+        dirs_to_scan.push(root.join("skills-view"));
+        dirs_to_scan.push(root.join("skills"));
+    }
+    dirs_to_scan.push(config.join(".agents/skills"));
+    dirs_to_scan.push(config.join("skills"));
+
+    let mut seen = std::collections::BTreeMap::new();
+    for base in dirs_to_scan {
+        let Ok(entries) = std::fs::read_dir(&base) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let skill_md = path.join("SKILL.md");
+            if !skill_md.is_file() {
+                continue;
+            }
+            let Some(slug) = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            if seen.contains_key(&slug) {
+                continue;
+            }
+            let Ok(raw_md) = std::fs::read_to_string(&skill_md) else {
+                continue;
+            };
+            let (_, desc) = anyagents_core::learned_memory::parse_topic_frontmatter(&slug, &raw_md);
+            seen.insert(slug, desc);
+        }
+    }
+    seen.into_iter().collect()
+}
+
+pub fn build_cloud_system_prompt(config: &Path) -> Option<String> {
+    let mut sections = Vec::new();
+
+    let base_prompt = std::fs::read_to_string(config.join("SYSTEM_PROMPT.md"))
+        .or_else(|_| std::fs::read_to_string(config.join("AGENTS.md")))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let has_learned_memory = base_prompt
+        .as_deref()
+        .is_some_and(|p| p.contains("<learned_memory>"));
+
+    if let Some(base) = base_prompt {
+        sections.push(base);
+    }
+
+    if !has_learned_memory {
+        let mut memory_candidates = vec![config.join("memory/MEMORY.md")];
+        if let Some(root) = config.parent() {
+            memory_candidates.insert(0, root.join("memory/MEMORY.md"));
+        }
+        for mem_path in memory_candidates {
+            if let Ok(raw_mem) = std::fs::read_to_string(&mem_path) {
+                let trimmed = raw_mem.trim();
+                if !trimmed.is_empty() {
+                    sections.push(format!("<learned_memory>\n{trimmed}\n</learned_memory>"));
+                    break;
+                }
+            }
+        }
+    }
+
+    let skills = collect_agent_skills_catalog(config);
+    if !skills.is_empty() {
+        let mut block = String::from(
+            "<available_skills>\n\
+             When a task matches a skill's description below, call the `skills` MCP tool with `{\"action\": \"read\", \"name\": \"<skill-name>\"}` to load its full `SKILL.md` instructions before proceeding:\n",
+        );
+        for (name, desc) in skills {
+            block.push_str(&format!("- `{name}`: {desc}\n"));
+        }
+        block.push_str("</available_skills>");
+        sections.push(block);
+    }
+
+    if sections.is_empty() {
+        None
+    } else {
+        Some(sections.join("\n\n"))
+    }
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn dispatch_cloud_turn(
     config: &Path,
@@ -556,10 +697,29 @@ pub fn dispatch_cloud_turn_with_cancel(
     let auth_token = resolve_cloud_auth_token(config, harness);
     let canonical = normalize_harness_name(harness);
 
+    let default_profile = if let Some(explicit) = read_cloud_json(config)
+        .and_then(|v| {
+            v.get("mcp_profile")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .filter(|s| !s.trim().is_empty())
+    {
+        explicit
+    } else if anyagents_tools::SandboxConfig::resolve(Some(config)).is_some()
+        || disable_builtin_tools_flag(config)
+    {
+        "full".to_string()
+    } else {
+        "remote".to_string()
+    };
+    let mcp_url = mcp_url_with_profile(&mcp_base_url, &default_profile);
+    let system_prompt = build_cloud_system_prompt(config);
+    let disabled_tools = resolve_cloud_disabled_tools(config);
+
     let (endpoint, payload) = match canonical {
         "spiron-cloud" => {
-            let mcp_url = mcp_url_with_profile(&mcp_base_url, "coordination");
-            let body = json!({
+            let mut body = json!({
                 "prompt": prompt_text,
                 "model": model.unwrap_or("claude-sonnet-4.6"),
                 "session_id": session_id,
@@ -570,13 +730,15 @@ pub fn dispatch_cloud_turn_with_cancel(
                         "bearer_token": capability,
                     }
                 ],
-                "disabled_tools": [],
+                "disabled_tools": disabled_tools,
             });
+            if let Some(sys) = system_prompt {
+                body["system_prompt"] = Value::String(sys);
+            }
             (format!("{base_url}/api/agent-runs"), body)
         }
         "claude-cloud" => {
-            let mcp_url = mcp_url_with_profile(&mcp_base_url, "remote");
-            let body = json!({
+            let mut body = json!({
                 "model": model.unwrap_or("claude-sonnet-4-6"),
                 "max_tokens": 8192,
                 "messages": [
@@ -594,11 +756,20 @@ pub fn dispatch_cloud_turn_with_cancel(
                     }
                 ],
             });
+            if let Some(sys) = system_prompt {
+                body["system"] = Value::String(sys);
+            }
+            if !disabled_tools.is_empty() {
+                let configs: Vec<Value> = disabled_tools
+                    .iter()
+                    .map(|name| json!({ "name": name, "enabled": false }))
+                    .collect();
+                body["toolset_configs"] = Value::Array(configs);
+            }
             (format!("{base_url}/v1/messages"), body)
         }
         "openai-cloud" => {
-            let mcp_url = mcp_url_with_profile(&mcp_base_url, "remote");
-            let body = json!({
+            let mut body = json!({
                 "model": model.unwrap_or("gpt-5.4"),
                 "input": prompt_text,
                 "previous_response_id": session_id,
@@ -614,11 +785,13 @@ pub fn dispatch_cloud_turn_with_cancel(
                     }
                 ],
             });
+            if let Some(sys) = system_prompt {
+                body["instructions"] = Value::String(sys);
+            }
             (format!("{base_url}/v1/responses"), body)
         }
         "cursor-cloud" => {
-            let mcp_url = mcp_url_with_profile(&mcp_base_url, "remote");
-            let body = json!({
+            let mut body = json!({
                 "prompt": {
                     "text": prompt_text,
                 },
@@ -632,6 +805,16 @@ pub fn dispatch_cloud_turn_with_cancel(
                     }
                 ],
             });
+            if let Some(sys) = system_prompt {
+                body["system_prompt"] = Value::String(sys);
+            }
+            if !disabled_tools.is_empty() {
+                body["config"] = json!({
+                    "permissions": {
+                        "deny": disabled_tools,
+                    }
+                });
+            }
             (format!("{base_url}/v0/agents"), body)
         }
         other => {
@@ -1166,16 +1349,29 @@ mod tests {
         )
         .unwrap();
         std::fs::write(
+            cfg.join("SYSTEM_PROMPT.md"),
+            "# Agent Identity\nYou are test-agent.\n\n<learned_memory>\n- `deploy-rule`: Always verify before claiming.\n</learned_memory>\n",
+        )
+        .unwrap();
+        let skill_dir = cfg.join(".agents/skills/prove-it");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: prove-it\ndescription: Use when verifying a live status or root-cause claim.\n---\n# Prove It\nFull instructions here.\n",
+        )
+        .unwrap();
+        std::fs::write(
             cfg.join("cloud.json"),
             serde_json::to_vec(&json!({
                 "base_url": format!("http://{addr}"),
-                "api_key": "upstream-api-key"
+                "api_key": "upstream-api-key",
+                "disabled_tools": ["bash", "write"]
             }))
             .unwrap(),
         )
         .unwrap();
 
-        // 1. spiron-cloud
+        // 1. spiron-cloud (treated uniformly with other cloud harnesses)
         let cfg_clone = cfg.clone();
         let spiron_out = tokio::task::spawn_blocking(move || {
             dispatch_cloud_turn(
@@ -1197,9 +1393,17 @@ mod tests {
             assert_eq!(calls[0]["prompt"], "ping spiron");
             assert_eq!(
                 calls[0]["mcp_servers"][0]["url"],
-                "https://mcp.example.test/mcp?profile=coordination"
+                "https://mcp.example.test/mcp?profile=remote"
             );
             assert_eq!(calls[0]["mcp_servers"][0]["bearer_token"], "cap-secret-xyz");
+            assert_eq!(calls[0]["disabled_tools"], json!(["bash", "write"]));
+            let sys = calls[0]["system_prompt"].as_str().unwrap();
+            assert!(sys.contains("<learned_memory>"), "{sys}");
+            assert!(sys.contains("<available_skills>"), "{sys}");
+            assert!(
+                sys.contains("- `prove-it`: Use when verifying a live status"),
+                "{sys}"
+            );
         }
 
         // 2. claude-cloud
@@ -1229,6 +1433,17 @@ mod tests {
             assert_eq!(
                 calls[0].1["mcp_servers"][0]["authorization_token"],
                 "cap-secret-xyz"
+            );
+            let sys = calls[0].1["system"].as_str().unwrap();
+            assert!(sys.contains("<learned_memory>"), "{sys}");
+            assert!(sys.contains("<available_skills>"), "{sys}");
+            assert!(sys.contains("prove-it"), "{sys}");
+            assert_eq!(
+                calls[0].1["toolset_configs"],
+                json!([
+                    {"name": "bash", "enabled": false},
+                    {"name": "write", "enabled": false}
+                ])
             );
         }
 
@@ -1261,6 +1476,10 @@ mod tests {
                 calls[0]["tools"][0]["headers"]["Authorization"],
                 "Bearer cap-secret-xyz"
             );
+            let sys = calls[0]["instructions"].as_str().unwrap();
+            assert!(sys.contains("<learned_memory>"), "{sys}");
+            assert!(sys.contains("<available_skills>"), "{sys}");
+            assert!(sys.contains("prove-it"), "{sys}");
         }
 
         // 4. cursor-cloud
@@ -1288,6 +1507,14 @@ mod tests {
                 "https://mcp.example.test/mcp?profile=remote"
             );
             assert_eq!(calls[0]["mcp_servers"][0]["bearer_token"], "cap-secret-xyz");
+            let sys = calls[0]["system_prompt"].as_str().unwrap();
+            assert!(sys.contains("<learned_memory>"), "{sys}");
+            assert!(sys.contains("<available_skills>"), "{sys}");
+            assert!(sys.contains("prove-it"), "{sys}");
+            assert_eq!(
+                calls[0]["config"]["permissions"]["deny"],
+                json!(["bash", "write"])
+            );
         }
 
         server_handle.abort();

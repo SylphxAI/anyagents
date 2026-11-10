@@ -28,7 +28,7 @@ use crate::api::{
 use crate::operator::CAPABILITY_FILE;
 use crate::server;
 
-/// Three-mode MCP tool surface profile.
+/// MCP tool surface profile.
 #[derive(
     Clone,
     Copy,
@@ -44,18 +44,19 @@ use crate::server;
 pub enum McpProfile {
     /// Exposes all AnyAgents MCP tools (`send`, `inbox`, `agents`, `groups`, `schedules`,
     /// `conversation`, `code`, `web_search`, `web_fetch`, `memory`, `skills`, `browser`,
-    /// `computer`). Default for `anyagents mcp` over `stdio` for third-party local CLI harnesses.
+    /// `computer`). Default for `anyagents mcp` over `stdio` across all local CLI harnesses
+    /// (`spiron`, `claude-code`, `codex`, `agy`, `opencode`) and for cloud agents bound to a
+    /// `SandboxConfig` or with built-in tools disabled.
     #[default]
     Full,
-    /// Default for Streamable HTTP `POST /mcp` (closed-box third-party Cloud Agents).
-    /// Omits host-local `code` (`files`/`exec` on the orchestrator host's disk) so cloud agents
-    /// use their own container sandbox file/bash tools.
+    /// Default for Streamable HTTP `POST /mcp` across all Cloud Agents (`spiron-cloud`,
+    /// `claude-cloud`, `openai-cloud`, `cursor-cloud`) when no remote `SandboxConfig` is bound.
+    /// Exposes coordination, `memory`, `skills`, `web_search`, `web_fetch`, `browser`, and
+    /// `computer` while omitting host-local `code`.
     Remote,
-    /// Default when the authenticated agent's `harness == "spiron"` (or `--profile coordination`).
-    /// Omits duplicate `code`, `web_search`, `web_fetch`, `memory`, and `skills` (since `spiron`
-    /// provides those natively from the shared capability core), exposing only coordination and
-    /// host device tools (`send`, `inbox`, `agents`, `groups`, `schedules`, `conversation`,
-    /// `browser`, `computer`).
+    /// Optional explicit coordination-only profile (`--profile coordination` or `?profile=coordination`).
+    /// Exposes only pure multi-agent coordination tools (`send`, `inbox`, `agents`, `groups`,
+    /// `schedules`, `conversation`).
     Coordination,
 }
 
@@ -97,8 +98,6 @@ pub const COORDINATION_MCP_TOOLS: &[&str] = &[
     "groups",
     "schedules",
     "conversation",
-    "browser",
-    "computer",
 ];
 
 impl McpProfile {
@@ -114,7 +113,7 @@ impl McpProfile {
         match raw.trim().to_ascii_lowercase().as_str() {
             "full" | "stdio" | "local" => Some(Self::Full),
             "remote" | "http" | "cloud" => Some(Self::Remote),
-            "coordination" | "coord" | "spiron" => Some(Self::Coordination),
+            "coordination" | "coord" => Some(Self::Coordination),
             _ => None,
         }
     }
@@ -134,34 +133,25 @@ impl McpProfile {
             .unwrap_or(raw_name.trim());
         match clean {
             "code" | "files" => matches!(self, Self::Full),
-            "web" | "web_search" | "web_fetch" | "memory" | "skills" => {
+            "web" | "web_search" | "web_fetch" | "memory" | "skills" | "browser" | "computer"
+            | "device" | "media" => {
                 matches!(self, Self::Full | Self::Remote)
             }
             "send" | "inbox" | "agents" | "groups" | "schedules" | "schedule" | "conversation"
-            | "search" | "browser" | "computer" | "device" | "media" | "spawn" | "subagents"
-            | "describe" | "archive" | "wake" | "interact" => true,
+            | "search" | "spawn" | "subagents" | "describe" | "archive" | "wake" | "interact" => {
+                true
+            }
             _ => false,
         }
     }
 
-    pub fn resolve_stdio(explicit: Option<Self>, harness: Option<&str>, config: &Path) -> Self {
-        if let Some(profile) = explicit {
-            return profile;
-        }
-        if harness.is_some_and(|h| {
-            crate::vendor::is_spiron_harness(h)
-                || anyagents_harness::normalize_harness_name(h) == "spiron-cloud"
-        }) || config.join("spiron-mcp.json").is_file()
-        {
-            Self::Coordination
-        } else {
-            Self::Full
-        }
+    pub fn resolve_stdio(explicit: Option<Self>, _harness: Option<&str>, _config: &Path) -> Self {
+        explicit.unwrap_or(Self::Full)
     }
 
     pub fn resolve_http_with_config(
         explicit: Option<&str>,
-        harness: &str,
+        _harness: &str,
         config_dir: Option<&Path>,
     ) -> Result<Self, String> {
         if let Some(raw) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
@@ -169,11 +159,9 @@ impl McpProfile {
                 format!("invalid MCP profile `{raw}`; expected `full`, `remote`, or `coordination`")
             });
         }
-        if crate::vendor::is_spiron_harness(harness)
-            || anyagents_harness::normalize_harness_name(harness) == "spiron-cloud"
+        if anyagents_tools::SandboxConfig::resolve(config_dir).is_some()
+            || config_dir.is_some_and(crate::cloud_harness::disable_builtin_tools_flag)
         {
-            Ok(Self::Coordination)
-        } else if anyagents_tools::SandboxConfig::resolve(config_dir).is_some() {
             Ok(Self::Full)
         } else {
             Ok(Self::Remote)
