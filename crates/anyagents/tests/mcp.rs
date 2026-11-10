@@ -358,8 +358,25 @@ async fn mcp_tools_use_the_server_socket() {
     let names: Vec<_> = tools.iter().map(|tool| tool.name.to_string()).collect();
     assert_eq!(
         names,
-        vec!["code".to_string()],
-        "expected Pure Code Mode (`CANONICAL_MCP_TOOLS = &[\"code\"]`), got {names:?}"
+        [
+            "send",
+            "inbox",
+            "agents",
+            "groups",
+            "schedules",
+            "conversation",
+            "code",
+            "web_search",
+            "web_fetch",
+            "memory",
+            "skills",
+            "browser",
+            "computer",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>(),
+        "expected Full MCP profile tools on claude-code stdio session, got {names:?}"
     );
 
     let listed: AgentsResponse = ok_json(call(&alpha, "agents", serde_json::json!({})).await);

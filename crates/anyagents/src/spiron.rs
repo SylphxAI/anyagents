@@ -25,11 +25,16 @@ pub fn write_spiron_config(
     mcp_command: &Path,
     mcp_args: &[String],
 ) -> Result<(), Error> {
+    let mut effective_args: Vec<String> = mcp_args.to_vec();
+    if !effective_args.iter().any(|a| a == "--profile") {
+        effective_args.push("--profile".to_string());
+        effective_args.push("coordination".to_string());
+    }
     let value = serde_json::json!({
         "mcpServers": {
             "anyagents": {
                 "command": mcp_command.display().to_string(),
-                "args": mcp_args,
+                "args": effective_args,
                 "env": {},
             }
         }
@@ -90,8 +95,9 @@ fn write_spiron_config_toml(config_dir: &Path, model: Option<&str>) -> Result<()
     Ok(())
 }
 
-/// Materialize `<config_dir>/auth.json` for Spiron from seeded Sylphx profile
-/// credential files when `auth.json` does not already contain a valid Spiron `access_token`.
+/// Materialize `<config_dir>/auth.json`, `.config/sylphx/auth.json`, and
+/// `.spiron/auth.json` for Spiron from seeded Sylphx/Spiron profile credential
+/// files when `auth.json` does not already contain a valid Spiron `access_token`.
 pub fn ensure_spiron_seat_auth(config_dir: &Path) {
     let auth_path = config_dir.join("auth.json");
     if let Ok(existing_raw) = std::fs::read_to_string(&auth_path)
@@ -101,39 +107,42 @@ pub fn ensure_spiron_seat_auth(config_dir: &Path) {
             .and_then(|v| v.as_str())
             .is_some_and(|s| !s.trim().is_empty())
     {
+        mirror_spiron_auth_paths(config_dir, existing_raw.as_bytes());
         return;
     }
-    if let Ok(raw) = std::fs::read_to_string(config_dir.join(".config/sylphx/credentials.json"))
-        && let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw)
-        && let Some(key) = val
-            .get("api_key")
-            .or_else(|| val.get("access_token"))
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-    {
-        let mut doc = serde_json::json!({
-            "access_token": key,
-        });
-        if let Some(org_id) = val
-            .get("org_id")
-            .or_else(|| val.get("active_org"))
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
+    for rel in [
+        ".config/sylphx/auth.json",
+        ".spiron/auth.json",
+        ".config/sylphx/credentials.json",
+        "credentials.json",
+    ] {
+        if let Ok(raw) = std::fs::read_to_string(config_dir.join(rel))
+            && let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw)
+            && let Some(key) = val
+                .get("access_token")
+                .or_else(|| val.get("api_key"))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
         {
-            doc["org_id"] = serde_json::Value::String(org_id.to_string());
-        }
-        if let Ok(bytes) = serde_json::to_vec_pretty(&doc) {
-            let _ = std::fs::write(&auth_path, bytes);
-            #[cfg(unix)]
+            let mut doc = serde_json::json!({
+                "access_token": key,
+            });
+            if let Some(org_id) = val
+                .get("org_id")
+                .or_else(|| val.get("active_org"))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
             {
-                use std::os::unix::fs::PermissionsExt;
-                let _ =
-                    std::fs::set_permissions(&auth_path, std::fs::Permissions::from_mode(0o600));
+                doc["org_id"] = serde_json::Value::String(org_id.to_string());
             }
+            if let Ok(bytes) = serde_json::to_vec_pretty(&doc) {
+                write_restricted_auth_file(&auth_path, &bytes);
+                mirror_spiron_auth_paths(config_dir, &bytes);
+            }
+            return;
         }
-        return;
     }
     for rel in [".config/sylphx/key", ".config/opencode/sylphx.key"] {
         if let Ok(raw) = std::fs::read_to_string(config_dir.join(rel)) {
@@ -143,18 +152,41 @@ pub fn ensure_spiron_seat_auth(config_dir: &Path) {
                     "access_token": key,
                 });
                 if let Ok(bytes) = serde_json::to_vec_pretty(&doc) {
-                    let _ = std::fs::write(&auth_path, bytes);
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        let _ = std::fs::set_permissions(
-                            &auth_path,
-                            std::fs::Permissions::from_mode(0o600),
-                        );
-                    }
+                    write_restricted_auth_file(&auth_path, &bytes);
+                    mirror_spiron_auth_paths(config_dir, &bytes);
                 }
                 return;
             }
+        }
+    }
+}
+
+fn write_restricted_auth_file(path: &Path, bytes: &[u8]) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, bytes);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+}
+
+fn mirror_spiron_auth_paths(config_dir: &Path, bytes: &[u8]) {
+    for rel in [".config/sylphx/auth.json", ".spiron/auth.json"] {
+        let target = config_dir.join(rel);
+        let needs_write = std::fs::read_to_string(&target)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+            .and_then(|v| {
+                v.get("access_token")
+                    .and_then(|t| t.as_str())
+                    .map(|s| s.trim().to_string())
+            })
+            .is_none_or(|s| s.is_empty());
+        if needs_write {
+            write_restricted_auth_file(&target, bytes);
         }
     }
 }

@@ -28,6 +28,149 @@ use crate::api::{
 use crate::operator::CAPABILITY_FILE;
 use crate::server;
 
+/// Three-mode MCP tool surface profile.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    clap::ValueEnum,
+    serde::Deserialize,
+    serde::Serialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum McpProfile {
+    /// Exposes all AnyAgents MCP tools (`send`, `inbox`, `agents`, `groups`, `schedules`,
+    /// `conversation`, `code`, `web_search`, `web_fetch`, `memory`, `skills`, `browser`,
+    /// `computer`). Default for `anyagents mcp` over `stdio` for third-party local CLI harnesses.
+    #[default]
+    Full,
+    /// Default for Streamable HTTP `POST /mcp` (closed-box third-party Cloud Agents).
+    /// Omits host-local `code` (`files`/`exec` on the orchestrator host's disk) so cloud agents
+    /// use their own container sandbox file/bash tools.
+    Remote,
+    /// Default when the authenticated agent's `harness == "spiron"` (or `--profile coordination`).
+    /// Omits duplicate `code`, `web_search`, `web_fetch`, `memory`, and `skills` (since `spiron`
+    /// provides those natively from the shared capability core), exposing only coordination and
+    /// host device tools (`send`, `inbox`, `agents`, `groups`, `schedules`, `conversation`,
+    /// `browser`, `computer`).
+    Coordination,
+}
+
+pub const FULL_MCP_TOOLS: &[&str] = &[
+    "send",
+    "inbox",
+    "agents",
+    "groups",
+    "schedules",
+    "conversation",
+    "code",
+    "web_search",
+    "web_fetch",
+    "memory",
+    "skills",
+    "browser",
+    "computer",
+];
+
+pub const REMOTE_MCP_TOOLS: &[&str] = &[
+    "send",
+    "inbox",
+    "agents",
+    "groups",
+    "schedules",
+    "conversation",
+    "web_search",
+    "web_fetch",
+    "memory",
+    "skills",
+    "browser",
+    "computer",
+];
+
+pub const COORDINATION_MCP_TOOLS: &[&str] = &[
+    "send",
+    "inbox",
+    "agents",
+    "groups",
+    "schedules",
+    "conversation",
+    "browser",
+    "computer",
+];
+
+impl McpProfile {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Remote => "remote",
+            Self::Coordination => "coordination",
+        }
+    }
+
+    pub fn from_str_opt(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "full" | "stdio" | "local" => Some(Self::Full),
+            "remote" | "http" | "cloud" => Some(Self::Remote),
+            "coordination" | "coord" | "spiron" => Some(Self::Coordination),
+            _ => None,
+        }
+    }
+
+    pub fn exposed_tools(&self) -> &'static [&'static str] {
+        match self {
+            Self::Full => FULL_MCP_TOOLS,
+            Self::Remote => REMOTE_MCP_TOOLS,
+            Self::Coordination => COORDINATION_MCP_TOOLS,
+        }
+    }
+
+    pub fn allows_tool(&self, raw_name: &str) -> bool {
+        let clean = raw_name
+            .trim()
+            .strip_prefix("mcp__anyagents__")
+            .unwrap_or(raw_name.trim());
+        match clean {
+            "code" | "files" => matches!(self, Self::Full),
+            "web" | "web_search" | "web_fetch" | "memory" | "skills" => {
+                matches!(self, Self::Full | Self::Remote)
+            }
+            "send" | "inbox" | "agents" | "groups" | "schedules" | "schedule" | "conversation"
+            | "search" | "browser" | "computer" | "device" | "media" | "spawn" | "subagents"
+            | "describe" | "archive" | "wake" | "interact" => true,
+            _ => false,
+        }
+    }
+
+    pub fn resolve_stdio(explicit: Option<Self>, harness: Option<&str>, config: &Path) -> Self {
+        if let Some(profile) = explicit {
+            return profile;
+        }
+        if harness.is_some_and(crate::vendor::is_spiron_harness)
+            || config.join("spiron-mcp.json").is_file()
+        {
+            Self::Coordination
+        } else {
+            Self::Full
+        }
+    }
+
+    pub fn resolve_http(explicit: Option<&str>, harness: &str) -> Result<Self, String> {
+        if let Some(raw) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
+            return Self::from_str_opt(raw).ok_or_else(|| {
+                format!("invalid MCP profile `{raw}`; expected `full`, `remote`, or `coordination`")
+            });
+        }
+        if crate::vendor::is_spiron_harness(harness) {
+            Ok(Self::Coordination)
+        } else {
+            Ok(Self::Remote)
+        }
+    }
+}
+
 /// The agent whose tools run here: the id and name the server resolved from
 /// the capability, never a name the caller wrote.
 #[derive(Clone, Debug)]
@@ -41,7 +184,7 @@ pub struct AgentRef {
 /// server names the directory it started this agent with as
 /// `ANYAGENTS_AGENT_CONFIG`; a command line that omits it is read from there,
 /// and from nowhere else.
-pub fn run(data: &Path, config: Option<&Path>) -> Result<(), Error> {
+pub fn run(data: &Path, config: Option<&Path>, profile: Option<McpProfile>) -> Result<(), Error> {
     let owned;
     let config = match config {
         Some(config) => config,
@@ -64,10 +207,10 @@ pub fn run(data: &Path, config: Option<&Path>) -> Result<(), Error> {
     runtime.block_on(async {
         let client = Client {
             socket,
-            config: config_buf,
+            config: config_buf.clone(),
             capability,
         };
-        let who = client.whoami().await.map_err(Error::Message)?;
+        let (who, harness) = client.whoami_with_harness().await.map_err(Error::Message)?;
         // A harness names the agent id it was given; the server already
         // answered with the agent this session acts as, and the two may not
         // differ.
@@ -78,10 +221,15 @@ pub fn run(data: &Path, config: Option<&Path>) -> Result<(), Error> {
                 "this config directory belongs to another agent".into(),
             ));
         }
-        let service = AgentMcp { agent: who, client }
-            .serve(rmcp::transport::io::stdio())
-            .await
-            .map_err(|err| Error::Message(err.to_string()))?;
+        let resolved_profile = McpProfile::resolve_stdio(profile, harness.as_deref(), &config_buf);
+        let service = AgentMcp {
+            agent: who,
+            client,
+            profile: resolved_profile,
+        }
+        .serve(rmcp::transport::io::stdio())
+        .await
+        .map_err(|err| Error::Message(err.to_string()))?;
         service
             .waiting()
             .await
@@ -110,10 +258,10 @@ fn capability_of(config: &Path) -> Result<String, Error> {
 }
 
 #[derive(Clone)]
-struct Client {
-    socket: PathBuf,
-    config: PathBuf,
-    capability: String,
+pub(crate) struct Client {
+    pub(crate) socket: PathBuf,
+    pub(crate) config: PathBuf,
+    pub(crate) capability: String,
 }
 
 impl Client {
@@ -122,7 +270,7 @@ impl Client {
     }
 
     /// The agent this capability authenticates, as the server resolved it.
-    async fn whoami(&self) -> Result<AgentRef, String> {
+    async fn whoami_with_harness(&self) -> Result<(AgentRef, Option<String>), String> {
         let named = crate::client::agent_identity().map(|id| id.to_string());
         let cap = self.current_capability();
         let who: serde_json::Value = request_naming(
@@ -156,11 +304,20 @@ impl Client {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(PathBuf::from);
-        Ok(AgentRef {
-            id: AgentId::parse(id).map_err(|err| err.to_string())?,
-            name: name.to_string(),
-            workdir,
-        })
+        let harness = who
+            .get("harness")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        Ok((
+            AgentRef {
+                id: AgentId::parse(id).map_err(|err| err.to_string())?,
+                name: name.to_string(),
+                workdir,
+            },
+            harness,
+        ))
     }
 
     async fn get<T: DeserializeOwned>(
@@ -202,9 +359,10 @@ impl Client {
 }
 
 #[derive(Clone)]
-struct AgentMcp {
-    agent: AgentRef,
-    client: Client,
+pub(crate) struct AgentMcp {
+    pub(crate) agent: AgentRef,
+    pub(crate) client: Client,
+    pub(crate) profile: McpProfile,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -810,6 +968,50 @@ struct MemoryArgs {
     #[serde(default, alias = "target")]
     agent: Option<String>,
     /// Maximum number of results when `action = "search"` or `"list"` (default 20).
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+struct InboxArgs {
+    /// Optional sequence number cursor (`seq > since`).
+    #[serde(default, alias = "after_seq", alias = "from_seq")]
+    since: Option<i64>,
+    /// Optional maximum number of inbox messages to return.
+    #[serde(default)]
+    limit: Option<usize>,
+    /// When `true`, returns only unread messages.
+    #[serde(default)]
+    unread: Option<bool>,
+    /// Optional sender substring filter.
+    #[serde(default, alias = "from")]
+    sender: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+struct SkillsArgs {
+    /// Skill operation to perform:
+    /// - `"list"` (default when `name` and `query` are omitted): List available skills and their trigger descriptions.
+    /// - `"read"` (inferred when `name` is provided): Read a skill's `SKILL.md` (or relative `file`).
+    /// - `"search"` (inferred when `query` is provided): Search skills by name, description, or body.
+    #[serde(default)]
+    action: Option<String>,
+    /// Skill slug / directory name (e.g. `"deliver-and-verify"`, `"prove-it"`).
+    #[serde(
+        default,
+        alias = "skill",
+        alias = "slug",
+        alias = "topic",
+        alias = "id"
+    )]
+    name: Option<String>,
+    /// Optional relative file path inside the skill directory when `action = "read"` (defaults to `"SKILL.md"`).
+    #[serde(default, alias = "path")]
+    file: Option<String>,
+    /// Search query when `action = "search"`.
+    #[serde(default, alias = "q", alias = "search")]
+    query: Option<String>,
+    /// Maximum number of skills to return when listing or searching (default 50).
     #[serde(default)]
     limit: Option<usize>,
 }
@@ -2449,6 +2651,50 @@ impl AgentMcp {
     }
 
     #[tool(
+        description = "Read your own incoming mailbox queue (`since`, `limit`, `unread`, `sender`). Returns structured messages with delivery sequence numbers, sender identities, reply tokens, and attachments."
+    )]
+    async fn inbox(
+        &self,
+        Parameters(args): Parameters<InboxArgs>,
+    ) -> Result<rmcp::handler::server::wrapper::Json<crate::api::InboxResponse>, String> {
+        let mut query = Vec::new();
+        if let Some(since) = args.since {
+            query.push(format!("since={since}"));
+        }
+        if let Some(limit) = args.limit {
+            query.push(format!("limit={limit}"));
+        }
+        if let Some(unread) = args.unread {
+            query.push(format!("unread={unread}"));
+        }
+        if let Some(sender) = args
+            .sender
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            query.push(format!("sender={}", urlencoding_simple(sender)));
+        }
+        let path = if query.is_empty() {
+            format!("/v1/agents/{}/inbox", self.agent.id)
+        } else {
+            format!("/v1/agents/{}/inbox?{}", self.agent.id, query.join("&"))
+        };
+        let response = self.client.get(&path, None).await?;
+        Ok(rmcp::handler::server::wrapper::Json(response))
+    }
+
+    #[tool(
+        description = "Schedule your own wakes (`at` or `every` with `prompt`) and external event watches (`watch` with `prompt`), or `list` and `cancel` (`id`: `<sch_...>` | `\"all\"`) your schedules. Supported `watch` specs: `github:pr:<owner>/<repo>#<num>` (PR or checks terminal), `github:check:<owner>/<repo>@<ref>` (check runs terminal), `spiron:promise:<id>` (Spiron promise state change pulled from the public API), and `agent:idle:<name_or_id>` (AnyAgents agent going idle). Wakes fire only when you are idle and not quota-blocked, and a missed wake never fires twice."
+    )]
+    async fn schedules(
+        &self,
+        Parameters(args): Parameters<ScheduleArgs>,
+    ) -> Result<rmcp::handler::server::wrapper::Json<serde_json::Value>, String> {
+        self.schedule(Parameters(args)).await
+    }
+
+    #[tool(
         description = "First-class learned-memory manager (`action`: `\"list\"` | `\"read\"` | `\"write\"` | `\"upsert\"` | `\"delete\"` | `\"search\"`). Inferred automatically when `action` is omitted: `delete: true` -> `\"delete\"`, `content` -> `\"write\"`, `query` -> `\"search\"`, `topic` -> `\"read\"`, else `\"list\"`. Writes `<agent_root>/memory/<topic>.md`, syncs the FTS5 memory index, and rebuilds `MEMORY.md` (<150 lines / 4 KB)."
     )]
     async fn memory(
@@ -2457,6 +2703,39 @@ impl AgentMcp {
     ) -> Result<rmcp::handler::server::wrapper::Json<serde_json::Value>, String> {
         let val = self.execute_memory_tool(args).await?;
         Ok(rmcp::handler::server::wrapper::Json(val))
+    }
+
+    #[tool(
+        description = "Discover, search, and read reusable Agent Skills (`action`: `\"list\"` | `\"read\"` | `\"search\"`). Pass `name: \"<skill-slug>\"` to read `SKILL.md` (or a colocated `file` such as `\"references/...\"`), or `query` to search skill instructions."
+    )]
+    async fn skills(
+        &self,
+        Parameters(args): Parameters<SkillsArgs>,
+    ) -> Result<rmcp::handler::server::wrapper::Json<serde_json::Value>, String> {
+        let val = self.execute_skills_tool(args)?;
+        Ok(rmcp::handler::server::wrapper::Json(val))
+    }
+
+    #[tool(
+        description = "Policy-aware multi-provider web search (`query`, optional `engine`: `\"auto\"` | `\"parallel\"` | `\"exa\"` | `\"tavily\"` | `\"firecrawl\"` | `\"perplexity\"` | `\"brave\"` | `\"anysearch\"`, `allowed_domains`, `blocked_domains`, `country`, `max_results`, `mode`, `external_web_access`)."
+    )]
+    async fn web_search(
+        &self,
+        Parameters(mut args): Parameters<crate::web::WebRequest>,
+    ) -> Result<rmcp::handler::server::wrapper::Json<serde_json::Value>, String> {
+        args.action = Some("search".to_string());
+        self.web(Parameters(args)).await
+    }
+
+    #[tool(
+        description = "Policy-aware multi-provider web URL extraction and fetch (`url`, optional `engine`: `\"auto\"` | `\"firecrawl\"` | `\"exa\"` | `\"parallel\"` | `\"tavily\"` | `\"anysearch\"` | `\"direct\"`, `allowed_domains`, `blocked_domains`, `max_chars`, `external_web_access`)."
+    )]
+    async fn web_fetch(
+        &self,
+        Parameters(mut args): Parameters<crate::web::WebRequest>,
+    ) -> Result<rmcp::handler::server::wrapper::Json<serde_json::Value>, String> {
+        args.action = Some("fetch".to_string());
+        self.web(Parameters(args)).await
     }
 
     #[tool(
@@ -2561,9 +2840,18 @@ impl AgentMcp {
     }
 }
 
+#[cfg(test)]
 pub const CANONICAL_MCP_TOOLS: &[&str] = &["code"];
 
-#[rmcp::tool_handler(router = Self::tool_router())]
+pub fn tool_definitions(profile: McpProfile) -> Vec<rmcp::model::Tool> {
+    let allowed = profile.exposed_tools();
+    let all = AgentMcp::tool_router().list_all();
+    allowed
+        .iter()
+        .filter_map(|wanted| all.iter().find(|t| t.name.as_ref() == *wanted).cloned())
+        .collect()
+}
+
 impl rmcp::ServerHandler for AgentMcp {
     async fn list_tools(
         &self,
@@ -2573,11 +2861,7 @@ impl rmcp::ServerHandler for AgentMcp {
         let supports_cache_hints = context
             .protocol_version()
             .is_some_and(|version| version >= rmcp::model::ProtocolVersion::V_2026_07_28);
-        let tools = Self::tool_router()
-            .list_all()
-            .into_iter()
-            .filter(|t| CANONICAL_MCP_TOOLS.contains(&t.name.as_ref()))
-            .collect();
+        let tools = tool_definitions(self.profile);
         Ok(rmcp::model::ListToolsResult {
             result_type: Some(rmcp::model::ResultType::COMPLETE),
             tools,
@@ -2586,6 +2870,32 @@ impl rmcp::ServerHandler for AgentMcp {
             ttl_ms: supports_cache_hints.then_some(0),
             cache_scope: supports_cache_hints.then_some(rmcp::model::CacheScope::Public),
         })
+    }
+
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
+        if !self.profile.allows_tool(request.name.as_ref()) {
+            return Err(rmcp::ErrorData::invalid_params(
+                format!(
+                    "tool `{}` is not available under the `{}` MCP profile",
+                    request.name,
+                    self.profile.as_str()
+                ),
+                None,
+            ));
+        }
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        Self::tool_router().call(tcc).await
+    }
+
+    fn get_tool(&self, name: &str) -> Option<rmcp::model::Tool> {
+        if !self.profile.allows_tool(name) {
+            return None;
+        }
+        Self::tool_router().get(name).cloned()
     }
 }
 
@@ -3459,6 +3769,359 @@ impl AgentMcp {
         }
     }
 
+    pub(crate) fn new_for_http(
+        agent: AgentRef,
+        socket: PathBuf,
+        config: PathBuf,
+        capability: String,
+        profile: McpProfile,
+    ) -> Self {
+        Self {
+            agent,
+            client: Client {
+                socket,
+                config,
+                capability,
+            },
+            profile,
+        }
+    }
+
+    fn collect_skill_directories(&self) -> std::collections::BTreeMap<String, PathBuf> {
+        let mut map = std::collections::BTreeMap::new();
+        let mut roots = Vec::new();
+        if let Some(data_dir) = self.client.socket.parent() {
+            roots.push(data_dir.join("skills"));
+        }
+        if let Some(agent_root) = self.client.config.parent() {
+            roots.push(agent_root.join("skills-view"));
+            roots.push(agent_root.join("skills"));
+        }
+        roots.push(self.client.config.join("skills"));
+        roots.push(self.client.config.join(".agents/skills"));
+        let wd = self.resolve_workdir();
+        roots.push(wd.join(".agents/skills"));
+        roots.push(wd.join("skills"));
+
+        for root in roots {
+            let Ok(entries) = std::fs::read_dir(&root) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_dir() || !path.join("SKILL.md").is_file() {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.is_empty() || name.starts_with('.') {
+                    continue;
+                }
+                map.insert(name, path);
+            }
+        }
+        map
+    }
+
+    fn execute_skills_tool(&self, args: SkillsArgs) -> Result<serde_json::Value, String> {
+        let raw_name = args
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let raw_query = args
+            .query
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let action = args
+            .action
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_else(|| {
+                if raw_name.is_some() {
+                    "read".to_string()
+                } else if raw_query.is_some() {
+                    "search".to_string()
+                } else {
+                    "list".to_string()
+                }
+            });
+
+        let skill_dirs = self.collect_skill_directories();
+        match action.as_str() {
+            "list" | "ls" => {
+                let limit = args.limit.unwrap_or(50).max(1);
+                let mut skills = Vec::new();
+                for (slug, dir) in skill_dirs.into_iter().take(limit) {
+                    let md = std::fs::read_to_string(dir.join("SKILL.md")).unwrap_or_default();
+                    let (_, description) =
+                        anyagents_core::learned_memory::parse_topic_frontmatter(&slug, &md);
+                    skills.push(serde_json::json!({
+                        "name": slug,
+                        "description": description,
+                    }));
+                }
+                let count = skills.len();
+                Ok(serde_json::json!({
+                    "action": "list",
+                    "skills": skills,
+                    "count": count,
+                }))
+            }
+            "read" | "get" => {
+                let name = raw_name.ok_or_else(|| "`skills` read requires `name`".to_string())?;
+                if name.contains('/') || name.contains('\\') || name == "." || name == ".." {
+                    return Err(format!("invalid skill name `{name}`"));
+                }
+                let dir = skill_dirs
+                    .get(&name)
+                    .ok_or_else(|| format!("skill `{name}` not found"))?;
+                let rel_file = args
+                    .file
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("SKILL.md");
+                let rel_path = Path::new(rel_file);
+                if rel_path.is_absolute()
+                    || rel_path
+                        .components()
+                        .any(|c| !matches!(c, std::path::Component::Normal(_)))
+                {
+                    return Err(format!("invalid skill file path `{rel_file}`"));
+                }
+                let target = dir.join(rel_path);
+                let content = std::fs::read_to_string(&target)
+                    .map_err(|e| format!("cannot read `{name}/{rel_file}`: {e}"))?;
+                let (_, description) =
+                    anyagents_core::learned_memory::parse_topic_frontmatter(&name, &content);
+                Ok(serde_json::json!({
+                    "action": "read",
+                    "name": name,
+                    "file": rel_file,
+                    "description": description,
+                    "content": content,
+                }))
+            }
+            "search" | "query" | "find" => {
+                let q = raw_query
+                    .or(raw_name)
+                    .ok_or_else(|| "`skills` search requires `query`".to_string())?;
+                let tokens: Vec<String> = q
+                    .to_ascii_lowercase()
+                    .split_whitespace()
+                    .filter(|t| !t.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                let limit = args.limit.unwrap_or(20).max(1);
+                let mut hits = Vec::new();
+                for (slug, dir) in skill_dirs {
+                    let md = std::fs::read_to_string(dir.join("SKILL.md")).unwrap_or_default();
+                    let (_, description) =
+                        anyagents_core::learned_memory::parse_topic_frontmatter(&slug, &md);
+                    let hay = format!("{slug} {description} {md}").to_ascii_lowercase();
+                    if tokens.iter().all(|tok| hay.contains(tok)) {
+                        hits.push(serde_json::json!({
+                            "name": slug,
+                            "description": description,
+                        }));
+                        if hits.len() >= limit {
+                            break;
+                        }
+                    }
+                }
+                let count = hits.len();
+                Ok(serde_json::json!({
+                    "action": "search",
+                    "query": q,
+                    "skills": hits,
+                    "count": count,
+                }))
+            }
+            other => Err(format!(
+                "unknown `skills` action `{other}`; expected `list`, `read`, or `search`"
+            )),
+        }
+    }
+
+    pub(crate) async fn handle_jsonrpc_request(
+        &self,
+        payload: serde_json::Value,
+    ) -> Option<serde_json::Value> {
+        if let serde_json::Value::Array(items) = payload {
+            let mut responses = Vec::new();
+            for item in items {
+                if let Some(resp) = self.handle_single_jsonrpc(item).await {
+                    responses.push(resp);
+                }
+            }
+            if responses.is_empty() {
+                None
+            } else {
+                Some(serde_json::Value::Array(responses))
+            }
+        } else {
+            self.handle_single_jsonrpc(payload).await
+        }
+    }
+
+    async fn handle_single_jsonrpc(&self, req: serde_json::Value) -> Option<serde_json::Value> {
+        let Some(obj) = req.as_object() else {
+            return Some(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": null,
+                "error": {
+                    "code": -32600,
+                    "message": "Invalid Request: expected JSON object"
+                }
+            }));
+        };
+        let id = obj.get("id").cloned();
+        let method = obj
+            .get("method")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .trim();
+        let params = obj
+            .get("params")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+
+        // Notifications (such as `notifications/initialized`) carry no `id` and expect no body.
+        if id.is_none() || method.starts_with("notifications/") {
+            return None;
+        }
+        let id_val = id.unwrap_or(serde_json::Value::Null);
+
+        match method {
+            "initialize" => {
+                let requested_version = params
+                    .get("protocolVersion")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("2025-03-26");
+                Some(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id_val,
+                    "result": {
+                        "protocolVersion": requested_version,
+                        "capabilities": {
+                            "tools": {
+                                "listChanged": false
+                            }
+                        },
+                        "serverInfo": {
+                            "name": "anyagents",
+                            "version": env!("CARGO_PKG_VERSION")
+                        }
+                    }
+                }))
+            }
+            "ping" => Some(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id_val,
+                "result": {}
+            })),
+            "tools/list" => {
+                let tools = tool_definitions(self.profile);
+                Some(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id_val,
+                    "result": {
+                        "tools": tools
+                    }
+                }))
+            }
+            "tools/call" => {
+                let Some(tool_name) = params
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                else {
+                    return Some(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id_val,
+                        "error": {
+                            "code": -32602,
+                            "message": "missing required `name` in `tools/call` params"
+                        }
+                    }));
+                };
+                if !self.profile.allows_tool(tool_name) {
+                    return Some(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id_val,
+                        "error": {
+                            "code": -32601,
+                            "message": format!(
+                                "tool `{tool_name}` is disabled by active MCP profile `{}`",
+                                self.profile.as_str()
+                            )
+                        }
+                    }));
+                }
+                let args = params
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({}));
+                let call_result =
+                    match self.dispatch_any_tool(tool_name, args).await {
+                        Ok((val, media)) => {
+                            let mut res = rmcp::model::CallToolResult::structured(val);
+                            res.content.extend(media);
+                            res
+                        }
+                        Err(err_msg) => rmcp::model::CallToolResult::error(vec![
+                            rmcp::model::ContentBlock::text(err_msg),
+                        ]),
+                    };
+                Some(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id_val,
+                    "result": call_result
+                }))
+            }
+            other => Some(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id_val,
+                "error": {
+                    "code": -32601,
+                    "message": format!("Method not found: `{other}`")
+                }
+            })),
+        }
+    }
+
+    async fn dispatch_any_tool(
+        &self,
+        tool: &str,
+        args: serde_json::Value,
+    ) -> Result<(serde_json::Value, Vec<rmcp::model::ContentBlock>), String> {
+        let norm = tool
+            .trim()
+            .strip_prefix("mcp__anyagents__")
+            .unwrap_or(tool.trim());
+        if !self.profile.allows_tool(norm) {
+            return Err(format!(
+                "tool `{norm}` is not available under the `{}` MCP profile",
+                self.profile.as_str()
+            ));
+        }
+        if norm == "code" {
+            let parsed: CodeArgs = serde_json::from_value(args)
+                .map_err(|e| format!("invalid `code` arguments: {e}"))?;
+            let MultimediaJson(val, media) = self.code(Parameters(parsed)).await?;
+            return Ok((val, media));
+        }
+        self.dispatch_code_tool(norm, args).await
+    }
+
     async fn dispatch_code_tool(
         &self,
         tool: &str,
@@ -3469,6 +4132,20 @@ impl AgentMcp {
             .strip_prefix("mcp__anyagents__")
             .unwrap_or(tool.trim());
         match norm {
+            "inbox" => {
+                let parsed: InboxArgs = serde_json::from_value(args)
+                    .map_err(|e| format!("invalid `inbox` arguments: {e}"))?;
+                let res = self.inbox(Parameters(parsed)).await?.0;
+                Ok((
+                    serde_json::to_value(res).map_err(|e| e.to_string())?,
+                    Vec::new(),
+                ))
+            }
+            "skills" => {
+                let parsed: SkillsArgs = serde_json::from_value(args)
+                    .map_err(|e| format!("invalid `skills` arguments: {e}"))?;
+                Ok((self.skills(Parameters(parsed)).await?.0, Vec::new()))
+            }
             "memory" => {
                 let parsed: MemoryArgs = serde_json::from_value(args)
                     .map_err(|e| format!("invalid `memory` arguments: {e}"))?;
@@ -3502,7 +4179,7 @@ impl AgentMcp {
                     Vec::new(),
                 ))
             }
-            "schedule" => {
+            "schedule" | "schedules" => {
                 let parsed: ScheduleArgs = serde_json::from_value(args)
                     .map_err(|e| format!("invalid `schedule` arguments: {e}"))?;
                 Ok((self.schedule(Parameters(parsed)).await?.0, Vec::new()))
@@ -7326,6 +8003,7 @@ mod spawn_args_tests {
                 config: dir.path().join("config"),
                 capability: "synthetic-test-capability".into(),
             },
+            profile: McpProfile::Full,
         };
         for legacy in [false, true] {
             for (arguments, expected_len, next, first) in [
@@ -7422,6 +8100,7 @@ mod spawn_args_tests {
                 config: dir.path().join("config"),
                 capability: "test-cap".into(),
             },
+            profile: McpProfile::Full,
         };
 
         // 1. Write a nested file (auto-creating parent directories).
@@ -7592,6 +8271,7 @@ mod spawn_args_tests {
                 config: dir.path().join("config"),
                 capability: "synthetic-receipt-capability".into(),
             },
+            profile: McpProfile::Full,
         };
         let fabricated = mcp
             .code(Parameters(CodeArgs {
@@ -7713,6 +8393,7 @@ mod spawn_args_tests {
                 config: dir.path().join("config"),
                 capability: "synthetic-test-capability".into(),
             },
+            profile: McpProfile::Full,
         };
 
         // 1. Parallel Promise.all across `tools.anyagents.agents` and `tools.anyagents.files` / `tools.workspace` with TypeScript syntax.
@@ -7975,6 +8656,7 @@ mod spawn_args_tests {
                 config: dir.path().join("config"),
                 capability: "test-cap".into(),
             },
+            profile: McpProfile::Full,
         };
 
         // Direct `files` read on PNG returns clean metadata + native MCP Image ContentBlock.

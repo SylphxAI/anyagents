@@ -12,9 +12,9 @@ AnyAgents is one home for every agent: any harness, any model, any channel. The 
 
 Within the Sylphx ecosystem, AnyAgents is the open-source multi-harness runtime and developer entry point:
 
-1. **AnyAgents (`@sylphx/anyagents`, OSS):** Runs on your own machine or cluster and coordinates our first-party external `spiron` harness and third-party vendor harnesses (`claude-code`, `codex`, `opencode`, `agy`, `muse`, `omp`, `dsh`, `grok`). The legacy `sylphx` harness name remains a compatibility alias for `spiron`.
-2. **Sylphx Service Platform (`https://api.sylphx.com`):** A single `anyagents sign-in sylphx` connects AnyAgents to **Sylphx AI** (unified frontier model gateway), **Sylphx Sandboxes** (ephemeral Cloud Kata microVM git worktrees), and **Sylphx Agents** (`sylphx.agents.v1` Backend-as-a-Service agent runtime).
-3. **Spiron (`https://spiron.ai`):** Our first-party Agent Harness CLI/TUI, invoked as `spiron`. Spiron can consume the Sylphx Backend-as-a-Service; the harness and the backend are separate products.
+1. **AnyAgents (`@sylphx/anyagents`, OSS):** Runs on your own machine or cluster and coordinates our first-party external `spiron` harness, third-party vendor CLI harnesses (`claude-code`, `codex`, `opencode`, `agy`, `muse`, `omp`, `dsh`, `grok`), and remote Cloud Agents (`Claude Cloud`, `OpenAI Cloud`, `Cursor Cloud` via Streamable HTTPS `POST /mcp`). The legacy `sylphx` harness name remains a compatibility alias for `spiron`.
+2. **Sylphx Service Platform (`https://api.sylphx.com`):** Connects AnyAgents and Spiron to **Sylphx AI** (unified frontier model gateway), **Sylphx Sandboxes** (ephemeral Cloud Kata microVM git worktrees), and **Sylphx Agents** (`sylphx.agents.v1` Backend-as-a-Service agent runtime).
+3. **Spiron (`https://spiron.ai`):** Our first-party Agent Harness CLI/TUI and Cloud Agent (`anyagents sign-in spiron` / `spiron login`), invoked as `spiron`. Spiron embeds the shared capability core (`code`, files, web, memory, skills) natively, so AnyAgents mounts a coordination-only MCP profile (`send`, `inbox`, `agents`, `groups`, `schedules`, `conversation`, `browser`, `computer`) without duplicating built-in tools.
 
 Peer-to-peer messaging between people's agent sessions, such as Reason Network, overlaps with one part of AnyAgents. AnyAgents also owns each agent's identity, history and channels, installs and signs in the harnesses, and routes any model through any harness, so an agent can change harness or model without losing either.
 
@@ -35,7 +35,8 @@ People and teams who already use one or more agent harnesses and want them runni
 
 - Server first. `anyagents serve` is the product. The CLI, the MCP server, a future TUI or GUI, and every channel are clients of the same API.
 - One Rust binary is the server, the CLI and the MCP server. The npm package is a launcher for that binary.
-- Local by default: the API listens on a Unix socket owned by the user. Network access is opt-in and needs a token.
+- Local by default: the API listens on a Unix socket owned by the user. Network access (`--listen` / `--webhook-listen`) is opt-in and authenticates every request via an operator token or per-agent `mcp-capability` (`POST /mcp` / `GET /mcp` for remote Cloud Agents).
+- Three MCP mounting profiles prevent tool collisions across execution boundaries: `full` over `stdio` for local third-party CLIs (`code` + coordination + memory/skills + web + browser/computer), `remote` over HTTPS `/mcp` for closed-box third-party Cloud Agents (omitting host-local `code` so the cloud container uses its own native sandbox file/bash tools while sharing coordination, memory/skills, web, and host browser/computer), and `coordination` for `spiron` (omitting duplicate `code`/web/memory/skills so `spiron` uses its native capability core).
 - Vendor sign-in credentials live in a config directory AnyAgents owns, written and read only by the vendor tool. AnyAgents never reads, sends or logs the token, and never routes a subscription through the gateway.
 - External tool credentials and hardware belong to the runtime environment (`local` host `$HOME`, Docker container volumes/env, or Kubernetes `Secret` / `ServiceAccount`), never to a credential broker inside AnyAgents ([ADR 0002](adr/0002-runtime-drivers-and-capability-identity.md)).
 - Stability is the bar. Every delivery guarantee in [architecture.md](architecture.md#guarantees) is a tested invariant, not a convention.
