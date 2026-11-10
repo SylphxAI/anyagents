@@ -373,15 +373,15 @@ struct AgentsArgs {
     /// - `"inspect"` / `"status"` (inspect an agent or sub-agent's live status, schedules, and recent conversation turns)
     /// - `"spawn"` (spawn a new sub-agent under this agent, with optional `repo` / `branch` / `base` / `workdir` for an isolated Git worktree)
     /// - `"create"` (admin-only: create a standalone root agent with no parent)
-    /// - `"describe"` (read or update an agent's role & responsibility `description` / `instructions` and short `role` label; defaults `name` to `"self"`)
+    /// - `"describe"` (read any agent's role & responsibility `description` / `instructions`, defaulting `name` to `"self"`, or update a target's `description` / `instructions` / `role` / `scope` — mutations require the target's Parent/Ancestor agent or an Admin)
     /// - `"steer"` / `"send"` (send/steer a follow-up `prompt` into an agent or sub-agent, waking it if archived)
     /// - `"wake"` / `"resume"` (wake an archived or paused agent, with optional `prompt`)
     /// - `"reset_session"` / `"new_session"` (new session for a quiescent managed agent; preserves old pins and raw state)
     /// - `"pause"` (pause an agent)
     /// - `"archive"` (any agent, including roots and labelled children, may self-archive; preserves browser profiles; auto-reaps clean/pushed managed Git worktrees while preserving dirty ones)
     /// - `"delete"` / `"kill"` (permanently delete a sub-agent or agent)
-    /// - `"rename"` (admin-only: rename an agent in place while keeping its `agt_...` ID and old name as an alias)
-    /// - `"role"` (set or clear an agent's short role label)
+    /// - `"rename"` (Parent/Ancestor or Admin: rename a descendant or agent in place while keeping its `agt_...` ID and old name as an alias)
+    /// - `"role"` (Parent/Ancestor or Admin: set or clear an agent's short role label)
     /// - `"harness"` (declaratively update an agent's harness/model/profile)
     /// - `"models"` (list upstream provider profile model catalogs)
     #[serde(default)]
@@ -1260,7 +1260,7 @@ impl AgentMcp {
     }
 
     #[tool(
-        description = "Unified agent & cross-harness sub-agent manager (`action`: `list` | `inspect` | `spawn` | `create` | `describe` | `redact` | `steer` | `wake` | `pause` | `archive` | `delete` | `rename` | `role` | `harness` | `models`, supporting multi-level sub-agent trees). Use `list` (default, with optional `parent`: `\"self\"` | `\"subagents\"` | `\"root\"` and `state`: `\"running\"` | `\"working\"` | `\"paused\"` | `\"archived\"` | `\"all\"`) to inspect agents and sub-agents; use `inspect` (`name`: `\"<agent-or-id>\"`, `limit`: `10`) to view live status, schedules, and recent turns; use `spawn` (`name`, `repo`: `\"<org>/<repo>\"` | `\"inherit\"`, `branch`, `base`, `workdir`: path | `\"worktree\"` | `\"private\"` | `\"inherit\"`, `description`, `prompt`, `harness`, `model`, `profile`) to launch a sub-agent with an isolated managed Git worktree; use `describe` (`name`: `\"self\"` | `\"all\"` | `\"<agent>\"`, `description`: `\"...\"`) to read or update role descriptions; use `steer`, `wake`, `pause`, `archive` (auto-reaps clean/pushed managed worktrees while preserving dirty ones), or `delete` to control lifecycle; use `redact` (`name`, `message_id` or `seq`, optional `span`: {`unit`: `bytes` | `chars`, `start`, `end`}, `reason`) for audited erasure with permission `conversation.redact` (ancestors/admin only, quiescent target); or use `create`, `rename`, `role`, `harness`, `models`."
+        description = "Unified agent & cross-harness sub-agent manager (`action`: `list` | `inspect` | `spawn` | `create` | `describe` | `redact` | `steer` | `wake` | `pause` | `archive` | `delete` | `rename` | `role` | `harness` | `models`, supporting multi-level sub-agent trees). Use `list` (default, with optional `parent`: `\"self\"` | `\"subagents\"` | `\"root\"` and `state`: `\"running\"` | `\"working\"` | `\"paused\"` | `\"archived\"` | `\"all\"`) to inspect agents and sub-agents; use `inspect` (`name`: `\"<agent-or-id>\"`, `limit`: `10`) to view live status, schedules, and recent turns; use `spawn` (`name`, `repo`: `\"<org>/<repo>\"` | `\"inherit\"`, `branch`, `base`, `workdir`: path | `\"worktree\"` | `\"private\"` | `\"inherit\"`, `description`, `prompt`, `harness`, `model`, `profile`) to launch a sub-agent with an isolated managed Git worktree; use `describe` (`name`: `\"self\"` | `\"all\"` | `\"<agent>\"`, `description`: `\"...\"`) to read role descriptions or update a target's `description`/`instructions`/`role` (updating `description`, `instructions`, `role`, or `rename` requires the target's Parent/Ancestor agent or an Admin); use `steer`, `wake`, `pause`, `archive` (auto-reaps clean/pushed managed worktrees while preserving dirty ones), or `delete` to control lifecycle; use `redact` (`name`, `message_id` or `seq`, optional `span`: {`unit`: `bytes` | `chars`, `start`, `end`}, `reason`) for audited erasure with permission `conversation.redact` (ancestors/admin only, quiescent target); or use `create`, `rename`, `role`, `harness`, `models`."
     )]
     async fn agents(
         &self,
@@ -2300,7 +2300,7 @@ impl AgentMcp {
     }
 
     #[tool(
-        description = "Read or update an agent's role & responsibility description (`description` / `instructions`). Any agent can update its own description (`agent: \"self\"`, `description: \"...\"`) whenever its mission or focus evolves, and Owner Admins or Parent agents can update other agents' descriptions. Updating `description` automatically syncs the agent's private `SYSTEM_PROMPT.md` / `AGENTS.md` and makes the role visible to all peers in `agents` and `groups`."
+        description = "Read or update an agent's role & responsibility description (`description` / `instructions`). Any agent can read its own or peers' descriptions (`agent: \"self\"` or `\"all\"`), while updating `description`, `instructions`, `role`, or `rename` requires the target's Parent/Ancestor agent or an Admin (`self` cannot modify its own `description` or `instructions` unless it is an Admin). Updating `description` automatically syncs the agent's private `SYSTEM_PROMPT.md` / `AGENTS.md` and makes the role visible to all peers in `agents` and `groups`."
     )]
     async fn describe(
         &self,
@@ -6958,6 +6958,30 @@ mod spawn_args_tests {
         for archetype in [agents.archetype, spawn.archetype, subagents.archetype] {
             assert_eq!(archetype.as_deref(), Some("custom-template"));
         }
+    }
+
+    #[test]
+    fn describe_and_agents_tool_docs_require_parent_ancestor_or_admin_for_mutations() {
+        let schema = serde_json::to_value(schemars::schema_for!(AgentsArgs)).unwrap();
+        let action_doc = schema["properties"]["action"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(action_doc.contains("Parent/Ancestor agent or an Admin"));
+        assert!(action_doc.contains("Parent/Ancestor or Admin: rename"));
+        let router = AgentMcp::tool_router();
+        let tools = router.list_all();
+        let agents_tool = tools.iter().find(|t| t.name == "agents").unwrap();
+        let describe_tool = tools.iter().find(|t| t.name == "describe").unwrap();
+        assert!(
+            agents_tool
+                .description
+                .as_deref()
+                .unwrap()
+                .contains("requires the target's Parent/Ancestor agent or an Admin")
+        );
+        let describe_doc = describe_tool.description.as_deref().unwrap();
+        assert!(describe_doc.contains("requires the target's Parent/Ancestor agent or an Admin"));
+        assert!(!describe_doc.contains("Any agent can update its own description"));
     }
 
     #[test]

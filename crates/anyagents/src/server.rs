@@ -663,15 +663,15 @@ fn capability_mark(store: Arc<Store>) -> impl Fn() -> Result<(), Error> + Send +
     }
 }
 
-/// `POST /v1/operator/agents/{name}/capability`: the operator gives one agent a
-/// fresh capability, retiring the last one. The value is written into that
-/// agent's own config directory and never returned.
+/// `POST /v1/operator/agents/{name}/capability`: the operator or a root admin
+/// gives one agent a fresh capability, retiring the last one. The value is
+/// written into that agent's own config directory and never returned.
 async fn mint_capability(
     principal: Principal,
     State(state): State<AppState>,
     AxumPath(name): AxumPath<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_operator(&principal)?;
+    require_admin_or_operator(&state.store, &principal, "agents.mint_capability", &name)?;
     let agent = state
         .store
         .agent_by_name(&name)
@@ -806,15 +806,15 @@ impl axum::extract::FromRequestParts<AppState> for Whoami {
 }
 
 /// `GET /v1/operator/agents/{name}/inbox`: any agent's mailbox, for the
-/// operator's own reading. A different path from the agent's own route, so a
-/// name can never be taken for an identity.
+/// operator's or a root admin's reading. A different path from the agent's own
+/// route, so a name can never be taken for an identity.
 async fn operator_inbox(
     principal: Principal,
     State(state): State<AppState>,
     AxumPath(name): AxumPath<String>,
     Query(query): Query<Since>,
 ) -> Result<Json<InboxResponse>, ApiError> {
-    require_operator(&principal)?;
+    require_admin_or_operator(&state.store, &principal, "agents.operator_inbox", &name)?;
     let agent = state
         .store
         .agent_by_name(&name)
@@ -941,7 +941,9 @@ async fn reset_session_route(
             .map_err(ApiError::from_store)?;
         let found = state.store.agent(&found.id).map_err(ApiError::from_store)?;
         match &principal {
-            Principal::Agent { agent_id, .. } if found.parent_id.as_ref() == Some(agent_id) => (),
+            Principal::Agent { agent_id, .. }
+                if agent_id != &found.id && is_self_or_ancestor(&state.store, agent_id, &found) => {
+            }
             _ => {
                 require_admin_or_operator(
                     &state.store,
@@ -973,7 +975,7 @@ async fn harness_route(
             Principal::Agent {
                 agent_id,
                 name: caller_name,
-            } if found.parent_id.as_ref() == Some(agent_id) => {
+            } if agent_id != &found.id && is_self_or_ancestor(&state.store, agent_id, &found) => {
                 format!("agent:{caller_name}")
             }
             _ => {
@@ -1014,14 +1016,11 @@ async fn transfer_agent_route(
             .store
             .agent_by_name(&name)
             .map_err(ApiError::from_store)?;
-        let actor = match &principal {
-            Principal::Agent {
-                agent_id,
-                name: caller_name,
-            } if found.parent_id.as_ref() == Some(agent_id) => {
-                format!("agent:{caller_name}")
+        let is_ancestor = match &principal {
+            Principal::Agent { agent_id, .. } => {
+                agent_id != &found.id && is_self_or_ancestor(&state.store, agent_id, &found)
             }
-            _ => require_admin_or_operator(&state.store, &principal, "agents.transfer", &found.name)?,
+            Principal::Operator => false,
         };
         let old_parent_name = found
             .parent_id
@@ -1037,10 +1036,16 @@ async fn transfer_agent_route(
             None | Some("none" | "root" | "null") => None,
             Some(raw) => {
                 let clean = raw.strip_prefix("agent:").unwrap_or(raw);
-                let target = state
-                    .store
-                    .agent_by_name(clean)
-                    .map_err(ApiError::from_store)?;
+                let target = if clean.eq_ignore_ascii_case("self")
+                    && let Principal::Agent { ref agent_id, .. } = principal
+                {
+                    state.store.agent(agent_id).map_err(ApiError::from_store)?
+                } else {
+                    state
+                        .store
+                        .agent_by_name(clean)
+                        .map_err(ApiError::from_store)?
+                };
                 if target.state == "archived" {
                     return Err(ApiError::new(
                         StatusCode::BAD_REQUEST,
@@ -1048,6 +1053,21 @@ async fn transfer_agent_route(
                     ));
                 }
                 Some(target)
+            }
+        };
+        let actor = match &principal {
+            Principal::Agent {
+                agent_id,
+                name: caller_name,
+            } if is_ancestor
+                && new_parent
+                    .as_ref()
+                    .is_some_and(|np| is_self_or_ancestor(&state.store, agent_id, np)) =>
+            {
+                format!("agent:{caller_name}")
+            }
+            _ => {
+                require_admin_or_operator(&state.store, &principal, "agents.transfer", &found.name)?
             }
         };
         let updated = state
@@ -1156,7 +1176,9 @@ fn authorize_schedule_target(
                 return store.agent(agent_id).map_err(ApiError::from_store);
             }
             let found = store.agent_by_name(clean).map_err(ApiError::from_store)?;
-            if &found.id == agent_id || found.parent_id.as_ref() == Some(agent_id) {
+            if &found.id == agent_id
+                || (agent_id != &found.id && is_self_or_ancestor(store, agent_id, &found))
+            {
                 return Ok(found);
             }
             require_admin_or_operator(store, principal, "agents.schedule", &found.name)?;
@@ -1457,7 +1479,15 @@ async fn rename_agent_route(
             .store
             .agent_by_name(&name)
             .map_err(ApiError::from_store)?;
-        require_admin_or_operator(&state.store, &principal, "agents.rename", &old.name)?;
+        let is_ancestor = match &principal {
+            Principal::Agent { agent_id, .. } => {
+                *agent_id != old.id && is_self_or_ancestor(&state.store, agent_id, &old)
+            }
+            Principal::Operator => true,
+        };
+        if !is_ancestor {
+            require_admin_or_operator(&state.store, &principal, "agents.rename", &old.name)?;
+        }
         let updated = state
             .store
             .rename_agent(&old.id, &body.name)
@@ -1510,7 +1540,15 @@ async fn role_agent_route(
             .store
             .agent_by_name(&name)
             .map_err(ApiError::from_store)?;
-        require_admin_or_operator(&state.store, &principal, "agents.role", &found.name)?;
+        let is_ancestor = match &principal {
+            Principal::Agent { agent_id, .. } => {
+                *agent_id != found.id && is_self_or_ancestor(&state.store, agent_id, &found)
+            }
+            Principal::Operator => true,
+        };
+        if !is_ancestor {
+            require_admin_or_operator(&state.store, &principal, "agents.role", &found.name)?;
+        }
         let new_role = if body.clear.unwrap_or(false) {
             None
         } else {
@@ -1768,13 +1806,13 @@ async fn set_description_route(
                 .agent_by_name(&name)
                 .map_err(ApiError::from_store)?
         };
-        let is_self_or_parent = match &principal {
+        let is_ancestor = match &principal {
             Principal::Agent { agent_id, .. } => {
-                is_self_or_ancestor(&state.store, agent_id, &target)
+                *agent_id != target.id && is_self_or_ancestor(&state.store, agent_id, &target)
             }
             Principal::Operator => true,
         };
-        if !is_self_or_parent {
+        if !is_ancestor {
             require_admin_or_operator(
                 &state.store,
                 &principal,
@@ -1787,12 +1825,6 @@ async fn set_description_route(
             Principal::Agent { name, .. } => format!("agent:{name}"),
         };
         let mut rec = target;
-        let is_ancestor = match &principal {
-            Principal::Agent { agent_id, .. } => {
-                *agent_id != rec.id && is_self_or_ancestor(&state.store, agent_id, &rec)
-            }
-            Principal::Operator => true,
-        };
         if let Some(ref scope_val) = body.scope {
             if !is_ancestor {
                 require_admin_or_operator(&state.store, &principal, "agents.scope", &rec.name)?;
@@ -3128,7 +3160,7 @@ async fn archive_agent_route(
         } else if matches!(
             &principal,
             Principal::Agent { agent_id, .. }
-                if agent_id != &found.id && found.parent_id.as_ref() != Some(agent_id)
+                if agent_id != &found.id && !is_self_or_ancestor(&state.store, agent_id, &found)
         ) {
             require_admin_or_operator(&state.store, &principal, "agents.archive", &found.name)?;
         }
@@ -3571,7 +3603,7 @@ async fn pause_agent_route(
         } else if matches!(
             &principal,
             Principal::Agent { agent_id, .. }
-                if agent_id != &found.id && found.parent_id.as_ref() != Some(agent_id)
+                if agent_id != &found.id && !is_self_or_ancestor(&state.store, agent_id, &found)
         ) {
             require_admin_or_operator(&state.store, &principal, "agents.pause", &found.name)?;
         }
@@ -3621,7 +3653,7 @@ async fn delete_agent_route(
         } else if matches!(
             &principal,
             Principal::Agent { agent_id, .. }
-                if agent_id != &found.id && found.parent_id.as_ref() != Some(agent_id)
+                if agent_id != &found.id && !is_self_or_ancestor(&state.store, agent_id, &found)
         ) {
             require_admin_or_operator(&state.store, &principal, "agents.delete", &found.name)?;
         }
@@ -3704,12 +3736,14 @@ async fn wake_agent_route(
             .agent_by_name(&name)
             .map_err(ApiError::from_store)?;
         if let Principal::Agent {
+            agent_id: ref caller_id,
             name: ref caller_name,
-            ..
         } = principal
         {
             let actor = Actor::Agent(caller_name.clone());
-            if can_actor_message_agent(&state.store, &actor, &found).is_err() {
+            if !is_self_or_ancestor(&state.store, caller_id, &found)
+                && can_actor_message_agent(&state.store, &actor, &found).is_err()
+            {
                 require_admin_or_operator(&state.store, &principal, "agents.wake", &found.name)?;
             }
         }
@@ -7663,13 +7697,25 @@ pub(crate) mod tests {
                     assert_eq!(store.agent(&mind.id).unwrap(), before);
                 }
             }
-            let err = set_description_route(caller(&mind), State(state.clone()), AxumPath("self".into()), Json(serde_json::from_value(serde_json::json!({"scope":"public"})).unwrap()))
-                .await.expect_err("self cannot widen scope");
-            assert_eq!(err.status, StatusCode::FORBIDDEN);
+            for self_caller in [&mind, &parent] {
+                for body in [
+                    serde_json::json!({"scope":"public"}),
+                    serde_json::json!({"description":"Self-modified description"}),
+                    serde_json::json!({"instructions":"Self-modified instructions"}),
+                ] {
+                    let err = set_description_route(caller(self_caller), State(state.clone()), AxumPath("self".into()), Json(serde_json::from_value(body).unwrap()))
+                        .await.expect_err("non-admin self cannot mutate description, instructions, or scope");
+                    assert_eq!(err.status, StatusCode::FORBIDDEN);
+                }
+                let Json(read_self) = get_description_route(caller(self_caller), State(state.clone()), AxumPath("self".into()))
+                    .await.expect("self can read own description");
+                assert_eq!(read_self["name"], self_caller.name);
+            }
+            assert_eq!(store.agent(&mind.id).unwrap(), before);
 
             // An admin's self update is allowed and has the same atomic audit.
             store.set_agent_admin(&parent.id, true).unwrap();
-            let _ = set_description_route(caller(&parent), State(state.clone()), AxumPath("self".into()), Json(serde_json::from_value(serde_json::json!({"scope":"isolated"})).unwrap()))
+            let _ = set_description_route(caller(&parent), State(state.clone()), AxumPath("self".into()), Json(serde_json::from_value(serde_json::json!({"scope":"isolated", "description":"Admin self charter"})).unwrap()))
                 .await.unwrap_or_else(|e| panic!("{}", e.message));
             let conn = rusqlite::Connection::open(dir.path().join("state.db")).unwrap();
             let mut stmt = conn.prepare("SELECT actor,before_scope,after_scope,source FROM admin_audit WHERE target='mind' AND source IS NOT NULL ORDER BY id").unwrap();
