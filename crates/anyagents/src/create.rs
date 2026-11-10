@@ -1876,6 +1876,9 @@ pub(crate) fn seed_harness_credentials(
     if let (Some(bound), Some(primary_profile_root)) =
         (current_bound.clone(), profile_roots.first().cloned())
     {
+        if bound.starts_with("sylphx/") || bound.starts_with("spiron/") {
+            crate::spiron::ensure_spiron_seat_auth(&primary_profile_root);
+        }
         let harvest_peers = all_agents.len() <= 32;
         for other in &all_agents {
             if !harvest_peers && other.id != agent.id {
@@ -8414,7 +8417,32 @@ pub(crate) fn apply_archetype_defaults(
     {
         body.workdir = Some(wd);
     }
+    let sub_cfg = load_subagent_defaults(data_dir);
+    let sub_spec = parent
+        .and_then(|p| sub_cfg.agents.get(&p.name))
+        .unwrap_or(&sub_cfg.default);
+    let preset_subagent = parent.is_some() && !sub_spec.mode.eq_ignore_ascii_case("inherit");
+    let preset_has_harness = preset_subagent
+        && sub_spec
+            .harness
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|s| !s.is_empty() && !s.eq_ignore_ascii_case("inherit"));
+    let preset_has_model = preset_subagent
+        && sub_spec
+            .model
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|s| !s.is_empty() && !s.eq_ignore_ascii_case("inherit"));
+    let preset_has_profile = preset_subagent
+        && sub_spec
+            .profile
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|s| !s.is_empty() && !s.eq_ignore_ascii_case("inherit"));
+
     if body.harness.as_deref().is_none_or(|h| h.trim().is_empty())
+        && !preset_has_harness
         && let Some(h) = tpl.harness
     {
         body.harness = Some(h);
@@ -8424,6 +8452,7 @@ pub(crate) fn apply_archetype_defaults(
         .as_deref()
         .map(str::trim)
         .is_none_or(str::is_empty)
+        && !preset_has_model
         && let Some(m) = tpl.model
     {
         body.model = Some(m);
@@ -8433,6 +8462,7 @@ pub(crate) fn apply_archetype_defaults(
         .as_deref()
         .map(str::trim)
         .is_none_or(str::is_empty)
+        && !preset_has_profile
         && let Some(p) = tpl.profile
     {
         body.profile = Some(p);

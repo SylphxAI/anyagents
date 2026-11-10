@@ -100,6 +100,52 @@ fn write_spiron_config_toml(config_dir: &Path, model: Option<&str>) -> Result<()
 /// files when `auth.json` does not already contain a valid Spiron `access_token`.
 pub fn ensure_spiron_seat_auth(config_dir: &Path) {
     let auth_path = config_dir.join("auth.json");
+    let discovered_org_id = [
+        ".config/sylphx/credentials.json",
+        "credentials.json",
+        "auth.json",
+        ".config/sylphx/auth.json",
+        ".spiron/auth.json",
+    ]
+    .into_iter()
+    .find_map(|rel| {
+        let raw = std::fs::read_to_string(config_dir.join(rel)).ok()?;
+        let val = serde_json::from_str::<serde_json::Value>(&raw).ok()?;
+        val.get("org_id")
+            .or_else(|| val.get("active_org"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    });
+
+    // Prefer project-bound keys (.config/sylphx/key, .config/opencode/sylphx.key,
+    // or credentials.json project_keys) over org-wide keys so Spiron never
+    // fails with project_key_required, even if auth.json was previously
+    // seeded with an org-wide api_key.
+    for rel in [".config/sylphx/key", ".config/opencode/sylphx.key"] {
+        if let Ok(raw) = std::fs::read_to_string(config_dir.join(rel)) {
+            let key = raw.trim();
+            if !key.is_empty() {
+                write_spiron_auth_doc(config_dir, &auth_path, key, discovered_org_id.as_deref());
+                return;
+            }
+        }
+    }
+    for rel in [".config/sylphx/credentials.json", "credentials.json"] {
+        if let Ok(raw) = std::fs::read_to_string(config_dir.join(rel))
+            && let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw)
+            && let Some(project_key) = extract_project_bound_key(config_dir, &val)
+        {
+            write_spiron_auth_doc(
+                config_dir,
+                &auth_path,
+                &project_key,
+                discovered_org_id.as_deref(),
+            );
+            return;
+        }
+    }
     if let Ok(existing_raw) = std::fs::read_to_string(&auth_path)
         && let Ok(existing_val) = serde_json::from_str::<serde_json::Value>(&existing_raw)
         && existing_val
@@ -125,40 +171,53 @@ pub fn ensure_spiron_seat_auth(config_dir: &Path) {
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
         {
-            let mut doc = serde_json::json!({
-                "access_token": key,
-            });
-            if let Some(org_id) = val
-                .get("org_id")
-                .or_else(|| val.get("active_org"))
-                .and_then(|v| v.as_str())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-            {
-                doc["org_id"] = serde_json::Value::String(org_id.to_string());
-            }
-            if let Ok(bytes) = serde_json::to_vec_pretty(&doc) {
-                write_restricted_auth_file(&auth_path, &bytes);
-                mirror_spiron_auth_paths(config_dir, &bytes);
-            }
+            write_spiron_auth_doc(config_dir, &auth_path, key, discovered_org_id.as_deref());
             return;
         }
     }
-    for rel in [".config/sylphx/key", ".config/opencode/sylphx.key"] {
-        if let Ok(raw) = std::fs::read_to_string(config_dir.join(rel)) {
-            let key = raw.trim();
-            if !key.is_empty() {
-                let doc = serde_json::json!({
-                    "access_token": key,
-                });
-                if let Ok(bytes) = serde_json::to_vec_pretty(&doc) {
-                    write_restricted_auth_file(&auth_path, &bytes);
-                    mirror_spiron_auth_paths(config_dir, &bytes);
-                }
-                return;
-            }
+}
+
+fn write_spiron_auth_doc(config_dir: &Path, auth_path: &Path, key: &str, org_id: Option<&str>) {
+    let mut doc = serde_json::json!({
+        "access_token": key,
+    });
+    if let Some(org) = org_id.map(str::trim).filter(|s| !s.is_empty()) {
+        doc["org_id"] = serde_json::Value::String(org.to_string());
+    }
+    if let Ok(bytes) = serde_json::to_vec_pretty(&doc) {
+        write_restricted_auth_file(auth_path, &bytes);
+        mirror_spiron_auth_paths(config_dir, &bytes);
+    }
+}
+
+fn extract_project_bound_key(config_dir: &Path, val: &serde_json::Value) -> Option<String> {
+    let map = val.get("project_keys")?.as_object()?;
+    if let Ok(ctx_raw) = std::fs::read_to_string(config_dir.join(".config/sylphx/context.json"))
+        && let Ok(ctx) = serde_json::from_str::<serde_json::Value>(&ctx_raw)
+    {
+        let project = ctx
+            .get("project_id")
+            .or_else(|| ctx.get("project"))
+            .and_then(|v| v.as_str());
+        let env = ctx
+            .get("environment")
+            .or_else(|| ctx.get("env"))
+            .and_then(|v| v.as_str());
+        if let (Some(p), Some(e)) = (project, env)
+            && let Some(k) = map
+                .get(&format!("{p}:{e}"))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        {
+            return Some(k.to_string());
         }
     }
+    map.values()
+        .filter_map(|v| v.as_str())
+        .map(str::trim)
+        .find(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 fn write_restricted_auth_file(path: &Path, bytes: &[u8]) {
@@ -176,17 +235,56 @@ fn write_restricted_auth_file(path: &Path, bytes: &[u8]) {
 fn mirror_spiron_auth_paths(config_dir: &Path, bytes: &[u8]) {
     for rel in [".config/sylphx/auth.json", ".spiron/auth.json"] {
         let target = config_dir.join(rel);
-        let needs_write = std::fs::read_to_string(&target)
-            .ok()
-            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-            .and_then(|v| {
-                v.get("access_token")
-                    .and_then(|t| t.as_str())
-                    .map(|s| s.trim().to_string())
-            })
-            .is_none_or(|s| s.is_empty());
-        if needs_write {
+        if std::fs::read(&target).ok().as_deref() != Some(bytes) {
             write_restricted_auth_file(&target, bytes);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ensure_spiron_seat_auth_prefers_project_key_over_org_wide_credentials_and_heals_stale_auth()
+    {
+        let temp = tempfile::tempdir().unwrap();
+        let cfg = temp.path();
+        std::fs::create_dir_all(cfg.join(".config/sylphx")).unwrap();
+        std::fs::write(
+            cfg.join(".config/sylphx/credentials.json"),
+            r#"{"api_key":"sk_org_wide_123","org_id":"org_demo","project_keys":{"proj_1:production":"sk_proj_bound_456"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            cfg.join("auth.json"),
+            r#"{"access_token":"sk_org_wide_123","org_id":"org_demo"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            cfg.join(".config/sylphx/auth.json"),
+            r#"{"access_token":"sk_org_wide_123","org_id":"org_demo"}"#,
+        )
+        .unwrap();
+
+        ensure_spiron_seat_auth(cfg);
+        let auth: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(cfg.join("auth.json")).unwrap()).unwrap();
+        assert_eq!(auth["access_token"], "sk_proj_bound_456");
+        assert_eq!(auth["org_id"], "org_demo");
+
+        std::fs::write(
+            cfg.join(".config/sylphx/key"),
+            "sk_proj_explicit_789
+",
+        )
+        .unwrap();
+        ensure_spiron_seat_auth(cfg);
+        for rel in ["auth.json", ".config/sylphx/auth.json", ".spiron/auth.json"] {
+            let doc: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(cfg.join(rel)).unwrap()).unwrap();
+            assert_eq!(doc["access_token"], "sk_proj_explicit_789");
+            assert_eq!(doc["org_id"], "org_demo");
         }
     }
 }
