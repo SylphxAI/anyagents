@@ -804,13 +804,13 @@ fn authenticate_mcp_request(
 fn ensure_internal_socket_listener(state: &AppState) -> PathBuf {
     let data_dir = state.store.data_dir();
     let sock = socket_path(data_dir);
-    if !sock.exists() {
-        if let Ok(listener) = tokio::net::UnixListener::bind(&sock) {
-            let app = build_router(state.clone());
-            tokio::spawn(async move {
-                let _ = axum::serve(listener, app).await;
-            });
-        }
+    if !sock.exists()
+        && let Ok(listener) = tokio::net::UnixListener::bind(&sock)
+    {
+        let app = build_router(state.clone());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
     }
     sock
 }
