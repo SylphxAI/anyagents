@@ -686,6 +686,8 @@ pub(crate) fn build_webhook_router(state: AppState) -> Router {
         .route("/healthz", get(webhook_healthz))
         .route("/v1/webhooks/healthz", get(webhook_healthz))
         .route("/v1/webhooks/telegram/{channel_id}", post(telegram_webhook))
+        .route("/v1/webhooks/mcp", get(mcp_get_route).post(mcp_post_route))
+        .route("/v1/mcp", get(mcp_get_route).post(mcp_post_route))
         .route("/mcp", get(mcp_get_route).post(mcp_post_route))
         .with_state(state)
 }
@@ -754,6 +756,8 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/v1/whoami", get(whoami))
         .route("/v1/webhooks/healthz", get(webhook_healthz))
         .route("/v1/webhooks/telegram/{channel_id}", post(telegram_webhook))
+        .route("/v1/webhooks/mcp", get(mcp_get_route).post(mcp_post_route))
+        .route("/v1/mcp", get(mcp_get_route).post(mcp_post_route))
         .route("/mcp", get(mcp_get_route).post(mcp_post_route))
         .with_state(state)
 }
