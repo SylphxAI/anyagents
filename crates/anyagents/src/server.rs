@@ -3343,6 +3343,7 @@ async fn archive_agent_route(
                     .health
                     .get(&found.id)
                     .is_none_or(|live| !live.process_alive)
+                    && state.store.try_lock_agent(&found.id).is_ok()
                 {
                     break;
                 }
@@ -3779,6 +3780,7 @@ async fn pause_agent_route(
                 .health
                 .get(&found.id)
                 .is_none_or(|live| !live.process_alive)
+                && state.store.try_lock_agent(&found.id).is_ok()
             {
                 break;
             }
