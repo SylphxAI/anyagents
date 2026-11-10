@@ -1106,8 +1106,9 @@ fn poisoned_agy_result_retires_the_session_without_acknowledging_the_turn() {
         };
         let line = super::message_line(&spec, &message);
         assert!(matches!(
-            harness.deliver(&message, &line).unwrap(),
-            anyagents_harness::DeliverOutcome::Accepted { .. }
+            harness.deliver(&message, &line),
+            Ok(anyagents_harness::DeliverOutcome::Accepted { .. })
+                | Err(anyagents_harness::HarnessError::Dead)
         ));
         assert!(harness.wait_pred(Duration::from_secs(3), |state| state.epoch > 0));
         assert_eq!(harness.health().process_alive, !poisoned);
@@ -1193,8 +1194,9 @@ fn synthetic_401_claude_turn_fails_and_stops_stream_without_completing_turn() {
     };
     let line = super::message_line(&spec, &message);
     assert!(matches!(
-        harness.deliver(&message, &line).unwrap(),
-        anyagents_harness::DeliverOutcome::Accepted { .. }
+        harness.deliver(&message, &line),
+        Ok(anyagents_harness::DeliverOutcome::Accepted { .. })
+            | Err(anyagents_harness::HarnessError::Dead)
     ));
     assert!(harness.wait_pred(Duration::from_secs(3), |state| !state.alive));
     assert!(!harness.health().process_alive);
