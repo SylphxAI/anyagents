@@ -2415,7 +2415,10 @@ mod tests {
                 let deadline = std::time::Instant::now() + Duration::from_secs(5);
                 let mut stream = loop {
                     match listener.accept() {
-                        Ok((stream, _)) => break stream,
+                        Ok((stream, _)) => {
+                            stream.set_nonblocking(false).unwrap();
+                            break stream;
+                        }
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                             assert!(std::time::Instant::now() < deadline, "missing HTTP request");
                             std::thread::sleep(Duration::from_millis(5));
@@ -2423,6 +2426,7 @@ mod tests {
                         Err(error) => panic!("fixture accept: {error}"),
                     }
                 };
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(2)))
                     .unwrap();
