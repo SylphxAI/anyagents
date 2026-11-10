@@ -740,7 +740,6 @@ pub(super) fn invalidate_peers_cache() {
 /// Registered root-to-principal resolution is the same authority used by vendor
 /// launch. Unregistered directories remain foreign in the shared inventory.
 pub(crate) fn peer_principals(store: &anyagents_core::Store) -> Result<String, Error> {
-    use std::sync::{Mutex, OnceLock};
     let agents = store.list_agents()?;
     let cacheable = !is_isolated_test_env() && std::env::var_os("ANYAGENTS_PRINCIPALS").is_none();
     if cacheable
