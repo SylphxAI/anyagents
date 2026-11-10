@@ -341,6 +341,17 @@ fn create_with_seat(
         }
         crate::operator::mint(store, &agent.id)?;
         store.set_agent_launch_env(&agent.id, &pairs)?;
+        if anyagents_tools::SandboxConfig::from_config_dir(&config).is_none()
+            && let Some(provider) = anyagents_tools::SandboxProviderConfig::resolve(Some(&data))
+            && let Ok(sbx) = anyagents_tools::SandboxProvider::provision(
+                &provider,
+                agent.id.as_str(),
+                &agent.name,
+                effective_repo,
+            )
+        {
+            let _ = sbx.write_to_config_dir(&config);
+        }
         let mut pre_running = agent.clone();
         pre_running.workdir = Some(cwd.display().to_string());
         reconcile_agent_runtime_config(store, &data, &pre_running, &config, &cwd)?;

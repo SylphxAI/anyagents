@@ -3336,6 +3336,11 @@ async fn archive_agent_route(
             .map_err(ApiError::from_store)?;
         mark_explicitly_archived_locked(&state.store, state.store.data_dir(), &agent)
             .map_err(ApiError::from_store)?;
+        if let Some(sbx) = anyagents_tools::SandboxConfig::from_config_dir(
+            &anyagents_core::agent_config_dir(state.store.data_dir(), &found.id),
+        ) {
+            let _ = anyagents_tools::SandboxProvider::pause(&sbx);
+        }
         if !is_self {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
             while std::time::Instant::now() < deadline {
@@ -3774,6 +3779,11 @@ async fn pause_agent_route(
             .store
             .set_agent_state(&found.id, "paused")
             .map_err(ApiError::from_store)?;
+        if let Some(sbx) = anyagents_tools::SandboxConfig::from_config_dir(
+            &anyagents_core::agent_config_dir(state.store.data_dir(), &found.id),
+        ) {
+            let _ = anyagents_tools::SandboxProvider::pause(&sbx);
+        }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while std::time::Instant::now() < deadline {
             if state
@@ -3860,6 +3870,10 @@ async fn delete_agent_route(
             .data_dir()
             .join("agents")
             .join(deleted.id.as_str());
+        if let Some(sbx) = anyagents_tools::SandboxConfig::from_config_dir(&agent_dir.join("config"))
+        {
+            let _ = anyagents_tools::SandboxProvider::destroy(&sbx);
+        }
         let seat_ids = detect_seat_ids(&agent_dir.join("config"));
         let _ = crate::browser::stop_profile(state.store.data_dir(), &deleted.name);
         remove_path_with_seat(
@@ -3932,6 +3946,9 @@ async fn wake_agent_route(
 /// succeeds; direct sends commit it atomically with their mailbox append.
 fn prepare_agent_wake(store: &Store, found: &Agent) -> Result<(), ApiError> {
     let cfg = anyagents_core::agent_config_dir(store.data_dir(), &found.id);
+    if let Some(sbx) = anyagents_tools::SandboxConfig::from_config_dir(&cfg) {
+        let _ = anyagents_tools::SandboxProvider::resume(&sbx);
+    }
     let work_dir = found
         .workdir
         .as_deref()

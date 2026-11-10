@@ -31,6 +31,7 @@ mod opencode_config;
 mod operator;
 mod reply;
 mod sandbox;
+mod sandbox_exec;
 mod schedule;
 mod seat_tree;
 mod server;
@@ -569,6 +570,9 @@ enum Command {
     /// Run the outbound cloud harness adapter (`spiron-cloud`, `claude-cloud`, `openai-cloud`, `cursor-cloud`) speaking `stream-json`.
     #[command(name = "cloud-harness")]
     CloudHarness(cloud_harness::CloudHarnessArgs),
+    /// Run a local CLI harness inside a remote sandbox (`POST /v1/sandboxes/{id}/exec`) speaking `stream-json`.
+    #[command(name = "sandbox-exec")]
+    SandboxExec(sandbox_exec::SandboxExecArgs),
 }
 
 #[derive(Subcommand)]
@@ -936,6 +940,15 @@ fn main() -> ExitCode {
     let raw_argv: Vec<String> = std::env::args().collect();
     if let Some(cloud_args) = cloud_harness::try_parse_from_raw_argv(&raw_argv) {
         return match cloud_harness::run(cloud_args) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("{err}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if let Some(sbx_args) = sandbox_exec::try_parse_from_raw_argv(&raw_argv) {
+        return match sandbox_exec::run(sbx_args) {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
                 eprintln!("{err}");
@@ -1383,6 +1396,7 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
         } => schedule_cmd(&data, agent, at, every, watch, prompt, cancel, json),
         Command::Inspect { agent, limit, json } => inspect_cmd(&data, agent, limit, json),
         Command::CloudHarness(args) => cloud_harness::run(args),
+        Command::SandboxExec(args) => sandbox_exec::run(args),
     }
 }
 
