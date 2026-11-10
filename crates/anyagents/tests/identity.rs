@@ -1446,3 +1446,253 @@ fn offline_session_reset_refuses_agent_self_and_peer_but_allows_operator() {
         );
     }
 }
+
+#[test]
+fn three_tier_agent_authority_separates_worker_parent_subtree_and_admin() {
+    use anyagents_core::{AgentId, Store};
+    let _env = support::lock();
+    let dir = support::physical_tempdir();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    support::operator_for_contract(&data);
+    let server = start_server(&data);
+
+    let h1_root = create(&data, "tree-root");
+    let h2_dept_a = create(&data, "dept-a");
+    let h2_dept_b = create(&data, "dept-b");
+    let h3_worker = create(&data, "worker-leaf");
+    let outsider_root = create(&data, "outsider-root");
+    let sys_admin = create(&data, "sys-admin");
+
+    let store = Store::open(data.join("state.db")).unwrap();
+    let h1_id = AgentId::parse(&h1_root).unwrap();
+    let h2a_id = AgentId::parse(&h2_dept_a).unwrap();
+    let h2b_id = AgentId::parse(&h2_dept_b).unwrap();
+    let h3_id = AgentId::parse(&h3_worker).unwrap();
+    let admin_id = AgentId::parse(&sys_admin).unwrap();
+
+    store.set_agent_parent(&h2a_id, Some(&h1_id)).unwrap();
+    store.set_agent_parent(&h2b_id, Some(&h1_id)).unwrap();
+    store.set_agent_parent(&h3_id, Some(&h2a_id)).unwrap();
+    store.set_agent_admin(&admin_id, true).unwrap();
+
+    let call_as = |caller_id: &str, method: &str, path: &str, body: Value| {
+        let auth = format!("x-anyagents-agent: {}\r\n", capability(&data, caller_id));
+        support::call_raw(&server.socket, method, path, &body.to_string(), &auth)
+    };
+
+    // 1. Tier 1 (Worker/Self): cannot mutate own description, instructions, role, or rename self,
+    //    even if it is a non-admin root (`tree-root`), while read-only GET on `self` works.
+    for caller in [&h3_worker, &h2_dept_a, &h1_root] {
+        let get_self = call_as(caller, "GET", "/v1/agents/self/description", json!(null));
+        assert!(get_self.starts_with("HTTP/1.1 200"), "{get_self}");
+        for payload in [
+            json!({"description": "self-mutated description"}),
+            json!({"instructions": "self-mutated instructions"}),
+            json!({"role": "SelfRole"}),
+            json!({"clear": true}),
+        ] {
+            let refused = call_as(caller, "POST", "/v1/agents/self/description", payload);
+            assert!(refused.starts_with("HTTP/1.1 403"), "{refused}");
+        }
+    }
+    assert!(
+        call_as(
+            &h3_worker,
+            "POST",
+            "/v1/agents/worker-leaf/role",
+            json!({"role": "SelfRole"})
+        )
+        .starts_with("HTTP/1.1 403")
+    );
+    assert!(
+        call_as(
+            &h3_worker,
+            "POST",
+            "/v1/agents/worker-leaf/rename",
+            json!({"name": "worker-self-renamed"})
+        )
+        .starts_with("HTTP/1.1 403")
+    );
+
+    // 2. Tier 2 (Parent/Ancestor `is_ancestor` without `is_admin`):
+    //    `tree-root` (H1) can manage multi-hop grandchild `worker-leaf` (H3) across all subtree routes.
+    let desc_ok = call_as(
+        &h1_root,
+        "POST",
+        "/v1/agents/worker-leaf/description",
+        json!({"description": "Grandchild mission", "instructions": "Grandchild rules", "role": "Executor"}),
+    );
+    assert!(desc_ok.starts_with("HTTP/1.1 200"), "{desc_ok}");
+
+    let role_ok = call_as(
+        &h1_root,
+        "POST",
+        "/v1/agents/worker-leaf/role",
+        json!({"role": "Senior Executor"}),
+    );
+    assert!(role_ok.starts_with("HTTP/1.1 200"), "{role_ok}");
+
+    let rename_ok = call_as(
+        &h1_root,
+        "POST",
+        "/v1/agents/worker-leaf/rename",
+        json!({"name": "worker-leaf-v2"}),
+    );
+    assert!(rename_ok.starts_with("HTTP/1.1 200"), "{rename_ok}");
+
+    let sched_set = call_as(
+        &h1_root,
+        "POST",
+        "/v1/agents/worker-leaf-v2/schedules",
+        json!({"action": "set", "every": "1h", "prompt": "subtree check"}),
+    );
+    assert!(sched_set.starts_with("HTTP/1.1 200"), "{sched_set}");
+    let sched_list = call_as(
+        &h1_root,
+        "GET",
+        "/v1/agents/worker-leaf-v2/schedules",
+        json!(null),
+    );
+    assert!(
+        sched_list.starts_with("HTTP/1.1 200") && sched_list.contains("subtree check"),
+        "{sched_list}"
+    );
+
+    // Pause, reset_session, harness, archive, and wake on multi-hop grandchild `worker-leaf-v2` by `tree-root` (H1).
+    let paused = call_as(
+        &h1_root,
+        "POST",
+        "/v1/agents/worker-leaf-v2/pause",
+        json!({}),
+    );
+    assert!(paused.starts_with("HTTP/1.1 200"), "{paused}");
+
+    let reset_ok = call_as(
+        &h1_root,
+        "POST",
+        "/v1/agents/worker-leaf-v2/session/reset",
+        json!({}),
+    );
+    assert!(reset_ok.starts_with("HTTP/1.1 200"), "{reset_ok}");
+
+    let harness_ok = call_as(
+        &h1_root,
+        "POST",
+        "/v1/agents/worker-leaf-v2/harness",
+        json!({"harness": "claude-code", "model": "claude-sonnet-4-6"}),
+    );
+    assert!(harness_ok.starts_with("HTTP/1.1 200"), "{harness_ok}");
+
+    let archived = call_as(
+        &h1_root,
+        "POST",
+        "/v1/agents/worker-leaf-v2/archive",
+        json!({}),
+    );
+    assert!(archived.starts_with("HTTP/1.1 200"), "{archived}");
+
+    let woke = call_as(
+        &h1_root,
+        "POST",
+        "/v1/agents/worker-leaf-v2/wake",
+        json!({}),
+    );
+    assert!(woke.starts_with("HTTP/1.1 200"), "{woke}");
+
+    // Transfer within `tree-root`'s subtree (`dept-a` -> `dept-b` and `dept-b` -> `self`) is allowed,
+    // while transferring outside `tree-root`'s subtree (`outsider-root` or `root`) is refused (403)!
+    let transfer_within = call_as(
+        &h1_root,
+        "POST",
+        "/v1/agents/worker-leaf-v2/transfer",
+        json!({"parent": "dept-b", "reason": "rebalance within tree"}),
+    );
+    assert!(
+        transfer_within.starts_with("HTTP/1.1 200"),
+        "{transfer_within}"
+    );
+    let transfer_to_self = call_as(
+        &h1_root,
+        "POST",
+        "/v1/agents/worker-leaf-v2/transfer",
+        json!({"parent": "self", "reason": "direct custody"}),
+    );
+    assert!(
+        transfer_to_self.starts_with("HTTP/1.1 200"),
+        "{transfer_to_self}"
+    );
+    let transfer_back = call_as(
+        &h1_root,
+        "POST",
+        "/v1/agents/worker-leaf-v2/transfer",
+        json!({"parent": "dept-a"}),
+    );
+    assert!(transfer_back.starts_with("HTTP/1.1 200"), "{transfer_back}");
+
+    for outside_parent in ["root", "outsider-root"] {
+        let refused_escape = call_as(
+            &h1_root,
+            "POST",
+            "/v1/agents/worker-leaf-v2/transfer",
+            json!({"parent": outside_parent}),
+        );
+        assert!(
+            refused_escape.starts_with("HTTP/1.1 403"),
+            "non-admin parent must not transfer to {outside_parent}: {refused_escape}"
+        );
+    }
+
+    // Outsider cannot manage `worker-leaf-v2`.
+    assert!(
+        call_as(
+            &outsider_root,
+            "POST",
+            "/v1/agents/worker-leaf-v2/rename",
+            json!({"name": "hijacked"})
+        )
+        .starts_with("HTTP/1.1 403")
+    );
+
+    // 3. Tier 3 (Admin `is_admin = 1` on `sys-admin`):
+    //    Can access `/v1/operator/agents/{name}/inbox` and `/v1/operator/agents/{name}/capability`,
+    //    and can delete `worker-leaf-v2` (or `tree-root` can delete its own grandchild).
+    assert!(
+        call_as(
+            &h1_root,
+            "GET",
+            "/v1/operator/agents/outsider-root/inbox",
+            json!(null)
+        )
+        .starts_with("HTTP/1.1 403")
+    );
+    assert!(
+        call_as(
+            &h1_root,
+            "POST",
+            "/v1/operator/agents/outsider-root/capability",
+            json!({})
+        )
+        .starts_with("HTTP/1.1 403")
+    );
+    let admin_inbox = call_as(
+        &sys_admin,
+        "GET",
+        "/v1/operator/agents/outsider-root/inbox",
+        json!(null),
+    );
+    assert!(admin_inbox.starts_with("HTTP/1.1 200"), "{admin_inbox}");
+    let admin_mint = call_as(
+        &sys_admin,
+        "POST",
+        "/v1/operator/agents/outsider-root/capability",
+        json!({}),
+    );
+    assert!(admin_mint.starts_with("HTTP/1.1 200"), "{admin_mint}");
+
+    // Multi-hop ancestor `tree-root` can delete grandchild `worker-leaf-v2`.
+    let deleted = call_as(&h1_root, "DELETE", "/v1/agents/worker-leaf-v2", json!(null));
+    assert!(deleted.starts_with("HTTP/1.1 200"), "{deleted}");
+
+    drop(server);
+}

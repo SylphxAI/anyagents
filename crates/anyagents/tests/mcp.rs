@@ -895,8 +895,32 @@ async fn mcp_tools_use_the_server_socket() {
         "unexpected private group post error: {beta_post_private_group}"
     );
 
-    // Custody transfer (`agents` `action = "transfer"`): `alpha` transfers `worker-1` to `beta`,
-    // after which `beta` CAN message `worker-1` directly, and `beta` transfers `worker-1` back to `alpha`.
+    // Custody transfer (`agents` `action = "transfer"`): a non-admin parent cannot transfer a child
+    // outside its own subtree (`beta`), while an Admin can transfer across root trees.
+    let cross_tree_err = error_text(
+        &call(
+            &alpha,
+            "agents",
+            serde_json::json!({
+                "action": "transfer",
+                "name": &spawned.id,
+                "parent": "beta",
+                "prompt": "unauthorized cross-tree handoff"
+            }),
+        )
+        .await,
+    );
+    assert!(
+        cross_tree_err.contains("administrative authority required"),
+        "unexpected error: {cross_tree_err}"
+    );
+    {
+        let store = anyagents_core::Store::open(dir.path().join("state.db")).unwrap();
+        let alpha_rec = store.agent_by_name("alpha").unwrap();
+        let beta_rec = store.agent_by_name("beta").unwrap();
+        store.set_agent_admin(&alpha_rec.id, true).unwrap();
+        store.set_agent_admin(&beta_rec.id, true).unwrap();
+    }
     let transferred_to_beta: serde_json::Value = ok_json(
         call(
             &alpha,
@@ -938,6 +962,13 @@ async fn mcp_tools_use_the_server_socket() {
     );
     assert_eq!(transferred_back["previous_parent"], "beta");
     assert_eq!(transferred_back["new_parent"], "alpha");
+    {
+        let store = anyagents_core::Store::open(dir.path().join("state.db")).unwrap();
+        let alpha_rec = store.agent_by_name("alpha").unwrap();
+        let beta_rec = store.agent_by_name("beta").unwrap();
+        store.set_agent_admin(&alpha_rec.id, false).unwrap();
+        store.set_agent_admin(&beta_rec.id, false).unwrap();
+    }
 
     // Archive the sub-agent (`state = archived`), then pause `beta` to verify `to: ["all"]` reports paused Root peers in `skipped`.
     let archived: AgentView =
@@ -1329,6 +1360,19 @@ async fn describe_preserves_config_permissions_without_vendor_restart_writers() 
         let alpha_cfg = dir.path().join("agents").join(&alpha_id).join("config");
         std::fs::set_permissions(&alpha_cfg, std::fs::Permissions::from_mode(0o0700)).unwrap();
         let before_gid = std::fs::metadata(&alpha_cfg).unwrap().gid();
+        let self_mut_err = error_text(
+            &call(
+                &alpha,
+                "describe",
+                serde_json::json!({"agent": "self", "description": "Unauthorized self mutation."}),
+            )
+            .await,
+        );
+        assert!(
+            self_mut_err.contains("administrative authority required"),
+            "unexpected error: {self_mut_err}"
+        );
+        store.set_agent_admin(&agent.id, true).unwrap();
         let desc_res: serde_json::Value = ok_json(
             call(
                 &alpha,
