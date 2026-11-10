@@ -258,7 +258,24 @@ fn checks_with_principals(
         if Some(peer.as_path()) == config.and_then(Path::parent) || same_seat {
             continue;
         }
-        foreign_roots.push(std::fs::canonicalize(&peer)?);
+        let canonical_peer = match std::fs::canonicalize(&peer) {
+            Ok(path) => path,
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound
+                ) =>
+            {
+                match (peer.parent(), peer.file_name()) {
+                    (Some(parent), Some(name)) => std::fs::canonicalize(parent)
+                        .unwrap_or_else(|_| parent.to_path_buf())
+                        .join(name),
+                    _ => peer.clone(),
+                }
+            }
+            Err(err) => return Err(err),
+        };
+        foreign_roots.push(canonical_peer);
         for name in ["config", "memory", "skills"] {
             let p = quote(&peer.join(name))?;
             peer_trees_program.push_str(&format!(
@@ -342,18 +359,58 @@ fn checks_with_principals(
             let entries = match std::fs::read_dir(&source) {
                 Ok(entries) => entries,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error)
+                    if source == root.join("skills")
+                        && error.kind() == std::io::ErrorKind::PermissionDenied =>
+                {
+                    let source = quote(&source)?;
+                    let view = quote(&root.join("skills-view"))?;
+                    let global = quote(&data.join("skills"))?;
+                    for mirror in [".claude/skills", ".agents/skills", ".agy/skills"] {
+                        let target_path = config.join(mirror);
+                        let parent = quote(target_path.parent().unwrap())?;
+                        let target = quote(&target_path)?;
+                        list.push(Check {
+                            what: "mounted host skills are readable by the agent",
+                            program: format!(
+                                "if [ -d {source} ] && [ ! -L {parent} ] && {{ [ ! -L {target} ] || \
+                                 [ \"$(readlink {target})\" = {view} ] || \
+                                 [ \"$(readlink {target})\" = {global} ]; }}; then \
+                                 for entry in {source}/*; do \
+                                 [ -f \"$entry/SKILL.md\" ] || continue; \
+                                 [ -r {target}/\"$(basename \"$entry\")\"/SKILL.md ] || exit 1; \
+                                 done; fi"
+                            ),
+                        });
+                    }
+                    continue;
+                }
                 Err(error) => return Err(error),
             };
             for entry in entries {
                 let entry = entry?;
-                if !entry.path().join("SKILL.md").is_file() {
-                    continue;
-                }
+                let skill_md = entry.path().join("SKILL.md");
+                let check_as_seat = match std::fs::metadata(&skill_md) {
+                    Ok(meta) if meta.is_file() => false,
+                    Err(error)
+                        if source == root.join("skills")
+                            && error.kind() == std::io::ErrorKind::PermissionDenied =>
+                    {
+                        true
+                    }
+                    _ => continue,
+                };
+                let source_skill = quote(&skill_md)?;
                 for mirror in [".claude/skills", ".agents/skills", ".agy/skills"] {
                     let target = config.join(mirror);
                     let parent = quote(target.parent().unwrap())?;
                     let skill = quote(&target.join(entry.file_name()).join("SKILL.md"))?;
                     let target = quote(&target)?;
+                    let exists_guard = if check_as_seat {
+                        format!("[ -f {source_skill} ] && ")
+                    } else {
+                        String::new()
+                    };
                     // Mounting deliberately preserves a foreign vendor parent
                     // or skills link. Evaluate that same distinction as the
                     // seat, including owner-private parents the host cannot
@@ -361,7 +418,7 @@ fn checks_with_principals(
                     list.push(Check {
                         what: "mounted host skills are readable by the agent",
                         program: format!(
-                            "if [ ! -L {parent} ] && {{ [ ! -L {target} ] || \
+                            "if {exists_guard}[ ! -L {parent} ] && {{ [ ! -L {target} ] || \
                              [ \"$(readlink {target})\" = {view} ] || \
                              [ \"$(readlink {target})\" = {global} ]; }}; then [ -r {skill} ]; fi",
                             view = quote(&root.join("skills-view"))?,
@@ -611,6 +668,50 @@ mod tests {
         assert!(
             !run().status.success(),
             "missing ordinary mirror must still refuse"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn seat_private_skills_tree_delegates_mirror_check_without_failing_host_inventory() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("agents/one");
+        let config = root.join("config");
+        let seat_skills = root.join("skills");
+        std::fs::create_dir_all(seat_skills.join("local-only")).unwrap();
+        std::fs::write(seat_skills.join("local-only/SKILL.md"), "local").unwrap();
+        for mirror in [".claude", ".agents", ".agy"] {
+            std::fs::create_dir_all(config.join(mirror).join("skills/local-only")).unwrap();
+            std::fs::write(
+                config.join(mirror).join("skills/local-only/SKILL.md"),
+                "local",
+            )
+            .unwrap();
+        }
+        std::fs::set_permissions(&seat_skills, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let built = checks(Some(&config), dir.path(), 2100, 2100);
+        std::fs::set_permissions(&seat_skills, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let selected: Vec<_> = built
+            .expect("host inventory should delegate unreadable seat skills dir")
+            .into_iter()
+            .filter(|c| c.what == "mounted host skills are readable by the agent")
+            .collect();
+        let script = admission_script(selected);
+        let ok = std::process::Command::new("/bin/sh")
+            .args(["-c", &script])
+            .output()
+            .unwrap();
+        assert!(ok.status.success(), "{ok:?}");
+        std::fs::remove_file(config.join(".claude/skills/local-only/SKILL.md")).unwrap();
+        let refused = std::process::Command::new("/bin/sh")
+            .args(["-c", &script])
+            .output()
+            .unwrap();
+        assert!(!refused.status.success());
+        assert_eq!(
+            refused.stderr,
+            b"boundary check failed: mounted host skills are readable by the agent\n"
         );
     }
 
