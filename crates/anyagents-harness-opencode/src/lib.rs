@@ -1189,20 +1189,13 @@ fn is_opencode_service_pid(pid: u32) -> bool {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn proc_ppid(pid: u32) -> Option<u32> {
-    #[cfg(target_os = "linux")]
-    {
-        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-        let after_comm = stat.rfind(')')?;
-        let mut fields = stat[after_comm + 1..].split_whitespace();
-        let _state = fields.next()?;
-        fields.next()?.parse::<u32>().ok()
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = pid;
-        None
-    }
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_comm = stat.rfind(')')?;
+    let mut fields = stat[after_comm + 1..].split_whitespace();
+    let _state = fields.next()?;
+    fields.next()?.parse::<u32>().ok()
 }
 
 fn direct_child_pids(parent_pid: u32) -> Vec<u32> {
