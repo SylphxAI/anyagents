@@ -10228,13 +10228,33 @@ exec '{}' "$@"
                 "{skills_res}"
             );
 
-            // 4. `McpProfile::Coordination` is auto-selected for `spiron` agents (and when `?profile=coordination` is passed).
-            let (_, spiron_list_json) = post_mcp(
+            // 4. `spiron` agents are treated uniformly (defaulting to `McpProfile::Remote` over HTTP `/mcp`),
+            // while explicit `?profile=coordination` exposes pure coordination tools only.
+            let (_, spiron_default_json) = post_mcp(
                 &spiron_cap,
                 None,
                 serde_json::json!({
                     "jsonrpc": "2.0",
                     "id": 9,
+                    "method": "tools/list",
+                    "params": {}
+                }),
+            )
+            .await;
+            let spiron_default_tools: Vec<String> = spiron_default_json["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["name"].as_str().unwrap().to_string())
+                .collect();
+            assert_eq!(spiron_default_tools, expected_remote);
+
+            let (_, spiron_list_json) = post_mcp(
+                &spiron_cap,
+                Some("coordination"),
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 91,
                     "method": "tools/list",
                     "params": {}
                 }),
@@ -10251,11 +10271,19 @@ exec '{}' "$@"
                 .map(|s| (*s).to_string())
                 .collect();
             assert_eq!(spiron_tools, expected_coord);
-            for omitted in ["code", "web_search", "web_fetch", "memory", "skills"] {
+            for omitted in [
+                "code",
+                "web_search",
+                "web_fetch",
+                "memory",
+                "skills",
+                "browser",
+                "computer",
+            ] {
                 assert!(!spiron_tools.contains(&omitted.to_string()));
                 let (_, err_json) = post_mcp(
                     &spiron_cap,
-                    None,
+                    Some("coordination"),
                     serde_json::json!({
                         "jsonrpc": "2.0",
                         "id": 10,

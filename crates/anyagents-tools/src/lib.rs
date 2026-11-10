@@ -13,8 +13,6 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-pub mod memory;
-pub mod skills;
 pub mod web;
 
 const DEFAULT_REMOTE_WORKDIR: &str = "/workspace";
@@ -1085,7 +1083,7 @@ mod tests {
         let events_srv = Arc::clone(&events);
         let files_srv = Arc::clone(&remote_files);
         let handle = std::thread::spawn(move || {
-            for _ in 0..9 {
+            for _ in 0..6 {
                 let Ok((mut stream, _)) = listener.accept() else {
                     break;
                 };
@@ -1232,14 +1230,15 @@ mod tests {
         let reloaded = SandboxConfig::from_config_dir(&cfg_dir).unwrap();
         assert_eq!(reloaded, sbx);
 
-        // Verify MemoryStore over RemoteSandbox
-        let mem =
-            memory::MemoryStore::with_default_dir(WorkspaceBackend::RemoteSandbox(sbx.clone()));
-        mem.write_index("# Remote Memory\n").unwrap();
-        assert_eq!(mem.read_index().unwrap(), "# Remote Memory\n");
-        mem.write_topic("roadmap", "Ship v1\n").unwrap();
-        assert_eq!(mem.read_topic("roadmap").unwrap(), "Ship v1\n");
-        assert_eq!(mem.list_topics().unwrap(), vec!["roadmap".to_string()]);
+        // Verify WorkspaceBackend::RemoteSandbox read/write
+        let backend = WorkspaceBackend::RemoteSandbox(sbx.clone());
+        backend
+            .write_file_bytes(Some("notes.md"), b"# Remote Sandbox\n", false, true)
+            .unwrap();
+        assert_eq!(
+            backend.read_file_bytes(Some("notes.md")).unwrap().1,
+            b"# Remote Sandbox\n"
+        );
 
         SandboxProvider::pause(&sbx).unwrap();
         SandboxProvider::resume(&sbx).unwrap();
