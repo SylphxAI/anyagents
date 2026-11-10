@@ -223,6 +223,8 @@ mod tests {
                     body.len()
                 )
                 .unwrap();
+                stream.flush().unwrap();
+                let _ = stream.shutdown(std::net::Shutdown::Write);
             }
         });
         assert!(verify_capability(&reopened, &agent.id, &token).is_ok());
