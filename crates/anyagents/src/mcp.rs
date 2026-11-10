@@ -2853,6 +2853,15 @@ pub fn tool_definitions(profile: McpProfile) -> Vec<rmcp::model::Tool> {
 }
 
 impl rmcp::ServerHandler for AgentMcp {
+    fn get_info(&self) -> rmcp::model::ServerConfig {
+        rmcp::model::ServerConfig::new(
+            rmcp::model::ServerCapabilities::builder()
+                .enable_tools()
+                .build(),
+        )
+        .with_server_info(rmcp::model::Implementation::from_build_env())
+    }
+
     async fn list_tools(
         &self,
         _request: Option<rmcp::model::PaginatedRequestParams>,
@@ -8658,6 +8667,13 @@ mod spawn_args_tests {
             },
             profile: McpProfile::Full,
         };
+        assert!(
+            rmcp::ServerHandler::get_info(&mcp)
+                .capabilities
+                .tools
+                .is_some(),
+            "stdio ServerHandler::get_info() must advertise tools capability so MCP clients call tools/list"
+        );
 
         // Direct `files` read on PNG returns clean metadata + native MCP Image ContentBlock.
         let MultimediaJson(png_json, png_media) = mcp
