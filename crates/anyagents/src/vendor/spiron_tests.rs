@@ -756,3 +756,52 @@ sys.exit({exit})
         }
     }
 }
+
+#[test]
+fn spiron_runtime_config_writes_always_approve_and_materializes_seat_auth() {
+    let temp = crate::test_tempdir();
+    let config = temp.path().join("config");
+    std::fs::create_dir_all(config.join(".config/sylphx")).unwrap();
+    std::fs::write(
+        config.join(".config/sylphx/credentials.json"),
+        r#"{"api_key":"sk-sylphx-seat-key","org_id":"org_test_1"}"#,
+    )
+    .unwrap();
+    // Stale codex config.toml should be replaced with Spiron's config.toml
+    std::fs::write(
+        config.join("config.toml"),
+        "[mcp_servers.anyagents]\ncommand = \"/old/anyagents\"\n",
+    )
+    .unwrap();
+
+    crate::spiron::write_spiron_config(
+        &config,
+        Some("sylphx/openai/gpt-6.1-sol#xhigh"),
+        Path::new("/usr/bin/anyagents"),
+        &["mcp".to_string()],
+    )
+    .unwrap();
+
+    crate::create::verify_harness_runtime_config(
+        &config,
+        "spiron",
+        Some("sylphx/openai/gpt-6.1-sol#xhigh"),
+    )
+    .unwrap();
+
+    let toml_text = std::fs::read_to_string(config.join("config.toml")).unwrap();
+    assert!(toml_text.contains("always_approve = true"), "{toml_text}");
+    assert!(
+        toml_text.contains("model = \"openai/gpt-6.1-sol#xhigh\""),
+        "{toml_text}"
+    );
+    assert!(
+        !toml_text.contains("[mcp_servers.anyagents]"),
+        "{toml_text}"
+    );
+
+    let auth_raw = std::fs::read_to_string(config.join("auth.json")).unwrap();
+    let auth_json: serde_json::Value = serde_json::from_str(&auth_raw).unwrap();
+    assert_eq!(auth_json["access_token"], "sk-sylphx-seat-key");
+    assert_eq!(auth_json["org_id"], "org_test_1");
+}

@@ -566,25 +566,27 @@ fn format_subtree_breakdown(stats: &SubtreeStats) -> String {
     parts.join(" ")
 }
 
-/// Strip redundant provider/gateway prefixes from model IDs for compact display.
-pub fn short_model_name(raw: &str) -> &str {
+/// Compact model IDs for display:
+/// - `<gateway>/<vendor>/<model>` -> `<gateway>/<model>` (preserves gateway routing identity without hardcoding gateway names)
+/// - `<vendor>/<model>` -> `<model>` for standard model vendors
+pub fn short_model_name(raw: &str) -> std::borrow::Cow<'_, str> {
     let s = raw.trim();
-    for prefix in [
-        "sylphx/openai/",
-        "sylphx/anthropic/",
-        "sylphx/google/",
-        "sylphx/xai/",
-        "sylphx/",
-        "openai/",
-        "anthropic/",
-        "google/",
-        "xai/",
-    ] {
-        if let Some(rest) = s.strip_prefix(prefix) {
-            return rest;
+    if let Some((first, rest)) = s.split_once('/') {
+        if let Some((_vendor, leaf)) = rest.split_once('/')
+            && !first.is_empty()
+            && !leaf.is_empty()
+        {
+            return std::borrow::Cow::Owned(format!("{first}/{leaf}"));
+        }
+        if matches!(
+            first,
+            "openai" | "anthropic" | "google" | "xai" | "deepseek" | "meta"
+        ) && !rest.is_empty()
+        {
+            return std::borrow::Cow::Borrowed(rest);
         }
     }
-    s
+    std::borrow::Cow::Borrowed(s)
 }
 
 fn format_status_with_alerts(agent: &AgentView, now: i64) -> String {
@@ -1099,7 +1101,7 @@ pub fn print_agents_table_with_options(
         if agent.harness == "claude-code"
             && let Some(stripped) = short_model.strip_prefix("claude-")
         {
-            short_model = stripped;
+            short_model = std::borrow::Cow::Owned(stripped.to_string());
         }
         let same_as_parent = node
             .parent_runtime
@@ -1598,10 +1600,10 @@ mod tests {
     }
 
     #[test]
-    fn short_model_strips_provider_prefixes() {
+    fn short_model_preserves_gateway_and_strips_vendor_prefixes() {
         assert_eq!(
             short_model_name("sylphx/openai/gpt-6.1-sol#xhigh"),
-            "gpt-6.1-sol#xhigh"
+            "sylphx/gpt-6.1-sol#xhigh"
         );
         assert_eq!(
             short_model_name("anthropic/claude-opus-5-5#xhigh"),
