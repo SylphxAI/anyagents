@@ -7,9 +7,61 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
+mod desktop;
+mod mobile;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DesktopPlatform {
+    Linux,
+    MacOs,
+    Windows,
+    ChromeOs,
+}
+
+impl DesktopPlatform {
+    pub fn detect(req: &Value) -> Result<Self, String> {
+        let platform = req
+            .get("platform")
+            .or_else(|| req.get("os"))
+            .and_then(Value::as_str);
+        Self::from_environment(
+            platform,
+            std::env::consts::OS,
+            std::env::var_os("SOMMELIER_VERSION").is_some()
+                || std::env::var_os("CHROMEOS_RELEASE_NAME").is_some(),
+        )
+    }
+
+    fn from_environment(
+        platform: Option<&str>,
+        host: &str,
+        crostini: bool,
+    ) -> Result<Self, String> {
+        let name = platform
+            .unwrap_or(if crostini { "chromeos" } else { host })
+            .trim()
+            .to_ascii_lowercase();
+        match name.as_str() {
+            "linux" => Ok(Self::Linux),
+            "macos" | "mac_os" | "mac" | "darwin" => Ok(Self::MacOs),
+            "windows" | "win32" | "win" => Ok(Self::Windows),
+            "chromeos" | "chrome_os" | "chromebook" | "crostini" => Ok(Self::ChromeOs),
+            other => Err(format!("unsupported desktop platform `{other}`")),
+        }
+    }
+}
+
+fn skip_host_desktop_queries(req: &Value) -> bool {
+    // Tests must not query the host desktop or trigger headless permission prompts.
+    // An explicit platform/os still opts into exercising that backend.
+    crate::sandbox::is_isolated_test_env()
+        && req.get("platform").or_else(|| req.get("os")).is_none()
+}
+
 const B64_ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-fn base64_encode(data: &[u8]) -> String {
+pub(crate) fn base64_encode(data: &[u8]) -> String {
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b0 = chunk[0] as u32;
@@ -1256,6 +1308,7 @@ async fn run_cmd(
 ) -> Result<std::process::Output, String> {
     let mut cmd = tokio::process::Command::new(program);
     cmd.args(args)
+        .kill_on_drop(true)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -1279,6 +1332,7 @@ async fn run_cmd_with_stdin(
     use tokio::io::AsyncWriteExt as _;
     let mut cmd = tokio::process::Command::new(program);
     cmd.args(args)
+        .kill_on_drop(true)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -1288,14 +1342,18 @@ async fn run_cmd_with_stdin(
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("failed to spawn `{program}`: {e}"))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(stdin_bytes)
-            .await
-            .map_err(|e| format!("failed writing stdin to `{program}`: {e}"))?;
-        let _ = stdin.shutdown().await;
-    }
-    tokio::time::timeout(Duration::from_millis(timeout_ms), child.wait_with_output())
+    let mut stdin = child.stdin.take().ok_or("child stdin unavailable")?;
+    let write = async {
+        stdin.write_all(stdin_bytes).await?;
+        stdin.shutdown().await
+    };
+    // Drain stdout/stderr concurrently with stdin: native scripts can emit large trees/images.
+    let operation = async {
+        let (written, output) = tokio::join!(write, child.wait_with_output());
+        written?;
+        output
+    };
+    tokio::time::timeout(Duration::from_millis(timeout_ms), operation)
         .await
         .map_err(|_| format!("`{program}` timed out after {timeout_ms}ms"))?
         .map_err(|e| format!("failed waiting for `{program}`: {e}"))
@@ -1310,7 +1368,7 @@ async fn list_local_windows(envs: &[(&str, &str)]) -> Result<Vec<Value>, String>
         let mut windows = Vec::new();
         for line in text.lines() {
             let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 8 {
+            if parts.len() >= 9 {
                 let win_id = parts[0].to_string();
                 let desktop = parts[1].to_string();
                 let pid = parts[2].parse::<u32>().unwrap_or(0);
@@ -1398,6 +1456,14 @@ async fn collect_local_a11y_nodes(
     window_filter: Option<&str>,
 ) -> Vec<RawA11yNode> {
     let windows = list_local_windows(envs).await.unwrap_or_default();
+    a11y_nodes_from_windows(windows, app_filter, window_filter)
+}
+
+fn a11y_nodes_from_windows(
+    windows: Vec<Value>,
+    app_filter: Option<&str>,
+    window_filter: Option<&str>,
+) -> Vec<RawA11yNode> {
     let mut nodes = Vec::new();
     for w in windows {
         let wid = w
@@ -1467,14 +1533,9 @@ async fn collect_local_a11y_nodes(
 }
 
 async fn capture_local_screenshot(
-    display: Option<&str>,
+    envs: &[(&str, &str)],
     crop: Option<Region>,
 ) -> Result<(Vec<u8>, &'static str), String> {
-    let mut envs = Vec::new();
-    if let Some(d) = display.filter(|s| !s.trim().is_empty()) {
-        envs.push(("DISPLAY", d));
-    }
-
     // 1. ImageMagick `import` (X11)
     let mut import_args = vec!["-window", "root"];
     let crop_spec;
@@ -1485,7 +1546,7 @@ async fn capture_local_screenshot(
         import_args.push("+repage");
     }
     import_args.push("png:-");
-    if let Ok(out) = run_cmd("import", &import_args, &envs, 10_000).await
+    if let Ok(out) = run_cmd("import", &import_args, envs, 10_000).await
         && out.status.success()
         && !out.stdout.is_empty()
     {
@@ -1501,7 +1562,7 @@ async fn capture_local_screenshot(
         grim_args.push(&grim_geom);
     }
     grim_args.push("-");
-    if let Ok(out) = run_cmd("grim", &grim_args, &envs, 10_000).await
+    if let Ok(out) = run_cmd("grim", &grim_args, envs, 10_000).await
         && out.status.success()
         && !out.stdout.is_empty()
     {
@@ -1526,7 +1587,7 @@ async fn capture_local_screenshot(
         scrot_args.push(&scrot_crop);
     }
     scrot_args.push(&tmp_str);
-    if let Ok(out) = run_cmd("scrot", &scrot_args, &envs, 10_000).await
+    if let Ok(out) = run_cmd("scrot", &scrot_args, envs, 10_000).await
         && out.status.success()
         && let Ok(bytes) = tokio::fs::read(&tmp_path).await
     {
@@ -1583,6 +1644,14 @@ async fn execute_computer_request_inner(
     if let Some(d) = display.filter(|s| !s.trim().is_empty()) {
         envs.push(("DISPLAY", d));
     }
+    let wayland_owned = payload
+        .get("wayland_display")
+        .or_else(|| req.get("wayland_display"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    if let Some(d) = wayland_owned.as_deref().filter(|s| !s.trim().is_empty()) {
+        envs.push(("WAYLAND_DISPLAY", d));
+    }
 
     let raw_action = payload
         .get("action")
@@ -1591,6 +1660,86 @@ async fn execute_computer_request_inner(
         .unwrap_or("screenshot")
         .trim()
         .to_ascii_lowercase();
+
+    // Forward every cloud action (including snapshots/clipboard) before touching the local host.
+    let session_id = req
+        .get("session_id")
+        .or_else(|| req.get("sandbox_id"))
+        .and_then(Value::as_str);
+    if session_id.is_some()
+        || req
+            .get("provider")
+            .and_then(Value::as_str)
+            .is_some_and(|p| p.eq_ignore_ascii_case("cloud"))
+    {
+        let base_url = std::env::var("SYLPHX_SANDBOX_URL")
+            .unwrap_or_else(|_| resolve_sylphx_gateway_base_url());
+        let api_key = resolve_sylphx_api_key(data_dir, config_dir).ok_or(
+            "cloud computer sandbox requires SYLPHX_API_KEY or configured Sylphx gateway key",
+        )?;
+        let endpoint = format!(
+            "{}/v1/sandboxes/{}/computer",
+            base_url.trim_end_matches('/'),
+            session_id.unwrap_or("default")
+        );
+        // Preserve the cloud pixel-action protocol; semantic/ref requests stay intact.
+        let cloud_payload = if payload
+            .get("ref")
+            .or_else(|| payload.get("ref_id"))
+            .is_none()
+        {
+            parse_computer_action(&payload)
+                .ok()
+                .map(|action| json!({"action": action, "display": display}))
+        } else {
+            None
+        }
+        .unwrap_or(payload);
+        let (status, bytes) = tokio::task::spawn_blocking(move || {
+            post_json_bytes(&endpoint, &api_key, &cloud_payload, 30)
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        let body: Value = serde_json::from_slice(&bytes)
+            .map_err(|e| format!("invalid cloud computer JSON: {e}"))?;
+        return if (200..300).contains(&status) {
+            Ok(body)
+        } else {
+            Err(format!("cloud computer sandbox returned {status}: {body}"))
+        };
+    }
+    let platform_req = if payload
+        .get("platform")
+        .or_else(|| payload.get("os"))
+        .is_some()
+    {
+        &payload
+    } else {
+        &req
+    };
+    let platform = DesktopPlatform::detect(platform_req)?;
+    let skip_host_queries = skip_host_desktop_queries(platform_req);
+    if platform == DesktopPlatform::ChromeOs {
+        if raw_action == "open_url" {
+            let url = payload
+                .get("url")
+                .and_then(Value::as_str)
+                .ok_or("missing `url` for computer.open_url")?;
+            let out = run_cmd("garcon-url-handler", &[url], &envs, 10_000).await?;
+            desktop::checked_output(out, "garcon-url-handler")?;
+            return Ok(json!({"action": "open_url", "platform": "chrome_os", "url": url}));
+        }
+        if raw_action == "device"
+            || payload.get("target").and_then(Value::as_str) == Some("android")
+        {
+            let mut device_req = payload
+                .get("device_request")
+                .cloned()
+                .unwrap_or_else(|| payload.clone());
+            device_req["platform"] = json!("android");
+            return execute_device_request(config_dir, device_req).await;
+        }
+    }
 
     // Handle Semantic Accessibility Snapshot, Window Management & Clipboard actions first:
     match raw_action.as_str() {
@@ -1627,7 +1776,16 @@ async fn execute_computer_request_inner(
             };
 
             let snapshot_id = generate_snapshot_id();
-            let mut raw_nodes = collect_local_a11y_nodes(&envs, app_filter, window_filter).await;
+            let mut raw_nodes = if skip_host_queries {
+                a11y_nodes_from_windows(Vec::new(), app_filter, window_filter)
+            } else {
+                match platform {
+                    DesktopPlatform::MacOs | DesktopPlatform::Windows => {
+                        desktop::collect_nodes(platform, &payload).await?
+                    }
+                    _ => collect_local_a11y_nodes(&envs, app_filter, window_filter).await,
+                }
+            };
             if let Some(ref root_entry) = resolved_root {
                 raw_nodes = filter_a11y_subtree_by_ref(raw_nodes, root_entry);
             }
@@ -1637,13 +1795,23 @@ async fn execute_computer_request_inner(
             return Ok(json!({
                 "action": "snapshot",
                 "snapshot_id": snapshot_id,
+                "platform": platform,
                 "root_ref": resolved_root.map(|e| e.ref_id),
                 "element_count": ref_map.refs.len(),
                 "elements": elements,
             }));
         }
         "list_windows" | "windows" => {
-            let windows = list_local_windows(&envs).await?;
+            let windows = if skip_host_queries {
+                Vec::new()
+            } else {
+                match platform {
+                    DesktopPlatform::MacOs | DesktopPlatform::Windows => {
+                        desktop::list_windows(platform).await?
+                    }
+                    _ => list_local_windows(&envs).await?,
+                }
+            };
             return Ok(json!({
                 "action": "list_windows",
                 "count": windows.len(),
@@ -1651,6 +1819,9 @@ async fn execute_computer_request_inner(
             }));
         }
         "focus_window" => {
+            if matches!(platform, DesktopPlatform::MacOs | DesktopPlatform::Windows) {
+                return desktop::execute_aux(platform, &payload).await;
+            }
             let wid = payload
                 .get("window_id")
                 .or_else(|| payload.get("id"))
@@ -1685,6 +1856,9 @@ async fn execute_computer_request_inner(
             ));
         }
         "clipboard_get" => {
+            if matches!(platform, DesktopPlatform::MacOs | DesktopPlatform::Windows) {
+                return desktop::execute_aux(platform, &payload).await;
+            }
             for (prog, args) in [
                 ("xclip", &["-selection", "clipboard", "-o"][..]),
                 ("xsel", &["--clipboard", "--output"][..]),
@@ -1707,6 +1881,9 @@ async fn execute_computer_request_inner(
             );
         }
         "clipboard_set" => {
+            if matches!(platform, DesktopPlatform::MacOs | DesktopPlatform::Windows) {
+                return desktop::execute_aux(platform, &payload).await;
+            }
             let text = payload
                 .get("text")
                 .and_then(Value::as_str)
@@ -1766,49 +1943,9 @@ async fn execute_computer_request_inner(
     }
 
     let action = parse_computer_action(&payload)?;
-    let session_id = req
-        .get("session_id")
-        .or_else(|| req.get("sandbox_id"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    let provider = req
-        .get("provider")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .unwrap_or("auto");
-
-    if session_id.is_some() || provider.eq_ignore_ascii_case("cloud") {
-        let base_url = std::env::var("SYLPHX_SANDBOX_URL")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(resolve_sylphx_gateway_base_url);
-        let api_key = resolve_sylphx_api_key(data_dir, config_dir).ok_or_else(|| {
-            "cloud computer sandbox requires SYLPHX_API_KEY or configured Sylphx gateway key"
-                .to_string()
-        })?;
-        let sid = session_id.unwrap_or("default");
-        let endpoint = format!(
-            "{}/v1/sandboxes/{}/computer",
-            base_url.trim_end_matches('/'),
-            sid
-        );
-        let payload = json!({
-            "action": action,
-            "display": display,
-        });
-        let (status, bytes) =
-            tokio::task::spawn_blocking(move || post_json_bytes(&endpoint, &api_key, &payload, 30))
-                .await
-                .map_err(|e| format!("cloud computer sandbox task failed: {e}"))??;
-        let body: Value = serde_json::from_slice(&bytes)
-            .map_err(|e| format!("invalid JSON from cloud computer sandbox ({status}): {e}"))?;
-        if !(200..300).contains(&status) {
-            return Err(format!("cloud computer sandbox returned {status}: {body}"));
-        }
-        return Ok(body);
+    if matches!(platform, DesktopPlatform::MacOs | DesktopPlatform::Windows) {
+        return desktop::execute_action(platform, &action, resolved_ref_entry.as_ref()).await;
     }
-
     if let Some(ref entry) = resolved_ref_entry
         && let Some(ref wid) = entry.window_id
         && wid != "root"
@@ -1818,7 +1955,7 @@ async fn execute_computer_request_inner(
 
     match action {
         ComputerAction::Screenshot => {
-            let (png, backend) = capture_local_screenshot(display, None).await?;
+            let (png, backend) = capture_local_screenshot(&envs, None).await?;
             let (width, height) = parse_png_dimensions(&png).unwrap_or((0, 0));
             let b64 = base64_encode(&png);
             Ok(json!({
@@ -1832,7 +1969,7 @@ async fn execute_computer_request_inner(
             }))
         }
         ComputerAction::Zoom { region } => {
-            let (png, backend) = capture_local_screenshot(display, Some(region)).await?;
+            let (png, backend) = capture_local_screenshot(&envs, Some(region)).await?;
             let (width, height) =
                 parse_png_dimensions(&png).unwrap_or((region.width, region.height));
             let b64 = base64_encode(&png);
@@ -2202,6 +2339,21 @@ async fn run_adb(serial: Option<&str>, args: &[&str], timeout_ms: u64) -> Result
 
 /// Execute a `tools.device` (Android/iOS mobile device control) request.
 pub async fn execute_device_request(work_dir: &Path, req: Value) -> Result<Value, String> {
+    mobile::execute(work_dir, req).await.map_err(|err| {
+        if err.contains("\"disposition\"") { err } else {
+            let mut disposition = classify_computer_error(&err);
+            disposition.hint = Some(match disposition.kind.as_str() {
+                "stale_ref" => "Call tools.device.snapshot() for fresh refs on this device.",
+                "settled_absence" => "Inspect the device and take a new tools.device.snapshot(); do not blindly retry.",
+                "retryable_failure" => "Transient device transport failure; retry once.",
+                _ => "Check platform, device identity, and adb/idb/simctl/WDA configuration.",
+            }.into());
+            format_computer_error(err, disposition)
+        }
+    })
+}
+
+async fn execute_android_request(work_dir: &Path, req: Value) -> Result<Value, String> {
     let action = req
         .get("action")
         .and_then(Value::as_str)
@@ -2793,6 +2945,92 @@ pub async fn execute_media_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn desktop_platform_detection_and_overrides() {
+        for (name, expected) in [
+            ("linux", DesktopPlatform::Linux),
+            ("darwin", DesktopPlatform::MacOs),
+            ("windows", DesktopPlatform::Windows),
+            ("chromebook", DesktopPlatform::ChromeOs),
+        ] {
+            assert_eq!(
+                DesktopPlatform::from_environment(Some(name), "linux", false).unwrap(),
+                expected
+            );
+        }
+        assert_eq!(
+            DesktopPlatform::from_environment(None, "linux", true).unwrap(),
+            DesktopPlatform::ChromeOs
+        );
+        assert_eq!(
+            DesktopPlatform::from_environment(Some("linux"), "linux", true).unwrap(),
+            DesktopPlatform::Linux
+        );
+        assert_eq!(
+            DesktopPlatform::from_environment(None, "macos", false).unwrap(),
+            DesktopPlatform::MacOs
+        );
+        assert!(DesktopPlatform::from_environment(Some("unsupported"), "linux", false).is_err());
+    }
+
+    #[test]
+    fn isolated_desktop_queries_require_an_explicit_platform() {
+        assert!(skip_host_desktop_queries(&json!({"action": "snapshot"})));
+        for key in ["platform", "os"] {
+            for platform in ["linux", "macos", "windows", "chromeos"] {
+                let mut req = json!({"action": "snapshot"});
+                req[key] = json!(platform);
+                assert!(!skip_host_desktop_queries(&req), "{req}");
+            }
+        }
+    }
+
+    #[test]
+    fn isolated_desktop_snapshot_and_window_list_complete_without_subprocesses() {
+        use futures::FutureExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        for req in [
+            json!({"action": "snapshot"}),
+            json!({"action_json": {"action": "snapshot"}}),
+            json!({"payload": {"action": "snapshot"}}),
+        ] {
+            // No runtime is needed: isolated snapshots must complete on the first poll,
+            // without spawning desktop backends or awaiting a permission prompt.
+            let snap = execute_computer_request(None, dir.path(), req)
+                .now_or_never()
+                .expect("isolated snapshot must not wait for host desktop queries")
+                .unwrap();
+            assert_eq!(snap["element_count"], 1);
+            assert_eq!(snap["elements"][0]["role"], "desktop");
+            let map = load_ref_map(dir.path());
+            let entry = resolve_snapshot_ref(&map, snap["elements"][0]["ref_id"].as_str().unwrap())
+                .unwrap();
+            assert_eq!(entry.window_id.as_deref(), Some("root"));
+        }
+        for action in ["list_windows", "windows"] {
+            let windows = execute_computer_request(None, dir.path(), json!({"action": action}))
+                .now_or_never()
+                .expect("isolated window lists must not wait for host desktop queries")
+                .unwrap();
+            assert_eq!(windows["count"], 0);
+            assert_eq!(windows["windows"], json!([]));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn subprocess_timeout_covers_blocked_stdin_and_output() {
+        // More than a pipe buffer ensures the timeout also covers a blocked write.
+        let input = vec![b'x'; 1024 * 1024];
+        let started = std::time::Instant::now();
+        let err = run_cmd_with_stdin("/bin/sh", &["-c", "exec /bin/sleep 30"], &[], &input, 25)
+            .await
+            .unwrap_err();
+        assert!(err.contains("timed out after 25ms"), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
 
     #[test]
     fn parses_anthropic_computer_actions() {

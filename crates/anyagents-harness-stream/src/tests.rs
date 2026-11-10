@@ -636,6 +636,284 @@ sys.stdin.read()
 }
 
 #[test]
+fn bounded_stderr_withholds_partial_lines_and_decodes_invalid_utf8() {
+    let mut capture = super::BoundedStderr::default();
+    capture.push(b"safe diagnostic\n");
+    capture.push(&vec![b'x'; super::STDERR_LIMIT - 20]);
+    capture.push(b"sk-SYNTHETIC_LONG_UNTERMINATED_CREDENTIAL_0123456789");
+    let masked = capture.masked(true);
+    assert!(masked.starts_with("safe diagnostic\n"));
+    assert!(masked.contains("stderr truncated"));
+    assert!(!masked.contains("SYNTHETIC"));
+    assert!(!masked.contains("sk-"));
+    assert_eq!(capture.bytes.len(), super::STDERR_LIMIT);
+    let mut ordinary = super::BoundedStderr::default();
+    ordinary.push(b"failed \xff\n");
+    assert_eq!(ordinary.masked(true), "failed \u{fffd}\n");
+}
+
+#[test]
+fn partial_stderr_prefix_is_withheld_until_eof_and_uncertainty_keeps_exit_diagnostic() {
+    let mut capture = super::BoundedStderr::default();
+    capture.push(b"safe diagnostic\nsk-SYNTH");
+    assert_eq!(capture.masked(false), "safe diagnostic\n");
+    capture.push(b"ETIC_COMPLETE_CREDENTIAL_0123456789");
+    assert_eq!(capture.masked(true), "safe diagnostic\n[redacted]");
+    let mut safe = super::BoundedStderr::default();
+    safe.push("config.toml is invalid; 測試🙂".as_bytes());
+    assert_eq!(safe.masked(false), "");
+    assert_eq!(safe.masked(true), "config.toml is invalid; 測試🙂");
+    let mut state = super::State::new(None);
+    state.unconfirmed = true;
+    state.exit_fault =
+        Some("harness exited with exit status: 1; stderr: failed to parse config.toml".into());
+    let error = state.failure().unwrap();
+    assert!(error.contains("unconfirmed steering input"));
+    assert!(error.contains("exit status: 1"));
+    assert!(error.contains("failed to parse config.toml"));
+}
+
+#[cfg(unix)]
+fn immediate_receipt_harness() -> super::StreamHarness {
+    immediate_receipt_fixture(IMMEDIATE_RECEIPT_SCRIPT, 0).unwrap()
+}
+
+#[cfg(unix)]
+const IMMEDIATE_RECEIPT_SCRIPT: &str = r#"
+import json,sys,time
+time.sleep(int(sys.argv[1])/1000)
+print(json.dumps({'type':'ready','session_id':'fixture-ready'}),flush=True)
+first=None
+for line in sys.stdin:
+ m=json.loads(line)
+ if m['type']=='cancel':
+  print(json.dumps({'type':'result','request_id':first,'status':'completed'}),flush=True)
+ elif m['request_id']=='refused':
+  print(json.dumps({'type':'rejected','request_id':'refused','code':'fixture-refusal'}),flush=True)
+ elif m['request_id']=='self-ack':
+  print(json.dumps({'type':'accepted','request_id':'self-ack'}),flush=True)
+ elif first is None:
+  first=m['request_id']
+  print(json.dumps({'type':'accepted','request_id':first}),flush=True)
+ else:
+  print(json.dumps({'type':'steer_ack','request_id':m['request_id'],'accepted':True,'turn_id':first}),flush=True)
+"#;
+
+#[cfg(unix)]
+fn immediate_receipt_fixture(
+    script: &str,
+    startup_delay_ms: u64,
+) -> Result<super::StreamHarness, String> {
+    let harness = super::StreamHarness::launch(super::Launch {
+        spec: StreamSpec {
+            name: "immediate-receipt".into(),
+            args: vec![],
+            resume_flag: "--session",
+            start_line: "user",
+            cancel: "cancel",
+            protocol: LineProtocol::AcknowledgedResult,
+        },
+        program: "/usr/bin/python3".into(),
+        args: vec![
+            "-u".into(),
+            "-c".into(),
+            script.into(),
+            startup_delay_ms.to_string(),
+        ],
+        environment: vec![],
+        work_dir: None,
+        session_id: None,
+        mode: anyagents_harness::DeliveryMode::Steer,
+        steer: anyagents_harness::SteerSupport::Yes,
+    })
+    .map_err(|error| error.to_string())?;
+    // Cold interpreter/module setup is not the receipt-ordering contract. Wait
+    // for a frame processed by the real stdout reader before arming its 3s bound.
+    harness.wait_pred(std::time::Duration::from_secs(15), |state| {
+        state.session_id.as_deref() == Some("fixture-ready") || !state.alive
+    });
+    {
+        let state = super::lock(&harness.shared);
+        if !state.alive || state.session_id.as_deref() != Some("fixture-ready") {
+            return Err(format!(
+                "receipt fixture did not become ready: alive={}, failure={:?}, stderr={}",
+                state.alive,
+                state.failure(),
+                state.stderr.masked(state.stderr_done)
+            ));
+        }
+    }
+    Ok(harness)
+}
+
+#[cfg(unix)]
+fn await_receipt_before_post_write(
+    harness: &mut super::StreamHarness,
+    received: impl Fn(&super::State) -> bool + Send + 'static,
+) {
+    let shared = std::sync::Arc::clone(&harness.shared);
+    let wake = std::sync::Arc::clone(&harness.wake);
+    harness.after_write = Some(Box::new(move || {
+        // The pipe write has returned, but deliver has not re-locked shared
+        // state. Only the production stdout reader can satisfy this predicate.
+        let state = super::lock(&shared);
+        let (state, _) = wake
+            .wait_timeout_while(state, std::time::Duration::from_secs(3), |state| {
+                !received(state)
+            })
+            .unwrap();
+        assert!(
+            received(&state),
+            "peer receipt was not processed before post-write decision: alive={}, failure={:?}, stderr={}",
+            state.alive,
+            state.failure(),
+            state.stderr.masked(state.stderr_done)
+        );
+    }));
+}
+
+#[cfg(unix)]
+fn receipt_message(id: &str) -> anyagents_harness::OutboundMessage {
+    anyagents_harness::OutboundMessage {
+        id: id.into(),
+        seq: 1,
+        text: id.into(),
+        sender: None,
+        reply_to: None,
+        source_time_ms: None,
+        context: Default::default(),
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn immediate_steer_ack_before_post_write_keeps_custody_until_terminal_receipt() {
+    use anyagents_harness::DeliverOutcome::{Accepted, Deferred};
+    let mut harness = immediate_receipt_harness();
+    let first = receipt_message("first");
+    await_receipt_before_post_write(&mut harness, |state| state.acknowledged.contains("first"));
+    assert_eq!(
+        harness
+            .deliver(&first, &json!({"type":"user","request_id":"first"}))
+            .unwrap(),
+        Accepted {
+            turn_finished: false
+        },
+        "an acknowledged initial input remains an allowed control"
+    );
+    let steer = receipt_message("steer");
+    let line = json!({"type":"user","request_id":"steer"});
+    await_receipt_before_post_write(&mut harness, |state| {
+        state.acknowledged.contains("steer")
+            && state
+                .input_turns
+                .get("steer")
+                .is_some_and(|turn| turn == "first")
+    });
+    assert_eq!(
+        harness.deliver(&steer, &line).unwrap(),
+        Deferred,
+        "first write cannot accept a busy steer even when its ack wins the lock"
+    );
+    assert_eq!(harness.deliver(&steer, &line).unwrap(), Deferred);
+    assert_eq!(harness.written_ids(), ["first", "steer"]);
+    harness.cancel(&json!({"type":"cancel"})).unwrap();
+    assert!(harness.wait_finished("steer", std::time::Duration::from_secs(3)));
+    assert_eq!(
+        harness.deliver(&steer, &line).unwrap(),
+        Accepted {
+            turn_finished: true
+        }
+    );
+    assert_eq!(
+        harness.written_ids(),
+        ["first", "steer"],
+        "no replay after completion"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn immediate_rejection_before_post_write_is_a_typed_failure_without_replay() {
+    let mut harness = immediate_receipt_harness();
+    let message = receipt_message("refused");
+    let line = json!({"type":"user","request_id":"refused"});
+    await_receipt_before_post_write(&mut harness, |state| state.rejected.contains_key("refused"));
+    for _ in 0..2 {
+        let error = harness.deliver(&message, &line).unwrap_err();
+        assert!(
+            matches!(error, anyagents_harness::HarnessError::Failed(ref reason)
+            if reason == "controller rejected input: fixture-refusal"),
+            "{error:?}"
+        );
+    }
+    assert_eq!(harness.written_ids(), ["refused"]);
+}
+
+#[test]
+#[cfg(unix)]
+fn immediate_self_ack_cannot_release_an_input_behind_an_open_turn() {
+    use anyagents_harness::DeliverOutcome::{Accepted, Deferred};
+    let mut harness = immediate_receipt_harness();
+    await_receipt_before_post_write(&mut harness, |state| state.acknowledged.contains("first"));
+    assert_eq!(
+        harness
+            .deliver(
+                &receipt_message("first"),
+                &json!({"type":"user","request_id":"first"})
+            )
+            .unwrap(),
+        Accepted {
+            turn_finished: false
+        }
+    );
+    await_receipt_before_post_write(&mut harness, |state| {
+        state
+            .input_turns
+            .get("self-ack")
+            .is_some_and(|turn| turn == "self-ack")
+    });
+    let message = receipt_message("self-ack");
+    let line = json!({"type":"user","request_id":"self-ack"});
+    assert_eq!(harness.deliver(&message, &line).unwrap(), Deferred);
+    assert_eq!(harness.deliver(&message, &line).unwrap(), Deferred);
+    assert_eq!(harness.written_ids(), ["first", "self-ack"]);
+}
+
+#[test]
+#[cfg(unix)]
+fn immediate_receipt_setup_does_not_consume_the_post_write_deadline() {
+    let start = std::time::Instant::now();
+    // Longer than the unchanged 3s post-write bound: the old fixture failed
+    // here before reaching any receipt or custody assertion.
+    let mut harness = immediate_receipt_fixture(IMMEDIATE_RECEIPT_SCRIPT, 3_200).unwrap();
+    assert!(start.elapsed() >= std::time::Duration::from_secs(3));
+    await_receipt_before_post_write(&mut harness, |state| state.acknowledged.contains("first"));
+    assert_eq!(
+        harness
+            .deliver(
+                &receipt_message("first"),
+                &json!({"type":"user","request_id":"first"})
+            )
+            .unwrap(),
+        anyagents_harness::DeliverOutcome::Accepted {
+            turn_finished: false
+        }
+    );
+    assert_eq!(harness.written_ids(), ["first"]);
+}
+
+#[test]
+#[cfg(unix)]
+fn immediate_receipt_setup_reports_peer_exit_before_readiness() {
+    let error = immediate_receipt_fixture("raise RuntimeError('fixture startup failure')", 0)
+        .err()
+        .expect("an exited peer cannot satisfy readiness");
+    assert!(error.contains("did not become ready"), "{error}");
+    assert!(error.contains("fixture startup failure"), "{error}");
+}
+
+#[test]
 fn cascade_run_status_requires_authoritative_running_or_idle_values() {
     use super::agy_running_status;
     for (status, running) in [
@@ -845,4 +1123,88 @@ fn poisoned_agy_result_retires_the_session_without_acknowledging_the_turn() {
         }
         // Drop kills this test's child even though stdout deliberately stays open.
     }
+}
+
+#[test]
+#[cfg(unix)]
+fn synthetic_401_claude_turn_fails_and_stops_stream_without_completing_turn() {
+    use std::time::Duration;
+
+    let synthetic = json!({
+        "type": "assistant",
+        "session_id": "sess-1",
+        "message": {
+            "model": "<synthetic>",
+            "role": "assistant",
+            "content": [{
+                "type": "text",
+                "text": "Failed to authenticate. API Error: 401 {\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\"message\":\"OAuth access token has expired.\"}}"
+            }]
+        }
+    });
+    assert!(
+        super::synthetic_auth_error(&synthetic)
+            .unwrap()
+            .contains("OAuth access token has expired")
+    );
+    let real_reply = json!({
+        "type": "assistant",
+        "message": {
+            "model": "claude-opus-4-6",
+            "role": "assistant",
+            "content": [{
+                "type": "text",
+                "text": "Quoting error: Failed to authenticate. API Error: 401 OAuth access token has expired"
+            }]
+        }
+    });
+    assert!(super::synthetic_auth_error(&real_reply).is_none());
+
+    let spec = StreamSpec::for_program("claude");
+    let result = json!({
+        "type": "result",
+        "subtype": "success",
+        "session_id": "sess-1",
+        "result": "Failed to authenticate. API Error: 401 OAuth access token has expired"
+    });
+    let script = format!(
+        "read line; printf '%s\\n' '{}' '{}'; exec sleep 30",
+        synthetic, result
+    );
+    let mut harness = super::StreamHarness::launch(super::Launch {
+        spec: spec.clone(),
+        program: "/bin/sh".into(),
+        args: vec!["-c".into(), script],
+        environment: vec![],
+        work_dir: None,
+        session_id: Some("sess-1".into()),
+        mode: anyagents_harness::DeliveryMode::Steer,
+        steer: anyagents_harness::SteerSupport::Yes,
+    })
+    .unwrap();
+    let message = anyagents_harness::OutboundMessage {
+        id: "input".into(),
+        seq: 1,
+        text: "work".into(),
+        sender: None,
+        reply_to: None,
+        source_time_ms: None,
+        context: anyagents_harness::Context::default(),
+    };
+    let line = super::message_line(&spec, &message);
+    assert!(matches!(
+        harness.deliver(&message, &line).unwrap(),
+        anyagents_harness::DeliverOutcome::Accepted { .. }
+    ));
+    assert!(harness.wait_pred(Duration::from_secs(3), |state| !state.alive));
+    assert!(!harness.health().process_alive);
+    assert_eq!(harness.turns_served(), 0);
+    assert!(!harness.wait_finished("input", Duration::from_millis(10)));
+    assert!(
+        harness
+            .health()
+            .sign_in_fault
+            .unwrap()
+            .contains("OAuth access token has expired")
+    );
 }

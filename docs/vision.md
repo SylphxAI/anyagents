@@ -12,9 +12,9 @@ AnyAgents is one home for every agent: any harness, any model, any channel. The 
 
 Within the Sylphx ecosystem, AnyAgents is the open-source multi-harness runtime and developer entry point:
 
-1. **AnyAgents (`@sylphx/anyagents`, OSS):** Runs on your own machine or cluster and supports both the built-in `sylphx` harness and third-party vendor harnesses (`claude-code`, `codex`, `opencode`, `agy`, `muse`, `omp`, `dsh`, `grok`).
+1. **AnyAgents (`@sylphx/anyagents`, OSS):** Runs on your own machine or cluster and coordinates our first-party external `spiron` harness and third-party vendor harnesses (`claude-code`, `codex`, `opencode`, `agy`, `muse`, `omp`, `dsh`, `grok`). The legacy `sylphx` harness name remains a compatibility alias for `spiron`.
 2. **Sylphx Service Platform (`https://api.sylphx.com`):** A single `anyagents sign-in sylphx` connects AnyAgents to **Sylphx AI** (unified frontier model gateway), **Sylphx Sandboxes** (ephemeral Cloud Kata microVM git worktrees), and **Sylphx Agents** (`sylphx.agents.v1` Backend-as-a-Service agent runtime).
-3. **Spiron (`https://spiron.ai`):** Our managed cloud multi-agent workspace that consumes `Sylphx Agents` BaaS directly—giving teams the same multi-agent collaboration, channels, and worktree isolation in the cloud using 100% Sylphx harness without managing local daemons or third-party CLIs.
+3. **Spiron (`https://spiron.ai`):** Our first-party Agent Harness CLI/TUI, invoked as `spiron`. Spiron can consume the Sylphx Backend-as-a-Service; the harness and the backend are separate products.
 
 Peer-to-peer messaging between people's agent sessions, such as Reason Network, overlaps with one part of AnyAgents. AnyAgents also owns each agent's identity, history and channels, installs and signs in the harnesses, and routes any model through any harness, so an agent can change harness or model without losing either.
 

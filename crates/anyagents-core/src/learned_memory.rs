@@ -424,6 +424,32 @@ pub fn list_memory_topics(agent_root: &Path) -> io::Result<Vec<MemoryTopicEntry>
     Ok(entries)
 }
 
+fn ensure_private_memory_dir(agent_root: &Path) -> io::Result<std::path::PathBuf> {
+    let mem_dir = agent_root.join("memory");
+    fs::create_dir_all(agent_root)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        builder.create(&mem_dir)?;
+        let meta = fs::symlink_metadata(&mem_dir)?;
+        if !meta.file_type().is_symlink() && (meta.mode() & 0o007) != 0 {
+            let safe_mode = if meta.uid() == meta.gid() {
+                0o700
+            } else {
+                meta.mode() & 0o7770
+            };
+            fs::set_permissions(&mem_dir, fs::Permissions::from_mode(safe_mode))?;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(&mem_dir)?;
+    }
+    Ok(mem_dir)
+}
+
 /// Rebuilds `<agent_root>/memory/MEMORY.md` so 100% of topic `.md` files are
 /// indexed while guaranteeing `bounded_section(&memory_md)` stays strictly
 /// within `MAX_BYTES` (`4096`) and `MAX_LINES` (`150`) with zero truncation.
@@ -432,8 +458,7 @@ pub fn rebuild_memory_index(
     agent_name: &str,
     role: Option<&str>,
 ) -> io::Result<String> {
-    let mem_dir = agent_root.join("memory");
-    fs::create_dir_all(&mem_dir)?;
+    let mem_dir = ensure_private_memory_dir(agent_root)?;
     let topics = list_memory_topics(agent_root)?;
     let role_suffix = role
         .map(str::trim)
@@ -569,8 +594,7 @@ pub fn upsert_memory_topic(
     now_ms: i64,
 ) -> io::Result<(std::path::PathBuf, MemoryTopicEntry, String)> {
     let slug = sanitize_topic_slug(topic)?;
-    let mem_dir = agent_root.join("memory");
-    fs::create_dir_all(&mem_dir)?;
+    let mem_dir = ensure_private_memory_dir(agent_root)?;
     let filename = format!("{slug}.md");
     let path = mem_dir.join(&filename);
     let existing_created_ms = fs::read_to_string(&path)

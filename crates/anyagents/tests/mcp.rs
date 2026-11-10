@@ -130,14 +130,10 @@ fn claude_double(data: &std::path::Path) -> std::path::PathBuf {
 }
 
 fn start_server(data: &std::path::Path) -> Serve {
-    start_server_mode(data, "serve")
-}
-
-fn start_server_mode(data: &std::path::Path, mode: &str) -> Serve {
     let mut child = support::contract_server()
         .arg("--data")
         .arg(data)
-        .arg(mode)
+        .arg("serve")
         .env("PATH", machine_path(data))
         .env("ANYAGENTS_CLAUDE_CODE_BIN", claude_double(data))
         .env("ANYAGENTS_CODEX_BIN", "/bin/true")
@@ -154,11 +150,7 @@ fn start_server_mode(data: &std::path::Path, mode: &str) -> Serve {
         let _ = pipe.read_to_string(&mut buf);
         *captured.lock().unwrap() = buf;
     });
-    let socket = data.join(if mode == "serve-admin" {
-        "admin.sock"
-    } else {
-        "anyagents.sock"
-    });
+    let socket = data.join("anyagents.sock");
     let started = Instant::now();
     loop {
         if socket.exists() {
@@ -228,7 +220,8 @@ async fn connect(
             // The single-user route: this deployment has no operator token, so
             // its own agent route names the agent. The server still resolves
             // the name itself, and a tool call never sends as anyone else.
-            cmd.env("ANYAGENTS_AGENT_ROUTE", data)
+            cmd.env("ANYAGENTS_TESTS", "1")
+                .env("ANYAGENTS_AGENT_ROUTE", data)
                 .env("ANYAGENTS_DATA", data)
                 .env("ANYAGENTS_AGENT_ID", &id)
                 .arg("--data")
@@ -902,8 +895,32 @@ async fn mcp_tools_use_the_server_socket() {
         "unexpected private group post error: {beta_post_private_group}"
     );
 
-    // Custody transfer (`agents` `action = "transfer"`): `alpha` transfers `worker-1` to `beta`,
-    // after which `beta` CAN message `worker-1` directly, and `beta` transfers `worker-1` back to `alpha`.
+    // Custody transfer (`agents` `action = "transfer"`): a non-admin parent cannot transfer a child
+    // outside its own subtree (`beta`), while an Admin can transfer across root trees.
+    let cross_tree_err = error_text(
+        &call(
+            &alpha,
+            "agents",
+            serde_json::json!({
+                "action": "transfer",
+                "name": &spawned.id,
+                "parent": "beta",
+                "prompt": "unauthorized cross-tree handoff"
+            }),
+        )
+        .await,
+    );
+    assert!(
+        cross_tree_err.contains("administrative authority required"),
+        "unexpected error: {cross_tree_err}"
+    );
+    {
+        let store = anyagents_core::Store::open(dir.path().join("state.db")).unwrap();
+        let alpha_rec = store.agent_by_name("alpha").unwrap();
+        let beta_rec = store.agent_by_name("beta").unwrap();
+        store.set_agent_admin(&alpha_rec.id, true).unwrap();
+        store.set_agent_admin(&beta_rec.id, true).unwrap();
+    }
     let transferred_to_beta: serde_json::Value = ok_json(
         call(
             &alpha,
@@ -945,6 +962,13 @@ async fn mcp_tools_use_the_server_socket() {
     );
     assert_eq!(transferred_back["previous_parent"], "beta");
     assert_eq!(transferred_back["new_parent"], "alpha");
+    {
+        let store = anyagents_core::Store::open(dir.path().join("state.db")).unwrap();
+        let alpha_rec = store.agent_by_name("alpha").unwrap();
+        let beta_rec = store.agent_by_name("beta").unwrap();
+        store.set_agent_admin(&alpha_rec.id, false).unwrap();
+        store.set_agent_admin(&beta_rec.id, false).unwrap();
+    }
 
     // Archive the sub-agent (`state = archived`), then pause `beta` to verify `to: ["all"]` reports paused Root peers in `skipped`.
     let archived: AgentView =
@@ -1086,7 +1110,7 @@ async fn mcp_tools_use_the_server_socket() {
     let inbox = bin()
         .arg("--data")
         .arg(dir.path())
-        .args(["inbox", "beta"])
+        .args(["inbox", "beta", "--json"])
         .output()
         .unwrap();
     assert!(
@@ -1096,7 +1120,12 @@ async fn mcp_tools_use_the_server_socket() {
     );
     // Two addressed lines, the room line, and the three `all` broadcast lines, each readable from the CLI too.
     let listed = String::from_utf8(inbox.stdout).unwrap();
-    assert_eq!(listed.lines().count(), 6, "{listed}");
+    let response: serde_json::Value = serde_json::from_str(&listed).unwrap();
+    assert_eq!(
+        response["messages"].as_array().unwrap().len(),
+        6,
+        "{listed}"
+    );
     assert!(listed.contains("room line"), "{listed}");
     assert!(listed.contains("broadcast to active"), "{listed}");
 }
@@ -1107,12 +1136,12 @@ async fn redaction_mcp_and_cli_share_authenticated_audited_api() {
     let dir = support::physical_tempdir();
     let store = Store::open(dir.path().join("state.db")).unwrap();
     let root = store
-        .create_agent(NewAgent::new("redaction-root", "sylphx"))
+        .create_agent(NewAgent::new("redaction-root", "spiron"))
         .unwrap();
     let peer = store
-        .create_agent(NewAgent::new("redaction-peer", "sylphx"))
+        .create_agent(NewAgent::new("redaction-peer", "spiron"))
         .unwrap();
-    let mut input = NewAgent::new("redaction-child", "sylphx");
+    let mut input = NewAgent::new("redaction-child", "spiron");
     input.parent_id = Some(root.id.clone());
     let child = store.create_agent(input).unwrap();
     for agent in [&root, &peer, &child] {
@@ -1196,12 +1225,12 @@ async fn session_reset_mcp_and_cli_share_quiescent_authorized_api() {
     let dir = support::physical_tempdir();
     let store = Store::open(dir.path().join("state.db")).unwrap();
     let parent = store
-        .create_agent(NewAgent::new("session-parent", "sylphx"))
+        .create_agent(NewAgent::new("session-parent", "spiron"))
         .unwrap();
     let peer = store
-        .create_agent(NewAgent::new("session-peer", "sylphx"))
+        .create_agent(NewAgent::new("session-peer", "spiron"))
         .unwrap();
-    let mut input = NewAgent::new("session-child", "sylphx");
+    let mut input = NewAgent::new("session-child", "spiron");
     input.parent_id = Some(parent.id.clone());
     let child = store.create_agent(input).unwrap();
     for agent in [&parent, &peer, &child] {
@@ -1211,8 +1240,9 @@ async fn session_reset_mcp_and_cli_share_quiescent_authorized_api() {
     std::fs::create_dir_all(root.join("config")).unwrap();
     std::fs::create_dir_all(root.join("memory")).unwrap();
     std::fs::write(root.join("memory/MEMORY.md"), "first pin").unwrap();
-    let old = host_session::ensure_active(&root, "sylphx").unwrap();
+    let old = host_session::ensure_active(&root, "spiron").unwrap();
     std::fs::write(root.join("config/sylphx-session-id"), "old-vendor\n").unwrap();
+    std::fs::write(root.join("config/spiron-session-id"), "old-vendor\n").unwrap();
     std::fs::write(
         root.join("config/sylphx-transcript.jsonl"),
         "retained raw bytes",
@@ -1250,6 +1280,10 @@ async fn session_reset_mcp_and_cli_share_quiescent_authorized_api() {
         std::fs::read(root.join("config/sylphx-session-id")).unwrap(),
         b"old-vendor\n"
     );
+    assert_eq!(
+        std::fs::read(root.join("config/spiron-session-id")).unwrap(),
+        b"old-vendor\n"
+    );
     drop(process);
     let result: serde_json::Value = ok_json(
         call(
@@ -1263,6 +1297,11 @@ async fn session_reset_mcp_and_cli_share_quiescent_authorized_api() {
     assert_eq!(result["generation"], second.generation);
     assert_ne!(second.generation, old.generation);
     assert!(second.memory.section.contains("second pin"));
+    assert!(!root.join("config/spiron-session-id").exists());
+    assert_eq!(
+        std::fs::read(root.join("config/sylphx-session-id")).unwrap(),
+        b"old-vendor\n"
+    );
     std::fs::write(root.join("memory/MEMORY.md"), "third pin").unwrap();
     let cli = bin()
         .arg("--data")
@@ -1285,7 +1324,7 @@ async fn session_reset_mcp_and_cli_share_quiescent_authorized_api() {
         b"retained raw bytes"
     );
     assert_eq!(
-        host_session::resume_vendor(&root, "sylphx", "old-vendor").unwrap(),
+        host_session::resume_vendor(&root, "spiron", "old-vendor").unwrap(),
         old
     );
     parent_mcp.cancel().await.unwrap();
@@ -1308,13 +1347,11 @@ async fn describe_preserves_config_permissions_without_vendor_restart_writers() 
         "{}",
         String::from_utf8_lossy(&created.stderr)
     );
-    // The primary fixture's /bin/true harness exits and restarts, concurrently
-    // preparing config. This case measures describe's own permission contract,
-    // so keep the real MCP/auth/HTTP path but run no vendor-config writer.
-    let server = start_server_mode(dir.path(), "serve-admin");
-    // MCP initialization asks whoami on the primary socket name. Route that
-    // fixture-only name to the admin router rather than starting a supervisor.
-    std::os::unix::fs::symlink("admin.sock", dir.path().join("anyagents.sock")).unwrap();
+    // Pause before startup so describe is the only config writer.
+    let store = anyagents_core::Store::open(dir.path().join("state.db")).unwrap();
+    let agent = store.agent_by_name("alpha").unwrap();
+    store.set_agent_state(&agent.id, "paused").unwrap();
+    let server = start_server(dir.path());
     let alpha = connect(dir.path(), "alpha").await;
     let alpha_id = created_id(dir.path(), "alpha");
     #[cfg(unix)]
@@ -1323,6 +1360,19 @@ async fn describe_preserves_config_permissions_without_vendor_restart_writers() 
         let alpha_cfg = dir.path().join("agents").join(&alpha_id).join("config");
         std::fs::set_permissions(&alpha_cfg, std::fs::Permissions::from_mode(0o0700)).unwrap();
         let before_gid = std::fs::metadata(&alpha_cfg).unwrap().gid();
+        let self_mut_err = error_text(
+            &call(
+                &alpha,
+                "describe",
+                serde_json::json!({"agent": "self", "description": "Unauthorized self mutation."}),
+            )
+            .await,
+        );
+        assert!(
+            self_mut_err.contains("administrative authority required"),
+            "unexpected error: {self_mut_err}"
+        );
+        store.set_agent_admin(&agent.id, true).unwrap();
         let desc_res: serde_json::Value = ok_json(
             call(
                 &alpha,
@@ -1345,7 +1395,7 @@ async fn describe_preserves_config_permissions_without_vendor_restart_writers() 
 async fn history_search_defaults_and_all_never_escape_a_private_childs_tree() {
     use anyagents_core::{Incoming, Store};
     let dir = support::physical_tempdir();
-    for name in ["coordinator", "planner", "reviewer", "runner"] {
+    for name in ["coordinator", "planner", "tester", "builder"] {
         let created = bin()
             .env("PATH", machine_path(dir.path()))
             .arg("--data")
@@ -1358,16 +1408,16 @@ async fn history_search_defaults_and_all_never_escape_a_private_childs_tree() {
     let store = Store::open(dir.path().join("state.db")).unwrap();
     let coordinator = store.agent_by_name("coordinator").unwrap();
     let planner = store.agent_by_name("planner").unwrap();
-    let reviewer = store.agent_by_name("reviewer").unwrap();
-    let runner = store.agent_by_name("runner").unwrap();
+    let tester = store.agent_by_name("tester").unwrap();
+    let builder = store.agent_by_name("builder").unwrap();
     store
         .set_agent_parent(&planner.id, Some(&coordinator.id))
         .unwrap();
     store
-        .set_agent_parent(&reviewer.id, Some(&coordinator.id))
+        .set_agent_parent(&tester.id, Some(&coordinator.id))
         .unwrap();
     store
-        .set_agent_parent(&runner.id, Some(&planner.id))
+        .set_agent_parent(&builder.id, Some(&planner.id))
         .unwrap();
     // Synthetic bodies only. These identifiers reproduce the reported search
     // shape without importing any production conversation content.
@@ -1377,11 +1427,11 @@ async fn history_search_defaults_and_all_never_escape_a_private_childs_tree() {
             "C msg_01m6svh4znevfapf3mmpsnk0a4 #2291 private parent",
         ),
         (
-            &reviewer.id,
+            &tester.id,
             "C msg_01m6svrywtez39wvnttdvz53xf #2291 private sibling",
         ),
         (&planner.id, "C #2291 authorized own mailbox"),
-        (&runner.id, "C #2291 authorized descendant"),
+        (&builder.id, "C #2291 authorized descendant"),
     ] {
         store
             .receive(
@@ -1417,8 +1467,11 @@ async fn history_search_defaults_and_all_never_escape_a_private_childs_tree() {
             "C out_msg_01m6svqn4nesw9ws13fjy48kzt #2291 private outbound",
         )
         .unwrap();
-    let server = start_server_mode(dir.path(), "serve-admin");
-    std::os::unix::fs::symlink("admin.sock", dir.path().join("anyagents.sock")).unwrap();
+    // Keep synthetic history stable while exercising the real API and MCP path.
+    for agent in [&coordinator, &planner, &tester, &builder] {
+        store.set_agent_state(&agent.id, "paused").unwrap();
+    }
+    let server = start_server(dir.path());
     let client = connect(dir.path(), "planner").await;
     let native: ConversationResponse = ok_json(
         call(
@@ -1458,9 +1511,9 @@ async fn history_search_defaults_and_all_never_escape_a_private_childs_tree() {
     }
     for target in [
         "coordinator",
-        "reviewer",
+        "tester",
         coordinator.id.as_str(),
-        reviewer.id.as_str(),
+        tester.id.as_str(),
     ] {
         for tool in ["conversation", "search"] {
             let denied = call(
@@ -1538,6 +1591,7 @@ async fn code_mode_supports_memory_sdk_workspace_patch_list_exec_and_computer_sn
 
                 // 3. Semantic Accessibility Snapshot & STALE_REF guard on tools.computer
                 const snap = await tools.computer.snapshot();
+                const windows = await tools.computer.list_windows();
                 let staleCaught = false;
                 try {
                     await tools.computer.click("@e1");
@@ -1557,6 +1611,8 @@ async fn code_mode_supports_memory_sdk_workspace_patch_list_exec_and_computer_sn
                     execStdout: execOut.stdout,
                     snapshotIdPrefix: snap.snapshot_id.startsWith("s"),
                     firstRef: snap.elements[0]?.ref_id,
+                    snapshotRole: snap.elements[0]?.role,
+                    windowCount: windows.count,
                     staleCaught,
                 };
             "##
@@ -1586,6 +1642,8 @@ async fn code_mode_supports_memory_sdk_workspace_patch_list_exec_and_computer_sn
         res["firstRef"].as_str().unwrap_or("").contains(":e1"),
         "{code_res:?}"
     );
+    assert_eq!(res["snapshotRole"], "desktop", "{code_res:?}");
+    assert_eq!(res["windowCount"], 0, "{code_res:?}");
     assert_eq!(res["staleCaught"], true, "{code_res:?}");
 
     client.cancel().await.unwrap();

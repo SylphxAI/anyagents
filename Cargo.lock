@@ -71,6 +71,7 @@ dependencies = [
 name = "anyagents"
 version = "0.1.4"
 dependencies = [
+ "anyagents-agent",
  "anyagents-channel-telegram",
  "anyagents-core",
  "anyagents-gateway",
@@ -82,11 +83,11 @@ dependencies = [
  "anyagents-harness-omp",
  "anyagents-harness-opencode",
  "anyagents-harness-stream",
- "anyagents-harness-sylphx",
  "anyagents-installer",
  "anyagents-supervisor",
  "axum",
  "bytes",
+ "chrono",
  "clap",
  "futures",
  "http-body-util",
@@ -94,6 +95,7 @@ dependencies = [
  "hyper-util",
  "libc",
  "rmcp",
+ "roxmltree",
  "rusqlite",
  "schemars",
  "serde",
@@ -236,23 +238,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "anyagents-harness-sylphx"
-version = "0.1.4"
-dependencies = [
- "anyagents-core",
- "anyagents-harness",
- "anyagents-installer",
- "libc",
- "serde",
- "serde_json",
- "tempfile",
- "ureq",
-]
-
-[[package]]
 name = "anyagents-installer"
 version = "0.1.4"
 dependencies = [
+ "anyagents-harness",
  "serde",
  "tempfile",
  "thiserror",
@@ -1525,6 +1514,15 @@ dependencies = [
  "quote",
  "serde_json",
  "syn 3.0.9",
+]
+
+[[package]]
+name = "roxmltree"
+version = "0.21.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9da7f59328b09405b181fee1018925fad50f157afb43c0c0f5c522c256dd5907"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]

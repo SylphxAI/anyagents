@@ -372,6 +372,13 @@ fn three_lines_sent_while_a_turn_is_open_are_all_taken_and_none_twice() {
         "{:?}",
         other.inbox(&agent.id, None)
     );
+    // The cursor commits the pipe write before the child necessarily reads it.
+    // Wait for its third receipt before checking the complete log.
+    assert!(
+        wait_until(|| log_contains(&log, "user:3:")),
+        "child did not read all three messages: {}",
+        std::fs::read_to_string(&log).unwrap_or_default()
+    );
     let text = std::fs::read_to_string(&log).unwrap_or_default();
     for seq in 1..=3 {
         let id = other
@@ -431,6 +438,8 @@ fn a_restart_mid_stream_loses_nothing_and_writes_nothing_twice() {
     assert!(wait_until(
         || other.delivered_cursor(&agent.id).unwrap() >= 1
     ));
+    // Do not kill the child until it has read the first accepted pipe write.
+    assert!(wait_until(|| log_contains(&log, "user:1:")));
     // The process dies with the turn still open. The supervisor starts a new
     // one after its backoff, and the next two lines go to it in order.
     let pid = supervisor.live(&agent.id).unwrap().pid.unwrap();
@@ -453,6 +462,13 @@ fn a_restart_mid_stream_loses_nothing_and_writes_nothing_twice() {
         other.inbox(&agent.id, None)
     );
     let inbox = other.inbox(&agent.id, None).unwrap();
+    assert!(
+        wait_until(|| inbox
+            .iter()
+            .all(|message| { log_contains(&log, &format!("anyagents-message:{}", message.id)) })),
+        "child did not read all messages across restart: {}",
+        std::fs::read_to_string(&log).unwrap_or_default()
+    );
     let text = std::fs::read_to_string(&log).unwrap_or_default();
     for message in &inbox {
         assert_eq!(
@@ -1030,6 +1046,12 @@ done
         &dir.path().join("vendor.log"),
         "initial-long-turn"
     )));
+    loop {
+        let (now, deadline) = rx.recv_timeout(WAIT_CEILING).unwrap();
+        if deadline == Some(now + 250) {
+            break;
+        }
+    }
     let first_pid = supervisor.live(&agent.id).unwrap().pid.unwrap();
     let before_cursor = store.delivered_cursor(&agent.id).unwrap();
     let config = anyagents_core::agent_config_dir(dir.path(), &agent.id);
@@ -1281,7 +1303,7 @@ fn switch_at_dispatch(state: &str, retiring: RetiringTurn, model_only: bool) {
 
     let dir = short_dir();
     let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
-    let mut spec = NewAgent::new("switch-target", "sylphx");
+    let mut spec = NewAgent::new("switch-target", "spiron");
     spec.model = Some("old-model".into());
     spec.instructions = Some("preserve these instructions".into());
     let agent = store.create_agent(spec).unwrap();
@@ -1324,9 +1346,34 @@ fn switch_at_dispatch(state: &str, retiring: RetiringTurn, model_only: bool) {
         {
             let launches = Arc::clone(&launches);
             let probes = Arc::clone(&probes);
+            let now_ms = clock.now_ms();
             Arc::new(move |request: LaunchRequest| {
-                let probe = Arc::new(Mutex::new(SwitchProbe::default()));
-                probes.lock().unwrap().push(Arc::clone(&probe));
+                let mut initial = SwitchProbe::default();
+                let mut guard = probes.lock().unwrap();
+                if guard.is_empty() {
+                    initial.health.turn_state = if retiring == RetiringTurn::FaultedIdle {
+                        TurnState::Idle
+                    } else {
+                        TurnState::InTurn
+                    };
+                    if matches!(
+                        retiring,
+                        RetiringTurn::Faulted
+                            | RetiringTurn::FaultedIdle
+                            | RetiringTurn::QuotaBlocked
+                    ) {
+                        initial.health.sign_in_fault =
+                            Some("HTTP 400: context limit exceeded".into());
+                    }
+                    if retiring == RetiringTurn::QuotaBlocked {
+                        // A pending switch must not inherit the retiring process's hold.
+                        initial.health.quota_reset_at_ms = Some(now_ms + 60_000);
+                    }
+                    initial.health.process_alive = retiring != RetiringTurn::Dead;
+                }
+                let probe = Arc::new(Mutex::new(initial));
+                guard.push(Arc::clone(&probe));
+                drop(guard);
                 launches.lock().unwrap().push(request.agent);
                 Ok(SwitchHarness { probe })
             })
@@ -1336,37 +1383,18 @@ fn switch_at_dispatch(state: &str, retiring: RetiringTurn, model_only: bool) {
     .unwrap();
     assert!(wait_until(|| supervisor.live(&agent.id).is_some()));
     let old = Arc::clone(&probes.lock().unwrap()[0]);
-    {
-        let mut probe = old.lock().unwrap();
-        probe.health.turn_state = if retiring == RetiringTurn::FaultedIdle {
-            TurnState::Idle
-        } else {
-            TurnState::InTurn
-        };
-        if matches!(
-            retiring,
-            RetiringTurn::Faulted | RetiringTurn::FaultedIdle | RetiringTurn::QuotaBlocked
-        ) {
-            probe.health.sign_in_fault = Some("HTTP 400: context limit exceeded".into());
-        }
-        if retiring == RetiringTurn::QuotaBlocked {
-            // A pending switch must not inherit the retiring process's hold.
-            probe.health.quota_reset_at_ms = Some(clock.now_ms() + 60_000);
-        }
-        probe.health.process_alive = retiring != RetiringTurn::Dead;
-    }
     if state != "running" {
         store.set_agent_state(&agent.id, state).unwrap();
         assert!(wait_until(|| supervisor
             .live(&agent.id)
             .is_some_and(|l| !l.process_alive)));
     }
+    let reads = old.lock().unwrap().health_reads;
     if !model_only {
         store.set_agent_harness(&agent.id, "codex").unwrap();
     }
     store.set_agent_model(&agent.id, "new-model").unwrap();
     store.set_agent_state(&agent.id, "running").unwrap();
-    let reads = old.lock().unwrap().health_reads;
     store.poke(Wake::Agent {
         agent_id: agent.id.clone(),
     });
@@ -1384,7 +1412,7 @@ fn switch_at_dispatch(state: &str, retiring: RetiringTurn, model_only: bool) {
     }
     assert!(wait_until(|| supervisor.live(&agent.id).is_some_and(|l| {
         l.live_model.as_deref() == Some("new-model")
-            && l.live_harness.as_deref() == Some(if model_only { "sylphx" } else { "codex" })
+            && l.live_harness.as_deref() == Some(if model_only { "spiron" } else { "codex" })
     })));
     // No manual-clock advance: an errored turn must not wait for the drain.
     assert_eq!(clock.now_ms(), 1_700_000_000_000);

@@ -30,7 +30,12 @@ pub(crate) fn read_candidates(paths: &[std::path::PathBuf]) -> Result<serde_json
 }
 
 pub fn write_claude(path: &Path, command: &Path, args: &[String]) -> Result<(), Error> {
-    let mut root = read_json(path)?;
+    let mut root = match read_json(path) {
+        Ok(val) if val.is_object() => val,
+        Ok(_) | Err(_) if path.is_file() => serde_json::json!({}),
+        Err(err) => return Err(err),
+        Ok(_) => return Err(Error::Message("claude config is not an object".into())),
+    };
     let servers = root
         .as_object_mut()
         .ok_or_else(|| Error::Message("claude config is not an object".into()))?
@@ -114,49 +119,28 @@ pub fn sanitize_claude_settings(config_dir: &Path) -> Result<(), Error> {
             let deny = perms_obj
                 .entry("deny".to_string())
                 .or_insert_with(|| serde_json::json!(["SendFeedback"]));
-            if let Some(deny_arr) = deny.as_array_mut() {
-                if std::env::var_os("ANYAGENTS_ALLOW_NATIVE_SUBAGENTS").is_none() {
-                    for tool in [
-                        "SendFeedback",
-                        "Task",
-                        "Agent",
-                        "TeamCreate",
-                        "TeamDelete",
-                        "SendMessage",
-                        "ScheduleWakeup",
-                        "Monitor",
-                        "CronCreate",
-                        "CronDelete",
-                        "CronList",
-                        "RemoteTrigger",
-                        "PushNotification",
-                    ] {
-                        if !deny_arr.iter().any(|v| v.as_str() == Some(tool)) {
-                            deny_arr.push(serde_json::Value::String(tool.to_string()));
-                        }
-                    }
-                }
-                if !std::env::var("ANYAGENTS_ALLOW_NATIVE_FILE_TOOLS")
-                    .ok()
-                    .is_some_and(|v| v.trim() == "1")
-                {
-                    for tool in [
-                        "Read",
-                        "Write",
-                        "Edit",
-                        "MultiEdit",
-                        "Glob",
-                        "Grep",
-                        "LS",
-                        "NotebookEdit",
-                        "TodoRead",
-                        "TodoWrite",
-                        "WebSearch",
-                        "WebFetch",
-                    ] {
-                        if !deny_arr.iter().any(|v| v.as_str() == Some(tool)) {
-                            deny_arr.push(serde_json::Value::String(tool.to_string()));
-                        }
+            if let Some(deny_arr) = deny.as_array_mut()
+                && std::env::var_os("ANYAGENTS_ALLOW_NATIVE_SUBAGENTS").is_none()
+            {
+                for tool in [
+                    "SendFeedback",
+                    "Task",
+                    "Agent",
+                    "TeamCreate",
+                    "TeamDelete",
+                    "SendMessage",
+                    "ScheduleWakeup",
+                    "Monitor",
+                    "CronCreate",
+                    "CronDelete",
+                    "CronList",
+                    "RemoteTrigger",
+                    "PushNotification",
+                    "WebSearch",
+                    "WebFetch",
+                ] {
+                    if !deny_arr.iter().any(|v| v.as_str() == Some(tool)) {
+                        deny_arr.push(serde_json::Value::String(tool.to_string()));
                     }
                 }
             }
@@ -566,6 +550,40 @@ mod tests {
         assert_eq!(cleaned["env"]["OTHER"], "1");
         assert_eq!(cleaned["includeCoAuthoredBy"], false);
         assert_eq!(cleaned["skipDangerousModePermissionPrompt"], true);
+        let denied = cleaned["permissions"]["deny"].as_array().unwrap();
+        for tool in [
+            "Read",
+            "Write",
+            "Edit",
+            "MultiEdit",
+            "Glob",
+            "Grep",
+            "LS",
+            "NotebookEdit",
+            "TodoRead",
+            "TodoWrite",
+        ] {
+            assert!(
+                !denied.iter().any(|value| value.as_str() == Some(tool)),
+                "{tool}"
+            );
+        }
+        if std::env::var_os("ANYAGENTS_ALLOW_NATIVE_SUBAGENTS").is_none() {
+            for tool in [
+                "Task",
+                "Agent",
+                "TeamCreate",
+                "TeamDelete",
+                "SendMessage",
+                "WebSearch",
+                "WebFetch",
+            ] {
+                assert!(
+                    denied.iter().any(|value| value.as_str() == Some(tool)),
+                    "{tool}"
+                );
+            }
+        }
     }
     #[test]
     fn malformed_settings_and_non_notfound_reads_preserve_existing_bytes() {
@@ -590,5 +608,28 @@ mod tests {
         std::fs::write(&path, br#"{"theme":"night"}"#).unwrap();
         sanitize_claude_settings(dir.path()).unwrap();
         assert_eq!(read_json(&path).unwrap()["theme"], "night");
+    }
+
+    #[test]
+    fn write_claude_self_heals_empty_or_corrupted_mcp_config_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let mcp_path = dir.path().join(".gemini/config/mcp_config.json");
+        std::fs::create_dir_all(mcp_path.parent().unwrap()).unwrap();
+        for initial in [b"".as_slice(), b"{truncated", b"[]"] {
+            std::fs::write(&mcp_path, initial).unwrap();
+            write_claude(
+                &mcp_path,
+                Path::new("/usr/local/bin/anyagents"),
+                &["mcp".to_string()],
+            )
+            .unwrap();
+            let parsed = read_json(&mcp_path).unwrap();
+            assert_eq!(
+                parsed
+                    .pointer("/mcpServers/anyagents/command")
+                    .and_then(serde_json::Value::as_str),
+                Some("/usr/local/bin/anyagents")
+            );
+        }
     }
 }

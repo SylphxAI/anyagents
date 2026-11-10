@@ -231,8 +231,9 @@ pub fn seat_for_agent_with_hint(
         return admitted_principal(raw.to_str()?, agent_name);
     }
     let path = std::env::var_os("ANYAGENTS_PRINCIPAL_REGISTRY")?;
-    let raw = principals::read_principal_registry(Path::new(&path).parent()?).ok()??;
-    admitted_principal(&raw, agent_name)
+    principals::read_admitted_principal(Path::new(&path).parent()?, agent_name)
+        .ok()
+        .flatten()
 }
 
 /// Operator-owned map keyed by immutable agent ID, never inferred from names or files.
@@ -254,6 +255,21 @@ pub(super) fn admitted_principal_entry(
         number("gid")?,
         number("socket_gid")?,
     ))
+}
+
+/// Resolve immutable-ID seat labels once for a roster response. Parent names
+/// are display metadata and never confer execution authority.
+pub(crate) fn roster_seats() -> std::collections::HashMap<String, (String, u32, u32, u32)> {
+    if let Ok(raw) = std::env::var("ANYAGENTS_PRINCIPALS") {
+        return serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&raw)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(id, entry)| admitted_principal_entry(&entry).map(|seat| (id, seat)))
+            .collect();
+    }
+    std::env::var_os("ANYAGENTS_PRINCIPAL_REGISTRY")
+        .and_then(|path| principals::read_admitted_principals(Path::new(&path).parent()?).ok())
+        .unwrap_or_default()
 }
 
 fn admitted_principal(raw: &str, agent_id: &str) -> Option<(String, u32, u32, u32)> {
@@ -421,7 +437,7 @@ pub fn share_config_with_seat_uid(config_dir: &Path, uid: u32, gid: u32) {
         None => (uid, gid),
     };
     if config_dir.is_dir()
-        && let Err(err) = give_tree(config_dir, eff_uid, eff_gid)
+        && let Err(err) = crate::seat_tree::share_config(config_dir, eff_uid, eff_gid)
     {
         eprintln!("seat: cannot share {}: {err}", config_dir.display());
     }
@@ -439,7 +455,7 @@ pub fn share_config_with_seat_uid(config_dir: &Path, uid: u32, gid: u32) {
                 continue;
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                if std::fs::create_dir_all(&path).is_err() {
+                if ensure_seat_dir_as_owner(&path, eff_uid, eff_gid, 0o2770).is_err() {
                     continue;
                 }
             }
@@ -460,6 +476,68 @@ pub fn share_config_with_seat_uid(config_dir: &Path, uid: u32, gid: u32) {
             }
         }
     }
+}
+
+pub(crate) fn ensure_seat_dir_as_owner(
+    path: &Path,
+    uid: u32,
+    gid: u32,
+    mode: u32,
+) -> std::io::Result<()> {
+    if std::fs::create_dir_all(path).is_ok() {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let owner = path
+            .parent()
+            .into_iter()
+            .flat_map(Path::ancestors)
+            .find_map(|p| std::fs::symlink_metadata(p).ok().filter(|m| m.is_dir()));
+        let (eff_uid, eff_gid) = owner.map(|m| (m.uid(), m.gid())).unwrap_or((uid, gid));
+        if eff_uid != server_uid()
+            && let Some(launcher) = descriptor_launcher()
+        {
+            let groups = match sock_gid_for() {
+                Some(sg) if sg != eff_gid && sg != 0 => format!("{eff_gid},{sg}"),
+                _ => eff_gid.to_string(),
+            };
+            let mode_str = format!("{mode:04o}");
+            let status = std::process::Command::new(launcher)
+                .args([
+                    "--reuid",
+                    &eff_uid.to_string(),
+                    "--regid",
+                    &eff_gid.to_string(),
+                    "--groups",
+                    &groups,
+                    "--no-new-privs",
+                    "--",
+                    "/bin/sh",
+                    "-c",
+                    r#"if [ -L "$1" ]; then exit 1; fi; mkdir -p -m "$2" "$1" && chmod "$2" "$1""#,
+                    "seat-mkdir-owner",
+                ])
+                .arg(path.as_os_str())
+                .arg(&mode_str)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()?;
+            if status.success() {
+                return Ok(());
+            }
+        }
+    }
+    Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+}
+
+pub(crate) fn prepare_config_with_seat_uid(config: &Path, uid: u32, gid: u32) -> Result<(), Error> {
+    crate::seat_tree::share_config(config, uid, gid).map_err(|error| Error::WorkdirPermission {
+        path: config.display().to_string(),
+        message: format!("cannot prepare shared harness configuration: {error}"),
+    })
 }
 
 /// Share a working directory and both per-worktree and common Git metadata.
@@ -623,65 +701,76 @@ pub fn hydrate_operator_groups_if_needed() {
     }
 }
 
-fn config_root_already_shared(config: &Path, gid: u32) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-        std::fs::symlink_metadata(config).is_ok_and(|meta| {
-            meta.is_dir() && meta.gid() == gid && (meta.mode() & 0o7777) == 0o2770
+fn is_peer_boundary_shared(config: &Path, gid: u32) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    let check_dir = |p: &Path| -> bool {
+        std::fs::symlink_metadata(p).is_ok_and(|m| {
+            m.is_dir() && !m.file_type().is_symlink() && m.gid() == gid && (m.mode() & 0o007) == 0
         })
-    }
-    #[cfg(not(unix))]
+    };
+    if !check_dir(config)
+        || !check_dir(&config.with_file_name("memory"))
+        || !check_dir(&config.with_file_name("skills"))
     {
-        let _ = (config, gid);
-        false
+        return false;
     }
+    let cap = config.join("mcp-capability");
+    if let Ok(m) = std::fs::symlink_metadata(&cap)
+        && (m.gid() != gid || (m.mode() & 0o007) != 0)
+    {
+        return false;
+    }
+    true
 }
 
 /// Registered root-to-principal resolution is the same authority used by vendor
 /// launch. Unregistered directories remain foreign in the shared inventory.
 pub(crate) fn peer_principals(store: &anyagents_core::Store) -> Result<String, Error> {
-    let parsed_registry: Option<serde_json::Value> =
-        if let Some(raw) = std::env::var_os("ANYAGENTS_PRINCIPALS") {
-            raw.to_str().and_then(|s| serde_json::from_str(s).ok())
-        } else if let Some(path) = std::env::var_os("ANYAGENTS_PRINCIPAL_REGISTRY") {
-            Path::new(&path)
-                .parent()
-                .and_then(|p| principals::read_principal_registry(p).ok().flatten())
-                .and_then(|raw| serde_json::from_str(&raw).ok())
-        } else {
-            None
-        };
+    use std::sync::{Mutex, OnceLock};
+    type CachedPeers = (std::time::Instant, PathBuf, usize, String);
+    static PEERS_CACHE: OnceLock<Mutex<Option<CachedPeers>>> = OnceLock::new();
+
+    let agents = store.list_agents()?;
+    let cacheable = !is_isolated_test_env() && std::env::var_os("ANYAGENTS_PRINCIPALS").is_none();
+    if cacheable
+        && let Ok(guard) = PEERS_CACHE.get_or_init(|| Mutex::new(None)).lock()
+        && let Some((at, ref dir, count, ref json)) = *guard
+        && dir == store.data_dir()
+        && count == agents.len()
+        && at.elapsed() < std::time::Duration::from_secs(15)
+    {
+        return Ok(json.clone());
+    }
+
     let mut peers = Vec::new();
-    for agent in store.list_agents()? {
-        let resolved = if let Some(ref reg) = parsed_registry {
-            reg.get(agent.id.as_str())
-                .and_then(admitted_principal_entry)
-                .map(|(u, uid, gid, _)| (u, uid, gid, None))
-        } else {
-            crate::create::resolved_agent_seat_info(store, &agent)
-        };
-        if let Some((_, uid, gid, _)) = resolved {
+    for agent in agents.iter() {
+        if let Some((_, uid, gid, _)) = crate::create::resolved_agent_seat_info(store, agent) {
             let config = anyagents_core::agent_config_dir(store.data_dir(), &agent.id);
+            let root = config.parent().unwrap().to_owned();
+            if !root.exists() {
+                continue;
+            }
             // The immutable-ID grant, not historical ownership, authorizes this
             // projection. Reconcile created peers before another seat probes them.
             if config.is_dir()
                 && existing_config_seat(&config).is_none()
-                && !config_root_already_shared(&config, gid)
+                && !is_peer_boundary_shared(&config, gid)
             {
                 share_config_with_seat_uid(&config, uid, gid);
             }
-            peers.push(anyagents_harness::SeatPeer {
-                root: anyagents_core::agent_config_dir(store.data_dir(), &agent.id)
-                    .parent()
-                    .unwrap()
-                    .to_owned(),
-                uid,
-                gid,
-            });
+            peers.push(anyagents_harness::SeatPeer { root, uid, gid });
         }
     }
-    serde_json::to_string(&peers).map_err(|e| Error::Message(e.to_string()))
+    let json = serde_json::to_string(&peers).map_err(|e| Error::Message(e.to_string()))?;
+    if cacheable && let Ok(mut guard) = PEERS_CACHE.get_or_init(|| Mutex::new(None)).lock() {
+        *guard = Some((
+            std::time::Instant::now(),
+            store.data_dir().to_path_buf(),
+            agents.len(),
+            json.clone(),
+        ));
+    }
+    Ok(json)
 }
 
 pub(super) fn descriptor_launcher() -> Option<PathBuf> {

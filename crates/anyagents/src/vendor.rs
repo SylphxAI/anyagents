@@ -15,12 +15,11 @@ use anyagents_harness_codex::CodexHarness;
 use anyagents_harness_muse::MuseHarness;
 use anyagents_harness_omp::OmpHarness;
 use anyagents_harness_opencode::OpenCodeHarness;
-use anyagents_harness_stream::{Launch, StreamHarness};
+use anyagents_harness_stream::{Launch, LineProtocol, StreamHarness, StreamSpec};
 use anyagents_supervisor::LaunchRequest;
 
 use crate::dsh::DshHarness;
 use crate::grok::GrokHarness;
-use crate::sylphx::SylphxHarness;
 
 pub enum VendorHarness {
     Claude(Box<ClaudeHarness>, PathBuf),
@@ -31,7 +30,9 @@ pub enum VendorHarness {
     Omp(Box<OmpHarness>, PathBuf),
     Dsh(Box<DshHarness>, PathBuf),
     Grok(Box<GrokHarness>, PathBuf),
-    Sylphx(Box<SylphxHarness>, PathBuf),
+    /// The external Spiron CLI.  The `PathBuf` is the canonical session file;
+    /// legacy `sylphx-session-id` is read once when this adapter starts.
+    Spiron(Box<StreamHarness>, PathBuf, String),
     Contract(Box<ContractHarness>),
 }
 
@@ -50,7 +51,7 @@ impl VendorHarness {
             Self::Omp(harness, path) => (harness.session_id(), Some(path)),
             Self::Dsh(harness, path) => (harness.session_id(), Some(path)),
             Self::Grok(harness, path) => (harness.session_id(), Some(path)),
-            Self::Sylphx(harness, path) => (harness.session_id(), Some(path)),
+            Self::Spiron(harness, path, _) => (harness.session_id(), Some(path)),
             Self::OpenCode(harness, path) => (harness.session_id(), Some(path)),
             Self::Contract(_) => (None, None),
         };
@@ -72,7 +73,7 @@ impl VendorHarness {
                         Self::Omp(..) => "omp",
                         Self::Dsh(..) => "dsh",
                         Self::Grok(..) => "grok",
-                        Self::Sylphx(..) => "sylphx",
+                        Self::Spiron(_, _, selector) => selector.as_str(),
                         _ => unreachable!(),
                     };
                     if let Err(error) =
@@ -102,7 +103,9 @@ impl VendorHarness {
 fn adapter_config(config_dir: &Path, harness: &str) -> Option<PathBuf> {
     let text = std::fs::read_to_string(config_dir.join("adapter.json")).ok()?;
     let value: serde_json::Value = serde_json::from_str(&text).ok()?;
-    if value.get("mode").and_then(|v| v.as_str()) == Some("sylphx-native") {
+    // Ignore the retired in-process mode marker. Explicit contract doubles
+    // remain available to the credential-free server acceptance suite.
+    if value.get("mode").and_then(|item| item.as_str()) == Some("sylphx-native") {
         return None;
     }
     let named = value.get("harness").and_then(|item| item.as_str())?;
@@ -391,6 +394,7 @@ pub fn persist_last_error(config_dir: &Path, error: Option<&str>, quota_reset_at
     }
 }
 
+#[cfg(test)]
 pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
     vendor_launch_authorized(request, None)
 }
@@ -491,31 +495,51 @@ fn retire_poisoned_agy_session(config_dir: &Path, now_ms: i64) -> Result<bool, S
 
 fn prepare_host_session(request: &LaunchRequest) -> Result<(), String> {
     let root = request.config_dir.parent().ok_or("agent root missing")?;
-    let source = memory_source(&request.agent);
     anyagents_core::host_session::recover_pending(root).map_err(|e| e.to_string())?;
     let previous = anyagents_core::host_session::active(root).map_err(|e| e.to_string())?;
     let switched = previous
         .as_ref()
         .is_some_and(|s| s.harness != request.agent.harness);
-    if switched {
-        // Deliberate harness cutover starts a native session too. Keep its raw
-        // history in place; only retire the pointer, not its transcript/state.
-        if let Some(file) = crate::create::harness_session_filename(&request.agent.harness) {
-            match std::fs::remove_file(request.config_dir.join(file)) {
-                Ok(()) => (),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
-                Err(e) => return Err(e.to_string()),
+    // Adopt the legacy pointer once, without modifying it. A reset/cutover must
+    // never resurrect it: an existing host pin requires a positively matching
+    // legacy alias, not merely a still-present historical file.
+    if is_spiron_harness(&request.agent.harness)
+        && !switched
+        && session_from_file(&request.config_dir, "spiron-session-id")?.is_none()
+        && let Some(legacy) = session_from_file(&request.config_dir, "sylphx-session-id")?
+    {
+        let adopt = match &previous {
+            None => true,
+            Some(active) => {
+                anyagents_core::host_session::bound_vendor(root, &request.agent.harness, &legacy)
+                    .map_err(|e| e.to_string())?
+                    .is_some_and(|bound| bound.generation == active.generation)
             }
+        };
+        if adopt {
+            anyagents_core::learned_memory::atomic_write(
+                &request.config_dir.join("spiron-session-id"),
+                format!("{legacy}\n").as_bytes(),
+            )
+            .map_err(|e| format!("legacy session adoption failed: {e}"))?;
         }
-        anyagents_core::host_session::new_session_with_source(root, &request.agent.harness, source)
-    } else {
+    }
+    let source = memory_source(&request.agent);
+    let prepared = anyagents_core::host_session::prepare_harness_with_source(
+        root,
+        &request.agent.harness,
+        crate::create::harness_session_filename(&request.agent.harness),
+        source,
+    )
+    .map_err(|e| format!("host session pin failed: {e}"))?;
+    if prepared.is_none() {
         anyagents_core::host_session::ensure_active_with_source(
             root,
             &request.agent.harness,
             source,
         )
+        .map_err(|e| format!("host session pin failed: {e}"))?;
     }
-    .map_err(|e| format!("host session pin failed: {e}"))?;
     if let Some(file) = crate::create::harness_session_filename(&request.agent.harness)
         && let Some(id) = session_from_file(&request.config_dir, file)?
     {
@@ -695,6 +719,10 @@ fn vendor_launch_inner(
             request.agent.id
         ));
     }
+    if let Some((_, uid, gid, _)) = resolved_seat.as_ref() {
+        crate::sandbox::prepare_config_with_seat_uid(&request.config_dir, *uid, *gid)
+            .map_err(|error| error.to_string())?;
+    }
     if request.agent.harness == "agy" {
         ensure_agy_steering_settings(&request.config_dir, &request.work_dir)
             .map_err(|err| err.to_string())?;
@@ -730,6 +758,12 @@ fn vendor_launch_inner(
             )
             .map_err(|e| e.to_string())?;
         }
+    } else if let Some(store) = store_opt {
+        let _ = crate::create::compute_live_session_continuity(
+            store,
+            &request.agent,
+            &request.config_dir,
+        );
     }
     if let Some((ref seat_user, ref seat_launch)) = seat_spec {
         crate::create::ensure_seat_environment(&request.config_dir, &request.work_dir)
@@ -758,6 +792,9 @@ fn vendor_launch_inner(
         }) {
             crate::sandbox::share_config_with_seat_uid(&request.config_dir, uid, gid);
             let managed_work = anyagents_core::agent_work_dir(&request.data_dir, &request.agent.id);
+            if request.work_dir == managed_work && !managed_work.exists() {
+                let _ = crate::sandbox::ensure_seat_dir_as_owner(&managed_work, uid, gid, 0o2770);
+            }
             if request.work_dir == managed_work
                 && managed_work.is_dir()
                 && !managed_work.join(".git").exists()
@@ -875,7 +912,7 @@ fn vendor_launch_inner(
                 .filter(|m| !m.is_empty())
                 .unwrap_or("muse-wonder-1.0")
                 .to_string();
-            vec![
+            let mut args = vec![
                 "--provider".to_string(),
                 "meta".to_string(),
                 "--model".to_string(),
@@ -887,7 +924,20 @@ fn vendor_launch_inner(
                 "context.foreign_personal_rules=false".to_string(),
                 "-c".to_string(),
                 "context.foreign_personal_skills=false".to_string(),
-            ]
+            ];
+            if std::env::var_os("ANYAGENTS_ALLOW_NATIVE_SUBAGENTS").is_none() {
+                for override_kv in [
+                    "local_session_messaging.enabled=false",
+                    "tools.web_search.mode=\"off\"",
+                    "tools.web_fetch.enabled=false",
+                    "run.subagent_delegation_mode=\"off\"",
+                    "run.workflow_trigger_mode=\"off\"",
+                ] {
+                    args.push("-c".to_string());
+                    args.push(override_kv.to_string());
+                }
+            }
+            args
         };
         let harness = MuseHarness::start_in_with_args(
             &program,
@@ -936,6 +986,13 @@ fn vendor_launch_inner(
             {
                 spec.args.push("--model".to_string());
                 spec.args.push(model.to_string());
+            }
+            if std::env::var_os("ANYAGENTS_ALLOW_NATIVE_SUBAGENTS").is_none() {
+                let policy_path = crate::grok::ensure_omp_policy(&omp_agent_dir)
+                    .map_err(|err| err.to_string())?;
+                spec.args.push("--config".to_string());
+                spec.args.push(policy_path.display().to_string());
+                spec.args.push("--no-extensions".to_string());
             }
             let sys_prompt = request.config_dir.join("SYSTEM_PROMPT.md");
             if sys_prompt.is_file() {
@@ -997,37 +1054,23 @@ fn vendor_launch_inner(
         );
         vh.sync_session()?;
         Ok(vh)
-    } else if request.agent.harness == "sylphx" {
-        let session = session_from_file(&request.config_dir, "sylphx-session-id")?;
-        let exe = crate::data::current_exe_clean().unwrap_or_else(|_| PathBuf::from("anyagents"));
-        let mcp_args = vec![
-            "--data".to_string(),
-            request.data_dir.display().to_string(),
-            "mcp".to_string(),
-            "--config".to_string(),
-            request.config_dir.display().to_string(),
-        ];
-        let mut harness = SylphxHarness::start(
+    } else if is_spiron_harness(&request.agent.harness) {
+        let session = session_from_file(&request.config_dir, "spiron-session-id")?;
+        let program = std::env::var("ANYAGENTS_SPIRON_BIN")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| crate::install::program(&root, "spiron"));
+        let harness = start_spiron(
+            &program,
             &request.config_dir,
             &request.work_dir,
-            request.agent.model.as_deref(),
+            &request.agent,
             session.as_deref(),
-            &pairs(&env),
-            &exe,
-            &mcp_args,
-        )
-        .map_err(|err| err.to_string())?;
-        if seat_spec.is_some() {
-            let store = anyagents_core::Store::open(request.data_dir.join("state.db"))
-                .map_err(|e| format!("cannot refresh seat peers: {e}"))?;
-            harness.set_seat_peers_resolver(move || {
-                crate::sandbox::peer_principals(&store)
-                    .map_err(|e| format!("cannot refresh seat peers: {e}"))
-            });
-        }
-        let vh = VendorHarness::Sylphx(
+            &env,
+        )?;
+        let vh = VendorHarness::Spiron(
             Box::new(harness),
-            request.config_dir.join("sylphx-session-id"),
+            request.config_dir.join("spiron-session-id"),
+            request.agent.harness.clone(),
         );
         vh.sync_session()?;
         Ok(vh)
@@ -1129,7 +1172,7 @@ fn vendor_launch_inner(
             if std::env::var_os("ANYAGENTS_ALLOW_NATIVE_SUBAGENTS").is_none() {
                 args.push("--disallowedTools".to_string());
                 args.push(
-                    "Task,Agent,TeamCreate,TeamDelete,SendMessage,ScheduleWakeup,Monitor,CronCreate,CronDelete,CronList,RemoteTrigger,PushNotification"
+                    "Task,Agent,TeamCreate,TeamDelete,SendMessage,ScheduleWakeup,Monitor,CronCreate,CronDelete,CronList,RemoteTrigger,PushNotification,WebSearch,WebFetch"
                         .to_string(),
                 );
             }
@@ -1231,32 +1274,43 @@ pub(crate) fn ensure_agy_steering_settings(
                 changed = true;
             }
             if let Some(deny_arr) = deny.as_array_mut() {
+                const AGY_DENIED_NATIVE_TOOLS: &[&str] = &[
+                    "invoke_subagent",
+                    "define_subagent",
+                    "manage_subagents",
+                    "send_message",
+                    "schedule",
+                    "search_web",
+                    "read_url_content",
+                    "browser_subagent",
+                    "open_browser_url",
+                    "run_command",
+                    "manage_task",
+                    "read_file",
+                    "write_file",
+                    "edit_file",
+                    "view_file",
+                    "grep_search",
+                    "find_by_name",
+                    "list_dir",
+                    "command(*)",
+                    "read_file(*)",
+                    "write_file(*)",
+                    "read_url(*)",
+                    "execute_url(*)",
+                ];
                 if std::env::var_os("ANYAGENTS_ALLOW_NATIVE_SUBAGENTS").is_none() {
-                    for tool in [
-                        "invoke_subagent",
-                        "define_subagent",
-                        "manage_subagents",
-                        "send_message",
-                        "schedule",
-                    ] {
-                        if !deny_arr.iter().any(|v| v.as_str() == Some(tool)) {
-                            deny_arr.push(serde_json::Value::String(tool.to_string()));
+                    for tool in AGY_DENIED_NATIVE_TOOLS {
+                        if !deny_arr.iter().any(|v| v.as_str() == Some(*tool)) {
+                            deny_arr.push(serde_json::Value::String((*tool).to_string()));
                             changed = true;
                         }
                     }
                 } else {
                     let before = deny_arr.len();
                     deny_arr.retain(|v| {
-                        !matches!(
-                            v.as_str(),
-                            Some(
-                                "invoke_subagent"
-                                    | "define_subagent"
-                                    | "manage_subagents"
-                                    | "send_message"
-                                    | "schedule"
-                            )
-                        )
+                        !v.as_str()
+                            .is_some_and(|s| AGY_DENIED_NATIVE_TOOLS.contains(&s))
                     });
                     if deny_arr.len() != before {
                         changed = true;
@@ -1289,19 +1343,50 @@ pub(crate) fn ensure_agy_steering_settings(
         }
     }
     let hook_dir = config_dir.join(".gemini").join("config");
+    std::fs::create_dir_all(&hook_dir)?;
     let _ = std::fs::remove_file(hook_dir.join("anyagents-steer-hook.sh"));
     let _ = std::fs::remove_file(hook_dir.join("steer.jsonl"));
     let hooks_path = hook_dir.join("hooks.json");
-    if let Ok(text) = std::fs::read_to_string(&hooks_path)
-        && let Ok(mut hooks_map) =
-            serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&text)
-        && hooks_map.remove("anyagents-steer").is_some()
-    {
+    let mut hooks_root = if hooks_path.exists() {
+        crate::mcp_config::read_candidates(std::slice::from_ref(&hooks_path))?
+    } else {
+        serde_json::json!({})
+    };
+    let hooks_map = hooks_root
+        .as_object_mut()
+        .ok_or_else(|| anyagents_core::Error::Message("AGY hooks.json is not an object".into()))?;
+    let mut hooks_changed = hooks_map.remove("anyagents-steer").is_some();
+    if std::env::var_os("ANYAGENTS_ALLOW_NATIVE_SUBAGENTS").is_none() {
+        let desired_guard = serde_json::json!({
+            "enabled": true,
+            "PreToolUse": [
+                {
+                    "matcher": "^(invoke_subagent|define_subagent|manage_subagents|send_message|schedule|search_web|read_url_content|browser_subagent|open_browser_url|browser_.*|run_command|manage_task|send_command_input|command_status|shell_exec|read_file|write_file|edit_file|view_file|view_file_outline|view_code_item|view_content_chunk|code_action|grep_search|find_by_name|find|list_dir|list_directory)$",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": "printf '%s\\n' '{\"decision\":\"deny\",\"reason\":\"Native built-in tools are disabled under AnyAgents; use the anyagents MCP code tool (workspace.*, web.*, anyagents.*) instead.\"}'",
+                            "timeout": 5
+                        }
+                    ]
+                }
+            ]
+        });
+        if hooks_map.get("anyagents-native-tool-guard") != Some(&desired_guard) {
+            hooks_map.insert("anyagents-native-tool-guard".to_string(), desired_guard);
+            hooks_changed = true;
+        }
+    } else if hooks_map.remove("anyagents-native-tool-guard").is_some() {
+        hooks_changed = true;
+    }
+    if hooks_changed {
         if hooks_map.is_empty() {
             let _ = std::fs::remove_file(&hooks_path);
-        } else if let Ok(body) = serde_json::to_string_pretty(&serde_json::Value::Object(hooks_map))
-        {
-            let _ = std::fs::write(&hooks_path, format!("{body}\n"));
+        } else {
+            let mut body = serde_json::to_vec_pretty(&hooks_root)
+                .map_err(|err| anyagents_core::Error::Message(err.to_string()))?;
+            body.push(b'\n');
+            crate::create::write_required_file(&hooks_path, &body, 0o664)?;
         }
     }
     Ok(())
@@ -1317,6 +1402,91 @@ fn start_claude(
     let pairs = pairs(env);
     ClaudeHarness::start_in_with_args(program, extra_args, session, &pairs, Some(work_dir))
         .map_err(|err| err.to_string())
+}
+
+/// Legacy AnyAgents records named `sylphx` are deliberately only a selector
+/// alias.  They launch the external `spiron` process and never enter a local
+/// model/tool loop.
+pub(crate) fn is_spiron_harness(harness: &str) -> bool {
+    anyagents_harness::normalize_harness_name(harness) == "spiron"
+}
+
+fn start_spiron(
+    program: &Path,
+    config_dir: &Path,
+    work_dir: &Path,
+    agent: &anyagents_core::Agent,
+    session: Option<&str>,
+    env: &[(String, String)],
+) -> Result<StreamHarness, String> {
+    let mcp_config = config_dir.join("spiron-mcp.json");
+    let skills = config_dir.join(".agents/skills");
+    let mut args = vec![
+        "--headless".to_string(),
+        "--json".to_string(),
+        "--mcp-config".to_string(),
+        mcp_config.display().to_string(),
+        "--workdir".to_string(),
+        work_dir.display().to_string(),
+        "--skills-dir".to_string(),
+        skills.display().to_string(),
+        "--state-dir".to_string(),
+        config_dir.display().to_string(),
+        "--instructions-file".to_string(),
+        config_dir.join("SYSTEM_PROMPT.md").display().to_string(),
+        "--agent-id".to_string(),
+        agent.id.to_string(),
+        "--agent-name".to_string(),
+        agent.name.clone(),
+    ];
+    if let Some(model) = agent
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+    {
+        args.extend(["--model".to_string(), model.to_string()]);
+    }
+    let base_args = args.clone();
+    if let Some(session) = session {
+        args.extend(["--session".to_string(), session.to_string()]);
+    }
+    let spec = StreamSpec {
+        name: "anyagents-spiron".to_string(),
+        args: base_args,
+        resume_flag: "--session",
+        start_line: "user",
+        cancel: "cancel",
+        protocol: LineProtocol::AcknowledgedResult,
+    };
+    let mut environment = env.to_vec();
+    environment.push(("HOME".to_string(), config_dir.display().to_string()));
+    // Profiles are materialized into the seat config by create.rs. Do not pass
+    // their coordinator selector as a Spiron TOML filename.
+    environment.extend([
+        (
+            "SPIRON_MCP_CONFIG".to_string(),
+            mcp_config.display().to_string(),
+        ),
+        (
+            "SPIRON_WORKSPACE".to_string(),
+            work_dir.display().to_string(),
+        ),
+        ("SPIRON_SKILLS".to_string(), skills.display().to_string()),
+    ]);
+    let harness = StreamHarness::launch(Launch {
+        spec,
+        program: program.to_path_buf(),
+        args,
+        environment,
+        work_dir: Some(work_dir.to_path_buf()),
+        session_id: session.map(str::to_string),
+        mode: anyagents_harness::DeliveryMode::Steer,
+        steer: anyagents_harness::SteerSupport::Yes,
+    })
+    .map_err(|err| err.to_string())?;
+    harness.set_state_dir(config_dir);
+    Ok(harness)
 }
 
 fn start_codex(
@@ -1346,7 +1516,11 @@ impl Harness for VendorHarness {
             Self::Omp(harness, _) => harness.deliver(message),
             Self::Dsh(harness, _) => harness.deliver(message),
             Self::Grok(harness, _) => harness.deliver(message),
-            Self::Sylphx(harness, _) => harness.deliver(message),
+            Self::Spiron(harness, _, _) => harness.deliver(message, &serde_json::json!({
+                "type": "user",
+                "request_id": message.id,
+                "text": anyagents_harness::compose_message(&message.id, &message.context, &message.text),
+            })),
             Self::Contract(harness) => harness.deliver(message),
         };
         self.sync_session().map_err(HarnessError::Failed)?;
@@ -1363,7 +1537,7 @@ impl Harness for VendorHarness {
             Self::Omp(harness, _) => harness.background(),
             Self::Dsh(harness, _) => harness.background(),
             Self::Grok(harness, _) => harness.background(),
-            Self::Sylphx(harness, _) => harness.background(),
+            Self::Spiron(harness, _, _) => harness.background(),
             Self::Contract(harness) => harness.background(),
         }
     }
@@ -1378,7 +1552,7 @@ impl Harness for VendorHarness {
             Self::Omp(harness, _) => harness.resume(session),
             Self::Dsh(harness, _) => harness.resume(session),
             Self::Grok(harness, _) => harness.resume(session),
-            Self::Sylphx(harness, _) => harness.resume(session),
+            Self::Spiron(harness, _, _) => harness.resume(session),
             Self::Contract(harness) => harness.resume(session),
         };
         self.sync_session().map_err(HarnessError::Failed)?;
@@ -1395,7 +1569,7 @@ impl Harness for VendorHarness {
             Self::Omp(harness, _) => harness.cancel(),
             Self::Dsh(harness, _) => harness.cancel(),
             Self::Grok(harness, _) => harness.cancel(),
-            Self::Sylphx(harness, _) => harness.cancel(),
+            Self::Spiron(harness, _, _) => harness.cancel(&serde_json::json!({"type": "cancel"})),
             Self::Contract(harness) => harness.cancel(),
         }
     }
@@ -1420,7 +1594,7 @@ impl Harness for VendorHarness {
             Self::Omp(harness, _) => harness.health(),
             Self::Dsh(harness, _) => harness.health(),
             Self::Grok(harness, _) => harness.health(),
-            Self::Sylphx(harness, _) => harness.health(),
+            Self::Spiron(harness, _, _) => harness.health(),
             Self::Contract(harness) => harness.health(),
         }
     }
@@ -1435,7 +1609,7 @@ impl Harness for VendorHarness {
             Self::Omp(harness, _) => harness.input_ready(),
             Self::Dsh(harness, _) => harness.input_ready(),
             Self::Grok(harness, _) => harness.input_ready(),
-            Self::Sylphx(harness, _) => harness.input_ready(),
+            Self::Spiron(harness, _, _) => harness.input_ready(),
             Self::Contract(harness) => harness.input_ready(),
         }
     }
@@ -1453,9 +1627,13 @@ impl Harness for VendorHarness {
             Self::Omp(harness, _) => harness.last_usage(),
             Self::Dsh(harness, _) => harness.last_usage(),
             Self::Grok(harness, _) => harness.last_usage(),
-            Self::Sylphx(harness, _) => harness.last_usage(),
+            Self::Spiron(harness, _, _) => harness.served_usage(),
             Self::Contract(harness) => harness.last_usage(),
         }
+    }
+
+    fn served_usage(&self) -> TurnUsage {
+        self.last_usage()
     }
 
     fn turns_served(&self) -> u32 {
@@ -1468,7 +1646,7 @@ impl Harness for VendorHarness {
             Self::Omp(harness, _) => harness.turns_served(),
             Self::Dsh(harness, _) => harness.turns_served(),
             Self::Grok(harness, _) => harness.turns_served(),
-            Self::Sylphx(harness, _) => harness.turns_served(),
+            Self::Spiron(harness, _, _) => harness.turns_served(),
             Self::Contract(harness) => harness.turns_served(),
         }
     }
@@ -1483,7 +1661,7 @@ impl Harness for VendorHarness {
             Self::Omp(harness, _) => harness.quiet_for(id, quiet, patience),
             Self::Dsh(harness, _) => harness.quiet_for(id, quiet, patience),
             Self::Grok(harness, _) => harness.quiet_for(id, quiet, patience),
-            Self::Sylphx(harness, _) => harness.quiet_for(id, quiet, patience),
+            Self::Spiron(_, _, _) => false,
             Self::Contract(harness) => harness.quiet_for(id, quiet, patience),
         }
     }
@@ -1498,7 +1676,7 @@ impl Harness for VendorHarness {
             Self::Omp(harness, _) => harness.ends_on_quiet(),
             Self::Dsh(harness, _) => harness.ends_on_quiet(),
             Self::Grok(harness, _) => harness.ends_on_quiet(),
-            Self::Sylphx(harness, _) => harness.ends_on_quiet(),
+            Self::Spiron(_, _, _) => None,
             Self::Contract(harness) => harness.ends_on_quiet(),
         }
     }
@@ -1513,7 +1691,7 @@ impl Harness for VendorHarness {
             Self::Omp(harness, _) => harness.clear_quota(),
             Self::Dsh(harness, _) => harness.clear_quota(),
             Self::Grok(harness, _) => harness.clear_quota(),
-            Self::Sylphx(harness, _) => harness.clear_quota(),
+            Self::Spiron(harness, _, _) => harness.clear_quota(),
             Self::Contract(harness) => harness.clear_quota(),
         }
     }
@@ -1528,7 +1706,7 @@ impl Harness for VendorHarness {
             Self::Omp(harness, _) => harness.process_id(),
             Self::Dsh(harness, _) => harness.process_id(),
             Self::Grok(harness, _) => harness.process_id(),
-            Self::Sylphx(harness, _) => harness.process_id(),
+            Self::Spiron(harness, _, _) => harness.process_id(),
             Self::Contract(harness) => harness.process_id(),
         }
     }
@@ -1543,8 +1721,55 @@ impl Harness for VendorHarness {
             Self::Omp(harness, _) => harness.watch_activity(notify),
             Self::Dsh(harness, _) => harness.watch_activity(notify),
             Self::Grok(harness, _) => harness.watch_activity(notify),
-            Self::Sylphx(harness, _) => harness.watch_activity(notify),
+            Self::Spiron(harness, _, _) => harness.watch_activity(notify),
             Self::Contract(harness) => harness.watch_activity(notify),
+        }
+    }
+
+    fn poll_steer(&mut self) -> Result<Option<anyagents_harness::SteerItem>, HarnessError> {
+        match self {
+            Self::Claude(harness, _) => harness.poll_steer(),
+            Self::Codex(harness, _) => harness.poll_steer(),
+            Self::OpenCode(harness, _) => harness.poll_steer(),
+            Self::Agy(harness, _) => harness.poll_steer(),
+            Self::Muse(harness, _) => harness.poll_steer(),
+            Self::Omp(harness, _) => harness.poll_steer(),
+            Self::Dsh(harness, _) => harness.poll_steer(),
+            Self::Grok(harness, _) => harness.poll_steer(),
+            Self::Spiron(..) => Ok(None),
+            Self::Contract(harness) => harness.poll_steer(),
+        }
+    }
+
+    fn inject(&mut self, message: &OutboundMessage) -> Result<bool, HarnessError> {
+        let out = match self {
+            Self::Claude(harness, _) => harness.inject(message),
+            Self::Codex(harness, _) => harness.inject(message),
+            Self::OpenCode(harness, _) => harness.inject(message),
+            Self::Agy(harness, _) => harness.inject(message),
+            Self::Muse(harness, _) => harness.inject(message),
+            Self::Omp(harness, _) => harness.inject(message),
+            Self::Dsh(harness, _) => harness.inject(message),
+            Self::Grok(harness, _) => harness.inject(message),
+            Self::Spiron(..) => Ok(false),
+            Self::Contract(harness) => harness.inject(message),
+        };
+        self.sync_session().map_err(HarnessError::Failed)?;
+        out
+    }
+
+    fn release_steer(&mut self, keep: &str) {
+        match self {
+            Self::Claude(harness, _) => harness.release_steer(keep),
+            Self::Codex(harness, _) => harness.release_steer(keep),
+            Self::OpenCode(harness, _) => harness.release_steer(keep),
+            Self::Agy(harness, _) => harness.release_steer(keep),
+            Self::Muse(harness, _) => harness.release_steer(keep),
+            Self::Omp(harness, _) => harness.release_steer(keep),
+            Self::Dsh(harness, _) => harness.release_steer(keep),
+            Self::Grok(harness, _) => harness.release_steer(keep),
+            Self::Spiron(..) => {}
+            Self::Contract(harness) => harness.release_steer(keep),
         }
     }
 }
@@ -1843,6 +2068,30 @@ rmdir -- "$1"
             0o600,
             gid,
         );
+        // Reproduce a daemon-to-seat handoff with old private runtime trees.
+        // No pre-grant: production sharing must repair every owned descendant.
+        for name in ["cache-home", "tmp"] {
+            directory(&config.join(name), 0o700, 0, 0);
+            directory(&config.join(name).join("nested"), 0o700, 0, 0);
+            directory(&config.join(name).join("nested/__pycache__"), 0o700, 0, 0);
+            file(
+                &config.join(name).join("nested/retained"),
+                "retained-runtime-bytes\n",
+                0o600,
+                0,
+            );
+            let foreign = config.join(name).join("foreign-private");
+            directory(&foreign, 0o700, uid + 1, gid + 1);
+            protected.push(foreign);
+            std::os::unix::fs::symlink(&peer, config.join(name).join("peer-link")).unwrap();
+        }
+        // A recursive group-write operation must not make a valid capability
+        // permanently fail its own seat's admission.
+        std::fs::set_permissions(
+            config.join("mcp-capability"),
+            std::fs::Permissions::from_mode(0o660),
+        )
+        .unwrap();
         let report = config.join("native-vendor-report");
         let probe = fixture.join("vendor-probe.sh");
         file(
@@ -1859,6 +2108,15 @@ trust=$(/usr/bin/git config --no-includes --file "$ANYAGENTS_AGENT_CONFIG/.gitco
 for mirror in .claude .agents .agy; do
   grep -qx '# global preserved' "$ANYAGENTS_AGENT_CONFIG/$mirror/skills/global/SKILL.md"
   grep -qx '# local' "$ANYAGENTS_AGENT_CONFIG/$mirror/skills/local/SKILL.md"
+done
+for name in cache-home tmp; do
+  runtime="$ANYAGENTS_AGENT_CONFIG/$name"
+  grep -qxE '(retained-runtime-bytes|changed-runtime-bytes)' "$runtime/nested/retained"
+  printf changed-runtime-bytes > "$runtime/nested/retained"
+  printf created > "$runtime/nested/__pycache__/created"
+  rm "$runtime/nested/__pycache__/created"
+  [ ! -r "$runtime/foreign-private" ]; [ ! -x "$runtime/foreign-private" ]
+  [ ! -r "$runtime/peer-link/config/private" ]
 done
 printf synthetic-memory-after > "$ANYAGENTS_AGENT_CONFIG/../memory/MEMORY.md"
 printf authored > "$ANYAGENTS_AGENT_CONFIG/../skills/authored"
@@ -1951,8 +2209,8 @@ cat >/dev/null
         );
         assert_eq!(
             std::fs::metadata(config.join(".agy")).unwrap().mode() & 0o777,
-            0o700,
-            "sharing must retain the existing owner-private vendor parent"
+            0o770,
+            "config preparation must restore the admitted daemon group's access"
         );
         println!("NATIVE_VENDOR_LEGACY_SQLITE_OWNER_AND_BYTES_RETAINED");
         let evidence = std::fs::read_to_string(&report).unwrap_or_else(|error| {
@@ -1972,9 +2230,169 @@ cat >/dev/null
             "synthetic-memory-after"
         );
         assert!(evidence.contains("GIT_TRUST_EXACT"), "{evidence}");
+        assert_eq!(
+            std::fs::metadata(config.join("mcp-capability"))
+                .unwrap()
+                .mode()
+                & 0o777,
+            0o640
+        );
+        for name in ["cache-home", "tmp"] {
+            assert_eq!(
+                std::fs::read(config.join(name).join("nested/retained")).unwrap(),
+                b"changed-runtime-bytes"
+            );
+            for suffix in ["", "nested", "nested/__pycache__"] {
+                let meta = std::fs::metadata(config.join(name).join(suffix)).unwrap();
+                assert_eq!(
+                    (meta.uid(), meta.gid(), meta.mode() & 0o7777),
+                    (0, gid, 0o2770)
+                );
+            }
+        }
+        println!("NATIVE_VENDOR_RUNTIME_CACHE_TMP_HANDOFF_AND_CAPABILITY_NORMALIZATION_OK");
         println!("{evidence}");
         drop(harness);
         std::fs::remove_file(&report).unwrap();
+        // Cover the other historical ownership branch without host DAC override.
+        let capability = config.join("mcp-capability");
+        let c_cap = std::ffi::CString::new(capability.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::chown(c_cap.as_ptr(), uid, gid) }, 0);
+        let changed = std::process::Command::new("/usr/bin/setpriv")
+            .args([
+                "--reuid",
+                &uid.to_string(),
+                "--regid",
+                &gid.to_string(),
+                "--clear-groups",
+                "--no-new-privs",
+                "--",
+                "/bin/chmod",
+                "660",
+            ])
+            .arg(&capability)
+            .status()
+            .unwrap();
+        assert!(changed.success());
+        let seat_owned_harness = launch().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !report.is_file() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            std::fs::read_to_string(&report).is_ok_and(
+                |text| text.contains("REAL_MOUNTS_UMASK077_OWNER_FALLBACK_OK SAME_SEAT_OK")
+            ),
+            "seat-owned capability must admit the actual vendor command"
+        );
+        assert_eq!(
+            std::fs::metadata(&capability).unwrap().mode() & 0o777,
+            0o640
+        );
+        drop(seat_owned_harness);
+        // The second command was observed through its real report before stop.
+        let _ = std::fs::remove_file(&report);
+        println!("NATIVE_VENDOR_SEAT_OWNED_CAPABILITY_NORMALIZED_OK");
+        // A real admitted child inherits group-writable defaults even when the
+        // daemon inherited 077. Explicit 0600 replacements still need the next
+        // pre-read config repair; a umask cannot add permissions to such files.
+        let agy_probe = fixture.join("agy-config-probe.sh");
+        file(
+            &agy_probe,
+            r#"#!/bin/sh
+set -eu
+[ "$(umask)" = 0007 ]
+base="$ANYAGENTS_AGENT_CONFIG/.gemini/antigravity-cli"
+grep -q 'send-immediately' "$base/settings.json"
+cp "$base/settings.json" "$ANYAGENTS_AGENT_CONFIG/agy-before-start.json"
+mkdir -p "$base/builtin" "$base/conversations"
+printf default > "$base/conversations/default"
+printf '{"queuedMessages":"queued","retained":"synthetic"}' > "$base/settings.new"
+chmod 600 "$base/settings.new"
+mv "$base/settings.new" "$base/settings.json"
+printf ready > "$ANYAGENTS_AGENT_CONFIG/agy-config-ready"
+cat >/dev/null
+"#,
+            0o555,
+            0,
+        );
+        let mut agy_agent = agent.clone();
+        agy_agent.harness = "agy".into();
+        unsafe {
+            std::env::set_var("ANYAGENTS_AGY_BIN", &agy_probe);
+        }
+        let old_mask = unsafe { libc::umask(0o077) };
+        let agy_launch = vendor_launch_with_store(
+            LaunchRequest {
+                agent: agy_agent.clone(),
+                data_dir: data.clone(),
+                config_dir: config.clone(),
+                work_dir: root.join("work"),
+                extra_env: vec![],
+            },
+            &store,
+        );
+        unsafe {
+            libc::umask(old_mask);
+        }
+        let agy_harness = agy_launch.unwrap();
+        let ready = config.join("agy-config-ready");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !ready.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(ready.exists(), "admitted AGY fixture did not complete");
+        drop(agy_harness);
+        let vendor_dir = config.join(".gemini/antigravity-cli");
+        let settings = vendor_dir.join("settings.json");
+        assert_eq!(
+            std::fs::metadata(vendor_dir.join("conversations"))
+                .unwrap()
+                .mode()
+                & 0o7777,
+            0o2770
+        );
+        assert_eq!(
+            std::fs::metadata(vendor_dir.join("conversations/default"))
+                .unwrap()
+                .mode()
+                & 0o777,
+            0o660
+        );
+        assert_eq!(
+            std::fs::read(&settings).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert!(ensure_agy_steering_settings(&config, &root.join("work")).is_err());
+        // Relaunch with the inaccessible replacement still in place. This
+        // exercises actual pre-read preparation, not a helper-only repair.
+        std::fs::remove_file(&ready).unwrap();
+        let relaunched = vendor_launch_with_store(
+            LaunchRequest {
+                agent: agy_agent,
+                data_dir: data.clone(),
+                config_dir: config.clone(),
+                work_dir: root.join("work"),
+                extra_env: vec![],
+            },
+            &store,
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !ready.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(ready.exists(), "AGY relaunch refused before config repair");
+        drop(relaunched);
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(config.join("agy-before-start.json")).unwrap())
+                .unwrap();
+        assert_eq!(value["retained"], "synthetic");
+        assert_eq!(value["queuedMessages"], "send-immediately");
+        crate::sandbox::prepare_config_with_seat_uid(&config, uid, gid).unwrap();
+        ensure_agy_steering_settings(&config, &root.join("work")).unwrap();
+        assert_eq!(std::fs::metadata(&settings).unwrap().mode() & 0o060, 0o060);
+        println!("NATIVE_AGY_GROUP_DEFAULTS_AND_PRIVATE_REPLACEMENT_REPAIRED");
         for name in ["memory", "skills", "config"] {
             std::fs::set_permissions(peer.join(name), std::fs::Permissions::from_mode(0o777))
                 .unwrap();
@@ -2226,6 +2644,12 @@ done
         std::fs::rename(config.join(".claude-host-held"), config.join(".claude")).unwrap();
         assert_eq!(snapshot(), before, "protected bytes or permissions changed");
         println!("NATIVE_VENDOR_PROTECTED_BEFORE_EQUALS_AFTER");
+        // The protected foreign-owner controls are empty leaves created only
+        // by this fixture. Unlink them through the admitted writable parent;
+        // never widen their private mode merely to perform teardown.
+        for name in ["cache-home", "tmp"] {
+            std::fs::remove_dir(config.join(name).join("foreign-private")).unwrap();
+        }
         // Native launch also creates a private op leaf. Prove that the reduced-
         // DAC daemon cannot enumerate it before its actual owner removes only
         // known token links and the empty directory. Do not widen private modes
@@ -2326,6 +2750,89 @@ done
     }
 
     #[test]
+    fn spiron_host_pin_adopts_legacy_once_and_never_revives_it_after_reset() {
+        use anyagents_core::{NewAgent, Store, host_session};
+        for selector in [
+            "spiron",
+            "sylphx",
+            "sylphx-agent",
+            "sylphx_agent",
+            "sylphx/default",
+        ] {
+            for already_pinned in [false, true] {
+                let dir = crate::test_tempdir();
+                let store = Store::open(dir.path().join("state.db")).unwrap();
+                let agent = store
+                    .create_agent(NewAgent::new("legacy-pin", selector))
+                    .unwrap();
+                let config = anyagents_core::agent_config_dir(dir.path(), &agent.id);
+                std::fs::create_dir_all(&config).unwrap();
+                let root = config.parent().unwrap();
+                let legacy = b"legacy-resume\n";
+                std::fs::write(config.join("sylphx-session-id"), legacy).unwrap();
+                std::fs::create_dir_all(root.join("memory")).unwrap();
+                std::fs::write(root.join("memory/MEMORY.md"), "original pin").unwrap();
+                let prior = already_pinned.then(|| {
+                    host_session::ensure_active(root, selector).unwrap();
+                    host_session::bind_vendor(root, selector, "legacy-resume").unwrap()
+                });
+                let request = || LaunchRequest {
+                    agent: agent.clone(),
+                    data_dir: dir.path().to_owned(),
+                    config_dir: config.clone(),
+                    work_dir: root.join("work"),
+                    extra_env: vec![],
+                };
+                prepare_host_session(&request()).unwrap();
+                let first = host_session::active(root).unwrap().unwrap();
+                if let Some(prior) = prior {
+                    assert_eq!(first, prior);
+                }
+                assert_eq!(first.harness, "spiron");
+                assert_eq!(
+                    std::fs::read(config.join("spiron-session-id")).unwrap(),
+                    legacy
+                );
+                assert_eq!(
+                    host_session::bound_vendor(root, selector, "legacy-resume")
+                        .unwrap()
+                        .unwrap(),
+                    first
+                );
+                std::fs::write(root.join("memory/MEMORY.md"), "next pin").unwrap();
+                prepare_host_session(&request()).unwrap();
+                assert_eq!(host_session::active(root).unwrap().unwrap(), first);
+                let next = host_session::reset_session(
+                    root,
+                    selector,
+                    crate::create::harness_session_filename(selector),
+                )
+                .unwrap();
+                assert_ne!(next.generation, first.generation);
+                assert!(next.memory.section.contains("next pin"));
+                prepare_host_session(&request()).unwrap();
+                assert_eq!(host_session::active(root).unwrap().unwrap(), next);
+                assert!(
+                    !config.join("spiron-session-id").exists(),
+                    "reset resurrected legacy pointer"
+                );
+                assert_eq!(
+                    std::fs::read(config.join("sylphx-session-id")).unwrap(),
+                    legacy
+                );
+                assert_eq!(
+                    host_session::bound_vendor(root, selector, "legacy-resume")
+                        .unwrap()
+                        .unwrap(),
+                    first,
+                    "read-only alias lookup changed the active pin"
+                );
+                assert_eq!(host_session::active(root).unwrap().unwrap(), next);
+            }
+        }
+    }
+
+    #[test]
     fn ensure_agy_steering_settings_populates_permissions_and_trusted_workspaces() {
         let dir = crate::test_tempdir();
         let config_dir = dir.path().join("config");
@@ -2353,19 +2860,62 @@ done
                 "define_subagent",
                 "manage_subagents",
                 "send_message",
-                "schedule"
+                "schedule",
+                "search_web",
+                "read_url_content",
+                "browser_subagent",
+                "open_browser_url",
+                "run_command",
+                "manage_task",
+                "read_file",
+                "write_file",
+                "edit_file",
+                "view_file",
+                "grep_search",
+                "find_by_name",
+                "list_dir",
+                "command(*)",
+                "read_file(*)",
+                "write_file(*)",
+                "read_url(*)",
+                "execute_url(*)"
             ])
         );
         assert_eq!(
             json["trustedWorkspaces"],
             serde_json::json!([work_dir.display().to_string()])
         );
+        let hooks_path = config_dir.join(".gemini").join("config").join("hooks.json");
+        let hooks_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&hooks_path).unwrap()).unwrap();
+        assert_eq!(
+            hooks_json["anyagents-native-tool-guard"]["enabled"],
+            serde_json::json!(true)
+        );
+        let matcher = hooks_json["anyagents-native-tool-guard"]["PreToolUse"][0]["matcher"]
+            .as_str()
+            .unwrap();
+        for blocked in [
+            "invoke_subagent",
+            "define_subagent",
+            "manage_subagents",
+            "search_web",
+            "run_command",
+            "read_file",
+            "write_file",
+            "edit_file",
+        ] {
+            assert!(matcher.contains(blocked), "matcher missing {blocked}");
+        }
 
         // Calling a second time is idempotent and does not duplicate entries.
         ensure_agy_steering_settings(&config_dir, &work_dir).unwrap();
         let text2 = std::fs::read_to_string(&settings_path).unwrap();
         let json2: serde_json::Value = serde_json::from_str(&text2).unwrap();
         assert_eq!(json2, json);
+        let hooks_json2: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&hooks_path).unwrap()).unwrap();
+        assert_eq!(hooks_json2, hooks_json);
     }
     #[test]
     fn poisoned_agy_session_retires_only_the_pointer_and_stale_error() {
@@ -2513,3 +3063,7 @@ done
         assert!(ensure_agy_steering_settings(blocked.path(), blocked.path()).is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "vendor/spiron_tests.rs"]
+mod spiron_tests;

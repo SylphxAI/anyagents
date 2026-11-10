@@ -180,36 +180,8 @@ impl Client {
     ) -> Result<T, String> {
         let named = crate::client::agent_identity().map(|id| id.to_string());
         let cap = self.current_capability();
-        let body_clone = body.clone();
-        let admin_socket = self.socket.parent().map(|p| p.join("admin.sock"));
-        let prefer_admin = admin_socket.as_ref().is_some_and(|s| s.exists())
-            && ((method == "POST" && path == "/v1/agents")
-                || (method == "GET" && path == "/v1/agents")
-                || path.ends_with("/harness")
-                || path.ends_with("/model")
-                || path.ends_with("/rename")
-                || path.ends_with("/role")
-                || path.ends_with("/description")
-                || path.ends_with("/wake")
-                || path.ends_with("/pause")
-                || path.ends_with("/archive")
-                || path.starts_with("/v1/subagent-defaults")
-                || path.starts_with("/v1/profiles")
-                || path.starts_with("/v1/schedules")
-                || path.starts_with("/v1/browser")
-                || path.starts_with("/v1/web")
-                || path.starts_with("/v1/channels")
-                || path.starts_with("/v1/send")
-                || path.starts_with("/v1/interact")
-                || path.contains("/schedules")
-                || path.contains("/conversation"));
-        let (primary_sock, secondary_sock) = match (&admin_socket, prefer_admin) {
-            (Some(adm), true) => (adm.as_path(), Some(self.socket.as_path())),
-            (Some(adm), false) if adm.exists() => (self.socket.as_path(), Some(adm.as_path())),
-            _ => (self.socket.as_path(), None),
-        };
-        let primary_res = request_naming(
-            primary_sock,
+        let (status, bytes) = request_naming(
+            &self.socket,
             method,
             path,
             body,
@@ -217,42 +189,7 @@ impl Client {
             None,
             named.as_deref(),
         )
-        .await;
-        let (mut status, mut bytes) = match primary_res {
-            Ok(ans) => ans,
-            Err(primary_err) => {
-                if let Some(sec_sock) = secondary_sock {
-                    request_naming(
-                        sec_sock,
-                        method,
-                        path,
-                        body_clone.clone(),
-                        Some(&cap),
-                        None,
-                        named.as_deref(),
-                    )
-                    .await?
-                } else {
-                    return Err(primary_err);
-                }
-            }
-        };
-        if !status.is_success()
-            && let Some(sec_sock) = secondary_sock
-            && let Ok(fallback) = request_naming(
-                sec_sock,
-                method,
-                path,
-                body_clone,
-                Some(&cap),
-                None,
-                named.as_deref(),
-            )
-            .await
-            && fallback.0.is_success()
-        {
-            (status, bytes) = fallback;
-        }
+        .await?;
         if !status.is_success() {
             return Err(error_message(&bytes));
         }
@@ -260,77 +197,7 @@ impl Client {
     }
 
     async fn get_agents(&self) -> Result<AgentsResponse, String> {
-        let mut resp: AgentsResponse = self.get("/v1/agents", None).await?;
-        if let Some(parent_dir) = self.socket.parent() {
-            let admin_socket = parent_dir.join("admin.sock");
-            if admin_socket.exists() {
-                let named = crate::client::agent_identity().map(|id| id.to_string());
-                let cap = self.current_capability();
-                if let Ok((st, bytes)) = request_naming(
-                    &admin_socket,
-                    "GET",
-                    "/v1/agents",
-                    None,
-                    Some(&cap),
-                    None,
-                    named.as_deref(),
-                )
-                .await
-                    && st.is_success()
-                    && let Ok(admin_resp) = serde_json::from_slice::<AgentsResponse>(&bytes)
-                {
-                    let by_id: std::collections::HashMap<String, AgentView> = admin_resp
-                        .agents
-                        .into_iter()
-                        .map(|a| (a.id.clone(), a))
-                        .collect();
-                    for view in &mut resp.agents {
-                        if let Some(adm) = by_id.get(&view.id) {
-                            view.name = adm.name.clone();
-                            view.harness = adm.harness.clone();
-                            if adm.model.is_some() {
-                                view.model = adm.model.clone();
-                            }
-                            view.install = adm.install.clone();
-                            view.delivery_mode = adm.delivery_mode.clone();
-                            view.steer_support = adm.steer_support.clone();
-                            if adm.role.is_some() {
-                                view.role = adm.role.clone();
-                            }
-                            if !adm.aliases.is_empty() {
-                                view.aliases = adm.aliases.clone();
-                            }
-                            if view.quota_reset_at_ms.is_none() {
-                                view.quota_reset_at_ms = adm.quota_reset_at_ms;
-                            }
-                            if view.block_reason.is_none() {
-                                view.block_reason = adm.block_reason.clone();
-                            }
-                            if view.last_error.is_none() {
-                                view.last_error = adm.last_error.clone();
-                            }
-                            if adm.turn_state == "errored"
-                                || ((view.state == "running" || view.state == "idle")
-                                    && view.last_error.is_some()
-                                    && view.quota_reset_at_ms.is_none())
-                            {
-                                view.turn_state = "errored".to_string();
-                            }
-                            if view.oldest_undelivered_age_ms.is_none() {
-                                view.oldest_undelivered_age_ms = adm.oldest_undelivered_age_ms;
-                            }
-                            if adm.seat_user.is_some() {
-                                view.seat_user = adm.seat_user.clone();
-                                view.seat_uid = adm.seat_uid;
-                                view.seat_gid = adm.seat_gid;
-                            }
-                            view.schedules = adm.schedules.clone();
-                        }
-                    }
-                }
-            }
-        }
-        Ok(resp)
+        self.get("/v1/agents", None).await
     }
 }
 
@@ -444,7 +311,7 @@ struct ConversationArgs {
     /// Optional negative terms — any turn containing any of these substrings is excluded.
     #[serde(default, deserialize_with = "crate::api::deserialize_string_or_vec")]
     exclude: Vec<String>,
-    /// Agent name (`planner`, `builder`, `reviewer`, `"all"`) or `agt_...` ID whose complete
+    /// Agent name (`planner`, `builder`, `tester`, `"all"`) or `agt_...` ID whose complete
     /// two-way (`in` + `out`) conversation to read or search. Defaults to `"all"` when
     /// searching, or this agent when reading recent chronological turns. Non-admin
     /// callers can read only self and descendants; `all` means that authorized set.
@@ -506,21 +373,21 @@ struct AgentsArgs {
     /// - `"inspect"` / `"status"` (inspect an agent or sub-agent's live status, schedules, and recent conversation turns)
     /// - `"spawn"` (spawn a new sub-agent under this agent, with optional `repo` / `branch` / `base` / `workdir` for an isolated Git worktree)
     /// - `"create"` (admin-only: create a standalone root agent with no parent)
-    /// - `"describe"` (read or update an agent's role & responsibility `description` / `instructions` and short `role` label; defaults `name` to `"self"`)
+    /// - `"describe"` (read any agent's role & responsibility `description` / `instructions`, defaulting `name` to `"self"`, or update a target's `description` / `instructions` / `role` / `scope` — mutations require the target's Parent/Ancestor agent or an Admin)
     /// - `"steer"` / `"send"` (send/steer a follow-up `prompt` into an agent or sub-agent, waking it if archived)
     /// - `"wake"` / `"resume"` (wake an archived or paused agent, with optional `prompt`)
     /// - `"reset_session"` / `"new_session"` (new session for a quiescent managed agent; preserves old pins and raw state)
     /// - `"pause"` (pause an agent)
     /// - `"archive"` (any agent, including roots and labelled children, may self-archive; preserves browser profiles; auto-reaps clean/pushed managed Git worktrees while preserving dirty ones)
     /// - `"delete"` / `"kill"` (permanently delete a sub-agent or agent)
-    /// - `"rename"` (admin-only: rename an agent in place while keeping its `agt_...` ID and old name as an alias)
-    /// - `"role"` (set or clear an agent's short role label)
+    /// - `"rename"` (Parent/Ancestor or Admin: rename a descendant or agent in place while keeping its `agt_...` ID and old name as an alias)
+    /// - `"role"` (Parent/Ancestor or Admin: set or clear an agent's short role label)
     /// - `"harness"` (declaratively update an agent's harness/model/profile)
     /// - `"models"` (list upstream provider profile model catalogs)
     #[serde(default)]
     action: Option<String>,
     /// Target body id when action = "redact"; `transcript:<zero-based-line>` addresses
-    /// a Sylphx output/content string in config/sylphx-transcript.jsonl.
+    /// a legacy first-party output/content string in config/sylphx-transcript.jsonl.
     #[serde(default)]
     message_id: Option<String>,
     /// Mailbox sequence instead of message_id when action = "redact".
@@ -554,7 +421,7 @@ struct AgentsArgs {
     /// New agent name when `action = "rename"`.
     #[serde(default, alias = "to")]
     new_name: Option<String>,
-    /// Optional archetype template name (`.agents/agents/<archetype>.md`, e.g. `"writer"`, `"reviewer"`, `"mind"`) when `action` is `"spawn"` or `"create"`.
+    /// Optional archetype template name (`.agents/agents/<archetype>.md`, e.g. `"planner"`, `"builder"`, `"tester"`) when `action` is `"spawn"` or `"create"`.
     #[serde(default, alias = "type", alias = "template", alias = "preset")]
     archetype: Option<String>,
     /// Optional display-only role label (for example, `"Researcher"`); never selects lifecycle or scope.
@@ -564,7 +431,7 @@ struct AgentsArgs {
     /// Set `true` to clear the description or role label when `action` is `"describe"` or `"role"`.
     #[serde(default)]
     clear: Option<bool>,
-    /// Harness catalog ID when `action` is `"spawn"`, `"create"`, or `"harness"` (`sylphx`, `opencode`, `codex`, `claude-code`, `agy`, `muse`, `omp`, `dsh`, `grok`, or `"inherit"`).
+    /// Harness catalog ID when `action` is `"spawn"`, `"create"`, or `"harness"` (`spiron`, `opencode`, `codex`, `claude-code`, `agy`, `muse`, `omp`, `dsh`, `grok`, or `"inherit"`).
     #[serde(default)]
     harness: Option<String>,
     /// Optional model override when `action` is `"spawn"`, `"create"`, or `"harness"`.
@@ -638,7 +505,7 @@ struct SpawnArgs {
         alias = "target"
     )]
     name: Option<String>,
-    /// Optional archetype template name (`.agents/agents/<archetype>.md`, e.g. `"writer"`, `"reviewer"`, `"mind"`).
+    /// Optional archetype template name (`.agents/agents/<archetype>.md`, e.g. `"planner"`, `"builder"`, `"tester"`).
     #[serde(default, alias = "type", alias = "template", alias = "preset")]
     archetype: Option<String>,
     /// Optional display-only role label; no effect on lifecycle, scope or prompts.
@@ -688,7 +555,7 @@ struct SpawnArgs {
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 struct DescribeArgs {
-    /// Target agent name (`"self"`, `"reviewer"`, `"planner"`, `"all"`, or `agt_...` ID). Defaults to `"self"`.
+    /// Target agent name (`"self"`, `"tester"`, `"planner"`, `"all"`, or `agt_...` ID). Defaults to `"self"`.
     #[serde(default, alias = "name", alias = "target")]
     agent: Option<String>,
     /// Concise public role/responsibility summary (`description`, Layer 1 — visible to all peers and group rosters).
@@ -741,7 +608,7 @@ struct SubagentsArgs {
     /// Optional case-insensitive multi-token search query for `list`.
     #[serde(default, alias = "search", alias = "filter", alias = "q")]
     query: Option<String>,
-    /// Optional archetype template name (`.agents/agents/<archetype>.md`, e.g. `"writer"`, `"reviewer"`, `"mind"`) when `action = "spawn"`.
+    /// Optional archetype template name (`.agents/agents/<archetype>.md`, e.g. `"planner"`, `"builder"`, `"tester"`) when `action = "spawn"`.
     #[serde(default, alias = "type", alias = "template", alias = "preset")]
     archetype: Option<String>,
     /// Harness catalog ID when `action = "spawn"` (`opencode`, `codex`, `claude-code`, `agy`, `muse`, `omp`, `dsh`, `grok`).
@@ -1393,7 +1260,7 @@ impl AgentMcp {
     }
 
     #[tool(
-        description = "Unified agent & cross-harness sub-agent manager (`action`: `list` | `inspect` | `spawn` | `create` | `describe` | `redact` | `steer` | `wake` | `pause` | `archive` | `delete` | `rename` | `role` | `harness` | `models`, supporting multi-level sub-agent trees). Use `list` (default, with optional `parent`: `\"self\"` | `\"subagents\"` | `\"root\"` and `state`: `\"running\"` | `\"working\"` | `\"paused\"` | `\"archived\"` | `\"all\"`) to inspect agents and sub-agents; use `inspect` (`name`: `\"<agent-or-id>\"`, `limit`: `10`) to view live status, schedules, and recent turns; use `spawn` (`name`, `repo`: `\"<org>/<repo>\"` | `\"inherit\"`, `branch`, `base`, `workdir`: path | `\"worktree\"` | `\"private\"` | `\"inherit\"`, `description`, `prompt`, `harness`, `model`, `profile`) to launch a sub-agent with an isolated managed Git worktree; use `describe` (`name`: `\"self\"` | `\"all\"` | `\"<agent>\"`, `description`: `\"...\"`) to read or update role descriptions; use `steer`, `wake`, `pause`, `archive` (auto-reaps clean/pushed managed worktrees while preserving dirty ones), or `delete` to control lifecycle; use `redact` (`name`, `message_id` or `seq`, optional `span`: {`unit`: `bytes` | `chars`, `start`, `end`}, `reason`) for audited erasure with permission `conversation.redact` (ancestors/admin only, quiescent target); or use `create`, `rename`, `role`, `harness`, `models`."
+        description = "Unified agent & cross-harness sub-agent manager (`action`: `list` | `inspect` | `spawn` | `create` | `describe` | `redact` | `steer` | `wake` | `pause` | `archive` | `delete` | `rename` | `role` | `harness` | `models`, supporting multi-level sub-agent trees). Use `list` (default, with optional `parent`: `\"self\"` | `\"subagents\"` | `\"root\"` and `state`: `\"running\"` | `\"working\"` | `\"paused\"` | `\"archived\"` | `\"all\"`) to inspect agents and sub-agents; use `inspect` (`name`: `\"<agent-or-id>\"`, `limit`: `10`) to view live status, schedules, and recent turns; use `spawn` (`name`, `repo`: `\"<org>/<repo>\"` | `\"inherit\"`, `branch`, `base`, `workdir`: path | `\"worktree\"` | `\"private\"` | `\"inherit\"`, `description`, `prompt`, `harness`, `model`, `profile`) to launch a sub-agent with an isolated managed Git worktree; use `describe` (`name`: `\"self\"` | `\"all\"` | `\"<agent>\"`, `description`: `\"...\"`) to read role descriptions or update a target's `description`/`instructions`/`role` (updating `description`, `instructions`, `role`, or `rename` requires the target's Parent/Ancestor agent or an Admin); use `steer`, `wake`, `pause`, `archive` (auto-reaps clean/pushed managed worktrees while preserving dirty ones), or `delete` to control lifecycle; use `redact` (`name`, `message_id` or `seq`, optional `span`: {`unit`: `bytes` | `chars`, `start`, `end`}, `reason`) for audited erasure with permission `conversation.redact` (ancestors/admin only, quiescent target); or use `create`, `rename`, `role`, `harness`, `models`."
     )]
     async fn agents(
         &self,
@@ -2433,7 +2300,7 @@ impl AgentMcp {
     }
 
     #[tool(
-        description = "Read or update an agent's role & responsibility description (`description` / `instructions`). Any agent can update its own description (`agent: \"self\"`, `description: \"...\"`) whenever its mission or focus evolves, and Owner Admins or Parent agents can update other agents' descriptions. Updating `description` automatically syncs the agent's private `SYSTEM_PROMPT.md` / `AGENTS.md` and makes the role visible to all peers in `agents` and `groups`."
+        description = "Read or update an agent's role & responsibility description (`description` / `instructions`). Any agent can read its own or peers' descriptions (`agent: \"self\"` or `\"all\"`), while updating `description`, `instructions`, `role`, or `rename` requires the target's Parent/Ancestor agent or an Admin (`self` cannot modify its own `description` or `instructions` unless it is an Admin). Updating `description` automatically syncs the agent's private `SYSTEM_PROMPT.md` / `AGENTS.md` and makes the role visible to all peers in `agents` and `groups`."
     )]
     async fn describe(
         &self,
@@ -2521,16 +2388,28 @@ impl AgentMcp {
     )]
     async fn browser(
         &self,
-        Parameters(args): Parameters<crate::browser::BrowserRequest>,
-    ) -> Result<rmcp::handler::server::wrapper::Json<serde_json::Value>, String> {
-        let response: serde_json::Value = self
+        Parameters(mut args): Parameters<crate::browser::BrowserRequest>,
+    ) -> Result<MultimediaJson, String> {
+        if let Some(raw_path) = args
+            .path
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            && !Path::new(raw_path).is_absolute()
+            && let Ok(resolved) =
+                resolve_workspace_path(&self.resolve_workdir(), Some(raw_path), true)
+        {
+            args.path = Some(resolved.display().to_string());
+        }
+        let mut response: serde_json::Value = self
             .client
             .get(
                 "/v1/browser",
                 Some(serde_json::to_vec(&args).map_err(|err| err.to_string())?),
             )
             .await?;
-        Ok(rmcp::handler::server::wrapper::Json(response))
+        let media = extract_media_blocks_from_tool_value("browser", &mut response);
+        Ok(MultimediaJson(response, media))
     }
 
     #[tool(
@@ -2589,10 +2468,7 @@ impl AgentMcp {
     ) -> Result<rmcp::handler::server::wrapper::Json<serde_json::Value>, String> {
         let data_dir = self.client.socket.parent().map(Path::to_path_buf);
         let local_has_keys = !crate::web::load_web_keys(data_dir.as_deref()).is_empty();
-        let server_available = self.client.socket.exists()
-            || data_dir
-                .as_ref()
-                .is_some_and(|d| d.join("admin.sock").exists());
+        let server_available = self.client.socket.exists();
         if !local_has_keys && server_available {
             let body = serde_json::to_vec(&args).map_err(|e| e.to_string())?;
             if let Ok(val) = self
@@ -2617,27 +2493,29 @@ impl AgentMcp {
     async fn computer(
         &self,
         Parameters(args): Parameters<DynamicObjectArgs>,
-    ) -> Result<rmcp::handler::server::wrapper::Json<serde_json::Value>, String> {
+    ) -> Result<MultimediaJson, String> {
         let data_dir = self.client.socket.parent().map(Path::to_path_buf);
-        let val = crate::computer::execute_computer_request(
+        let mut val = crate::computer::execute_computer_request(
             data_dir.as_deref(),
             &self.client.config,
             args.into_value(),
         )
         .await?;
-        Ok(rmcp::handler::server::wrapper::Json(val))
+        let media = extract_media_blocks_from_tool_value("computer", &mut val);
+        Ok(MultimediaJson(val, media))
     }
 
     #[tool(
-        description = "Android / iOS Mobile Device Control tool (`action`: `\"screenshot\"` | `\"tap\"` | `\"swipe\"` | `\"type\"` | `\"press\"` | `\"install_app\"` | `\"launch_app\"` | `\"terminate_app\"` | `\"open_url\"` | `\"rotate\"`)."
+        description = "Android (adb, including ChromeOS ARC) / iOS (simctl + idb or WebDriverAgent wda_url) control. Select platform: android|ios and serial|udid|wda_url. Actions: snapshot (pruned semantic tree with @<snapshot_id>:e<N> refs), screenshot, tap, swipe, type, press, install_app, launch_app, terminate_app, open_url, rotate. tap/type accept ref with STALE_REF validation. iOS app installs use app_path (.app/.ipa); set backend:idb for physical devices. WDA install_app also requires udid + idb."
     )]
     async fn device(
         &self,
         Parameters(args): Parameters<DynamicObjectArgs>,
-    ) -> Result<rmcp::handler::server::wrapper::Json<serde_json::Value>, String> {
+    ) -> Result<MultimediaJson, String> {
         let work_dir = self.resolve_workdir();
-        let val = crate::computer::execute_device_request(&work_dir, args.into_value()).await?;
-        Ok(rmcp::handler::server::wrapper::Json(val))
+        let mut val = crate::computer::execute_device_request(&work_dir, args.into_value()).await?;
+        let media = extract_media_blocks_from_tool_value("device", &mut val);
+        Ok(MultimediaJson(val, media))
     }
 
     #[tool(
@@ -2646,42 +2524,40 @@ impl AgentMcp {
     async fn media(
         &self,
         Parameters(args): Parameters<DynamicObjectArgs>,
-    ) -> Result<rmcp::handler::server::wrapper::Json<serde_json::Value>, String> {
+    ) -> Result<MultimediaJson, String> {
         let data_dir = self.client.socket.parent().map(Path::to_path_buf);
         let work_dir = self.resolve_workdir();
-        let val = crate::computer::execute_media_request(
+        let mut val = crate::computer::execute_media_request(
             data_dir.as_deref(),
             &self.client.config,
             &work_dir,
             args.into_value(),
         )
         .await?;
-        Ok(rmcp::handler::server::wrapper::Json(val))
+        let media = extract_media_blocks_from_tool_value("media", &mut val);
+        Ok(MultimediaJson(val, media))
     }
 
     #[tool(
-        description = "Unified cross-harness file, edit, patch, list, glob, grep, and command exec tool (`action`: `\"read\"` | `\"write\"` | `\"edit\"` | `\"multi_edit\"` | `\"patch\"` | `\"list\"` | `\"glob\"` | `\"grep\"` | `\"exec\"`), resolving relative paths deterministically against your `workdir`."
+        description = "Unified cross-harness file, edit, patch, list, glob, grep, and command exec tool (`action`: `\"read\"` | `\"write\"` | `\"edit\"` | `\"multi_edit\"` | `\"patch\"` | `\"list\"` | `\"glob\"` | `\"grep\"` | `\"exec\"`), resolving relative paths deterministically against your `workdir`. Calling `action: \"read\"` on multimedia files (`image/png`, `image/jpeg`, `image/webp`, `image/gif`, `image/bmp`, `image/avif`, `image/x-icon`, `application/pdf`, `audio/wav`, `audio/mpeg`, `audio/ogg`, `audio/flac`, `audio/mp4`, `audio/aac`, `video/mp4`, `video/webm`, `video/quicktime`) natively attaches MCP multimedia content blocks (`image`, `audio`, `resource`) for direct model inspection."
     )]
     async fn files(
         &self,
         Parameters(args): Parameters<FilesArgs>,
-    ) -> Result<rmcp::handler::server::wrapper::Json<serde_json::Value>, String> {
+    ) -> Result<MultimediaJson, String> {
         let base_dir = self.resolve_workdir();
-        let val = tokio::task::spawn_blocking(move || execute_files_tool(&base_dir, args))
-            .await
-            .map_err(|e| format!("files task join error: {e}"))??;
-        Ok(rmcp::handler::server::wrapper::Json(val))
+        let (val, media) =
+            tokio::task::spawn_blocking(move || execute_files_tool_with_media(&base_dir, args))
+                .await
+                .map_err(|e| format!("files task join error: {e}"))??;
+        Ok(MultimediaJson(val, media))
     }
 
     #[tool(
-        description = "Unified Cross-Harness Code Mode / Programmatic Tool Calling (`code`, optional `timeout_ms` default 30000, max 120000). Executes an async TypeScript / JavaScript snippet in an isolated capability sandbox (`process.env`, `require`, `child_process`, and raw `fs` are unavailable) with `anyagents.{memory,conversation,send,agents,schedule,groups,browser,web,computer,device,media,files}` (alias `tools.anyagents`), `web.{search,fetch}` (alias `tools.web`), `computer.{snapshot,list_windows,focus_window,clipboard_get,clipboard_set,screenshot,cursor_position,move,click,mouse_down,mouse_up,drag,scroll,type,key,hold_key,wait,zoom,action}` (alias `tools.computer`), `device.{screenshot,tap,swipe,type,press,install_app,launch_app,terminate_app,open_url,rotate}` (alias `tools.device`), `media.{image_generate,speech,transcribe}` (alias `tools.media`), and `workspace.{read,write,edit,multi_edit,patch,glob,grep,list,exec}` (alias `tools.workspace`). Compose parallel multi-tool queries with `await Promise.all([...])`, filter/aggregate intermediate data in memory, log diagnostics via `console.log`, and `return` only the compact result `{ result, logs, duration_ms }`."
+        description = "Unified Cross-Harness Code Mode / Programmatic Tool Calling (`code`, optional `timeout_ms` default 30000, max 120000). Executes an async TypeScript / JavaScript snippet in an isolated capability sandbox (`process.env`, `require`, `child_process`, and raw `fs` are unavailable) with `anyagents.{memory,conversation,send,agents,schedule,groups,browser,web,computer,device,media,files}` (alias `tools.anyagents`), `web.{search,fetch}` (alias `tools.web`), `computer.{snapshot,list_windows,focus_window,clipboard_get,clipboard_set,screenshot,cursor_position,move,click,mouse_down,mouse_up,drag,scroll,type,key,hold_key,wait,zoom,action}` (alias `tools.computer`), `device.{screenshot,tap,swipe,type,press,install_app,launch_app,terminate_app,open_url,rotate}` (alias `tools.device`), `media.{image_generate,speech,transcribe}` (alias `tools.media`), and `workspace.{read,write,edit,multi_edit,patch,glob,grep,list,exec}` (alias `tools.workspace`). Calling `workspace.read(path)` on images, PDFs, audio, or video (or calling `browser.screenshot`, `computer.screenshot`, `device.screenshot`, `media.image_generate`, `media.speech`) natively attaches MCP multimedia content blocks (`image`, `audio`, `resource`) directly to the tool response for visual/multimodal inspection. Compose parallel multi-tool queries with `await Promise.all([...])`, filter/aggregate intermediate data in memory, log diagnostics via `console.log`, and `return` only the compact result `{ result, logs, duration_ms }`."
     )]
-    async fn code(
-        &self,
-        Parameters(args): Parameters<CodeArgs>,
-    ) -> Result<rmcp::handler::server::wrapper::Json<serde_json::Value>, String> {
-        let val = self.execute_code_tool(args).await?;
-        Ok(rmcp::handler::server::wrapper::Json(val))
+    async fn code(&self, Parameters(args): Parameters<CodeArgs>) -> Result<MultimediaJson, String> {
+        self.execute_code_tool(args).await
     }
 }
 
@@ -2923,12 +2799,14 @@ rl.on("line", async (line) => {
         computerFn.hold_key = (opts = {}) => callTool("computer", { ...opts, action: "hold_key" });
         computerFn.wait = (msOrObj = {}) => callTool("computer", typeof msOrObj === "number" ? { action: "wait", duration_ms: msOrObj } : { ...msOrObj, action: "wait" });
         computerFn.zoom = (opts = {}) => callTool("computer", { ...opts, action: "zoom" });
+        computerFn.open_url = (opts = {}) => callTool("computer", typeof opts === "string" ? { action: "open_url", url: opts } : { ...opts, action: "open_url" });
         computerFn.action = (actionJson = {}) => callTool("computer", actionJson);
         Object.freeze(computerFn);
 
         const deviceFn = (req = {}) => callTool("device", typeof req === "string" ? { action: req } : req);
+        deviceFn.snapshot = (opts = {}) => callTool("device", { ...opts, action: "snapshot" });
         deviceFn.screenshot = (opts = {}) => callTool("device", { ...opts, action: "screenshot" });
-        deviceFn.tap = (opts = {}) => callTool("device", { ...opts, action: "tap" });
+        deviceFn.tap = (opts = {}) => callTool("device", typeof opts === "string" ? { action: "tap", ref: opts } : { ...opts, action: "tap" });
         deviceFn.swipe = (opts = {}) => callTool("device", { ...opts, action: "swipe" });
         deviceFn.type = (textOrObj = {}) => callTool("device", typeof textOrObj === "string" ? { action: "type", text: textOrObj } : { ...textOrObj, action: "type" });
         deviceFn.press = (btnOrObj = {}) => callTool("device", typeof btnOrObj === "string" ? { action: "press", button: btnOrObj } : { ...btnOrObj, action: "press" });
@@ -3585,7 +3463,7 @@ impl AgentMcp {
         &self,
         tool: &str,
         args: serde_json::Value,
-    ) -> Result<serde_json::Value, String> {
+    ) -> Result<(serde_json::Value, Vec<rmcp::model::ContentBlock>), String> {
         let norm = tool
             .trim()
             .strip_prefix("mcp__anyagents__")
@@ -3594,39 +3472,46 @@ impl AgentMcp {
             "memory" => {
                 let parsed: MemoryArgs = serde_json::from_value(args)
                     .map_err(|e| format!("invalid `memory` arguments: {e}"))?;
-                Ok(self.memory(Parameters(parsed)).await?.0)
+                Ok((self.memory(Parameters(parsed)).await?.0, Vec::new()))
             }
             "agents" => {
                 let parsed: AgentsArgs = serde_json::from_value(args)
                     .map_err(|e| format!("invalid `agents` arguments: {e}"))?;
-                Ok(self.agents(Parameters(parsed)).await?.0)
+                Ok((self.agents(Parameters(parsed)).await?.0, Vec::new()))
             }
             "send" => {
                 let parsed: SendArgs = serde_json::from_value(args)
                     .map_err(|e| format!("invalid `send` arguments: {e}"))?;
-                Ok(self.send(Parameters(parsed)).await?.0)
+                Ok((self.send(Parameters(parsed)).await?.0, Vec::new()))
             }
             "conversation" | "search" => {
                 let parsed: ConversationArgs = serde_json::from_value(args)
                     .map_err(|e| format!("invalid `conversation` arguments: {e}"))?;
                 let res = self.conversation(Parameters(parsed)).await?.0;
-                serde_json::to_value(res).map_err(|e| e.to_string())
+                Ok((
+                    serde_json::to_value(res).map_err(|e| e.to_string())?,
+                    Vec::new(),
+                ))
             }
             "groups" => {
                 let parsed: GroupsArgs = serde_json::from_value(args)
                     .map_err(|e| format!("invalid `groups` arguments: {e}"))?;
                 let res = self.groups(Parameters(parsed)).await?.0;
-                serde_json::to_value(res).map_err(|e| e.to_string())
+                Ok((
+                    serde_json::to_value(res).map_err(|e| e.to_string())?,
+                    Vec::new(),
+                ))
             }
             "schedule" => {
                 let parsed: ScheduleArgs = serde_json::from_value(args)
                     .map_err(|e| format!("invalid `schedule` arguments: {e}"))?;
-                Ok(self.schedule(Parameters(parsed)).await?.0)
+                Ok((self.schedule(Parameters(parsed)).await?.0, Vec::new()))
             }
             "browser" => {
                 let parsed: crate::browser::BrowserRequest = serde_json::from_value(args)
                     .map_err(|e| format!("invalid `browser` arguments: {e}"))?;
-                Ok(self.browser(Parameters(parsed)).await?.0)
+                let MultimediaJson(val, media) = self.browser(Parameters(parsed)).await?;
+                Ok((val, media))
             }
             "web" | "web_search" | "web_fetch" => {
                 let mut parsed: crate::web::WebRequest = serde_json::from_value(args)
@@ -3638,58 +3523,77 @@ impl AgentMcp {
                         parsed.action = Some("fetch".to_string());
                     }
                 }
-                Ok(self.web(Parameters(parsed)).await?.0)
+                Ok((self.web(Parameters(parsed)).await?.0, Vec::new()))
             }
-            "computer" => Ok(self
-                .computer(Parameters(DynamicObjectArgs::from_value(args)?))
-                .await?
-                .0),
-            "device" => Ok(self
-                .device(Parameters(DynamicObjectArgs::from_value(args)?))
-                .await?
-                .0),
-            "media" => Ok(self
-                .media(Parameters(DynamicObjectArgs::from_value(args)?))
-                .await?
-                .0),
+            "computer" => {
+                let MultimediaJson(val, media) = self
+                    .computer(Parameters(DynamicObjectArgs::from_value(args)?))
+                    .await?;
+                Ok((val, media))
+            }
+            "device" => {
+                let MultimediaJson(val, media) = self
+                    .device(Parameters(DynamicObjectArgs::from_value(args)?))
+                    .await?;
+                Ok((val, media))
+            }
+            "media" => {
+                let MultimediaJson(val, media) = self
+                    .media(Parameters(DynamicObjectArgs::from_value(args)?))
+                    .await?;
+                Ok((val, media))
+            }
             "files" => {
                 let parsed: FilesArgs = serde_json::from_value(args)
                     .map_err(|e| format!("invalid `files` arguments: {e}"))?;
-                Ok(self.files(Parameters(parsed)).await?.0)
+                let MultimediaJson(val, media) = self.files(Parameters(parsed)).await?;
+                Ok((val, media))
             }
             "subagents" => {
                 let parsed: SubagentsArgs = serde_json::from_value(args)
                     .map_err(|e| format!("invalid `subagents` arguments: {e}"))?;
-                Ok(self.subagents(Parameters(parsed)).await?.0)
+                Ok((self.subagents(Parameters(parsed)).await?.0, Vec::new()))
             }
             "spawn" => {
                 let parsed: SpawnArgs = serde_json::from_value(args)
                     .map_err(|e| format!("invalid `spawn` arguments: {e}"))?;
                 let res = self.spawn(Parameters(parsed)).await?.0;
-                serde_json::to_value(res).map_err(|e| e.to_string())
+                Ok((
+                    serde_json::to_value(res).map_err(|e| e.to_string())?,
+                    Vec::new(),
+                ))
             }
             "describe" => {
                 let parsed: DescribeArgs = serde_json::from_value(args)
                     .map_err(|e| format!("invalid `describe` arguments: {e}"))?;
-                Ok(self.describe(Parameters(parsed)).await?.0)
+                Ok((self.describe(Parameters(parsed)).await?.0, Vec::new()))
             }
             "archive" => {
                 let parsed: ArchiveArgs = serde_json::from_value(args)
                     .map_err(|e| format!("invalid `archive` arguments: {e}"))?;
                 let res = self.archive(Parameters(parsed)).await?.0;
-                serde_json::to_value(res).map_err(|e| e.to_string())
+                Ok((
+                    serde_json::to_value(res).map_err(|e| e.to_string())?,
+                    Vec::new(),
+                ))
             }
             "wake" => {
                 let parsed: WakeArgs = serde_json::from_value(args)
                     .map_err(|e| format!("invalid `wake` arguments: {e}"))?;
                 let res = self.wake(Parameters(parsed)).await?.0;
-                serde_json::to_value(res).map_err(|e| e.to_string())
+                Ok((
+                    serde_json::to_value(res).map_err(|e| e.to_string())?,
+                    Vec::new(),
+                ))
             }
             "interact" => {
                 let parsed: InteractArgs = serde_json::from_value(args)
                     .map_err(|e| format!("invalid `interact` arguments: {e}"))?;
                 let res = self.interact(Parameters(parsed)).await?.0;
-                serde_json::to_value(res).map_err(|e| e.to_string())
+                Ok((
+                    serde_json::to_value(res).map_err(|e| e.to_string())?,
+                    Vec::new(),
+                ))
             }
             other => Err(format!(
                 "unknown AnyAgents tool `{other}` in code mode; expected one of `memory`, `web`, `agents`, `send`, `conversation`, `groups`, `schedule`, `browser`, `files`"
@@ -3697,7 +3601,7 @@ impl AgentMcp {
         }
     }
 
-    async fn execute_code_tool(&self, args: CodeArgs) -> Result<serde_json::Value, String> {
+    async fn execute_code_tool(&self, args: CodeArgs) -> Result<MultimediaJson, String> {
         use std::io::{BufRead, BufReader, Write};
         use std::process::{Command, Stdio};
         use std::sync::{Arc, Mutex};
@@ -3791,9 +3695,10 @@ impl AgentMcp {
             String::from_utf8_lossy(&buf).into_owned()
         });
 
-        // Receipts come from the actual host dispatch, never snippet return
-        // values, source text or logs, which can contain invented deliveries.
+        // Receipts and native MCP multimedia blocks come from actual host
+        // dispatches, never snippet return values, source text or logs.
         let deliveries = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let media_blocks = Arc::new(Mutex::new(Vec::<rmcp::model::ContentBlock>::new()));
         let mut in_flight = tokio::task::JoinSet::new();
         let mut call_count = 0usize;
 
@@ -3829,22 +3734,31 @@ impl AgentMcp {
                         let mcp = self.clone();
                         let stdin_clone = Arc::clone(&shared_stdin);
                         let deliveries = Arc::clone(&deliveries);
+                        let media_blocks = Arc::clone(&media_blocks);
                         in_flight.spawn(async move {
                             let res = mcp.dispatch_code_tool(&tool_name, tool_args).await;
                             if tool_name.trim().trim_start_matches("mcp__anyagents__") == "send"
-                                && let Ok(val) = &res
+                                && let Ok((val, _)) = &res
                                 && let Some(items) = val.get("deliveries").and_then(serde_json::Value::as_array)
                             {
                                 deliveries.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
                                     .extend(items.iter().cloned());
                             }
                             let reply = match res {
-                                Ok(val) => serde_json::json!({
-                                    "type": "reply",
-                                    "id": id,
-                                    "ok": true,
-                                    "result": val,
-                                }),
+                                Ok((val, blocks)) => {
+                                    if !blocks.is_empty() {
+                                        media_blocks
+                                            .lock()
+                                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                            .extend(blocks);
+                                    }
+                                    serde_json::json!({
+                                        "type": "reply",
+                                        "id": id,
+                                        "ok": true,
+                                        "result": val,
+                                    })
+                                }
                                 Err(err) => serde_json::json!({
                                     "type": "reply",
                                     "id": id,
@@ -3921,6 +3835,10 @@ impl AgentMcp {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
+        let media_blocks = media_blocks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         let raw_result = done_msg
             .get("result")
             .cloned()
@@ -3937,25 +3855,568 @@ impl AgentMcp {
                 MAX_CODE_RESULT_BYTES,
                 &serialized[tail_start..]
             );
-            return Ok(serde_json::json!({
-                "result": preview,
-                "deliveries": deliveries,
-                "truncated": true,
-                "original_bytes": serialized.len(),
-                "max_bytes": MAX_CODE_RESULT_BYTES,
-                "logs": logs,
-                "duration_ms": duration_ms,
-            }));
+            return Ok(MultimediaJson(
+                serde_json::json!({
+                    "result": preview,
+                    "deliveries": deliveries,
+                    "truncated": true,
+                    "original_bytes": serialized.len(),
+                    "max_bytes": MAX_CODE_RESULT_BYTES,
+                    "logs": logs,
+                    "duration_ms": duration_ms,
+                }),
+                media_blocks,
+            ));
         }
 
-        Ok(serde_json::json!({
-            "result": raw_result,
-            "deliveries": deliveries,
-            "truncated": false,
-            "logs": logs,
-            "duration_ms": duration_ms,
-        }))
+        Ok(MultimediaJson(
+            serde_json::json!({
+                "result": raw_result,
+                "deliveries": deliveries,
+                "truncated": false,
+                "logs": logs,
+                "duration_ms": duration_ms,
+            }),
+            media_blocks,
+        ))
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct MultimediaJson(pub serde_json::Value, pub Vec<rmcp::model::ContentBlock>);
+
+impl rmcp::handler::server::tool::IntoCallToolResult for MultimediaJson {
+    fn into_call_tool_result(self) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
+        let mut res = rmcp::model::CallToolResult::structured(self.0);
+        res.content.extend(self.1);
+        Ok(res.into())
+    }
+}
+
+const MAX_MULTIMEDIA_READ_BYTES: usize = 20 * 1024 * 1024;
+
+fn detect_multimedia_mime(path: &Path, bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Some("image/png");
+    }
+    if bytes.starts_with(b"\xff\xd8\xff") {
+        return Some("image/jpeg");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    if bytes.starts_with(b"%PDF-") {
+        return Some("application/pdf");
+    }
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WAVE" {
+        return Some("audio/wav");
+    }
+    if bytes.starts_with(b"ID3") {
+        return Some("audio/mpeg");
+    }
+    if bytes.starts_with(b"OggS") {
+        return Some("audio/ogg");
+    }
+    if bytes.starts_with(b"fLaC") {
+        return Some("audio/flac");
+    }
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase);
+    if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
+        let brand = &bytes[8..12];
+        if brand == b"avif" || brand == b"avis" {
+            return Some("image/avif");
+        }
+        if brand == b"M4A " || brand == b"M4B " {
+            return Some("audio/mp4");
+        }
+        if brand == b"qt  " {
+            return Some("video/quicktime");
+        }
+        return match ext.as_deref() {
+            Some("m4a") => Some("audio/mp4"),
+            Some("mov") => Some("video/quicktime"),
+            Some("avif") => Some("image/avif"),
+            _ => Some("video/mp4"),
+        };
+    }
+    if bytes.starts_with(b"\x1a\x45\xdf\xa3") {
+        return match ext.as_deref() {
+            Some("webm") => Some("video/webm"),
+            _ => Some("video/x-matroska"),
+        };
+    }
+    match ext.as_deref() {
+        Some("png") => Some("image/png"),
+        Some("jpg" | "jpeg") => Some("image/jpeg"),
+        Some("gif") => Some("image/gif"),
+        Some("webp") => Some("image/webp"),
+        Some("bmp") => Some("image/bmp"),
+        Some("avif") => Some("image/avif"),
+        Some("ico") => Some("image/x-icon"),
+        Some("pdf") => Some("application/pdf"),
+        Some("wav" | "wave") => Some("audio/wav"),
+        Some("mp3") => Some("audio/mpeg"),
+        Some("ogg" | "oga" | "opus") => Some("audio/ogg"),
+        Some("flac") => Some("audio/flac"),
+        Some("m4a") => Some("audio/mp4"),
+        Some("aac") => Some("audio/aac"),
+        Some("mp4" | "m4v") => Some("video/mp4"),
+        Some("webm") => Some("video/webm"),
+        Some("mov") => Some("video/quicktime"),
+        _ => None,
+    }
+}
+
+fn parse_image_dimensions(mime_type: &str, bytes: &[u8]) -> Option<(u32, u32)> {
+    match mime_type {
+        "image/png" => crate::computer::parse_png_dimensions(bytes),
+        "image/gif" => {
+            if bytes.len() >= 10 && (&bytes[0..6] == b"GIF87a" || &bytes[0..6] == b"GIF89a") {
+                let w = u32::from(u16::from_le_bytes([bytes[6], bytes[7]]));
+                let h = u32::from(u16::from_le_bytes([bytes[8], bytes[9]]));
+                Some((w, h))
+            } else {
+                None
+            }
+        }
+        "image/bmp" => {
+            if bytes.len() >= 26 && &bytes[0..2] == b"BM" {
+                let w =
+                    i32::from_le_bytes([bytes[18], bytes[19], bytes[20], bytes[21]]).unsigned_abs();
+                let h =
+                    i32::from_le_bytes([bytes[22], bytes[23], bytes[24], bytes[25]]).unsigned_abs();
+                Some((w, h))
+            } else {
+                None
+            }
+        }
+        "image/webp" => {
+            if bytes.len() >= 30 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+                if &bytes[12..16] == b"VP8 " {
+                    let w = u32::from(u16::from_le_bytes([bytes[26], bytes[27]]) & 0x3fff);
+                    let h = u32::from(u16::from_le_bytes([bytes[28], bytes[29]]) & 0x3fff);
+                    return Some((w, h));
+                } else if &bytes[12..16] == b"VP8L" {
+                    let b0 = u32::from(bytes[21]);
+                    let b1 = u32::from(bytes[22]);
+                    let b2 = u32::from(bytes[23]);
+                    let b3 = u32::from(bytes[24]);
+                    let w = 1 + (((b1 & 0x3f) << 8) | b0);
+                    let h = 1 + (((b3 & 0x0f) << 10) | (b2 << 2) | ((b1 & 0xc0) >> 6));
+                    return Some((w, h));
+                } else if &bytes[12..16] == b"VP8X" {
+                    let w = 1
+                        + (u32::from(bytes[24])
+                            | (u32::from(bytes[25]) << 8)
+                            | (u32::from(bytes[26]) << 16));
+                    let h = 1
+                        + (u32::from(bytes[27])
+                            | (u32::from(bytes[28]) << 8)
+                            | (u32::from(bytes[29]) << 16));
+                    return Some((w, h));
+                }
+            }
+            None
+        }
+        "image/jpeg" => {
+            if bytes.len() < 4 || !bytes.starts_with(b"\xff\xd8") {
+                return None;
+            }
+            let mut pos = 2usize;
+            while pos + 1 < bytes.len() {
+                if bytes[pos] != 0xff {
+                    pos += 1;
+                    continue;
+                }
+                while pos < bytes.len() && bytes[pos] == 0xff {
+                    pos += 1;
+                }
+                if pos >= bytes.len() {
+                    break;
+                }
+                let marker = bytes[pos];
+                pos += 1;
+                if marker == 0xd8
+                    || marker == 0xd9
+                    || marker == 0x01
+                    || (0xd0..=0xd7).contains(&marker)
+                {
+                    continue;
+                }
+                if pos + 2 > bytes.len() {
+                    break;
+                }
+                let seg_len = usize::from(u16::from_be_bytes([bytes[pos], bytes[pos + 1]]));
+                if seg_len < 2 || pos + seg_len > bytes.len() {
+                    break;
+                }
+                if matches!(
+                    marker,
+                    0xc0..=0xc3 | 0xc5..=0xc7 | 0xc9..=0xcb | 0xcd..=0xcf
+                ) && seg_len >= 7
+                {
+                    let h = u32::from(u16::from_be_bytes([bytes[pos + 3], bytes[pos + 4]]));
+                    let w = u32::from(u16::from_be_bytes([bytes[pos + 5], bytes[pos + 6]]));
+                    return Some((w, h));
+                }
+                pos += seg_len;
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+struct ScopedTempDir(PathBuf);
+
+impl ScopedTempDir {
+    fn new() -> std::io::Result<Self> {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "anyagents-media-{}-{}-{}",
+            std::process::id(),
+            anyagents_core::now_ms(),
+            seq
+        ));
+        std::fs::create_dir_all(&dir)?;
+        Ok(Self(dir))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for ScopedTempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn transcode_image_to_png_bytes(path: &Path) -> Option<Vec<u8>> {
+    let dir = ScopedTempDir::new().ok()?;
+    let out_png = dir.path().join("converted.png");
+    let status = std::process::Command::new("convert")
+        .arg(format!("{}[0]", path.display()))
+        .arg(&out_png)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .ok()?;
+    if status.success() {
+        std::fs::read(&out_png).ok()
+    } else {
+        None
+    }
+}
+
+fn extract_media_blocks_from_tool_value(
+    tool_name: &str,
+    val: &mut serde_json::Value,
+) -> Vec<rmcp::model::ContentBlock> {
+    let mut blocks = Vec::new();
+    let Some(obj) = val.as_object_mut() else {
+        return blocks;
+    };
+
+    // 1. Direct `image_base64` (computer.screenshot, computer.zoom, device.screenshot, browser.screenshot)
+    if let Some(serde_json::Value::String(b64)) = obj.remove("image_base64")
+        && !b64.is_empty()
+    {
+        let mime = obj
+            .get("mime_type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("image/png")
+            .to_string();
+        blocks.push(rmcp::model::ContentBlock::image(b64, mime));
+        obj.insert("image_attached".to_string(), serde_json::Value::Bool(true));
+    }
+
+    // 2. Browser screenshot path fallback (e.g. takeover screenshot_path or local path)
+    if blocks.is_empty() && tool_name == "browser" {
+        for key in ["screenshot_path", "path"] {
+            if let Some(p_str) = obj.get(key).and_then(serde_json::Value::as_str) {
+                let p = Path::new(p_str);
+                if p.is_file()
+                    && let Ok(bytes) = std::fs::read(p)
+                    && let Some(mime) = detect_multimedia_mime(p, &bytes)
+                    && mime.starts_with("image/")
+                {
+                    let b64 = crate::computer::base64_encode(&bytes);
+                    blocks.push(rmcp::model::ContentBlock::image(b64, mime));
+                    obj.insert("image_attached".to_string(), serde_json::Value::Bool(true));
+                    break;
+                }
+            }
+        }
+    }
+
+    // 3. `audio_base64` (media.speech)
+    if let Some(serde_json::Value::String(b64)) = obj.remove("audio_base64")
+        && !b64.is_empty()
+    {
+        let fmt = obj
+            .get("response_format")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("mp3");
+        let mime = match fmt.to_ascii_lowercase().as_str() {
+            "wav" | "wave" => "audio/wav",
+            "ogg" | "opus" => "audio/ogg",
+            "flac" => "audio/flac",
+            "aac" => "audio/aac",
+            "m4a" | "mp4" => "audio/mp4",
+            _ => "audio/mpeg",
+        };
+        blocks.push(rmcp::model::ContentBlock::audio(b64, mime));
+        obj.insert("audio_attached".to_string(), serde_json::Value::Bool(true));
+    }
+
+    // 4. `data: [{"b64_json": ...}]` (media.image_generate)
+    if let Some(serde_json::Value::Array(items)) = obj.get_mut("data") {
+        for item in items.iter_mut() {
+            if let Some(item_obj) = item.as_object_mut()
+                && let Some(serde_json::Value::String(b64)) = item_obj.remove("b64_json")
+                && !b64.is_empty()
+            {
+                blocks.push(rmcp::model::ContentBlock::image(b64, "image/png"));
+                item_obj.insert("image_attached".to_string(), serde_json::Value::Bool(true));
+            }
+        }
+    }
+
+    blocks
+}
+
+fn read_multimedia_file(
+    resolved: &Path,
+    full_bytes: &[u8],
+    mime_type: &'static str,
+    sha256: String,
+    args: &FilesArgs,
+) -> Result<(serde_json::Value, Vec<rmcp::model::ContentBlock>), String> {
+    let total_bytes = full_bytes.len();
+    if total_bytes > MAX_MULTIMEDIA_READ_BYTES {
+        return Err(format!(
+            "multimedia file {} is {} bytes, exceeding maximum of {} bytes",
+            resolved.display(),
+            total_bytes,
+            MAX_MULTIMEDIA_READ_BYTES
+        ));
+    }
+
+    let mut media_blocks = Vec::new();
+    let uri = format!("file://{}", resolved.display());
+
+    if mime_type.starts_with("image/") {
+        let dims = parse_image_dimensions(mime_type, full_bytes);
+        let (b64, attached_mime) = if matches!(
+            mime_type,
+            "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+        ) {
+            (crate::computer::base64_encode(full_bytes), mime_type)
+        } else if let Some(png_bytes) = transcode_image_to_png_bytes(resolved) {
+            (crate::computer::base64_encode(&png_bytes), "image/png")
+        } else {
+            (crate::computer::base64_encode(full_bytes), mime_type)
+        };
+        media_blocks.push(rmcp::model::ContentBlock::image(b64, attached_mime));
+        let (width, height) = dims.unwrap_or((0, 0));
+        let dim_str = if width > 0 && height > 0 {
+            format!("{width}x{height}, ")
+        } else {
+            String::new()
+        };
+        return Ok((
+            serde_json::json!({
+                "action": "read",
+                "path": resolved.display().to_string(),
+                "mime_type": mime_type,
+                "media_kind": "image",
+                "width": width,
+                "height": height,
+                "bytes_read": total_bytes,
+                "total_bytes": total_bytes,
+                "truncated": false,
+                "sha256": sha256,
+                "image_attached": true,
+                "content": format!(
+                    "[Native {mime_type} image ({dim_str}{total_bytes} bytes) attached as MCP image content block]"
+                ),
+            }),
+            media_blocks,
+        ));
+    }
+
+    if mime_type == "application/pdf" {
+        let b64_pdf = crate::computer::base64_encode(full_bytes);
+        media_blocks.push(rmcp::model::ContentBlock::resource(
+            rmcp::model::ResourceContents::BlobResourceContents {
+                uri,
+                mime_type: Some("application/pdf".to_string()),
+                blob: b64_pdf,
+                meta: None,
+            },
+        ));
+
+        let start_page = args.start_line.unwrap_or(1).max(1);
+        let end_page = args
+            .end_line
+            .unwrap_or(start_page + 4)
+            .max(start_page)
+            .min(start_page + 9);
+
+        let extracted_text = std::process::Command::new("pdftotext")
+            .args([
+                "-f",
+                &start_page.to_string(),
+                "-l",
+                &end_page.to_string(),
+                &resolved.display().to_string(),
+                "-",
+            ])
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+            .unwrap_or_default();
+
+        let mut pages_rendered = 0usize;
+        if let Ok(tmp_dir) = ScopedTempDir::new() {
+            let prefix = tmp_dir.path().join("page");
+            if let Ok(status) = std::process::Command::new("pdftoppm")
+                .args([
+                    "-jpeg",
+                    "-r",
+                    "100",
+                    "-f",
+                    &start_page.to_string(),
+                    "-l",
+                    &end_page.to_string(),
+                    &resolved.display().to_string(),
+                    &prefix.display().to_string(),
+                ])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                && status.success()
+                && let Ok(entries) = std::fs::read_dir(tmp_dir.path())
+            {
+                let mut jpg_paths: Vec<PathBuf> = entries
+                    .filter_map(Result::ok)
+                    .map(|e| e.path())
+                    .filter(|p| {
+                        p.extension()
+                            .and_then(|e| e.to_str())
+                            .is_some_and(|e| e.eq_ignore_ascii_case("jpg"))
+                    })
+                    .collect();
+                jpg_paths.sort();
+                for jpg_path in jpg_paths {
+                    if let Ok(jpg_bytes) = std::fs::read(&jpg_path) {
+                        media_blocks.push(rmcp::model::ContentBlock::image(
+                            crate::computer::base64_encode(&jpg_bytes),
+                            "image/jpeg",
+                        ));
+                        pages_rendered += 1;
+                    }
+                }
+            }
+        }
+
+        let max_bytes = args
+            .max_bytes
+            .unwrap_or(DEFAULT_READ_MAX_BYTES)
+            .clamp(1, HARD_READ_MAX_BYTES);
+        let text_end = floor_char_boundary_str(&extracted_text, max_bytes);
+        let text_slice = &extracted_text[..text_end];
+        let content_summary = if text_slice.is_empty() {
+            format!(
+                "[Native application/pdf ({total_bytes} bytes, pages {start_page}-{end_page}, {pages_rendered} page image(s)) attached as MCP content blocks]"
+            )
+        } else {
+            text_slice.to_string()
+        };
+
+        return Ok((
+            serde_json::json!({
+                "action": "read",
+                "path": resolved.display().to_string(),
+                "mime_type": "application/pdf",
+                "media_kind": "pdf",
+                "start_page": start_page,
+                "end_page": end_page,
+                "pages_rendered": pages_rendered,
+                "bytes_read": total_bytes,
+                "total_bytes": total_bytes,
+                "truncated": text_end < extracted_text.len(),
+                "sha256": sha256,
+                "resource_attached": true,
+                "content": content_summary,
+            }),
+            media_blocks,
+        ));
+    }
+
+    if mime_type.starts_with("audio/") {
+        let b64 = crate::computer::base64_encode(full_bytes);
+        media_blocks.push(rmcp::model::ContentBlock::audio(b64, mime_type));
+        return Ok((
+            serde_json::json!({
+                "action": "read",
+                "path": resolved.display().to_string(),
+                "mime_type": mime_type,
+                "media_kind": "audio",
+                "bytes_read": total_bytes,
+                "total_bytes": total_bytes,
+                "truncated": false,
+                "sha256": sha256,
+                "audio_attached": true,
+                "content": format!(
+                    "[Native {mime_type} audio ({total_bytes} bytes) attached as MCP audio content block]"
+                ),
+            }),
+            media_blocks,
+        ));
+    }
+
+    let b64 = crate::computer::base64_encode(full_bytes);
+    media_blocks.push(rmcp::model::ContentBlock::resource(
+        rmcp::model::ResourceContents::BlobResourceContents {
+            uri,
+            mime_type: Some(mime_type.to_string()),
+            blob: b64,
+            meta: None,
+        },
+    ));
+    let media_kind = if mime_type.starts_with("video/") {
+        "video"
+    } else {
+        "binary"
+    };
+    Ok((
+        serde_json::json!({
+            "action": "read",
+            "path": resolved.display().to_string(),
+            "mime_type": mime_type,
+            "media_kind": media_kind,
+            "bytes_read": total_bytes,
+            "total_bytes": total_bytes,
+            "truncated": false,
+            "sha256": sha256,
+            "resource_attached": true,
+            "content": format!(
+                "[Native {mime_type} {media_kind} ({total_bytes} bytes) attached as MCP resource content block]"
+            ),
+        }),
+        media_blocks,
+    ))
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -4043,6 +4504,50 @@ fn resolve_workspace_path(
         base.join(candidate)
     };
     Ok(normalize_lexical_path(&joined))
+}
+
+fn execute_files_tool_with_media(
+    base_dir: &Path,
+    args: FilesArgs,
+) -> Result<(serde_json::Value, Vec<rmcp::model::ContentBlock>), String> {
+    let is_read_action = matches!(
+        args.action
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("read" | "cat" | "view")
+    ) || (args.action.as_deref().is_none_or(|s| s.trim().is_empty())
+        && args.cmd.is_none()
+        && args.patch.is_none()
+        && args.edits.is_empty()
+        && args.target.is_none()
+        && args.content.is_none()
+        && args.query.is_none()
+        && args.pattern.is_none()
+        && args.glob.is_none());
+
+    if is_read_action {
+        let resolved = resolve_workspace_path(base_dir, args.path.as_deref(), true)?;
+        let meta = std::fs::metadata(&resolved)
+            .map_err(|e| format!("cannot read {}: {e}", resolved.display()))?;
+        if meta.is_dir() {
+            return Err(format!(
+                "{} is a directory; use `action: \"list\"` or `action: \"glob\"` to list files",
+                resolved.display()
+            ));
+        }
+        let full_bytes = std::fs::read(&resolved)
+            .map_err(|e| format!("cannot read {}: {e}", resolved.display()))?;
+        if let Some(mime_type) = detect_multimedia_mime(&resolved, &full_bytes) {
+            let sha256 = sha256_hex(&full_bytes);
+            return read_multimedia_file(&resolved, &full_bytes, mime_type, sha256, &args);
+        }
+    }
+
+    let val = execute_files_tool(base_dir, args)?;
+    Ok((val, Vec::new()))
 }
 
 fn execute_files_tool(base_dir: &Path, args: FilesArgs) -> Result<serde_json::Value, String> {
@@ -6244,6 +6749,70 @@ fn parse_sequence_range(range: Option<&str>) -> Result<(Option<i64>, Option<i64>
 
 #[cfg(test)]
 mod spawn_args_tests {
+    #[tokio::test]
+    async fn mcp_and_cli_use_only_primary_socket_and_preserve_its_errors() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("anyagents.sock");
+        let primary = tokio::net::UnixListener::bind(&socket).unwrap();
+        let admin = tokio::net::UnixListener::bind(dir.path().join("admin.sock")).unwrap();
+        let admin_calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&admin_calls);
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, status, body) = tokio::select! {
+                    accepted = primary.accept() => (accepted.unwrap().0, "500 Internal Server Error", r#"{"error":"primary refused"}"#),
+                    accepted = admin.accept() => {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                        (accepted.unwrap().0, "200 OK", r#"{"agents":[]}"#)
+                    }
+                };
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(stream.read_u8().await.unwrap());
+                }
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let client = Client {
+            socket,
+            config: dir.path().join("config"),
+            capability: "test-capability".into(),
+        };
+        assert_eq!(
+            client
+                .request_method::<serde_json::Value>("POST", "/v1/agents", None)
+                .await
+                .unwrap_err(),
+            "primary refused"
+        );
+        assert_eq!(client.get_agents().await.err().unwrap(), "primary refused");
+        let data = dir.path().to_owned();
+        let error = tokio::task::spawn_blocking(move || {
+            crate::client::call::<serde_json::Value>(
+                &data,
+                "POST",
+                "/v1/agents",
+                None,
+                &crate::client::Authority::None,
+            )
+            .unwrap_err()
+        })
+        .await
+        .unwrap();
+        assert_eq!(error, "primary refused");
+        assert_eq!(admin_calls.load(Ordering::SeqCst), 0);
+        server.abort();
+        let _ = server.await;
+    }
+
     #[test]
     fn send_turn_result_ends_closing_tokens_without_an_interrupt_failure() {
         let closed = send_turn_result(
@@ -6369,6 +6938,53 @@ mod spawn_args_tests {
     use serde_json::json;
 
     #[test]
+    fn archetype_schemas_offer_neutral_examples_without_restricting_templates() {
+        for schema in [
+            schemars::schema_for!(AgentsArgs),
+            schemars::schema_for!(SpawnArgs),
+            schemars::schema_for!(SubagentsArgs),
+        ] {
+            let value = serde_json::to_value(schema).unwrap();
+            let archetype = &value["properties"]["archetype"];
+            let description = archetype["description"].as_str().unwrap();
+            assert!(description.contains("`.agents/agents/<archetype>.md`"));
+            assert!(description.contains("`\"planner\"`, `\"builder\"`, `\"tester\"`"));
+            assert!(archetype.get("enum").is_none());
+        }
+        let input = json!({"archetype": "custom-template"});
+        let agents: AgentsArgs = serde_json::from_value(input.clone()).unwrap();
+        let spawn: SpawnArgs = serde_json::from_value(input.clone()).unwrap();
+        let subagents: SubagentsArgs = serde_json::from_value(input).unwrap();
+        for archetype in [agents.archetype, spawn.archetype, subagents.archetype] {
+            assert_eq!(archetype.as_deref(), Some("custom-template"));
+        }
+    }
+
+    #[test]
+    fn describe_and_agents_tool_docs_require_parent_ancestor_or_admin_for_mutations() {
+        let schema = serde_json::to_value(schemars::schema_for!(AgentsArgs)).unwrap();
+        let action_doc = schema["properties"]["action"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(action_doc.contains("Parent/Ancestor agent or an Admin"));
+        assert!(action_doc.contains("Parent/Ancestor or Admin: rename"));
+        let router = AgentMcp::tool_router();
+        let tools = router.list_all();
+        let agents_tool = tools.iter().find(|t| t.name == "agents").unwrap();
+        let describe_tool = tools.iter().find(|t| t.name == "describe").unwrap();
+        assert!(
+            agents_tool
+                .description
+                .as_deref()
+                .unwrap()
+                .contains("requires the target's Parent/Ancestor agent or an Admin")
+        );
+        let describe_doc = describe_tool.description.as_deref().unwrap();
+        assert!(describe_doc.contains("requires the target's Parent/Ancestor agent or an Admin"));
+        assert!(!describe_doc.contains("Any agent can update its own description"));
+    }
+
+    #[test]
     fn spawn_routes_accept_separate_description_and_instructions() {
         let input = json!({
             "action": "spawn",
@@ -6407,6 +7023,8 @@ mod spawn_args_tests {
         description: Option<&str>,
     ) -> AgentView {
         AgentView {
+            has_open_turn: false,
+            profile: None,
             id: id.to_string(),
             name: name.to_string(),
             role: None,
@@ -6455,24 +7073,24 @@ mod spawn_args_tests {
         }
         agents.push(dummy_agent_view(
             "agt_work_1",
-            "active-writer",
+            "active-builder",
             "running",
             "working",
             Some("Implementing archetype parser"),
         ));
         agents.push(dummy_agent_view(
             "agt_err_1",
-            "broken-runner",
+            "failed-tester",
             "running",
             "errored",
             Some("OOM failure"),
         ));
         agents.push(dummy_agent_view(
             "agt_run_idle_1",
-            "standing-mind",
+            "idle-planner",
             "running",
             "idle",
-            Some("Domain mind"),
+            Some("Planning tasks"),
         ));
 
         let mut default_capped = agents.clone();
@@ -6486,9 +7104,9 @@ mod spawn_args_tests {
         assert_eq!(summary["scaled_to_zero"], 120);
         assert_eq!(summary["idle"], 121);
         assert_eq!(default_capped.len(), 100);
-        assert!(default_capped.iter().any(|a| a.name == "active-writer"));
-        assert!(default_capped.iter().any(|a| a.name == "broken-runner"));
-        assert!(default_capped.iter().any(|a| a.name == "standing-mind"));
+        assert!(default_capped.iter().any(|a| a.name == "active-builder"));
+        assert!(default_capped.iter().any(|a| a.name == "failed-tester"));
+        assert!(default_capped.iter().any(|a| a.name == "idle-planner"));
 
         let mut queried = agents.clone();
         let q_summary =
@@ -6498,7 +7116,7 @@ mod spawn_args_tests {
         assert_eq!(q_summary["idle"], 121);
         assert_eq!(q_summary["running"], 3);
         assert_eq!(q_summary["returned"], 1);
-        assert_eq!(queried[0].name, "active-writer");
+        assert_eq!(queried[0].name, "active-builder");
 
         let mut limited = agents.clone();
         let limited_summary =
@@ -6664,6 +7282,7 @@ mod spawn_args_tests {
             a.parent = Some(parent_id.to_string());
         }
         let body = serde_json::to_vec(&AgentsResponse {
+            archived_count: 0,
             agents: population,
             gateway: None,
         })
@@ -7060,6 +7679,7 @@ mod spawn_args_tests {
             dummy_agent_view("agt_2", "beta-worker", "idle", "idle", Some("Second")),
         ];
         let body = serde_json::to_vec(&AgentsResponse {
+            archived_count: 0,
             agents: population,
             gateway: None,
         })
@@ -7315,5 +7935,122 @@ mod spawn_args_tests {
         assert_eq!(evo_res["result"]["execExit"], 0);
         assert_eq!(evo_res["result"]["execStdout"], "hello-exec");
         assert_eq!(evo_res["result"]["hasWebHelpers"], true);
+    }
+
+    #[tokio::test]
+    async fn files_and_code_tools_emit_native_mcp_multimedia_content_blocks() {
+        use rmcp::handler::server::tool::IntoCallToolResult as _;
+        let dir = tempfile::tempdir().unwrap();
+        let workdir = dir.path().join("work");
+        std::fs::create_dir_all(&workdir).unwrap();
+
+        // 1. Write a valid PNG header (640x480), WAV header, and minimal PDF file.
+        let mut png_bytes = Vec::new();
+        png_bytes.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+        png_bytes.extend_from_slice(&13u32.to_be_bytes());
+        png_bytes.extend_from_slice(b"IHDR");
+        png_bytes.extend_from_slice(&640u32.to_be_bytes());
+        png_bytes.extend_from_slice(&480u32.to_be_bytes());
+        png_bytes.extend_from_slice(&[8, 6, 0, 0, 0, 0, 0, 0, 0]);
+        std::fs::write(workdir.join("frame.png"), &png_bytes).unwrap();
+
+        let mut wav_bytes = Vec::new();
+        wav_bytes.extend_from_slice(b"RIFF");
+        wav_bytes.extend_from_slice(&36u32.to_le_bytes());
+        wav_bytes.extend_from_slice(b"WAVEfmt ");
+        wav_bytes.extend_from_slice(&[16, 0, 0, 0, 1, 0, 1, 0]);
+        std::fs::write(workdir.join("clip.wav"), &wav_bytes).unwrap();
+
+        let pdf_bytes = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n";
+        std::fs::write(workdir.join("spec.pdf"), pdf_bytes).unwrap();
+
+        let mcp = AgentMcp {
+            agent: AgentRef {
+                id: AgentId::generate(),
+                name: "multimedia-worker".into(),
+                workdir: Some(workdir.clone()),
+            },
+            client: Client {
+                socket: dir.path().join("unused.sock"),
+                config: dir.path().join("config"),
+                capability: "test-cap".into(),
+            },
+        };
+
+        // Direct `files` read on PNG returns clean metadata + native MCP Image ContentBlock.
+        let MultimediaJson(png_json, png_media) = mcp
+            .files(Parameters(
+                serde_json::from_value(json!({
+                    "action": "read",
+                    "path": "frame.png",
+                }))
+                .unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(png_json["mime_type"], "image/png");
+        assert_eq!(png_json["media_kind"], "image");
+        assert_eq!(png_json["width"], 640);
+        assert_eq!(png_json["height"], 480);
+        assert_eq!(png_json["image_attached"], true);
+        assert_eq!(png_media.len(), 1);
+        match &png_media[0] {
+            rmcp::model::ContentBlock::Image(img) => {
+                assert_eq!(img.mime_type, "image/png");
+                assert_eq!(img.data, crate::computer::base64_encode(&png_bytes));
+            }
+            other => panic!("expected ContentBlock::Image, got {other:?}"),
+        }
+
+        // Calling `workspace.read` inside `code` attaches Image, Audio, and PDF Resource ContentBlocks to the outer `code` tool result!
+        let code_multimedia = mcp
+            .code(Parameters(CodeArgs {
+                code: r#"
+                    const [img, aud, doc] = await Promise.all([
+                        workspace.read("frame.png"),
+                        workspace.read("clip.wav"),
+                        workspace.read("spec.pdf"),
+                    ]);
+                    return {
+                        imgDims: [img.width, img.height],
+                        audMime: aud.mime_type,
+                        docMime: doc.mime_type,
+                    };
+                "#
+                .to_string(),
+                timeout_ms: Some(15_000),
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(code_multimedia.0["result"]["imgDims"], json!([640, 480]));
+        assert_eq!(code_multimedia.0["result"]["audMime"], "audio/wav");
+        assert_eq!(code_multimedia.0["result"]["docMime"], "application/pdf");
+        assert!(
+            code_multimedia.1.len() >= 3,
+            "expected at least 3 native multimedia content blocks, got {}",
+            code_multimedia.1.len()
+        );
+
+        let call_tool_resp = code_multimedia.into_call_tool_result().unwrap();
+        let rmcp::model::CallToolResponse::Complete(call_res) = call_tool_resp else {
+            panic!("expected CallToolResponse::Complete");
+        };
+        assert!(call_res.structured_content.is_some());
+        assert!(call_res.content.iter().any(
+            |c| matches!(c, rmcp::model::ContentBlock::Image(i) if i.mime_type == "image/png")
+        ));
+        assert!(call_res.content.iter().any(
+            |c| matches!(c, rmcp::model::ContentBlock::Audio(a) if a.mime_type == "audio/wav")
+        ));
+        assert!(call_res.content.iter().any(|c| matches!(
+            c,
+            rmcp::model::ContentBlock::Resource(r)
+                if matches!(
+                    &r.resource,
+                    rmcp::model::ResourceContents::BlobResourceContents { mime_type: Some(m), .. }
+                        if m == "application/pdf"
+                )
+        )));
     }
 }

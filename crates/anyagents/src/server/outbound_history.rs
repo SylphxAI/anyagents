@@ -23,8 +23,18 @@ fn directory(store: &Store) -> PathBuf {
     store.data_dir().join("outbound-history")
 }
 
+/// Releases the open-file-description flock on drop even when a concurrent
+/// `fork()` temporarily holds an inherited descriptor before `execve()`.
+struct FileLock(File);
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
 /// Shared with core redaction; acquire before entering any Store transaction.
-fn publication_barrier(store: &Store) -> Result<File, Error> {
+fn publication_barrier(store: &Store) -> Result<FileLock, Error> {
     let directory = directory(store);
     std::fs::create_dir_all(&directory)?;
     let file = OpenOptions::new()
@@ -35,7 +45,7 @@ fn publication_barrier(store: &Store) -> Result<File, Error> {
         .mode(0o600)
         .open(directory.join(".publication.lock"))?;
     file.lock_shared()?;
-    Ok(file)
+    Ok(FileLock(file))
 }
 
 fn write(path: &Path, intent: &Intent) -> Result<(), Error> {
@@ -146,6 +156,7 @@ where
     lock.lock()
         .map_err(Error::from)
         .map_err(ApiError::from_store)?;
+    let _lock = FileLock(lock);
     let existing = load(&path.with_extension("done"))
         .map_err(ApiError::from_store)?
         .or(load(&path).map_err(ApiError::from_store)?);
@@ -236,6 +247,7 @@ pub(super) fn reconcile(store: &Store) -> Result<(), Error> {
                 Err(std::fs::TryLockError::WouldBlock) => return Ok(()),
                 Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
             }
+            let _lock = FileLock(lock);
             if let Some(intent) = load(&path)? {
                 settle(store, &path, &intent)?;
             }

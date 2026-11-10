@@ -8,6 +8,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use anyagents_harness::normalize_harness_name;
 use serde::{Deserialize, Serialize};
 
 /// How a harness is installed on one platform.
@@ -48,14 +49,11 @@ pub struct CatalogEntry {
 pub fn builtin_catalog() -> Vec<CatalogEntry> {
     vec![
         entry(
-            "sylphx",
+            "spiron",
             InstallMethod::Vendored,
-            vec!["sylphx".to_string(), "login".to_string()],
+            vec!["spiron".to_string(), "login".to_string()],
             Some("SYLPHX_API_KEY".to_string()),
-            vec![
-                "sylphx/openai/gpt-6.1-sol#xhigh".to_string(),
-                "sylphx/openai/gpt-6.1-sol#medium".to_string(),
-            ],
+            vec![],
             "",
         ),
         entry(
@@ -230,7 +228,9 @@ pub enum InstallError {
 
 /// Where one harness version lives: `<root>/harnesses/<id>/<version>/`.
 pub fn install_dir(root: &Path, id: &str, version: &str) -> PathBuf {
-    root.join("harnesses").join(id).join(version)
+    root.join("harnesses")
+        .join(normalize_harness_name(id))
+        .join(version)
 }
 
 /// Install `version` of `harness` if that exact directory is not already there.
@@ -244,6 +244,7 @@ pub fn ensure_installed(
     version: &str,
     runner: &mut dyn CommandRunner,
 ) -> Result<PathBuf, InstallError> {
+    let harness = normalize_harness_name(harness);
     let entry = catalog
         .iter()
         .find(|e| e.id == harness)
@@ -297,6 +298,7 @@ pub fn catalog_version(
     harness: &str,
     runner: &mut dyn CommandRunner,
 ) -> Result<String, InstallError> {
+    let harness = normalize_harness_name(harness);
     let entry = catalog
         .iter()
         .find(|e| e.id == harness)
@@ -333,7 +335,7 @@ pub const UNPINNED: &str = "unpinned";
 
 /// The launcher a harness's own copy is called when the machine has one.
 fn launcher_name(harness: &str) -> &str {
-    match harness {
+    match normalize_harness_name(harness) {
         "claude-code" => "claude",
         other => other,
     }
@@ -341,9 +343,6 @@ fn launcher_name(harness: &str) -> &str {
 
 /// Whether the harness's launcher is already on `PATH` (or built-in).
 pub fn machine_has(harness: &str) -> bool {
-    if harness == "sylphx" {
-        return true;
-    }
     let name = launcher_name(harness);
     std::env::var_os("PATH").is_some_and(|path| {
         std::env::split_paths(&path)
@@ -397,18 +396,20 @@ impl LineSink for NopLines {
 /// `<root>/config/<harness>/<profile>/`. The vendor tool is pointed at this
 /// directory by the variable it documents; this crate never reads what it writes.
 pub fn config_dir(root: &Path, harness: &str, profile: &str) -> PathBuf {
-    root.join("config").join(harness).join(profile)
+    root.join("config")
+        .join(normalize_harness_name(harness))
+        .join(profile)
 }
 
 /// The variable that points this harness at its private config directory.
 pub fn config_dir_variable(harness: &str) -> Option<&'static str> {
-    match harness {
+    match normalize_harness_name(harness) {
         "claude-code" => Some("CLAUDE_CONFIG_DIR"),
         "codex" => Some("CODEX_HOME"),
         "agy" => Some("AGY_CONFIG_DIR"),
         "muse" => Some("MUSE_CONFIG_HOME"),
         "omp" => Some("PI_CODING_AGENT_DIR"),
-        "dsh" | "grok" | "sylphx" => Some("HOME"),
+        "dsh" | "grok" | "spiron" => Some("HOME"),
         _ => None,
     }
 }
@@ -473,6 +474,7 @@ pub fn sign_in_at(
     runner: &mut dyn CommandRunner,
     sink: &mut dyn SignInSink,
 ) -> Result<SignInOutcome, InstallError> {
+    let harness = normalize_harness_name(harness);
     let entry = catalog
         .iter()
         .find(|e| e.id == harness)
@@ -564,6 +566,47 @@ mod tests {
 
     fn catalog() -> Vec<CatalogEntry> {
         builtin_catalog()
+    }
+
+    #[test]
+    fn spiron_is_the_only_first_party_catalog_entry_and_legacy_callers_resolve() {
+        let catalog = catalog();
+        assert_eq!(catalog.iter().filter(|e| e.id == "spiron").count(), 1);
+        assert!(!catalog.iter().any(|e| e.id.starts_with("sylphx")));
+        let root = tempfile::tempdir().unwrap();
+        let mut runner = ScriptedRunner::default();
+        runner.answer("spiron", "SIGNED_IN ada@example\n");
+        for legacy in [
+            "spiron",
+            "sylphx",
+            "sylphx-agent",
+            "sylphx_agent",
+            "sylphx/default",
+        ] {
+            assert_eq!(launcher_name(legacy), "spiron");
+            assert_eq!(
+                catalog_version(&catalog, legacy, &mut runner).unwrap(),
+                UNPINNED
+            );
+            let dir =
+                ensure_installed(&catalog, root.path(), legacy, UNPINNED, &mut runner).unwrap();
+            assert_eq!(dir, root.path().join("harnesses/spiron/unpinned"));
+            let outcome = sign_in(
+                &catalog,
+                root.path(),
+                legacy,
+                "default",
+                &mut runner,
+                &mut NopSignIn,
+            )
+            .unwrap();
+            assert!(outcome.signed_in);
+            let call = runner.calls.last().unwrap();
+            assert_eq!(call.program, "spiron");
+            assert_eq!(call.args, ["login"]);
+            assert_eq!(call.dir, root.path().join("config/spiron/default"));
+            assert_eq!(call.env, [("HOME".into(), call.dir.display().to_string())]);
+        }
     }
 
     #[test]

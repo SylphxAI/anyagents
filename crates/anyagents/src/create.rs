@@ -5,6 +5,7 @@
 use std::path::{Path, PathBuf};
 
 use anyagents_core::{Agent, AgentId, Error, NewAgent, Store, agent_config_dir, agent_work_dir};
+use anyagents_harness::normalize_harness_name;
 
 use crate::{install, mcp_config, muse_config, opencode_config};
 
@@ -72,10 +73,7 @@ fn create_with_seat(
     consumer: &crate::worktree::Consumer,
     seat_override: Option<WorkdirSeat>,
 ) -> Result<Agent, Error> {
-    let normalized_harness = match request.harness.trim() {
-        "sylphx-agent" | "sylphx_agent" => "sylphx".to_string(),
-        other => other.to_string(),
-    };
+    let normalized_harness = normalize_harness_name(&request.harness).to_string();
     // A harness is installed only if an adapter can start it.
     install::adapter(&normalized_harness)?;
     let mut new = NewAgent::new(request.name, normalized_harness.clone());
@@ -85,8 +83,8 @@ fn create_with_seat(
         .map(|m| m.trim().to_string())
         .filter(|m| !m.is_empty())
         .or_else(|| {
-            (normalized_harness == "sylphx")
-                .then(|| crate::sylphx::DEFAULT_SYLPHX_MODEL.to_string())
+            (normalized_harness == "spiron")
+                .then(|| crate::spiron::DEFAULT_SPIRON_MODEL.to_string())
         });
     new.description = request
         .description
@@ -192,13 +190,28 @@ fn create_with_seat(
                 .ok()
                 .is_some_and(|v| !v.trim().is_empty());
         if wd_is_cloud_keyword && !pairs.iter().any(|(k, _)| k == "SYLPHX_AGENT_ENV") {
-            pairs.push(("SYLPHX_AGENT_ENV".to_string(), "default".to_string()));
+            let env_slug = std::fs::read_to_string(config.join(".config/sylphx/context.json"))
+                .ok()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                .and_then(|v| {
+                    v.get("environment")
+                        .or_else(|| v.get("env"))
+                        .and_then(|s| s.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| "default".to_string());
+            pairs.push(("SYLPHX_AGENT_ENV".to_string(), env_slug));
         }
         let workdir_created =
             explicit_workdir.as_ref().is_some_and(|p| !p.exists()) || effective_repo.is_some();
         let managed_abs = std::path::absolute(&managed)?;
         let cwd = if let Some(repo_raw) = effective_repo {
-            if agent.harness == "sylphx" && is_cloud_agent_mode && explicit_workdir.is_none() {
+            if crate::vendor::is_spiron_harness(&agent.harness)
+                && is_cloud_agent_mode
+                && explicit_workdir.is_none()
+            {
                 provision_cloud_sandbox_worktree_marker(
                     store,
                     &agent,
@@ -227,7 +240,7 @@ fn create_with_seat(
                 target_wt
             }
         } else if wd_is_private_keyword {
-            if agent.harness == "sylphx" && is_cloud_agent_mode {
+            if crate::vendor::is_spiron_harness(&agent.harness) && is_cloud_agent_mode {
                 provision_cloud_sandbox_worktree_marker(
                     store,
                     &agent,
@@ -274,7 +287,7 @@ fn create_with_seat(
                 }
                 None => {
                     if agent.parent_id.is_some() {
-                        if agent.harness == "sylphx" && is_cloud_agent_mode {
+                        if crate::vendor::is_spiron_harness(&agent.harness) && is_cloud_agent_mode {
                             provision_cloud_sandbox_worktree_marker(
                                 store,
                                 &agent,
@@ -557,7 +570,7 @@ fn provision_cloud_sandbox_worktree_marker(
     }
 
     let payload = serde_json::json!({
-        "path": crate::sylphx::CLOUD_WORKSPACE_DIR,
+        "path": crate::spiron::CLOUD_WORKSPACE_DIR,
         "cloud_sandbox": true,
         "repo": resolved_repo,
         "branch": branch,
@@ -669,12 +682,35 @@ pub(crate) fn write_agent_instructions(
     write_agent_instructions_with_continuity(config, agent, parent_name, cached_bridge.as_deref())
 }
 
+fn lock_instruction_mirrors(config: &Path) -> std::io::Result<std::fs::File> {
+    let root = config
+        .parent()
+        .ok_or_else(|| std::io::Error::other("agent root missing"))?;
+    let sessions = root.join("sessions");
+    create_private_config_dir(&sessions)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).truncate(false).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let file = options.open(sessions.join("instructions.lock"))?;
+    file.lock()?;
+    Ok(file)
+}
+
 pub(crate) fn write_agent_instructions_with_continuity(
     config: &Path,
     agent: &Agent,
     parent_name: Option<&str>,
     continuity: Option<&str>,
 ) -> Result<(), Error> {
+    // Launch preparation and description/config updates can render concurrently,
+    // including from different server processes. Hold a host-owned lock through
+    // all mirrors and their readbacks so writers cannot replace each other's
+    // verified output or leave mirrors from different snapshots.
+    let _instructions_lock = lock_instruction_mirrors(config)?;
     let _ = std::fs::remove_file(config.join(".anyagents-harness-continuity.md"));
     let mut doc = format!(
         "# AnyAgents Identity & Environment Awareness\n\n\
@@ -735,8 +771,8 @@ pub(crate) fn write_agent_instructions_with_continuity(
         ));
     }
 
-    // Only the host lifecycle allocates a generation. Describe/restart/render
-    // consume its persisted pin without opening live learned-memory files.
+    // A configured harness switch rotates before rendering. Ordinary updates
+    // consume the persisted pin without opening live learned-memory files.
     if let Some(root) = config.parent() {
         if let Some((_, policy)) = agent
             .launch_env
@@ -748,19 +784,18 @@ pub(crate) fn write_agent_instructions_with_continuity(
             doc.push_str(policy);
             doc.push('\n');
         }
-        match anyagents_core::host_session::active(root) {
-            Ok(Some(session)) if session.harness == agent.harness => {
+        match anyagents_core::host_session::prepare_harness_with_source(
+            root,
+            &agent.harness,
+            harness_session_filename(&agent.harness),
+            crate::vendor::memory_source(agent),
+        ) {
+            Ok(Some(session)) => {
                 doc.push('\n');
                 doc.push_str(&session.memory.section);
                 doc.push('\n');
             }
             Ok(None) => (), // First dispatch pins and rerenders before launch.
-            Ok(Some(_)) => {
-                return Err(Error::Message(format!(
-                    "host session harness mismatch for {}",
-                    agent.id
-                )));
-            }
             Err(error) => {
                 return Err(Error::Message(format!(
                     "invalid host memory pin for {}: {error}",
@@ -770,7 +805,7 @@ pub(crate) fn write_agent_instructions_with_continuity(
         }
     }
 
-    // Sylphx assembles the shared layer independently. Native harnesses load
+    // Spiron assembles the shared layer independently. Other harnesses load
     // their global AGENTS.md / CLAUDE.md / GEMINI.md instead, so those files
     // must retain the shared layer even though SYSTEM_PROMPT.md stays compact.
     let mut native_doc = doc.clone();
@@ -1098,18 +1133,24 @@ fn install_skill_projection_as_owner(
     overlay: &Path,
 ) -> std::io::Result<()> {
     use std::os::unix::fs::MetadataExt as _;
-    let relative = target.strip_prefix(config).map_err(std::io::Error::other)?;
-    if relative
-        .components()
-        .any(|c| !matches!(c, std::path::Component::Normal(_)))
-    {
-        return Err(std::io::Error::other("invalid skill projection path"));
-    }
+    let root = view.parent().unwrap_or(config);
+    let relative = if target == view {
+        Path::new("skills-view")
+    } else {
+        let rel = target.strip_prefix(config).map_err(std::io::Error::other)?;
+        if rel
+            .components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        {
+            return Err(std::io::Error::other("invalid skill projection path"));
+        }
+        rel
+    };
     let owner = target
         .parent()
         .into_iter()
         .flat_map(Path::ancestors)
-        .take_while(|p| p.starts_with(config))
+        .take_while(|p| p.starts_with(root))
         .find_map(|p| std::fs::symlink_metadata(p).ok().filter(|m| m.is_dir()));
     let owner = owner.ok_or_else(|| std::io::Error::other("skill projection owner missing"))?;
     // UID and primary GID are independent OS identities.
@@ -1130,6 +1171,39 @@ fn install_skill_projection_as_owner(
         "--groups", &groups, "--no-new-privs", "--", "/bin/sh", "-c",
         r#"set -eu
 config=$1; relative=$2; view=$3; global=$4; overlay=$5
+if [ "$relative" = "skills-view" ]; then
+  if [ -L "$overlay" ] || [ -L "$view" ]; then exit 1; fi
+  mkdir -p -m 0700 "$overlay"
+  chmod 0700 "$overlay"
+  mkdir -p "$view"
+  chmod 0755 "$view"
+  for item in "$view"/*; do
+    [ -L "$item" ] || continue
+    old=$(readlink "$item"); source_parent=${old%/*}; name=${item##*/}
+    if [ "$source_parent" = "$global" ] || [ "$source_parent" = "$overlay" ]; then
+      if [ -d "$overlay/$name" ]; then expected="$overlay/$name"
+      elif [ -d "$global/$name" ]; then expected="$global/$name"
+      else expected=""; fi
+      if [ "$old" != "$expected" ]; then rm "$item"; fi
+    fi
+  done
+  for src_root in "$global" "$overlay"; do
+    [ -d "$src_root" ] || continue
+    for item in "$src_root"/*; do
+      [ -d "$item" ] || continue
+      name=${item##*/}; link="$view/$name"
+      if [ -d "$overlay/$name" ]; then desired="$overlay/$name"; else desired="$item"; fi
+      if [ -L "$link" ]; then
+        old=$(readlink "$link"); source_parent=${old%/*}
+        if [ "$source_parent" != "$global" ] && [ "$source_parent" != "$overlay" ]; then continue; fi
+        if [ "$old" = "$desired" ]; then continue; fi
+        rm "$link"
+      elif [ -e "$link" ]; then continue; fi
+      ln -s "$desired" "$link"
+    done
+  done
+  exit 0
+fi
 # Every existing component is inspected by its actual owner, not the daemon
 # which was denied traversal. Foreign parent links are preserved untouched.
 parent=$config
@@ -1380,10 +1454,18 @@ fn persist_refreshed_credentials(root: &Path, rels: &[&str], bytes: &[u8]) -> Re
 }
 
 fn post_anthropic_oauth_refresh(http: &ureq::Agent, req_body: &str) -> Option<serde_json::Value> {
-    for url in [
-        "https://api.anthropic.com/v1/oauth/token",
-        "https://platform.claude.com/v1/oauth/token",
-    ] {
+    let custom_url = std::env::var("ANYAGENTS_ANTHROPIC_OAUTH_TOKEN_URL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let urls: Vec<&str> = match custom_url.as_deref() {
+        Some(u) => vec![u],
+        None => vec![
+            "https://api.anthropic.com/v1/oauth/token",
+            "https://platform.claude.com/v1/oauth/token",
+        ],
+    };
+    for url in urls {
         if let Ok(rresp) = http
             .post(url)
             .header("content-type", "application/json")
@@ -1403,7 +1485,9 @@ fn post_anthropic_oauth_refresh(http: &ureq::Agent, req_body: &str) -> Option<se
 }
 
 fn seat_sanitized_anthropic_credentials(src_bytes: &[u8], now_ms: i64) -> Vec<u8> {
-    if crate::sandbox::is_isolated_test_env() {
+    if crate::sandbox::is_isolated_test_env()
+        && std::env::var_os("ANYAGENTS_ANTHROPIC_OAUTH_TOKEN_URL").is_none()
+    {
         return src_bytes.to_vec();
     }
     let Ok(mut val) = serde_json::from_slice::<serde_json::Value>(src_bytes) else {
@@ -1433,7 +1517,9 @@ fn seat_sanitized_anthropic_credentials(src_bytes: &[u8], now_ms: i64) -> Vec<u8
 }
 
 fn refresh_anthropic_profile_oauth_if_due(data: &Path, profile_root: &Path) -> Result<(), Error> {
-    if crate::sandbox::is_isolated_test_env() {
+    if crate::sandbox::is_isolated_test_env()
+        && std::env::var_os("ANYAGENTS_ANTHROPIC_OAUTH_TOKEN_URL").is_none()
+    {
         return Ok(());
     }
     let cred_path = profile_root.join(".credentials.json");
@@ -1459,7 +1545,12 @@ fn refresh_anthropic_profile_oauth_if_due(data: &Path, profile_root: &Path) -> R
         .ok()
         .and_then(|s| s.trim().parse::<i64>().ok())
         .unwrap_or(0);
-    if now_ms.saturating_sub(last_attempt_ms) < 300_000 {
+    let min_retry_ms = if expires_at <= now_ms.saturating_add(30 * 60 * 1_000) {
+        60_000
+    } else {
+        300_000
+    };
+    if now_ms.saturating_sub(last_attempt_ms) < min_retry_ms {
         return Ok(());
     }
     let Some(rtok) = cred
@@ -1518,23 +1609,125 @@ fn refresh_anthropic_profile_oauth_if_due(data: &Path, profile_root: &Path) -> R
             );
         }
         if let Ok(updated) = serde_json::to_string(&cred) {
-            persist_refreshed_credentials(
+            if let Err(err) = persist_refreshed_credentials(
                 profile_root,
                 &[".credentials.json", ".claude/.credentials.json"],
                 updated.as_bytes(),
-            )?;
+            ) {
+                let _ = std::fs::remove_file(&attempt_path);
+                return Err(err);
+            }
             let _ = std::fs::remove_file(profile_root.join(".anyagents-usage-backoff-until-ms"));
-            if let Some(profile_name) = profile_root.file_name().and_then(|n| n.to_str()) {
-                propagate_profile_files_to_bound_agents(
+            if let Some(profile_name) = profile_root.file_name().and_then(|n| n.to_str())
+                && let Err(err) = propagate_profile_files_to_bound_agents(
                     data,
                     "anthropic",
                     profile_name,
                     &[".credentials.json", ".claude/.credentials.json"],
-                )?;
+                )
+            {
+                let _ = std::fs::remove_file(&attempt_path);
+                return Err(err);
             }
         }
     }
     Ok(())
+}
+
+fn heal_mcp_config_file(path: &Path) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    let needs_heal = match std::fs::read(path) {
+        Ok(bytes) => {
+            bytes.is_empty()
+                || !serde_json::from_slice::<serde_json::Value>(&bytes)
+                    .is_ok_and(|val| val.is_object())
+        }
+        Err(_) => false,
+    };
+    if needs_heal {
+        write_seat_shared_file(path, b"{\"mcpServers\":{}}\n", 0o660)
+    } else {
+        false
+    }
+}
+
+pub(crate) fn ensure_agy_mcp_config(profile_roots: &[PathBuf], target_config: &Path) {
+    for profile_root in profile_roots {
+        let _ = heal_mcp_config_file(&profile_root.join(".gemini/config/mcp_config.json"));
+        let _ = heal_mcp_config_file(&profile_root.join("mcp_config.json"));
+    }
+    let _ = heal_mcp_config_file(&target_config.join(".gemini/config/mcp_config.json"));
+    let _ = heal_mcp_config_file(&target_config.join("mcp_config.json"));
+}
+
+pub(crate) fn sync_anthropic_agent_credentials_from_profile(
+    store: Option<&Store>,
+    data: &Path,
+    agent: &Agent,
+    target_config: &Path,
+    profile_root: &Path,
+) {
+    if !target_config.is_dir() || !profile_root.is_dir() {
+        return;
+    }
+    let _ = refresh_anthropic_profile_oauth_if_due(data, profile_root);
+    let src = if profile_root.join(".credentials.json").is_file() {
+        profile_root.join(".credentials.json")
+    } else if profile_root.join(".claude/.credentials.json").is_file() {
+        profile_root.join(".claude/.credentials.json")
+    } else {
+        return;
+    };
+    let Ok(raw_src_bytes) = std::fs::read(&src) else {
+        return;
+    };
+    let now_ms = anyagents_core::now_ms();
+    let Some(src_exp) = json_oauth_expires_at(&raw_src_bytes) else {
+        return;
+    };
+    if src_exp <= now_ms {
+        return;
+    }
+    let sanitized = seat_sanitized_anthropic_credentials(&raw_src_bytes, now_ms);
+    let mut rewrote_any = false;
+    for rel in [".credentials.json", ".claude/.credentials.json"] {
+        let dst = target_config.join(rel);
+        let needs_rewrite = match std::fs::read(&dst) {
+            Ok(dst_bytes) => {
+                if dst_bytes == sanitized {
+                    false
+                } else {
+                    let dst_exp = json_oauth_expires_at(&dst_bytes).unwrap_or(0);
+                    dst_bytes.is_empty()
+                        || dst_exp <= now_ms.saturating_add(30 * 60 * 1_000)
+                        || src_exp > dst_exp
+                }
+            }
+            Err(_) => !dst.is_dir(),
+        };
+        if needs_rewrite && write_seat_shared_file(&dst, &sanitized, 0o660) {
+            rewrote_any = true;
+        }
+    }
+    if rewrote_any && let Some(s) = store {
+        if let Some((_, uid, gid, _)) = resolved_agent_seat_info(s, agent) {
+            crate::sandbox::share_config_with_seat_uid(target_config, uid, gid);
+        }
+        if !s.has_open_turn(&agent.id).unwrap_or(false) {
+            let _ = write_profile_marker(
+                target_config,
+                ".anyagents-profile-rotated-ms",
+                &format!("{now_ms}\n"),
+            );
+            let _ = std::fs::remove_file(target_config.join(".anyagents-last-error.json"));
+            poke_agent_wake_socket(data, &agent.id);
+        }
+    }
 }
 
 pub(crate) fn seed_harness_credentials(
@@ -1548,7 +1741,7 @@ pub(crate) fn seed_harness_credentials(
         all_agents.retain(|a| a.state != "archived");
     }
     let provider = upstream_provider_of(&agent.harness, agent.model.as_deref());
-    let static_rel_paths: &[&str] = match agent.harness.as_str() {
+    let static_rel_paths: &[&str] = match normalize_harness_name(&agent.harness) {
         "claude-code" => &[".credentials.json", ".claude/.credentials.json"],
         "codex" if provider == "openai" => &[
             "auth.json",
@@ -1609,7 +1802,7 @@ pub(crate) fn seed_harness_credentials(
             ".grok/models_cache.json",
             ".grok/settings_cache.json",
         ],
-        "sylphx" => &[
+        "spiron" => &[
             ".config/sylphx/credentials.json",
             ".config/sylphx/context.json",
             ".config/sylphx/key",
@@ -1622,7 +1815,6 @@ pub(crate) fn seed_harness_credentials(
             ".config/opencode/minimax-code-plan.key",
             ".config/opencode/openrouter.key",
             ".config/opencode/opencode.json",
-            "sylphx-agent.json",
         ],
         _ => &[],
     };
@@ -1651,7 +1843,11 @@ pub(crate) fn seed_harness_credentials(
     if let (Some(bound), Some(primary_profile_root)) =
         (current_bound.clone(), profile_roots.first().cloned())
     {
+        let harvest_peers = all_agents.len() <= 32;
         for other in &all_agents {
+            if !harvest_peers && other.id != agent.id {
+                continue;
+            }
             let other_cfg = agent_config_dir(data, &other.id);
             if bound_profile_name(&other_cfg).as_deref() == Some(bound.as_str()) {
                 for rel in [
@@ -1680,6 +1876,7 @@ pub(crate) fn seed_harness_credentials(
             refresh_anthropic_profile_oauth_if_due(data, &primary_profile_root)?;
         }
     }
+    ensure_agy_mcp_config(&profile_roots, target_config);
 
     for profile_root in &profile_roots {
         for candidate in [
@@ -1783,6 +1980,9 @@ pub(crate) fn seed_harness_credentials(
             }
         }
     }
+    if crate::vendor::is_spiron_harness(&agent.harness) {
+        crate::spiron::ensure_spiron_seat_auth(target_config);
+    }
     if let Some(ref bound) = current_bound {
         write_profile_marker(
             target_config,
@@ -1852,7 +2052,7 @@ pub(crate) fn harness_session_filename(harness: &str) -> Option<&'static str> {
         "omp" => Some("omp-session-id"),
         "dsh" => Some("dsh-session-id"),
         "grok" => Some("grok-session-id"),
-        "sylphx" => Some("sylphx-session-id"),
+        selector if crate::vendor::is_spiron_harness(selector) => Some("spiron-session-id"),
         _ => None,
     }
 }
@@ -1929,10 +2129,19 @@ pub(crate) fn compute_live_session_continuity(
 ) -> Option<String> {
     let _ = std::fs::remove_file(config.join(".anyagents-harness-continuity.md"));
     let bridge_cache_path = config.join(".anyagents-session-bridge.json");
+    let recovery_cache_path = config.join(".anyagents-session-recovery.md");
     let turns = store.conversation(&agent.id, None, None, Some(10)).ok()?;
     if turns.is_empty() {
         let _ = std::fs::remove_file(&bridge_cache_path);
+        let _ = std::fs::remove_file(&recovery_cache_path);
         return None;
+    }
+    if let Some(recovery_summary) =
+        build_harness_continuity_summary(store, agent, None, &agent.harness)
+    {
+        let _ = write_seat_shared_file(&recovery_cache_path, recovery_summary.as_bytes(), 0o664);
+    } else {
+        let _ = std::fs::remove_file(&recovery_cache_path);
     }
 
     let active_sess_file = harness_session_filename(&agent.harness).map(|f| config.join(f));
@@ -1954,9 +2163,9 @@ pub(crate) fn compute_live_session_continuity(
         "omp",
         "dsh",
         "grok",
-        "sylphx",
+        "spiron",
     ] {
-        if candidate == agent.harness {
+        if candidate == normalize_harness_name(&agent.harness) {
             continue;
         }
         if let Some(fname) = harness_session_filename(candidate) {
@@ -2025,7 +2234,7 @@ pub(crate) fn compute_live_session_continuity(
 }
 
 /// Walks `parent_id` in `state.db` up to the root ancestor so multi-hop sub-agents
-/// inherit the root ancestor's hint consistently across `serve-admin` and `serve`.
+/// inherit the root ancestor's hint consistently.
 pub(crate) fn resolve_root_seat_hint(store: &Store, agent: &Agent) -> Option<String> {
     let mut curr = agent.parent_id.clone();
     let mut hops = 0usize;
@@ -2095,6 +2304,9 @@ pub(crate) fn reconcile_agent_runtime_config(
             .map(|m| m.permissions().mode() & 0o7777)
     };
     create_private_config_dir(config)?;
+    if let Some((_, uid, gid, _)) = resolved_agent_seat_info(store, agent) {
+        crate::sandbox::prepare_config_with_seat_uid(config, uid, gid)?;
+    }
     #[cfg(unix)]
     if let Some(base_mode) = pre_existing_mode {
         use std::os::unix::fs::PermissionsExt as _;
@@ -2181,13 +2393,15 @@ pub(crate) fn reconcile_agent_runtime_config(
             ("muse", "settings.json"),
             ("claude-code", ".claude.json"),
             ("claude-code", "mcp.json"),
-            ("sylphx", "sylphx-agent.json"),
         ] {
-            if agent.harness != other_harness {
+            if agent.harness != other_harness
+                && !(stale_file == "config.toml"
+                    && crate::vendor::is_spiron_harness(&agent.harness))
+            {
                 let _ = std::fs::remove_file(config.join(stale_file));
             }
         }
-        match agent.harness.as_str() {
+        match normalize_harness_name(&agent.harness) {
             "codex" => {
                 let codex_toml = config.join("config.toml");
                 mcp_config::write_codex_with_model(
@@ -2222,8 +2436,8 @@ pub(crate) fn reconcile_agent_runtime_config(
             "grok" => {
                 crate::grok::write_grok_config(config, agent.model.as_deref(), &command, &args)?;
             }
-            "sylphx" => {
-                crate::sylphx::write_sylphx_config(
+            "spiron" => {
+                crate::spiron::write_spiron_config(
                     config,
                     agent.model.as_deref(),
                     &command,
@@ -2438,14 +2652,26 @@ pub(crate) fn verify_harness_runtime_config(
                 ));
             }
         }
-        "sylphx" => {
-            let path = config.join("sylphx-agent.json");
+        selector if crate::vendor::is_spiron_harness(selector) => {
+            let path = config.join("spiron-mcp.json");
             let text = std::fs::read_to_string(&path).map_err(|_| {
-                Error::Message(format!("sylphx runtime config missing: {}", path.display()))
+                Error::Message(format!("spiron runtime config missing: {}", path.display()))
             })?;
             if !text.contains("\"anyagents\"") {
                 return Err(Error::Message(
-                    "sylphx-agent.json missing anyagents MCP server".into(),
+                    "spiron-mcp.json missing anyagents MCP server".into(),
+                ));
+            }
+            let cfg_toml = config.join("config.toml");
+            let toml_text = std::fs::read_to_string(&cfg_toml).map_err(|_| {
+                Error::Message(format!(
+                    "spiron config.toml missing: {}",
+                    cfg_toml.display()
+                ))
+            })?;
+            if !toml_text.contains("always_approve = true") {
+                return Err(Error::Message(
+                    "spiron config.toml missing always_approve = true".into(),
                 ));
             }
         }
@@ -2574,9 +2800,8 @@ pub(crate) fn configure_agent_runtime(
     let config = agent_config_dir(data, &existing.id);
     let target_harness = match harness.map(str::trim) {
         Some("") => return Err(Error::Message("harness is empty".into())),
-        Some("sylphx-agent" | "sylphx_agent") => "sylphx".to_string(),
-        Some(h) => h.to_string(),
-        None => existing.harness.clone(),
+        Some(h) => normalize_harness_name(h).to_string(),
+        None => normalize_harness_name(&existing.harness).to_string(),
     };
     crate::install::adapter(&target_harness)?;
     if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none()
@@ -2644,7 +2869,7 @@ pub(crate) fn configure_agent_runtime(
             .map(|arr| {
                 let mut v: Vec<String> = arr
                     .into_iter()
-                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .filter_map(|x| x.as_str().map(normalize_harness_name).map(str::to_string))
                     .collect();
                 for d in &default_compat {
                     if !v.iter().any(|x| x == d) {
@@ -2737,17 +2962,20 @@ pub(crate) fn configure_agent_runtime(
             Ok(())
         }
         copy_files(&profile_dir, &config)?;
+    }
+    let now_rot = anyagents_core::now_ms();
+    let _ = write_profile_marker(
+        &config,
+        ".anyagents-quota-cleared-ms",
+        &format!("{now_rot}\n"),
+    );
+    if !in_progress_turn || current_bound.as_deref() != Some(normalized_profile.as_str()) {
         write_profile_marker(
             &config,
             ".anyagents-profile-rotated-ms",
-            &format!("{}\n", anyagents_core::now_ms()),
+            &format!("{now_rot}\n"),
         )?;
     }
-    write_profile_marker(
-        &config,
-        ".anyagents-profile-rotated-ms",
-        &format!("{}\n", anyagents_core::now_ms()),
-    )?;
     write_profile_marker(
         &config,
         ".anyagents-profile",
@@ -2993,11 +3221,22 @@ pub(crate) fn propagate_profile_files_to_bound_agents(
             ".anyagents-seeded-profile",
             &format!("{target_tag}\n"),
         )?;
-        write_profile_marker(
+        let now_prop = anyagents_core::now_ms();
+        let _ = write_profile_marker(
             &cfg,
-            ".anyagents-profile-rotated-ms",
-            &format!("{}\n", anyagents_core::now_ms()),
-        )?;
+            ".anyagents-quota-cleared-ms",
+            &format!("{now_prop}\n"),
+        );
+        let has_open = store_opt
+            .as_ref()
+            .is_some_and(|s| s.has_open_turn(&agent_rec.id).unwrap_or(false));
+        if !has_open {
+            write_profile_marker(
+                &cfg,
+                ".anyagents-profile-rotated-ms",
+                &format!("{now_prop}\n"),
+            )?;
+        }
         let _ = std::fs::remove_file(cfg.join(".anyagents-last-error.json"));
         if let Some(s) = store_opt.as_ref() {
             if let Some((_, uid, gid, _)) = resolved_agent_seat_info(s, agent_rec) {
@@ -4034,14 +4273,14 @@ pub(crate) fn upstream_provider_of(harness: &str, model: Option<&str>) -> String
             _ => {}
         }
     }
-    match harness {
+    match normalize_harness_name(harness) {
         "claude-code" => "anthropic".to_string(),
         "codex" => "openai".to_string(),
         "agy" => "google-antigravity".to_string(),
         "muse" => "muse".to_string(),
         "dsh" => "deepseek".to_string(),
         "grok" => "xai".to_string(),
-        "sylphx" | "opencode" | "omp" => "sylphx".to_string(),
+        "spiron" | "opencode" | "omp" => "sylphx".to_string(),
         other => other.to_string(),
     }
 }
@@ -4052,7 +4291,7 @@ pub(crate) fn default_kind_and_harnesses(provider: &str) -> (&'static str, Vec<S
         "sylphx" => (
             "api-key",
             harnesses(&[
-                "sylphx",
+                "spiron",
                 "opencode",
                 "omp",
                 "claude-code",
@@ -4076,7 +4315,7 @@ pub(crate) fn default_kind_and_harnesses(provider: &str) -> (&'static str, Vec<S
         ),
         "qwen-token-plan" | "kimi-code-plan" | "glm-code-plan" | "minimax-code-plan" => (
             "coding-plan",
-            harnesses(&["sylphx", "opencode", "omp", "claude-code", "codex", "dsh"]),
+            harnesses(&["spiron", "opencode", "omp", "claude-code", "codex", "dsh"]),
         ),
         "anthropic" => (
             "subscription",
@@ -4305,7 +4544,7 @@ pub(crate) fn sync_and_list_provider_profiles(
 }
 
 pub(crate) fn list_provider_profiles_fast(store: &Store, data: &Path) -> Vec<ProviderProfileEntry> {
-    sync_and_list_provider_profiles_inner(store, data, true, false)
+    sync_and_list_provider_profiles_inner(store, data, true, true)
 }
 
 pub(crate) fn sync_and_list_provider_profiles_with_options(
@@ -4501,7 +4740,9 @@ fn sync_and_list_provider_profiles_inner(
                     {
                         let parsed: Vec<String> = arr
                             .iter()
-                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .filter_map(|v| {
+                                v.as_str().map(normalize_harness_name).map(str::to_string)
+                            })
                             .collect();
                         if !parsed.is_empty() {
                             compatible_harnesses = parsed;
@@ -4516,10 +4757,12 @@ fn sync_and_list_provider_profiles_inner(
                         | "glm-code-plan"
                         | "minimax-code-plan"
                         | "openrouter"
-                ) && !compatible_harnesses.iter().any(|h| h == "sylphx")
+                ) && !compatible_harnesses.iter().any(|h| h == "spiron")
                 {
-                    compatible_harnesses.insert(0, "sylphx".to_string());
+                    compatible_harnesses.insert(0, "spiron".to_string());
                 }
+                let mut seen = std::collections::HashSet::new();
+                compatible_harnesses.retain(|h| seen.insert(h.clone()));
                 let (acct_email, acct_id) = extract_profile_account_identity(&prof_path, &provider);
                 entries.push(ProviderProfileEntry {
                     provider: provider.clone(),
@@ -4998,6 +5241,15 @@ pub(crate) fn sync_fresher_bound_agent_credentials(data: &Path) {
         return;
     }
     let _ = std::fs::write(&sync_stamp, format!("{now_ms}\n"));
+    if let Ok(entries) = std::fs::read_dir(profiles_root.join("google-antigravity")) {
+        for entry in entries.flatten() {
+            let prof_path = entry.path();
+            if prof_path.is_dir() {
+                let _ = heal_mcp_config_file(&prof_path.join(".gemini/config/mcp_config.json"));
+                let _ = heal_mcp_config_file(&prof_path.join("mcp_config.json"));
+            }
+        }
+    }
     if let Ok(store) = Store::open(data.join("state.db"))
         && let Ok(agents) = store.list_agents()
     {
@@ -5025,6 +5277,7 @@ pub(crate) fn sync_fresher_bound_agent_credentials(data: &Path) {
                 })
                 .unwrap_or_else(|| "default".to_string());
             let profile_dir = profiles_root.join(&provider).join(&prof_name);
+            ensure_agy_mcp_config(std::slice::from_ref(&profile_dir), &cfg);
             let rels: &[&str] = match provider.as_str() {
                 "anthropic" => &[".credentials.json", ".claude/.credentials.json"],
                 "openai" => &["auth.json", ".codex/auth.json"],
@@ -5045,6 +5298,14 @@ pub(crate) fn sync_fresher_bound_agent_credentials(data: &Path) {
             if updated_any {
                 propagate_profile_files_to_bound_agents(data, &provider, &prof_name, rels)
                     .unwrap_or_else(|err| eprintln!("runtime persistence failed: {err}"));
+            } else if provider == "anthropic" {
+                sync_anthropic_agent_credentials_from_profile(
+                    Some(&store),
+                    data,
+                    agent,
+                    &cfg,
+                    &profile_dir,
+                );
             }
         }
     }
@@ -6770,7 +7031,6 @@ pub(crate) fn probe_one_profile_usage(
                 Some(format!("active ({count} models)"))
             }
             "sylphx" => {
-                let _key = crate::sylphx::read_sylphx_key_from_dir(&prof_dir)?;
                 let resp = http.get("https://api.sylphx.com/health").call().ok()?;
                 let body = resp.into_body().read_to_string().ok()?;
                 let val: serde_json::Value = serde_json::from_str(&body).ok()?;
@@ -7619,10 +7879,20 @@ impl Default for SubagentDefaultsConfig {
 
 pub(crate) fn load_subagent_defaults(data: &Path) -> SubagentDefaultsConfig {
     let path = data.join("subagent-defaults.json");
-    std::fs::read_to_string(&path)
+    let mut cfg = std::fs::read_to_string(&path)
         .ok()
         .and_then(|text| serde_json::from_str::<SubagentDefaultsConfig>(&text).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    normalize_subagent_harnesses(&mut cfg);
+    cfg
+}
+
+fn normalize_subagent_harnesses(cfg: &mut SubagentDefaultsConfig) {
+    for spec in std::iter::once(&mut cfg.default).chain(cfg.agents.values_mut()) {
+        if let Some(harness) = spec.harness.as_mut() {
+            *harness = normalize_harness_name(harness).to_string();
+        }
+    }
 }
 
 pub(crate) fn save_subagent_defaults(
@@ -7630,7 +7900,9 @@ pub(crate) fn save_subagent_defaults(
     cfg: &SubagentDefaultsConfig,
 ) -> Result<(), Error> {
     let path = data.join("subagent-defaults.json");
-    let text = serde_json::to_string_pretty(cfg).map_err(|err| Error::Message(err.to_string()))?;
+    let mut cfg = cfg.clone();
+    normalize_subagent_harnesses(&mut cfg);
+    let text = serde_json::to_string_pretty(&cfg).map_err(|err| Error::Message(err.to_string()))?;
     std::fs::write(path, format!("{text}\n"))?;
     Ok(())
 }
@@ -7710,7 +7982,7 @@ pub(crate) fn parse_archetype_markdown(raw: &str) -> Result<ArchetypeTemplate, E
                 "description" | "summary" => tpl.description = Some(value.to_string()),
                 "scope" => tpl.scope = Some(anyagents_core::parse_agent_scope(value)?.to_string()),
                 "workdir" | "workspace" => tpl.workdir = Some(value.to_string()),
-                "harness" => tpl.harness = Some(value.to_string()),
+                "harness" => tpl.harness = Some(normalize_harness_name(value).to_string()),
                 "model" => tpl.model = Some(value.to_string()),
                 "role" => tpl.role = Some(value.to_string()),
                 "profile" => tpl.profile = Some(value.to_string()),
@@ -7969,10 +8241,17 @@ pub(crate) fn apply_archetype_defaults(
         } else {
             None
         };
-        if direct.is_some() {
+        let resolved = if direct.is_some() {
             direct
         } else if valid_template_stem(&slugified) {
             resolve_archetype_template(&slugified, explicit_wd.as_deref(), parent_wd, data_dir)?
+        } else {
+            None
+        };
+        if resolved.is_some() {
+            resolved
+        } else if let Some(fallback_slug) = fallback_archetype_slug_from_role(role) {
+            resolve_archetype_template(fallback_slug, explicit_wd.as_deref(), parent_wd, data_dir)?
         } else {
             // A display label is not required to be a template stem.
             None
@@ -8063,6 +8342,21 @@ pub(crate) fn apply_archetype_defaults(
     Ok(())
 }
 
+fn fallback_archetype_slug_from_role(role: &str) -> Option<&'static str> {
+    let lower = role.to_ascii_lowercase();
+    if lower.contains("director") || role.contains("總監") || role.contains("總管") {
+        Some("director")
+    } else if lower.contains("manager") || role.contains("主管") {
+        Some("manager")
+    } else if lower.contains("assistant") || role.contains("專屬助理") {
+        Some("assistant")
+    } else if lower.contains("worker") || role.contains("專員") {
+        Some("worker")
+    } else {
+        None
+    }
+}
+
 fn valid_template_stem(value: &str) -> bool {
     let value = value.trim();
     !value.is_empty()
@@ -8079,7 +8373,7 @@ pub(crate) fn resolve_subagent_defaults(
     raw_model: Option<String>,
     raw_profile: Option<String>,
 ) -> (String, Option<String>, Option<String>) {
-    let h_trim = raw_harness.trim();
+    let h_trim = normalize_harness_name(raw_harness);
     let m_trim = raw_model
         .as_deref()
         .map(str::trim)
@@ -8099,8 +8393,7 @@ pub(crate) fn resolve_subagent_defaults(
             .filter(|m| !m.eq_ignore_ascii_case("inherit"))
             .map(str::to_string)
             .or_else(|| {
-                matches!(harness.as_str(), "sylphx" | "sylphx-agent" | "sylphx_agent")
-                    .then(|| crate::sylphx::DEFAULT_SYLPHX_MODEL.to_string())
+                (harness == "spiron").then(|| crate::spiron::DEFAULT_SPIRON_MODEL.to_string())
             });
         let profile = p_trim
             .filter(|p| !p.eq_ignore_ascii_case("inherit"))
@@ -8115,9 +8408,9 @@ pub(crate) fn resolve_subagent_defaults(
 
     let inherit_harness = || {
         if parent_agent.harness == "agy" {
-            "sylphx".to_string()
+            "spiron".to_string()
         } else {
-            parent_agent.harness.clone()
+            normalize_harness_name(&parent_agent.harness).to_string()
         }
     };
 
@@ -8168,17 +8461,13 @@ pub(crate) fn resolve_subagent_defaults(
         None
     }
     .or_else(|| {
-        matches!(
-            resolved_harness.as_str(),
-            "sylphx" | "sylphx-agent" | "sylphx_agent"
-        )
-        .then(|| {
+        (resolved_harness == "spiron").then(|| {
             spec.model
                 .as_deref()
                 .map(str::trim)
                 .filter(|m| m.starts_with("sylphx/"))
                 .map(str::to_string)
-                .unwrap_or_else(|| crate::sylphx::DEFAULT_SYLPHX_MODEL.to_string())
+                .unwrap_or_else(|| crate::spiron::DEFAULT_SPIRON_MODEL.to_string())
         })
     });
 
@@ -8226,6 +8515,108 @@ pub(crate) fn resolve_subagent_defaults(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_harness_selectors_create_and_switch_to_spiron_without_renaming_gateway() {
+        let dir = crate::test_tempdir();
+        let data = dir.path();
+        let store = Store::open(data.join("state.db")).unwrap();
+        store
+            .hold_capability_key("0123456789abcdef0123456789abcdef")
+            .unwrap();
+        let model = crate::spiron::DEFAULT_SPIRON_MODEL;
+        for (index, legacy) in ["sylphx", "sylphx-agent", "sylphx_agent", "sylphx/default"]
+            .into_iter()
+            .enumerate()
+        {
+            let (harness, resolved_model, profile) =
+                resolve_subagent_defaults(data, None, legacy, None, Some("sylphx/default".into()));
+            assert_eq!(harness, "spiron");
+            assert_eq!(resolved_model.as_deref(), Some(model));
+            assert_eq!(profile.as_deref(), Some("sylphx/default"));
+            let created = create(
+                &store,
+                data,
+                CreateRequest {
+                    name: format!("legacy-{index}"),
+                    role: None,
+                    harness: legacy.into(),
+                    model: None,
+                    profile: Some("sylphx/default".into()),
+                    repo: None,
+                    branch: None,
+                    base: None,
+                    workdir: None,
+                    workdir_default: None,
+                    description: None,
+                    instructions: None,
+                    parent_id: None,
+                },
+            )
+            .unwrap();
+            assert_eq!(created.harness, "spiron");
+            assert_eq!(created.model.as_deref(), Some(model));
+            assert_eq!(upstream_provider_of(legacy, None), "sylphx");
+            let switched =
+                set_agent_harness(&store, data, "operator", &created.name, legacy, None, None)
+                    .unwrap();
+            assert_eq!(switched["harness"], "spiron");
+            assert_eq!(switched["model"], model);
+            assert_eq!(switched["profile"], "sylphx/default");
+        }
+    }
+
+    #[test]
+    fn legacy_profile_compatibility_lists_expose_only_canonical_harnesses() {
+        let dir = crate::test_tempdir();
+        let profile = dir.path().join("profiles/sylphx/default");
+        std::fs::create_dir_all(&profile).unwrap();
+        std::fs::write(profile.join("profile.json"), serde_json::json!({
+            "compatible_harnesses": ["sylphx", "sylphx-agent", "sylphx_agent", "sylphx/default", "spiron", "codex"]
+        }).to_string()).unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let profiles = sync_and_list_provider_profiles_inner(&store, dir.path(), false, false);
+        let entry = profiles
+            .iter()
+            .find(|entry| entry.provider == "sylphx")
+            .unwrap();
+        assert_eq!(entry.compatible_harnesses, ["spiron", "codex"]);
+        for provider in [
+            "sylphx",
+            "qwen-token-plan",
+            "kimi-code-plan",
+            "glm-code-plan",
+            "minimax-code-plan",
+        ] {
+            let (_, harnesses) = default_kind_and_harnesses(provider);
+            assert_eq!(harnesses.iter().filter(|h| *h == "spiron").count(), 1);
+            assert!(!harnesses.iter().any(|h| h.starts_with("sylphx")));
+        }
+    }
+
+    #[test]
+    fn legacy_subagent_defaults_are_canonical_but_provider_profiles_are_preserved() {
+        let dir = crate::test_tempdir();
+        std::fs::write(dir.path().join("subagent-defaults.json"), serde_json::json!({
+            "default": {"mode": "custom", "harness": "sylphx/default", "model": "sylphx/openai/gpt-6.1-sol#medium", "profile": "sylphx/default"},
+            "agents": {"parent": {"mode": "custom", "harness": "sylphx-agent", "profile": "sylphx/default"}}
+        }).to_string()).unwrap();
+        let cfg = load_subagent_defaults(dir.path());
+        assert_eq!(cfg.default.harness.as_deref(), Some("spiron"));
+        assert_eq!(cfg.agents["parent"].harness.as_deref(), Some("spiron"));
+        assert_eq!(cfg.default.profile.as_deref(), Some("sylphx/default"));
+        assert_eq!(
+            cfg.default.model.as_deref(),
+            Some(crate::spiron::DEFAULT_SPIRON_MODEL)
+        );
+        save_subagent_defaults(dir.path(), &cfg).unwrap();
+        let saved: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(dir.path().join("subagent-defaults.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(saved["default"]["harness"], "spiron");
+        assert_eq!(saved["default"]["profile"], "sylphx/default");
+    }
 
     fn rebalance_test_profiles(data: &Path, busy_pct: i64) -> Vec<ProviderProfileEntry> {
         [("busy", busy_pct), ("healthy", 80)]
@@ -8447,6 +8838,45 @@ mod tests {
     }
 
     #[test]
+    fn propagate_profile_files_defers_rotated_marker_during_open_turn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path();
+        let store = Store::open(data.join("state.db")).unwrap();
+        store
+            .hold_capability_key("0123456789abcdef0123456789abcdef")
+            .unwrap();
+        let _entries = rebalance_test_profiles(data, 80);
+        let idle = rebalance_test_agent(&store, "idle-seat", None);
+        let working = rebalance_test_agent(&store, "working-seat", None);
+        store
+            .receive(&working.id, anyagents_core::Incoming::new("active turn"))
+            .unwrap();
+        let message = store.next_undelivered(&working.id).unwrap().unwrap();
+        store.note_delivered(&working.id, message.seq).unwrap();
+        assert!(store.has_open_turn(&working.id).unwrap());
+
+        let idle_cfg = agent_config_dir(data, &idle.id);
+        let working_cfg = agent_config_dir(data, &working.id);
+        let _ = std::fs::remove_file(idle_cfg.join(".anyagents-profile-rotated-ms"));
+        let _ = std::fs::remove_file(working_cfg.join(".anyagents-profile-rotated-ms"));
+
+        propagate_profile_files_to_bound_agents(data, "openai", "busy", &[]).unwrap();
+
+        assert!(
+            idle_cfg.join(".anyagents-profile-rotated-ms").exists(),
+            "idle seat should receive rotated marker on credential refresh"
+        );
+        assert!(
+            !working_cfg.join(".anyagents-profile-rotated-ms").exists(),
+            "working seat with open turn must not receive rotated marker mid-turn"
+        );
+        assert!(
+            working_cfg.join(".anyagents-quota-cleared-ms").exists(),
+            "working seat should still receive quota-cleared marker"
+        );
+    }
+
+    #[test]
     fn quota_rotation_counts_subagent_load_and_preserves_exclusions() {
         let tmp = tempfile::tempdir().unwrap();
         let data = tmp.path();
@@ -8525,7 +8955,7 @@ mod tests {
         let root = config.parent().unwrap();
         std::fs::create_dir_all(root.join("memory")).unwrap();
         std::fs::write(root.join("memory/MEMORY.md"), "繁體長記憶".repeat(3000)).unwrap();
-        for harness in ["claude-code", "sylphx"] {
+        for harness in ["claude-code", "spiron"] {
             agent.harness = harness.into();
             let pin = anyagents_core::host_session::new_session(root, harness).unwrap();
             write_agent_instructions(&config, &agent, None).unwrap();
@@ -8551,7 +8981,8 @@ mod tests {
     #[test]
     fn instruction_mirrors_share_one_pinned_snapshot_across_harnesses() {
         use anyagents_core::host_session;
-        let tmp = tempfile::tempdir().unwrap();
+        // Resume-pointer reads reject symlinked ancestors, including macOS /var.
+        let tmp = crate::test_tempdir();
         let data = tmp.path();
         let store = Store::open(data.join("state.db")).unwrap();
         store
@@ -8588,14 +9019,13 @@ mod tests {
         let rerender = std::fs::read_to_string(config.join("SYSTEM_PROMPT.md")).unwrap();
         assert!(rerender.contains("PINNED_FIRST_FACT"));
         assert!(!rerender.contains("EDITED_SECOND_FACT"));
-        // Launch assembly consumes the actual mirror, not an isolated formatter.
-        let assembled =
-            anyagents_harness_sylphx::assemble_system_prompt(&config, &data.join("workspace"));
-        assert!(assembled.contains(&first.memory.section));
-        assert!(!assembled.contains("EDITED_SECOND_FACT"));
-        agent.harness = "sylphx".into();
-        let switched = host_session::new_session(root, &agent.harness).unwrap();
+        // External CLI consumption of this mirror is exercised by the real-pipe
+        // Spiron launch/wake probe; AnyAgents no longer assembles model prompts.
+        agent.harness = "spiron".into();
         write_agent_instructions(&config, &agent, None).unwrap();
+        let switched = host_session::active(root).unwrap().unwrap();
+        assert_eq!(switched.harness, "spiron");
+        assert_ne!(switched.generation, first.generation);
         for path in paths {
             let text = std::fs::read_to_string(config.join(path)).unwrap();
             assert!(text.contains(&switched.memory.section));
@@ -8665,7 +9095,7 @@ mod tests {
 
     #[test]
     fn set_agent_harness_preserves_identity_history_and_refuses_incompatible() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_tempdir();
         let data = tmp.path();
         let owner_workdir = data.join("owner-workdir");
         std::fs::create_dir(&owner_workdir).unwrap();
@@ -8701,6 +9131,10 @@ mod tests {
         let cfg = agent_config_dir(data, &owner.id);
         std::fs::create_dir_all(&cfg).unwrap();
         write_profile_marker(&cfg, ".anyagents-profile", "sylphx/default\n").unwrap();
+        let root = cfg.parent().unwrap();
+        let initial_session =
+            anyagents_core::host_session::ensure_active(root, "opencode").unwrap();
+        anyagents_core::host_session::bind_vendor(root, "opencode", "ses_original").unwrap();
         let mut inc = anyagents_core::Incoming::new("Initial owner task");
         inc.sender = Some("agent:sample-parent".to_string());
         let _ = store.receive(&owner.id, inc).unwrap();
@@ -8739,6 +9173,9 @@ mod tests {
         assert_eq!(receipt["profile"], "sylphx/default");
         assert_eq!(receipt["state"], "archived");
         assert_eq!(receipt["cutover_status"], "ready_on_next_wake");
+        let switched_session = anyagents_core::host_session::active(root).unwrap().unwrap();
+        assert_eq!(switched_session.harness, "codex");
+        assert_ne!(switched_session.generation, initial_session.generation);
 
         let after = store.agent(&owner.id).unwrap();
         assert_eq!(after.id, owner.id);
@@ -8782,6 +9219,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(roundtrip["harness"], "opencode");
+        let roundtrip_session = anyagents_core::host_session::active(root).unwrap().unwrap();
+        assert_eq!(roundtrip_session.harness, "opencode");
+        assert_ne!(roundtrip_session.generation, switched_session.generation);
+        // The outgoing generation's pin and alias remain resumable.
+        assert_eq!(
+            anyagents_core::host_session::resume_vendor(root, "opencode", "ses_original").unwrap(),
+            initial_session
+        );
         assert!(!cfg.join("opencode-session-id").exists());
         let agents_md = std::fs::read_to_string(cfg.join("AGENTS.md")).unwrap();
         assert!(agents_md.contains("Completed second turn on Codex"));
@@ -9094,43 +9539,29 @@ mod tests {
             .unwrap();
         rollout.set_modified(rotated_at).unwrap();
 
-        let mut views = vec![crate::api::AgentView {
-            id: child.id.to_string(),
-            name: child.name.clone(),
-            role: child.role.clone(),
-            aliases: Vec::new(),
-            parent: Some(parent.id.to_string()),
-            harness: child.harness.clone(),
-            model: child.model.clone(),
-            live_harness: Some(child.harness.clone()),
-            live_model: child.model.clone(),
-            process_started_at_ms: Some(anyagents_core::now_ms()),
-            pending_switch: false,
-            workdir: child.workdir.clone(),
-            state: "running".to_string(),
-            process: "alive".to_string(),
-            turn_state: "working".to_string(),
-            delivery_mode: "steer".to_string(),
-            steer_support: "yes".to_string(),
-            quota_reset_at_ms: None,
-            block_reason: None,
-            last_error: None,
-            oldest_undelivered_age_ms: None,
-            install: "installed".to_string(),
-            description: child.public_description(),
-            instructions: child.instructions.clone(),
-            seat_user: None,
-            seat_uid: None,
-            seat_gid: None,
-            scope: child.scope().to_string(),
-            relationship: None,
-            can_message: None,
-            schedules: Vec::new(),
-        }];
+        let health = anyagents_supervisor::HealthBoard::default();
+        let (delivery_mode, steer_support) = anyagents_supervisor::declared(&child.harness);
+        health.publish(
+            &child.id,
+            anyagents_supervisor::LiveState {
+                process_alive: true,
+                turn_state: anyagents_harness::TurnState::InTurn,
+                delivery_mode,
+                steer_support,
+                quota_reset_at_ms: None,
+                restart_at_ms: None,
+                pid: None,
+                live_harness: Some(child.harness.clone()),
+                live_model: child.model.clone(),
+                process_started_at_ms: Some(anyagents_core::now_ms()),
+                last_error: None,
+            },
+        );
+        let mut views;
 
         // A rollout at the rotation boundary is stale, even if it contains an
         // error. Do not let wall-clock or filesystem precision decide freshness.
-        crate::agent::reconcile_and_enrich_views(data, &mut views);
+        views = vec![crate::server::agent_view(&store, &health, &child).unwrap()];
         assert_eq!(views[0].turn_state, "working");
         assert!(views[0].last_error.is_none());
         assert!(store.next_undelivered(&parent.id).unwrap().is_none());
@@ -9138,7 +9569,7 @@ mod tests {
         rollout
             .set_modified(rotated_at + std::time::Duration::from_secs(1))
             .unwrap();
-        crate::agent::reconcile_and_enrich_views(data, &mut views);
+        views = vec![crate::server::agent_view(&store, &health, &child).unwrap()];
         assert_eq!(views[0].turn_state, "errored");
         assert_eq!(
             views[0].last_error.as_deref(),
@@ -9159,7 +9590,7 @@ mod tests {
         store.note_delivered(&parent.id, first_msg.seq).unwrap();
 
         // Second check must not re-notify parent for the same error.
-        crate::agent::reconcile_and_enrich_views(data, &mut views);
+        let _ = crate::server::agent_view(&store, &health, &child).unwrap();
         assert!(
             store.next_undelivered(&parent.id).unwrap().is_none(),
             "parent should only be notified once per error"
@@ -10295,7 +10726,7 @@ git -c safe.directory="$5" -C "$5" status --porcelain
             2
         );
 
-        // 6. Sylphx identity stays compact at every depth, while native
+        // 6. Spiron identity stays compact at every depth, while other
         // harness entrypoints retain the shared company instructions.
         for (ag, expected_desc) in [
             (&root, "Root owner role description."),
@@ -10328,16 +10759,6 @@ git -c safe.directory="$5" -C "$5" status --porcelain
                 let parent = store.agent(parent_id).unwrap();
                 assert!(prompt.contains(&format!("Direct parent: `agent:{}`", parent.name)));
             }
-            let assembled = anyagents_harness_sylphx::assemble_system_prompt(
-                &cfg,
-                Path::new(ag.workdir.as_deref().unwrap()),
-            );
-            assert_eq!(
-                assembled
-                    .matches("# ExampleOrg Shared Constitution")
-                    .count(),
-                1
-            );
             let toml = std::fs::read_to_string(cfg.join("config.toml")).unwrap();
             assert!(toml.contains("project_doc_max_bytes = 131072"));
         }
@@ -10660,7 +11081,7 @@ git -c safe.directory="$5" -C "$5" status --porcelain
     }
 
     #[test]
-    fn shared_agents_md_reaches_native_aliases_and_sylphx_assembly_exactly_once() {
+    fn shared_agents_md_reaches_native_aliases_exactly_once() {
         let dir = tempfile::tempdir().unwrap();
         let data = dir.path();
         let store = Store::open(data.join("state.db")).unwrap();
@@ -10677,7 +11098,7 @@ git -c safe.directory="$5" -C "$5" status --porcelain
         .unwrap();
         let shared = "# Example/shared-instructions\nSHARED_ONLY_RULE 繁體\n";
 
-        for harness in ["agy", "claude-code", "codex", "sylphx"] {
+        for harness in ["agy", "claude-code", "codex", "spiron"] {
             std::fs::write(&shared_path, shared).unwrap();
             let agent = store
                 .create_agent(anyagents_core::NewAgent::new(harness, harness))
@@ -10713,33 +11134,6 @@ git -c safe.directory="$5" -C "$5" status --porcelain
             }
             assert!(!config.join(".gemini/config/AGENTS.md").exists());
             assert!(!config.join(".gemini/config/rules/AGENTS.md").exists());
-
-            // Sylphx's native-gateway and cloud paths share this real assembler.
-            // It must read current shared rules, not also load the native alias.
-            let assembled = anyagents_harness_sylphx::assemble_system_prompt(&config, &work);
-            assert_eq!(
-                assembled.matches("SHARED_ONLY_RULE").count(),
-                1,
-                "{harness}"
-            );
-            assert_eq!(assembled.matches("LOCAL_ONLY_RULE").count(), 1, "{harness}");
-            assert_eq!(assembled.matches("# AnyAgents Identity").count(), 1);
-            std::fs::write(
-                &shared_path,
-                "# Example/shared-instructions\nUPDATED_SHARED_RULE\n",
-            )
-            .unwrap();
-            let updated = anyagents_harness_sylphx::assemble_system_prompt(&config, &work);
-            assert_eq!(updated.matches("UPDATED_SHARED_RULE").count(), 1);
-            assert!(!updated.contains("SHARED_ONLY_RULE"));
-
-            // If the global mount is unavailable, recover the shared layer
-            // from config/AGENTS.md without copying the identity layer twice.
-            std::fs::remove_file(&shared_path).unwrap();
-            let fallback = anyagents_harness_sylphx::assemble_system_prompt(&config, &work);
-            assert_eq!(fallback.matches("SHARED_ONLY_RULE").count(), 1, "{harness}");
-            assert_eq!(fallback.matches("LOCAL_ONLY_RULE").count(), 1, "{harness}");
-            assert_eq!(fallback.matches("# AnyAgents Identity").count(), 1);
         }
     }
 
@@ -10881,14 +11275,6 @@ git -c safe.directory="$5" -C "$5" status --porcelain
             "{} bytes",
             native_prompt.len()
         );
-        let assembled = anyagents_harness_sylphx::assemble_system_prompt(
-            &cfg,
-            Path::new(agent.workdir.as_deref().unwrap()),
-        );
-        assert_eq!(
-            assembled.matches("# Example/shared-instructions").count(),
-            1
-        );
         assert!(!gemini_agents.exists());
         assert!(!gemini_rules_agents.exists());
         // exists() alone also accepts dangling symlinks; neither alias may remain.
@@ -10953,6 +11339,58 @@ mod archetype_tests {
         assert!(
             parse_archetype_markdown("---\nname: worker\nunknown: rejected\n---\nBody.").is_err()
         );
+    }
+
+    #[test]
+    fn composite_role_labels_resolve_fallback_archetype_templates() {
+        let dir = tempfile::tempdir().unwrap();
+        let templates_dir = dir.path().join(".agents/agents");
+        std::fs::create_dir_all(&templates_dir).unwrap();
+        for (slug, scope, body_text) in [
+            ("director", "public", "Director template body."),
+            ("manager", "siblings", "Manager template body."),
+            ("assistant", "isolated", "Assistant template body."),
+            ("worker", "private", "Worker template body."),
+        ] {
+            std::fs::write(
+                templates_dir.join(format!("{slug}.md")),
+                format!(
+                    "---\nname: {slug}\nscope: {scope}\ndescription: Default {slug}\n---\n{body_text}"
+                ),
+            )
+            .unwrap();
+        }
+
+        for (role_label, expected_scope, expected_body) in [
+            (
+                "工作總監 (Work Director)",
+                "public",
+                "Director template body.",
+            ),
+            ("項目總管", "public", "Director template body."),
+            (
+                "商業化與數值經濟主管 (Monetization & Economy Manager)",
+                "siblings",
+                "Manager template body.",
+            ),
+            ("外部聯絡專屬助理", "isolated", "Assistant template body."),
+            ("專員 / Worker", "private", "Worker template body."),
+        ] {
+            let mut req: crate::api::CreateAgentRequest =
+                serde_json::from_value(serde_json::json!({
+                    "name": "sample-agent",
+                    "role": role_label,
+                    "instructions": "Custom assignment instructions."
+                }))
+                .unwrap();
+            apply_archetype_defaults(dir.path(), None, &mut req).unwrap();
+            assert_eq!(req.role.as_deref(), Some(role_label));
+            assert_eq!(req.scope.as_deref(), Some(expected_scope));
+            assert_eq!(
+                req.instructions.as_deref(),
+                Some(format!("{expected_body}\n\nCustom assignment instructions.").as_str())
+            );
+        }
     }
 
     #[test]
@@ -11090,6 +11528,59 @@ mod runtime_config_tests {
                 .join(".anyagents-pending-credentials.json")
                 .exists()
         );
+    }
+
+    #[test]
+    fn concurrent_instruction_renders_publish_one_complete_set_of_mirrors() {
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        store
+            .hold_capability_key("0123456789abcdef0123456789abcdef")
+            .unwrap();
+        let agent = store
+            .create_agent(anyagents_core::NewAgent::new(
+                "concurrent-render",
+                "claude-code",
+            ))
+            .unwrap();
+        let config = agent_config_dir(dir.path(), &agent.id);
+        let barrier = std::sync::Barrier::new(4);
+        std::thread::scope(|scope| {
+            for writer in 0..4 {
+                let mut agent = agent.clone();
+                agent.description = Some(format!("CONCURRENT_RENDER_{writer}"));
+                let config = &config;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    for _ in 0..8 {
+                        write_agent_instructions(config, &agent, None).unwrap();
+                    }
+                });
+            }
+        });
+        let system = std::fs::read_to_string(config.join("SYSTEM_PROMPT.md")).unwrap();
+        let last = (0..4)
+            .map(|writer| format!("CONCURRENT_RENDER_{writer}"))
+            .find(|marker| system.contains(marker))
+            .unwrap();
+        for name in [
+            "AGENTS.md",
+            "CLAUDE.md",
+            ".claude/CLAUDE.md",
+            "opencode/AGENTS.md",
+            ".config/opencode/AGENTS.md",
+            ".gemini/config/GEMINI.md",
+            "muse/AGENTS.md",
+            ".config/muse/AGENTS.md",
+            ".omp/agent/APPEND_SYSTEM.md",
+            ".omp/agent/AGENTS.md",
+            ".dsh/AGENTS.md",
+            ".grok/AGENTS.md",
+        ] {
+            let mirror = std::fs::read_to_string(config.join(name)).unwrap();
+            assert!(mirror.contains(&last), "{name} contains another render");
+        }
     }
 
     #[test]
@@ -11552,6 +12043,200 @@ mod runtime_config_tests {
                     None => std::env::remove_var(key),
                 }
             }
+        }
+    }
+
+    #[test]
+    fn zero_byte_and_corrupted_mcp_configs_are_self_healed_across_profile_and_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        store
+            .hold_capability_key("0123456789abcdef0123456789abcdef")
+            .unwrap();
+        let agent = store
+            .create_agent(anyagents_core::NewAgent::new("agy-sample", "agy"))
+            .unwrap();
+        let profile = dir.path().join("profiles/google-antigravity/default");
+        std::fs::create_dir_all(profile.join(".gemini/config")).unwrap();
+        std::fs::create_dir_all(profile.join(".gemini/antigravity-cli")).unwrap();
+        std::fs::write(
+            profile.join(".gemini/antigravity-cli/antigravity-oauth-token"),
+            br#"{"access_token":"fixture-token"}"#,
+        )
+        .unwrap();
+        let profile_mcp = profile.join(".gemini/config/mcp_config.json");
+        std::fs::write(&profile_mcp, b"").unwrap();
+
+        let cfg = agent_config_dir(dir.path(), &agent.id);
+        std::fs::create_dir_all(cfg.join(".gemini/config")).unwrap();
+        write_profile_marker(&cfg, ".anyagents-profile", "google-antigravity/default\n").unwrap();
+        let agent_mcp = cfg.join(".gemini/config/mcp_config.json");
+        std::fs::write(&agent_mcp, b"").unwrap();
+
+        seed_harness_credentials(&store, dir.path(), &agent, &cfg).unwrap();
+        let parsed_profile: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&profile_mcp).unwrap()).unwrap();
+        assert!(parsed_profile.get("mcpServers").unwrap().is_object());
+        let parsed_agent: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&agent_mcp).unwrap()).unwrap();
+        assert!(parsed_agent.get("mcpServers").unwrap().is_object());
+
+        // Truncate again and verify reconcile_agent_runtime_config self-heals
+        // 0-byte or truncated JSON and writes the agent's MCP capability config.
+        std::fs::write(&profile_mcp, b"{truncated").unwrap();
+        std::fs::write(&agent_mcp, b"").unwrap();
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        reconcile_agent_runtime_config(&store, dir.path(), &agent, &cfg, &work).unwrap();
+        let healed_profile: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&profile_mcp).unwrap()).unwrap();
+        assert!(healed_profile.get("mcpServers").unwrap().is_object());
+        let healed_agent: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&agent_mcp).unwrap()).unwrap();
+        assert!(
+            healed_agent
+                .pointer("/mcpServers/anyagents/command")
+                .and_then(serde_json::Value::as_str)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn mid_session_anthropic_oauth_refresh_updates_profile_and_sanitized_agent_credentials() {
+        const WORKER: &str = "ANYAGENTS_ANTHROPIC_REFRESH_TEST";
+        if std::env::var_os(WORKER).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "create::runtime_config_tests::mid_session_anthropic_oauth_refresh_updates_profile_and_sanitized_agent_credentials",
+                    "--nocapture",
+                ])
+                .env(WORKER, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+            return;
+        }
+
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let body = r#"{"access_token":"fresh-access-token","refresh_token":"fresh-refresh-token","expires_in":28800}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        let token_url = format!("http://{addr}/v1/oauth/token");
+        unsafe {
+            std::env::set_var("ANYAGENTS_ANTHROPIC_OAUTH_TOKEN_URL", &token_url);
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        store
+            .hold_capability_key("0123456789abcdef0123456789abcdef")
+            .unwrap();
+        let agent = store
+            .create_agent(anyagents_core::NewAgent::new(
+                "claude-sample",
+                "claude-code",
+            ))
+            .unwrap();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        // Expiring in 10 minutes (< 30 minute proactive refresh threshold).
+        let expiring_soon = now_ms + 10 * 60 * 1000;
+        let profile = dir.path().join("profiles/anthropic/default");
+        std::fs::create_dir_all(profile.join(".claude")).unwrap();
+        let initial_profile_creds = serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "old-access-token",
+                "refreshToken": "old-refresh-token",
+                "expiresAt": expiring_soon,
+                "subscriptionType": "max"
+            }
+        });
+        let raw_initial = serde_json::to_vec(&initial_profile_creds).unwrap();
+        std::fs::write(profile.join(".credentials.json"), &raw_initial).unwrap();
+        std::fs::write(profile.join(".claude/.credentials.json"), &raw_initial).unwrap();
+
+        let cfg = agent_config_dir(dir.path(), &agent.id);
+        std::fs::create_dir_all(cfg.join(".claude")).unwrap();
+        write_profile_marker(&cfg, ".anyagents-profile", "anthropic/default\n").unwrap();
+        let stale_agent_creds = serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "old-access-token",
+                "refreshToken": null,
+                "expiresAt": expiring_soon,
+                "subscriptionType": "max"
+            }
+        });
+        let raw_stale = serde_json::to_vec(&stale_agent_creds).unwrap();
+        std::fs::write(cfg.join(".credentials.json"), &raw_stale).unwrap();
+        std::fs::write(cfg.join(".claude/.credentials.json"), &raw_stale).unwrap();
+
+        sync_fresher_bound_agent_credentials(dir.path());
+        server.join().unwrap();
+
+        for rel in [".credentials.json", ".claude/.credentials.json"] {
+            let prof_val: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(profile.join(rel)).unwrap()).unwrap();
+            assert_eq!(
+                prof_val
+                    .pointer("/claudeAiOauth/accessToken")
+                    .and_then(serde_json::Value::as_str),
+                Some("fresh-access-token")
+            );
+            assert_eq!(
+                prof_val
+                    .pointer("/claudeAiOauth/refreshToken")
+                    .and_then(serde_json::Value::as_str),
+                Some("fresh-refresh-token")
+            );
+
+            let agent_val: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(cfg.join(rel)).unwrap()).unwrap();
+            assert_eq!(
+                agent_val
+                    .pointer("/claudeAiOauth/accessToken")
+                    .and_then(serde_json::Value::as_str),
+                Some("fresh-access-token")
+            );
+            assert!(
+                agent_val
+                    .pointer("/claudeAiOauth/refreshToken")
+                    .is_some_and(serde_json::Value::is_null),
+                "seat credentials must strip refreshToken: {agent_val}"
+            );
+            assert!(
+                agent_val
+                    .pointer("/claudeAiOauth/expiresAt")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap()
+                    > expiring_soon
+            );
+        }
+
+        unsafe {
+            std::env::remove_var("ANYAGENTS_ANTHROPIC_OAUTH_TOKEN_URL");
         }
     }
 }

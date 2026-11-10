@@ -160,7 +160,7 @@ fn api(args: &[String]) {
             print!("{{\"data\":{{\"id\":\"ses_fake\",\"title\":\"fake\"}}}}");
         }
         ("POST", "/api/session") => {
-            let id = if mode == "gone" {
+            let id = if mode == "gone" || mode.starts_with("prompt-404") {
                 "ses_fresh"
             } else {
                 "ses_fake"
@@ -168,9 +168,44 @@ fn api(args: &[String]) {
             print!("{{\"data\":{{\"id\":\"{id}\"}}}}");
         }
         ("POST", p) if p.ends_with("/prompt") => {
+            let dir = env::var("ANYAGENTS_FAKE_STATE").unwrap_or_default();
+            if mode == "prompt-500" {
+                eprintln!("HTTP 500 Internal Server Error");
+                print!("{{\"error\":{{\"code\":500,\"message\":\"internal server error\"}}}}");
+                exit(1);
+            }
+            if mode == "prompt-400" {
+                eprintln!("HTTP 400 Bad Request");
+                print!("{{\"error\":{{\"code\":400,\"message\":\"bad request\"}}}}");
+                exit(1);
+            }
+            if mode == "prompt-404-always" {
+                eprintln!("HTTP 404 Not Found");
+                print!("{{\"error\":{{\"code\":404,\"message\":\"session not found\"}}}}");
+                exit(1);
+            }
+            if (mode == "prompt-404" || mode == "prompt-404-stderr")
+                && p == "/api/session/ses_fake/prompt"
+            {
+                eprintln!("HTTP 404 Not Found");
+                if mode == "prompt-404" {
+                    print!("{{\"error\":{{\"code\":404,\"message\":\"session not found\"}}}}");
+                }
+                exit(1);
+            }
+            if mode == "prompt-404-after-first" && p == "/api/session/ses_fake/prompt" {
+                let first_marker = format!("{dir}/first-prompt-delivered");
+                if std::path::Path::new(&first_marker).exists() {
+                    eprintln!("HTTP 404 Not Found");
+                    print!("{{\"error\":{{\"code\":404,\"message\":\"session not found\"}}}}");
+                    exit(1);
+                }
+                if !dir.is_empty() {
+                    let _ = std::fs::write(&first_marker, "1");
+                }
+            }
             let steered = body.contains("\"delivery\":\"steer\"");
             let text = prompt_text(&body);
-            let dir = env::var("ANYAGENTS_FAKE_STATE").unwrap_or_default();
             if !dir.is_empty() {
                 let _ = std::fs::write(format!("{dir}/last-prompt"), &text);
             }

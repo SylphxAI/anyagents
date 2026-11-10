@@ -290,7 +290,7 @@ pub fn format_timestamp_ms(ms: i64) -> String {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = if m <= 2 { y + 1 } else { y };
-    format!("{year:04}-{m:02}-{d:02} {hour:02}:{min:02}:{sec:02}")
+    format!("{year:04}-{m:02}-{d:02} {hour:02}:{min:02}:{sec:02}Z")
 }
 
 /// Format token counts with thousands separators (`1,234,567` or `1.2M`).
@@ -454,6 +454,7 @@ fn state_rank(state: &str, process: &str, turn_state: &str) -> u8 {
 #[derive(Clone, Copy, Debug)]
 pub struct AgentsTableOptions {
     pub include_archived: bool,
+    pub archived_count: Option<usize>,
     /// Maximum sub-agent tree depth to expand (`Some(0)` = roots only with subtree summary;
     /// `Some(n)` = expand up to `n` levels deep; `None` = expand all levels).
     pub max_depth: Option<usize>,
@@ -467,6 +468,7 @@ impl Default for AgentsTableOptions {
     fn default() -> Self {
         Self {
             include_archived: false,
+            archived_count: None,
             max_depth: Some(0),
             only_with_subagents: false,
             wide: false,
@@ -564,25 +566,27 @@ fn format_subtree_breakdown(stats: &SubtreeStats) -> String {
     parts.join(" ")
 }
 
-/// Strip redundant provider/gateway prefixes from model IDs for compact display.
-pub fn short_model_name(raw: &str) -> &str {
+/// Compact model IDs for display:
+/// - `<gateway>/<vendor>/<model>` -> `<gateway>/<model>` (preserves gateway routing identity without hardcoding gateway names)
+/// - `<vendor>/<model>` -> `<model>` for standard model vendors
+pub fn short_model_name(raw: &str) -> std::borrow::Cow<'_, str> {
     let s = raw.trim();
-    for prefix in [
-        "sylphx/openai/",
-        "sylphx/anthropic/",
-        "sylphx/google/",
-        "sylphx/xai/",
-        "sylphx/",
-        "openai/",
-        "anthropic/",
-        "google/",
-        "xai/",
-    ] {
-        if let Some(rest) = s.strip_prefix(prefix) {
-            return rest;
+    if let Some((first, rest)) = s.split_once('/') {
+        if let Some((_vendor, leaf)) = rest.split_once('/')
+            && !first.is_empty()
+            && !leaf.is_empty()
+        {
+            return std::borrow::Cow::Owned(format!("{first}/{leaf}"));
+        }
+        if matches!(
+            first,
+            "openai" | "anthropic" | "google" | "xai" | "deepseek" | "meta"
+        ) && !rest.is_empty()
+        {
+            return std::borrow::Cow::Borrowed(rest);
         }
     }
-    s
+    std::borrow::Cow::Borrowed(s)
 }
 
 fn format_status_with_alerts(agent: &AgentView, now: i64) -> String {
@@ -772,7 +776,9 @@ pub fn print_agents_table_with_options(
     let idle = running.saturating_sub(working).saturating_sub(quota_count);
     let scaled_idle = agents.iter().filter(|a| a.state == "idle").count();
     let paused = agents.iter().filter(|a| a.state == "paused").count();
-    let archived = agents.iter().filter(|a| a.state == "archived").count();
+    let archived = options
+        .archived_count
+        .unwrap_or_else(|| agents.iter().filter(|a| a.state == "archived").count());
 
     let all_by_id: HashMap<&str, &AgentView> = agents.iter().map(|a| (a.id.as_str(), a)).collect();
     let mut visible_ids: std::collections::HashSet<&str> = agents
@@ -1095,7 +1101,7 @@ pub fn print_agents_table_with_options(
         if agent.harness == "claude-code"
             && let Some(stripped) = short_model.strip_prefix("claude-")
         {
-            short_model = stripped;
+            short_model = std::borrow::Cow::Owned(stripped.to_string());
         }
         let same_as_parent = node
             .parent_runtime
@@ -1515,7 +1521,7 @@ pub fn print_inbox_pretty(agent_name: &str, messages: &[MessageView]) {
         ("MESSAGE", false),
     ]);
     for m in messages {
-        let seq = dim(&format!("#{}", m.seq));
+        let seq = dim(&format!("[#{}]", m.seq));
         let ack = match m.ack.as_str() {
             "delivered" => green("✓ delivered"),
             "received" => yellow("● queued"),
@@ -1556,7 +1562,7 @@ pub fn print_conversation_pretty(
         };
         let route = format!("{} {} {}", bold(&turn.from), dim("→"), bold(&turn.to));
         let id = dim(&format!("[{}]", turn.id));
-        println!("  {ts}  {dir}  {route}  {id}");
+        println!("  [#{}] {ts}  {dir}  {route}  {id}", turn.seq);
         for line in turn.text.lines() {
             println!("      {line}");
         }
@@ -1594,10 +1600,10 @@ mod tests {
     }
 
     #[test]
-    fn short_model_strips_provider_prefixes() {
+    fn short_model_preserves_gateway_and_strips_vendor_prefixes() {
         assert_eq!(
             short_model_name("sylphx/openai/gpt-6.1-sol#xhigh"),
-            "gpt-6.1-sol#xhigh"
+            "sylphx/gpt-6.1-sol#xhigh"
         );
         assert_eq!(
             short_model_name("anthropic/claude-opus-5-5#xhigh"),

@@ -26,41 +26,83 @@ pub fn mount_with_fallback(
 ) -> io::Result<()> {
     let overlay = agent_root.join("skills");
     let view = agent_root.join("skills-view");
-    fs::create_dir_all(&overlay)?;
-    fs::create_dir_all(&view)?;
-    // The host publishes this read-only projection, not a seat-private overlay.
-    // Explicit mode is required even when the daemon starts with umask 077.
-    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
-    let directory = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
-        .open(&view)?;
-    directory.set_permissions(fs::Permissions::from_mode(0o755))?;
-    // Refuse a foreign view/overlay link rather than writing into another tree.
-    if fs::symlink_metadata(&overlay)?.file_type().is_symlink()
-        || fs::symlink_metadata(&view)?.file_type().is_symlink()
-    {
-        return Err(io::Error::other(
-            "skill overlay/view must be host directories",
-        ));
-    }
-    let mut entries = BTreeMap::new();
-    for source in [global, overlay.as_path()] {
-        match fs::read_dir(source) {
-            Ok(children) => {
-                for child in children {
-                    let child = child?;
-                    let path = child.path();
-                    if path.is_dir() {
-                        entries.insert(child.file_name(), path);
+    let prepare_view = || -> io::Result<BTreeMap<std::ffi::OsString, PathBuf>> {
+        fs::create_dir_all(agent_root)?;
+        {
+            use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
+            let mut builder = fs::DirBuilder::new();
+            builder.recursive(true).mode(0o700);
+            builder.create(&overlay)?;
+            let meta = fs::symlink_metadata(&overlay)?;
+            if !meta.file_type().is_symlink() && (meta.mode() & 0o007) != 0 {
+                let safe_mode = if meta.uid() == meta.gid() {
+                    0o700
+                } else {
+                    meta.mode() & 0o7770
+                };
+                fs::set_permissions(&overlay, fs::Permissions::from_mode(safe_mode))?;
+            }
+        }
+        fs::create_dir_all(&view)?;
+        // The host publishes this read-only projection, not a seat-private overlay.
+        // Explicit mode is required even when the daemon starts with umask 077.
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+        let directory = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+            .open(&view)?;
+        if directory.metadata()?.permissions().mode() & 0o777 != 0o755 {
+            directory.set_permissions(fs::Permissions::from_mode(0o755))?;
+        }
+        // Refuse a foreign view/overlay link rather than writing into another tree.
+        if fs::symlink_metadata(&overlay)?.file_type().is_symlink()
+            || fs::symlink_metadata(&view)?.file_type().is_symlink()
+        {
+            return Err(io::Error::other(
+                "skill overlay/view must be host directories",
+            ));
+        }
+        let mut entries = BTreeMap::new();
+        for source in [global, overlay.as_path()] {
+            match fs::read_dir(source) {
+                Ok(children) => {
+                    for child in children {
+                        let child = child?;
+                        let path = child.path();
+                        if path.is_dir() {
+                            entries.insert(child.file_name(), path);
+                        }
                     }
                 }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => (),
+                Err(e) => return Err(e),
             }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => (),
-            Err(e) => return Err(e),
         }
-    }
-    sync_entries(&view, &entries, &[global, &overlay])?;
+        sync_entries(&view, &entries, &[global, &overlay])?;
+        Ok(entries)
+    };
+    let entries = match prepare_view() {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            fallback(&view, &view, global, &overlay)?;
+            if fs::symlink_metadata(&overlay)?.file_type().is_symlink()
+                || fs::symlink_metadata(&view)?.file_type().is_symlink()
+            {
+                return Err(io::Error::other(
+                    "skill overlay/view must be host directories",
+                ));
+            }
+            let mut entries = BTreeMap::new();
+            for child in fs::read_dir(&view)? {
+                let child = child?;
+                if child.file_type()?.is_symlink() {
+                    entries.insert(child.file_name(), fs::read_link(child.path())?);
+                }
+            }
+            entries
+        }
+        Err(error) => return Err(error),
+    };
     for rel in [
         "skills",
         ".agents/skills",
@@ -241,6 +283,59 @@ mod tests {
         assert_eq!(
             fs::read(personal.join("private/SKILL.md")).unwrap(),
             b"private"
+        );
+    }
+    #[test]
+    fn seat_owned_root_delegates_view_and_mirror_creation_to_fallback() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = crate::test_tempdir();
+        let root = dir.path().join("agents/seat-owned");
+        let config = root.join("config");
+        let global = dir.path().join("skills");
+        skill(&global, "shared", b"shared skill");
+        fs::create_dir_all(&config).unwrap();
+        // Make agent_root and config read-only to the direct caller so
+        // mount_with_fallback must delegate both view and mirror setup.
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o550)).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o550)).unwrap();
+        let result = mount_with_fallback(
+            &root,
+            &global,
+            &config,
+            |target, view, global_dir, overlay_dir| {
+                fs::set_permissions(&root, fs::Permissions::from_mode(0o750))?;
+                fs::set_permissions(&config, fs::Permissions::from_mode(0o750))?;
+                if target == view {
+                    fs::create_dir_all(overlay_dir)?;
+                    fs::create_dir_all(view)?;
+                    fs::set_permissions(view, fs::Permissions::from_mode(0o755))?;
+                    for child in fs::read_dir(global_dir)? {
+                        let child = child?;
+                        if child.path().is_dir() {
+                            replace_link(&view.join(child.file_name()), &child.path())?;
+                        }
+                    }
+                } else {
+                    if let Some(parent) = target.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    replace_link(target, view)?;
+                }
+                fs::set_permissions(&config, fs::Permissions::from_mode(0o550))?;
+                fs::set_permissions(&root, fs::Permissions::from_mode(0o550))?;
+                Ok(())
+            },
+        );
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o750)).unwrap();
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o750)).unwrap();
+        result.unwrap();
+        assert_eq!(
+            fs::read(config.join(".claude/skills/shared/SKILL.md")).unwrap(),
+            b"shared skill"
+        );
+        assert_eq!(
+            fs::read(config.join(".agy/skills/shared/SKILL.md")).unwrap(),
+            b"shared skill"
         );
     }
 }

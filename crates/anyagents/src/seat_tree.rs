@@ -74,17 +74,25 @@ fn names(directory: &File) -> io::Result<Vec<std::ffi::OsString>> {
     Ok(out)
 }
 
-fn grant(file: &File, uid: u32, gid: u32, capability: bool) -> io::Result<()> {
+fn grant(file: &File, uid: u32, gid: u32, capability: bool, daemon_access: bool) -> io::Result<()> {
     let meta = file.metadata()?;
     if !meta.is_dir() && (!meta.is_file() || meta.nlink() != 1) {
         return Err(io::Error::other(
             "seat sharing requires a directory or single-link regular file",
         ));
     }
-    if meta.uid() == uid && meta.is_dir() && meta.mode() & 0o700 == 0o700 {
+    if !daemon_access && meta.uid() == uid && meta.is_dir() && meta.mode() & 0o700 == 0o700 {
         return Ok(());
     }
-    let mode = if meta.is_dir() {
+    if !daemon_access
+        && meta.uid() == uid
+        && !meta.is_dir()
+        && !capability
+        && meta.mode() & 0o600 == 0o600
+    {
+        return Ok(());
+    }
+    let mode: libc::mode_t = if meta.is_dir() {
         0o2770
     } else if capability {
         0o640
@@ -93,6 +101,13 @@ fn grant(file: &File, uid: u32, gid: u32, capability: bool) -> io::Result<()> {
     } else {
         0o660
     };
+    #[allow(
+        clippy::unnecessary_cast,
+        reason = "MetadataExt::mode is u32 while libc::mode_t is u16 on macOS"
+    )]
+    if meta.gid() == gid && (meta.mode() as libc::mode_t & 0o7777) == mode {
+        return Ok(());
+    }
     let fd = file.as_raw_fd();
     let group_ok = meta.gid() == gid || unsafe { libc::fchown(fd, u32::MAX, gid) } == 0;
     let mode_ok = unsafe { libc::fchmod(fd, mode) } == 0;
@@ -132,7 +147,12 @@ fn grant(file: &File, uid: u32, gid: u32, capability: bool) -> io::Result<()> {
     }
     // Seat-owned objects with the intended effective grant need no mutation.
     let after = file.metadata()?;
-    if after.uid() == uid && after.gid() == gid && after.mode() & 0o700 == 0o700 && meta.is_dir() {
+    if !daemon_access
+        && after.uid() == uid
+        && after.gid() == gid
+        && after.mode() & 0o700 == 0o700
+        && meta.is_dir()
+    {
         return Ok(());
     }
     Err(io::Error::other("cannot grant the opened seat inode"))
@@ -147,6 +167,7 @@ fn inaccessible_child(
     uid: u32,
     gid: u32,
     expected: &libc::stat,
+    access: ShareAccess,
 ) -> io::Result<Option<File>> {
     let name = CString::new(name.as_bytes()).map_err(io::Error::other)?;
     let fd = unsafe {
@@ -166,12 +187,27 @@ fn inaccessible_child(
             "seat tree inode changed before owner repair",
         ));
     }
-    if meta.uid() == uid && meta.is_dir() && meta.mode() & 0o700 == 0o700 {
-        // The existing seat-private vendor parent already has its owner's
-        // required grant. Do not widen it just to enumerate as the daemon.
+    if access.runtime_tree && meta.uid() != super::sandbox::server_uid() && meta.uid() != uid {
         return Ok(None);
     }
-    grant(&bound, uid, gid, name.as_bytes() == b"mcp-capability")?;
+    if !access.daemon_access
+        && meta.uid() == uid
+        && ((meta.is_dir() && meta.mode() & 0o700 == 0o700)
+            || (!meta.is_dir()
+                && name.as_bytes() != b"mcp-capability"
+                && meta.mode() & 0o600 == 0o600))
+    {
+        // The existing seat-private inode already has its owner's required
+        // grant. Do not widen it just to reopen as the daemon.
+        return Ok(None);
+    }
+    grant(
+        &bound,
+        uid,
+        gid,
+        name.as_bytes() == b"mcp-capability",
+        access.daemon_access,
+    )?;
     Ok(Some(File::open(format!("/dev/fd/{fd}"))?))
 }
 #[cfg(not(target_os = "linux"))]
@@ -181,6 +217,7 @@ fn inaccessible_child(
     _uid: u32,
     _gid: u32,
     _expected: &libc::stat,
+    _access: ShareAccess,
 ) -> io::Result<Option<File>> {
     Err(io::Error::from(io::ErrorKind::PermissionDenied))
 }
@@ -347,8 +384,77 @@ fn migrate_open_file(
     Err(io::Error::other("managed UID file handoff requires Linux"))
 }
 
+#[derive(Clone, Copy, Default)]
+struct ShareAccess {
+    daemon_access: bool,
+    runtime_tree: bool,
+}
+
 pub(super) fn share(path: &Path, uid: u32, gid: u32) -> io::Result<()> {
-    share_open(open_root(path)?, path, uid, gid, &mut |_, _| {})
+    share_open(
+        open_root(path)?,
+        path,
+        uid,
+        gid,
+        ShareAccess::default(),
+        &mut |_, _| {},
+    )
+}
+
+/// Config is jointly maintained by the daemon and its admitted principal.
+/// Vendor-created private modes must be repaired before any daemon config read.
+pub(super) fn share_config(path: &Path, uid: u32, gid: u32) -> io::Result<()> {
+    let directory = match open_root(path) {
+        Ok(directory) => directory,
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            let absolute = std::path::absolute(path)?;
+            let parent = open_root(
+                absolute
+                    .parent()
+                    .ok_or_else(|| io::Error::other("config parent missing"))?,
+            )?;
+            let name = absolute
+                .file_name()
+                .ok_or_else(|| io::Error::other("config name missing"))?;
+            let c_name = CString::new(name.as_bytes()).map_err(io::Error::other)?;
+            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+            if unsafe {
+                libc::fstatat(
+                    parent.as_raw_fd(),
+                    c_name.as_ptr(),
+                    stat.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            } != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            inaccessible_child(
+                &parent,
+                name,
+                uid,
+                gid,
+                &unsafe { stat.assume_init() },
+                ShareAccess {
+                    daemon_access: true,
+                    runtime_tree: false,
+                },
+            )?
+            .ok_or_else(|| io::Error::other("config root repair did not grant daemon access"))?
+        }
+        Err(error) => return Err(error),
+    };
+    share_open(
+        directory,
+        path,
+        uid,
+        gid,
+        ShareAccess {
+            daemon_access: true,
+            runtime_tree: false,
+        },
+        &mut |_, _| {},
+    )
 }
 
 fn share_open(
@@ -356,30 +462,40 @@ fn share_open(
     path: &Path,
     uid: u32,
     gid: u32,
+    access: ShareAccess,
     before_open: &mut impl FnMut(&Path, &OsStr),
 ) -> io::Result<()> {
-    grant(&directory, uid, gid, false)?;
+    grant(&directory, uid, gid, false, access.daemon_access)?;
     for name in names(&directory)? {
         let child_path = path.join(&name);
         let text = name.to_string_lossy();
         if text.starts_with(".seat-") {
             continue;
         }
-        if matches!(
-            text.as_ref(),
-            ".ssh"
-                | ".gnupg"
-                | "node_modules"
-                | ".bun"
-                | ".turbo"
-                | ".next"
-                | "target"
-                | ".git"
-                | "cache-home"
-                | "tmp"
-                | ".cargo"
-                | ".rustup"
-        ) || (text == "op" && path.ends_with(".config"))
+        if !access.runtime_tree
+            && (matches!(
+                text.as_ref(),
+                ".ssh"
+                    | ".gnupg"
+                    | "node_modules"
+                    | ".bun"
+                    | ".turbo"
+                    | ".next"
+                    | "target"
+                    | ".git"
+                    | "data-home"
+                    | "state-home"
+                    | ".cargo"
+                    | ".rustup"
+                    | "brain"
+                    | ".system_generated"
+                    | "plugins"
+                    | "sessions"
+                    | "shell-snapshots"
+                    | "telemetry"
+                    | "statsig"
+                    | "__pycache__"
+            ) || (text == "op" && path.ends_with(".config")))
         {
             continue;
         }
@@ -401,6 +517,16 @@ fn share_open(
             return Err(err);
         }
         let stat = unsafe { stat.assume_init() };
+        // Runtime scratch/cache trees need the same admitted seat grant after
+        // an execution-identity handoff. Do not mutate a foreign owner's tree.
+        let access = ShareAccess {
+            runtime_tree: access.runtime_tree || matches!(text.as_ref(), "cache-home" | "tmp"),
+            ..access
+        };
+        if access.runtime_tree && stat.st_uid != super::sandbox::server_uid() && stat.st_uid != uid
+        {
+            continue;
+        }
         let kind = stat.st_mode & libc::S_IFMT;
         if kind == libc::S_IFLNK || kind == libc::S_IFSOCK || kind == libc::S_IFIFO {
             continue;
@@ -413,7 +539,7 @@ fn share_open(
             Ok(child) => child,
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
-                match inaccessible_child(&directory, &name, uid, gid, &stat) {
+                match inaccessible_child(&directory, &name, uid, gid, &stat, access) {
                     Ok(Some(child)) => child,
                     Ok(None) => continue,
                     Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
@@ -433,14 +559,26 @@ fn share_open(
                 "seat tree inode changed during enumeration",
             ));
         }
+        if access.runtime_tree
+            && opened.uid() != super::sandbox::server_uid()
+            && opened.uid() != uid
+        {
+            continue;
+        }
         if kind == libc::S_IFDIR {
-            match share_open(child, &child_path, uid, gid, before_open) {
+            match share_open(child, &child_path, uid, gid, access, before_open) {
                 Ok(()) => (),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
                 Err(e) => return Err(e),
             }
         } else {
-            grant(&child, uid, gid, text == "mcp-capability")?;
+            grant(
+                &child,
+                uid,
+                gid,
+                text == "mcp-capability",
+                access.daemon_access,
+            )?;
             if !text.starts_with(".seat-")
                 && (text.starts_with("opencode.db")
                     || text == "serve-exit.jsonl"
@@ -462,6 +600,181 @@ fn share_open(
 mod tests {
     use super::*;
     #[test]
+    fn capability_group_write_is_normalized_for_current_and_distinct_seat_owners() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = crate::test_tempdir();
+        let own = temp.path().join("config");
+        std::fs::create_dir(&own).unwrap();
+        let cap = own.join(crate::operator::CAPABILITY_FILE);
+        std::fs::write(&cap, "synthetic-capability").unwrap();
+        let me = super::super::sandbox::server_uid();
+        let gid = super::super::sandbox::server_gid();
+        for seat_uid in [me, if me == 42001 { 42002 } else { 42001 }] {
+            for mode in [0o600, 0o660, 0o664] {
+                std::fs::set_permissions(&cap, std::fs::Permissions::from_mode(mode)).unwrap();
+                share(&own, seat_uid, gid).unwrap();
+                let meta = cap.metadata().unwrap();
+                assert_eq!(meta.mode() & 0o7777, 0o640);
+                assert_eq!(meta.gid(), gid);
+                assert_eq!(
+                    std::fs::read_to_string(&cap).unwrap(),
+                    "synthetic-capability"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn server_owned_cache_and_tmp_descendants_receive_the_admitted_group_grant() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = crate::test_tempdir();
+        let own = temp.path().join("config");
+        let me = super::super::sandbox::server_uid();
+        let seat_uid = if me == 42001 { 42002 } else { 42001 };
+        let gid = super::super::sandbox::server_gid();
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let before = outside.metadata().unwrap();
+        for name in ["cache-home", "tmp"] {
+            let nested = own.join(name).join("nested/deep");
+            std::fs::create_dir_all(&nested).unwrap();
+            std::fs::write(nested.join("retained"), "preserved").unwrap();
+            for p in [
+                own.join(name),
+                own.join(name).join("nested"),
+                nested.clone(),
+            ] {
+                std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            std::os::unix::fs::symlink(&outside, own.join(name).join("foreign-link")).unwrap();
+        }
+        share(&own, seat_uid, gid).unwrap();
+        for name in ["cache-home", "tmp"] {
+            for suffix in ["", "nested", "nested/deep"] {
+                let meta = own.join(name).join(suffix).metadata().unwrap();
+                assert_eq!(meta.gid(), gid);
+                assert_eq!(meta.mode() & 0o7777, 0o2770);
+            }
+            assert_eq!(
+                std::fs::read_to_string(own.join(name).join("nested/deep/retained")).unwrap(),
+                "preserved"
+            );
+        }
+        let after = outside.metadata().unwrap();
+        assert_eq!(
+            (before.dev(), before.ino(), before.mode(), before.gid()),
+            (after.dev(), after.ino(), after.mode(), after.gid())
+        );
+    }
+
+    #[test]
+    fn cache_directory_swap_refuses_without_changing_the_outside_inode() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = crate::test_tempdir();
+        let config = temp.path().join("config");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(config.join("cache-home/nested")).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let before = outside.metadata().unwrap();
+        let mut swapped = false;
+        let result = share_open(
+            open_root(&config).unwrap(),
+            &config,
+            if super::super::sandbox::server_uid() == 42001 {
+                42002
+            } else {
+                42001
+            },
+            super::super::sandbox::server_gid(),
+            ShareAccess::default(),
+            &mut |parent, name| {
+                if parent.ends_with("cache-home") && name == "nested" {
+                    std::fs::rename(parent.join(name), parent.join("held")).unwrap();
+                    std::os::unix::fs::symlink(&outside, parent.join(name)).unwrap();
+                    swapped = true;
+                }
+            },
+        );
+        assert!(swapped);
+        assert!(result.is_err());
+        let after = outside.metadata().unwrap();
+        assert_eq!(
+            (before.dev(), before.ino(), before.mode(), before.gid()),
+            (after.dev(), after.ino(), after.mode(), after.gid())
+        );
+    }
+
+    #[test]
+    fn config_grants_group_access_to_private_vendor_objects_but_not_capability_writes() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = crate::test_tempdir();
+        let config = temp.path().join("config");
+        let vendor = config.join(".gemini/antigravity-cli");
+        std::fs::create_dir_all(vendor.join("builtin")).unwrap();
+        std::fs::create_dir_all(vendor.join("conversations")).unwrap();
+        for path in [
+            &config,
+            &vendor,
+            &vendor.join("builtin"),
+            &vendor.join("conversations"),
+        ] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let settings = vendor.join("settings.json");
+        std::fs::write(&settings, b"{\"retained\":true}").unwrap();
+        std::fs::set_permissions(&settings, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let capability = config.join("mcp-capability");
+        std::fs::write(&capability, b"synthetic-capability").unwrap();
+        share_config(
+            &config,
+            crate::sandbox::server_uid(),
+            crate::sandbox::server_gid(),
+        )
+        .unwrap();
+        for path in [
+            &config,
+            &vendor,
+            &vendor.join("builtin"),
+            &vendor.join("conversations"),
+        ] {
+            assert_eq!(std::fs::metadata(path).unwrap().mode() & 0o7777, 0o2770);
+        }
+        assert_eq!(std::fs::metadata(&settings).unwrap().mode() & 0o777, 0o660);
+        assert_eq!(std::fs::metadata(capability).unwrap().mode() & 0o777, 0o640);
+        assert_eq!(std::fs::read(settings).unwrap(), b"{\"retained\":true}");
+    }
+
+    #[test]
+    fn config_sharing_never_changes_symlink_targets_or_hardlinked_private_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = crate::test_tempdir();
+        let config = temp.path().join("config");
+        std::fs::create_dir(&config).unwrap();
+        let private = temp.path().join("private");
+        std::fs::write(&private, b"preserve").unwrap();
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::os::unix::fs::symlink(&private, config.join("symlink")).unwrap();
+        share_config(
+            &config,
+            crate::sandbox::server_uid(),
+            crate::sandbox::server_gid(),
+        )
+        .unwrap();
+        std::fs::hard_link(&private, config.join("hardlink")).unwrap();
+        assert!(
+            share_config(
+                &config,
+                crate::sandbox::server_uid(),
+                crate::sandbox::server_gid()
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::metadata(private).unwrap().mode() & 0o777, 0o600);
+    }
+
+    #[test]
     fn planted_directory_to_symlink_swap_preserves_peer_inode_and_bytes() {
         let temp = crate::test_tempdir();
         let own = temp.path().join("own");
@@ -477,6 +790,10 @@ mod tests {
             &own,
             super::super::sandbox::server_uid(),
             super::super::sandbox::server_gid(),
+            ShareAccess {
+                daemon_access: true,
+                runtime_tree: false,
+            },
             &mut |parent, name| {
                 if name == "nested" {
                     std::fs::rename(parent.join(name), parent.join("held")).unwrap();

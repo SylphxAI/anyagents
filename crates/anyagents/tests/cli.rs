@@ -98,6 +98,241 @@ fn mcp_without_a_server_fails() {
 }
 
 #[test]
+fn operator_read_commands_fall_back_on_socket_failure_but_agents_do_not() {
+    use anyagents_core::{Incoming, NewAgent};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path().join("state.db")).unwrap();
+    let own = store
+        .create_agent(NewAgent::new("fallback", "spiron"))
+        .unwrap();
+    store
+        .receive(
+            &own.id,
+            Incoming {
+                text: "offline read canary".into(),
+                sender: Some("operator".into()),
+                source_time_ms: None,
+                source_key: None,
+                reply_to: None,
+                quote: None,
+                origin: None,
+                received_at_ms: None,
+            },
+        )
+        .unwrap();
+    let token = dir.path().join("operator-token");
+    std::fs::write(&token, "fixture-token").unwrap();
+    let socket = dir.path().join("anyagents.sock");
+    // A stale socket must trigger the same safe fallback as a disconnected read.
+    drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+    for args in [
+        vec!["agents", "list", "-d", "1"],
+        vec!["logs", "fallback", "-n", "5", "--json"],
+        vec!["inbox", "fallback", "-n", "5", "--json"],
+        vec!["inspect", "fallback", "-n", "5", "--json"],
+        vec!["status", "--json"],
+    ] {
+        let output = bin()
+            .env("ANYAGENTS_TESTS", "1")
+            .env("ANYAGENTS_OPERATOR_TOKEN_FILE", &token)
+            .arg("--data")
+            .arg(dir.path())
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let expected = if args[0] == "inbox" {
+            "offline read canary"
+        } else {
+            "fallback"
+        };
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains(expected),
+            "{args:?}"
+        );
+        let output = bin()
+            .env("ANYAGENTS_TESTS", "1")
+            .env("ANYAGENTS_OPERATOR_TOKEN_FILE", &token)
+            .env("ANYAGENTS_AGENT_ID", own.id.as_str())
+            .arg("--data")
+            .arg(dir.path())
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "agent used offline fallback: {args:?}"
+        );
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("offline read canary"));
+    }
+}
+
+#[test]
+fn operator_read_fallback_handles_disconnect_without_hiding_http_refusals() {
+    use std::io::{Read, Write};
+    let dir = tempfile::tempdir().unwrap();
+    Store::open(dir.path().join("state.db"))
+        .unwrap()
+        .create_agent(anyagents_core::NewAgent::new("socket-reader", "spiron"))
+        .unwrap();
+    let token = dir.path().join("operator-token");
+    std::fs::write(&token, "fixture-token").unwrap();
+    for refuse in [false, true] {
+        let socket = dir.path().join("anyagents.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut header = Vec::new();
+            while !header.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                header.push(byte[0]);
+            }
+            if refuse {
+                // Even transport-looking server error text is an HTTP refusal.
+                let body = r#"{"error":"the server did not answer"}"#;
+                write!(stream, "HTTP/1.1 403 Forbidden\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        let output = bin()
+            .env("ANYAGENTS_TESTS", "1")
+            .env("ANYAGENTS_OPERATOR_TOKEN_FILE", &token)
+            .arg("--data")
+            .arg(dir.path())
+            .args(["agents", "list"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.success(),
+            !refuse,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).contains("socket-reader"),
+            !refuse
+        );
+        server.join().unwrap();
+        std::fs::remove_file(socket).unwrap();
+    }
+}
+
+#[test]
+fn daemon_survives_sigpipe_from_closed_child_pipes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut child = bin()
+        .env("ANYAGENTS_TESTS", "1")
+        .arg("--data")
+        .arg(dir.path())
+        .arg("serve")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !dir.path().join("anyagents.sock").exists() {
+        if child.try_wait().unwrap().is_some() || std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("fixture daemon never listened");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGPIPE) }, 0);
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let status = child.try_wait().unwrap();
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(status.is_none(), "SIGPIPE terminated daemon: {status:?}");
+}
+
+#[test]
+fn closed_stdout_uses_sigpipe_without_panicking() {
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::Stdio;
+    let dir = tempfile::tempdir().unwrap();
+    Store::open(dir.path().join("state.db"))
+        .unwrap()
+        .create_agent(anyagents_core::NewAgent::new("pipeline", "spiron"))
+        .unwrap();
+    let mut child = bin()
+        .env("ANYAGENTS_TESTS", "1")
+        .arg("--data")
+        .arg(dir.path())
+        .args(["agents", "list"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stdout.take());
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.signal(), Some(libc::SIGPIPE));
+    assert!(
+        output.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn plain_log_tail_keeps_the_bounded_conversation_route() {
+    use std::io::{Read, Write};
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("operator-token"), "fixture-token").unwrap();
+    let listener =
+        std::os::unix::net::UnixListener::bind(dir.path().join("anyagents.sock")).unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut header = Vec::new();
+        while !header.ends_with(b"\r\n\r\n") {
+            let mut byte = [0];
+            stream.read_exact(&mut byte).unwrap();
+            header.push(byte[0]);
+        }
+        let header = String::from_utf8(header).unwrap();
+        let line = header.lines().next().unwrap();
+        assert!(
+            line.contains("/v1/agents/vulcan/conversation?limit=5"),
+            "{line}"
+        );
+        assert!(
+            !line.contains("include_tools"),
+            "plain tails must not select indexed/native transcript search: {line}"
+        );
+        let body = r#"{"agent":"vulcan","agent_id":"fixture","turns":[]}"#;
+        write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).unwrap();
+    });
+    let output = bin()
+        .env(
+            "ANYAGENTS_OPERATOR_TOKEN_FILE",
+            dir.path().join("operator-token"),
+        )
+        .arg("--data")
+        .arg(dir.path())
+        .args(["logs", "vulcan", "-n", "5", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(value["turns"].as_array().unwrap().is_empty());
+    server.join().unwrap();
+}
+
+#[test]
 fn create_send_inbox_and_usage() {
     let dir = tempfile::tempdir().unwrap();
     let create = bin_in(dir.path())

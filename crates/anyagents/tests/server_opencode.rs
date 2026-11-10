@@ -343,3 +343,115 @@ fn deleting_an_opencode_agent_removes_its_allocation_and_releases_only_its_port(
         "deleting alpha must leave beta running"
     );
 }
+
+#[test]
+fn stale_opencode_session_404_after_server_restart_recovers_with_context_and_persists_new_session()
+{
+    let _env = support::lock();
+    let dir = support::physical_tempdir();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    support::operator_for_contract(&data);
+
+    let created = create(&data, "alpha");
+    assert!(created.status.success(), "{created:?}");
+    let other = create(&data, "owner");
+    assert!(other.status.success(), "{other:?}");
+
+    let store = Store::open(data.join("state.db")).unwrap();
+    let alpha = store.agent_by_name("alpha").unwrap();
+    let config_dir = data.join("agents").join(alpha.id.as_str()).join("config");
+    let socket = data.join("anyagents.sock");
+
+    // Record a completed prior conversation turn in `state.db` and a stale
+    // `ses_stale` session id in `opencode-session-id` before starting the
+    // server (simulating a coordinator/server restart where `GET /api/session/ses_stale`
+    // still returns 200 OK, but `POST /api/session/ses_stale/prompt` returns HTTP 404).
+    let mut prior_in = anyagents_core::Incoming::new("first assignment before restart");
+    prior_in.sender = Some("agent:owner".to_string());
+    let anyagents_core::ReceiveOutcome::New(prior_msg) =
+        store.receive(&alpha.id, prior_in).unwrap()
+    else {
+        unreachable!("stored message");
+    };
+    store.note_delivered(&alpha.id, prior_msg.seq).unwrap();
+    let _ = store.record_outbound(
+        &alpha.id,
+        "agent:owner",
+        None,
+        "completed first assignment before restart",
+    );
+    let _ = store.note_turn_completed(&alpha.id);
+    std::fs::write(config_dir.join("opencode-session-id"), "ses_stale\n").unwrap();
+
+    let server = Server::start(&data);
+    let second_sent = call(
+        &socket,
+        &json!({"to": ["alpha"], "text": "wake after server restart", "sender": "agent:owner"})
+            .to_string(),
+    );
+    let second_seq = second_sent["deliveries"][0]["seq"].as_i64().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while store.delivered_cursor(&alpha.id).unwrap() < second_seq {
+        assert!(
+            Instant::now() < deadline,
+            "second message not delivered after 404 recovery: {}",
+            std::fs::read_to_string(data.join("fake.log")).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    assert_eq!(
+        std::fs::read_to_string(config_dir.join("opencode-session-id"))
+            .unwrap()
+            .trim(),
+        "ses_recovered"
+    );
+    let registry: Value = serde_json::from_slice(
+        &std::fs::read(config_dir.parent().unwrap().join("sessions/registry.json")).unwrap(),
+    )
+    .unwrap();
+    let recovered_alias = serde_json::to_string(&("opencode", "ses_recovered")).unwrap();
+    assert!(
+        registry["aliases"].get(&recovered_alias).is_some(),
+        "host session registry binds the replacement session alias: {registry}"
+    );
+
+    // Next wake goes directly to `ses_recovered` without hitting `ses_stale` again.
+    let third_sent = call(
+        &socket,
+        &json!({"to": ["alpha"], "text": "third wake on recovered session", "sender": "agent:owner"})
+            .to_string(),
+    );
+    let third_seq = third_sent["deliveries"][0]["seq"].as_i64().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while store.delivered_cursor(&alpha.id).unwrap() < third_seq {
+        assert!(Instant::now() < deadline, "third message not delivered");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let log = std::fs::read_to_string(data.join("fake.log")).unwrap_or_default();
+    assert_eq!(
+        log.matches("api:POST /api/session/ses_stale/prompt")
+            .count(),
+        1,
+        "stale session must only be attempted once before replacement: {log}"
+    );
+    assert!(
+        log.contains(
+            "<session_recovery stale_session=\"ses_stale\" new_session=\"ses_recovered\">"
+        ),
+        "replacement session receives recovery context: {log}"
+    );
+    assert!(
+        log.contains("completed first assignment before restart"),
+        "replacement session restores prior completed turn continuity: {log}"
+    );
+    assert!(
+        log.matches("api:POST /api/session/ses_recovered/prompt")
+            .count()
+            >= 2,
+        "retried prompt and subsequent wake both use ses_recovered: {log}"
+    );
+    drop(server);
+}

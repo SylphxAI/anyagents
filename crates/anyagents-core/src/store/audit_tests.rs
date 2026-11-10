@@ -43,6 +43,46 @@ fn assert_fts(store: &Store, term: &str) {
 }
 
 #[test]
+fn current_schema_reopens_while_another_connection_holds_the_writer_lock() {
+    let (dir, store, agent) = setup();
+    store
+        .receive(&agent.id, Incoming::new("indexedneedle"))
+        .unwrap();
+    let writer = Connection::open(dir.path().join("custom-mailbox.sqlite")).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let reopened = Store::open(dir.path().join("custom-mailbox.sqlite")).unwrap();
+    assert_fts(&reopened, "indexedneedle");
+    writer.execute_batch("ROLLBACK").unwrap();
+}
+
+#[test]
+fn only_pre_23_schemas_probe_and_backfill_fts_on_open() {
+    for baseline in [22, 23] {
+        let dir = crate::test_tempdir();
+        let path = dir.path().join("state.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at_ms INTEGER NOT NULL);",
+        ).unwrap();
+        for (version, sql) in migrate::MIGRATIONS.iter().filter(|(v, _)| *v <= baseline) {
+            conn.execute_batch(sql).unwrap();
+            conn.execute("INSERT INTO schema_migrations VALUES (?1, 0)", [version])
+                .unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO rag_chunks(chunk_id,agent_id,agent_name,direction,sender,destination,timestamp_ms,content_hash,text)
+             VALUES ('legacy','agent','worker','in','peer','worker',0,'legacy','legacyftsneedle');",
+        ).unwrap();
+        drop(conn);
+        let store = Store::open(&path).unwrap();
+        assert_eq!(count(&store, "rag_chunks_fts"), i64::from(baseline < 23));
+        if baseline < 23 {
+            assert_fts(&store, "legacyftsneedle");
+        }
+    }
+}
+
+#[test]
 fn group_column_upgrade_is_idempotent_and_unexpected_ddl_failure_is_visible() {
     let (dir, store, _) = setup();
     store.set_group_public("shared", true).unwrap();
@@ -72,9 +112,9 @@ fn group_column_upgrade_is_idempotent_and_unexpected_ddl_failure_is_visible() {
 }
 
 #[test]
-fn reopen_repairs_partial_duplicate_orphan_and_stale_fts_generations() {
+fn legacy_backfill_repairs_partial_duplicate_orphan_and_stale_fts_generations() {
     for fault in ["partial", "duplicate", "orphan", "stale"] {
-        let (dir, store, agent) = setup();
+        let (_dir, store, agent) = setup();
         store
             .receive(&agent.id, Incoming::new("ftsneedlefirst"))
             .unwrap();
@@ -110,8 +150,7 @@ fn reopen_repairs_partial_duplicate_orphan_and_stale_fts_generations() {
             _ => unreachable!(),
         }
         drop(conn);
-        drop(store);
-        let store = Store::open(dir.path().join("custom-mailbox.sqlite")).unwrap();
+        ensure_lexical_fts_backfilled(&mut store.conn()).unwrap();
         assert_eq!(count(&store, "rag_chunks_fts"), 2, "{fault}");
         assert_fts(&store, "ftsneedlefirst");
         assert_fts(&store, "ftsneedlesecond");
@@ -119,7 +158,7 @@ fn reopen_repairs_partial_duplicate_orphan_and_stale_fts_generations() {
 }
 
 #[test]
-fn failed_fts_rebuild_rolls_back_and_reopen_retries_the_generation() {
+fn failed_legacy_fts_backfill_rolls_back_and_retries_the_generation() {
     let (dir, store, agent) = setup();
     store
         .receive(&agent.id, Incoming::new("ftsneedlefirst"))
@@ -135,9 +174,12 @@ fn failed_fts_rebuild_rolls_back_and_reopen_retries_the_generation() {
          INSERT INTO rag_chunks_fts SELECT chunk_id,agent_name,sender,destination,kind,tool_name,text,text
              FROM rag_chunks WHERE text='ftsneedlefirst';",
     ).unwrap();
+    assert_fault(
+        ensure_lexical_fts_backfilled(&mut store.conn()).unwrap_err(),
+        "fixture_fts_write",
+    );
     drop(store);
     let path = dir.path().join("custom-mailbox.sqlite");
-    assert_fault(Store::open(&path).err().unwrap(), "fixture_fts_write");
     let conn = Connection::open(&path).unwrap();
     assert_eq!(
         conn.query_row("SELECT count(*) FROM rag_chunks_fts", [], |r| r
@@ -153,6 +195,7 @@ fn failed_fts_rebuild_rolls_back_and_reopen_retries_the_generation() {
     .unwrap();
     drop(conn);
     let store = Store::open(&path).unwrap();
+    ensure_lexical_fts_backfilled(&mut store.conn()).unwrap();
     assert_fts(&store, "ftsneedlefirst");
     assert_fts(&store, "ftsneedlesecond");
 }
@@ -211,29 +254,33 @@ fn incoming_outgoing_and_tool_index_failures_refuse_receipts_and_roll_back() {
 }
 
 #[test]
-fn authorized_repair_enumerates_missing_chunks_without_indexing_hidden_bodies() {
+fn authorized_upgrade_reads_only_legacy_chunks_without_indexing_hidden_bodies() {
     let (dir, store, own) = setup();
     let hidden = store.create_agent(NewAgent::new("hidden", "test")).unwrap();
     store
-        .receive(&own.id, Incoming::new("missinginboundneedle"))
+        .receive(&own.id, Incoming::new("legacyinboundneedle"))
         .unwrap();
     store
-        .record_outbound(&own.id, "peer", None, "missingoutboundneedle")
+        .record_outbound(&own.id, "peer", None, "legacyoutboundneedle")
         .unwrap();
     store.receive(&own.id, Incoming::new("x")).unwrap();
     store
-        .receive(&hidden.id, Incoming::new("hiddenmissingneedle"))
+        .receive(&hidden.id, Incoming::new("hiddenlegacyneedle"))
         .unwrap();
     store
         .conn()
-        .execute_batch("DELETE FROM rag_chunks; DELETE FROM rag_chunks_fts;")
+        // Ingress maintains chunk membership transactionally. Only legacy text
+        // needs repair; searching must not enumerate the entire raw mailbox.
+        .execute_batch(
+            "UPDATE rag_chunks SET text='legacy prefix',text_format=1; DELETE FROM rag_chunks_fts;",
+        )
         .unwrap();
     drop(store);
     let store = Store::open(dir.path().join("custom-mailbox.sqlite")).unwrap();
     for term in [
-        "missinginboundneedle",
-        "missingoutboundneedle",
-        "hiddenmissingneedle",
+        "legacyinboundneedle",
+        "legacyoutboundneedle",
+        "hiddenlegacyneedle",
     ] {
         let result = store
             .search_history(&HistorySearchQuery {
@@ -242,11 +289,20 @@ fn authorized_repair_enumerates_missing_chunks_without_indexing_hidden_bodies() 
                 ..Default::default()
             })
             .unwrap();
-        assert_eq!(result.len(), usize::from(term != "hiddenmissingneedle"));
+        assert_eq!(result.len(), usize::from(term != "hiddenlegacyneedle"));
     }
-    assert_eq!(count(&store, "rag_chunks"), 2);
-    assert_fts(&store, "missinginboundneedle");
-    assert_fts(&store, "missingoutboundneedle");
+    assert_eq!(count(&store, "rag_chunks"), 3);
+    let hidden_format: i64 = store
+        .conn()
+        .query_row(
+            "SELECT text_format FROM rag_chunks WHERE agent_id=?1",
+            [hidden.id.as_str()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(hidden_format, 1);
+    assert_fts(&store, "legacyinboundneedle");
+    assert_fts(&store, "legacyoutboundneedle");
 }
 
 #[test]
@@ -474,7 +530,8 @@ fn fts_rebuild_propagates_chunk_decode_errors_without_committing_partial_rows() 
         .unwrap();
     drop(store);
     let path = dir.path().join("custom-mailbox.sqlite");
-    let error = Store::open(&path).err().unwrap();
+    let store = Store::open(&path).unwrap();
+    let error = ensure_lexical_fts_backfilled(&mut store.conn()).unwrap_err();
     assert!(
         matches!(error, Error::Db(rusqlite::Error::InvalidColumnType(..))),
         "{error:?}"

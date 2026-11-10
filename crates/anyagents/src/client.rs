@@ -55,6 +55,39 @@ pub(crate) fn agent_identity() -> Option<AgentId> {
     AgentId::parse(raw.trim()).ok()
 }
 
+/// Read through the authenticated server when available. Only a host operator
+/// may use the caller's offline read path after a transport failure; HTTP and
+/// decoding errors must remain errors, never an authorization bypass.
+pub(crate) fn get<T: serde::de::DeserializeOwned>(
+    data: &Path,
+    path: &str,
+) -> Result<Option<T>, String> {
+    if !can_call_server(data) {
+        return Ok(None);
+    }
+    match call_inner(data, "GET", path, None, &authority(data)) {
+        Err(err) if may_read_offline(&err, agent_identity().is_some()) => Ok(None),
+        result => result.map_err(CallError::message),
+    }
+}
+
+enum CallError {
+    Transport(String),
+    Response(String),
+}
+
+impl CallError {
+    fn message(self) -> String {
+        match self {
+            Self::Transport(message) | Self::Response(message) => message,
+        }
+    }
+}
+
+fn may_read_offline(error: &CallError, is_agent: bool) -> bool {
+    !is_agent && matches!(error, CallError::Transport(_))
+}
+
 fn capability(data: &Path, id: &AgentId) -> Option<String> {
     let dir = std::env::var_os("ANYAGENTS_AGENT_CONFIG")
         .filter(|v| !v.is_empty())
@@ -77,6 +110,16 @@ pub(crate) fn call<T: serde::de::DeserializeOwned>(
     body: Option<Vec<u8>>,
     authority: &Authority,
 ) -> Result<Option<T>, String> {
+    call_inner(data, method, path, body, authority).map_err(CallError::message)
+}
+
+fn call_inner<T: serde::de::DeserializeOwned>(
+    data: &Path,
+    method: &str,
+    path: &str,
+    body: Option<Vec<u8>>,
+    authority: &Authority,
+) -> Result<Option<T>, CallError> {
     let (agent_token, operator_token) = match authority {
         Authority::Operator => (None, crate::operator::operator_token(data)),
         Authority::Agent(id) => (capability(data, id), None),
@@ -85,40 +128,15 @@ pub(crate) fn call<T: serde::de::DeserializeOwned>(
     // A boundary refuses a call that has no credential rather than answering
     // with nothing, so a client notices instead of reading an empty deployment.
     let socket = server::socket_path(data);
-    let admin_socket = data.join("admin.sock");
-    let prefer_admin = admin_socket.exists()
-        && ((method == "POST" && path == "/v1/agents")
-            || path.ends_with("/harness")
-            || path.ends_with("/model")
-            || path.ends_with("/rename")
-            || path.ends_with("/role")
-            || path.ends_with("/description")
-            || path.ends_with("/wake")
-            || path.ends_with("/pause")
-            || path.ends_with("/archive")
-            || path.starts_with("/v1/subagent-defaults")
-            || path.starts_with("/v1/profiles")
-            || path.starts_with("/v1/schedules")
-            || path.starts_with("/v1/browser")
-            || path.starts_with("/v1/send")
-            || path.starts_with("/v1/interact")
-            || path.contains("/schedules")
-            || path.contains("/conversation"));
-    let (primary_sock, secondary_sock) = if prefer_admin {
-        (&admin_socket, Some(&socket))
-    } else {
-        (&socket, admin_socket.exists().then_some(&admin_socket))
-    };
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .map_err(|err| err.to_string())?;
-    let body_clone = body.clone();
-    let primary_res = runtime.block_on(async {
+        .map_err(|err| CallError::Response(err.to_string()))?;
+    let (status, bytes) = runtime.block_on(async {
         tokio::time::timeout(
             TIMEOUT,
             crate::mcp::request(
-                primary_sock,
+                &socket,
                 method,
                 path,
                 body,
@@ -127,63 +145,20 @@ pub(crate) fn call<T: serde::de::DeserializeOwned>(
             ),
         )
         .await
-        .map_err(|_| "the server did not answer".to_string())?
-    });
-    let (mut status, mut bytes) = match primary_res {
-        Ok(ans) => ans,
-        Err(primary_err) => {
-            if let Some(sec_sock) = secondary_sock {
-                runtime.block_on(async {
-                    tokio::time::timeout(
-                        TIMEOUT,
-                        crate::mcp::request(
-                            sec_sock,
-                            method,
-                            path,
-                            body_clone.clone(),
-                            agent_token.as_deref(),
-                            operator_token.as_deref(),
-                        ),
-                    )
-                    .await
-                    .map_err(|_| "the server did not answer".to_string())?
-                })?
-            } else {
-                return Err(primary_err);
-            }
-        }
-    };
-    if !status.is_success()
-        && let Some(sec_sock) = secondary_sock
-        && let Ok(Ok(fallback)) = runtime.block_on(async {
-            tokio::time::timeout(
-                TIMEOUT,
-                crate::mcp::request(
-                    sec_sock,
-                    method,
-                    path,
-                    body_clone,
-                    agent_token.as_deref(),
-                    operator_token.as_deref(),
-                ),
-            )
-            .await
-        })
-        && (fallback.0.is_success() || status.as_u16() == 404)
-    {
-        (status, bytes) = fallback;
-    }
+        .map_err(|_| CallError::Transport("the server did not answer".into()))?
+        .map_err(CallError::Transport)
+    })?;
     if !status.is_success() {
         let msg = error_message(&bytes);
-        return Err(if msg.is_empty() {
+        return Err(CallError::Response(if msg.is_empty() {
             format!("http {}", status.as_u16())
         } else {
             msg
-        });
+        }));
     }
     serde_json::from_slice(&bytes)
         .map(Some)
-        .map_err(|err| err.to_string())
+        .map_err(|err| CallError::Response(err.to_string()))
 }
 
 /// The error a refused call reported, without a secret or a presented token.
@@ -197,4 +172,35 @@ fn error_message(bytes: &[u8]) -> String {
                 .map(str::to_string)
         })
         .unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn offline_reads_require_operator_and_transport_failure() {
+        for error in [
+            "the server did not answer",
+            "cannot reach the server: Connection refused (os error 111)",
+            "cannot reach the server: connection closed before message completed",
+            "cannot reach the server: error reading a body from connection",
+        ] {
+            let failure = CallError::Transport(error.into());
+            assert!(may_read_offline(&failure, false), "{error}");
+            assert!(!may_read_offline(&failure, true), "{error}");
+        }
+        for error in [
+            "forbidden",
+            "http 403",
+            "primary refused",
+            "invalid JSON",
+            "the server did not answer",
+            "cannot reach the server: forbidden",
+        ] {
+            let failure = CallError::Response(error.into());
+            assert!(!may_read_offline(&failure, false), "{error}");
+            assert!(!may_read_offline(&failure, true), "{error}");
+        }
+    }
 }

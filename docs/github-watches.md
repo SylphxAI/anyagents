@@ -15,7 +15,7 @@ Merged/closed PR watches and completed check watches settle after delivery.
 
 ## Dedicated credentials
 
-Set `ANYAGENTS_GITHUB_TOKEN_DIR` in the `serve-admin` environment to an absolute
+Set `ANYAGENTS_GITHUB_TOKEN_DIR` in the `serve` environment to an absolute
 directory containing `<owner>.token` files, for example `example-org.token` and
 `another-org.token`. Each contains that owner's raw GitHub App installation token
 (an optional trailing newline is accepted). Owner matching is case-insensitive;

@@ -250,9 +250,9 @@ impl HealthBoard {
 /// turn to end. AGY's stream input also starts a turn per line; its hook helpers
 /// have no wired, confirmed consumption acknowledgement.
 pub fn declared(harness: &str) -> (DeliveryMode, SteerSupport) {
-    match harness {
+    match anyagents_harness::normalize_harness_name(harness) {
         "codex" | "claude-code" | "opencode" | "muse" | "agy" | "omp" | "dsh" | "grok"
-        | "sylphx" => (DeliveryMode::Steer, SteerSupport::Yes),
+        | "spiron" => (DeliveryMode::Steer, SteerSupport::Yes),
         _ => (DeliveryMode::Followup, SteerSupport::Unproven),
     }
 }
@@ -448,11 +448,9 @@ fn listen_wake<H: Harness>(socket: UnixDatagram, inner: Arc<Inner<H>>) {
 }
 
 fn route<H: Harness + 'static>(inner: Arc<Inner<H>>, events: Receiver<Wake>) {
-    let skip_sylphx = inner.store.data_dir().join("admin.sock").exists()
-        || inner.store.data_dir().join("admin.lock").exists();
     if let Ok(agents) = inner.store.list_agents() {
         for agent in agents {
-            if agent.state == "running" && !(skip_sylphx && agent.harness == "sylphx") {
+            if agent.state == "running" {
                 if inner.store.complete_idle_agent(&agent.id).unwrap_or(false) {
                     continue;
                 }
@@ -488,11 +486,7 @@ fn route<H: Harness + 'static>(inner: Arc<Inner<H>>, events: Receiver<Wake>) {
 }
 
 fn is_running(store: &Store, id: &AgentId) -> bool {
-    let skip_sylphx = store.data_dir().join("admin.sock").exists()
-        || store.data_dir().join("admin.lock").exists();
-    store
-        .agent(id)
-        .is_ok_and(|agent| agent.state == "running" && !(skip_sylphx && agent.harness == "sylphx"))
+    store.agent(id).is_ok_and(|agent| agent.state == "running")
 }
 
 fn stop_slot<H: Harness + 'static>(inner: &Arc<Inner<H>>, id: &AgentId) {
@@ -932,7 +926,15 @@ impl<H: Harness + 'static> Session<H> {
                     .ok()
                     .and_then(|s| s.trim().parse::<i64>().ok())
                     .is_some_and(|ms| ms >= started_at);
-            if rotated {
+            let cleared =
+                fs::read_to_string(self.paths.config_dir.join(".anyagents-quota-cleared-ms"))
+                    .ok()
+                    .and_then(|s| s.trim().parse::<i64>().ok())
+                    .is_some_and(|ms| ms >= started_at);
+            let config_switched = self.inner.store.agent(&self.id).is_ok_and(|fresh| {
+                fresh.harness != self.agent.harness || fresh.model != self.agent.model
+            });
+            if rotated || cleared || config_switched {
                 self.attempt = 0;
                 break;
             }
@@ -1036,6 +1038,9 @@ impl<H: Harness + 'static> Session<H> {
     ///
     /// `true` when a second loop already holds the agent.
     fn deliver_once(&mut self) -> bool {
+        if self.try_apply_pending_switch() {
+            return false;
+        }
         if let Some(switch_started_at) = self.pending_switch_started_at {
             // A harness, model, or profile switch is pending while the old
             // process is mid-turn: hold new mailbox messages in SQLite for the
@@ -1453,11 +1458,37 @@ fn harness_has_inflight_processes(root_pid: Option<u32>) -> bool {
     }
 }
 
-fn reap_ephemeral_dirs(config_dir: &std::path::Path, _managed_work: &std::path::Path) {
+fn reap_ephemeral_dirs(config_dir: &std::path::Path, managed_work: &std::path::Path) {
     let seat_ids = detect_seat_ids(config_dir);
-    for rel in ["cache-home", "tmp", ".rustup", ".cargo"] {
+    for rel in [
+        "cache-home",
+        "tmp",
+        ".tmp",
+        ".rustup",
+        ".cargo",
+        ".gemini/tmp",
+        ".cache",
+        "cache",
+    ] {
         let target = config_dir.join(rel);
         remove_path_with_seat(&target, seat_ids);
+    }
+    const BUILD_DIRS: &[&str] = &["target", "node_modules", ".next", ".turbo", "dist"];
+    for rel in BUILD_DIRS {
+        remove_path_with_seat(&managed_work.join(rel), seat_ids);
+    }
+    for container in ["apps", "packages", "crates", "services"] {
+        let Ok(entries) = fs::read_dir(managed_work.join(container)) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                for rel in BUILD_DIRS {
+                    remove_path_with_seat(&path.join(rel), seat_ids);
+                }
+            }
+        }
     }
 }
 
@@ -1612,7 +1643,11 @@ mod tests {
             "omp",
             "dsh",
             "grok",
+            "spiron",
             "sylphx",
+            "sylphx-agent",
+            "sylphx_agent",
+            "sylphx/default",
         ] {
             assert_eq!(
                 super::declared(harness),
@@ -1627,6 +1662,44 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn legacy_admin_files_do_not_disable_spiron_supervision() {
+        let dir = tempfile::tempdir().unwrap();
+        for legacy in ["admin.sock", "admin.lock"] {
+            fs::write(dir.path().join(legacy), b"stale").unwrap();
+        }
+        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        let mut new = anyagents_core::NewAgent::new("cloud-worker", "spiron");
+        new.role = Some("Worker".into());
+        let agent = store.create_agent(new).unwrap();
+        store.set_agent_state(&agent.id, "running").unwrap();
+        store
+            .receive(&agent.id, anyagents_core::Incoming::new("first"))
+            .unwrap();
+        let (launched, launches) = std::sync::mpsc::channel();
+        let supervisor = Supervisor::start(
+            Arc::clone(&store),
+            Arc::new(SystemClock::new()),
+            Arc::new(move |_| {
+                launched.send(()).unwrap();
+                Ok(anyagents_harness::FakeHarness::new(DeliveryMode::Steer))
+            }),
+            Vec::new(),
+        )
+        .unwrap();
+        launches.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(is_running(&store, &agent.id));
+        store
+            .receive(&agent.id, anyagents_core::Incoming::new("second"))
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while store.delivered_cursor(&agent.id).unwrap() != 2 {
+            assert!(std::time::Instant::now() < deadline, "mail was stranded");
+            thread::sleep(Duration::from_millis(5));
+        }
+        drop(supervisor);
+    }
 
     struct FinishFirstTurn(anyagents_harness::FakeHarness);
 

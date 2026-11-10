@@ -508,10 +508,10 @@ fn the_capability_file_of_one_agent_never_opens_another() {
     assert!(op_only.starts_with("HTTP/1.1 403"), "{op_only}");
 }
 
-/// The health response describes each serving process even when the installed
-/// pathname is replaced while both processes remain alive.
+/// The health response describes the running image even when its installed
+/// pathname is replaced while the process remains alive.
 #[test]
-fn health_reports_each_running_image_and_survives_atomic_install() {
+fn health_reports_running_image_and_survives_atomic_install() {
     use sha2::{Digest, Sha256};
     use std::io::{Read, Write};
     use std::os::unix::fs::PermissionsExt;
@@ -531,7 +531,6 @@ fn health_reports_each_running_image_and_survives_atomic_install() {
     let image = dir.path().join("anyagents");
     std::fs::copy(env!("CARGO_BIN_EXE_anyagents"), &image).unwrap();
     let expected_hash = format!("{:x}", Sha256::digest(std::fs::read(&image).unwrap()));
-    let earliest_start = anyagents_core::now_ms();
     let start = |verb: &str, socket: &str| {
         let child = Command::new(&image)
             .arg("--data")
@@ -586,28 +585,14 @@ fn health_reports_each_running_image_and_survives_atomic_install() {
         }
     };
     let serve = start("serve", "anyagents.sock");
-    let admin = start("serve-admin", "admin.sock");
     let serving = complete(&serve.socket);
-    let administering = complete(&admin.socket);
-    for value in [&serving, &administering] {
-        assert_eq!(value["ok"], true);
-        assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
-        assert_eq!(value["source_sha"], expected_source);
-        assert_eq!(value["binary_sha256"], expected_hash);
-    }
+    assert_eq!(serving["ok"], true);
+    assert_eq!(serving["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(serving["source_sha"], expected_source);
+    assert_eq!(serving["binary_sha256"], expected_hash);
     assert!(serving.get("pid").is_none());
     assert!(serving.get("process_started_at_ms").is_none());
     assert_eq!(serving.as_object().unwrap().len(), 5);
-    assert_eq!(administering["pid"], admin.child.id());
-    assert_ne!(administering["pid"], serve.child.id());
-    let started = administering["process_started_at_ms"].as_i64().unwrap();
-    assert!(started >= earliest_start && started <= anyagents_core::now_ms());
-    assert_eq!(
-        administering.as_object().unwrap().len(),
-        7,
-        "no private state in health"
-    );
-
     // Public health aliases report the same image with no process-local details.
     let addr = std::fs::read_to_string(data.join("webhook.addr")).unwrap();
     for path in ["/", "/healthz", "/v1/webhooks/healthz"] {
@@ -634,24 +619,6 @@ fn health_reports_each_running_image_and_survives_atomic_install() {
     assert_ne!(
         format!("{:x}", Sha256::digest(std::fs::read(&image).unwrap())),
         expected_hash
-    );
-    assert_eq!(health(&serve.socket), serving);
-    assert_eq!(health(&admin.socket), administering);
-
-    // Restarting just the sidecar gets a new process identity; serve is stable.
-    let old_pid = admin.child.id();
-    drop(admin);
-    std::fs::copy(env!("CARGO_BIN_EXE_anyagents"), &image).unwrap();
-    // The old sidecar leaves its socket file, so remove only this test's file.
-    std::fs::remove_file(data.join("admin.sock")).unwrap();
-    let restarted = start("serve-admin", "admin.sock");
-    let identity = complete(&restarted.socket);
-    assert_ne!(identity["pid"], old_pid);
-    assert_eq!(identity["pid"], restarted.child.id());
-    assert_eq!(identity["binary_sha256"], expected_hash);
-    assert!(
-        identity["process_started_at_ms"].as_i64().unwrap()
-            >= administering["process_started_at_ms"].as_i64().unwrap()
     );
     assert_eq!(health(&serve.socket), serving);
 }
@@ -844,99 +811,93 @@ fn conversation_reads_are_downward_only_for_every_scope_and_cli_fails_closed() {
     }
 }
 
-/// Exercise both executable entrypoints, not just a maintenance helper: neither
+/// Exercise the executable entrypoint, not just a maintenance helper: neither
 /// corrupt recovery state nor a held global lock may prevent socket service.
 #[test]
-fn migration_failure_and_busy_global_lock_do_not_block_host_sockets() {
+fn migration_failure_and_busy_global_lock_do_not_block_host_socket() {
     use anyagents_core::{NewAgent, Store};
     use std::fs;
     let _env = support::lock();
-    for command in ["serve", "serve-admin"] {
-        for busy in [false, true] {
-            let dir = support::physical_tempdir();
-            let data = dir.path();
-            support::operator_for_contract(data);
-            let store = Store::open(data.join("state.db")).unwrap();
-            let agent = store
-                .create_agent(NewAgent::new("maintenance-only", "sylphx"))
-                .unwrap();
-            store.set_agent_state(&agent.id, "archived").unwrap();
-            let memory = data
-                .join("agents")
-                .join(agent.id.as_str())
-                .join("config/projects/known/memory");
-            fs::create_dir_all(&memory).unwrap();
-            fs::write(memory.join("MEMORY.md"), b"must survive failed maintenance").unwrap();
-            let migration = data.join("host-memory-migration");
-            fs::create_dir_all(&migration).unwrap();
-            let manifest = migration.join("manifest-v1.json");
-            let original = if busy {
-                b"{\"version\":1,\"entries\":[]}".as_slice()
-            } else {
-                b"corrupt manifest must not be replaced".as_slice()
-            };
-            fs::write(&manifest, original).unwrap();
-            let held = fs::OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .read(true)
-                .write(true)
-                .open(migration.join("migration.lock"))
-                .unwrap();
-            if busy {
-                held.lock().unwrap();
-            }
-            let child = Command::new(env!("CARGO_BIN_EXE_anyagents"))
-                .env("PATH", support::machine_path(data))
-                .env("ANYAGENTS_TESTS", "1")
-                .env("ANYAGENTS_CLAUDE_CODE_BIN", "/bin/true")
-                .arg("--data")
-                .arg(data)
-                .arg(command)
-                .stdout(Stdio::null())
-                .stderr(Stdio::from(
-                    fs::File::create(data.join("server.stderr")).unwrap(),
-                ))
-                .spawn()
-                .unwrap();
-            let socket = data.join(if command == "serve" {
-                "anyagents.sock"
-            } else {
-                "admin.sock"
-            });
-            let server = Serve { child, socket };
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while std::os::unix::net::UnixStream::connect(&server.socket).is_err() {
-                assert!(
-                    Instant::now() < deadline,
-                    "{command}, busy={busy}: {}",
-                    fs::read_to_string(data.join("server.stderr")).unwrap_or_default()
-                );
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            let receipt_path = migration.join(if busy {
-                "deferred-startup-v1.json"
-            } else {
-                "startup-error-v1.json"
-            });
-            let receipt: Value = serde_json::from_slice(&fs::read(receipt_path).unwrap()).unwrap();
-            assert_eq!(
-                receipt["status"],
-                if busy {
-                    "deferred_busy_lock"
-                } else {
-                    "deferred_error"
-                }
-            );
-            assert_eq!(receipt["retryable"], true);
-            assert_eq!(fs::read(&manifest).unwrap(), original);
-            assert_eq!(
-                fs::read(memory.join("MEMORY.md")).unwrap(),
-                b"must survive failed maintenance"
-            );
-            drop(server);
-            drop(held);
+    for busy in [false, true] {
+        let dir = support::physical_tempdir();
+        let data = dir.path();
+        support::operator_for_contract(data);
+        let store = Store::open(data.join("state.db")).unwrap();
+        let agent = store
+            .create_agent(NewAgent::new("maintenance-only", "spiron"))
+            .unwrap();
+        store.set_agent_state(&agent.id, "archived").unwrap();
+        let memory = data
+            .join("agents")
+            .join(agent.id.as_str())
+            .join("config/projects/known/memory");
+        fs::create_dir_all(&memory).unwrap();
+        fs::write(memory.join("MEMORY.md"), b"must survive failed maintenance").unwrap();
+        let migration = data.join("host-memory-migration");
+        fs::create_dir_all(&migration).unwrap();
+        let manifest = migration.join("manifest-v1.json");
+        let original = if busy {
+            b"{\"version\":1,\"entries\":[]}".as_slice()
+        } else {
+            b"corrupt manifest must not be replaced".as_slice()
+        };
+        fs::write(&manifest, original).unwrap();
+        let held = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(migration.join("migration.lock"))
+            .unwrap();
+        if busy {
+            held.lock().unwrap();
         }
+        let child = Command::new(env!("CARGO_BIN_EXE_anyagents"))
+            .env("PATH", support::machine_path(data))
+            .env("ANYAGENTS_TESTS", "1")
+            .env("ANYAGENTS_CLAUDE_CODE_BIN", "/bin/true")
+            .arg("--data")
+            .arg(data)
+            .arg("serve")
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(
+                fs::File::create(data.join("server.stderr")).unwrap(),
+            ))
+            .spawn()
+            .unwrap();
+        let socket = data.join("anyagents.sock");
+        let server = Serve { child, socket };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while std::os::unix::net::UnixStream::connect(&server.socket).is_err() {
+            assert!(
+                Instant::now() < deadline,
+                "serve, busy={busy}: {}",
+                fs::read_to_string(data.join("server.stderr")).unwrap_or_default()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let receipt_path = migration.join(if busy {
+            "deferred-startup-v1.json"
+        } else {
+            "startup-error-v1.json"
+        });
+        let receipt: Value = serde_json::from_slice(&fs::read(receipt_path).unwrap()).unwrap();
+        assert_eq!(
+            receipt["status"],
+            if busy {
+                "deferred_busy_lock"
+            } else {
+                "deferred_error"
+            }
+        );
+        assert_eq!(receipt["retryable"], true);
+        assert_eq!(fs::read(&manifest).unwrap(), original);
+        assert_eq!(
+            fs::read(memory.join("MEMORY.md")).unwrap(),
+            b"must survive failed maintenance"
+        );
+        drop(server);
+        drop(held);
     }
 }
 
@@ -1384,10 +1345,10 @@ fn offline_session_reset_refuses_agent_self_and_peer_but_allows_operator() {
     let data = dir.path();
     let store = Store::open(data.join("state.db")).unwrap();
     let own = store
-        .create_agent(NewAgent::new("offline-reset-own", "sylphx"))
+        .create_agent(NewAgent::new("offline-reset-own", "spiron"))
         .unwrap();
     let peer = store
-        .create_agent(NewAgent::new("offline-reset-peer", "sylphx"))
+        .create_agent(NewAgent::new("offline-reset-peer", "spiron"))
         .unwrap();
     for target in [&own, &peer] {
         store.set_agent_state(&target.id, "paused").unwrap();
@@ -1395,9 +1356,16 @@ fn offline_session_reset_refuses_agent_self_and_peer_but_allows_operator() {
         std::fs::create_dir_all(root.join("config")).unwrap();
         std::fs::create_dir_all(root.join("memory")).unwrap();
         std::fs::write(root.join("memory/MEMORY.md"), "old offline pin").unwrap();
-        let first = host_session::ensure_active(&root, "sylphx").unwrap();
+        let first = host_session::ensure_active(&root, "spiron").unwrap();
         std::fs::write(
             root.join("config/sylphx-session-id"),
+            "old-offline-vendor\n",
+        )
+        .unwrap();
+        // External Spiron owns the canonical pointer; retained legacy bytes
+        // are history, never a pointer the reset is allowed to resurrect.
+        std::fs::write(
+            root.join("config/spiron-session-id"),
             "old-offline-vendor\n",
         )
         .unwrap();
@@ -1440,6 +1408,10 @@ fn offline_session_reset_refuses_agent_self_and_peer_but_allows_operator() {
             std::fs::read(root.join("config/sylphx-session-id")).unwrap(),
             b"old-offline-vendor\n"
         );
+        assert_eq!(
+            std::fs::read(root.join("config/spiron-session-id")).unwrap(),
+            b"old-offline-vendor\n"
+        );
         assert_eq!(host_session::active(&root).unwrap().unwrap(), first);
 
         let accepted = Command::new(env!("CARGO_BIN_EXE_anyagents"))
@@ -1456,10 +1428,271 @@ fn offline_session_reset_refuses_agent_self_and_peer_but_allows_operator() {
         assert_eq!(value["generation"], next.generation);
         assert_ne!(next.generation, first.generation);
         assert!(next.memory.section.contains("new offline pin"));
-        assert!(!root.join("config/sylphx-session-id").exists());
+        assert!(!root.join("config/spiron-session-id").exists());
+        assert_eq!(
+            std::fs::read(root.join("config/sylphx-session-id")).unwrap(),
+            b"old-offline-vendor\n"
+        );
+        assert_eq!(
+            host_session::bound_vendor(&root, "spiron", "old-offline-vendor")
+                .unwrap()
+                .unwrap(),
+            first
+        );
+        assert_eq!(host_session::active(&root).unwrap().unwrap(), next);
         assert_eq!(
             std::fs::read(root.join("config/sylphx-transcript.jsonl")).unwrap(),
             b"retained raw bytes"
         );
     }
+}
+
+#[test]
+fn three_tier_agent_authority_separates_worker_parent_subtree_and_admin() {
+    use anyagents_core::{AgentId, Store};
+    let _env = support::lock();
+    let dir = support::physical_tempdir();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    support::operator_for_contract(&data);
+    let server = start_server(&data);
+
+    let h1_root = create(&data, "tree-root");
+    let h2_dept_a = create(&data, "dept-a");
+    let h2_dept_b = create(&data, "dept-b");
+    let h3_worker = create(&data, "worker-leaf");
+    let outsider_root = create(&data, "outsider-root");
+    let sys_admin = create(&data, "sys-admin");
+
+    let store = Store::open(data.join("state.db")).unwrap();
+    let h1_id = AgentId::parse(&h1_root).unwrap();
+    let h2a_id = AgentId::parse(&h2_dept_a).unwrap();
+    let h2b_id = AgentId::parse(&h2_dept_b).unwrap();
+    let h3_id = AgentId::parse(&h3_worker).unwrap();
+    let admin_id = AgentId::parse(&sys_admin).unwrap();
+
+    store.set_agent_parent(&h2a_id, Some(&h1_id)).unwrap();
+    store.set_agent_parent(&h2b_id, Some(&h1_id)).unwrap();
+    store.set_agent_parent(&h3_id, Some(&h2a_id)).unwrap();
+    store.set_agent_admin(&admin_id, true).unwrap();
+
+    let call_as = |caller_id: &str, method: &str, path: &str, body: Value| {
+        let auth = format!("x-anyagents-agent: {}\r\n", capability(&data, caller_id));
+        support::call_raw(&server.socket, method, path, &body.to_string(), &auth)
+    };
+
+    // 1. Tier 1 (Worker/Self): cannot mutate own description, instructions, role, or rename self,
+    //    even if it is a non-admin root (`tree-root`), while read-only GET on `self` works.
+    for caller in [&h3_worker, &h2_dept_a, &h1_root] {
+        let get_self = call_as(caller, "GET", "/v1/agents/self/description", json!(null));
+        assert!(get_self.starts_with("HTTP/1.1 200"), "{get_self}");
+        for payload in [
+            json!({"description": "self-mutated description"}),
+            json!({"instructions": "self-mutated instructions"}),
+            json!({"role": "SelfRole"}),
+            json!({"clear": true}),
+        ] {
+            let refused = call_as(caller, "POST", "/v1/agents/self/description", payload);
+            assert!(refused.starts_with("HTTP/1.1 403"), "{refused}");
+        }
+    }
+    assert!(
+        call_as(
+            &h3_worker,
+            "POST",
+            "/v1/agents/worker-leaf/role",
+            json!({"role": "SelfRole"})
+        )
+        .starts_with("HTTP/1.1 403")
+    );
+    assert!(
+        call_as(
+            &h3_worker,
+            "POST",
+            "/v1/agents/worker-leaf/rename",
+            json!({"name": "worker-self-renamed"})
+        )
+        .starts_with("HTTP/1.1 403")
+    );
+
+    // 2. Tier 2 (Parent/Ancestor `is_ancestor` without `is_admin`):
+    //    `tree-root` (H1) can manage multi-hop grandchild `worker-leaf` (H3) across all subtree routes.
+    let desc_ok = call_as(
+        &h1_root,
+        "POST",
+        "/v1/agents/worker-leaf/description",
+        json!({"description": "Grandchild mission", "instructions": "Grandchild rules", "role": "Executor"}),
+    );
+    assert!(desc_ok.starts_with("HTTP/1.1 200"), "{desc_ok}");
+
+    let role_ok = call_as(
+        &h1_root,
+        "POST",
+        "/v1/agents/worker-leaf/role",
+        json!({"role": "Senior Executor"}),
+    );
+    assert!(role_ok.starts_with("HTTP/1.1 200"), "{role_ok}");
+
+    let rename_ok = call_as(
+        &h1_root,
+        "POST",
+        "/v1/agents/worker-leaf/rename",
+        json!({"name": "worker-leaf-v2"}),
+    );
+    assert!(rename_ok.starts_with("HTTP/1.1 200"), "{rename_ok}");
+
+    let sched_set = call_as(
+        &h1_root,
+        "POST",
+        "/v1/agents/worker-leaf-v2/schedules",
+        json!({"action": "set", "every": "1h", "prompt": "subtree check"}),
+    );
+    assert!(sched_set.starts_with("HTTP/1.1 200"), "{sched_set}");
+    let sched_list = call_as(
+        &h1_root,
+        "GET",
+        "/v1/agents/worker-leaf-v2/schedules",
+        json!(null),
+    );
+    assert!(
+        sched_list.starts_with("HTTP/1.1 200") && sched_list.contains("subtree check"),
+        "{sched_list}"
+    );
+
+    // Pause, reset_session, harness, archive, and wake on multi-hop grandchild `worker-leaf-v2` by `tree-root` (H1).
+    let paused = call_as(
+        &h1_root,
+        "POST",
+        "/v1/agents/worker-leaf-v2/pause",
+        json!({}),
+    );
+    assert!(paused.starts_with("HTTP/1.1 200"), "{paused}");
+
+    let reset_ok = call_as(
+        &h1_root,
+        "POST",
+        "/v1/agents/worker-leaf-v2/session/reset",
+        json!({}),
+    );
+    assert!(reset_ok.starts_with("HTTP/1.1 200"), "{reset_ok}");
+
+    let harness_ok = call_as(
+        &h1_root,
+        "POST",
+        "/v1/agents/worker-leaf-v2/harness",
+        json!({"harness": "claude-code", "model": "claude-sonnet-4-6"}),
+    );
+    assert!(harness_ok.starts_with("HTTP/1.1 200"), "{harness_ok}");
+
+    let archived = call_as(
+        &h1_root,
+        "POST",
+        "/v1/agents/worker-leaf-v2/archive",
+        json!({}),
+    );
+    assert!(archived.starts_with("HTTP/1.1 200"), "{archived}");
+
+    let woke = call_as(
+        &h1_root,
+        "POST",
+        "/v1/agents/worker-leaf-v2/wake",
+        json!({}),
+    );
+    assert!(woke.starts_with("HTTP/1.1 200"), "{woke}");
+
+    // Transfer within `tree-root`'s subtree (`dept-a` -> `dept-b` and `dept-b` -> `self`) is allowed,
+    // while transferring outside `tree-root`'s subtree (`outsider-root` or `root`) is refused (403)!
+    let transfer_within = call_as(
+        &h1_root,
+        "POST",
+        "/v1/agents/worker-leaf-v2/transfer",
+        json!({"parent": "dept-b", "reason": "rebalance within tree"}),
+    );
+    assert!(
+        transfer_within.starts_with("HTTP/1.1 200"),
+        "{transfer_within}"
+    );
+    let transfer_to_self = call_as(
+        &h1_root,
+        "POST",
+        "/v1/agents/worker-leaf-v2/transfer",
+        json!({"parent": "self", "reason": "direct custody"}),
+    );
+    assert!(
+        transfer_to_self.starts_with("HTTP/1.1 200"),
+        "{transfer_to_self}"
+    );
+    let transfer_back = call_as(
+        &h1_root,
+        "POST",
+        "/v1/agents/worker-leaf-v2/transfer",
+        json!({"parent": "dept-a"}),
+    );
+    assert!(transfer_back.starts_with("HTTP/1.1 200"), "{transfer_back}");
+
+    for outside_parent in ["root", "outsider-root"] {
+        let refused_escape = call_as(
+            &h1_root,
+            "POST",
+            "/v1/agents/worker-leaf-v2/transfer",
+            json!({"parent": outside_parent}),
+        );
+        assert!(
+            refused_escape.starts_with("HTTP/1.1 403"),
+            "non-admin parent must not transfer to {outside_parent}: {refused_escape}"
+        );
+    }
+
+    // Outsider cannot manage `worker-leaf-v2`.
+    assert!(
+        call_as(
+            &outsider_root,
+            "POST",
+            "/v1/agents/worker-leaf-v2/rename",
+            json!({"name": "hijacked"})
+        )
+        .starts_with("HTTP/1.1 403")
+    );
+
+    // 3. Tier 3 (Admin `is_admin = 1` on `sys-admin`):
+    //    Can access `/v1/operator/agents/{name}/inbox` and `/v1/operator/agents/{name}/capability`,
+    //    and can delete `worker-leaf-v2` (or `tree-root` can delete its own grandchild).
+    assert!(
+        call_as(
+            &h1_root,
+            "GET",
+            "/v1/operator/agents/outsider-root/inbox",
+            json!(null)
+        )
+        .starts_with("HTTP/1.1 403")
+    );
+    assert!(
+        call_as(
+            &h1_root,
+            "POST",
+            "/v1/operator/agents/outsider-root/capability",
+            json!({})
+        )
+        .starts_with("HTTP/1.1 403")
+    );
+    let admin_inbox = call_as(
+        &sys_admin,
+        "GET",
+        "/v1/operator/agents/outsider-root/inbox",
+        json!(null),
+    );
+    assert!(admin_inbox.starts_with("HTTP/1.1 200"), "{admin_inbox}");
+    let admin_mint = call_as(
+        &sys_admin,
+        "POST",
+        "/v1/operator/agents/outsider-root/capability",
+        json!({}),
+    );
+    assert!(admin_mint.starts_with("HTTP/1.1 200"), "{admin_mint}");
+
+    // Multi-hop ancestor `tree-root` can delete grandchild `worker-leaf-v2`.
+    let deleted = call_as(&h1_root, "DELETE", "/v1/agents/worker-leaf-v2", json!(null));
+    assert!(deleted.starts_with("HTTP/1.1 200"), "{deleted}");
+
+    drop(server);
 }

@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock, PoisonError};
 
+use anyagents_harness::normalize_harness_name;
 use anyagents_installer::{
     CommandRunner, InstallError, LineSink, builtin_catalog, catalog_version, ensure_installed,
 };
@@ -39,6 +40,7 @@ impl Installer {
     /// Install `harness` once. Every agent of that harness gets the same
     /// answer, and a failure is remembered rather than retried.
     pub fn ensure(&self, harness: &str) -> Result<Install, String> {
+        let harness = normalize_harness_name(harness);
         let mut done = self.done.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(answer) = done.get(harness) {
             return answer.clone();
@@ -51,16 +53,6 @@ impl Installer {
     }
 
     fn install(&self, harness: &str) -> Result<Install, String> {
-        if harness == "sylphx" {
-            let dir = self
-                .root
-                .join("harnesses")
-                .join("sylphx")
-                .join(env!("CARGO_PKG_VERSION"));
-            let _ = std::fs::create_dir_all(&dir);
-            let _ = std::fs::write(dir.join(".installed"), env!("CARGO_PKG_VERSION"));
-            return Ok(Install { dir });
-        }
         let dirs = self.root.join("harnesses").join(harness);
         if let Ok(versions) = std::fs::read_dir(&dirs) {
             let mut installed: Vec<PathBuf> = versions
@@ -106,10 +98,8 @@ fn version_sort_key(path: &Path) -> (u64, u64, u64, String) {
 }
 
 /// Detect the currently active version string of `harness`.
-pub fn detect_version(root: &Path, harness: &str) -> String {
-    if harness == "sylphx" {
-        return env!("CARGO_PKG_VERSION").to_string();
-    }
+pub fn recorded_version(root: &Path, harness: &str) -> String {
+    let harness = normalize_harness_name(harness);
     let dirs = root.join("harnesses").join(harness);
     if let Ok(versions) = std::fs::read_dir(&dirs) {
         let mut installed: Vec<PathBuf> = versions
@@ -127,6 +117,14 @@ pub fn detect_version(root: &Path, harness: &str) -> String {
                 return ver.to_string();
             }
         }
+    }
+    "-".to_string()
+}
+
+pub fn detect_version(root: &Path, harness: &str) -> String {
+    let recorded = recorded_version(root, harness);
+    if recorded != "-" {
+        return recorded;
     }
     let bin = program(root, harness);
     if let Ok(out) = Command::new(&bin)
@@ -158,6 +156,7 @@ pub fn detect_version(root: &Path, harness: &str) -> String {
 /// `<root>/harnesses/<harness>/<version>/` (or update its host/staged binary),
 /// and prune superseded version directories.
 pub fn update_harness(root: &Path, harness: &str) -> Result<(String, String, bool), String> {
+    let harness = normalize_harness_name(harness);
     let before = detect_version(root, harness);
     let catalog = builtin_catalog();
     let mut runner = ProcessRunner;
@@ -294,9 +293,9 @@ fn ensure_vendored_binary(root: &Path, harness: &str) {
 
 /// Whether any adapter can run this harness, and the reason when none can.
 pub fn adapter(harness: &str) -> Result<(), anyagents_core::Error> {
-    match harness {
+    match normalize_harness_name(harness) {
         "claude-code" | "codex" | "opencode" | "agy" | "muse" | "omp" | "dsh" | "grok"
-        | "sylphx" | "sylphx-agent" | "sylphx_agent" => Ok(()),
+        | "spiron" => Ok(()),
         other => Err(anyagents_core::Error::Message(format!(
             "unknown harness: {other}"
         ))),
@@ -317,6 +316,7 @@ pub fn record(root: &Path, harness: &str) -> Result<Install, String> {
 /// is installed, `Some(Err(reason))` when it could not be, `None` while this
 /// server has not needed it. It never installs anything.
 pub fn recorded(harness: &str) -> Option<Result<(), String>> {
+    let harness = normalize_harness_name(harness);
     let done = INSTALLER
         .get()?
         .done
@@ -333,9 +333,7 @@ pub fn recorded(harness: &str) -> Option<Result<(), String>> {
 /// operating system looks up. `ANYAGENTS_<ID>_BIN` wins, so tests never start a
 /// real vendor and an unusual install can be pointed at.
 pub fn program(root: &Path, harness: &str) -> PathBuf {
-    if harness == "sylphx" {
-        return crate::data::current_exe_clean().unwrap_or_else(|_| PathBuf::from("anyagents"));
-    }
+    let harness = normalize_harness_name(harness);
     if let Some(named) = std::env::var_os(format!(
         "ANYAGENTS_{}_BIN",
         harness.to_uppercase().replace('-', "_")
@@ -564,6 +562,33 @@ mod tests {
             std::env::remove_var("ANYAGENTS_CLAUDE_BIN");
             std::env::remove_var("ANYAGENTS_CLAUDE_CODE_BIN");
         }
+    }
+
+    #[test]
+    fn legacy_first_party_install_and_program_selectors_use_spiron() {
+        let _environment = crate::server::tests::env_lock();
+        let root = crate::test_tempdir();
+        let expected = root.path().join("synthetic-spiron-probe");
+        unsafe { std::env::set_var("ANYAGENTS_SPIRON_BIN", &expected) };
+        let installer = Installer::new(root.path());
+        for legacy in [
+            "spiron",
+            "sylphx",
+            "sylphx-agent",
+            "sylphx_agent",
+            "sylphx/default",
+        ] {
+            adapter(legacy).unwrap();
+            assert_eq!(program(root.path(), legacy), expected);
+            assert_eq!(
+                installer.ensure(legacy).unwrap().dir,
+                root.path().join("harnesses/spiron/unpinned")
+            );
+        }
+        let done = installer.done.lock().unwrap();
+        assert_eq!(done.len(), 1);
+        assert!(done.contains_key("spiron"));
+        unsafe { std::env::remove_var("ANYAGENTS_SPIRON_BIN") };
     }
 
     #[test]

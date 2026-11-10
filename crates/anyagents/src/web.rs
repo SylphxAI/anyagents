@@ -224,6 +224,10 @@ pub fn load_web_keys(data_dir: Option<&Path>) -> HashMap<String, String> {
         }
     }
     for name in [
+        "SYLPHX_API_KEY",
+        "SYLPHX_PLATFORM_KEY",
+        "SYLPHX_BASE_URL",
+        "SYLPHX_AI_BASE_URL",
         "PARALLEL_API_KEY",
         "EXA_API_KEY",
         "FIRECRAWL_API_KEY",
@@ -241,6 +245,31 @@ pub fn load_web_keys(data_dir: Option<&Path>) -> HashMap<String, String> {
         }
     }
     keys
+}
+
+pub fn sylphx_baas_config(keys: &HashMap<String, String>) -> Option<(String, String)> {
+    let api_key = keys
+        .get("SYLPHX_API_KEY")
+        .or_else(|| keys.get("SYLPHX_PLATFORM_KEY"))
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())?
+        .to_string();
+    let raw_base = keys
+        .get("SYLPHX_BASE_URL")
+        .or_else(|| keys.get("SYLPHX_AI_BASE_URL"))
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("https://api.sylphx.com");
+    let trimmed = raw_base.trim_end_matches('/');
+    let normalized = trimmed
+        .strip_suffix("/v1")
+        .unwrap_or(trimmed)
+        .trim_end_matches('/')
+        .to_string();
+    if normalized.is_empty() {
+        return None;
+    }
+    Some((normalized, api_key))
 }
 
 pub fn parse_dotenv_into(text: &str, out: &mut HashMap<String, String>) {
@@ -618,6 +647,54 @@ fn is_non_global_ip(ip: IpAddr) -> bool {
     }
 }
 
+fn execute_sylphx_baas_search(
+    base_url: &str,
+    api_key: &str,
+    query: &str,
+    selected: SearchEngine,
+    req: &WebRequest,
+    timeout_ms: u64,
+) -> Result<JsonValue, EngineError> {
+    let mut payload = json!({
+        "query": query,
+        "engine": selected.as_str(),
+        "timeout_ms": timeout_ms,
+    });
+    if let Some(mode) = req.mode.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        payload["mode"] = json!(mode);
+    }
+    if let Some(max_results) = req.max_results {
+        payload["max_results"] = json!(max_results);
+    }
+    if let Some(max_chars) = req.max_chars {
+        payload["max_chars"] = json!(max_chars);
+    }
+    if !req.allowed_domains.is_empty() {
+        payload["allowed_domains"] = json!(req.allowed_domains);
+    }
+    if !req.blocked_domains.is_empty() {
+        payload["blocked_domains"] = json!(req.blocked_domains);
+    }
+    if let Some(country) = req
+        .country
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        payload["country"] = json!(country);
+    }
+    if let Some(ext) = req.external_web_access {
+        payload["external_web_access"] = json!(ext);
+    }
+    let endpoint = format!("{base_url}/v1/tools/web_search");
+    let headers = [
+        ("Authorization", format!("Bearer {api_key}")),
+        ("Content-Type", "application/json".to_string()),
+        ("Accept", "application/json".to_string()),
+    ];
+    send_http_json("POST", &endpoint, &headers, Some(&payload), timeout_ms)
+}
+
 fn execute_web_search(
     keys: &HashMap<String, String>,
     req: &WebRequest,
@@ -640,11 +717,12 @@ fn execute_web_search(
                 .to_string(),
         );
     }
+    let baas_cfg = sylphx_baas_config(keys);
     let admitted: Vec<SearchEngine> = policy_supported
         .into_iter()
         .filter(|e| search_engine_has_key(*e, keys))
         .collect();
-    if admitted.is_empty() {
+    if baas_cfg.is_none() && admitted.is_empty() {
         return Err(format!(
             "no API key configured for eligible web search engine(s) (selected `{}`)",
             selected.as_str()
@@ -655,8 +733,77 @@ fn execute_web_search(
         .timeout_ms
         .unwrap_or(DEFAULT_ENGINE_TIMEOUT_MS)
         .clamp(1_000, 60_000);
+    let max_res = req
+        .max_results
+        .unwrap_or(DEFAULT_SEARCH_MAX_RESULTS)
+        .clamp(1, 20) as usize;
     let mut attempts = Vec::new();
     let mut last_err = String::new();
+
+    if let Some((base_url, api_key)) = baas_cfg {
+        let started = Instant::now();
+        match execute_sylphx_baas_search(&base_url, &api_key, query, selected, req, timeout_ms) {
+            Ok(resp) => {
+                let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(0);
+                let mut hits: Vec<JsonValue> = resp
+                    .get("results")
+                    .and_then(JsonValue::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                hits.retain(|h| {
+                    h.get("url").and_then(JsonValue::as_str).is_some_and(|u| {
+                        url_allowed_by_domain_policy(u, &req.allowed_domains, &req.blocked_domains)
+                    })
+                });
+                if hits.len() > max_res {
+                    hits.truncate(max_res);
+                }
+                let engine_name = resp
+                    .get("engine")
+                    .and_then(JsonValue::as_str)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(selected.as_str());
+                let fallback_used = resp
+                    .get("fallback_used")
+                    .and_then(JsonValue::as_bool)
+                    .unwrap_or(false);
+                if let Some(remote_attempts) = resp.get("attempts").and_then(JsonValue::as_array)
+                    && !remote_attempts.is_empty()
+                {
+                    attempts.extend(remote_attempts.iter().cloned());
+                } else {
+                    attempts.push(json!({
+                        "engine": engine_name,
+                        "via": "sylphx_baas",
+                        "outcome": "succeeded",
+                        "duration_ms": duration_ms,
+                    }));
+                }
+                let count = hits.len();
+                return Ok(json!({
+                    "action": "search",
+                    "engine": engine_name,
+                    "via": "sylphx_baas",
+                    "fallback_used": fallback_used,
+                    "query": query,
+                    "results": hits,
+                    "count": count,
+                    "attempts": attempts,
+                }));
+            }
+            Err(err) => {
+                let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(0);
+                attempts.push(json!({
+                    "engine": "sylphx_baas",
+                    "outcome": "failed",
+                    "http_status": err.status,
+                    "duration_ms": duration_ms,
+                    "error": err.message,
+                }));
+                last_err = format!("sylphx_baas: {}", err.message);
+            }
+        }
+    }
 
     for engine in admitted.into_iter().take(MAX_FAILOVER_ATTEMPTS) {
         let started = Instant::now();
@@ -668,13 +815,10 @@ fn execute_web_search(
                         url_allowed_by_domain_policy(u, &req.allowed_domains, &req.blocked_domains)
                     })
                 });
-                let max_res = req
-                    .max_results
-                    .unwrap_or(DEFAULT_SEARCH_MAX_RESULTS)
-                    .clamp(1, 20) as usize;
                 if hits.len() > max_res {
                     hits.truncate(max_res);
                 }
+                let fallback_used = !attempts.is_empty();
                 attempts.push(json!({
                     "engine": engine.as_str(),
                     "outcome": "succeeded",
@@ -684,6 +828,7 @@ fn execute_web_search(
                 return Ok(json!({
                     "action": "search",
                     "engine": engine.as_str(),
+                    "fallback_used": fallback_used,
                     "query": query,
                     "results": hits,
                     "count": count,
@@ -1194,6 +1339,39 @@ fn make_hit(url: Option<&str>, title: Option<&str>, snippet: Option<&str>) -> Op
     }))
 }
 
+fn execute_sylphx_baas_fetch(
+    base_url: &str,
+    api_key: &str,
+    url: &str,
+    selected: FetchEngine,
+    req: &WebRequest,
+    max_chars: usize,
+    timeout_ms: u64,
+) -> Result<JsonValue, EngineError> {
+    let mut payload = json!({
+        "url": url,
+        "engine": selected.as_str(),
+        "max_chars": max_chars,
+        "timeout_ms": timeout_ms,
+    });
+    if !req.allowed_domains.is_empty() {
+        payload["allowed_domains"] = json!(req.allowed_domains);
+    }
+    if !req.blocked_domains.is_empty() {
+        payload["blocked_domains"] = json!(req.blocked_domains);
+    }
+    if let Some(ext) = req.external_web_access {
+        payload["external_web_access"] = json!(ext);
+    }
+    let endpoint = format!("{base_url}/v1/tools/web_fetch");
+    let headers = [
+        ("Authorization", format!("Bearer {api_key}")),
+        ("Content-Type", "application/json".to_string()),
+        ("Accept", "application/json".to_string()),
+    ];
+    send_http_json("POST", &endpoint, &headers, Some(&payload), timeout_ms)
+}
+
 fn execute_web_fetch(
     keys: &HashMap<String, String>,
     req: &WebRequest,
@@ -1223,11 +1401,16 @@ fn execute_web_fetch(
                 .to_string(),
         );
     }
+    let baas_cfg = if selected != FetchEngine::Direct {
+        sylphx_baas_config(keys)
+    } else {
+        None
+    };
     let admitted: Vec<FetchEngine> = policy_supported
         .into_iter()
         .filter(|e| fetch_engine_has_key(*e, keys))
         .collect();
-    if admitted.is_empty() {
+    if baas_cfg.is_none() && admitted.is_empty() {
         return Err(format!(
             "no API key configured for eligible web fetch engine(s) (selected `{}`)",
             selected.as_str()
@@ -1243,6 +1426,96 @@ fn execute_web_fetch(
         .unwrap_or(DEFAULT_ENGINE_TIMEOUT_MS)
         .clamp(1_000, 60_000);
 
+    let mut attempts = Vec::new();
+    let mut last_err = String::new();
+
+    if let Some((base_url, api_key)) = baas_cfg {
+        let started = Instant::now();
+        match execute_sylphx_baas_fetch(
+            &base_url, &api_key, url, selected, req, max_chars, timeout_ms,
+        ) {
+            Ok(resp) => {
+                let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(0);
+                let final_url = resp
+                    .get("url")
+                    .and_then(JsonValue::as_str)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(url)
+                    .to_string();
+                if !url_allowed_by_domain_policy(
+                    &final_url,
+                    &req.allowed_domains,
+                    &req.blocked_domains,
+                ) {
+                    return Err(format!(
+                        "fetched destination URL `{final_url}` violates `allowed_domains` / `blocked_domains` policy"
+                    ));
+                }
+                let title = resp
+                    .get("title")
+                    .and_then(JsonValue::as_str)
+                    .map(str::to_string);
+                let full_text = resp
+                    .get("content")
+                    .or_else(|| resp.get("text"))
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let original_chars = full_text.chars().count();
+                let truncated = original_chars > max_chars;
+                let bounded: String = if truncated {
+                    full_text.chars().take(max_chars).collect()
+                } else {
+                    full_text
+                };
+                let engine_name = resp
+                    .get("engine")
+                    .and_then(JsonValue::as_str)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(selected.as_str());
+                let fallback_used = resp
+                    .get("fallback_used")
+                    .and_then(JsonValue::as_bool)
+                    .unwrap_or(false);
+                if let Some(remote_attempts) = resp.get("attempts").and_then(JsonValue::as_array)
+                    && !remote_attempts.is_empty()
+                {
+                    attempts.extend(remote_attempts.iter().cloned());
+                } else {
+                    attempts.push(json!({
+                        "engine": engine_name,
+                        "via": "sylphx_baas",
+                        "outcome": "succeeded",
+                        "duration_ms": duration_ms,
+                    }));
+                }
+                return Ok(json!({
+                    "action": "fetch",
+                    "engine": engine_name,
+                    "via": "sylphx_baas",
+                    "fallback_used": fallback_used,
+                    "url": final_url,
+                    "title": title,
+                    "content": bounded,
+                    "original_chars": original_chars,
+                    "truncated": truncated,
+                    "attempts": attempts,
+                }));
+            }
+            Err(err) => {
+                let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(0);
+                attempts.push(json!({
+                    "engine": "sylphx_baas",
+                    "outcome": "failed",
+                    "http_status": err.status,
+                    "duration_ms": duration_ms,
+                    "error": err.message,
+                }));
+                last_err = format!("sylphx_baas: {}", err.message);
+            }
+        }
+    }
+
     // In `auto` mode, try up to MAX_FAILOVER_ATTEMPTS API engines, plus `Direct` as the final fallback if `external_web_access != false`.
     let mut plan: Vec<FetchEngine> = admitted
         .iter()
@@ -1257,9 +1530,6 @@ fn execute_web_fetch(
     {
         plan.push(FetchEngine::Direct);
     }
-
-    let mut attempts = Vec::new();
-    let mut last_err = String::new();
 
     for engine in plan {
         let started = Instant::now();
@@ -1282,6 +1552,7 @@ fn execute_web_fetch(
                 } else {
                     full_text
                 };
+                let fallback_used = !attempts.is_empty();
                 attempts.push(json!({
                     "engine": engine.as_str(),
                     "outcome": "succeeded",
@@ -1290,6 +1561,7 @@ fn execute_web_fetch(
                 return Ok(json!({
                     "action": "fetch",
                     "engine": engine.as_str(),
+                    "fallback_used": fallback_used,
                     "url": final_url,
                     "title": title,
                     "content": bounded,
@@ -2058,5 +2330,189 @@ mod tests {
         assert!(md.contains("Hello world!"));
         assert!(md.contains("- Item 1"));
         assert!(!md.contains("alert(1)"));
+    }
+
+    #[test]
+    fn sylphx_baas_config_normalizes_base_url_and_accepts_api_or_platform_key() {
+        let mut keys = HashMap::new();
+        assert!(sylphx_baas_config(&keys).is_none());
+
+        keys.insert("SYLPHX_API_KEY".into(), "sk_live_baas_1".into());
+        assert_eq!(
+            sylphx_baas_config(&keys),
+            Some(("https://api.sylphx.com".into(), "sk_live_baas_1".into()))
+        );
+
+        keys.insert(
+            "SYLPHX_BASE_URL".into(),
+            "https://gateway.sylphx.com/v1/".into(),
+        );
+        assert_eq!(
+            sylphx_baas_config(&keys),
+            Some(("https://gateway.sylphx.com".into(), "sk_live_baas_1".into()))
+        );
+
+        keys.remove("SYLPHX_API_KEY");
+        keys.insert("SYLPHX_PLATFORM_KEY".into(), "pk_platform_2".into());
+        assert_eq!(
+            sylphx_baas_config(&keys),
+            Some(("https://gateway.sylphx.com".into(), "pk_platform_2".into()))
+        );
+    }
+
+    #[test]
+    fn web_search_and_fetch_route_through_sylphx_baas_primary_and_record_fallback_on_failure() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = std::thread::spawn(move || {
+            for idx in 0..3 {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                let mut data = Vec::new();
+                let mut chunk = [0u8; 1024];
+                loop {
+                    match stream.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            data.extend_from_slice(&chunk[..n]);
+                            if let Some(hdr_end) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                                let body_start = hdr_end + 4;
+                                let hdr_str = String::from_utf8_lossy(&data[..hdr_end]);
+                                let content_len = hdr_str
+                                    .lines()
+                                    .find_map(|line| {
+                                        let (k, v) = line.split_once(':')?;
+                                        k.trim()
+                                            .eq_ignore_ascii_case("content-length")
+                                            .then(|| v.trim().parse::<usize>().ok())
+                                            .flatten()
+                                    })
+                                    .unwrap_or(0);
+                                if data.len() >= body_start + content_len {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                let req_str = String::from_utf8_lossy(&data);
+                let response = match idx {
+                    0 => {
+                        assert!(req_str.starts_with("POST /v1/tools/web_search "));
+                        assert!(
+                            req_str
+                                .to_ascii_lowercase()
+                                .contains("authorization: bearer sk_test_baas")
+                        );
+                        let body = serde_json::json!({
+                            "object": "web_search.result",
+                            "action": "search",
+                            "query": "sylphx baas",
+                            "engine": "parallel",
+                            "fallback_used": false,
+                            "count": 1,
+                            "results": [
+                                {
+                                    "url": "https://1.1.1.1/docs/baas",
+                                    "title": "Sylphx BaaS Unified Web Engine",
+                                    "snippet": "Canonical search and fetch via /v1/tools/web_search"
+                                }
+                            ]
+                        })
+                        .to_string();
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        )
+                    }
+                    1 => {
+                        assert!(req_str.starts_with("POST /v1/tools/web_fetch "));
+                        let body = serde_json::json!({
+                            "object": "web_fetch.result",
+                            "action": "fetch",
+                            "url": "https://1.1.1.1/docs/baas",
+                            "title": "Sylphx BaaS Doc",
+                            "engine": "firecrawl",
+                            "fallback_used": false,
+                            "content": "# Sylphx BaaS\nUnified fetch content."
+                        })
+                        .to_string();
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        )
+                    }
+                    _ => {
+                        let body = r#"{"error":{"message":"baas unavailable"}}"#;
+                        format!(
+                            "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        )
+                    }
+                };
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+                let _ = stream.shutdown(std::net::Shutdown::Write);
+            }
+        });
+
+        let mut keys = HashMap::new();
+        keys.insert("SYLPHX_API_KEY".into(), "sk_test_baas".into());
+        keys.insert("SYLPHX_BASE_URL".into(), format!("http://{addr}/v1"));
+
+        // 1. Primary BaaS search succeeds with zero local provider keys
+        let search_res = execute_web_search(
+            &keys,
+            &WebRequest {
+                action: Some("search".into()),
+                query: Some("sylphx baas".into()),
+                ..Default::default()
+            },
+        )
+        .expect("baas search should succeed");
+        assert_eq!(search_res["via"], "sylphx_baas");
+        assert_eq!(search_res["engine"], "parallel");
+        assert_eq!(search_res["count"], 1);
+        assert_eq!(search_res["results"][0]["url"], "https://1.1.1.1/docs/baas");
+
+        // 2. Primary BaaS fetch succeeds with zero local provider keys
+        let fetch_res = execute_web_fetch(
+            &keys,
+            &WebRequest {
+                action: Some("fetch".into()),
+                url: Some("https://1.1.1.1/docs/baas".into()),
+                ..Default::default()
+            },
+        )
+        .expect("baas fetch should succeed");
+        assert_eq!(fetch_res["via"], "sylphx_baas");
+        assert_eq!(fetch_res["engine"], "firecrawl");
+        assert_eq!(fetch_res["title"], "Sylphx BaaS Doc");
+        assert!(
+            fetch_res["content"]
+                .as_str()
+                .unwrap_or("")
+                .contains("Unified fetch content.")
+        );
+
+        // 3. When BaaS returns 503 and no local search keys exist, error records sylphx_baas attempt
+        let failed = execute_web_search(
+            &keys,
+            &WebRequest {
+                action: Some("search".into()),
+                query: Some("fallback test".into()),
+                ..Default::default()
+            },
+        )
+        .expect_err("baas 503 with no local keys should return error");
+        assert!(failed.contains("sylphx_baas: HTTP 503"), "got: {failed}");
+
+        handle.join().expect("server thread");
     }
 }

@@ -249,15 +249,11 @@ impl Store {
             .filter(|a| selected.as_ref().is_none_or(|id| id == &a.id))
             .collect();
         agents.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
-        let mut guards = Vec::new();
-        for a in &agents {
-            guards.push(
-                self.lock_agent_lifecycle(&a.id)
-                    .map_err(|e| io::Error::other(e.to_string()))?,
-            );
-        }
         let mut index = HostIndex::open(&self.data_dir().join(INDEX_FILE))?;
         for agent in &agents {
+            let _guard = self
+                .lock_agent_lifecycle(&agent.id)
+                .map_err(|e| io::Error::other(e.to_string()))?;
             let root = self.data_dir().join("agents").join(agent.id.as_str());
             if !safe_components(self.data_dir(), &root)? {
                 index.retain_agent_scope(agent.id.as_str(), scope, &HashSet::new())?;
@@ -332,14 +328,29 @@ impl Store {
         let mut request = query.clone();
         request.agent = None;
         let hits = index.search(&visible, scope, &request)?;
-        hits.into_iter()
-            .map(|hit| {
-                // Return the matching bounded window, not an unbounded tool payload.
-                // The whole-event coordinate remains available for explicit readback.
-                let bytes = read_raw(&hit.window)?;
-                Ok((hit, bytes))
-            })
-            .collect()
+        let mut out = Vec::with_capacity(hits.len());
+        for hit in hits {
+            let owner_id = crate::AgentId::parse(&hit.metadata.agent_id)
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            let _guard = self
+                .lock_agent_lifecycle(&owner_id)
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            let Some(current) =
+                index.document(std::slice::from_ref(&hit.metadata.agent_id), scope, &hit.id)?
+            else {
+                continue;
+            };
+            if current.raw.sha256 != hit.raw.sha256
+                || self.is_host_path_redacted(&hit.metadata.agent_id, &hit.window.segment)?
+            {
+                continue;
+            }
+            // Return the matching bounded window, not an unbounded tool payload.
+            // The whole-event coordinate remains available for explicit readback.
+            let bytes = read_raw(&hit.window)?;
+            out.push((hit, bytes));
+        }
+        Ok(out)
     }
 }
 
@@ -711,10 +722,10 @@ mod tests {
         let db = dir.path().join("state.db");
         let store = Store::open(&db).unwrap();
         let own = store
-            .create_agent(NewAgent::new("tool-owner", "sylphx"))
+            .create_agent(NewAgent::new("tool-owner", "spiron"))
             .unwrap();
         let peer = store
-            .create_agent(NewAgent::new("tool-peer", "sylphx"))
+            .create_agent(NewAgent::new("tool-peer", "spiron"))
             .unwrap();
         let path = |agent: &Agent| {
             dir.path()
@@ -888,7 +899,7 @@ mod tests {
         let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let agent = store
-            .create_agent(NewAgent::new("native-time", "sylphx"))
+            .create_agent(NewAgent::new("native-time", "spiron"))
             .unwrap();
         let path = dir
             .path()
@@ -959,10 +970,10 @@ mod tests {
         let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let own = store
-            .create_agent(NewAgent::new("page-owner", "sylphx"))
+            .create_agent(NewAgent::new("page-owner", "spiron"))
             .unwrap();
         let hidden = store
-            .create_agent(NewAgent::new("page-hidden", "sylphx"))
+            .create_agent(NewAgent::new("page-hidden", "spiron"))
             .unwrap();
         let mut own_path = PathBuf::new();
         for agent in [&own, &hidden] {
@@ -1021,7 +1032,7 @@ mod tests {
         let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let agent = store
-            .create_agent(NewAgent::new("boundary-owner", "sylphx"))
+            .create_agent(NewAgent::new("boundary-owner", "spiron"))
             .unwrap();
         let root = dir.path().join("agents").join(agent.id.as_str());
         fs::create_dir_all(root.join("config")).unwrap();
@@ -1149,7 +1160,7 @@ mod tests {
         let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let agent = store
-            .create_agent(NewAgent::new("verifier-owner", "sylphx"))
+            .create_agent(NewAgent::new("verifier-owner", "spiron"))
             .unwrap();
         let root = dir
             .path()
@@ -1289,7 +1300,7 @@ mod tests {
         let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let agent = store
-            .create_agent(NewAgent::new("scoped-owner", "sylphx"))
+            .create_agent(NewAgent::new("scoped-owner", "spiron"))
             .unwrap();
         let root = dir.path().join("agents").join(agent.id.as_str());
         fs::create_dir_all(root.join("memory")).unwrap();
@@ -1350,7 +1361,7 @@ mod tests {
         let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let agent = store
-            .create_agent(NewAgent::new("cursor-owner", "sylphx"))
+            .create_agent(NewAgent::new("cursor-owner", "spiron"))
             .unwrap();
         let path = dir.path().join("native.jsonl");
         let prefix = b"{\"role\":\"user\",\"content\":\"originalneedle\"}\n{\"role\":\"assistant\",\"content\":\"secondneedle\"}\n";
@@ -1490,7 +1501,7 @@ mod tests {
         let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let agent = store
-            .create_agent(NewAgent::new("redaction-owner", "sylphx"))
+            .create_agent(NewAgent::new("redaction-owner", "spiron"))
             .unwrap();
         store.set_agent_state(&agent.id, "archived").unwrap();
         let root = dir.path().join("agents").join(agent.id.as_str());
@@ -1659,7 +1670,7 @@ mod tests {
         let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let agent = store
-            .create_agent(NewAgent::new("old-name", "sylphx"))
+            .create_agent(NewAgent::new("old-name", "spiron"))
             .unwrap();
         store.rename_agent(&agent.id, "new-name").unwrap();
         let root = dir
@@ -1705,9 +1716,9 @@ mod tests {
     fn authorized_full_text_native_in_place_and_memory_share_filters() {
         let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
-        let own = store.create_agent(NewAgent::new("own", "sylphx")).unwrap();
+        let own = store.create_agent(NewAgent::new("own", "spiron")).unwrap();
         let hidden = store
-            .create_agent(NewAgent::new("hidden", "sylphx"))
+            .create_agent(NewAgent::new("hidden", "spiron"))
             .unwrap();
         for agent in [&own, &hidden] {
             let root = dir.path().join("agents").join(agent.id.as_str());
@@ -1833,7 +1844,7 @@ mod tests {
         let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let agent = store
-            .create_agent(NewAgent::new("topic-owner", "sylphx"))
+            .create_agent(NewAgent::new("topic-owner", "spiron"))
             .unwrap();
         let root = dir.path().join("agents").join(agent.id.as_str());
         crate::learned_memory::write_sleep_state(
@@ -1896,5 +1907,93 @@ mod tests {
             dot_hits.is_empty(),
             "dotfiles in memory/ must never be indexed"
         );
+    }
+
+    #[test]
+    fn search_host_files_locks_one_agent_at_a_time_across_multi_agent_refresh_and_readback() {
+        use std::time::{Duration, Instant};
+        let dir = crate::test_tempdir();
+        let db = dir.path().join("state.db");
+        let store = Store::open(&db).unwrap();
+        let a = store
+            .create_agent(NewAgent::new("agent-a", "spiron"))
+            .unwrap();
+        let b = store
+            .create_agent(NewAgent::new("agent-b", "spiron"))
+            .unwrap();
+        let (first, second) = if a.id.as_str() < b.id.as_str() {
+            (a, b)
+        } else {
+            (b, a)
+        };
+        for agent in [&first, &second] {
+            let mem_dir = dir
+                .path()
+                .join("agents")
+                .join(agent.id.as_str())
+                .join("memory");
+            fs::create_dir_all(&mem_dir).unwrap();
+            fs::write(
+                mem_dir.join("MEMORY.md"),
+                format!("multilockneedle {}", agent.name),
+            )
+            .unwrap();
+        }
+        let first_mem = dir
+            .path()
+            .join("agents")
+            .join(first.id.as_str())
+            .join("memory/MEMORY.md");
+        let second_lock = store.lock_agent_lifecycle(&second.id).unwrap();
+        let ids = vec![first.id.to_string(), second.id.to_string()];
+        let search_db = db.clone();
+        let index_path = dir.path().join(INDEX_FILE);
+        let handle = std::thread::spawn(move || {
+            let search_store = Store::open(&search_db).unwrap();
+            search_store
+                .search_host_files(
+                    &ids,
+                    MemoryScope::Memory,
+                    &HistorySearchQuery {
+                        query: Some("multilockneedle".into()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut first_refreshed = false;
+        let mut first_released = false;
+        while Instant::now() < deadline {
+            if !first_refreshed
+                && index_path.exists()
+                && HostIndex::open(&index_path)
+                    .ok()
+                    .and_then(|idx| idx.source_cursor(first.id.as_str(), &first_mem).ok())
+                    .flatten()
+                    .is_some()
+            {
+                first_refreshed = true;
+            }
+            if first_refreshed && let Ok(probe_first) = store.try_lock_agent_lifecycle(&first.id) {
+                drop(probe_first);
+                first_released = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            first_refreshed,
+            "search_host_files did not refresh first agent before waiting on second"
+        );
+        // While search_host_files is waiting on `second.id`, `first.id`'s lifecycle lock
+        // must already be released so at most one `.lifecycle` lock is held at a time.
+        assert!(
+            first_released,
+            "first agent lifecycle lock remained held while acquiring second"
+        );
+        drop(second_lock);
+        let hits = handle.join().unwrap();
+        assert_eq!(hits.len(), 2);
     }
 }

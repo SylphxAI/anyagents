@@ -3,6 +3,7 @@
 //! used to order delivery. The delivery cursor moves only over a contiguous
 //! prefix.
 
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read};
 use std::os::unix::io::AsRawFd;
@@ -12,6 +13,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
+use anyagents_harness::normalize_harness_name;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::error::Error;
@@ -69,6 +71,15 @@ fn scope_env(agent: &Agent, scope: &str) -> Vec<(String, String)> {
         env.push(("ANYAGENTS_PUBLIC".to_string(), "1".to_string()));
     }
     env
+}
+
+/// Batched roster metadata. Archived agents never need runtime diagnostics.
+#[derive(Default)]
+pub struct AgentQueryMetadata {
+    pub aliases: HashMap<String, Vec<String>>,
+    pub oldest_undelivered: HashMap<String, i64>,
+    pub open_turns: HashMap<String, i64>,
+    pub schedules: HashMap<String, Vec<AgentSchedule>>,
 }
 
 /// One agent row.
@@ -369,6 +380,8 @@ pub enum ReceiveOutcome {
 /// One turn in an agent's bidirectional conversation timeline (`in` or `out`).
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ConversationTurn {
+    #[serde(default)]
+    pub seq: i64,
     pub id: String,
     /// `"in"` when received by this agent; `"out"` when sent by this agent.
     pub direction: String,
@@ -626,6 +639,15 @@ const CAPABILITY_BYTES: usize = 32;
 /// New rows always have an explicit scope. This bounded, transactional upgrade
 /// touches only legacy environment metadata, never identities or work state.
 fn preserve_legacy_scopes(conn: &mut Connection) -> Result<(), Error> {
+    let missing_scope_sql = "SELECT EXISTS(SELECT 1 FROM agents WHERE NOT EXISTS (
+                SELECT 1 FROM json_each(CASE WHEN json_valid(launch_env) THEN launch_env ELSE '[]' END) entry
+                WHERE entry.key % 2 = 0 AND entry.value = 'ANYAGENTS_SCOPE'
+                  AND lower(trim(json_extract(launch_env, '$[' || (entry.key + 1) || ']'))) IN (
+                    'isolated','none','private','false','0','siblings','sibling','team',
+                    'public','org','all','true','1')))";
+    if !conn.query_row(missing_scope_sql, [], |r| r.get::<_, bool>(0))? {
+        return Ok(());
+    }
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let ids: Vec<String> = {
         let mut stmt = tx.prepare(
@@ -673,39 +695,95 @@ impl Store {
         let conn = Connection::open(path)?;
         conn.busy_timeout(Duration::from_secs(15))?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        let mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
+        let mut mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+        if !mode.eq_ignore_ascii_case("wal") {
+            mode = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
+        }
         if !mode.eq_ignore_ascii_case("wal") {
             return Err(Error::Message(format!(
                 "sqlite journal mode is {mode}, not wal"
             )));
         }
         let mut conn = conn;
+        let schema_version = migrate::current_version(&conn)?;
         migrate::migrate(&mut conn)?;
         preserve_legacy_scopes(&mut conn)?;
         if migrate::current_version(&conn)? < 1 {
             return Err(Error::Message("migrations did not apply".into()));
         }
-        conn.execute(
-            "UPDATE agents SET state = 'archived' WHERE state NOT IN ('created', 'running', 'idle', 'paused', 'archived')",
+        // Read first so ordinary opens of current stores do not take the writer
+        // lock. The UPDATE is idempotent and changes only the harness selector.
+        let has_legacy_harness: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM agents WHERE harness IN ('sylphx', 'sylphx-agent', 'sylphx_agent', 'sylphx/default'))",
             [],
+            |row| row.get(0),
         )?;
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS message_versions (
-                agent_id TEXT NOT NULL,
-                chat_id INTEGER NOT NULL,
-                message_id INTEGER NOT NULL,
-                body TEXT NOT NULL,
-                updated_at_ms INTEGER NOT NULL,
-                PRIMARY KEY (agent_id, chat_id, message_id)
-            );
-            CREATE TABLE IF NOT EXISTS agent_topology_state (
-                agent_id TEXT PRIMARY KEY,
-                state_json TEXT NOT NULL,
-                updated_at_ms INTEGER NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_rag_chunks_agent_id_time
-                ON rag_chunks(agent_id, timestamp_ms DESC, chunk_id);",
+        if has_legacy_harness {
+            conn.execute(
+                "UPDATE agents SET harness = 'spiron' WHERE harness IN ('sylphx', 'sylphx-agent', 'sylphx_agent', 'sylphx/default')",
+                [],
+            )?;
+        }
+        let has_legacy_state: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM agents WHERE state NOT IN ('created', 'running', 'idle', 'paused', 'archived'))",
+            [],
+            |row| row.get(0),
         )?;
+        if has_legacy_state {
+            conn.execute(
+                "UPDATE agents SET state = 'archived' WHERE state NOT IN ('created', 'running', 'idle', 'paused', 'archived')",
+                [],
+            )?;
+        }
+        let has_aux_schema: bool = conn.query_row(
+            "SELECT (SELECT count(*) FROM sqlite_master WHERE name IN ('message_versions', 'agent_topology_state', 'idx_rag_chunks_agent_id_time')) = 3",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_aux_schema {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS message_versions (
+                    agent_id TEXT NOT NULL,
+                    chat_id INTEGER NOT NULL,
+                    message_id INTEGER NOT NULL,
+                    body TEXT NOT NULL,
+                    updated_at_ms INTEGER NOT NULL,
+                    PRIMARY KEY (agent_id, chat_id, message_id)
+                );
+                CREATE TABLE IF NOT EXISTS agent_topology_state (
+                    agent_id TEXT PRIMARY KEY,
+                    state_json TEXT NOT NULL,
+                    updated_at_ms INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_rag_chunks_agent_id_time
+                    ON rag_chunks(agent_id, timestamp_ms DESC, chunk_id);",
+            )?;
+        }
+        // UNIQUE(agent_id, seq) already supports reverse mailbox sequence scans.
+        // Avoid even idempotent DDL on ordinary opens: it needs the writer lock.
+        for (name, sql) in [
+            (
+                "idx_schedules_active_agent",
+                "CREATE INDEX IF NOT EXISTS idx_schedules_active_agent ON agent_schedules(agent_id, created_at_ms, id) WHERE state = 'active'",
+            ),
+            (
+                "idx_messages_agent_time",
+                "CREATE INDEX IF NOT EXISTS idx_messages_agent_time ON messages(agent_id, received_at_ms DESC, seq DESC)",
+            ),
+            (
+                "idx_outbound_agent_time",
+                "CREATE INDEX IF NOT EXISTS idx_outbound_agent_time ON outbound_messages(agent_id, sent_at_ms DESC, id DESC)",
+            ),
+        ] {
+            let exists: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1)",
+                [name],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                conn.execute_batch(sql)?;
+            }
+        }
         // Older databases may already have this column from an earlier runtime.
         // Presence, not an arbitrary failed ALTER, is the idempotency condition.
         let has_public: bool = conn.query_row(
@@ -719,7 +797,12 @@ impl Store {
                 [],
             )?;
         }
-        ensure_lexical_fts_backfilled(&mut conn)?;
+        // Current schemas maintain FTS transactionally on every history write.
+        // Only legacy upgrades need the full derivative-index validation; doing
+        // it on every open scans history and competes with the server writer.
+        if schema_version < 23 {
+            ensure_lexical_fts_backfilled(&mut conn)?;
+        }
         Ok(Self {
             conn: Mutex::new(conn),
             db_path: path.to_path_buf(),
@@ -742,6 +825,16 @@ impl Store {
             .lock()
             .unwrap_or_else(|err| err.into_inner()) = Some(key.to_string());
         Ok(())
+    }
+
+    /// Whether this process can decide capability validity authoritatively.
+    /// Helpers without the key may ask the daemon; the daemon must never ask
+    /// its own socket again after rejecting a capability.
+    pub fn holds_capability_key(&self) -> bool {
+        self.capabilities
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .is_some()
     }
 
     pub(crate) fn database_path(&self) -> &Path {
@@ -792,7 +885,7 @@ impl Store {
     pub fn authenticate_capability(&self, token: &str) -> Result<AgentId, Error> {
         let key = self.capability_key()?;
         let digest = hash(&key, token);
-        let conn = self.conn();
+        let conn = self.read_conn();
         let found = conn
             .query_row(
                 "SELECT agent_id FROM agent_capabilities
@@ -1001,7 +1094,8 @@ impl Store {
 
     pub fn create_agent(&self, new: NewAgent) -> Result<Agent, Error> {
         validate_token(&new.name, "agent name")?;
-        if new.harness.is_empty() {
+        let harness = normalize_harness_name(&new.harness);
+        if harness.is_empty() {
             return Err(Error::Message("harness is empty".into()));
         }
         let clean_role = new
@@ -1032,7 +1126,7 @@ impl Store {
             name: new.name,
             role: clean_role,
             description: clean_description,
-            harness: new.harness,
+            harness: harness.to_string(),
             model: new.model,
             workdir: new.workdir,
             instructions: new.instructions,
@@ -1079,7 +1173,7 @@ impl Store {
     }
 
     pub fn agent(&self, id: &AgentId) -> Result<Agent, Error> {
-        agent_by_id(&self.conn(), id)
+        agent_by_id(&self.read_conn(), id)
     }
 
     pub fn set_agent_admin(&self, agent_id: &AgentId, is_admin: bool) -> Result<(), Error> {
@@ -1112,7 +1206,7 @@ impl Store {
     }
 
     pub fn set_agent_harness(&self, agent_id: &AgentId, harness: &str) -> Result<Agent, Error> {
-        let clean = harness.trim();
+        let clean = normalize_harness_name(harness);
         if clean.is_empty() {
             return Err(Error::Message("harness is empty".into()));
         }
@@ -1241,7 +1335,7 @@ impl Store {
 
     /// Former names recorded for this agent via `rename_agent`.
     pub fn agent_aliases(&self, id: &AgentId) -> Result<Vec<String>, Error> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT alias FROM agent_aliases WHERE agent_id = ?1 ORDER BY created_at_ms DESC",
         )?;
@@ -1304,7 +1398,7 @@ impl Store {
 
     pub fn agent_by_name(&self, name: &str) -> Result<Agent, Error> {
         let lookup = name.strip_prefix("agent:").unwrap_or(name);
-        let conn = self.conn();
+        let conn = self.read_conn();
         let found = conn
             .query_row(
                 &format!("SELECT {AGENT_COLS} FROM agents WHERE name = ?1 OR id = ?1"),
@@ -1330,7 +1424,7 @@ impl Store {
     }
 
     pub fn list_agents(&self) -> Result<Vec<Agent>, Error> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let mut stmt = conn.prepare(&format!("SELECT {AGENT_COLS} FROM agents ORDER BY name"))?;
         let mut rows = stmt.query([])?;
         let mut agents = Vec::new();
@@ -1340,8 +1434,60 @@ impl Store {
         Ok(agents)
     }
 
+    /// Load roster metadata with a fixed number of SQL statements. Indexed range
+    /// seeks avoid scanning the message history of archived agents.
+    pub fn agent_query_metadata(&self) -> Result<AgentQueryMetadata, Error> {
+        let mut metadata = AgentQueryMetadata::default();
+        {
+            let conn = self.read_conn();
+            let mut stmt =
+                conn.prepare("SELECT agent_id, alias FROM agent_aliases ORDER BY alias")?;
+            for row in
+                stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            {
+                let (id, alias) = row?;
+                metadata.aliases.entry(id).or_default().push(alias);
+            }
+            let mut stmt = conn.prepare(
+                "SELECT a.id, (SELECT m.received_at_ms FROM messages m
+                   WHERE m.agent_id = a.id AND m.seq > COALESCE(d.delivered_seq, 0)
+                     AND (CASE WHEN json_valid(m.context) THEN json_extract(m.context, '$.event') END) IS NOT 'reaction_passive'
+                   ORDER BY m.seq LIMIT 1)
+                 FROM agents a LEFT JOIN mailbox_cursors d ON d.agent_id = a.id
+                 WHERE a.state != 'archived'",
+            )?;
+            for row in stmt.query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?))
+            })? {
+                let (id, timestamp) = row?;
+                if let Some(timestamp) = timestamp {
+                    metadata.oldest_undelivered.insert(id, timestamp);
+                }
+            }
+            let mut stmt = conn.prepare(
+                "SELECT t.agent_id, COALESCE((SELECT m.received_at_ms FROM messages m
+                    WHERE m.agent_id = t.agent_id AND m.seq > t.completed_seq AND m.seq <= t.opened_seq
+                    ORDER BY m.seq LIMIT 1), t.opened_at_ms)
+                 FROM turn_recovery t JOIN agents a ON a.id = t.agent_id
+                 WHERE t.opened_seq > t.completed_seq AND a.state != 'archived'",
+            )?;
+            for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))? {
+                let (id, timestamp) = row?;
+                metadata.open_turns.insert(id, timestamp);
+            }
+        }
+        for schedule in self.list_schedules(None, true)? {
+            metadata
+                .schedules
+                .entry(schedule.agent_id.to_string())
+                .or_default()
+                .push(schedule);
+        }
+        Ok(metadata)
+    }
+
     pub fn children_of(&self, parent_id: &AgentId) -> Result<Vec<Agent>, Error> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let mut stmt = conn.prepare(&format!(
             "SELECT {AGENT_COLS} FROM agents WHERE parent_id = ?1 ORDER BY created_at_ms, name"
         ))?;
@@ -1626,7 +1772,7 @@ impl Store {
 
     /// Every channel, with the agents attached to it. No secret is in the rows.
     pub fn list_channels(&self) -> Result<Vec<Channel>, Error> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT id, kind, identity, config, credential_ref, created_at_ms, state FROM channels
              ORDER BY created_at_ms",
@@ -2173,7 +2319,7 @@ impl Store {
         let changed = {
             let mut conn = self.conn();
             // Read and merge under the same write transaction, including when
-            // serve and serve-admin use separate Store connections.
+            // callers use separate Store connections.
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let current = agent_by_id(&tx, id)?;
             let json = encode_env(&update(&current));
@@ -2442,6 +2588,53 @@ impl Store {
         Ok(messages)
     }
 
+    /// Latest matching messages, limited in SQLite and returned in sequence order.
+    pub fn inbox_query(
+        &self,
+        agent_id: &AgentId,
+        since: Option<i64>,
+        limit: Option<usize>,
+        unread_only: bool,
+    ) -> Result<Vec<Message>, Error> {
+        self.inbox_query_filtered(agent_id, since, limit, unread_only, None)
+    }
+
+    pub fn inbox_query_filtered(
+        &self,
+        agent_id: &AgentId,
+        since: Option<i64>,
+        limit: Option<usize>,
+        unread_only: bool,
+        sender: Option<&str>,
+    ) -> Result<Vec<Message>, Error> {
+        let conn = self.read_conn();
+        agent_by_id(&conn, agent_id)?;
+        let delivered = cursor(&conn, agent_id)?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {MESSAGE_COLS} FROM messages
+             WHERE agent_id = ?1 AND seq > ?2
+               AND (?3 IS NULL OR sender = ?3)
+             ORDER BY seq DESC LIMIT ?4"
+        ))?;
+        let lower = since
+            .unwrap_or(i64::MIN)
+            .max(if unread_only { delivered } else { i64::MIN });
+        let mut rows = stmt.query(params![
+            agent_id.as_str(),
+            lower,
+            sender,
+            limit
+                .map(|n| i64::try_from(n).unwrap_or(i64::MAX))
+                .unwrap_or(-1)
+        ])?;
+        let mut messages = Vec::new();
+        while let Some(row) = rows.next()? {
+            messages.push(message_from_row_with_cursor(row, delivered)?);
+        }
+        messages.reverse();
+        Ok(messages)
+    }
+
     /// Record an outbound message sent by `agent_id` to `destination` (a user,
     /// a channel chat/topic, a group, or another agent) so the agent's full
     /// two-way conversation can be read by authorized supervising agents.
@@ -2603,7 +2796,7 @@ impl Store {
         limit: Option<usize>,
         visible_agent_ids: Option<&[String]>,
     ) -> Result<Vec<ConversationTurn>, Error> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let agent = agent_by_id(&conn, agent_id)?;
         if let Some(visible) = visible_agent_ids
             && !visible.iter().any(|name| name == agent.id.as_str())
@@ -2656,6 +2849,7 @@ impl Store {
                 .filter(|r| r.starts_with("telegram:chat:") || r.starts_with("group:"))
                 .unwrap_or_else(|| self_addr.clone());
             turns.push(ConversationTurn {
+                seq: msg.seq,
                 id: msg.id.to_string(),
                 direction: "in".to_string(),
                 from,
@@ -2669,17 +2863,17 @@ impl Store {
         // 2. Outbound messages sent by this agent.
         let out_sql = match (sql_limit, since_ms.is_none()) {
             (Some(_), true) => {
-                "SELECT id, destination, reply_to, body, sent_at_ms
+                "SELECT id, destination, reply_to, body, sent_at_ms, COALESCE((SELECT seq FROM rag_chunks c WHERE c.chunk_id = outbound_messages.id), 0)
                  FROM outbound_messages WHERE agent_id = ?1 AND sent_at_ms > ?2
                  ORDER BY sent_at_ms DESC, id DESC LIMIT ?3"
             }
             (Some(_), false) => {
-                "SELECT id, destination, reply_to, body, sent_at_ms
+                "SELECT id, destination, reply_to, body, sent_at_ms, COALESCE((SELECT seq FROM rag_chunks c WHERE c.chunk_id = outbound_messages.id), 0)
                  FROM outbound_messages WHERE agent_id = ?1 AND sent_at_ms > ?2
                  ORDER BY sent_at_ms ASC, id ASC LIMIT ?3"
             }
             (None, _) => {
-                "SELECT id, destination, reply_to, body, sent_at_ms
+                "SELECT id, destination, reply_to, body, sent_at_ms, COALESCE((SELECT seq FROM rag_chunks c WHERE c.chunk_id = outbound_messages.id), 0)
                  FROM outbound_messages WHERE agent_id = ?1 AND sent_at_ms > ?2
                  ORDER BY sent_at_ms, id"
             }
@@ -2692,6 +2886,7 @@ impl Store {
         };
         while let Some(row) = out_rows.next()? {
             turns.push(ConversationTurn {
+                seq: row.get(5)?,
                 id: row.get(0)?,
                 direction: "out".to_string(),
                 from: self_addr.clone(),
@@ -2743,9 +2938,11 @@ impl Store {
         limit: Option<usize>,
         visible_agent_ids: Option<&[String]>,
     ) -> Result<Vec<ConversationTurn>, Error> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let since = since_ms.unwrap_or(0);
-        let lim = i64::try_from(limit.unwrap_or(50).max(1)).unwrap_or(50);
+        let lim = limit
+            .map(|n| i64::try_from(n).unwrap_or(i64::MAX))
+            .unwrap_or(i64::MAX / 8);
         let peer_filter = with_peer.map(str::trim).filter(|s| !s.is_empty());
         let fetch_limit = if peer_filter.is_some() {
             lim.saturating_mul(4)
@@ -2755,7 +2952,7 @@ impl Store {
         let visibility_sql = visible_agent_ids_sql("agent_id", visible_agent_ids, 3);
         let sql = if since_ms.is_some() {
             format!(
-                "SELECT chunk_id, direction, sender, destination, text, timestamp_ms
+                "SELECT chunk_id, direction, sender, destination, text, timestamp_ms, seq
                  FROM rag_chunks
                  WHERE timestamp_ms > ?1 {visibility_sql}
                  ORDER BY timestamp_ms ASC, chunk_id ASC
@@ -2763,7 +2960,7 @@ impl Store {
             )
         } else {
             format!(
-                "SELECT chunk_id, direction, sender, destination, text, timestamp_ms
+                "SELECT chunk_id, direction, sender, destination, text, timestamp_ms, seq
                  FROM rag_chunks
                  WHERE timestamp_ms > ?1 {visibility_sql}
                  ORDER BY timestamp_ms DESC, chunk_id DESC
@@ -2778,6 +2975,7 @@ impl Store {
         )))?;
         while let Some(row) = rows.next()? {
             turns.push(ConversationTurn {
+                seq: row.get(6)?,
                 id: row.get(0)?,
                 direction: row.get(1)?,
                 from: row.get(2)?,
@@ -2805,32 +3003,46 @@ impl Store {
         Ok(turns)
     }
 
-    /// Repair missing and legacy authorized derivative chunks, in bounded batches. Old
-    /// standalone tool summaries have no recoverable raw mailbox body: preserve
-    /// them exactly rather than inventing the clipped-away suffix. New tools use
-    /// the full-text policy. Redacted mailbox bodies are the authoritative input.
+    /// Upgrade only legacy authorized derivative chunks, in bounded transactions.
+    /// The format index makes current history a read-only no-op, independent of
+    /// mailbox size. Standalone tool summaries retain their available text;
+    /// redacted mailbox bodies remain the authoritative input when present.
     fn backfill_full_mailbox_history(&self, visible: Option<&[String]>) -> Result<(), Error> {
-        let mut conn = self.conn();
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        {
+            let conn = self.read_conn();
+            let visibility = visible_agent_ids_sql("c.agent_id", visible, 1);
+            let pending = conn
+                .query_row(
+                    &format!(
+                        "SELECT 1 FROM rag_chunks c INDEXED BY idx_rag_chunks_format
+                         WHERE c.text_format < 2 {visibility} LIMIT 1"
+                    ),
+                    rusqlite::params_from_iter(scoped_params(&[], visible)),
+                    |_| Ok(()),
+                )
+                .optional()?;
+            if pending.is_none() {
+                return Ok(());
+            }
+        }
         let mut after = String::new();
         loop {
-            let visibility = visible_agent_ids_sql("r.agent_id", visible, 2);
+            let mut conn = self.conn();
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let visibility = visible_agent_ids_sql("c.agent_id", visible, 2);
             let mut select = tx.prepare(&format!(
-                "WITH raw AS (
-                    SELECT id,agent_id,'in' AS direction,COALESCE(sender,'unknown') AS sender,
-                           reply_to AS destination,received_at_ms AS timestamp_ms,body,seq FROM messages
-                    UNION ALL
-                    SELECT o.id,o.agent_id,'out','agent:' || a.name,o.destination,o.sent_at_ms,o.body,
-                           COALESCE((SELECT max(seq) FROM messages WHERE agent_id=o.agent_id),0)
-                    FROM outbound_messages o JOIN agents a ON a.id=o.agent_id
-                 )
-                 SELECT r.id,r.agent_id,a.name,r.direction,r.sender,
-                        COALESCE(r.destination,'agent:' || a.name),r.timestamp_ms,
-                        r.body,c.kind,c.tool_name,COALESCE(c.seq,r.seq)
-                 FROM raw r JOIN agents a ON a.id=r.agent_id
-                 LEFT JOIN rag_chunks c ON c.agent_id=r.agent_id AND c.chunk_id=r.id
-                 WHERE r.id > ?1 AND (c.chunk_id IS NULL OR c.text_format<2){visibility}
-                 ORDER BY r.id LIMIT 32"
+                "SELECT c.chunk_id, c.agent_id, a.name, c.direction,
+                        COALESCE(m.sender, CASE WHEN o.id IS NOT NULL THEN 'agent:' || a.name ELSE c.sender END),
+                        COALESCE(m.reply_to, o.destination, c.destination, 'agent:' || a.name),
+                        COALESCE(m.received_at_ms, o.sent_at_ms, c.timestamp_ms),
+                        COALESCE(m.body, o.body, c.text), c.kind, c.tool_name,
+                        COALESCE(m.seq, c.seq)
+                 FROM rag_chunks c INDEXED BY idx_rag_chunks_format
+                 JOIN agents a ON a.id = c.agent_id
+                 LEFT JOIN messages m ON m.id = c.chunk_id AND m.agent_id = c.agent_id
+                 LEFT JOIN outbound_messages o ON o.id = c.chunk_id AND o.agent_id = c.agent_id
+                 WHERE c.text_format < 2 AND c.chunk_id > ?1 {visibility}
+                 ORDER BY c.chunk_id LIMIT 64"
             ))?;
             struct Chunk {
                 id: String,
@@ -2865,13 +3077,17 @@ impl Store {
                     },
                 )?
                 .collect::<Result<Vec<_>, _>>()?;
+            drop(select);
             if chunks.is_empty() {
                 break;
             }
             for chunk in chunks {
                 after = chunk.id.clone();
                 if clean_rag_text(&chunk.text).chars().count() < 2 {
-                    tx.execute("DELETE FROM rag_chunks_fts WHERE chunk_id=?1", [&chunk.id])?;
+                    tx.execute(
+                        "DELETE FROM rag_chunks_fts WHERE chunk_id MATCH ?1",
+                        [format!("\"{}\"", chunk.id.replace('"', "\"\""))],
+                    )?;
                     tx.execute(
                         "DELETE FROM rag_chunks WHERE chunk_id=?1 AND agent_id=?2",
                         params![chunk.id, chunk.owner],
@@ -2892,13 +3108,9 @@ impl Store {
                     chunk.tool.as_deref(),
                     chunk.seq,
                 )?;
-                tx.execute(
-                    "UPDATE rag_chunks SET text_format=2 WHERE chunk_id=?1 AND agent_id=?2",
-                    params![chunk.id, chunk.owner],
-                )?;
             }
+            tx.commit()?;
         }
-        tx.commit()?;
         Ok(())
     }
 
@@ -2913,7 +3125,11 @@ impl Store {
     pub fn search_history(&self, req: &HistorySearchQuery) -> Result<Vec<ConversationTurn>, Error> {
         self.backfill_full_mailbox_history(req.visible_agent_ids.as_deref())?;
         let conn = self.read_conn();
-        let limit = req.limit.clamp(1, 200);
+        let limit = if req.limit == 0 {
+            (i64::MAX / 16) as usize
+        } else {
+            req.limit
+        };
         let radius = req.radius.min(10);
         let since = req.since_ms.unwrap_or(0);
         let until = req.until_ms.unwrap_or(i64::MAX);
@@ -3110,6 +3326,7 @@ impl Store {
                     let seq: i64 = row.get(9)?;
                     let bm25_raw: f64 = row.get(10).unwrap_or(0.0);
                     let turn = ConversationTurn {
+                        seq,
                         id: cid.clone(),
                         direction: row.get(1)?,
                         from: row.get(2)?,
@@ -3200,6 +3417,7 @@ impl Store {
                         let tool_name: String = row.get(8)?;
                         let seq: i64 = row.get(9)?;
                         let turn = ConversationTurn {
+                            seq,
                             id: cid.clone(),
                             direction: row.get(1)?,
                             from: row.get(2)?,
@@ -3262,6 +3480,7 @@ impl Store {
                 let tool_name: String = row.get(8)?;
                 let seq: i64 = row.get(9)?;
                 let turn = ConversationTurn {
+                    seq,
                     id: cid.clone(),
                     direction: row.get(1)?,
                     from: row.get(2)?,
@@ -3363,6 +3582,7 @@ impl Store {
                     }
                     let seq: i64 = r.get(7)?;
                     let turn = ConversationTurn {
+                        seq,
                         id: r.get(0)?,
                         direction: r.get(1)?,
                         from: r.get(2)?,
@@ -3418,6 +3638,7 @@ impl Store {
                     }
                     let seq: i64 = r.get(7)?;
                     let turn = ConversationTurn {
+                        seq,
                         id: r.get(0)?,
                         direction: r.get(1)?,
                         from: r.get(2)?,
@@ -3794,7 +4015,7 @@ impl Store {
 
     /// The one delivery cursor: the last sequence the harness took.
     pub fn delivered_cursor(&self, agent_id: &AgentId) -> Result<i64, Error> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         agent_by_id(&conn, agent_id)?;
         cursor(&conn, agent_id)
     }
@@ -3911,7 +4132,7 @@ impl Store {
     /// internal virtual group (`group_agents`) or attached to the same Telegram chat.
     pub fn share_any_group_or_chat(&self, agent_a: &AgentId, agent_b: &AgentId) -> bool {
         let shares_group = {
-            let conn = self.conn();
+            let conn = self.read_conn();
             conn.query_row(
                 "SELECT EXISTS(
                      SELECT 1 FROM group_agents g1
@@ -3953,7 +4174,7 @@ impl Store {
     /// message to `to_agent`, allowing `to_agent` to reply back even if `from_agent` is `public: false`.
     pub fn has_messaged(&self, from_agent: &Agent, to_agent: &Agent) -> bool {
         let dest_name = format!("agent:{}", to_agent.name);
-        let conn = self.conn();
+        let conn = self.read_conn();
         conn.query_row(
             "SELECT EXISTS(
                  SELECT 1 FROM outbound_messages
@@ -3994,7 +4215,7 @@ impl Store {
 
     /// Return `true` when the agent currently has an open turn (`opened_seq > completed_seq`).
     pub fn has_open_turn(&self, agent_id: &AgentId) -> Result<bool, Error> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let row: Option<(i64, i64)> = conn
             .query_row(
                 "SELECT opened_seq, completed_seq FROM turn_recovery WHERE agent_id = ?1",
@@ -4008,7 +4229,7 @@ impl Store {
     /// Return the agent's open turn (`opened_seq > completed_seq`) when it is
     /// eligible for automatic mid-turn recovery.
     pub fn open_turn(&self, agent_id: &AgentId) -> Result<Option<OpenTurn>, Error> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         agent_by_id(&conn, agent_id)?;
         let row: Option<(i64, i64, i64, i64)> = conn
             .query_row(
@@ -4176,7 +4397,7 @@ impl Store {
     }
 
     fn age_at(&self, agent_id: &AgentId, seq: i64, now_ms: i64) -> Result<Option<i64>, Error> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT received_at_ms, context FROM messages WHERE agent_id = ?1 AND seq >= ?2 ORDER BY seq ASC",
         )?;
@@ -4275,7 +4496,7 @@ impl Store {
         agent_id: Option<&AgentId>,
         active_only: bool,
     ) -> Result<Vec<AgentSchedule>, Error> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let mut out = Vec::new();
         match (agent_id, active_only) {
             (Some(aid), true) => {
@@ -5259,18 +5480,19 @@ fn claim_schedule_tick_on(
 }
 
 fn ensure_lexical_fts_backfilled(conn: &mut Connection) -> Result<(), Error> {
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    // A nonempty index can still be partial, duplicated or stale. Check the
-    // entire derivative membership under the same lock as any rebuild.
-    let complete: bool = tx.query_row(
+    let fts_complete_sql =
         "SELECT (SELECT count(*) FROM rag_chunks) = (SELECT count(*) FROM rag_chunks_fts)
          AND NOT EXISTS (
             SELECT chunk_id, agent_name, sender, destination, kind, tool_name, text FROM rag_chunks
             EXCEPT
-            SELECT chunk_id, agent_name, sender, destination, kind, tool_name, text FROM rag_chunks_fts)",
-        [],
-        |r| r.get(0),
-    )?;
+            SELECT chunk_id, agent_name, sender, destination, kind, tool_name, text FROM rag_chunks_fts)";
+    if conn.query_row(fts_complete_sql, [], |r| r.get::<_, bool>(0))? {
+        return Ok(());
+    }
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    // A nonempty index can still be partial, duplicated or stale. Check the
+    // entire derivative membership under the same lock as any rebuild.
+    let complete: bool = tx.query_row(fts_complete_sql, [], |r| r.get(0))?;
     if !complete {
         tx.execute("DELETE FROM rag_chunks_fts", [])?;
         let mut sel = tx.prepare(
@@ -6818,6 +7040,228 @@ mod tests {
     }
 
     #[test]
+    fn legacy_harness_rows_migrate_idempotently_without_changing_agent_state() {
+        let (dir, store) = setup();
+        let parent = agent(&store, "parent");
+        let mut expected = Vec::new();
+        for (index, legacy) in ["sylphx", "sylphx-agent", "sylphx_agent", "sylphx/default"]
+            .into_iter()
+            .enumerate()
+        {
+            let mut new = NewAgent::new(format!("legacy-{index}"), "spiron");
+            new.parent_id = Some(parent.id.clone());
+            new.model = Some("sylphx/openai/gpt-6.1-sol#medium".into());
+            new.workdir = Some(format!("/work/legacy-{index}"));
+            new.instructions = Some("preserve instructions".into());
+            let created = store.create_agent(new).unwrap();
+            store.set_agent_state(&created.id, "paused").unwrap();
+            store
+                .receive(&created.id, Incoming::new("delivered"))
+                .unwrap();
+            store.note_delivered(&created.id, 1).unwrap();
+            store
+                .receive(&created.id, Incoming::new("pending"))
+                .unwrap();
+            let schedule = store
+                .create_schedule(NewSchedule {
+                    agent_id: created.id.clone(),
+                    kind: "at".into(),
+                    spec: "2099-01-01T00:00:00Z".into(),
+                    prompt: "preserve schedule".into(),
+                    interval_ms: None,
+                    next_fire_at_ms: Some(4_070_908_800_000),
+                    watch_baseline: None,
+                })
+                .unwrap();
+            let before = store.agent(&created.id).unwrap();
+            // Simulate an existing database, bypassing canonical writes.
+            store
+                .conn()
+                .execute(
+                    "UPDATE agents SET harness = ?1 WHERE id = ?2",
+                    params![legacy, created.id.as_str()],
+                )
+                .unwrap();
+            expected.push((before, schedule));
+        }
+        let mut third_party = NewAgent::new("gateway-codex", "codex");
+        third_party.model = Some("sylphx/openai/gpt-6.1-sol#xhigh".into());
+        let third_party = store.create_agent(third_party).unwrap();
+        drop(store);
+
+        for _ in 0..2 {
+            let reopened = Store::open(dir.path().join("state.db")).unwrap();
+            assert_eq!(reopened.agent(&parent.id).unwrap(), parent);
+            assert_eq!(reopened.agent(&third_party.id).unwrap(), third_party);
+            for (before, schedule) in &expected {
+                assert_eq!(&reopened.agent(&before.id).unwrap(), before);
+                assert_eq!(reopened.delivered_cursor(&before.id).unwrap(), 1);
+                assert_eq!(
+                    reopened.next_undelivered(&before.id).unwrap().unwrap().text,
+                    "pending"
+                );
+                assert_eq!(
+                    reopened.get_schedule(&schedule.id).unwrap().as_ref(),
+                    Some(schedule)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_harness_writes_are_canonical_and_gateway_models_are_unchanged() {
+        let (_dir, store) = setup();
+        for (index, legacy) in ["sylphx", "sylphx-agent", "sylphx_agent", "sylphx/default"]
+            .into_iter()
+            .enumerate()
+        {
+            let mut new = NewAgent::new(format!("alias-{index}"), legacy);
+            new.model = Some("sylphx/openai/gpt-6.1-sol#medium".into());
+            let created = store.create_agent(new).unwrap();
+            assert_eq!(created.harness, "spiron");
+            assert_eq!(
+                created.model.as_deref(),
+                Some("sylphx/openai/gpt-6.1-sol#medium")
+            );
+            store.set_agent_harness(&created.id, "codex").unwrap();
+            let switched = store.set_agent_harness(&created.id, legacy).unwrap();
+            assert_eq!(switched, created);
+        }
+    }
+
+    #[test]
+    fn inbox_query_limits_unread_and_sender_before_materializing() {
+        let (_dir, store) = setup();
+        let own = agent(&store, "limited");
+        for i in 1..=12 {
+            let mut incoming = Incoming::new(format!("message {i}\nsecond line"));
+            incoming.sender = Some(
+                if i % 2 == 0 {
+                    "agent:even"
+                } else {
+                    "agent:odd"
+                }
+                .into(),
+            );
+            store.receive(&own.id, incoming).unwrap();
+        }
+        for seq in 1..=8 {
+            store.note_delivered(&own.id, seq).unwrap();
+        }
+        let seqs = |rows: Vec<Message>| rows.into_iter().map(|m| m.seq).collect::<Vec<_>>();
+        assert_eq!(
+            seqs(store.inbox_query(&own.id, None, Some(3), false).unwrap()),
+            vec![10, 11, 12]
+        );
+        assert_eq!(
+            seqs(store.inbox_query(&own.id, None, None, true).unwrap()),
+            vec![9, 10, 11, 12]
+        );
+        assert_eq!(
+            seqs(
+                store
+                    .inbox_query(&own.id, Some(10), Some(20), true)
+                    .unwrap()
+            ),
+            vec![11, 12]
+        );
+        assert_eq!(
+            seqs(
+                store
+                    .inbox_query_filtered(&own.id, None, Some(2), true, Some("agent:odd"))
+                    .unwrap()
+            ),
+            vec![9, 11]
+        );
+        assert!(
+            store
+                .inbox_query(&own.id, None, Some(0), false)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store.inbox_query(&own.id, None, None, false).unwrap().len(),
+            12
+        );
+        let conn = store.conn();
+        let plan: String = conn.query_row("EXPLAIN QUERY PLAN SELECT seq FROM messages WHERE agent_id = ?1 AND seq > 8 ORDER BY seq DESC LIMIT 3", [own.id.as_str()], |r| r.get(3)).unwrap();
+        assert!(
+            plan.contains("SEARCH") && plan.contains("agent_id"),
+            "{plan}"
+        );
+    }
+
+    #[test]
+    fn batch_metadata_matches_single_agent_queries() {
+        let (_dir, store) = setup();
+        let own = agent(&store, "before-rename");
+        let own = store.rename_agent(&own.id, "after-rename").unwrap();
+        for i in 0..3 {
+            store
+                .receive(&own.id, Incoming::new(format!("batch {i}")))
+                .unwrap();
+        }
+        let metadata = store.agent_query_metadata().unwrap();
+        assert_eq!(
+            metadata.aliases.get(own.id.as_str()).unwrap(),
+            &store.agent_aliases(&own.id).unwrap()
+        );
+        assert_eq!(
+            metadata
+                .oldest_undelivered
+                .get(own.id.as_str())
+                .map(|t| 123456789_i64.saturating_sub(*t).max(0)),
+            store
+                .lag(&own.id, 123456789)
+                .unwrap()
+                .oldest_undelivered_age_ms
+        );
+        assert_eq!(
+            metadata.open_turns.contains_key(own.id.as_str()),
+            store.has_open_turn(&own.id).unwrap()
+        );
+        // Batched lag must skip passive reactions just like the single-agent path.
+        store
+            .conn()
+            .execute(
+                "UPDATE messages SET context = ?1 WHERE agent_id = ?2 AND seq = 1",
+                params![r#"{"event":"reaction_passive"}"#, own.id.as_str()],
+            )
+            .unwrap();
+        let now = crate::now_ms();
+        let metadata = store.agent_query_metadata().unwrap();
+        assert_eq!(
+            metadata
+                .oldest_undelivered
+                .get(own.id.as_str())
+                .map(|t| now.saturating_sub(*t).max(0)),
+            store.lag(&own.id, now).unwrap().oldest_undelivered_age_ms
+        );
+        for seq in 1..=3 {
+            store.note_delivered(&own.id, seq).unwrap();
+        }
+        let metadata = store.agent_query_metadata().unwrap();
+        assert!(!metadata.oldest_undelivered.contains_key(own.id.as_str()));
+        assert!(metadata.open_turns.contains_key(own.id.as_str()));
+        store.note_turn_completed(&own.id).unwrap();
+        assert!(
+            !store
+                .agent_query_metadata()
+                .unwrap()
+                .open_turns
+                .contains_key(own.id.as_str())
+        );
+        store.set_agent_state(&own.id, "archived").unwrap();
+        assert!(
+            !store
+                .agent_query_metadata()
+                .unwrap()
+                .oldest_undelivered
+                .contains_key(own.id.as_str())
+        );
+    }
+
+    #[test]
     fn lexical_dedup_keeps_distinct_tails_but_collapses_identical_broadcasts() {
         let (_dir, store) = setup();
         let own = agent(&store, "dedup-own");
@@ -7808,6 +8252,125 @@ mod tests {
             .unwrap();
         assert_eq!(tools.len(), 1, "{tools:?}");
         assert!(tools[0].text.ends_with("own browser"));
+    }
+
+    #[test]
+    fn read_endpoints_and_current_history_do_not_wait_for_writer() {
+        let (dir, store) = setup();
+        let own = agent(&store, "reader");
+        store.hold_capability_key(&"a".repeat(64)).unwrap();
+        let token = store.issue_capability(&own.id).unwrap();
+        let hidden = agent(&store, "legacy-hidden");
+        store
+            .record_tool_event(&hidden.id, "browser", "old tool")
+            .unwrap();
+        store
+            .conn()
+            .execute(
+                "UPDATE rag_chunks SET text_format=1 WHERE agent_id=?1",
+                [hidden.id.as_str()],
+            )
+            .unwrap();
+        std::thread::scope(|scope| {
+            let mut writer = store.conn();
+            let tx = writer
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            tx.execute(
+                "UPDATE agents SET description='uncommitted' WHERE id=?1",
+                [own.id.as_str()],
+            )
+            .unwrap();
+            let (send, receive) = std::sync::mpsc::channel();
+            let store = &store;
+            let id = &own.id;
+            let db = dir.path().join("state.db");
+            scope.spawn(move || {
+                let result = (|| -> Result<(), Error> {
+                    assert_eq!(store.agent(id)?.description, None);
+                    store.agent_by_name("reader")?;
+                    assert_eq!(store.authenticate_capability(&token)?, *id);
+                    store.list_agents()?;
+                    store.children_of(id)?;
+                    store.list_channels()?;
+                    store.share_any_group_or_chat(id, id);
+                    store.has_messaged(&store.agent(id)?, &store.agent(id)?);
+                    store.agent_query_metadata()?;
+                    store.agent_aliases(id)?;
+                    store.list_schedules(Some(id), true)?;
+                    store.inbox_query_filtered(id, None, Some(5), false, None)?;
+                    store.conversation_scoped(id, None, None, Some(5), None)?;
+                    store.conversation_all_scoped(None, None, Some(5), None)?;
+                    store.lag(id, now_ms())?;
+                    store.has_open_turn(id)?;
+                    store.open_turn(id)?;
+                    // No legacy chunks at all, then only invisible legacy chunks:
+                    // neither case may acquire the writer mutex or transaction.
+                    store.backfill_full_mailbox_history(Some(&[]))?;
+                    store.search_history(&HistorySearchQuery {
+                        visible_agent_ids: Some(vec![id.to_string()]),
+                        ..Default::default()
+                    })?;
+                    Store::open(db)?.list_agents()?;
+                    Ok(())
+                })();
+                send.send(result).unwrap();
+            });
+            let result = receive.recv_timeout(Duration::from_secs(2));
+            // Release before asserting so a regression cannot hang the test join.
+            drop(tx);
+            drop(writer);
+            result
+                .expect("read endpoint blocked on the writer")
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn full_mailbox_history_upgrade_and_redaction() {
+        let (_dir, store) = setup();
+        let own = agent(&store, "batch-owner");
+        // Cross multiple 64-row batches, retaining standalone tools as well.
+        for n in 0..130 {
+            store
+                .record_outbound(&own.id, "agent:peer", None, &format!("full body {n}"))
+                .unwrap();
+        }
+        store
+            .record_tool_event(&own.id, "browser", "legacy tool summary")
+            .unwrap();
+        {
+            let conn = store.conn();
+            conn.execute(
+                "UPDATE rag_chunks SET text='clipped',text_format=1 WHERE kind='message'",
+                [],
+            )
+            .unwrap();
+            conn.execute("UPDATE rag_chunks SET text_format=1 WHERE kind='tool'", [])
+                .unwrap();
+            // A redacted/short authoritative body removes its stale derivative.
+            conn.execute("UPDATE outbound_messages SET body='x' WHERE id=(SELECT min(id) FROM outbound_messages)", []).unwrap();
+        }
+        store.backfill_full_mailbox_history(None).unwrap();
+        let conn = store.read_conn();
+        let (old, messages, tools): (i64, i64, i64) = conn.query_row(
+            "SELECT count(*) FILTER (WHERE text_format<2), count(*) FILTER (WHERE kind='message'), count(*) FILTER (WHERE kind='tool') FROM rag_chunks",
+            [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        ).unwrap();
+        assert_eq!((old, messages, tools), (0, 129, 1));
+        let stale: i64 = conn.query_row("SELECT count(*) FROM rag_chunks_fts WHERE text='clipped' OR chunk_id IN (SELECT id FROM outbound_messages WHERE body='x')", [], |r| r.get(0)).unwrap();
+        assert_eq!(stale, 0);
+        let mut stmt = conn.prepare("EXPLAIN QUERY PLAN SELECT 1 FROM rag_chunks c INDEXED BY idx_rag_chunks_format WHERE c.text_format<2 LIMIT 1").unwrap();
+        let plan = stmt
+            .query_map([], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .join("\n");
+        assert!(
+            plan.contains("COVERING INDEX idx_rag_chunks_format"),
+            "{plan}"
+        );
     }
 
     #[test]
@@ -8929,7 +9492,7 @@ mod tests {
         let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let agent = store
-            .create_agent(NewAgent::new("sleep-neutral", "sylphx"))
+            .create_agent(NewAgent::new("sleep-neutral", "spiron"))
             .unwrap();
         let mut msg = Incoming::new("Directive message body that exceeds thirty characters easily");
         msg.sender = Some("operator".into());
@@ -8963,7 +9526,7 @@ mod tests {
         let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let agent = store
-            .create_agent(NewAgent::new("sleep-noise", "sylphx"))
+            .create_agent(NewAgent::new("sleep-noise", "spiron"))
             .unwrap();
         let root = dir.path().join("agents").join(agent.id.as_str());
         std::fs::create_dir_all(root.join("memory")).unwrap();
@@ -9022,7 +9585,7 @@ mod tests {
         let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let agent = store
-            .create_agent(NewAgent::new("sleep-upsert", "sylphx"))
+            .create_agent(NewAgent::new("sleep-upsert", "spiron"))
             .unwrap();
         let root = dir.path().join("agents").join(agent.id.as_str());
         crate::learned_memory::upsert_memory_topic(
@@ -9096,7 +9659,7 @@ mod tests {
         let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let agent = store
-            .create_agent(NewAgent::new("sleep-defrag", "sylphx"))
+            .create_agent(NewAgent::new("sleep-defrag", "spiron"))
             .unwrap();
         let root = dir.path().join("agents").join(agent.id.as_str());
         crate::learned_memory::upsert_memory_topic(
@@ -9183,7 +9746,7 @@ mod tests {
         let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let agent = store
-            .create_agent(NewAgent::new("sleep-cooldown", "sylphx"))
+            .create_agent(NewAgent::new("sleep-cooldown", "spiron"))
             .unwrap();
         let root = dir.path().join("agents").join(agent.id.as_str());
         std::fs::create_dir_all(root.join("memory")).unwrap();

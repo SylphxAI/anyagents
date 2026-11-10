@@ -16,7 +16,7 @@ temporary data directories rather than your existing AnyAgents state.
 
 | Layer | Evidence |
 | --- | --- |
-| Sylphx request projection | `cargo test -p anyagents-harness-sylphx --locked` checks the native Responses request builder, pair-aware stride boundaries, context edits within tool batches, legacy transcript entries and response-envelope diagnostics without a model call. It verifies projected input and unchanged raw transcript bytes; it does not certify a deployed binary or recover a live agent. |
+| External Spiron protocol | `cargo test -p anyagents spiron_external --locked` launches a synthetic `ANYAGENTS_SPIRON_BIN` executable for `spiron` and the legacy selectors `sylphx`, `sylphx-agent`, `sylphx_agent` and `sylphx/default`. It checks canonical `spiron` agent records, MCP/workspace/skills/model/identity/state paths, correlated acceptance before mailbox release, busy steering, unrelated results, cancellation and wake/resume, usage and unchanged stored identity/mail/history/schedules/legacy files. Real Spiron authentication, model calls and legacy-state import are upstream integration requirements, not certified by this probe. |
 | Native protocols | Each of Claude Code, Codex, OpenCode, agy, Muse and omp has an adapter `protocol` suite using scripted vendor processes. These exercise the native launch and wire contracts, turn completion, retries, and the adapter's steering or buffering behavior. |
 | Shared transport | `anyagents-harness-stream` tests the shared stream/RPC machinery used by adapters, including dsh and grok. This is not a dedicated live dsh/grok compatibility check. |
 | Server round trips | `server_harnesses` creates agents for all eight catalog harnesses and checks two successive correlated mailbox replies per harness through the real server, supervisor and MCP tool server. It substitutes a common contract double: passing does **not** prove native vendor protocol compatibility. |
@@ -47,6 +47,16 @@ The strict product launch guard remains enabled; this startup check does not
 claim a real cross-UID launch.
 
 ## Seat Git configuration
+
+The required Linux managed-UID lane also exercises runtime-directory handoff.
+It starts with daemon-owned `0700` cache/tmp directories and retained files;
+the admitted seat must read and update those files and create children inside
+nested cache directories. Foreign-owned descendants and peer symlink targets
+retain their original permissions. Capability files are normalized to `0640`
+for both daemon and seat ownership. Direct admission accepts `0600`, `0640` and
+`0660` only for a readable regular non-symlink file in the exact admitted seat
+group; outside-readable modes and a mismatched group refuse before execution.
+The existing `verify-host-memory-seat.py` lane requires all of these receipts.
 
 Seat Git configuration runs file-only edits in daemon-owned staging, with
 `GIT_DIR=/dev/null` and inherited Git repository/parameter routing removed.
@@ -85,17 +95,39 @@ cargo test -p anyagents --test cli archive_reap --locked
 ```
 
 The unit cases verify mail progress while cleanup is blocked in a git probe,
-nonblocking descendant reconciliation, durable completion across restart,
+durable completion across restart,
 wake/rearchive invalidation, failed cleanup retry, and preservation of shared,
 external and unpushed work. Worktree admission also retains managed-config
 provenance after the last reader retires and its private gitdir is removed,
 without restoring retired access or accepting a replacement config link. The CLI cases execute the production binary with a
 cleared environment and synthetic host home. They verify archive cleanup does
-not recreate seat skill directories and real `serve-admin` maintenance reaps a
+not recreate seat skill directories and real `serve` maintenance reaps a
 legacy archive only once across restart. Unit-test isolation disables host-home
 and maintenance paths, so unit tests alone do not cover that production branch.
 These disposable fixtures do not certify adoption by an existing running daemon
 or attribute a historical mailbox delay.
+
+## Immediate stream receipts
+
+The acknowledged-result fixtures wait for a ready frame processed by the real
+stdout reader before arming the unchanged three-second post-write receipt bound.
+Interpreter startup and imports have a separate setup deadline and failure
+diagnostic. A deliberately slow startup exceeds the receipt bound but still
+reaches the ordering assertion; an exited peer cannot satisfy readiness. These
+checks retain busy-steer custody, typed rejection and no-replay assertions.
+
+## Shared harness configuration
+
+An admitted seat starts its program with `umask 0007`, after the UID/GID boundary
+and without changing the daemon's process-wide mask. Config preparation grants
+the admitted group read/write/search and setgid directories before any daemon
+settings read, including existing vendor-created `0600` files. Umask cannot add
+group rights to explicit `0600` replacements, so every launch repeats that repair.
+The descriptor-bound walk refuses linked regular files and never follows symlinks;
+capabilities remain `0640`, while unrelated host history and peer trees remain
+private. The Linux managed-UID CI proof runs the actual AGY adapter twice with
+restrictive settings replacements, verifies daemon writeback and retains peer
+denial controls. Ordinary unit tests do not claim that privileged cross-UID proof.
 
 ## Sylphx transcript projection contract
 
@@ -425,7 +457,7 @@ ancestor makes its ordinary `RUNNER_TEMP` inaccessible to the distinct UID.
 The receipt remains in `RUNNER_TEMP`, read only by the invoking CI process.
 No account, ACL, real agent directory or daemon is changed.
 
-An already-started native Sylphx harness refreshes the embedding host's registered
+The legacy first-party harness refreshed the embedding host's registered
 peer principal inventory before every local workspace command. A child or sibling
 created mid-turn in the same seat is admitted by its resolved UID, GID and exact
 agent root, not directory group or mode. The unit regression creates a `02770`

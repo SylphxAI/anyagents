@@ -2,6 +2,7 @@
 //! not authority to refresh memory. Call lifecycle operations under the host's
 //! per-agent lifecycle lock; no marker/mtime/compaction heuristic starts a session.
 use crate::learned_memory::{MemoryPin, atomic_write, pin_session_from_source, read_pin, sha256};
+use anyagents_harness::normalize_harness_name;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -57,7 +58,42 @@ pub struct HostSession {
 
 fn read(root: &Path) -> io::Result<Registry> {
     match fs::read(root.join("sessions/registry.json")) {
-        Ok(bytes) => serde_json::from_slice(&bytes).map_err(io::Error::other),
+        Ok(bytes) => {
+            let mut registry: Registry =
+                serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+            // Renaming a selector is not a harness switch: retain the generation,
+            // pinned memory and vendor aliases when an agent row is migrated.
+            for session in registry
+                .active
+                .iter_mut()
+                .chain(registry.aliases.values_mut())
+                .chain(
+                    registry
+                        .pending_reset
+                        .iter_mut()
+                        .map(|pending| &mut pending.session),
+                )
+            {
+                session.harness = normalize_harness_name(&session.harness).to_string();
+            }
+            let mut aliases: BTreeMap<String, Session> = BTreeMap::new();
+            for (key, session) in registry.aliases {
+                let (harness, vendor_id): (String, String) =
+                    serde_json::from_str(&key).map_err(io::Error::other)?;
+                let key = alias(&harness, &vendor_id)?;
+                if aliases
+                    .get(&key)
+                    .is_some_and(|old| old.generation != session.generation)
+                {
+                    return Err(io::Error::other(
+                        "conflicting legacy vendor session aliases",
+                    ));
+                }
+                aliases.insert(key, session);
+            }
+            registry.aliases = aliases;
+            Ok(registry)
+        }
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Registry::default()),
         Err(e) => Err(e),
     }
@@ -79,7 +115,7 @@ fn alias(harness: &str, vendor_id: &str) -> io::Result<String> {
     if harness.is_empty() || vendor_id.trim().is_empty() {
         return Err(io::Error::other("empty vendor session identity"));
     }
-    serde_json::to_string(&(harness, vendor_id)).map_err(io::Error::other)
+    serde_json::to_string(&(normalize_harness_name(harness), vendor_id)).map_err(io::Error::other)
 }
 
 /// Read-only renderer path. No session allocation, MEMORY.md read, or repin.
@@ -180,6 +216,41 @@ pub fn recover_pending(root: &Path) -> io::Result<()> {
     read_ready(root).map(|_| ())
 }
 
+/// Prepare a configured harness before rendering or dispatch. A harness change
+/// rotates the active generation and retires the destination's native resume
+/// pointer, preserving all old pins, aliases and transcripts. First dispatch
+/// still owns allocation when there is no active session.
+pub fn prepare_harness_with_source(
+    root: &Path,
+    harness: &str,
+    marker: Option<&str>,
+    source: Option<&Path>,
+) -> io::Result<Option<HostSession>> {
+    let harness = normalize_harness_name(harness);
+    if harness.trim().is_empty() || marker.is_some_and(|name| !single_filename(name)) {
+        return Err(io::Error::other("invalid harness session identity"));
+    }
+    let _lock = lock(root)?;
+    let mut registry = read_ready(root)?;
+    let Some(old) = registry.active.as_ref() else {
+        return Ok(None);
+    };
+    let previous = materialize(root, old)?;
+    if old.harness == harness {
+        return Ok(Some(previous));
+    }
+    // This marker belongs to the destination harness's historical session,
+    // never to the outgoing generation. Keep its existing alias unchanged.
+    let retired_marker = marker
+        .map(|name| {
+            marker_bytes(&root.join("config").join(name))
+                .map(|bytes| bytes.map(|bytes| (name.to_owned(), sha256(&bytes))))
+        })
+        .transpose()?
+        .flatten();
+    start_reset(root, &mut registry, harness, retired_marker, source).map(Some)
+}
+
 /// Explicit reset of a quiescent agent. Preserve old pins, vendor aliases and
 /// raw/vendor state; retire only the small native resume pointer. The durable
 /// intent makes either side of the pointer rename recoverable after a crash.
@@ -195,6 +266,7 @@ pub fn reset_session_with_source(
     marker: Option<&str>,
     source: Option<&Path>,
 ) -> io::Result<HostSession> {
+    let harness = normalize_harness_name(harness);
     if harness.trim().is_empty() {
         return Err(io::Error::other("empty session harness"));
     }
@@ -236,17 +308,25 @@ pub fn reset_session_with_source(
             registry.aliases.insert(key, old.clone());
         }
     }
+    let retired_marker = old_marker.map(|(name, bytes)| (name.to_owned(), sha256(&bytes)));
+    start_reset(root, &mut registry, harness, retired_marker, source)
+}
+
+fn start_reset(
+    root: &Path,
+    registry: &mut Registry,
+    harness: &str,
+    marker: Option<(String, String)>,
+    source: Option<&Path>,
+) -> io::Result<HostSession> {
     let session = Session {
         generation: uuid::Uuid::now_v7().to_string(),
         harness: harness.to_owned(),
     };
     pin_session_from_source(root, &session.generation, source)?;
-    registry.pending_reset = Some(PendingReset {
-        session,
-        marker: old_marker.map(|(name, bytes)| (name.to_owned(), sha256(&bytes))),
-    });
-    write(root, &registry)?;
-    complete_reset(root, &mut registry)?;
+    registry.pending_reset = Some(PendingReset { session, marker });
+    write(root, registry)?;
+    complete_reset(root, registry)?;
     materialize(root, registry.active.as_ref().unwrap())
 }
 
@@ -262,6 +342,7 @@ pub fn ensure_active_with_source(
     harness: &str,
     source: Option<&Path>,
 ) -> io::Result<HostSession> {
+    let harness = normalize_harness_name(harness);
     let _lock = lock(root)?;
     let registry = read_ready(root)?;
     match registry.active {
@@ -294,6 +375,7 @@ fn new_session_unlocked(
     harness: &str,
     source: Option<&Path>,
 ) -> io::Result<HostSession> {
+    let harness = normalize_harness_name(harness);
     if harness.trim().is_empty() {
         return Err(io::Error::other("empty session harness"));
     }
@@ -318,6 +400,7 @@ fn new_session_unlocked(
 /// Bind a late vendor marker to the ALREADY pinned generation. A marker change
 /// is only a new alias and does not start or refresh the host session.
 pub fn bind_vendor(root: &Path, harness: &str, vendor_id: &str) -> io::Result<HostSession> {
+    let harness = normalize_harness_name(harness);
     let _lock = lock(root)?;
     let mut registry = read_ready(root)?;
     let session = registry
@@ -346,6 +429,27 @@ pub fn bind_vendor(root: &Path, harness: &str, vendor_id: &str) -> io::Result<Ho
     Ok(result)
 }
 
+/// Read an already-bound vendor alias without changing the active generation.
+/// Legacy-pointer adoption uses this positive evidence to avoid reviving a
+/// historical session after an explicit reset.
+pub fn bound_vendor(
+    root: &Path,
+    harness: &str,
+    vendor_id: &str,
+) -> io::Result<Option<HostSession>> {
+    let registry = read(root)?;
+    if registry.pending_reset.is_some() {
+        return Err(io::Error::other(
+            "host session reset pending; retry lifecycle",
+        ));
+    }
+    registry
+        .aliases
+        .get(&alias(harness, vendor_id)?)
+        .map(|session| materialize(root, session))
+        .transpose()
+}
+
 /// An explicit resume reuses the original pin, including after a harness switch.
 pub fn resume_vendor(root: &Path, harness: &str, vendor_id: &str) -> io::Result<HostSession> {
     let _lock = lock(root)?;
@@ -368,6 +472,134 @@ mod tests {
     fn memory(root: &Path, text: &str) {
         fs::create_dir_all(root.join("memory")).unwrap();
         fs::write(root.join("memory/MEMORY.md"), text).unwrap();
+    }
+
+    #[test]
+    fn legacy_registry_names_preserve_generation_memory_and_vendor_aliases() {
+        for legacy in ["sylphx", "sylphx-agent", "sylphx_agent", "sylphx/default"] {
+            let dir = crate::test_tempdir();
+            let root = dir.path();
+            memory(root, "original pin");
+            let original = ensure_active(root, "spiron").unwrap();
+            bind_vendor(root, "spiron", "legacy-vendor").unwrap();
+            let mut registry = read(root).unwrap();
+            registry.active.as_mut().unwrap().harness = legacy.into();
+            let mut session = registry
+                .aliases
+                .remove(&alias("spiron", "legacy-vendor").unwrap())
+                .unwrap();
+            session.harness = legacy.into();
+            registry.aliases.insert(
+                serde_json::to_string(&(legacy, "legacy-vendor")).unwrap(),
+                session,
+            );
+            write(root, &registry).unwrap();
+            let bytes = fs::read(root.join("sessions/registry.json")).unwrap();
+            memory(root, "must not repin");
+            assert_eq!(active(root).unwrap().unwrap(), original);
+            assert_eq!(ensure_active(root, legacy).unwrap(), original);
+            assert_eq!(
+                prepare_harness_with_source(
+                    root,
+                    "spiron",
+                    None,
+                    Some(Path::new("memory/MEMORY.md"))
+                )
+                .unwrap()
+                .unwrap(),
+                original
+            );
+            assert_eq!(
+                bound_vendor(root, "spiron", "legacy-vendor")
+                    .unwrap()
+                    .unwrap(),
+                original
+            );
+            assert_eq!(
+                fs::read(root.join("sessions/registry.json")).unwrap(),
+                bytes
+            );
+            assert_eq!(
+                resume_vendor(root, legacy, "legacy-vendor").unwrap(),
+                original
+            );
+        }
+    }
+    #[test]
+    fn conflicting_legacy_vendor_aliases_fail_without_changing_the_registry() {
+        let dir = crate::test_tempdir();
+        let root = dir.path();
+        ensure_active(root, "spiron").unwrap();
+        bind_vendor(root, "spiron", "vendor-id").unwrap();
+        let mut registry = read(root).unwrap();
+        let mut conflicting = registry.active.clone().unwrap();
+        conflicting.harness = "sylphx".into();
+        conflicting.generation = uuid::Uuid::now_v7().to_string();
+        registry.aliases.insert(
+            serde_json::to_string(&("sylphx", "vendor-id")).unwrap(),
+            conflicting,
+        );
+        write(root, &registry).unwrap();
+        let before = fs::read(root.join("sessions/registry.json")).unwrap();
+        assert!(active(root).is_err());
+        assert!(ensure_active(root, "spiron").is_err());
+        assert_eq!(
+            fs::read(root.join("sessions/registry.json")).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn preparing_harness_switches_once_and_preserves_history_and_aliases() {
+        let dir = crate::test_tempdir();
+        let root = dir.path();
+        let source = Some(Path::new("memory/MEMORY.md"));
+        assert!(
+            prepare_harness_with_source(root, "opencode", None, source)
+                .unwrap()
+                .is_none()
+        );
+        fs::create_dir_all(root.join("config")).unwrap();
+        memory(root, "original fact");
+        let original = ensure_active(root, "opencode").unwrap();
+        bind_vendor(root, "opencode", "old-opencode").unwrap();
+        fs::write(root.join("config/opencode-session-id"), "old-opencode\n").unwrap();
+        fs::write(root.join("config/history.jsonl"), "retained transcript").unwrap();
+        memory(root, "spiron fact");
+        let switched = prepare_harness_with_source(root, "spiron", None, source)
+            .unwrap()
+            .unwrap();
+        assert_ne!(switched.generation, original.generation);
+        assert_eq!(switched.harness, "spiron");
+        assert!(switched.memory.section.contains("spiron fact"));
+        memory(root, "roundtrip fact");
+        let roundtrip =
+            prepare_harness_with_source(root, "opencode", Some("opencode-session-id"), source)
+                .unwrap()
+                .unwrap();
+        assert_ne!(roundtrip.generation, switched.generation);
+        assert!(!root.join("config/opencode-session-id").exists());
+        let retired = root.join(format!(
+            "sessions/retired-{}/opencode-session-id",
+            roundtrip.generation
+        ));
+        assert_eq!(fs::read_to_string(retired).unwrap(), "old-opencode\n");
+        assert_eq!(
+            fs::read_to_string(root.join("config/history.jsonl")).unwrap(),
+            "retained transcript"
+        );
+        memory(root, "must not repin");
+        assert_eq!(
+            prepare_harness_with_source(root, "opencode", Some("opencode-session-id"), source)
+                .unwrap()
+                .unwrap(),
+            roundtrip
+        );
+        assert_eq!(active(root).unwrap().unwrap(), roundtrip);
+        assert_eq!(
+            resume_vendor(root, "opencode", "old-opencode").unwrap(),
+            original
+        );
     }
     #[test]
     fn explicit_reset_retires_only_pointer_and_resumes_prepared_intent_without_repin() {
@@ -511,14 +743,14 @@ mod tests {
     fn corrupt_registry_and_foreign_alias_fail_without_refresh() {
         let dir = crate::test_tempdir();
         let root = dir.path();
-        let initial = ensure_active(root, "sylphx").unwrap();
-        bind_vendor(root, "sylphx", "id").unwrap();
-        let reset = new_session(root, "sylphx").unwrap();
+        let initial = ensure_active(root, "spiron").unwrap();
+        bind_vendor(root, "spiron", "id").unwrap();
+        let reset = new_session(root, "spiron").unwrap();
         assert_ne!(initial.generation, reset.generation);
-        assert!(bind_vendor(root, "sylphx", "id").is_err());
-        assert_eq!(ensure_active(root, "sylphx").unwrap(), reset);
+        assert!(bind_vendor(root, "spiron", "id").is_err());
+        assert_eq!(ensure_active(root, "spiron").unwrap(), reset);
         fs::write(root.join("sessions/registry.json"), b"broken").unwrap();
-        assert!(ensure_active(root, "sylphx").is_err());
+        assert!(ensure_active(root, "spiron").is_err());
         assert_eq!(
             fs::read(root.join("sessions/registry.json")).unwrap(),
             b"broken"
@@ -529,14 +761,14 @@ mod tests {
         let dir = crate::test_tempdir();
         let root = dir.path();
         memory(root, "old");
-        let initial = ensure_active(root, "sylphx").unwrap();
+        let initial = ensure_active(root, "spiron").unwrap();
         let path = root
             .join("sessions")
             .join(crate::learned_memory::sha256(initial.generation.as_bytes()))
             .join("memory-pin.json");
         fs::remove_file(&path).unwrap();
         memory(root, "new must not leak into old session");
-        assert!(ensure_active(root, "sylphx").is_err());
+        assert!(ensure_active(root, "spiron").is_err());
         assert!(!path.exists());
     }
     #[test]

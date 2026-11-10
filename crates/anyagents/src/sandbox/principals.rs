@@ -1,14 +1,26 @@
 //! Durable, immutable-ID principal grants, with a bounded legacy import.
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
 
 use anyagents_core::{Agent, AgentId, Error, Store};
 use serde_json::{Map, Value};
 
 const REGISTRY: &str = "execution-principals.json";
+
+type PrincipalTuple = (String, u32, u32, u32);
+type ParsedRegistry = (String, HashMap<String, PrincipalTuple>);
+type FileStamp = (u64, u64, u64, i64, i64);
+type CachedRegistry = (u32, FileStamp, String, HashMap<String, PrincipalTuple>);
+
+fn registry_cache() -> &'static Mutex<Option<CachedRegistry>> {
+    static CACHE: OnceLock<Mutex<Option<CachedRegistry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
 
 /// Select the deployment's registry before runtime threads start. Child API
 /// clients need not read the operator file; only a launch resolves its grants.
@@ -23,7 +35,19 @@ pub(crate) fn load_principal_registry(data: &Path) -> Result<(), Error> {
     Ok(())
 }
 
-pub(super) fn read_principal_registry(data: &Path) -> Result<Option<String>, Error> {
+/// A trusted display snapshot. Launch authorization still reads fresh grants.
+pub(super) fn read_admitted_principals(
+    data: &Path,
+) -> Result<HashMap<String, PrincipalTuple>, Error> {
+    Ok(read_principal_registry_parsed(data)?
+        .map(|(_, map)| map)
+        .unwrap_or_default())
+}
+
+pub(super) fn read_admitted_principal(
+    data: &Path,
+    agent_id: &str,
+) -> Result<Option<PrincipalTuple>, Error> {
     let path = data.join(REGISTRY);
     let file = match OpenOptions::new()
         .read(true)
@@ -46,7 +70,57 @@ pub(super) fn read_principal_registry(data: &Path) -> Result<Option<String>, Err
             )));
         }
     };
-    trusted_file(&file)?;
+    let stamp = trusted_file(&file)?;
+    let me = super::current_uid();
+    if !super::is_isolated_test_env()
+        && let Ok(guard) = registry_cache().lock()
+        && let Some((cached_uid, cached_stamp, _, cached_map)) = guard.as_ref()
+        && *cached_uid == me
+        && *cached_stamp == stamp
+    {
+        return Ok(cached_map.get(agent_id).cloned());
+    }
+    let Some((_, parsed)) = read_principal_registry_from_file(file, stamp)? else {
+        return Ok(None);
+    };
+    Ok(parsed.get(agent_id).cloned())
+}
+
+pub(super) fn read_principal_registry(data: &Path) -> Result<Option<String>, Error> {
+    Ok(read_principal_registry_parsed(data)?.map(|(raw, _)| raw))
+}
+
+fn read_principal_registry_parsed(data: &Path) -> Result<Option<ParsedRegistry>, Error> {
+    let path = data.join(REGISTRY);
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return match std::fs::symlink_metadata(&path) {
+                Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                _ => Err(Error::Message(
+                    "execution principal registry path cannot be resolved".into(),
+                )),
+            };
+        }
+        Err(err) => {
+            return Err(Error::Message(format!(
+                "cannot read {}: {err}",
+                path.display()
+            )));
+        }
+    };
+    let stamp = trusted_file(&file)?;
+    read_principal_registry_from_file(file, stamp)
+}
+
+fn read_principal_registry_from_file(
+    file: File,
+    stamp: FileStamp,
+) -> Result<Option<ParsedRegistry>, Error> {
     let mut raw = String::new();
     file.take(1_048_577).read_to_string(&mut raw)?;
     if raw.len() > 1_048_576 {
@@ -54,22 +128,40 @@ pub(super) fn read_principal_registry(data: &Path) -> Result<Option<String>, Err
             "execution principal registry exceeds 1 MiB".into(),
         ));
     }
+    let me = super::current_uid();
+    if let Ok(guard) = registry_cache().lock()
+        && let Some((cached_uid, _, cached_raw, cached_map)) = guard.as_ref()
+        && *cached_uid == me
+        && cached_raw == &raw
+    {
+        return Ok(Some((raw, cached_map.clone())));
+    }
     let value: Value = serde_json::from_str(&raw)
         .map_err(|_| Error::Message("invalid execution principal registry JSON".into()))?;
     let entries = value
         .as_object()
         .ok_or_else(|| Error::Message("execution principal registry must be an object".into()))?;
+    let mut parsed = HashMap::with_capacity(entries.len());
     for (id, entry) in entries {
-        if AgentId::parse(id).is_err() || super::admitted_principal_entry(entry).is_none() {
+        let Some(principal) = super::admitted_principal_entry(entry) else {
+            return Err(Error::Message(
+                "execution principal registry contains an invalid identity or grant".into(),
+            ));
+        };
+        if AgentId::parse(id).is_err() {
             return Err(Error::Message(
                 "execution principal registry contains an invalid identity or grant".into(),
             ));
         }
+        parsed.insert(id.clone(), principal);
     }
-    Ok(Some(raw))
+    if let Ok(mut guard) = registry_cache().lock() {
+        *guard = Some((me, stamp, raw.clone(), parsed.clone()));
+    }
+    Ok(Some((raw, parsed)))
 }
 
-fn trusted_file(file: &File) -> Result<(), Error> {
+fn trusted_file(file: &File) -> Result<FileStamp, Error> {
     let meta = file.metadata()?;
     if !meta.is_file()
         || meta.uid() != super::current_uid()
@@ -78,7 +170,13 @@ fn trusted_file(file: &File) -> Result<(), Error> {
     {
         return Err(Error::Message("execution principal registry must be a server-owned regular file without shared write access or links".into()));
     }
-    Ok(())
+    Ok((
+        meta.dev(),
+        meta.ino(),
+        meta.len(),
+        meta.mtime(),
+        meta.mtime_nsec(),
+    ))
 }
 
 /// Only the first daemon startup can import exact legacy OS account names.
