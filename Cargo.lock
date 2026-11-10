@@ -85,6 +85,7 @@ dependencies = [
  "anyagents-harness-stream",
  "anyagents-installer",
  "anyagents-supervisor",
+ "anyagents-tools",
  "axum",
  "bytes",
  "chrono",
@@ -268,6 +269,17 @@ dependencies = [
  "rusqlite",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "anyagents-tools"
+version = "0.1.4"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "ureq",
 ]
 
 [[package]]

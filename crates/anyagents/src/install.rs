@@ -295,7 +295,7 @@ fn ensure_vendored_binary(root: &Path, harness: &str) {
 pub fn adapter(harness: &str) -> Result<(), anyagents_core::Error> {
     match normalize_harness_name(harness) {
         "claude-code" | "codex" | "opencode" | "agy" | "muse" | "omp" | "dsh" | "grok"
-        | "spiron" => Ok(()),
+        | "spiron" | "spiron-cloud" | "claude-cloud" | "openai-cloud" | "cursor-cloud" => Ok(()),
         other => Err(anyagents_core::Error::Message(format!(
             "unknown harness: {other}"
         ))),
@@ -339,6 +339,12 @@ pub fn program(root: &Path, harness: &str) -> PathBuf {
         harness.to_uppercase().replace('-', "_")
     )) {
         return PathBuf::from(named);
+    }
+    if matches!(
+        harness,
+        "spiron-cloud" | "claude-cloud" | "openai-cloud" | "cursor-cloud"
+    ) {
+        return std::env::current_exe().unwrap_or_else(|_| PathBuf::from("anyagents"));
     }
     let dirs = root.join("harnesses").join(harness);
     if let Ok(versions) = std::fs::read_dir(&dirs) {

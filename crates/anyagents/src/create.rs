@@ -1146,20 +1146,36 @@ fn install_skill_projection_as_owner(
         }
         rel
     };
-    let owner = target
-        .parent()
-        .into_iter()
-        .flat_map(Path::ancestors)
-        .take_while(|p| p.starts_with(root))
-        .find_map(|p| std::fs::symlink_metadata(p).ok().filter(|m| m.is_dir()));
-    let owner = owner.ok_or_else(|| std::io::Error::other("skill projection owner missing"))?;
-    // UID and primary GID are independent OS identities.
-    let (eff_uid, eff_gid) = (owner.uid(), owner.gid());
-    if eff_uid == crate::sandbox::server_uid() {
-        return Err(std::io::Error::other(
-            "skill projection is not owned by another seat",
-        ));
+    let srv_uid = crate::sandbox::server_uid();
+    let candidates = std::iter::once(target)
+        .chain(std::iter::once(overlay))
+        .chain(
+            target
+                .parent()
+                .into_iter()
+                .flat_map(Path::ancestors)
+                .take_while(|p| p.starts_with(root)),
+        )
+        .chain(std::iter::once(config));
+    let mut any_dir = false;
+    let mut seat_owner = None;
+    for path in candidates {
+        if let Ok(meta) = std::fs::symlink_metadata(path)
+            && meta.is_dir()
+        {
+            any_dir = true;
+            if meta.uid() != srv_uid {
+                seat_owner = Some((meta.uid(), meta.gid()));
+                break;
+            }
+        }
     }
+    if !any_dir {
+        return Err(std::io::Error::other("skill projection owner missing"));
+    }
+    // UID and primary GID are independent OS identities.
+    let (eff_uid, eff_gid) = seat_owner
+        .ok_or_else(|| std::io::Error::other("skill projection is not owned by another seat"))?;
     let launcher = crate::sandbox::descriptor_launcher()
         .ok_or_else(|| std::io::Error::other("skill projection launcher missing"))?;
     let groups = match crate::sandbox::sock_gid_for() {
@@ -1173,8 +1189,8 @@ fn install_skill_projection_as_owner(
 config=$1; relative=$2; view=$3; global=$4; overlay=$5
 if [ "$relative" = "skills-view" ]; then
   if [ -L "$overlay" ] || [ -L "$view" ]; then exit 1; fi
-  mkdir -p -m 0700 "$overlay"
-  chmod 0700 "$overlay"
+  mkdir -p -m 02770 "$overlay"
+  chmod 02770 "$overlay"
   mkdir -p "$view"
   chmod 0755 "$view"
   for item in "$view"/*; do
@@ -1742,8 +1758,8 @@ pub(crate) fn seed_harness_credentials(
     }
     let provider = upstream_provider_of(&agent.harness, agent.model.as_deref());
     let static_rel_paths: &[&str] = match normalize_harness_name(&agent.harness) {
-        "claude-code" => &[".credentials.json", ".claude/.credentials.json"],
-        "codex" if provider == "openai" => &[
+        "claude-code" | "claude-cloud" => &[".credentials.json", ".claude/.credentials.json"],
+        "codex" | "openai-cloud" if provider == "openai" => &[
             "auth.json",
             ".codex/auth.json",
             "models_cache.json",
@@ -1752,7 +1768,7 @@ pub(crate) fn seed_harness_credentials(
             ".config/opencode/sylphx.key",
             ".config/opencode/opencode.json",
         ],
-        "codex" => &[
+        "codex" | "openai-cloud" => &[
             "models_cache.json",
             "model-catalog-direct.json",
             ".config/sylphx/key",
@@ -1802,7 +1818,7 @@ pub(crate) fn seed_harness_credentials(
             ".grok/models_cache.json",
             ".grok/settings_cache.json",
         ],
-        "spiron" => &[
+        "spiron" | "spiron-cloud" => &[
             "auth.json",
             "credentials.json",
             "config.toml",
@@ -1821,6 +1837,7 @@ pub(crate) fn seed_harness_credentials(
             ".config/opencode/openrouter.key",
             ".config/opencode/opencode.json",
         ],
+        "cursor-cloud" => &["cursor-auth.json", "auth.json", "credentials.json"],
         _ => &[],
     };
     let mut rel_paths: Vec<String> = static_rel_paths.iter().map(|s| (*s).to_string()).collect();
@@ -2077,7 +2094,7 @@ pub(crate) fn reset_agent_session_locked(
 }
 
 pub(crate) fn harness_session_filename(harness: &str) -> Option<&'static str> {
-    match harness {
+    match normalize_harness_name(harness) {
         "codex" => Some("codex-session-id"),
         "opencode" => Some("opencode-session-id"),
         "claude-code" => Some("claude-session-id"),
@@ -2086,6 +2103,10 @@ pub(crate) fn harness_session_filename(harness: &str) -> Option<&'static str> {
         "omp" => Some("omp-session-id"),
         "dsh" => Some("dsh-session-id"),
         "grok" => Some("grok-session-id"),
+        "spiron-cloud" => Some("spiron-cloud-session-id"),
+        "claude-cloud" => Some("claude-cloud-session-id"),
+        "openai-cloud" => Some("openai-cloud-session-id"),
+        "cursor-cloud" => Some("cursor-cloud-session-id"),
         selector if crate::vendor::is_spiron_harness(selector) => Some("spiron-session-id"),
         _ => None,
     }
@@ -2198,6 +2219,10 @@ pub(crate) fn compute_live_session_continuity(
         "dsh",
         "grok",
         "spiron",
+        "spiron-cloud",
+        "claude-cloud",
+        "openai-cloud",
+        "cursor-cloud",
     ] {
         if candidate == normalize_harness_name(&agent.harness) {
             continue;
@@ -2470,7 +2495,7 @@ pub(crate) fn reconcile_agent_runtime_config(
             "grok" => {
                 crate::grok::write_grok_config(config, agent.model.as_deref(), &command, &args)?;
             }
-            "spiron" => {
+            "spiron" | "spiron-cloud" => {
                 crate::spiron::write_spiron_config(
                     config,
                     agent.model.as_deref(),
@@ -2686,7 +2711,10 @@ pub(crate) fn verify_harness_runtime_config(
                 ));
             }
         }
-        selector if crate::vendor::is_spiron_harness(selector) => {
+        selector
+            if crate::vendor::is_spiron_harness(selector)
+                || normalize_harness_name(selector) == "spiron-cloud" =>
+        {
             let path = config.join("spiron-mcp.json");
             let text = std::fs::read_to_string(&path).map_err(|_| {
                 Error::Message(format!("spiron runtime config missing: {}", path.display()))
@@ -4308,13 +4336,14 @@ pub(crate) fn upstream_provider_of(harness: &str, model: Option<&str>) -> String
         }
     }
     match normalize_harness_name(harness) {
-        "claude-code" => "anthropic".to_string(),
-        "codex" => "openai".to_string(),
+        "claude-code" | "claude-cloud" => "anthropic".to_string(),
+        "codex" | "openai-cloud" => "openai".to_string(),
         "agy" => "google-antigravity".to_string(),
         "muse" => "muse".to_string(),
         "dsh" => "deepseek".to_string(),
         "grok" => "xai".to_string(),
-        "spiron" | "opencode" | "omp" => "sylphx".to_string(),
+        "cursor-cloud" => "cursor".to_string(),
+        "spiron" | "spiron-cloud" | "opencode" | "omp" => "sylphx".to_string(),
         other => other.to_string(),
     }
 }
@@ -4326,10 +4355,14 @@ pub(crate) fn default_kind_and_harnesses(provider: &str) -> (&'static str, Vec<S
             "api-key",
             harnesses(&[
                 "spiron",
+                "spiron-cloud",
                 "opencode",
                 "omp",
                 "claude-code",
+                "claude-cloud",
                 "codex",
+                "openai-cloud",
+                "cursor-cloud",
                 "muse",
                 "grok",
                 "dsh",
@@ -4349,21 +4382,32 @@ pub(crate) fn default_kind_and_harnesses(provider: &str) -> (&'static str, Vec<S
         ),
         "qwen-token-plan" | "kimi-code-plan" | "glm-code-plan" | "minimax-code-plan" => (
             "coding-plan",
-            harnesses(&["spiron", "opencode", "omp", "claude-code", "codex", "dsh"]),
+            harnesses(&[
+                "spiron",
+                "spiron-cloud",
+                "opencode",
+                "omp",
+                "claude-code",
+                "codex",
+                "dsh",
+            ]),
         ),
         "anthropic" => (
             "subscription",
-            harnesses(&["claude-code", "opencode", "omp", "muse"]),
+            harnesses(&["claude-code", "claude-cloud", "opencode", "omp", "muse"]),
         ),
         "openai" => (
             "subscription",
-            harnesses(&["codex", "opencode", "omp", "muse"]),
+            harnesses(&["codex", "openai-cloud", "opencode", "omp", "muse"]),
         ),
         "google-antigravity" => ("subscription", harnesses(&["agy", "opencode", "omp"])),
         "muse" => ("subscription", harnesses(&["muse", "omp"])),
         "deepseek" => ("subscription", harnesses(&["dsh", "opencode", "omp"])),
         "xai" => ("subscription", harnesses(&["grok", "opencode", "omp"])),
-        "cursor" => ("subscription", harnesses(&["omp", "opencode"])),
+        "cursor" => (
+            "subscription",
+            harnesses(&["cursor-cloud", "omp", "opencode"]),
+        ),
         _ => (
             "api-key",
             harnesses(&["opencode", "omp", "claude-code", "codex"]),
@@ -7795,9 +7839,14 @@ fn count_bound_profile_agents(
 /// Harnesses/providers that share compatible credential and profile directories.
 pub(crate) fn compatible_harnesses_for(provider_or_harness: &str) -> &'static [&'static str] {
     match provider_or_harness.trim() {
-        "spiron" | "sylphx" | "sylphx-agent" | "sylphx_agent" => &["spiron", "sylphx"],
-        "claude-code" | "anthropic" => &["anthropic", "claude-code"],
-        "codex" | "openai" => &["openai", "codex"],
+        "spiron" | "spiron-cloud" | "sylphx" | "sylphx-agent" | "sylphx_agent" => {
+            &["spiron", "spiron-cloud", "sylphx"]
+        }
+        "claude-code" | "claude-cloud" | "anthropic" => {
+            &["anthropic", "claude-code", "claude-cloud"]
+        }
+        "codex" | "openai-cloud" | "openai" => &["openai", "codex", "openai-cloud"],
+        "cursor-cloud" | "cursor" => &["cursor", "cursor-cloud"],
         "agy" | "google" => &["google", "agy"],
         "grok" | "xai" => &["xai", "grok"],
         _ => &[],
@@ -7810,8 +7859,10 @@ pub(crate) fn list_harness_profiles(
     provider_or_harness: &str,
 ) -> Vec<(String, PathBuf)> {
     let provider = match provider_or_harness {
-        "claude-code" | "codex" | "agy" | "muse" | "dsh" | "grok" | "opencode" | "omp"
-        | "spiron" | "sylphx" => upstream_provider_of(provider_or_harness, None),
+        "claude-code" | "claude-cloud" | "codex" | "openai-cloud" | "cursor-cloud" | "agy"
+        | "muse" | "dsh" | "grok" | "opencode" | "omp" | "spiron" | "spiron-cloud" | "sylphx" => {
+            upstream_provider_of(provider_or_harness, None)
+        }
         other => other.to_string(),
     };
     let mut base_dirs = vec![

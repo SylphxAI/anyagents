@@ -146,6 +146,54 @@ pub fn builtin_catalog() -> Vec<CatalogEntry> {
             vec!["grok-4.20".to_string()],
             "",
         ),
+        entry(
+            "spiron-cloud",
+            InstallMethod::Vendored,
+            vec!["spiron".to_string(), "login".to_string()],
+            Some("SYLPHX_API_KEY".to_string()),
+            vec![
+                "claude-opus-4.6".to_string(),
+                "claude-sonnet-4.6".to_string(),
+                "gpt-5.4".to_string(),
+            ],
+            "https://sylphx.com/terms",
+        ),
+        entry(
+            "claude-cloud",
+            InstallMethod::Vendored,
+            vec![
+                "claude".to_string(),
+                "auth".to_string(),
+                "login".to_string(),
+            ],
+            Some("ANTHROPIC_API_KEY".to_string()),
+            vec![
+                "claude-opus-4-6".to_string(),
+                "claude-sonnet-4-6".to_string(),
+                "claude-haiku-4-5".to_string(),
+            ],
+            "https://www.anthropic.com/legal/consumer-terms",
+        ),
+        entry(
+            "openai-cloud",
+            InstallMethod::Vendored,
+            vec!["codex".to_string(), "login".to_string()],
+            Some("OPENAI_API_KEY".to_string()),
+            vec![
+                "gpt-5.4".to_string(),
+                "gpt-5.4-mini".to_string(),
+                "gpt-5.3-codex".to_string(),
+            ],
+            "https://openai.com/policies/row-terms-of-use/",
+        ),
+        entry(
+            "cursor-cloud",
+            InstallMethod::Vendored,
+            vec!["cursor".to_string(), "login".to_string()],
+            Some("CURSOR_API_KEY".to_string()),
+            vec!["claude-4.6-opus".to_string(), "gpt-5.4".to_string()],
+            "https://www.cursor.com/terms-of-service",
+        ),
     ]
 }
 

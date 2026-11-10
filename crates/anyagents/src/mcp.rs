@@ -148,8 +148,10 @@ impl McpProfile {
         if let Some(profile) = explicit {
             return profile;
         }
-        if harness.is_some_and(crate::vendor::is_spiron_harness)
-            || config.join("spiron-mcp.json").is_file()
+        if harness.is_some_and(|h| {
+            crate::vendor::is_spiron_harness(h)
+                || anyagents_harness::normalize_harness_name(h) == "spiron-cloud"
+        }) || config.join("spiron-mcp.json").is_file()
         {
             Self::Coordination
         } else {
@@ -157,14 +159,22 @@ impl McpProfile {
         }
     }
 
-    pub fn resolve_http(explicit: Option<&str>, harness: &str) -> Result<Self, String> {
+    pub fn resolve_http_with_config(
+        explicit: Option<&str>,
+        harness: &str,
+        config_dir: Option<&Path>,
+    ) -> Result<Self, String> {
         if let Some(raw) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
             return Self::from_str_opt(raw).ok_or_else(|| {
                 format!("invalid MCP profile `{raw}`; expected `full`, `remote`, or `coordination`")
             });
         }
-        if crate::vendor::is_spiron_harness(harness) {
+        if crate::vendor::is_spiron_harness(harness)
+            || anyagents_harness::normalize_harness_name(harness) == "spiron-cloud"
+        {
             Ok(Self::Coordination)
+        } else if anyagents_tools::SandboxConfig::resolve(config_dir).is_some() {
+            Ok(Self::Full)
         } else {
             Ok(Self::Remote)
         }
@@ -2825,10 +2835,14 @@ impl AgentMcp {
         Parameters(args): Parameters<FilesArgs>,
     ) -> Result<MultimediaJson, String> {
         let base_dir = self.resolve_workdir();
-        let (val, media) =
-            tokio::task::spawn_blocking(move || execute_files_tool_with_media(&base_dir, args))
-                .await
-                .map_err(|e| format!("files task join error: {e}"))??;
+        let config_dir = self.client.config.clone();
+        let (val, media) = tokio::task::spawn_blocking(move || {
+            let backend =
+                anyagents_tools::WorkspaceBackend::resolve(Some(&config_dir), base_dir.clone());
+            execute_files_tool_with_media_backend(&backend, &base_dir, args)
+        })
+        .await
+        .map_err(|e| format!("files task join error: {e}"))??;
         Ok(MultimediaJson(val, media))
     }
 
@@ -5190,6 +5204,265 @@ fn resolve_workspace_path(
         base.join(candidate)
     };
     Ok(normalize_lexical_path(&joined))
+}
+
+fn execute_files_tool_with_media_backend(
+    backend: &anyagents_tools::WorkspaceBackend,
+    base_dir: &Path,
+    args: FilesArgs,
+) -> Result<(serde_json::Value, Vec<rmcp::model::ContentBlock>), String> {
+    if matches!(backend, anyagents_tools::WorkspaceBackend::RemoteSandbox(_)) {
+        return execute_remote_files_tool_with_media(backend, args);
+    }
+    execute_files_tool_with_media(base_dir, args)
+}
+
+fn execute_remote_files_tool_with_media(
+    backend: &anyagents_tools::WorkspaceBackend,
+    args: FilesArgs,
+) -> Result<(serde_json::Value, Vec<rmcp::model::ContentBlock>), String> {
+    let action = args
+        .action
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_else(|| {
+            if args.cmd.is_some() {
+                "exec".to_string()
+            } else if args.patch.is_some() {
+                "patch".to_string()
+            } else if !args.edits.is_empty() {
+                "multi_edit".to_string()
+            } else if args.target.is_some() {
+                "edit".to_string()
+            } else if args.content.is_some() {
+                "write".to_string()
+            } else if args.query.is_some() {
+                "grep".to_string()
+            } else if args.pattern.is_some() || args.glob.is_some() {
+                "glob".to_string()
+            } else {
+                "read".to_string()
+            }
+        });
+
+    match action.as_str() {
+        "read" | "cat" | "view" => {
+            let (resolved_str, full_bytes) = backend.read_file_bytes(args.path.as_deref())?;
+            let resolved_path = Path::new(&resolved_str);
+            if let Some(mime_type) = detect_multimedia_mime(resolved_path, &full_bytes) {
+                let sha256 = sha256_hex(&full_bytes);
+                return read_multimedia_file(resolved_path, &full_bytes, mime_type, sha256, &args);
+            }
+            let sha256 = sha256_hex(&full_bytes);
+            let total_bytes = full_bytes.len();
+            let text = String::from_utf8_lossy(&full_bytes);
+            let all_lines: Vec<&str> = text.lines().collect();
+            let total_lines = all_lines.len();
+            let max_bytes = args
+                .max_bytes
+                .unwrap_or(DEFAULT_READ_MAX_BYTES)
+                .clamp(1, HARD_READ_MAX_BYTES);
+            let byte_offset = args.byte_offset.unwrap_or(0);
+            if total_lines == 0 {
+                return Ok((
+                    serde_json::json!({
+                        "action": "read",
+                        "path": resolved_str,
+                        "content": "",
+                        "numbered": "",
+                        "start_line": 0,
+                        "end_line": 0,
+                        "total_lines": 0,
+                        "bytes_read": 0,
+                        "total_bytes": total_bytes,
+                        "byte_offset": byte_offset,
+                        "truncated": false,
+                        "sha256": sha256,
+                    }),
+                    Vec::new(),
+                ));
+            }
+            let start_line = args.start_line.unwrap_or(1).max(1);
+            if start_line > total_lines {
+                return Ok((
+                    serde_json::json!({
+                        "action": "read",
+                        "path": resolved_str,
+                        "content": "",
+                        "numbered": "",
+                        "start_line": start_line,
+                        "end_line": total_lines,
+                        "total_lines": total_lines,
+                        "bytes_read": 0,
+                        "total_bytes": total_bytes,
+                        "byte_offset": byte_offset,
+                        "truncated": false,
+                        "sha256": sha256,
+                    }),
+                    Vec::new(),
+                ));
+            }
+            let requested_end = args
+                .end_line
+                .unwrap_or(total_lines)
+                .min(total_lines)
+                .max(start_line);
+            let selected_lines = &all_lines[start_line - 1..requested_end];
+            let joined = selected_lines.join("\n");
+            let start_byte = floor_char_boundary_str(&joined, byte_offset.min(joined.len()));
+            let after_offset = &joined[start_byte..];
+            let end_byte = floor_char_boundary_str(after_offset, max_bytes);
+            let sliced = &after_offset[..end_byte];
+            let truncated = end_byte < after_offset.len() || requested_end < total_lines;
+            let offset_lines = joined[..start_byte].bytes().filter(|&b| b == b'\n').count();
+            let first_line_no = start_line + offset_lines;
+            let sliced_lines: Vec<&str> = sliced.lines().collect();
+            let actual_end_line = if sliced_lines.is_empty() {
+                first_line_no
+            } else {
+                first_line_no + sliced_lines.len() - 1
+            };
+            let mut numbered = String::with_capacity(sliced.len() + sliced_lines.len() * 8);
+            for (idx, line) in sliced_lines.iter().enumerate() {
+                if idx > 0 {
+                    numbered.push('\n');
+                }
+                numbered.push_str(&format!("{}: {line}", first_line_no + idx));
+            }
+            Ok((
+                serde_json::json!({
+                    "action": "read",
+                    "path": resolved_str,
+                    "content": sliced,
+                    "numbered": numbered,
+                    "start_line": first_line_no,
+                    "end_line": actual_end_line,
+                    "total_lines": total_lines,
+                    "bytes_read": sliced.len(),
+                    "total_bytes": total_bytes,
+                    "byte_offset": start_byte,
+                    "truncated": truncated,
+                    "sha256": sha256,
+                }),
+                Vec::new(),
+            ))
+        }
+        "write" | "create" => {
+            let content = args.content.unwrap_or_default();
+            let append = args.append.unwrap_or(false);
+            let overwrite = args.overwrite.unwrap_or(true);
+            let (resolved_str, total_bytes, sha256) = backend.write_file_bytes(
+                args.path.as_deref(),
+                content.as_bytes(),
+                append,
+                overwrite,
+            )?;
+            Ok((
+                serde_json::json!({
+                    "action": "write",
+                    "path": resolved_str,
+                    "bytes_written": content.len(),
+                    "total_bytes": total_bytes,
+                    "append": append,
+                    "sha256": sha256,
+                }),
+                Vec::new(),
+            ))
+        }
+        "edit" | "multi_edit" | "replace" => {
+            let mut specs = Vec::new();
+            if let Some(target) = args.target {
+                specs.push(FileEditSpec {
+                    target,
+                    replacement: args.replacement.unwrap_or_default(),
+                    replace_all: args.replace_all,
+                });
+            }
+            specs.extend(args.edits);
+            if specs.is_empty() {
+                return Err(
+                    "`files` edit requires `target` (and optional `replacement`) or non-empty `edits`"
+                        .to_string(),
+                );
+            }
+            let (resolved_str, existing_bytes) = backend.read_file_bytes(args.path.as_deref())?;
+            let existing = String::from_utf8(existing_bytes)
+                .map_err(|e| format!("cannot decode {resolved_str} as UTF-8 for edit: {e}"))?;
+            let (updated, replacements_made, lines_added, lines_removed) = apply_atomic_edits(
+                &existing,
+                &specs,
+                args.replace_all.unwrap_or(true),
+                Path::new(&resolved_str),
+            )?;
+            backend.write_file_bytes(args.path.as_deref(), updated.as_bytes(), false, true)?;
+            let sha256 = sha256_hex(updated.as_bytes());
+            Ok((
+                serde_json::json!({
+                    "action": if action == "multi_edit" { "multi_edit" } else { "edit" },
+                    "path": resolved_str,
+                    "replacements_made": replacements_made,
+                    "lines_added": lines_added,
+                    "lines_removed": lines_removed,
+                    "sha256": sha256,
+                }),
+                Vec::new(),
+            ))
+        }
+        "list" | "ls" | "list_dir" => {
+            let include_hidden = args.include_hidden.unwrap_or(true);
+            let max_results = args
+                .max_results
+                .unwrap_or(DEFAULT_LIST_MAX_RESULTS)
+                .clamp(1, HARD_LIST_MAX_RESULTS);
+            let val = backend.list_dir(args.path.as_deref(), include_hidden, max_results)?;
+            Ok((val, Vec::new()))
+        }
+        "exec" | "bash" | "sh" | "command" => {
+            if std::env::var("ANYAGENTS_DISABLE_WORKSPACE_EXEC")
+                .ok()
+                .is_some_and(|v| {
+                    matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes")
+                })
+            {
+                return Err(
+                    "workspace.exec is disabled for this agent (ANYAGENTS_DISABLE_WORKSPACE_EXEC=1); delegate command execution to a subagent".to_string(),
+                );
+            }
+            let cmd_str = args
+                .cmd
+                .as_deref()
+                .or(args.content.as_deref())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| "`workspace.exec` requires a non-empty `cmd`".to_string())?;
+            let raw_cwd = args.cwd.as_deref().or(args.path.as_deref());
+            let resolved_cwd = backend.resolve_path(raw_cwd, false)?;
+            let timeout_ms = args
+                .timeout_ms
+                .unwrap_or(DEFAULT_CODE_TIMEOUT_MS)
+                .clamp(100, MAX_CODE_TIMEOUT_MS);
+            let started = std::time::Instant::now();
+            let out = backend.exec(cmd_str, Some(&resolved_cwd), Some(timeout_ms))?;
+            let duration_ms = started.elapsed().as_millis() as u64;
+            Ok((
+                serde_json::json!({
+                    "action": "exec",
+                    "cmd": cmd_str,
+                    "cwd": resolved_cwd,
+                    "exit_code": out.exit_code,
+                    "stdout": out.stdout,
+                    "stderr": out.stderr,
+                    "duration_ms": duration_ms,
+                }),
+                Vec::new(),
+            ))
+        }
+        other => Err(format!(
+            "remote sandbox `files` action `{other}` is not supported directly; use `read`, `write`, `edit`, `multi_edit`, `list`, or `exec`"
+        )),
+    }
 }
 
 fn execute_files_tool_with_media(
@@ -8750,5 +9023,281 @@ mod spawn_args_tests {
                         if m == "application/pdf"
                 )
         )));
+    }
+
+    #[tokio::test]
+    async fn remote_sandbox_backend_executes_files_and_code_and_upgrades_http_mcp_profile() {
+        use axum::{
+            Router,
+            body::Bytes,
+            extract::{Path as AxumPath, Query},
+            http::{HeaderMap, StatusCode},
+            routing::{get, post},
+        };
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Default)]
+        struct MockSandboxState {
+            files: Mutex<HashMap<String, Vec<u8>>>,
+            exec_log: Mutex<Vec<serde_json::Value>>,
+        }
+
+        let sandbox_state = Arc::new(MockSandboxState::default());
+        let app = Router::new()
+            .route(
+                "/v1/sandboxes/{id}/exec",
+                post({
+                    let state = Arc::clone(&sandbox_state);
+                    move |AxumPath(id): AxumPath<String>,
+                          headers: HeaderMap,
+                          axum::Json(payload): axum::Json<serde_json::Value>| {
+                        let state = Arc::clone(&state);
+                        async move {
+                            let auth = headers
+                                .get("authorization")
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("");
+                            if auth != "Bearer sbx-token-123" || id != "sbx-42" {
+                                return (
+                                    StatusCode::UNAUTHORIZED,
+                                    axum::Json(json!({"error": "unauthorized"})),
+                                );
+                            }
+                            state.exec_log.lock().unwrap().push(payload.clone());
+                            let cmd = payload
+                                .get("command")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            let cwd = payload.get("cwd").and_then(|v| v.as_str()).unwrap_or("");
+                            (
+                                StatusCode::OK,
+                                axum::Json(json!({
+                                    "stdout": format!("remote-exec:{cmd}@{cwd}"),
+                                    "stderr": "",
+                                    "exit_code": 0
+                                })),
+                            )
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/v1/sandboxes/{id}/files",
+                get({
+                    let state = Arc::clone(&sandbox_state);
+                    move |AxumPath(id): AxumPath<String>,
+                          headers: HeaderMap,
+                          Query(params): Query<HashMap<String, String>>| {
+                        let state = Arc::clone(&state);
+                        async move {
+                            let auth = headers
+                                .get("authorization")
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("");
+                            if auth != "Bearer sbx-token-123" || id != "sbx-42" {
+                                return (
+                                    StatusCode::UNAUTHORIZED,
+                                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                                    Bytes::from_static(b"{\"error\":\"unauthorized\"}"),
+                                );
+                            }
+                            let path = params.get("path").cloned().unwrap_or_default();
+                            if params.get("list").is_some_and(|v| v == "true") {
+                                let files = state.files.lock().unwrap();
+                                let prefix = format!("{}/", path.trim_end_matches('/'));
+                                let mut entries = Vec::new();
+                                for (k, v) in files.iter() {
+                                    if let Some(rel) = k.strip_prefix(&prefix)
+                                        && !rel.contains('/')
+                                    {
+                                        entries.push(json!({
+                                            "name": rel,
+                                            "path": rel,
+                                            "kind": "file",
+                                            "bytes": v.len()
+                                        }));
+                                    }
+                                }
+                                let body =
+                                    serde_json::to_vec(&json!({ "entries": entries })).unwrap();
+                                return (
+                                    StatusCode::OK,
+                                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                                    Bytes::from(body),
+                                );
+                            }
+                            let files = state.files.lock().unwrap();
+                            if let Some(bytes) = files.get(&path) {
+                                (
+                                    StatusCode::OK,
+                                    [(
+                                        axum::http::header::CONTENT_TYPE,
+                                        "application/octet-stream",
+                                    )],
+                                    Bytes::from(bytes.clone()),
+                                )
+                            } else {
+                                (
+                                    StatusCode::NOT_FOUND,
+                                    [(axum::http::header::CONTENT_TYPE, "text/plain")],
+                                    Bytes::from_static(b"not found"),
+                                )
+                            }
+                        }
+                    }
+                })
+                .put({
+                    let state = Arc::clone(&sandbox_state);
+                    move |AxumPath(id): AxumPath<String>,
+                          headers: HeaderMap,
+                          Query(params): Query<HashMap<String, String>>,
+                          body: Bytes| {
+                        let state = Arc::clone(&state);
+                        async move {
+                            let auth = headers
+                                .get("authorization")
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("");
+                            if auth != "Bearer sbx-token-123" || id != "sbx-42" {
+                                return StatusCode::UNAUTHORIZED;
+                            }
+                            let path = params.get("path").cloned().unwrap_or_default();
+                            state.files.lock().unwrap().insert(path, body.to_vec());
+                            StatusCode::OK
+                        }
+                    }
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("config");
+        let host_workdir = dir.path().join("host-work");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::create_dir_all(&host_workdir).unwrap();
+
+        // Without sandbox.json, HTTP MCP defaults to Remote profile (code disabled).
+        assert_eq!(
+            McpProfile::resolve_http_with_config(None, "claude-cloud", Some(&config_dir)),
+            Ok(McpProfile::Remote)
+        );
+
+        // Write sandbox.json into agent config_dir.
+        std::fs::write(
+            config_dir.join("sandbox.json"),
+            serde_json::to_vec(&json!({
+                "endpoint": format!("http://{addr}"),
+                "sandbox_id": "sbx-42",
+                "token": "sbx-token-123",
+                "workdir": "/workspace"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        // With sandbox.json present, HTTP MCP upgrades to Full profile so remote sandbox agents can use `code` and `files`.
+        assert_eq!(
+            McpProfile::resolve_http_with_config(None, "claude-cloud", Some(&config_dir)),
+            Ok(McpProfile::Full)
+        );
+
+        let mcp = AgentMcp {
+            agent: AgentRef {
+                id: AgentId::generate(),
+                name: "remote-sandbox-worker".into(),
+                workdir: Some(host_workdir.clone()),
+            },
+            client: Client {
+                socket: dir.path().join("unused.sock"),
+                config: config_dir.clone(),
+                capability: "test-cap".into(),
+            },
+            profile: McpProfile::Full,
+        };
+
+        // 1. Direct `files` write/edit/read/list/exec routes through RemoteSandbox, NOT host_workdir.
+        let write_res = mcp
+            .files(Parameters(
+                serde_json::from_value(json!({
+                    "action": "write",
+                    "path": "src/hello.txt",
+                    "content": "hello world\nline two\n",
+                }))
+                .unwrap(),
+            ))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(write_res["path"], "/workspace/src/hello.txt");
+        assert!(!host_workdir.join("src/hello.txt").exists());
+
+        let edit_res = mcp
+            .files(Parameters(
+                serde_json::from_value(json!({
+                    "action": "edit",
+                    "path": "src/hello.txt",
+                    "target": "hello world",
+                    "replacement": "hello remote sandbox",
+                }))
+                .unwrap(),
+            ))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(edit_res["replacements_made"], 1);
+
+        let read_res = mcp
+            .files(Parameters(
+                serde_json::from_value(json!({
+                    "action": "read",
+                    "path": "src/hello.txt",
+                }))
+                .unwrap(),
+            ))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(read_res["content"], "hello remote sandbox\nline two");
+
+        // 2. `code` tool's `workspace.read`, `workspace.write`, `workspace.list`, and `workspace.exec` transparently route through RemoteSandbox.
+        let code_res = mcp
+            .code(Parameters(CodeArgs {
+                code: r#"
+                    await workspace.write("src/from_code.txt", "created via code");
+                    const readBack = await workspace.read("src/hello.txt");
+                    const listed = await workspace.list("src");
+                    const execOut = await workspace.exec({ cmd: "cargo --version", cwd: "src" });
+                    return {
+                        readContent: readBack.content,
+                        entryCount: listed.count,
+                        execStdout: execOut.stdout,
+                        execExit: execOut.exit_code,
+                    };
+                "#
+                .to_string(),
+                timeout_ms: Some(15_000),
+            }))
+            .await
+            .unwrap()
+            .0;
+
+        assert_eq!(
+            code_res["result"]["readContent"],
+            "hello remote sandbox\nline two"
+        );
+        assert_eq!(code_res["result"]["entryCount"], 2);
+        assert_eq!(
+            code_res["result"]["execStdout"],
+            "remote-exec:cargo --version@/workspace/src"
+        );
+        assert_eq!(code_res["result"]["execExit"], 0);
+
+        server_handle.abort();
     }
 }

@@ -15,6 +15,7 @@ members = [
     "crates/anyagents-installer",
     "crates/anyagents-channel-telegram",
     "crates/anyagents-gateway",
+    "crates/anyagents-tools",
     "crates/anyagents",
     "tests/invariants",
 ]

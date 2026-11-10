@@ -65,7 +65,13 @@ impl VendorHarness {
                 };
                 if let Some(root) = path.parent().and_then(Path::parent) {
                     let harness = match self {
-                        Self::Claude(..) => "claude-code",
+                        Self::Claude(_, path) => match path.file_name().and_then(|n| n.to_str()) {
+                            Some("spiron-cloud-session-id") => "spiron-cloud",
+                            Some("claude-cloud-session-id") => "claude-cloud",
+                            Some("openai-cloud-session-id") => "openai-cloud",
+                            Some("cursor-cloud-session-id") => "cursor-cloud",
+                            _ => "claude-code",
+                        },
                         Self::Codex(..) => "codex",
                         Self::OpenCode(..) => "opencode",
                         Self::Agy(..) => "agy",
@@ -1054,6 +1060,38 @@ fn vendor_launch_inner(
         );
         vh.sync_session()?;
         Ok(vh)
+    } else if is_cloud_harness(&request.agent.harness) {
+        let canonical = anyagents_harness::normalize_harness_name(&request.agent.harness);
+        let session_file = format!("{canonical}-session-id");
+        let session = session_from_file(&request.config_dir, &session_file)?;
+        let program = crate::install::program(&root, canonical);
+        let mut extra_args = vec![
+            "cloud-harness".to_string(),
+            "--config".to_string(),
+            request.config_dir.display().to_string(),
+            "--harness".to_string(),
+            canonical.to_string(),
+        ];
+        if let Some(model) = request
+            .agent
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+        {
+            extra_args.push("--model".to_string());
+            extra_args.push(model.to_string());
+        }
+        let harness = start_claude(
+            &program.display().to_string(),
+            &extra_args,
+            session.as_deref(),
+            &env,
+            &request.work_dir,
+        )?;
+        let vh = VendorHarness::Claude(Box::new(harness), request.config_dir.join(&session_file));
+        vh.sync_session()?;
+        Ok(vh)
     } else if is_spiron_harness(&request.agent.harness) {
         let session = session_from_file(&request.config_dir, "spiron-session-id")?;
         let program = std::env::var("ANYAGENTS_SPIRON_BIN")
@@ -1409,6 +1447,13 @@ fn start_claude(
 /// model/tool loop.
 pub(crate) fn is_spiron_harness(harness: &str) -> bool {
     anyagents_harness::normalize_harness_name(harness) == "spiron"
+}
+
+pub(crate) fn is_cloud_harness(harness: &str) -> bool {
+    matches!(
+        anyagents_harness::normalize_harness_name(harness),
+        "spiron-cloud" | "claude-cloud" | "openai-cloud" | "cursor-cloud"
+    )
 }
 
 fn start_spiron(

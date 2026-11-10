@@ -5,6 +5,10 @@
 pub fn normalize_harness_name(harness: &str) -> &str {
     match harness.trim() {
         "sylphx" | "sylphx-agent" | "sylphx_agent" | "sylphx/default" => "spiron",
+        "spiron-cloud" | "spiron_cloud" | "sylphx-cloud" | "sylphx_cloud" => "spiron-cloud",
+        "claude-cloud" | "claude_cloud" | "anthropic-cloud" | "anthropic_cloud" => "claude-cloud",
+        "openai-cloud" | "openai_cloud" | "codex-cloud" | "codex_cloud" => "openai-cloud",
+        "cursor-cloud" | "cursor_cloud" => "cursor-cloud",
         other => other,
     }
 }
