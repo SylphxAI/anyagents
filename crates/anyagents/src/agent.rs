@@ -284,8 +284,24 @@ pub fn role_cmd(data: &Path, agent: &str, role: Option<&str>, clear: bool) -> Re
     let found = store.agent_by_name(clean_agent)?;
     crate::operator::ensure(&store, &found.id)?;
     store.record_admin_audit("operator", "agents.role", &found.name)?;
-    let new_role = if clear { None } else { role };
-    let updated = store.set_agent_role(&found.id, new_role)?;
+    let new_role = if clear {
+        None
+    } else if let Some(raw) = role.map(str::trim).filter(|s| !s.is_empty()) {
+        let parent_wd = found
+            .parent_id
+            .as_ref()
+            .and_then(|pid| store.agent(pid).ok())
+            .and_then(|p| p.workdir);
+        Some(crate::create::normalize_or_validate_agent_role(
+            raw,
+            found.workdir.as_deref().map(std::path::Path::new),
+            parent_wd.as_deref().map(std::path::Path::new),
+            data,
+        )?)
+    } else {
+        None
+    };
+    let updated = store.set_agent_role(&found.id, new_role.as_deref())?;
     let cfg = anyagents_core::agent_config_dir(data, &updated.id);
     let work_dir = updated
         .workdir
@@ -500,9 +516,19 @@ pub fn describe_cmd(
         let new_r = if r.trim().is_empty() {
             None
         } else {
-            Some(r.trim())
+            let parent_wd = rec
+                .parent_id
+                .as_ref()
+                .and_then(|pid| store.agent(pid).ok())
+                .and_then(|p| p.workdir);
+            Some(crate::create::normalize_or_validate_agent_role(
+                r.trim(),
+                rec.workdir.as_deref().map(std::path::Path::new),
+                parent_wd.as_deref().map(std::path::Path::new),
+                data,
+            )?)
         };
-        rec = store.set_agent_role(&rec.id, new_r)?;
+        rec = store.set_agent_role(&rec.id, new_r.as_deref())?;
         crate::telegram::sync_agent_telegram_bot_name(&store, data, &rec);
     }
     if clear {

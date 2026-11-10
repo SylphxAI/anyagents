@@ -8092,6 +8092,7 @@ pub(crate) fn parse_archetype_markdown(raw: &str) -> Result<ArchetypeTemplate, E
                 "archetype template frontmatter requires fields or a markdown body".to_string(),
             ));
         }
+        let mut frontmatter_stem: Option<String> = None;
         for (key, value) in fields {
             let value = value.trim();
             if key.trim().is_empty() || value.is_empty() {
@@ -8107,13 +8108,20 @@ pub(crate) fn parse_archetype_markdown(raw: &str) -> Result<ArchetypeTemplate, E
                 "model" => tpl.model = Some(value.to_string()),
                 "role" => tpl.role = Some(value.to_string()),
                 "profile" => tpl.profile = Some(value.to_string()),
-                "name" | "archetype" => {}
+                "name" | "archetype" => {
+                    if frontmatter_stem.is_none() && valid_template_stem(value) {
+                        frontmatter_stem = Some(value.to_string());
+                    }
+                }
                 _ => {
                     return Err(Error::Message(format!(
                         "unknown archetype template frontmatter key {key:?}"
                     )));
                 }
             }
+        }
+        if tpl.role.is_none() {
+            tpl.role = frontmatter_stem;
         }
         &rest[end..]
     } else {
@@ -8123,24 +8131,11 @@ pub(crate) fn parse_archetype_markdown(raw: &str) -> Result<ArchetypeTemplate, E
     Ok(tpl)
 }
 
-/// Resolve an archetype template by name across:
-/// 1. `<explicit_workdir>/.agents/agents/<archetype>.md` (or `<archetype>/agent.md`)
-/// 2. `<parent_workdir>/.agents/agents/<archetype>.md` (or `<archetype>/agent.md`)
-/// 3. `<data_dir>/.agents/agents/<archetype>.md` (then `<data_dir>/agents-templates/`, `<data_dir>/archetypes/`)
-/// 4. `<HOME>/.agents/agents/<archetype>.md` (and `owner_workdir()/.agents/agents/`)
-pub(crate) fn resolve_archetype_template(
-    archetype: &str,
+pub(crate) fn archetype_search_roots(
     explicit_workdir: Option<&Path>,
     parent_workdir: Option<&Path>,
     data_dir: &Path,
-) -> Result<Option<ArchetypeTemplate>, Error> {
-    let slug = archetype.trim();
-    if !valid_template_stem(slug) {
-        return Err(Error::Message(format!(
-            "invalid archetype template name {archetype:?}; expected a single filename stem"
-        )));
-    }
-
+) -> Vec<(PathBuf, PathBuf)> {
     let mut search_roots: Vec<(PathBuf, PathBuf)> = Vec::new();
     if let Some(wd) = explicit_workdir {
         let s = wd.to_string_lossy();
@@ -8163,7 +8158,66 @@ pub(crate) fn resolve_archetype_template(
             search_roots.push((owd, PathBuf::from(".agents/agents")));
         }
     }
+    search_roots
+}
 
+pub(crate) fn discover_available_archetype_slugs(
+    explicit_workdir: Option<&Path>,
+    parent_workdir: Option<&Path>,
+    data_dir: &Path,
+) -> Vec<String> {
+    let mut slugs = std::collections::BTreeSet::new();
+    for (base, rel_root) in archetype_search_roots(explicit_workdir, parent_workdir, data_dir) {
+        let dir = base.join(rel_root);
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
+            if ft.is_symlink() {
+                continue;
+            }
+            let path = entry.path();
+            if ft.is_file() {
+                if path.extension().and_then(|e| e.to_str()) == Some("md")
+                    && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+                    && valid_template_stem(stem)
+                {
+                    slugs.insert(stem.to_string());
+                }
+            } else if ft.is_dir()
+                && let Some(stem) = path.file_name().and_then(|s| s.to_str())
+                && valid_template_stem(stem)
+                && (path.join("agent.md").is_file() || path.join("AGENT.md").is_file())
+            {
+                slugs.insert(stem.to_string());
+            }
+        }
+    }
+    slugs.into_iter().collect()
+}
+
+/// Resolve an archetype template by name across:
+/// 1. `<explicit_workdir>/.agents/agents/<archetype>.md` (or `<archetype>/agent.md`)
+/// 2. `<parent_workdir>/.agents/agents/<archetype>.md` (or `<archetype>/agent.md`)
+/// 3. `<data_dir>/.agents/agents/<archetype>.md` (then `<data_dir>/agents-templates/`, `<data_dir>/archetypes/`)
+/// 4. `<HOME>/.agents/agents/<archetype>.md` (and `owner_workdir()/.agents/agents/`)
+pub(crate) fn resolve_archetype_template(
+    archetype: &str,
+    explicit_workdir: Option<&Path>,
+    parent_workdir: Option<&Path>,
+    data_dir: &Path,
+) -> Result<Option<ArchetypeTemplate>, Error> {
+    let slug = archetype.trim();
+    if !valid_template_stem(slug) {
+        return Err(Error::Message(format!(
+            "invalid archetype template name {archetype:?}; expected a single filename stem"
+        )));
+    }
+
+    let search_roots = archetype_search_roots(explicit_workdir, parent_workdir, data_dir);
     let candidates = [
         format!("{slug}.md"),
         format!("{}/agent.md", slug),
@@ -8173,7 +8227,17 @@ pub(crate) fn resolve_archetype_template(
     for (base, root) in search_roots {
         for rel in &candidates {
             if let Some(raw) = read_archetype_file(&base, &root.join(rel))? {
-                return parse_archetype_markdown(&raw).map(Some);
+                let mut tpl = parse_archetype_markdown(&raw)?;
+                if tpl
+                    .role
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|r| valid_template_stem(r))
+                    .is_none()
+                {
+                    tpl.role = Some(slug.to_string());
+                }
+                return Ok(Some(tpl));
             }
         }
     }
@@ -8321,9 +8385,9 @@ fn open_archetype_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
 }
 
 /// Apply archetype template defaults (`.agents/agents/<archetype>.md`) to a `CreateAgentRequest`
-/// in-place before agent creation. When `archetype` is omitted, also checks whether `role`
-/// matches a template slug (e.g. `role: "code-reviewer"` when `.agents/agents/code-reviewer.md`
-/// exists) while keeping `role` methodology-neutral when no template matches.
+/// in-place before agent creation. Unifies `role` and `archetype`: resolving a template sets
+/// `body.role` to the canonical template stem `<slug>`, and when templates are configured in
+/// `.agents/agents/`, unknown `role` names are rejected before persistence.
 pub(crate) fn apply_archetype_defaults(
     data_dir: &Path,
     parent: Option<&Agent>,
@@ -8336,14 +8400,14 @@ pub(crate) fn apply_archetype_defaults(
         .filter(|s| !s.is_empty())
         .map(PathBuf::from);
     let parent_wd = parent.and_then(|p| p.workdir.as_deref()).map(Path::new);
-    let tpl = if let Some(arch) = body
+    let resolved = if let Some(arch) = body
         .archetype
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
         match resolve_archetype_template(arch, explicit_wd.as_deref(), parent_wd, data_dir)? {
-            Some(template) => Some(template),
+            Some(template) => Some((arch.to_string(), template)),
             None => {
                 return Err(Error::Message(format!(
                     "unknown archetype template {arch:?}"
@@ -8359,28 +8423,35 @@ pub(crate) fn apply_archetype_defaults(
         let slugified = role.to_ascii_lowercase().replace(' ', "-");
         let direct = if valid_template_stem(role) {
             resolve_archetype_template(role, explicit_wd.as_deref(), parent_wd, data_dir)?
+                .map(|tpl| (role.to_string(), tpl))
         } else {
             None
         };
-        let resolved = if direct.is_some() {
+        let matched = if direct.is_some() {
             direct
         } else if valid_template_stem(&slugified) {
             resolve_archetype_template(&slugified, explicit_wd.as_deref(), parent_wd, data_dir)?
+                .map(|tpl| (slugified, tpl))
         } else {
             None
         };
-        if resolved.is_some() {
-            resolved
-        } else if let Some(fallback_slug) = fallback_archetype_slug_from_role(role) {
-            resolve_archetype_template(fallback_slug, explicit_wd.as_deref(), parent_wd, data_dir)?
+        if matched.is_some() {
+            matched
         } else {
-            // A display label is not required to be a template stem.
+            let available =
+                discover_available_archetype_slugs(explicit_wd.as_deref(), parent_wd, data_dir);
+            if !available.is_empty() {
+                return Err(Error::Message(format!(
+                    "unknown role template {role:?} (available: {})",
+                    available.join(", ")
+                )));
+            }
             None
         }
     } else {
         None
     };
-    let Some(tpl) = tpl else {
+    let Some((resolved_slug, tpl)) = resolved else {
         return Ok(());
     };
 
@@ -8467,15 +8538,14 @@ pub(crate) fn apply_archetype_defaults(
     {
         body.profile = Some(p);
     }
-    if body
+    let canonical_role = tpl
         .role
         .as_deref()
         .map(str::trim)
-        .is_none_or(str::is_empty)
-        && let Some(r) = tpl.role
-    {
-        body.role = Some(r);
-    }
+        .filter(|r| valid_template_stem(r))
+        .unwrap_or(&resolved_slug)
+        .to_string();
+    body.role = Some(canonical_role);
     if !tpl.body.is_empty() {
         body.instructions = match body
             .instructions
@@ -8490,19 +8560,41 @@ pub(crate) fn apply_archetype_defaults(
     Ok(())
 }
 
-fn fallback_archetype_slug_from_role(role: &str) -> Option<&'static str> {
-    let lower = role.to_ascii_lowercase();
-    if lower.contains("director") || role.contains("總監") || role.contains("總管") {
-        Some("director")
-    } else if lower.contains("manager") || role.contains("主管") {
-        Some("manager")
-    } else if lower.contains("assistant") || role.contains("專屬助理") {
-        Some("assistant")
-    } else if lower.contains("worker") || role.contains("專員") {
-        Some("worker")
-    } else {
-        None
+pub(crate) fn normalize_or_validate_agent_role(
+    raw_role: &str,
+    agent_workdir: Option<&Path>,
+    parent_workdir: Option<&Path>,
+    data_dir: &Path,
+) -> Result<String, Error> {
+    let role = raw_role.trim();
+    let slugified = role.to_ascii_lowercase().replace(' ', "-");
+    if valid_template_stem(role)
+        && let Some(tpl) =
+            resolve_archetype_template(role, agent_workdir, parent_workdir, data_dir)?
+    {
+        return Ok(tpl
+            .role
+            .filter(|r| valid_template_stem(r))
+            .unwrap_or_else(|| role.to_string()));
     }
+    if slugified != role
+        && valid_template_stem(&slugified)
+        && let Some(tpl) =
+            resolve_archetype_template(&slugified, agent_workdir, parent_workdir, data_dir)?
+    {
+        return Ok(tpl
+            .role
+            .filter(|r| valid_template_stem(r))
+            .unwrap_or(slugified));
+    }
+    let available = discover_available_archetype_slugs(agent_workdir, parent_workdir, data_dir);
+    if !available.is_empty() {
+        return Err(Error::Message(format!(
+            "unknown role template {role:?} (available: {})",
+            available.join(", ")
+        )));
+    }
+    Ok(role.to_string())
 }
 
 fn valid_template_stem(value: &str) -> bool {
@@ -11490,15 +11582,15 @@ mod archetype_tests {
     }
 
     #[test]
-    fn composite_role_labels_resolve_fallback_archetype_templates() {
+    fn role_and_archetype_unify_on_canonical_template_slug_and_reject_unknown_roles() {
         let dir = tempfile::tempdir().unwrap();
         let templates_dir = dir.path().join(".agents/agents");
         std::fs::create_dir_all(&templates_dir).unwrap();
         for (slug, scope, body_text) in [
             ("director", "public", "Director template body."),
-            ("manager", "siblings", "Manager template body."),
+            ("engineer", "private", "Engineer template body."),
             ("assistant", "isolated", "Assistant template body."),
-            ("worker", "private", "Worker template body."),
+            ("code-reviewer", "siblings", "Reviewer template body."),
         ] {
             std::fs::write(
                 templates_dir.join(format!("{slug}.md")),
@@ -11509,36 +11601,54 @@ mod archetype_tests {
             .unwrap();
         }
 
-        for (role_label, expected_scope, expected_body) in [
+        for (selector_key, selector_val, expected_slug, expected_scope, expected_body) in [
+            ("role", "director", "director", "public", "Director template body."),
+            ("archetype", "engineer", "engineer", "private", "Engineer template body."),
+            ("role", "assistant", "assistant", "isolated", "Assistant template body."),
             (
-                "工作總監 (Work Director)",
-                "public",
-                "Director template body.",
-            ),
-            ("項目總管", "public", "Director template body."),
-            (
-                "商業化與數值經濟主管 (Monetization & Economy Manager)",
+                "role",
+                "Code Reviewer",
+                "code-reviewer",
                 "siblings",
-                "Manager template body.",
+                "Reviewer template body.",
             ),
-            ("外部聯絡專屬助理", "isolated", "Assistant template body."),
-            ("專員 / Worker", "private", "Worker template body."),
         ] {
             let mut req: crate::api::CreateAgentRequest =
                 serde_json::from_value(serde_json::json!({
                     "name": "sample-agent",
-                    "role": role_label,
+                    selector_key: selector_val,
                     "instructions": "Custom assignment instructions."
                 }))
                 .unwrap();
             apply_archetype_defaults(dir.path(), None, &mut req).unwrap();
-            assert_eq!(req.role.as_deref(), Some(role_label));
+            assert_eq!(req.role.as_deref(), Some(expected_slug));
             assert_eq!(req.scope.as_deref(), Some(expected_scope));
             assert_eq!(
                 req.instructions.as_deref(),
                 Some(format!("{expected_body}\n\nCustom assignment instructions.").as_str())
             );
         }
+
+        let mut bad_req: crate::api::CreateAgentRequest =
+            serde_json::from_value(serde_json::json!({
+                "name": "sample-agent",
+                "role": "nonexistent-role",
+            }))
+            .unwrap();
+        let err = apply_archetype_defaults(dir.path(), None, &mut bad_req)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("unknown role template \"nonexistent-role\""),
+            "{err}"
+        );
+        assert!(
+            normalize_or_validate_agent_role("nonexistent-role", None, None, dir.path()).is_err()
+        );
+        assert_eq!(
+            normalize_or_validate_agent_role("Code Reviewer", None, None, dir.path()).unwrap(),
+            "code-reviewer"
+        );
     }
 
     #[test]

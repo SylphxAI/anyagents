@@ -359,9 +359,9 @@ impl Table {
         self.rows.push(row);
     }
 
-    pub fn print(&self) {
+    pub fn render_lines(&self) -> Vec<String> {
         if self.headers.is_empty() {
-            return;
+            return Vec::new();
         }
         let cols = self.headers.len();
         let mut widths: Vec<usize> = self.headers.iter().map(|(h, _)| visible_width(h)).collect();
@@ -384,6 +384,8 @@ impl Table {
             None
         };
 
+        let mut out = Vec::with_capacity(1 + self.rows.len());
+
         // Header line
         let mut header_line = String::from(self.indent);
         for (i, (title, right)) in self.headers.iter().enumerate() {
@@ -405,7 +407,7 @@ impl Table {
         if self.fit_terminal && term_w >= 115 && visible_width(&header_line) > term_w {
             header_line = truncate_visible(&header_line, term_w);
         }
-        println!("{header_line}");
+        out.push(header_line);
 
         // Data rows
         for row in &self.rows {
@@ -433,6 +435,13 @@ impl Table {
             if self.fit_terminal && term_w >= 115 && visible_width(&line) > term_w {
                 line = truncate_visible(&line, term_w);
             }
+            out.push(line);
+        }
+        out
+    }
+
+    pub fn print(&self) {
+        for line in self.render_lines() {
             println!("{line}");
         }
     }
@@ -950,19 +959,11 @@ pub fn print_agents_table_with_options(
         max_depth: Option<usize>,
         out: &mut Vec<RenderedNode<'a>>,
     ) {
-        let role_tag = node
-            .role
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
         let display_name = if depth == 0 {
-            match (node.state.as_str(), role_tag) {
-                ("running", Some(r)) => format!("{} {}", bold(&node.name), dim(&format!("· {r}"))),
-                ("running", None) => bold(&node.name),
-                ("paused", Some(r)) => format!("{} {}", node.name, dim(&format!("· {r}"))),
-                ("paused", None) => node.name.clone(),
-                (_, Some(r)) => dim(&format!("{} · {r}", node.name)),
-                (_, None) => dim(&node.name),
+            match node.state.as_str() {
+                "running" => bold(&node.name),
+                "paused" => node.name.clone(),
+                _ => dim(&node.name),
             }
         } else {
             let mut prefix = String::new();
@@ -978,12 +979,10 @@ pub fn print_agents_table_with_options(
             } else {
                 prefix.push_str("├─ ");
             }
-            let kid_name = match (node.state.as_str(), role_tag) {
-                ("archived" | "idle", Some(r)) => dim(&format!("{} · {r}", node.name)),
-                ("archived" | "idle", None) => dim(&node.name),
-                ("running", Some(r)) => format!("{} {}", bold(&node.name), dim(&format!("· {r}"))),
-                (_, Some(r)) => format!("{} {}", node.name, dim(&format!("· {r}"))),
-                (_, None) => node.name.clone(),
+            let kid_name = match node.state.as_str() {
+                "archived" | "idle" => dim(&node.name),
+                "running" => bold(&node.name),
+                _ => node.name.clone(),
             };
             format!("{}{kid_name}", dim(&prefix))
         };
@@ -1043,6 +1042,7 @@ pub fn print_agents_table_with_options(
 
     let mut headers = vec![
         ("AGENT", false),
+        ("ROLE", false),
         ("STATUS", false),
         ("TREE", false),
         ("RUNTIME", false),
@@ -1117,7 +1117,18 @@ pub fn print_agents_table_with_options(
             format!("{}{}{styled_model}", cyan(&agent.harness), dim(" · "))
         };
 
-        let mut row = vec![node.display_name, status, tree_cell, runtime];
+        let role_cell = match agent
+            .role
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(r) if is_dim => dim(r),
+            Some(r) => cyan(r),
+            None => dim("-"),
+        };
+
+        let mut row = vec![node.display_name, role_cell, status, tree_cell, runtime];
         if let Some(lookup) = profile_lookup {
             let prof = lookup(agent);
             row.push(if is_dim { dim(&prof) } else { prof });
@@ -1622,5 +1633,41 @@ mod tests {
             ),
             "preserve all documents during import"
         );
+    }
+
+    #[test]
+    fn table_renders_role_column_right_after_agent_column() {
+        let mut table = Table::new(&[
+            ("AGENT", false),
+            ("ROLE", false),
+            ("STATUS", false),
+            ("TREE", false),
+            ("RUNTIME", false),
+        ])
+        .with_fit_terminal(false);
+        table.add_row(vec![
+            "alpha".to_string(),
+            "director".to_string(),
+            "○ idle".to_string(),
+            "1 sub".to_string(),
+            "agy · gemini".to_string(),
+        ]);
+        table.add_row(vec![
+            "└─ beta".to_string(),
+            "engineer".to_string(),
+            "● working".to_string(),
+            "L1".to_string(),
+            "spiron · gpt".to_string(),
+        ]);
+        let lines = table.render_lines();
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].contains("AGENT"));
+        assert!(lines[0].contains("ROLE"));
+        assert!(!lines[1].contains("alpha · director"));
+        assert!(lines[1].contains("alpha"));
+        assert!(lines[1].contains("director"));
+        assert!(!lines[2].contains("beta · engineer"));
+        assert!(lines[2].contains("└─ beta"));
+        assert!(lines[2].contains("engineer"));
     }
 }
