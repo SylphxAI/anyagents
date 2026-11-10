@@ -255,6 +255,7 @@ fn update(data: &Path, agents: &[Agent], import_legacy: bool) -> Result<(), Erro
         file.sync_all()?;
         std::fs::rename(&temp, data.join(REGISTRY))?;
         File::open(data)?.sync_all()?;
+        super::invalidate_peers_cache();
         Ok(())
     })();
     if result.is_err() {

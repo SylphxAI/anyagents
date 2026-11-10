@@ -164,6 +164,66 @@ fn admission_script(checks: impl IntoIterator<Item = Check>) -> String {
     script
 }
 
+fn live_registry_same_seat_roots(data: &Path, uid: u32, gid: u32) -> Vec<std::path::PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::io::Read as _;
+        use std::os::unix::fs::MetadataExt as _;
+        if uid == 0 || uid == current_uid() {
+            return Vec::new();
+        }
+        let path = data.join("execution-principals.json");
+        let Ok(link_meta) = std::fs::symlink_metadata(&path) else {
+            return Vec::new();
+        };
+        if !link_meta.is_file() {
+            return Vec::new();
+        }
+        let Ok(file) = std::fs::File::open(&path) else {
+            return Vec::new();
+        };
+        let Ok(meta) = file.metadata() else {
+            return Vec::new();
+        };
+        if !meta.is_file()
+            || (meta.dev(), meta.ino()) != (link_meta.dev(), link_meta.ino())
+            || meta.uid() != current_uid()
+            || (meta.mode() & 0o022) != 0
+            || meta.nlink() != 1
+            || meta.len() > 1_048_576
+        {
+            return Vec::new();
+        }
+        let mut raw = String::new();
+        if file.take(1_048_577).read_to_string(&mut raw).is_err() || raw.len() > 1_048_576 {
+            return Vec::new();
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            return Vec::new();
+        };
+        let Some(entries) = value.as_object() else {
+            return Vec::new();
+        };
+        let agents_dir = data.join("agents");
+        entries
+            .iter()
+            .filter_map(|(id, entry)| {
+                if id.is_empty() || id == "." || id == ".." || id.contains('/') || id.contains(char::from(0)) {
+                    return None;
+                }
+                let entry_uid = entry.get("uid")?.as_u64().and_then(|n| u32::try_from(n).ok())?;
+                let entry_gid = entry.get("gid")?.as_u64().and_then(|n| u32::try_from(n).ok())?;
+                (entry_uid == uid && entry_gid == gid).then(|| agents_dir.join(id))
+            })
+            .collect()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (data, uid, gid);
+        Vec::new()
+    }
+}
+
 #[cfg(test)]
 fn checks(
     config: Option<&Path>,
@@ -242,11 +302,12 @@ fn checks_with_principals(
         Err(err) => return Err(err),
     };
     peers.sort();
-    let same_seat_roots: std::collections::HashSet<&Path> = principals
+    let mut same_seat_roots: std::collections::HashSet<std::path::PathBuf> = principals
         .iter()
         .filter(|p| p.uid == uid && p.gid == gid)
-        .map(|p| p.root.as_path())
+        .map(|p| p.root.clone())
         .collect();
+    same_seat_roots.extend(live_registry_same_seat_roots(data, uid, gid));
     let mut foreign_roots = Vec::new();
     let mut peer_trees_program = String::new();
     let mut peer_caps_program = String::new();
@@ -1101,5 +1162,46 @@ mod peer_search_regressions {
                 b"boundary check failed: peer seats' private trees are denied\n"
             );
         }
+    }
+
+    #[test]
+    fn live_execution_principals_registry_admits_same_seat_peers_created_after_env_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("agents/own/config");
+        let later_same_seat = dir.path().join("agents/agt_later_same_seat");
+        std::fs::create_dir_all(&config).unwrap();
+        for name in ["config", "memory", "skills"] {
+            std::fs::create_dir_all(later_same_seat.join(name)).unwrap();
+        }
+        let run = || {
+            let selected = checks_with_principals(Some(&config), dir.path(), 24031, 24032, &[])
+                .unwrap()
+                .into_iter()
+                .filter(|c| c.what == "peer seats' private trees are denied");
+            Command::new("/bin/sh")
+                .args(["-c", &admission_script(selected)])
+                .output()
+                .unwrap()
+        };
+        assert!(!run().status.success(), "unregistered peer must be denied");
+        let registry = dir.path().join("execution-principals.json");
+        std::fs::write(
+            &registry,
+            serde_json::json!({
+                "agt_later_same_seat": {
+                    "user": "seat-shared",
+                    "uid": 24031,
+                    "gid": 24032,
+                    "socket_gid": 24033
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::set_permissions(&registry, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(
+            run().status.success(),
+            "same-seat peer in server-owned execution-principals.json must be admitted even when absent from frozen env snapshot"
+        );
     }
 }

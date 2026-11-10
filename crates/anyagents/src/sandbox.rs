@@ -723,17 +723,28 @@ fn is_peer_boundary_shared(config: &Path, gid: u32) -> bool {
     true
 }
 
+type CachedPeers = (std::time::Instant, PathBuf, usize, String);
+
+fn peers_cache() -> &'static std::sync::Mutex<Option<CachedPeers>> {
+    static PEERS_CACHE: std::sync::OnceLock<std::sync::Mutex<Option<CachedPeers>>> =
+        std::sync::OnceLock::new();
+    PEERS_CACHE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+pub(super) fn invalidate_peers_cache() {
+    if let Ok(mut guard) = peers_cache().lock() {
+        *guard = None;
+    }
+}
+
 /// Registered root-to-principal resolution is the same authority used by vendor
 /// launch. Unregistered directories remain foreign in the shared inventory.
 pub(crate) fn peer_principals(store: &anyagents_core::Store) -> Result<String, Error> {
     use std::sync::{Mutex, OnceLock};
-    type CachedPeers = (std::time::Instant, PathBuf, usize, String);
-    static PEERS_CACHE: OnceLock<Mutex<Option<CachedPeers>>> = OnceLock::new();
-
     let agents = store.list_agents()?;
     let cacheable = !is_isolated_test_env() && std::env::var_os("ANYAGENTS_PRINCIPALS").is_none();
     if cacheable
-        && let Ok(guard) = PEERS_CACHE.get_or_init(|| Mutex::new(None)).lock()
+        && let Ok(guard) = peers_cache().lock()
         && let Some((at, ref dir, count, ref json)) = *guard
         && dir == store.data_dir()
         && count == agents.len()
@@ -762,7 +773,7 @@ pub(crate) fn peer_principals(store: &anyagents_core::Store) -> Result<String, E
         }
     }
     let json = serde_json::to_string(&peers).map_err(|e| Error::Message(e.to_string()))?;
-    if cacheable && let Ok(mut guard) = PEERS_CACHE.get_or_init(|| Mutex::new(None)).lock() {
+    if cacheable && let Ok(mut guard) = peers_cache().lock() {
         *guard = Some((
             std::time::Instant::now(),
             store.data_dir().to_path_buf(),
