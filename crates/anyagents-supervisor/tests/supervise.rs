@@ -1060,9 +1060,9 @@ done
         format!("{}\n", clock.now_ms() + 1),
     )
     .unwrap();
-    // Wait until the supervisor loop latches the pending rotation (1s review
-    // wait) before queueing the message, avoiding a race with the non-blocking
-    // ObservedClock poll loop.
+    store.poke(Wake::Agent {
+        agent_id: agent.id.clone(),
+    });
     loop {
         let (now, deadline) = rx.recv_timeout(WAIT_CEILING).unwrap();
         if deadline == Some(now + 1_000) {
@@ -1072,6 +1072,12 @@ done
     store
         .receive(&agent.id, Incoming::new("queued-for-new-profile"))
         .unwrap();
+    loop {
+        let (now, deadline) = rx.recv_timeout(WAIT_CEILING).unwrap();
+        if deadline == Some(now + 1_000) {
+            break;
+        }
+    }
     for elapsed in [15_001, 30_001] {
         let now = 1_700_000_000_000 + elapsed;
         clock.set_ms(now);
