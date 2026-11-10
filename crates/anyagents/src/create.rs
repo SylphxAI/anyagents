@@ -190,7 +190,19 @@ fn create_with_seat(
                 .ok()
                 .is_some_and(|v| !v.trim().is_empty());
         if wd_is_cloud_keyword && !pairs.iter().any(|(k, _)| k == "SYLPHX_AGENT_ENV") {
-            pairs.push(("SYLPHX_AGENT_ENV".to_string(), "default".to_string()));
+            let env_slug = std::fs::read_to_string(config.join(".config/sylphx/context.json"))
+                .ok()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                .and_then(|v| {
+                    v.get("environment")
+                        .or_else(|| v.get("env"))
+                        .and_then(|s| s.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| "default".to_string());
+            pairs.push(("SYLPHX_AGENT_ENV".to_string(), env_slug));
         }
         let workdir_created =
             explicit_workdir.as_ref().is_some_and(|p| !p.exists()) || effective_repo.is_some();
@@ -1929,6 +1941,9 @@ pub(crate) fn seed_harness_credentials(
             }
         }
     }
+    if crate::vendor::is_spiron_harness(&agent.harness) {
+        crate::spiron::ensure_spiron_seat_auth(target_config);
+    }
     if let Some(ref bound) = current_bound {
         write_profile_marker(
             target_config,
@@ -2331,7 +2346,10 @@ pub(crate) fn reconcile_agent_runtime_config(
             ("claude-code", ".claude.json"),
             ("claude-code", "mcp.json"),
         ] {
-            if agent.harness != other_harness {
+            if agent.harness != other_harness
+                && !(stale_file == "config.toml"
+                    && crate::vendor::is_spiron_harness(&agent.harness))
+            {
                 let _ = std::fs::remove_file(config.join(stale_file));
             }
         }
@@ -2594,6 +2612,18 @@ pub(crate) fn verify_harness_runtime_config(
             if !text.contains("\"anyagents\"") {
                 return Err(Error::Message(
                     "spiron-mcp.json missing anyagents MCP server".into(),
+                ));
+            }
+            let cfg_toml = config.join("config.toml");
+            let toml_text = std::fs::read_to_string(&cfg_toml).map_err(|_| {
+                Error::Message(format!(
+                    "spiron config.toml missing: {}",
+                    cfg_toml.display()
+                ))
+            })?;
+            if !toml_text.contains("always_approve = true") {
+                return Err(Error::Message(
+                    "spiron config.toml missing always_approve = true".into(),
                 ));
             }
         }
