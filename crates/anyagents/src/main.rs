@@ -12,6 +12,7 @@ mod auth;
 mod browser;
 mod channel;
 mod client;
+mod cloud_harness;
 mod computer;
 mod create;
 mod data;
@@ -565,6 +566,9 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Run the outbound cloud harness adapter (`spiron-cloud`, `claude-cloud`, `openai-cloud`, `cursor-cloud`) speaking `stream-json`.
+    #[command(name = "cloud-harness")]
+    CloudHarness(cloud_harness::CloudHarnessArgs),
 }
 
 #[derive(Subcommand)]
@@ -929,6 +933,16 @@ fn main() -> ExitCode {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
     sandbox::hydrate_operator_groups_if_needed();
+    let raw_argv: Vec<String> = std::env::args().collect();
+    if let Some(cloud_args) = cloud_harness::try_parse_from_raw_argv(&raw_argv) {
+        return match cloud_harness::run(cloud_args) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("{err}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     let cli = Cli::parse();
     // The daemon also writes child stdin pipes and must handle their closure as
     // an I/O error, not terminate the entire service. Only operator output uses
@@ -1368,6 +1382,7 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
             json,
         } => schedule_cmd(&data, agent, at, every, watch, prompt, cancel, json),
         Command::Inspect { agent, limit, json } => inspect_cmd(&data, agent, limit, json),
+        Command::CloudHarness(args) => cloud_harness::run(args),
     }
 }
 

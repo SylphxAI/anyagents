@@ -1,0 +1,16 @@
+[package]
+name = "anyagents-tools"
+version.workspace = true
+edition = "2024"
+license = "MIT"
+rust-version = "1.98"
+description = "Shared capability core and pluggable workspace backend (LocalHost vs RemoteSandbox) for AnyAgents"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+ureq = { version = "3", features = ["json"] }
+
+[dev-dependencies]
+tempfile = "3"

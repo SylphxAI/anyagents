@@ -20,6 +20,7 @@ anyagents-harness-muse = { path = "../anyagents-harness-muse" }
 anyagents-harness-codex = { path = "../anyagents-harness-codex" }
 anyagents-harness-opencode = { path = "../anyagents-harness-opencode" }
 anyagents-supervisor = { path = "../anyagents-supervisor" }
+anyagents-tools = { path = "../anyagents-tools" }
 axum = { version = "0.8", features = ["json"] }
 bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["std"] }

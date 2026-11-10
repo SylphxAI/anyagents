@@ -825,8 +825,13 @@ async fn mcp_get_route(
     Query(query): Query<McpRouteQuery>,
 ) -> Result<axum::response::Response, ApiError> {
     let (agent, _token) = authenticate_mcp_request(&state.store, &headers)?;
-    let profile = crate::mcp::McpProfile::resolve_http(query.profile.as_deref(), &agent.harness)
-        .map_err(|msg| ApiError::new(StatusCode::BAD_REQUEST, msg))?;
+    let config_dir = anyagents_core::agent_config_dir(state.store.data_dir(), &agent.id);
+    let profile = crate::mcp::McpProfile::resolve_http_with_config(
+        query.profile.as_deref(),
+        &agent.harness,
+        Some(&config_dir),
+    )
+    .map_err(|msg| ApiError::new(StatusCode::BAD_REQUEST, msg))?;
     let accept = headers
         .get(axum::http::header::ACCEPT)
         .and_then(|v| v.to_str().ok())
@@ -871,10 +876,14 @@ async fn mcp_post_route(
     Json(payload): Json<serde_json::Value>,
 ) -> Result<axum::response::Response, ApiError> {
     let (agent, token) = authenticate_mcp_request(&state.store, &headers)?;
-    let profile = crate::mcp::McpProfile::resolve_http(query.profile.as_deref(), &agent.harness)
-        .map_err(|msg| ApiError::new(StatusCode::BAD_REQUEST, msg))?;
-    let sock = ensure_internal_socket_listener(&state);
     let config_dir = anyagents_core::agent_config_dir(state.store.data_dir(), &agent.id);
+    let profile = crate::mcp::McpProfile::resolve_http_with_config(
+        query.profile.as_deref(),
+        &agent.harness,
+        Some(&config_dir),
+    )
+    .map_err(|msg| ApiError::new(StatusCode::BAD_REQUEST, msg))?;
+    let sock = ensure_internal_socket_listener(&state);
     let _ = std::fs::create_dir_all(&config_dir);
     let mcp = crate::mcp::AgentMcp::new_for_http(
         crate::mcp::AgentRef {
