@@ -2367,8 +2367,7 @@ cat >/dev/null
         assert!(changed.success());
         let seat_owned_harness = launch().unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while !std::fs::read_to_string(&report)
-            .is_ok_and(|text| text.contains("GIT_TRUST_EXACT"))
+        while !std::fs::read_to_string(&report).is_ok_and(|text| text.contains("GIT_TRUST_EXACT"))
             && std::time::Instant::now() < deadline
         {
             std::thread::sleep(Duration::from_millis(10));
