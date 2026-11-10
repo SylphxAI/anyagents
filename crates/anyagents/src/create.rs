@@ -1174,9 +1174,8 @@ fn install_skill_projection_as_owner(
         return Err(std::io::Error::other("skill projection owner missing"));
     }
     // UID and primary GID are independent OS identities.
-    let (eff_uid, eff_gid) = seat_owner.ok_or_else(|| {
-        std::io::Error::other("skill projection is not owned by another seat")
-    })?;
+    let (eff_uid, eff_gid) = seat_owner
+        .ok_or_else(|| std::io::Error::other("skill projection is not owned by another seat"))?;
     let launcher = crate::sandbox::descriptor_launcher()
         .ok_or_else(|| std::io::Error::other("skill projection launcher missing"))?;
     let groups = match crate::sandbox::sock_gid_for() {
