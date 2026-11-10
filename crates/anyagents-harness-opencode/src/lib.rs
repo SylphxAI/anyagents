@@ -1088,17 +1088,35 @@ impl OpenCodeHarness {
         port::PortLease::release_stored(Some(dir));
     }
 
+    fn stored_port_occupied(&self) -> bool {
+        let Some(port) = self.config_dir.as_deref().and_then(|dir| {
+            std::fs::read_to_string(dir.join("opencode-service-port"))
+                .ok()?
+                .trim()
+                .parse::<u16>()
+                .ok()
+        }) else {
+            return false;
+        };
+        matches!(
+            std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)),
+            Err(err) if err.kind() == std::io::ErrorKind::AddrInUse
+        )
+    }
+
     fn terminate_service_pid(&self, pid: u32) {
         let children = direct_child_pids(pid);
         anyagents_harness::kill_pid(pid, "-TERM", &self.environment);
         let deadline = Instant::now() + Duration::from_millis(500);
-        while Instant::now() < deadline && process_exists(pid) {
+        while Instant::now() < deadline && (process_exists(pid) || self.stored_port_occupied()) {
             std::thread::sleep(Duration::from_millis(25));
         }
-        if process_exists(pid) {
+        if process_exists(pid) || self.stored_port_occupied() {
             anyagents_harness::kill_pid(pid, "-KILL", &self.environment);
-            let kill_deadline = Instant::now() + Duration::from_millis(250);
-            while Instant::now() < kill_deadline && process_exists(pid) {
+            let kill_deadline = Instant::now() + Duration::from_millis(500);
+            while Instant::now() < kill_deadline
+                && (process_exists(pid) || self.stored_port_occupied())
+            {
                 std::thread::sleep(Duration::from_millis(25));
             }
         }
