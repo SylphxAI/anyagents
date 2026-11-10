@@ -391,9 +391,15 @@ A channel adapter has an inbound side (a stream of events, each with its source 
 - **Sending.** The `send` tool takes `telegram:chat:<id>[:<topic>]`, and `telegram:user:<id>[:<message>]` where the message is what the reply answers, plus `reply_to` for an explicit Telegram message id. A forum post carries its `message_thread_id`. The returned id is the Telegram message id.
 - **Bot to bot.** A bot generally does not receive messages sent by other bots ([bot FAQ](https://core.telegram.org/bots/faq#what-messages-will-my-bot-get)), and recent Bot API versions deliver only some of them. So a chat an agent's bot deals in is remembered in the channel state, and when an agent posts into a chat through its bot the server also delivers that post into the mailbox of every other agent on the same chat, keyed by the outbound message id; if Telegram also delivers the same post, the copy is dropped by its source key. The sender does not receive its own post.
 
-## Send, inbox and agents (the MCP tools)
+## Send, inbox and agents (the MCP tools and three mounting modes)
 
-`anyagents mcp --config <agent config dir>` is the MCP server registered into each agent's harness. It holds one opaque capability, minted by the server for one agent instance, so the agent acts as exactly that agent and nothing a tool argument says.
+`anyagents mcp --config <agent config dir>` (over `stdio`) and Streamable HTTP `POST /mcp` / `GET /mcp` (over the server's HTTP listener or public webhook port, authenticated via `Authorization: Bearer <mcp-capability>` or `x-anyagents-agent: <mcp-capability>`) expose AnyAgents' MCP surface. Each connection holds one opaque capability minted by the server for one agent instance, so the agent acts as exactly that agent and nothing a tool argument says.
+
+AnyAgents selects the exposed MCP tool profile according to the execution boundary:
+
+1. **`full` (Default for Local 3rd-Party CLI Harnesses over `stdio` — `claude-code`, `codex`, `agy`, `opencode`):** Exposes the local workspace `code` tool (`read`, `write`, `edit`, `bash`, `search` inside the agent's local worktree), `memory`, `skills`, `web_search`, `web_fetch`, `browser`, `computer`, and the coordination tools (`send`, `inbox`, `agents`, `groups`, `schedules`, `conversation`).
+2. **`remote` (Default for Streamable HTTPS `POST /mcp` — Closed-Box 3rd-Party Cloud Agents such as Claude Cloud, OpenAI Responses/Codex Cloud, and Cursor Cloud Agents):** Closed-box vendor cloud containers keep their own native container file/bash sandbox tools; AnyAgents' remote `/mcp` omits host-local `code` (so a cloud agent never accidentally edits the orchestrator host's disk) while exposing `send`, `inbox`, `agents`, `groups`, `schedules`, `conversation`, `memory`, `skills`, `web_search`, `web_fetch`, `browser`, and `computer`.
+3. **`coordination` (Default when `harness == "spiron"` or `--profile coordination` / `?profile=coordination`):** Because the first-party `spiron` harness natively embeds the shared capability core's `code`, file, `web_search`, `web_fetch`, `memory`, and `skills` tools, AnyAgents exposes only the orchestration and host-device tools (`send`, `inbox`, `agents`, `groups`, `schedules`, `conversation`, `browser`, `computer`), eliminating duplicate tool definitions and duplicate `<available_skills>` / `<memory>` prompt blocks.
 
 ## Identity: one authenticated connection per agent session
 
@@ -512,10 +518,7 @@ for a public agent it restores the default above. An explicit `scope` takes
 precedence when both fields are supplied. To enable sibling collaboration, send
 `scope: "siblings"` explicitly.
 
-Agents may edit their own description and instructions. Changing scope or role
-requires an ancestor, a root admin or the operator; updating another agent's
-private metadata requires the same authority. Unrelated non-admin agents cannot
-overwrite it.
+Only a strict ancestor (`is_ancestor`: parent, grandparent, or higher ancestor in the supervision tree, excluding `self`), a root admin (`is_admin`), or the operator may edit an agent's `description`, `instructions`, `role`, `scope`, `public`, `name` (`rename`), `harness`, or lifecycle state (`reset`, `pause`, `archive`, `delete`, `wake`, `schedule`, and subtree-bounded `transfer`). An agent (`self` without admin authority) has read-only access to its own metadata and authorized tree (`conversation`) and cannot overwrite its own instructions, description, role, or scope. Unrelated non-admin agents cannot read or overwrite another subtree's private metadata. Cross-tree operations (`mint_capability`, `operator_inbox`, cross-tree `transfer`, root creation) require `is_admin` or the operator token.
 
 Every accepted scope or legacy-public write, including an unchanged value,
 atomically records its authenticated `actor`, `before_scope`, `after_scope` and
