@@ -209,6 +209,10 @@ impl OpenCodeHarness {
 
     /// Start the service, wait until it answers, and resume the session.
     fn begin(&mut self) -> Result<(), HarnessError> {
+        // Reap any prior service or PPID=1 orphan for this config before
+        // acquiring the port so a daemon restart reclaims its stable port and
+        // never leaves duplicate OpenCode servers sharing one session store.
+        self.reap_prior_service();
         // Keep a stable private port across restarts; never use the managed
         // service default or allow `api` to discover a different service.
         for attempt in 0..3 {
@@ -271,6 +275,7 @@ impl OpenCodeHarness {
         let mut child = command
             .spawn()
             .map_err(|err| HarnessError::Failed(err.to_string()))?;
+        self.write_service_pid(child.id());
         let collision = port::watch_collision(child.stderr.take().expect("piped stderr"));
         self.child = Some(child);
         if let Some(stdout) = self.child.as_mut().and_then(|child| child.stdout.take()) {
@@ -1032,13 +1037,86 @@ impl Harness for OpenCodeHarness {
     }
 }
 
+const SERVICE_PID_FILE: &str = "opencode-service-pid";
+
 impl OpenCodeHarness {
+    fn write_service_pid(&self, pid: u32) {
+        let Some(dir) = self.config_dir.as_deref() else {
+            return;
+        };
+        let _ = std::fs::create_dir_all(dir);
+        let path = dir.join(SERVICE_PID_FILE);
+        let temp = dir.join(format!(".{SERVICE_PID_FILE}.{}.new", std::process::id()));
+        if std::fs::write(&temp, format!("{pid}\n")).is_ok() {
+            let _ = std::fs::rename(&temp, &path);
+        }
+    }
+
+    fn clear_service_pid(&self, expected: Option<u32>) {
+        let Some(dir) = self.config_dir.as_deref() else {
+            return;
+        };
+        let path = dir.join(SERVICE_PID_FILE);
+        if let Some(expected_pid) = expected
+            && let Ok(text) = std::fs::read_to_string(&path)
+            && text.trim().parse::<u32>().ok() != Some(expected_pid)
+        {
+            return;
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn reap_prior_service(&self) {
+        let Some(dir) = self.config_dir.as_deref() else {
+            return;
+        };
+        let pid_path = dir.join(SERVICE_PID_FILE);
+        if let Ok(text) = std::fs::read_to_string(&pid_path)
+            && let Ok(pid) = text.trim().parse::<u32>()
+            && pid > 1
+            && pid != std::process::id()
+            && is_opencode_service_pid(pid)
+        {
+            self.terminate_service_pid(pid);
+        }
+        let _ = std::fs::remove_file(&pid_path);
+        for orphan_pid in find_orphan_service_pids(dir) {
+            if orphan_pid > 1 && orphan_pid != std::process::id() {
+                self.terminate_service_pid(orphan_pid);
+            }
+        }
+        port::PortLease::release_stored(Some(dir));
+    }
+
+    fn terminate_service_pid(&self, pid: u32) {
+        let children = direct_child_pids(pid);
+        anyagents_harness::kill_pid(pid, "-TERM", &self.environment);
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < deadline && process_exists(pid) {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        if process_exists(pid) {
+            anyagents_harness::kill_pid(pid, "-KILL", &self.environment);
+            let kill_deadline = Instant::now() + Duration::from_millis(250);
+            while Instant::now() < kill_deadline && process_exists(pid) {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        }
+        for child_pid in children {
+            if child_pid > 1 && process_exists(child_pid) {
+                anyagents_harness::kill_pid(child_pid, "-KILL", &self.environment);
+            }
+        }
+    }
+
     fn stop_child(&mut self) {
         self.lock().alive = false;
         if let Some(mut child) = self.child.take() {
+            let pid = child.id();
+            let children = direct_child_pids(pid);
             // The exact child, never a pattern or a group: a shared desk refuses
             // a group signal it does not own, and it is right to.
-            anyagents_harness::kill_pid(child.id(), "-TERM", &self.environment);
+            anyagents_harness::kill_pid(pid, "-TERM", &self.environment);
             let deadline = Instant::now() + Duration::from_secs(5);
             loop {
                 match child.try_wait() {
@@ -1053,9 +1131,166 @@ impl OpenCodeHarness {
                 }
             }
             let _ = child.wait();
+            for child_pid in children {
+                if child_pid > 1 && process_exists(child_pid) {
+                    anyagents_harness::kill_pid(child_pid, "-KILL", &self.environment);
+                }
+            }
+            self.clear_service_pid(Some(pid));
         }
         self.lock().service = None;
         self.lock().password = None;
+    }
+}
+
+fn process_exists(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        let Some(after_comm) = stat.rfind(')') else {
+            return true;
+        };
+        let state = stat[after_comm + 1..]
+            .split_whitespace()
+            .next()
+            .unwrap_or("");
+        !matches!(state, "Z" | "X" | "x")
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+fn is_opencode_service_pid(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        match std::fs::read(format!("/proc/{pid}/cmdline")) {
+            Ok(bytes) if !bytes.is_empty() => {
+                let args: Vec<&str> = bytes
+                    .split(|b| *b == 0)
+                    .filter(|s| !s.is_empty())
+                    .filter_map(|s| std::str::from_utf8(s).ok())
+                    .collect();
+                args.contains(&"serve") && (args.contains(&"--port") || args.contains(&"--service"))
+            }
+            Ok(_) => false,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+            Err(_) => true,
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
+fn proc_ppid(pid: u32) -> Option<u32> {
+    #[cfg(target_os = "linux")]
+    {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let after_comm = stat.rfind(')')?;
+        let mut fields = stat[after_comm + 1..].split_whitespace();
+        let _state = fields.next()?;
+        fields.next()?.parse::<u32>().ok()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+fn direct_child_pids(parent_pid: u32) -> Vec<u32> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut out = Vec::new();
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return out;
+        };
+        for entry in entries.flatten() {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|s| s.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            if proc_ppid(pid) == Some(parent_pid) {
+                out.push(pid);
+            }
+        }
+        out
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = parent_pid;
+        Vec::new()
+    }
+}
+
+fn find_orphan_service_pids(config_dir: &Path) -> Vec<u32> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut out = Vec::new();
+        let stored_port = std::fs::read_to_string(config_dir.join("opencode-service-port"))
+            .ok()
+            .and_then(|s| s.trim().parse::<u16>().ok())
+            .map(|p| p.to_string());
+        let config_str = config_dir.to_string_lossy();
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return out;
+        };
+        for entry in entries.flatten() {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|s| s.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let Ok(bytes) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+                continue;
+            };
+            let args: Vec<&str> = bytes
+                .split(|b| *b == 0)
+                .filter(|s| !s.is_empty())
+                .filter_map(|s| std::str::from_utf8(s).ok())
+                .collect();
+            if args.is_empty() {
+                continue;
+            }
+            if let Some(port_str) = stored_port.as_deref()
+                && proc_ppid(pid) == Some(1)
+                && args.contains(&"serve")
+                && args.windows(2).any(|w| w == ["--port", port_str])
+                && !out.contains(&pid)
+            {
+                out.push(pid);
+            }
+            if args.contains(&"mcp")
+                && args
+                    .windows(2)
+                    .any(|w| w == ["--config", config_str.as_ref()])
+                && let Some(parent) = proc_ppid(pid)
+                && parent > 1
+                && proc_ppid(parent) == Some(1)
+                && is_opencode_service_pid(parent)
+                && !out.contains(&parent)
+            {
+                out.push(parent);
+            }
+        }
+        out
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = config_dir;
+        Vec::new()
     }
 }
 

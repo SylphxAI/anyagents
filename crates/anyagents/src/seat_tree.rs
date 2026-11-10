@@ -457,6 +457,140 @@ pub(super) fn share_config(path: &Path, uid: u32, gid: u32) -> io::Result<()> {
     )
 }
 
+fn tighten_private_inode(
+    file: &File,
+    meta: &std::fs::Metadata,
+    uid: u32,
+    gid: u32,
+    mode: libc::mode_t,
+) -> io::Result<()> {
+    if meta.uid() != uid {
+        return Ok(());
+    }
+    #[allow(
+        clippy::unnecessary_cast,
+        reason = "MetadataExt::mode is u32 while libc::mode_t is u16 on macOS"
+    )]
+    if (meta.mode() as libc::mode_t & 0o7777) == mode {
+        return Ok(());
+    }
+    if unsafe { libc::fchmod(file.as_raw_fd(), mode) } == 0 {
+        return Ok(());
+    }
+    if (!super::sandbox::is_isolated_test_env()
+        || std::env::var_os("ANYAGENTS_REQUIRE_NATIVE_SEAT_TEST").is_some())
+        && let Some(launcher) = super::sandbox::descriptor_launcher()
+    {
+        let status = std::process::Command::new(launcher)
+            .args([
+                "--reuid",
+                &meta.uid().to_string(),
+                "--regid",
+                &meta.gid().to_string(),
+                "--groups",
+                &format!("{},{gid}", meta.gid()),
+                "--no-new-privs",
+                "--",
+                "/bin/sh",
+                "-c",
+                "chmod $1 /dev/fd/0",
+                "seat-inode",
+                &format!("{mode:o}"),
+            ])
+            .stdin(file.try_clone()?)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()?;
+        if status.success() {
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
+fn tighten_private_op_dir(parent: &File, name: &OsStr, uid: u32, gid: u32) -> io::Result<()> {
+    match open_child(parent, name, true) {
+        Ok(op_dir) => {
+            let meta = op_dir.metadata()?;
+            if !meta.is_dir() {
+                return Ok(());
+            }
+            for child_name in names(&op_dir).unwrap_or_default() {
+                if let Ok(child) = open_child(&op_dir, &child_name, false)
+                    && let Ok(cmeta) = child.metadata()
+                    && cmeta.is_file()
+                    && cmeta.nlink() == 1
+                {
+                    let _ = tighten_private_inode(&child, &cmeta, uid, gid, 0o600);
+                } else {
+                    #[cfg(target_os = "linux")]
+                    if let Ok(c_child) = CString::new(child_name.as_bytes()) {
+                        let fd = unsafe {
+                            libc::openat(
+                                op_dir.as_raw_fd(),
+                                c_child.as_ptr(),
+                                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                            )
+                        };
+                        if fd >= 0 {
+                            let bound = unsafe { File::from_raw_fd(fd) };
+                            if let Ok(cmeta) = bound.metadata()
+                                && cmeta.is_file()
+                                && cmeta.nlink() == 1
+                            {
+                                let _ = tighten_private_inode(&bound, &cmeta, uid, gid, 0o600);
+                            }
+                        }
+                    }
+                }
+            }
+            let _ = tighten_private_inode(&op_dir, &meta, uid, gid, 0o700);
+        }
+        #[cfg(target_os = "linux")]
+        Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
+            let c_name = CString::new(name.as_bytes()).map_err(io::Error::other)?;
+            let fd = unsafe {
+                libc::openat(
+                    parent.as_raw_fd(),
+                    c_name.as_ptr(),
+                    libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd >= 0 {
+                let bound = unsafe { File::from_raw_fd(fd) };
+                if let Ok(meta) = bound.metadata()
+                    && meta.is_dir()
+                    && meta.uid() == uid
+                    && (!super::sandbox::is_isolated_test_env()
+                        || std::env::var_os("ANYAGENTS_REQUIRE_NATIVE_SEAT_TEST").is_some())
+                    && let Some(launcher) = super::sandbox::descriptor_launcher()
+                {
+                    let _ = std::process::Command::new(launcher)
+                        .args([
+                            "--reuid",
+                            &meta.uid().to_string(),
+                            "--regid",
+                            &meta.gid().to_string(),
+                            "--groups",
+                            &format!("{},{gid}", meta.gid()),
+                            "--no-new-privs",
+                            "--",
+                            "/bin/sh",
+                            "-c",
+                            "chmod 700 /dev/fd/0 && if [ -f /dev/fd/0/config ] && [ ! -L /dev/fd/0/config ]; then chmod 600 /dev/fd/0/config; fi",
+                        ])
+                        .stdin(bound.try_clone()?)
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status();
+                }
+            }
+        }
+        Err(_) => {}
+    }
+    Ok(())
+}
+
 fn share_open(
     directory: File,
     path: &Path,
@@ -495,8 +629,15 @@ fn share_open(
                     | "telemetry"
                     | "statsig"
                     | "__pycache__"
-            ) || (text == "op" && path.ends_with(".config")))
+            ))
         {
+            continue;
+        }
+        if !access.runtime_tree
+            && text == "op"
+            && (path.ends_with(".config") || path.ends_with("config-home"))
+        {
+            let _ = tighten_private_op_dir(&directory, &name, uid, gid);
             continue;
         }
         let c_name = CString::new(name.as_bytes()).map_err(io::Error::other)?;
@@ -744,6 +885,21 @@ mod tests {
         assert_eq!(std::fs::metadata(&settings).unwrap().mode() & 0o777, 0o660);
         assert_eq!(std::fs::metadata(capability).unwrap().mode() & 0o777, 0o640);
         assert_eq!(std::fs::read(settings).unwrap(), b"{\"retained\":true}");
+
+        let op_dir = config.join(".config/op");
+        std::fs::create_dir_all(&op_dir).unwrap();
+        let op_cfg = op_dir.join("config");
+        std::fs::write(&op_cfg, b"{}").unwrap();
+        std::fs::set_permissions(&op_dir, std::fs::Permissions::from_mode(0o2770)).unwrap();
+        std::fs::set_permissions(&op_cfg, std::fs::Permissions::from_mode(0o660)).unwrap();
+        share_config(
+            &config,
+            crate::sandbox::server_uid(),
+            crate::sandbox::server_gid(),
+        )
+        .unwrap();
+        assert_eq!(std::fs::metadata(&op_dir).unwrap().mode() & 0o7777, 0o700);
+        assert_eq!(std::fs::metadata(&op_cfg).unwrap().mode() & 0o777, 0o600);
     }
 
     #[test]
