@@ -78,6 +78,13 @@ class CutTests(unittest.TestCase):
         self.files["HEAD"] = manifests("0.1.1")
         self.assertIsNone(self.cut("docs: improve setup"))
 
+    def test_parent_cargo_already_at_cut_version_accepted_other_mismatch_refused(self):
+        self.files["HEAD^1"]["Cargo.toml"] = '[workspace.package]\nversion = "0.1.2"\n'
+        self.assertEqual(self.cut(), "0.1.2")
+        self.files["HEAD^1"]["Cargo.toml"] = '[workspace.package]\nversion = "0.1.9"\n'
+        with self.assertRaisesRegex(ValueError, "Cargo/npm version mismatch"):
+            self.cut()
+
     def test_marker_downgrade_and_mismatched_manifests_refused(self):
         with self.assertRaisesRegex(ValueError, "release-cut"):
             self.cut("feat: update version")

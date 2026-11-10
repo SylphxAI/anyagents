@@ -2216,7 +2216,8 @@ for path in "$ANYAGENTS_DATA/secrets" "$ANYAGENTS_DATA/operator-token" "$ANYAGEN
   if (printf forbidden > "$path") 2>/dev/null; then exit 42; fi
 done
 if (printf forbidden > "$ANYAGENTS_AGENT_CONFIG/.agy/skills/global/SKILL.md") 2>/dev/null; then exit 43; fi
-printf 'ACTUAL_UID=%s PRIMARY_GID=%s REAL_MOUNTS_UMASK077_OWNER_FALLBACK_OK SAME_SEAT_OK MEMORY_RW_OK PRIVATE_GLOBAL_DENIED GIT_TRUST_EXACT\n' "$(id -u)" "$(id -g)" > "$ANYAGENTS_AGENT_CONFIG/native-vendor-report"
+printf 'ACTUAL_UID=%s PRIMARY_GID=%s REAL_MOUNTS_UMASK077_OWNER_FALLBACK_OK SAME_SEAT_OK MEMORY_RW_OK PRIVATE_GLOBAL_DENIED GIT_TRUST_EXACT\n' "$(id -u)" "$(id -g)" > "$ANYAGENTS_AGENT_CONFIG/native-vendor-report.tmp"
+mv "$ANYAGENTS_AGENT_CONFIG/native-vendor-report.tmp" "$ANYAGENTS_AGENT_CONFIG/native-vendor-report"
 # Keep the real adapter child alive until its owner drops the harness.
 cat >/dev/null
 "#,
@@ -2366,7 +2367,9 @@ cat >/dev/null
         assert!(changed.success());
         let seat_owned_harness = launch().unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while !report.is_file() && std::time::Instant::now() < deadline {
+        while !std::fs::read_to_string(&report).is_ok_and(|text| text.contains("GIT_TRUST_EXACT"))
+            && std::time::Instant::now() < deadline
+        {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(
@@ -2400,7 +2403,8 @@ printf default > "$base/conversations/default"
 printf '{"queuedMessages":"queued","retained":"synthetic"}' > "$base/settings.new"
 chmod 600 "$base/settings.new"
 mv "$base/settings.new" "$base/settings.json"
-printf ready > "$ANYAGENTS_AGENT_CONFIG/agy-config-ready"
+printf ready > "$ANYAGENTS_AGENT_CONFIG/agy-config-ready.tmp"
+mv "$ANYAGENTS_AGENT_CONFIG/agy-config-ready.tmp" "$ANYAGENTS_AGENT_CONFIG/agy-config-ready"
 cat >/dev/null
 "#,
             0o555,
