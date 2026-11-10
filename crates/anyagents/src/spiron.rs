@@ -47,34 +47,30 @@ pub fn write_spiron_config(
 /// `glm-code-plan/`, `qwen-token-plan/`, `minimax-code-plan/`) so Spiron sends
 /// the bare provider model ID to the Coding Plan endpoint.
 pub fn strip_coding_plan_prefix(model: &str) -> &str {
-    for prefix in [
+    [
         "kimi-code-plan/",
         "glm-code-plan/",
         "qwen-token-plan/",
         "minimax-code-plan/",
-    ] {
-        if let Some(rest) = model.strip_prefix(prefix) {
-            return rest;
-        }
-    }
-    model
+    ]
+    .into_iter()
+    .find_map(|prefix| model.strip_prefix(prefix))
+    .unwrap_or(model)
 }
 
 fn coding_plan_provider_for_model(model: Option<&str>) -> Option<&'static str> {
     let m = model?.trim();
-    for provider in [
+    [
         "kimi-code-plan",
         "glm-code-plan",
         "qwen-token-plan",
         "minimax-code-plan",
-    ] {
-        if m.strip_prefix(provider)
+    ]
+    .into_iter()
+    .find(|&provider| {
+        m.strip_prefix(provider)
             .is_some_and(|rest| rest.starts_with('/'))
-        {
-            return Some(provider);
-        }
-    }
-    None
+    })
 }
 
 fn write_spiron_config_toml(config_dir: &Path, model: Option<&str>) -> Result<(), Error> {
