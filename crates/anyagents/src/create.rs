@@ -1764,6 +1764,11 @@ pub(crate) fn seed_harness_credentials(
             ".grok/settings_cache.json",
         ],
         "spiron" => &[
+            "auth.json",
+            "credentials.json",
+            "config.toml",
+            ".config/sylphx/auth.json",
+            ".spiron/auth.json",
             ".config/sylphx/credentials.json",
             ".config/sylphx/context.json",
             ".config/sylphx/key",
@@ -1810,18 +1815,34 @@ pub(crate) fn seed_harness_credentials(
                 continue;
             }
             let other_cfg = agent_config_dir(data, &other.id);
-            if bound_profile_name(&other_cfg).as_deref() == Some(bound.as_str()) {
+            let other_bound = bound_profile_name(&other_cfg);
+            let same_or_compatible_bound = other_bound.as_deref() == Some(bound.as_str())
+                || other_bound.as_deref().is_some_and(|ob| {
+                    let (b_prov, b_prof) = bound.split_once('/').unwrap_or((&bound, "default"));
+                    let (o_prov, o_prof) = ob.split_once('/').unwrap_or((ob, "default"));
+                    b_prof == o_prof && compatible_harnesses_for(b_prov).contains(&o_prov)
+                });
+            if same_or_compatible_bound {
                 for rel in [
                     ".credentials.json",
                     ".claude/.credentials.json",
                     "auth.json",
                     ".codex/auth.json",
+                    ".config/sylphx/auth.json",
+                    ".spiron/auth.json",
+                    ".config/sylphx/credentials.json",
+                    "credentials.json",
                     "models_cache.json",
                     "model-catalog-direct.json",
                     ".gemini/antigravity-cli/antigravity-oauth-token",
                 ] {
-                    if matches!(rel, "auth.json" | ".codex/auth.json")
+                    if rel == ".codex/auth.json" && !bound.starts_with("openai/") {
+                        continue;
+                    }
+                    if rel == "auth.json"
                         && !bound.starts_with("openai/")
+                        && !bound.starts_with("sylphx/")
+                        && !bound.starts_with("spiron/")
                     {
                         continue;
                     }
@@ -1869,6 +1890,10 @@ pub(crate) fn seed_harness_credentials(
                     | ".gemini/antigravity-cli/jetski_state.pbtxt"
                     | "auth.json"
                     | ".codex/auth.json"
+                    | "credentials.json"
+                    | ".config/sylphx/auth.json"
+                    | ".spiron/auth.json"
+                    | ".config/sylphx/credentials.json"
                     | "muse/auth.json"
                     | ".config/muse/auth.json"
                     | ".grok/auth.json"
@@ -1883,14 +1908,23 @@ pub(crate) fn seed_harness_credentials(
         for profile_root in &profile_roots {
             let mut src = profile_root.join(rel);
             if !src.is_file() {
-                let fallback = match rel.as_str() {
-                    ".claude/.credentials.json" => Some(".credentials.json"),
-                    ".codex/auth.json" => Some("auth.json"),
-                    ".config/muse/auth.json" => Some("muse/auth.json"),
-                    _ => None,
+                let fallbacks: &[&str] = match rel.as_str() {
+                    ".claude/.credentials.json" => &[".credentials.json"],
+                    ".codex/auth.json" => &["auth.json"],
+                    ".config/muse/auth.json" => &["muse/auth.json"],
+                    "auth.json" => &[".config/sylphx/auth.json", ".spiron/auth.json"],
+                    ".config/sylphx/auth.json" => &["auth.json", ".spiron/auth.json"],
+                    ".spiron/auth.json" => &["auth.json", ".config/sylphx/auth.json"],
+                    "credentials.json" => &[".config/sylphx/credentials.json"],
+                    ".config/sylphx/credentials.json" => &["credentials.json"],
+                    _ => &[],
                 };
-                if let Some(fb) = fallback {
-                    src = profile_root.join(fb);
+                for fb in fallbacks {
+                    let candidate = profile_root.join(fb);
+                    if candidate.is_file() {
+                        src = candidate;
+                        break;
+                    }
                 }
             }
             if src.is_file() {
@@ -7719,24 +7753,40 @@ fn count_bound_profile_agents(
     counts
 }
 
+/// Harnesses/providers that share compatible credential and profile directories.
+pub(crate) fn compatible_harnesses_for(provider_or_harness: &str) -> &'static [&'static str] {
+    match provider_or_harness.trim() {
+        "spiron" | "sylphx" | "sylphx-agent" | "sylphx_agent" => &["spiron", "sylphx"],
+        "claude-code" | "anthropic" => &["anthropic", "claude-code"],
+        "codex" | "openai" => &["openai", "codex"],
+        "agy" | "google" => &["google", "agy"],
+        "grok" | "xai" => &["xai", "grok"],
+        _ => &[],
+    }
+}
+
 /// Lists all available Master Profiles for `provider_or_harness` under `<data>/profiles/<provider>/<profile>`.
 pub(crate) fn list_harness_profiles(
     data: &Path,
     provider_or_harness: &str,
 ) -> Vec<(String, PathBuf)> {
     let provider = match provider_or_harness {
-        "claude-code" | "codex" | "agy" | "muse" | "dsh" | "grok" | "opencode" | "omp" => {
-            upstream_provider_of(provider_or_harness, None)
-        }
+        "claude-code" | "codex" | "agy" | "muse" | "dsh" | "grok" | "opencode" | "omp"
+        | "spiron" | "sylphx" => upstream_provider_of(provider_or_harness, None),
         other => other.to_string(),
     };
-    let mut out: Vec<(String, PathBuf)> = Vec::new();
-    for base in [
+    let mut base_dirs = vec![
         data.join("profiles").join(&provider),
         data.join("profiles").join(provider_or_harness),
         data.join("config").join(&provider),
         data.join("config").join(provider_or_harness),
-    ] {
+    ];
+    for compat in compatible_harnesses_for(provider_or_harness) {
+        base_dirs.push(data.join("profiles").join(compat));
+        base_dirs.push(data.join("config").join(compat));
+    }
+    let mut out: Vec<(String, PathBuf)> = Vec::new();
+    for base in base_dirs {
         let Ok(entries) = std::fs::read_dir(&base) else {
             continue;
         };
@@ -7789,6 +7839,12 @@ fn select_or_bind_profile(
         let exact_dir = data.join("profiles").join(&provider).join(prof_name);
         if exact_dir.is_dir() {
             return vec![exact_dir];
+        }
+        for compat in compatible_harnesses_for(&provider) {
+            let compat_dir = data.join("profiles").join(compat).join(prof_name);
+            if compat_dir.is_dir() {
+                return vec![compat_dir];
+            }
         }
     }
     let chosen_name = if available.iter().any(|(n, _)| n == "default") || available.is_empty() {

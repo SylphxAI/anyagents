@@ -900,6 +900,12 @@ impl Store {
         }
     }
 
+    /// Resolves the full [`Agent`] record authenticated by a presented capability token.
+    pub fn authenticate_agent(&self, token: &str) -> Result<Agent, Error> {
+        let agent_id = self.authenticate_capability(token)?;
+        self.agent(&agent_id)
+    }
+
     /// A receipt one named send already produced, or `None`.
     pub fn send_receipt(&self, id: &str) -> Result<Option<String>, Error> {
         let conn = self.conn();

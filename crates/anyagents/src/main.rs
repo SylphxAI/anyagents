@@ -390,6 +390,10 @@ enum Command {
         /// harness it starts, so a harness that omits it is read from there.
         #[arg(long)]
         config: Option<PathBuf>,
+        /// Optional MCP tool profile (`full`, `remote`, or `coordination`).
+        /// Defaults to `coordination` for `spiron` agents and `full` for third-party local CLI harnesses.
+        #[arg(long)]
+        profile: Option<mcp::McpProfile>,
     },
     /// Start one agent command inside the deployment's OS boundary, or refuse
     /// and name the admission it needs. Never starts it unisolated.
@@ -980,7 +984,7 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
             target.as_deref(),
             key_file.as_deref(),
         ),
-        Command::Mcp { config } => mcp::run(&data, config.as_deref()),
+        Command::Mcp { config, profile } => mcp::run(&data, config.as_deref(), profile),
         Command::AgentRun { config, command } => sandbox::run(&data, config.as_deref(), &command),
         Command::Boundary => print_boundary(&data),
         Command::FakeOpencode => fake_opencode::run(),

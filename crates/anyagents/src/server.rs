@@ -295,12 +295,7 @@ async fn serve(
                 if let Ok(local) = tcp_listener.local_addr() {
                     let _ = std::fs::write(data.join("webhook.addr"), format!("{local}\n"));
                 }
-                let webhook_app = Router::new()
-                    .route("/", get(webhook_healthz))
-                    .route("/healthz", get(webhook_healthz))
-                    .route("/v1/webhooks/healthz", get(webhook_healthz))
-                    .route("/v1/webhooks/telegram/{channel_id}", post(telegram_webhook))
-                    .with_state(state.clone());
+                let webhook_app = build_webhook_router(state.clone());
                 tokio::spawn(async move {
                     let _ = axum::serve(tcp_listener, webhook_app).await;
                 });
@@ -310,70 +305,7 @@ async fn serve(
             }
         }
     }
-    let app = Router::new()
-        .route("/v1/agents", get(list_agents).post(create_agent_route))
-        .route("/v1/agents/{name}", get(get_agent))
-        .route("/v1/agents/{name}/admin", post(set_admin_route))
-        .route("/v1/agents/{name}/rename", post(rename_agent_route))
-        .route("/v1/agents/{name}/role", post(role_agent_route))
-        .route("/v1/agents/{name}/transfer", post(transfer_agent_route))
-        .route("/v1/agents/{name}/model", post(model_route))
-        .route("/v1/agents/{name}/harness", post(harness_route))
-        .route("/v1/agents/{name}/session/reset", post(reset_session_route))
-        .route(
-            "/v1/agents/{name}/schedules",
-            get(list_schedules_route).post(schedules_action_route),
-        )
-        .route(
-            "/v1/schedules",
-            get(list_self_schedules_route).post(self_schedules_action_route),
-        )
-        .route(
-            "/v1/agents/{name}/description",
-            get(get_description_route).post(set_description_route),
-        )
-        .route(
-            "/v1/agents/{name}/instructions",
-            get(get_description_route).post(set_description_route),
-        )
-        .route("/v1/browser", post(browser_route))
-        .route("/v1/web", post(web_route))
-        .route("/v1/profiles", get(profiles_route).post(set_profile_route))
-        .route("/v1/profiles/models", get(profile_models_route))
-        .route(
-            "/v1/subagent-defaults",
-            get(get_subagent_defaults_route).post(set_subagent_defaults_route),
-        )
-        .route("/v1/channels", get(channels_route).post(add_channel_route))
-        .route("/v1/agents/{name}/inbox", get(inbox))
-        .route("/v1/agents/{name}/conversation", get(conversation_route))
-        .route(
-            "/v1/agents/{name}/conversation/redact",
-            post(redact_conversation_route),
-        )
-        .route("/v1/agents/{name}/archive", post(archive_agent_route))
-        .route("/v1/agents/{name}/pause", post(pause_agent_route))
-        .route("/v1/agents/{name}/wake", post(wake_agent_route))
-        .route(
-            "/v1/agents/{name}",
-            axum::routing::delete(delete_agent_route),
-        )
-        .route(
-            "/v1/groups",
-            get(list_groups_route).post(group_action_route),
-        )
-        .route("/v1/send", post(send))
-        .route("/v1/interact", post(interact_route))
-        .route("/v1/harnesses/{id}/sign-in", post(sign_in_route))
-        .route(
-            "/v1/operator/agents/{name}/capability",
-            post(mint_capability),
-        )
-        .route("/v1/operator/agents/{name}/inbox", get(operator_inbox))
-        .route("/v1/whoami", get(whoami))
-        .route("/v1/webhooks/healthz", get(webhook_healthz))
-        .route("/v1/webhooks/telegram/{channel_id}", post(telegram_webhook))
-        .with_state(state);
+    let app = build_router(state);
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let result = axum::serve(listener, app)
         .with_graceful_shutdown(async move {
@@ -748,6 +680,220 @@ fn webhook_listen_addr() -> Option<String> {
     Some("0.0.0.0:8788".to_string())
 }
 
+pub(crate) fn build_webhook_router(state: AppState) -> Router {
+    Router::new()
+        .route("/", get(webhook_healthz))
+        .route("/healthz", get(webhook_healthz))
+        .route("/v1/webhooks/healthz", get(webhook_healthz))
+        .route("/v1/webhooks/telegram/{channel_id}", post(telegram_webhook))
+        .route("/mcp", get(mcp_get_route).post(mcp_post_route))
+        .with_state(state)
+}
+
+pub(crate) fn build_router(state: AppState) -> Router {
+    Router::new()
+        .route("/v1/agents", get(list_agents).post(create_agent_route))
+        .route("/v1/agents/{name}", get(get_agent))
+        .route("/v1/agents/{name}/admin", post(set_admin_route))
+        .route("/v1/agents/{name}/rename", post(rename_agent_route))
+        .route("/v1/agents/{name}/role", post(role_agent_route))
+        .route("/v1/agents/{name}/transfer", post(transfer_agent_route))
+        .route("/v1/agents/{name}/model", post(model_route))
+        .route("/v1/agents/{name}/harness", post(harness_route))
+        .route("/v1/agents/{name}/session/reset", post(reset_session_route))
+        .route(
+            "/v1/agents/{name}/schedules",
+            get(list_schedules_route).post(schedules_action_route),
+        )
+        .route(
+            "/v1/schedules",
+            get(list_self_schedules_route).post(self_schedules_action_route),
+        )
+        .route(
+            "/v1/agents/{name}/description",
+            get(get_description_route).post(set_description_route),
+        )
+        .route(
+            "/v1/agents/{name}/instructions",
+            get(get_description_route).post(set_description_route),
+        )
+        .route("/v1/browser", post(browser_route))
+        .route("/v1/web", post(web_route))
+        .route("/v1/profiles", get(profiles_route).post(set_profile_route))
+        .route("/v1/profiles/models", get(profile_models_route))
+        .route(
+            "/v1/subagent-defaults",
+            get(get_subagent_defaults_route).post(set_subagent_defaults_route),
+        )
+        .route("/v1/channels", get(channels_route).post(add_channel_route))
+        .route("/v1/agents/{name}/inbox", get(inbox))
+        .route("/v1/agents/{name}/conversation", get(conversation_route))
+        .route(
+            "/v1/agents/{name}/conversation/redact",
+            post(redact_conversation_route),
+        )
+        .route("/v1/agents/{name}/archive", post(archive_agent_route))
+        .route("/v1/agents/{name}/pause", post(pause_agent_route))
+        .route("/v1/agents/{name}/wake", post(wake_agent_route))
+        .route(
+            "/v1/agents/{name}",
+            axum::routing::delete(delete_agent_route),
+        )
+        .route(
+            "/v1/groups",
+            get(list_groups_route).post(group_action_route),
+        )
+        .route("/v1/send", post(send))
+        .route("/v1/interact", post(interact_route))
+        .route("/v1/harnesses/{id}/sign-in", post(sign_in_route))
+        .route(
+            "/v1/operator/agents/{name}/capability",
+            post(mint_capability),
+        )
+        .route("/v1/operator/agents/{name}/inbox", get(operator_inbox))
+        .route("/v1/whoami", get(whoami))
+        .route("/v1/webhooks/healthz", get(webhook_healthz))
+        .route("/v1/webhooks/telegram/{channel_id}", post(telegram_webhook))
+        .route("/mcp", get(mcp_get_route).post(mcp_post_route))
+        .with_state(state)
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct McpRouteQuery {
+    #[serde(default)]
+    profile: Option<String>,
+}
+
+fn authenticate_mcp_request(
+    store: &Store,
+    headers: &axum::http::HeaderMap,
+) -> Result<(Agent, String), ApiError> {
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|raw| {
+            let trimmed = raw.trim();
+            trimmed
+                .strip_prefix("Bearer ")
+                .or_else(|| trimmed.strip_prefix("bearer "))
+        })
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            headers
+                .get(crate::operator::AGENT_HEADER)
+                .and_then(|v| v.to_str().ok())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        })
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::UNAUTHORIZED,
+                "missing MCP capability token (expected `Authorization: Bearer <mcp-capability>` or `x-anyagents-agent`)",
+            )
+        })?;
+    let agent = store.authenticate_agent(token).map_err(|_| {
+        ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "invalid or expired MCP capability token",
+        )
+    })?;
+    Ok((agent, token.to_string()))
+}
+
+fn ensure_internal_socket_listener(state: &AppState) -> PathBuf {
+    let data_dir = state.store.data_dir();
+    let sock = socket_path(data_dir);
+    if !sock.exists() {
+        if let Ok(listener) = tokio::net::UnixListener::bind(&sock) {
+            let app = build_router(state.clone());
+            tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+        }
+    }
+    sock
+}
+
+async fn mcp_get_route(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Query(query): Query<McpRouteQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    let (agent, _token) = authenticate_mcp_request(&state.store, &headers)?;
+    let profile = crate::mcp::McpProfile::resolve_http(query.profile.as_deref(), &agent.harness)
+        .map_err(|msg| ApiError::new(StatusCode::BAD_REQUEST, msg))?;
+    let accept = headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if accept.contains("application/json") && !accept.contains("text/event-stream") {
+        let body = serde_json::json!({
+            "ok": true,
+            "transport": "streamable-http",
+            "protocolVersion": "2025-03-26",
+            "agent": agent.name,
+            "harness": agent.harness,
+            "profile": profile.as_str(),
+            "tools": profile.exposed_tools(),
+        });
+        return Ok(axum::response::IntoResponse::into_response(Json(body)));
+    }
+    let event_payload = serde_json::json!({
+        "type": "endpoint",
+        "transport": "streamable-http",
+        "protocolVersion": "2025-03-26",
+        "agent": agent.name,
+        "profile": profile.as_str(),
+    });
+    let sse_body = format!(": anyagents-mcp\nevent: endpoint\ndata: {event_payload}\n\n");
+    Ok(axum::http::Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            axum::http::header::CONTENT_TYPE,
+            "text/event-stream; charset=utf-8",
+        )
+        .header(axum::http::header::CACHE_CONTROL, "no-cache")
+        .body(axum::body::Body::from(sse_body))
+        .unwrap_or_else(|_| {
+            axum::response::IntoResponse::into_response(StatusCode::INTERNAL_SERVER_ERROR)
+        }))
+}
+
+async fn mcp_post_route(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Query(query): Query<McpRouteQuery>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<axum::response::Response, ApiError> {
+    let (agent, token) = authenticate_mcp_request(&state.store, &headers)?;
+    let profile = crate::mcp::McpProfile::resolve_http(query.profile.as_deref(), &agent.harness)
+        .map_err(|msg| ApiError::new(StatusCode::BAD_REQUEST, msg))?;
+    let sock = ensure_internal_socket_listener(&state);
+    let config_dir = anyagents_core::agent_config_dir(state.store.data_dir(), &agent.id);
+    let _ = std::fs::create_dir_all(&config_dir);
+    let mcp = crate::mcp::AgentMcp::new_for_http(
+        crate::mcp::AgentRef {
+            id: agent.id.clone(),
+            name: agent.name.clone(),
+            workdir: agent.workdir.as_deref().map(PathBuf::from),
+        },
+        sock,
+        config_dir,
+        token,
+        profile,
+    );
+    match mcp.handle_jsonrpc_request(payload).await {
+        Some(response_json) => Ok(axum::response::IntoResponse::into_response((
+            StatusCode::OK,
+            Json(response_json),
+        ))),
+        None => Ok(axum::response::IntoResponse::into_response(
+            StatusCode::ACCEPTED,
+        )),
+    }
+}
+
 /// `GET /v1/whoami`: the agent this call acts as. A tool server asks before it
 /// speaks for anyone, and gets the id the server resolved from the capability,
 /// never the name a caller wrote.
@@ -757,11 +903,14 @@ async fn whoami(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     match ctx.principal {
         Principal::Agent { agent_id, name } => {
-            let workdir = state.store.agent(&agent_id).ok().and_then(|a| a.workdir);
+            let agent_record = state.store.agent(&agent_id).ok();
+            let workdir = agent_record.as_ref().and_then(|a| a.workdir.clone());
+            let harness = agent_record.as_ref().map(|a| a.harness.clone());
             Ok(Json(serde_json::json!({
-            "agent_id": agent_id.as_str(),
-            "name": name,
+                "agent_id": agent_id.as_str(),
+                "name": name,
                 "workdir": workdir,
+                "harness": harness,
             })))
         }
         Principal::Operator => Err(ApiError::new(
@@ -9741,6 +9890,404 @@ exec '{}' "$@"
         store.set_agent_state(&archived.id, "archived").unwrap();
         let seats = active_seat_ids(&store).unwrap();
         assert_eq!(seats, vec![active.id.to_string()]);
+    }
+
+    #[test]
+    fn streamable_http_mcp_enforces_bearer_auth_and_three_mode_profiles() {
+        use http_body_util::BodyExt as _;
+
+        let _env = env_lock();
+        let dir = crate::test_tempdir();
+        let state = archetype_validation_state(dir.path());
+        let cloud_agent = state
+            .store
+            .create_agent(anyagents_core::NewAgent::new("cloud-worker", "claude-code"))
+            .unwrap();
+        let spiron_agent = state
+            .store
+            .create_agent(anyagents_core::NewAgent::new("spiron-worker", "spiron"))
+            .unwrap();
+        let cloud_cap = state.store.issue_capability(&cloud_agent.id).unwrap();
+        let spiron_cap = state.store.issue_capability(&spiron_agent.id).unwrap();
+
+        // Seed a skill inside the agent's config dir so `skills` list/read works deterministically.
+        let skill_dir = anyagents_core::agent_config_dir(state.store.data_dir(), &cloud_agent.id)
+            .join(".agents/skills/test-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: test-skill\ndescription: Synthetic test skill for MCP verification\n---\n# Test Skill\nBody content.\n",
+        )
+        .unwrap();
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            // Verify both `build_router` and `build_webhook_router` compile and bind `/mcp`.
+            let _main_app = build_router(state.clone());
+            let _webhook_app = build_webhook_router(state.clone());
+
+            // 1. Missing or invalid bearer token returns 401 Unauthorized.
+            let unauth_err = mcp_post_route(
+                State(state.clone()),
+                axum::http::HeaderMap::new(),
+                Query(McpRouteQuery::default()),
+                Json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {}
+                })),
+            )
+            .await
+            .expect_err("missing auth must fail with 401");
+            assert_eq!(unauth_err.status, StatusCode::UNAUTHORIZED);
+
+            let mut bad_headers = axum::http::HeaderMap::new();
+            bad_headers.insert(
+                axum::http::header::AUTHORIZATION,
+                "Bearer invalid-capability-token".parse().unwrap(),
+            );
+            let bad_err = mcp_post_route(
+                State(state.clone()),
+                bad_headers,
+                Query(McpRouteQuery::default()),
+                Json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {}
+                })),
+            )
+            .await
+            .expect_err("invalid token must fail with 401");
+            assert_eq!(bad_err.status, StatusCode::UNAUTHORIZED);
+
+            // Helper to call `mcp_post_route` with a Bearer token and optional profile query.
+            let post_mcp = |token: &str, profile: Option<&str>, body: serde_json::Value| {
+                let state = state.clone();
+                let mut headers = axum::http::HeaderMap::new();
+                headers.insert(
+                    axum::http::header::AUTHORIZATION,
+                    format!("Bearer {token}").parse().unwrap(),
+                );
+                let query = McpRouteQuery {
+                    profile: profile.map(str::to_string),
+                };
+                async move {
+                    let resp = mcp_post_route(State(state), headers, Query(query), Json(body))
+                        .await
+                        .unwrap();
+                    let status = resp.status();
+                    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+                    let json: serde_json::Value = if bytes.is_empty() {
+                        serde_json::Value::Null
+                    } else {
+                        serde_json::from_slice(&bytes).unwrap()
+                    };
+                    (status, json)
+                }
+            };
+
+            // 2. GET /mcp returns 200 OK text/event-stream by default and JSON when Accept: application/json.
+            let mut get_headers = axum::http::HeaderMap::new();
+            get_headers.insert(
+                axum::http::header::AUTHORIZATION,
+                format!("Bearer {cloud_cap}").parse().unwrap(),
+            );
+            let sse_resp = mcp_get_route(
+                State(state.clone()),
+                get_headers,
+                Query(McpRouteQuery::default()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(sse_resp.status(), StatusCode::OK);
+            assert!(
+                sse_resp
+                    .headers()
+                    .get("content-type")
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .starts_with("text/event-stream")
+            );
+
+            // 3. POST /mcp with valid Bearer capability handles `initialize` and `tools/list` under default `Remote` profile.
+            let (status, init_json) = post_mcp(
+                &cloud_cap,
+                None,
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {}
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(init_json["result"]["serverInfo"]["name"], "anyagents");
+
+            let (status, list_json) = post_mcp(
+                &cloud_cap,
+                None,
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/list",
+                    "params": {}
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            let remote_tools: Vec<String> = list_json["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["name"].as_str().unwrap().to_string())
+                .collect();
+            let expected_remote: Vec<String> = crate::mcp::REMOTE_MCP_TOOLS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect();
+            assert_eq!(remote_tools, expected_remote);
+            assert!(!remote_tools.contains(&"code".to_string()));
+
+            // Calling `code` under `Remote` profile is refused with JSON-RPC error.
+            let (status, code_err_json) = post_mcp(
+                &cloud_cap,
+                None,
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "code",
+                        "arguments": { "code": "return 1;" }
+                    }
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(
+                code_err_json["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("disabled by active MCP profile `remote`"),
+                "unexpected error response: {code_err_json}"
+            );
+
+            // Calling `send`, `inbox`, `agents`, `memory`, `skills` succeeds under `Remote` profile.
+            let (_, send_res) = post_mcp(
+                &cloud_cap,
+                None,
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 4,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "send",
+                        "arguments": {
+                            "to": ["spiron-worker"],
+                            "text": "hello from remote mcp"
+                        }
+                    }
+                }),
+            )
+            .await;
+            assert_ne!(
+                send_res["result"]["isError"],
+                serde_json::json!(true),
+                "{send_res}"
+            );
+
+            let (_, inbox_res) = post_mcp(
+                &spiron_cap,
+                None,
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 5,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "inbox",
+                        "arguments": { "limit": 10 }
+                    }
+                }),
+            )
+            .await;
+            assert_ne!(
+                inbox_res["result"]["isError"],
+                serde_json::json!(true),
+                "{inbox_res}"
+            );
+            assert_eq!(
+                inbox_res["result"]["structuredContent"]["messages"][0]["text"],
+                "hello from remote mcp"
+            );
+
+            let (_, agents_res) = post_mcp(
+                &cloud_cap,
+                None,
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 6,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "agents",
+                        "arguments": { "action": "list" }
+                    }
+                }),
+            )
+            .await;
+            assert_ne!(
+                agents_res["result"]["isError"],
+                serde_json::json!(true),
+                "{agents_res}"
+            );
+
+            let (_, mem_res) = post_mcp(
+                &cloud_cap,
+                None,
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 7,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "memory",
+                        "arguments": {
+                            "action": "write",
+                            "topic": "remote-note",
+                            "description": "Note written over remote MCP",
+                            "content": "# Remote Note\nVerified.\n"
+                        }
+                    }
+                }),
+            )
+            .await;
+            assert_ne!(
+                mem_res["result"]["isError"],
+                serde_json::json!(true),
+                "{mem_res}"
+            );
+
+            let (_, skills_res) = post_mcp(
+                &cloud_cap,
+                None,
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 8,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "skills",
+                        "arguments": { "action": "list" }
+                    }
+                }),
+            )
+            .await;
+            assert_ne!(
+                skills_res["result"]["isError"],
+                serde_json::json!(true),
+                "{skills_res}"
+            );
+            assert!(
+                skills_res["result"]["structuredContent"]["skills"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|s| s["name"] == "test-skill"),
+                "{skills_res}"
+            );
+
+            // 4. `McpProfile::Coordination` is auto-selected for `spiron` agents (and when `?profile=coordination` is passed).
+            let (_, spiron_list_json) = post_mcp(
+                &spiron_cap,
+                None,
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 9,
+                    "method": "tools/list",
+                    "params": {}
+                }),
+            )
+            .await;
+            let spiron_tools: Vec<String> = spiron_list_json["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["name"].as_str().unwrap().to_string())
+                .collect();
+            let expected_coord: Vec<String> = crate::mcp::COORDINATION_MCP_TOOLS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect();
+            assert_eq!(spiron_tools, expected_coord);
+            for omitted in ["code", "web_search", "web_fetch", "memory", "skills"] {
+                assert!(!spiron_tools.contains(&omitted.to_string()));
+                let (_, err_json) = post_mcp(
+                    &spiron_cap,
+                    None,
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 10,
+                        "method": "tools/call",
+                        "params": {
+                            "name": omitted,
+                            "arguments": {}
+                        }
+                    }),
+                )
+                .await;
+                assert!(
+                    err_json["error"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("disabled by active MCP profile `coordination`"),
+                    "expected `{omitted}` to be blocked in coordination profile, got {err_json}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn spiron_and_sylphx_share_compatible_harnesses_and_seed_auth_json_paths() {
+        let dir = crate::test_tempdir();
+        let data = dir.path();
+        let store = Store::open(data.join("state.db")).unwrap();
+        let sylphx_profile = data.join("profiles/sylphx/default/.config/sylphx");
+        std::fs::create_dir_all(&sylphx_profile).unwrap();
+        std::fs::write(
+            sylphx_profile.join("auth.json"),
+            r#"{"access_token":"spiron-shared-token-123","org_id":"org_shared"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            crate::create::compatible_harnesses_for("spiron"),
+            &["spiron", "sylphx"]
+        );
+        assert_eq!(
+            crate::create::compatible_harnesses_for("sylphx"),
+            &["spiron", "sylphx"]
+        );
+
+        let agent = store
+            .create_agent(anyagents_core::NewAgent::new("spiron-seat", "spiron"))
+            .unwrap();
+        let target_cfg = data.join("agents").join(agent.id.as_str());
+        std::fs::create_dir_all(&target_cfg).unwrap();
+        crate::create::seed_harness_credentials(&store, data, &agent, &target_cfg).unwrap();
+        crate::spiron::write_spiron_config(
+            &target_cfg,
+            agent.model.as_deref(),
+            Path::new("/usr/bin/anyagents"),
+            &["mcp".to_string()],
+        )
+        .unwrap();
+
+        for rel in ["auth.json", ".config/sylphx/auth.json", ".spiron/auth.json"] {
+            let raw = std::fs::read_to_string(target_cfg.join(rel))
+                .unwrap_or_else(|e| panic!("missing {rel}: {e}"));
+            let val: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(val["access_token"], "spiron-shared-token-123", "in {rel}");
+        }
     }
 }
 
