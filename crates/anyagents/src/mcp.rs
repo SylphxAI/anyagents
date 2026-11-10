@@ -791,13 +791,11 @@ struct SubagentsArgs {
     /// Optional concise public description when `action = "spawn"`.
     #[serde(default)]
     description: Option<String>,
+    /// Optional role template slug (`.agents/agents/<role>.md`, e.g. `"engineer"`, `"creative"`, `"commercial"`, `"frontline"`, `"counsel"`, `"assistant"`, `"director"`) when `action = "spawn"`.
+    #[serde(default)]
+    role: Option<String>,
     /// Optional private system/role instructions when `action = "spawn"`.
-    #[serde(
-        default,
-        alias = "role",
-        alias = "instruction",
-        alias = "system_prompt"
-    )]
+    #[serde(default, alias = "instruction", alias = "system_prompt")]
     instructions: Option<String>,
     /// Optional internal communication & visibility scope (`"isolated"` | `"private"` | `"siblings"` | `"public"`).
     #[serde(default)]
@@ -2156,7 +2154,7 @@ impl AgentMcp {
                     .spawn(Parameters(SpawnArgs {
                         name: args.agent,
                         archetype: args.archetype,
-                        role: None,
+                        role: args.role,
                         harness: args.harness,
                         model: args.model,
                         profile: args.profile,
@@ -7955,10 +7953,11 @@ mod spawn_args_tests {
     #[test]
     fn subagents_preserves_description_without_synthesizing_instructions() {
         let args: SubagentsArgs = serde_json::from_value(json!({
-            "action": "spawn", "description": "Public role"
+            "action": "spawn", "description": "Public role", "role": "engineer"
         }))
         .unwrap();
         assert_eq!(args.description.as_deref(), Some("Public role"));
+        assert_eq!(args.role.as_deref(), Some("engineer"));
         assert!(args.instructions.is_none());
     }
 

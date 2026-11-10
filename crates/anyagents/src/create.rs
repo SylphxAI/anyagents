@@ -8488,32 +8488,7 @@ pub(crate) fn apply_archetype_defaults(
     {
         body.workdir = Some(wd);
     }
-    let sub_cfg = load_subagent_defaults(data_dir);
-    let sub_spec = parent
-        .and_then(|p| sub_cfg.agents.get(&p.name))
-        .unwrap_or(&sub_cfg.default);
-    let preset_subagent = parent.is_some() && !sub_spec.mode.eq_ignore_ascii_case("inherit");
-    let preset_has_harness = preset_subagent
-        && sub_spec
-            .harness
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|s| !s.is_empty() && !s.eq_ignore_ascii_case("inherit"));
-    let preset_has_model = preset_subagent
-        && sub_spec
-            .model
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|s| !s.is_empty() && !s.eq_ignore_ascii_case("inherit"));
-    let preset_has_profile = preset_subagent
-        && sub_spec
-            .profile
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|s| !s.is_empty() && !s.eq_ignore_ascii_case("inherit"));
-
     if body.harness.as_deref().is_none_or(|h| h.trim().is_empty())
-        && !preset_has_harness
         && let Some(h) = tpl.harness
     {
         body.harness = Some(h);
@@ -8523,7 +8498,6 @@ pub(crate) fn apply_archetype_defaults(
         .as_deref()
         .map(str::trim)
         .is_none_or(str::is_empty)
-        && !preset_has_model
         && let Some(m) = tpl.model
     {
         body.model = Some(m);
@@ -8533,7 +8507,6 @@ pub(crate) fn apply_archetype_defaults(
         .as_deref()
         .map(str::trim)
         .is_none_or(str::is_empty)
-        && !preset_has_profile
         && let Some(p) = tpl.profile
     {
         body.profile = Some(p);
@@ -11595,11 +11568,42 @@ mod archetype_tests {
             std::fs::write(
                 templates_dir.join(format!("{slug}.md")),
                 format!(
-                    "---\nname: {slug}\nscope: {scope}\ndescription: Default {slug}\n---\n{body_text}"
+                    "---\nname: {slug}\nscope: {scope}\nharness: spiron\nmodel: gpt-6.1-sol#high\ndescription: Default {slug}\n---\n{body_text}"
                 ),
             )
             .unwrap();
         }
+        std::fs::write(
+            dir.path().join("subagent-defaults.json"),
+            serde_json::json!({
+                "default": {"mode": "custom", "harness": "muse", "model": "muse-ember-1.0"}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let parent_agent = anyagents_core::Agent {
+            id: "agt_parent".into(),
+            name: "parent".into(),
+            role: Some("director".into()),
+            aliases: Vec::new(),
+            parent_id: None,
+            scope_value: "public".into(),
+            public: true,
+            admin: false,
+            harness: "agy".into(),
+            model: Some("gemini-4-argon-high".into()),
+            workdir: None,
+            description: None,
+            instructions: None,
+            state: anyagents_core::AgentState::Running,
+            delivery_mode: anyagents_core::DeliveryMode::Steer,
+            launch_env: Vec::new(),
+            quota_reset_at_ms: None,
+            block_reason: None,
+            last_error: None,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        };
 
         for (selector_key, selector_val, expected_slug, expected_scope, expected_body) in [
             ("role", "director", "director", "public", "Director template body."),
@@ -11620,9 +11624,11 @@ mod archetype_tests {
                     "instructions": "Custom assignment instructions."
                 }))
                 .unwrap();
-            apply_archetype_defaults(dir.path(), None, &mut req).unwrap();
+            apply_archetype_defaults(dir.path(), Some(&parent_agent), &mut req).unwrap();
             assert_eq!(req.role.as_deref(), Some(expected_slug));
             assert_eq!(req.scope.as_deref(), Some(expected_scope));
+            assert_eq!(req.harness.as_deref(), Some("spiron"));
+            assert_eq!(req.model.as_deref(), Some("gpt-6.1-sol#high"));
             assert_eq!(
                 req.instructions.as_deref(),
                 Some(format!("{expected_body}\n\nCustom assignment instructions.").as_str())
