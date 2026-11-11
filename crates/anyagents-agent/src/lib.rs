@@ -66,6 +66,17 @@ impl<H: Harness> DeliveryLoop<H> {
     pub fn start(store: Store, agent_id: AgentId, harness: H) -> Result<Self, Error> {
         store.agent(&agent_id)?;
         let lock = store.try_lock_agent(&agent_id)?;
+        Self::start_with_lock(store, lock, agent_id, harness)
+    }
+
+    /// Construct a delivery loop from an already-acquired per-agent process lock.
+    pub fn start_with_lock(
+        store: Store,
+        lock: anyagents_core::AgentLock,
+        agent_id: AgentId,
+        harness: H,
+    ) -> Result<Self, Error> {
+        store.agent(&agent_id)?;
         Ok(Self {
             store,
             agent_id,

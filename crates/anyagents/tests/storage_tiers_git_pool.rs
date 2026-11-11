@@ -90,8 +90,18 @@ fn three_tier_storage_bare_git_pool_and_archive_scratch_reap_end_to_end() {
     std::fs::write(&cap_path, format!("{}\n", support::CAPABILITY_KEY)).unwrap();
 
     // Fake harness wrapper that records injected build/tmp/cache environment into
-    // CARGO_TARGET_DIR/env-receipt.json before delegating to fake opencode.
+    // CARGO_TARGET_DIR/env-receipt.json before delegating to scripted_opencode.
     let bin = env!("CARGO_BIN_EXE_anyagents");
+    let scripted_opencode = Path::new(bin)
+        .parent()
+        .expect("test binary parent")
+        .join("scripted_opencode");
+    assert!(
+        scripted_opencode.is_file(),
+        "missing scripted_opencode beside test binary at {}",
+        scripted_opencode.display()
+    );
+    let scripted_bin = scripted_opencode.display();
     let wrapper = fixture.path().join("fake-opencode-wrapper.sh");
     let wrapper_body = format!(
         r#"#!/bin/sh
@@ -108,7 +118,7 @@ if [ -n "${{TMPDIR:-}}" ]; then
   mkdir -p "$TMPDIR"
   printf 'tmp-artifact' > "$TMPDIR/rustc-scratch.tmp"
 fi
-exec "{bin}" "$@"
+exec "{scripted_bin}" "$@"
 "#
     );
     assert!(
