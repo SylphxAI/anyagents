@@ -608,6 +608,7 @@ fn ensure<H: Harness + 'static>(inner: &Arc<Inner<H>>, id: AgentId) {
 enum Boot<H: Harness> {
     Ready(Box<DeliveryLoop<H>>),
     Busy,
+    Stopped,
     Retry,
 }
 
@@ -739,6 +740,12 @@ impl<H: Harness + 'static> Session<H> {
                         self.publish();
                         return true;
                     }
+                    Boot::Stopped => {
+                        self.delivery = None;
+                        self.restart_at = None;
+                        self.publish();
+                        return false;
+                    }
                     Boot::Retry => {
                         if !self.wait_backoff() {
                             self.delivery = None;
@@ -780,15 +787,36 @@ impl<H: Harness + 'static> Session<H> {
     }
 
     fn boot(&mut self) -> Boot<H> {
+        if self.stop.load(Ordering::SeqCst) {
+            return Boot::Stopped;
+        }
         let store = match Store::open(self.inner.store.data_dir().join("state.db")) {
             Ok(store) => store,
             Err(_) => return Boot::Retry,
         };
-        let harness = match self.launch_harness() {
-            Ok(harness) => harness,
+        // Acquire the per-agent process lock BEFORE launching the child or
+        // creating workspace/scratch directories so concurrent archive/delete
+        // reaping under this lock cannot race an in-flight spawn.
+        let lock = match store.try_lock_agent(&self.id) {
+            Ok(lock) => lock,
+            Err(anyagents_core::Error::AgentBusy) => return Boot::Busy,
             Err(_) => return Boot::Retry,
         };
-        match DeliveryLoop::start(store, self.id.clone(), harness) {
+        match store.agent(&self.id) {
+            Ok(fresh) if fresh.state != "running" => return Boot::Stopped,
+            Ok(_) => {}
+            Err(anyagents_core::Error::AgentNotFound(_)) => return Boot::Stopped,
+            Err(_) => return Boot::Retry,
+        }
+        if self.stop.load(Ordering::SeqCst) {
+            return Boot::Stopped;
+        }
+        let harness = match self.launch_harness() {
+            Ok(harness) => harness,
+            Err(_) if self.stop.load(Ordering::SeqCst) => return Boot::Stopped,
+            Err(_) => return Boot::Retry,
+        };
+        match DeliveryLoop::start_with_lock(store, lock, self.id.clone(), harness) {
             Ok(delivery) => Boot::Ready(Box::new(delivery)),
             Err(err) if err.agent_busy() => Boot::Busy,
             Err(_) => Boot::Retry,
@@ -796,7 +824,17 @@ impl<H: Harness + 'static> Session<H> {
     }
 
     fn launch_harness(&mut self) -> Result<H, String> {
+        if self.stop.load(Ordering::SeqCst) {
+            return Err("session stopping".into());
+        }
         if let Ok(fresh) = self.inner.store.agent(&self.id) {
+            if matches!(
+                fresh.state.as_str(),
+                "archived" | "paused" | "stopped" | "idle"
+            ) {
+                self.stop.store(true, Ordering::SeqCst);
+                return Err(format!("agent is {}", fresh.state));
+            }
             self.paths = AgentPaths::from_store(&self.inner.store, &fresh);
             self.agent = fresh;
         }
@@ -2198,5 +2236,65 @@ mod persistence_tests {
             assert_eq!(row.input_tokens, 11);
             assert_eq!(row.output_tokens, 7);
         }
+    }
+
+    #[test]
+    fn boot_refuses_to_spawn_or_recreate_dirs_when_agent_is_archived_or_locked() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        let agent = store
+            .create_agent(anyagents_core::NewAgent::new("worker", "opencode"))
+            .unwrap();
+        let agent = store.set_agent_state(&agent.id, "running").unwrap();
+        let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let launches_counter = Arc::clone(&launches);
+        let inner = Arc::new(Inner::<FakeHarness> {
+            store: Arc::clone(&store),
+            clock: Arc::new(SystemClock::new()),
+            launch: Arc::new(move |_| {
+                launches_counter.fetch_add(1, Ordering::SeqCst);
+                Err("unexpected launch".into())
+            }),
+            extra_env: Vec::new(),
+            board: HealthBoard::default(),
+            stop: AtomicBool::new(false),
+            workers: Mutex::new(HashMap::new()),
+            idle_release_hook: None,
+        });
+        let paths = AgentPaths::from_store(&store, &agent);
+        let mut session = Session {
+            inner,
+            id: agent.id.clone(),
+            agent,
+            paths,
+            notify: Arc::new(|| {}),
+            stop: Arc::new(AtomicBool::new(false)),
+            woken: Arc::new(AtomicBool::new(false)),
+            attempt: 0,
+            restart_at: None,
+            delivery: None,
+            served: None,
+            written: 0,
+            turns_recorded: 0,
+            pending_recovery: false,
+            completed_turn_in_session: false,
+            quota_started_at: None,
+            pending_switch_started_at: None,
+            process_started_at: None,
+            process_profile_rotated_ms: 0,
+            last_error: None,
+            consecutive_turn_errors: 0,
+        };
+
+        let held = store.try_lock_agent(&session.id).unwrap();
+        assert!(matches!(session.boot(), Boot::Busy));
+        assert_eq!(launches.load(Ordering::SeqCst), 0);
+        drop(held);
+
+        store.set_agent_state(&session.id, "archived").unwrap();
+        let _ = fs::remove_dir_all(&session.paths.work_dir);
+        assert!(matches!(session.boot(), Boot::Stopped));
+        assert_eq!(launches.load(Ordering::SeqCst), 0);
+        assert!(!session.paths.work_dir.exists());
     }
 }

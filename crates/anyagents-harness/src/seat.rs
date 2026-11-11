@@ -500,12 +500,14 @@ fn checks_with_principals(
                 }
             }
         }
-        for name in ["sessions", "transcripts"] {
-            list.push(deny(
-                "host-only session and transcript trees are denied",
-                &root.join(name),
-            )?);
-        }
+        list.push(Check {
+            what: "seat-admitted own sessions",
+            program: format!("[ -r {} ]", quote(&root.join("sessions"))?),
+        });
+        list.push(deny(
+            "host-only transcript trees are denied",
+            &root.join("transcripts"),
+        )?);
         let capability = quote(&config.join("mcp-capability"))?;
         list.push(Check {
             what: "its capability is readable by its own seat only",
