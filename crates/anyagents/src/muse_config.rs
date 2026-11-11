@@ -191,7 +191,16 @@ pub fn ensure_workspace_session(
         ("XDG_STATE_HOME", config_dir.join("state-home")),
         ("XDG_CACHE_HOME", config_dir.join("cache-home")),
         ("HOME", config_dir.to_owned()),
-        ("TMPDIR", config_dir.join("tmp")),
+        (
+            "TMPDIR",
+            anyagents_core::configured_scratch_dir()
+                .and_then(|s| {
+                    anyagents_core::AgentId::parse(agent_id)
+                        .ok()
+                        .map(|id| anyagents_core::agent_scratch_tmp_dir(&s, &id))
+                })
+                .unwrap_or_else(|| config_dir.join("tmp")),
+        ),
     ] {
         environment.push((key.to_owned(), value.display().to_string()));
     }

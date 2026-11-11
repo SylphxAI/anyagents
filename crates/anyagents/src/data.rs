@@ -20,12 +20,10 @@ pub(crate) fn current_exe_clean() -> std::io::Result<PathBuf> {
 }
 
 /// The data directory this process belongs to, when its deployment named one
-/// via `ANYAGENTS_DATA` or a `<exe_dir>/anyagents-data.path` pointer file.
+/// via `ANYAGENTS_STATE_DIR`, `ANYAGENTS_DATA`, or a `<exe_dir>/anyagents-data.path` pointer file.
 pub fn data_dir() -> Option<PathBuf> {
-    if let Some(value) = std::env::var_os("ANYAGENTS_DATA")
-        && !value.is_empty()
-    {
-        return Some(PathBuf::from(value));
+    if let Some(state_dir) = anyagents_core::configured_state_dir() {
+        return Some(state_dir);
     }
     if !crate::sandbox::is_isolated_test_env()
         && let Ok(exe) = current_exe_clean()

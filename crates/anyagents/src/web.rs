@@ -215,8 +215,8 @@ pub fn load_web_keys(data_dir: Option<&Path>) -> HashMap<String, String> {
     if let Some(dir) = data_dir {
         env_files.push(dir.join(".web-keys.env"));
     }
-    if let Some(env_data) = std::env::var_os("ANYAGENTS_DATA") {
-        env_files.push(std::path::PathBuf::from(env_data).join(".web-keys.env"));
+    if let Some(env_data) = anyagents_core::configured_state_dir() {
+        env_files.push(env_data.join(".web-keys.env"));
     }
     for path in env_files {
         if let Ok(text) = std::fs::read_to_string(&path) {
