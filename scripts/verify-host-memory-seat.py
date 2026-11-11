@@ -101,9 +101,10 @@ def main():
         for name in ['config', 'memory', 'skills', 'sessions', 'transcripts']:
             directory(f'data/agents/synthetic-peer/{name}', 0o700)
             put(f'data/agents/synthetic-peer/{name}/private', 'synthetic-peer-only\n')
-        for name in ['sessions', 'transcripts']:
-            directory(f'data/agents/synthetic-own/{name}', 0o700)
-            put(f'data/agents/synthetic-own/{name}/private', 'synthetic-host-only\n')
+        directory('data/agents/synthetic-own/sessions', 0o2770, True)
+        put('data/agents/synthetic-own/sessions/private', 'synthetic-host-only\n', 0o660, True)
+        directory('data/agents/synthetic-own/transcripts', 0o700)
+        put('data/agents/synthetic-own/transcripts/private', 'synthetic-host-only\n')
         put('data/identity-boundary.json', json.dumps({
             'version': 1, 'data_dir': str(data), 'agent_route': str(data),
             'agents': {'mechanism': 'managed-uid', 'denied': [], 'writable': [], 'readable': []},
