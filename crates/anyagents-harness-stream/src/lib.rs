@@ -2358,20 +2358,29 @@ pub fn detect_agy_session_quota_and_error(
         .and_then(|s| s.trim().parse::<i64>().ok())
         .unwrap_or(0);
     let reset_floor_ms = rotated_ms.max(cleared_ms);
-    if let Ok(raw) = std::fs::read_to_string(config_dir.join(".anyagents-last-error.json"))
+    let err_path = config_dir.join(".anyagents-last-error.json");
+    if let Ok(raw) = std::fs::read_to_string(&err_path)
         && let Ok(val) = serde_json::from_str::<Value>(&raw)
     {
         let ts = val.get("timestamp_ms").and_then(Value::as_i64).unwrap_or(0);
         if ts > reset_floor_ms {
             let err = val.get("error").and_then(Value::as_str).map(str::to_string);
-            if let Some(raw_reset) = val.get("quota_reset_at_ms").and_then(Value::as_i64) {
-                if raw_reset > now_ms {
-                    return (Some(raw_reset), err);
+            if err
+                .as_deref()
+                .is_some_and(|e| e.contains("spiron-unconfirmed-steers.json"))
+                && !config_dir.join("spiron-unconfirmed-steers.json").exists()
+            {
+                let _ = std::fs::remove_file(&err_path);
+            } else {
+                if let Some(raw_reset) = val.get("quota_reset_at_ms").and_then(Value::as_i64) {
+                    if raw_reset > now_ms {
+                        return (Some(raw_reset), err);
+                    }
+                    return (None, None);
                 }
-                return (None, None);
-            }
-            if err.is_some() {
-                return (None, err);
+                if err.is_some() {
+                    return (None, err);
+                }
             }
         }
     }

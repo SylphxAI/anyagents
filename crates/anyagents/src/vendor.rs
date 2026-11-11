@@ -222,7 +222,8 @@ pub fn child_env() -> Vec<(String, String)> {
 }
 
 pub fn read_persisted_last_error(config_dir: &Path) -> Option<(Option<String>, Option<i64>)> {
-    let raw = std::fs::read_to_string(config_dir.join(".anyagents-last-error.json")).ok()?;
+    let err_path = config_dir.join(".anyagents-last-error.json");
+    let raw = std::fs::read_to_string(&err_path).ok()?;
     let val = serde_json::from_str::<serde_json::Value>(&raw).ok()?;
     let rotated_ms = std::fs::read_to_string(config_dir.join(".anyagents-profile-rotated-ms"))
         .ok()
@@ -239,17 +240,35 @@ pub fn read_persisted_last_error(config_dir: &Path) -> Option<(Option<String>, O
         .get("error")
         .and_then(|v| v.as_str())
         .map(str::to_string);
+    if err
+        .as_deref()
+        .is_some_and(|e| e.contains("spiron-unconfirmed-steers.json"))
+        && !config_dir.join("spiron-unconfirmed-steers.json").exists()
+    {
+        let _ = std::fs::remove_file(&err_path);
+        return None;
+    }
     let reset = val.get("quota_reset_at_ms").and_then(|v| v.as_i64());
     Some((err, reset))
 }
 
 fn has_persisted_turn_error(config_dir: &Path) -> bool {
-    let Ok(raw) = std::fs::read_to_string(config_dir.join(".anyagents-last-error.json")) else {
+    let err_path = config_dir.join(".anyagents-last-error.json");
+    let Ok(raw) = std::fs::read_to_string(&err_path) else {
         return false;
     };
     let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) else {
         return false;
     };
+    if val
+        .get("error")
+        .and_then(|v| v.as_str())
+        .is_some_and(|e| e.contains("spiron-unconfirmed-steers.json"))
+        && !config_dir.join("spiron-unconfirmed-steers.json").exists()
+    {
+        let _ = std::fs::remove_file(&err_path);
+        return false;
+    }
     val.get("consecutive_turn_errors")
         .and_then(|v| v.as_u64())
         .unwrap_or(0)
