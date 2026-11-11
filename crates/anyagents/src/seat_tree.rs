@@ -265,9 +265,7 @@ fn migrate_open_file(
             }
             if let Ok(c_temp) = CString::new(self.temp.as_bytes()) {
                 let rc = unsafe { libc::unlinkat(self.parent.as_raw_fd(), c_temp.as_ptr(), 0) };
-                if rc == 0
-                    || io::Error::last_os_error().kind() == io::ErrorKind::NotFound
-                {
+                if rc == 0 || io::Error::last_os_error().kind() == io::ErrorKind::NotFound {
                     return;
                 }
             }
@@ -686,7 +684,8 @@ fn share_open(
                     if (stat.st_mode & libc::S_IFMT) == libc::S_IFREG
                         && now_secs.saturating_sub(stat.st_mtime.max(0)) >= 60
                     {
-                        let _ = unsafe { libc::unlinkat(directory.as_raw_fd(), c_name.as_ptr(), 0) };
+                        let _ =
+                            unsafe { libc::unlinkat(directory.as_raw_fd(), c_name.as_ptr(), 0) };
                     }
                 }
             }
@@ -826,9 +825,41 @@ fn share_open(
 /// Read-only handle to a seat-owned SQLite database that never creates or mutates
 /// `-wal`, `-shm`, or `-journal` sidecars in the seat directory (preventing the
 /// daemon from claiming ownership of WAL/SHM sidecars away from the seat user).
+struct PrivateSnapshotDir(std::path::PathBuf);
+
+impl PrivateSnapshotDir {
+    fn create() -> Option<Self> {
+        use std::os::unix::fs::DirBuilderExt as _;
+        let base = std::env::temp_dir();
+        let pid = std::process::id();
+        for seq in 0..64u32 {
+            let candidate = base.join(format!(
+                "anyagents-ro-sqlite-{pid}-{}-{seq}",
+                anyagents_core::now_ms()
+            ));
+            let mut builder = std::fs::DirBuilder::new();
+            builder.mode(0o700);
+            if builder.create(&candidate).is_ok() {
+                return Some(Self(candidate));
+            }
+        }
+        None
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for PrivateSnapshotDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 pub(crate) struct ReadOnlySeatDb {
     conn: rusqlite::Connection,
-    _snapshot: Option<tempfile::TempDir>,
+    _snapshot: Option<PrivateSnapshotDir>,
 }
 
 impl std::ops::Deref for ReadOnlySeatDb {
@@ -869,9 +900,7 @@ pub(crate) fn open_readonly_seat_sqlite(db_path: &Path) -> Option<ReadOnlySeatDb
     let has_nonempty_wal = std::fs::metadata(&wal_path)
         .map(|m| m.is_file() && m.len() > 0)
         .unwrap_or(false);
-    if !has_nonempty_wal
-        && let Some(uri) = sqlite_immutable_uri(db_path)
-    {
+    if !has_nonempty_wal && let Some(uri) = sqlite_immutable_uri(db_path) {
         let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
             | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
             | rusqlite::OpenFlags::SQLITE_OPEN_URI;
@@ -883,10 +912,7 @@ pub(crate) fn open_readonly_seat_sqlite(db_path: &Path) -> Option<ReadOnlySeatDb
             });
         }
     }
-    let tmp = tempfile::Builder::new()
-        .prefix("anyagents-ro-sqlite-")
-        .tempdir()
-        .ok()?;
+    let tmp = PrivateSnapshotDir::create()?;
     let snap_db = tmp.path().join("snapshot.sqlite3");
     std::fs::copy(db_path, &snap_db).ok()?;
     if has_nonempty_wal {
@@ -1230,7 +1256,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(count, 2, "must replay uncheckpointed WAL frames via private snapshot");
+        assert_eq!(
+            count, 2,
+            "must replay uncheckpointed WAL frames via private snapshot"
+        );
         assert!(
             !crash_cfg.join("sessions.sqlite3-shm").exists(),
             "snapshot read must never create daemon-owned -shm in crash_cfg"

@@ -9926,7 +9926,7 @@ mod tests {
     #[test]
     fn steered_active_turn_advances_cursor_without_lag_and_reclaim_rewinds_custody() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
         let agent = store.create_agent(NewAgent::new("steered", "agy")).unwrap();
 
         let mut first_in = Incoming::new("long running turn");

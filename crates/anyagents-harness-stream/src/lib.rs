@@ -281,6 +281,7 @@ struct State {
     last_turn_step_type: Option<String>,
     idle_since: Option<Instant>,
     last_rpc_health_poll: Option<Instant>,
+    turn_started_at: Option<Instant>,
     last_steer_probe: Option<Instant>,
     reclaimed_steers: Vec<String>,
     planner_config: Option<Value>,
@@ -825,6 +826,11 @@ impl StreamHarness {
                     if state
                         .idle_since
                         .is_some_and(|t| t.elapsed() < AGY_TURN_CLOSE_GRACE)
+                        || (state.turn_user_inputs == 0
+                            && (state.session_id.is_some()
+                                || state
+                                    .turn_started_at
+                                    .is_some_and(|t| t.elapsed() < Duration::from_millis(250))))
                     {
                         return Ok(DeliverOutcome::Deferred);
                     }
@@ -870,6 +876,7 @@ impl StreamHarness {
                         state.turns_started += 1;
                         state.open.push(message.id.clone());
                         state.turn_user_inputs = 0;
+                        state.turn_started_at = Some(Instant::now());
                         state.idle_since = None;
                         state.sign_in_fault = None;
                     } else if self.mode == DeliveryMode::Steer {
@@ -1080,7 +1087,12 @@ impl StreamHarness {
             && (state
                 .idle_since
                 .is_some_and(|t| t.elapsed() < AGY_TURN_CLOSE_GRACE)
-                || ((state.session_id.is_none() || state.turn_user_inputs == 0)
+                || (state.turn_user_inputs == 0
+                    && (state.session_id.is_some()
+                        || state
+                            .turn_started_at
+                            .is_some_and(|t| t.elapsed() < Duration::from_millis(250))))
+                || (state.session_id.is_none()
                     && state
                         .last_steer_probe
                         .is_some_and(|t| t.elapsed() < Duration::from_millis(400))))
@@ -1184,6 +1196,7 @@ impl StreamHarness {
             state.last_turn_step_type = None;
             state.idle_since = None;
             state.last_rpc_health_poll = None;
+            state.turn_started_at = None;
             state.last_steer_probe = None;
             state.planner_config = None;
             state.http_port = self.agy_rpc.as_ref().and_then(|r| r.port_override);
@@ -1300,6 +1313,7 @@ impl StreamHarness {
         state.last_turn_step_type = None;
         state.idle_since = None;
         state.last_rpc_health_poll = None;
+        state.turn_started_at = None;
         state.last_steer_probe = None;
         state.planner_config = None;
         state.http_port = None;
@@ -1394,7 +1408,12 @@ impl State {
             return Err(HarnessError::Failed(reason.clone()));
         }
         let finished = self.finished.contains(id);
-        if protocol == LineProtocol::AcknowledgedResult && !self.acknowledged.contains(id) {
+        if protocol == LineProtocol::AcknowledgedResult
+            && (!self.acknowledged.contains(id)
+                || ((self.input_turns.get(id).is_some_and(|turn| turn != id)
+                    || self.open.first().is_some_and(|turn| turn != id))
+                    && !finished))
+        {
             return Ok(DeliverOutcome::Deferred);
         }
         Ok(DeliverOutcome::Accepted {
@@ -1491,6 +1510,7 @@ impl State {
             last_turn_step_type: None,
             idle_since: None,
             last_rpc_health_poll: None,
+            turn_started_at: None,
             last_steer_probe: None,
             reclaimed_steers: Vec::new(),
             planner_config: None,

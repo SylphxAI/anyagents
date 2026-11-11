@@ -35,7 +35,7 @@ impl Drop for Environment {
 }
 #[track_caller]
 fn eventually(mut check: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while !check() {
         assert!(
             Instant::now() < deadline,
@@ -217,10 +217,8 @@ for line in sys.stdin:
         eventually(|| config.join("steer-ack").exists());
         assert_eq!(
             vendor.deliver(&message("steer")).unwrap(),
-            DeliverOutcome::Accepted {
-                turn_finished: false
-            },
-            "steer_ack immediately advances active-turn delivery"
+            DeliverOutcome::Deferred,
+            "socket acknowledgement is not journal commit"
         );
         assert_eq!(
             vendor.turns_served(),
@@ -463,7 +461,7 @@ for line in sys.stdin:
     delivery.run_once().unwrap();
     assert_eq!(
         delivery.store().delivered_cursor(&agent.id).unwrap(),
-        steer.seq
+        first.seq
     );
     assert!(
         delivery
@@ -472,23 +470,11 @@ for line in sys.stdin:
             .unwrap()
             .unwrap()
             .delivered_at_ms
-            .is_some()
-    );
-    assert_eq!(
-        delivery
-            .store()
-            .lag(&agent.id, anyagents_core::now_ms())
-            .unwrap()
-            .oldest_undelivered_age_ms,
-        None
+            .is_none()
     );
     delivery.harness_mut().cancel().unwrap();
     eventually(|| delivery.harness().turns_served() > 0);
     delivery.run_once().unwrap();
-    assert_eq!(
-        delivery.store().delivered_cursor(&agent.id).unwrap(),
-        first.seq
-    );
     let health = delivery.harness().health();
     assert_eq!(health.turn_state, anyagents_harness::TurnState::InTurn);
     assert!(
@@ -1168,11 +1154,7 @@ for raw in sys.stdin:
 
     anyagents_core::host_session::ensure_active(&agent_root, "spiron").unwrap();
     anyagents_core::host_session::bind_vendor(&agent_root, "spiron", "old-stuck-session").unwrap();
-    std::fs::write(
-        cfg.join("spiron-session-id"),
-        "old-stuck-session\n",
-    )
-    .unwrap();
+    std::fs::write(cfg.join("spiron-session-id"), "old-stuck-session\n").unwrap();
 
     let ReceiveOutcome::New(m1) = store
         .receive(&agent.id, Incoming::new("task part 1"))

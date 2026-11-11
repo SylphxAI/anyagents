@@ -1218,13 +1218,24 @@ fn agy_rpc_discovers_running_turn_one_trajectory_and_accepts_steer_before_stdout
     use std::sync::{Arc, Mutex};
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
     let port = listener.local_addr().unwrap().port();
     let steered = Arc::new(Mutex::new(Vec::<String>::new()));
     let steered_srv = Arc::clone(&steered);
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_srv = Arc::clone(&stop);
     let server = std::thread::spawn(move || {
-        for _ in 0..4 {
-            let Ok((mut stream, _)) = listener.accept() else {
-                break;
+        while !stop_srv.load(std::sync::atomic::Ordering::SeqCst) {
+            let mut stream = match listener.accept() {
+                Ok((stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
+                    stream
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    continue;
+                }
+                Err(_) => break,
             };
             let mut buf = vec![0u8; 8192];
             let mut total = 0usize;
@@ -1312,6 +1323,11 @@ fn agy_rpc_discovers_running_turn_one_trajectory_and_accepts_steer_before_stdout
             turn_finished: false
         }
     );
+    assert!(!harness.input_ready());
+    let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !harness.input_ready() && std::time::Instant::now() < ready_deadline {
+        std::thread::sleep(std::time::Duration::from_millis(15));
+    }
     assert!(harness.input_ready());
 
     let second = anyagents_harness::OutboundMessage {
@@ -1337,5 +1353,6 @@ fn agy_rpc_discovers_running_turn_one_trajectory_and_accepts_steer_before_stdout
     assert!(recorded[0].contains("conv-turn-1"));
     assert!(recorded[0].contains("mid-turn steer before stdout init"));
     drop(harness);
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
     let _ = server.join();
 }

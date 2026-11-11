@@ -1033,9 +1033,40 @@ mod tests {
         let server = std::thread::spawn(move || {
             for step in 0..3 {
                 let (mut stream, _) = listener.accept().unwrap();
-                let mut buf = [0u8; 4096];
-                let n = stream.read(&mut buf).unwrap();
-                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                let mut raw = Vec::with_capacity(4096);
+                let mut chunk = [0u8; 2048];
+                let mut header_end = None;
+                let mut content_len = 0usize;
+                loop {
+                    match stream.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            raw.extend_from_slice(&chunk[..n]);
+                            if header_end.is_none()
+                                && let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n")
+                            {
+                                let end = pos + 4;
+                                header_end = Some(end);
+                                let hdr = String::from_utf8_lossy(&raw[..end]);
+                                for line in hdr.lines() {
+                                    if let Some((k, v)) = line.split_once(':')
+                                        && k.trim().eq_ignore_ascii_case("content-length")
+                                    {
+                                        content_len = v.trim().parse::<usize>().unwrap_or(0);
+                                    }
+                                }
+                            }
+                            if let Some(end) = header_end
+                                && raw.len() >= end + content_len
+                            {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let req = String::from_utf8_lossy(&raw).to_string();
                 let (status, body) = match step {
                     0 => {
                         assert!(req.contains("client_secret=wrong-secret"));
@@ -1069,10 +1100,21 @@ mod tests {
                     body.len()
                 );
                 stream.write_all(resp.as_bytes()).unwrap();
+                let _ = stream.flush();
+                let _ = stream.shutdown(std::net::Shutdown::Write);
             }
         });
 
         let data = tempfile::tempdir().unwrap();
+        let existing_default = data
+            .path()
+            .join("profiles/google-antigravity/default/.gemini/antigravity-cli");
+        std::fs::create_dir_all(&existing_default).unwrap();
+        std::fs::write(
+            existing_default.join("antigravity-oauth-token"),
+            r#"{"email":"bob@example.com","token":{"access_token":"ya29.bob","refresh_token":"1//bob"}}"#,
+        )
+        .unwrap();
         let staging = data
             .path()
             .join("profiles/google-antigravity/.signin-staging-test");
@@ -1114,7 +1156,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(prof_name, "alice.dev");
+        assert_eq!(prof_name, "alice-dev");
         assert_eq!(acct.as_deref(), Some("alice.dev@example.com"));
         assert!(!staging.exists(), "staging directory must be cleaned up");
         let saved: serde_json::Value = serde_json::from_slice(

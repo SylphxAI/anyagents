@@ -607,7 +607,7 @@ fn is_healthy_active_turn(agent: &AgentView, on_quota: bool) -> bool {
 
 fn is_expected_turn_queue(agent: &AgentView, on_quota: bool) -> bool {
     is_healthy_active_turn(agent, on_quota)
-        && (agent.delivery_mode == "followup" || agent.pending_switch)
+        && (agent.delivery_mode == "followup" || agent.pending_switch || agent.harness == "spiron")
 }
 
 fn format_status_with_alerts(agent: &AgentView, now: i64) -> String {
