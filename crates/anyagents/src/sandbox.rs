@@ -466,14 +466,24 @@ pub fn share_config_with_seat_uid(config_dir: &Path, uid: u32, gid: u32) {
             eprintln!("seat: cannot share {}: {error}", path.display());
         }
     }
+    // Sessions holds the harness session database and must stay admitted
+    // to the seat principal (0o2770 + seat group) exactly like config, or
+    // seat-side resume fails with Permission denied (os error 13).
+    // Transcripts remain host-private under daemon ownership.
+    let sessions_dir = config_dir.with_file_name("sessions");
+    let _ = std::fs::create_dir_all(&sessions_dir);
+    if sessions_dir.is_dir()
+        && let Err(err) = crate::seat_tree::share_config(&sessions_dir, eff_uid, eff_gid)
+    {
+        eprintln!("seat: cannot share {}: {err}", sessions_dir.display());
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        for host_only in ["sessions", "transcripts"] {
-            let p = config_dir.with_file_name(host_only);
-            if p.is_dir() {
-                let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700));
-            }
+        let transcripts_dir = config_dir.with_file_name("transcripts");
+        if transcripts_dir.is_dir() {
+            let _ =
+                std::fs::set_permissions(&transcripts_dir, std::fs::Permissions::from_mode(0o700));
         }
     }
 }
