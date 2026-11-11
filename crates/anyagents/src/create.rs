@@ -12857,6 +12857,68 @@ mod runtime_config_tests {
         );
     }
 
+    fn serve_one_http_request(
+        mut stream: std::net::TcpStream,
+        handler: impl FnOnce(&str) -> (&'static str, &'static str),
+    ) {
+        use std::io::{Read, Write};
+        let _ = stream.set_nonblocking(false);
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+        let mut req = Vec::with_capacity(1024);
+        let mut chunk = [0u8; 1024];
+        let mut expected_total: Option<usize> = None;
+        loop {
+            match stream.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    req.extend_from_slice(&chunk[..n]);
+                    if expected_total.is_none()
+                        && let Some(pos) = req.windows(4).position(|w| {
+                            w == b"
+
+"
+                        })
+                    {
+                        let hdr_end = pos + 4;
+                        let hdr_str = String::from_utf8_lossy(&req[..hdr_end]);
+                        let content_len = hdr_str
+                            .lines()
+                            .find_map(|line| {
+                                let (k, v) = line.split_once(':')?;
+                                k.trim()
+                                    .eq_ignore_ascii_case("content-length")
+                                    .then(|| v.trim().parse::<usize>().ok())
+                                    .flatten()
+                            })
+                            .unwrap_or(0);
+                        expected_total = Some(hdr_end + content_len);
+                    }
+                    if expected_total.is_some_and(|total| req.len() >= total) {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let req_str = String::from_utf8_lossy(&req);
+        let (status, body) = handler(&req_str);
+        let resp = format!(
+            "HTTP/1.1 {status}
+Content-Type: application/json
+Content-Length: {}
+Connection: close
+
+{}",
+            body.len(),
+            body
+        );
+        let _ = stream.write_all(resp.as_bytes());
+        let _ = stream.flush();
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(200)));
+        let _ = stream.read(&mut chunk);
+    }
+
     #[test]
     fn mid_session_anthropic_oauth_refresh_updates_profile_and_sanitized_agent_credentials() {
         const WORKER: &str = "ANYAGENTS_ANTHROPIC_REFRESH_TEST";
@@ -12880,21 +12942,16 @@ mod runtime_config_tests {
             return;
         }
 
-        use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
-            if let Ok((mut stream, _)) = listener.accept() {
-                let mut buf = [0u8; 4096];
-                let _ = stream.read(&mut buf);
-                let body = r#"{"access_token":"fresh-access-token","refresh_token":"fresh-refresh-token","expires_in":28800}"#;
-                let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                let _ = stream.write_all(resp.as_bytes());
-                let _ = stream.flush();
+            if let Ok((stream, _)) = listener.accept() {
+                serve_one_http_request(stream, |_| {
+                    (
+                        "200 OK",
+                        r#"{"access_token":"fresh-access-token","refresh_token":"fresh-refresh-token","expires_in":28800}"#,
+                    )
+                });
             }
         });
 
@@ -13195,7 +13252,6 @@ mod runtime_config_tests {
             return;
         }
 
-        use std::io::{Read, Write};
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -13209,37 +13265,23 @@ mod runtime_config_tests {
         let server = std::thread::spawn(move || {
             while !stop_srv.load(Ordering::SeqCst) {
                 match listener.accept() {
-                    Ok((mut stream, _)) => {
-                        stream.set_nonblocking(false).unwrap();
-                        let mut buf = [0u8; 4096];
-                        let n = stream.read(&mut buf).unwrap_or(0);
-                        let req = String::from_utf8_lossy(&buf[..n]);
-                        let (status, body) = if req.starts_with("POST /v1/oauth/token") {
-                            token_hits_srv.fetch_add(1, Ordering::SeqCst);
-                            (
-                                "200 OK",
-                                r#"{"access_token":"rotated-access-token","refresh_token":"rotated-refresh-token","expires_in":28800}"#,
-                            )
-                        } else if req.starts_with("GET /api/oauth/usage") {
-                            (
-                                "200 OK",
-                                r#"{"five_hour":{"utilization":12.0},"seven_day":{"utilization":25.0}}"#,
-                            )
-                        } else {
-                            ("404 Not Found", r#"{"error":"not_found"}"#)
-                        };
-                        let resp = format!(
-                            "HTTP/1.1 {status}
-Content-Type: application/json
-Content-Length: {}
-Connection: close
-
-{}",
-                            body.len(),
-                            body
-                        );
-                        let _ = stream.write_all(resp.as_bytes());
-                        let _ = stream.flush();
+                    Ok((stream, _)) => {
+                        serve_one_http_request(stream, |req| {
+                            if req.starts_with("POST /v1/oauth/token") {
+                                token_hits_srv.fetch_add(1, Ordering::SeqCst);
+                                (
+                                    "200 OK",
+                                    r#"{"access_token":"rotated-access-token","refresh_token":"rotated-refresh-token","expires_in":28800}"#,
+                                )
+                            } else if req.starts_with("GET /api/oauth/usage") {
+                                (
+                                    "200 OK",
+                                    r#"{"five_hour":{"utilization":12.0},"seven_day":{"utilization":25.0}}"#,
+                                )
+                            } else {
+                                ("404 Not Found", r#"{"error":"not_found"}"#)
+                            }
+                        });
                     }
                     Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                         std::thread::sleep(std::time::Duration::from_millis(5));
