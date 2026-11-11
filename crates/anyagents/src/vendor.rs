@@ -194,6 +194,28 @@ impl anyagents_harness::Harness for ContractHarness {
         self.inner.clear_quota()
     }
 
+    fn take_reclaimed_steers(&mut self) -> Vec<String> {
+        self.inner.take_reclaimed_steers()
+    }
+
+    fn has_unconfirmed_hold(&self) -> bool {
+        self.inner.has_unconfirmed_hold()
+    }
+
+    fn has_unconfirmed_idle_hold(&self) -> bool {
+        self.inner.has_unconfirmed_idle_hold()
+    }
+
+    fn peek_unconfirmed_request_ids(&self) -> Vec<String> {
+        self.inner.peek_unconfirmed_request_ids()
+    }
+
+    fn reconcile_unconfirmed_for_recovery(
+        &mut self,
+    ) -> Result<Option<anyagents_harness::ReconciledUnconfirmed>, HarnessError> {
+        self.inner.reconcile_unconfirmed_for_recovery()
+    }
+
     fn process_id(&self) -> Option<u32> {
         self.inner.process_id()
     }
@@ -1450,13 +1472,21 @@ pub(crate) fn ensure_agy_steering_settings(
                 *allow = serde_json::json!([]);
                 changed = true;
             }
-            if let Some(allow_arr) = allow.as_array_mut()
-                && !allow_arr
-                    .iter()
-                    .any(|v| v.as_str() == Some("mcp(anyagents/*)"))
-            {
-                allow_arr.push(serde_json::Value::String("mcp(anyagents/*)".to_string()));
-                changed = true;
+            let mcp_schema_grant = format!(
+                "read_file({})",
+                config_dir
+                    .join(".gemini")
+                    .join("antigravity-cli")
+                    .join("mcp")
+                    .display()
+            );
+            if let Some(allow_arr) = allow.as_array_mut() {
+                for grant in ["mcp(anyagents/*)", mcp_schema_grant.as_str()] {
+                    if !allow_arr.iter().any(|v| v.as_str() == Some(grant)) {
+                        allow_arr.push(serde_json::Value::String(grant.to_string()));
+                        changed = true;
+                    }
+                }
             }
             let deny = perms_obj
                 .entry("deny".to_string())
@@ -1466,6 +1496,20 @@ pub(crate) fn ensure_agy_steering_settings(
                 changed = true;
             }
             if let Some(deny_arr) = deny.as_array_mut() {
+                // Keep read_file / view_file out of static permissions.deny
+                // (which overrides PreToolUse decision="allow" in agy) so
+                // anyagents-native-tool-guard can permit reading lazy MCP tool
+                // schemas under ~/.gemini/antigravity-cli/mcp/*.json while
+                // denying all workspace and host reads fail-closed.
+                const AGY_LEGACY_READ_DENIES: &[&str] = &["read_file", "view_file", "read_file(*)"];
+                let before_legacy = deny_arr.len();
+                deny_arr.retain(|v| {
+                    !v.as_str()
+                        .is_some_and(|s| AGY_LEGACY_READ_DENIES.contains(&s))
+                });
+                if deny_arr.len() != before_legacy {
+                    changed = true;
+                }
                 const AGY_DENIED_NATIVE_TOOLS: &[&str] = &[
                     "invoke_subagent",
                     "define_subagent",
@@ -1478,15 +1522,12 @@ pub(crate) fn ensure_agy_steering_settings(
                     "open_browser_url",
                     "run_command",
                     "manage_task",
-                    "read_file",
                     "write_file",
                     "edit_file",
-                    "view_file",
                     "grep_search",
                     "find_by_name",
                     "list_dir",
                     "command(*)",
-                    "read_file(*)",
                     "write_file(*)",
                     "read_url(*)",
                     "execute_url(*)",
@@ -1557,7 +1598,7 @@ pub(crate) fn ensure_agy_steering_settings(
                     "hooks": [
                         {
                             "type": "command",
-                            "command": "printf '%s\\n' '{\"decision\":\"deny\",\"reason\":\"Native built-in tools are disabled under AnyAgents; use the anyagents MCP code tool (workspace.*, web.*, anyagents.*) instead.\"}'",
+                            "command": "python3 -c 'import json,os,sys\ndeny=\"Native built-in tools are disabled under AnyAgents. Invoke AnyAgents MCP tools via call_mcp_tool with ServerName=\\\"anyagents\\\" (read schemas in ~/.gemini/antigravity-cli/mcp/anyagents/*.json if needed): e.g. ToolName=\\\"code\\\" with Arguments={\\\"code\\\":\\\"return await workspace.read({ path: \\\\\\\"...\\\\\\\" });\\\"} for workspace/web/anyagents operations, ToolName=\\\"send\\\" with Arguments={\\\"to\\\":[\\\"parent\\\"],\\\"text\\\":\\\"...\\\"} to reply, ToolName=\\\"agents\\\", ToolName=\\\"schedules\\\", or ToolName=\\\"skills\\\".\"\ntry:\n d=json.load(sys.stdin);tc=d.get(\"toolCall\") or {}\n if tc.get(\"name\") in (\"read_file\",\"view_file\"):\n  p=(tc.get(\"args\") or {}).get(\"Path\") or \"\"\n  mcp=os.path.realpath(os.path.expanduser(\"~/.gemini/antigravity-cli/mcp\"))\n  rp=os.path.realpath(os.path.expanduser(p)) if p else \"\"\n  if rp.startswith(mcp+\"/\") and rp.endswith(\".json\") and os.path.isfile(rp):\n   print(json.dumps({\"decision\":\"allow\",\"permissionOverrides\":[\"read_file(*)\",\"read_file\",\"view_file\"]}));sys.exit(0)\nexcept Exception:\n pass\nprint(json.dumps({\"decision\":\"deny\",\"reason\":deny}))' 2>/dev/null || printf '%s\\n' '{\"decision\":\"deny\",\"reason\":\"Native built-in tools are disabled under AnyAgents; invoke AnyAgents MCP tools via call_mcp_tool with ServerName=\\\"anyagents\\\" and ToolName=\\\"code\\\" or \\\"send\\\" instead.\"}'",
                             "timeout": 5
                         }
                     ]
@@ -1687,6 +1728,40 @@ fn start_spiron(
     .map_err(|err| err.to_string())?;
     harness.set_state_dir(config_dir);
     Ok(harness)
+}
+
+fn populate_spiron_journal_reconciliation(
+    config_dir: &Path,
+    session_id: &str,
+    rec: &mut anyagents_harness::ReconciledUnconfirmed,
+) {
+    let db_path = config_dir.join("sessions.sqlite3");
+    if !db_path.is_file() {
+        return;
+    }
+    let Some(conn) = crate::seat_tree::open_readonly_seat_sqlite(&db_path) else {
+        return;
+    };
+    let Ok(mut stmt) =
+        conn.prepare("SELECT event FROM session_entries WHERE session_id = ?1 ORDER BY idx ASC")
+    else {
+        return;
+    };
+    let Ok(rows) = stmt.query_map([session_id], |row| row.get::<_, String>(0)) else {
+        return;
+    };
+    let events: Vec<String> = rows.flatten().collect();
+    for id in &rec.request_ids {
+        let marker = format!("anyagents-message:{id}");
+        if events
+            .iter()
+            .any(|ev| ev.contains(&marker) || ev.contains(id))
+        {
+            rec.journal_committed_ids.push(id.clone());
+        } else {
+            rec.journal_missing_ids.push(id.clone());
+        }
+    }
 }
 
 fn start_codex(
@@ -1893,6 +1968,66 @@ impl Harness for VendorHarness {
             Self::Grok(harness, _) => harness.clear_quota(),
             Self::Spiron(harness, _, _) => harness.clear_quota(),
             Self::Contract(harness) => harness.clear_quota(),
+        }
+    }
+
+    fn take_reclaimed_steers(&mut self) -> Vec<String> {
+        match self {
+            Self::Agy(harness, _) => harness.take_reclaimed_steers(),
+            Self::Spiron(harness, _, _) => harness.take_reclaimed_steers(),
+            Self::Contract(harness) => harness.take_reclaimed_steers(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn has_unconfirmed_hold(&self) -> bool {
+        match self {
+            Self::Spiron(harness, _, _) => harness.has_unconfirmed_hold(),
+            Self::Contract(harness) => harness.has_unconfirmed_hold(),
+            _ => false,
+        }
+    }
+
+    fn has_unconfirmed_idle_hold(&self) -> bool {
+        match self {
+            Self::Spiron(harness, _, _) => harness.has_unconfirmed_idle_hold(),
+            Self::Contract(harness) => harness.has_unconfirmed_idle_hold(),
+            _ => false,
+        }
+    }
+
+    fn peek_unconfirmed_request_ids(&self) -> Vec<String> {
+        match self {
+            Self::Spiron(harness, _, _) => harness.peek_unconfirmed_request_ids(),
+            Self::Contract(harness) => harness.peek_unconfirmed_request_ids(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn reconcile_unconfirmed_for_recovery(
+        &mut self,
+    ) -> Result<Option<anyagents_harness::ReconciledUnconfirmed>, HarnessError> {
+        match self {
+            Self::Spiron(harness, marker, _) => {
+                let dir = harness.state_dir();
+                let session_id = harness.session_id().or_else(|| {
+                    std::fs::read_to_string(marker)
+                        .ok()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                });
+                let Some(mut rec) = harness.reconcile_unconfirmed_for_recovery()? else {
+                    return Ok(None);
+                };
+                if let (Some(dir), Some(sid)) = (dir, session_id)
+                    && !rec.request_ids.is_empty()
+                {
+                    populate_spiron_journal_reconciliation(&dir, &sid, &mut rec);
+                }
+                Ok(Some(rec))
+            }
+            Self::Contract(harness) => harness.reconcile_unconfirmed_for_recovery(),
+            _ => Ok(None),
         }
     }
 
@@ -3070,9 +3205,17 @@ done
         let text = std::fs::read_to_string(&settings_path).unwrap();
         let json: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(json["queuedMessages"], "send-immediately");
+        let expected_mcp_grant = format!(
+            "read_file({})",
+            config_dir
+                .join(".gemini")
+                .join("antigravity-cli")
+                .join("mcp")
+                .display()
+        );
         assert_eq!(
             json["permissions"]["allow"],
-            serde_json::json!(["mcp(anyagents/*)"])
+            serde_json::json!(["mcp(anyagents/*)", expected_mcp_grant])
         );
         assert_eq!(
             json["permissions"]["deny"],
@@ -3088,15 +3231,12 @@ done
                 "open_browser_url",
                 "run_command",
                 "manage_task",
-                "read_file",
                 "write_file",
                 "edit_file",
-                "view_file",
                 "grep_search",
                 "find_by_name",
                 "list_dir",
                 "command(*)",
-                "read_file(*)",
                 "write_file(*)",
                 "read_url(*)",
                 "execute_url(*)"
@@ -3137,6 +3277,128 @@ done
         let hooks_json2: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&hooks_path).unwrap()).unwrap();
         assert_eq!(hooks_json2, hooks_json);
+    }
+
+    #[test]
+    fn agy_native_tool_guard_allows_only_mcp_schema_reads_and_prunes_stale_read_deny() {
+        let dir = crate::test_tempdir();
+        let config_dir = dir.path().join("config");
+        let work_dir = dir.path().join("work");
+        let mcp_dir = config_dir
+            .join(".gemini")
+            .join("antigravity-cli")
+            .join("mcp")
+            .join("anyagents");
+        std::fs::create_dir_all(&mcp_dir).unwrap();
+        std::fs::create_dir_all(&work_dir).unwrap();
+
+        // Pre-seed legacy static read_file(*) deny to verify automatic healing.
+        let settings_path = config_dir
+            .join(".gemini")
+            .join("antigravity-cli")
+            .join("settings.json");
+        std::fs::write(
+            &settings_path,
+            serde_json::json!({
+                "permissions": {
+                    "allow": ["mcp(anyagents/*)"],
+                    "deny": ["read_file", "view_file", "read_file(*)", "command(*)"]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        ensure_agy_steering_settings(&config_dir, &work_dir).unwrap();
+        let healed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        let deny_list = healed["permissions"]["deny"].as_array().unwrap();
+        for stale in ["read_file", "view_file", "read_file(*)"] {
+            assert!(
+                !deny_list.iter().any(|v| v.as_str() == Some(stale)),
+                "stale deny {stale} must be pruned"
+            );
+        }
+
+        let schema_file = mcp_dir.join("code.json");
+        std::fs::write(&schema_file, r#"{"name":"code"}"#).unwrap();
+        let work_secret = work_dir.join("secret.txt");
+        std::fs::write(&work_secret, "workspace secret").unwrap();
+        let oauth_token = config_dir
+            .join(".gemini")
+            .join("antigravity-cli")
+            .join("antigravity-oauth-token");
+        std::fs::write(&oauth_token, "token").unwrap();
+        #[cfg(unix)]
+        let escaped_symlink = {
+            let link = mcp_dir.join("escape.json");
+            std::os::unix::fs::symlink(&work_secret, &link).unwrap();
+            link
+        };
+
+        let hooks_path = config_dir.join(".gemini").join("config").join("hooks.json");
+        let hooks_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&hooks_path).unwrap()).unwrap();
+        let cmd = hooks_json["anyagents-native-tool-guard"]["PreToolUse"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+
+        let run_hook = |tool: &str, path: Option<&Path>| -> serde_json::Value {
+            use std::io::Write as _;
+            let payload = match path {
+                Some(p) => serde_json::json!({
+                    "toolCall": { "name": tool, "args": { "Path": p.display().to_string() } }
+                }),
+                None => serde_json::json!({
+                    "toolCall": { "name": tool, "args": { "CommandLine": "ls" } }
+                }),
+            };
+            let mut child = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(cmd)
+                .env("HOME", &config_dir)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(payload.to_string().as_bytes())
+                .unwrap();
+            let out = child.wait_with_output().unwrap();
+            assert!(out.status.success());
+            serde_json::from_slice(&out.stdout).unwrap()
+        };
+
+        let allow_out = run_hook("read_file", Some(&schema_file));
+        assert_eq!(allow_out["decision"], "allow");
+
+        for blocked_path in [
+            &work_secret,
+            &oauth_token,
+            #[cfg(unix)]
+            &escaped_symlink,
+        ] {
+            let deny_out = run_hook("read_file", Some(blocked_path));
+            assert_eq!(deny_out["decision"], "deny");
+            assert!(
+                deny_out["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("call_mcp_tool")
+            );
+        }
+
+        let cmd_deny = run_hook("run_command", None);
+        assert_eq!(cmd_deny["decision"], "deny");
+        assert!(
+            cmd_deny["reason"]
+                .as_str()
+                .unwrap()
+                .contains("call_mcp_tool")
+        );
     }
     #[test]
     fn poisoned_agy_session_retires_only_the_pointer_and_stale_error() {

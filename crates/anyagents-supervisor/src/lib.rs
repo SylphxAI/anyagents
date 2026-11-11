@@ -1097,6 +1097,20 @@ impl<H: Harness + 'static> Session<H> {
             self.inner.clock.wait(Some(wait_until), &self.woken);
             return false;
         }
+        if self.pending_recovery
+            && self
+                .delivery
+                .as_ref()
+                .is_some_and(|d| d.harness().has_unconfirmed_hold())
+        {
+            if self.recover_once() {
+                return false;
+            }
+            if !self.pending_recovery {
+                self.wake_unless_more();
+                return false;
+            }
+        }
         let outcome = {
             let Some(delivery) = self.delivery.as_mut() else {
                 return false;
@@ -1130,8 +1144,33 @@ impl<H: Harness + 'static> Session<H> {
                 if self.try_apply_pending_switch() {
                     return false;
                 }
+                if self.delivery.as_ref().is_some_and(|d| {
+                    !d.harness().health().process_alive
+                        && (d.store().has_open_turn(&self.id).unwrap_or(false)
+                            || d.harness().has_unconfirmed_hold())
+                }) {
+                    if !self.wait_backoff() {
+                        return false;
+                    }
+                    self.replace_process();
+                    return false;
+                }
                 if self.pending_recovery && self.recover_once() {
                     return false;
+                }
+                if let Some(err) = self.recoverable_mid_turn_fault() {
+                    self.last_error = Some(err);
+                    if self.consecutive_turn_errors < 3 {
+                        self.consecutive_turn_errors =
+                            self.consecutive_turn_errors.saturating_add(1);
+                        self.publish();
+                        if !self.wait_backoff() {
+                            return false;
+                        }
+                        self.replace_process();
+                        return false;
+                    }
+                    self.pending_recovery = false;
                 }
                 if self.try_release_idle_agent() {
                     return false;
@@ -1326,20 +1365,66 @@ impl<H: Harness + 'static> Session<H> {
     /// process has an unfinished turn (`opened_seq > completed_seq`) and an
     /// empty mailbox. Returns `true` when the caller should re-enter the main
     /// loop immediately (e.g. after process replacement on failure).
+    fn recoverable_mid_turn_fault(&self) -> Option<String> {
+        let delivery = self.delivery.as_ref()?;
+        let health = delivery.harness().health();
+        let fault = health.sign_in_fault?;
+        if delivery.harness().has_unconfirmed_idle_hold() {
+            return Some(fault);
+        }
+        if health.turn_state != TurnState::Idle
+            || !delivery.store().has_open_turn(&self.id).unwrap_or(false)
+        {
+            return None;
+        }
+        is_transient_turn_fault(&fault).then_some(fault)
+    }
+
     fn recover_once(&mut self) -> bool {
         let outcome = {
             let Some(delivery) = self.delivery.as_mut() else {
                 self.pending_recovery = false;
                 return false;
             };
-            // Idle also covers deferred or passive mail. Recovery must not
-            // overtake any queued message, and a failed read is not emptiness.
-            if !matches!(delivery.store().next_undelivered(&self.id), Ok(None)) {
+            let has_hold = delivery.harness().has_unconfirmed_hold();
+            if has_hold {
+                let held_ids = delivery.harness().peek_unconfirmed_request_ids();
+                if !held_ids.is_empty()
+                    && let Err(err) = delivery
+                        .store()
+                        .promote_messages_to_open_turn(&self.id, &held_ids)
+                {
+                    self.last_error = Some(format!("read open turn for recovery: {err}"));
+                    return false;
+                }
+            } else if !matches!(delivery.store().next_undelivered(&self.id), Ok(None)) {
+                // Idle also covers deferred or passive mail. Recovery must not
+                // overtake any queued message, and a failed read is not emptiness.
                 return false;
             }
             let open = match delivery.store().open_turn(&self.id) {
-                Ok(Some(open)) => open,
-                Ok(None) => {
+                Ok(open) => open,
+                Err(err) => {
+                    self.last_error = Some(format!("read open turn for recovery: {err}"));
+                    return false;
+                }
+            };
+            let reconciled = if has_hold {
+                match delivery.harness_mut().reconcile_unconfirmed_for_recovery() {
+                    Ok(rec) => Ok(rec),
+                    Err(anyagents_harness::HarnessError::Dead) => {
+                        Err(anyagents_agent::Error::HarnessDown)
+                    }
+                    Err(anyagents_harness::HarnessError::Failed(reason)) => {
+                        Err(anyagents_agent::Error::HarnessFailed(reason))
+                    }
+                }
+            } else {
+                Ok(None)
+            };
+            match (reconciled, open) {
+                (Err(err), _) => Err(err),
+                (Ok(_), None) => {
                     self.pending_recovery = false;
                     if self
                         .last_error
@@ -1348,14 +1433,15 @@ impl<H: Harness + 'static> Session<H> {
                     {
                         self.last_error = None;
                     }
+                    if has_hold {
+                        self.last_error = None;
+                    }
                     return false;
                 }
-                Err(err) => {
-                    self.last_error = Some(format!("read open turn for recovery: {err}"));
-                    return false;
+                (Ok(rec), Some(open)) => {
+                    delivery.recover_open_turn_with_reconciliation(&open, rec.as_ref())
                 }
-            };
-            delivery.recover_open_turn(&open)
+            }
         };
         match outcome {
             Ok(DeliverOutcome::Accepted { .. }) => {
@@ -1422,6 +1508,51 @@ impl<H: Harness + 'static> Session<H> {
             &self.woken,
         );
     }
+}
+
+fn is_transient_turn_fault(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("(400)")
+        || lower.contains("http 400")
+        || lower.contains("status 400")
+        || lower.contains("(401)")
+        || lower.contains(" 401 ")
+        || lower.contains("status 401")
+        || lower.contains("http 401")
+        || lower.contains("unauthorized")
+        || lower.contains("invalid_api_key")
+        || lower.contains("(403)")
+        || lower.contains("http 403")
+        || lower.contains("context limit")
+        || lower.contains("not signed in")
+    {
+        return false;
+    }
+    [
+        "server_error",
+        "internal_error",
+        "overloaded",
+        "http 500",
+        "http 502",
+        "http 503",
+        "http 504",
+        "status 500",
+        "status 502",
+        "status 503",
+        "status 504",
+        "bad gateway",
+        "service unavailable",
+        "gateway timeout",
+        "connection reset",
+        "broken pipe",
+        "unexpected eof",
+        "stream closed",
+        "stream ended",
+        "timed out",
+        "temporarily unavailable",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 /// Return `true` when `root_pid` has any non-zombie descendant process in `/proc`

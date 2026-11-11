@@ -249,6 +249,64 @@ fn migrate_open_file(
     );
     let temp = std::ffi::OsString::from(format!(".seat-copy-{nonce}"));
     let backup = std::ffi::OsString::from(format!(".seat-before-{nonce}"));
+    let fd = parent.as_raw_fd();
+    struct TempCopyCleanup<'a> {
+        parent: &'a File,
+        temp: &'a OsStr,
+        launcher: &'a Path,
+        uid: u32,
+        gid: u32,
+        armed: bool,
+    }
+    impl Drop for TempCopyCleanup<'_> {
+        fn drop(&mut self) {
+            if !self.armed {
+                return;
+            }
+            if let Ok(c_temp) = CString::new(self.temp.as_bytes()) {
+                let rc = unsafe { libc::unlinkat(self.parent.as_raw_fd(), c_temp.as_ptr(), 0) };
+                if rc == 0 || io::Error::last_os_error().kind() == io::ErrorKind::NotFound {
+                    return;
+                }
+            }
+            let dir_fd = self.parent.as_raw_fd();
+            let mut rm = std::process::Command::new(self.launcher);
+            rm.args([
+                "--reuid",
+                &self.uid.to_string(),
+                "--regid",
+                &self.gid.to_string(),
+                "--groups",
+                &self.gid.to_string(),
+                "--no-new-privs",
+                "--",
+                "/bin/rm",
+                "-f",
+                "--",
+            ])
+            .arg(Path::new(".").join(self.temp))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+            unsafe {
+                rm.pre_exec(move || {
+                    if libc::fchdir(dir_fd) != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let _ = rm.status();
+        }
+    }
+    let mut cleanup = TempCopyCleanup {
+        parent,
+        temp: &temp,
+        launcher: &launcher,
+        uid,
+        gid,
+        armed: true,
+    };
     let mut command = std::process::Command::new(&launcher);
     command
         .args([
@@ -262,19 +320,19 @@ fn migrate_open_file(
             "--",
             "/bin/sh",
             "-c",
-            "set -euC; umask 007; cat > \"/dev/fd/3/$1\"",
+            "set -euC; umask 007; cat > \"./$1\"",
             "seat-copy",
         ])
         .arg(&temp)
         .stdin(source.try_clone()?)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
-    let fd = parent.as_raw_fd();
-    // Only async-signal-safe syscalls occur between fork and exec. Descriptor 3
-    // binds the destination directory across privilege drop and path renames.
+    // Bind working directory directly to the opened parent descriptor via fchdir
+    // before privilege drop, avoiding /dev/fd/3 (/proc/self/fd/3) traversal when
+    // setresuid sets PR_SET_DUMPABLE=0 (mode 0500 root:root on /proc/self/fd).
     unsafe {
         command.pre_exec(move || {
-            if libc::dup2(fd, 3) < 0 || libc::fcntl(3, libc::F_SETFD, 0) < 0 {
+            if libc::fchdir(fd) != 0 {
                 return Err(io::Error::last_os_error());
             }
             Ok(())
@@ -303,7 +361,7 @@ fn migrate_open_file(
             "--",
             "/bin/sh",
             "-c",
-            "set -eu; cmp -s - \"/dev/fd/3/$1\"; sync -f \"/dev/fd/3/$1\"",
+            "set -eu; cmp -s - \"./$1\"; sync -f \"./$1\"",
             "seat-readback",
         ])
         .arg(&temp)
@@ -312,7 +370,7 @@ fn migrate_open_file(
         .stderr(std::process::Stdio::null());
     unsafe {
         verify.pre_exec(move || {
-            if libc::dup2(fd, 3) < 0 || libc::fcntl(3, libc::F_SETFD, 0) < 0 {
+            if libc::fchdir(fd) != 0 {
                 return Err(io::Error::last_os_error());
             }
             Ok(())
@@ -369,7 +427,11 @@ fn migrate_open_file(
             "seat source name changed; recovery copies retained",
         ));
     }
-    rename(&temp, name)?;
+    if let Err(err) = rename(&temp, name) {
+        let _ = rename(&backup, name);
+        return Err(err);
+    }
+    cleanup.armed = false;
     parent.sync_all()?;
     Ok(())
 }
@@ -604,6 +666,29 @@ fn share_open(
         let child_path = path.join(&name);
         let text = name.to_string_lossy();
         if text.starts_with(".seat-") {
+            if text.starts_with(".seat-copy-")
+                && let Ok(c_name) = CString::new(name.as_bytes())
+            {
+                let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+                if unsafe {
+                    libc::fstatat(
+                        directory.as_raw_fd(),
+                        c_name.as_ptr(),
+                        stat.as_mut_ptr(),
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    )
+                } == 0
+                {
+                    let stat = unsafe { stat.assume_init() };
+                    let now_secs = (anyagents_core::now_ms() / 1000).max(0);
+                    if (stat.st_mode & libc::S_IFMT) == libc::S_IFREG
+                        && now_secs.saturating_sub(stat.st_mtime.max(0)) >= 60
+                    {
+                        let _ =
+                            unsafe { libc::unlinkat(directory.as_raw_fd(), c_name.as_ptr(), 0) };
+                    }
+                }
+            }
             continue;
         }
         if !access.runtime_tree
@@ -735,6 +820,111 @@ fn share_open(
         }
     }
     Ok(())
+}
+
+/// Read-only handle to a seat-owned SQLite database that never creates or mutates
+/// `-wal`, `-shm`, or `-journal` sidecars in the seat directory (preventing the
+/// daemon from claiming ownership of WAL/SHM sidecars away from the seat user).
+struct PrivateSnapshotDir(std::path::PathBuf);
+
+impl PrivateSnapshotDir {
+    fn create() -> Option<Self> {
+        use std::os::unix::fs::DirBuilderExt as _;
+        let base = std::env::temp_dir();
+        let pid = std::process::id();
+        for seq in 0..64u32 {
+            let candidate = base.join(format!(
+                "anyagents-ro-sqlite-{pid}-{}-{seq}",
+                anyagents_core::now_ms()
+            ));
+            let mut builder = std::fs::DirBuilder::new();
+            builder.mode(0o700);
+            if builder.create(&candidate).is_ok() {
+                return Some(Self(candidate));
+            }
+        }
+        None
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for PrivateSnapshotDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+pub(crate) struct ReadOnlySeatDb {
+    conn: rusqlite::Connection,
+    _snapshot: Option<PrivateSnapshotDir>,
+}
+
+impl std::ops::Deref for ReadOnlySeatDb {
+    type Target = rusqlite::Connection;
+    fn deref(&self) -> &Self::Target {
+        &self.conn
+    }
+}
+
+fn sqlite_immutable_uri(path: &Path) -> Option<String> {
+    let abs = std::path::absolute(path).ok()?;
+    let raw = abs.to_str()?;
+    let mut out = String::with_capacity(raw.len() + 24);
+    out.push_str("file:");
+    if !raw.starts_with('/') {
+        out.push('/');
+    }
+    for b in raw.bytes() {
+        match b {
+            b'%' => out.push_str("%25"),
+            b'?' => out.push_str("%3f"),
+            b'#' => out.push_str("%23"),
+            b' ' => out.push_str("%20"),
+            _ => out.push(b as char),
+        }
+    }
+    out.push_str("?immutable=1");
+    Some(out)
+}
+
+pub(crate) fn open_readonly_seat_sqlite(db_path: &Path) -> Option<ReadOnlySeatDb> {
+    if !db_path.is_file() {
+        return None;
+    }
+    let mut wal_os = db_path.as_os_str().to_os_string();
+    wal_os.push("-wal");
+    let wal_path = std::path::PathBuf::from(wal_os);
+    let has_nonempty_wal = std::fs::metadata(&wal_path)
+        .map(|m| m.is_file() && m.len() > 0)
+        .unwrap_or(false);
+    if !has_nonempty_wal && let Some(uri) = sqlite_immutable_uri(db_path) {
+        let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | rusqlite::OpenFlags::SQLITE_OPEN_URI;
+        if let Ok(conn) = rusqlite::Connection::open_with_flags(uri, flags) {
+            let _ = conn.busy_timeout(std::time::Duration::from_millis(500));
+            return Some(ReadOnlySeatDb {
+                conn,
+                _snapshot: None,
+            });
+        }
+    }
+    let tmp = PrivateSnapshotDir::create()?;
+    let snap_db = tmp.path().join("snapshot.sqlite3");
+    std::fs::copy(db_path, &snap_db).ok()?;
+    if has_nonempty_wal {
+        let _ = std::fs::copy(&wal_path, tmp.path().join("snapshot.sqlite3-wal"));
+    }
+    let conn = rusqlite::Connection::open(&snap_db).ok()?;
+    let _ = conn.busy_timeout(std::time::Duration::from_millis(500));
+    let _ = conn.pragma_update(None, "query_only", "ON");
+    Some(ReadOnlySeatDb {
+        conn,
+        _snapshot: Some(tmp),
+    })
 }
 
 #[cfg(test)]
@@ -988,6 +1178,225 @@ mod tests {
         assert_eq!(
             std::fs::read(peer.join("private")).unwrap(),
             b"protected peer bytes"
+        );
+    }
+
+    #[test]
+    fn open_readonly_seat_sqlite_never_creates_wal_or_shm_sidecars() {
+        let temp = crate::test_tempdir();
+        let cfg = temp.path().join("config");
+        std::fs::create_dir_all(&cfg).unwrap();
+        let db_path = cfg.join("sessions.sqlite3");
+
+        {
+            let writer = rusqlite::Connection::open(&db_path).unwrap();
+            let _: String = writer
+                .query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))
+                .unwrap();
+            writer
+                .execute_batch(
+                    "CREATE TABLE session_entries(session_id TEXT NOT NULL, idx INTEGER NOT NULL, event TEXT NOT NULL);
+                     INSERT INTO session_entries VALUES('s1', 0, 'anyagents-message:msg_1');",
+                )
+                .unwrap();
+        }
+        assert!(!cfg.join("sessions.sqlite3-wal").exists());
+        assert!(!cfg.join("sessions.sqlite3-shm").exists());
+
+        {
+            let ro = open_readonly_seat_sqlite(&db_path).expect("open WAL db immutable");
+            let ev: String = ro
+                .query_row(
+                    "SELECT event FROM session_entries WHERE session_id = 's1'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(ev, "anyagents-message:msg_1");
+            assert!(
+                !cfg.join("sessions.sqlite3-wal").exists(),
+                "daemon read-only query must never create -wal sidecar in seat config"
+            );
+            assert!(
+                !cfg.join("sessions.sqlite3-shm").exists(),
+                "daemon read-only query must never create -shm sidecar in seat config"
+            );
+        }
+
+        let crash_cfg = temp.path().join("crash-config");
+        std::fs::create_dir_all(&crash_cfg).unwrap();
+        let writer = rusqlite::Connection::open(&db_path).unwrap();
+        let _ = writer.pragma_update(None, "wal_autocheckpoint", 0);
+        writer
+            .execute(
+                "INSERT INTO session_entries VALUES('s1', 1, 'anyagents-message:msg_2')",
+                [],
+            )
+            .unwrap();
+        assert!(
+            std::fs::metadata(cfg.join("sessions.sqlite3-wal"))
+                .unwrap()
+                .len()
+                > 0
+        );
+        std::fs::copy(&db_path, crash_cfg.join("sessions.sqlite3")).unwrap();
+        std::fs::copy(
+            cfg.join("sessions.sqlite3-wal"),
+            crash_cfg.join("sessions.sqlite3-wal"),
+        )
+        .unwrap();
+        drop(writer);
+
+        let ro2 = open_readonly_seat_sqlite(&crash_cfg.join("sessions.sqlite3"))
+            .expect("open snapshot with uncheckpointed WAL");
+        let count: i64 = ro2
+            .query_row(
+                "SELECT COUNT(*) FROM session_entries WHERE session_id = 's1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 2,
+            "must replay uncheckpointed WAL frames via private snapshot"
+        );
+        assert!(
+            !crash_cfg.join("sessions.sqlite3-shm").exists(),
+            "snapshot read must never create daemon-owned -shm in crash_cfg"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn migrate_open_file_uses_fchdir_without_dev_fd_3_and_unlinks_temp_on_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let _lock = crate::server::tests::env_lock();
+        let temp = crate::test_tempdir();
+        let launcher = temp.path().join("fake-seat-launcher.sh");
+        std::fs::write(
+            &launcher,
+            r#"#!/usr/bin/env python3
+import os, subprocess, sys
+args = sys.argv[1:]
+sep = args.index("--")
+cmd = args[sep + 1:]
+joined = " ".join(cmd)
+if "/dev/fd/3" in joined:
+    sys.exit(97)
+mode = os.environ.get("FAKE_LAUNCHER_MODE", "ok")
+if mode == "fail_copy_after_touch" and len(cmd) > 3 and cmd[3] == "seat-copy":
+    open("./" + cmd[4], "wb").close()
+    sys.exit(41)
+if mode == "fail_verify" and len(cmd) > 3 and cmd[3] == "seat-readback":
+    sys.exit(42)
+os.execvp(cmd[0], cmd)
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let cfg = temp.path().join("config");
+        std::fs::create_dir_all(&cfg).unwrap();
+        let shm = cfg.join("sessions.sqlite3-shm");
+        std::fs::write(&shm, vec![0xABu8; 32768]).unwrap();
+        let me = crate::sandbox::server_uid();
+        let gid = crate::sandbox::server_gid();
+        let other_uid = if me == 42001 { 42002 } else { 42001 };
+
+        struct EnvReset;
+        impl Drop for EnvReset {
+            fn drop(&mut self) {
+                unsafe {
+                    std::env::remove_var("ANYAGENTS_LAUNCHER");
+                    std::env::remove_var("FAKE_LAUNCHER_MODE");
+                }
+            }
+        }
+        let _reset = EnvReset;
+        unsafe {
+            std::env::set_var("ANYAGENTS_LAUNCHER", &launcher);
+            std::env::set_var("FAKE_LAUNCHER_MODE", "fail_copy_after_touch");
+        }
+        let parent = open_root(&cfg).unwrap();
+        let child = open_child(&parent, OsStr::new("sessions.sqlite3-shm"), false).unwrap();
+        let err = migrate_open_file(
+            &parent,
+            OsStr::new("sessions.sqlite3-shm"),
+            &child,
+            other_uid,
+            gid,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("seat inode copy refused"));
+        let leftovers: Vec<_> = std::fs::read_dir(&cfg)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".seat-copy-"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "failed copy must unlink 0-byte .seat-copy-* temp file: {leftovers:?}"
+        );
+
+        unsafe {
+            std::env::set_var("FAKE_LAUNCHER_MODE", "fail_verify");
+        }
+        let err2 = migrate_open_file(
+            &parent,
+            OsStr::new("sessions.sqlite3-shm"),
+            &child,
+            other_uid,
+            gid,
+        )
+        .unwrap_err();
+        assert!(err2.to_string().contains("seat copy readback differs"));
+        let leftovers2: Vec<_> = std::fs::read_dir(&cfg)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".seat-copy-"))
+            .collect();
+        assert!(
+            leftovers2.is_empty(),
+            "failed readback must unlink .seat-copy-* temp file: {leftovers2:?}"
+        );
+
+        unsafe {
+            std::env::set_var("FAKE_LAUNCHER_MODE", "ok");
+        }
+        migrate_open_file(
+            &parent,
+            OsStr::new("sessions.sqlite3-shm"),
+            &child,
+            other_uid,
+            gid,
+        )
+        .expect("fchdir ./$1 copy + verify + atomic swap must succeed without /dev/fd/3");
+        assert_eq!(std::fs::read(&shm).unwrap().len(), 32768);
+
+        let stale_orphan = cfg.join(".seat-copy-67774-1000-99");
+        std::fs::write(&stale_orphan, b"").unwrap();
+        let c_stale = CString::new(stale_orphan.as_os_str().as_bytes()).unwrap();
+        let old_ts = [
+            libc::timespec {
+                tv_sec: 1_700_000_000,
+                tv_nsec: 0,
+            },
+            libc::timespec {
+                tv_sec: 1_700_000_000,
+                tv_nsec: 0,
+            },
+        ];
+        unsafe {
+            libc::utimensat(libc::AT_FDCWD, c_stale.as_ptr(), old_ts.as_ptr(), 0);
+            std::env::remove_var("ANYAGENTS_LAUNCHER");
+            std::env::remove_var("FAKE_LAUNCHER_MODE");
+        }
+        share_config(&cfg, me, gid).unwrap();
+        assert!(
+            !stale_orphan.exists(),
+            "share_config must reap stale .seat-copy-* orphan"
         );
     }
 }

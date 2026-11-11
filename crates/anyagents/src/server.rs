@@ -2807,6 +2807,7 @@ fn archived_agent_view_fast(agent: &Agent) -> AgentView {
     let (mode, steer) = declared(&agent.harness);
     AgentView {
         has_open_turn: false,
+        open_turn_age_ms: None,
         profile: None,
         id: agent.id.to_string(),
         name: agent.name.clone(),
@@ -3012,24 +3013,29 @@ fn agent_view_preloaded(
         }
     }
     let block_reason = compute_block_reason(quota, last_error.as_deref(), now);
+    let open_turn_age_ms = if has_open_turn {
+        if let Some(metadata) = metadata.as_ref() {
+            metadata
+                .open_turns
+                .get(agent.id.as_str())
+                .map(|ms| now.saturating_sub(*ms).max(0))
+        } else {
+            store.open_turn(&agent.id).ok().flatten().map(|open| {
+                open.messages
+                    .first()
+                    .map(|m| now.saturating_sub(m.received_at_ms).max(0))
+                    .unwrap_or_else(|| now.saturating_sub(open.opened_at_ms).max(0))
+            })
+        }
+    } else {
+        None
+    };
     let oldest_undelivered_age_ms = match lag.oldest_undelivered_age_ms {
         Some(age) => Some(age),
         None if has_open_turn
             && (quota.is_some() || last_error.is_some() || turn_state != "working") =>
         {
-            if let Some(metadata) = metadata.as_ref() {
-                metadata
-                    .open_turns
-                    .get(agent.id.as_str())
-                    .map(|ms| now.saturating_sub(*ms))
-            } else {
-                store.open_turn(&agent.id).ok().flatten().map(|open| {
-                    open.messages
-                        .first()
-                        .map(|m| now.saturating_sub(m.received_at_ms))
-                        .unwrap_or_else(|| now.saturating_sub(open.opened_at_ms))
-                })
-            }
+            open_turn_age_ms
         }
         None => None,
     };
@@ -3063,6 +3069,7 @@ fn agent_view_preloaded(
     .collect();
     Ok(AgentView {
         has_open_turn,
+        open_turn_age_ms,
         profile: create::bound_profile_name(&cfg),
         id: agent.id.to_string(),
         name: agent.name.clone(),
@@ -3162,8 +3169,13 @@ async fn create_agent_route(
             }
             (None, None) => None,
         };
-        create::apply_archetype_defaults(state.store.data_dir(), parent_agent.as_ref(), &mut body)
-            .map_err(ApiError::from_store)?;
+        create::apply_archetype_defaults(
+            Some(&state.store),
+            state.store.data_dir(),
+            parent_agent.as_ref(),
+            &mut body,
+        )
+        .map_err(ApiError::from_store)?;
         if let Some(scope) = body.scope.as_deref() {
             anyagents_core::parse_agent_scope(scope).map_err(ApiError::from_store)?;
         }

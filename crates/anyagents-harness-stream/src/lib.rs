@@ -281,6 +281,9 @@ struct State {
     last_turn_step_type: Option<String>,
     idle_since: Option<Instant>,
     last_rpc_health_poll: Option<Instant>,
+    turn_started_at: Option<Instant>,
+    last_steer_probe: Option<Instant>,
+    reclaimed_steers: Vec<String>,
     planner_config: Option<Value>,
     http_port: Option<u16>,
     seen: HashSet<String>,
@@ -379,6 +382,107 @@ impl StreamHarness {
 
     pub fn written_ids(&self) -> Vec<String> {
         lock(&self.shared).written.clone()
+    }
+
+    pub fn take_reclaimed_steers(&self) -> Vec<String> {
+        std::mem::take(&mut lock(&self.shared).reclaimed_steers)
+    }
+
+    pub fn state_dir(&self) -> Option<PathBuf> {
+        lock(&self.shared).state_dir.clone()
+    }
+
+    pub fn has_unconfirmed_hold(&self) -> bool {
+        if self.pending.is_some() {
+            return false;
+        }
+        let state = lock(&self.shared);
+        if !state.open.is_empty() || !state.followups.is_empty() {
+            return false;
+        }
+        state.unconfirmed
+            || state.state_dir.as_ref().is_some_and(|dir| {
+                dir.join("spiron-unconfirmed-steers.json").exists()
+                    || dir.join(".anyagents-session-reset-recovery").exists()
+            })
+    }
+
+    pub fn has_unconfirmed_idle_hold(&self) -> bool {
+        let state = lock(&self.shared);
+        state.unconfirmed && state.open.is_empty() && state.followups.is_empty()
+    }
+
+    pub fn peek_unconfirmed_request_ids(&self) -> Vec<String> {
+        let state = lock(&self.shared);
+        let Some(dir) = &state.state_dir else {
+            return Vec::new();
+        };
+        parse_hold_file(&dir.join("spiron-unconfirmed-steers.json")).1
+    }
+
+    pub fn reconcile_unconfirmed_for_recovery(
+        &self,
+    ) -> Result<Option<anyagents_harness::ReconciledUnconfirmed>, HarnessError> {
+        let mut state = lock(&self.shared);
+        let Some(dir) = state.state_dir.clone() else {
+            if !state.unconfirmed {
+                return Ok(None);
+            }
+            state.unconfirmed = false;
+            state.sign_in_fault = None;
+            state.exit_fault = None;
+            state.reclaimed_steers.clear();
+            return Ok(Some(anyagents_harness::ReconciledUnconfirmed::default()));
+        };
+        let hold_path = dir.join("spiron-unconfirmed-steers.json");
+        let reset_marker = dir.join(".anyagents-session-reset-recovery");
+        if !state.unconfirmed && !hold_path.exists() && !reset_marker.exists() {
+            return Ok(None);
+        }
+        let (turn_id, request_ids) = parse_hold_file(&hold_path);
+        if let Ok(meta) = std::fs::symlink_metadata(&hold_path) {
+            if meta.file_type().is_file()
+                && meta.len() > 0
+                && let Ok(bytes) = std::fs::read(&hold_path)
+            {
+                let _ = anyagents_harness::atomic_write_in_existing_dir(
+                    &dir.join("spiron-unconfirmed-steers.reconciled.json"),
+                    &bytes,
+                    0o664,
+                );
+            }
+            match std::fs::remove_file(&hold_path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(HarnessError::Failed(format!(
+                        "cannot clear reconciled Spiron input hold: {err}"
+                    )));
+                }
+            }
+        }
+        let _ = std::fs::remove_file(dir.join(".anyagents-last-error.json"));
+        let _ = std::fs::remove_file(&reset_marker);
+        state.unconfirmed = false;
+        state.sign_in_fault = None;
+        state.exit_fault = None;
+        state.reclaimed_steers.clear();
+        Ok(Some(anyagents_harness::ReconciledUnconfirmed {
+            turn_id,
+            request_ids,
+            journal_committed_ids: Vec::new(),
+            journal_missing_ids: Vec::new(),
+        }))
+    }
+
+    pub fn seed_session_id(&self, session_id: &str) {
+        let trimmed = session_id.trim();
+        if !trimmed.is_empty() {
+            let mut state = lock(&self.shared);
+            if state.session_id.is_none() {
+                state.session_id = Some(trimmed.to_string());
+            }
+        }
     }
 
     pub fn turns_started(&self) -> usize {
@@ -722,12 +826,15 @@ impl StreamHarness {
                     if state
                         .idle_since
                         .is_some_and(|t| t.elapsed() < AGY_TURN_CLOSE_GRACE)
-                        || state.turn_user_inputs == 0
-                        || state.session_id.is_none()
+                        || (state.turn_user_inputs == 0
+                            && (state.session_id.is_some()
+                                || state
+                                    .turn_started_at
+                                    .is_some_and(|t| t.elapsed() < Duration::from_millis(250))))
                     {
                         return Ok(DeliverOutcome::Deferred);
                     }
-                    let session_id = state.session_id.clone().expect("checked above");
+                    let session_id = state.session_id.clone().unwrap_or_default();
                     let child_pid = state.child.as_ref().map(Child::id);
                     let cached_port = state.http_port;
                     let cached_planner = state.planner_config.clone();
@@ -769,6 +876,7 @@ impl StreamHarness {
                         state.turns_started += 1;
                         state.open.push(message.id.clone());
                         state.turn_user_inputs = 0;
+                        state.turn_started_at = Some(Instant::now());
                         state.idle_since = None;
                         state.sign_in_fault = None;
                     } else if self.mode == DeliveryMode::Steer {
@@ -792,8 +900,11 @@ impl StreamHarness {
         {
             let Some(port) = resolve_agy_http_port(&rpc, cached_port, child_pid) else {
                 let mut state = lock(&self.shared);
-                if state.generation == generation && !state.open.is_empty() {
-                    state.idle_since = Some(Instant::now());
+                if state.generation == generation {
+                    state.last_steer_probe = Some(Instant::now());
+                    if state.turn_user_inputs > 0 && !state.open.is_empty() {
+                        state.idle_since = Some(Instant::now());
+                    }
                 }
                 return Ok(DeliverOutcome::Deferred);
             };
@@ -806,6 +917,13 @@ impl StreamHarness {
             }
             let (resolved_sid, running) = agy_rpc_is_running(port, &rpc.csrf_token, &session_id)
                 .map_err(HarnessError::Failed)?;
+            if resolved_sid.is_empty() {
+                let mut state = lock(&self.shared);
+                if state.generation == generation {
+                    state.last_steer_probe = Some(Instant::now());
+                }
+                return Ok(DeliverOutcome::Deferred);
+            }
             if resolved_sid != session_id {
                 session_id = resolved_sid;
                 let mut state = lock(&self.shared);
@@ -819,13 +937,16 @@ impl StreamHarness {
                     return Err(HarnessError::Dead);
                 }
                 state.idle_since = None;
+                state.last_steer_probe = None;
+                state.turn_user_inputs = state.turn_user_inputs.max(1);
             } else {
                 let mut state = lock(&self.shared);
                 if state.generation != generation || !state.alive {
                     return Err(HarnessError::Dead);
                 }
-                if state.open.is_empty() && state.turn_user_inputs == 0 {
+                if state.turn_user_inputs == 0 {
                     state.idle_since = None;
+                    state.last_steer_probe = Some(Instant::now());
                     return Ok(DeliverOutcome::Deferred);
                 }
                 if !state.open.is_empty() {
@@ -966,8 +1087,15 @@ impl StreamHarness {
             && (state
                 .idle_since
                 .is_some_and(|t| t.elapsed() < AGY_TURN_CLOSE_GRACE)
-                || state.turn_user_inputs == 0
-                || state.session_id.is_none())
+                || (state.turn_user_inputs == 0
+                    && (state.session_id.is_some()
+                        || state
+                            .turn_started_at
+                            .is_some_and(|t| t.elapsed() < Duration::from_millis(250))))
+                || (state.session_id.is_none()
+                    && state
+                        .last_steer_probe
+                        .is_some_and(|t| t.elapsed() < Duration::from_millis(400))))
         {
             return false;
         }
@@ -1068,6 +1196,8 @@ impl StreamHarness {
             state.last_turn_step_type = None;
             state.idle_since = None;
             state.last_rpc_health_poll = None;
+            state.turn_started_at = None;
+            state.last_steer_probe = None;
             state.planner_config = None;
             state.http_port = self.agy_rpc.as_ref().and_then(|r| r.port_override);
             state.text = None;
@@ -1183,6 +1313,8 @@ impl StreamHarness {
         state.last_turn_step_type = None;
         state.idle_since = None;
         state.last_rpc_health_poll = None;
+        state.turn_started_at = None;
+        state.last_steer_probe = None;
         state.planner_config = None;
         state.http_port = None;
         state.text = None;
@@ -1378,6 +1510,9 @@ impl State {
             last_turn_step_type: None,
             idle_since: None,
             last_rpc_health_poll: None,
+            turn_started_at: None,
+            last_steer_probe: None,
+            reclaimed_steers: Vec::new(),
             planner_config: None,
             http_port: None,
             finished: HashSet::new(),
@@ -1841,6 +1976,43 @@ fn finish_open(state: &mut State, usage: TurnUsage) {
     }
 }
 
+fn parse_hold_file(path: &Path) -> (Option<String>, Vec<String>) {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return (None, Vec::new());
+    };
+    if !meta.file_type().is_file() || meta.len() == 0 {
+        return (None, Vec::new());
+    }
+    let Ok(bytes) = std::fs::read(path) else {
+        return (None, Vec::new());
+    };
+    let Ok(val) = serde_json::from_slice::<Value>(&bytes) else {
+        return (None, Vec::new());
+    };
+    let turn_id = val
+        .get("turn_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let mut ids: Vec<String> = val
+        .get("request_ids")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(ref tid) = turn_id
+        && !ids.iter().any(|id| id == tid)
+    {
+        ids.insert(0, tid.clone());
+    }
+    (turn_id, ids)
+}
+
 fn finish_correlated(state: &mut State, turn: &str, usage: TurnUsage, unconfirmed: bool) {
     let ids: Vec<String> = state
         .open
@@ -1858,6 +2030,11 @@ fn finish_correlated(state: &mut State, turn: &str, usage: TurnUsage, unconfirme
         state.unconfirmed = true;
         // The pre-dispatch hold already exists. No terminal write (which could
         // fail after effects became uncertain) is required to retain custody.
+        for id in &ids {
+            if id != turn && !state.reclaimed_steers.contains(id) {
+                state.reclaimed_steers.push(id.clone());
+            }
+        }
     }
     for id in ids {
         if unconfirmed && id != turn {

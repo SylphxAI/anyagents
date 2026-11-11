@@ -791,6 +791,7 @@ fn set_state(data: &Path, name: &str, state: &str) -> Result<AgentView, Error> {
     let scope_val = agent.scope().to_string();
     Ok(AgentView {
         has_open_turn: false,
+        open_turn_age_ms: None,
         profile: None,
         id: agent.id.to_string(),
         name: agent.name,
@@ -859,7 +860,7 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
         ),
         None => None,
     };
-    crate::create::apply_archetype_defaults(data, parent_agent.as_ref(), &mut parsed)
+    crate::create::apply_archetype_defaults(Some(&store), data, parent_agent.as_ref(), &mut parsed)
         .map_err(|err| err.to_string())?;
     if let Some(scope) = parsed.scope.as_deref() {
         anyagents_core::parse_agent_scope(scope).map_err(|err| err.to_string())?;
@@ -930,6 +931,7 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
     let scope_val = agent.scope().to_string();
     Ok(AgentView {
         has_open_turn: false,
+        open_turn_age_ms: None,
         profile: None,
         id: agent.id.to_string(),
         name: agent.name,

@@ -2115,17 +2115,30 @@ fn sign_in(data: &Path, target: &str, profile: Option<&str>) -> Result<(), anyag
             .join(format!(".signin-staging-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&staging_dir);
         std::fs::create_dir_all(&staging_dir)?;
-        let outcome = match anyagents_installer::sign_in_at(
-            &anyagents_installer::builtin_catalog(),
-            &staging_dir,
-            target,
-            &mut runner,
-            &mut sink,
-        ) {
-            Ok(o) => o,
-            Err(err) => {
-                let _ = std::fs::remove_dir_all(&staging_dir);
-                return Err(anyagents_core::Error::Message(err.to_string()));
+        let use_native_agy_pkce = target == "agy"
+            && std::env::var_os("ANYAGENTS_FAKE_MODE").is_none()
+            && std::env::var_os("ANYAGENTS_FAKE_VENDOR_MODE").is_none();
+        let outcome = if use_native_agy_pkce {
+            match signin::google_antigravity_pkce_sign_in(&staging_dir, &mut sink) {
+                Ok(o) => o,
+                Err(err) => {
+                    let _ = std::fs::remove_dir_all(&staging_dir);
+                    return Err(err);
+                }
+            }
+        } else {
+            match anyagents_installer::sign_in_at(
+                &anyagents_installer::builtin_catalog(),
+                &staging_dir,
+                target,
+                &mut runner,
+                &mut sink,
+            ) {
+                Ok(o) => o,
+                Err(err) => {
+                    let _ = std::fs::remove_dir_all(&staging_dir);
+                    return Err(anyagents_core::Error::Message(err.to_string()));
+                }
             }
         };
         let (resolved_prof, final_dir, resolved_acct) =
@@ -2161,8 +2174,19 @@ fn sign_in(data: &Path, target: &str, profile: Option<&str>) -> Result<(), anyag
             return Ok(());
         }
     }
-    let outcome = signin::sign_in_agent(data, target, &mut runner, &mut sink)?;
     let rec = agent::named(data, target)?;
+    let outcome = if anyagents_harness::normalize_harness_name(&rec.harness) == "agy"
+        && std::env::var_os("ANYAGENTS_FAKE_MODE").is_none()
+        && std::env::var_os("ANYAGENTS_FAKE_VENDOR_MODE").is_none()
+    {
+        let root = std::path::absolute(data)?;
+        let cfg = anyagents_core::agent_config_dir(&root, &rec.id);
+        std::fs::create_dir_all(&cfg)?;
+        std::fs::create_dir_all(anyagents_core::agent_work_dir(&root, &rec.id))?;
+        signin::google_antigravity_pkce_sign_in(&cfg, &mut sink)?
+    } else {
+        signin::sign_in_agent(data, target, &mut runner, &mut sink)?
+    };
     let harness = rec.harness.clone();
     if !outcome.signed_in {
         let hint = signin::install_hint(&harness).unwrap_or_else(|| "-".to_string());

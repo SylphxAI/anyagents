@@ -476,6 +476,16 @@ pub struct SteerItem {
     pub order: u64,
 }
 
+/// Reconciled unconfirmed input custody returned when a supervisor prepares
+/// to resume an interrupted turn via explicit `[Recovery]`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReconciledUnconfirmed {
+    pub turn_id: Option<String>,
+    pub request_ids: Vec<String>,
+    pub journal_committed_ids: Vec<String>,
+    pub journal_missing_ids: Vec<String>,
+}
+
 /// Calls every harness adapter implements. The last calls have defaults so a
 /// scripted fake can stay a delivery double without a process.
 pub trait Harness: Send {
@@ -525,6 +535,41 @@ pub trait Harness: Send {
 
     /// Forget a quota wait so delivery can resume after the reset time.
     fn clear_quota(&mut self) {}
+
+    /// Drain steered message IDs whose mid-turn delivery became unconfirmed
+    /// before turn completion so mailbox custody rewinds their cursor.
+    fn take_reclaimed_steers(&mut self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Return `true` when the adapter holds unconfirmed input custody or a
+    /// pending session-reset recovery marker that requires supervisor
+    /// `[Recovery]` reconciliation before ordinary raw mailbox delivery.
+    fn has_unconfirmed_hold(&self) -> bool {
+        false
+    }
+
+    /// Return `true` when the adapter has finished its in-flight turn on the
+    /// wire (`open` is empty) and is paused solely on an unconfirmed steer hold.
+    fn has_unconfirmed_idle_hold(&self) -> bool {
+        false
+    }
+
+    /// Non-destructively read message IDs recorded in an unconfirmed input hold
+    /// so the supervisor can promote them into `turn_recovery` before clearing
+    /// the on-disk hold.
+    fn peek_unconfirmed_request_ids(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Reconcile an unconfirmed input hold against the vendor session journal
+    /// (when present), archive/clear the hold, and return reconciled IDs for
+    /// explicit `[Recovery]` delivery.
+    fn reconcile_unconfirmed_for_recovery(
+        &mut self,
+    ) -> Result<Option<ReconciledUnconfirmed>, HarnessError> {
+        Ok(None)
+    }
 
     /// Take the oldest message that entered input the vendor reads between
     /// model steps (a before-step hook, a steering socket), for the host to
