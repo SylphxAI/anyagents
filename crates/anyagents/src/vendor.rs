@@ -2090,7 +2090,7 @@ rmdir -- "$1"
         let peer = data.join("agents/foreign-seat");
         directory(&peer, 0o711, 0, 0);
         let mut protected = Vec::new();
-        for name in ["config", "memory", "skills"] {
+        for name in ["config", "memory", "skills", "sessions", "transcripts"] {
             directory(&peer.join(name), 0o700, 0, 0);
             file(
                 &peer.join(name).join("private"),
@@ -2104,7 +2104,9 @@ rmdir -- "$1"
         for name in ["sessions", "transcripts"] {
             directory(&root.join(name), 0o700, 0, 0);
             file(&root.join(name).join("private"), "host-only\n", 0o600, 0);
-            protected.push(root.join(name).join("private"));
+            if name == "transcripts" {
+                protected.push(root.join(name).join("private"));
+            }
         }
         for name in [
             "secrets",
@@ -2212,12 +2214,17 @@ done
 printf synthetic-memory-after > "$ANYAGENTS_AGENT_CONFIG/../memory/MEMORY.md"
 printf authored > "$ANYAGENTS_AGENT_CONFIG/../skills/authored"
 rm "$ANYAGENTS_AGENT_CONFIG/../skills/authored"
-for path in "$ANYAGENTS_DATA/secrets" "$ANYAGENTS_DATA/operator-token" "$ANYAGENTS_DATA/agents/foreign-seat/memory/private" "$ANYAGENTS_AGENT_CONFIG/../sessions/private"; do
+grep -qx host-only "$ANYAGENTS_AGENT_CONFIG/../sessions/private"
+printf 'host-only\n' > "$ANYAGENTS_AGENT_CONFIG/../sessions/private"
+printf 'created\n' > "$ANYAGENTS_AGENT_CONFIG/../sessions/created"
+grep -qx created "$ANYAGENTS_AGENT_CONFIG/../sessions/created"
+rm "$ANYAGENTS_AGENT_CONFIG/../sessions/created"
+for path in "$ANYAGENTS_DATA/secrets" "$ANYAGENTS_DATA/operator-token" "$ANYAGENTS_DATA/agents/foreign-seat/memory/private" "$ANYAGENTS_DATA/agents/foreign-seat/sessions/private" "$ANYAGENTS_DATA/agents/foreign-seat/transcripts/private" "$ANYAGENTS_AGENT_CONFIG/../transcripts/private"; do
   if cat "$path" >/dev/null 2>&1; then exit 41; fi
   if (printf forbidden > "$path") 2>/dev/null; then exit 42; fi
 done
 if (printf forbidden > "$ANYAGENTS_AGENT_CONFIG/.agy/skills/global/SKILL.md") 2>/dev/null; then exit 43; fi
-printf 'ACTUAL_UID=%s PRIMARY_GID=%s REAL_MOUNTS_UMASK077_OWNER_FALLBACK_OK SAME_SEAT_OK MEMORY_RW_OK PRIVATE_GLOBAL_DENIED GIT_TRUST_EXACT\n' "$(id -u)" "$(id -g)" > "$ANYAGENTS_AGENT_CONFIG/native-vendor-report.tmp"
+printf 'ACTUAL_UID=%s PRIMARY_GID=%s REAL_MOUNTS_UMASK077_OWNER_FALLBACK_OK SAME_SEAT_OK MEMORY_RW_OK SESSIONS_RW_OK PRIVATE_GLOBAL_DENIED GIT_TRUST_EXACT\n' "$(id -u)" "$(id -g)" > "$ANYAGENTS_AGENT_CONFIG/native-vendor-report.tmp"
 mv "$ANYAGENTS_AGENT_CONFIG/native-vendor-report.tmp" "$ANYAGENTS_AGENT_CONFIG/native-vendor-report"
 # Keep the real adapter child alive until its owner drops the harness.
 cat >/dev/null

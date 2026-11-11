@@ -137,9 +137,16 @@ printf '# synthetic authored skill\n' > "$root/agents/synthetic-own/skills/autho
 grep -qx '# synthetic authored skill' "$root/agents/synthetic-own/skills/authored.md"
 rm "$root/agents/synthetic-own/skills/authored.md"
 echo SKILL_VIEWS_READ_AND_OWN_OVERLAY_WRITE_OK
+grep -qx synthetic-host-only "$root/agents/synthetic-own/sessions/private"
+printf 'synthetic-host-only\n' > "$root/agents/synthetic-own/sessions/private"
+printf 'synthetic-created\n' > "$root/agents/synthetic-own/sessions/created"
+grep -qx synthetic-created "$root/agents/synthetic-own/sessions/created"
+rm "$root/agents/synthetic-own/sessions/created"
+echo SESSIONS_RW_OK
 for file in "$root/state.db" "$root/secrets" "$root/operator-token" "$root/identity-boundary.json" \
   "$root/agents/synthetic-peer/config/private" "$root/agents/synthetic-peer/memory/private" "$root/agents/synthetic-peer/skills/private" \
-  "$root/agents/synthetic-own/sessions/private" "$root/agents/synthetic-own/transcripts/private"; do
+  "$root/agents/synthetic-peer/sessions/private" "$root/agents/synthetic-peer/transcripts/private" \
+  "$root/agents/synthetic-own/transcripts/private"; do
   if cat "$file" >/dev/null 2>&1; then exit 21; fi
   if (printf forbidden > "$file") 2>/dev/null; then exit 22; fi
 done
@@ -189,7 +196,7 @@ echo REAL_UID_FIXTURE_TRAVERSAL_OK
             if success:
                 for marker in [f'ACTUAL_UID={args.uid} PRIMARY_GID={args.gid}', 'MEMORY_RW_OK',
                                'PEER_PARENT_TRAVERSE_ONLY', 'SKILL_VIEWS_READ_AND_OWN_OVERLAY_WRITE_OK',
-                               'PRIVATE_AND_GLOBAL_DENIED']:
+                               'SESSIONS_RW_OK', 'PRIVATE_AND_GLOBAL_DENIED']:
                     if marker not in result.stdout:
                         raise RuntimeError(f'missing {marker}')
             elif 'MEMORY_RW_OK' in result.stdout or 'agent not started' not in result.stderr:
