@@ -178,6 +178,303 @@ pub struct AgentRef {
     pub workdir: Option<PathBuf>,
 }
 
+/// Hard cap for one JSON-RPC frame written to stdio, including the trailing
+/// newline: 56 KiB, strictly below the 64 KiB single-line scanner buffer many
+/// stdio clients use. A frame over the cap is spilled to a `0600` file and
+/// replaced by a compact summary so the pipe never breaks.
+pub(crate) const MCP_STDIO_FRAME_CAP_BYTES: usize = 56 * 1024;
+const MCP_STDIO_FRAME_PREVIEW_CHARS: usize = 2_000;
+
+/// Write one oversize frame verbatim to a fresh `0600` file under `dir`.
+fn spill_oversize_frame(frame: &[u8], dir: &Path, seq: u64) -> std::io::Result<PathBuf> {
+    use std::io::Write as _;
+    let path = dir.join(format!(
+        "anyagents-mcp-stdio-frame-{}-{seq}.json",
+        std::process::id()
+    ));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    options.open(&path)?.write_all(frame)?;
+    Ok(path)
+}
+
+/// Build the bounded replacement frame (with trailing newline) for one
+/// oversize frame. The preview shrinks until the serialized, escaped frame
+/// fits the cap, so the check runs on final bytes, not on the input size.
+fn capped_frame(frame: &[u8], dir: &Path, seq: u64) -> Vec<u8> {
+    let spill = spill_oversize_frame(frame, dir, seq)
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| dir.display().to_string());
+    let id = serde_json::from_slice::<serde_json::Value>(frame)
+        .ok()
+        .and_then(|value| value.get("id").cloned())
+        .unwrap_or(serde_json::Value::Null);
+    let text = String::from_utf8_lossy(frame);
+    let mut preview_chars = MCP_STDIO_FRAME_PREVIEW_CHARS;
+    loop {
+        let preview: String = text.chars().take(preview_chars).collect();
+        let summary = format!(
+            "This response exceeded the {MCP_STDIO_FRAME_CAP_BYTES}-byte single-line stdio frame limit \
+             (original: {} bytes) and was written in full to {spill} with file mode 0600. \
+             Read that file in pages (offset/length windows) instead of requesting the whole response again.\n\n\
+             Preview (first {preview_chars} characters):\n{preview}",
+            frame.len()
+        );
+        let mut bytes = serde_json::to_vec(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {
+                "content": [{"type": "text", "text": summary}],
+                "isError": false,
+            }
+        }))
+        .expect("summary frame serializes");
+        bytes.push(b'\n');
+        if bytes.len() <= MCP_STDIO_FRAME_CAP_BYTES || preview_chars == 0 {
+            return bytes;
+        }
+        preview_chars /= 2;
+    }
+}
+
+/// `AsyncWrite` gate for the stdio transport: buffers partial lines, passes
+/// frames within the cap through untouched, and swaps oversize frames for
+/// their capped summary.
+pub(crate) struct FrameCapStdout<W> {
+    inner: W,
+    pending: Vec<u8>,
+    out: Vec<u8>,
+    spill_dir: PathBuf,
+    seq: u64,
+}
+
+impl<W> FrameCapStdout<W> {
+    pub(crate) fn new(inner: W) -> Self {
+        Self {
+            inner,
+            pending: Vec::new(),
+            out: Vec::new(),
+            spill_dir: std::env::temp_dir(),
+            seq: 0,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_spill_dir(inner: W, spill_dir: PathBuf) -> Self {
+        Self {
+            inner,
+            pending: Vec::new(),
+            out: Vec::new(),
+            spill_dir,
+            seq: 0,
+        }
+    }
+
+    fn transform_line(&mut self, line: &[u8]) {
+        let frame = line.strip_suffix(b"\n").unwrap_or(line);
+        if frame.len() + 1 > MCP_STDIO_FRAME_CAP_BYTES {
+            self.seq += 1;
+            let capped = capped_frame(frame, &self.spill_dir.clone(), self.seq);
+            self.out.extend_from_slice(&capped);
+        } else {
+            self.out.extend_from_slice(line);
+        }
+    }
+
+    fn absorb_pending(&mut self) {
+        while let Some(pos) = self.pending.iter().position(|byte| *byte == b'\n') {
+            let line: Vec<u8> = self.pending.drain(..=pos).collect();
+            self.transform_line(&line);
+        }
+    }
+}
+
+impl<W: tokio::io::AsyncWrite + Unpin> FrameCapStdout<W> {
+    fn drain_out(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        use std::task::Poll;
+        while !self.out.is_empty() {
+            match std::pin::Pin::new(&mut self.inner).poll_write(cx, &self.out) {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "failed to write the stdio frame",
+                    )));
+                }
+                Poll::Ready(Ok(written)) => {
+                    self.out.drain(..written);
+                }
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl<W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for FrameCapStdout<W> {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        use std::task::Poll;
+        if !this.out.is_empty() {
+            match this.drain_out(cx) {
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Ok(())) => {}
+            }
+        }
+        this.pending.extend_from_slice(buf);
+        this.absorb_pending();
+        // Transformed bytes are buffered; the caller reports the input as
+        // consumed and the next write/flush drains the queue.
+        let _ = this.drain_out(cx);
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        use std::task::Poll;
+        if !this.pending.is_empty() {
+            let line = std::mem::take(&mut this.pending);
+            this.transform_line(&line);
+        }
+        match this.drain_out(cx) {
+            Poll::Ready(Ok(())) => {}
+            other => return other,
+        }
+        std::pin::Pin::new(&mut this.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        use std::task::Poll;
+        match std::pin::Pin::new(&mut *this).poll_flush(cx) {
+            Poll::Ready(Ok(())) => {}
+            other => return other,
+        }
+        std::pin::Pin::new(&mut this.inner).poll_shutdown(cx)
+    }
+}
+
+#[cfg(test)]
+mod stdio_frame_cap_tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt as _;
+
+    #[test]
+    fn tools_list_frame_stays_below_48_kib() {
+        let tools = tool_definitions(McpProfile::Full);
+        assert!(!tools.is_empty());
+        let frame = serde_json::to_vec(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": { "tools": tools },
+        }))
+        .unwrap();
+        assert!(
+            frame.len() + 1 < 48 * 1024,
+            "tools/list frame is {} bytes, over the 48 KiB budget",
+            frame.len() + 1
+        );
+    }
+
+    #[tokio::test]
+    async fn oversize_frame_spills_to_0600_file_and_stays_single_line() {
+        // 128 KiB payload mixing multi-byte UTF-8 with quotes and backslashes,
+        // so JSON string escaping inflates the wire size further.
+        let payload = "é漢字\"\\".repeat(16 * 1024);
+        let frame = serde_json::to_vec(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "result": {
+                "content": [{"type": "text", "text": payload}],
+                "isError": false,
+            }
+        }))
+        .unwrap();
+        assert!(frame.len() > 128 * 1024, "frame is {} bytes", frame.len());
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut gated = FrameCapStdout::with_spill_dir(Vec::new(), dir.path().to_path_buf());
+        let mut wire = frame.clone();
+        wire.push(b'\n');
+        // Write in 8 KiB chunks so partial-line buffering is exercised.
+        for chunk in wire.chunks(8 * 1024) {
+            gated.write_all(chunk).await.unwrap();
+        }
+        gated.flush().await.unwrap();
+        let out = gated.inner;
+
+        assert!(
+            out.len() <= MCP_STDIO_FRAME_CAP_BYTES,
+            "capped frame is {} bytes",
+            out.len()
+        );
+        assert!(out.len() < 64 * 1024);
+        assert_eq!(out.iter().filter(|byte| **byte == b'\n').count(), 1);
+        let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(value["jsonrpc"], "2.0");
+        assert_eq!(value["id"], 42);
+        let summary = value["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(summary.contains("0600"), "summary names the spill mode");
+        let spill = summary
+            .split("written in full to ")
+            .nth(1)
+            .unwrap()
+            .split(' ')
+            .next()
+            .unwrap();
+        let spill_path = PathBuf::from(spill);
+        assert_eq!(spill_path.parent(), Some(dir.path()));
+        let spilled = std::fs::read(&spill_path).unwrap();
+        assert_eq!(spilled, frame, "spilled file must be byte-identical");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(&spill_path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn small_frame_passes_through_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut gated = FrameCapStdout::with_spill_dir(Vec::new(), dir.path().to_path_buf());
+        gated
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"ok\":true}}\n")
+            .await
+            .unwrap();
+        gated.flush().await.unwrap();
+        assert_eq!(
+            gated.inner,
+            b"{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"ok\":true}}\n".to_vec()
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+}
+
 /// Run the tool server for the agent whose config directory is `config`. The
 /// server names the directory it started this agent with as
 /// `ANYAGENTS_AGENT_CONFIG`; a command line that omits it is read from there,
@@ -225,7 +522,10 @@ pub fn run(data: &Path, config: Option<&Path>, profile: Option<McpProfile>) -> R
             client,
             profile: resolved_profile,
         }
-        .serve(rmcp::transport::io::stdio())
+        .serve({
+            let (stdin, stdout) = rmcp::transport::io::stdio();
+            (stdin, FrameCapStdout::new(stdout))
+        })
         .await
         .map_err(|err| Error::Message(err.to_string()))?;
         service
@@ -2904,12 +3204,54 @@ impl AgentMcp {
 #[cfg(test)]
 pub const CANONICAL_MCP_TOOLS: &[&str] = &["code"];
 
+/// Remove prose keys (`description`, `title`) from a JSON Schema tree. Field
+/// prose duplicates the tool-level description and is the main driver of
+/// `tools/list` frame size; keeping the structural schema (types, required
+/// fields, enums) preserves how clients build calls.
+fn strip_schema_prose(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            map.remove("description");
+            map.remove("title");
+            for nested in map.values_mut() {
+                strip_schema_prose(nested);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                strip_schema_prose(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Compact one tool definition for `tools/list`: schema prose is dropped so
+/// the single-line JSON-RPC response stays below the 64 KiB stdio scanner
+/// budget that stdio clients use. The tool description itself is untouched.
+fn compact_tool_definition(mut tool: rmcp::model::Tool) -> rmcp::model::Tool {
+    let mut input = serde_json::to_value(&*tool.input_schema).unwrap_or(serde_json::Value::Null);
+    strip_schema_prose(&mut input);
+    if let Some(object) = input.as_object() {
+        tool.input_schema = std::sync::Arc::new(object.clone());
+    }
+    if let Some(output) = &tool.output_schema {
+        let mut output = serde_json::to_value(&**output).unwrap_or(serde_json::Value::Null);
+        strip_schema_prose(&mut output);
+        if let Some(object) = output.as_object() {
+            tool.output_schema = Some(std::sync::Arc::new(object.clone()));
+        }
+    }
+    tool
+}
+
 pub fn tool_definitions(profile: McpProfile) -> Vec<rmcp::model::Tool> {
     let allowed = profile.exposed_tools();
     let all = AgentMcp::tool_router().list_all();
     allowed
         .iter()
         .filter_map(|wanted| all.iter().find(|t| t.name.as_ref() == *wanted).cloned())
+        .map(compact_tool_definition)
         .collect()
 }
 
