@@ -781,6 +781,32 @@ pub(crate) fn write_agent_instructions_with_continuity(
             "- Direct parent: `agent:{parent}`; report via `send` to `parent`.\n"
         ));
     }
+    let data_dir_guess = config
+        .parent()
+        .and_then(|agent_dir| {
+            let parent = agent_dir.parent()?;
+            if parent.file_name().and_then(|s| s.to_str()) == Some("agents") {
+                parent.parent()
+            } else {
+                Some(agent_dir)
+            }
+        })
+        .unwrap_or(config);
+    let available_roles = discover_available_archetype_slugs(
+        agent.workdir.as_deref().map(Path::new),
+        config.parent(),
+        data_dir_guess,
+    );
+    if !available_roles.is_empty() {
+        let formatted_roles = available_roles
+            .iter()
+            .map(|slug| format!("`{slug}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        doc.push_str(&format!(
+            "- Available sub-agent roles (`role` in `agents`/`spawn`): {formatted_roles} (see `spawn` tool `role` schema for details).\n"
+        ));
+    }
 
     // A configured harness switch rotates before rendering. Ordinary updates
     // consume the persisted pin without opening live learned-memory files.
@@ -8199,6 +8225,38 @@ pub(crate) fn discover_available_archetype_slugs(
     slugs.into_iter().collect()
 }
 
+pub(crate) fn has_configured_archetype_roots(
+    explicit_workdir: Option<&Path>,
+    parent_workdir: Option<&Path>,
+    data_dir: &Path,
+) -> bool {
+    for (base, rel_root) in archetype_search_roots(explicit_workdir, parent_workdir, data_dir) {
+        if base.join(rel_root).exists() {
+            return true;
+        }
+    }
+    false
+}
+
+pub(crate) fn discover_available_archetype_templates(
+    explicit_workdir: Option<&Path>,
+    parent_workdir: Option<&Path>,
+    data_dir: &Path,
+) -> Vec<(String, Option<String>)> {
+    let slugs = discover_available_archetype_slugs(explicit_workdir, parent_workdir, data_dir);
+    let mut out = Vec::with_capacity(slugs.len());
+    for slug in slugs {
+        let desc = resolve_archetype_template(&slug, explicit_workdir, parent_workdir, data_dir)
+            .ok()
+            .flatten()
+            .and_then(|tpl| tpl.description)
+            .map(|d| d.trim().to_string())
+            .filter(|d| !d.is_empty());
+        out.push((slug, desc));
+    }
+    out
+}
+
 /// Resolve an archetype template by name across:
 /// 1. `<explicit_workdir>/.agents/agents/<archetype>.md` (or `<archetype>/agent.md`)
 /// 2. `<parent_workdir>/.agents/agents/<archetype>.md` (or `<archetype>/agent.md`)
@@ -8400,53 +8458,50 @@ pub(crate) fn apply_archetype_defaults(
         .filter(|s| !s.is_empty())
         .map(PathBuf::from);
     let parent_wd = parent.and_then(|p| p.workdir.as_deref()).map(Path::new);
-    let resolved = if let Some(arch) = body
-        .archetype
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        match resolve_archetype_template(arch, explicit_wd.as_deref(), parent_wd, data_dir)? {
-            Some(template) => Some((arch.to_string(), template)),
-            None => {
-                return Err(Error::Message(format!(
-                    "unknown archetype template {arch:?}"
-                )));
-            }
-        }
-    } else if let Some(role) = body
+    let resolved = if let Some(role) = body
         .role
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
         let slugified = role.to_ascii_lowercase().replace(' ', "-");
-        let direct = if valid_template_stem(role) {
-            resolve_archetype_template(role, explicit_wd.as_deref(), parent_wd, data_dir)?
-                .map(|tpl| (role.to_string(), tpl))
-        } else {
+        if !valid_template_stem(role) && !valid_template_stem(&slugified) {
+            resolve_archetype_template(role, explicit_wd.as_deref(), parent_wd, data_dir)?;
             None
-        };
-        let matched = if direct.is_some() {
-            direct
-        } else if valid_template_stem(&slugified) {
-            resolve_archetype_template(&slugified, explicit_wd.as_deref(), parent_wd, data_dir)?
-                .map(|tpl| (slugified, tpl))
         } else {
-            None
-        };
-        if matched.is_some() {
-            matched
-        } else {
-            let available =
-                discover_available_archetype_slugs(explicit_wd.as_deref(), parent_wd, data_dir);
-            if !available.is_empty() {
-                return Err(Error::Message(format!(
-                    "unknown role template {role:?} (available: {})",
-                    available.join(", ")
-                )));
+            let direct = if valid_template_stem(role) {
+                resolve_archetype_template(role, explicit_wd.as_deref(), parent_wd, data_dir)?
+                    .map(|tpl| (role.to_string(), tpl))
+            } else {
+                None
+            };
+            let matched = if direct.is_some() {
+                direct
+            } else if valid_template_stem(&slugified) {
+                resolve_archetype_template(&slugified, explicit_wd.as_deref(), parent_wd, data_dir)?
+                    .map(|tpl| (slugified, tpl))
+            } else {
+                None
+            };
+            if matched.is_some() {
+                matched
+            } else {
+                let available =
+                    discover_available_archetype_slugs(explicit_wd.as_deref(), parent_wd, data_dir);
+                if !available.is_empty()
+                    || has_configured_archetype_roots(explicit_wd.as_deref(), parent_wd, data_dir)
+                {
+                    let suffix = if available.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" (available: {})", available.join(", "))
+                    };
+                    return Err(Error::Message(format!(
+                        "unknown archetype template {role:?}{suffix}"
+                    )));
+                }
+                None
             }
-            None
         }
     } else {
         None
@@ -11581,29 +11636,10 @@ mod archetype_tests {
             .to_string(),
         )
         .unwrap();
-        let parent_agent = anyagents_core::Agent {
-            id: "agt_parent".into(),
-            name: "parent".into(),
-            role: Some("director".into()),
-            aliases: Vec::new(),
-            parent_id: None,
-            scope_value: "public".into(),
-            public: true,
-            admin: false,
-            harness: "agy".into(),
-            model: Some("gemini-4-argon-high".into()),
-            workdir: None,
-            description: None,
-            instructions: None,
-            state: anyagents_core::AgentState::Running,
-            delivery_mode: anyagents_core::DeliveryMode::Steer,
-            launch_env: Vec::new(),
-            quota_reset_at_ms: None,
-            block_reason: None,
-            last_error: None,
-            created_at_ms: 0,
-            updated_at_ms: 0,
-        };
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let parent_agent = store
+            .create_agent(anyagents_core::NewAgent::new("parent", "agy"))
+            .unwrap();
 
         for (selector_key, selector_val, expected_slug, expected_scope, expected_body) in [
             ("role", "director", "director", "public", "Director template body."),
@@ -11645,7 +11681,7 @@ mod archetype_tests {
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("unknown role template \"nonexistent-role\""),
+            err.contains("unknown archetype template \"nonexistent-role\""),
             "{err}"
         );
         assert!(
@@ -11654,6 +11690,17 @@ mod archetype_tests {
         assert_eq!(
             normalize_or_validate_agent_role("Code Reviewer", None, None, dir.path()).unwrap(),
             "code-reviewer"
+        );
+
+        let cfg = agent_config_dir(dir.path(), &parent_agent.id);
+        std::fs::create_dir_all(&cfg).unwrap();
+        write_agent_instructions_with_continuity(&cfg, &parent_agent, None, None).unwrap();
+        let prompt = std::fs::read_to_string(cfg.join("SYSTEM_PROMPT.md")).unwrap();
+        assert!(
+            prompt.contains(
+                "- Available sub-agent roles (`role` in `agents`/`spawn`): `assistant`, `code-reviewer`, `director`, `engineer` (see `spawn` tool `role` schema for details)."
+            ),
+            "{prompt}"
         );
     }
 
