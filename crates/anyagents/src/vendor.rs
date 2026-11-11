@@ -2101,13 +2101,23 @@ rmdir -- "$1"
             protected.push(peer.join(name));
             protected.push(peer.join(name).join("private"));
         }
-        for name in ["sessions", "transcripts"] {
-            directory(&root.join(name), 0o700, 0, 0);
-            file(&root.join(name).join("private"), "host-only\n", 0o600, 0);
-            if name == "transcripts" {
-                protected.push(root.join(name).join("private"));
-            }
-        }
+        directory(&root.join("sessions"), 0o2770, 0, gid);
+        file(
+            &root.join("sessions/private"),
+            "host-only
+",
+            0o660,
+            gid,
+        );
+        directory(&root.join("transcripts"), 0o700, 0, 0);
+        file(
+            &root.join("transcripts/private"),
+            "host-only
+",
+            0o600,
+            0,
+        );
+        protected.push(root.join("transcripts/private"));
         for name in [
             "secrets",
             "operator-token",
