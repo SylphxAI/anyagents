@@ -1233,7 +1233,7 @@ mod tests {
         assert_eq!(count, 2, "must replay uncheckpointed WAL frames via private snapshot");
         assert!(
             !crash_cfg.join("sessions.sqlite3-shm").exists(),
-            "snapshot read must never create kyle-owned -shm in crash_cfg"
+            "snapshot read must never create daemon-owned -shm in crash_cfg"
         );
     }
 

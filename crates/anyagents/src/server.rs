@@ -3366,6 +3366,7 @@ async fn archive_agent_route(
         ) {
             let _ = anyagents_tools::SandboxProvider::pause(&sbx);
         }
+        let mut process_guard = None;
         if !is_self {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
             while std::time::Instant::now() < deadline {
@@ -3373,20 +3374,32 @@ async fn archive_agent_route(
                     .health
                     .get(&found.id)
                     .is_none_or(|live| !live.process_alive)
-                    && state.store.try_lock_agent(&found.id).is_ok()
+                    && let Ok(guard) = state.store.try_lock_agent(&found.id)
                 {
+                    process_guard = Some(guard);
                     break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
+            if process_guard.is_none()
+                && state
+                    .health
+                    .get(&found.id)
+                    .is_none_or(|live| !live.process_alive)
+            {
+                process_guard = state.store.try_lock_agent(&found.id).ok();
+            }
         }
-        if state
-            .health
-            .get(&found.id)
-            .is_none_or(|live| !live.process_alive)
+        if process_guard.is_some()
+            || (is_self
+                && state
+                    .health
+                    .get(&found.id)
+                    .is_none_or(|live| !live.process_alive))
         {
             reap_archived_agent_locked(&state.store, state.store.data_dir(), &found.id);
         }
+        drop(process_guard);
         Ok(Json(agent_view(&state.store, &state.health, &agent)?))
     })
     .await
@@ -3467,11 +3480,13 @@ pub(crate) fn reap_subagent_ephemeral_dirs(
             seat_ids,
         );
     }
-    let _ = std::fs::remove_file(
-        data_dir
-            .join("locks")
-            .join(format!("{}.lock", agent_id.as_str())),
-    );
+    if agent.is_none() {
+        let _ = std::fs::remove_file(
+            data_dir
+                .join("locks")
+                .join(format!("{}.lock", agent_id.as_str())),
+        );
+    }
     let mut shared_workdirs = std::collections::HashSet::new();
     if let Some(agent) = agent {
         let _ = crate::browser::stop_profile(data_dir, &agent.name);

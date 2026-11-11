@@ -8436,10 +8436,66 @@ pub(crate) fn bound_profile_name(config_dir: &Path) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+const PROFILE_HEALTHY_USAGE_FRESHNESS_MS: i64 = 65_000;
+const PROFILE_HEALTHY_OAUTH_ATTEMPT_FRESHNESS_MS: i64 = 300_000;
+
+/// Positive-signal health check for a candidate profile directory. Returns true only when
+/// the profile directory itself carries conclusive unhealthy evidence: a quota reading
+/// of zero percent left written within the last minute, or an expired OAuth token whose
+/// most recent refresh attempt also happened recently (so the token cannot silently
+/// recover on its own). Never probes the network and never treats a missing or stale
+/// signal as unhealthy evidence.
+fn profile_has_unhealthy_evidence(dir: &Path) -> bool {
+    let now_ms = anyagents_core::now_ms();
+    let usage_path = dir.join(".anyagents-last-usage.txt");
+    if let Ok(usage) = std::fs::read_to_string(&usage_path) {
+        let age_ms = std::fs::metadata(&usage_path)
+            .and_then(|meta| meta.modified())
+            .map(|mtime| {
+                std::time::SystemTime::now()
+                    .duration_since(mtime)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0)
+            })
+            .unwrap_or(i64::MAX);
+        if parse_remaining_pct_from_usage(&usage, None) == Some(0)
+            && age_ms < PROFILE_HEALTHY_USAGE_FRESHNESS_MS
+        {
+            return true;
+        }
+    }
+    let cred_text = std::fs::read_to_string(dir.join(".credentials.json"))
+        .or_else(|_| std::fs::read_to_string(dir.join(".claude/.credentials.json")));
+    let Ok(cred_text) = cred_text else {
+        return false;
+    };
+    let Ok(cred) = serde_json::from_str::<serde_json::Value>(&cred_text) else {
+        return false;
+    };
+    let expires_at = cred
+        .pointer("/claudeAiOauth/expiresAt")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(i64::MAX);
+    if expires_at > now_ms {
+        return false;
+    }
+    let last_attempt_ms = std::fs::read_to_string(dir.join(OAUTH_REFRESH_ATTEMPT_FILE))
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .unwrap_or(0);
+    now_ms.saturating_sub(last_attempt_ms) < PROFILE_HEALTHY_OAUTH_ATTEMPT_FRESHNESS_MS
+}
+
 /// Selects (or reuses the already-bound) Upstream Provider Profile for `agent`
 /// from `<data>/profiles/<provider>/<profile>` with zero automatic load-balancing
 /// ("分流"): an agent uses its explicitly assigned `.anyagents-profile` (defaulting
 /// deterministically to `<provider>/default`).
+///
+/// Initial bind is health-aware. When the implicit default profile carries positive
+/// unhealthy evidence (see profile_has_unhealthy_evidence), the first healthy sibling
+/// profile of the same provider wins instead. The default is kept whenever it is
+/// healthy or has no healthy replacement, and an explicit harness binding is never
+/// overridden by this routing.
 fn select_or_bind_profile(
     data: &Path,
     _all_agents: &[Agent],
@@ -8473,11 +8529,16 @@ fn select_or_bind_profile(
             }
         }
     }
-    if let Some((chosen_name, chosen_dir)) = available
-        .iter()
-        .find(|(n, _)| n == "default")
-        .or_else(|| available.first())
-    {
+    let default_entry = available.iter().find(|(n, _)| n == "default");
+    let chosen_entry = match default_entry {
+        Some((_, default_dir)) if profile_has_unhealthy_evidence(default_dir) => available
+            .iter()
+            .find(|(n, dir)| n != "default" && !profile_has_unhealthy_evidence(dir))
+            .or(default_entry),
+        _ => default_entry,
+    }
+    .or_else(|| available.first());
+    if let Some((chosen_name, chosen_dir)) = chosen_entry {
         let chosen_prov = chosen_dir
             .parent()
             .and_then(Path::file_name)
@@ -12961,6 +13022,68 @@ mod runtime_config_tests {
         );
     }
 
+    fn serve_one_http_request(
+        mut stream: std::net::TcpStream,
+        handler: impl FnOnce(&str) -> (&'static str, &'static str),
+    ) {
+        use std::io::{Read, Write};
+        let _ = stream.set_nonblocking(false);
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+        let mut req = Vec::with_capacity(1024);
+        let mut chunk = [0u8; 1024];
+        let mut expected_total: Option<usize> = None;
+        loop {
+            match stream.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    req.extend_from_slice(&chunk[..n]);
+                    if expected_total.is_none()
+                        && let Some(pos) = req.windows(4).position(|w| {
+                            w == b"
+
+"
+                        })
+                    {
+                        let hdr_end = pos + 4;
+                        let hdr_str = String::from_utf8_lossy(&req[..hdr_end]);
+                        let content_len = hdr_str
+                            .lines()
+                            .find_map(|line| {
+                                let (k, v) = line.split_once(':')?;
+                                k.trim()
+                                    .eq_ignore_ascii_case("content-length")
+                                    .then(|| v.trim().parse::<usize>().ok())
+                                    .flatten()
+                            })
+                            .unwrap_or(0);
+                        expected_total = Some(hdr_end + content_len);
+                    }
+                    if expected_total.is_some_and(|total| req.len() >= total) {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let req_str = String::from_utf8_lossy(&req);
+        let (status, body) = handler(&req_str);
+        let resp = format!(
+            "HTTP/1.1 {status}
+Content-Type: application/json
+Content-Length: {}
+Connection: close
+
+{}",
+            body.len(),
+            body
+        );
+        let _ = stream.write_all(resp.as_bytes());
+        let _ = stream.flush();
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(200)));
+        let _ = stream.read(&mut chunk);
+    }
+
     #[test]
     fn mid_session_anthropic_oauth_refresh_updates_profile_and_sanitized_agent_credentials() {
         const WORKER: &str = "ANYAGENTS_ANTHROPIC_REFRESH_TEST";
@@ -12984,21 +13107,16 @@ mod runtime_config_tests {
             return;
         }
 
-        use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
-            if let Ok((mut stream, _)) = listener.accept() {
-                let mut buf = [0u8; 4096];
-                let _ = stream.read(&mut buf);
-                let body = r#"{"access_token":"fresh-access-token","refresh_token":"fresh-refresh-token","expires_in":28800}"#;
-                let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                let _ = stream.write_all(resp.as_bytes());
-                let _ = stream.flush();
+            if let Ok((stream, _)) = listener.accept() {
+                serve_one_http_request(stream, |_| {
+                    (
+                        "200 OK",
+                        r#"{"access_token":"fresh-access-token","refresh_token":"fresh-refresh-token","expires_in":28800}"#,
+                    )
+                });
             }
         });
 
@@ -13299,7 +13417,6 @@ mod runtime_config_tests {
             return;
         }
 
-        use std::io::{Read, Write};
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -13313,37 +13430,23 @@ mod runtime_config_tests {
         let server = std::thread::spawn(move || {
             while !stop_srv.load(Ordering::SeqCst) {
                 match listener.accept() {
-                    Ok((mut stream, _)) => {
-                        stream.set_nonblocking(false).unwrap();
-                        let mut buf = [0u8; 4096];
-                        let n = stream.read(&mut buf).unwrap_or(0);
-                        let req = String::from_utf8_lossy(&buf[..n]);
-                        let (status, body) = if req.starts_with("POST /v1/oauth/token") {
-                            token_hits_srv.fetch_add(1, Ordering::SeqCst);
-                            (
-                                "200 OK",
-                                r#"{"access_token":"rotated-access-token","refresh_token":"rotated-refresh-token","expires_in":28800}"#,
-                            )
-                        } else if req.starts_with("GET /api/oauth/usage") {
-                            (
-                                "200 OK",
-                                r#"{"five_hour":{"utilization":12.0},"seven_day":{"utilization":25.0}}"#,
-                            )
-                        } else {
-                            ("404 Not Found", r#"{"error":"not_found"}"#)
-                        };
-                        let resp = format!(
-                            "HTTP/1.1 {status}
-Content-Type: application/json
-Content-Length: {}
-Connection: close
-
-{}",
-                            body.len(),
-                            body
-                        );
-                        let _ = stream.write_all(resp.as_bytes());
-                        let _ = stream.flush();
+                    Ok((stream, _)) => {
+                        serve_one_http_request(stream, |req| {
+                            if req.starts_with("POST /v1/oauth/token") {
+                                token_hits_srv.fetch_add(1, Ordering::SeqCst);
+                                (
+                                    "200 OK",
+                                    r#"{"access_token":"rotated-access-token","refresh_token":"rotated-refresh-token","expires_in":28800}"#,
+                                )
+                            } else if req.starts_with("GET /api/oauth/usage") {
+                                (
+                                    "200 OK",
+                                    r#"{"five_hour":{"utilization":12.0},"seven_day":{"utilization":25.0}}"#,
+                                )
+                            } else {
+                                ("404 Not Found", r#"{"error":"not_found"}"#)
+                            }
+                        });
                     }
                     Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                         std::thread::sleep(std::time::Duration::from_millis(5));
@@ -13739,7 +13842,7 @@ Connection: close
         )
         .unwrap();
 
-        let store = Store::open(&data_dir).unwrap();
+        let store = Store::open(data_dir.join("state.db")).unwrap();
         let mut l0_new = NewAgent::new("l0-root", "spiron");
         l0_new.workdir = Some(root_repo.display().to_string());
         let l0 = store.create_agent(l0_new).unwrap();
@@ -13786,7 +13889,7 @@ Connection: close
         );
 
         {
-            let conn = rusqlite::Connection::open(data_dir.join("anyagents.db")).unwrap();
+            let conn = rusqlite::Connection::open(data_dir.join("state.db")).unwrap();
             conn.execute(
                 "UPDATE agents SET parent_id = ?1 WHERE id = ?2",
                 rusqlite::params![l1.id.as_str(), l0.id.as_str()],
@@ -13901,5 +14004,134 @@ Connection: close
                 .join(".anyagents-session-reset-recovery")
                 .is_file()
         );
+    }
+
+    fn bind_test_store() -> (tempfile::TempDir, Store) {
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        store
+            .hold_capability_key("0123456789abcdef0123456789abcdef")
+            .unwrap();
+        (dir, store)
+    }
+
+    fn unbound_test_agent(store: &Store, data: &Path, name: &str) -> Agent {
+        let agent = store.create_agent(NewAgent::new(name, "codex")).unwrap();
+        let cfg = agent_config_dir(data, &agent.id);
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::remove_file(cfg.join(".anyagents-profile")).ok();
+        agent
+    }
+
+    fn stage_profile(data: &Path, name: &str) -> PathBuf {
+        let dir = data.join("profiles").join("openai").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_exhausted_usage(dir: &Path) {
+        let nl = char::from_u32(10).unwrap();
+        let text = format!("5h: 0% left{nl}7d: 85% left{nl}");
+        std::fs::write(dir.join(".anyagents-last-usage.txt"), text).unwrap();
+    }
+
+    fn write_expired_oauth(dir: &Path, with_recent_attempt: bool) {
+        let cred = serde_json::json!({
+            "claudeAiOauth": {
+                "expiresAt": anyagents_core::now_ms() - 60_000,
+                "refreshToken": "rust-dummy"
+            }
+        });
+        std::fs::write(dir.join(".credentials.json"), cred.to_string()).unwrap();
+        if with_recent_attempt {
+            std::fs::write(
+                dir.join(OAUTH_REFRESH_ATTEMPT_FILE),
+                anyagents_core::now_ms().to_string(),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn initial_bind_skips_exhausted_default_for_healthy_sibling() {
+        let (dir, store) = bind_test_store();
+        let data = dir.path();
+        let default = stage_profile(data, "default");
+        let healthy = stage_profile(data, "team-alpha");
+        write_exhausted_usage(&default);
+        let agent = unbound_test_agent(&store, data, "exhausted-default");
+        let cfg = agent_config_dir(data, &agent.id);
+        let picked = select_or_bind_profile(data, &[], &agent, &cfg);
+        assert_eq!(picked, vec![healthy]);
+        assert_eq!(
+            bound_profile_name(&cfg).as_deref(),
+            Some("openai/team-alpha")
+        );
+    }
+
+    #[test]
+    fn initial_bind_keeps_unhealthy_default_when_no_healthy_sibling() {
+        let (dir, store) = bind_test_store();
+        let data = dir.path();
+        let default = stage_profile(data, "default");
+        write_exhausted_usage(&default);
+        let agent = unbound_test_agent(&store, data, "lonely-default");
+        let cfg = agent_config_dir(data, &agent.id);
+        let picked = select_or_bind_profile(data, &[], &agent, &cfg);
+        assert_eq!(picked, vec![default]);
+    }
+
+    #[test]
+    fn initial_bind_keeps_healthy_default() {
+        let (dir, store) = bind_test_store();
+        let data = dir.path();
+        let default = stage_profile(data, "default");
+        let _sibling = stage_profile(data, "team-beta");
+        let agent = unbound_test_agent(&store, data, "healthy-default");
+        let cfg = agent_config_dir(data, &agent.id);
+        let picked = select_or_bind_profile(data, &[], &agent, &cfg);
+        assert_eq!(picked, vec![default]);
+    }
+
+    #[test]
+    fn initial_bind_skips_default_with_expired_oauth_and_recent_failed_refresh() {
+        let (dir, store) = bind_test_store();
+        let data = dir.path();
+        let default = stage_profile(data, "default");
+        let healthy = stage_profile(data, "team-alpha");
+        write_expired_oauth(&default, true);
+        let agent = unbound_test_agent(&store, data, "expired-default");
+        let cfg = agent_config_dir(data, &agent.id);
+        let picked = select_or_bind_profile(data, &[], &agent, &cfg);
+        assert_eq!(picked, vec![healthy]);
+    }
+
+    #[test]
+    fn initial_bind_treats_expired_oauth_without_recent_failed_refresh_as_healthy() {
+        let (dir, store) = bind_test_store();
+        let data = dir.path();
+        let default = stage_profile(data, "default");
+        let _sibling = stage_profile(data, "team-alpha");
+        write_expired_oauth(&default, false);
+        let agent = unbound_test_agent(&store, data, "expired-no-attempt");
+        let cfg = agent_config_dir(data, &agent.id);
+        let picked = select_or_bind_profile(data, &[], &agent, &cfg);
+        assert_eq!(picked, vec![default]);
+    }
+
+    #[test]
+    fn initial_bind_never_overrides_an_explicit_binding() {
+        let (dir, store) = bind_test_store();
+        let data = dir.path();
+        let default = stage_profile(data, "default");
+        let explicit = stage_profile(data, "team-beta");
+        write_exhausted_usage(&default);
+        let agent = unbound_test_agent(&store, data, "explicit-bound");
+        let cfg = agent_config_dir(data, &agent.id);
+        let nl = char::from_u32(10).unwrap();
+        let marker = format!("openai/team-beta{nl}");
+        std::fs::write(cfg.join(".anyagents-profile"), marker).unwrap();
+        let picked = select_or_bind_profile(data, &[], &agent, &cfg);
+        assert_eq!(picked, vec![explicit]);
     }
 }

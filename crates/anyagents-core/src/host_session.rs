@@ -19,7 +19,13 @@ fn lock(root: &Path) -> io::Result<fs::File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        let _ = fs::set_permissions(&sessions, fs::Permissions::from_mode(0o700));
+        // Sessions is seat-admitted exactly like config: keep 0o2770 with the
+        // existing seat group instead of clamping to a private 0o700. The
+        // daemon stays owner and keeps full access through owner bits, while
+        // the seat principal can enter the directory for harness resume.
+        // Clamping to 0o700 here ran on every active-turn call and caused
+        // seat-side resume to fail with Permission denied (os error 13).
+        let _ = fs::set_permissions(&sessions, fs::Permissions::from_mode(0o2770));
     }
     let file = fs::OpenOptions::new()
         .create(true)
@@ -242,13 +248,7 @@ fn retire_session_hold_and_errors(root: &Path, generation: &str) -> io::Result<(
     }
     let marker_tmp = config_dir.join(".anyagents-session-reset-recovery.tmp");
     let marker_dst = config_dir.join(".anyagents-session-reset-recovery");
-    fs::write(
-        &marker_tmp,
-        format!(
-            "{generation}
-"
-        ),
-    )?;
+    fs::write(&marker_tmp, format!("{generation}\n"))?;
     fs::rename(&marker_tmp, &marker_dst)?;
     Ok(())
 }
@@ -521,6 +521,31 @@ mod tests {
     fn memory(root: &Path, text: &str) {
         fs::create_dir_all(root.join("memory")).unwrap();
         fs::write(root.join("memory/MEMORY.md"), text).unwrap();
+    }
+    #[cfg(unix)]
+    #[test]
+    fn active_turn_keeps_sessions_seat_admitted() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = crate::test_tempdir();
+        let root = dir.path();
+        let sessions = root.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::set_permissions(&sessions, fs::Permissions::from_mode(0o2770)).unwrap();
+        let _ = ensure_active(root, "spiron").unwrap();
+        let mode = fs::metadata(&sessions).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(
+            mode, 0o2770,
+            "active turn keeps sessions seat-admitted, never clamps to 0o700"
+        );
+        let dir2 = crate::test_tempdir();
+        let root2 = dir2.path();
+        let _ = ensure_active(root2, "spiron").unwrap();
+        let mode2 = fs::metadata(root2.join("sessions"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(mode2, 0o2770, "fresh sessions dir is created seat-admitted");
     }
 
     #[test]
