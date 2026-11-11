@@ -994,7 +994,13 @@ fn persist_codex_fault_error(config_dir: Option<&Path>, err: Option<&str>) {
                 "quota_reset_at_ms": null,
                 "timestamp_ms": ts,
             });
-            let _ = std::fs::write(&path, payload.to_string());
+            if let Err(err) = anyagents_harness::atomic_write_in_existing_dir(
+                &path,
+                payload.to_string().as_bytes(),
+                0o664,
+            ) {
+                eprintln!("cannot persist {}: {err}", path.display());
+            }
         }
         None => {
             let _ = std::fs::remove_file(&path);

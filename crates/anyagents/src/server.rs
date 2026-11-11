@@ -293,7 +293,14 @@ async fn serve(
         match tokio::net::TcpListener::bind(&addr).await {
             Ok(tcp_listener) => {
                 if let Ok(local) = tcp_listener.local_addr() {
-                    let _ = std::fs::write(data.join("webhook.addr"), format!("{local}\n"));
+                    let addr_path = data.join("webhook.addr");
+                    if let Err(err) = anyagents_harness::atomic_write_nonempty_file(
+                        &addr_path,
+                        format!("{local}\n").as_bytes(),
+                        0o644,
+                    ) {
+                        eprintln!("cannot persist {}: {err}", addr_path.display());
+                    }
                 }
                 let webhook_app = build_webhook_router(state.clone());
                 tokio::spawn(async move {
@@ -389,10 +396,14 @@ fn mark_archive_generation_locked(store: &Store, data_dir: &Path, agent: &Agent)
     let cfg = anyagents_core::agent_config_dir(data_dir, &agent.id);
     let _ = std::fs::create_dir_all(&cfg);
     let _ = std::fs::remove_file(cfg.join(".anyagents-reaped"));
-    let _ = std::fs::write(
-        cfg.join(".anyagents-archived"),
-        format!("{}:{}\n", now_ms(), anyagents_core::AgentId::generate()),
-    );
+    let archived_marker = cfg.join(".anyagents-archived");
+    if let Err(err) = anyagents_harness::atomic_write_nonempty_file(
+        &archived_marker,
+        format!("{}:{}\n", now_ms(), anyagents_core::AgentId::generate()).as_bytes(),
+        0o644,
+    ) {
+        eprintln!("cannot persist {}: {err}", archived_marker.display());
+    }
     if let Ok(schedules) = store.list_schedules(Some(&agent.id), true) {
         for sched in schedules {
             let _ = store.cancel_schedule(Some(&agent.id), &sched.id);
@@ -433,8 +444,10 @@ pub(crate) fn reap_archived_agent_locked(
     if std::fs::read(&reaped).is_ok_and(|done| done == generation) {
         return;
     }
-    if reap_subagent_ephemeral_dirs(data_dir, agent_id) {
-        let _ = std::fs::write(reaped, generation);
+    if reap_subagent_ephemeral_dirs(data_dir, agent_id)
+        && let Err(err) = anyagents_harness::atomic_write_nonempty_file(&reaped, &generation, 0o644)
+    {
+        eprintln!("cannot persist {}: {err}", reaped.display());
     }
 }
 
@@ -3966,12 +3979,11 @@ fn prepare_agent_wake(store: &Store, found: &Agent) -> Result<(), ApiError> {
     let _ = std::fs::remove_file(cfg.join(".anyagents-last-error.json"));
     let _ = std::fs::remove_file(cfg.join(".anyagents-notified-parent-error.json"));
     let now = now_ms();
-    let _ = std::fs::write(cfg.join(".anyagents-quota-cleared-ms"), format!("{now}\n"));
+    create::write_profile_marker(&cfg, ".anyagents-quota-cleared-ms", &format!("{now}\n"))
+        .map_err(ApiError::from_store)?;
     if !store.has_open_turn(&found.id).unwrap_or(false) {
-        let _ = std::fs::write(
-            cfg.join(".anyagents-profile-rotated-ms"),
-            format!("{now}\n"),
-        );
+        create::write_profile_marker(&cfg, ".anyagents-profile-rotated-ms", &format!("{now}\n"))
+            .map_err(ApiError::from_store)?;
     }
     crate::worktree_access::restore_recorded(store.data_dir(), &found.id)
         .map_err(ApiError::from_store)?;

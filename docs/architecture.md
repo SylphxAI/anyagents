@@ -24,6 +24,16 @@ The established pattern for running vendor agents is a long-lived gateway that d
 
 Everything runs in one process, `anyagents serve`, with one embedded database. Each module below is one crate with one public interface; the protocol gateway is a sixth module used only in API-key mode.
 
+## Three-axis vendor-neutral model (`Harness × Profile × Sandbox`)
+
+AnyAgents never runs an internal LLM loop. Every agent is a pure composition of three orthogonal axes:
+
+- **Harness (`anyagents-harness`, `spiron`, `cloud_harness`):** Which external single-agent loop executes turns (`spiron` CLI / `spiron-cloud` at `https://spiron.ai`, `claude-code` / `claude-cloud`, `codex` / `openai-cloud`, `opencode`, `agy`, `muse`, `omp`, `dsh`, `grok`, `cursor-cloud`).
+- **Profile (`profiles/<provider>/<profile>`):** Which upstream subscription or API key authenticates (`anthropic`, `openai`, `google-antigravity`, `muse`, `openrouter`, `sylphx`, Coding Plans). Profile-to-harness resolution is strictly **fail-closed**: if a bound profile has no mapping for the target harness (for example, binding an OAuth-only subscription profile to `opencode` without an OpenCode provider/auth/key mapping), AnyAgents refuses configuration rather than writing an empty config that silently degrades to an external free tier.
+- **Sandbox (`anyagents_tools::WorkspaceBackend` trait):** Where filesystem and shell operations execute—`LocalWorkspace` (default host directory or git worktree), `RemoteSandboxWorkspace` (Cloud Sandbox / E2B HTTP APIs), `DockerWorkspace` (`docker://<host>`), or custom trait implementations.
+
+System prompt rendering (`write_agent_instructions_with_continuity`) injects a minimal, persona-neutral identity and routing envelope (`arXiv:2611.05306`, `arXiv:2611.03931`) so each sub-agent starts with an unpolluted short context window while tool schemas carry API parameter details.
+
 ## AnyAgents owns the state
 
 An agent's identity, instructions, conversation history, mailbox, channels and credentials live in AnyAgents, never only in a vendor tool's local files. A vendor session is a working copy. So an agent can move to another harness or another model and keep its history, its mailbox and its Telegram bot.

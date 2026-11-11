@@ -69,13 +69,15 @@ impl PortLease {
                 }
             };
             if let Some(dir) = config {
-                std::fs::create_dir_all(dir).map_err(failed)?;
-                // One lifecycle writer owns each agent config. Rename avoids a
-                // partial number becoming the next restart's allocation.
+                // One lifecycle writer owns each agent config. Atomic persistence avoids a
+                // partial or empty number becoming the next restart's allocation.
                 let path = dir.join(FILENAME);
-                let temp = dir.join(format!(".{FILENAME}.{}.new", std::process::id()));
-                std::fs::write(&temp, format!("{port}\n")).map_err(failed)?;
-                std::fs::rename(&temp, &path).map_err(failed)?;
+                anyagents_harness::atomic_write_nonempty_file(
+                    &path,
+                    format!("{port}\n").as_bytes(),
+                    0o664,
+                )
+                .map_err(failed)?;
                 if let Some(previous) = stored.or(avoid).filter(|previous| *previous != port) {
                     eprintln!(
                         "anyagents-opencode: port {previous} is occupied; persisted port {port} in {}",

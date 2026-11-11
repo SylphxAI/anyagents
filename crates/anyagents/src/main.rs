@@ -2147,7 +2147,7 @@ fn sign_in(data: &Path, target: &str, profile: Option<&str>) -> Result<(), anyag
         let expected_prov = create::upstream_provider_of(&rec.harness, rec.model.as_deref());
         let (prov, prof_name) = prof.split_once('/').unwrap_or((&expected_prov, prof));
         let normalized = format!("{prov}/{prof_name}");
-        std::fs::write(cfg.join(".anyagents-profile"), format!("{normalized}\n"))?;
+        create::write_profile_marker(&cfg, ".anyagents-profile", &format!("{normalized}\n"))?;
         let prof_dir = data.join("profiles").join(prov).join(prof_name);
         let has_stored_creds = std::fs::read_dir(&prof_dir)
             .ok()

@@ -200,19 +200,7 @@ fn random_token() -> Result<String, Error> {
 }
 
 fn write_private(file: &Path, text: &str) -> Result<(), Error> {
-    use std::io::Write;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    if let Some(parent) = file.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut handle = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(file)?;
-    handle.write_all(text.as_bytes())?;
-    std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600))?;
+    anyagents_harness::atomic_write_nonempty_file(file, text.as_bytes(), 0o600)?;
     Ok(())
 }
 
