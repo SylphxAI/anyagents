@@ -1539,9 +1539,10 @@ fn translate_agent_mentions_for_telegram(store: &Store, text: &str) -> String {
     out
 }
 
-pub fn format_telegram_bot_display_name(name: &str, role: Option<&str>) -> String {
-    let title: String = name
-        .split(['-', '_'])
+/// Telegram bot display name: the agent name title-cased (`helper-bot` -> `Helper Bot`).
+/// The role is deliberately excluded so role edits never rename the bot.
+pub fn format_telegram_bot_display_name(name: &str) -> String {
+    name.split(['-', '_'])
         .filter(|part| !part.is_empty())
         .map(|part| {
             let mut chars = part.chars();
@@ -1551,11 +1552,7 @@ pub fn format_telegram_bot_display_name(name: &str, role: Option<&str>) -> Strin
             }
         })
         .collect::<Vec<_>>()
-        .join(" ");
-    match role.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(r) => format!("{title} · {r}"),
-        None => title,
-    }
+        .join(" ")
 }
 
 fn url_encode_query_param(s: &str) -> String {
@@ -1787,8 +1784,7 @@ pub fn bind_agent_telegram_token(
         }
     }
 
-    let display_name =
-        format_telegram_bot_display_name(&updated_agent.name, updated_agent.role.as_deref());
+    let display_name = format_telegram_bot_display_name(&updated_agent.name);
     Ok(serde_json::json!({
         "status": "bound",
         "kind": "telegram",
@@ -1858,8 +1854,7 @@ fn handle_managed_bot_event(
             &new_bot_token,
             Some((event.bot_id, &event.bot_username)),
         )?;
-        let disp =
-            format_telegram_bot_display_name(&target_agent.name, target_agent.role.as_deref());
+        let disp = format_telegram_bot_display_name(&target_agent.name);
         let notice = format!(
             "[Telegram Managed Bot @{} (id={}) created{} and automatically bound to agent `{}` (`{}`). Display name synced to \"{}\" with visibility unchanged.]",
             event.bot_username,
@@ -2165,8 +2160,7 @@ pub fn request_or_bind_telegram_channel(
     };
 
     let suggested = normalize_bot_username(bot_username.unwrap_or(""), &target_agent.name);
-    let display_name =
-        format_telegram_bot_display_name(&target_agent.name, target_agent.role.as_deref());
+    let display_name = format_telegram_bot_display_name(&target_agent.name);
     let mut mem = Memory::try_from_state(&mgr_channel.state)?;
     mem.pending_managed_bots
         .insert(suggested.to_ascii_lowercase(), target_agent.id.to_string());
@@ -2273,7 +2267,8 @@ fn candidate_manager_channels(
 
 /// Synchronizes the attached Telegram bot's display name (`setMyName`) and
 /// profile descriptions (`setMyShortDescription`, `setMyDescription`) with
-/// `format_telegram_bot_display_name(&agent.name, agent.role.as_deref())` (e.g. `"Helper · Documentation"`).
+/// `format_telegram_bot_display_name(&agent.name)` (e.g. `"Helper Bot"`); the role is not
+/// part of the name, so a role-only edit leaves `setMyName` untouched.
 pub fn sync_agent_telegram_bot_name(
     store: &Store,
     data_dir: &std::path::Path,
@@ -2295,7 +2290,7 @@ pub fn sync_agent_telegram_bot_name(
     let Ok(token) = token_of(&FileCredentialStore::new(data_dir), credential_ref) else {
         return;
     };
-    let raw_name = format_telegram_bot_display_name(&agent.name, agent.role.as_deref());
+    let raw_name = format_telegram_bot_display_name(&agent.name);
     let bot_name: String = raw_name.chars().take(64).collect();
     let clean_desc = agent.description.as_deref().unwrap_or("").trim();
     let short_desc: String = if clean_desc.is_empty() {
@@ -3973,6 +3968,19 @@ pub(crate) mod tests {
     pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
         ENV.lock().unwrap_or_else(|err| err.into_inner())
+    }
+
+    #[test]
+    fn telegram_bot_display_name_is_the_title_cased_name_without_role() {
+        // An agent `helper-bot` with role `Documentation` is named `Helper Bot`;
+        // the sync skips `setMyName` when this computed name already matches, so a
+        // role-only edit never renames the bot.
+        assert_eq!(format_telegram_bot_display_name("helper-bot"), "Helper Bot");
+        assert_eq!(
+            format_telegram_bot_display_name("ops_desk--x"),
+            "Ops Desk X"
+        );
+        assert!(!format_telegram_bot_display_name("helper-bot").contains('·'));
     }
 
     #[test]
