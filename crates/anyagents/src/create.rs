@@ -8395,10 +8395,66 @@ pub(crate) fn bound_profile_name(config_dir: &Path) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+const PROFILE_HEALTHY_USAGE_FRESHNESS_MS: i64 = 65_000;
+const PROFILE_HEALTHY_OAUTH_ATTEMPT_FRESHNESS_MS: i64 = 300_000;
+
+/// Positive-signal health check for a candidate profile directory. Returns true only when
+/// the profile directory itself carries conclusive unhealthy evidence: a quota reading
+/// of zero percent left written within the last minute, or an expired OAuth token whose
+/// most recent refresh attempt also happened recently (so the token cannot silently
+/// recover on its own). Never probes the network and never treats a missing or stale
+/// signal as unhealthy evidence.
+fn profile_has_unhealthy_evidence(dir: &Path) -> bool {
+    let now_ms = anyagents_core::now_ms();
+    let usage_path = dir.join(".anyagents-last-usage.txt");
+    if let Ok(usage) = std::fs::read_to_string(&usage_path) {
+        let age_ms = std::fs::metadata(&usage_path)
+            .and_then(|meta| meta.modified())
+            .map(|mtime| {
+                std::time::SystemTime::now()
+                    .duration_since(mtime)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0)
+            })
+            .unwrap_or(i64::MAX);
+        if parse_remaining_pct_from_usage(&usage, None) == Some(0)
+            && age_ms < PROFILE_HEALTHY_USAGE_FRESHNESS_MS
+        {
+            return true;
+        }
+    }
+    let cred_text = std::fs::read_to_string(dir.join(".credentials.json"))
+        .or_else(|_| std::fs::read_to_string(dir.join(".claude/.credentials.json")));
+    let Ok(cred_text) = cred_text else {
+        return false;
+    };
+    let Ok(cred) = serde_json::from_str::<serde_json::Value>(&cred_text) else {
+        return false;
+    };
+    let expires_at = cred
+        .pointer("/claudeAiOauth/expiresAt")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(i64::MAX);
+    if expires_at > now_ms {
+        return false;
+    }
+    let last_attempt_ms = std::fs::read_to_string(dir.join(OAUTH_REFRESH_ATTEMPT_FILE))
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .unwrap_or(0);
+    now_ms.saturating_sub(last_attempt_ms) < PROFILE_HEALTHY_OAUTH_ATTEMPT_FRESHNESS_MS
+}
+
 /// Selects (or reuses the already-bound) Upstream Provider Profile for `agent`
 /// from `<data>/profiles/<provider>/<profile>` with zero automatic load-balancing
 /// ("分流"): an agent uses its explicitly assigned `.anyagents-profile` (defaulting
 /// deterministically to `<provider>/default`).
+///
+/// Initial bind is health-aware. When the implicit default profile carries positive
+/// unhealthy evidence (see profile_has_unhealthy_evidence), the first healthy sibling
+/// profile of the same provider wins instead. The default is kept whenever it is
+/// healthy or has no healthy replacement, and an explicit harness binding is never
+/// overridden by this routing.
 fn select_or_bind_profile(
     data: &Path,
     _all_agents: &[Agent],
@@ -8432,11 +8488,16 @@ fn select_or_bind_profile(
             }
         }
     }
-    if let Some((chosen_name, chosen_dir)) = available
-        .iter()
-        .find(|(n, _)| n == "default")
-        .or_else(|| available.first())
-    {
+    let default_entry = available.iter().find(|(n, _)| n == "default");
+    let chosen_entry = match default_entry {
+        Some((_, default_dir)) if profile_has_unhealthy_evidence(default_dir) => available
+            .iter()
+            .find(|(n, dir)| n != "default" && !profile_has_unhealthy_evidence(dir))
+            .or(default_entry),
+        _ => default_entry,
+    }
+    .or_else(|| available.first());
+    if let Some((chosen_name, chosen_dir)) = chosen_entry {
         let chosen_prov = chosen_dir
             .parent()
             .and_then(Path::file_name)
@@ -13543,5 +13604,134 @@ Connection: close
                 .join("profiles/google-antigravity/default")
                 .exists()
         );
+    }
+
+    fn bind_test_store() -> (tempfile::TempDir, Store) {
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        store
+            .hold_capability_key("0123456789abcdef0123456789abcdef")
+            .unwrap();
+        (dir, store)
+    }
+
+    fn unbound_test_agent(store: &Store, data: &Path, name: &str) -> Agent {
+        let agent = store.create_agent(NewAgent::new(name, "codex")).unwrap();
+        let cfg = agent_config_dir(data, &agent.id);
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::remove_file(cfg.join(".anyagents-profile")).ok();
+        agent
+    }
+
+    fn stage_profile(data: &Path, name: &str) -> PathBuf {
+        let dir = data.join("profiles").join("openai").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_exhausted_usage(dir: &Path) {
+        let nl = char::from_u32(10).unwrap();
+        let text = format!("5h: 0% left{nl}7d: 85% left{nl}");
+        std::fs::write(dir.join(".anyagents-last-usage.txt"), text).unwrap();
+    }
+
+    fn write_expired_oauth(dir: &Path, with_recent_attempt: bool) {
+        let cred = serde_json::json!({
+            "claudeAiOauth": {
+                "expiresAt": anyagents_core::now_ms() - 60_000,
+                "refreshToken": "rust-dummy"
+            }
+        });
+        std::fs::write(dir.join(".credentials.json"), cred.to_string()).unwrap();
+        if with_recent_attempt {
+            std::fs::write(
+                dir.join(OAUTH_REFRESH_ATTEMPT_FILE),
+                anyagents_core::now_ms().to_string(),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn initial_bind_skips_exhausted_default_for_healthy_sibling() {
+        let (dir, store) = bind_test_store();
+        let data = dir.path();
+        let default = stage_profile(data, "default");
+        let healthy = stage_profile(data, "sudointernationalltd");
+        write_exhausted_usage(&default);
+        let agent = unbound_test_agent(&store, data, "exhausted-default");
+        let cfg = agent_config_dir(data, &agent.id);
+        let picked = select_or_bind_profile(data, &[], &agent, &cfg);
+        assert_eq!(picked, vec![healthy]);
+        assert_eq!(
+            bound_profile_name(&cfg).as_deref(),
+            Some("openai/sudointernationalltd")
+        );
+    }
+
+    #[test]
+    fn initial_bind_keeps_unhealthy_default_when_no_healthy_sibling() {
+        let (dir, store) = bind_test_store();
+        let data = dir.path();
+        let default = stage_profile(data, "default");
+        write_exhausted_usage(&default);
+        let agent = unbound_test_agent(&store, data, "lonely-default");
+        let cfg = agent_config_dir(data, &agent.id);
+        let picked = select_or_bind_profile(data, &[], &agent, &cfg);
+        assert_eq!(picked, vec![default]);
+    }
+
+    #[test]
+    fn initial_bind_keeps_healthy_default() {
+        let (dir, store) = bind_test_store();
+        let data = dir.path();
+        let default = stage_profile(data, "default");
+        let _sibling = stage_profile(data, "cubeage-insight");
+        let agent = unbound_test_agent(&store, data, "healthy-default");
+        let cfg = agent_config_dir(data, &agent.id);
+        let picked = select_or_bind_profile(data, &[], &agent, &cfg);
+        assert_eq!(picked, vec![default]);
+    }
+
+    #[test]
+    fn initial_bind_skips_default_with_expired_oauth_and_recent_failed_refresh() {
+        let (dir, store) = bind_test_store();
+        let data = dir.path();
+        let default = stage_profile(data, "default");
+        let healthy = stage_profile(data, "sudointernationalltd");
+        write_expired_oauth(&default, true);
+        let agent = unbound_test_agent(&store, data, "expired-default");
+        let cfg = agent_config_dir(data, &agent.id);
+        let picked = select_or_bind_profile(data, &[], &agent, &cfg);
+        assert_eq!(picked, vec![healthy]);
+    }
+
+    #[test]
+    fn initial_bind_treats_expired_oauth_without_recent_failed_refresh_as_healthy() {
+        let (dir, store) = bind_test_store();
+        let data = dir.path();
+        let default = stage_profile(data, "default");
+        let _sibling = stage_profile(data, "sudointernationalltd");
+        write_expired_oauth(&default, false);
+        let agent = unbound_test_agent(&store, data, "expired-no-attempt");
+        let cfg = agent_config_dir(data, &agent.id);
+        let picked = select_or_bind_profile(data, &[], &agent, &cfg);
+        assert_eq!(picked, vec![default]);
+    }
+
+    #[test]
+    fn initial_bind_never_overrides_an_explicit_binding() {
+        let (dir, store) = bind_test_store();
+        let data = dir.path();
+        let default = stage_profile(data, "default");
+        let explicit = stage_profile(data, "cubeage-insight");
+        write_exhausted_usage(&default);
+        let agent = unbound_test_agent(&store, data, "explicit-bound");
+        let cfg = agent_config_dir(data, &agent.id);
+        let nl = char::from_u32(10).unwrap();
+        let marker = format!("openai/cubeage-insight{nl}");
+        std::fs::write(cfg.join(".anyagents-profile"), marker).unwrap();
+        let picked = select_or_bind_profile(data, &[], &agent, &cfg);
+        assert_eq!(picked, vec![explicit]);
     }
 }
