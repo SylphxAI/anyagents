@@ -163,12 +163,19 @@ fn create_with_seat(
             "private" | "sandbox" | "self" | "cloud" | "cloud-agent"
         );
         let wd_is_inherit_keyword = matches!(wd_lower.as_str(), "inherit" | "parent");
+        let parent_has_git_workdir = agent
+            .parent_id
+            .as_ref()
+            .and_then(|pid| store.agent(pid).ok())
+            .and_then(|p| p.workdir)
+            .map(PathBuf::from)
+            .is_some_and(|pwd| pwd.is_dir() && is_git_repo_dir(&pwd));
         let effective_repo = request
             .repo
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .or(if wd_is_worktree_keyword {
+            .or(if wd_is_worktree_keyword && parent_has_git_workdir {
                 Some("inherit")
             } else {
                 None
@@ -239,7 +246,7 @@ fn create_with_seat(
                 )?;
                 target_wt
             }
-        } else if wd_is_private_keyword {
+        } else if wd_is_private_keyword || wd_is_worktree_keyword {
             if crate::vendor::is_spiron_harness(&agent.harness) && is_cloud_agent_mode {
                 provision_cloud_sandbox_worktree_marker(
                     store,
@@ -752,7 +759,7 @@ pub(crate) fn write_agent_instructions_with_continuity(
         doc.push_str("- **Role**: Root Agent\n");
     }
 
-    doc.push_str("- **Lifecycle**: Role labels do not set lifecycle policy; follow your instructions. Any agent may call `agents` with `action: \"archive\"`. Idle processes release after mailbox/child/background work drains; identity and session persist.\n");
+    doc.push_str("- **Lifecycle**: Role templates may declare `lifecycle: standing | task`. Sub-agents never archive themselves; the spawning parent closes/archives a task sub-agent (`action: \"archive\"`) once its deliverable is accepted. Idle processes release after mailbox/child/background work drains; identity and session persist.\n");
 
     if let Some(custom) = agent
         .instructions
@@ -774,6 +781,7 @@ pub(crate) fn write_agent_instructions_with_continuity(
          - Stdout never reaches peers/parents/channels. Always call `send` to reply/report (`to`, `reply_to: \"anyagents:reply:msg_...\"`, `text`, etc.); use the envelope's `answer_to`.\n\
          - Never poll an inbox: messages, sub-agent completions and watches wake you reactively.\n\
          - Vendor sub-agent/timer tools are disabled by default. Use `code` (`anyagents.*`, `workspace.*`, `web.*`, `computer.*`) or `agents` for lifecycle: isolated `<data>/agents/<id>/work` by default, or `repo` worktrees; `archive` reaps clean/pushed worktrees, preserves dirty/unpushed ones. Use `memory` for durable facts, `conversation` for history/search, `groups` for groups, `schedule` for wakes/event watches.\n\
+         - Recursive sub-agent tree: (1) execute simple/cohesive tasks directly (never spawn a 1-to-1 relay child); (2) fan out in parallel via `agents`/`spawn` (`role`, `name`, `message`) when work is multi-module, cross-role, or context-heavy; (3) enforce disjoint write scopes across parallel children (`repo` worktree or separate files), verify primary-source results, and archive your own task sub-agents (`archive`) once accepted.\n\
          - `browser` provides persistent Chromium; fill secrets with `secret_ref: \"op://...\"` / `\"op-otp://...\"` without reading them. On `captcha_detected: true`, use `action: \"takeover\"` and send the takeover URL to the user.\n",
     );
     if let Some(parent) = parent_name {
@@ -11642,9 +11650,27 @@ mod archetype_tests {
             .unwrap();
 
         for (selector_key, selector_val, expected_slug, expected_scope, expected_body) in [
-            ("role", "director", "director", "public", "Director template body."),
-            ("archetype", "engineer", "engineer", "private", "Engineer template body."),
-            ("role", "assistant", "assistant", "isolated", "Assistant template body."),
+            (
+                "role",
+                "director",
+                "director",
+                "public",
+                "Director template body.",
+            ),
+            (
+                "archetype",
+                "engineer",
+                "engineer",
+                "private",
+                "Engineer template body.",
+            ),
+            (
+                "role",
+                "assistant",
+                "assistant",
+                "isolated",
+                "Assistant template body.",
+            ),
             (
                 "role",
                 "Code Reviewer",
@@ -12549,5 +12575,143 @@ mod runtime_config_tests {
         unsafe {
             std::env::remove_var("ANYAGENTS_ANTHROPIC_OAUTH_TOKEN_URL");
         }
+    }
+
+    #[test]
+    fn worktree_keyword_without_repo_falls_back_to_private_workdir_when_parent_not_git_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path();
+        let store = anyagents_core::Store::open(data.join("anyagents.db")).unwrap();
+        store
+            .hold_capability_key("0123456789abcdef0123456789abcdef")
+            .unwrap();
+
+        let non_git_parent = create(
+            &store,
+            data,
+            CreateRequest {
+                name: "non-git-parent".to_string(),
+                role: Some("director".to_string()),
+                harness: "agy".to_string(),
+                model: None,
+                profile: None,
+                repo: None,
+                branch: None,
+                base: None,
+                workdir: None,
+                workdir_default: None,
+                description: None,
+                instructions: None,
+                parent_id: None,
+            },
+        )
+        .unwrap();
+        assert!(!is_git_repo_dir(Path::new(
+            non_git_parent.workdir.as_deref().unwrap()
+        )));
+
+        let child_under_non_git = create(
+            &store,
+            data,
+            CreateRequest {
+                name: "child-non-git".to_string(),
+                role: Some("engineer".to_string()),
+                harness: "agy".to_string(),
+                model: None,
+                profile: None,
+                repo: None,
+                branch: None,
+                base: None,
+                workdir: Some(PathBuf::from("worktree")),
+                workdir_default: None,
+                description: None,
+                instructions: None,
+                parent_id: Some(non_git_parent.id.clone()),
+            },
+        )
+        .unwrap();
+        let expected_private_wd = anyagents_core::agent_config_dir(data, &child_under_non_git.id)
+            .parent()
+            .unwrap()
+            .join("work");
+        assert_eq!(
+            PathBuf::from(child_under_non_git.workdir.as_deref().unwrap()),
+            expected_private_wd
+        );
+        assert!(!is_git_repo_dir(&expected_private_wd));
+
+        let explicit_inherit_err = create(
+            &store,
+            data,
+            CreateRequest {
+                name: "child-explicit-inherit".to_string(),
+                role: Some("engineer".to_string()),
+                harness: "agy".to_string(),
+                model: None,
+                profile: None,
+                repo: Some("inherit".to_string()),
+                branch: None,
+                base: None,
+                workdir: Some(PathBuf::from("worktree")),
+                workdir_default: None,
+                description: None,
+                instructions: None,
+                parent_id: Some(non_git_parent.id.clone()),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            explicit_inherit_err
+                .to_string()
+                .contains("not a git repository"),
+            "unexpected error: {explicit_inherit_err}"
+        );
+
+        let fixture = crate::worktree::tests::Fixture::new(data);
+        let git_parent = create_with_consumer(
+            &store,
+            data,
+            CreateRequest {
+                name: "git-parent".to_string(),
+                role: Some("director".to_string()),
+                harness: "agy".to_string(),
+                model: None,
+                profile: None,
+                repo: None,
+                branch: None,
+                base: None,
+                workdir: Some(fixture.source.clone()),
+                workdir_default: None,
+                description: None,
+                instructions: None,
+                parent_id: None,
+            },
+            &fixture.consumer,
+        )
+        .unwrap();
+
+        let child_under_git = create_with_consumer(
+            &store,
+            data,
+            CreateRequest {
+                name: "child-git".to_string(),
+                role: Some("engineer".to_string()),
+                harness: "agy".to_string(),
+                model: None,
+                profile: None,
+                repo: None,
+                branch: None,
+                base: None,
+                workdir: Some(PathBuf::from("worktree")),
+                workdir_default: None,
+                description: None,
+                instructions: None,
+                parent_id: Some(git_parent.id.clone()),
+            },
+            &fixture.consumer,
+        )
+        .unwrap();
+        let child_git_wd = PathBuf::from(child_under_git.workdir.as_deref().unwrap());
+        fixture.assert_checkout(&child_git_wd);
     }
 }

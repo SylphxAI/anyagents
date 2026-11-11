@@ -1890,6 +1890,8 @@ struct DescriptionRequest {
     role: Option<String>,
     #[serde(default)]
     scope: Option<String>,
+    #[serde(default)]
+    lifecycle: Option<String>,
     #[serde(default, alias = "allow_external")]
     public: Option<bool>,
     #[serde(default)]
@@ -1933,6 +1935,7 @@ async fn get_description_route(
             "name": rec.name,
             "role": rec.role,
             "scope": rec.scope(),
+            "lifecycle": rec.lifecycle(),
             "public": rec.is_public(),
             "harness": rec.harness,
             "model": rec.model,
@@ -1960,6 +1963,7 @@ async fn set_description_route(
             && body.instructions.is_none()
             && body.role.is_none()
             && body.scope.is_none()
+            && body.lifecycle.is_none()
             && body.public.is_none()
             && !body.clear.unwrap_or(false)
         {
@@ -2022,6 +2026,15 @@ async fn set_description_route(
             rec = state
                 .store
                 .set_agent_public_as(&rec.id, pub_val, &actor)
+                .map_err(ApiError::from_store)?;
+        }
+        if let Some(ref lifecycle_val) = body.lifecycle {
+            if !is_ancestor {
+                require_admin_or_operator(&state.store, &principal, "agents.lifecycle", &rec.name)?;
+            }
+            rec = state
+                .store
+                .set_agent_lifecycle_as(&rec.id, lifecycle_val, &actor)
                 .map_err(ApiError::from_store)?;
         }
         if let Some(ref role_str) = body.role {
@@ -2113,6 +2126,7 @@ async fn set_description_route(
             "name": rec.name,
             "role": rec.role,
             "scope": rec.scope(),
+            "lifecycle": rec.lifecycle(),
             "public": rec.is_public(),
             "aliases": aliases,
             "description": rec.public_description(),
@@ -2839,6 +2853,7 @@ fn archived_agent_view_fast(agent: &Agent) -> AgentView {
         aliases: Vec::new(),
         parent: agent.parent_id.as_ref().map(ToString::to_string),
         scope: agent.scope().to_string(),
+        lifecycle: agent.lifecycle().to_string(),
         relationship: None,
         can_message: None,
         harness: agent.harness.clone(),
@@ -3095,6 +3110,7 @@ fn agent_view_preloaded(
         aliases,
         parent: agent.parent_id.as_ref().map(ToString::to_string),
         scope: agent.scope().to_string(),
+        lifecycle: agent.lifecycle().to_string(),
         relationship: None,
         can_message: None,
         harness: agent.harness.clone(),
@@ -3192,6 +3208,9 @@ async fn create_agent_route(
         if let Some(scope) = body.scope.as_deref() {
             anyagents_core::parse_agent_scope(scope).map_err(ApiError::from_store)?;
         }
+        if let Some(lifecycle) = body.lifecycle.as_deref() {
+            anyagents_core::parse_agent_lifecycle(lifecycle).map_err(ApiError::from_store)?;
+        }
         let parent_id = parent_agent.as_ref().map(|p| p.id.clone());
         let (harness, model, profile) = create::resolve_subagent_defaults(
             state.store.data_dir(),
@@ -3243,6 +3262,12 @@ async fn create_agent_route(
                 .set_agent_public_as(&agent.id, false, &actor)
                 .map_err(ApiError::from_store)?;
             scope_changed = true;
+        }
+        if let Some(ref lifecycle_val) = body.lifecycle {
+            agent = state
+                .store
+                .set_agent_lifecycle_as(&agent.id, lifecycle_val, &actor)
+                .map_err(ApiError::from_store)?;
         }
         if scope_changed {
             let cfg = anyagents_core::agent_config_dir(state.store.data_dir(), &agent.id);

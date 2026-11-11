@@ -619,6 +619,9 @@ struct AgentsArgs {
     /// Internal communication & visibility scope (`"isolated"` | `"private"` | `"siblings"` | `"public"`) when `action` is `"spawn"`, `"create"`, or `"describe"`.
     #[serde(default)]
     scope: Option<String>,
+    /// Optional agent lifecycle mode (`"task"` | `"standing"`, defaulting to `"task"` for sub-agents and `"standing"` for root agents) when `action` is `"spawn"`, `"create"`, or `"describe"`. `"task"` sub-agents are single-mission freelancers closed (`archive`) by their parent upon completion; `"standing"` agents stay on idle standby between assignments.
+    #[serde(default)]
+    lifecycle: Option<String>,
     /// Whether this sub-agent accepts external messages (`true`) from agents outside its direct parent/child lineage (and allows outside agents to invite it to virtual groups). Defaults to `false` (`private`) when spawning a sub-agent.
     #[serde(default, alias = "allow_external")]
     public: Option<bool>,
@@ -703,6 +706,9 @@ struct SpawnArgs {
     /// Optional internal communication & visibility scope (`"isolated"` | `"private"` | `"siblings"` | `"public"`).
     #[serde(default)]
     scope: Option<String>,
+    /// Optional agent lifecycle mode (`"task"` | `"standing"`, defaulting to `"task"` for sub-agents). `"task"` sub-agents are single-mission freelancers closed (`archive`) by their parent upon completion; `"standing"` agents stay on idle standby between assignments.
+    #[serde(default)]
+    lifecycle: Option<String>,
     /// Whether this sub-agent accepts external messages (`true`) from agents outside its direct parent/child lineage. Defaults to `false` (`private`).
     #[serde(default, alias = "allow_external")]
     public: Option<bool>,
@@ -738,6 +744,9 @@ struct DescribeArgs {
     /// Optional internal communication & visibility scope (`"isolated"` | `"private"` | `"siblings"` | `"public"`).
     #[serde(default)]
     scope: Option<String>,
+    /// Optional agent lifecycle mode (`"task"` | `"standing"`, defaulting to `"task"` for sub-agents). `"task"` sub-agents are single-mission freelancers closed (`archive`) by their parent upon completion; `"standing"` agents stay on idle standby between assignments.
+    #[serde(default)]
+    lifecycle: Option<String>,
     /// Optional toggle (`true` or `false`) for whether a sub-agent accepts external messages from agents outside its direct parent/child lineage.
     #[serde(default, alias = "allow_external")]
     public: Option<bool>,
@@ -814,6 +823,9 @@ struct SubagentsArgs {
     /// Optional internal communication & visibility scope (`"isolated"` | `"private"` | `"siblings"` | `"public"`).
     #[serde(default)]
     scope: Option<String>,
+    /// Optional agent lifecycle mode (`"task"` | `"standing"`, defaulting to `"task"` for sub-agents). `"task"` sub-agents are single-mission freelancers closed (`archive`) by their parent upon completion; `"standing"` agents stay on idle standby between assignments.
+    #[serde(default)]
+    lifecycle: Option<String>,
     /// Whether this sub-agent accepts external messages (`true`) from agents outside its direct parent/child lineage. Defaults to `false` (`private`).
     #[serde(default, alias = "allow_external")]
     public: Option<bool>,
@@ -1639,6 +1651,7 @@ impl AgentMcp {
                         description: args.description,
                         instructions: args.instructions,
                         scope: args.scope,
+                        lifecycle: args.lifecycle,
                         public: args.public,
                         group: args.group,
                         prompt: args.prompt,
@@ -1688,6 +1701,7 @@ impl AgentMcp {
                     instructions: args.instructions,
                     parent: parent_val,
                     scope: args.scope,
+                    lifecycle: args.lifecycle,
                     public: args.public,
                     group: args.group,
                     prompt: args.prompt,
@@ -1710,6 +1724,7 @@ impl AgentMcp {
                     instructions: args.instructions,
                     role: args.role,
                     scope: args.scope,
+                    lifecycle: args.lifecycle,
                     public: args.public,
                     clear: args.clear,
                 }))
@@ -2037,6 +2052,7 @@ impl AgentMcp {
             instructions: args.instructions,
             parent: Some(self.agent.id.to_string()),
             scope: args.scope,
+            lifecycle: args.lifecycle,
             public: args.public,
             group: args.group,
             prompt: args.prompt,
@@ -2175,6 +2191,7 @@ impl AgentMcp {
                         description: args.description,
                         instructions: args.instructions,
                         scope: args.scope,
+                        lifecycle: args.lifecycle,
                         public: args.public,
                         group: args.group,
                         prompt: args.prompt,
@@ -2531,6 +2548,7 @@ impl AgentMcp {
             && args.instructions.is_none()
             && args.role.is_none()
             && args.scope.is_none()
+            && args.lifecycle.is_none()
             && args.public.is_none()
             && !args.clear.unwrap_or(false)
         {
@@ -2547,6 +2565,7 @@ impl AgentMcp {
                         "aliases": a.aliases,
                         "parent": a.parent,
                         "scope": a.scope,
+                        "lifecycle": a.lifecycle,
                         "relationship": a.relationship,
                         "can_message": a.can_message,
                         "harness": a.harness,
@@ -2564,6 +2583,7 @@ impl AgentMcp {
             || args.instructions.is_some()
             || args.role.is_some()
             || args.scope.is_some()
+            || args.lifecycle.is_some()
             || args.public.is_some()
             || args.clear.unwrap_or(false)
         {
@@ -2572,6 +2592,7 @@ impl AgentMcp {
                 "instructions": args.instructions,
                 "role": args.role,
                 "scope": args.scope,
+                "lifecycle": args.lifecycle,
                 "public": args.public,
                 "clear": args.clear.unwrap_or(false),
             });
@@ -8054,6 +8075,7 @@ mod spawn_args_tests {
             aliases: Vec::new(),
             parent: Some("agt_parent".to_string()),
             scope: "private".to_string(),
+            lifecycle: "task".to_string(),
             relationship: Some("child".to_string()),
             can_message: Some(true),
             harness: "opencode".to_string(),

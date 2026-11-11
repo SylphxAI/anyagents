@@ -262,7 +262,7 @@ fn migrate_open_file(
             "--",
             "/bin/sh",
             "-c",
-            "set -euC; umask 007; cat > \"/dev/fd/3/$1\"",
+            "set -euC; umask 007; target=\"/dev/fd/3/$1\"; [ -d /dev/fd/3 ] || target=\"./$1\"; cat > \"$target\"",
             "seat-copy",
         ])
         .arg(&temp)
@@ -270,11 +270,13 @@ fn migrate_open_file(
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     let fd = parent.as_raw_fd();
-    // Only async-signal-safe syscalls occur between fork and exec. Descriptor 3
-    // binds the destination directory across privilege drop and path renames.
+    // Only async-signal-safe syscalls occur between fork and exec. `fchdir(fd)`
+    // (plus descriptor 3 when not stripped by `close_range(3, ~0, 0)`) binds
+    // the exact destination directory inode across privilege drop and renames.
     unsafe {
         command.pre_exec(move || {
-            if libc::dup2(fd, 3) < 0 || libc::fcntl(3, libc::F_SETFD, 0) < 0 {
+            if libc::fchdir(fd) < 0 || libc::dup2(fd, 3) < 0 || libc::fcntl(3, libc::F_SETFD, 0) < 0
+            {
                 return Err(io::Error::last_os_error());
             }
             Ok(())
@@ -303,7 +305,7 @@ fn migrate_open_file(
             "--",
             "/bin/sh",
             "-c",
-            "set -eu; cmp -s - \"/dev/fd/3/$1\"; sync -f \"/dev/fd/3/$1\"",
+            "set -eu; target=\"/dev/fd/3/$1\"; [ -d /dev/fd/3 ] || target=\"./$1\"; cmp -s - \"$target\"; sync -f \"$target\"",
             "seat-readback",
         ])
         .arg(&temp)
@@ -312,7 +314,8 @@ fn migrate_open_file(
         .stderr(std::process::Stdio::null());
     unsafe {
         verify.pre_exec(move || {
-            if libc::dup2(fd, 3) < 0 || libc::fcntl(3, libc::F_SETFD, 0) < 0 {
+            if libc::fchdir(fd) < 0 || libc::dup2(fd, 3) < 0 || libc::fcntl(3, libc::F_SETFD, 0) < 0
+            {
                 return Err(io::Error::last_os_error());
             }
             Ok(())

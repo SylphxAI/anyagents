@@ -810,6 +810,7 @@ fn set_state(data: &Path, name: &str, state: &str) -> Result<AgentView, Error> {
     let seat_info = crate::create::resolved_agent_seat_info(&store, &agent);
     let public_desc = agent.public_description();
     let scope_val = agent.scope().to_string();
+    let lifecycle_val = agent.lifecycle().to_string();
     Ok(AgentView {
         has_open_turn: false,
         profile: None,
@@ -819,6 +820,7 @@ fn set_state(data: &Path, name: &str, state: &str) -> Result<AgentView, Error> {
         aliases,
         parent: agent.parent_id.as_ref().map(ToString::to_string),
         scope: scope_val,
+        lifecycle: lifecycle_val,
         relationship: None,
         can_message: None,
         harness: agent.harness,
@@ -885,6 +887,9 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
     if let Some(scope) = parsed.scope.as_deref() {
         anyagents_core::parse_agent_scope(scope).map_err(|err| err.to_string())?;
     }
+    if let Some(lifecycle) = parsed.lifecycle.as_deref() {
+        anyagents_core::parse_agent_lifecycle(lifecycle).map_err(|err| err.to_string())?;
+    }
     let parent_id = parent_agent.as_ref().map(|p| p.id.clone());
     let (harness, model, profile) = crate::create::resolve_subagent_defaults(
         data,
@@ -928,6 +933,11 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
         crate::create::sync_agent_description_files(&store, &agent, &cfg)
             .map_err(|error| error.to_string())?;
     }
+    if let Some(ref lifecycle_val) = parsed.lifecycle {
+        agent = store
+            .set_agent_lifecycle_as(&agent.id, lifecycle_val, "operator")
+            .map_err(|err| err.to_string())?;
+    }
     // A create is a new instance: its capability is minted so its harness
     // starts with one.
     crate::operator::mint(&store, &agent.id).map_err(|err| err.to_string())?;
@@ -949,6 +959,7 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
     let seat_info = crate::create::resolved_agent_seat_info(&store, &agent);
     let public_desc = agent.public_description();
     let scope_val = agent.scope().to_string();
+    let lifecycle_val = agent.lifecycle().to_string();
     Ok(AgentView {
         has_open_turn: false,
         profile: None,
@@ -958,6 +969,7 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
         aliases,
         parent: agent.parent_id.as_ref().map(ToString::to_string),
         scope: scope_val,
+        lifecycle: lifecycle_val,
         relationship: None,
         can_message: None,
         harness: agent.harness,

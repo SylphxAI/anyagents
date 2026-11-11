@@ -21,6 +21,9 @@ pub struct AgentView {
     /// Internal communication and discovery scope (`"isolated"` | `"private"` | `"siblings"` | `"public"`).
     #[serde(default)]
     pub scope: String,
+    /// Lifecycle mode (`"standing"` | `"task"`): `"standing"` stays on idle standby between assignments; `"task"` (default for sub-agents) is a single-mission freelancer closed (`archive`) by its parent upon completion.
+    #[serde(default)]
+    pub lifecycle: String,
     /// Structural relationship of this agent to the authenticated caller (`"self"`, `"parent"`, `"sibling"`, `"child"`, `"descendant"`, `"ancestor"`, `"peer"`, `"other"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relationship: Option<String>,
@@ -157,6 +160,8 @@ pub struct CreateAgentRequest {
     pub parent: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<String>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
