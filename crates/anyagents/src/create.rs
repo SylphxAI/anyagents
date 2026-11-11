@@ -8810,11 +8810,22 @@ pub(crate) fn archetype_search_roots_with_ancestors(
             );
         }
     }
-    push_unique_search_root(
-        &mut search_roots,
-        data_dir.to_path_buf(),
-        PathBuf::from(".agents/agents"),
-    );
+    #[cfg(not(test))]
+    if search_roots.is_empty()
+        && let Some(owd) = crate::server::owner_workdir()
+    {
+        push_unique_search_root(&mut search_roots, owd, PathBuf::from(".agents/agents"));
+    }
+    let has_workspace_agents_dir = search_roots
+        .iter()
+        .any(|(base, rel)| base.join(rel).is_dir());
+    if !has_workspace_agents_dir {
+        push_unique_search_root(
+            &mut search_roots,
+            data_dir.to_path_buf(),
+            PathBuf::from(".agents/agents"),
+        );
+    }
     push_unique_search_root(
         &mut search_roots,
         data_dir.to_path_buf(),
@@ -8826,13 +8837,8 @@ pub(crate) fn archetype_search_roots_with_ancestors(
         PathBuf::from("archetypes"),
     );
     #[cfg(not(test))]
-    {
-        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-            push_unique_search_root(&mut search_roots, home, PathBuf::from(".agents/agents"));
-        }
-        if let Some(owd) = crate::server::owner_workdir() {
-            push_unique_search_root(&mut search_roots, owd, PathBuf::from(".agents/agents"));
-        }
+    if !has_workspace_agents_dir && let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        push_unique_search_root(&mut search_roots, home, PathBuf::from(".agents/agents"));
     }
     search_roots
 }
@@ -13841,6 +13847,11 @@ Connection: close
             "---\nscope: private\n---\nStale data_dir engineer instructions.",
         )
         .unwrap();
+        std::fs::write(
+            data_dir.join(".agents/agents/retired-director.md"),
+            "---\nscope: public\n---\nStale retired role in data_dir.",
+        )
+        .unwrap();
 
         let store = Store::open(data_dir.join("state.db")).unwrap();
         let mut l0_new = NewAgent::new("l0-root", "spiron");
@@ -13867,6 +13878,33 @@ Connection: close
             assert_eq!(req.scope.as_deref(), Some(expected_scope));
             assert_eq!(req.instructions.as_deref(), Some(expected_body));
         }
+
+        // A role deleted/retired in the authoritative workspace .agents/agents must NOT fall back
+        // to a stale residual file under data_dir/.agents/agents.
+        let mut retired_role_req: crate::api::CreateAgentRequest =
+            serde_json::from_value(serde_json::json!({
+                "name": "l2-retired-role",
+                "role": "retired-director",
+                "workdir": "private"
+            }))
+            .unwrap();
+        apply_archetype_defaults(Some(&store), &data_dir, Some(&l1), &mut retired_role_req)
+            .unwrap();
+        assert!(
+            retired_role_req.instructions.is_none(),
+            "stale data_dir/.agents/agents template must not pollute workspace .agents/agents"
+        );
+        let mut retired_arch_req: crate::api::CreateAgentRequest =
+            serde_json::from_value(serde_json::json!({
+                "name": "l2-retired-arch",
+                "archetype": "retired-director",
+                "workdir": "private"
+            }))
+            .unwrap();
+        assert!(
+            apply_archetype_defaults(Some(&store), &data_dir, Some(&l1), &mut retired_arch_req)
+                .is_err()
+        );
 
         let l1_work = anyagents_core::agent_work_dir(&data_dir, &l1.id);
         std::fs::create_dir_all(l1_work.join(".agents/agents")).unwrap();
