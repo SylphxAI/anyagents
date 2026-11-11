@@ -540,6 +540,12 @@ struct AgentsArgs {
     /// - `"role"` (Parent/Ancestor or Admin: set or clear an agent's short role label)
     /// - `"harness"` (declaratively update an agent's harness/model/profile)
     /// - `"models"` (list upstream provider profile model catalogs)
+    /// - `"usage"` (structured token/cost usage aggregation; `name` is the optional
+    ///   target agent or `"all"`, `include_descendants`/`subtree` selects the subtree,
+    ///   `since_ms`/`until_ms`/`days` bound the window, `group_by` is one of
+    ///   `agent`/`day`/`model`/`harness`. Callers with `scope == "public"`, roots and
+    ///   the local operator see the whole workspace; other callers see only self plus
+    ///   causal descendants, and an explicit out-of-scope target is refused.)
     #[serde(default)]
     action: Option<String>,
     /// Target body id when action = "redact"; `transcript:<zero-based-line>` addresses
@@ -647,6 +653,21 @@ struct AgentsArgs {
     /// Page size for list (default 100, clamped to 1..=100), or recent turns for inspect (default 10).
     #[serde(default)]
     limit: Option<usize>,
+    /// For `usage`: include causal descendants of the target (alias `subtree`).
+    #[serde(default, alias = "subtree")]
+    include_descendants: Option<bool>,
+    /// For `usage`: window start, inclusive (unix ms).
+    #[serde(default)]
+    since_ms: Option<i64>,
+    /// For `usage`: window end, inclusive (unix ms).
+    #[serde(default)]
+    until_ms: Option<i64>,
+    /// For `usage`: trailing window in days, intersected with `since_ms`/`until_ms`.
+    #[serde(default)]
+    days: Option<i64>,
+    /// For `usage`: grouping dimension (`agent`, `day`, `model`, `harness`).
+    #[serde(default)]
+    group_by: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -1490,6 +1511,42 @@ impl AgentMcp {
                 }
             });
         match action.as_str() {
+            "usage" => {
+                let mut qs = String::new();
+                let mut push = |k: &str, v: String| {
+                    if !qs.is_empty() {
+                        qs.push('&');
+                    }
+                    qs.push_str(k);
+                    qs.push('=');
+                    qs.push_str(&urlencoding_simple(&v));
+                };
+                if let Some(t) = args.name.as_deref().filter(|t| !t.trim().is_empty()) {
+                    push("agent", t.to_string());
+                }
+                if let Some(v) = args.include_descendants {
+                    push("include_descendants", v.to_string());
+                }
+                if let Some(v) = args.since_ms {
+                    push("since_ms", v.to_string());
+                }
+                if let Some(v) = args.until_ms {
+                    push("until_ms", v.to_string());
+                }
+                if let Some(v) = args.days {
+                    push("days", v.to_string());
+                }
+                if let Some(v) = args.group_by.as_deref().filter(|v| !v.trim().is_empty()) {
+                    push("group_by", v.to_string());
+                }
+                let path = if qs.is_empty() {
+                    "/v1/usage".to_string()
+                } else {
+                    format!("/v1/usage?{qs}")
+                };
+                let response = self.client.get(&path, None).await?;
+                Ok(rmcp::handler::server::wrapper::Json(response))
+            }
             "redact" => {
                 let target = args
                     .name
@@ -2912,6 +2969,9 @@ impl rmcp::ServerHandler for AgentMcp {
     }
 }
 
+pub(crate) fn urlencoding_simple_pub(s: &str) -> String {
+    urlencoding_simple(s)
+}
 fn urlencoding_simple(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for byte in s.bytes() {

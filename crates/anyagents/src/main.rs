@@ -377,13 +377,29 @@ enum Command {
     },
     /// Zero-Embedding Lexical + Structured search across historical and live conversations.
     Search(SearchArgs),
-    /// List recorded usage.
+    /// List recorded usage. Queried through the daemon socket when it is
+    /// running, with a read-only direct fallback otherwise.
     Usage {
         #[arg(long)]
         agent: Option<String>,
-        /// Group sums. Only `day` is supported.
+        /// Group sums (`agent`, `day`, `model`, `harness`). `day` is the
+        /// legacy spelling of `--group-by day`.
         #[arg(long)]
         by: Option<String>,
+        #[arg(long = "group-by")]
+        group_by: Option<String>,
+        /// Include causal descendants of `--agent`.
+        #[arg(long)]
+        include_descendants: bool,
+        /// Window start, inclusive (unix ms).
+        #[arg(long = "since-ms")]
+        since_ms: Option<i64>,
+        /// Window end, inclusive (unix ms).
+        #[arg(long = "until-ms")]
+        until_ms: Option<i64>,
+        /// Trailing window in days.
+        #[arg(long)]
+        days: Option<i64>,
     },
     /// Speak MCP for one agent. Its capability comes from its config
     /// directory, never from a name.
@@ -1345,11 +1361,29 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
                 options: args.options,
             },
         ),
-        Command::Usage { agent, by } => agent::usage(&data, agent.as_deref(), by.as_deref())
-            .map_err(|err| match err {
-                agent::UsageError::Store(err) => err,
-                agent::UsageError::Refused(text) => anyagents_core::Error::Message(text),
-            }),
+        Command::Usage {
+            agent,
+            by,
+            group_by,
+            include_descendants,
+            since_ms,
+            until_ms,
+            days,
+        } => agent::usage(
+            &data,
+            &agent::UsageParams {
+                agent,
+                group_by: group_by.or(by),
+                since_ms,
+                until_ms,
+                days,
+                include_descendants: include_descendants.then_some(true),
+            },
+        )
+        .map_err(|err| match err {
+            agent::UsageError::Store(err) => err,
+            agent::UsageError::Refused(text) => anyagents_core::Error::Message(text),
+        }),
         Command::Channels { action } => channel::channels(&data, action),
         Command::Groups { action } => groups(&data, action),
         Command::Describe {
