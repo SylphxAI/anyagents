@@ -7973,6 +7973,7 @@ mod spawn_args_tests {
     ) -> AgentView {
         AgentView {
             has_open_turn: false,
+            open_turn_age_ms: None,
             profile: None,
             id: id.to_string(),
             name: name.to_string(),

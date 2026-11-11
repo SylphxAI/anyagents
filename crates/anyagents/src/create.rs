@@ -2163,6 +2163,7 @@ pub(crate) fn reset_agent_session_locked(
     }
     let _process = store.try_lock_agent(&agent.id)?;
     let root = store.data_dir().join("agents").join(agent.id.as_str());
+    promote_retired_spiron_hold_to_recovery(store, agent, &root)?;
     let session = anyagents_core::host_session::reset_session_with_source(
         &root,
         &agent.harness,
@@ -2174,6 +2175,42 @@ pub(crate) fn reset_agent_session_locked(
         "generation": session.generation, "harness": session.harness,
         "memory_sha256": session.memory.sha256,
     }))
+}
+
+fn promote_retired_spiron_hold_to_recovery(
+    store: &Store,
+    agent: &Agent,
+    root: &Path,
+) -> Result<(), Error> {
+    let hold_path = root.join("config/spiron-unconfirmed-steers.json");
+    if let Ok(meta) = std::fs::symlink_metadata(&hold_path)
+        && meta.file_type().is_file()
+        && meta.len() > 0
+        && let Ok(bytes) = std::fs::read(&hold_path)
+        && let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes)
+    {
+        let mut ids: Vec<String> = val
+            .get("request_ids")
+            .and_then(serde_json::Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Some(turn_id) = val.get("turn_id").and_then(serde_json::Value::as_str)
+            && !turn_id.is_empty()
+            && !ids.iter().any(|id| id == turn_id)
+        {
+            ids.insert(0, turn_id.to_string());
+        }
+        if !ids.is_empty() {
+            store.promote_messages_to_open_turn(&agent.id, &ids)?;
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn harness_session_filename(harness: &str) -> Option<&'static str> {
@@ -3546,10 +3583,7 @@ pub(crate) fn extract_profile_account_identity(
             for rel in ["agent.db", ".omp/agent/agent.db"] {
                 let db_path = prof_dir.join(rel);
                 if db_path.is_file()
-                    && let Ok(conn) = rusqlite::Connection::open_with_flags(
-                        &db_path,
-                        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-                    )
+                    && let Some(conn) = crate::seat_tree::open_readonly_seat_sqlite(&db_path)
                     && let Ok(id_key) = conn.query_row(
                         "SELECT identity_key FROM auth_credentials WHERE provider = 'cursor' ORDER BY id DESC LIMIT 1",
                         [],
@@ -5827,17 +5861,25 @@ fn read_dsh_yaml_ref(base: &Path, key_name: &str) -> Option<String> {
     None
 }
 
-fn extract_agy_oauth_clients() -> Vec<(String, String)> {
+pub(crate) fn extract_agy_oauth_clients() -> Vec<(String, String)> {
     static AGY_CLIENTS: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
     AGY_CLIENTS
         .get_or_init(|| {
             let mut candidates = Vec::new();
             let cache_path = crate::sandbox::host_home_dir()
                 .map(|h| h.join(".cache/anyagents-agy-oauth-clients.json"));
+            if let Some(override_bin) = std::env::var_os("ANYAGENTS_AGY_BIN") {
+                candidates.push(PathBuf::from(override_bin));
+            }
             if let Some(home) = crate::sandbox::host_home_dir() {
                 candidates.push(home.join(".local/bin/agy"));
             }
             candidates.push(PathBuf::from("/usr/local/bin/agy"));
+            if let Some(path_var) = std::env::var_os("PATH") {
+                for entry in std::env::split_paths(&path_var) {
+                    candidates.push(entry.join("agy"));
+                }
+            }
             let Some(agy_bin) = candidates.into_iter().find(|p| p.is_file()) else {
                 return Vec::new();
             };
@@ -5908,8 +5950,7 @@ fn extract_cursor_oauth_from_db(prof_dir: &Path) -> Option<(String, String)> {
         .into_iter()
         .map(|r| prof_dir.join(r))
         .find(|p| p.is_file())?;
-    if let Ok(conn) =
-        rusqlite::Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+    if let Some(conn) = crate::seat_tree::open_readonly_seat_sqlite(&db_path)
         && let Ok(data_str) = conn.query_row(
             "SELECT data FROM auth_credentials WHERE provider = 'cursor' ORDER BY id DESC LIMIT 1",
             [],
@@ -8621,43 +8662,145 @@ pub(crate) fn parse_archetype_markdown(raw: &str) -> Result<ArchetypeTemplate, E
 /// 2. `<parent_workdir>/.agents/agents/<archetype>.md` (or `<archetype>/agent.md`)
 /// 3. `<data_dir>/.agents/agents/<archetype>.md` (then `<data_dir>/agents-templates/`, `<data_dir>/archetypes/`)
 /// 4. `<HOME>/.agents/agents/<archetype>.md` (and `owner_workdir()/.agents/agents/`)
-pub(crate) fn archetype_search_roots(
+fn is_archetype_workdir_keyword(path: &Path) -> bool {
+    matches!(
+        path.to_string_lossy().trim(),
+        "" | "worktree" | "branch" | "private" | "inherit"
+    )
+}
+
+fn push_unique_search_root(
+    search_roots: &mut Vec<(PathBuf, PathBuf)>,
+    base: PathBuf,
+    rel_root: PathBuf,
+) {
+    if !search_roots
+        .iter()
+        .any(|(b, r)| b == &base && r == &rel_root)
+    {
+        search_roots.push((base, rel_root));
+    }
+}
+
+pub(crate) fn ancestor_archetype_workdirs(
+    store: Option<&Store>,
+    data_dir: &Path,
+    parent: Option<&Agent>,
+) -> Result<Vec<PathBuf>, Error> {
+    const MAX_ANCESTOR_DEPTH: usize = 64;
+    let mut workdirs = Vec::new();
+    let Some(first) = parent else {
+        return Ok(workdirs);
+    };
+    let mut visited = std::collections::HashSet::new();
+    visited.insert(first.id.clone());
+    let push_agent_wd = |agent: &Agent, out: &mut Vec<PathBuf>| {
+        if let Some(wd) = agent.workdir.as_deref() {
+            let p = Path::new(wd);
+            if !is_archetype_workdir_keyword(p) {
+                out.push(p.to_path_buf());
+                return;
+            }
+        }
+        out.push(anyagents_core::agent_work_dir(data_dir, &agent.id));
+    };
+    push_agent_wd(first, &mut workdirs);
+    let mut next_parent_id = first.parent_id.clone();
+    while let Some(pid) = next_parent_id {
+        if visited.len() >= MAX_ANCESTOR_DEPTH || !visited.insert(pid.clone()) {
+            break;
+        }
+        let Some(st) = store else {
+            break;
+        };
+        match st.agent(&pid) {
+            Ok(anc) => {
+                push_agent_wd(&anc, &mut workdirs);
+                next_parent_id = anc.parent_id;
+            }
+            Err(Error::AgentNotFound(_)) => break,
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(workdirs)
+}
+
+pub(crate) fn archetype_search_roots_with_ancestors(
     explicit_workdir: Option<&Path>,
-    parent_workdir: Option<&Path>,
+    ancestor_workdirs: &[PathBuf],
     data_dir: &Path,
 ) -> Vec<(PathBuf, PathBuf)> {
     let mut search_roots: Vec<(PathBuf, PathBuf)> = Vec::new();
-    if let Some(wd) = explicit_workdir {
-        let s = wd.to_string_lossy();
-        if !matches!(s.trim(), "" | "worktree" | "branch" | "private" | "inherit") {
-            search_roots.push((wd.to_path_buf(), PathBuf::from(".agents/agents")));
+    if let Some(wd) = explicit_workdir
+        && !is_archetype_workdir_keyword(wd)
+    {
+        push_unique_search_root(
+            &mut search_roots,
+            wd.to_path_buf(),
+            PathBuf::from(".agents/agents"),
+        );
+    }
+    for pwd in ancestor_workdirs {
+        if !is_archetype_workdir_keyword(pwd) {
+            push_unique_search_root(
+                &mut search_roots,
+                pwd.clone(),
+                PathBuf::from(".agents/agents"),
+            );
         }
     }
-    if let Some(pwd) = parent_workdir {
-        let s = pwd.to_string_lossy();
-        if !matches!(s.trim(), "" | "worktree" | "branch" | "private" | "inherit") {
-            search_roots.push((pwd.to_path_buf(), PathBuf::from(".agents/agents")));
-        }
-    }
-    search_roots.push((data_dir.to_path_buf(), PathBuf::from(".agents/agents")));
-    search_roots.push((data_dir.to_path_buf(), PathBuf::from("agents-templates")));
-    search_roots.push((data_dir.to_path_buf(), PathBuf::from("archetypes")));
+    push_unique_search_root(
+        &mut search_roots,
+        data_dir.to_path_buf(),
+        PathBuf::from(".agents/agents"),
+    );
+    push_unique_search_root(
+        &mut search_roots,
+        data_dir.to_path_buf(),
+        PathBuf::from("agents-templates"),
+    );
+    push_unique_search_root(
+        &mut search_roots,
+        data_dir.to_path_buf(),
+        PathBuf::from("archetypes"),
+    );
     #[cfg(not(test))]
     {
         if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-            search_roots.push((home, PathBuf::from(".agents/agents")));
+            push_unique_search_root(&mut search_roots, home, PathBuf::from(".agents/agents"));
         }
         if let Some(owd) = crate::server::owner_workdir() {
-            search_roots.push((owd, PathBuf::from(".agents/agents")));
+            push_unique_search_root(&mut search_roots, owd, PathBuf::from(".agents/agents"));
         }
     }
     search_roots
 }
 
+#[cfg(test)]
+pub(crate) fn archetype_search_roots(
+    explicit_workdir: Option<&Path>,
+    parent_workdir: Option<&Path>,
+    data_dir: &Path,
+) -> Vec<(PathBuf, PathBuf)> {
+    let ancestors: Vec<PathBuf> = parent_workdir.map(Path::to_path_buf).into_iter().collect();
+    archetype_search_roots_with_ancestors(explicit_workdir, &ancestors, data_dir)
+}
+
+#[cfg(test)]
 pub(crate) fn resolve_archetype_template(
     archetype: &str,
     explicit_workdir: Option<&Path>,
     parent_workdir: Option<&Path>,
+    data_dir: &Path,
+) -> Result<Option<ArchetypeTemplate>, Error> {
+    let ancestors: Vec<PathBuf> = parent_workdir.map(Path::to_path_buf).into_iter().collect();
+    resolve_archetype_template_with_ancestors(archetype, explicit_workdir, &ancestors, data_dir)
+}
+
+pub(crate) fn resolve_archetype_template_with_ancestors(
+    archetype: &str,
+    explicit_workdir: Option<&Path>,
+    ancestor_workdirs: &[PathBuf],
     data_dir: &Path,
 ) -> Result<Option<ArchetypeTemplate>, Error> {
     let slug = archetype.trim();
@@ -8667,7 +8810,8 @@ pub(crate) fn resolve_archetype_template(
         )));
     }
 
-    let search_roots = archetype_search_roots(explicit_workdir, parent_workdir, data_dir);
+    let search_roots =
+        archetype_search_roots_with_ancestors(explicit_workdir, ancestor_workdirs, data_dir);
     let candidates = [
         format!("{slug}.md"),
         format!("{}/agent.md", slug),
@@ -8872,6 +9016,7 @@ fn open_archetype_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
 /// matches a template slug (e.g. `role: "code-reviewer"` when `.agents/agents/code-reviewer.md`
 /// exists) while keeping `role` methodology-neutral when no template matches.
 pub(crate) fn apply_archetype_defaults(
+    store: Option<&Store>,
     data_dir: &Path,
     parent: Option<&Agent>,
     body: &mut crate::api::CreateAgentRequest,
@@ -8882,14 +9027,19 @@ pub(crate) fn apply_archetype_defaults(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(PathBuf::from);
-    let parent_wd = parent.and_then(|p| p.workdir.as_deref()).map(Path::new);
+    let ancestor_wds = ancestor_archetype_workdirs(store, data_dir, parent)?;
     let tpl = if let Some(arch) = body
         .archetype
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        match resolve_archetype_template(arch, explicit_wd.as_deref(), parent_wd, data_dir)? {
+        match resolve_archetype_template_with_ancestors(
+            arch,
+            explicit_wd.as_deref(),
+            &ancestor_wds,
+            data_dir,
+        )? {
             Some(template) => Some(template),
             None => {
                 return Err(Error::Message(format!(
@@ -8905,21 +9055,36 @@ pub(crate) fn apply_archetype_defaults(
     {
         let slugified = role.to_ascii_lowercase().replace(' ', "-");
         let direct = if valid_template_stem(role) {
-            resolve_archetype_template(role, explicit_wd.as_deref(), parent_wd, data_dir)?
+            resolve_archetype_template_with_ancestors(
+                role,
+                explicit_wd.as_deref(),
+                &ancestor_wds,
+                data_dir,
+            )?
         } else {
             None
         };
         let resolved = if direct.is_some() {
             direct
         } else if valid_template_stem(&slugified) {
-            resolve_archetype_template(&slugified, explicit_wd.as_deref(), parent_wd, data_dir)?
+            resolve_archetype_template_with_ancestors(
+                &slugified,
+                explicit_wd.as_deref(),
+                &ancestor_wds,
+                data_dir,
+            )?
         } else {
             None
         };
         if resolved.is_some() {
             resolved
         } else if let Some(fallback_slug) = fallback_archetype_slug_from_role(role) {
-            resolve_archetype_template(fallback_slug, explicit_wd.as_deref(), parent_wd, data_dir)?
+            resolve_archetype_template_with_ancestors(
+                fallback_slug,
+                explicit_wd.as_deref(),
+                &ancestor_wds,
+                data_dir,
+            )?
         } else {
             // A display label is not required to be a template stem.
             None
@@ -12078,7 +12243,7 @@ mod archetype_tests {
                     "instructions": "Custom assignment instructions."
                 }))
                 .unwrap();
-            apply_archetype_defaults(dir.path(), None, &mut req).unwrap();
+            apply_archetype_defaults(None, dir.path(), None, &mut req).unwrap();
             assert_eq!(req.role.as_deref(), Some(role_label));
             assert_eq!(req.scope.as_deref(), Some(expected_scope));
             assert_eq!(
@@ -13542,6 +13707,199 @@ Connection: close
             !dir.path()
                 .join("profiles/google-antigravity/default")
                 .exists()
+        );
+    }
+
+    #[test]
+    fn archetype_defaults_walk_parent_id_ancestors_with_cycle_guard_and_nofollow() {
+        let dir = crate::test_tempdir();
+        let data_dir = dir.path().join("data");
+        let root_repo = dir.path().join("root-repo");
+        std::fs::create_dir_all(root_repo.join(".agents/agents")).unwrap();
+        std::fs::create_dir_all(data_dir.join(".agents/agents")).unwrap();
+
+        std::fs::write(
+            root_repo.join(".agents/agents/orchestrator.md"),
+            "---\nscope: private\n---\nRoot orchestrator instructions.",
+        )
+        .unwrap();
+        std::fs::write(
+            root_repo.join(".agents/agents/writer.md"),
+            "---\nscope: isolated\n---\nRoot writer instructions.",
+        )
+        .unwrap();
+        std::fs::write(
+            root_repo.join(".agents/agents/engineer.md"),
+            "---\nscope: private\n---\nFresh root engineer instructions.",
+        )
+        .unwrap();
+        std::fs::write(
+            data_dir.join(".agents/agents/engineer.md"),
+            "---\nscope: private\n---\nStale data_dir engineer instructions.",
+        )
+        .unwrap();
+
+        let store = Store::open(&data_dir).unwrap();
+        let mut l0_new = NewAgent::new("l0-root", "spiron");
+        l0_new.workdir = Some(root_repo.display().to_string());
+        let l0 = store.create_agent(l0_new).unwrap();
+
+        let mut l1_new = NewAgent::new("l1-mid", "spiron");
+        l1_new.parent_id = Some(l0.id.clone());
+        let l1 = store.create_agent(l1_new).unwrap();
+
+        for (role_name, expected_scope, expected_body) in [
+            ("orchestrator", "private", "Root orchestrator instructions."),
+            ("writer", "isolated", "Root writer instructions."),
+            ("engineer", "private", "Fresh root engineer instructions."),
+        ] {
+            let mut req: crate::api::CreateAgentRequest =
+                serde_json::from_value(serde_json::json!({
+                    "name": format!("l2-{role_name}"),
+                    "role": role_name,
+                    "workdir": "private"
+                }))
+                .unwrap();
+            apply_archetype_defaults(Some(&store), &data_dir, Some(&l1), &mut req).unwrap();
+            assert_eq!(req.scope.as_deref(), Some(expected_scope));
+            assert_eq!(req.instructions.as_deref(), Some(expected_body));
+        }
+
+        let l1_work = anyagents_core::agent_work_dir(&data_dir, &l1.id);
+        std::fs::create_dir_all(l1_work.join(".agents/agents")).unwrap();
+        std::fs::write(
+            l1_work.join(".agents/agents/writer.md"),
+            "---\nscope: private\n---\nL1 local writer override.",
+        )
+        .unwrap();
+        let mut override_req: crate::api::CreateAgentRequest =
+            serde_json::from_value(serde_json::json!({
+                "name": "l2-writer-override",
+                "role": "writer",
+                "workdir": "private"
+            }))
+            .unwrap();
+        apply_archetype_defaults(Some(&store), &data_dir, Some(&l1), &mut override_req).unwrap();
+        assert_eq!(
+            override_req.instructions.as_deref(),
+            Some("L1 local writer override.")
+        );
+
+        {
+            let conn = rusqlite::Connection::open(data_dir.join("anyagents.db")).unwrap();
+            conn.execute(
+                "UPDATE agents SET parent_id = ?1 WHERE id = ?2",
+                rusqlite::params![l1.id.as_str(), l0.id.as_str()],
+            )
+            .unwrap();
+        }
+        let wds = ancestor_archetype_workdirs(Some(&store), &data_dir, Some(&l1)).unwrap();
+        assert_eq!(wds.len(), 2);
+
+        #[cfg(unix)]
+        {
+            let outside = dir.path().join("outside-secret.md");
+            std::fs::write(&outside, "secret").unwrap();
+            std::os::unix::fs::symlink(&outside, root_repo.join(".agents/agents/escape.md"))
+                .unwrap();
+            let mut escape_req: crate::api::CreateAgentRequest =
+                serde_json::from_value(serde_json::json!({
+                    "name": "l2-escape",
+                    "archetype": "escape",
+                    "workdir": "private"
+                }))
+                .unwrap();
+            let err = apply_archetype_defaults(Some(&store), &data_dir, Some(&l1), &mut escape_req)
+                .unwrap_err();
+            assert!(err.to_string().contains("symlink"));
+        }
+    }
+
+    #[test]
+    fn reset_agent_session_clears_zero_byte_and_archives_nonempty_spiron_steer_hold() {
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let mut agent = store
+            .create_agent(NewAgent::new("spiron-node", "spiron"))
+            .unwrap();
+        agent = store.set_agent_state(&agent.id, "paused").unwrap();
+        let root = dir.path().join("agents").join(agent.id.as_str());
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        anyagents_core::host_session::new_session(&root, "spiron").unwrap();
+
+        let hold_path = config_dir.join("spiron-unconfirmed-steers.json");
+        let err_path = config_dir.join(".anyagents-last-error.json");
+        std::fs::write(&hold_path, b"").unwrap();
+        std::fs::write(
+            &err_path,
+            r#"{"error":"Spiron reported unconfirmed steering input; Reconcile spiron-unconfirmed-steers.json","timestamp_ms":100}"#,
+        )
+        .unwrap();
+
+        let out1 = reset_agent_session_locked(&store, &agent).unwrap();
+        let gen1 = out1["generation"].as_str().unwrap().to_string();
+        assert!(!gen1.is_empty());
+        assert!(!hold_path.exists(), "0-byte hold file must be removed");
+        assert!(
+            !err_path.exists(),
+            "stale unconfirmed-steers error must be cleared"
+        );
+
+        let anyagents_core::ReceiveOutcome::New(m1) = store
+            .receive(&agent.id, anyagents_core::Incoming::new("turn 1"))
+            .unwrap()
+        else {
+            panic!("expected m1");
+        };
+        store.note_delivered(&agent.id, m1.seq).unwrap();
+        let anyagents_core::ReceiveOutcome::New(m2) = store
+            .receive(&agent.id, anyagents_core::Incoming::new("steered"))
+            .unwrap()
+        else {
+            panic!("expected m2");
+        };
+        store.note_delivered(&agent.id, m2.seq).unwrap();
+        std::fs::write(
+            &hold_path,
+            serde_json::json!({
+                "turn_id": m1.id,
+                "request_ids": [m1.id, m2.id]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let out2 = reset_agent_session_locked(&store, &agent).unwrap();
+        let gen2 = out2["generation"].as_str().unwrap().to_string();
+        assert_ne!(gen1, gen2);
+        assert!(
+            !hold_path.exists(),
+            "non-empty hold must move out of config/"
+        );
+        assert!(
+            root.join("sessions")
+                .join(format!("retired-{gen2}"))
+                .join("spiron-unconfirmed-steers.json")
+                .is_file(),
+            "forensic hold copy must be archived under sessions/"
+        );
+        assert_eq!(store.delivered_cursor(&agent.id).unwrap(), m2.seq);
+        assert!(
+            store.next_undelivered(&agent.id).unwrap().is_none(),
+            "reset-session must keep unconfirmed messages in turn_recovery rather than raw replay"
+        );
+        let open = store
+            .open_turn(&agent.id)
+            .unwrap()
+            .expect("open turn retained for [Recovery]");
+        assert_eq!(open.messages.len(), 2);
+        assert_eq!(open.messages[0].id, m1.id);
+        assert_eq!(open.messages[1].id, m2.id);
+        assert!(
+            config_dir
+                .join(".anyagents-session-reset-recovery")
+                .is_file()
         );
     }
 }

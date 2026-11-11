@@ -105,6 +105,9 @@ impl AgyHarness {
             },
             agy_rpc,
         )?;
+        if let Some(id) = session_id {
+            inner.seed_session_id(id);
+        }
         Ok(Self { inner, spec })
     }
 
@@ -165,6 +168,10 @@ impl Harness for AgyHarness {
 
     fn clear_quota(&mut self) {
         self.inner.clear_quota();
+    }
+
+    fn take_reclaimed_steers(&mut self) -> Vec<String> {
+        self.inner.take_reclaimed_steers()
     }
 
     fn process_id(&self) -> Option<u32> {

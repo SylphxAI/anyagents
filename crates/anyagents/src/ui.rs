@@ -522,9 +522,10 @@ fn compute_subtree_stats<'a>(
                 .block_reason
                 .as_deref()
                 .is_some_and(|r| !r.trim().is_empty());
-            let has_lag = kid
-                .oldest_undelivered_age_ms
-                .is_some_and(|ms| ms >= 120_000);
+            let has_lag = !is_expected_turn_queue(kid, on_quota)
+                && kid
+                    .oldest_undelivered_age_ms
+                    .is_some_and(|ms| ms >= 120_000);
             if kid.state != "archived"
                 && kid.state != "paused"
                 && (on_quota || is_blocked || has_lag)
@@ -589,6 +590,26 @@ pub fn short_model_name(raw: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Borrowed(s)
 }
 
+fn is_healthy_active_turn(agent: &AgentView, on_quota: bool) -> bool {
+    agent.state == "running"
+        && agent.process == "alive"
+        && agent.turn_state == "working"
+        && !on_quota
+        && agent
+            .block_reason
+            .as_deref()
+            .is_none_or(|r| r.trim().is_empty())
+        && agent
+            .last_error
+            .as_deref()
+            .is_none_or(|e| e.trim().is_empty())
+}
+
+fn is_expected_turn_queue(agent: &AgentView, on_quota: bool) -> bool {
+    is_healthy_active_turn(agent, on_quota)
+        && (agent.delivery_mode == "followup" || agent.pending_switch)
+}
+
 fn format_status_with_alerts(agent: &AgentView, now: i64) -> String {
     let on_quota = agent
         .quota_reset_at_ms
@@ -599,17 +620,34 @@ fn format_status_with_alerts(agent: &AgentView, now: i64) -> String {
     {
         return yellow(&format!("○ quota ({})", format_duration_ms(reset_ms - now)));
     }
-    let base = format_agent_status(
+    let mut base = format_agent_status(
         &agent.state,
         &agent.process,
         &agent.turn_state,
         agent.quota_reset_at_ms,
         agent.block_reason.as_deref(),
     );
+    if is_healthy_active_turn(agent, on_quota)
+        && let Some(turn_ms) = agent.open_turn_age_ms.filter(|&ms| ms >= 5_000)
+    {
+        base = format!(
+            "{base} {}",
+            dim(&format!("({})", format_duration_ms(turn_ms)))
+        );
+    }
     if agent.state != "archived"
         && agent.state != "paused"
         && let Some(ms) = agent.oldest_undelivered_age_ms
     {
+        if is_expected_turn_queue(agent, on_quota) {
+            if ms >= 5_000 {
+                return format!(
+                    "{base} {}",
+                    dim(&format!("queued {}", format_duration_ms(ms)))
+                );
+            }
+            return base;
+        }
         if ms >= 120_000 {
             return format!(
                 "{base} {}",
@@ -1622,5 +1660,63 @@ mod tests {
             ),
             "preserve all documents during import"
         );
+    }
+
+    #[test]
+    fn status_formatting_separates_active_turn_duration_from_true_lag() {
+        let sample_agent = |turn_state: &str,
+                            delivery_mode: &str,
+                            open_turn_age_ms: Option<i64>,
+                            oldest_undelivered_age_ms: Option<i64>|
+         -> AgentView {
+            serde_json::from_value(serde_json::json!({
+                "has_open_turn": open_turn_age_ms.is_some(),
+                "open_turn_age_ms": open_turn_age_ms,
+                "id": "agt_sample",
+                "name": "worker-1",
+                "parent": "agt_root",
+                "scope": "private",
+                "harness": "spiron",
+                "workdir": null,
+                "state": "running",
+                "process": "alive",
+                "turn_state": turn_state,
+                "delivery_mode": delivery_mode,
+                "steer_support": if delivery_mode == "steer" { "yes" } else { "no" },
+                "quota_reset_at_ms": null,
+                "oldest_undelivered_age_ms": oldest_undelivered_age_ms,
+                "install": "installed",
+                "description": null,
+                "instructions": null,
+                "schedules": []
+            }))
+            .unwrap()
+        };
+
+        // 1. Healthy steered long turn: shows active turn duration, zero ! lag.
+        let steered = sample_agent("working", "steer", Some(56 * 60_000), None);
+        let rendered_steered = format_status_with_alerts(&steered, 10_000_000);
+        assert!(rendered_steered.contains("working"));
+        assert!(rendered_steered.contains("(56m)"));
+        assert!(!rendered_steered.contains("! lag"));
+
+        // 2. Healthy followup turn with queued mail: shows dim queued age, zero ! lag.
+        let followup = sample_agent("working", "followup", Some(20 * 60_000), Some(180_000));
+        let rendered_followup = format_status_with_alerts(&followup, 10_000_000);
+        assert!(rendered_followup.contains("(20m)"));
+        assert!(rendered_followup.contains("queued 3m"));
+        assert!(!rendered_followup.contains("! lag"));
+
+        // 3. Genuine undelivered backlog: renders ! lag and increments subtree lagging count.
+        let stalled = sample_agent("idle", "steer", None, Some(180_000));
+        let rendered_stalled = format_status_with_alerts(&stalled, 10_000_000);
+        assert!(rendered_stalled.contains("! lag 3m"));
+
+        let mut children: HashMap<&str, Vec<&AgentView>> = HashMap::new();
+        children.insert("agt_root", vec![&steered, &followup, &stalled]);
+        let mut memo = HashMap::new();
+        let stats = compute_subtree_stats("agt_root", &children, 10_000_000, &mut memo);
+        assert_eq!(stats.working, 2);
+        assert_eq!(stats.lagging, 1);
     }
 }

@@ -1210,3 +1210,132 @@ fn synthetic_401_claude_turn_fails_and_stops_stream_without_completing_turn() {
             .contains("OAuth access token has expired")
     );
 }
+
+#[test]
+fn agy_rpc_discovers_running_turn_one_trajectory_and_accepts_steer_before_stdout_init() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let steered = Arc::new(Mutex::new(Vec::<String>::new()));
+    let steered_srv = Arc::clone(&steered);
+    let server = std::thread::spawn(move || {
+        for _ in 0..4 {
+            let Ok((mut stream, _)) = listener.accept() else {
+                break;
+            };
+            let mut buf = vec![0u8; 8192];
+            let mut total = 0usize;
+            loop {
+                let n = stream.read(&mut buf[total..]).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                total += n;
+                if let Some(hdr_end) = buf[..total].windows(4).position(|w| w == b"\r\n\r\n") {
+                    let hdr = String::from_utf8_lossy(&buf[..hdr_end]);
+                    let content_len = hdr
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if total >= hdr_end + 4 + content_len {
+                        let body_str =
+                            String::from_utf8_lossy(&buf[hdr_end + 4..hdr_end + 4 + content_len])
+                                .to_string();
+                        let resp_json = if hdr.contains("GetAllCascadeTrajectories") {
+                            serde_json::json!({
+                                "trajectorySummaries": {
+                                    "conv-turn-1": { "status": "CASCADE_RUN_STATUS_RUNNING" }
+                                }
+                            })
+                        } else if hdr.contains("SendUserCascadeMessage") {
+                            steered_srv.lock().unwrap().push(body_str);
+                            serde_json::json!({})
+                        } else {
+                            serde_json::json!({})
+                        };
+                        let resp_bytes = resp_json.to_string();
+                        let reply = format!(
+                            "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                            resp_bytes.len(),
+                            resp_bytes
+                        );
+                        let _ = stream.write_all(reply.as_bytes());
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let spec = super::StreamSpec::for_program("agy");
+    let mut harness = super::StreamHarness::launch_with_agy_rpc(
+        super::Launch {
+            spec: spec.clone(),
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), "read line; exec sleep 30".into()],
+            environment: vec![],
+            work_dir: Some(dir.path().to_path_buf()),
+            session_id: None,
+            mode: anyagents_harness::DeliveryMode::Steer,
+            steer: anyagents_harness::SteerSupport::Yes,
+        },
+        Some(super::AgyRpcConfig {
+            config_dir: dir.path().to_path_buf(),
+            csrf_token: "csrf-test".into(),
+            port_override: Some(port),
+        }),
+    )
+    .unwrap();
+
+    let first = anyagents_harness::OutboundMessage {
+        id: "m1".into(),
+        seq: 1,
+        text: "first long turn".into(),
+        sender: None,
+        reply_to: None,
+        source_time_ms: None,
+        context: anyagents_harness::Context::default(),
+    };
+    assert_eq!(
+        harness
+            .deliver(&first, &super::message_line(&spec, &first))
+            .unwrap(),
+        anyagents_harness::DeliverOutcome::Accepted {
+            turn_finished: false
+        }
+    );
+    assert!(harness.input_ready());
+
+    let second = anyagents_harness::OutboundMessage {
+        id: "m2".into(),
+        seq: 2,
+        text: "mid-turn steer before stdout init".into(),
+        sender: None,
+        reply_to: None,
+        source_time_ms: None,
+        context: anyagents_harness::Context::default(),
+    };
+    assert_eq!(
+        harness
+            .deliver(&second, &super::message_line(&spec, &second))
+            .unwrap(),
+        anyagents_harness::DeliverOutcome::Accepted {
+            turn_finished: false
+        }
+    );
+    assert_eq!(harness.session_id().as_deref(), Some("conv-turn-1"));
+    let recorded = steered.lock().unwrap().clone();
+    assert_eq!(recorded.len(), 1);
+    assert!(recorded[0].contains("conv-turn-1"));
+    assert!(recorded[0].contains("mid-turn steer before stdout init"));
+    drop(harness);
+    let _ = server.join();
+}

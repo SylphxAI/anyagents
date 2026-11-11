@@ -4091,6 +4091,116 @@ impl Store {
         Ok(())
     }
 
+    /// Ensure message IDs from a reconciled external input hold are recorded in
+    /// `turn_recovery` as an open interrupted turn (and past `delivered_seq`)
+    /// so recovery resumes them with `[Recovery]` rather than raw replay.
+    pub fn promote_messages_to_open_turn(
+        &self,
+        agent_id: &AgentId,
+        message_ids: &[String],
+    ) -> Result<(), Error> {
+        if message_ids.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        agent_by_id(&tx, agent_id)?;
+        let mut seqs = Vec::new();
+        for msg_id in message_ids {
+            if let Some(seq) = tx
+                .query_row(
+                    "SELECT seq FROM messages WHERE agent_id = ?1 AND id = ?2",
+                    params![agent_id.as_str(), msg_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?
+            {
+                seqs.push(seq);
+            }
+        }
+        let (Some(&min_seq), Some(&max_seq)) = (seqs.iter().min(), seqs.iter().max()) else {
+            return Ok(());
+        };
+        let cur = cursor(&tx, agent_id)?;
+        let now = now_ms();
+        if max_seq > cur {
+            tx.execute(
+                "INSERT INTO mailbox_cursors (agent_id, delivered_seq) VALUES (?1, ?2)
+                 ON CONFLICT(agent_id) DO UPDATE SET delivered_seq = MAX(delivered_seq, ?2)",
+                params![agent_id.as_str(), max_seq],
+            )?;
+            tx.execute(
+                "UPDATE messages
+                 SET delivered_at_ms = COALESCE(delivered_at_ms, ?1)
+                 WHERE agent_id = ?2 AND seq > ?3 AND seq <= ?4",
+                params![now, agent_id.as_str(), cur, max_seq],
+            )?;
+        }
+        let completed_floor = (min_seq - 1).max(0);
+        tx.execute(
+            "INSERT INTO turn_recovery (agent_id, opened_seq, completed_seq, recovery_count, opened_at_ms)
+             VALUES (?1, ?2, ?3, 0, ?4)
+             ON CONFLICT(agent_id) DO UPDATE SET
+                 opened_seq = MAX(turn_recovery.opened_seq, ?2),
+                 completed_seq = MIN(turn_recovery.completed_seq, ?3)",
+            params![agent_id.as_str(), max_seq, completed_floor, now],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Rewind mailbox delivery custody for mid-turn steered messages whose
+    /// execution became unconfirmed (e.g. cancelled before terminal commit).
+    pub fn reclaim_unconfirmed_steers(
+        &self,
+        agent_id: &AgentId,
+        message_ids: &[String],
+    ) -> Result<(), Error> {
+        if message_ids.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        agent_by_id(&tx, agent_id)?;
+        let mut min_seq: Option<i64> = None;
+        for msg_id in message_ids {
+            if let Some(seq) = tx
+                .query_row(
+                    "SELECT seq FROM messages
+                     WHERE agent_id = ?1 AND id = ?2 AND delivered_at_ms IS NOT NULL",
+                    params![agent_id.as_str(), msg_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?
+            {
+                min_seq = Some(min_seq.map_or(seq, |cur| cur.min(seq)));
+            }
+        }
+        if let Some(first_reclaimed_seq) = min_seq {
+            let rewind_to = (first_reclaimed_seq - 1).max(0);
+            tx.execute(
+                "UPDATE mailbox_cursors
+                 SET delivered_seq = MIN(delivered_seq, ?1)
+                 WHERE agent_id = ?2",
+                params![rewind_to, agent_id.as_str()],
+            )?;
+            tx.execute(
+                "UPDATE messages
+                 SET delivered_at_ms = NULL
+                 WHERE agent_id = ?1 AND seq >= ?2",
+                params![agent_id.as_str(), first_reclaimed_seq],
+            )?;
+            tx.execute(
+                "UPDATE turn_recovery
+                 SET opened_seq = MIN(opened_seq, ?1)
+                 WHERE agent_id = ?2",
+                params![rewind_to, agent_id.as_str()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Set the internal communication and discovery scope (`"isolated"`, `"private"`, `"siblings"`, or `"public"`).
     pub fn set_agent_scope(&self, agent_id: &AgentId, scope: &str) -> Result<Agent, Error> {
         self.set_agent_scope_as(agent_id, scope, "system")
@@ -9811,5 +9921,56 @@ mod tests {
         let sleep_after = crate::learned_memory::read_sleep_state(&root);
         assert_eq!(sleep_after.last_inbound_seq, 1);
         assert_eq!(sleep_after.consolidated_topics, 1);
+    }
+
+    #[test]
+    fn steered_active_turn_advances_cursor_without_lag_and_reclaim_rewinds_custody() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let agent = store.create_agent(NewAgent::new("steered", "agy")).unwrap();
+
+        let mut first_in = Incoming::new("long running turn");
+        first_in.received_at_ms = Some(1_000);
+        let ReceiveOutcome::New(first) = store.receive(&agent.id, first_in).unwrap() else {
+            panic!("expected new message");
+        };
+        store.note_delivered(&agent.id, first.seq).unwrap();
+
+        let mut steer_in = Incoming::new("mid-turn steer");
+        steer_in.received_at_ms = Some(60_000);
+        let ReceiveOutcome::New(steer) = store.receive(&agent.id, steer_in).unwrap() else {
+            panic!("expected new steer");
+        };
+        store.note_delivered(&agent.id, steer.seq).unwrap();
+
+        assert_eq!(store.delivered_cursor(&agent.id).unwrap(), steer.seq);
+        assert!(store.has_open_turn(&agent.id).unwrap());
+        assert_eq!(
+            store
+                .lag(&agent.id, 3_600_000)
+                .unwrap()
+                .oldest_undelivered_age_ms,
+            None
+        );
+        let open = store.open_turn(&agent.id).unwrap().unwrap();
+        assert_eq!(open.messages.first().unwrap().received_at_ms, 1_000);
+
+        store
+            .reclaim_unconfirmed_steers(&agent.id, &[steer.id.to_string()])
+            .unwrap();
+        assert_eq!(store.delivered_cursor(&agent.id).unwrap(), first.seq);
+        assert!(store.has_open_turn(&agent.id).unwrap());
+        assert_eq!(
+            store.next_undelivered(&agent.id).unwrap().unwrap().id,
+            steer.id
+        );
+        assert!(
+            store
+                .message(&agent.id, steer.id.as_str())
+                .unwrap()
+                .unwrap()
+                .delivered_at_ms
+                .is_none()
+        );
     }
 }
