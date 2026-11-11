@@ -46,13 +46,13 @@ jobs:
       fail-fast: false
       max-parallel: 1
       matrix: ${{ fromJSON(needs.admit.outputs.matrix) }}
-    uses: SylphxAI/mcp-kit/.github/workflows/release.yml@ee5c6ba4d058b50e960c461a0708d74c5d00bf69
+    uses: SylphxAI/mcp-kit/.github/workflows/release.yml@119b4126b2a0fe96371c2a087e7697fec8713eb8
     permissions:
       contents: write
       id-token: write
       packages: write
     with:
-      kit-ref: ee5c6ba4d058b50e960c461a0708d74c5d00bf69
+      kit-ref: 119b4126b2a0fe96371c2a087e7697fec8713eb8
       source-sha: ${{ matrix.source }}
       name: anyagents
       npm-package: '@sylphx/anyagents'
