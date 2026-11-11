@@ -1,6 +1,6 @@
 {
   "name": "@sylphx/anyagents",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "Run any coding agent harness as a long-lived agent on your own machine or server: install and sign in Claude Code, Codex, OpenCode, Gemini CLI and more, keep every agent running, connect each one to Telegram, and see what each one costs. A single Rust binary that runs on your machine.",
   "bin": {
     "anyagents": "bin/anyagents.js"
@@ -14,10 +14,10 @@
     "node": ">=18"
   },
   "optionalDependencies": {
-    "@sylphx/anyagents-darwin-arm64": "0.1.6",
-    "@sylphx/anyagents-darwin-x64": "0.1.6",
-    "@sylphx/anyagents-linux-x64-gnu": "0.1.6",
-    "@sylphx/anyagents-linux-arm64-gnu": "0.1.6"
+    "@sylphx/anyagents-darwin-arm64": "0.1.7",
+    "@sylphx/anyagents-darwin-x64": "0.1.7",
+    "@sylphx/anyagents-linux-x64-gnu": "0.1.7",
+    "@sylphx/anyagents-linux-arm64-gnu": "0.1.7"
   },
   "keywords": [
     "anyagents",

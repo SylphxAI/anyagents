@@ -1,6 +1,6 @@
 {
   "name": "@sylphx/anyagents-darwin-x64",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "anyagents native binary for darwin-x64. Installed as an optional dependency of @sylphx/anyagents.",
   "os": [
     "darwin"
