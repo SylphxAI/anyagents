@@ -4772,8 +4772,17 @@ fn schedule_from_row(row: &rusqlite::Row<'_>) -> Result<AgentSchedule, rusqlite:
     })
 }
 
-/// `{data}/agents/{id}/work`.
+/// `{workspaces}/{id}` when `ANYAGENTS_WORKSPACES_DIR` is configured,
+/// otherwise `{data}/agents/{id}/work`.
 pub fn agent_work_dir(data_dir: &Path, id: &AgentId) -> PathBuf {
+    if let Some(workspaces) = crate::storage::configured_workspaces_dir() {
+        return workspaces.join(id.as_str());
+    }
+    legacy_agent_work_dir(data_dir, id)
+}
+
+/// Single-root `{data}/agents/{id}/work` path.
+pub fn legacy_agent_work_dir(data_dir: &Path, id: &AgentId) -> PathBuf {
     data_dir.join("agents").join(id.as_str()).join("work")
 }
 

@@ -425,9 +425,12 @@ impl OpenCodeHarness {
                 HarnessError::Failed("OpenCode did not supply a session id".into())
             })?;
         if let Some(dir) = &self.config_dir {
-            std::fs::write(dir.join("opencode-session-id"), format!("{session}\n")).map_err(
-                |err| HarnessError::Failed(format!("persist OpenCode session id: {err}")),
-            )?;
+            anyagents_harness::atomic_write_nonempty_file(
+                &dir.join("opencode-session-id"),
+                format!("{session}\n").as_bytes(),
+                0o664,
+            )
+            .map_err(|err| HarnessError::Failed(format!("persist OpenCode session id: {err}")))?;
         }
         Ok(())
     }
@@ -480,8 +483,17 @@ impl OpenCodeHarness {
             "previous_harness": Value::Null,
             "summary": trimmed,
         });
-        if let Ok(bytes) = serde_json::to_vec_pretty(&bridge) {
-            let _ = std::fs::write(dir.join(".anyagents-session-bridge.json"), bytes);
+        if let Ok(bytes) = serde_json::to_vec_pretty(&bridge)
+            && let Err(err) = anyagents_harness::atomic_write_nonempty_file(
+                &dir.join(".anyagents-session-bridge.json"),
+                &bytes,
+                0o664,
+            )
+        {
+            eprintln!(
+                "cannot persist {}: {err}",
+                dir.join(".anyagents-session-bridge.json").display()
+            );
         }
         const MAX_DOC_BYTES: usize = 23_200;
         for rel in [
@@ -515,7 +527,11 @@ impl OpenCodeHarness {
                     doc.push_str(&trimmed[..cut]);
                 }
                 doc.push('\n');
-                let _ = std::fs::write(&path, doc);
+                if let Err(err) =
+                    anyagents_harness::atomic_write_nonempty_file(&path, doc.as_bytes(), 0o664)
+                {
+                    eprintln!("cannot persist {}: {err}", path.display());
+                }
             }
         }
     }
@@ -1044,11 +1060,13 @@ impl OpenCodeHarness {
         let Some(dir) = self.config_dir.as_deref() else {
             return;
         };
-        let _ = std::fs::create_dir_all(dir);
         let path = dir.join(SERVICE_PID_FILE);
-        let temp = dir.join(format!(".{SERVICE_PID_FILE}.{}.new", std::process::id()));
-        if std::fs::write(&temp, format!("{pid}\n")).is_ok() {
-            let _ = std::fs::rename(&temp, &path);
+        if let Err(err) = anyagents_harness::atomic_write_nonempty_file(
+            &path,
+            format!("{pid}\n").as_bytes(),
+            0o664,
+        ) {
+            eprintln!("cannot persist {}: {err}", path.display());
         }
     }
 

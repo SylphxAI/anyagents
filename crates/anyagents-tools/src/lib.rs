@@ -1,10 +1,10 @@
-//! Shared capability core and pluggable workspace backend (`LocalHost` vs `RemoteSandbox`).
+//! Shared capability core and vendor-neutral [`WorkspaceBackend`] trait (`Sandbox` axis).
 //!
-//! When an agent has a local worktree on the orchestrator host, [`WorkspaceBackend::LocalHost`]
-//! executes file and command operations directly against that directory. When an agent is bound
-//! to a remote container sandbox via `<agent_config_dir>/sandbox.json` or `ANYAGENTS_SANDBOX_*`
-//! environment variables, [`WorkspaceBackend::RemoteSandbox`] routes command execution and file
-//! reads/writes/edits/listings to the remote sandbox HTTP API.
+//! By default, [`LocalWorkspace`] executes file and command operations against a local directory
+//! or git worktree on the orchestrator host. Pluggable isolated backends—[`RemoteSandboxWorkspace`]
+//! (Cloud Sandbox / E2B HTTP APIs), [`DockerWorkspace`] (local/remote Docker containers via
+//! `docker://<host>` or direct construction), or custom [`WorkspaceBackend`] trait implementations—
+//! swap the execution substrate without coupling to any harness or credential profile.
 
 use std::io::Read as _;
 use std::path::{Component, Path, PathBuf};
@@ -353,69 +353,335 @@ pub struct ExecOutput {
     pub exit_code: i32,
 }
 
-/// Pluggable execution and file backend for an agent's workspace.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum WorkspaceBackend {
-    /// Local directory on the orchestrator host.
-    LocalHost { root: PathBuf },
-    /// Remote sandbox container reachable over HTTP.
-    RemoteSandbox(SandboxConfig),
+/// Resolve a user-supplied relative or absolute path against a workspace root directory.
+pub fn resolve_workspace_path(
+    base: &Path,
+    raw: Option<&str>,
+    required: bool,
+) -> Result<String, String> {
+    let Some(raw_str) = raw else {
+        if required {
+            return Err("`path` is required for this `files` action".to_string());
+        }
+        return Ok(normalize_lexical_path(base).display().to_string());
+    };
+    if raw_str.contains('\0') {
+        return Err("`path` must not contain null bytes".to_string());
+    }
+    let trimmed = raw_str.trim();
+    if trimmed.is_empty() {
+        if required {
+            return Err("`path` must not be empty".to_string());
+        }
+        return Ok(normalize_lexical_path(base).display().to_string());
+    }
+    let candidate = Path::new(trimmed);
+    let joined = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        base.join(candidate)
+    };
+    Ok(normalize_lexical_path(&joined).display().to_string())
 }
 
-impl WorkspaceBackend {
-    /// Resolve the active backend for an agent from its config directory and local workdir fallback.
-    pub fn resolve(config_dir: Option<&Path>, local_root: PathBuf) -> Self {
-        if let Some(cfg) = SandboxConfig::resolve(config_dir) {
-            Self::RemoteSandbox(cfg)
+/// Pluggable execution and filesystem substrate for an agent's workspace (`Sandbox` axis).
+///
+/// Orthogonal to both the `Harness` axis (the external runtime loop) and the `Profile` axis
+/// (the upstream provider credential pool). Built-in implementations cover local directories /
+/// git worktrees ([`LocalWorkspace`]), remote HTTP / E2B cloud sandboxes
+/// ([`RemoteSandboxWorkspace`]), and Docker containers ([`DockerWorkspace`]); external crates
+/// may implement this trait for custom microVMs or VFS backends.
+pub trait WorkspaceBackend: Send + Sync {
+    /// Canonical backend driver identifier (e.g. `"local"`, `"cloud-sandbox"`, `"e2b"`, `"docker"`).
+    fn kind(&self) -> &'static str;
+
+    /// Whether file and command operations run outside the orchestrator host filesystem.
+    fn is_remote(&self) -> bool {
+        self.kind() != "local"
+    }
+
+    /// Display path of the workspace root inside this backend.
+    fn root_display(&self) -> String {
+        self.base_path().display().to_string()
+    }
+
+    /// Root path against which relative paths are resolved.
+    fn base_path(&self) -> &Path;
+
+    /// Resolve a user-supplied relative or absolute path against [`Self::base_path`].
+    fn resolve_path(&self, raw: Option<&str>, required: bool) -> Result<String, String> {
+        resolve_workspace_path(self.base_path(), raw, required)
+    }
+
+    /// Execute a shell command inside the workspace.
+    fn exec(
+        &self,
+        command: &str,
+        cwd: Option<&str>,
+        timeout_ms: Option<u64>,
+    ) -> Result<ExecOutput, String>;
+
+    /// Read raw file bytes from the workspace, returning `(resolved_path, bytes)`.
+    fn read_file_bytes(&self, path: Option<&str>) -> Result<(String, Vec<u8>), String>;
+
+    /// Write or append file bytes in the workspace, returning `(resolved_path, total_bytes, sha256_hex)`.
+    fn write_file_bytes(
+        &self,
+        path: Option<&str>,
+        content: &[u8],
+        append: bool,
+        overwrite: bool,
+    ) -> Result<(String, usize, String), String>;
+
+    /// List entries in a directory inside the workspace.
+    fn list_dir(
+        &self,
+        path: Option<&str>,
+        include_hidden: bool,
+        max_results: usize,
+    ) -> Result<serde_json::Value, String>;
+}
+
+impl dyn WorkspaceBackend {
+    /// Resolve the active workspace backend from `<config_dir>/sandbox.json` (or `ANYAGENTS_SANDBOX_*`),
+    /// defaulting to [`LocalWorkspace`] rooted at `local_root`.
+    pub fn resolve(config_dir: Option<&Path>, local_root: PathBuf) -> Box<dyn WorkspaceBackend> {
+        resolve_workspace_backend(config_dir, local_root)
+    }
+}
+
+/// Resolve the active [`WorkspaceBackend`] for an agent:
+/// - `docker://<host>` endpoint in `sandbox.json` -> [`DockerWorkspace`]
+/// - HTTP / E2B `sandbox.json` -> [`RemoteSandboxWorkspace`]
+/// - Otherwise -> [`LocalWorkspace`] (local directory or git worktree)
+pub fn resolve_workspace_backend(
+    config_dir: Option<&Path>,
+    local_root: PathBuf,
+) -> Box<dyn WorkspaceBackend> {
+    if let Some(cfg) = SandboxConfig::resolve(config_dir) {
+        if let Some(rest) = cfg.endpoint.strip_prefix("docker://") {
+            let docker_host = (!rest.is_empty() && rest != "local").then(|| rest.to_string());
+            return Box::new(DockerWorkspace {
+                container: cfg.sandbox_id,
+                workdir: PathBuf::from(cfg.workdir),
+                docker_host,
+            });
+        }
+        return Box::new(RemoteSandboxWorkspace::new(cfg));
+    }
+    Box::new(LocalWorkspace::new(local_root))
+}
+
+/// Local directory or git worktree workspace on the orchestrator host (default `Sandbox` backend).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalWorkspace {
+    pub root: PathBuf,
+}
+
+impl LocalWorkspace {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+}
+
+impl WorkspaceBackend for LocalWorkspace {
+    fn kind(&self) -> &'static str {
+        "local"
+    }
+
+    fn base_path(&self) -> &Path {
+        self.root.as_path()
+    }
+
+    fn exec(
+        &self,
+        command: &str,
+        cwd: Option<&str>,
+        _timeout_ms: Option<u64>,
+    ) -> Result<ExecOutput, String> {
+        let cmd_trimmed = command.trim();
+        if cmd_trimmed.is_empty() {
+            return Err("`workspace.exec` requires a non-empty `cmd`".to_string());
+        }
+        let resolved_cwd = self.resolve_path(cwd, false)?;
+        let cwd_path = PathBuf::from(&resolved_cwd);
+        if !cwd_path.is_dir() {
+            return Err(format!(
+                "exec working directory {} does not exist",
+                cwd_path.display()
+            ));
+        }
+        let output = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(cmd_trimmed)
+            .current_dir(&cwd_path)
+            .output()
+            .map_err(|e| format!("failed to spawn command: {e}"))?;
+        Ok(ExecOutput {
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            exit_code: output.status.code().unwrap_or(-1),
+        })
+    }
+
+    fn read_file_bytes(&self, path: Option<&str>) -> Result<(String, Vec<u8>), String> {
+        let resolved = self.resolve_path(path, true)?;
+        let p = Path::new(&resolved);
+        let meta = std::fs::metadata(p).map_err(|e| format!("cannot read {resolved}: {e}"))?;
+        if meta.is_dir() {
+            return Err(format!(
+                "{resolved} is a directory; use `action: \"list\"` or `action: \"glob\"` to list files"
+            ));
+        }
+        let bytes = std::fs::read(p).map_err(|e| format!("cannot read {resolved}: {e}"))?;
+        Ok((resolved, bytes))
+    }
+
+    fn write_file_bytes(
+        &self,
+        path: Option<&str>,
+        content: &[u8],
+        append: bool,
+        overwrite: bool,
+    ) -> Result<(String, usize, String), String> {
+        let resolved = self.resolve_path(path, true)?;
+        let p = Path::new(&resolved);
+        if !append && !overwrite && p.exists() {
+            return Err(format!(
+                "file {resolved} already exists and `overwrite` is false"
+            ));
+        }
+        if let Some(parent) = p.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("cannot create parent directory {}: {e}", parent.display()))?;
+        }
+        if append {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(p)
+                .map_err(|e| format!("cannot open {resolved} for append: {e}"))?;
+            f.write_all(content)
+                .map_err(|e| format!("cannot append to {resolved}: {e}"))?;
         } else {
-            Self::LocalHost { root: local_root }
+            std::fs::write(p, content).map_err(|e| format!("cannot write {resolved}: {e}"))?;
         }
+        let final_bytes =
+            std::fs::read(p).map_err(|e| format!("cannot read back {resolved}: {e}"))?;
+        let sha = sha256_hex(&final_bytes);
+        Ok((resolved, final_bytes.len(), sha))
     }
 
-    pub fn is_remote(&self) -> bool {
-        matches!(self, Self::RemoteSandbox(_))
-    }
-
-    pub fn root_display(&self) -> String {
-        match self {
-            Self::LocalHost { root } => root.display().to_string(),
-            Self::RemoteSandbox(cfg) => cfg.workdir.clone(),
-        }
-    }
-
-    /// Resolve a user-supplied relative or absolute path against the backend's root directory.
-    pub fn resolve_path(&self, raw: Option<&str>, required: bool) -> Result<String, String> {
-        let base = match self {
-            Self::LocalHost { root } => root.as_path(),
-            Self::RemoteSandbox(cfg) => Path::new(&cfg.workdir),
-        };
-        let Some(raw_str) = raw else {
-            if required {
-                return Err("`path` is required for this `files` action".to_string());
+    fn list_dir(
+        &self,
+        path: Option<&str>,
+        include_hidden: bool,
+        max_results: usize,
+    ) -> Result<serde_json::Value, String> {
+        let resolved = self.resolve_path(path, false)?;
+        let dir_path = Path::new(&resolved);
+        let rd = std::fs::read_dir(dir_path)
+            .map_err(|e| format!("cannot list directory {resolved}: {e}"))?;
+        let mut raw_entries: Vec<(String, serde_json::Value)> = Vec::new();
+        for entry_res in rd {
+            let Ok(entry) = entry_res else {
+                continue;
+            };
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !include_hidden && name.starts_with('.') {
+                continue;
             }
-            return Ok(normalize_lexical_path(base).display().to_string());
-        };
-        if raw_str.contains('\0') {
-            return Err("`path` must not contain null bytes".to_string());
+            let entry_path = entry.path();
+            let Ok(sym_meta) = std::fs::symlink_metadata(&entry_path) else {
+                continue;
+            };
+            let ft = sym_meta.file_type();
+            let (kind, bytes) = if ft.is_symlink() {
+                let target_len = std::fs::metadata(&entry_path)
+                    .ok()
+                    .filter(|m| m.is_file())
+                    .map_or(0, |m| m.len());
+                ("symlink", target_len)
+            } else if ft.is_dir() {
+                ("dir", 0)
+            } else {
+                ("file", sym_meta.len())
+            };
+            let rel_path = entry_path
+                .strip_prefix(&self.root)
+                .ok()
+                .filter(|p| !p.as_os_str().is_empty())
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| entry_path.display().to_string());
+            raw_entries.push((
+                name.clone(),
+                serde_json::json!({
+                    "name": name,
+                    "path": rel_path,
+                    "kind": kind,
+                    "bytes": bytes,
+                }),
+            ));
         }
-        let trimmed = raw_str.trim();
-        if trimmed.is_empty() {
-            if required {
-                return Err("`path` must not be empty".to_string());
-            }
-            return Ok(normalize_lexical_path(base).display().to_string());
+        raw_entries.sort_by(|a, b| a.0.cmp(&b.0));
+        let truncated = raw_entries.len() > max_results;
+        let entries: Vec<serde_json::Value> = raw_entries
+            .into_iter()
+            .take(max_results)
+            .map(|(_, v)| v)
+            .collect();
+        let count = entries.len();
+        Ok(serde_json::json!({
+            "action": "list",
+            "path": resolved,
+            "entries": entries,
+            "count": count,
+            "truncated": truncated,
+        }))
+    }
+}
+
+/// Remote HTTP / Cloud Sandbox / E2B workspace backend driven by [`SandboxConfig`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteSandboxWorkspace {
+    pub config: SandboxConfig,
+}
+
+impl RemoteSandboxWorkspace {
+    pub fn new(mut config: SandboxConfig) -> Self {
+        if let Some(rest) = config.endpoint.strip_prefix("e2b://") {
+            config.endpoint = format!("https://{rest}");
         }
-        let candidate = Path::new(trimmed);
-        let joined = if candidate.is_absolute() {
-            candidate.to_path_buf()
+        Self { config }
+    }
+
+    pub fn is_e2b(&self) -> bool {
+        let lower = self.config.endpoint.to_ascii_lowercase();
+        lower.contains(".e2b.") || lower.contains("//e2b.")
+    }
+}
+
+impl WorkspaceBackend for RemoteSandboxWorkspace {
+    fn kind(&self) -> &'static str {
+        if self.is_e2b() {
+            "e2b"
         } else {
-            base.join(candidate)
-        };
-        Ok(normalize_lexical_path(&joined).display().to_string())
+            "cloud-sandbox"
+        }
     }
 
-    /// Execute a shell command on the backend (`LocalHost` or `RemoteSandbox`).
-    pub fn exec(
+    fn root_display(&self) -> String {
+        self.config.workdir.clone()
+    }
+
+    fn base_path(&self) -> &Path {
+        Path::new(&self.config.workdir)
+    }
+
+    fn exec(
         &self,
         command: &str,
         cwd: Option<&str>,
@@ -429,61 +695,16 @@ impl WorkspaceBackend {
             .unwrap_or(DEFAULT_EXEC_TIMEOUT_MS)
             .clamp(100, 120_000);
         let resolved_cwd = self.resolve_path(cwd, false)?;
-
-        match self {
-            Self::LocalHost { .. } => {
-                let cwd_path = PathBuf::from(&resolved_cwd);
-                if !cwd_path.is_dir() {
-                    return Err(format!(
-                        "exec working directory {} does not exist",
-                        cwd_path.display()
-                    ));
-                }
-                let output = std::process::Command::new("/bin/sh")
-                    .arg("-c")
-                    .arg(cmd_trimmed)
-                    .current_dir(&cwd_path)
-                    .output()
-                    .map_err(|e| format!("failed to spawn command: {e}"))?;
-                Ok(ExecOutput {
-                    stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                    stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-                    exit_code: output.status.code().unwrap_or(-1),
-                })
-            }
-            Self::RemoteSandbox(cfg) => {
-                remote_exec(cfg, cmd_trimmed, &resolved_cwd, effective_timeout)
-            }
-        }
+        remote_exec(&self.config, cmd_trimmed, &resolved_cwd, effective_timeout)
     }
 
-    /// Read raw file bytes from the backend (`LocalHost` or `RemoteSandbox`).
-    /// Returns `(resolved_path, bytes)`.
-    pub fn read_file_bytes(&self, path: Option<&str>) -> Result<(String, Vec<u8>), String> {
+    fn read_file_bytes(&self, path: Option<&str>) -> Result<(String, Vec<u8>), String> {
         let resolved = self.resolve_path(path, true)?;
-        match self {
-            Self::LocalHost { .. } => {
-                let p = Path::new(&resolved);
-                let meta =
-                    std::fs::metadata(p).map_err(|e| format!("cannot read {resolved}: {e}"))?;
-                if meta.is_dir() {
-                    return Err(format!(
-                        "{resolved} is a directory; use `action: \"list\"` or `action: \"glob\"` to list files"
-                    ));
-                }
-                let bytes = std::fs::read(p).map_err(|e| format!("cannot read {resolved}: {e}"))?;
-                Ok((resolved, bytes))
-            }
-            Self::RemoteSandbox(cfg) => {
-                let bytes = remote_read_file(cfg, &resolved)?;
-                Ok((resolved, bytes))
-            }
-        }
+        let bytes = remote_read_file(&self.config, &resolved)?;
+        Ok((resolved, bytes))
     }
 
-    /// Write or append file bytes to the backend (`LocalHost` or `RemoteSandbox`).
-    /// Returns `(resolved_path, total_bytes_after_write, sha256_hex)`.
-    pub fn write_file_bytes(
+    fn write_file_bytes(
         &self,
         path: Option<&str>,
         content: &[u8],
@@ -491,121 +712,214 @@ impl WorkspaceBackend {
         overwrite: bool,
     ) -> Result<(String, usize, String), String> {
         let resolved = self.resolve_path(path, true)?;
-        match self {
-            Self::LocalHost { .. } => {
-                let p = Path::new(&resolved);
-                if !append && !overwrite && p.exists() {
-                    return Err(format!(
-                        "file {resolved} already exists and `overwrite` is false"
-                    ));
-                }
-                if let Some(parent) = p.parent()
-                    && !parent.as_os_str().is_empty()
-                {
-                    std::fs::create_dir_all(parent).map_err(|e| {
-                        format!("cannot create parent directory {}: {e}", parent.display())
-                    })?;
-                }
-                if append {
-                    use std::io::Write as _;
-                    let mut f = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(p)
-                        .map_err(|e| format!("cannot open {resolved} for append: {e}"))?;
-                    f.write_all(content)
-                        .map_err(|e| format!("cannot append to {resolved}: {e}"))?;
-                } else {
-                    std::fs::write(p, content)
-                        .map_err(|e| format!("cannot write {resolved}: {e}"))?;
-                }
-                let final_bytes =
-                    std::fs::read(p).map_err(|e| format!("cannot read back {resolved}: {e}"))?;
-                let sha = sha256_hex(&final_bytes);
-                Ok((resolved, final_bytes.len(), sha))
-            }
-            Self::RemoteSandbox(cfg) => {
-                let final_bytes = remote_write_file(cfg, &resolved, content, append, overwrite)?;
-                let sha = sha256_hex(&final_bytes);
-                Ok((resolved, final_bytes.len(), sha))
-            }
-        }
+        let final_bytes = remote_write_file(&self.config, &resolved, content, append, overwrite)?;
+        let sha = sha256_hex(&final_bytes);
+        Ok((resolved, final_bytes.len(), sha))
     }
 
-    /// List entries in a directory on the backend.
-    pub fn list_dir(
+    fn list_dir(
         &self,
         path: Option<&str>,
         include_hidden: bool,
         max_results: usize,
     ) -> Result<serde_json::Value, String> {
         let resolved = self.resolve_path(path, false)?;
-        match self {
-            Self::LocalHost { root } => {
-                let dir_path = Path::new(&resolved);
-                let rd = std::fs::read_dir(dir_path)
-                    .map_err(|e| format!("cannot list directory {resolved}: {e}"))?;
-                let mut raw_entries: Vec<(String, serde_json::Value)> = Vec::new();
-                for entry_res in rd {
-                    let Ok(entry) = entry_res else {
-                        continue;
-                    };
-                    let name = entry.file_name().to_string_lossy().into_owned();
-                    if !include_hidden && name.starts_with('.') {
-                        continue;
-                    }
-                    let entry_path = entry.path();
-                    let Ok(sym_meta) = std::fs::symlink_metadata(&entry_path) else {
-                        continue;
-                    };
-                    let ft = sym_meta.file_type();
-                    let (kind, bytes) = if ft.is_symlink() {
-                        let target_len = std::fs::metadata(&entry_path)
-                            .ok()
-                            .filter(|m| m.is_file())
-                            .map_or(0, |m| m.len());
-                        ("symlink", target_len)
-                    } else if ft.is_dir() {
-                        ("dir", 0)
-                    } else {
-                        ("file", sym_meta.len())
-                    };
-                    let rel_path = entry_path
-                        .strip_prefix(root)
-                        .ok()
-                        .filter(|p| !p.as_os_str().is_empty())
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|| entry_path.display().to_string());
-                    raw_entries.push((
-                        name.clone(),
-                        serde_json::json!({
-                            "name": name,
-                            "path": rel_path,
-                            "kind": kind,
-                            "bytes": bytes,
-                        }),
-                    ));
-                }
-                raw_entries.sort_by(|a, b| a.0.cmp(&b.0));
-                let truncated = raw_entries.len() > max_results;
-                let entries: Vec<serde_json::Value> = raw_entries
-                    .into_iter()
-                    .take(max_results)
-                    .map(|(_, v)| v)
-                    .collect();
-                let count = entries.len();
-                Ok(serde_json::json!({
-                    "action": "list",
-                    "path": resolved,
-                    "entries": entries,
-                    "count": count,
-                    "truncated": truncated,
-                }))
-            }
-            Self::RemoteSandbox(cfg) => {
-                remote_list_dir(cfg, &resolved, include_hidden, max_results)
-            }
+        remote_list_dir(&self.config, &resolved, include_hidden, max_results)
+    }
+}
+
+/// Containerized Docker workspace backend (`docker exec` against a running container).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DockerWorkspace {
+    pub container: String,
+    pub workdir: PathBuf,
+    pub docker_host: Option<String>,
+}
+
+impl DockerWorkspace {
+    pub fn new(container: impl Into<String>, workdir: impl Into<PathBuf>) -> Self {
+        Self {
+            container: container.into(),
+            workdir: workdir.into(),
+            docker_host: None,
         }
+    }
+
+    fn docker_cmd(&self) -> std::process::Command {
+        let bin = std::env::var("ANYAGENTS_DOCKER_BIN").unwrap_or_else(|_| "docker".to_string());
+        let mut cmd = std::process::Command::new(bin);
+        if let Some(ref host) = self.docker_host {
+            cmd.env("DOCKER_HOST", host);
+        }
+        cmd
+    }
+}
+
+impl WorkspaceBackend for DockerWorkspace {
+    fn kind(&self) -> &'static str {
+        "docker"
+    }
+
+    fn base_path(&self) -> &Path {
+        self.workdir.as_path()
+    }
+
+    fn exec(
+        &self,
+        command: &str,
+        cwd: Option<&str>,
+        _timeout_ms: Option<u64>,
+    ) -> Result<ExecOutput, String> {
+        let cmd_trimmed = command.trim();
+        if cmd_trimmed.is_empty() {
+            return Err("`workspace.exec` requires a non-empty `cmd`".to_string());
+        }
+        let resolved_cwd = self.resolve_path(cwd, false)?;
+        let output = self
+            .docker_cmd()
+            .args([
+                "exec",
+                "-w",
+                &resolved_cwd,
+                &self.container,
+                "/bin/sh",
+                "-c",
+                cmd_trimmed,
+            ])
+            .output()
+            .map_err(|e| format!("failed to spawn docker exec: {e}"))?;
+        Ok(ExecOutput {
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            exit_code: output.status.code().unwrap_or(-1),
+        })
+    }
+
+    fn read_file_bytes(&self, path: Option<&str>) -> Result<(String, Vec<u8>), String> {
+        let resolved = self.resolve_path(path, true)?;
+        let output = self
+            .docker_cmd()
+            .args([
+                "exec",
+                &self.container,
+                "/bin/sh",
+                "-c",
+                r#"test ! -d "$1" && cat -- "$1""#,
+                "sh",
+                &resolved,
+            ])
+            .output()
+            .map_err(|e| format!("cannot read {resolved} from docker container: {e}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "cannot read {resolved} in docker container ({}): {}",
+                self.container,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Ok((resolved, output.stdout))
+    }
+
+    fn write_file_bytes(
+        &self,
+        path: Option<&str>,
+        content: &[u8],
+        append: bool,
+        overwrite: bool,
+    ) -> Result<(String, usize, String), String> {
+        use std::io::Write as _;
+        use std::process::Stdio;
+        let resolved = self.resolve_path(path, true)?;
+        let script = if append {
+            r#"mkdir -p -- "$(dirname -- "$1")" && cat >> "$1""#
+        } else if overwrite {
+            r#"mkdir -p -- "$(dirname -- "$1")" && cat > "$1""#
+        } else {
+            r#"test ! -e "$1" && mkdir -p -- "$(dirname -- "$1")" && cat > "$1""#
+        };
+        let mut child = self
+            .docker_cmd()
+            .args([
+                "exec",
+                "-i",
+                &self.container,
+                "/bin/sh",
+                "-c",
+                script,
+                "sh",
+                &resolved,
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("cannot write {resolved} in docker container: {e}"))?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin
+                .write_all(content)
+                .map_err(|e| format!("cannot stream bytes to docker container: {e}"))?;
+        }
+        let out = child
+            .wait_with_output()
+            .map_err(|e| format!("docker write wait failed: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "cannot write {resolved} in docker container ({}): {}",
+                self.container,
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        let (_, final_bytes) = self.read_file_bytes(Some(&resolved))?;
+        let sha = sha256_hex(&final_bytes);
+        Ok((resolved, final_bytes.len(), sha))
+    }
+
+    fn list_dir(
+        &self,
+        path: Option<&str>,
+        include_hidden: bool,
+        max_results: usize,
+    ) -> Result<serde_json::Value, String> {
+        let resolved = self.resolve_path(path, false)?;
+        let flag = if include_hidden { "-1Ap" } else { "-1p" };
+        let out = self.exec(
+            &format!("ls {flag} -- {}", shell_single_quote(&resolved)),
+            None,
+            None,
+        )?;
+        if out.exit_code != 0 {
+            return Err(format!(
+                "cannot list directory {resolved}: {}",
+                out.stderr.trim()
+            ));
+        }
+        let mut raw_entries: Vec<serde_json::Value> = out
+            .stdout
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|line| {
+                let (name, kind) = match line.strip_suffix('/') {
+                    Some(dir_name) => (dir_name, "dir"),
+                    None => (line, "file"),
+                };
+                serde_json::json!({
+                    "name": name,
+                    "path": format!("{resolved}/{name}"),
+                    "kind": kind,
+                    "bytes": 0,
+                })
+            })
+            .collect();
+        let truncated = raw_entries.len() > max_results;
+        raw_entries.truncate(max_results);
+        let count = raw_entries.len();
+        Ok(serde_json::json!({
+            "action": "list",
+            "path": resolved,
+            "entries": raw_entries,
+            "count": count,
+            "truncated": truncated,
+        }))
     }
 }
 
@@ -1049,9 +1363,7 @@ mod tests {
         assert_eq!(loaded.token.as_deref(), Some("tok-1"));
         assert_eq!(loaded.workdir, "/workspace");
 
-        let local = WorkspaceBackend::LocalHost {
-            root: work_dir.clone(),
-        };
+        let local = LocalWorkspace::new(work_dir.clone());
         let (_, written, _) = local
             .write_file_bytes(Some("sub/note.txt"), b"hello local", false, true)
             .unwrap();
@@ -1231,7 +1543,7 @@ mod tests {
         assert_eq!(reloaded, sbx);
 
         // Verify WorkspaceBackend::RemoteSandbox read/write
-        let backend = WorkspaceBackend::RemoteSandbox(sbx.clone());
+        let backend = RemoteSandboxWorkspace::new(sbx.clone());
         backend
             .write_file_bytes(Some("notes.md"), b"# Remote Sandbox\n", false, true)
             .unwrap();
@@ -1249,5 +1561,116 @@ mod tests {
             *events.lock().unwrap(),
             vec!["provision", "pause", "resume", "destroy"]
         );
+    }
+    #[test]
+    fn workspace_backend_trait_supports_local_cloud_e2b_docker_and_custom_drivers() {
+        struct InMemoryBackend {
+            root: PathBuf,
+            files: std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>,
+        }
+        impl WorkspaceBackend for InMemoryBackend {
+            fn kind(&self) -> &'static str {
+                "in-memory"
+            }
+            fn base_path(&self) -> &Path {
+                &self.root
+            }
+            fn exec(
+                &self,
+                command: &str,
+                _cwd: Option<&str>,
+                _timeout_ms: Option<u64>,
+            ) -> Result<ExecOutput, String> {
+                Ok(ExecOutput {
+                    stdout: format!("mem:{command}"),
+                    stderr: String::new(),
+                    exit_code: 0,
+                })
+            }
+            fn read_file_bytes(&self, path: Option<&str>) -> Result<(String, Vec<u8>), String> {
+                let resolved = self.resolve_path(path, true)?;
+                let bytes = self
+                    .files
+                    .lock()
+                    .unwrap()
+                    .get(&resolved)
+                    .cloned()
+                    .ok_or_else(|| format!("missing {resolved}"))?;
+                Ok((resolved, bytes))
+            }
+            fn write_file_bytes(
+                &self,
+                path: Option<&str>,
+                content: &[u8],
+                _append: bool,
+                _overwrite: bool,
+            ) -> Result<(String, usize, String), String> {
+                let resolved = self.resolve_path(path, true)?;
+                self.files
+                    .lock()
+                    .unwrap()
+                    .insert(resolved.clone(), content.to_vec());
+                Ok((resolved, content.len(), sha256_hex(content)))
+            }
+            fn list_dir(
+                &self,
+                path: Option<&str>,
+                _include_hidden: bool,
+                _max_results: usize,
+            ) -> Result<serde_json::Value, String> {
+                let resolved = self.resolve_path(path, false)?;
+                Ok(
+                    serde_json::json!({ "action": "list", "path": resolved, "entries": [], "count": 0, "truncated": false }),
+                )
+            }
+        }
+
+        let tmp = std::env::temp_dir().join(format!("anyagents-ws-trait-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let cfg_dir = tmp.join("cfg");
+        let work_dir = tmp.join("work");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::create_dir_all(&work_dir).unwrap();
+
+        let resolved_local = <dyn WorkspaceBackend>::resolve(Some(&cfg_dir), work_dir.clone());
+        assert_eq!(resolved_local.kind(), "local");
+        assert!(!resolved_local.is_remote());
+
+        std::fs::write(
+            cfg_dir.join("sandbox.json"),
+            r#"{"endpoint":"e2b://api.e2b.dev","sandbox_id":"sbx-e2b","workdir":"/home/user"}"#,
+        )
+        .unwrap();
+        let resolved_e2b = <dyn WorkspaceBackend>::resolve(Some(&cfg_dir), work_dir.clone());
+        assert_eq!(resolved_e2b.kind(), "e2b");
+        assert!(resolved_e2b.is_remote());
+        assert_eq!(resolved_e2b.root_display(), "/home/user");
+
+        std::fs::write(
+            cfg_dir.join("sandbox.json"),
+            r#"{"endpoint":"docker://local","sandbox_id":"ctr-123","workdir":"/workspace"}"#,
+        )
+        .unwrap();
+        let resolved_docker = <dyn WorkspaceBackend>::resolve(Some(&cfg_dir), work_dir.clone());
+        assert_eq!(resolved_docker.kind(), "docker");
+        assert!(resolved_docker.is_remote());
+        assert_eq!(resolved_docker.root_display(), "/workspace");
+
+        let custom: Box<dyn WorkspaceBackend> = Box::new(InMemoryBackend {
+            root: PathBuf::from("/vfs"),
+            files: std::sync::Mutex::new(std::collections::HashMap::new()),
+        });
+        assert_eq!(custom.kind(), "in-memory");
+        assert!(custom.is_remote());
+        custom
+            .write_file_bytes(Some("a.txt"), b"ok", false, true)
+            .unwrap();
+        assert_eq!(custom.read_file_bytes(Some("a.txt")).unwrap().1, b"ok");
+        assert_eq!(
+            custom.exec("uname", None, None).unwrap().stdout,
+            "mem:uname"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

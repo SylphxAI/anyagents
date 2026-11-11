@@ -749,9 +749,12 @@ impl StreamHarness {
                         let turn = state.open.first().unwrap_or(&message.id);
                         let mut ids: Vec<_> = state.open.iter().collect();
                         ids.push(&message.id);
-                        if let Err(error) = std::fs::write(
-                            dir.join("spiron-unconfirmed-steers.json"),
-                            json!({"turn_id": turn, "request_ids": ids}).to_string(),
+                        if let Err(error) = anyagents_harness::atomic_write_in_existing_dir(
+                            &dir.join("spiron-unconfirmed-steers.json"),
+                            json!({"turn_id": turn, "request_ids": ids})
+                                .to_string()
+                                .as_bytes(),
+                            0o664,
                         ) {
                             let reason = format!(
                                 "cannot persist Spiron input hold before dispatch: {error}"
@@ -1306,9 +1309,18 @@ impl State {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |time| time.as_millis());
-            let _ = std::fs::write(dir.join(".anyagents-last-error.json"), json!({
-                "error": error, "timestamp_ms": now, "quota_reset_at_ms": self.quota_reset_at_ms,
-            }).to_string());
+            let path = dir.join(".anyagents-last-error.json");
+            let payload = json!({
+                "error": error,
+                "timestamp_ms": now,
+                "quota_reset_at_ms": self.quota_reset_at_ms,
+            })
+            .to_string();
+            if let Err(err) =
+                anyagents_harness::atomic_write_in_existing_dir(&path, payload.as_bytes(), 0o664)
+            {
+                eprintln!("cannot persist {}: {err}", path.display());
+            }
         }
     }
 
@@ -1469,17 +1481,22 @@ fn read_stdout(
         }
         if let Some(ref rpc) = agy_rpc {
             if poisoned_agy {
-                let _ = std::fs::write(
-                    rpc.config_dir.join(".anyagents-last-error.json"),
-                    json!({
-                        "error": error,
-                        "timestamp_ms": std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_millis() as i64)
-                            .unwrap_or(0),
-                    })
-                    .to_string(),
-                );
+                let path = rpc.config_dir.join(".anyagents-last-error.json");
+                let payload = json!({
+                    "error": error,
+                    "timestamp_ms": std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as i64)
+                        .unwrap_or(0),
+                })
+                .to_string();
+                if let Err(err) = anyagents_harness::atomic_write_in_existing_dir(
+                    &path,
+                    payload.as_bytes(),
+                    0o664,
+                ) {
+                    eprintln!("cannot persist {}: {err}", path.display());
+                }
             } else if let Some(reset_at_ms) = effect.quota_reset_at_ms {
                 let err_msg = value
                     .pointer("/result/error")
@@ -1490,15 +1507,20 @@ fn read_stdout(
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis() as i64)
                     .unwrap_or(0);
-                let _ = std::fs::write(
-                    rpc.config_dir.join(".anyagents-last-error.json"),
-                    serde_json::json!({
-                        "error": err_msg,
-                        "quota_reset_at_ms": reset_at_ms,
-                        "timestamp_ms": now_ms,
-                    })
-                    .to_string(),
-                );
+                let path = rpc.config_dir.join(".anyagents-last-error.json");
+                let payload = serde_json::json!({
+                    "error": err_msg,
+                    "quota_reset_at_ms": reset_at_ms,
+                    "timestamp_ms": now_ms,
+                })
+                .to_string();
+                if let Err(err) = anyagents_harness::atomic_write_in_existing_dir(
+                    &path,
+                    payload.as_bytes(),
+                    0o664,
+                ) {
+                    eprintln!("cannot persist {}: {err}", path.display());
+                }
             } else if effect.finishes_turn {
                 let _ = std::fs::remove_file(rpc.config_dir.join(".anyagents-last-error.json"));
             }

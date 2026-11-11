@@ -366,14 +366,7 @@ pub fn write_grok_config(
             .replace('"', "\\\""),
         escaped_args.join(", ")
     ));
-    let tmp = path.with_extension("toml.new");
-    std::fs::write(&tmp, out)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o664));
-    }
-    std::fs::rename(&tmp, &path)?;
+    anyagents_harness::atomic_write_nonempty_file(&path, out.as_bytes(), 0o664)?;
     Ok(())
 }
 
@@ -400,14 +393,11 @@ ask:
 pub fn ensure_omp_policy(omp_dir: &Path) -> Result<std::path::PathBuf, anyagents_core::Error> {
     std::fs::create_dir_all(omp_dir)?;
     let policy_path = omp_dir.join("anyagents-policy.yml");
-    let tmp = policy_path.with_extension("yml.new");
-    std::fs::write(&tmp, OMP_NATIVE_TOOL_POLICY_YAML)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o664));
-    }
-    std::fs::rename(&tmp, &policy_path)?;
+    anyagents_harness::atomic_write_nonempty_file(
+        &policy_path,
+        OMP_NATIVE_TOOL_POLICY_YAML.as_bytes(),
+        0o664,
+    )?;
     Ok(policy_path)
 }
 

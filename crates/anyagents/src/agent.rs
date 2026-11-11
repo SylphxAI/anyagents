@@ -751,12 +751,17 @@ fn set_state(data: &Path, name: &str, state: &str) -> Result<AgentView, Error> {
         let _ = std::fs::remove_file(cfg.join(".anyagents-last-error.json"));
         let _ = std::fs::remove_file(cfg.join(".anyagents-notified-parent-error.json"));
         let now = anyagents_core::now_ms();
-        let _ = std::fs::write(cfg.join(".anyagents-quota-cleared-ms"), format!("{now}\n"));
+        crate::create::write_profile_marker(
+            &cfg,
+            ".anyagents-quota-cleared-ms",
+            &format!("{now}\n"),
+        )?;
         if !store.has_open_turn(&found.id).unwrap_or(false) {
-            let _ = std::fs::write(
-                cfg.join(".anyagents-profile-rotated-ms"),
-                format!("{now}\n"),
-            );
+            crate::create::write_profile_marker(
+                &cfg,
+                ".anyagents-profile-rotated-ms",
+                &format!("{now}\n"),
+            )?;
         }
     }
     if state == "running" {

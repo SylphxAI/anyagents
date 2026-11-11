@@ -370,8 +370,11 @@ fn save_ref_map(config_dir: &Path, map: &SnapshotRefMap) {
         g.insert(dir.to_path_buf(), merged.clone());
     }
     let path = dir.join("computer-refmap.json");
-    if let Ok(raw) = serde_json::to_string_pretty(&merged) {
-        let _ = std::fs::write(path, raw);
+    if let Ok(raw) = serde_json::to_string_pretty(&merged)
+        && let Err(err) =
+            anyagents_harness::atomic_write_nonempty_file(&path, raw.as_bytes(), 0o644)
+    {
+        eprintln!("cannot persist {}: {err}", path.display());
     }
 }
 

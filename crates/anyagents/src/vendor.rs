@@ -400,7 +400,13 @@ pub fn persist_last_error(config_dir: &Path, error: Option<&str>, quota_reset_at
                 "quota_reset_at_ms": quota_reset_at_ms,
                 "timestamp_ms": now_ms,
             });
-            let _ = std::fs::write(&path, payload.to_string());
+            if let Err(err) = anyagents_harness::atomic_write_nonempty_file(
+                &path,
+                payload.to_string().as_bytes(),
+                0o664,
+            ) {
+                eprintln!("cannot persist {}: {err}", path.display());
+            }
         }
         None => {
             let _ = std::fs::remove_file(&path);
@@ -499,9 +505,10 @@ fn retire_poisoned_agy_session(config_dir: &Path, now_ms: i64) -> Result<bool, S
     // continuation pointer is poisoned. A watermark prevents stale log replay.
     retire_session_pointer(&config_dir.join("agy-session-id"))?;
     retire_session_pointer(&config_dir.join(".anyagents-last-error.json"))?;
-    std::fs::write(
-        config_dir.join(".anyagents-quota-cleared-ms"),
-        now_ms.to_string(),
+    anyagents_harness::atomic_write_nonempty_file(
+        &config_dir.join(".anyagents-quota-cleared-ms"),
+        now_ms.to_string().as_bytes(),
+        0o664,
     )
     .map_err(|err| format!("cannot persist agy recovery watermark: {err}"))?;
     Ok(true)
@@ -629,6 +636,10 @@ fn vendor_launch_inner(
                 anyagents_harness::SEAT_LAUNCH_ENV
                     | anyagents_harness::SEAT_PEERS_ENV
                     | "ANYAGENTS_DATA"
+                    | anyagents_core::STATE_DIR_ENV
+                    | anyagents_core::WORKSPACES_DIR_ENV
+                    | anyagents_core::SCRATCH_DIR_ENV
+                    | anyagents_core::GIT_POOL_DIR_ENV
                     | "ANYAGENTS_AGENT_CONFIG"
                     | "ANYAGENTS_AGENT_UID"
                     | "ANYAGENTS_OPERATOR_TOKEN_FILE"
@@ -645,6 +656,40 @@ fn vendor_launch_inner(
         "ANYAGENTS_DATA".to_string(),
         request.data_dir.display().to_string(),
     ));
+    if anyagents_core::storage_env_enabled()
+        && std::env::var_os(anyagents_core::STATE_DIR_ENV).is_some()
+    {
+        env.push((
+            anyagents_core::STATE_DIR_ENV.to_string(),
+            request.data_dir.display().to_string(),
+        ));
+    }
+    if let Some(workspaces_dir) = anyagents_core::configured_workspaces_dir() {
+        env.push((
+            anyagents_core::WORKSPACES_DIR_ENV.to_string(),
+            workspaces_dir.display().to_string(),
+        ));
+    }
+    if let Some(scratch_dir) = anyagents_core::configured_scratch_dir() {
+        env.push((
+            anyagents_core::SCRATCH_DIR_ENV.to_string(),
+            scratch_dir.display().to_string(),
+        ));
+        if anyagents_core::storage_env_enabled()
+            && let Some(test_flag) = std::env::var_os(anyagents_core::TEST_STORAGE_TIERS_ENV)
+        {
+            env.push((
+                anyagents_core::TEST_STORAGE_TIERS_ENV.to_string(),
+                test_flag.to_string_lossy().into_owned(),
+            ));
+        }
+    }
+    if let Some(git_pool_dir) = anyagents_core::configured_git_pool_dir() {
+        env.push((
+            anyagents_core::GIT_POOL_DIR_ENV.to_string(),
+            git_pool_dir.display().to_string(),
+        ));
+    }
     env.push((
         "ANYAGENTS_AGENT_ID".to_string(),
         request.agent.id.as_str().to_string(),
@@ -682,6 +727,10 @@ fn vendor_launch_inner(
                 anyagents_harness::SEAT_LAUNCH_ENV
                     | anyagents_harness::SEAT_PEERS_ENV
                     | "ANYAGENTS_DATA"
+                    | anyagents_core::STATE_DIR_ENV
+                    | anyagents_core::WORKSPACES_DIR_ENV
+                    | anyagents_core::SCRATCH_DIR_ENV
+                    | anyagents_core::GIT_POOL_DIR_ENV
                     | "ANYAGENTS_AGENT_CONFIG"
                     | "ANYAGENTS_AGENT_UID"
                     | "ANYAGENTS_OPERATOR_TOKEN_FILE"
@@ -797,13 +846,15 @@ fn vendor_launch_inner(
             let _ = std::fs::create_dir_all(&dot_config);
             dot_config
         };
-        if let Some((_, uid, gid, _)) = resolved_seat.or_else(|| {
+        let effective_seat = resolved_seat.clone().or_else(|| {
             crate::sandbox::seat_for_agent_with_hint(
                 request.agent.id.as_str(),
                 seat_hint.as_deref(),
             )
             .map(|(u, uid, gid, _)| (u, uid, gid, None))
-        }) {
+        });
+        if let Some((_, uid, gid, _)) = effective_seat.as_ref() {
+            let (uid, gid) = (*uid, *gid);
             crate::sandbox::share_config_with_seat_uid(&request.config_dir, uid, gid);
             let managed_work = anyagents_core::agent_work_dir(&request.data_dir, &request.agent.id);
             if request.work_dir == managed_work && !managed_work.exists() {
@@ -839,8 +890,66 @@ fn vendor_launch_inner(
             cache_home.display().to_string(),
         ));
         env.push(("TMPDIR".to_string(), tmp_dir.display().to_string()));
+        if let Some((_, uid, gid, _)) = effective_seat.as_ref()
+            && let Some(scratch_root) = anyagents_core::configured_scratch_dir()
+        {
+            let _ = crate::sandbox::prepare_scratch_dirs_for_seat(
+                &scratch_root,
+                &request.agent.id,
+                *uid,
+                *gid,
+            );
+        }
         for key in ["RUSTUP_HOME", "CARGO_HOME"] {
             if let Some(value) = std::env::var_os(format!("ANYAGENTS_{key}")) {
+                env.push((key.to_string(), value.to_string_lossy().into_owned()));
+            }
+        }
+    }
+    if let Some(scratch_root) = anyagents_core::configured_scratch_dir() {
+        let build_root = anyagents_core::agent_scratch_build_dir(&scratch_root, &request.agent.id);
+        let cargo_target = build_root.join("cargo");
+        let gradle_home = build_root.join("gradle");
+        let derived_data = build_root.join("derived-data");
+        let scratch_tmp = anyagents_core::agent_scratch_tmp_dir(&scratch_root, &request.agent.id);
+        if seat_spec.is_none() {
+            for dir in [&cargo_target, &gradle_home, &derived_data, &scratch_tmp] {
+                let _ = std::fs::create_dir_all(dir);
+            }
+        }
+        env.push(("TMPDIR".to_string(), scratch_tmp.display().to_string()));
+        env.push(("BUN_TMPDIR".to_string(), scratch_tmp.display().to_string()));
+        env.push((
+            "CARGO_TARGET_DIR".to_string(),
+            cargo_target.display().to_string(),
+        ));
+        env.push((
+            "GRADLE_USER_HOME".to_string(),
+            gradle_home.display().to_string(),
+        ));
+        env.push((
+            "DERIVED_DATA_PATH".to_string(),
+            derived_data.display().to_string(),
+        ));
+        for key in [
+            "RUSTUP_HOME",
+            "CARGO_HOME",
+            "SCCACHE_DIR",
+            "SCCACHE_CACHE_SIZE",
+            "BUN_INSTALL_CACHE_DIR",
+            "UV_CACHE_DIR",
+            "UV_PYTHON_INSTALL_DIR",
+            "PIP_CACHE_DIR",
+            "NPM_CONFIG_CACHE",
+            "PLAYWRIGHT_BROWSERS_PATH",
+        ] {
+            if env.iter().any(|(k, _)| k == key) {
+                continue;
+            }
+            if let Some(value) = std::env::var_os(format!("ANYAGENTS_{key}"))
+                .or_else(|| std::env::var_os(key))
+                .filter(|v| !v.is_empty())
+            {
                 env.push((key.to_string(), value.to_string_lossy().into_owned()));
             }
         }

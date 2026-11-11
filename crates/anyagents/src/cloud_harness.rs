@@ -267,11 +267,16 @@ fn read_persisted_session_id(config: &Path, harness: &str) -> Option<String> {
 }
 
 fn persist_session_id(config: &Path, harness: &str, session_id: &str) {
-    if !session_id.trim().is_empty() {
-        let _ = std::fs::write(
-            config.join(session_filename_for(harness)),
-            format!("{}\n", session_id.trim()),
-        );
+    let trimmed = session_id.trim();
+    if !trimmed.is_empty() {
+        let path = config.join(session_filename_for(harness));
+        if let Err(err) = anyagents_harness::atomic_write_nonempty_file(
+            &path,
+            format!("{trimmed}\n").as_bytes(),
+            0o664,
+        ) {
+            eprintln!("cannot persist {}: {err}", path.display());
+        }
     }
 }
 
@@ -399,7 +404,7 @@ fn resolve_cloud_base_url(config: &Path, harness: &str) -> String {
             .or_else(|| std::env::var("SPIRON_CLOUD_URL").ok())
             .filter(|s| !s.trim().is_empty())
             .or(json_url)
-            .unwrap_or_else(|| "https://sylphx.com".to_string())
+            .unwrap_or_else(|| "https://spiron.ai".to_string())
             .trim_end_matches('/')
             .to_string(),
         "claude-cloud" => std::env::var("ANYAGENTS_ANTHROPIC_API_URL")
@@ -449,6 +454,7 @@ fn resolve_cloud_auth_token(config: &Path, harness: &str) -> Option<String> {
             }
             for rel in [
                 ".spiron/auth.json",
+                ".spiron/credentials.json",
                 ".config/sylphx/auth.json",
                 "credentials.json",
                 "auth.json",
@@ -1789,5 +1795,29 @@ mod tests {
         );
 
         server_handle.abort();
+    }
+    #[test]
+    fn spiron_cloud_defaults_to_spiron_ai_and_reads_spiron_credentials() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path();
+        std::fs::create_dir_all(cfg.join(".spiron")).unwrap();
+        std::fs::write(
+            cfg.join(".spiron/auth.json"),
+            r#"{"access_token":"sp_tok_abc123"}"#,
+        )
+        .unwrap();
+        let url = resolve_cloud_base_url(cfg, "spiron-cloud");
+        if std::env::var("ANYAGENTS_SPIRON_CLOUD_URL").is_err()
+            && std::env::var("SPIRON_CLOUD_URL").is_err()
+        {
+            assert_eq!(url, "https://spiron.ai");
+        }
+        let tok = resolve_cloud_auth_token(cfg, "spiron-cloud");
+        if std::env::var("ANYAGENTS_SPIRON_API_KEY").is_err()
+            && std::env::var("SPIRON_API_KEY").is_err()
+            && std::env::var("SYLPHX_API_KEY").is_err()
+        {
+            assert_eq!(tok.as_deref(), Some("sp_tok_abc123"));
+        }
     }
 }

@@ -2751,10 +2751,11 @@ fn publish_telegraph_article(
                 .pointer("/result/access_token")
                 .and_then(serde_json::Value::as_str)?
                 .to_string();
-            if let Some(parent) = token_path.parent() {
-                let _ = std::fs::create_dir_all(parent);
+            if let Err(err) =
+                anyagents_harness::atomic_write_nonempty_file(&token_path, tok.as_bytes(), 0o600)
+            {
+                eprintln!("cannot persist {}: {err}", token_path.display());
             }
-            let _ = std::fs::write(&token_path, &tok);
             Some(tok)
         })?;
     let nodes: Vec<serde_json::Value> = markdown

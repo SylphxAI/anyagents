@@ -8,6 +8,7 @@ use anyagents_core::Error;
 
 pub(crate) struct Consumer {
     executable: PathBuf,
+    git_pool_dir: Option<PathBuf>,
 }
 
 impl Consumer {
@@ -16,6 +17,7 @@ impl Consumer {
             executable: std::env::var_os("ANYAGENTS_CHECKOUT_PROVIDER_BIN")
                 .map(PathBuf::from)
                 .unwrap_or_default(),
+            git_pool_dir: anyagents_core::configured_git_pool_dir(),
         }
     }
 
@@ -23,17 +25,19 @@ impl Consumer {
         if self.executable.as_os_str().is_empty() {
             return Err(Error::WorktreeProvisioning {
                 repo: repo.into(),
-                message: "configure ANYAGENTS_CHECKOUT_PROVIDER_BIN with a checkout provider"
+                message: "configure ANYAGENTS_CHECKOUT_PROVIDER_BIN with a checkout provider or ANYAGENTS_GIT_POOL_DIR with a bare Git pool"
                     .into(),
             });
         }
-        let out = Command::new(&self.executable)
-            .args(args)
-            .output()
-            .map_err(|error| Error::WorktreeProvisioning {
-                repo: repo.into(),
-                message: format!("{}: {error}", self.executable.display()),
-            })?;
+        let mut cmd = Command::new(&self.executable);
+        cmd.args(args);
+        if let Some(pool) = &self.git_pool_dir {
+            cmd.env(anyagents_core::GIT_POOL_DIR_ENV, pool);
+        }
+        let out = cmd.output().map_err(|error| Error::WorktreeProvisioning {
+            repo: repo.into(),
+            message: format!("{}: {error}", self.executable.display()),
+        })?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
             let stdout = String::from_utf8_lossy(&out.stdout);
@@ -54,6 +58,11 @@ impl Consumer {
     }
 
     fn fetch(&self, repo: &str, base: &str) -> Result<(), Error> {
+        if self.executable.as_os_str().is_empty()
+            && let Some(pool_root) = &self.git_pool_dir
+        {
+            return pool_fetch(pool_root, repo, base);
+        }
         self.run(repo, &["fetch".as_ref(), repo.as_ref(), base.as_ref()])
     }
 
@@ -64,6 +73,11 @@ impl Consumer {
         branch: &str,
         base: Option<&str>,
     ) -> Result<(), Error> {
+        if self.executable.as_os_str().is_empty()
+            && let Some(pool_root) = &self.git_pool_dir
+        {
+            return pool_checkout(pool_root, repo, target, branch, base);
+        }
         let mut args = vec![
             "worktree".as_ref(),
             repo.as_ref(),
@@ -196,6 +210,388 @@ impl Consumer {
         self.fetch(&repo, &reference)?;
         self.checkout(&repo, target, branch, Some(&selected))
     }
+}
+
+fn is_safe_slug_part(part: &str) -> bool {
+    !part.is_empty()
+        && part != "."
+        && !part.contains("..")
+        && part
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+}
+
+fn resolve_pool_slot(pool_root: &Path, raw: &str) -> Result<(PathBuf, PathBuf, String), Error> {
+    let fail = |message: String| Error::WorktreeProvisioning {
+        repo: raw.into(),
+        message,
+    };
+    let trimmed = raw.trim().trim_end_matches('/');
+    let (org, name, remote_url) = if let Some(slug) = github_repo(trimmed) {
+        let (org, name) = slug
+            .split_once('/')
+            .ok_or_else(|| fail("invalid repository slug".into()))?;
+        let remote_url = if trimmed.starts_with("https://")
+            || trimmed.starts_with("http://")
+            || trimmed.starts_with("git@")
+            || trimmed.starts_with("ssh://")
+            || trimmed.starts_with("file://")
+        {
+            trimmed.to_string()
+        } else {
+            let base = std::env::var("ANYAGENTS_GIT_REMOTE_BASE")
+                .ok()
+                .map(|s| s.trim().trim_end_matches('/').to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "https://github.com".to_string());
+            format!("{base}/{slug}.git")
+        };
+        (org.to_string(), name.to_string(), remote_url)
+    } else if trimmed.starts_with("file://") || Path::new(trimmed).is_absolute() {
+        let path_part = trimmed.strip_prefix("file://").unwrap_or(trimmed);
+        let comps: Vec<&str> = Path::new(path_part)
+            .components()
+            .filter_map(|c| match c {
+                std::path::Component::Normal(s) => s.to_str(),
+                _ => None,
+            })
+            .collect();
+        if comps.is_empty() {
+            return Err(fail("invalid local repository source".into()));
+        }
+        let raw_name = comps[comps.len() - 1];
+        let name = raw_name.strip_suffix(".git").unwrap_or(raw_name);
+        let org = if comps.len() >= 2 {
+            comps[comps.len() - 2]
+        } else {
+            "local"
+        };
+        if !is_safe_slug_part(org) || !is_safe_slug_part(name) {
+            return Err(fail("unsafe repository path component".into()));
+        }
+        (org.to_string(), name.to_string(), trimmed.to_string())
+    } else {
+        return Err(fail(format!(
+            "unsupported repository identifier for bare pool: {trimmed}"
+        )));
+    };
+    let pool_repo = pool_root.join(&org).join(format!("{name}.git"));
+    let lock_file = pool_root.join(".locks").join(format!("{org}-{name}.lock"));
+    Ok((pool_repo, lock_file, remote_url))
+}
+
+fn lock_pool_slot(repo: &str, lock_path: &Path) -> Result<std::fs::File, Error> {
+    use std::os::fd::AsRawFd as _;
+    let fail = |e: std::io::Error| Error::WorktreeProvisioning {
+        repo: repo.into(),
+        message: format!("pool lock {}: {e}", lock_path.display()),
+    };
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent).map_err(fail)?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(lock_path)
+        .map_err(fail)?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(fail(std::io::Error::last_os_error()));
+    }
+    Ok(file)
+}
+
+fn run_git_pool(
+    repo: &str,
+    dir: Option<&Path>,
+    args: &[&std::ffi::OsStr],
+) -> Result<String, Error> {
+    let mut cmd = Command::new("git");
+    cmd.args([
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "fetch.writeCommitGraph=false",
+    ]);
+    if let Some(d) = dir {
+        cmd.arg("-C").arg(d);
+    }
+    cmd.args(args);
+    let out = cmd.output().map_err(|e| Error::WorktreeProvisioning {
+        repo: repo.into(),
+        message: format!("git: {e}"),
+    })?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        return Err(Error::WorktreeProvisioning {
+            repo: repo.into(),
+            message: format!(
+                "{}: {}",
+                out.status,
+                if stderr.trim().is_empty() {
+                    stdout.trim()
+                } else {
+                    stderr.trim()
+                }
+            ),
+        });
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+fn clamp_pool_permissions(pool_repo: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        for dir in [pool_repo.to_path_buf(), pool_repo.join("worktrees")] {
+            if let Ok(meta) = std::fs::symlink_metadata(&dir)
+                && meta.is_dir()
+                && !meta.file_type().is_symlink()
+            {
+                let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o750));
+            }
+        }
+        for file in [pool_repo.join("config"), pool_repo.join("config.worktree")] {
+            if let Ok(meta) = std::fs::symlink_metadata(&file)
+                && meta.is_file()
+                && !meta.file_type().is_symlink()
+            {
+                let _ = std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o640));
+            }
+        }
+        if let Ok(entries) = std::fs::read_dir(pool_repo.join("worktrees")) {
+            for entry in entries.flatten() {
+                let wt_meta = entry.path();
+                if wt_meta.is_dir() {
+                    let _ =
+                        std::fs::set_permissions(&wt_meta, std::fs::Permissions::from_mode(0o750));
+                    for name in ["commondir", "config.worktree"] {
+                        let f = wt_meta.join(name);
+                        if let Ok(m) = std::fs::symlink_metadata(&f)
+                            && m.is_file()
+                            && !m.file_type().is_symlink()
+                        {
+                            let _ = std::fs::set_permissions(
+                                &f,
+                                std::fs::Permissions::from_mode(0o640),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn ensure_pool_repo(repo: &str, pool_repo: &Path, remote_url: &str) -> Result<(), Error> {
+    if !pool_repo.join("HEAD").is_file() {
+        if let Some(parent) = pool_repo.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| Error::WorktreeProvisioning {
+                repo: repo.into(),
+                message: format!("{}: {e}", parent.display()),
+            })?;
+        }
+        run_git_pool(
+            repo,
+            None,
+            &[
+                "clone".as_ref(),
+                "--bare".as_ref(),
+                "--reference-if-able".as_ref(),
+                pool_repo.as_os_str(),
+                remote_url.as_ref(),
+                pool_repo.as_os_str(),
+            ],
+        )?;
+    }
+    let worktrees_dir = pool_repo.join("worktrees");
+    let _ = std::fs::create_dir_all(&worktrees_dir);
+    for (k, v) in [
+        ("remote.origin.url", remote_url),
+        ("remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"),
+        ("extensions.worktreeConfig", "true"),
+        ("fetch.prune", "false"),
+        ("gc.auto", "0"),
+        ("gc.pruneExpire", "never"),
+    ] {
+        // When managed Git config symlink is already active, write through the real config path.
+        let cfg_file = std::fs::canonicalize(pool_repo.join("config"))
+            .unwrap_or_else(|_| pool_repo.join("config"));
+        run_git_pool(
+            repo,
+            None,
+            &[
+                "config".as_ref(),
+                "--file".as_ref(),
+                cfg_file.as_os_str(),
+                k.as_ref(),
+                v.as_ref(),
+            ],
+        )?;
+    }
+    clamp_pool_permissions(pool_repo);
+    Ok(())
+}
+
+fn ensure_pool_default_ref(repo: &str, pool_repo: &Path) -> Result<String, Error> {
+    if let Ok(sym) = run_git_pool(
+        repo,
+        Some(pool_repo),
+        &["symbolic-ref".as_ref(), "refs/remotes/origin/HEAD".as_ref()],
+    ) && !sym.is_empty()
+    {
+        let branch = sym.strip_prefix("refs/remotes/origin/").unwrap_or("main");
+        let spec = format!("+refs/heads/{branch}:refs/remotes/origin/{branch}");
+        let _ = run_git_pool(
+            repo,
+            Some(pool_repo),
+            &[
+                "fetch".as_ref(),
+                "--no-tags".as_ref(),
+                "--no-auto-maintenance".as_ref(),
+                "origin".as_ref(),
+                spec.as_ref(),
+            ],
+        );
+        return Ok(format!("origin/{branch}"));
+    }
+    if let Ok(advertised) = run_git_pool(
+        repo,
+        Some(pool_repo),
+        &[
+            "ls-remote".as_ref(),
+            "--symref".as_ref(),
+            "origin".as_ref(),
+            "HEAD".as_ref(),
+        ],
+    ) {
+        for line in advertised.lines() {
+            if let Some((target, name)) = line.split_once('\t')
+                && name == "HEAD"
+                && let Some(branch) = target.strip_prefix("ref: refs/heads/")
+            {
+                let spec = format!("+refs/heads/{branch}:refs/remotes/origin/{branch}");
+                run_git_pool(
+                    repo,
+                    Some(pool_repo),
+                    &[
+                        "fetch".as_ref(),
+                        "--no-tags".as_ref(),
+                        "--no-auto-maintenance".as_ref(),
+                        "origin".as_ref(),
+                        spec.as_ref(),
+                    ],
+                )?;
+                let sym_target = format!("refs/remotes/origin/{branch}");
+                run_git_pool(
+                    repo,
+                    Some(pool_repo),
+                    &[
+                        "symbolic-ref".as_ref(),
+                        "refs/remotes/origin/HEAD".as_ref(),
+                        sym_target.as_ref(),
+                    ],
+                )?;
+                return Ok(format!("origin/{branch}"));
+            }
+        }
+    }
+    Ok("HEAD".to_string())
+}
+
+fn pool_fetch(pool_root: &Path, repo: &str, base: &str) -> Result<(), Error> {
+    let (pool_repo, lock_path, remote_url) = resolve_pool_slot(pool_root, repo)?;
+    let _lock = lock_pool_slot(repo, &lock_path)?;
+    ensure_pool_repo(repo, &pool_repo, &remote_url)?;
+    let spec = if let Some(tag) = base.strip_prefix("refs/tags/") {
+        format!("+refs/tags/{tag}:refs/tags/{tag}")
+    } else if let Some(branch) = base.strip_prefix("refs/heads/") {
+        format!("+refs/heads/{branch}:refs/remotes/origin/{branch}")
+    } else {
+        let branch = base.strip_prefix("origin/").unwrap_or(base);
+        format!("+refs/heads/{branch}:refs/remotes/origin/{branch}")
+    };
+    run_git_pool(
+        repo,
+        Some(&pool_repo),
+        &[
+            "fetch".as_ref(),
+            "--no-tags".as_ref(),
+            "--no-auto-maintenance".as_ref(),
+            "origin".as_ref(),
+            spec.as_ref(),
+        ],
+    )?;
+    clamp_pool_permissions(&pool_repo);
+    Ok(())
+}
+
+fn pool_checkout(
+    pool_root: &Path,
+    repo: &str,
+    target: &Path,
+    branch: &str,
+    base: Option<&str>,
+) -> Result<(), Error> {
+    let (pool_repo, lock_path, remote_url) = resolve_pool_slot(pool_root, repo)?;
+    let _lock = lock_pool_slot(repo, &lock_path)?;
+    ensure_pool_repo(repo, &pool_repo, &remote_url)?;
+    let default_ref = ensure_pool_default_ref(repo, &pool_repo)?;
+    let start = match base {
+        Some(b) if b != "HEAD" && b != "origin/HEAD" => b,
+        _ => default_ref.as_str(),
+    };
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| Error::WorktreeProvisioning {
+            repo: repo.into(),
+            message: format!("{}: {e}", parent.display()),
+        })?;
+    }
+    if branch.trim().is_empty() {
+        run_git_pool(
+            repo,
+            Some(&pool_repo),
+            &[
+                "worktree".as_ref(),
+                "add".as_ref(),
+                "--detach".as_ref(),
+                target.as_os_str(),
+                start.as_ref(),
+            ],
+        )?;
+    } else {
+        run_git_pool(
+            repo,
+            Some(&pool_repo),
+            &[
+                "worktree".as_ref(),
+                "add".as_ref(),
+                "-b".as_ref(),
+                branch.as_ref(),
+                target.as_os_str(),
+                start.as_ref(),
+            ],
+        )?;
+    }
+    // With extensions.worktreeConfig=true on a bare pool, explicitly mark the
+    // linked checkout non-bare in its private config.worktree so work-tree Git
+    // operations (status, diff, commit) succeed while the pool stays bare.
+    run_git_pool(
+        repo,
+        Some(target),
+        &[
+            "config".as_ref(),
+            "--worktree".as_ref(),
+            "core.bare".as_ref(),
+            "false".as_ref(),
+        ],
+    )?;
+    clamp_pool_permissions(&pool_repo);
+    Ok(())
 }
 
 fn is_commit_id(raw: &str) -> bool {
@@ -353,7 +749,10 @@ esac
                 ),
             );
             Self {
-                consumer: Consumer { executable },
+                consumer: Consumer {
+                    executable,
+                    git_pool_dir: None,
+                },
                 source,
                 log,
                 fail,
@@ -522,6 +921,7 @@ esac
         let f = Fixture::new(dir.path());
         let consumer = Consumer {
             executable: dir.path().join("absent-consumer"),
+            git_pool_dir: None,
         };
         let target = dir.path().join("work");
         let err = consumer
@@ -538,6 +938,7 @@ esac
         let dir = tempfile::tempdir().unwrap();
         let unconfigured = Consumer {
             executable: PathBuf::new(),
+            git_pool_dir: None,
         };
         assert!(
             unconfigured
@@ -558,7 +959,10 @@ esac
                 receipt.display()
             ),
         );
-        let configured = Consumer { executable };
+        let configured = Consumer {
+            executable,
+            git_pool_dir: None,
+        };
         configured
             .remote(
                 "https://git.example.test/team/repo.git",
