@@ -157,27 +157,8 @@ pub fn sanitize_claude_settings(config_dir: &Path) -> Result<(), Error> {
     Ok(())
 }
 
-static NEXT_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-
 fn atomic_write_shared(path: &Path, bytes: &[u8]) -> Result<(), Error> {
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let seq = NEXT_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let pid = std::process::id();
-    let tmp_path = path.with_file_name(format!(
-        ".{}.{pid}.{seq}.anyagents-new",
-        path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("config")
-    ));
-    std::fs::write(&tmp_path, bytes)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o664));
-    }
-    std::fs::rename(&tmp_path, path)?;
+    anyagents_harness::atomic_write_nonempty_file(path, bytes, 0o664)?;
     Ok(())
 }
 

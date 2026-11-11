@@ -35,12 +35,19 @@ cargo install --locked --path crates/anyagents --bin anyagents
 anyagents --version
 ```
 
+## Three Orthogonal Axes: Harness × Profile × Sandbox
+
+AnyAgents is a **100% vendor-neutral multi-agent orchestrator**. It never implements an LLM loop; instead, each agent composes three independent axes:
+
+1. **Harness (`--harness`) — Who runs the single-agent loop:** Local CLIs (`spiron`, `claude-code`, `codex`, `opencode`, `agy`, `muse`, `omp`, `dsh`, `grok`) and Cloud Harnesses (`spiron-cloud` at `https://spiron.ai`, `claude-cloud`, `openai-cloud`, `cursor-cloud`).
+2. **Profile (`--profile`) — Whose credentials or subscription pays:** Peer provider pools (`anthropic`, `openai`, `google-antigravity`, `muse`, `openrouter`, `sylphx`, Coding Plans) live under `<data>/profiles/<provider>/<profile>`. Binding a profile without a target harness mapping **fails closed** instead of silently falling back to an unauthenticated free tier.
+3. **Sandbox (`WorkspaceBackend`) — Where files and commands execute:** Implements the `anyagents_tools::WorkspaceBackend` trait—`LocalWorkspace` (local directory or git worktree by default), `RemoteSandboxWorkspace` (Cloud Sandbox / E2B HTTP APIs), `DockerWorkspace` (`docker://<host>`), or custom embedders.
+
 ## Why
 
-- **External harnesses, one coordinator.** Run `spiron`, `claude-code`, `codex`, `opencode`, `agy`, `muse`, `omp`, `dsh` and `grok` side-by-side in the same agent organization. `sylphx` remains a compatibility alias for `spiron`.
-- **Vendor-owned sign-in.** AnyAgents launches each harness's sign-in command in its isolated configuration directory. Spiron owns its authentication and model runtime; AnyAgents supplies the authenticated MCP connection to its coordinator.
-- **Any harness, any model.** Pick the harness, the model and how you pay separately. With a Sylphx AI key or provider API key, any model runs in any harness through the built-in protocol gateway. With a subscription, the vendor's own tool runs the vendor's own models.
-- **Your agents keep their state.** Identity, instructions, history, mailbox, groups and channels live in AnyAgents, so an agent can change harness or model without losing any of it.
+- **External harnesses, one coordinator.** Run `spiron`, `claude-code`, `codex`, `opencode`, `agy`, `muse`, `omp`, `dsh` and `grok` side-by-side in the same agent organization with isolated per-agent context windows (`arXiv:2611.05306`) and persona-neutral system envelopes (`arXiv:2611.03931`).
+- **Vendor-owned sign-in.** AnyAgents launches each harness's sign-in command in its isolated configuration directory and refuses unmapped profile-to-harness combinations fail-closed.
+- **Decoupled Harness × Profile × Sandbox.** Switch an agent's harness, credential profile, or sandbox substrate independently without losing its identity, mailbox cursor, history, groups, or channels.
 - **Nothing gets lost, and messages steer live.** Every message goes through a durable per-agent mailbox with ordered, idempotent delivery, visible lag and real-time mid-turn steering into active sessions. The guarantees are tested with crash injection.
 - **Zero-config local tools & clean sandbox boundaries.** In local mode (default), agents run under your own user and keep your `$HOME`, CLI tools and hardware while isolating each agent's harness state and `mcp-capability`. Workspace execution belongs to the selected harness; AnyAgents passes the preserved worktree path and MCP configuration to that process.
 - **Audited erasure for accidental captures.** Ancestors and admins can redact a body/span without changing message ids, order or cursors, including managed JSONL session copies. See [redaction](docs/redaction.md) for permissions, selectors and incomplete-copy receipts.

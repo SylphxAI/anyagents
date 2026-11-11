@@ -133,14 +133,22 @@ fn create_with_seat(
             .map(str::trim)
             .filter(|s| !s.is_empty())
         {
-            let normalized = if prof.contains('/') {
-                prof.to_string()
-            } else {
-                format!(
-                    "{}/{prof}",
-                    upstream_provider_of(&agent.harness, agent.model.as_deref())
-                )
+            let (prov, prof_name) = match prof.split_once('/') {
+                Some((pv, pn)) => (pv.trim().to_string(), pn.trim().to_string()),
+                None => (
+                    upstream_provider_of(&agent.harness, agent.model.as_deref()),
+                    prof.to_string(),
+                ),
             };
+            ensure_profile_compatible_and_mapped(
+                &data,
+                &prov,
+                &prof_name,
+                normalize_harness_name(&agent.harness),
+                agent.model.as_deref(),
+                Some(&config),
+            )?;
+            let normalized = format!("{prov}/{prof_name}");
             write_profile_marker(&config, ".anyagents-profile", &format!("{normalized}\n"))?;
         }
         let wd_str = request
@@ -723,11 +731,10 @@ pub(crate) fn write_agent_instructions_with_continuity(
     // verified output or leave mirrors from different snapshots.
     let _instructions_lock = lock_instruction_mirrors(config)?;
     let _ = std::fs::remove_file(config.join(".anyagents-harness-continuity.md"));
+    // Minimal, persona-neutral identity & routing envelope (arXiv:2611.05306 / arXiv:2611.03931):
+    // inject only causal addressing facts and non-obvious runtime rules; tool schemas carry API details.
     let mut doc = format!(
-        "# AnyAgents Identity & Environment Awareness\n\n\
-         ## 1. Your Identity (Who You Are)\n\n\
-         - **Agent Name**: `{name}` (addressable as `agent:{name}`)\n\
-         - **Agent ID**: `{id}`\n",
+        "# AnyAgents Identity & Environment Awareness\n\n         ## 1. Identity\n\n         - **Agent Name**: `{name}` (`agent:{name}`)\n         - **Agent ID**: `{id}`\n",
         name = agent.name,
         id = agent.id,
     );
@@ -740,19 +747,13 @@ pub(crate) fn write_agent_instructions_with_continuity(
         doc.push_str(&format!("- **Role Label**: `{role}`\n"));
     }
     if let Some(pub_desc) = agent.public_description() {
-        doc.push_str(&format!(
-            "- **Public Description (`description` — visible to all peers & group rosters)**: {pub_desc}\n"
-        ));
+        doc.push_str(&format!("- **Public Description**: {pub_desc}\n"));
     }
     if let Some(parent) = parent_name {
-        doc.push_str(&format!(
-            "- **Relationship**: Sub-agent of `agent:{parent}` (addressable as `\"parent\"` or `\"agent:{parent}\"`).\n"
-        ));
+        doc.push_str(&format!("- **Parent**: `agent:{parent}` (`\"parent\"`)\n"));
     } else {
-        doc.push_str("- **Role**: Root Agent\n");
+        doc.push_str("- **Parent**: none (root)\n");
     }
-
-    doc.push_str("- **Lifecycle**: Role labels do not set lifecycle policy; follow your instructions. Any agent may call `agents` with `action: \"archive\"`. Idle processes release after mailbox/child/background work drains; identity and session persist.\n");
 
     if let Some(custom) = agent
         .instructions
@@ -760,21 +761,13 @@ pub(crate) fn write_agent_instructions_with_continuity(
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        doc.push_str("\n## 2. Role, Responsibilities & Private Instructions (`instructions`)\n\n");
+        doc.push_str("\n## 2. Instructions\n\n");
         doc.push_str(custom);
         doc.push('\n');
     }
 
     doc.push_str(
-        "\n## 3. Hierarchy, Topology & Communication Rules\n\
-         \n\
-         - `description` is a public routing card; `instructions` are private to you and ancestors. Supervision is downward-only.\n\
-         - Live rosters arrive via `<topology event=\"initial|delta\" ... />`; inline `<message ...>` routing carries `sender_rel`, `sender_role`, `reply_to`, `answer_to`.\n\
-         - `scope`: \"isolated\" = parent/children/bound channels; \"private\" (sub-agent default) adds shared groups; \"siblings\" adds siblings; \"public\" = workspace-wide. In group chats only the matching domain agent replies; otherwise `NO_REPLY`.\n\
-         - Stdout never reaches peers/parents/channels. Always call `send` to reply/report (`to`, `reply_to: \"anyagents:reply:msg_...\"`, `text`, etc.); use the envelope's `answer_to`.\n\
-         - Never poll an inbox: messages, sub-agent completions and watches wake you reactively.\n\
-         - Vendor sub-agent/timer tools are disabled by default. Use `code` (`anyagents.*`, `workspace.*`, `web.*`, `computer.*`) or `agents` for lifecycle: isolated `<data>/agents/<id>/work` by default, or `repo` worktrees; `archive` reaps clean/pushed worktrees, preserves dirty/unpushed ones. Use `memory` for durable facts, `conversation` for history/search, `groups` for groups, `schedule` for wakes/event watches.\n\
-         - `browser` provides persistent Chromium; fill secrets with `secret_ref: \"op://...\"` / `\"op-otp://...\"` without reading them. On `captcha_detected: true`, use `action: \"takeover\"` and send the takeover URL to the user.\n",
+        "\n## 3. Hierarchy, Topology & Communication Rules\n\n         - `description` is public; `instructions` are private. Supervision is downward-only; role labels impose no preset persona or lifecycle policy.\n         - Stdout never reaches peers or channels. Reply via `send` (`to`, `reply_to`, `text`) using `<message ... answer_to=\"...\">`; emit `NO_REPLY` in non-matching group turns.\n         - Never poll: `<message>`, child completions, and `schedule` watches wake you reactively.\n         - Any agent may call `agents` (`spawn`/`archive`) or `code` (`anyagents.*`, `workspace.*`, `web.*`, `computer.*`) instead of vendor sub-agent/timer tools; pass `secret_ref: \"op://...\"` to `browser` without reading secrets, and use `action: \"takeover\"` on `captcha_detected: true`.\n",
     );
     if let Some(parent) = parent_name {
         doc.push_str(&format!(
@@ -855,12 +848,21 @@ pub(crate) fn write_agent_instructions_with_continuity(
     let sys_prompt_path = config.join("SYSTEM_PROMPT.md");
     let prompt_changed = std::fs::read(&sys_prompt_path).ok().as_deref() != Some(doc.as_bytes())
         || std::fs::read(config.join("AGENTS.md")).ok().as_deref() != Some(native_doc.as_bytes());
-    if prompt_changed && config.join("sylphx-cloud-session.json").is_file() {
-        let _ = write_seat_shared_file(
-            &config.join(".sylphx-cloud-instructions-fingerprint"),
-            b"stale\n",
-            0o664,
-        );
+    if prompt_changed {
+        for (sess_file, fp_file) in [
+            (
+                "spiron-cloud-session.json",
+                ".spiron-cloud-instructions-fingerprint",
+            ),
+            (
+                "sylphx-cloud-session.json",
+                ".sylphx-cloud-instructions-fingerprint",
+            ),
+        ] {
+            if config.join(sess_file).is_file() {
+                let _ = write_seat_shared_file(&config.join(fp_file), b"stale\n", 0o664);
+            }
+        }
     }
 
     let paths = [
@@ -1363,7 +1365,9 @@ pub(crate) fn chmod_seat_file_readable(path: &Path) {
     #[cfg(unix)]
     if !crate::sandbox::is_isolated_test_env()
         && Path::new("/usr/local/bin/anyagents-setpriv").is_file()
-        && let Ok(meta) = std::fs::metadata(path)
+        && let Ok(meta) = std::fs::symlink_metadata(path)
+        && !meta.file_type().is_symlink()
+        && meta.file_type().is_file()
     {
         use std::os::unix::fs::MetadataExt as _;
         let uid = meta.uid();
@@ -1394,55 +1398,11 @@ pub(crate) fn chmod_seat_file_readable(path: &Path) {
     }
 }
 
-/// Atomically replace only after a complete write, sync and read-back. A failed
-/// destination write never removes the old file or the caller's source.
+/// Atomically replace `dst` only after writing a sibling temp file, `sync_all()`,
+/// non-empty + full read-back verification, `rename`, and parent-directory sync.
+/// A failed write (`ENOSPC`, `EROFS`, `EACCES`) never truncates or removes `dst`.
 pub(crate) fn write_required_file(dst: &Path, bytes: &[u8], mode: u32) -> Result<(), Error> {
-    use std::io::Write as _;
-    if let Some(parent) = dst.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp = dst.with_file_name(format!(
-        ".{}.{}.{}.new",
-        dst.file_name().unwrap_or_default().to_string_lossy(),
-        std::process::id(),
-        seq
-    ));
-    let result = (|| -> Result<(), Error> {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            file.set_permissions(std::fs::Permissions::from_mode(mode))?;
-        }
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        if std::fs::read(&tmp)? != bytes {
-            return Err(Error::Message(format!(
-                "write verification failed: {}",
-                dst.display()
-            )));
-        }
-        std::fs::rename(&tmp, dst)?;
-        if let Some(parent) = dst.parent() {
-            std::fs::File::open(parent)?.sync_all()?;
-        }
-        if std::fs::read(dst)? != bytes {
-            return Err(Error::Message(format!(
-                "write verification failed: {}",
-                dst.display()
-            )));
-        }
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    result
+    anyagents_harness::atomic_write_nonempty_file(dst, bytes, mode).map_err(Error::from)
 }
 
 pub(crate) fn write_seat_shared_file(dst: &Path, bytes: &[u8], mode: u32) -> bool {
@@ -1470,6 +1430,10 @@ pub(crate) fn seeded_profile_name(config_dir: &Path) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+const OAUTH_REFRESH_RESERVATION_FILE: &str = ".anyagents-refresh-reservation";
+const OAUTH_REFRESH_ATTEMPT_FILE: &str = ".anyagents-oauth-refresh-attempt-ms";
+const OAUTH_REFRESH_MIN_RESERVE_BYTES: usize = 16_384;
+
 fn persist_refreshed_credentials(root: &Path, rels: &[&str], bytes: &[u8]) -> Result<(), Error> {
     let recovery = root.join(".anyagents-pending-credentials.json");
     write_required_file(&recovery, bytes, 0o600)?;
@@ -1478,6 +1442,102 @@ fn persist_refreshed_credentials(root: &Path, rels: &[&str], bytes: &[u8]) -> Re
     }
     std::fs::remove_file(recovery)?;
     Ok(())
+}
+
+struct OAuthRefreshDiskReservation {
+    profile_root: PathBuf,
+    reservation_path: PathBuf,
+}
+
+impl OAuthRefreshDiskReservation {
+    /// Fail-closed pre-flight guard before issuing any single-use or rotating
+    /// OAuth `refresh_token` network request:
+    /// 1. Ensures target credential parent directories exist under `profile_root`.
+    /// 2. Pre-writes and `sync_all()`s `.anyagents-refresh-reservation`
+    ///    (`>= max(existing_cred_bytes * 2, 8192)` bytes, scaled by target copies)
+    ///    plus syncs `profile_root` so `ENOSPC`/`EROFS`/`EACCES` abort BEFORE the
+    ///    OAuth server rotates and revokes the existing `refresh_token`.
+    /// 3. Records `.anyagents-oauth-refresh-attempt-ms` via checked `write_required_file`.
+    fn acquire(
+        profile_root: &Path,
+        target_rels: &[&str],
+        existing_cred_bytes: usize,
+        attempt_ms: i64,
+    ) -> Result<Self, Error> {
+        for rel in target_rels {
+            if let Some(parent) = profile_root.join(rel).parent()
+                && parent != profile_root
+            {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        let copies = target_rels.len().saturating_add(2).max(2);
+        let reserve_bytes = existing_cred_bytes
+            .saturating_mul(copies)
+            .max(existing_cred_bytes.saturating_mul(2))
+            .max(OAUTH_REFRESH_MIN_RESERVE_BYTES);
+        let reservation_path = profile_root.join(OAUTH_REFRESH_RESERVATION_FILE);
+        if std::fs::symlink_metadata(&reservation_path)
+            .is_ok_and(|meta| meta.file_type().is_symlink())
+        {
+            std::fs::remove_file(&reservation_path)?;
+        }
+        let write_res = (|| -> Result<(), Error> {
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&reservation_path)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            }
+            let payload = vec![b'0'; reserve_bytes];
+            file.write_all(&payload)?;
+            file.sync_all()?;
+            drop(file);
+            std::fs::File::open(profile_root)?.sync_all()?;
+            Ok(())
+        })();
+        if let Err(err) = write_res {
+            let _ = std::fs::remove_file(&reservation_path);
+            return Err(err);
+        }
+        let guard = Self {
+            profile_root: profile_root.to_path_buf(),
+            reservation_path,
+        };
+        write_required_file(
+            &profile_root.join(OAUTH_REFRESH_ATTEMPT_FILE),
+            format!("{attempt_ms}\n").as_bytes(),
+            0o600,
+        )?;
+        Ok(guard)
+    }
+
+    fn persist_credentials(mut self, rels: &[&str], bytes: &[u8]) -> Result<(), Error> {
+        let _ = std::fs::remove_file(&self.reservation_path);
+        self.reservation_path.clear();
+        persist_refreshed_credentials(&self.profile_root, rels, bytes)
+    }
+}
+
+impl Drop for OAuthRefreshDiskReservation {
+    fn drop(&mut self) {
+        if !self.reservation_path.as_os_str().is_empty() {
+            let _ = std::fs::remove_file(&self.reservation_path);
+        }
+    }
+}
+
+fn anthropic_oauth_usage_url() -> String {
+    std::env::var("ANYAGENTS_ANTHROPIC_OAUTH_USAGE_URL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "https://api.anthropic.com/api/oauth/usage".to_string())
 }
 
 fn post_anthropic_oauth_refresh(http: &ureq::Agent, req_body: &str) -> Option<serde_json::Value> {
@@ -1588,7 +1648,12 @@ fn refresh_anthropic_profile_oauth_if_due(data: &Path, profile_root: &Path) -> R
     else {
         return Ok(());
     };
-    let _ = std::fs::write(&attempt_path, format!("{now_ms}\n"));
+    let reservation = OAuthRefreshDiskReservation::acquire(
+        profile_root,
+        &[".credentials.json", ".claude/.credentials.json"],
+        cred_text.len(),
+        now_ms,
+    )?;
     let http = ureq::Agent::config_builder()
         .timeout_global(Some(std::time::Duration::from_secs(8)))
         .build()
@@ -1636,8 +1701,7 @@ fn refresh_anthropic_profile_oauth_if_due(data: &Path, profile_root: &Path) -> R
             );
         }
         if let Ok(updated) = serde_json::to_string(&cred) {
-            if let Err(err) = persist_refreshed_credentials(
-                profile_root,
+            if let Err(err) = reservation.persist_credentials(
                 &[".credentials.json", ".claude/.credentials.json"],
                 updated.as_bytes(),
             ) {
@@ -1702,7 +1766,12 @@ pub(crate) fn sync_anthropic_agent_credentials_from_profile(
     if !target_config.is_dir() || !profile_root.is_dir() {
         return;
     }
-    let _ = refresh_anthropic_profile_oauth_if_due(data, profile_root);
+    if let Err(err) = refresh_anthropic_profile_oauth_if_due(data, profile_root) {
+        eprintln!(
+            "anthropic oauth refresh skipped for {}: {err}",
+            profile_root.display()
+        );
+    }
     let src = if profile_root.join(".credentials.json").is_file() {
         profile_root.join(".credentials.json")
     } else if profile_root.join(".claude/.credentials.json").is_file() {
@@ -2132,7 +2201,7 @@ pub(crate) fn build_harness_continuity_summary(
     previous_harness: Option<&str>,
     target_harness: &str,
 ) -> Option<String> {
-    let turns = store.conversation(&agent.id, None, None, Some(10)).ok()?;
+    let turns = store.conversation(&agent.id, None, None, Some(6)).ok()?;
     let last_out_idx = turns.iter().rposition(|t| t.direction == "out")?;
     let completed_turns = &turns[..=last_out_idx];
     if completed_turns.is_empty() {
@@ -2143,12 +2212,7 @@ pub(crate) fn build_harness_continuity_summary(
         None => format!("`state.db` -> `{target_harness}`"),
     };
     let mut out = format!(
-        "## 4. Cross-Harness Session Continuity ({header_pair})\n\n\
-         - This AnyAgents identity (`{}` / `{}`) is running on harness `{target_harness}` while retaining its AnyAgents ID, role description, model (`{}`), workdir (`{}`), mailbox cursor, and external execution custody.\n\
-         - **Do NOT replay or repeat already-completed `[OUT]` turns or external side effects** listed below; your mailbox cursor (`delivered_seq`) is already advanced past all prior delivered messages.\n\
-         - **Do NOT reopen paused, archived, or restricted product work** merely because the harness session started; act only on the new incoming `<message>` envelope delivered in the current turn.\n\
-         - Your full historical two-way transcript in `state.db` remains queryable on demand via `conversation({{ \"agent\": \"self\", \"limit\": 30 }})`.\n\n\
-         ### Recent Completed Two-Way Turns (`state.db`)\n\n",
+        "## 4. Cross-Harness Session Continuity ({header_pair})\n\n         - Identity `{}` (`{}`) resumed on `{target_harness}` (`model={}`, `workdir={}`).\n         - Do NOT replay completed `[OUT]` turns below (`delivered_seq` is already advanced); act only on the current `<message>`. Query older turns on demand via `conversation`.\n\n         ### Recent Completed Two-Way Turns (`state.db`)\n\n",
         agent.name,
         agent.id.as_str(),
         agent.model.as_deref().unwrap_or("default"),
@@ -2815,7 +2879,7 @@ pub(crate) fn maybe_notify_parent_on_error(
         "error": trimmed,
         "timestamp_ms": anyagents_core::now_ms(),
     });
-    let _ = std::fs::write(&marker_path, marker.to_string());
+    write_seat_shared_file(&marker_path, marker.to_string().as_bytes(), 0o664);
     let text = format!(
         "[Sub-Agent Error] Sub-agent `{}` (`{}`) entered `turn_state: \"errored\"` on harness `{}`: {}",
         agent.name,
@@ -2919,53 +2983,16 @@ pub(crate) fn configure_agent_runtime(
             )
         };
 
-    let valid_token = |s: &str| {
-        !s.is_empty()
-            && s != "."
-            && s != ".."
-            && s.bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
-    };
-    if !valid_token(&provider) || !valid_token(&profile_name) {
-        return Err(Error::Message(format!(
-            "invalid provider profile `{provider}/{profile_name}`"
-        )));
-    }
-    let (_, default_compat) = default_kind_and_harnesses(&provider);
+    ensure_profile_compatible_and_mapped(
+        data,
+        &provider,
+        &profile_name,
+        &target_harness,
+        resolved_model.as_deref(),
+        Some(&config),
+    )?;
     let profile_dir = data.join("profiles").join(&provider).join(&profile_name);
-    let compatible_harnesses = if profile_dir.join("profile.json").is_file() {
-        std::fs::read_to_string(profile_dir.join("profile.json"))
-            .ok()
-            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-            .and_then(|v| {
-                v.get("compatible_harnesses")
-                    .and_then(|a| a.as_array())
-                    .cloned()
-            })
-            .map(|arr| {
-                let mut v: Vec<String> = arr
-                    .into_iter()
-                    .filter_map(|x| x.as_str().map(normalize_harness_name).map(str::to_string))
-                    .collect();
-                for d in &default_compat {
-                    if !v.iter().any(|x| x == d) {
-                        v.push(d.clone());
-                    }
-                }
-                v
-            })
-            .filter(|v| !v.is_empty())
-            .unwrap_or(default_compat)
-    } else {
-        default_compat
-    };
-    if !compatible_harnesses.iter().any(|h| h == &target_harness) {
-        return Err(Error::Message(format!(
-            "harness `{target_harness}` is not compatible with provider profile `{provider}/{profile_name}` (compatible harnesses: {})",
-            compatible_harnesses.join(", ")
-        )));
-    }
-    if data.join("profiles").is_dir() && !profile_dir.is_dir() {
+    if data.join("profiles").is_dir() && !profile_dir.is_dir() && provider != target_harness {
         return Err(Error::Message(format!(
             "provider profile not found: `{provider}/{profile_name}`"
         )));
@@ -3144,24 +3171,24 @@ pub(crate) fn set_provider_profile(
     let default_dir = data.join("profiles").join(provider).join("default");
     if default_dir != dir {
         for rel in [".config/opencode/opencode.json", "opencode.json"] {
-            if default_dir.join(rel).is_file() && !dir.join(rel).exists() {
-                if let Some(p) = dir.join(rel).parent() {
-                    let _ = std::fs::create_dir_all(p);
-                }
-                let _ = std::fs::copy(default_dir.join(rel), dir.join(rel));
+            let donor = default_dir.join(rel);
+            if let Ok(meta) = std::fs::symlink_metadata(&donor)
+                && !meta.file_type().is_symlink()
+                && meta.file_type().is_file()
+                && !dir.join(rel).exists()
+                && let Ok(bytes) = std::fs::read(&donor)
+                && !bytes.is_empty()
+            {
+                write_required_file(&dir.join(rel), &bytes, 0o600)?;
             }
         }
     }
     if provider == "google-antigravity" {
-        let tok_dir = dir.join(".gemini").join("antigravity-cli");
-        std::fs::create_dir_all(&tok_dir)?;
-        let tok_path = tok_dir.join("antigravity-oauth-token");
-        std::fs::write(&tok_path, format!("{trimmed}\n"))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&tok_path, std::fs::Permissions::from_mode(0o600));
-        }
+        let tok_path = dir
+            .join(".gemini")
+            .join("antigravity-cli")
+            .join("antigravity-oauth-token");
+        write_required_file(&tok_path, format!("{trimmed}\n").as_bytes(), 0o600)?;
         let _ = std::fs::remove_file(dir.join(".config/opencode/google.key"));
         propagate_profile_files_to_bound_agents(
             data,
@@ -3200,16 +3227,8 @@ pub(crate) fn set_provider_profile(
 }
 
 fn write_profile_key_file(dir: &Path, filename: &str, key: &str) -> Result<(), Error> {
-    let key_dir = dir.join(".config").join("opencode");
-    std::fs::create_dir_all(&key_dir)?;
-    let key_path = key_dir.join(filename);
-    std::fs::write(&key_path, format!("{key}\n"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600));
-    }
-    Ok(())
+    let key_path = dir.join(".config").join("opencode").join(filename);
+    write_required_file(&key_path, format!("{key}\n").as_bytes(), 0o600)
 }
 
 pub(crate) fn propagate_profile_files_to_bound_agents(
@@ -3359,7 +3378,7 @@ pub(crate) fn update_profile_json_identity(
         changed = true;
     }
     if changed && let Ok(text) = serde_json::to_string_pretty(&val) {
-        let _ = std::fs::write(&meta_path, text);
+        write_seat_shared_file(&meta_path, text.as_bytes(), 0o600);
     }
 }
 
@@ -3602,26 +3621,6 @@ fn sanitize_profile_slug(raw: &str) -> String {
     }
 }
 
-fn copy_dir_recursive_overwrite(src: &Path, dst: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let ft = entry.file_type()?;
-        let dst_path = dst.join(entry.file_name());
-        if ft.is_dir() {
-            copy_dir_recursive_overwrite(&entry.path(), &dst_path)?;
-        } else if ft.is_file() {
-            let bytes = std::fs::read(entry.path())?;
-            write_required_file(&dst_path, &bytes, 0o600).map_err(std::io::Error::other)?;
-        } else {
-            return Err(std::io::Error::other(
-                "staged credentials must be regular files or directories",
-            ));
-        }
-    }
-    Ok(())
-}
-
 fn extract_profile_dedup_key(prof_dir: &Path, provider: &str) -> Option<String> {
     let (email, account_id) = extract_profile_account_identity(prof_dir, provider);
     if let Some(em) = email {
@@ -3752,6 +3751,7 @@ pub(crate) fn deduplicate_same_account_profiles(data: &Path) {
                     "google-antigravity" => &[
                         ".gemini/antigravity-cli/antigravity-oauth-token",
                         ".gemini/antigravity-cli/antigravity_state.pbtxt",
+                        ".gemini/antigravity-cli/jetski_state.pbtxt",
                         ".gemini/config/config.json",
                     ],
                     "muse" => &["muse/auth.json", ".config/muse/auth.json"],
@@ -3859,51 +3859,271 @@ fn has_credential_material(value: &serde_json::Value) -> bool {
     })
 }
 
-fn validate_staged_credentials(stage: &Path, provider: &str) -> Result<(), Error> {
-    let candidates: &[&str] = match provider {
-        "anthropic" => &[".credentials.json", ".claude/.credentials.json"],
-        "openai" => &["auth.json", ".codex/auth.json"],
-        "google-antigravity" => &[".gemini/antigravity-cli/antigravity-oauth-token"],
-        "muse" => &["muse/auth.json", ".config/muse/auth.json"],
-        "xai" => &[".grok/auth.json"],
-        _ => {
+/// Declared `(primary_credentials, companion_state_files)` for a sign-in provider.
+///
+/// Only files in this manifest are ever read or committed into `profiles/<provider>/<profile>`;
+/// vendor CLI runtime artifacts created inside `.signin-staging-<pid>` (such as `cli.log`
+/// symlinks, `cache/`, `crashes/`, `brain/`, `builtin/`, `log/`, sockets, lockfiles, and
+/// SQLite conversation caches) are ignored and discarded with the staging directory.
+fn staged_signin_manifest(
+    provider: &str,
+) -> Result<(&'static [&'static str], &'static [&'static str]), Error> {
+    match provider {
+        "anthropic" => Ok((
+            &[".credentials.json", ".claude/.credentials.json"],
+            &[".claude.json", ".claude/.claude.json"],
+        )),
+        "openai" => Ok((&["auth.json", ".codex/auth.json"], &[])),
+        "google-antigravity" => Ok((
+            &[".gemini/antigravity-cli/antigravity-oauth-token"],
+            &[
+                ".gemini/antigravity-cli/antigravity_state.pbtxt",
+                ".gemini/antigravity-cli/jetski_state.pbtxt",
+                ".gemini/config/config.json",
+                ".gemini/config/.migrated",
+            ],
+        )),
+        "muse" => Ok((
+            &[
+                "muse/auth.json",
+                ".config/muse/auth.json",
+                ".local/share/muse/auth.json",
+            ],
+            &[
+                "settings.json",
+                "muse/settings.json",
+                "muse/trust.json",
+                ".config/muse/settings.json",
+                ".config/muse/trust.json",
+            ],
+        )),
+        "xai" => Ok((&[".grok/auth.json"], &[])),
+        "spiron" | "sylphx" => Ok((
+            &[
+                "auth.json",
+                "credentials.json",
+                ".config/sylphx/auth.json",
+                ".spiron/auth.json",
+                ".spiron/credentials.json",
+                ".config/sylphx/credentials.json",
+                ".spiron/key",
+                ".config/sylphx/key",
+                ".config/opencode/sylphx.key",
+            ],
+            &[
+                "config.toml",
+                ".spiron/context.json",
+                ".config/sylphx/context.json",
+                ".config/opencode/opencode.json",
+            ],
+        )),
+        "opencode" => Ok((
+            &[
+                "data-home/opencode/auth.json",
+                ".local/share/opencode/auth.json",
+            ],
+            &[
+                "opencode/opencode.json",
+                ".config/opencode/opencode.json",
+                "opencode.json",
+            ],
+        )),
+        "deepseek" => Ok((
+            &[".dsh/.credentials.yaml", ".config/opencode/deepseek.key"],
+            &[
+                ".dsh/settings.yaml",
+                ".dsh/.anonymous-user-id",
+                ".dsh/profiles/headless/cordis.yml",
+            ],
+        )),
+        "omp" | "cursor" => Ok((
+            &[
+                "agent.db",
+                ".omp/agent/agent.db",
+                "cursor-auth.json",
+                "auth.json",
+                "credentials.json",
+            ],
+            &["models.yml", ".omp/agent/models.yml"],
+        )),
+        _ => Err(Error::Message(format!(
+            "unsupported sign-in provider: {provider}"
+        ))),
+    }
+}
+
+/// Fail-closed regular-file reader under `root`:
+/// - Returns `Ok(None)` ONLY when `rel` or an intermediate directory does not exist.
+/// - Refuses (`Err`) if any intermediate segment is a symlink/non-directory or if the
+///   target file itself is a symlink, directory, FIFO, socket, or device, opening the
+///   leaf with `O_NOFOLLOW` on Unix to defeat TOCTOU symlink swaps.
+fn read_staged_regular_file(root: &Path, rel: &str) -> Result<Option<Vec<u8>>, Error> {
+    use std::io::Read as _;
+    use std::path::Component;
+
+    let rel_path = Path::new(rel);
+    let comps: Vec<&std::ffi::OsStr> = rel_path
+        .components()
+        .map(|c| match c {
+            Component::Normal(s) => Ok(s),
+            _ => Err(Error::Message(format!(
+                "invalid staged credential relative path: {rel}"
+            ))),
+        })
+        .collect::<Result<_, _>>()?;
+    if comps.is_empty() {
+        return Err(Error::Message("empty staged credential path".into()));
+    }
+
+    let mut cur = root.to_path_buf();
+    for parent_seg in &comps[..comps.len() - 1] {
+        cur.push(parent_seg);
+        let meta = match std::fs::symlink_metadata(&cur) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
             return Err(Error::Message(format!(
-                "unsupported sign-in provider: {provider}"
+                "staged credential path traverses symlink or non-directory: {rel}"
             )));
         }
+    }
+
+    cur.push(comps[comps.len() - 1]);
+    let leaf_meta = match std::fs::symlink_metadata(&cur) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
     };
+    if leaf_meta.file_type().is_symlink() || !leaf_meta.file_type().is_file() {
+        return Err(Error::Message(format!(
+            "staged credential must be a regular file (not symlink or directory): {rel}"
+        )));
+    }
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = match opts.open(&cur) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    if !file.metadata()?.file_type().is_file() {
+        return Err(Error::Message(format!(
+            "staged credential must be a regular file: {rel}"
+        )));
+    }
+    let mut bytes = Vec::with_capacity(leaf_meta.len() as usize);
+    file.read_to_end(&mut bytes)?;
+    Ok(Some(bytes))
+}
+
+fn validate_staged_primary_bytes(provider: &str, rel: &str, bytes: &[u8]) -> Result<(), Error> {
+    if bytes.is_empty() {
+        return Err(Error::Message(format!("empty staged credential: {rel}")));
+    }
+    if rel.ends_with(".key") || rel.ends_with("/key") {
+        let valid_key = std::str::from_utf8(bytes).is_ok_and(|text| {
+            let token = text.trim();
+            !token.is_empty() && !token.contains(char::is_whitespace)
+        });
+        if !valid_key {
+            return Err(Error::Message(format!("invalid staged API key: {rel}")));
+        }
+        return Ok(());
+    }
+    if rel.ends_with(".yaml") || rel.ends_with(".yml") {
+        let valid_yaml = std::str::from_utf8(bytes).is_ok_and(|text| !text.trim().is_empty());
+        if !valid_yaml {
+            return Err(Error::Message(format!(
+                "invalid staged YAML credential: {rel}"
+            )));
+        }
+        return Ok(());
+    }
+    if rel.ends_with(".db") {
+        if !bytes.starts_with(b"SQLite format 3\0") {
+            return Err(Error::Message(format!(
+                "invalid staged SQLite credential store: {rel}"
+            )));
+        }
+        return Ok(());
+    }
+    // AGY also accepts an operator-provided plaintext refresh token. Other
+    // providers use JSON credential stores; metadata alone is not a login.
+    let plaintext_agy_token = provider == "google-antigravity"
+        && std::str::from_utf8(bytes).is_ok_and(|text| {
+            let token = text.trim();
+            !token.is_empty()
+                && !token.contains(char::is_whitespace)
+                && !token.starts_with(['{', '[', '"'])
+        });
+    if !plaintext_agy_token {
+        let value: serde_json::Value = serde_json::from_slice(bytes)
+            .map_err(|err| Error::Message(format!("invalid staged credential {rel}: {err}")))?;
+        if !has_credential_material(&value) {
+            return Err(Error::Message(format!(
+                "no usable credential material in staged file: {rel}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_staged_credentials(stage: &Path, provider: &str) -> Result<(), Error> {
+    let (primary_rels, companion_rels) = staged_signin_manifest(provider)?;
     let mut found = false;
-    for rel in candidates {
-        let bytes = match std::fs::read(stage.join(rel)) {
-            Ok(bytes) => bytes,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(err) => return Err(err.into()),
+    for rel in primary_rels {
+        let Some(bytes) = read_staged_regular_file(stage, rel)? else {
+            continue;
         };
-        if bytes.is_empty() {
-            return Err(Error::Message(format!("empty staged credential: {rel}")));
-        }
-        // AGY also accepts an operator-provided plaintext refresh token. Other
-        // providers use JSON credential stores; metadata alone is not a login.
-        let plaintext_agy_token = provider == "google-antigravity"
-            && std::str::from_utf8(&bytes).is_ok_and(|text| {
-                let token = text.trim();
-                !token.is_empty()
-                    && !token.contains(char::is_whitespace)
-                    && !token.starts_with(['{', '[', '"'])
-            });
-        if !plaintext_agy_token {
-            let value: serde_json::Value = serde_json::from_slice(&bytes)
-                .map_err(|err| Error::Message(format!("invalid staged credential {rel}: {err}")))?;
-            if !has_credential_material(&value) {
-                return Err(Error::Message(format!(
-                    "no usable credential material in staged file: {rel}"
-                )));
-            }
-        }
+        validate_staged_primary_bytes(provider, rel, &bytes)?;
         found = true;
+    }
+    for rel in companion_rels {
+        let _ = read_staged_regular_file(stage, rel)?;
     }
     if !found {
         return Err(Error::Message("no staged sign-in credentials".into()));
+    }
+    Ok(())
+}
+
+fn commit_staged_signin_files(
+    staging_dir: &Path,
+    final_dir: &Path,
+    provider: &str,
+) -> Result<(), Error> {
+    let (primary_rels, companion_rels) = staged_signin_manifest(provider)?;
+    let mut to_commit: Vec<(&'static str, Vec<u8>)> = Vec::new();
+    let mut primary_count = 0usize;
+    for &rel in primary_rels {
+        let Some(bytes) = read_staged_regular_file(staging_dir, rel)? else {
+            continue;
+        };
+        validate_staged_primary_bytes(provider, rel, &bytes)?;
+        to_commit.push((rel, bytes));
+        primary_count += 1;
+    }
+    if primary_count == 0 {
+        return Err(Error::Message("no staged sign-in credentials".into()));
+    }
+    for &rel in companion_rels {
+        if let Some(bytes) = read_staged_regular_file(staging_dir, rel)?
+            && !bytes.is_empty()
+        {
+            to_commit.push((rel, bytes));
+        }
+    }
+    std::fs::create_dir_all(final_dir)?;
+    for (rel, bytes) in to_commit {
+        write_required_file(&final_dir.join(rel), &bytes, 0o600)?;
     }
     Ok(())
 }
@@ -3981,15 +4201,15 @@ pub(crate) fn resolve_and_commit_staged_signin(
         && std::env::var_os("ANYAGENTS_FAKE_MODE").is_none()
         && std::env::var_os("ANYAGENTS_FAKE_VENDOR_MODE").is_none()
     {
-        let tok_path = staging_dir.join(".gemini/antigravity-cli/antigravity-oauth-token");
-        if !tok_path.is_file() {
-            let _ = std::fs::remove_dir_all(staging_dir);
+        let tok_rel = ".gemini/antigravity-cli/antigravity-oauth-token";
+        let tok_path = staging_dir.join(tok_rel);
+        let Some(tok_bytes) = read_staged_regular_file(staging_dir, tok_rel)? else {
             return Err(Error::Message(
                 "agy sign-in did not complete: no OAuth token was written".into(),
             ));
-        }
-        if let Ok(text) = std::fs::read_to_string(&tok_path)
-            && let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&text)
+        };
+        if let Ok(text) = std::str::from_utf8(&tok_bytes)
+            && let Ok(mut val) = serde_json::from_str::<serde_json::Value>(text)
         {
             let has_email = val
                 .get("email")
@@ -4041,8 +4261,8 @@ pub(crate) fn resolve_and_commit_staged_signin(
                             serde_json::Value::String(id.to_string()),
                         );
                     }
-                    if let Ok(updated) = serde_json::to_string(&val) {
-                        let _ = std::fs::write(&tok_path, updated);
+                    if let Ok(updated) = serde_json::to_string_pretty(&val) {
+                        write_required_file(&tok_path, updated.as_bytes(), 0o600)?;
                     }
                 }
             }
@@ -4121,7 +4341,7 @@ pub(crate) fn resolve_and_commit_staged_signin(
 
     let final_dir = data.join("profiles").join(provider).join(&chosen_profile);
     if staging_dir != final_dir {
-        copy_dir_recursive_overwrite(staging_dir, &final_dir)?;
+        commit_staged_signin_files(staging_dir, &final_dir, provider)?;
         std::fs::remove_dir_all(staging_dir)?;
     }
     finalize_profile_signin(data, provider, &chosen_profile)?;
@@ -4144,7 +4364,8 @@ pub(crate) fn finalize_profile_signin(
 ) -> Result<(), Error> {
     let prof_dir = data.join("profiles").join(provider).join(profile);
     ensure_provider_profile_meta(&prof_dir, provider, None);
-    let _ = std::fs::remove_file(prof_dir.join(".anyagents-oauth-refresh-attempt-ms"));
+    let _ = std::fs::remove_file(prof_dir.join(OAUTH_REFRESH_ATTEMPT_FILE));
+    let _ = std::fs::remove_file(prof_dir.join(OAUTH_REFRESH_RESERVATION_FILE));
     let _ = std::fs::remove_file(prof_dir.join(".anyagents-profile-meta-sync-ms"));
     let _ = std::fs::remove_file(prof_dir.join(".anyagents-usage-backoff-until-ms"));
     let _ = std::fs::remove_file(prof_dir.join(".anyagents-quota-reset-ms"));
@@ -4244,6 +4465,7 @@ pub(crate) fn finalize_profile_signin(
                 &[
                     ".gemini/antigravity-cli/antigravity-oauth-token",
                     ".gemini/antigravity-cli/antigravity_state.pbtxt",
+                    ".gemini/antigravity-cli/jetski_state.pbtxt",
                     ".gemini/config/config.json",
                 ],
             )?;
@@ -4273,54 +4495,64 @@ pub(crate) fn finalize_agent_signin(data: &Path, agent: &Agent) -> Result<(), Er
         anyagents_core::now_ms()
     ));
     std::fs::create_dir_all(&stage)?;
-    let rels: &[&str] = match provider.as_str() {
-        "anthropic" => &[".credentials.json", ".claude/.credentials.json"],
-        "openai" => &["auth.json", ".codex/auth.json"],
-        "google-antigravity" => &[
-            ".gemini/antigravity-cli/antigravity-oauth-token",
-            ".gemini/antigravity-cli/antigravity_state.pbtxt",
-            ".gemini/config/config.json",
-        ],
-        "muse" => &["muse/auth.json", ".config/muse/auth.json"],
-        "xai" => &[".grok/auth.json"],
-        _ => &[],
-    };
-    let mut best_src: Option<(std::time::SystemTime, Vec<u8>)> = None;
-    for rel in rels {
-        let src = cfg.join(rel);
-        if std::fs::read(&src).is_err() {
-            chmod_seat_file_readable(&src);
+    let (primary_rels, companion_rels) = match staged_signin_manifest(&provider) {
+        Ok(m) => m,
+        Err(err) => {
+            let _ = std::fs::remove_dir_all(&stage);
+            return Err(err);
         }
-        if let Ok(meta) = std::fs::metadata(&src)
-            && meta.is_file()
-            && meta.len() > 0
-            && let Ok(bytes) = std::fs::read(&src)
-        {
-            let mt = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+    };
+    let read_seat_regular = |rel: &str| -> Result<Option<Vec<u8>>, Error> {
+        match read_staged_regular_file(&cfg, rel) {
+            Ok(v) => Ok(v),
+            Err(Error::Io(ref io_err)) if io_err.kind() == std::io::ErrorKind::PermissionDenied => {
+                chmod_seat_file_readable(&cfg.join(rel));
+                read_staged_regular_file(&cfg, rel)
+            }
+            Err(err) => Err(err),
+        }
+    };
+    let stage_res = (|| -> Result<(), Error> {
+        let mut best_src: Option<(std::time::SystemTime, Vec<u8>)> = None;
+        for &rel in primary_rels {
+            let Some(bytes) = read_seat_regular(rel)? else {
+                continue;
+            };
+            if bytes.is_empty() {
+                continue;
+            }
+            let mt = std::fs::symlink_metadata(cfg.join(rel))
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .unwrap_or(std::time::UNIX_EPOCH);
             if matches!(provider.as_str(), "anthropic" | "openai") {
                 if best_src.as_ref().is_none_or(|(bmt, _)| mt > *bmt) {
                     best_src = Some((mt, bytes));
                 }
             } else {
-                let dst = stage.join(rel);
-                if let Some(p) = dst.parent() {
-                    std::fs::create_dir_all(p)?;
-                }
-                write_required_file(&dst, &bytes, 0o600)?;
+                write_required_file(&stage.join(rel), &bytes, 0o600)?;
             }
         }
-    }
-    if let Some((_, bytes)) = best_src {
-        for rel in rels {
-            let dst = stage.join(rel);
-            if let Some(p) = dst.parent() {
-                std::fs::create_dir_all(p)?;
+        if let Some((_, bytes)) = best_src {
+            for &rel in primary_rels {
+                write_required_file(&stage.join(rel), &bytes, 0o600)?;
             }
-            write_required_file(&dst, &bytes, 0o600)?;
         }
-    }
-    if !rels.iter().any(|rel| stage.join(rel).is_file()) {
-        return Err(Error::Message("no staged sign-in credentials".into()));
+        for &rel in companion_rels {
+            if let Some(bytes) = read_seat_regular(rel)?
+                && !bytes.is_empty()
+            {
+                write_required_file(&stage.join(rel), &bytes, 0o600)?;
+            }
+        }
+        if !primary_rels.iter().any(|rel| stage.join(rel).is_file()) {
+            return Err(Error::Message("no staged sign-in credentials".into()));
+        }
+        Ok(())
+    })();
+    if let Err(err) = stage_res {
+        let _ = std::fs::remove_dir_all(&stage);
+        return Err(err);
     }
     let (resolved_prof, _, _) = resolve_and_commit_staged_signin(data, &provider, &stage, None)?;
     let normalized = format!("{provider}/{resolved_prof}\n");
@@ -4342,12 +4574,20 @@ pub(crate) fn upstream_provider_of(harness: &str, model: Option<&str>) -> String
         && let Some((prefix, _)) = m.split_once('/')
     {
         match prefix {
-            "sylphx" | "openrouter" | "qwen-token-plan" | "kimi-code-plan" | "glm-code-plan"
-            | "minimax-code-plan" | "anthropic" | "openai" | "xai" | "deepseek" => {
+            "sylphx" | "spiron" | "opencode" | "omp" | "openrouter" | "opengateway"
+            | "google-gemini" | "google-antigravity" | "muse" | "qwen-token-plan"
+            | "kimi-code-plan" | "glm-code-plan" | "minimax-code-plan" | "anthropic" | "openai"
+            | "xai" | "deepseek" | "cursor" => {
                 return prefix.to_string();
             }
             _ => {}
         }
+    }
+    if matches!(
+        harness.trim().to_ascii_lowercase().as_str(),
+        "sylphx" | "sylphx-agent" | "sylphx_agent" | "sylphx/default"
+    ) {
+        return "sylphx".to_string();
     }
     match normalize_harness_name(harness) {
         "claude-code" | "claude-cloud" => "anthropic".to_string(),
@@ -4357,7 +4597,9 @@ pub(crate) fn upstream_provider_of(harness: &str, model: Option<&str>) -> String
         "dsh" => "deepseek".to_string(),
         "grok" => "xai".to_string(),
         "cursor-cloud" => "cursor".to_string(),
-        "spiron" | "spiron-cloud" | "opencode" | "omp" => "sylphx".to_string(),
+        "spiron" | "spiron-cloud" => "spiron".to_string(),
+        "opencode" => "opencode".to_string(),
+        "omp" => "omp".to_string(),
         other => other.to_string(),
     }
 }
@@ -4365,6 +4607,16 @@ pub(crate) fn upstream_provider_of(harness: &str, model: Option<&str>) -> String
 pub(crate) fn default_kind_and_harnesses(provider: &str) -> (&'static str, Vec<String>) {
     let harnesses = |list: &[&str]| list.iter().map(|s| (*s).to_string()).collect();
     match provider {
+        "anthropic" => ("subscription", harnesses(&["claude-code", "claude-cloud"])),
+        "openai" => ("subscription", harnesses(&["codex", "openai-cloud"])),
+        "google-antigravity" => ("subscription", harnesses(&["agy"])),
+        "muse" => ("subscription", harnesses(&["muse"])),
+        "deepseek" => ("subscription", harnesses(&["dsh"])),
+        "xai" => ("subscription", harnesses(&["grok"])),
+        "cursor" => ("subscription", harnesses(&["cursor-cloud"])),
+        "spiron" => ("api-key", harnesses(&["spiron", "spiron-cloud"])),
+        "opencode" => ("api-key", harnesses(&["opencode"])),
+        "omp" => ("api-key", harnesses(&["omp"])),
         "sylphx" => (
             "api-key",
             harnesses(&[
@@ -4385,6 +4637,7 @@ pub(crate) fn default_kind_and_harnesses(provider: &str) -> (&'static str, Vec<S
         "openrouter" | "opengateway" | "google-gemini" => (
             "api-key",
             harnesses(&[
+                "spiron",
                 "opencode",
                 "omp",
                 "claude-code",
@@ -4406,40 +4659,151 @@ pub(crate) fn default_kind_and_harnesses(provider: &str) -> (&'static str, Vec<S
                 "dsh",
             ]),
         ),
-        "anthropic" => (
-            "subscription",
-            harnesses(&["claude-code", "claude-cloud", "opencode", "omp", "muse"]),
-        ),
-        "openai" => (
-            "subscription",
-            harnesses(&["codex", "openai-cloud", "opencode", "omp", "muse"]),
-        ),
-        "google-antigravity" => ("subscription", harnesses(&["agy", "opencode", "omp"])),
-        "muse" => ("subscription", harnesses(&["muse", "omp"])),
-        "deepseek" => ("subscription", harnesses(&["dsh", "opencode", "omp"])),
-        "xai" => ("subscription", harnesses(&["grok", "opencode", "omp"])),
-        "cursor" => (
-            "subscription",
-            harnesses(&["cursor-cloud", "omp", "opencode"]),
-        ),
         _ => (
             "api-key",
-            harnesses(&["opencode", "omp", "claude-code", "codex"]),
+            harnesses(&["spiron", "opencode", "omp", "claude-code", "codex"]),
         ),
     }
 }
 
+pub(crate) fn profile_compatible_harnesses(profile_dir: &Path, provider: &str) -> Vec<String> {
+    let (_, default_compat) = default_kind_and_harnesses(provider);
+    if !profile_dir.join("profile.json").is_file() {
+        return default_compat;
+    }
+    std::fs::read_to_string(profile_dir.join("profile.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| {
+            v.get("compatible_harnesses")
+                .and_then(serde_json::Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|x| x.as_str().map(normalize_harness_name).map(str::to_string))
+                        .collect::<Vec<_>>()
+                })
+        })
+        .filter(|v| !v.is_empty())
+        .unwrap_or(default_compat)
+}
+
+fn dir_has_opencode_mapping(dir: &Path, provider: &str) -> bool {
+    for rel in [
+        "opencode/opencode.json",
+        ".config/opencode/opencode.json",
+        "opencode.json",
+    ] {
+        if let Ok(raw) = std::fs::read_to_string(dir.join(rel))
+            && let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw)
+            && val
+                .get("provider")
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(|m| !m.is_empty())
+        {
+            return true;
+        }
+    }
+    for rel in [
+        "data-home/opencode/auth.json",
+        ".local/share/opencode/auth.json",
+    ] {
+        if let Ok(raw) = std::fs::read_to_string(dir.join(rel))
+            && let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw)
+            && val.as_object().is_some_and(|m| !m.is_empty())
+        {
+            return true;
+        }
+    }
+    let key_rels: Vec<String> = match provider {
+        "sylphx" => vec![
+            ".config/sylphx/key".to_string(),
+            ".config/opencode/sylphx.key".to_string(),
+        ],
+        "qwen-token-plan" => vec![
+            ".config/opencode/qwen-coding-plan.key".to_string(),
+            ".config/opencode/qwen-token-plan.key".to_string(),
+        ],
+        other => vec![format!(".config/opencode/{other}.key")],
+    };
+    key_rels.iter().any(|rel| {
+        std::fs::read_to_string(dir.join(rel))
+            .ok()
+            .is_some_and(|s| !s.trim().is_empty())
+    })
+}
+
+pub(crate) fn ensure_profile_compatible_and_mapped(
+    data: &Path,
+    provider: &str,
+    profile_name: &str,
+    target_harness: &str,
+    resolved_model: Option<&str>,
+    agent_config: Option<&Path>,
+) -> Result<(), Error> {
+    let valid_token = |s: &str| {
+        !s.is_empty()
+            && s != "."
+            && s != ".."
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+    };
+    if !valid_token(provider) || !valid_token(profile_name) {
+        return Err(Error::Message(format!(
+            "invalid provider profile `{provider}/{profile_name}`"
+        )));
+    }
+    let profile_dir = data.join("profiles").join(provider).join(profile_name);
+    let compatible_harnesses = profile_compatible_harnesses(&profile_dir, provider);
+    if !compatible_harnesses.iter().any(|h| h == target_harness) {
+        return Err(Error::Message(format!(
+            "harness `{target_harness}` is not compatible with provider profile `{provider}/{profile_name}` (compatible harnesses: {})",
+            compatible_harnesses.join(", ")
+        )));
+    }
+    if target_harness == "opencode" && provider != "opencode" {
+        let explicit_sylphx_model = provider == "sylphx"
+            && resolved_model
+                .map(str::trim)
+                .is_some_and(|m| m.starts_with("sylphx/"));
+        let data_donor = std::fs::read_to_string(data.join("opencode-provider.json"))
+            .ok()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+            .and_then(|v| {
+                v.get("provider")
+                    .and_then(serde_json::Value::as_object)
+                    .cloned()
+            })
+            .is_some_and(|m| m.contains_key(provider));
+        let mapped = explicit_sylphx_model
+            || data_donor
+            || dir_has_opencode_mapping(&profile_dir, provider)
+            || agent_config.is_some_and(|cfg| dir_has_opencode_mapping(cfg, provider));
+        if !mapped {
+            return Err(Error::Message(format!(
+                "provider profile `{provider}/{profile_name}` has no target mapping for harness `opencode` (fail-closed)"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn copy_host_file(src: &Path, dst: &Path) -> bool {
-    if !src.is_file() {
+    let Ok(meta) = std::fs::symlink_metadata(src) else {
+        return false;
+    };
+    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
         return false;
     }
     if dst.is_file() {
         return true;
     }
-    if let Some(p) = dst.parent() {
-        let _ = std::fs::create_dir_all(p);
+    let Ok(bytes) = std::fs::read(src) else {
+        return false;
+    };
+    if bytes.is_empty() {
+        return false;
     }
-    std::fs::copy(src, dst).is_ok()
+    write_seat_shared_file(dst, &bytes, 0o600)
 }
 
 fn json_oauth_expires_at(bytes: &[u8]) -> Option<i64> {
@@ -4525,10 +4889,10 @@ fn merge_preserved_oauth_metadata(src_bytes: &[u8], dst_bytes: &[u8]) -> Option<
 }
 
 fn copy_seat_file_if_newer(src: &Path, dst: &Path) -> bool {
-    let Ok(src_meta) = std::fs::metadata(src) else {
+    let Ok(src_meta) = std::fs::symlink_metadata(src) else {
         return false;
     };
-    if !src_meta.is_file() || src_meta.len() == 0 {
+    if src_meta.file_type().is_symlink() || !src_meta.file_type().is_file() || src_meta.len() == 0 {
         return false;
     }
     if std::fs::read(src).is_err() {
@@ -4594,18 +4958,7 @@ fn copy_seat_file_if_newer(src: &Path, dst: &Path) -> bool {
             return false;
         }
     }
-    if let Some(p) = dst.parent() {
-        let _ = std::fs::create_dir_all(p);
-    }
-    if std::fs::write(dst, &src_bytes).is_err() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        let _ = std::fs::set_permissions(dst, std::fs::Permissions::from_mode(0o600));
-    }
-    true
+    write_seat_shared_file(dst, &src_bytes, 0o600)
 }
 
 fn ensure_provider_profile_meta(dir: &Path, provider: &str, kind_override: Option<&str>) {
@@ -4620,7 +4973,7 @@ fn ensure_provider_profile_meta(dir: &Path, provider: &str, kind_override: Optio
             "compatible_harnesses": harnesses,
         });
         if let Ok(text) = serde_json::to_string_pretty(&meta) {
-            let _ = std::fs::write(&meta_path, text);
+            write_seat_shared_file(&meta_path, text.as_bytes(), 0o600);
         }
     }
 }
@@ -4669,16 +5022,7 @@ fn sync_and_list_provider_profiles_inner(
     if !skip_heavy_seed {
         // Migrate any legacy harness-named empty/default directories if they match a harness name
         // rather than a provider name and have no `profile.json`.
-        for legacy_harness in [
-            "claude-code",
-            "codex",
-            "opencode",
-            "agy",
-            "omp",
-            "dsh",
-            "grok",
-            "opengateway",
-        ] {
+        for legacy_harness in ["claude-code", "codex", "agy", "dsh", "grok", "opengateway"] {
             let legacy_dir = profiles_root.join(legacy_harness);
             if legacy_dir.is_dir() && !legacy_dir.join("default").join("profile.json").exists() {
                 let _ = std::fs::remove_dir_all(&legacy_dir);
@@ -4777,7 +5121,7 @@ fn sync_and_list_provider_profiles_inner(
                                 "provider": prov_block,
                             });
                             if let Ok(clean_bytes) = serde_json::to_vec_pretty(&clean) {
-                                let _ = std::fs::write(&dst_json, clean_bytes);
+                                write_seat_shared_file(&dst_json, &clean_bytes, 0o600);
                             }
                         }
                         if let Ok(text) = std::fs::read_to_string(&src_json) {
@@ -4841,15 +5185,28 @@ fn sync_and_list_provider_profiles_inner(
                         }
                     }
                 }
-                if matches!(
-                    provider.as_str(),
-                    "sylphx"
-                        | "kimi-code-plan"
-                        | "qwen-token-plan"
-                        | "glm-code-plan"
-                        | "minimax-code-plan"
-                        | "openrouter"
-                ) && !compatible_harnesses.iter().any(|h| h == "spiron")
+                let explicit_harnesses_in_meta =
+                    std::fs::read_to_string(prof_path.join("profile.json"))
+                        .ok()
+                        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+                        .and_then(|val| {
+                            val.get("compatible_harnesses")
+                                .and_then(serde_json::Value::as_array)
+                                .cloned()
+                        })
+                        .is_some_and(|arr| !arr.is_empty());
+                if !explicit_harnesses_in_meta
+                    && matches!(
+                        provider.as_str(),
+                        "sylphx"
+                            | "spiron"
+                            | "kimi-code-plan"
+                            | "qwen-token-plan"
+                            | "glm-code-plan"
+                            | "minimax-code-plan"
+                            | "openrouter"
+                    )
+                    && !compatible_harnesses.iter().any(|h| h == "spiron")
                 {
                     compatible_harnesses.insert(0, "spiron".to_string());
                 }
@@ -5184,7 +5541,7 @@ pub(crate) fn record_profile_quota_reset(data: &Path, agent: &Agent, reset_at_ms
             .and_then(|s| s.trim().parse::<i64>().ok())
             .unwrap_or(0);
         if existing != reset_at_ms {
-            let _ = std::fs::write(&marker, format!("{reset_at_ms}\n"));
+            write_seat_shared_file(&marker, format!("{reset_at_ms}\n").as_bytes(), 0o600);
         }
     }
 }
@@ -5332,7 +5689,7 @@ pub(crate) fn sync_fresher_bound_agent_credentials(data: &Path) {
     {
         return;
     }
-    let _ = std::fs::write(&sync_stamp, format!("{now_ms}\n"));
+    write_seat_shared_file(&sync_stamp, format!("{now_ms}\n").as_bytes(), 0o600);
     if let Ok(entries) = std::fs::read_dir(profiles_root.join("google-antigravity")) {
         for entry in entries.flatten() {
             let prof_path = entry.path();
@@ -5539,7 +5896,7 @@ fn extract_agy_oauth_clients() -> Vec<(String, String)> {
                     "bin_size": bin_size,
                     "clients": out,
                 });
-                let _ = std::fs::write(cp, cache_obj.to_string());
+                write_seat_shared_file(cp, cache_obj.to_string().as_bytes(), 0o600);
             }
             out
         })
@@ -5707,7 +6064,7 @@ fn sync_anthropic_profile_metadata(
         && let Ok(body) = resp.into_body().read_to_string()
         && let Ok(pval) = serde_json::from_str::<serde_json::Value>(&body)
     {
-        let _ = std::fs::write(&meta_sync_path, format!("{now_ms}\n"));
+        write_seat_shared_file(&meta_sync_path, format!("{now_ms}\n").as_bytes(), 0o600);
         let org_type = pval
             .pointer("/organization/organization_type")
             .and_then(serde_json::Value::as_str);
@@ -5785,9 +6142,18 @@ fn sync_anthropic_profile_metadata(
     if (changed || !prof_dir.join(".claude/.credentials.json").is_file())
         && let Ok(updated) = serde_json::to_string(cred)
     {
-        let _ = std::fs::create_dir_all(prof_dir.join(".claude"));
-        let _ = std::fs::write(prof_dir.join(".credentials.json"), &updated);
-        let _ = std::fs::write(prof_dir.join(".claude/.credentials.json"), &updated);
+        persist_refreshed_credentials(
+            prof_dir,
+            &[".credentials.json", ".claude/.credentials.json"],
+            updated.as_bytes(),
+        )
+        .map_err(|err| {
+            eprintln!(
+                "cannot persist anthropic profile metadata ({}): {err}",
+                prof_dir.display()
+            )
+        })
+        .ok()?;
         if !profile.starts_with('.') {
             propagate_profile_files_to_bound_agents(
                 data,
@@ -6071,9 +6437,10 @@ pub(crate) fn probe_one_profile_usage(
                 if token.is_empty() {
                     return None;
                 }
+                let usage_url = anthropic_oauth_usage_url();
                 let fetch_usage = |tok: &str| -> Result<serde_json::Value, u16> {
                     match http
-                        .get("https://api.anthropic.com/api/oauth/usage")
+                        .get(&usage_url)
                         .header("authorization", &format!("Bearer {tok}"))
                         .header("anthropic-beta", "oauth-2025-04-20")
                         .header("cache-control", "no-cache")
@@ -6169,8 +6536,11 @@ pub(crate) fn probe_one_profile_usage(
                     Ok(v) => v,
                     Err(code) if code != 401 => {
                         if code == 429 {
-                            let _ =
-                                std::fs::write(&backoff_path, format!("{}\n", now_ms + 180_000));
+                            write_seat_shared_file(
+                                &backoff_path,
+                                format!("{}\n", now_ms + 180_000).as_bytes(),
+                                0o600,
+                            );
                         }
                         return fallback_cached_usage(&cred, expires_at <= now_ms);
                     }
@@ -6188,9 +6558,10 @@ pub(crate) fn probe_one_profile_usage(
                                 Ok(v) => v,
                                 Err(code) => {
                                     if code == 429 {
-                                        let _ = std::fs::write(
+                                        write_seat_shared_file(
                                             &backoff_path,
-                                            format!("{}\n", now_ms + 180_000),
+                                            format!("{}\n", now_ms + 180_000).as_bytes(),
+                                            0o600,
                                         );
                                     }
                                     return fallback_cached_usage(&cred, false);
@@ -6205,7 +6576,21 @@ pub(crate) fn probe_one_profile_usage(
                             if rtok.is_empty() {
                                 return fallback_cached_usage(&cred, expires_at <= now_ms);
                             }
-                            let _ = std::fs::write(&attempt_path, format!("{now_ms}\n"));
+                            let reservation = match OAuthRefreshDiskReservation::acquire(
+                                &prof_dir,
+                                &[".credentials.json", ".claude/.credentials.json"],
+                                cred_text.len(),
+                                now_ms,
+                            ) {
+                                Ok(r) => r,
+                                Err(err) => {
+                                    eprintln!(
+                                        "oauth refresh aborted before network call ({}): {err}",
+                                        prof_dir.display()
+                                    );
+                                    return fallback_cached_usage(&cred, expires_at <= now_ms);
+                                }
+                            };
                             let req_body = serde_json::json!({
                                 "grant_type": "refresh_token",
                                 "refresh_token": rtok,
@@ -6248,15 +6633,17 @@ pub(crate) fn probe_one_profile_usage(
                                     );
                                 }
                                 if let Ok(updated) = serde_json::to_string(&cred) {
-                                    persist_refreshed_credentials(
-                                        &prof_dir,
-                                        &[".credentials.json", ".claude/.credentials.json"],
-                                        updated.as_bytes(),
-                                    )
-                                    .map_err(|err| {
-                                        eprintln!("credential refresh persistence failed: {err}")
-                                    })
-                                    .ok()?;
+                                    reservation
+                                        .persist_credentials(
+                                            &[".credentials.json", ".claude/.credentials.json"],
+                                            updated.as_bytes(),
+                                        )
+                                        .map_err(|err| {
+                                            eprintln!(
+                                                "credential refresh persistence failed: {err}"
+                                            )
+                                        })
+                                        .ok()?;
                                     propagate_profile_files_to_bound_agents(
                                         data,
                                         provider,
@@ -6280,7 +6667,7 @@ pub(crate) fn probe_one_profile_usage(
                 );
                 let formatted = format_anthropic_usage_summary(&val, tier_badge);
                 if let Some(ref s) = formatted {
-                    let _ = std::fs::write(&last_usage_path, format!("{s}\n"));
+                    write_seat_shared_file(&last_usage_path, format!("{s}\n").as_bytes(), 0o600);
                     let _ = std::fs::remove_file(&backoff_path);
                     if parse_remaining_pct_from_usage(s, None).is_some_and(|p| p > 0) {
                         let _ = std::fs::remove_file(prof_dir.join(".anyagents-quota-reset-ms"));
@@ -6339,6 +6726,19 @@ pub(crate) fn probe_one_profile_usage(
                         if rtok.is_empty() {
                             return None;
                         }
+                        let reservation = OAuthRefreshDiskReservation::acquire(
+                            &prof_dir,
+                            &["auth.json", ".codex/auth.json"],
+                            auth_text.len(),
+                            anyagents_core::now_ms(),
+                        )
+                        .map_err(|err| {
+                            eprintln!(
+                                "oauth refresh aborted before network call ({}): {err}",
+                                prof_dir.display()
+                            )
+                        })
+                        .ok()?;
                         let req_body = serde_json::json!({
                             "client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
                             "grant_type": "refresh_token",
@@ -6371,15 +6771,15 @@ pub(crate) fn probe_one_profile_usage(
                                 );
                             }
                             if let Ok(updated) = serde_json::to_string_pretty(&auth) {
-                                persist_refreshed_credentials(
-                                    &prof_dir,
-                                    &["auth.json", ".codex/auth.json"],
-                                    updated.as_bytes(),
-                                )
-                                .map_err(|err| {
-                                    eprintln!("credential refresh persistence failed: {err}")
-                                })
-                                .ok()?;
+                                reservation
+                                    .persist_credentials(
+                                        &["auth.json", ".codex/auth.json"],
+                                        updated.as_bytes(),
+                                    )
+                                    .map_err(|err| {
+                                        eprintln!("credential refresh persistence failed: {err}")
+                                    })
+                                    .ok()?;
                                 propagate_profile_files_to_bound_agents(
                                     data,
                                     provider,
@@ -6458,10 +6858,9 @@ pub(crate) fn probe_one_profile_usage(
                         .and_then(|s| s.trim().parse::<i64>().ok())
                         .unwrap_or(0);
                     if now_ms.saturating_sub(last_attempt_ms) < 300_000 {
-                        let _ = std::fs::write(&last_usage_path, "__NONE__\n");
+                        write_seat_shared_file(&last_usage_path, b"__NONE__\n", 0o600);
                         return None;
                     }
-                    let _ = std::fs::write(&attempt_path, format!("{now_ms}\n"));
                     let rtok = tok_val
                         .pointer("/token/refresh_token")
                         .or_else(|| tok_val.get("refresh_token"))
@@ -6469,10 +6868,25 @@ pub(crate) fn probe_one_profile_usage(
                         .trim()
                         .to_string();
                     if rtok.is_empty() {
-                        let _ = std::fs::write(&last_usage_path, "__NONE__\n");
+                        write_seat_shared_file(&last_usage_path, b"__NONE__\n", 0o600);
                         return None;
                     }
-                    let mut refreshed_acc = None;
+                    let reservation = match OAuthRefreshDiskReservation::acquire(
+                        &prof_dir,
+                        &[tok_rel],
+                        tok_text.len(),
+                        now_ms,
+                    ) {
+                        Ok(r) => r,
+                        Err(err) => {
+                            eprintln!(
+                                "oauth refresh aborted before network call ({}): {err}",
+                                prof_dir.display()
+                            );
+                            return None;
+                        }
+                    };
+                    let mut refreshed_tokens = None;
                     for (cid, csec) in extract_agy_oauth_clients() {
                         let form_body = format!(
                             "client_id={cid}&client_secret={csec}&refresh_token={rtok}&grant_type=refresh_token"
@@ -6489,12 +6903,18 @@ pub(crate) fn probe_one_profile_usage(
                                 .map(|s| s.trim().to_string())
                             && !acc.is_empty()
                         {
-                            refreshed_acc = Some(acc);
+                            let next_ref = rval
+                                .get("refresh_token")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .map(ToOwned::to_owned);
+                            refreshed_tokens = Some((acc, next_ref));
                             break;
                         }
                     }
-                    let Some(new_acc) = refreshed_acc else {
-                        let _ = std::fs::write(&last_usage_path, "__NONE__\n");
+                    let Some((new_acc, new_ref)) = refreshed_tokens else {
+                        write_seat_shared_file(&last_usage_path, b"__NONE__\n", 0o600);
                         return None;
                     };
                     if let Some(tok_obj) = tok_val
@@ -6505,14 +6925,27 @@ pub(crate) fn probe_one_profile_usage(
                             "access_token".to_string(),
                             serde_json::Value::String(new_acc.clone()),
                         );
+                        if let Some(nr) = new_ref {
+                            tok_obj
+                                .insert("refresh_token".to_string(), serde_json::Value::String(nr));
+                        }
                     } else if let Some(root_obj) = tok_val.as_object_mut() {
                         root_obj.insert(
                             "access_token".to_string(),
                             serde_json::Value::String(new_acc.clone()),
                         );
+                        if let Some(nr) = new_ref {
+                            root_obj
+                                .insert("refresh_token".to_string(), serde_json::Value::String(nr));
+                        }
                     }
                     if let Ok(updated) = serde_json::to_string_pretty(&tok_val) {
-                        let _ = std::fs::write(&tok_path, &updated);
+                        reservation
+                            .persist_credentials(&[tok_rel], updated.as_bytes())
+                            .map_err(|err| {
+                                eprintln!("credential refresh persistence failed: {err}")
+                            })
+                            .ok()?;
                         propagate_profile_files_to_bound_agents(
                             data,
                             provider,
@@ -6604,10 +7037,15 @@ pub(crate) fn probe_one_profile_usage(
                             .and_then(|b| serde_json::from_str::<serde_json::Value>(&b).ok())
                             .as_ref().and_then(observed_agy_tier)
                             .filter(|tier| !tier.is_empty())?;
-                            let _ = std::fs::write(&tier_cache_path, format!("{resolved_tier}\n"));
-                            let _ = std::fs::write(
-                                prof_dir.join(".anyagents-profile-meta-sync-ms"),
-                                format!("{now_ms}\n"),
+                            write_seat_shared_file(
+                                &tier_cache_path,
+                                format!("{resolved_tier}\n").as_bytes(),
+                                0o600,
+                            );
+                            write_seat_shared_file(
+                                &prof_dir.join(".anyagents-profile-meta-sync-ms"),
+                                format!("{now_ms}\n").as_bytes(),
+                                0o600,
                             );
                             resolved_tier
                         };
@@ -6899,6 +7337,19 @@ pub(crate) fn probe_one_profile_usage(
                 let val = match fetch_summary(&access) {
                     Some(v) => v,
                     None if !refresh.is_empty() => {
+                        let _reservation = OAuthRefreshDiskReservation::acquire(
+                            &prof_dir,
+                            &[],
+                            refresh.len(),
+                            anyagents_core::now_ms(),
+                        )
+                        .map_err(|err| {
+                            eprintln!(
+                                "oauth refresh aborted before network call ({}): {err}",
+                                prof_dir.display()
+                            )
+                        })
+                        .ok()?;
                         let cursor_cid = concat!("KbZUR41c", "Y7W6zRSd", "pSUJ7I7m", "LYBKOCmB");
                         let req_body = serde_json::json!({
                             "grant_type": "refresh_token",
@@ -7033,6 +7484,19 @@ pub(crate) fn probe_one_profile_usage(
                         if rtok.is_empty() || cid.is_empty() {
                             return None;
                         }
+                        let reservation = OAuthRefreshDiskReservation::acquire(
+                            &prof_dir,
+                            &[auth_rel],
+                            auth_text.len(),
+                            anyagents_core::now_ms(),
+                        )
+                        .map_err(|err| {
+                            eprintln!(
+                                "oauth refresh aborted before network call ({}): {err}",
+                                prof_dir.display()
+                            )
+                        })
+                        .ok()?;
                         let form_body = format!(
                             "grant_type=refresh_token&refresh_token={rtok}&client_id={cid}"
                         );
@@ -7065,15 +7529,12 @@ pub(crate) fn probe_one_profile_usage(
                                 );
                             }
                             if let Ok(updated) = serde_json::to_string_pretty(&root_auth) {
-                                persist_refreshed_credentials(
-                                    &prof_dir,
-                                    &[auth_rel],
-                                    updated.as_bytes(),
-                                )
-                                .map_err(|err| {
-                                    eprintln!("credential refresh persistence failed: {err}")
-                                })
-                                .ok()?;
+                                reservation
+                                    .persist_credentials(&[auth_rel], updated.as_bytes())
+                                    .map_err(|err| {
+                                        eprintln!("credential refresh persistence failed: {err}")
+                                    })
+                                    .ok()?;
                                 propagate_profile_files_to_bound_agents(
                                     data,
                                     provider,
@@ -7157,9 +7618,9 @@ pub(crate) fn probe_one_profile_usage(
     })();
     if provider != "anthropic" {
         if let Some(ref s) = result {
-            let _ = std::fs::write(&last_usage_path, format!("{s}\n"));
+            write_seat_shared_file(&last_usage_path, format!("{s}\n").as_bytes(), 0o600);
         } else {
-            let _ = std::fs::write(&last_usage_path, "__NONE__\n");
+            write_seat_shared_file(&last_usage_path, b"__NONE__\n", 0o600);
         }
     }
     result
@@ -7286,7 +7747,8 @@ pub(crate) fn force_refresh_provider_profiles(
             }
             let _ = std::fs::remove_file(prof_dir.join(".anyagents-profile-meta-sync-ms"));
             let _ = std::fs::remove_file(prof_dir.join(".anyagents-last-usage.txt"));
-            let _ = std::fs::remove_file(prof_dir.join(".anyagents-oauth-refresh-attempt-ms"));
+            let _ = std::fs::remove_file(prof_dir.join(OAUTH_REFRESH_ATTEMPT_FILE));
+            let _ = std::fs::remove_file(prof_dir.join(OAUTH_REFRESH_RESERVATION_FILE));
             match provider.as_str() {
                 "anthropic" => {
                     let Ok(cred_text) = std::fs::read_to_string(prof_dir.join(".credentials.json"))
@@ -7315,31 +7777,33 @@ pub(crate) fn force_refresh_provider_profiles(
                         .pointer("/claudeAiOauth/expiresAt")
                         .and_then(serde_json::Value::as_i64)
                         .unwrap_or(0);
+                    let usage_url = anthropic_oauth_usage_url();
                     let tok_valid = !tok.is_empty()
                         && expires_at > now_ms + 300_000
                         && http
-                            .get("https://api.anthropic.com/api/oauth/usage")
+                            .get(&usage_url)
                             .header("authorization", &format!("Bearer {tok}"))
                             .header("anthropic-beta", "oauth-2025-04-20")
                             .header("cache-control", "no-cache")
                             .header("user-agent", "claude-code/2.1.310")
                             .call()
                             .is_ok();
-                    let last_attempt_ms = std::fs::read_to_string(
-                        prof_dir.join(".anyagents-oauth-refresh-attempt-ms"),
-                    )
-                    .ok()
-                    .and_then(|s| s.trim().parse::<i64>().ok())
-                    .unwrap_or(0);
+                    let last_attempt_ms =
+                        std::fs::read_to_string(prof_dir.join(OAUTH_REFRESH_ATTEMPT_FILE))
+                            .ok()
+                            .and_then(|s| s.trim().parse::<i64>().ok())
+                            .unwrap_or(0);
                     let mut refreshed_token = false;
                     if !tok_valid
                         && !rtok.is_empty()
                         && now_ms.saturating_sub(last_attempt_ms) >= 300_000
                     {
-                        let _ = std::fs::write(
-                            prof_dir.join(".anyagents-oauth-refresh-attempt-ms"),
-                            format!("{now_ms}\n"),
-                        );
+                        let reservation = OAuthRefreshDiskReservation::acquire(
+                            &prof_dir,
+                            &[".credentials.json", ".claude/.credentials.json"],
+                            cred_text.len(),
+                            now_ms,
+                        )?;
                         let req_body = serde_json::json!({
                             "grant_type": "refresh_token",
                             "refresh_token": rtok,
@@ -7381,6 +7845,12 @@ pub(crate) fn force_refresh_provider_profiles(
                                     );
                                 }
                             }
+                            let updated = serde_json::to_string(&cred)
+                                .map_err(|e| Error::Message(e.to_string()))?;
+                            reservation.persist_credentials(
+                                &[".credentials.json", ".claude/.credentials.json"],
+                                updated.as_bytes(),
+                            )?;
                         }
                     }
                     if !tok.is_empty() {
@@ -7418,6 +7888,12 @@ pub(crate) fn force_refresh_provider_profiles(
                         .trim()
                         .to_string();
                     if !rtok.is_empty() {
+                        let reservation = OAuthRefreshDiskReservation::acquire(
+                            &prof_dir,
+                            &["auth.json", ".codex/auth.json"],
+                            auth_text.len(),
+                            now_ms,
+                        )?;
                         let req_body = serde_json::json!({
                             "client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
                             "grant_type": "refresh_token",
@@ -7453,8 +7929,7 @@ pub(crate) fn force_refresh_provider_profiles(
                                 );
                             }
                             if let Ok(updated) = serde_json::to_string_pretty(&auth) {
-                                persist_refreshed_credentials(
-                                    &prof_dir,
+                                reservation.persist_credentials(
                                     &["auth.json", ".codex/auth.json"],
                                     updated.as_bytes(),
                                 )?;
@@ -7874,7 +8349,7 @@ pub(crate) fn list_harness_profiles(
 ) -> Vec<(String, PathBuf)> {
     let provider = match provider_or_harness {
         "claude-code" | "claude-cloud" | "codex" | "openai-cloud" | "cursor-cloud" | "agy"
-        | "muse" | "dsh" | "grok" | "opencode" | "omp" | "spiron" | "spiron-cloud" | "sylphx" => {
+        | "muse" | "dsh" | "grok" | "opencode" | "omp" | "spiron" | "spiron-cloud" => {
             upstream_provider_of(provider_or_harness, None)
         }
         other => other.to_string(),
@@ -7933,6 +8408,12 @@ fn select_or_bind_profile(
     let provider = upstream_provider_of(&agent.harness, agent.model.as_deref());
     let available = list_harness_profiles(data, &provider);
     if let Some(existing) = bound_profile_name(target_config) {
+        if let Some((bound_prov, prof_name)) = existing.split_once('/') {
+            let explicit_dir = data.join("profiles").join(bound_prov).join(prof_name);
+            if explicit_dir.is_dir() {
+                return vec![explicit_dir];
+            }
+        }
         let prof_name = existing
             .split_once('/')
             .map(|(_, p)| p)
@@ -7951,18 +8432,31 @@ fn select_or_bind_profile(
             }
         }
     }
-    let chosen_name = if available.iter().any(|(n, _)| n == "default") || available.is_empty() {
-        "default".to_string()
-    } else {
-        available[0].0.clone()
-    };
+    if let Some((chosen_name, chosen_dir)) = available
+        .iter()
+        .find(|(n, _)| n == "default")
+        .or_else(|| available.first())
+    {
+        let chosen_prov = chosen_dir
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|n| n.to_str())
+            .unwrap_or(provider.as_str());
+        write_profile_marker(
+            target_config,
+            ".anyagents-profile",
+            &format!("{chosen_prov}/{chosen_name}\n"),
+        )
+        .unwrap_or_else(|err| eprintln!("runtime persistence failed: {err}"));
+        return vec![chosen_dir.clone()];
+    }
     write_profile_marker(
         target_config,
         ".anyagents-profile",
-        &format!("{provider}/{chosen_name}\n"),
+        &format!("{provider}/default\n"),
     )
     .unwrap_or_else(|err| eprintln!("runtime persistence failed: {err}"));
-    vec![data.join("profiles").join(&provider).join(chosen_name)]
+    vec![data.join("profiles").join(&provider).join("default")]
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -8024,8 +8518,7 @@ pub(crate) fn save_subagent_defaults(
     let mut cfg = cfg.clone();
     normalize_subagent_harnesses(&mut cfg);
     let text = serde_json::to_string_pretty(&cfg).map_err(|err| Error::Message(err.to_string()))?;
-    std::fs::write(path, format!("{text}\n"))?;
-    Ok(())
+    write_required_file(&path, format!("{text}\n").as_bytes(), 0o644)
 }
 
 /// Parsed archetype template loaded from `<archetype>.md` or `<archetype>/agent.md`.
@@ -8128,19 +8621,11 @@ pub(crate) fn parse_archetype_markdown(raw: &str) -> Result<ArchetypeTemplate, E
 /// 2. `<parent_workdir>/.agents/agents/<archetype>.md` (or `<archetype>/agent.md`)
 /// 3. `<data_dir>/.agents/agents/<archetype>.md` (then `<data_dir>/agents-templates/`, `<data_dir>/archetypes/`)
 /// 4. `<HOME>/.agents/agents/<archetype>.md` (and `owner_workdir()/.agents/agents/`)
-pub(crate) fn resolve_archetype_template(
-    archetype: &str,
+pub(crate) fn archetype_search_roots(
     explicit_workdir: Option<&Path>,
     parent_workdir: Option<&Path>,
     data_dir: &Path,
-) -> Result<Option<ArchetypeTemplate>, Error> {
-    let slug = archetype.trim();
-    if !valid_template_stem(slug) {
-        return Err(Error::Message(format!(
-            "invalid archetype template name {archetype:?}; expected a single filename stem"
-        )));
-    }
-
+) -> Vec<(PathBuf, PathBuf)> {
     let mut search_roots: Vec<(PathBuf, PathBuf)> = Vec::new();
     if let Some(wd) = explicit_workdir {
         let s = wd.to_string_lossy();
@@ -8149,7 +8634,10 @@ pub(crate) fn resolve_archetype_template(
         }
     }
     if let Some(pwd) = parent_workdir {
-        search_roots.push((pwd.to_path_buf(), PathBuf::from(".agents/agents")));
+        let s = pwd.to_string_lossy();
+        if !matches!(s.trim(), "" | "worktree" | "branch" | "private" | "inherit") {
+            search_roots.push((pwd.to_path_buf(), PathBuf::from(".agents/agents")));
+        }
     }
     search_roots.push((data_dir.to_path_buf(), PathBuf::from(".agents/agents")));
     search_roots.push((data_dir.to_path_buf(), PathBuf::from("agents-templates")));
@@ -8163,7 +8651,23 @@ pub(crate) fn resolve_archetype_template(
             search_roots.push((owd, PathBuf::from(".agents/agents")));
         }
     }
+    search_roots
+}
 
+pub(crate) fn resolve_archetype_template(
+    archetype: &str,
+    explicit_workdir: Option<&Path>,
+    parent_workdir: Option<&Path>,
+    data_dir: &Path,
+) -> Result<Option<ArchetypeTemplate>, Error> {
+    let slug = archetype.trim();
+    if !valid_template_stem(slug) {
+        return Err(Error::Message(format!(
+            "invalid archetype template name {archetype:?}; expected a single filename stem"
+        )));
+    }
+
+    let search_roots = archetype_search_roots(explicit_workdir, parent_workdir, data_dir);
     let candidates = [
         format!("{slug}.md"),
         format!("{}/agent.md", slug),
@@ -8180,15 +8684,68 @@ pub(crate) fn resolve_archetype_template(
     Ok(None)
 }
 
-/// Read a template without ever following a symlink in the candidate path.  The
-/// check is intentionally performed for every lookup, including implicit role
-/// lookup, so a hostile `.agents/agents` cannot be bypassed by falling through to
-/// another search root.
+/// Read a template under a trusted search root `base` while refusing any symlink
+/// or traversal inside `relative`.
+///
+/// Trusted `base` roots themselves may be symlinks or sit beneath symlinked mount
+/// points (e.g. `/home/user/workspace -> /workspace-data/workspace` or macOS
+/// `/var -> /private/var`), so `base` is canonicalized first; every component of
+/// `relative` beneath `canonical_base` is then verified symlink-free and opened
+/// with `O_NOFOLLOW` descriptor pinning.
 fn read_archetype_file(base: &Path, relative: &Path) -> Result<Option<String>, Error> {
-    let inspect = |component: &Path| -> Result<bool, Error> {
+    use std::path::Component;
+
+    let mut normal_parts = Vec::new();
+    for part in relative.components() {
+        match part {
+            Component::Normal(seg) => normal_parts.push(seg),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(Error::Message(format!(
+                    "archetype template relative path escapes base: {}",
+                    relative.display()
+                )));
+            }
+        }
+    }
+    if normal_parts.is_empty() {
+        return Err(Error::Message(
+            "archetype template relative path is empty".to_string(),
+        ));
+    }
+
+    let canonical_base = match std::fs::canonicalize(base) {
+        Ok(resolved) => resolved,
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(err) => {
+            return Err(Error::Message(format!(
+                "cannot resolve archetype base {}: {err}",
+                base.display()
+            )));
+        }
+    };
+    if !canonical_base.is_dir() {
+        return Ok(None);
+    }
+
+    let inspect_relative_component = |component: &Path| -> Result<bool, Error> {
         let metadata = match std::fs::symlink_metadata(component) {
             Ok(metadata) => metadata,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                return Ok(false);
+            }
             Err(err) => {
                 return Err(Error::Message(format!(
                     "cannot inspect archetype template path {}: {err}",
@@ -8204,27 +8761,15 @@ fn read_archetype_file(base: &Path, relative: &Path) -> Result<Option<String>, E
         }
         Ok(true)
     };
-    if !inspect(base)? {
-        return Ok(None);
-    }
-    // Ancestors above the authorized base can contain OS aliases (e.g. macOS
-    // /var -> /private/var). Resolve those once, then refuse every symlink from
-    // the base through the template file itself.
-    let canonical_base = std::fs::canonicalize(base).map_err(|err| {
-        Error::Message(format!(
-            "cannot resolve archetype base {}: {err}",
-            base.display()
-        ))
-    })?;
+
     let mut component = canonical_base.clone();
-    for part in relative.components() {
-        component.push(part);
-        if !inspect(&component)? {
+    for seg in &normal_parts {
+        component.push(seg);
+        if !inspect_relative_component(&component)? {
             return Ok(None);
         }
     }
-    let path = canonical_base.join(relative);
-    let path = path.as_path();
+    let path = component.as_path();
 
     let template_dir = path.parent().ok_or_else(|| {
         Error::Message(format!(
@@ -8244,7 +8789,9 @@ fn read_archetype_file(base: &Path, relative: &Path) -> Result<Option<String>, E
             path.display()
         ))
     })?;
-    if canonical_file.parent() != Some(canonical_dir.as_path()) {
+    if !canonical_file.starts_with(&canonical_base)
+        || canonical_file.parent() != Some(canonical_dir.as_path())
+    {
         return Err(Error::Message(format!(
             "archetype template escapes its authorized directory: {}",
             path.display()
@@ -12386,5 +12933,615 @@ mod runtime_config_tests {
         unsafe {
             std::env::remove_var("ANYAGENTS_ANTHROPIC_OAUTH_TOKEN_URL");
         }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn archetype_lookup_allows_symlinked_trusted_base_roots_and_blocks_relative_escapes() {
+        let dir = crate::test_tempdir();
+        let storage = dir.path().join("workspace-data/workspace/repo");
+        let data_dir = dir.path().join("data");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(storage.join(".agents/agents")).unwrap();
+        std::fs::create_dir_all(data_dir.join(".agents/agents")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        std::fs::write(
+            storage.join(".agents/agents/architect.md"),
+            "---\ndescription: Workspace architect\n---\nFrom symlinked base.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            data_dir.join(".agents/agents/architect.md"),
+            "---\ndescription: Fallback architect\n---\nFrom data_dir.\n",
+        )
+        .unwrap();
+        std::fs::write(outside.join("secret.md"), "From outside.\n").unwrap();
+
+        let base_symlink = dir.path().join("workspace-link");
+        std::os::unix::fs::symlink(&storage, &base_symlink).unwrap();
+
+        let roots =
+            archetype_search_roots(Some(Path::new("worktree")), Some(&base_symlink), &data_dir);
+        assert_eq!(
+            roots[0],
+            (base_symlink.clone(), PathBuf::from(".agents/agents"))
+        );
+
+        let via_explicit =
+            resolve_archetype_template("architect", Some(&base_symlink), None, &data_dir)
+                .unwrap()
+                .expect("template under symlinked base must resolve");
+        assert_eq!(
+            via_explicit.description.as_deref(),
+            Some("Workspace architect")
+        );
+        assert_eq!(via_explicit.body, "From symlinked base.");
+
+        let via_parent = resolve_archetype_template(
+            "architect",
+            Some(Path::new("private")),
+            Some(&base_symlink),
+            &data_dir,
+        )
+        .unwrap()
+        .expect("template under symlinked parent_workdir must resolve");
+        assert_eq!(via_parent.body, "From symlinked base.");
+
+        let missing_base = dir.path().join("nonexistent-workdir");
+        let via_fallback =
+            resolve_archetype_template("architect", Some(&missing_base), None, &data_dir)
+                .unwrap()
+                .expect("missing explicit workdir should fall through to data_dir");
+        assert_eq!(via_fallback.body, "From data_dir.");
+
+        std::os::unix::fs::symlink(
+            outside.join("secret.md"),
+            storage.join(".agents/agents/evil.md"),
+        )
+        .unwrap();
+        std::fs::write(
+            data_dir.join(".agents/agents/evil.md"),
+            "Fallback evil should never be reached.\n",
+        )
+        .unwrap();
+        let err = resolve_archetype_template("evil", Some(&base_symlink), None, &data_dir)
+            .expect_err("relative symlink inside symlinked base must fail closed");
+        assert!(err.to_string().contains("symlink"), "{err}");
+
+        let trav = read_archetype_file(
+            &base_symlink,
+            Path::new(".agents/agents/../../../outside/secret.md"),
+        )
+        .expect_err("parent traversal in relative path must fail closed");
+        assert!(trav.to_string().contains("escapes base"), "{trav}");
+    }
+
+    #[test]
+    fn vendor_neutral_profiles_and_fail_closed_harness_mappings() {
+        let dir = crate::test_tempdir();
+        let data = dir.path();
+        let store = Store::open(data.join("state.db")).unwrap();
+        store
+            .hold_capability_key("0123456789abcdef0123456789abcdef")
+            .unwrap();
+
+        assert_eq!(upstream_provider_of("opencode", None), "opencode");
+        assert_eq!(upstream_provider_of("omp", None), "omp");
+        assert_eq!(upstream_provider_of("spiron", None), "spiron");
+        assert_eq!(upstream_provider_of("spiron-cloud", None), "spiron");
+        assert_eq!(
+            upstream_provider_of("opencode", Some("sylphx/openai/gpt-6.1-sol")),
+            "sylphx"
+        );
+
+        for (prov, expected_harness) in [
+            ("anthropic", "claude-code"),
+            ("openai", "codex"),
+            ("google-antigravity", "agy"),
+            ("muse", "muse"),
+            ("sylphx", "spiron"),
+        ] {
+            ensure_provider_profile_meta(
+                &data.join("profiles").join(prov).join("default"),
+                prov,
+                None,
+            );
+            let (_, compat) = default_kind_and_harnesses(prov);
+            assert!(
+                compat.iter().any(|h| h == expected_harness),
+                "{prov}: {compat:?}"
+            );
+        }
+
+        for unmapped in [
+            "anthropic/default",
+            "openai/default",
+            "google-antigravity/default",
+            "muse/default",
+        ] {
+            let res = create(
+                &store,
+                data,
+                CreateRequest {
+                    name: format!("bad-{}", unmapped.replace('/', "-")),
+                    role: None,
+                    harness: "opencode".to_string(),
+                    model: None,
+                    profile: Some(unmapped.to_string()),
+                    repo: None,
+                    branch: None,
+                    base: None,
+                    workdir: None,
+                    workdir_default: Some(data.to_path_buf()),
+                    description: Some("test".to_string()),
+                    instructions: Some("test".to_string()),
+                    parent_id: None,
+                },
+            );
+            assert!(
+                res.is_err(),
+                "expected fail-closed rejection for {unmapped} on opencode"
+            );
+        }
+
+        let narrowed = data.join("profiles/sylphx/spiron-only");
+        std::fs::create_dir_all(&narrowed).unwrap();
+        std::fs::write(
+            narrowed.join("profile.json"),
+            r#"{"provider":"sylphx","kind":"api-key","compatible_harnesses":["spiron"]}"#,
+        )
+        .unwrap();
+        assert!(
+            ensure_profile_compatible_and_mapped(
+                data,
+                "sylphx",
+                "spiron-only",
+                "codex",
+                Some("sylphx/openai/gpt-6.1-sol"),
+                None
+            )
+            .is_err(),
+            "narrowed compatible_harnesses in profile.json must be strictly honored"
+        );
+        assert!(
+            ensure_profile_compatible_and_mapped(data, "sylphx", "default", "opencode", None, None)
+                .is_err(),
+            "sylphx/default without key, provider block, or sylphx/ model must fail closed on opencode"
+        );
+    }
+
+    #[test]
+    fn oauth_refresh_fails_closed_without_network_request_when_reservation_cannot_persist() {
+        const WORKER: &str = "ANYAGENTS_OAUTH_RESERVATION_TEST";
+        if std::env::var_os(WORKER).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "create::runtime_config_tests::oauth_refresh_fails_closed_without_network_request_when_reservation_cannot_persist",
+                    "--nocapture",
+                ])
+                .env(WORKER, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}
+{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+            return;
+        }
+
+        use std::io::{Read, Write};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let token_hits = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let token_hits_srv = Arc::clone(&token_hits);
+        let stop_srv = Arc::clone(&stop);
+        let server = std::thread::spawn(move || {
+            while !stop_srv.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
+                        let mut buf = [0u8; 4096];
+                        let n = stream.read(&mut buf).unwrap_or(0);
+                        let req = String::from_utf8_lossy(&buf[..n]);
+                        let (status, body) = if req.starts_with("POST /v1/oauth/token") {
+                            token_hits_srv.fetch_add(1, Ordering::SeqCst);
+                            (
+                                "200 OK",
+                                r#"{"access_token":"rotated-access-token","refresh_token":"rotated-refresh-token","expires_in":28800}"#,
+                            )
+                        } else if req.starts_with("GET /api/oauth/usage") {
+                            (
+                                "200 OK",
+                                r#"{"five_hour":{"utilization":12.0},"seven_day":{"utilization":25.0}}"#,
+                            )
+                        } else {
+                            ("404 Not Found", r#"{"error":"not_found"}"#)
+                        };
+                        let resp = format!(
+                            "HTTP/1.1 {status}
+Content-Type: application/json
+Content-Length: {}
+Connection: close
+
+{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                        let _ = stream.flush();
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let token_url = format!("http://{addr}/v1/oauth/token");
+        let usage_url = format!("http://{addr}/api/oauth/usage");
+        unsafe {
+            std::env::set_var("ANYAGENTS_ANTHROPIC_OAUTH_TOKEN_URL", &token_url);
+            std::env::set_var("ANYAGENTS_ANTHROPIC_OAUTH_USAGE_URL", &usage_url);
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("profiles/anthropic/default");
+        std::fs::create_dir_all(profile.join(".claude")).unwrap();
+        let now_ms = anyagents_core::now_ms();
+        let initial_creds = serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "initial-access-token",
+                "refreshToken": "single-use-refresh-token",
+                "expiresAt": now_ms - 60_000,
+                "subscriptionType": "max"
+            }
+        });
+        let raw_initial = serde_json::to_vec(&initial_creds).unwrap();
+        std::fs::write(profile.join(".credentials.json"), &raw_initial).unwrap();
+        std::fs::write(profile.join(".claude/.credentials.json"), &raw_initial).unwrap();
+
+        // Case 1: Reservation write fails (blocked reservation target + read-only profile_root).
+        std::fs::create_dir(profile.join(OAUTH_REFRESH_RESERVATION_FILE)).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&profile, std::fs::Permissions::from_mode(0o555)).unwrap();
+        }
+        assert!(
+            refresh_anthropic_profile_oauth_if_due(dir.path(), &profile).is_err(),
+            "refresh must fail closed when disk reservation cannot persist"
+        );
+        let _ = probe_one_profile_usage(dir.path(), "anthropic", "default");
+        assert_eq!(
+            token_hits.load(Ordering::SeqCst),
+            0,
+            "zero OAuth refresh HTTP requests may fire when reservation fails"
+        );
+        for rel in [".credentials.json", ".claude/.credentials.json"] {
+            assert_eq!(std::fs::read(profile.join(rel)).unwrap(), raw_initial);
+        }
+
+        // Restore directory permissions and remove reservation blocker.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&profile, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::remove_dir(profile.join(OAUTH_REFRESH_RESERVATION_FILE)).unwrap();
+
+        // Case 2: Checked `.anyagents-oauth-refresh-attempt-ms` write fails; reservation is cleaned up.
+        std::fs::create_dir(profile.join(OAUTH_REFRESH_ATTEMPT_FILE)).unwrap();
+        assert!(
+            refresh_anthropic_profile_oauth_if_due(dir.path(), &profile).is_err(),
+            "refresh must fail closed when attempt-ms marker write fails"
+        );
+        assert_eq!(token_hits.load(Ordering::SeqCst), 0);
+        assert!(!profile.join(OAUTH_REFRESH_RESERVATION_FILE).exists());
+        assert_eq!(
+            std::fs::read(profile.join(".credentials.json")).unwrap(),
+            raw_initial
+        );
+        std::fs::remove_dir(profile.join(OAUTH_REFRESH_ATTEMPT_FILE)).unwrap();
+
+        // Case 3: Writable profile_root reserves space, rotates once, persists atomically, and cleans reservation.
+        refresh_anthropic_profile_oauth_if_due(dir.path(), &profile).unwrap();
+        assert_eq!(token_hits.load(Ordering::SeqCst), 1);
+        assert!(!profile.join(OAUTH_REFRESH_RESERVATION_FILE).exists());
+        assert!(!profile.join(".anyagents-pending-credentials.json").exists());
+        assert!(profile.join(OAUTH_REFRESH_ATTEMPT_FILE).is_file());
+        for rel in [".credentials.json", ".claude/.credentials.json"] {
+            let val: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(profile.join(rel)).unwrap()).unwrap();
+            assert_eq!(
+                val.pointer("/claudeAiOauth/accessToken")
+                    .and_then(serde_json::Value::as_str),
+                Some("rotated-access-token")
+            );
+            assert_eq!(
+                val.pointer("/claudeAiOauth/refreshToken")
+                    .and_then(serde_json::Value::as_str),
+                Some("rotated-refresh-token")
+            );
+        }
+
+        stop.store(true, Ordering::SeqCst);
+        server.join().unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn enospc_and_write_failures_preserve_antigravity_and_anthropic_credentials() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let agy_prof = dir.path().join("profiles/google-antigravity/default");
+        let agy_rel = ".gemini/antigravity-cli/antigravity-oauth-token";
+        let agy_tok = agy_prof.join(agy_rel);
+        let agy_initial = br#"{"token":{"access_token":"ya29.orig","refresh_token":"1//keep-this-refresh"},"email":"operator@example.com"}"#;
+        write_required_file(&agy_tok, agy_initial, 0o600).unwrap();
+
+        // Simulate mid-write ENOSPC (errno 28) during token refresh persistence.
+        let enospc_err = anyagents_harness::atomic_write_with(
+            &agy_tok,
+            br#"{"token":{"access_token":"ya29.new","refresh_token":"1//keep-this-refresh"}}"#,
+            0o600,
+            true,
+            |file, data| {
+                use std::io::Write as _;
+                file.write_all(&data[..20])?;
+                Err(std::io::Error::from_raw_os_error(28))
+            },
+        )
+        .unwrap_err();
+        assert_eq!(enospc_err.raw_os_error(), Some(28));
+        assert_eq!(std::fs::read(&agy_tok).unwrap(), agy_initial);
+
+        // Lock parent dir (0o500) while leaving token file writable (0o600):
+        // naive std::fs::write with O_TRUNC would truncate agy_tok to 0 bytes,
+        // whereas write_required_file / persist_refreshed_credentials preserves it intact.
+        let agy_parent = agy_tok.parent().unwrap();
+        std::fs::set_permissions(agy_parent, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let unprivileged = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(agy_parent.join(".probe"))
+            .is_err();
+        let write_res = write_required_file(
+            &agy_tok,
+            br#"{"token":{"access_token":"ya29.blocked"}}"#,
+            0o600,
+        );
+        std::fs::set_permissions(agy_parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let _ = std::fs::remove_file(agy_parent.join(".probe"));
+        if unprivileged {
+            assert!(write_res.is_err());
+            assert_eq!(std::fs::read(&agy_tok).unwrap(), agy_initial);
+        }
+
+        // Also verify Anthropic dual-file credential persistence never truncates on write failure.
+        let claude_prof = dir.path().join("profiles/anthropic/default");
+        let claude_initial = br#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-orig","refreshToken":"sk-ant-ort01-keep"}}"#;
+        write_required_file(
+            &claude_prof.join(".credentials.json"),
+            claude_initial,
+            0o600,
+        )
+        .unwrap();
+        write_required_file(
+            &claude_prof.join(".claude/.credentials.json"),
+            claude_initial,
+            0o600,
+        )
+        .unwrap();
+        let claude_sub = claude_prof.join(".claude");
+        std::fs::set_permissions(&claude_sub, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let res_claude = persist_refreshed_credentials(
+            &claude_prof,
+            &[".credentials.json", ".claude/.credentials.json"],
+            br#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-next","refreshToken":"sk-ant-ort01-next"}}"#, 
+        );
+        std::fs::set_permissions(&claude_sub, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if unprivileged {
+            assert!(res_claude.is_err());
+            assert_eq!(
+                std::fs::read(claude_prof.join(".claude/.credentials.json")).unwrap(),
+                claude_initial
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn staged_signin_commits_declared_agy_files_ignoring_cli_log_symlink_and_runtime_garbage() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir
+            .path()
+            .join("profiles/google-antigravity/.signin-staging-4242");
+        let agy_dir = staging.join(".gemini/antigravity-cli");
+        let cfg_dir = staging.join(".gemini/config");
+        std::fs::create_dir_all(agy_dir.join("log")).unwrap();
+        std::fs::create_dir_all(agy_dir.join("cache")).unwrap();
+        std::fs::create_dir_all(agy_dir.join("crashes")).unwrap();
+        std::fs::create_dir_all(agy_dir.join("brain/session-1")).unwrap();
+        std::fs::create_dir_all(agy_dir.join("builtin/skills")).unwrap();
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+
+        let oauth_bytes = br#"{"token":{"access_token":"ya29.staged-ok","refresh_token":"1//staged-refresh"},"email":"operator@example.com","account_id":"acct-staged-1"}"#;
+        std::fs::write(agy_dir.join("antigravity-oauth-token"), oauth_bytes).unwrap();
+        std::fs::write(
+            agy_dir.join("antigravity_state.pbtxt"),
+            b"onboarding_done: true\n",
+        )
+        .unwrap();
+        std::fs::write(agy_dir.join("jetski_state.pbtxt"), b"tier: standard\n").unwrap();
+        std::fs::write(cfg_dir.join("config.json"), br#"{"theme":"dark"}"#).unwrap();
+        std::fs::write(cfg_dir.join(".migrated"), b"1\n").unwrap();
+
+        // Vendor runtime artifacts created by agy during interactive OAuth sign-in:
+        std::fs::write(agy_dir.join("log/cli-20261111.log"), b"agy startup log\n").unwrap();
+        symlink("log/cli-20261111.log", agy_dir.join("cli.log")).unwrap();
+        symlink("/nonexistent/agy.sock", agy_dir.join("dangling.sock")).unwrap();
+        std::fs::write(agy_dir.join("cache/blob.bin"), b"ephemeral").unwrap();
+        std::fs::write(agy_dir.join("crashes/minidump.dmp"), b"crash").unwrap();
+        std::fs::write(agy_dir.join("brain/session-1/notes.md"), b"scratch").unwrap();
+        std::fs::write(agy_dir.join("builtin/skills/SKILL.md"), b"builtin").unwrap();
+        std::fs::write(agy_dir.join("conversation_summaries.db"), b"sqlite-cache").unwrap();
+        std::fs::write(agy_dir.join("conversation_summaries.db-wal"), b"wal").unwrap();
+
+        let (chosen, final_dir, acct) =
+            resolve_and_commit_staged_signin(dir.path(), "google-antigravity", &staging, None)
+                .expect("staged sign-in must succeed despite cli.log symlink and runtime caches");
+
+        assert_eq!(chosen, "default");
+        assert_eq!(acct.as_deref(), Some("operator@example.com"));
+        assert!(
+            !staging.exists(),
+            "staging_dir must be cleaned up after commit"
+        );
+
+        let committed_tok = final_dir.join(".gemini/antigravity-cli/antigravity-oauth-token");
+        assert_eq!(std::fs::read(&committed_tok).unwrap(), oauth_bytes);
+        assert_eq!(
+            std::fs::metadata(&committed_tok)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert!(
+            final_dir
+                .join(".gemini/antigravity-cli/antigravity_state.pbtxt")
+                .is_file()
+        );
+        assert!(
+            final_dir
+                .join(".gemini/antigravity-cli/jetski_state.pbtxt")
+                .is_file()
+        );
+        assert!(final_dir.join(".gemini/config/config.json").is_file());
+        assert!(final_dir.join(".gemini/config/.migrated").is_file());
+
+        for excluded in [
+            ".gemini/antigravity-cli/cli.log",
+            ".gemini/antigravity-cli/dangling.sock",
+            ".gemini/antigravity-cli/log",
+            ".gemini/antigravity-cli/cache",
+            ".gemini/antigravity-cli/crashes",
+            ".gemini/antigravity-cli/brain",
+            ".gemini/antigravity-cli/builtin",
+            ".gemini/antigravity-cli/conversation_summaries.db",
+            ".gemini/antigravity-cli/conversation_summaries.db-wal",
+        ] {
+            assert!(
+                std::fs::symlink_metadata(final_dir.join(excluded)).is_err(),
+                "vendor runtime artifact must not be copied into profile dir: {excluded}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn staged_signin_refuses_symlinked_credential_or_state_file_fail_closed() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside_secret = dir.path().join("outside-secret.json");
+        std::fs::write(
+            &outside_secret,
+            br#"{"token":{"access_token":"ya29.stolen","refresh_token":"1//stolen"},"email":"victim@example.com"}"#, 
+        )
+        .unwrap();
+
+        // Case 1: Primary credential file itself is a symlink -> fail closed.
+        let stage1 = dir
+            .path()
+            .join("profiles/google-antigravity/.signin-staging-sym-1");
+        std::fs::create_dir_all(stage1.join(".gemini/antigravity-cli")).unwrap();
+        symlink(
+            &outside_secret,
+            stage1.join(".gemini/antigravity-cli/antigravity-oauth-token"),
+        )
+        .unwrap();
+        let err1 =
+            resolve_and_commit_staged_signin(dir.path(), "google-antigravity", &stage1, None)
+                .unwrap_err();
+        assert!(
+            err1.to_string().contains("regular file"),
+            "unexpected error for symlinked primary credential: {err1}"
+        );
+        assert!(
+            !dir.path()
+                .join("profiles/google-antigravity/default")
+                .exists(),
+            "failed staged sign-in must not commit profile directory"
+        );
+
+        // Case 2: Companion state file (jetski_state.pbtxt) is a symlink -> fail closed.
+        let stage2 = dir
+            .path()
+            .join("profiles/google-antigravity/.signin-staging-sym-2");
+        std::fs::create_dir_all(stage2.join(".gemini/antigravity-cli")).unwrap();
+        std::fs::write(
+            stage2.join(".gemini/antigravity-cli/antigravity-oauth-token"),
+            br#"{"token":{"access_token":"ya29.valid","refresh_token":"1//valid"},"email":"operator@example.com"}"#, 
+        )
+        .unwrap();
+        symlink(
+            &outside_secret,
+            stage2.join(".gemini/antigravity-cli/jetski_state.pbtxt"),
+        )
+        .unwrap();
+        let err2 =
+            resolve_and_commit_staged_signin(dir.path(), "google-antigravity", &stage2, None)
+                .unwrap_err();
+        assert!(
+            err2.to_string().contains("regular file"),
+            "unexpected error for symlinked state file: {err2}"
+        );
+        assert!(
+            !dir.path()
+                .join("profiles/google-antigravity/default")
+                .exists()
+        );
+
+        // Case 3: Parent segment (.gemini/antigravity-cli) is a symlink -> fail closed.
+        let external_dir = dir.path().join("external-agy-dir");
+        std::fs::create_dir_all(&external_dir).unwrap();
+        std::fs::write(
+            external_dir.join("antigravity-oauth-token"),
+            br#"{"token":{"access_token":"ya29.ext","refresh_token":"1//ext"}}"#,
+        )
+        .unwrap();
+        let stage3 = dir
+            .path()
+            .join("profiles/google-antigravity/.signin-staging-sym-3");
+        std::fs::create_dir_all(stage3.join(".gemini")).unwrap();
+        symlink(&external_dir, stage3.join(".gemini/antigravity-cli")).unwrap();
+        let err3 =
+            resolve_and_commit_staged_signin(dir.path(), "google-antigravity", &stage3, None)
+                .unwrap_err();
+        assert!(
+            err3.to_string().contains("symlink"),
+            "unexpected error for symlinked parent segment: {err3}"
+        );
+        assert!(
+            !dir.path()
+                .join("profiles/google-antigravity/default")
+                .exists()
+        );
     }
 }

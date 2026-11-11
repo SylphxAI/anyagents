@@ -25,6 +25,9 @@ mod secret;
 mod store;
 
 pub use address::{Address, AddressError};
+pub use anyagents_harness::{
+    atomic_write_file, atomic_write_in_existing_dir, atomic_write_nonempty_file, atomic_write_with,
+};
 pub use error::Error;
 pub use id::{AgentId, ChannelId, MessageId, UsageId};
 pub use quote::{Quote, QuoteRef};

@@ -400,7 +400,13 @@ pub fn persist_last_error(config_dir: &Path, error: Option<&str>, quota_reset_at
                 "quota_reset_at_ms": quota_reset_at_ms,
                 "timestamp_ms": now_ms,
             });
-            let _ = std::fs::write(&path, payload.to_string());
+            if let Err(err) = anyagents_harness::atomic_write_nonempty_file(
+                &path,
+                payload.to_string().as_bytes(),
+                0o664,
+            ) {
+                eprintln!("cannot persist {}: {err}", path.display());
+            }
         }
         None => {
             let _ = std::fs::remove_file(&path);
@@ -499,9 +505,10 @@ fn retire_poisoned_agy_session(config_dir: &Path, now_ms: i64) -> Result<bool, S
     // continuation pointer is poisoned. A watermark prevents stale log replay.
     retire_session_pointer(&config_dir.join("agy-session-id"))?;
     retire_session_pointer(&config_dir.join(".anyagents-last-error.json"))?;
-    std::fs::write(
-        config_dir.join(".anyagents-quota-cleared-ms"),
-        now_ms.to_string(),
+    anyagents_harness::atomic_write_nonempty_file(
+        &config_dir.join(".anyagents-quota-cleared-ms"),
+        now_ms.to_string().as_bytes(),
+        0o664,
     )
     .map_err(|err| format!("cannot persist agy recovery watermark: {err}"))?;
     Ok(true)

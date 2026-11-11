@@ -4,6 +4,7 @@
 //! mailbox and the delivery loop do not change between modes. Adapters carry
 //! the mailbox id on the first line of the user text as `anyagents-message:<id>`.
 
+mod atomic_fs;
 mod fake;
 pub mod masking;
 mod name;
@@ -14,6 +15,9 @@ use std::time::Duration;
 
 use serde_json::Value;
 
+pub use atomic_fs::{
+    atomic_write_file, atomic_write_in_existing_dir, atomic_write_nonempty_file, atomic_write_with,
+};
 pub use fake::FakeHarness;
 pub use name::normalize_harness_name;
 
@@ -766,7 +770,7 @@ fn write_lines(path: &std::path::Path, lines: &[SteerLine]) -> std::io::Result<(
         text.push_str(&serde_json::to_string(line).map_err(std::io::Error::other)?);
         text.push('\n');
     }
-    std::fs::write(path, text)
+    atomic_write_file(path, text.as_bytes(), 0o600)
 }
 
 /// First line of user text. The rest of the text is the mailbox body.

@@ -4,9 +4,8 @@
 //! of the value. The file store writes mode 0600 and refuses to read a file
 //! that the group or anyone else can read.
 
-use std::fs::{self, OpenOptions};
-use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use crate::error::Error;
@@ -75,17 +74,7 @@ impl CredentialStore for FileCredentialStore {
 
     fn write(&self, credential_ref: &str, value: &[u8]) -> Result<(), Error> {
         let path = self.path(credential_ref)?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&path)?;
-        file.write_all(value)?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        anyagents_harness::atomic_write_nonempty_file(&path, value, 0o600)?;
         Ok(())
     }
 }

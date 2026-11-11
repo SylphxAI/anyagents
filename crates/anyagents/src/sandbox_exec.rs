@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use anyagents_core::Error;
 use anyagents_harness::normalize_harness_name;
-use anyagents_tools::{SandboxConfig, WorkspaceBackend};
+use anyagents_tools::{RemoteSandboxWorkspace, SandboxConfig, WorkspaceBackend};
 use clap::Args;
 use serde_json::{Value, json};
 
@@ -134,7 +134,7 @@ pub fn run(args: SandboxExecArgs) -> Result<(), Error> {
         } else {
             format!("{} {}", program, args.args.join(" "))
         };
-        let out = WorkspaceBackend::RemoteSandbox(sbx)
+        let out = RemoteSandboxWorkspace::new(sbx)
             .exec(&cmd_str, None, Some(300_000))
             .map_err(Error::Message)?;
         if !out.stdout.is_empty() {
@@ -293,7 +293,7 @@ pub fn materialize_remote_mcp_config(sbx: &SandboxConfig, config_dir: &Path) -> 
     let mut bytes =
         serde_json::to_vec_pretty(&mcp_doc).map_err(|e| format!("serialize .mcp.json: {e}"))?;
     bytes.push(b'\n');
-    WorkspaceBackend::RemoteSandbox(sbx.clone())
+    RemoteSandboxWorkspace::new(sbx.clone())
         .write_file_bytes(Some(".mcp.json"), &bytes, false, true)
         .map(|_| ())
 }
@@ -563,7 +563,14 @@ fn persist_session_id(config: &Path, harness: &str, session_id: &str) {
         return;
     }
     for fname in session_filenames_for(harness) {
-        let _ = std::fs::write(config.join(fname), format!("{trimmed}\n"));
+        let path = config.join(fname);
+        if let Err(err) = anyagents_harness::atomic_write_nonempty_file(
+            &path,
+            format!("{trimmed}\n").as_bytes(),
+            0o664,
+        ) {
+            eprintln!("cannot persist {}: {err}", path.display());
+        }
     }
 }
 

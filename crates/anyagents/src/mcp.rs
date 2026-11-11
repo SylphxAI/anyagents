@@ -2825,9 +2825,11 @@ impl AgentMcp {
         let base_dir = self.resolve_workdir();
         let config_dir = self.client.config.clone();
         let (val, media) = tokio::task::spawn_blocking(move || {
-            let backend =
-                anyagents_tools::WorkspaceBackend::resolve(Some(&config_dir), base_dir.clone());
-            execute_files_tool_with_media_backend(&backend, &base_dir, args)
+            let backend = <dyn anyagents_tools::WorkspaceBackend>::resolve(
+                Some(&config_dir),
+                base_dir.clone(),
+            );
+            execute_files_tool_with_media_backend(backend.as_ref(), &base_dir, args)
         })
         .await
         .map_err(|e| format!("files task join error: {e}"))??;
@@ -5195,18 +5197,18 @@ fn resolve_workspace_path(
 }
 
 fn execute_files_tool_with_media_backend(
-    backend: &anyagents_tools::WorkspaceBackend,
+    backend: &dyn anyagents_tools::WorkspaceBackend,
     base_dir: &Path,
     args: FilesArgs,
 ) -> Result<(serde_json::Value, Vec<rmcp::model::ContentBlock>), String> {
-    if matches!(backend, anyagents_tools::WorkspaceBackend::RemoteSandbox(_)) {
+    if backend.is_remote() {
         return execute_remote_files_tool_with_media(backend, args);
     }
     execute_files_tool_with_media(base_dir, args)
 }
 
 fn execute_remote_files_tool_with_media(
-    backend: &anyagents_tools::WorkspaceBackend,
+    backend: &dyn anyagents_tools::WorkspaceBackend,
     args: FilesArgs,
 ) -> Result<(serde_json::Value, Vec<rmcp::model::ContentBlock>), String> {
     let action = args

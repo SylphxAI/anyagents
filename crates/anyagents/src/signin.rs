@@ -135,7 +135,12 @@ impl CommandRunner for ProcessRunner {
                 for name in ["jetski_state.pbtxt", "antigravity_state.pbtxt"] {
                     let p = agy_dir.join(name);
                     if !p.exists() {
-                        let _ = std::fs::write(&p, onboarding_pbtxt);
+                        anyagents_harness::atomic_write_nonempty_file(
+                            &p,
+                            onboarding_pbtxt.as_bytes(),
+                            0o600,
+                        )
+                        .map_err(|err| InstallError::Failed(err.to_string()))?;
                     }
                 }
             }
