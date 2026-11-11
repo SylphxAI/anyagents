@@ -2,7 +2,9 @@
 //! Raw bytes stay in their original filesystem segment. Every result requires
 //! an explicit host-authorized agent set, including learned-memory results.
 use crate::{HistorySearchQuery, HistorySort, raw_segment::RawCoordinate};
-use rusqlite::{Connection, OptionalExtension, params, params_from_iter, types::Value};
+use rusqlite::{
+    Connection, OptionalExtension, TransactionBehavior, params, params_from_iter, types::Value,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -79,15 +81,7 @@ pub struct HostIndex {
     conn: Connection,
 }
 impl HostIndex {
-    pub fn open(path: &Path) -> Result<Self, IndexError> {
-        let conn = Connection::open(path)?;
-        conn.busy_timeout(std::time::Duration::from_secs(30))?;
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON;",
-        )?;
-        // This index is a rebuildable projection, not a raw-history authority.
-        // Early unreleased PR1 caches used mandatory mtime fallbacks. Invalidate
-        // those projections rather than presenting guessed historical times.
+    fn schema_state(conn: &Connection) -> Result<(bool, bool), rusqlite::Error> {
         let old_required_time = conn
             .prepare("PRAGMA table_info(host_documents)")?
             .query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, i64>(3)?)))?
@@ -112,16 +106,31 @@ impl HostIndex {
                 .optional()
                 .unwrap_or(None)
                 .unwrap_or(false);
+        Ok((old_required_time, already_initialized))
+    }
+
+    pub fn open(path: &Path) -> Result<Self, IndexError> {
+        let conn = Connection::open(path)?;
+        conn.busy_timeout(std::time::Duration::from_secs(30))?;
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON;",
+        )?;
+        // This index is a rebuildable projection, not a raw-history authority.
+        // Early unreleased PR1 caches used mandatory mtime fallbacks. Invalidate
+        // those projections rather than presenting guessed historical times.
+        let (_, already_initialized) = Self::schema_state(&conn)?;
         if already_initialized {
             return Ok(Self { conn });
         }
-        if old_required_time {
-            // Serialize and recheck the disposable-schema upgrade: another
-            // process may have rebuilt it after the first metadata read.
-            conn.execute_batch("BEGIN IMMEDIATE;")?;
-            let still_required: i64 = conn.query_row(
-                "SELECT coalesce(max([notnull]),0) FROM pragma_table_info('host_documents') WHERE name='timestamp_ms'", [], |r| r.get(0))?;
-            if still_required != 0 {
+        // Serialize first-time schema creation and disposable-schema upgrades so
+        // concurrent readers/writers never race unserialized DDL or FTS config writes.
+        conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let init_result = (|| -> Result<bool, IndexError> {
+            let (still_old_required, now_initialized) = Self::schema_state(&conn)?;
+            if now_initialized {
+                return Ok(false);
+            }
+            if still_old_required {
                 conn.execute_batch(
                     "
                 DROP TRIGGER IF EXISTS host_windows_delete;
@@ -133,8 +142,7 @@ impl HostIndex {
                 DROP TABLE IF EXISTS host_fts;",
                 )?;
             }
-        }
-        conn.execute_batch("CREATE TABLE IF NOT EXISTS host_documents (
+            conn.execute_batch("CREATE TABLE IF NOT EXISTS host_documents (
                 id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, source TEXT NOT NULL,
                 timestamp_ms INTEGER, direction TEXT NOT NULL,
                 sender TEXT NOT NULL, destination TEXT NOT NULL, tool_name TEXT,
@@ -159,14 +167,25 @@ impl HostIndex {
             CREATE TRIGGER IF NOT EXISTS host_windows_delete AFTER DELETE ON host_windows BEGIN
                 DELETE FROM host_fts WHERE rowid=old.id;
             END;")?;
-        conn.execute(
-            "INSERT INTO host_fts(host_fts,rank) VALUES('secure-delete',1)",
-            [],
-        )?;
-        if old_required_time {
-            conn.execute_batch("COMMIT; PRAGMA wal_checkpoint(TRUNCATE);")?;
+            conn.execute(
+                "INSERT INTO host_fts(host_fts,rank) VALUES('secure-delete',1)",
+                [],
+            )?;
+            Ok(still_old_required)
+        })();
+        match init_result {
+            Ok(upgraded) => {
+                conn.execute_batch("COMMIT;")?;
+                if upgraded {
+                    let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+                }
+                Ok(Self { conn })
+            }
+            Err(error) => {
+                let _ = conn.execute_batch("ROLLBACK;");
+                Err(error)
+            }
         }
-        Ok(Self { conn })
     }
 
     /// Delete stale filesystem coordinates after a complete authorized scan.
@@ -203,7 +222,9 @@ impl HostIndex {
                 return Ok(());
             }
         }
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         for id in stale {
             tx.execute("DELETE FROM host_documents WHERE id=?1", [id])?;
         }
@@ -343,23 +364,46 @@ impl HostIndex {
     }
     /// A source frontier and all its documents/windows publish together. Nested
     /// document savepoints cannot advance a cursor after an interrupted batch.
+    fn in_write_scope<T>(
+        &mut self,
+        savepoint: &str,
+        apply: impl FnOnce(&mut Self) -> Result<T, IndexError>,
+    ) -> Result<T, IndexError> {
+        let started_tx = self.conn.is_autocommit();
+        if started_tx {
+            self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        }
+        if let Err(error) = self.conn.execute_batch(&format!("SAVEPOINT {savepoint}")) {
+            if started_tx {
+                let _ = self.conn.execute_batch("ROLLBACK");
+            }
+            return Err(error.into());
+        }
+        match apply(self) {
+            Ok(value) => {
+                self.conn.execute_batch(&format!("RELEASE {savepoint}"))?;
+                if started_tx {
+                    self.conn.execute_batch("COMMIT")?;
+                }
+                Ok(value)
+            }
+            Err(error) => {
+                let _ = self
+                    .conn
+                    .execute_batch(&format!("ROLLBACK TO {savepoint}; RELEASE {savepoint}"));
+                if started_tx {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                }
+                Err(error)
+            }
+        }
+    }
+
     pub(crate) fn refresh_source<T>(
         &mut self,
         apply: impl FnOnce(&mut Self) -> Result<T, IndexError>,
     ) -> Result<T, IndexError> {
-        self.conn.execute_batch("SAVEPOINT host_source_refresh")?;
-        match apply(self) {
-            Ok(value) => {
-                self.conn.execute_batch("RELEASE host_source_refresh")?;
-                Ok(value)
-            }
-            Err(error) => {
-                self.conn.execute_batch(
-                    "ROLLBACK TO host_source_refresh; RELEASE host_source_refresh",
-                )?;
-                Err(error)
-            }
-        }
+        self.in_write_scope("host_source_refresh", apply)
     }
 
     pub fn checkpoint(&self) -> Result<(), IndexError> {
@@ -378,6 +422,17 @@ impl HostIndex {
     /// publish a partial replacement; the prior index remains available.
     /// At most one 4KiB raw window and its token projection are resident.
     pub fn index(
+        &mut self,
+        id: &str,
+        metadata: &IndexMetadata,
+        raw: &RawCoordinate,
+    ) -> Result<bool, IndexError> {
+        self.in_write_scope("host_document_index", |this| {
+            this.index_in_write_scope(id, metadata, raw)
+        })
+    }
+
+    fn index_in_write_scope(
         &mut self,
         id: &str,
         metadata: &IndexMetadata,
