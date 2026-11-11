@@ -22,6 +22,7 @@ pub mod quote;
 pub mod raw_segment;
 pub mod redaction;
 mod secret;
+pub mod storage;
 mod store;
 
 pub use address::{Address, AddressError};
@@ -32,13 +33,19 @@ pub use error::Error;
 pub use id::{AgentId, ChannelId, MessageId, UsageId};
 pub use quote::{Quote, QuoteRef};
 pub use secret::{CredentialStore, FileCredentialStore, Secret};
+pub use storage::{
+    GIT_POOL_DIR_ENV, SCRATCH_DIR_ENV, STATE_DIR_ENV, TEST_STORAGE_TIERS_ENV, WORKSPACES_DIR_ENV,
+    agent_scratch_build_dir, agent_scratch_tmp_dir, configured_git_pool_dir,
+    configured_scratch_dir, configured_state_dir, configured_workspaces_dir, storage_env_enabled,
+};
 pub use store::{
     Ack, Agent, AgentLock, AgentQueryMetadata, AgentSchedule, BillingMode, Channel,
     ConversationTurn, Group, GroupAction, GroupActor, HistorySearchQuery, HistorySort, Incoming,
     Lag, MAX_RECOVERY_ATTEMPTS, Message, NewAgent, NewChannel, NewSchedule, NewUsage, OpenTurn,
     Origin, OutboundEffect, ReceiveOutcome, Store, UsageRecord, UsageTotal, Wake, agent_config_dir,
-    agent_work_dir, clean_rag_text, now_ms, parse_agent_scope, rag_content_hash,
-    read_children_roster, read_root_roster, sum_usage, tokenize_hybrid_search_tokens, utc_day,
+    agent_work_dir, clean_rag_text, legacy_agent_work_dir, now_ms, parse_agent_scope,
+    rag_content_hash, read_children_roster, read_root_roster, sum_usage,
+    tokenize_hybrid_search_tokens, utc_day,
 };
 
 /// The token a client presents as an agent, when it has one. A capability is

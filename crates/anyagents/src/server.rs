@@ -3397,8 +3397,11 @@ pub(crate) fn reap_subagent_ephemeral_dirs(
     let mut complete = true;
     let agent_root = data_dir.join("agents").join(agent_id.as_str());
     let config_dir = agent_root.join("config");
-    let seat_ids =
-        detect_seat_ids(&config_dir).or_else(|| detect_seat_ids(&agent_root.join("work")));
+    let configured_work = anyagents_core::agent_work_dir(data_dir, agent_id);
+    let legacy_work = anyagents_core::legacy_agent_work_dir(data_dir, agent_id);
+    let seat_ids = detect_seat_ids(&config_dir)
+        .or_else(|| detect_seat_ids(&configured_work))
+        .or_else(|| detect_seat_ids(&legacy_work));
     // Quarantine protects recovery evidence, including build-output paths that
     // would otherwise be removed after a failed Git cleanliness check.
     if crate::worktree_access::reaping_blocked(data_dir, agent_id) {
@@ -3442,6 +3445,16 @@ pub(crate) fn reap_subagent_ephemeral_dirs(
         complete &= remove_path_with_seat(&target, seat_ids);
     }
     complete &= remove_path_with_seat(&agent_root.join("tmp"), seat_ids);
+    if let Some(scratch_dir) = anyagents_core::configured_scratch_dir() {
+        complete &= remove_path_with_seat(
+            &anyagents_core::agent_scratch_build_dir(&scratch_dir, agent_id),
+            seat_ids,
+        );
+        complete &= remove_path_with_seat(
+            &anyagents_core::agent_scratch_tmp_dir(&scratch_dir, agent_id),
+            seat_ids,
+        );
+    }
     let _ = std::fs::remove_file(
         data_dir
             .join("locks")
@@ -3473,15 +3486,26 @@ pub(crate) fn reap_subagent_ephemeral_dirs(
         .map(PathBuf::from)
         .map(|p| std::path::absolute(&p).unwrap_or(p));
 
-    let work_dir =
-        std::path::absolute(agent_root.join("work")).unwrap_or_else(|_| agent_root.join("work"));
+    let mut managed_work_dirs =
+        vec![std::path::absolute(&configured_work).unwrap_or_else(|_| configured_work.clone())];
+    let legacy_abs = std::path::absolute(&legacy_work).unwrap_or_else(|_| legacy_work.clone());
+    if !managed_work_dirs.contains(&legacy_abs) && legacy_abs.exists() {
+        managed_work_dirs.push(legacy_abs);
+    }
     // Never reap an external `explicit-worktree` (`wt_path != &work_dir`) such as `/scratch/wt/...`
     // that a parent or operator created and lent to a child agent. Only reap the agent's own
-    // ephemeral `agent_root/work` directory when not shared with another agent.
-    if !shared_workdirs.contains(&work_dir) {
-        let journaled = crate::worktree_access::grant_path(data_dir, agent_id)
-            .symlink_metadata()
-            .is_ok();
+    // managed workspace directory when not shared with another agent.
+    let journaled_any = crate::worktree_access::grant_path(data_dir, agent_id)
+        .symlink_metadata()
+        .is_ok();
+    for (idx, work_dir) in managed_work_dirs.into_iter().enumerate() {
+        if shared_workdirs.contains(&work_dir) {
+            continue;
+        }
+        let journaled = journaled_any
+            && (idx == 0
+                || crate::worktree_access::RecordedWorktree::load(data_dir, agent_id, &work_dir)
+                    .is_some());
         if journaled
             && crate::worktree_access::RecordedWorktree::load(data_dir, agent_id, &work_dir)
                 .is_none_or(|record| !record.checkout_pointer_matches())
