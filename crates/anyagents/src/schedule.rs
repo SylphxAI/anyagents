@@ -570,8 +570,9 @@ fn initial_watch_baseline(
     }
 }
 
-/// Returns `Some(reason)` when the owning agent must NOT receive a scheduled wake
-/// right now (`"paused"`, `"quota_blocked"`, or `"busy"`), or `None` when idle and eligible.
+/// Returns `Some(reason)` when the agent cannot act on a turn-ownership nudge right
+/// now (`"paused"`, `"archived"`, `"quota_blocked"` or `"busy"`), or `None` when idle
+/// and eligible. Schedule wakes never consult it: they always enter the mailbox.
 pub fn agent_wake_block_reason(
     store: &Store,
     health: &HealthBoard,
@@ -584,39 +585,20 @@ pub fn agent_wake_block_reason(
     if agent.state == "archived" || crate::server::is_explicitly_archived(store.data_dir(), agent) {
         return Some("archived");
     }
+    // The typed reset deadline is the only quota authority: an error text that
+    // mentions a quota or rate limit says nothing once its deadline has passed.
     let cfg = anyagents_core::agent_config_dir(store.data_dir(), &agent.id);
-    let (session_quota, session_error) = if agent.harness == "claude-code" {
-        let (_, persisted_err) =
-            anyagents_harness_agy::detect_agy_session_quota_and_error(&cfg, now);
-        (
-            anyagents_harness_claude::detect_session_quota_reset_ms(&cfg, now),
-            persisted_err,
-        )
+    let session_quota = if agent.harness == "claude-code" {
+        anyagents_harness_claude::detect_session_quota_reset_ms(&cfg, now)
     } else {
-        anyagents_harness_agy::detect_agy_session_quota_and_error(&cfg, now)
+        anyagents_harness_agy::detect_agy_session_quota_and_error(&cfg, now).0
     };
-    let live = health.get(&agent.id);
-    let effective_quota = live
-        .as_ref()
-        .and_then(|l| l.quota_reset_at_ms)
+    let effective_quota = health
+        .get(&agent.id)
+        .and_then(|live| live.quota_reset_at_ms)
         .or(session_quota);
-    let effective_err = live
-        .as_ref()
-        .and_then(|l| l.last_error.clone())
-        .or(session_error);
     if effective_quota.is_some_and(|ms| ms > now) {
         return Some("quota_blocked");
-    }
-    if let Some(ref err) = effective_err {
-        let lower = err.to_ascii_lowercase();
-        if lower.contains("quota")
-            || lower.contains("rate limit")
-            || lower.contains("429")
-            || lower.contains("credit balance is too low")
-            || lower.contains("usage limit")
-        {
-            return Some("quota_blocked");
-        }
     }
     if is_agent_busy(store, health, agent, now) {
         return Some("busy");
@@ -2049,6 +2031,58 @@ mod tests {
             0
         );
         assert_eq!(store.inbox(&owner.id, None).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn expired_quota_deadline_with_stale_rate_limit_text_is_not_blocked() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let health = HealthBoard::default();
+        let owner = store
+            .create_agent(NewAgent::new("recovered-owner", "codex"))
+            .unwrap();
+        store.set_agent_running(&owner.id, "/work").unwrap();
+        let now = anyagents_core::now_ms();
+        let mut live = LiveState {
+            process_alive: true,
+            turn_state: TurnState::Idle,
+            delivery_mode: DeliveryMode::Steer,
+            steer_support: SteerSupport::Yes,
+            quota_reset_at_ms: Some(now - 1_000),
+            restart_at_ms: None,
+            pid: None,
+            live_harness: None,
+            live_model: None,
+            process_started_at_ms: Some(1000),
+            last_error: Some("HTTP 429: rate limit, quota exceeded".into()),
+        };
+        health.publish(&owner.id, live.clone());
+        let owner = store.agent(&owner.id).unwrap();
+        assert_eq!(agent_wake_block_reason(&store, &health, &owner, now), None);
+        live.quota_reset_at_ms = Some(now + 60_000);
+        health.publish(&owner.id, live.clone());
+        assert_eq!(
+            agent_wake_block_reason(&store, &health, &owner, now),
+            Some("quota_blocked")
+        );
+        live.quota_reset_at_ms = Some(now - 1_000);
+        health.publish(&owner.id, live);
+
+        let sched = create_agent_schedule(
+            &store,
+            &health,
+            &owner,
+            None,
+            Some("1m"),
+            None,
+            "recovered check",
+        )
+        .unwrap();
+        let due = sched.next_fire_at_ms.unwrap();
+        assert_eq!(tick_schedules_once(&store, &health, due), 1);
+        let inbox = store.inbox(&owner.id, None).unwrap();
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].text, "recovered check");
     }
 
     #[test]
