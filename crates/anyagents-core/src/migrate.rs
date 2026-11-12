@@ -53,6 +53,7 @@ pub const MIGRATIONS: &[(i64, &str)] = &[
         25,
         include_str!("../migrations/026_full_mailbox_history.sql"),
     ),
+    (26, include_str!("../migrations/027_runtime_state.sql")),
 ];
 
 /// Apply pending migrations. Each migration commits on its own, in order.
