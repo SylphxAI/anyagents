@@ -1127,12 +1127,14 @@ impl<H: Harness + 'static> Session<H> {
                 self.written = self
                     .written
                     .saturating_add(delivered.clamp(0, u64::from(u32::MAX)) as u32);
+                self.attempt = 0;
                 self.wake_unless_more();
                 false
             }
             Ok(RunOutcome::Idle) => {
                 // No message was accepted on this pass (the mailbox may still
                 // contain deferred mail). Record whatever the vendor reported.
+                self.attempt = 0;
                 if !self.record_usage() {
                     self.publish();
                     self.inner.clock.wait(
@@ -1209,8 +1211,15 @@ impl<H: Harness + 'static> Session<H> {
                 false
             }
             Err(err) if err.agent_busy() => true,
-            Err(_) => {
-                self.wake_unless_more();
+            Err(err) => {
+                // Store errors (locked/malformed) retry with backoff, not the
+                // fixed 250ms idle poll: a fleet of agents hitting the same
+                // locked store at 4Hz pins the daemon at ~100% per agent.
+                self.last_error = Some(format!("store: {err}"));
+                self.publish();
+                if !self.wait_backoff() {
+                    return false;
+                }
                 false
             }
         }
@@ -2266,6 +2275,32 @@ mod persistence_tests {
                 .unwrap()
                 .recovery_count,
             1
+        );
+    }
+
+    #[test]
+    fn store_error_in_delivery_backs_off_instead_of_repolling_at_idle_interval() {
+        let (_dir, mut session, sql) = fixture(TurnUsage::default());
+        // Store errors (locked/malformed) must take the backoff branch:
+        // attempt advances (restart_delay_ms >= 200ms) instead of an
+        // immediate retry at the fleet-wide 250ms idle poll.
+        sql.execute_batch(
+            "ALTER TABLE messages RENAME TO saved_messages;
+            CREATE VIEW messages AS SELECT * FROM unavailable_messages;",
+        )
+        .unwrap();
+        session.attempt = 0;
+        session.deliver_once();
+        assert_eq!(
+            session.attempt, 1,
+            "store error must use wait_backoff, not the idle poll"
+        );
+        assert!(
+            session
+                .last_error
+                .as_deref()
+                .is_some_and(|e| e.starts_with("store:")),
+            "store error must be recorded"
         );
     }
 
