@@ -113,9 +113,7 @@ impl HostIndex {
     pub fn open(path: &Path) -> Result<Self, IndexError> {
         match Self::open_inner(path) {
             Err(IndexError::Sql(error))
-                if error
-                    .to_string()
-                    .contains("malformed")
+                if error.to_string().contains("malformed")
                     || error.to_string().contains("not a database") =>
             {
                 // Derived projection, not a raw-history authority: a
