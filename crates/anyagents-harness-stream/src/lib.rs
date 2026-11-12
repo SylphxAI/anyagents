@@ -1624,6 +1624,8 @@ fn read_stdout(
         if line.trim().is_empty() {
             continue;
         }
+        #[cfg(test)]
+        eprintln!("reader line trace: {}", &line[..line.len().min(200)]);
         let Ok(mut value) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
