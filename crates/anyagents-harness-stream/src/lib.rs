@@ -16,6 +16,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -359,6 +360,43 @@ impl StreamHarness {
             steer: SteerSupport::Unproven,
         })
     }
+
+/// Atomically replace the unconfirmed-steer hold file in `dir`.
+///
+/// An in-place `std::fs::write` truncates the file before writing, so a full
+/// disk (ENOSPC) leaves a 0-byte or torn hold file that `set_state_dir` still
+/// treats as unconfirmed custody but that no longer names the request ids the
+/// mailbox retained. Writing to a unique temporary file in the same
+/// directory, fsyncing it, and renaming over the hold keeps the visible hold
+/// file always a complete document: before the rename the previous hold (if
+/// any) is untouched, after it the new one is complete. On error the
+/// existing hold is left as it was and the temp file is removed, so the
+/// caller can keep mailbox custody of the unsent input.
+fn write_hold_file_atomic(dir: &Path, contents: &str) -> std::io::Result<()> {
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let target = dir.join("spiron-unconfirmed-steers.json");
+    let temp = dir.join(format!(
+        ".spiron-unconfirmed-steers.json.tmp-{}-{}",
+        std::process::id(),
+        TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let written = (|| -> std::io::Result<()> {
+        let mut file = std::fs::File::create(&temp)?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&temp, &target)?;
+        // Best-effort durability of the rename itself; the content above is
+        // already complete and readable, so a dir-sync failure is not fatal.
+        if let Ok(dir_file) = std::fs::File::open(dir) {
+            let _ = dir_file.sync_all();
+        }
+        Ok(())
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    written
+}
 
     /// Persist transport failures and unconfirmed steering custody for the
     /// external adapter. A terminal uncertainty hold is never an auto-retry.
@@ -749,10 +787,8 @@ impl StreamHarness {
                         let turn = state.open.first().unwrap_or(&message.id);
                         let mut ids: Vec<_> = state.open.iter().collect();
                         ids.push(&message.id);
-                        if let Err(error) = std::fs::write(
-                            dir.join("spiron-unconfirmed-steers.json"),
-                            json!({"turn_id": turn, "request_ids": ids}).to_string(),
-                        ) {
+                        let hold = json!({"turn_id": turn, "request_ids": ids}).to_string();
+                        if let Err(error) = write_hold_file_atomic(dir, &hold) {
                             let reason = format!(
                                 "cannot persist Spiron input hold before dispatch: {error}"
                             );

@@ -1210,3 +1210,53 @@ fn synthetic_401_claude_turn_fails_and_stops_stream_without_completing_turn() {
             .contains("OAuth access token has expired")
     );
 }
+#[test]
+fn hold_file_write_replaces_atomically_and_leaves_no_temp() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    let first = json!({"turn_id": "msg_1", "request_ids": ["msg_1", "msg_2"]}).to_string();
+    super::write_hold_file_atomic(path, &first).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(path.join("spiron-unconfirmed-steers.json")).unwrap(),
+        first
+    );
+    assert_eq!(std::fs::read_dir(path).unwrap().count(), 1);
+
+    // A shorter successor replaces the hold fully, with no torn trailing
+    // bytes from the longer previous hold.
+    let shorter = json!({"turn_id": "msg_2", "request_ids": ["msg_2"]}).to_string();
+    assert!(shorter.len() < first.len());
+    super::write_hold_file_atomic(path, &shorter).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(path.join("spiron-unconfirmed-steers.json")).unwrap(),
+        shorter
+    );
+    assert_eq!(std::fs::read_dir(path).unwrap().count(), 1);
+}
+
+#[test]
+fn hold_file_write_fails_without_creating_hold_in_missing_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("does-not-exist");
+    assert!(super::write_hold_file_atomic(&missing, "{}").is_err());
+    assert!(!missing.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn hold_file_write_failure_preserves_existing_hold_and_cleans_up() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    super::write_hold_file_atomic(path, "previous-hold").unwrap();
+    // Block temp-file creation without disturbing the existing hold.
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let result = super::write_hold_file_atomic(path, "new-hold");
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(result.is_err());
+    assert_eq!(
+        std::fs::read_to_string(path.join("spiron-unconfirmed-steers.json")).unwrap(),
+        "previous-hold"
+    );
+    assert_eq!(std::fs::read_dir(path).unwrap().count(), 1);
+}
