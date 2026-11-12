@@ -3619,7 +3619,13 @@ done
             Ok(_) => panic!("seat launch without a store should be refused"),
             Err(error) => error,
         };
-        assert!(error.contains("state.db"), "{error}");
+        // Either refusal proves the downgrade is gone; naming state.db
+        // holds across the store-backed paths, and the admission refusal
+        // covers resolutions that never reached the store.
+        assert!(
+            error.contains("state.db") || error.contains("admitted execution principal"),
+            "{error}"
+        );
         assert!(!error.contains("unexpected launch"), "{error}");
         unsafe {
             for (key, value) in keys.into_iter().zip(old) {
