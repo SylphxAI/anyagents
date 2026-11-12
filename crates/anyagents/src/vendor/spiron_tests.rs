@@ -1081,7 +1081,11 @@ for raw in sys.stdin:
     );
     let m1 = rig.receive("initial assignment");
     rig.start();
-    eventually(|| rig.store.delivered_cursor(&rig.agent.id).unwrap() == m1.seq);
+    // m1 reached the probe; mailbox cursor reads can trail the writer's WAL.
+    eventually(|| rig
+        .wire()
+        .iter()
+        .any(|v| v["msg"]["request_id"].as_str() == Some(m1.id.as_str())));
     let m2 = rig.receive("mid-turn steer detail");
 
     eventually(|| rig.wire().iter().filter(|v| v["launch"] == 2).count() >= 2);
@@ -1168,7 +1172,7 @@ for raw in sys.stdin:
         std::thread::sleep(Duration::from_millis(5));
     }
     let deadline = Instant::now() + Duration::from_secs(30);
-    while rig.store.delivered_cursor(&rig.agent.id).unwrap() != m1.seq {
+    while rig.journaled(m1.id.as_str()) < 1 {
         assert!(Instant::now() < deadline, "{}", rig.stall_report());
         std::thread::sleep(Duration::from_millis(5));
     }
@@ -1343,7 +1347,9 @@ for raw in sys.stdin:
     // The probe journals the redelivery just after recording it on the wire.
     eventually(|| rig.journaled(m2.id.as_str()) == 2);
     assert!(!rig.cfg.join("spiron-unconfirmed-steers.json").exists());
-    assert_eq!(rig.store.delivered_cursor(&rig.agent.id).unwrap(), m2.seq);
+    // The mailbox cursor may lag the writer's WAL; the wire and journal
+    // above already prove the deliveries.
+    eventually(|| rig.store.delivered_cursor(&rig.agent.id).unwrap() == m2.seq);
 }
 
 #[test]
@@ -1390,7 +1396,9 @@ for raw in sys.stdin:
     assert_eq!(rig.journaled(m1.id.as_str()), 1);
     assert_eq!(rig.journaled(m2.id.as_str()), 1);
     assert!(!rig.cfg.join("spiron-unconfirmed-steers.json").exists());
-    assert_eq!(rig.store.delivered_cursor(&rig.agent.id).unwrap(), m2.seq);
+    // The mailbox cursor may lag the writer's WAL; the wire and journal
+    // above already prove the deliveries.
+    eventually(|| rig.store.delivered_cursor(&rig.agent.id).unwrap() == m2.seq);
 }
 
 #[test]
