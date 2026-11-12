@@ -190,3 +190,146 @@ impl Harness for AgyHarness {
         self.inner.watch_activity(notify);
     }
 }
+
+/// Native tool policy: the one function behind both the advertised set
+/// (`settings.json` `permissions.deny`) and the hook allow predicate
+/// (`hooks.json` `anyagents-native-tool-guard` matcher), so a tool is
+/// advertised if and only if the hook allows it.
+///
+/// `agy` has no supported `settings.json` key to exclude tools from what the
+/// model sees: only `queuedMessages`, `trustedWorkspaces` and `permissions`
+/// validate (other keys are rejected as `unknown setting`), and
+/// `permissions.deny` blocks at permission time without hiding the tool.
+/// The model therefore still proposes every native built-in below, and the
+/// static deny plus hook are the enforcement. Both derive below; tools outside
+/// this known set stay usable natively and are listed in the pull-request
+/// description rather than silently assumed covered.
+///
+/// File/exec tools are gated by `ANYAGENTS_ALLOW_NATIVE_FILE_TOOLS == "1"`;
+/// messaging/schedule/web/browser tools are gated by the presence of
+/// `ANYAGENTS_ALLOW_NATIVE_SUBAGENTS`. `read_file`/`view_file` stay out of
+/// static deny (which overrides a hook allow in `agy`) and are allowed only
+/// for MCP schema reads under `~/.gemini/antigravity-cli/mcp/`.
+pub const AGY_FILE_TOOLS: &[&str] = &[
+    "read_file",
+    "view_file",
+    "view_file_outline",
+    "view_code_item",
+    "view_content_chunk",
+    "code_action",
+    "write_file",
+    "edit_file",
+    "grep_search",
+    "find_by_name",
+    "find",
+    "list_dir",
+    "list_directory",
+    "run_command",
+    "manage_task",
+    "send_command_input",
+    "command_status",
+    "shell_exec",
+];
+
+pub const AGY_SUBAGENT_TOOLS: &[&str] = &[
+    "invoke_subagent",
+    "define_subagent",
+    "manage_subagents",
+    "send_message",
+    "schedule",
+    "search_web",
+    "read_url_content",
+    "browser_subagent",
+    "open_browser_url",
+    "browser_*",
+];
+
+/// `(allow_file_tools, allow_subagents)` from the process environment.
+pub fn agy_allow_flags_from_env() -> (bool, bool) {
+    let allow_file = std::env::var("ANYAGENTS_ALLOW_NATIVE_FILE_TOOLS")
+        .ok()
+        .is_some_and(|v| v.trim() == "1");
+    let allow_subagents = std::env::var_os("ANYAGENTS_ALLOW_NATIVE_SUBAGENTS").is_some();
+    (allow_file, allow_subagents)
+}
+
+/// Whether the hook allows `name` unconditionally (ignoring the
+/// `read_file`/`view_file` MCP-schema path exception, which the hook
+/// command implements). `browser_*` matches the `browser_` family.
+pub fn agy_tool_is_allowed(name: &str, allow_file_tools: bool, allow_subagents: bool) -> bool {
+    if AGY_FILE_TOOLS.contains(&name) {
+        return allow_file_tools;
+    }
+    if AGY_SUBAGENT_TOOLS.contains(&name) {
+        return allow_subagents;
+    }
+    if name.starts_with("browser_") && AGY_SUBAGENT_TOOLS.contains(&"browser_*") {
+        return allow_subagents;
+    }
+    // Unknown tools are outside the generated config: allowed by both sides.
+    true
+}
+
+/// Hook tool names denied unconditionally (including `read_file`/`view_file`,
+/// which the hook then narrows to MCP schema reads).
+pub fn agy_denied_hook_tools(allow_file_tools: bool, allow_subagents: bool) -> Vec<String> {
+    let mut out = Vec::new();
+    if !allow_file_tools {
+        out.extend(AGY_FILE_TOOLS.iter().map(|s| (*s).to_string()));
+    }
+    if !allow_subagents {
+        out.extend(AGY_SUBAGENT_TOOLS.iter().map(|s| (*s).to_string()));
+    }
+    out
+}
+
+/// `permissions.deny` entries for the denied set, excluding
+/// `read_file`/`view_file` (see module docs).
+pub fn agy_static_deny_entries(allow_file_tools: bool, allow_subagents: bool) -> Vec<String> {
+    let mut out = Vec::new();
+    for tool in agy_denied_hook_tools(allow_file_tools, allow_subagents) {
+        match tool.as_str() {
+            "run_command" => {
+                out.push("run_command".to_string());
+                out.push("command(*)".to_string());
+            }
+            "read_url_content" => {
+                out.push("read_url_content".to_string());
+                out.push("read_url(*)".to_string());
+            }
+            "open_browser_url" => {
+                out.push("open_browser_url".to_string());
+                out.push("execute_url(*)".to_string());
+            }
+            "write_file" => {
+                out.push("write_file".to_string());
+                out.push("write_file(*)".to_string());
+            }
+            "read_file" | "view_file" => {}
+            _ => out.push(tool),
+        }
+    }
+    out
+}
+
+/// Every permission string this policy can generate (for healing stale
+/// entries when the flags flip).
+pub fn agy_all_static_deny_entries() -> Vec<String> {
+    agy_static_deny_entries(false, false)
+}
+
+/// `PreToolUse` matcher, or `None` when nothing is denied (hook removed).
+pub fn agy_hook_matcher(allow_file_tools: bool, allow_subagents: bool) -> Option<String> {
+    let denied = agy_denied_hook_tools(allow_file_tools, allow_subagents);
+    if denied.is_empty() {
+        return None;
+    }
+    let parts: Vec<String> = denied.iter().map(|t| t.replace('*', ".*")).collect();
+    Some(format!("^({})$", parts.join("|")))
+}
+
+/// Hook command: denies every matched tool except `read_file`/`view_file`
+/// MCP schema reads, which it allows.
+pub fn agy_hook_command() -> String {
+    "python3 -c 'import json,os,sys\ndeny=\"Native built-in tools are disabled under AnyAgents. Invoke AnyAgents MCP tools via call_mcp_tool with ServerName=\\\"anyagents\\\" (read schemas in ~/.gemini/antigravity-cli/mcp/anyagents/*.json if needed): e.g. ToolName=\\\"code\\\" with Arguments={\\\"code\\\":\\\"return await workspace.read({ path: \\\\\\\"...\\\\\\\" });\\\"} for workspace/web/anyagents operations, ToolName=\\\"send\\\" with Arguments={\\\"to\\\":[\\\"parent\\\"],\\\"text\\\":\\\"...\\\"} to reply, ToolName=\\\"agents\\\", ToolName=\\\"schedules\\\", or ToolName=\\\"skills\\\".\"\ntry:\n d=json.load(sys.stdin);tc=d.get(\"toolCall\") or {}\n if tc.get(\"name\") in (\"read_file\",\"view_file\"):\n  p=(tc.get(\"args\") or {}).get(\"Path\") or \"\"\n  mcp=os.path.realpath(os.path.expanduser(\"~/.gemini/antigravity-cli/mcp\"))\n  rp=os.path.realpath(os.path.expanduser(p)) if p else \"\"\n  if rp.startswith(mcp+\"/\") and rp.endswith(\".json\") and os.path.isfile(rp):\n   print(json.dumps({\"decision\":\"allow\",\"permissionOverrides\":[\"read_file(*)\",\"read_file\",\"view_file\"]}));sys.exit(0)\nexcept Exception:\n pass\nprint(json.dumps({\"decision\":\"deny\",\"reason\":deny}))' 2>/dev/null || printf '%s\\n' '{\"decision\":\"deny\",\"reason\":\"Native built-in tools are disabled under AnyAgents; invoke AnyAgents MCP tools via call_mcp_tool with ServerName=\\\"anyagents\\\" and ToolName=\\\"code\\\" or \\\"send\\\" instead.\"}'".to_string()
+}
