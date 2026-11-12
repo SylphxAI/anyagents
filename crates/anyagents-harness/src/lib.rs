@@ -15,6 +15,73 @@ use std::time::Duration;
 
 use serde_json::Value;
 
+/// Structured inputs supplied by an adapter when a vendor asks it to wait.
+/// Values are typed at this boundary; adapters do not parse vendor prose.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct QuotaResetInput<'a> {
+    pub event: Option<&'a Value>,
+    /// HTTP Retry-After, as delta-seconds or an epoch timestamp in ms.
+    pub retry_after: Option<&'a str>,
+    pub now_ms: i64,
+}
+
+/// Extract a quota reset from structured event fields or Retry-After.
+/// Absolute timestamps win, followed by reset seconds and then Retry-After.
+/// Unknown values return None; callers must use bounded backoff.
+pub fn extract_quota_reset(input: QuotaResetInput<'_>) -> Option<i64> {
+    fn find(value: &Value, now_ms: i64) -> Option<i64> {
+        match value {
+            Value::Object(map) => {
+                for key in ["reset_at_ms", "resets_at_ms", "resetAtMs", "resetsAtMs"] {
+                    if let Some(ms) = map.get(key).and_then(Value::as_i64).filter(|v| *v > 0) {
+                        return Some(ms);
+                    }
+                }
+                for key in ["reset_seconds", "reset_after_seconds"] {
+                    if let Some(seconds) = map.get(key).and_then(Value::as_i64).filter(|v| *v >= 0) {
+                        return Some(now_ms.saturating_add(seconds.saturating_mul(1000)));
+                    }
+                }
+                map.values().find_map(|v| find(v, now_ms))
+            }
+            Value::Array(items) => items.iter().find_map(|v| find(v, now_ms)),
+            _ => None,
+        }
+    }
+    if let Some(event) = input.event {
+        if let Some(reset) = find(event, input.now_ms) { return Some(reset); }
+    }
+    let value = input.retry_after?.trim();
+    let n = value.parse::<i64>().ok()?;
+    if n < 0 { return None; }
+    Some(if n < 10_000_000_000 { input.now_ms.saturating_add(n.saturating_mul(1000)) } else { n })
+}
+
+#[cfg(test)]
+mod quota_reset_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn extracts_nested_absolute_reset_before_retry_after() {
+        let event = json!({"error": {"resets_at_ms": 1_700_000_000_000_i64}});
+        assert_eq!(extract_quota_reset(QuotaResetInput { event: Some(&event), retry_after: Some("2"), now_ms: 10 }), Some(1_700_000_000_000));
+    }
+
+    #[test]
+    fn converts_structured_seconds_and_retry_after() {
+        let event = json!({"reset_seconds": 30});
+        assert_eq!(extract_quota_reset(QuotaResetInput { event: Some(&event), retry_after: None, now_ms: 1_000 }), Some(31_000));
+        assert_eq!(extract_quota_reset(QuotaResetInput { event: None, retry_after: Some("30"), now_ms: 1_000 }), Some(31_000));
+    }
+
+    #[test]
+    fn rejects_unknown_or_negative_values_without_text_parsing() {
+        let event = json!({"message": "resets at 2026-10-26T00:00:00Z"});
+        assert_eq!(extract_quota_reset(QuotaResetInput { event: Some(&event), retry_after: Some("-1"), now_ms: 1_000 }), None);
+    }
+}
+
 pub use atomic_fs::{
     atomic_write_file, atomic_write_in_existing_dir, atomic_write_nonempty_file, atomic_write_with,
 };
