@@ -826,9 +826,10 @@ impl Store {
         // Store::open fail (sandbox skips SEAT_PEERS and denies peer-trees).
         // Defer legacy work to the next open when the WAL frees.
         if let Err(e) = preserve_legacy_scopes(&mut conn)
-            && !is_transient_lock_error(&e) {
-                return Err(e);
-            }
+            && !is_transient_lock_error(&e)
+        {
+            return Err(e);
+        }
         if migrate::current_version(&conn)? < 1 {
             return Err(Error::Message("migrations did not apply".into()));
         }
@@ -896,9 +897,10 @@ impl Store {
                 CREATE INDEX IF NOT EXISTS idx_rag_chunks_agent_id_time
                     ON rag_chunks(agent_id, timestamp_ms DESC, chunk_id);",
             )
-                && !is_transient_sqlite_error(&e) {
-                    return Err(e.into());
-                }
+            && !is_transient_sqlite_error(&e)
+        {
+            return Err(e.into());
+        }
         // UNIQUE(agent_id, seq) already supports reverse mailbox sequence scans.
         // Avoid even idempotent DDL on ordinary opens: it needs the writer lock.
         for (name, sql) in [
@@ -934,9 +936,10 @@ impl Store {
             };
             if !exists
                 && let Err(e) = conn.execute_batch(sql)
-                    && !is_transient_sqlite_error(&e) {
-                        return Err(e.into());
-                    }
+                && !is_transient_sqlite_error(&e)
+            {
+                return Err(e.into());
+            }
         }
         // Older databases may already have this column from an earlier runtime.
         // Presence, not an arbitrary failed ALTER, is the idempotency condition.
@@ -955,9 +958,10 @@ impl Store {
                 "ALTER TABLE groups ADD COLUMN public INTEGER NOT NULL DEFAULT 0",
                 [],
             )
-                && !is_transient_sqlite_error(&e) {
-                    return Err(e.into());
-                }
+            && !is_transient_sqlite_error(&e)
+        {
+            return Err(e.into());
+        }
         // Current schemas maintain FTS transactionally on every history write.
         // Only legacy upgrades need the full derivative-index validation; doing
         // it on every open scans history and competes with the server writer.
