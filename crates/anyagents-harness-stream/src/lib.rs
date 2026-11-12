@@ -2208,7 +2208,6 @@ fn finish_correlated(state: &mut State, turn: &str, usage: TurnUsage, unconfirme
             },
         ));
     }
-<<<<<<< HEAD
     if !state.unconfirmed && state.open.is_empty() && state.followups.is_empty() {
         if let Some(dir) = &state.state_dir
             && let Err(error) = std::fs::remove_file(dir.join(HOLD_FILE))
@@ -2229,29 +2228,6 @@ fn finish_correlated(state: &mut State, turn: &str, usage: TurnUsage, unconfirme
                 let _ = std::fs::remove_file(dir.join(".anyagents-last-error.json"));
             }
         }
-=======
-    if !state.unconfirmed
-        && state.open.is_empty()
-        && state.followups.is_empty()
-        && let Some(dir) = &state.state_dir
-        && let Err(error) = std::fs::remove_file(dir.join("spiron-unconfirmed-steers.json"))
-        && error.kind() != std::io::ErrorKind::NotFound
-    {
-        state.unconfirmed = true;
-        state.sign_in_fault = Some(format!("cannot clear confirmed Spiron input hold: {error}"));
-    } else if !state.unconfirmed
-        && state.open.is_empty()
-        && state.followups.is_empty()
-        && let Some(dir) = &state.state_dir
-    {
-        // A confirmed completion releases every custody artefact that
-        // accompanied the hold, not just the hold file: a lingering
-        // reset marker would re-flag the hold on the next pass. The
-        // last-error file is best-effort here; the reader repersists it
-        // when the turn failed right after this.
-        let _ = std::fs::remove_file(dir.join(".anyagents-session-reset-recovery"));
-        let _ = std::fs::remove_file(dir.join(".anyagents-last-error.json"));
->>>>>>> origin/main
     }
 }
 

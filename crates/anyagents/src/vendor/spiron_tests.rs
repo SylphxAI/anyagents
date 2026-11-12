@@ -408,6 +408,42 @@ fn external_probe(
 }
 
 #[test]
+fn spiron_admission_waits_for_session_before_first_input() {
+    let temp = crate::test_tempdir();
+    let (_lock, _store, _agent, harness) = external_probe(
+        temp.path(),
+        r#"
+import json, pathlib, sys, time
+cfg = pathlib.Path(sys.argv[sys.argv.index("--state-dir") + 1])
+while not (cfg / "announce").exists():
+    time.sleep(0.005)
+print(json.dumps({"type": "ready", "session_id": "admission-session"}), flush=True)
+for raw in sys.stdin:
+    pass
+"#,
+    );
+    assert!(
+        !spiron_admission(&harness).unwrap(),
+        "session admission is unknown before ready"
+    );
+    assert!(!harness.admission_verified());
+    let cfg = temp.path().join("config");
+    std::fs::write(cfg.join("announce"), "").unwrap();
+    eventually(|| harness.session_id().as_deref() == Some("admission-session"));
+    assert!(spiron_admission(&harness).unwrap());
+    assert!(harness.admission_verified());
+    // Once admitted, our own turn lease must not block acknowledgement polls
+    // or steering of that turn.
+    let db = rusqlite::Connection::open(cfg.join("sessions.sqlite3")).unwrap();
+    db.execute_batch(
+        "CREATE TABLE session_leases (session_id TEXT PRIMARY KEY, expires_at_ms INTEGER);
+        INSERT INTO session_leases VALUES ('admission-session', 9223372036854775807);",
+    )
+    .unwrap();
+    assert!(spiron_admission(&harness).unwrap());
+}
+
+#[test]
 fn spiron_external_cancelled_unconfirmed_steer_retains_mailbox_custody_across_restart() {
     use anyagents_agent::DeliveryLoop;
     let temp = crate::test_tempdir();
@@ -415,6 +451,7 @@ fn spiron_external_cancelled_unconfirmed_steer_retains_mailbox_custody_across_re
     // steering text is returned verbatim in undelivered_steers, without IDs.
     let script = r#"
 import sys,json,pathlib,os
+print(json.dumps({'type':'ready','session_id':'cancel-session'}),flush=True)
 pending=None
 first=None
 for line in sys.stdin:
@@ -535,6 +572,7 @@ fn spiron_external_hold_write_failure_refuses_unsent_steer_and_restart_keeps_cus
     let temp = crate::test_tempdir();
     let script = r#"
 import sys,json,pathlib
+print(json.dumps({'type':'ready','session_id':'write-failure-session'}),flush=True)
 for line in sys.stdin:
  m=json.loads(line)
  with pathlib.Path(__file__).with_name('wire.jsonl').open('a') as out:

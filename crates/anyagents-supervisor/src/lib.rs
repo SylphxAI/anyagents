@@ -1416,8 +1416,11 @@ impl<H: Harness + 'static> Session<H> {
         let delivery = self.delivery.as_ref()?;
         let health = delivery.harness().health();
         let fault = health.sign_in_fault?;
-        if delivery.harness().has_unconfirmed_idle_hold() {
-            return Some(fault);
+        if delivery.harness().has_unconfirmed_hold() {
+            // The reader can finish a held turn after the reconciliation check
+            // at the start of this pass. Leave its custody to the next pass,
+            // rather than replacing a healthy process for its terminal error.
+            return None;
         }
         if health.turn_state != TurnState::Idle
             || !delivery.store().has_open_turn(&self.id).unwrap_or(false)

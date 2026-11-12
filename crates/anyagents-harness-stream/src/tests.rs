@@ -1397,7 +1397,6 @@ for line in sys.stdin:
   print(json.dumps({'type':'result','request_id':first,'status':'failed','is_error':True,'error':'upstream unavailable','undelivered_steers':['acknowledged input']}),flush=True)
 "#;
 
-<<<<<<< HEAD
 #[test]
 fn input_hold_parse_requires_well_formed_ids() {
     let hold =
@@ -1531,8 +1530,6 @@ fn truncated_hold_with_a_live_copy_keeps_exact_ids() {
     assert!(!harness.has_unconfirmed_hold());
 }
 
-=======
->>>>>>> origin/main
 #[cfg(unix)]
 const CONFIRMED_TURN_SCRIPT: &str = r#"
 import json,sys,time
@@ -1573,18 +1570,7 @@ fn reconcile_clear_releases_hold_marker_error_and_restart_stays_clear() {
     std::fs::write(&marker, b"").unwrap();
     std::fs::write(&last_error, b"{}").unwrap();
 
-<<<<<<< HEAD
     harness.clear_unconfirmed_hold().unwrap();
-=======
-    let reconciled = harness
-        .reconcile_unconfirmed_for_recovery()
-        .unwrap()
-        .expect("a held turn reconciles");
-    assert_eq!(
-        reconciled.request_ids,
-        vec!["m1".to_string(), "m2".to_string()]
-    );
->>>>>>> origin/main
     assert!(!harness.has_unconfirmed_hold());
     assert!(!dir.path().join("spiron-unconfirmed-steers.json").exists());
     assert!(!marker.exists());
@@ -1630,7 +1616,6 @@ fn confirmed_turn_completion_clears_marker_and_error_artifacts() {
     );
     assert!(!harness.has_unconfirmed_hold());
 }
-<<<<<<< HEAD
 
 #[test]
 #[cfg(unix)]
@@ -1674,5 +1659,3 @@ fn deferred_admission_holds_new_turns_but_not_after_it_is_verified() {
         }
     );
 }
-=======
->>>>>>> origin/main

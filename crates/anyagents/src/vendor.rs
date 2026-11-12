@@ -1890,8 +1890,10 @@ fn spiron_admission(harness: &StreamHarness) -> Result<bool, HarnessError> {
         return Ok(false);
     }
     let (Some(dir), Some(session)) = (harness.state_dir(), harness.session_id()) else {
-        // No session announced yet: Spiron has not finished starting.
-        return Ok(true);
+        // Do not expose input before admission can be checked. Otherwise the
+        // first input can acquire its own lease before ready is processed, and
+        // the next pass mistakes that lease for a stranded predecessor turn.
+        return Ok(false);
     };
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
