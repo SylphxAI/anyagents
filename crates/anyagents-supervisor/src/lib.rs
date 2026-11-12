@@ -679,6 +679,35 @@ fn activity_notify(clock: Arc<dyn Clock>, woken: Arc<AtomicBool>) -> Arc<dyn Fn(
     })
 }
 
+/// Recreate a missing boot directory with its final mode in one step. The
+/// staging directory sits outside the `agents/` tree; the rename publishes
+/// it once, so the seat never sees a default-materialised (umask/setgid)
+/// directory. Existing directories pass through untouched.
+fn ensure_staged_dir(data_dir: &std::path::Path, target: &std::path::Path) {
+    if target.exists() {
+        return;
+    }
+    if let Some(parent) = target.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let staging = data_dir.join(format!(
+        ".restore-stage-{}-{}",
+        std::process::id(),
+        anyagents_core::now_ms()
+    ));
+    let _ = fs::remove_dir_all(&staging);
+    if fs::create_dir(&staging).is_err() {
+        // Best-effort fallback: legacy direct creation.
+        let _ = fs::create_dir_all(target);
+        return;
+    }
+    let _ = fs::set_permissions(&staging, fs::Permissions::from_mode(0o2770));
+    if fs::rename(&staging, target).is_err() {
+        let _ = fs::remove_dir_all(&staging);
+        let _ = fs::create_dir_all(target);
+    }
+}
+
 struct Session<H: Harness> {
     inner: Arc<Inner<H>>,
     id: AgentId,
@@ -838,9 +867,14 @@ impl<H: Harness + 'static> Session<H> {
             self.paths = AgentPaths::from_store(&self.inner.store, &fresh);
             self.agent = fresh;
         }
-        let _ = fs::create_dir_all(&self.paths.config_dir);
-        let _ = fs::create_dir_all(&self.paths.managed_work);
-        let _ = fs::create_dir_all(&self.paths.work_dir);
+        for target in [
+            self.paths.config_dir.clone(),
+            self.paths.managed_work.clone(),
+            self.paths.work_dir.clone(),
+        ] {
+            let data_dir = self.inner.store.data_dir().to_path_buf();
+            ensure_staged_dir(&data_dir, &target);
+        }
         let rotated_ms =
             fs::read_to_string(self.paths.config_dir.join(".anyagents-profile-rotated-ms"))
                 .ok()

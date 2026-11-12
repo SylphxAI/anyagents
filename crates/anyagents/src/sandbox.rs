@@ -429,6 +429,103 @@ pub fn share_capability_with_seat(path: &Path, gid: u32) -> std::io::Result<()> 
     Ok(())
 }
 
+/// Render the operator's gh credential into a seat-owned directory
+/// (`<config>/gh/hosts.yml`, 0640 to the seat's group) and return the
+/// `GH_CONFIG_DIR` to pin into the launch environment. Launches never
+/// inherit the host gh home: ambient `GH_CONFIG_DIR`/`GH_TOKEN` values are
+/// stripped by the caller. The rendered copy is per-seat, so one seat can
+/// be revoked without touching another's credential.
+pub(crate) fn render_seat_gh_config(config_dir: &Path, gid: u32) -> Result<Option<PathBuf>, Error> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    let operator = std::env::var_os("GH_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("XDG_CONFIG_HOME")
+                .map(PathBuf::from)
+                .map(|base| base.join("gh"))
+        })
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|home| home.join(".config/gh"))
+        });
+    let Some(operator) = operator else {
+        return Ok(None);
+    };
+    let source = operator.join("hosts.yml");
+    let bytes = match std::fs::read(&source) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(Error::Message(format!(
+                "cannot read gh credential {}: {error}",
+                source.display()
+            )));
+        }
+    };
+    let gh_dir = config_dir.join("gh");
+    if let Err(error) = std::fs::create_dir_all(&gh_dir) {
+        return Err(Error::Message(format!(
+            "cannot render gh config {}: {error}",
+            gh_dir.display()
+        )));
+    }
+    std::fs::set_permissions(&gh_dir, std::fs::Permissions::from_mode(0o750)).map_err(|error| {
+        Error::Message(format!(
+            "cannot render gh config {}: {error}",
+            gh_dir.display()
+        ))
+    })?;
+    chown_to_seat_group(&gh_dir, gid).map_err(|error| {
+        Error::Message(format!(
+            "cannot render gh config {}: {error}",
+            gh_dir.display()
+        ))
+    })?;
+    let rendered = gh_dir.join("hosts.yml");
+    // Replace atomically so a crash cannot leave a partial credential.
+    let temporary = gh_dir.join(format!(
+        ".hosts.yml-{}",
+        anyagents_core::AgentId::generate()
+    ));
+    std::fs::write(&temporary, &bytes).map_err(|error| {
+        Error::Message(format!(
+            "cannot render gh credential {}: {error}",
+            rendered.display()
+        ))
+    })?;
+    std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o640)).map_err(
+        |error| {
+            Error::Message(format!(
+                "cannot render gh credential {}: {error}",
+                rendered.display()
+            ))
+        },
+    )?;
+    chown_to_seat_group(&temporary, gid).map_err(|error| {
+        Error::Message(format!(
+            "cannot render gh credential {}: {error}",
+            rendered.display()
+        ))
+    })?;
+    std::fs::rename(&temporary, &rendered).map_err(|error| {
+        Error::Message(format!(
+            "cannot render gh credential {}: {error}",
+            rendered.display()
+        ))
+    })?;
+    let meta = std::fs::metadata(&rendered)?;
+    if meta.permissions().mode() & 0o777 != 0o640 || meta.gid() != gid {
+        return Err(Error::Message(format!(
+            "gh credential {} is {:o} in group {}",
+            rendered.display(),
+            meta.permissions().mode() & 0o777,
+            meta.gid()
+        )));
+    }
+    Ok(Some(gh_dir))
+}
+
 /// Give one agent's config directory to its explicitly admitted principal.
 /// Workdirs have separate fail-closed sharing before admission.
 pub fn share_config_with_seat_uid(config_dir: &Path, uid: u32, gid: u32) {
@@ -494,7 +591,26 @@ pub(crate) fn ensure_seat_dir_as_owner(
     gid: u32,
     mode: u32,
 ) -> std::io::Result<()> {
-    if std::fs::create_dir_all(path).is_ok() {
+    use std::os::unix::fs::DirBuilderExt;
+    // Materialise with the final mode in one step. A bare `create_dir_all`
+    // under a setgid parent yields umask defaults (2755 seen live), never
+    // the caller's mode; a returned success must not depend on a later
+    // repair pass.
+    let mut builder = std::fs::DirBuilder::new();
+    builder.mode(mode).recursive(true);
+    match builder.create(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() != std::io::ErrorKind::PermissionDenied => {
+            return Err(error);
+        }
+        Err(_) => {}
+    }
+    if let Ok(meta) = std::fs::symlink_metadata(path)
+        && meta.is_dir()
+        && !meta.file_type().is_symlink()
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
         return Ok(());
     }
     #[cfg(unix)]
@@ -733,7 +849,7 @@ fn is_peer_boundary_shared(config: &Path, gid: u32) -> bool {
     true
 }
 
-type CachedPeers = (std::time::Instant, PathBuf, usize, String);
+type CachedPeers = (std::time::Instant, PathBuf, u64, String);
 
 fn peers_cache() -> &'static std::sync::Mutex<Option<CachedPeers>> {
     static PEERS_CACHE: std::sync::OnceLock<std::sync::Mutex<Option<CachedPeers>>> =
@@ -747,16 +863,37 @@ pub(super) fn invalidate_peers_cache() {
     }
 }
 
+fn seat_assignment_digest(store: &anyagents_core::Store, agents: &[anyagents_core::Agent]) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut seats: Vec<(String, u32, u32)> = agents
+        .iter()
+        .filter_map(|agent| {
+            crate::create::resolved_agent_seat_info(store, agent)
+                .map(|(_, uid, gid, _)| (agent.id.as_str().to_string(), uid, gid))
+        })
+        .collect();
+    seats.sort();
+    let mut hasher = DefaultHasher::new();
+    for (id, uid, gid) in seats {
+        id.hash(&mut hasher);
+        uid.hash(&mut hasher);
+        gid.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 /// Registered root-to-principal resolution is the same authority used by vendor
 /// launch. Unregistered directories remain foreign in the shared inventory.
 pub(crate) fn peer_principals(store: &anyagents_core::Store) -> Result<String, Error> {
     let agents = store.list_agents()?;
     let cacheable = !is_isolated_test_env() && std::env::var_os("ANYAGENTS_PRINCIPALS").is_none();
+    let digest = cacheable.then(|| seat_assignment_digest(store, &agents));
     if cacheable
         && let Ok(guard) = peers_cache().lock()
-        && let Some((at, ref dir, count, ref json)) = *guard
+        && let Some((at, ref dir, cached, ref json)) = *guard
         && dir == store.data_dir()
-        && count == agents.len()
+        && Some(cached) == digest
         && at.elapsed() < std::time::Duration::from_secs(15)
     {
         return Ok(json.clone());
@@ -782,11 +919,13 @@ pub(crate) fn peer_principals(store: &anyagents_core::Store) -> Result<String, E
         }
     }
     let json = serde_json::to_string(&peers).map_err(|e| Error::Message(e.to_string()))?;
-    if cacheable && let Ok(mut guard) = peers_cache().lock() {
+    if let Some(digest) = digest
+        && let Ok(mut guard) = peers_cache().lock()
+    {
         *guard = Some((
             std::time::Instant::now(),
             store.data_dir().to_path_buf(),
-            agents.len(),
+            digest,
             json.clone(),
         ));
     }
@@ -871,11 +1010,23 @@ pub fn run(data: &Path, config: Option<&Path>, command: &[String]) -> Result<(),
             config.display().to_string(),
         ));
     }
-    if let Ok(store) = anyagents_core::Store::open(data.join("state.db")) {
-        environment.push((
-            anyagents_harness::SEAT_PEERS_ENV.to_owned(),
-            peer_principals(&store)?,
-        ));
+    // A seat launch without the peer projection is refused, never
+    // downgraded: with seats configured, an unopenable store is a
+    // named failure. Single-UID deployments stay on the quiet path.
+    match anyagents_core::Store::open(data.join("state.db")) {
+        Ok(store) => {
+            environment.push((
+                anyagents_harness::SEAT_PEERS_ENV.to_owned(),
+                peer_principals(&store)?,
+            ));
+        }
+        Err(error) if seats_configured() => {
+            return Err(Error::Message(format!(
+                "cannot open state.db {}: {error}",
+                data.join("state.db").display()
+            )));
+        }
+        Err(_) => {}
     }
     let status = anyagents_harness::spawn_command(Path::new(&command[0]), &environment)
         .map_err(|e| Error::Message(e.to_string()))?
@@ -1124,6 +1275,102 @@ mod tests {
             match previous {
                 Some(value) => std::env::set_var("ANYAGENTS_PRINCIPALS", value),
                 None => std::env::remove_var("ANYAGENTS_PRINCIPALS"),
+            }
+        }
+    }
+
+    #[test]
+    fn unopenable_store_refuses_seat_launch_naming_state_db() {
+        let dir = tempfile::tempdir().unwrap();
+        boundary::write(dir.path()).unwrap();
+        // A directory where the store file belongs: `Store::open` fails at
+        // any uid (root or not), independent of DAC overrides.
+        std::fs::create_dir(dir.path().join("state.db")).unwrap();
+        let config = dir.path().join("config");
+        std::fs::create_dir(&config).unwrap();
+        std::fs::write(config.join(crate::operator::CAPABILITY_FILE), "cap\n").unwrap();
+        let launcher = dir.path().join("launcher");
+        std::fs::write(&launcher, "").unwrap();
+        let uid = if current_uid() == 42001 { 42002 } else { 42001 };
+        let _env = crate::server::tests::env_lock();
+        let keys = [
+            "ANYAGENTS_AGENT_UID",
+            "ANYAGENTS_AGENT_GID",
+            "ANYAGENTS_SOCKET_GID",
+            "ANYAGENTS_LAUNCHER",
+            "ANYAGENTS_PRINCIPALS",
+        ];
+        let old: Vec<_> = keys.iter().map(|key| std::env::var_os(key)).collect();
+        unsafe {
+            std::env::set_var("ANYAGENTS_AGENT_UID", uid.to_string());
+            std::env::set_var("ANYAGENTS_AGENT_GID", "42003");
+            std::env::set_var("ANYAGENTS_SOCKET_GID", "42004");
+            std::env::set_var("ANYAGENTS_LAUNCHER", &launcher);
+            std::env::set_var("ANYAGENTS_PRINCIPALS", "{}");
+        }
+        let message = run(
+            dir.path(),
+            Some(&config),
+            &["/bin/echo".to_string(), "launched".to_string()],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(message.contains("state.db"), "{message}");
+        assert!(!message.contains("the agent command exited"), "{message}");
+        unsafe {
+            for (key, value) in keys.into_iter().zip(old) {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn seat_gh_config_renders_per_seat_without_host_home() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let _env = crate::server::tests::env_lock();
+        let dir = crate::test_tempdir();
+        let operator = dir.path().join("operator-gh");
+        std::fs::create_dir(&operator).unwrap();
+        std::fs::write(
+            operator.join("hosts.yml"),
+            "github.com:\n  oauth_token: gho_test\n",
+        )
+        .unwrap();
+        let config = dir.path().join("config");
+        std::fs::create_dir(&config).unwrap();
+        let gid = server_gid();
+        let previous = std::env::var_os("GH_CONFIG_DIR");
+        unsafe {
+            std::env::set_var("GH_CONFIG_DIR", &operator);
+        }
+        let rendered = render_seat_gh_config(&config, gid).unwrap().unwrap();
+        assert_eq!(rendered, config.join("gh"));
+        let hosts = rendered.join("hosts.yml");
+        assert_eq!(
+            std::fs::read_to_string(&hosts).unwrap(),
+            "github.com:\n  oauth_token: gho_test\n"
+        );
+        let meta = std::fs::metadata(&hosts).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o640);
+        assert_eq!(meta.gid(), gid);
+        let dir_meta = std::fs::metadata(&rendered).unwrap();
+        assert_eq!(dir_meta.permissions().mode() & 0o777, 0o750);
+        // No operator credential at the forced source: no render.
+        let empty = dir.path().join("empty-gh");
+        std::fs::create_dir(&empty).unwrap();
+        unsafe {
+            std::env::set_var("GH_CONFIG_DIR", &empty);
+        }
+        let bare = dir.path().join("bare-config");
+        std::fs::create_dir(&bare).unwrap();
+        assert!(render_seat_gh_config(&bare, gid).unwrap().is_none());
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("GH_CONFIG_DIR", value),
+                None => std::env::remove_var("GH_CONFIG_DIR"),
             }
         }
     }
