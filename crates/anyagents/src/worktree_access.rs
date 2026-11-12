@@ -2046,6 +2046,7 @@ fn walk_tree_policy(
                     0
                 };
             before_open(&child_path);
+            #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
             let mut child = unsafe { libc::openat(fd, name.as_ptr(), flags) };
             if child < 0 {
                 // Capture errno before any further syscall can overwrite it.
