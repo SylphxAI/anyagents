@@ -29,6 +29,7 @@ mod mcp_config;
 mod muse_config;
 mod opencode_config;
 mod operator;
+mod profile_binding;
 mod reply;
 mod sandbox;
 mod sandbox_exec;

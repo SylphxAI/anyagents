@@ -100,6 +100,41 @@ fn create_with_seat(
         .map(str::to_string)
         .or_else(|| new.description.clone());
     new.parent_id = request.parent_id;
+    // The profile is settled before the agent exists, so a triple the profile
+    // cannot serve is refused here rather than on the agent's first turn.
+    let profile_pair: Option<(String, String)> = match request
+        .profile
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(prof) => Some(match prof.split_once('/') {
+            Some((pv, pn)) => (pv.trim().to_string(), pn.trim().to_string()),
+            None => (
+                upstream_provider_of(&normalized_harness, new.model.as_deref()),
+                prof.to_string(),
+            ),
+        }),
+        None => crate::profile_binding::resolve_default_profile(
+            data,
+            &store.list_agents()?,
+            &normalized_harness,
+            new.model.as_deref(),
+        )?
+        .and_then(|full| {
+            full.split_once('/')
+                .map(|(pv, pn)| (pv.to_string(), pn.to_string()))
+        }),
+    };
+    if let Some((prov, prof_name)) = &profile_pair {
+        crate::profile_binding::validate_triple(
+            data,
+            &normalized_harness,
+            new.model.as_deref(),
+            prov,
+            prof_name,
+        )?;
+    }
     let agent = store.create_agent(new)?;
     let data = std::path::absolute(data)?;
     let finish = (|| -> Result<Agent, Error> {
@@ -127,19 +162,7 @@ fn create_with_seat(
         let config = agent_config_dir(&data, &agent.id);
         create_private_config_dir(&config)?;
         let _ = std::fs::create_dir_all(config.join("tmp"));
-        if let Some(prof) = request
-            .profile
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            let (prov, prof_name) = match prof.split_once('/') {
-                Some((pv, pn)) => (pv.trim().to_string(), pn.trim().to_string()),
-                None => (
-                    upstream_provider_of(&agent.harness, agent.model.as_deref()),
-                    prof.to_string(),
-                ),
-            };
+        if let Some((prov, prof_name)) = profile_pair {
             ensure_profile_compatible_and_mapped(
                 &data,
                 &prov,
@@ -2989,35 +3012,63 @@ pub(crate) fn configure_agent_runtime(
     }
     let current_bound = bound_profile_name(&config);
 
+    let target_prov = upstream_provider_of(&target_harness, resolved_model.as_deref());
+    let profiles_enabled = crate::profile_binding::profiles_enabled(data);
     let (provider, profile_name) =
         if let Some(explicit_prof) = profile.map(str::trim).filter(|s| !s.is_empty()) {
             if let Some((p, n)) = explicit_prof.split_once('/') {
                 (p.trim().to_string(), n.trim().to_string())
             } else {
-                (
-                    upstream_provider_of(&target_harness, resolved_model.as_deref()),
-                    explicit_prof.to_string(),
-                )
-            }
-        } else if let Some(ref bound) = current_bound {
-            if let Some((p, n)) = bound.split_once('/') {
-                let target_prov = upstream_provider_of(&target_harness, resolved_model.as_deref());
-                if model.is_some() && p.trim() != target_prov {
-                    (target_prov, "default".to_string())
-                } else {
-                    (p.trim().to_string(), n.trim().to_string())
-                }
-            } else {
-                (
-                    upstream_provider_of(&target_harness, resolved_model.as_deref()),
-                    bound.trim().to_string(),
-                )
+                (target_prov.clone(), explicit_prof.to_string())
             }
         } else {
-            (
-                upstream_provider_of(&target_harness, resolved_model.as_deref()),
-                "default".to_string(),
-            )
+            // Keep the bound profile while it still fits the target; otherwise the
+            // configured binding decides. There is no implicit profile name.
+            let mut bound_rejection: Option<String> = None;
+            let kept = current_bound
+                .as_deref()
+                .map(|bound| match bound.split_once('/') {
+                    Some((p, n)) => (p.trim().to_string(), n.trim().to_string()),
+                    None => (target_prov.clone(), bound.trim().to_string()),
+                })
+                .filter(|(p, _)| model.is_none() || *p == target_prov)
+                .filter(|(p, n)| {
+                    if !profiles_enabled {
+                        return true;
+                    }
+                    match crate::profile_binding::ensure_profile_serves_model(
+                        data,
+                        p,
+                        n,
+                        resolved_model.as_deref(),
+                    ) {
+                        Ok(()) => true,
+                        Err(err) => {
+                            bound_rejection = Some(err.to_string());
+                            false
+                        }
+                    }
+                });
+            match kept {
+                Some(pair) => pair,
+                None => match crate::profile_binding::resolve_default_profile(
+                    data,
+                    &store.list_agents()?,
+                    &target_harness,
+                    resolved_model.as_deref(),
+                )
+                .map_err(|err| match &bound_rejection {
+                    Some(why) => Error::Message(format!("bound profile rejected: {why}; {err}")),
+                    None => err,
+                })? {
+                    Some(full) => full
+                        .split_once('/')
+                        .map(|(p, n)| (p.to_string(), n.to_string()))
+                        .ok_or_else(|| Error::Message(format!("invalid profile `{full}`")))?,
+                    // No provider profiles are installed: the name is only a label.
+                    None => (target_prov.clone(), "default".to_string()),
+                },
+            }
         };
 
     ensure_profile_compatible_and_mapped(
@@ -3033,6 +3084,14 @@ pub(crate) fn configure_agent_runtime(
         return Err(Error::Message(format!(
             "provider profile not found: `{provider}/{profile_name}`"
         )));
+    }
+    if profiles_enabled && profile_dir.is_dir() {
+        crate::profile_binding::ensure_profile_serves_model(
+            data,
+            &provider,
+            &profile_name,
+            resolved_model.as_deref(),
+        )?;
     }
 
     let open_turn = store.has_open_turn(&existing.id).unwrap_or(false);
@@ -9232,16 +9291,27 @@ pub(crate) fn apply_archetype_defaults(
         .map(str::trim)
         .is_none_or(str::is_empty)
         && !preset_has_model
-        && let Some(m) = tpl.model
+        && let Some(m) = tpl.model.clone()
     {
         body.model = Some(m);
     }
+    // A template profile is chosen for the template's model; it does not follow
+    // a model the caller picked instead.
+    let template_profile_pairs = match (tpl.model.as_deref(), body.model.as_deref()) {
+        (Some(tpl_model), Some(model)) => {
+            crate::profile_binding::base_model_id(tpl_model)
+                == crate::profile_binding::base_model_id(model)
+        }
+        (Some(_), None) => false,
+        (None, _) => true,
+    };
     if body
         .profile
         .as_deref()
         .map(str::trim)
         .is_none_or(str::is_empty)
         && !preset_has_profile
+        && template_profile_pairs
         && let Some(p) = tpl.profile
     {
         body.profile = Some(p);
@@ -9405,8 +9475,28 @@ pub(crate) fn resolve_subagent_defaults(
                 .split_once('/')
                 .map(|(p, _)| p)
                 .unwrap_or(prof.as_str());
-            (prov == target_provider).then(|| prof.clone())
+            let name = prof.split_once('/').map_or(prof.as_str(), |(_, n)| n);
+            (prov == target_provider
+                && (!crate::profile_binding::profiles_enabled(data)
+                    || crate::profile_binding::ensure_profile_serves_model(
+                        data,
+                        prov,
+                        name,
+                        resolved_model.as_deref(),
+                    )
+                    .is_ok()))
+            .then(|| prof.clone())
         })
+    };
+    // The preset profile is chosen for the preset model; a different model gets
+    // its profile from the configured binding instead.
+    let spec_profile_pairs = match spec.model.as_deref().map(str::trim) {
+        Some(m) if !m.is_empty() && !m.eq_ignore_ascii_case("inherit") => {
+            resolved_model.as_deref().is_some_and(|r| {
+                crate::profile_binding::base_model_id(r) == crate::profile_binding::base_model_id(m)
+            })
+        }
+        _ => true,
     };
 
     let resolved_profile = if let Some(p) = p_trim {
@@ -9421,7 +9511,7 @@ pub(crate) fn resolve_subagent_defaults(
         spec.profile
             .as_deref()
             .map(str::trim)
-            .filter(|s| !s.is_empty())
+            .filter(|s| !s.is_empty() && spec_profile_pairs)
             .and_then(|p| {
                 if p.eq_ignore_ascii_case("inherit") {
                     inherit_profile_if_compatible()
@@ -10027,6 +10117,11 @@ mod tests {
         let owner_workdir = data.join("owner-workdir");
         std::fs::create_dir(&owner_workdir).unwrap();
         std::fs::create_dir_all(data.join("profiles/sylphx/default")).unwrap();
+        std::fs::write(
+            data.join("profiles/sylphx/default/profile.json"),
+            r#"{"models":["openai/gpt-6.1-sol","openai/gpt-5.4-mini"]}"#,
+        )
+        .unwrap();
         let store = Store::open(data.join("state.db")).unwrap();
         store
             .hold_capability_key("0123456789abcdef0123456789abcdef")
@@ -14171,5 +14266,245 @@ Connection: close
         std::fs::write(cfg.join(".anyagents-profile"), marker).unwrap();
         let picked = select_or_bind_profile(data, &[], &agent, &cfg);
         assert_eq!(picked, vec![explicit]);
+    }
+
+    fn binding_fixture(data: &Path) {
+        for (name, models) in [
+            ("openrouter/general", serde_json::json!(["lab/model-a"])),
+            ("openrouter/special", serde_json::json!(["lab/model-b"])),
+        ] {
+            let dir = data.join("profiles").join(name);
+            std::fs::create_dir_all(dir.join(".config/opencode")).unwrap();
+            std::fs::write(
+                dir.join("profile.json"),
+                serde_json::json!({
+                    "provider": "openrouter",
+                    "kind": "api-key",
+                    "compatible_harnesses": ["spiron"],
+                    "models": models,
+                })
+                .to_string(),
+            )
+            .unwrap();
+            std::fs::write(dir.join(".config/opencode/vendor.key"), "k\n").unwrap();
+        }
+        std::fs::write(
+            data.join(crate::profile_binding::BINDINGS_FILE),
+            serde_json::json!({"bindings": [
+                {"harness": "spiron", "profiles": ["openrouter/general"]},
+                {"harness": "spiron", "model": "openrouter/lab/model-b", "profiles": ["openrouter/special"]}
+            ]})
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    fn binding_request(name: &str, model: &str, profile: Option<&str>) -> CreateRequest {
+        CreateRequest {
+            name: name.to_string(),
+            role: None,
+            harness: "spiron".to_string(),
+            model: Some(model.to_string()),
+            profile: profile.map(str::to_string),
+            repo: None,
+            branch: None,
+            base: None,
+            workdir: None,
+            workdir_default: None,
+            description: None,
+            instructions: None,
+            parent_id: None,
+        }
+    }
+
+    #[test]
+    fn create_refuses_profile_that_does_not_serve_the_model_before_the_row_exists() {
+        let tmp = crate::test_tempdir();
+        let data = tmp.path();
+        binding_fixture(data);
+        let store = Store::open(data.join("state.db")).unwrap();
+        let err = create(
+            &store,
+            data,
+            binding_request(
+                "mismatched",
+                "openrouter/lab/model-a#medium",
+                Some("openrouter/special"),
+            ),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("does not serve model"), "{err}");
+        assert!(store.agent_by_name("mismatched").is_err());
+    }
+
+    #[test]
+    fn create_without_profile_binds_the_configured_profile_for_the_model() {
+        let tmp = crate::test_tempdir();
+        let data = tmp.path();
+        binding_fixture(data);
+        let store = Store::open(data.join("state.db")).unwrap();
+        store
+            .hold_capability_key("0123456789abcdef0123456789abcdef")
+            .unwrap();
+        for (name, model, expected) in [
+            (
+                "general-child",
+                "openrouter/lab/model-a#medium",
+                "openrouter/general",
+            ),
+            (
+                "special-child",
+                "openrouter/lab/model-b#xhigh",
+                "openrouter/special",
+            ),
+        ] {
+            let agent = create(&store, data, binding_request(name, model, None)).unwrap();
+            let cfg = agent_config_dir(data, &agent.id);
+            assert_eq!(
+                bound_profile_name(&cfg).as_deref(),
+                Some(expected),
+                "{name}"
+            );
+        }
+        std::fs::remove_file(data.join(crate::profile_binding::BINDINGS_FILE)).unwrap();
+        let err = create(
+            &store,
+            data,
+            binding_request("unbound", "openrouter/lab/model-a", None),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("no profile binding"), "{err}");
+        assert!(store.agent_by_name("unbound").is_err());
+    }
+
+    #[test]
+    fn template_profile_does_not_follow_a_caller_chosen_model() {
+        let tmp = crate::test_tempdir();
+        let data = tmp.path();
+        std::fs::create_dir_all(data.join(".agents/agents")).unwrap();
+        std::fs::write(
+            data.join(".agents/agents/builder.md"),
+            "---\nharness: spiron\nmodel: \"openrouter/lab/model-b#high\"\nprofile: \"openrouter/special\"\n---\nBuilder.",
+        )
+        .unwrap();
+        let request = |model: Option<&str>| -> crate::api::CreateAgentRequest {
+            serde_json::from_value(serde_json::json!({
+                "name": "templated",
+                "role": "builder",
+                "model": model,
+            }))
+            .unwrap()
+        };
+        let mut own_model = request(None);
+        apply_archetype_defaults(None, data, None, &mut own_model).unwrap();
+        assert_eq!(
+            own_model.model.as_deref(),
+            Some("openrouter/lab/model-b#high")
+        );
+        assert_eq!(own_model.profile.as_deref(), Some("openrouter/special"));
+
+        let mut same_model = request(Some("openrouter/lab/model-b#xhigh"));
+        apply_archetype_defaults(None, data, None, &mut same_model).unwrap();
+        assert_eq!(same_model.profile.as_deref(), Some("openrouter/special"));
+
+        let mut other_model = request(Some("openrouter/lab/model-a#medium"));
+        apply_archetype_defaults(None, data, None, &mut other_model).unwrap();
+        assert_eq!(
+            other_model.model.as_deref(),
+            Some("openrouter/lab/model-a#medium")
+        );
+        assert_eq!(other_model.profile, None);
+    }
+
+    #[test]
+    fn preset_profile_does_not_follow_a_caller_chosen_model() {
+        let tmp = crate::test_tempdir();
+        let data = tmp.path();
+        binding_fixture(data);
+        std::fs::write(
+            data.join("subagent-defaults.json"),
+            serde_json::json!({"default": {
+                "mode": "preset",
+                "harness": "spiron",
+                "model": "openrouter/lab/model-a#xhigh",
+                "profile": "openrouter/general"
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        let store = Store::open(data.join("state.db")).unwrap();
+        let parent = store
+            .create_agent(NewAgent::new("preset-parent", "spiron"))
+            .unwrap();
+        let (_, model, profile) = resolve_subagent_defaults(data, Some(&parent), "", None, None);
+        assert_eq!(model.as_deref(), Some("openrouter/lab/model-a#xhigh"));
+        assert_eq!(profile.as_deref(), Some("openrouter/general"));
+        let (_, model, profile) = resolve_subagent_defaults(
+            data,
+            Some(&parent),
+            "",
+            Some("openrouter/lab/model-b#medium".into()),
+            None,
+        );
+        assert_eq!(model.as_deref(), Some("openrouter/lab/model-b#medium"));
+        assert_eq!(profile, None, "the binding chooses the profile at create");
+    }
+
+    #[test]
+    fn switch_refuses_a_profile_that_does_not_serve_the_model_and_rebinds_on_model_change() {
+        let tmp = crate::test_tempdir();
+        let data = tmp.path();
+        binding_fixture(data);
+        let store = Store::open(data.join("state.db")).unwrap();
+        store
+            .hold_capability_key("0123456789abcdef0123456789abcdef")
+            .unwrap();
+        let agent = create(
+            &store,
+            data,
+            binding_request("switcher", "openrouter/lab/model-a#medium", None),
+        )
+        .unwrap();
+        let cfg = agent_config_dir(data, &agent.id);
+
+        let err = configure_agent_runtime(
+            &store,
+            data,
+            "operator",
+            "switcher",
+            Some("spiron"),
+            Some("openrouter/lab/model-a#xhigh"),
+            Some("openrouter/special"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("does not serve model"), "{err}");
+        let unchanged = store.agent(&agent.id).unwrap();
+        assert_eq!(
+            unchanged.model.as_deref(),
+            Some("openrouter/lab/model-a#medium")
+        );
+        assert_eq!(
+            bound_profile_name(&cfg).as_deref(),
+            Some("openrouter/general")
+        );
+
+        let out = configure_agent_runtime(
+            &store,
+            data,
+            "operator",
+            "switcher",
+            None,
+            Some("openrouter/lab/model-b#xhigh"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(out["profile"], "openrouter/special");
+        assert_eq!(
+            bound_profile_name(&cfg).as_deref(),
+            Some("openrouter/special")
+        );
     }
 }
