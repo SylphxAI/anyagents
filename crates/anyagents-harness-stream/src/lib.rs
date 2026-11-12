@@ -1620,7 +1620,11 @@ fn read_stdout(
     generation: u64,
 ) {
     for line in BufReader::new(stdout).lines() {
-        let Ok(line) = line else { break };
+        let line = match line {
+            Ok(line) => line,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
         if line.trim().is_empty() {
             continue;
         }
