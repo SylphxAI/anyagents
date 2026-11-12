@@ -99,6 +99,8 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Release admission policy
         run: python3 -m unittest discover -s tests -p 'test_release_admission.py' -v
+      - name: Deploy build policy
+        run: python3 -m unittest discover -s tests -p 'test_deploy_build.py' -v
       - name: Browser fixture tests
         run: npm test
       - name: Test
