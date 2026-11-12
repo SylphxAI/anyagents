@@ -1758,6 +1758,7 @@ fn read_stdout(
             {
                 // The test capture drops other threads' stderr; log through a
                 // file so the acceptance path stays observable on failure.
+                #[cfg(test)]
                 if let Some(dir) = state.state_dir.clone() {
                     use std::io::Write;
                     if let Ok(mut f) = std::fs::OpenOptions::new()
