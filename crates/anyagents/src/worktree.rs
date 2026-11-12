@@ -1119,6 +1119,7 @@ esac
                     "HOME=/nonexistent",
                     "GIT_CONFIG_GLOBAL=/dev/null",
                     "GIT_CONFIG_SYSTEM=/dev/null",
+                    "XDG_CONFIG_HOME=/nonexistent",
                 ])
                 .args([
                     "git",
@@ -1137,9 +1138,8 @@ esac
             let stderr = String::from_utf8_lossy(&out.stderr);
             let first = stderr
                 .lines()
-                .find(|l| {
-                    l.starts_with("error") || l.starts_with("fatal") || l.starts_with("warning")
-                })
+                .find(|l| l.starts_with("fatal"))
+                .or_else(|| stderr.lines().find(|l| l.starts_with("error")))
                 .unwrap_or("")
                 .to_string();
             (out.status.code().unwrap_or(-1), first)

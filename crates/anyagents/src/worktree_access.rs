@@ -1637,6 +1637,17 @@ fn share_known_locked(
     // witness only the exact managed objects, never restore their old grants.
     grant.config = recorded_config(journal, common).map_err(|e| refusal(journal, e))?;
     write_grant(journal, &grant).map_err(|e| refusal(journal, e))?;
+    // Branch reflogs are in the write allowlist, but a fresh bare store has no
+    // logs/refs and the seat cannot create it through traversal-only logs/.
+    // The store's owner creates the allowlisted directory (never following a
+    // planted symlink: an existing entry is opened no-follow below).
+    for name in ["logs", "logs/refs"] {
+        match std::fs::create_dir(common.join(name)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(refusal(&common.join(name), e)),
+        }
+    }
     // Clear any legacy broad grants/defaults for this seat before the allowlist.
     revoke_common(common, uid, gid, &retained, Some(&grant)).map_err(|e| refusal(common, e))?;
     for root in [
