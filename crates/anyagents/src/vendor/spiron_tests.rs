@@ -1013,6 +1013,9 @@ impl SpironRig {
                 tail.trim_end().to_string()
             })
             .unwrap_or_else(|_| "absent".to_string());
+        let lines = std::fs::read_to_string(self.cfg.join("reader-lines.log"))
+            .map(|s| s.lines().count().to_string())
+            .unwrap_or_else(|_| "absent".to_string());
         let reader = std::fs::read_to_string(self.cfg.join("reader-ack.log"))
             .map(|s| {
                 let tail = if s.len() > 800 {
@@ -1047,7 +1050,7 @@ impl SpironRig {
             .next_undelivered(&self.agent.id)
             .map(|m| m.map(|m| m.id.to_string()));
         format!(
-            "wire={:?} launched={launch} progress={progress} reader={reader} hold={hold} last_error={last_error} journal={journal} cursor={cursor:?} next={next:?} supervisor={supervisor:?}",
+            "wire={:?} launched={launch} progress={progress} reader={reader} lines={lines} hold={hold} last_error={last_error} journal={journal} cursor={cursor:?} next={next:?} supervisor={supervisor:?}",
             self.wire()
         )
     }
