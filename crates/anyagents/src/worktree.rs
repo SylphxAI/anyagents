@@ -975,4 +975,220 @@ esac
         assert!(args.contains("https://git.example.test/team/repo.git"));
         assert!(args.contains("worktree"));
     }
+
+    /// Measurement for the engine-owned pool as a multi-seat store: the server
+    /// (root here) owns the pool; a distinct unprivileged seat performs the
+    /// ordinary workflow in its admitted checkout. Prints a JSON receipt of
+    /// every operation's outcome. It asserts only what admission guarantees:
+    /// the pool passes the shared trust predicate and the seat can commit.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn privileged_pool_seat_workflow_receipt() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } != 0 {
+            assert!(
+                std::env::var_os("ANYAGENTS_REQUIRE_PRIVILEGED_WORKTREE_TEST").is_none(),
+                "requires root to create a distinct seat user"
+            );
+            eprintln!("requires root; pool seat workflow receipt not produced");
+            return;
+        }
+        struct User(String);
+        impl Drop for User {
+            fn drop(&mut self) {
+                let _ = Command::new("userdel").arg(&self.0).status();
+            }
+        }
+        let name = format!("aa-pool-{}", std::process::id());
+        assert!(
+            Command::new("useradd")
+                .args(["--no-create-home", "--user-group", &name])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let user = User(name);
+        let id = |flag: &str| -> u32 {
+            String::from_utf8(
+                Command::new("id")
+                    .args([flag, &user.0])
+                    .output()
+                    .unwrap()
+                    .stdout,
+            )
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+        };
+        let (uid, gid) = (id("-u"), id("-g"));
+
+        let dir = tempfile::tempdir_in("/var/tmp").unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let seed = dir.path().join("seed");
+        let origin = dir.path().join("origin.git");
+        std::fs::create_dir_all(&seed).unwrap();
+        git(&seed, &["init", "-q", "-b", "main"]);
+        for args in [
+            &[
+                "-c",
+                "user.name=A",
+                "-c",
+                "user.email=a@example.invalid",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "base",
+            ][..],
+            &["branch", "stale"][..],
+            &["branch", "packed-local"][..],
+        ] {
+            git(&seed, args);
+        }
+        git(
+            &seed,
+            &["clone", "-q", "--bare", ".", origin.to_str().unwrap()],
+        );
+        // The seat may push to its remote; the pool itself stays server-owned.
+        assert!(
+            Command::new("chown")
+                .args(["-R", &format!("{uid}:{gid}")])
+                .arg(&origin)
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let pool_root = dir.path().join("pool");
+        let consumer = Consumer {
+            executable: PathBuf::new(),
+            git_pool_dir: Some(pool_root.clone()),
+        };
+        let work = dir.path().join("work");
+        let source = format!("file://{}", origin.display());
+        consumer.remote(&source, &work, "agent/seat", None).unwrap();
+        let common = PathBuf::from(git(
+            &work,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        ));
+        // The bare pool already holds `packed-local` and `stale` as branches;
+        // fetch tracking refs too, then make every ref exist only packed.
+        git(
+            &common,
+            &[
+                "fetch",
+                "-q",
+                "origin",
+                "+refs/heads/*:refs/remotes/origin/*",
+            ],
+        );
+        git(&common, &["pack-refs", "--all"]);
+
+        let data = dir.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let agent = anyagents_core::AgentId::generate();
+        let journal = crate::worktree_access::grant_path(&data, &agent);
+        crate::worktree_access::share(&work, uid, gid, &journal).unwrap();
+        crate::worktree_access::RecordedWorktree::load(&data, &agent, &work)
+            .expect("recorded grant")
+            .validate()
+            .expect("the pool passes the launch trust predicate");
+        crate::worktree_access::verify(
+            &work,
+            uid,
+            gid,
+            Some(&format!("/usr/bin/setpriv\t{uid}\t{gid}\t{gid}")),
+        )
+        .expect("seat admission probe");
+
+        let seat = |args: &[&str]| -> (i32, String) {
+            let out = Command::new("/usr/bin/setpriv")
+                .args([
+                    "--reuid",
+                    &uid.to_string(),
+                    "--regid",
+                    &gid.to_string(),
+                    "--groups",
+                    &gid.to_string(),
+                    "--no-new-privs",
+                    "--",
+                ])
+                .args([
+                    "env",
+                    "HOME=/nonexistent",
+                    "GIT_CONFIG_GLOBAL=/dev/null",
+                    "GIT_CONFIG_SYSTEM=/dev/null",
+                    "XDG_CONFIG_HOME=/nonexistent",
+                ])
+                .args([
+                    "git",
+                    "-c",
+                    "safe.directory=*",
+                    "-c",
+                    "user.name=Seat",
+                    "-c",
+                    "user.email=seat@example.invalid",
+                    "-C",
+                ])
+                .arg(&work)
+                .args(args)
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let first = stderr
+                .lines()
+                .find(|l| l.starts_with("fatal"))
+                .or_else(|| stderr.lines().find(|l| l.starts_with("error")))
+                .unwrap_or("")
+                .to_string();
+            (out.status.code().unwrap_or(-1), first)
+        };
+        let mut receipt = Vec::new();
+        let mut record = |op: &str, result: (i32, String)| {
+            receipt.push(serde_json::json!({"op": op, "exit": result.0, "message": result.1}));
+            result.0
+        };
+        let commit = record(
+            "commit on new branch",
+            seat(&["commit", "-q", "--allow-empty", "-m", "seat work"]),
+        );
+        record(
+            "push -u",
+            seat(&["push", "-q", "-u", "origin", "HEAD:refs/heads/agent/seat"]),
+        );
+        record(
+            "upstream recorded in config",
+            seat(&["config", "--get", "branch.agent/seat.remote"]),
+        );
+        record(
+            "set-upstream-to",
+            seat(&["branch", "--set-upstream-to=origin/main"]),
+        );
+        record(
+            "worktree-scoped config write",
+            seat(&[
+                "config",
+                "--worktree",
+                "branch.agent/seat.description",
+                "seat",
+            ]),
+        );
+        git(&origin, &["branch", "-D", "stale"]);
+        record(
+            "fetch --prune (packed tracking ref)",
+            seat(&["fetch", "-q", "--prune", "origin"]),
+        );
+        record("create loose branch", seat(&["branch", "tmp-loose"]));
+        record("branch -d loose", seat(&["branch", "-d", "tmp-loose"]));
+        record("branch -D packed", seat(&["branch", "-D", "packed-local"]));
+        record("gc --auto", seat(&["gc", "--auto"]));
+        record("worktree prune", seat(&["worktree", "prune"]));
+        record("status", seat(&["status", "--porcelain"]));
+        eprintln!(
+            "POOL_SEAT_WORKFLOW_RECEIPT {}",
+            serde_json::to_string(&receipt).unwrap()
+        );
+        assert_eq!(commit, 0, "seat cannot commit in an admitted pool checkout");
+    }
 }

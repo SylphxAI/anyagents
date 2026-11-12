@@ -2666,6 +2666,59 @@ impl Store {
     }
 
     /// Permanently delete an agent and its associated records from the store.
+    /// A creation that failed before admission (`set_agent_running` is the only
+    /// writer of `workdir`) must not keep its name reserved. When its row has to
+    /// be kept, e.g. as the anchor of a pending revocation journal, archive it
+    /// and rename it to its own id, which can never collide with a chosen name.
+    /// The id, history and journal are untouched. Admitted agents are refused.
+    pub fn release_unadmitted_agent(&self, id: &AgentId) -> Result<Agent, Error> {
+        let released = {
+            let mut conn = self.conn();
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let changed = tx.execute(
+                "UPDATE agents SET name = id, state = 'archived'
+                 WHERE id = ?1 AND workdir IS NULL AND is_admin = 0",
+                [id.as_str()],
+            )?;
+            if changed == 0 {
+                agent_by_id(&tx, id)?;
+                return Err(Error::Message(format!(
+                    "agent {id} was admitted; its name is not a failed reservation"
+                )));
+            }
+            let agent = agent_by_id(&tx, id)?;
+            tx.commit()?;
+            agent
+        };
+        self.notify(Wake::Agent {
+            agent_id: id.clone(),
+        });
+        Ok(released)
+    }
+
+    /// Startup repair, run while the server lock excludes concurrent creation:
+    /// every row that never reached admission is a failed or interrupted
+    /// creation. Release each one's name. Returns the released `(id, name)`s.
+    pub fn release_unadmitted_names(&self) -> Result<Vec<(AgentId, String)>, Error> {
+        let rows: Vec<(String, String)> = {
+            let conn = self.read_conn();
+            let mut stmt = conn.prepare(
+                "SELECT id, name FROM agents
+                 WHERE workdir IS NULL AND is_admin = 0 AND name != id
+                   AND state IN ('created', 'archived')",
+            )?;
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<Result<_, _>>()?
+        };
+        let mut released = Vec::new();
+        for (id, name) in rows {
+            let id = AgentId::parse(&id)?;
+            self.release_unadmitted_agent(&id)?;
+            released.push((id, name));
+        }
+        Ok(released)
+    }
+
     pub fn delete_agent(&self, id: &AgentId) -> Result<Agent, Error> {
         let deleted = {
             let mut conn = self.conn();
@@ -8703,6 +8756,58 @@ mod tests {
                 .recv_timeout(std::time::Duration::from_millis(200))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn failed_creation_releases_its_name_and_admitted_agents_keep_theirs() {
+        let (_dir, store) = setup();
+        let failed = agent(&store, "reserved");
+        let admitted = agent(&store, "admitted");
+        store.set_agent_running(&admitted.id, "/work").unwrap();
+        store.set_agent_state(&admitted.id, "archived").unwrap();
+
+        let released = store.release_unadmitted_agent(&failed.id).unwrap();
+        assert_eq!(released.name, failed.id.as_str());
+        assert_eq!(released.state, "archived");
+        assert!(matches!(
+            store.agent_by_name("reserved"),
+            Err(Error::AgentNotFound(_))
+        ));
+        assert_eq!(store.agent(&failed.id).unwrap().id, failed.id);
+        agent(&store, "reserved");
+
+        let refused = store.release_unadmitted_agent(&admitted.id).unwrap_err();
+        assert!(refused.to_string().contains("was admitted"), "{refused}");
+        assert_eq!(store.agent(&admitted.id).unwrap().name, "admitted");
+    }
+
+    #[test]
+    fn startup_repair_releases_every_ghost_reservation_once() {
+        let (_dir, store) = setup();
+        let interrupted = agent(&store, "interrupted");
+        let ghost = agent(&store, "ghost");
+        store.set_agent_state(&ghost.id, "archived").unwrap();
+        let running = agent(&store, "running");
+        store.set_agent_running(&running.id, "/work").unwrap();
+        let retired = agent(&store, "retired");
+        store.set_agent_running(&retired.id, "/work").unwrap();
+        store.set_agent_state(&retired.id, "archived").unwrap();
+
+        let mut released = store.release_unadmitted_names().unwrap();
+        released.sort_by(|a, b| a.1.cmp(&b.1));
+        assert_eq!(
+            released,
+            vec![
+                (ghost.id.clone(), "ghost".to_string()),
+                (interrupted.id.clone(), "interrupted".to_string()),
+            ]
+        );
+        assert!(store.release_unadmitted_names().unwrap().is_empty());
+        for name in ["ghost", "interrupted"] {
+            agent(&store, name);
+        }
+        assert_eq!(store.agent(&running.id).unwrap().name, "running");
+        assert_eq!(store.agent(&retired.id).unwrap().name, "retired");
     }
 
     #[test]

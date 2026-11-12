@@ -905,6 +905,51 @@ fn unadmitted(boundary: &Boundary, why: &str) -> String {
 mod tests {
     use super::*;
 
+    /// Sessions created by the daemon as a private 0700 directory (as a harness
+    /// switch or an older daemon leaves them) are re-admitted to the agent's
+    /// seat group with 0o2770 by the same sharing pass that admits config.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn config_sharing_readmits_a_private_sessions_directory_to_the_seat() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("agent");
+        let config = root.join("config");
+        let sessions = root.join("sessions");
+        let transcripts = root.join("transcripts");
+        for path in [&config, &sessions, &transcripts] {
+            std::fs::create_dir_all(path).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        std::fs::write(sessions.join("session.json"), b"{}").unwrap();
+        std::fs::set_permissions(
+            sessions.join("session.json"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let (uid, gid) = (server_uid(), server_gid());
+        share_config_with_seat_uid(&config, uid, gid);
+        let meta = std::fs::metadata(&sessions).unwrap();
+        assert_eq!(
+            meta.mode() & 0o7777,
+            0o2770,
+            "sessions must be seat-admitted"
+        );
+        assert_eq!(meta.gid(), gid);
+        let file = std::fs::metadata(sessions.join("session.json")).unwrap();
+        assert_eq!(file.gid(), gid);
+        assert_ne!(
+            file.mode() & 0o060,
+            0,
+            "the seat group must reach session files"
+        );
+        assert_eq!(
+            std::fs::metadata(&transcripts).unwrap().mode() & 0o7777,
+            0o700,
+            "transcripts stay host-private"
+        );
+    }
+
     #[test]
     fn claude_executable_override_does_not_select_test_isolation() {
         const PROBE: &str = "ANYAGENTS_ISOLATION_REGRESSION_PROBE";

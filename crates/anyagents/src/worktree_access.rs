@@ -349,7 +349,7 @@ pub(crate) fn configure_seat_git(config: &Path, workdir: &Path) -> Result<(), Er
 /// The journal lives under the server-owned data directory, outside the seat's
 /// config/worktree. Persist it before granting anything so partial admission can
 /// always revoke, even if the checkout or its .git pointer later disappears.
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct Grant {
     common: PathBuf,
     gid: u32,
@@ -558,17 +558,78 @@ fn manage_config_with_hook(
     };
     let file = open_common_config(common, grant.config.as_ref())?;
     let directory = grant.config.as_ref().unwrap().directory.open()?;
-    let readers: Vec<_> = std::iter::once(&*grant)
+    let mut readers: Vec<_> = std::iter::once(&*grant)
         .chain(retained.iter())
         .filter(|g| g.active && !g.quarantined && !g.inspection)
         .map(|g| g.gid)
         .collect();
+    // Relocation must never narrow who could already read the config: Git
+    // checkouts the engine did not admit (made by an external provider) read
+    // it through the common directory's own group. Read only, never write.
+    readers.extend(store_group_reader(common)?);
     for gid in &readers {
         update_metadata_acl(&directory, *gid, Some(5), false, None)?;
         update_metadata_acl(&file, *gid, Some(4), false, None)?;
     }
     config_default_readers(&directory, &readers)?;
     Ok(())
+}
+
+/// The common directory's owning group, when it may list and traverse the
+/// store (and so could read a config file placed there before relocation).
+fn store_group_reader(common: &Path) -> std::io::Result<Option<u32>> {
+    use std::os::unix::fs::MetadataExt;
+    let directory = open_nofollow(common)?;
+    let meta = directory.metadata()?;
+    #[cfg(target_os = "linux")]
+    let group_permissions = {
+        let mut bytes = vec![0u8; 65536];
+        let len = read_xattr(&directory, c"system.posix_acl_access", &mut bytes);
+        if len >= 0 {
+            bytes.truncate(len as usize);
+            if bytes.len() < 4
+                || bytes[..4] != 2u32.to_le_bytes()
+                || !(bytes.len() - 4).is_multiple_of(8)
+            {
+                return Err(std::io::Error::other("invalid common directory ACL"));
+            }
+            let entries: Vec<_> = bytes[4..]
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|b| {
+                    (
+                        u16::from_le_bytes([b[0], b[1]]),
+                        u16::from_le_bytes([b[2], b[3]]),
+                    )
+                })
+                .collect();
+            let mask = entries.iter().find(|e| e.0 == 16).map_or(7, |e| e.1);
+            entries.iter().find(|e| e.0 == 4).map_or(0, |e| e.1 & mask)
+        } else {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ENODATA) {
+                return Err(error);
+            }
+            ((meta.mode() >> 3) & 7) as u16
+        }
+    };
+    #[cfg(not(target_os = "linux"))]
+    let group_permissions = ((meta.mode() >> 3) & 7) as u16;
+    Ok((group_permissions & 5 == 5).then_some(meta.gid()))
+}
+
+/// Recompute the managed config's reader set without admitting anything: the
+/// store group plus every still-active grant. Runs after a revocation and at
+/// startup so the last revocation never leaves provider checkouts unreadable.
+fn refresh_store_config_readers(journal: &Path, grant: &Grant) -> std::io::Result<()> {
+    if grant.config.is_none() || grant.quarantined || grant.inspection {
+        return Ok(());
+    }
+    // `manage_config` never adopts here: the record is already pinned.
+    let mut current = grant.clone();
+    let retained = other_active_grants(journal, &current)?;
+    manage_config(&mut current, journal, &retained)
 }
 
 #[cfg(target_os = "linux")]
@@ -653,6 +714,61 @@ pub(crate) fn reaping_blocked(data: &Path, id: &anyagents_core::AgentId) -> bool
     }
 }
 
+/// An unreadable object owned by another principal is bound with `O_PATH`.
+/// Such a descriptor names the exact inode but cannot be read or changed.
+#[cfg(unix)]
+fn path_only(file: &std::fs::File) -> bool {
+    use std::os::fd::AsRawFd;
+    #[cfg(target_os = "linux")]
+    {
+        let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+        flags >= 0 && flags & libc::O_PATH != 0
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = file.as_raw_fd();
+        false
+    }
+}
+
+/// Read an extended attribute of the opened inode. `O_PATH` descriptors do not
+/// support f*xattr, so they are read through their own /proc descriptor link,
+/// which stays bound to the same inode and never re-resolves a pathname.
+#[cfg(target_os = "linux")]
+fn read_xattr(file: &std::fs::File, name: &std::ffi::CStr, buffer: &mut [u8]) -> isize {
+    use std::os::fd::AsRawFd;
+    if path_only(file) {
+        let Ok(link) = std::ffi::CString::new(format!("/proc/self/fd/{}", file.as_raw_fd())) else {
+            return -1;
+        };
+        return unsafe {
+            libc::getxattr(
+                link.as_ptr(),
+                name.as_ptr(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+            )
+        };
+    }
+    unsafe {
+        libc::fgetxattr(
+            file.as_raw_fd(),
+            name.as_ptr(),
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+        )
+    }
+}
+
+/// Only an object's owner (or a fully privileged server) can change its mode
+/// or ACL. Anything else is read-only evidence for the server.
+#[cfg(unix)]
+fn server_may_change(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let server = crate::sandbox::server_uid();
+    server == 0 || meta.uid() == server
+}
+
 // st_mode's group bits are the POSIX ACL mask, not the owning-group entry.
 // A preserved named-owner rw grant can make that mask writable while every
 // foreign principal remains read-only. Inspect effective entries instead.
@@ -672,16 +788,8 @@ fn writable_file_by_untrusted(file: &std::fs::File, owners: &[u32]) -> std::io::
     let meta = file.metadata()?;
     #[cfg(target_os = "linux")]
     {
-        use std::os::fd::AsRawFd;
         let mut bytes = vec![0u8; 65536];
-        let len = unsafe {
-            libc::fgetxattr(
-                file.as_raw_fd(),
-                c"system.posix_acl_access".as_ptr(),
-                bytes.as_mut_ptr().cast(),
-                bytes.len(),
-            )
-        };
+        let len = read_xattr(file, c"system.posix_acl_access", &mut bytes);
         if len >= 0 {
             bytes.truncate(len as usize);
             if bytes.len() < 4
@@ -718,6 +826,71 @@ fn writable_file_by_untrusted(file: &std::fs::File, owners: &[u32]) -> std::io::
     Ok(meta.mode() & 0o022 != 0)
 }
 
+/// Launch and admission share this exact predicate: the common store and its
+/// worktrees/ directory belong to the private gitdir's (non-seat) owner and no
+/// other principal can write them. Admission must never accept a layout that
+/// every later launch refuses. Returns the trusted metadata owner.
+fn trusted_metadata_layout(common: &Path, private: &Path, seat_uid: u32) -> std::io::Result<u32> {
+    use std::os::unix::fs::MetadataExt;
+    if private.parent() != Some(common.join("worktrees").as_path()) {
+        return Err(std::io::Error::other("unrecorded private gitdir layout"));
+    }
+    let owner = std::fs::symlink_metadata(private)?.uid();
+    if owner == seat_uid && owner != crate::sandbox::server_uid() {
+        return Err(std::io::Error::other("seat-owned private gitdir"));
+    }
+    let trusted = [owner, crate::sandbox::server_uid()];
+    for path in [common, &common.join("worktrees"), private] {
+        let meta = std::fs::symlink_metadata(path)?;
+        let problem = if !meta.is_dir() {
+            Some("is not a directory".to_string())
+        } else if meta.uid() != owner {
+            Some(format!("is owned by uid {}, not uid {owner}", meta.uid()))
+        } else if std::fs::canonicalize(path)? != *path {
+            Some("is not a canonical path".to_string())
+        } else if path != private && writable_by_untrusted(path, &trusted)? {
+            Some(format!(
+                "is writable by principals other than uid {owner} (mode {:04o}{})",
+                meta.mode() & 0o7777,
+                if has_access_acl(path)? {
+                    " plus POSIX ACL"
+                } else {
+                    ""
+                }
+            ))
+        } else {
+            None
+        };
+        if let Some(problem) = problem {
+            return Err(std::io::Error::other(format!(
+                "untrusted Git metadata directory {}: {problem}",
+                path.display()
+            )));
+        }
+    }
+    Ok(owner)
+}
+
+#[cfg(target_os = "linux")]
+fn has_access_acl(path: &Path) -> std::io::Result<bool> {
+    let file = open_nofollow(path)?;
+    let mut bytes = vec![0u8; 65536];
+    if read_xattr(&file, c"system.posix_acl_access", &mut bytes) >= 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ENODATA) {
+        Ok(false)
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn has_access_acl(_path: &Path) -> std::io::Result<bool> {
+    Ok(false)
+}
+
 /// The checkout's .git file is seat-writable. Maintenance may only use this
 /// server-owned record, including after revocation; it must never rediscover a
 /// gitdir through the checkout or the seat-owned marker.
@@ -745,24 +918,7 @@ impl RecordedWorktree {
                 "worktree is quarantined after incomplete ACL recovery",
             ));
         }
-        if g.private.parent() != Some(g.common.join("worktrees").as_path()) {
-            return Err(std::io::Error::other("unrecorded private gitdir layout"));
-        }
-        let owner = std::fs::symlink_metadata(&g.private)?.uid();
-        if owner == g.uid && owner != crate::sandbox::server_uid() {
-            return Err(std::io::Error::other("seat-owned private gitdir"));
-        }
-        for path in [&g.common, &g.common.join("worktrees"), &g.private] {
-            let meta = std::fs::symlink_metadata(path)?;
-            if !meta.is_dir()
-                || meta.uid() != owner
-                || std::fs::canonicalize(path)? != *path
-                || path != &g.private
-                    && writable_by_untrusted(path, &[owner, crate::sandbox::server_uid()])?
-            {
-                return Err(std::io::Error::other("untrusted Git metadata directory"));
-            }
-        }
+        let owner = trusted_metadata_layout(&g.common, &g.private, g.uid)?;
         open_common_config(&g.common, current.config.as_ref())?;
         for path in [
             g.common.join("config.worktree"),
@@ -864,6 +1020,11 @@ impl RecordedWorktree {
             }
             use std::os::unix::fs::MetadataExt;
             let meta = file.metadata()?;
+            // The server cannot grant on another principal's object; such a
+            // grant is skipped, so it needs no inspection intent or revocation.
+            if path_only(file) || !server_may_change(&meta) {
+                return Ok(());
+            }
             files.borrow_mut().push((
                 InspectionPath {
                     path: path.to_path_buf(),
@@ -997,11 +1158,20 @@ pub(crate) fn revoke_recorded(data: &Path, id: &anyagents_core::AgentId) -> Resu
         return Ok(());
     }
     let retained = other_active_grants(&journal, &grant).map_err(|e| refusal(&journal, e))?;
-    revoke_common(&grant.common, grant.uid, grant.gid, &retained)
+    revoke_common(&grant.common, grant.uid, grant.gid, &retained, None)
         .map_err(|e| refusal(&grant.common, e))?;
     grant.active = false;
     grant.inspection = false;
-    write_grant(&journal, &grant).map_err(|e| refusal(&journal, e))
+    write_grant(&journal, &grant).map_err(|e| refusal(&journal, e))?;
+    // The revocation itself is complete and durable. A busy config lock only
+    // delays the reader refresh to the next admission or server start.
+    if let Err(error) = refresh_store_config_readers(&journal, &grant) {
+        eprintln!(
+            "warning: managed Git config readers of {} not refreshed: {error}",
+            grant.common.display()
+        );
+    }
+    Ok(())
 }
 
 /// Run before either server mode starts consumers. An inspection intent is
@@ -1045,6 +1215,34 @@ pub(crate) fn recover_inspections(data: &Path) -> Result<(), Error> {
                 "warning: quarantined worktree journal {}: {error}",
                 journal.display()
             );
+        }
+    }
+    // Repair stores whose managed config lost every reader when their last
+    // grant was revoked: one refresh per common store with a pinned record.
+    let mut refreshed: Vec<PathBuf> = Vec::new();
+    for entry in std::fs::read_dir(&directory)? {
+        let journal = entry?.path();
+        if journal.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(grant) = std::fs::read(&journal).and_then(|bytes| {
+            serde_json::from_slice::<Grant>(&bytes).map_err(std::io::Error::from)
+        }) else {
+            continue;
+        };
+        if grant.config.is_none()
+            || grant.quarantined
+            || grant.inspection
+            || refreshed.contains(&grant.common)
+        {
+            continue;
+        }
+        match refresh_store_config_readers(&journal, &grant) {
+            Ok(()) => refreshed.push(grant.common.clone()),
+            Err(error) => eprintln!(
+                "warning: managed Git config readers of {} not refreshed: {error}",
+                grant.common.display()
+            ),
         }
     }
     Ok(())
@@ -1143,6 +1341,15 @@ fn retained_path(common: &Path, path: &Path, grant: &Grant) -> bool {
         || path.starts_with(&grant.private)
 }
 
+/// Shared content the admission re-grants read/write. Revoking it first would
+/// only be undone, and is impossible on objects other principals wrote there.
+fn regranted_content(common: &Path, path: &Path, grant: &Grant) -> bool {
+    ["objects", "refs", "logs/refs", "packed-refs"]
+        .iter()
+        .any(|name| path.starts_with(common.join(name)))
+        || path.starts_with(&grant.private)
+}
+
 fn revoke_binding(
     file: &std::fs::File,
     path: &Path,
@@ -1150,13 +1357,18 @@ fn revoke_binding(
     uid: u32,
     gid: u32,
     retained: &[Grant],
+    regrant: Option<&Grant>,
 ) -> std::io::Result<()> {
-    let keep_group = retained
-        .iter()
-        .any(|g| g.gid == gid && retained_path(common, path, g));
-    let keep_user = retained
-        .iter()
-        .any(|g| g.uid == uid && retained_path(common, path, g));
+    let regranted =
+        regrant.is_some_and(|g| g.uid == uid && g.gid == gid && regranted_content(common, path, g));
+    let keep_group = regranted
+        || retained
+            .iter()
+            .any(|g| g.gid == gid && retained_path(common, path, g));
+    let keep_user = regranted
+        || retained
+            .iter()
+            .any(|g| g.uid == uid && retained_path(common, path, g));
     if keep_group && keep_user {
         return Ok(());
     }
@@ -1169,7 +1381,13 @@ fn revoke_binding(
     )
 }
 
-fn revoke_common(common: &Path, uid: u32, gid: u32, retained: &[Grant]) -> std::io::Result<()> {
+fn revoke_common(
+    common: &Path,
+    uid: u32,
+    gid: u32,
+    retained: &[Grant],
+    regrant: Option<&Grant>,
+) -> std::io::Result<()> {
     let _config_lock = match std::fs::symlink_metadata(common.join("config")) {
         Ok(meta) => {
             open_common_config(common, None)?;
@@ -1183,7 +1401,7 @@ fn revoke_common(common: &Path, uid: u32, gid: u32, retained: &[Grant]) -> std::
         Err(error) => return Err(error),
     };
     walk_tree(common, false, &|_| {}, &|file, path| {
-        revoke_binding(file, path, common, uid, gid, retained)
+        revoke_binding(file, path, common, uid, gid, retained, regrant)
     })
 }
 
@@ -1210,6 +1428,7 @@ fn revoke_inspection(grant: &Grant, retained: &[Grant]) -> std::io::Result<()> {
                     grant.uid,
                     grant.gid,
                     retained,
+                    None,
                 )
             };
             if let Err(error) = revoke() {
@@ -1222,7 +1441,17 @@ fn revoke_inspection(grant: &Grant, retained: &[Grant]) -> std::io::Result<()> {
         &grant.common,
         false,
         &|_| {},
-        &|file, path| revoke_binding(file, path, &grant.common, grant.uid, grant.gid, retained),
+        &|file, path| {
+            revoke_binding(
+                file,
+                path,
+                &grant.common,
+                grant.uid,
+                grant.gid,
+                retained,
+                None,
+            )
+        },
         true,
         Some(&issues),
     ) {
@@ -1370,6 +1599,9 @@ fn share_known_locked(
     journal: &Path,
 ) -> Result<(), Error> {
     validate_config_files(private, common)?;
+    // Fail closed before the first journal or ACL write: a store that launch
+    // would refuse must not be admitted, granted, or left needing revocation.
+    trusted_metadata_layout(common, private, uid).map_err(|e| refusal(common, e))?;
     let mut grant = Grant {
         common: common.to_path_buf(),
         gid,
@@ -1387,8 +1619,19 @@ fn share_known_locked(
     // witness only the exact managed objects, never restore their old grants.
     grant.config = recorded_config(journal, common).map_err(|e| refusal(journal, e))?;
     write_grant(journal, &grant).map_err(|e| refusal(journal, e))?;
+    // Branch reflogs are in the write allowlist, but a fresh bare store has no
+    // logs/refs and the seat cannot create it through traversal-only logs/.
+    // The store's owner creates the allowlisted directory (never following a
+    // planted symlink: an existing entry is opened no-follow below).
+    for name in ["logs", "logs/refs"] {
+        match std::fs::create_dir(common.join(name)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(refusal(&common.join(name), e)),
+        }
+    }
     // Clear any legacy broad grants/defaults for this seat before the allowlist.
-    revoke_common(common, uid, gid, &retained).map_err(|e| refusal(common, e))?;
+    revoke_common(common, uid, gid, &retained, Some(&grant)).map_err(|e| refusal(common, e))?;
     for root in [
         common.to_path_buf(),
         common.join("worktrees"),
@@ -1673,9 +1916,29 @@ fn clear_default_acl(_file: &std::fs::File) -> std::io::Result<()> {
 }
 
 #[cfg(unix)]
+fn unreadable_foreign(meta: &std::fs::Metadata) -> std::io::Error {
+    use std::os::unix::fs::MetadataExt;
+    std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!(
+            "object owned by uid {} is unreadable by the server",
+            meta.uid()
+        ),
+    )
+}
+
+#[cfg(unix)]
 fn restrict_others(file: &std::fs::File) -> std::io::Result<()> {
     use std::os::unix::fs::MetadataExt;
     let meta = file.metadata()?;
+    // Already restricted: nothing to change, including on objects the server
+    // does not own (e.g. HEAD/index deliberately handed to the seat).
+    if meta.mode() & 0o007 == 0 {
+        return Ok(());
+    }
+    if path_only(file) {
+        return Err(unreadable_foreign(&meta));
+    }
     if !meta.is_dir() && meta.nlink() != 1 {
         return Err(std::io::Error::other(
             "refusing permission changes to a hard-linked file",
@@ -1711,6 +1974,9 @@ fn protect_private_gitdir(private: &Path, uid: u32, gid: u32) -> std::io::Result
     }
     update_metadata_acl(&f, gid, Some(4), false, None)?;
     walk_tree(private, false, &|_| {}, &|file, path| {
+        if path_only(file) {
+            return Err(unreadable_foreign(&file.metadata()?));
+        }
         restrict_others(file)?;
         if path == config
             || path.parent() == Some(private)
@@ -1774,6 +2040,9 @@ fn share_tree_with_hook(
         }
         use std::os::unix::fs::MetadataExt;
         let meta = file.metadata()?;
+        if path_only(file) {
+            return Err(unreadable_foreign(&meta));
+        }
         let mode = meta.mode() & 0o7777;
         let desired = if meta.is_dir() {
             mode | 0o2770
@@ -1966,9 +2235,14 @@ fn walk_tree_policy(
             before_open(&child_path);
             #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
             let mut child = unsafe { libc::openat(fd, name.as_ptr(), flags) };
+            // Each failed open's errno is captured before any later syscall
+            // (including ignored repair attempts) can overwrite it.
+            #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+            let mut open_error = (child < 0).then(std::io::Error::last_os_error);
             #[cfg(target_os = "linux")]
-            if child < 0
-                && std::io::Error::last_os_error().kind() == std::io::ErrorKind::PermissionDenied
+            if open_error
+                .as_ref()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied)
                 && (kind == libc::S_IFDIR || stat.st_nlink == 1)
                 && descriptor_privilege_launcher().is_some()
             {
@@ -1996,9 +2270,10 @@ fn walk_tree_policy(
                             as libc::mode_t;
                         let _ = descriptor_fchmod(&bound, min_mode);
                         child = unsafe { libc::openat(fd, name.as_ptr(), flags) };
-                        if child < 0
-                            && std::io::Error::last_os_error().kind()
-                                == std::io::ErrorKind::PermissionDenied
+                        open_error = (child < 0).then(std::io::Error::last_os_error);
+                        if open_error
+                            .as_ref()
+                            .is_some_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied)
                         {
                             let orig_uid = bmeta.uid();
                             let srv_uid = crate::sandbox::server_uid();
@@ -2006,6 +2281,7 @@ fn walk_tree_policy(
                                 && descriptor_fchown(&bound, Some(srv_uid), None).is_ok()
                             {
                                 child = unsafe { libc::openat(fd, name.as_ptr(), flags) };
+                                open_error = (child < 0).then(std::io::Error::last_os_error);
                                 let _ = descriptor_fchown(&bound, Some(orig_uid), None);
                             }
                         }
@@ -2013,8 +2289,30 @@ fn walk_tree_policy(
                 }
             }
             if child < 0 {
-                record(issues, &child_path, std::io::Error::last_os_error())?;
-                continue;
+                let error = open_error
+                    .take()
+                    .unwrap_or_else(|| std::io::Error::other("open failed"));
+                // Another principal's unreadable regular file (e.g. a 0600 pack
+                // marker another seat wrote) is bound read-only by inode so the
+                // callback can inspect its ACL. Directories are never bound
+                // this way: their entries could not be enumerated.
+                #[cfg(target_os = "linux")]
+                if error.raw_os_error() == Some(libc::EACCES)
+                    && kind == libc::S_IFREG
+                    && stat.st_uid != crate::sandbox::server_uid()
+                {
+                    child = unsafe {
+                        libc::openat(
+                            fd,
+                            name.as_ptr(),
+                            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                        )
+                    };
+                }
+                if child < 0 {
+                    record(issues, &child_path, error)?;
+                    continue;
+                }
             }
             let child = unsafe { std::fs::File::from_raw_fd(child) };
             let opened = child.metadata()?;
@@ -2081,6 +2379,40 @@ fn update_metadata_acl(
 ) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::MetadataExt;
+    let access_name = c"system.posix_acl_access";
+    let default_name = c"system.posix_acl_default";
+    let owner_meta = file.metadata()?;
+    if path_only(file) || !server_may_change(&owner_meta) {
+        // Another principal's object (e.g. a pack another seat wrote into a
+        // shared store) cannot be changed by the server. Adding access is
+        // skipped: the seat-side admission probe proves the access it needs.
+        // Removing or narrowing existing access is impossible, so it refuses.
+        // Compare effective access (entry & mask). Inherited execute on a
+        // regular file grants nothing a data file's reader could use.
+        let relevant = if owner_meta.is_dir() { 7 } else { 6 };
+        let narrows = |entries: Option<Vec<(u16, u16, u32)>>| {
+            let entries = entries.unwrap_or_default();
+            let mask = entries.iter().find(|e| e.0 == 16).map_or(7, |e| e.1);
+            entries.iter().any(|&(tag, perm, id)| {
+                tag == 8
+                    && id == gid
+                    && permissions.is_none_or(|p| perm & mask & relevant & !p != 0)
+                    || tag == 2 && Some(id) == revoke_uid
+            })
+        };
+        let default = if owner_meta.is_dir() && (inherit || permissions.is_none()) {
+            read(file, default_name)?
+        } else {
+            None
+        };
+        if narrows(read(file, access_name)?) || narrows(default) {
+            return Err(std::io::Error::other(format!(
+                "cannot narrow an ACL entry on an object owned by uid {}",
+                owner_meta.uid()
+            )));
+        }
+        return Ok(());
+    }
     // Serialize read/modify/write ACL grants across simultaneous spawns.
     // A seat can flock even a read-only metadata descriptor. Never let that
     // advisory lock hold startup recovery or another seat's lifecycle hostage.
@@ -2106,22 +2438,12 @@ fn update_metadata_acl(
         (4, ((mode >> 3) & 7) as u16, u32::MAX),
         (32, (mode & 7) as u16, u32::MAX),
     ];
-    let access_name = c"system.posix_acl_access";
-    let default_name = c"system.posix_acl_default";
     fn read(
         file: &std::fs::File,
         name: &std::ffi::CStr,
     ) -> std::io::Result<Option<Vec<(u16, u16, u32)>>> {
-        use std::os::fd::AsRawFd;
         let mut bytes = vec![0u8; 65536];
-        let len = unsafe {
-            libc::fgetxattr(
-                file.as_raw_fd(),
-                name.as_ptr(),
-                bytes.as_mut_ptr().cast(),
-                bytes.len(),
-            )
-        };
+        let len = read_xattr(file, name, &mut bytes);
         if len < 0 {
             let err = std::io::Error::last_os_error();
             return if err.raw_os_error() == Some(libc::ENODATA) {
@@ -3727,6 +4049,215 @@ mod tests {
         }
         std::fs::set_permissions(&objects, std::fs::Permissions::from_mode(0o755)).unwrap();
         verify(dir.path(), uid, gid, None).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn acl_entries(path: &Path, name: &std::ffi::CStr) -> Vec<(u16, u16, u32)> {
+        let file = std::fs::File::open(path).unwrap();
+        let mut bytes = vec![0u8; 65536];
+        let len = read_xattr(&file, name, &mut bytes);
+        if len < 0 {
+            return Vec::new();
+        }
+        bytes.truncate(len as usize);
+        bytes[4..]
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|b| {
+                (
+                    u16::from_le_bytes([b[0], b[1]]),
+                    u16::from_le_bytes([b[2], b[3]]),
+                    u32::from_le_bytes([b[4], b[5], b[6], b[7]]),
+                )
+            })
+            .collect()
+    }
+
+    /// An object the server cannot open or change (another principal's
+    /// unreadable file in a shared store) is bound by inode with O_PATH. Its
+    /// ACL is still read exactly; additive grants are skipped and only a
+    /// revocation or narrowing that is actually needed refuses.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unchangeable_objects_skip_grants_and_refuse_only_needed_revocations() {
+        use std::os::fd::FromRawFd;
+        if crate::sandbox::server_uid() == 0 {
+            return; // a fully privileged server can change every object
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pack.promisor");
+        std::fs::write(&path, b"").unwrap();
+        let granted = 61_234;
+        update_metadata_acl(
+            &std::fs::File::open(&path).unwrap(),
+            granted,
+            Some(6),
+            false,
+            None,
+        )
+        .unwrap();
+        let before = acl_entries(&path, c"system.posix_acl_access");
+        // Owner class denied (so the owner cannot open it) while the ACL mask
+        // keeps the named entry effective.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o060)).unwrap();
+        assert_eq!(
+            std::fs::File::open(&path).unwrap_err().raw_os_error(),
+            Some(libc::EACCES)
+        );
+        let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        let fd = unsafe {
+            libc::open(
+                name.as_ptr(),
+                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        assert!(fd >= 0);
+        let bound = unsafe { std::fs::File::from_raw_fd(fd) };
+        assert!(path_only(&bound));
+        // Adding (or re-adding equal) access is skipped without mutation.
+        update_metadata_acl(&bound, granted, Some(6), false, None).unwrap();
+        update_metadata_acl(&bound, granted, Some(7), false, None).unwrap();
+        update_metadata_acl(&bound, 61_235, Some(6), false, None).unwrap();
+        // A gid without an entry needs no revocation.
+        update_metadata_acl(&bound, 61_235, None, false, None).unwrap();
+        // Narrowing or revoking an existing entry is impossible: refuse.
+        let narrow = update_metadata_acl(&bound, granted, Some(4), false, None).unwrap_err();
+        assert!(narrow.to_string().contains("cannot narrow"), "{narrow}");
+        let revoke = update_metadata_acl(&bound, granted, None, false, None).unwrap_err();
+        assert!(revoke.to_string().contains("cannot narrow"), "{revoke}");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let mut after = acl_entries(&path, c"system.posix_acl_access");
+        let mut expected = before.clone();
+        // chmod rewrote only the owner/mask/other classes; named entries stand.
+        after.retain(|e| e.0 == 8);
+        expected.retain(|e| e.0 == 8);
+        assert_eq!(after, expected, "an unchangeable object was modified");
+
+        // A readable object owned by another principal behaves the same way.
+        let foreign = std::fs::File::open("/etc/passwd").unwrap();
+        assert!(!server_may_change(&foreign.metadata().unwrap()));
+        update_metadata_acl(&foreign, granted, Some(6), false, None).unwrap();
+        update_metadata_acl(&foreign, granted, None, false, None).unwrap();
+    }
+
+    /// Admission applies launch's trust predicate before writing anything: a
+    /// common store writable by another principal is refused with the path and
+    /// mode, and leaves no journal or grant behind.
+    #[test]
+    fn admission_refuses_an_untrusted_store_before_any_grant() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = crate::worktree::tests::Fixture::new(dir.path());
+        let work = dir.path().join("work");
+        f.consumer
+            .remote("ExampleOrg/demo", &work, "work", None)
+            .unwrap();
+        let common = git_dirs(&work).unwrap().last().unwrap().clone();
+        let mode = std::fs::metadata(&common).unwrap().permissions().mode();
+        std::fs::set_permissions(&common, std::fs::Permissions::from_mode(mode | 0o020)).unwrap();
+        let id = anyagents_core::AgentId::generate();
+        let journal = grant_path(dir.path(), &id);
+        let uid = crate::sandbox::server_uid();
+        let gid = crate::sandbox::server_gid();
+        let error = share(&work, uid, gid, &journal).unwrap_err();
+        let text = error.to_string();
+        assert!(matches!(error, Error::WorkdirPermission { .. }), "{text}");
+        assert!(text.contains("untrusted Git metadata directory"), "{text}");
+        assert!(text.contains(common.to_str().unwrap()), "{text}");
+        assert!(text.contains("mode"), "{text}");
+        assert!(!journal.exists(), "refused admission wrote a grant journal");
+        assert!(
+            std::fs::symlink_metadata(common.join("config"))
+                .unwrap()
+                .is_file(),
+            "refused admission relocated the store's config"
+        );
+        // The same store is admitted once it is trustworthy.
+        std::fs::set_permissions(&common, std::fs::Permissions::from_mode(mode)).unwrap();
+        share(&work, uid, gid, &journal).unwrap();
+        RecordedWorktree::load(dir.path(), &id, &work)
+            .unwrap()
+            .validate()
+            .unwrap();
+    }
+
+    /// Relocating the config never narrows the store's existing read audience:
+    /// checkouts the engine never admitted keep reading it through the common
+    /// directory's group after the last grant is revoked, nobody but the owner
+    /// can write it, and startup repairs a store that lost its readers.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn managed_config_stays_readable_by_the_store_group_after_the_last_revocation() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let f = crate::worktree::tests::Fixture::new(dir.path());
+        let work = dir.path().join("work");
+        f.consumer
+            .remote("ExampleOrg/demo", &work, "work", None)
+            .unwrap();
+        let common = git_dirs(&work).unwrap().last().unwrap().clone();
+        let mode = std::fs::metadata(&common).unwrap().permissions().mode();
+        std::fs::set_permissions(&common, std::fs::Permissions::from_mode(mode | 0o050)).unwrap();
+        let store_group = std::fs::metadata(&common).unwrap().gid();
+        let id = anyagents_core::AgentId::generate();
+        let uid = crate::sandbox::server_uid();
+        let gid = crate::sandbox::server_gid();
+        share(&work, uid, gid, &grant_path(dir.path(), &id)).unwrap();
+        revoke_recorded(dir.path(), &id).unwrap();
+
+        let directory = common.join(CONFIG_DIRECTORY);
+        let config = directory.join("config");
+        let readable = |path: &Path, perm: u16| {
+            acl_entries(path, c"system.posix_acl_access").contains(&(8, perm, store_group))
+        };
+        assert!(
+            readable(&directory, 5),
+            "{:?}",
+            acl_entries(&directory, c"system.posix_acl_access")
+        );
+        assert!(
+            readable(&config, 4),
+            "{:?}",
+            acl_entries(&config, c"system.posix_acl_access")
+        );
+        assert!(
+            acl_entries(&directory, c"system.posix_acl_default").contains(&(8, 4, store_group)),
+            "Git's lock+rename replacement must inherit the store reader"
+        );
+        let owners = [uid];
+        assert!(!writable_file_by_untrusted(&open_nofollow(&directory).unwrap(), &owners).unwrap());
+        assert!(!writable_file_by_untrusted(&open_nofollow(&config).unwrap(), &owners).unwrap());
+
+        // Simulate the regression: every reader stripped from an adopted store.
+        for path in [&directory, &config] {
+            update_metadata_acl(
+                &open_nofollow(path).unwrap(),
+                store_group,
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+            assert!(!readable(path, if path == &directory { 5 } else { 4 }));
+        }
+        config_default_readers(&open_nofollow(&directory).unwrap(), &[]).unwrap();
+        recover_inspections(dir.path()).unwrap();
+        assert!(readable(&directory, 5));
+        assert!(readable(&config, 4));
+        assert!(
+            acl_entries(&directory, c"system.posix_acl_default").contains(&(8, 4, store_group))
+        );
+
+        // A store whose group cannot traverse it gains no store reader.
+        assert_eq!(
+            {
+                std::fs::set_permissions(&common, std::fs::Permissions::from_mode(mode & !0o070))
+                    .unwrap();
+                store_group_reader(&common).unwrap()
+            },
+            None
+        );
+        std::fs::set_permissions(&common, std::fs::Permissions::from_mode(mode)).unwrap();
     }
 
     #[test]
