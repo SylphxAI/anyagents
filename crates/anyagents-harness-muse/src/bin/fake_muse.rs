@@ -40,17 +40,28 @@ fn main() {
                 &id,
                 r#"{"session":{"sessionId":"sess-from-vendor"}}"#,
             ),
-            "session/resume" => answer(
-                &mut stdout,
-                &id,
-                &format!(
-                    r#"{{"session":{{"sessionId":"{}"}}}}"#,
-                    params
-                        .get("sessionId")
-                        .and_then(|s| s.as_str())
-                        .unwrap_or("sess-from-vendor")
-                ),
-            ),
+            "session/resume" => {
+                let sid = params
+                    .get("sessionId")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("sess-from-vendor");
+                if std::env::var_os("ANYAGENTS_FAKE_MUSE_LOCK_FILE")
+                    .is_some_and(|lock_path| std::path::Path::new(&lock_path).exists())
+                {
+                    notify(
+                        &mut stdout,
+                        &format!(
+                            r#"{{"jsonrpc":"2.0","id":{id},"error":{{"code":-32021,"message":"session {sid} is already in use"}}}}"#
+                        ),
+                    );
+                } else {
+                    answer(
+                        &mut stdout,
+                        &id,
+                        &format!(r#"{{"session":{{"sessionId":"{sid}"}}}}"#),
+                    );
+                }
+            }
             "session/setApprovalMode" => answer(&mut stdout, &id, "{}"),
             "turn/start" => {
                 if mode == "quota" {
@@ -113,6 +124,29 @@ fn main() {
                             r#"{{"status":"accepted","disposition":"started","turnId":"{turn}"}}"#
                         ),
                     );
+                    continue;
+                }
+                if mode == "early_complete" {
+                    notify(
+                        &mut stdout,
+                        &format!(
+                            r#"{{"jsonrpc":"2.0","method":"turn/completed","params":{{"turnId":"{turn}","status":"completed","usage":{{"inputTokens":11,"outputTokens":7,"cachedInputTokens":3}}}}}}"#
+                        ),
+                    );
+                    notify(
+                        &mut stdout,
+                        &format!(
+                            r#"{{"jsonrpc":"2.0","method":"turn/started","params":{{"turnId":"{turn}"}}}}"#
+                        ),
+                    );
+                    answer(
+                        &mut stdout,
+                        &id,
+                        &format!(
+                            r#"{{"status":"accepted","disposition":"started","turnId":"{turn}"}}"#
+                        ),
+                    );
+                    open = None;
                     continue;
                 }
                 if mode == "failed" {

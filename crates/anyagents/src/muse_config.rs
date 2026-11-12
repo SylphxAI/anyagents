@@ -345,6 +345,14 @@ fn finish_workspace_session(
         0o660,
     )?;
     std::fs::remove_file(pending)?;
+    drop(stdin);
+    let close_deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    while std::time::Instant::now() < close_deadline {
+        if matches!(child.child.try_wait(), Ok(Some(_))) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
     Ok(())
 }
 
