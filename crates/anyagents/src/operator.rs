@@ -144,12 +144,14 @@ pub fn mint(store: &Store, agent_id: &anyagents_core::AgentId) -> Result<(), Err
             .open(&temp)?;
         file.write_all(token.as_bytes())?;
         file.write_all(b"\n")?;
+        file.sync_all()?;
     }
     if let Err(err) = share_capability_if_needed(store, agent_id, &temp) {
         let _ = std::fs::remove_file(&temp);
         return Err(err);
     }
     std::fs::rename(&temp, &path)?;
+    std::fs::File::open(&dir)?.sync_all()?;
     Ok(())
 }
 

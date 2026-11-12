@@ -1,9 +1,9 @@
-//! Thin configuration boundary for the external `spiron` CLI.
+//! Thin Harness adapter boundary for the external `spiron` CLI (`AnyAgents ──(Harness)──▶ Spiron`).
 //!
-//! AnyAgents owns mailbox/control-plane state; Spiron owns model turns,
-//! context windows, tools and memory.  This module writes the MCP mount and
-//! headless seat configuration consumed by the external process and keeps
-//! legacy Sylphx model defaults.
+//! AnyAgents never runs an LLM loop; it owns multi-agent mailbox/control-plane
+//! state while Spiron (local CLI or cloud `spiron.ai`) owns single-agent model
+//! turns, context compaction, and tool execution. This module renders the MCP
+//! mount (`spiron-mcp.json`), headless seat `config.toml`, and seat auth paths.
 
 use std::path::Path;
 
@@ -36,7 +36,7 @@ pub fn write_spiron_config(
     });
     let mcp_path = config_dir.join("spiron-mcp.json");
     let bytes = serde_json::to_vec_pretty(&value).map_err(|err| Error::Message(err.to_string()))?;
-    std::fs::write(mcp_path, bytes)?;
+    anyagents_harness::atomic_write_nonempty_file(&mcp_path, &bytes, 0o664)?;
 
     write_spiron_config_toml(config_dir, model)?;
     ensure_spiron_seat_auth_for_model(config_dir, model);
@@ -128,20 +128,39 @@ fn write_spiron_config_toml(config_dir: &Path, model: Option<&str>) -> Result<()
         out.push_str(&format!("model = {escaped}\n"));
     }
     out.push_str("always_approve = true\n");
-    std::fs::write(&toml_path, out)?;
+    anyagents_harness::atomic_write_nonempty_file(&toml_path, out.as_bytes(), 0o664)?;
     Ok(())
 }
 
+fn model_provider_prefix(model: Option<&str>) -> Option<&str> {
+    let m = model?.trim();
+    let (prefix, rest) = m.split_once('/')?;
+    (!prefix.is_empty() && !rest.is_empty()).then_some(prefix)
+}
+
 fn discover_seat_gateway_url_for_model(config_dir: &Path, model: Option<&str>) -> Option<String> {
-    let provider_key = coding_plan_provider_for_model(model).unwrap_or("sylphx");
-    for rel in ["sylphx-agent.json", ".config/opencode/opencode.json"] {
+    let explicit_provider =
+        coding_plan_provider_for_model(model).or_else(|| model_provider_prefix(model));
+    for rel in [
+        "spiron-agent.json",
+        "sylphx-agent.json",
+        "opencode.json",
+        "opencode/opencode.json",
+        ".config/opencode/opencode.json",
+    ] {
         let path = config_dir.join(rel);
         if let Ok(raw) = std::fs::read_to_string(&path)
             && let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw)
-            && let Some(url) = val
-                .pointer(&format!("/provider/{provider_key}/options/baseURL"))
-                .and_then(|v| v.as_str())
+            && let Some(url) = explicit_provider
+                .and_then(|prov| {
+                    val.pointer(&format!("/provider/{prov}/options/baseURL"))
+                        .and_then(|v| v.as_str())
+                })
                 .or_else(|| val.get("gateway_base_url").and_then(|v| v.as_str()))
+                .or_else(|| {
+                    val.pointer("/provider/spiron/options/baseURL")
+                        .and_then(|v| v.as_str())
+                })
                 .or_else(|| {
                     val.pointer("/provider/sylphx/options/baseURL")
                         .and_then(|v| v.as_str())
@@ -165,11 +184,12 @@ pub fn ensure_spiron_seat_auth(config_dir: &Path) {
 pub fn ensure_spiron_seat_auth_for_model(config_dir: &Path, model: Option<&str>) {
     let auth_path = config_dir.join("auth.json");
     let discovered_org_id = [
+        ".spiron/credentials.json",
+        ".spiron/auth.json",
         ".config/sylphx/credentials.json",
         "credentials.json",
         "auth.json",
         ".config/sylphx/auth.json",
-        ".spiron/auth.json",
     ]
     .into_iter()
     .find_map(|rel| {
@@ -183,21 +203,31 @@ pub fn ensure_spiron_seat_auth_for_model(config_dir: &Path, model: Option<&str>)
             .map(str::to_string)
     });
 
-    if let Some(provider) = coding_plan_provider_for_model(model) {
-        let key_rel = match provider {
-            "kimi-code-plan" => ".config/opencode/kimi-code-plan.key",
-            "glm-code-plan" => ".config/opencode/glm-code-plan.key",
-            "qwen-token-plan" => ".config/opencode/qwen-coding-plan.key",
-            "minimax-code-plan" => ".config/opencode/minimax-code-plan.key",
-            _ => "",
+    if let Some(provider) =
+        coding_plan_provider_for_model(model).or_else(|| model_provider_prefix(model))
+    {
+        let candidates = match provider {
+            "qwen-token-plan" => vec![
+                ".config/opencode/qwen-coding-plan.key".to_string(),
+                ".config/opencode/qwen-token-plan.key".to_string(),
+            ],
+            prov => vec![
+                format!(".spiron/{prov}.key"),
+                format!(".config/opencode/{prov}.key"),
+            ],
         };
-        if !key_rel.is_empty()
-            && let Ok(raw) = std::fs::read_to_string(config_dir.join(key_rel))
-        {
-            let key = raw.trim();
-            if !key.is_empty() {
-                write_spiron_auth_doc(config_dir, &auth_path, key, discovered_org_id.as_deref());
-                return;
+        for key_rel in candidates {
+            if let Ok(raw) = std::fs::read_to_string(config_dir.join(key_rel)) {
+                let key = raw.trim();
+                if !key.is_empty() {
+                    write_spiron_auth_doc(
+                        config_dir,
+                        &auth_path,
+                        key,
+                        discovered_org_id.as_deref(),
+                    );
+                    return;
+                }
             }
         }
     }
@@ -206,7 +236,11 @@ pub fn ensure_spiron_seat_auth_for_model(config_dir: &Path, model: Option<&str>)
     // or credentials.json project_keys) over org-wide keys so Spiron never
     // fails with project_key_required, even if auth.json was previously
     // seeded with an org-wide api_key.
-    for rel in [".config/sylphx/key", ".config/opencode/sylphx.key"] {
+    for rel in [
+        ".spiron/key",
+        ".config/sylphx/key",
+        ".config/opencode/sylphx.key",
+    ] {
         if let Ok(raw) = std::fs::read_to_string(config_dir.join(rel)) {
             let key = raw.trim();
             if !key.is_empty() {
@@ -215,7 +249,11 @@ pub fn ensure_spiron_seat_auth_for_model(config_dir: &Path, model: Option<&str>)
             }
         }
     }
-    for rel in [".config/sylphx/credentials.json", "credentials.json"] {
+    for rel in [
+        ".spiron/credentials.json",
+        ".config/sylphx/credentials.json",
+        "credentials.json",
+    ] {
         if let Ok(raw) = std::fs::read_to_string(config_dir.join(rel))
             && let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw)
             && let Some(project_key) = extract_project_bound_key(config_dir, &val)
@@ -240,8 +278,9 @@ pub fn ensure_spiron_seat_auth_for_model(config_dir: &Path, model: Option<&str>)
         return;
     }
     for rel in [
-        ".config/sylphx/auth.json",
         ".spiron/auth.json",
+        ".spiron/credentials.json",
+        ".config/sylphx/auth.json",
         ".config/sylphx/credentials.json",
         "credentials.json",
     ] {
@@ -275,7 +314,8 @@ fn write_spiron_auth_doc(config_dir: &Path, auth_path: &Path, key: &str, org_id:
 
 fn extract_project_bound_key(config_dir: &Path, val: &serde_json::Value) -> Option<String> {
     let map = val.get("project_keys")?.as_object()?;
-    if let Ok(ctx_raw) = std::fs::read_to_string(config_dir.join(".config/sylphx/context.json"))
+    if let Ok(ctx_raw) = std::fs::read_to_string(config_dir.join(".spiron/context.json"))
+        .or_else(|_| std::fs::read_to_string(config_dir.join(".config/sylphx/context.json")))
         && let Ok(ctx) = serde_json::from_str::<serde_json::Value>(&ctx_raw)
     {
         let project = ctx
@@ -304,14 +344,8 @@ fn extract_project_bound_key(config_dir: &Path, val: &serde_json::Value) -> Opti
 }
 
 fn write_restricted_auth_file(path: &Path, bytes: &[u8]) {
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::write(path, bytes);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    if let Err(err) = anyagents_harness::atomic_write_nonempty_file(path, bytes, 0o600) {
+        eprintln!("cannot persist {}: {err}", path.display());
     }
 }
 
@@ -415,5 +449,39 @@ mod tests {
         let auth_kimi: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(cfg.join("auth.json")).unwrap()).unwrap();
         assert_eq!(auth_kimi["access_token"], "sk_kimi_222");
+    }
+    #[test]
+    fn write_spiron_config_resolves_vendor_neutral_provider_gateway_and_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let cfg = temp.path();
+        std::fs::create_dir_all(cfg.join(".config/opencode")).unwrap();
+        std::fs::write(
+            cfg.join(".config/opencode/opencode.json"),
+            r#"{"provider":{"openrouter":{"options":{"baseURL":"https://openrouter.ai/api/v1"}}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            cfg.join(".config/opencode/openrouter.key"),
+            "sk-or-v1-test-key\n",
+        )
+        .unwrap();
+
+        write_spiron_config(
+            cfg,
+            Some("openrouter/anthropic/claude-sonnet-4.6"),
+            Path::new("/usr/bin/anyagents"),
+            &["mcp".to_string()],
+        )
+        .unwrap();
+
+        let toml = std::fs::read_to_string(cfg.join("config.toml")).unwrap();
+        assert!(toml.contains("sylphx_ai_url = \"https://openrouter.ai/api/v1\""));
+        assert!(toml.contains("model = \"openrouter/anthropic/claude-sonnet-4.6\""));
+        assert!(toml.contains("always_approve = true"));
+
+        let auth: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(cfg.join(".spiron/auth.json")).unwrap())
+                .unwrap();
+        assert_eq!(auth["access_token"], "sk-or-v1-test-key");
     }
 }

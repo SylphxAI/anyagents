@@ -10,11 +10,11 @@ AnyAgents drives each vendor's own tool. It never re-implements a vendor client 
 
 AnyAgents is one home for every agent: any harness, any model, any channel. The name continues our open-source AnyMD family, so the brand stays consistent across our open-source tools. The npm name `anyagents` belongs to someone else, so the launcher package is `@sylphx/anyagents`.
 
-Within the Sylphx ecosystem, AnyAgents is the open-source multi-harness runtime and developer entry point:
+AnyAgents is **100% vendor-neutral** and separates orchestration into three orthogonal axes (`Harness × Profile × Sandbox`):
 
-1. **AnyAgents (`@sylphx/anyagents`, OSS):** Runs on your own machine or cluster and coordinates our first-party external `spiron` harness, third-party vendor CLI harnesses (`claude-code`, `codex`, `opencode`, `agy`, `muse`, `omp`, `dsh`, `grok`), and remote Cloud Agents (`Claude Cloud`, `OpenAI Cloud`, `Cursor Cloud` via Streamable HTTPS `POST /mcp`). The legacy `sylphx` harness name remains a compatibility alias for `spiron`.
-2. **Sylphx Service Platform (`https://api.sylphx.com`):** Connects AnyAgents and Spiron to **Sylphx AI** (unified frontier model gateway), **Sylphx Sandboxes** (ephemeral Cloud Kata microVM git worktrees), and **Sylphx Agents** (`sylphx.agents.v1` Backend-as-a-Service agent runtime).
-3. **Spiron (`https://spiron.ai`):** Our first-party Agent Harness CLI/TUI and Cloud Agent (`anyagents sign-in spiron` / `spiron login`), invoked as `spiron`. Spiron embeds the shared capability core (`code`, files, web, memory, skills) natively, so AnyAgents mounts a coordination-only MCP profile (`send`, `inbox`, `agents`, `groups`, `schedules`, `conversation`, `browser`, `computer`) without duplicating built-in tools.
+1. **AnyAgents (`@sylphx/anyagents`, OSS Orchestrator):** Owns durable multi-agent identity, mailboxes, topology, groups, schedules, and MCP coordination. AnyAgents never implements an LLM loop and carries zero hardcoded lock-in to any single provider.
+2. **Harnesses (`spiron`, `claude-code`, `codex`, `opencode`, `agy`, `muse`, `omp`, `dsh`, `grok`, plus `spiron-cloud`, `claude-cloud`, `openai-cloud`, `cursor-cloud`):** External single-agent runtimes driven over headless CLI or HTTPS (`https://spiron.ai` for `spiron-cloud`). Spiron embeds the shared capability core natively, so AnyAgents mounts a coordination-only MCP profile without duplicating built-in tools.
+3. **Profiles & Sandboxes:** Credential profiles (`anthropic`, `openai`, `google-antigravity`, `muse`, `openrouter`, `sylphx`, and Coding Plans) are peers with fail-closed harness mapping checks; workspace execution plugs into the `WorkspaceBackend` trait (local directories/worktrees by default, Cloud Sandbox / E2B HTTP APIs, or Docker containers).
 
 Peer-to-peer messaging between people's agent sessions, such as Reason Network, overlaps with one part of AnyAgents. AnyAgents also owns each agent's identity, history and channels, installs and signs in the harnesses, and routes any model through any harness, so an agent can change harness or model without losing either.
 

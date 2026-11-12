@@ -305,8 +305,12 @@ pub fn ensure_installed(
     if let Some((program, args)) = install_command(&entry.install, version) {
         runner.run(&program, &args, &dir, &[], &mut NopLines)?;
     }
-    std::fs::write(dir.join(".installed"), version)
-        .map_err(|e| InstallError::Failed(e.to_string()))?;
+    anyagents_harness::atomic_write_nonempty_file(
+        &dir.join(".installed"),
+        version.as_bytes(),
+        0o644,
+    )
+    .map_err(|e| InstallError::Failed(e.to_string()))?;
     Ok(dir)
 }
 

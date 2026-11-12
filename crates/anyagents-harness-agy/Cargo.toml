@@ -22,3 +22,7 @@ tempfile = "3"
 # from matching every crate.
 [package.metadata.cargo-machete]
 ignored = []
+
+[[bin]]
+name = "fake_agy"
+path = "../anyagents-harness/fake_line_protocol.rs"

@@ -178,6 +178,303 @@ pub struct AgentRef {
     pub workdir: Option<PathBuf>,
 }
 
+/// Hard cap for one JSON-RPC frame written to stdio, including the trailing
+/// newline: 56 KiB, strictly below the 64 KiB single-line scanner buffer many
+/// stdio clients use. A frame over the cap is spilled to a `0600` file and
+/// replaced by a compact summary so the pipe never breaks.
+pub(crate) const MCP_STDIO_FRAME_CAP_BYTES: usize = 56 * 1024;
+const MCP_STDIO_FRAME_PREVIEW_CHARS: usize = 2_000;
+
+/// Write one oversize frame verbatim to a fresh `0600` file under `dir`.
+fn spill_oversize_frame(frame: &[u8], dir: &Path, seq: u64) -> std::io::Result<PathBuf> {
+    use std::io::Write as _;
+    let path = dir.join(format!(
+        "anyagents-mcp-stdio-frame-{}-{seq}.json",
+        std::process::id()
+    ));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    options.open(&path)?.write_all(frame)?;
+    Ok(path)
+}
+
+/// Build the bounded replacement frame (with trailing newline) for one
+/// oversize frame. The preview shrinks until the serialized, escaped frame
+/// fits the cap, so the check runs on final bytes, not on the input size.
+fn capped_frame(frame: &[u8], dir: &Path, seq: u64) -> Vec<u8> {
+    let spill = spill_oversize_frame(frame, dir, seq)
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| dir.display().to_string());
+    let id = serde_json::from_slice::<serde_json::Value>(frame)
+        .ok()
+        .and_then(|value| value.get("id").cloned())
+        .unwrap_or(serde_json::Value::Null);
+    let text = String::from_utf8_lossy(frame);
+    let mut preview_chars = MCP_STDIO_FRAME_PREVIEW_CHARS;
+    loop {
+        let preview: String = text.chars().take(preview_chars).collect();
+        let summary = format!(
+            "This response exceeded the {MCP_STDIO_FRAME_CAP_BYTES}-byte single-line stdio frame limit \
+             (original: {} bytes) and was written in full to {spill} with file mode 0600. \
+             Read that file in pages (offset/length windows) instead of requesting the whole response again.\n\n\
+             Preview (first {preview_chars} characters):\n{preview}",
+            frame.len()
+        );
+        let mut bytes = serde_json::to_vec(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {
+                "content": [{"type": "text", "text": summary}],
+                "isError": false,
+            }
+        }))
+        .expect("summary frame serializes");
+        bytes.push(b'\n');
+        if bytes.len() <= MCP_STDIO_FRAME_CAP_BYTES || preview_chars == 0 {
+            return bytes;
+        }
+        preview_chars /= 2;
+    }
+}
+
+/// `AsyncWrite` gate for the stdio transport: buffers partial lines, passes
+/// frames within the cap through untouched, and swaps oversize frames for
+/// their capped summary.
+pub(crate) struct FrameCapStdout<W> {
+    inner: W,
+    pending: Vec<u8>,
+    out: Vec<u8>,
+    spill_dir: PathBuf,
+    seq: u64,
+}
+
+impl<W> FrameCapStdout<W> {
+    pub(crate) fn new(inner: W) -> Self {
+        Self {
+            inner,
+            pending: Vec::new(),
+            out: Vec::new(),
+            spill_dir: std::env::temp_dir(),
+            seq: 0,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_spill_dir(inner: W, spill_dir: PathBuf) -> Self {
+        Self {
+            inner,
+            pending: Vec::new(),
+            out: Vec::new(),
+            spill_dir,
+            seq: 0,
+        }
+    }
+
+    fn transform_line(&mut self, line: &[u8]) {
+        let frame = line.strip_suffix(b"\n").unwrap_or(line);
+        if frame.len() + 1 > MCP_STDIO_FRAME_CAP_BYTES {
+            self.seq += 1;
+            let capped = capped_frame(frame, &self.spill_dir.clone(), self.seq);
+            self.out.extend_from_slice(&capped);
+        } else {
+            self.out.extend_from_slice(line);
+        }
+    }
+
+    fn absorb_pending(&mut self) {
+        while let Some(pos) = self.pending.iter().position(|byte| *byte == b'\n') {
+            let line: Vec<u8> = self.pending.drain(..=pos).collect();
+            self.transform_line(&line);
+        }
+    }
+}
+
+impl<W: tokio::io::AsyncWrite + Unpin> FrameCapStdout<W> {
+    fn drain_out(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        use std::task::Poll;
+        while !self.out.is_empty() {
+            match std::pin::Pin::new(&mut self.inner).poll_write(cx, &self.out) {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "failed to write the stdio frame",
+                    )));
+                }
+                Poll::Ready(Ok(written)) => {
+                    self.out.drain(..written);
+                }
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl<W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for FrameCapStdout<W> {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        use std::task::Poll;
+        if !this.out.is_empty() {
+            match this.drain_out(cx) {
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Ok(())) => {}
+            }
+        }
+        this.pending.extend_from_slice(buf);
+        this.absorb_pending();
+        // Transformed bytes are buffered; the caller reports the input as
+        // consumed and the next write/flush drains the queue.
+        let _ = this.drain_out(cx);
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        use std::task::Poll;
+        if !this.pending.is_empty() {
+            let line = std::mem::take(&mut this.pending);
+            this.transform_line(&line);
+        }
+        match this.drain_out(cx) {
+            Poll::Ready(Ok(())) => {}
+            other => return other,
+        }
+        std::pin::Pin::new(&mut this.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        use std::task::Poll;
+        match std::pin::Pin::new(&mut *this).poll_flush(cx) {
+            Poll::Ready(Ok(())) => {}
+            other => return other,
+        }
+        std::pin::Pin::new(&mut this.inner).poll_shutdown(cx)
+    }
+}
+
+#[cfg(test)]
+mod stdio_frame_cap_tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt as _;
+
+    #[test]
+    fn tools_list_frame_stays_below_48_kib() {
+        let tools = tool_definitions(McpProfile::Full);
+        assert!(!tools.is_empty());
+        let frame = serde_json::to_vec(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": { "tools": tools },
+        }))
+        .unwrap();
+        assert!(
+            frame.len() + 1 < 48 * 1024,
+            "tools/list frame is {} bytes, over the 48 KiB budget",
+            frame.len() + 1
+        );
+    }
+
+    #[tokio::test]
+    async fn oversize_frame_spills_to_0600_file_and_stays_single_line() {
+        // 128 KiB payload mixing multi-byte UTF-8 with quotes and backslashes,
+        // so JSON string escaping inflates the wire size further.
+        let payload = "é漢字\"\\".repeat(16 * 1024);
+        let frame = serde_json::to_vec(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "result": {
+                "content": [{"type": "text", "text": payload}],
+                "isError": false,
+            }
+        }))
+        .unwrap();
+        assert!(frame.len() > 128 * 1024, "frame is {} bytes", frame.len());
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut gated = FrameCapStdout::with_spill_dir(Vec::new(), dir.path().to_path_buf());
+        let mut wire = frame.clone();
+        wire.push(b'\n');
+        // Write in 8 KiB chunks so partial-line buffering is exercised.
+        for chunk in wire.chunks(8 * 1024) {
+            gated.write_all(chunk).await.unwrap();
+        }
+        gated.flush().await.unwrap();
+        let out = gated.inner;
+
+        assert!(
+            out.len() <= MCP_STDIO_FRAME_CAP_BYTES,
+            "capped frame is {} bytes",
+            out.len()
+        );
+        assert!(out.len() < 64 * 1024);
+        assert_eq!(out.iter().filter(|byte| **byte == b'\n').count(), 1);
+        let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(value["jsonrpc"], "2.0");
+        assert_eq!(value["id"], 42);
+        let summary = value["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(summary.contains("0600"), "summary names the spill mode");
+        let spill = summary
+            .split("written in full to ")
+            .nth(1)
+            .unwrap()
+            .split(' ')
+            .next()
+            .unwrap();
+        let spill_path = PathBuf::from(spill);
+        assert_eq!(spill_path.parent(), Some(dir.path()));
+        let spilled = std::fs::read(&spill_path).unwrap();
+        assert_eq!(spilled, frame, "spilled file must be byte-identical");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(&spill_path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn small_frame_passes_through_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut gated = FrameCapStdout::with_spill_dir(Vec::new(), dir.path().to_path_buf());
+        gated
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"ok\":true}}\n")
+            .await
+            .unwrap();
+        gated.flush().await.unwrap();
+        assert_eq!(
+            gated.inner,
+            b"{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"ok\":true}}\n".to_vec()
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+}
+
 /// Run the tool server for the agent whose config directory is `config`. The
 /// server names the directory it started this agent with as
 /// `ANYAGENTS_AGENT_CONFIG`; a command line that omits it is read from there,
@@ -225,7 +522,10 @@ pub fn run(data: &Path, config: Option<&Path>, profile: Option<McpProfile>) -> R
             client,
             profile: resolved_profile,
         }
-        .serve(rmcp::transport::io::stdio())
+        .serve({
+            let (stdin, stdout) = rmcp::transport::io::stdio();
+            (stdin, FrameCapStdout::new(stdout))
+        })
         .await
         .map_err(|err| Error::Message(err.to_string()))?;
         service
@@ -540,6 +840,12 @@ struct AgentsArgs {
     /// - `"role"` (Parent/Ancestor or Admin: set or clear an agent's short role label)
     /// - `"harness"` (declaratively update an agent's harness/model/profile)
     /// - `"models"` (list upstream provider profile model catalogs)
+    /// - `"usage"` (structured token/cost usage aggregation; `name` is the optional
+    ///   target agent or `"all"`, `include_descendants`/`subtree` selects the subtree,
+    ///   `since_ms`/`until_ms`/`days` bound the window, `group_by` is one of
+    ///   `agent`/`day`/`model`/`harness`. Callers with `scope == "public"`, roots and
+    ///   the local operator see the whole workspace; other callers see only self plus
+    ///   causal descendants, and an explicit out-of-scope target is refused.)
     #[serde(default)]
     action: Option<String>,
     /// Target body id when action = "redact"; `transcript:<zero-based-line>` addresses
@@ -652,6 +958,21 @@ struct AgentsArgs {
     /// Page size for list (default 100, clamped to 1..=100), or recent turns for inspect (default 10).
     #[serde(default)]
     limit: Option<usize>,
+    /// For `usage`: include causal descendants of the target (alias `subtree`).
+    #[serde(default, alias = "subtree")]
+    include_descendants: Option<bool>,
+    /// For `usage`: window start, inclusive (unix ms).
+    #[serde(default)]
+    since_ms: Option<i64>,
+    /// For `usage`: window end, inclusive (unix ms).
+    #[serde(default)]
+    until_ms: Option<i64>,
+    /// For `usage`: trailing window in days, intersected with `since_ms`/`until_ms`.
+    #[serde(default)]
+    days: Option<i64>,
+    /// For `usage`: grouping dimension (`agent`, `day`, `model`, `harness`).
+    #[serde(default)]
+    group_by: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -1514,6 +1835,42 @@ impl AgentMcp {
                 }
             });
         match action.as_str() {
+            "usage" => {
+                let mut qs = String::new();
+                let mut push = |k: &str, v: String| {
+                    if !qs.is_empty() {
+                        qs.push('&');
+                    }
+                    qs.push_str(k);
+                    qs.push('=');
+                    qs.push_str(&urlencoding_simple(&v));
+                };
+                if let Some(t) = args.name.as_deref().filter(|t| !t.trim().is_empty()) {
+                    push("agent", t.to_string());
+                }
+                if let Some(v) = args.include_descendants {
+                    push("include_descendants", v.to_string());
+                }
+                if let Some(v) = args.since_ms {
+                    push("since_ms", v.to_string());
+                }
+                if let Some(v) = args.until_ms {
+                    push("until_ms", v.to_string());
+                }
+                if let Some(v) = args.days {
+                    push("days", v.to_string());
+                }
+                if let Some(v) = args.group_by.as_deref().filter(|v| !v.trim().is_empty()) {
+                    push("group_by", v.to_string());
+                }
+                let path = if qs.is_empty() {
+                    "/v1/usage".to_string()
+                } else {
+                    format!("/v1/usage?{qs}")
+                };
+                let response = self.client.get(&path, None).await?;
+                Ok(rmcp::handler::server::wrapper::Json(response))
+            }
             "redact" => {
                 let target = args
                     .name
@@ -2854,9 +3211,11 @@ impl AgentMcp {
         let base_dir = self.resolve_workdir();
         let config_dir = self.client.config.clone();
         let (val, media) = tokio::task::spawn_blocking(move || {
-            let backend =
-                anyagents_tools::WorkspaceBackend::resolve(Some(&config_dir), base_dir.clone());
-            execute_files_tool_with_media_backend(&backend, &base_dir, args)
+            let backend = <dyn anyagents_tools::WorkspaceBackend>::resolve(
+                Some(&config_dir),
+                base_dir.clone(),
+            );
+            execute_files_tool_with_media_backend(backend.as_ref(), &base_dir, args)
         })
         .await
         .map_err(|e| format!("files task join error: {e}"))??;
@@ -2874,45 +3233,96 @@ impl AgentMcp {
 #[cfg(test)]
 pub const CANONICAL_MCP_TOOLS: &[&str] = &["code"];
 
+/// Remove prose keys (`description`, `title`) from a JSON Schema tree. Field
+/// prose duplicates the tool-level description and is the main driver of
+/// `tools/list` frame size; keeping the structural schema (types, required
+/// fields, enums) preserves how clients build calls.
+fn strip_schema_prose(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            map.remove("description");
+            map.remove("title");
+            for nested in map.values_mut() {
+                strip_schema_prose(nested);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                strip_schema_prose(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Compact one tool definition for `tools/list`: schema prose is dropped so
+/// the single-line JSON-RPC response stays below the 64 KiB stdio scanner
+/// budget that stdio clients use. The tool description itself is untouched.
+fn compact_tool_definition(mut tool: rmcp::model::Tool) -> rmcp::model::Tool {
+    let mut input = serde_json::to_value(&*tool.input_schema).unwrap_or(serde_json::Value::Null);
+    strip_schema_prose(&mut input);
+    if let Some(object) = input.as_object() {
+        tool.input_schema = std::sync::Arc::new(object.clone());
+    }
+    if let Some(output) = &tool.output_schema {
+        let mut output = serde_json::to_value(&**output).unwrap_or(serde_json::Value::Null);
+        strip_schema_prose(&mut output);
+        if let Some(object) = output.as_object() {
+            tool.output_schema = Some(std::sync::Arc::new(object.clone()));
+        }
+    }
+    tool
+}
+
+pub fn tool_definitions(profile: McpProfile) -> Vec<rmcp::model::Tool> {
+    let allowed = profile.exposed_tools();
+    let all = AgentMcp::tool_router().list_all();
+    allowed
+        .iter()
+        .filter_map(|wanted| all.iter().find(|t| t.name.as_ref() == *wanted).cloned())
+        .map(compact_tool_definition)
+        .collect()
+}
+
+/// `tool_definitions` plus the role-template catalog discovered under
+/// `.agents/agents/`. The catalog is appended to the tool-level description of
+/// every exposed tool with a `role` argument, because schema prose is stripped
+/// by `compact_tool_definition`.
 pub fn tool_definitions_with_roles(
     profile: McpProfile,
     workdir: Option<&Path>,
     data_dir: Option<&Path>,
 ) -> Vec<rmcp::model::Tool> {
-    let allowed = profile.exposed_tools();
-    let all = AgentMcp::tool_router().list_all();
-    let mut tools: Vec<rmcp::model::Tool> = allowed
+    let mut tools = tool_definitions(profile);
+    let Some(dd) = data_dir else {
+        return tools;
+    };
+    let templates = crate::create::discover_available_archetype_templates(workdir, None, dd);
+    if templates.is_empty() {
+        return tools;
+    }
+    let role_catalog = templates
         .iter()
-        .filter_map(|wanted| all.iter().find(|t| t.name.as_ref() == *wanted).cloned())
-        .collect();
-    if let Some(dd) = data_dir {
-        let templates = crate::create::discover_available_archetype_templates(workdir, None, dd);
-        if !templates.is_empty() {
-            let role_catalog = templates
-                .iter()
-                .map(|(slug, desc)| match desc {
-                    Some(d) => format!("`{slug}` ({d})"),
-                    None => format!("`{slug}`"),
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            let append_note = format!(" Available `.agents/agents/*.md` roles: {role_catalog}.");
-            for tool in &mut tools {
-                if matches!(
-                    tool.name.as_ref(),
-                    "agents" | "spawn" | "subagents" | "describe"
-                ) {
-                    let schema_map = std::sync::Arc::make_mut(&mut tool.input_schema);
-                    if let Some(serde_json::Value::Object(props)) = schema_map.get_mut("properties")
-                        && let Some(serde_json::Value::Object(role_prop)) = props.get_mut("role")
-                        && let Some(serde_json::Value::String(desc)) =
-                            role_prop.get_mut("description")
-                        && !desc.contains("Available `.agents/agents/*.md` roles:")
-                    {
-                        desc.push_str(&append_note);
-                    }
-                }
-            }
+        .map(|(slug, desc)| match desc {
+            Some(d) => format!("`{slug}` ({d})"),
+            None => format!("`{slug}`"),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let append_note = format!(" Available `.agents/agents/*.md` roles: {role_catalog}.");
+    for tool in &mut tools {
+        let has_role_arg = tool
+            .input_schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|props| props.contains_key("role"));
+        if !has_role_arg {
+            continue;
+        }
+        let mut desc = tool.description.as_deref().unwrap_or_default().to_string();
+        if !desc.contains("Available `.agents/agents/*.md` roles:") {
+            desc.push_str(&append_note);
+            tool.description = Some(desc.into());
         }
     }
     tools
@@ -2976,6 +3386,9 @@ impl rmcp::ServerHandler for AgentMcp {
     }
 }
 
+pub(crate) fn urlencoding_simple_pub(s: &str) -> String {
+    urlencoding_simple(s)
+}
 fn urlencoding_simple(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for byte in s.bytes() {
@@ -5263,18 +5676,18 @@ fn resolve_workspace_path(
 }
 
 fn execute_files_tool_with_media_backend(
-    backend: &anyagents_tools::WorkspaceBackend,
+    backend: &dyn anyagents_tools::WorkspaceBackend,
     base_dir: &Path,
     args: FilesArgs,
 ) -> Result<(serde_json::Value, Vec<rmcp::model::ContentBlock>), String> {
-    if matches!(backend, anyagents_tools::WorkspaceBackend::RemoteSandbox(_)) {
+    if backend.is_remote() {
         return execute_remote_files_tool_with_media(backend, args);
     }
     execute_files_tool_with_media(base_dir, args)
 }
 
 fn execute_remote_files_tool_with_media(
-    backend: &anyagents_tools::WorkspaceBackend,
+    backend: &dyn anyagents_tools::WorkspaceBackend,
     args: FilesArgs,
 ) -> Result<(serde_json::Value, Vec<rmcp::model::ContentBlock>), String> {
     let action = args
@@ -7991,15 +8404,29 @@ mod spawn_args_tests {
         )
         .unwrap();
         let tools = tool_definitions_with_roles(McpProfile::Full, None, Some(dir.path()));
-        let agents_tool = tools.iter().find(|t| t.name == "agents").unwrap();
-        let role_desc = agents_tool.input_schema["properties"]["role"]["description"]
-            .as_str()
-            .unwrap();
+        for name in ["agents", "spawn"] {
+            let tool = tools.iter().find(|t| t.name == name).unwrap();
+            let desc = tool.description.as_deref().unwrap_or_default();
+            assert!(
+                desc.contains(
+                    "Available `.agents/agents/*.md` roles: `builder` (Isolated builder specialist)."
+                ),
+                "{name}: {desc}"
+            );
+        }
+        let send_tool = tools.iter().find(|t| t.name == "send").unwrap();
         assert!(
-            role_desc.contains(
-                "Available `.agents/agents/*.md` roles: `builder` (Isolated builder specialist)."
-            ),
-            "agents: {role_desc}"
+            !send_tool
+                .description
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Available `.agents/agents/*.md` roles:")
+        );
+        let without_templates =
+            tool_definitions_with_roles(McpProfile::Full, None, Some(&dir.path().join("empty")));
+        assert_eq!(
+            serde_json::to_value(&without_templates).unwrap(),
+            serde_json::to_value(tool_definitions(McpProfile::Full)).unwrap()
         );
     }
 
@@ -8068,6 +8495,7 @@ mod spawn_args_tests {
     ) -> AgentView {
         AgentView {
             has_open_turn: false,
+            open_turn_age_ms: None,
             profile: None,
             id: id.to_string(),
             name: name.to_string(),

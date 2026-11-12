@@ -194,6 +194,28 @@ impl anyagents_harness::Harness for ContractHarness {
         self.inner.clear_quota()
     }
 
+    fn take_reclaimed_steers(&mut self) -> Vec<String> {
+        self.inner.take_reclaimed_steers()
+    }
+
+    fn has_unconfirmed_hold(&self) -> bool {
+        self.inner.has_unconfirmed_hold()
+    }
+
+    fn has_unconfirmed_idle_hold(&self) -> bool {
+        self.inner.has_unconfirmed_idle_hold()
+    }
+
+    fn peek_unconfirmed_request_ids(&self) -> Vec<String> {
+        self.inner.peek_unconfirmed_request_ids()
+    }
+
+    fn reconcile_unconfirmed_for_recovery(
+        &mut self,
+    ) -> Result<Option<anyagents_harness::ReconciledUnconfirmed>, HarnessError> {
+        self.inner.reconcile_unconfirmed_for_recovery()
+    }
+
     fn process_id(&self) -> Option<u32> {
         self.inner.process_id()
     }
@@ -222,8 +244,7 @@ pub fn child_env() -> Vec<(String, String)> {
 }
 
 pub fn read_persisted_last_error(config_dir: &Path) -> Option<(Option<String>, Option<i64>)> {
-    let err_path = config_dir.join(".anyagents-last-error.json");
-    let raw = std::fs::read_to_string(&err_path).ok()?;
+    let raw = std::fs::read_to_string(config_dir.join(".anyagents-last-error.json")).ok()?;
     let val = serde_json::from_str::<serde_json::Value>(&raw).ok()?;
     let rotated_ms = std::fs::read_to_string(config_dir.join(".anyagents-profile-rotated-ms"))
         .ok()
@@ -240,35 +261,17 @@ pub fn read_persisted_last_error(config_dir: &Path) -> Option<(Option<String>, O
         .get("error")
         .and_then(|v| v.as_str())
         .map(str::to_string);
-    if err
-        .as_deref()
-        .is_some_and(|e| e.contains("spiron-unconfirmed-steers.json"))
-        && !config_dir.join("spiron-unconfirmed-steers.json").exists()
-    {
-        let _ = std::fs::remove_file(&err_path);
-        return None;
-    }
     let reset = val.get("quota_reset_at_ms").and_then(|v| v.as_i64());
     Some((err, reset))
 }
 
 fn has_persisted_turn_error(config_dir: &Path) -> bool {
-    let err_path = config_dir.join(".anyagents-last-error.json");
-    let Ok(raw) = std::fs::read_to_string(&err_path) else {
+    let Ok(raw) = std::fs::read_to_string(config_dir.join(".anyagents-last-error.json")) else {
         return false;
     };
     let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) else {
         return false;
     };
-    if val
-        .get("error")
-        .and_then(|v| v.as_str())
-        .is_some_and(|e| e.contains("spiron-unconfirmed-steers.json"))
-        && !config_dir.join("spiron-unconfirmed-steers.json").exists()
-    {
-        let _ = std::fs::remove_file(&err_path);
-        return false;
-    }
     val.get("consecutive_turn_errors")
         .and_then(|v| v.as_u64())
         .unwrap_or(0)
@@ -419,7 +422,13 @@ pub fn persist_last_error(config_dir: &Path, error: Option<&str>, quota_reset_at
                 "quota_reset_at_ms": quota_reset_at_ms,
                 "timestamp_ms": now_ms,
             });
-            let _ = std::fs::write(&path, payload.to_string());
+            if let Err(err) = anyagents_harness::atomic_write_nonempty_file(
+                &path,
+                payload.to_string().as_bytes(),
+                0o664,
+            ) {
+                eprintln!("cannot persist {}: {err}", path.display());
+            }
         }
         None => {
             let _ = std::fs::remove_file(&path);
@@ -518,9 +527,10 @@ fn retire_poisoned_agy_session(config_dir: &Path, now_ms: i64) -> Result<bool, S
     // continuation pointer is poisoned. A watermark prevents stale log replay.
     retire_session_pointer(&config_dir.join("agy-session-id"))?;
     retire_session_pointer(&config_dir.join(".anyagents-last-error.json"))?;
-    std::fs::write(
-        config_dir.join(".anyagents-quota-cleared-ms"),
-        now_ms.to_string(),
+    anyagents_harness::atomic_write_nonempty_file(
+        &config_dir.join(".anyagents-quota-cleared-ms"),
+        now_ms.to_string().as_bytes(),
+        0o664,
     )
     .map_err(|err| format!("cannot persist agy recovery watermark: {err}"))?;
     Ok(true)
@@ -648,6 +658,10 @@ fn vendor_launch_inner(
                 anyagents_harness::SEAT_LAUNCH_ENV
                     | anyagents_harness::SEAT_PEERS_ENV
                     | "ANYAGENTS_DATA"
+                    | anyagents_core::STATE_DIR_ENV
+                    | anyagents_core::WORKSPACES_DIR_ENV
+                    | anyagents_core::SCRATCH_DIR_ENV
+                    | anyagents_core::GIT_POOL_DIR_ENV
                     | "ANYAGENTS_AGENT_CONFIG"
                     | "ANYAGENTS_AGENT_UID"
                     | "ANYAGENTS_OPERATOR_TOKEN_FILE"
@@ -664,6 +678,40 @@ fn vendor_launch_inner(
         "ANYAGENTS_DATA".to_string(),
         request.data_dir.display().to_string(),
     ));
+    if anyagents_core::storage_env_enabled()
+        && std::env::var_os(anyagents_core::STATE_DIR_ENV).is_some()
+    {
+        env.push((
+            anyagents_core::STATE_DIR_ENV.to_string(),
+            request.data_dir.display().to_string(),
+        ));
+    }
+    if let Some(workspaces_dir) = anyagents_core::configured_workspaces_dir() {
+        env.push((
+            anyagents_core::WORKSPACES_DIR_ENV.to_string(),
+            workspaces_dir.display().to_string(),
+        ));
+    }
+    if let Some(scratch_dir) = anyagents_core::configured_scratch_dir() {
+        env.push((
+            anyagents_core::SCRATCH_DIR_ENV.to_string(),
+            scratch_dir.display().to_string(),
+        ));
+        if anyagents_core::storage_env_enabled()
+            && let Some(test_flag) = std::env::var_os(anyagents_core::TEST_STORAGE_TIERS_ENV)
+        {
+            env.push((
+                anyagents_core::TEST_STORAGE_TIERS_ENV.to_string(),
+                test_flag.to_string_lossy().into_owned(),
+            ));
+        }
+    }
+    if let Some(git_pool_dir) = anyagents_core::configured_git_pool_dir() {
+        env.push((
+            anyagents_core::GIT_POOL_DIR_ENV.to_string(),
+            git_pool_dir.display().to_string(),
+        ));
+    }
     env.push((
         "ANYAGENTS_AGENT_ID".to_string(),
         request.agent.id.as_str().to_string(),
@@ -701,6 +749,10 @@ fn vendor_launch_inner(
                 anyagents_harness::SEAT_LAUNCH_ENV
                     | anyagents_harness::SEAT_PEERS_ENV
                     | "ANYAGENTS_DATA"
+                    | anyagents_core::STATE_DIR_ENV
+                    | anyagents_core::WORKSPACES_DIR_ENV
+                    | anyagents_core::SCRATCH_DIR_ENV
+                    | anyagents_core::GIT_POOL_DIR_ENV
                     | "ANYAGENTS_AGENT_CONFIG"
                     | "ANYAGENTS_AGENT_UID"
                     | "ANYAGENTS_OPERATOR_TOKEN_FILE"
@@ -816,13 +868,15 @@ fn vendor_launch_inner(
             let _ = std::fs::create_dir_all(&dot_config);
             dot_config
         };
-        if let Some((_, uid, gid, _)) = resolved_seat.or_else(|| {
+        let effective_seat = resolved_seat.clone().or_else(|| {
             crate::sandbox::seat_for_agent_with_hint(
                 request.agent.id.as_str(),
                 seat_hint.as_deref(),
             )
             .map(|(u, uid, gid, _)| (u, uid, gid, None))
-        }) {
+        });
+        if let Some((_, uid, gid, _)) = effective_seat.as_ref() {
+            let (uid, gid) = (*uid, *gid);
             crate::sandbox::share_config_with_seat_uid(&request.config_dir, uid, gid);
             let managed_work = anyagents_core::agent_work_dir(&request.data_dir, &request.agent.id);
             if request.work_dir == managed_work && !managed_work.exists() {
@@ -858,8 +912,66 @@ fn vendor_launch_inner(
             cache_home.display().to_string(),
         ));
         env.push(("TMPDIR".to_string(), tmp_dir.display().to_string()));
+        if let Some((_, uid, gid, _)) = effective_seat.as_ref()
+            && let Some(scratch_root) = anyagents_core::configured_scratch_dir()
+        {
+            let _ = crate::sandbox::prepare_scratch_dirs_for_seat(
+                &scratch_root,
+                &request.agent.id,
+                *uid,
+                *gid,
+            );
+        }
         for key in ["RUSTUP_HOME", "CARGO_HOME"] {
             if let Some(value) = std::env::var_os(format!("ANYAGENTS_{key}")) {
+                env.push((key.to_string(), value.to_string_lossy().into_owned()));
+            }
+        }
+    }
+    if let Some(scratch_root) = anyagents_core::configured_scratch_dir() {
+        let build_root = anyagents_core::agent_scratch_build_dir(&scratch_root, &request.agent.id);
+        let cargo_target = build_root.join("cargo");
+        let gradle_home = build_root.join("gradle");
+        let derived_data = build_root.join("derived-data");
+        let scratch_tmp = anyagents_core::agent_scratch_tmp_dir(&scratch_root, &request.agent.id);
+        if seat_spec.is_none() {
+            for dir in [&cargo_target, &gradle_home, &derived_data, &scratch_tmp] {
+                let _ = std::fs::create_dir_all(dir);
+            }
+        }
+        env.push(("TMPDIR".to_string(), scratch_tmp.display().to_string()));
+        env.push(("BUN_TMPDIR".to_string(), scratch_tmp.display().to_string()));
+        env.push((
+            "CARGO_TARGET_DIR".to_string(),
+            cargo_target.display().to_string(),
+        ));
+        env.push((
+            "GRADLE_USER_HOME".to_string(),
+            gradle_home.display().to_string(),
+        ));
+        env.push((
+            "DERIVED_DATA_PATH".to_string(),
+            derived_data.display().to_string(),
+        ));
+        for key in [
+            "RUSTUP_HOME",
+            "CARGO_HOME",
+            "SCCACHE_DIR",
+            "SCCACHE_CACHE_SIZE",
+            "BUN_INSTALL_CACHE_DIR",
+            "UV_CACHE_DIR",
+            "UV_PYTHON_INSTALL_DIR",
+            "PIP_CACHE_DIR",
+            "NPM_CONFIG_CACHE",
+            "PLAYWRIGHT_BROWSERS_PATH",
+        ] {
+            if env.iter().any(|(k, _)| k == key) {
+                continue;
+            }
+            if let Some(value) = std::env::var_os(format!("ANYAGENTS_{key}"))
+                .or_else(|| std::env::var_os(key))
+                .filter(|v| !v.is_empty())
+            {
                 env.push((key.to_string(), value.to_string_lossy().into_owned()));
             }
         }
@@ -1360,13 +1472,21 @@ pub(crate) fn ensure_agy_steering_settings(
                 *allow = serde_json::json!([]);
                 changed = true;
             }
-            if let Some(allow_arr) = allow.as_array_mut()
-                && !allow_arr
-                    .iter()
-                    .any(|v| v.as_str() == Some("mcp(anyagents/*)"))
-            {
-                allow_arr.push(serde_json::Value::String("mcp(anyagents/*)".to_string()));
-                changed = true;
+            let mcp_schema_grant = format!(
+                "read_file({})",
+                config_dir
+                    .join(".gemini")
+                    .join("antigravity-cli")
+                    .join("mcp")
+                    .display()
+            );
+            if let Some(allow_arr) = allow.as_array_mut() {
+                for grant in ["mcp(anyagents/*)", mcp_schema_grant.as_str()] {
+                    if !allow_arr.iter().any(|v| v.as_str() == Some(grant)) {
+                        allow_arr.push(serde_json::Value::String(grant.to_string()));
+                        changed = true;
+                    }
+                }
             }
             let deny = perms_obj
                 .entry("deny".to_string())
@@ -1376,6 +1496,20 @@ pub(crate) fn ensure_agy_steering_settings(
                 changed = true;
             }
             if let Some(deny_arr) = deny.as_array_mut() {
+                // Keep read_file / view_file out of static permissions.deny
+                // (which overrides PreToolUse decision="allow" in agy) so
+                // anyagents-native-tool-guard can permit reading lazy MCP tool
+                // schemas under ~/.gemini/antigravity-cli/mcp/*.json while
+                // denying all workspace and host reads fail-closed.
+                const AGY_LEGACY_READ_DENIES: &[&str] = &["read_file", "view_file", "read_file(*)"];
+                let before_legacy = deny_arr.len();
+                deny_arr.retain(|v| {
+                    !v.as_str()
+                        .is_some_and(|s| AGY_LEGACY_READ_DENIES.contains(&s))
+                });
+                if deny_arr.len() != before_legacy {
+                    changed = true;
+                }
                 const AGY_DENIED_NATIVE_TOOLS: &[&str] = &[
                     "invoke_subagent",
                     "define_subagent",
@@ -1388,15 +1522,12 @@ pub(crate) fn ensure_agy_steering_settings(
                     "open_browser_url",
                     "run_command",
                     "manage_task",
-                    "read_file",
                     "write_file",
                     "edit_file",
-                    "view_file",
                     "grep_search",
                     "find_by_name",
                     "list_dir",
                     "command(*)",
-                    "read_file(*)",
                     "write_file(*)",
                     "read_url(*)",
                     "execute_url(*)",
@@ -1467,7 +1598,7 @@ pub(crate) fn ensure_agy_steering_settings(
                     "hooks": [
                         {
                             "type": "command",
-                            "command": "printf '%s\\n' '{\"decision\":\"deny\",\"reason\":\"Native built-in tools are disabled under AnyAgents; use the anyagents MCP code tool (workspace.*, web.*, anyagents.*) instead.\"}'",
+                            "command": "python3 -c 'import json,os,sys\ndeny=\"Native built-in tools are disabled under AnyAgents. Invoke AnyAgents MCP tools via call_mcp_tool with ServerName=\\\"anyagents\\\" (read schemas in ~/.gemini/antigravity-cli/mcp/anyagents/*.json if needed): e.g. ToolName=\\\"code\\\" with Arguments={\\\"code\\\":\\\"return await workspace.read({ path: \\\\\\\"...\\\\\\\" });\\\"} for workspace/web/anyagents operations, ToolName=\\\"send\\\" with Arguments={\\\"to\\\":[\\\"parent\\\"],\\\"text\\\":\\\"...\\\"} to reply, ToolName=\\\"agents\\\", ToolName=\\\"schedules\\\", or ToolName=\\\"skills\\\".\"\ntry:\n d=json.load(sys.stdin);tc=d.get(\"toolCall\") or {}\n if tc.get(\"name\") in (\"read_file\",\"view_file\"):\n  p=(tc.get(\"args\") or {}).get(\"Path\") or \"\"\n  mcp=os.path.realpath(os.path.expanduser(\"~/.gemini/antigravity-cli/mcp\"))\n  rp=os.path.realpath(os.path.expanduser(p)) if p else \"\"\n  if rp.startswith(mcp+\"/\") and rp.endswith(\".json\") and os.path.isfile(rp):\n   print(json.dumps({\"decision\":\"allow\",\"permissionOverrides\":[\"read_file(*)\",\"read_file\",\"view_file\"]}));sys.exit(0)\nexcept Exception:\n pass\nprint(json.dumps({\"decision\":\"deny\",\"reason\":deny}))' 2>/dev/null || printf '%s\\n' '{\"decision\":\"deny\",\"reason\":\"Native built-in tools are disabled under AnyAgents; invoke AnyAgents MCP tools via call_mcp_tool with ServerName=\\\"anyagents\\\" and ToolName=\\\"code\\\" or \\\"send\\\" instead.\"}'",
                             "timeout": 5
                         }
                     ]
@@ -1597,6 +1728,40 @@ fn start_spiron(
     .map_err(|err| err.to_string())?;
     harness.set_state_dir(config_dir);
     Ok(harness)
+}
+
+fn populate_spiron_journal_reconciliation(
+    config_dir: &Path,
+    session_id: &str,
+    rec: &mut anyagents_harness::ReconciledUnconfirmed,
+) {
+    let db_path = config_dir.join("sessions.sqlite3");
+    if !db_path.is_file() {
+        return;
+    }
+    let Some(conn) = crate::seat_tree::open_readonly_seat_sqlite(&db_path) else {
+        return;
+    };
+    let Ok(mut stmt) =
+        conn.prepare("SELECT event FROM session_entries WHERE session_id = ?1 ORDER BY idx ASC")
+    else {
+        return;
+    };
+    let Ok(rows) = stmt.query_map([session_id], |row| row.get::<_, String>(0)) else {
+        return;
+    };
+    let events: Vec<String> = rows.flatten().collect();
+    for id in &rec.request_ids {
+        let marker = format!("anyagents-message:{id}");
+        if events
+            .iter()
+            .any(|ev| ev.contains(&marker) || ev.contains(id))
+        {
+            rec.journal_committed_ids.push(id.clone());
+        } else {
+            rec.journal_missing_ids.push(id.clone());
+        }
+    }
 }
 
 fn start_codex(
@@ -1803,6 +1968,66 @@ impl Harness for VendorHarness {
             Self::Grok(harness, _) => harness.clear_quota(),
             Self::Spiron(harness, _, _) => harness.clear_quota(),
             Self::Contract(harness) => harness.clear_quota(),
+        }
+    }
+
+    fn take_reclaimed_steers(&mut self) -> Vec<String> {
+        match self {
+            Self::Agy(harness, _) => harness.take_reclaimed_steers(),
+            Self::Spiron(harness, _, _) => harness.take_reclaimed_steers(),
+            Self::Contract(harness) => harness.take_reclaimed_steers(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn has_unconfirmed_hold(&self) -> bool {
+        match self {
+            Self::Spiron(harness, _, _) => harness.has_unconfirmed_hold(),
+            Self::Contract(harness) => harness.has_unconfirmed_hold(),
+            _ => false,
+        }
+    }
+
+    fn has_unconfirmed_idle_hold(&self) -> bool {
+        match self {
+            Self::Spiron(harness, _, _) => harness.has_unconfirmed_idle_hold(),
+            Self::Contract(harness) => harness.has_unconfirmed_idle_hold(),
+            _ => false,
+        }
+    }
+
+    fn peek_unconfirmed_request_ids(&self) -> Vec<String> {
+        match self {
+            Self::Spiron(harness, _, _) => harness.peek_unconfirmed_request_ids(),
+            Self::Contract(harness) => harness.peek_unconfirmed_request_ids(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn reconcile_unconfirmed_for_recovery(
+        &mut self,
+    ) -> Result<Option<anyagents_harness::ReconciledUnconfirmed>, HarnessError> {
+        match self {
+            Self::Spiron(harness, marker, _) => {
+                let dir = harness.state_dir();
+                let session_id = harness.session_id().or_else(|| {
+                    std::fs::read_to_string(marker)
+                        .ok()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                });
+                let Some(mut rec) = harness.reconcile_unconfirmed_for_recovery()? else {
+                    return Ok(None);
+                };
+                if let (Some(dir), Some(sid)) = (dir, session_id)
+                    && !rec.request_ids.is_empty()
+                {
+                    populate_spiron_journal_reconciliation(&dir, &sid, &mut rec);
+                }
+                Ok(Some(rec))
+            }
+            Self::Contract(harness) => harness.reconcile_unconfirmed_for_recovery(),
+            _ => Ok(None),
         }
     }
 
@@ -2109,7 +2334,7 @@ rmdir -- "$1"
         let peer = data.join("agents/foreign-seat");
         directory(&peer, 0o711, 0, 0);
         let mut protected = Vec::new();
-        for name in ["config", "memory", "skills"] {
+        for name in ["config", "memory", "skills", "sessions", "transcripts"] {
             directory(&peer.join(name), 0o700, 0, 0);
             file(
                 &peer.join(name).join("private"),
@@ -2120,11 +2345,23 @@ rmdir -- "$1"
             protected.push(peer.join(name));
             protected.push(peer.join(name).join("private"));
         }
-        for name in ["sessions", "transcripts"] {
-            directory(&root.join(name), 0o700, 0, 0);
-            file(&root.join(name).join("private"), "host-only\n", 0o600, 0);
-            protected.push(root.join(name).join("private"));
-        }
+        directory(&root.join("sessions"), 0o2770, 0, gid);
+        file(
+            &root.join("sessions/private"),
+            "host-only
+",
+            0o660,
+            gid,
+        );
+        directory(&root.join("transcripts"), 0o700, 0, 0);
+        file(
+            &root.join("transcripts/private"),
+            "host-only
+",
+            0o600,
+            0,
+        );
+        protected.push(root.join("transcripts/private"));
         for name in [
             "secrets",
             "operator-token",
@@ -2231,12 +2468,17 @@ done
 printf synthetic-memory-after > "$ANYAGENTS_AGENT_CONFIG/../memory/MEMORY.md"
 printf authored > "$ANYAGENTS_AGENT_CONFIG/../skills/authored"
 rm "$ANYAGENTS_AGENT_CONFIG/../skills/authored"
-for path in "$ANYAGENTS_DATA/secrets" "$ANYAGENTS_DATA/operator-token" "$ANYAGENTS_DATA/agents/foreign-seat/memory/private" "$ANYAGENTS_AGENT_CONFIG/../sessions/private"; do
+grep -qx host-only "$ANYAGENTS_AGENT_CONFIG/../sessions/private"
+printf 'host-only\n' > "$ANYAGENTS_AGENT_CONFIG/../sessions/private"
+printf 'created\n' > "$ANYAGENTS_AGENT_CONFIG/../sessions/created"
+grep -qx created "$ANYAGENTS_AGENT_CONFIG/../sessions/created"
+rm "$ANYAGENTS_AGENT_CONFIG/../sessions/created"
+for path in "$ANYAGENTS_DATA/secrets" "$ANYAGENTS_DATA/operator-token" "$ANYAGENTS_DATA/agents/foreign-seat/memory/private" "$ANYAGENTS_DATA/agents/foreign-seat/sessions/private" "$ANYAGENTS_DATA/agents/foreign-seat/transcripts/private" "$ANYAGENTS_AGENT_CONFIG/../transcripts/private"; do
   if cat "$path" >/dev/null 2>&1; then exit 41; fi
   if (printf forbidden > "$path") 2>/dev/null; then exit 42; fi
 done
 if (printf forbidden > "$ANYAGENTS_AGENT_CONFIG/.agy/skills/global/SKILL.md") 2>/dev/null; then exit 43; fi
-printf 'ACTUAL_UID=%s PRIMARY_GID=%s REAL_MOUNTS_UMASK077_OWNER_FALLBACK_OK SAME_SEAT_OK MEMORY_RW_OK PRIVATE_GLOBAL_DENIED GIT_TRUST_EXACT\n' "$(id -u)" "$(id -g)" > "$ANYAGENTS_AGENT_CONFIG/native-vendor-report.tmp"
+printf 'ACTUAL_UID=%s PRIMARY_GID=%s REAL_MOUNTS_UMASK077_OWNER_FALLBACK_OK SAME_SEAT_OK MEMORY_RW_OK SESSIONS_RW_OK PRIVATE_GLOBAL_DENIED GIT_TRUST_EXACT\n' "$(id -u)" "$(id -g)" > "$ANYAGENTS_AGENT_CONFIG/native-vendor-report.tmp"
 mv "$ANYAGENTS_AGENT_CONFIG/native-vendor-report.tmp" "$ANYAGENTS_AGENT_CONFIG/native-vendor-report"
 # Keep the real adapter child alive until its owner drops the harness.
 cat >/dev/null
@@ -2963,9 +3205,17 @@ done
         let text = std::fs::read_to_string(&settings_path).unwrap();
         let json: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(json["queuedMessages"], "send-immediately");
+        let expected_mcp_grant = format!(
+            "read_file({})",
+            config_dir
+                .join(".gemini")
+                .join("antigravity-cli")
+                .join("mcp")
+                .display()
+        );
         assert_eq!(
             json["permissions"]["allow"],
-            serde_json::json!(["mcp(anyagents/*)"])
+            serde_json::json!(["mcp(anyagents/*)", expected_mcp_grant])
         );
         assert_eq!(
             json["permissions"]["deny"],
@@ -2981,15 +3231,12 @@ done
                 "open_browser_url",
                 "run_command",
                 "manage_task",
-                "read_file",
                 "write_file",
                 "edit_file",
-                "view_file",
                 "grep_search",
                 "find_by_name",
                 "list_dir",
                 "command(*)",
-                "read_file(*)",
                 "write_file(*)",
                 "read_url(*)",
                 "execute_url(*)"
@@ -3030,6 +3277,128 @@ done
         let hooks_json2: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&hooks_path).unwrap()).unwrap();
         assert_eq!(hooks_json2, hooks_json);
+    }
+
+    #[test]
+    fn agy_native_tool_guard_allows_only_mcp_schema_reads_and_prunes_stale_read_deny() {
+        let dir = crate::test_tempdir();
+        let config_dir = dir.path().join("config");
+        let work_dir = dir.path().join("work");
+        let mcp_dir = config_dir
+            .join(".gemini")
+            .join("antigravity-cli")
+            .join("mcp")
+            .join("anyagents");
+        std::fs::create_dir_all(&mcp_dir).unwrap();
+        std::fs::create_dir_all(&work_dir).unwrap();
+
+        // Pre-seed legacy static read_file(*) deny to verify automatic healing.
+        let settings_path = config_dir
+            .join(".gemini")
+            .join("antigravity-cli")
+            .join("settings.json");
+        std::fs::write(
+            &settings_path,
+            serde_json::json!({
+                "permissions": {
+                    "allow": ["mcp(anyagents/*)"],
+                    "deny": ["read_file", "view_file", "read_file(*)", "command(*)"]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        ensure_agy_steering_settings(&config_dir, &work_dir).unwrap();
+        let healed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        let deny_list = healed["permissions"]["deny"].as_array().unwrap();
+        for stale in ["read_file", "view_file", "read_file(*)"] {
+            assert!(
+                !deny_list.iter().any(|v| v.as_str() == Some(stale)),
+                "stale deny {stale} must be pruned"
+            );
+        }
+
+        let schema_file = mcp_dir.join("code.json");
+        std::fs::write(&schema_file, r#"{"name":"code"}"#).unwrap();
+        let work_secret = work_dir.join("secret.txt");
+        std::fs::write(&work_secret, "workspace secret").unwrap();
+        let oauth_token = config_dir
+            .join(".gemini")
+            .join("antigravity-cli")
+            .join("antigravity-oauth-token");
+        std::fs::write(&oauth_token, "token").unwrap();
+        #[cfg(unix)]
+        let escaped_symlink = {
+            let link = mcp_dir.join("escape.json");
+            std::os::unix::fs::symlink(&work_secret, &link).unwrap();
+            link
+        };
+
+        let hooks_path = config_dir.join(".gemini").join("config").join("hooks.json");
+        let hooks_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&hooks_path).unwrap()).unwrap();
+        let cmd = hooks_json["anyagents-native-tool-guard"]["PreToolUse"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+
+        let run_hook = |tool: &str, path: Option<&Path>| -> serde_json::Value {
+            use std::io::Write as _;
+            let payload = match path {
+                Some(p) => serde_json::json!({
+                    "toolCall": { "name": tool, "args": { "Path": p.display().to_string() } }
+                }),
+                None => serde_json::json!({
+                    "toolCall": { "name": tool, "args": { "CommandLine": "ls" } }
+                }),
+            };
+            let mut child = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(cmd)
+                .env("HOME", &config_dir)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(payload.to_string().as_bytes())
+                .unwrap();
+            let out = child.wait_with_output().unwrap();
+            assert!(out.status.success());
+            serde_json::from_slice(&out.stdout).unwrap()
+        };
+
+        let allow_out = run_hook("read_file", Some(&schema_file));
+        assert_eq!(allow_out["decision"], "allow");
+
+        for blocked_path in [
+            &work_secret,
+            &oauth_token,
+            #[cfg(unix)]
+            &escaped_symlink,
+        ] {
+            let deny_out = run_hook("read_file", Some(blocked_path));
+            assert_eq!(deny_out["decision"], "deny");
+            assert!(
+                deny_out["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("call_mcp_tool")
+            );
+        }
+
+        let cmd_deny = run_hook("run_command", None);
+        assert_eq!(cmd_deny["decision"], "deny");
+        assert!(
+            cmd_deny["reason"]
+                .as_str()
+                .unwrap()
+                .contains("call_mcp_tool")
+        );
     }
     #[test]
     fn poisoned_agy_session_retires_only_the_pointer_and_stale_error() {

@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 pub struct AgentView {
     #[serde(default)]
     pub has_open_turn: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_turn_age_ms: Option<i64>,
     #[serde(default)]
     pub profile: Option<String>,
     pub id: String,

@@ -24,6 +24,16 @@ The established pattern for running vendor agents is a long-lived gateway that d
 
 Everything runs in one process, `anyagents serve`, with one embedded database. Each module below is one crate with one public interface; the protocol gateway is a sixth module used only in API-key mode.
 
+## Three-axis vendor-neutral model (`Harness × Profile × Sandbox`)
+
+AnyAgents never runs an internal LLM loop. Every agent is a pure composition of three orthogonal axes:
+
+- **Harness (`anyagents-harness`, `spiron`, `cloud_harness`):** Which external single-agent loop executes turns (`spiron` CLI / `spiron-cloud` at `https://spiron.ai`, `claude-code` / `claude-cloud`, `codex` / `openai-cloud`, `opencode`, `agy`, `muse`, `omp`, `dsh`, `grok`, `cursor-cloud`).
+- **Profile (`profiles/<provider>/<profile>`):** Which upstream subscription or API key authenticates (`anthropic`, `openai`, `google-antigravity`, `muse`, `openrouter`, `sylphx`, Coding Plans). Profile-to-harness resolution is strictly **fail-closed**: if a bound profile has no mapping for the target harness (for example, binding an OAuth-only subscription profile to `opencode` without an OpenCode provider/auth/key mapping), AnyAgents refuses configuration rather than writing an empty config that silently degrades to an external free tier.
+- **Sandbox (`anyagents_tools::WorkspaceBackend` trait):** Where filesystem and shell operations execute—`LocalWorkspace` (default host directory or git worktree), `RemoteSandboxWorkspace` (Cloud Sandbox / E2B HTTP APIs), `DockerWorkspace` (`docker://<host>`), or custom trait implementations.
+
+System prompt rendering (`write_agent_instructions_with_continuity`) injects a minimal, persona-neutral identity and routing envelope (`arXiv:2611.05306`, `arXiv:2611.03931`) so each sub-agent starts with an unpolluted short context window while tool schemas carry API parameter details.
+
 ## AnyAgents owns the state
 
 An agent's identity, instructions, conversation history, mailbox, channels and credentials live in AnyAgents, never only in a vendor tool's local files. A vendor session is a working copy. So an agent can move to another harness or another model and keep its history, its mailbox and its Telegram bot.
@@ -658,15 +668,20 @@ presence of a role label. The default CLI depth limit applies equally to all rol
 ### External steering custody
 
 A Spiron `steer_ack` proves socket acceptance, not journal commit. AnyAgents
-keeps that message in its durable mailbox until the owner's terminal `result`
-confirms completion without `undelivered_steers`. A terminal nonempty or malformed
-`undelivered_steers` receipt retains steering custody, records a reconciliation
-fault, and retains the ID-only `spiron-unconfirmed-steers.json` hold written in
-its config directory before any input bytes are dispatched. A returned hold-write
-error refuses the unsent input without advancing its mailbox cursor; confirmed
-terminal completion clears the hold. The hold survives child/coordinator restart;
-the adapter neither marks the steer finished nor silently replays potentially
-side-effecting work.
-The original message remains in the mailbox. Reconcile the named turn/input
-against the external session journal and any completed effects before removing
-the hold and resuming; removing it without reconciliation can duplicate effects.
+writes an ID-only `spiron-unconfirmed-steers.json` hold in the agent's config
+directory before any input bytes are dispatched; a hold-write error refuses the
+unsent input without advancing its mailbox cursor, and confirmed terminal
+completion without `undelivered_steers` clears the hold. Standalone adapter and
+`DeliveryLoop::run_once` passes never silently replay raw input while a hold is
+present.
+
+Under `Supervisor`, mid-turn process exits, coordinator restarts, unconfirmed
+`undelivered_steers` receipts, and transient upstream stream/server failures
+automatically reconcile `spiron-unconfirmed-steers.json` against Spiron's local
+`sessions.sqlite3` (`session_entries`), promote all messages of the interrupted
+turn into `turn_recovery`, archive/clear the hold and stale error state, and
+resume via an explicit `[Recovery]` turn instructing the agent to verify actual
+state before repeating side effects. An explicit `reset-session` similarly
+archives any retired-generation hold under `sessions/retired-<generation>/`,
+clears `.anyagents-last-error.json`, and retains unfinished mail in
+`turn_recovery` so the new session generation starts cleanly with `[Recovery]`.

@@ -66,6 +66,17 @@ impl<H: Harness> DeliveryLoop<H> {
     pub fn start(store: Store, agent_id: AgentId, harness: H) -> Result<Self, Error> {
         store.agent(&agent_id)?;
         let lock = store.try_lock_agent(&agent_id)?;
+        Self::start_with_lock(store, lock, agent_id, harness)
+    }
+
+    /// Construct a delivery loop from an already-acquired per-agent process lock.
+    pub fn start_with_lock(
+        store: Store,
+        lock: anyagents_core::AgentLock,
+        agent_id: AgentId,
+        harness: H,
+    ) -> Result<Self, Error> {
+        store.agent(&agent_id)?;
         Ok(Self {
             store,
             agent_id,
@@ -92,7 +103,17 @@ impl<H: Harness> DeliveryLoop<H> {
     /// Hand every undelivered message to the harness in sequence order, moving
     /// the cursor after each one its native input or steer API has taken. A
     /// quota answer is returned, not retried.
+    fn drain_reclaimed_steers(&mut self) -> Result<(), Error> {
+        let reclaimed = self.harness.take_reclaimed_steers();
+        if !reclaimed.is_empty() {
+            self.store
+                .reclaim_unconfirmed_steers(&self.agent_id, &reclaimed)?;
+        }
+        Ok(())
+    }
+
     pub fn run_once(&mut self) -> Result<RunOutcome, Error> {
+        self.drain_reclaimed_steers()?;
         let mut delivered = 0u64;
         if self.harness.health().turn_state == TurnState::Idle
             && !self.store.has_actionable_undelivered(&self.agent_id)?
@@ -117,7 +138,7 @@ impl<H: Harness> DeliveryLoop<H> {
             match self.harness.deliver(&outbound(&message)) {
                 Ok(DeliverOutcome::Accepted { turn_finished }) => {
                     self.store.note_delivered(&self.agent_id, seq)?;
-                    if turn_finished {
+                    if turn_finished && self.harness.health().sign_in_fault.is_none() {
                         self.store.note_turn_completed(&self.agent_id)?;
                     }
                     delivered += 1;
@@ -127,6 +148,7 @@ impl<H: Harness> DeliveryLoop<H> {
                 // The pass ends with what it did take, never with the line
                 // claimed as delivered.
                 Ok(DeliverOutcome::Deferred) => {
+                    self.drain_reclaimed_steers()?;
                     return Ok(if delivered == 0 {
                         RunOutcome::Idle
                     } else {
@@ -134,11 +156,18 @@ impl<H: Harness> DeliveryLoop<H> {
                     });
                 }
                 Ok(DeliverOutcome::Quota { reset_at_ms }) => {
+                    self.drain_reclaimed_steers()?;
                     self.quota_reset_at_ms = Some(reset_at_ms);
                     return Ok(RunOutcome::Quota { reset_at_ms });
                 }
-                Err(HarnessError::Dead) => return Err(Error::HarnessDown),
-                Err(HarnessError::Failed(reason)) => return Err(Error::HarnessFailed(reason)),
+                Err(HarnessError::Dead) => {
+                    let _ = self.drain_reclaimed_steers();
+                    return Err(Error::HarnessDown);
+                }
+                Err(HarnessError::Failed(reason)) => {
+                    let _ = self.drain_reclaimed_steers();
+                    return Err(Error::HarnessFailed(reason));
+                }
             }
         }
     }
@@ -237,7 +266,17 @@ impl<H: Harness> DeliveryLoop<H> {
         &mut self,
         open: &anyagents_core::OpenTurn,
     ) -> Result<DeliverOutcome, Error> {
-        let note = recovery_outbound(open);
+        self.recover_open_turn_with_reconciliation(open, None)
+    }
+
+    /// Deliver a synthetic `[Recovery]` message annotated with external session
+    /// journal reconciliation details when available.
+    pub fn recover_open_turn_with_reconciliation(
+        &mut self,
+        open: &anyagents_core::OpenTurn,
+        reconciled: Option<&anyagents_harness::ReconciledUnconfirmed>,
+    ) -> Result<DeliverOutcome, Error> {
+        let note = recovery_outbound_with_reconciliation(open, reconciled);
         match self.harness.deliver(&note) {
             Ok(DeliverOutcome::Accepted { turn_finished }) => {
                 self.store
@@ -262,6 +301,13 @@ impl<H: Harness> DeliveryLoop<H> {
 /// Build the synthetic `[Recovery]` user message that wakes a resumed CLI
 /// session when its previous process died mid-turn (`opened_seq > completed_seq`).
 pub fn recovery_outbound(open: &anyagents_core::OpenTurn) -> OutboundMessage {
+    recovery_outbound_with_reconciliation(open, None)
+}
+
+pub fn recovery_outbound_with_reconciliation(
+    open: &anyagents_core::OpenTurn,
+    reconciled: Option<&anyagents_harness::ReconciledUnconfirmed>,
+) -> OutboundMessage {
     let last = open
         .messages
         .last()
@@ -294,6 +340,16 @@ pub fn recovery_outbound(open: &anyagents_core::OpenTurn) -> OutboundMessage {
                 clip_chars(&out.body, 300).replace('\n', " ")
             ));
         }
+    }
+    if let Some(rec) = reconciled
+        && (!rec.journal_committed_ids.is_empty() || !rec.journal_missing_ids.is_empty())
+    {
+        lines.push(String::new());
+        lines.push(format!(
+            "Session journal reconciliation: committed=[{}], unconfirmed_before_journal=[{}].",
+            rec.journal_committed_ids.join(", "),
+            rec.journal_missing_ids.join(", "),
+        ));
     }
     lines.push(String::new());
     lines.push(

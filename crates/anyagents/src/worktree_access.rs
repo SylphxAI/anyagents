@@ -1438,7 +1438,7 @@ fn with_directory(
     walk_tree_depth(path, false, &|_| {}, &|f, _| apply(f), false)
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn descriptor_privilege_launcher() -> Option<PathBuf> {
     if !crate::sandbox::is_isolated_test_env()
         || std::env::var_os("ANYAGENTS_REQUIRE_NATIVE_SEAT_TEST").is_some()
@@ -1964,6 +1964,7 @@ fn walk_tree_policy(
                     0
                 };
             before_open(&child_path);
+            #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
             let mut child = unsafe { libc::openat(fd, name.as_ptr(), flags) };
             #[cfg(target_os = "linux")]
             if child < 0
@@ -1980,9 +1981,14 @@ fn walk_tree_policy(
                 };
                 if path_fd >= 0 {
                     let bound = unsafe { std::fs::File::from_raw_fd(path_fd) };
+                    #[allow(
+                        clippy::unnecessary_cast,
+                        reason = "stat fields differ across Unix targets"
+                    )]
+                    let (stat_dev, stat_ino) = (stat.st_dev as u64, stat.st_ino as u64);
                     if let Ok(bmeta) = bound.metadata()
-                        && bmeta.dev() == stat.st_dev as u64
-                        && bmeta.ino() == stat.st_ino as u64
+                        && bmeta.dev() == stat_dev
+                        && bmeta.ino() == stat_ino
                         && (bmeta.is_dir() || (bmeta.is_file() && bmeta.nlink() == 1))
                     {
                         let min_mode = ((bmeta.mode() & 0o7777)

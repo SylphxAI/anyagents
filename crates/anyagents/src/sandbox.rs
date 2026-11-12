@@ -466,14 +466,24 @@ pub fn share_config_with_seat_uid(config_dir: &Path, uid: u32, gid: u32) {
             eprintln!("seat: cannot share {}: {error}", path.display());
         }
     }
+    // Sessions holds the harness session database and must stay admitted
+    // to the seat principal (0o2770 + seat group) exactly like config, or
+    // seat-side resume fails with Permission denied (os error 13).
+    // Transcripts remain host-private under daemon ownership.
+    let sessions_dir = config_dir.with_file_name("sessions");
+    let _ = std::fs::create_dir_all(&sessions_dir);
+    if sessions_dir.is_dir()
+        && let Err(err) = crate::seat_tree::share_config(&sessions_dir, eff_uid, eff_gid)
+    {
+        eprintln!("seat: cannot share {}: {err}", sessions_dir.display());
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        for host_only in ["sessions", "transcripts"] {
-            let p = config_dir.with_file_name(host_only);
-            if p.is_dir() {
-                let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700));
-            }
+        let transcripts_dir = config_dir.with_file_name("transcripts");
+        if transcripts_dir.is_dir() {
+            let _ =
+                std::fs::set_permissions(&transcripts_dir, std::fs::Permissions::from_mode(0o700));
         }
     }
 }
@@ -790,6 +800,30 @@ pub(super) fn descriptor_launcher() -> Option<PathBuf> {
 
 fn give_tree(dir: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
     crate::seat_tree::share(dir, uid, gid)
+}
+
+/// Prepare per-agent disposable build and temporary directories on the scratch
+/// tier and grant read/write ownership to the agent's OS seat.
+pub(crate) fn prepare_scratch_dirs_for_seat(
+    scratch_root: &Path,
+    agent_id: &anyagents_core::AgentId,
+    uid: u32,
+    gid: u32,
+) -> std::io::Result<()> {
+    let build_root = anyagents_core::agent_scratch_build_dir(scratch_root, agent_id);
+    let tmp_root = anyagents_core::agent_scratch_tmp_dir(scratch_root, agent_id);
+    for dir in [
+        build_root.clone(),
+        build_root.join("cargo"),
+        build_root.join("gradle"),
+        build_root.join("derived-data"),
+        tmp_root.clone(),
+    ] {
+        ensure_seat_dir_as_owner(&dir, uid, gid, 0o2770)?;
+    }
+    give_tree(&build_root, uid, gid)?;
+    give_tree(&tmp_root, uid, gid)?;
+    Ok(())
 }
 
 /// Start one admitted agent command, or say what admission is missing.

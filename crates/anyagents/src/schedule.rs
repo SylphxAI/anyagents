@@ -779,23 +779,23 @@ pub fn tick_task_subagent_turn_ownership(store: &Store, health: &HealthBoard, no
                     }
                 }
             }
-        } else if last_out_ms > 0 && last_out_ms >= last_in_ms {
-            if !matches!(parent.state.as_str(), "paused" | "archived")
-                && !crate::server::is_explicitly_archived(store.data_dir(), parent)
-                && agent_wake_block_reason(store, health, parent, now).is_none()
-                && let Ok(parent_snap) = store.turn_ownership_snapshot(&parent.id)
-            {
-                let ref_ms = last_out_ms.max(parent_snap.last_delivered_at_ms.unwrap_or(0));
-                if now.saturating_sub(ref_ms) >= 900_000 {
-                    waiting_by_parent
-                        .entry(parent.id.clone())
-                        .or_default()
-                        .push((
-                            child.name.clone(),
-                            child.role.clone().unwrap_or_else(|| "task".to_string()),
-                            last_out_ms,
-                        ));
-                }
+        } else if last_out_ms > 0
+            && last_out_ms >= last_in_ms
+            && !matches!(parent.state.as_str(), "paused" | "archived")
+            && !crate::server::is_explicitly_archived(store.data_dir(), parent)
+            && agent_wake_block_reason(store, health, parent, now).is_none()
+            && let Ok(parent_snap) = store.turn_ownership_snapshot(&parent.id)
+        {
+            let ref_ms = last_out_ms.max(parent_snap.last_delivered_at_ms.unwrap_or(0));
+            if now.saturating_sub(ref_ms) >= 900_000 {
+                waiting_by_parent
+                    .entry(parent.id.clone())
+                    .or_default()
+                    .push((
+                        child.name.clone(),
+                        child.role.clone().unwrap_or_else(|| "task".to_string()),
+                        last_out_ms,
+                    ));
             }
         }
     }

@@ -777,12 +777,17 @@ fn set_state(data: &Path, name: &str, state: &str) -> Result<AgentView, Error> {
         let _ = std::fs::remove_file(cfg.join(".anyagents-last-error.json"));
         let _ = std::fs::remove_file(cfg.join(".anyagents-notified-parent-error.json"));
         let now = anyagents_core::now_ms();
-        let _ = std::fs::write(cfg.join(".anyagents-quota-cleared-ms"), format!("{now}\n"));
+        crate::create::write_profile_marker(
+            &cfg,
+            ".anyagents-quota-cleared-ms",
+            &format!("{now}\n"),
+        )?;
         if !store.has_open_turn(&found.id).unwrap_or(false) {
-            let _ = std::fs::write(
-                cfg.join(".anyagents-profile-rotated-ms"),
-                format!("{now}\n"),
-            );
+            crate::create::write_profile_marker(
+                &cfg,
+                ".anyagents-profile-rotated-ms",
+                &format!("{now}\n"),
+            )?;
         }
     }
     if state == "running" {
@@ -813,6 +818,7 @@ fn set_state(data: &Path, name: &str, state: &str) -> Result<AgentView, Error> {
     let lifecycle_val = agent.lifecycle().to_string();
     Ok(AgentView {
         has_open_turn: false,
+        open_turn_age_ms: None,
         profile: None,
         id: agent.id.to_string(),
         name: agent.name,
@@ -882,7 +888,7 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
         ),
         None => None,
     };
-    crate::create::apply_archetype_defaults(data, parent_agent.as_ref(), &mut parsed)
+    crate::create::apply_archetype_defaults(Some(&store), data, parent_agent.as_ref(), &mut parsed)
         .map_err(|err| err.to_string())?;
     if let Some(scope) = parsed.scope.as_deref() {
         anyagents_core::parse_agent_scope(scope).map_err(|err| err.to_string())?;
@@ -962,6 +968,7 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
     let lifecycle_val = agent.lifecycle().to_string();
     Ok(AgentView {
         has_open_turn: false,
+        open_turn_age_ms: None,
         profile: None,
         id: agent.id.to_string(),
         name: agent.name,
@@ -1484,13 +1491,33 @@ pub fn flush(data: &Path, name: &str) -> Result<(), anyagents_core::Error> {
     Ok(())
 }
 
-/// Recorded usage, summed. The socket has no usage route yet, so this reads the
-/// stored rows.
-pub fn usage(data: &Path, agent: Option<&str>, by: Option<&str>) -> Result<(), UsageError> {
-    use anyagents_core::sum_usage;
+/// Parameters for the structured usage query.
+#[derive(Debug, Default, Clone)]
+pub struct UsageParams {
+    pub agent: Option<String>,
+    pub group_by: Option<String>,
+    pub since_ms: Option<i64>,
+    pub until_ms: Option<i64>,
+    pub days: Option<i64>,
+    pub include_descendants: Option<bool>,
+}
+
+/// Recorded usage, summed. Prefers the daemon socket (`GET /v1/usage`) so an
+/// isolated seat process never has to open the owner-only store file; only
+/// when the daemon is unavailable does it fall back to a read-only direct
+/// open of the store, keeping the historical output unchanged.
+pub fn usage(data: &Path, params: &UsageParams) -> Result<(), UsageError> {
+    use anyagents_core::{UsageReport, sum_usage};
     use std::collections::HashMap;
-    let by_day = match by {
-        None => false,
+
+    // Normalize the legacy `--by day` spelling onto `group_by`.
+    let group_by = params
+        .group_by
+        .as_deref()
+        .map(str::trim)
+        .filter(|g| !g.is_empty());
+    let by_day = match group_by {
+        None | Some("agent") => false,
         Some("day") => true,
         Some(other) => {
             return Err(UsageError::Refused(format!(
@@ -1498,8 +1525,52 @@ pub fn usage(data: &Path, agent: Option<&str>, by: Option<&str>) -> Result<(), U
             )));
         }
     };
+
+    // 1) Socket-first: the daemon resolves the caller from its credential
+    // and enforces the causal authorization boundary server-side.
+    let mut qs: Vec<(String, String)> = Vec::new();
+    if let Some(agent) = params.agent.as_deref().filter(|a| !a.trim().is_empty()) {
+        qs.push(("agent".into(), agent.to_string()));
+    }
+    if let Some(v) = params.include_descendants {
+        qs.push(("include_descendants".into(), v.to_string()));
+    }
+    if let Some(v) = params.since_ms {
+        qs.push(("since_ms".into(), v.to_string()));
+    }
+    if let Some(v) = params.until_ms {
+        qs.push(("until_ms".into(), v.to_string()));
+    }
+    if let Some(v) = params.days {
+        qs.push(("days".into(), v.to_string()));
+    }
+    if let Some(g) = group_by {
+        qs.push(("group_by".into(), g.to_string()));
+    }
+    let path = if qs.is_empty() {
+        "/v1/usage".to_string()
+    } else {
+        let q = qs
+            .iter()
+            .map(|(k, v)| format!("{k}={}", crate::mcp::urlencoding_simple_pub(v)))
+            .collect::<Vec<_>>()
+            .join("&");
+        format!("/v1/usage?{q}")
+    };
+    match crate::client::get::<UsageReport>(data, &path) {
+        Ok(Some(report)) => {
+            print_report(&report);
+            return Ok(());
+        }
+        Ok(None) => {} // daemon unavailable: fall through to the read-only open
+        Err(err) => return Err(UsageError::Refused(err)),
+    }
+
+    // 2) Fallback: read-only direct open of the store (historical behavior).
+    // Only the legacy dimensions are renderable offline; window/subtree
+    // filters require the daemon.
     let store = open(data)?;
-    let agent = match agent {
+    let agent = match params.agent.as_deref() {
         Some(name) => Some(store.agent_by_name(name)?),
         None => None,
     };
@@ -1568,6 +1639,83 @@ pub fn usage(data: &Path, agent: Option<&str>, by: Option<&str>) -> Result<(), U
         );
     }
     Ok(())
+}
+
+/// Render a socket `UsageReport` in the historical table/TSV shape.
+fn print_report(report: &anyagents_core::UsageReport) {
+    let grouped = !matches!(report.group_by, anyagents_core::UsageGroupBy::Agent);
+    if crate::ui::is_pretty() {
+        if report.buckets.is_empty() {
+            println!("  {}", crate::ui::dim("No usage records found."));
+            return;
+        }
+        println!("\n  {}\n", crate::ui::bold_cyan("Token Usage"));
+        let mut table = crate::ui::Table::new(&[
+            ("AGENT", false),
+            ("DAY", false),
+            ("MODEL", false),
+            ("HARNESS", false),
+            ("INPUT", true),
+            ("OUTPUT", true),
+            ("CACHE READ", true),
+            ("CACHE WRITE", true),
+            ("COST", true),
+        ]);
+        for b in &report.buckets {
+            let name = b
+                .agent_name
+                .as_deref()
+                .unwrap_or_else(|| b.agent_id.as_str());
+            let dim = b
+                .day
+                .as_deref()
+                .or(b.model.as_deref())
+                .or(b.harness.as_deref())
+                .unwrap_or("all-time");
+            let _ = grouped;
+            let cost = match b.totals.reported_cost_micros {
+                Some(micros) => crate::ui::green(&format!("${:.4}", micros as f64 / 1_000_000.0)),
+                None => crate::ui::dim("-"),
+            };
+            table.add_row(vec![
+                crate::ui::bold(name),
+                crate::ui::dim(dim),
+                crate::ui::dim(b.model.as_deref().unwrap_or("-")),
+                crate::ui::dim(b.harness.as_deref().unwrap_or("-")),
+                crate::ui::format_tokens(b.totals.input_tokens),
+                crate::ui::format_tokens(b.totals.output_tokens),
+                crate::ui::format_tokens(b.totals.cache_read_tokens),
+                crate::ui::format_tokens(b.totals.cache_write_tokens),
+                cost,
+            ]);
+        }
+        table.print();
+        println!();
+        return;
+    }
+    for b in &report.buckets {
+        let name = b
+            .agent_name
+            .as_deref()
+            .unwrap_or_else(|| b.agent_id.as_str());
+        let dim = b
+            .day
+            .as_deref()
+            .or(b.model.as_deref())
+            .or(b.harness.as_deref())
+            .unwrap_or("-");
+        let cost = match b.totals.reported_cost_micros {
+            Some(micros) => micros.to_string(),
+            None => "-".to_string(),
+        };
+        println!(
+            "{name}\t{dim}\t{}\t{}\t{}\t{}\t{cost}",
+            b.totals.input_tokens,
+            b.totals.output_tokens,
+            b.totals.cache_read_tokens,
+            b.totals.cache_write_tokens,
+        );
+    }
 }
 
 #[cfg(test)]

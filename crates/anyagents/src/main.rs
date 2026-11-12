@@ -377,13 +377,29 @@ enum Command {
     },
     /// Zero-Embedding Lexical + Structured search across historical and live conversations.
     Search(SearchArgs),
-    /// List recorded usage.
+    /// List recorded usage. Queried through the daemon socket when it is
+    /// running, with a read-only direct fallback otherwise.
     Usage {
         #[arg(long)]
         agent: Option<String>,
-        /// Group sums. Only `day` is supported.
+        /// Group sums (`agent`, `day`, `model`, `harness`). `day` is the
+        /// legacy spelling of `--group-by day`.
         #[arg(long)]
         by: Option<String>,
+        #[arg(long = "group-by")]
+        group_by: Option<String>,
+        /// Include causal descendants of `--agent`.
+        #[arg(long)]
+        include_descendants: bool,
+        /// Window start, inclusive (unix ms).
+        #[arg(long = "since-ms")]
+        since_ms: Option<i64>,
+        /// Window end, inclusive (unix ms).
+        #[arg(long = "until-ms")]
+        until_ms: Option<i64>,
+        /// Trailing window in days.
+        #[arg(long)]
+        days: Option<i64>,
     },
     /// Speak MCP for one agent. Its capability comes from its config
     /// directory, never from a name.
@@ -1345,11 +1361,29 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
                 options: args.options,
             },
         ),
-        Command::Usage { agent, by } => agent::usage(&data, agent.as_deref(), by.as_deref())
-            .map_err(|err| match err {
-                agent::UsageError::Store(err) => err,
-                agent::UsageError::Refused(text) => anyagents_core::Error::Message(text),
-            }),
+        Command::Usage {
+            agent,
+            by,
+            group_by,
+            include_descendants,
+            since_ms,
+            until_ms,
+            days,
+        } => agent::usage(
+            &data,
+            &agent::UsageParams {
+                agent,
+                group_by: group_by.or(by),
+                since_ms,
+                until_ms,
+                days,
+                include_descendants: include_descendants.then_some(true),
+            },
+        )
+        .map_err(|err| match err {
+            agent::UsageError::Store(err) => err,
+            agent::UsageError::Refused(text) => anyagents_core::Error::Message(text),
+        }),
         Command::Channels { action } => channel::channels(&data, action),
         Command::Groups { action } => groups(&data, action),
         Command::Describe {
@@ -2115,17 +2149,30 @@ fn sign_in(data: &Path, target: &str, profile: Option<&str>) -> Result<(), anyag
             .join(format!(".signin-staging-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&staging_dir);
         std::fs::create_dir_all(&staging_dir)?;
-        let outcome = match anyagents_installer::sign_in_at(
-            &anyagents_installer::builtin_catalog(),
-            &staging_dir,
-            target,
-            &mut runner,
-            &mut sink,
-        ) {
-            Ok(o) => o,
-            Err(err) => {
-                let _ = std::fs::remove_dir_all(&staging_dir);
-                return Err(anyagents_core::Error::Message(err.to_string()));
+        let use_native_agy_pkce = target == "agy"
+            && std::env::var_os("ANYAGENTS_FAKE_MODE").is_none()
+            && std::env::var_os("ANYAGENTS_FAKE_VENDOR_MODE").is_none();
+        let outcome = if use_native_agy_pkce {
+            match signin::google_antigravity_pkce_sign_in(&staging_dir, &mut sink) {
+                Ok(o) => o,
+                Err(err) => {
+                    let _ = std::fs::remove_dir_all(&staging_dir);
+                    return Err(err);
+                }
+            }
+        } else {
+            match anyagents_installer::sign_in_at(
+                &anyagents_installer::builtin_catalog(),
+                &staging_dir,
+                target,
+                &mut runner,
+                &mut sink,
+            ) {
+                Ok(o) => o,
+                Err(err) => {
+                    let _ = std::fs::remove_dir_all(&staging_dir);
+                    return Err(anyagents_core::Error::Message(err.to_string()));
+                }
             }
         };
         let (resolved_prof, final_dir, resolved_acct) =
@@ -2147,7 +2194,7 @@ fn sign_in(data: &Path, target: &str, profile: Option<&str>) -> Result<(), anyag
         let expected_prov = create::upstream_provider_of(&rec.harness, rec.model.as_deref());
         let (prov, prof_name) = prof.split_once('/').unwrap_or((&expected_prov, prof));
         let normalized = format!("{prov}/{prof_name}");
-        std::fs::write(cfg.join(".anyagents-profile"), format!("{normalized}\n"))?;
+        create::write_profile_marker(&cfg, ".anyagents-profile", &format!("{normalized}\n"))?;
         let prof_dir = data.join("profiles").join(prov).join(prof_name);
         let has_stored_creds = std::fs::read_dir(&prof_dir)
             .ok()
@@ -2161,8 +2208,19 @@ fn sign_in(data: &Path, target: &str, profile: Option<&str>) -> Result<(), anyag
             return Ok(());
         }
     }
-    let outcome = signin::sign_in_agent(data, target, &mut runner, &mut sink)?;
     let rec = agent::named(data, target)?;
+    let outcome = if anyagents_harness::normalize_harness_name(&rec.harness) == "agy"
+        && std::env::var_os("ANYAGENTS_FAKE_MODE").is_none()
+        && std::env::var_os("ANYAGENTS_FAKE_VENDOR_MODE").is_none()
+    {
+        let root = std::path::absolute(data)?;
+        let cfg = anyagents_core::agent_config_dir(&root, &rec.id);
+        std::fs::create_dir_all(&cfg)?;
+        std::fs::create_dir_all(anyagents_core::agent_work_dir(&root, &rec.id))?;
+        signin::google_antigravity_pkce_sign_in(&cfg, &mut sink)?
+    } else {
+        signin::sign_in_agent(data, target, &mut runner, &mut sink)?
+    };
     let harness = rec.harness.clone();
     if !outcome.signed_in {
         let hint = signin::install_hint(&harness).unwrap_or_else(|| "-".to_string());

@@ -19,7 +19,13 @@ fn lock(root: &Path) -> io::Result<fs::File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        let _ = fs::set_permissions(&sessions, fs::Permissions::from_mode(0o700));
+        // Sessions is seat-admitted exactly like config: keep 0o2770 with the
+        // existing seat group instead of clamping to a private 0o700. The
+        // daemon stays owner and keeps full access through owner bits, while
+        // the seat principal can enter the directory for harness resume.
+        // Clamping to 0o700 here ran on every active-turn call and caused
+        // seat-side resume to fail with Permission denied (os error 13).
+        let _ = fs::set_permissions(&sessions, fs::Permissions::from_mode(0o2770));
     }
     let file = fs::OpenOptions::new()
         .create(true)
@@ -200,10 +206,53 @@ fn complete_reset(root: &Path, registry: &mut Registry) -> io::Result<()> {
         fs::File::open(&retired_dir)?.sync_all()?;
         fs::File::open(root.join("config"))?.sync_all()?;
     }
+    retire_session_hold_and_errors(root, &pending.session.generation)?;
     registry.active = Some(pending.session);
     registry.pending_reset = None;
     write(root, registry)
 }
+fn retire_session_hold_and_errors(root: &Path, generation: &str) -> io::Result<()> {
+    let config_dir = root.join("config");
+    let Ok(cfg_meta) = fs::symlink_metadata(&config_dir) else {
+        return Ok(());
+    };
+    if !cfg_meta.file_type().is_dir() {
+        return Ok(());
+    }
+    let hold_path = config_dir.join("spiron-unconfirmed-steers.json");
+    if let Ok(meta) = fs::symlink_metadata(&hold_path) {
+        if meta.file_type().is_file() && meta.len() > 0 {
+            let retired_dir = root.join("sessions").join(format!("retired-{generation}"));
+            fs::create_dir_all(&retired_dir)?;
+            let archived = retired_dir.join("spiron-unconfirmed-steers.json");
+            if fs::rename(&hold_path, &archived).is_err() {
+                let _ = fs::copy(&hold_path, &archived);
+                match fs::remove_file(&hold_path) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                    Err(err) => return Err(err),
+                }
+            }
+        } else {
+            match fs::remove_file(&hold_path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err),
+            }
+        }
+    }
+    match fs::remove_file(config_dir.join(".anyagents-last-error.json")) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+    let marker_tmp = config_dir.join(".anyagents-session-reset-recovery.tmp");
+    let marker_dst = config_dir.join(".anyagents-session-reset-recovery");
+    fs::write(&marker_tmp, format!("{generation}\n"))?;
+    fs::rename(&marker_tmp, &marker_dst)?;
+    Ok(())
+}
+
 fn read_ready(root: &Path) -> io::Result<Registry> {
     let mut registry = read(root)?;
     complete_reset(root, &mut registry)?;
@@ -472,6 +521,31 @@ mod tests {
     fn memory(root: &Path, text: &str) {
         fs::create_dir_all(root.join("memory")).unwrap();
         fs::write(root.join("memory/MEMORY.md"), text).unwrap();
+    }
+    #[cfg(unix)]
+    #[test]
+    fn active_turn_keeps_sessions_seat_admitted() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = crate::test_tempdir();
+        let root = dir.path();
+        let sessions = root.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::set_permissions(&sessions, fs::Permissions::from_mode(0o2770)).unwrap();
+        let _ = ensure_active(root, "spiron").unwrap();
+        let mode = fs::metadata(&sessions).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(
+            mode, 0o2770,
+            "active turn keeps sessions seat-admitted, never clamps to 0o700"
+        );
+        let dir2 = crate::test_tempdir();
+        let root2 = dir2.path();
+        let _ = ensure_active(root2, "spiron").unwrap();
+        let mode2 = fs::metadata(root2.join("sessions"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(mode2, 0o2770, "fresh sessions dir is created seat-admitted");
     }
 
     #[test]

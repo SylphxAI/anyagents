@@ -757,7 +757,10 @@ impl Store {
             std::fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(path)?;
-        conn.busy_timeout(Duration::from_secs(15))?;
+        // A 30s wait: ~78 agents finishing at once queue here instead of failing
+        // with `database is locked`. BEGIN IMMEDIATE (not the DEFERRED default)
+        // is what makes the wait apply to read-then-write paths.
+        conn.busy_timeout(Duration::from_secs(30))?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         let mut mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
         if !mode.eq_ignore_ascii_case("wal") {
@@ -2479,22 +2482,16 @@ impl Store {
     /// notifies the supervisor to stop its worker slot), or `Ok(false)` if new
     /// mail arrived, a turn is still open, or a child sub-agent is still running.
     pub fn complete_idle_agent(&self, id: &AgentId) -> Result<bool, Error> {
-        let cfg_dir = crate::agent_config_dir(self.data_dir(), id);
-        let err_file = cfg_dir.join(".anyagents-last-error.json");
+        let err_file =
+            crate::agent_config_dir(self.data_dir(), id).join(".anyagents-last-error.json");
         if let Ok(raw) = std::fs::read_to_string(&err_file)
             && let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw)
-            && let Some(err_str) = val
+            && val
                 .get("error")
                 .and_then(serde_json::Value::as_str)
-                .filter(|s| !s.trim().is_empty())
+                .is_some_and(|s| !s.trim().is_empty())
         {
-            if err_str.contains("spiron-unconfirmed-steers.json")
-                && !cfg_dir.join("spiron-unconfirmed-steers.json").exists()
-            {
-                let _ = std::fs::remove_file(&err_file);
-            } else {
-                return Ok(false);
-            }
+            return Ok(false);
         }
         let (transitioned, parent_to_wake, silent_completion) = {
             let mut conn = self.conn();
@@ -4213,6 +4210,116 @@ impl Store {
         Ok(())
     }
 
+    /// Ensure message IDs from a reconciled external input hold are recorded in
+    /// `turn_recovery` as an open interrupted turn (and past `delivered_seq`)
+    /// so recovery resumes them with `[Recovery]` rather than raw replay.
+    pub fn promote_messages_to_open_turn(
+        &self,
+        agent_id: &AgentId,
+        message_ids: &[String],
+    ) -> Result<(), Error> {
+        if message_ids.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        agent_by_id(&tx, agent_id)?;
+        let mut seqs = Vec::new();
+        for msg_id in message_ids {
+            if let Some(seq) = tx
+                .query_row(
+                    "SELECT seq FROM messages WHERE agent_id = ?1 AND id = ?2",
+                    params![agent_id.as_str(), msg_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?
+            {
+                seqs.push(seq);
+            }
+        }
+        let (Some(&min_seq), Some(&max_seq)) = (seqs.iter().min(), seqs.iter().max()) else {
+            return Ok(());
+        };
+        let cur = cursor(&tx, agent_id)?;
+        let now = now_ms();
+        if max_seq > cur {
+            tx.execute(
+                "INSERT INTO mailbox_cursors (agent_id, delivered_seq) VALUES (?1, ?2)
+                 ON CONFLICT(agent_id) DO UPDATE SET delivered_seq = MAX(delivered_seq, ?2)",
+                params![agent_id.as_str(), max_seq],
+            )?;
+            tx.execute(
+                "UPDATE messages
+                 SET delivered_at_ms = COALESCE(delivered_at_ms, ?1)
+                 WHERE agent_id = ?2 AND seq > ?3 AND seq <= ?4",
+                params![now, agent_id.as_str(), cur, max_seq],
+            )?;
+        }
+        let completed_floor = (min_seq - 1).max(0);
+        tx.execute(
+            "INSERT INTO turn_recovery (agent_id, opened_seq, completed_seq, recovery_count, opened_at_ms)
+             VALUES (?1, ?2, ?3, 0, ?4)
+             ON CONFLICT(agent_id) DO UPDATE SET
+                 opened_seq = MAX(turn_recovery.opened_seq, ?2),
+                 completed_seq = MIN(turn_recovery.completed_seq, ?3)",
+            params![agent_id.as_str(), max_seq, completed_floor, now],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Rewind mailbox delivery custody for mid-turn steered messages whose
+    /// execution became unconfirmed (e.g. cancelled before terminal commit).
+    pub fn reclaim_unconfirmed_steers(
+        &self,
+        agent_id: &AgentId,
+        message_ids: &[String],
+    ) -> Result<(), Error> {
+        if message_ids.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        agent_by_id(&tx, agent_id)?;
+        let mut min_seq: Option<i64> = None;
+        for msg_id in message_ids {
+            if let Some(seq) = tx
+                .query_row(
+                    "SELECT seq FROM messages
+                     WHERE agent_id = ?1 AND id = ?2 AND delivered_at_ms IS NOT NULL",
+                    params![agent_id.as_str(), msg_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?
+            {
+                min_seq = Some(min_seq.map_or(seq, |cur| cur.min(seq)));
+            }
+        }
+        if let Some(first_reclaimed_seq) = min_seq {
+            let rewind_to = (first_reclaimed_seq - 1).max(0);
+            tx.execute(
+                "UPDATE mailbox_cursors
+                 SET delivered_seq = MIN(delivered_seq, ?1)
+                 WHERE agent_id = ?2",
+                params![rewind_to, agent_id.as_str()],
+            )?;
+            tx.execute(
+                "UPDATE messages
+                 SET delivered_at_ms = NULL
+                 WHERE agent_id = ?1 AND seq >= ?2",
+                params![agent_id.as_str(), first_reclaimed_seq],
+            )?;
+            tx.execute(
+                "UPDATE turn_recovery
+                 SET opened_seq = MIN(opened_seq, ?1)
+                 WHERE agent_id = ?2",
+                params![rewind_to, agent_id.as_str()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Set the internal communication and discovery scope (`"isolated"`, `"private"`, `"siblings"`, or `"public"`).
     pub fn set_agent_scope(&self, agent_id: &AgentId, scope: &str) -> Result<Agent, Error> {
         self.set_agent_scope_as(agent_id, scope, "system")
@@ -4332,28 +4439,34 @@ impl Store {
 
     /// Mark the agent's current open turn as completed (`completed_seq = opened_seq`).
     pub fn note_turn_completed(&self, agent_id: &AgentId) -> Result<(), Error> {
-        let conn = self.conn();
-        agent_by_id(&conn, agent_id)?;
-        conn.execute(
+        let mut conn = self.conn();
+        // BEGIN IMMEDIATE: a SELECT-then-UPDATE under BEGIN DEFERRED raises
+        // SQLITE_BUSY without honouring busy_timeout when a peer is writing.
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        agent_by_id(&tx, agent_id)?;
+        tx.execute(
             "UPDATE turn_recovery
              SET completed_seq = opened_seq,
                  recovery_count = 0
              WHERE agent_id = ?1 AND completed_seq < opened_seq",
             [agent_id.as_str()],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
     /// Record that one `[Recovery]` wake was delivered for `opened_seq`.
     pub fn note_turn_recovered(&self, agent_id: &AgentId, opened_seq: i64) -> Result<(), Error> {
-        let conn = self.conn();
-        agent_by_id(&conn, agent_id)?;
-        conn.execute(
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        agent_by_id(&tx, agent_id)?;
+        tx.execute(
             "UPDATE turn_recovery
              SET recovery_count = recovery_count + 1
              WHERE agent_id = ?1 AND opened_seq = ?2",
             params![agent_id.as_str(), opened_seq],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -4471,9 +4584,10 @@ impl Store {
             day: new.day,
             recorded_at_ms: now_ms(),
         };
-        let conn = self.conn();
-        agent_by_id(&conn, &record.agent_id)?;
-        conn.execute(
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        agent_by_id(&tx, &record.agent_id)?;
+        tx.execute(
             "INSERT INTO usage_records (
                 id, agent_id, harness, model, input_tokens, output_tokens,
                 cache_read_tokens, cache_write_tokens, reported_cost_micros,
@@ -4496,6 +4610,7 @@ impl Store {
                 record.recorded_at_ms,
             ],
         )?;
+        tx.commit()?;
         Ok(record)
     }
 
@@ -4574,7 +4689,7 @@ impl Store {
                     | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
             )
         {
-            let _ = c.busy_timeout(Duration::from_secs(5));
+            let _ = c.busy_timeout(Duration::from_secs(30));
             let _ = c.pragma_update(None, "query_only", "ON");
             return ReadConn::Owned(c);
         }
@@ -4910,8 +5025,17 @@ fn schedule_from_row(row: &rusqlite::Row<'_>) -> Result<AgentSchedule, rusqlite:
     })
 }
 
-/// `{data}/agents/{id}/work`.
+/// `{workspaces}/{id}` when `ANYAGENTS_WORKSPACES_DIR` is configured,
+/// otherwise `{data}/agents/{id}/work`.
 pub fn agent_work_dir(data_dir: &Path, id: &AgentId) -> PathBuf {
+    if let Some(workspaces) = crate::storage::configured_workspaces_dir() {
+        return workspaces.join(id.as_str());
+    }
+    legacy_agent_work_dir(data_dir, id)
+}
+
+/// Single-root `{data}/agents/{id}/work` path.
+pub fn legacy_agent_work_dir(data_dir: &Path, id: &AgentId) -> PathBuf {
     data_dir.join("agents").join(id.as_str()).join("work")
 }
 
@@ -5122,6 +5246,337 @@ pub fn sum_usage(records: &[UsageRecord], by_day: bool) -> Vec<UsageTotal> {
         }
     }
     totals.into_values().collect()
+}
+
+/// How a structured usage query groups its detail buckets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageGroupBy {
+    Agent,
+    Day,
+    Model,
+    Harness,
+}
+
+impl UsageGroupBy {
+    /// Parse a caller-supplied grouping. Empty text means per-agent buckets.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "" | "agent" => Ok(Self::Agent),
+            "day" => Ok(Self::Day),
+            "model" => Ok(Self::Model),
+            "harness" => Ok(Self::Harness),
+            other => Err(format!(
+                "unsupported group_by `{other}`: expected agent, day, model or harness"
+            )),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Agent => "agent",
+            Self::Day => "day",
+            Self::Model => "model",
+            Self::Harness => "harness",
+        }
+    }
+}
+
+/// Inclusive time-window and grouping options for a usage aggregation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UsageFilter {
+    pub since_ms: Option<i64>,
+    pub until_ms: Option<i64>,
+    /// `days = N` keeps records with `recorded_at_ms >= now_ms - N days`,
+    /// intersected with any explicit bounds.
+    pub days: Option<i64>,
+    pub group_by: UsageGroupBy,
+}
+
+impl Default for UsageFilter {
+    fn default() -> Self {
+        Self {
+            since_ms: None,
+            until_ms: None,
+            days: None,
+            group_by: UsageGroupBy::Agent,
+        }
+    }
+}
+
+impl UsageFilter {
+    /// Resolve the effective inclusive `(since_ms, until_ms)` window.
+    pub fn window(self, now_ms: i64) -> Result<(Option<i64>, Option<i64>), String> {
+        let mut since = self.since_ms;
+        if let Some(days) = self.days {
+            if days <= 0 {
+                return Err("days must be a positive number of days".to_string());
+            }
+            let span = days
+                .checked_mul(86_400_000)
+                .ok_or_else(|| "days is too large".to_string())?;
+            let bound = now_ms.checked_sub(span).unwrap_or(i64::MIN);
+            since = Some(since.map_or(bound, |s| s.max(bound)));
+        }
+        if let (Some(since), Some(until)) = (since, self.until_ms)
+            && since > until
+        {
+            return Err("since_ms must not be after until_ms".to_string());
+        }
+        Ok((since, self.until_ms))
+    }
+}
+
+/// Aggregated usage metrics shared by grand totals and per-bucket detail.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct UsageTotals {
+    pub turns: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
+    pub reported_cost_micros: Option<i64>,
+}
+
+impl UsageTotals {
+    fn add_record(&mut self, record: &UsageRecord) {
+        self.turns += 1;
+        self.input_tokens += record.input_tokens;
+        self.output_tokens += record.output_tokens;
+        self.cache_read_tokens += record.cache_read_tokens;
+        self.cache_write_tokens += record.cache_write_tokens;
+        if let Some(cost) = record.reported_cost_micros {
+            self.reported_cost_micros = Some(self.reported_cost_micros.unwrap_or(0) + cost);
+        }
+    }
+
+    fn add_totals(&mut self, other: &Self) {
+        self.turns += other.turns;
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.cache_read_tokens += other.cache_read_tokens;
+        self.cache_write_tokens += other.cache_write_tokens;
+        if let Some(cost) = other.reported_cost_micros {
+            self.reported_cost_micros = Some(self.reported_cost_micros.unwrap_or(0) + cost);
+        }
+    }
+}
+
+/// One grouped usage bucket. Buckets are always per-agent; the optional
+/// `day`/`model`/`harness` fields carry the extra grouping dimension.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct UsageBucket {
+    pub agent_id: AgentId,
+    pub agent_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub day: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
+    #[serde(flatten)]
+    pub totals: UsageTotals,
+}
+
+/// A structured usage aggregation: grand totals plus grouped buckets,
+/// deterministically sorted by agent, then day/model/harness.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct UsageReport {
+    pub group_by: UsageGroupBy,
+    pub agent_ids: Vec<AgentId>,
+    pub totals: UsageTotals,
+    pub buckets: Vec<UsageBucket>,
+}
+
+/// Aggregate `records` for `agent_ids` in the filter window.
+///
+/// `agent_names` supplies best-effort display names. The window is tested
+/// against each record's `recorded_at_ms` with inclusive bounds.
+pub fn aggregate_usage(
+    records: &[UsageRecord],
+    agent_ids: &[AgentId],
+    agent_names: &std::collections::HashMap<AgentId, String>,
+    filter: UsageFilter,
+    now_ms: i64,
+) -> Result<UsageReport, String> {
+    use std::collections::{BTreeMap, HashSet};
+    let (since, until) = filter.window(now_ms)?;
+    let allowed: HashSet<&AgentId> = agent_ids.iter().collect();
+    // Key: (agent id, day, model, harness); only the grouped dimension is set.
+    type Key = (String, String, String, String);
+    let mut buckets: BTreeMap<Key, UsageBucket> = BTreeMap::new();
+    let mut totals = UsageTotals::default();
+    for record in records {
+        if !allowed.contains(&record.agent_id) {
+            continue;
+        }
+        if since.is_some_and(|s| record.recorded_at_ms < s)
+            || until.is_some_and(|u| record.recorded_at_ms > u)
+        {
+            continue;
+        }
+        let (day, model, harness) = match filter.group_by {
+            UsageGroupBy::Agent => (None, None, None),
+            UsageGroupBy::Day => (Some(record.day.clone()), None, None),
+            UsageGroupBy::Model => (None, record.model.clone(), None),
+            UsageGroupBy::Harness => (None, None, Some(record.harness.clone())),
+        };
+        let key: Key = (
+            record.agent_id.as_str().to_string(),
+            day.clone().unwrap_or_default(),
+            model.clone().unwrap_or_default(),
+            harness.clone().unwrap_or_default(),
+        );
+        let bucket = buckets.entry(key).or_insert_with(|| UsageBucket {
+            agent_id: record.agent_id.clone(),
+            agent_name: agent_names.get(&record.agent_id).cloned(),
+            day: day.clone(),
+            model: model.clone(),
+            harness: harness.clone(),
+            totals: UsageTotals::default(),
+        });
+        bucket.totals.add_record(record);
+        totals.add_record(record);
+    }
+    let bucket_values: Vec<UsageBucket> = buckets.into_values().collect();
+    // Fold the grand total from the buckets so the two can never diverge.
+    let mut folded = UsageTotals::default();
+    for bucket in &bucket_values {
+        folded.add_totals(&bucket.totals);
+    }
+    debug_assert_eq!(totals, folded);
+    Ok(UsageReport {
+        group_by: filter.group_by,
+        agent_ids: agent_ids.to_vec(),
+        totals,
+        buckets: bucket_values,
+    })
+}
+
+/// Why a usage query was refused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UsageAccessError {
+    /// The caller may not see usage for the requested target.
+    Forbidden(String),
+    /// The request itself is invalid (unknown agent, bad parameters).
+    Invalid(String),
+}
+
+impl std::fmt::Display for UsageAccessError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Forbidden(msg) | Self::Invalid(msg) => f.write_str(msg),
+        }
+    }
+}
+
+impl std::error::Error for UsageAccessError {}
+
+/// All causal descendants of `root` (excluding `root` itself), following
+/// `parent_id` links over `agents`.
+pub fn usage_descendants(root: &AgentId, agents: &[Agent]) -> Vec<AgentId> {
+    let mut set = std::collections::HashSet::from([root.clone()]);
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for agent in agents {
+            if let Some(parent) = &agent.parent_id
+                && set.contains(parent)
+                && set.insert(agent.id.clone())
+            {
+                changed = true;
+            }
+        }
+    }
+    set.remove(root);
+    let mut out: Vec<AgentId> = set.into_iter().collect();
+    out.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    out
+}
+
+/// Whether `caller` may query usage across the whole workspace: the local
+/// operator (`None`), a root caller (`parent_id` is `None`), or a caller
+/// whose scope is `public`.
+pub fn usage_caller_is_privileged(caller: Option<&Agent>) -> bool {
+    match caller {
+        None => true,
+        Some(agent) => agent.parent_id.is_none() || agent.scope() == "public",
+    }
+}
+
+fn find_agent<'a>(agents: &'a [Agent], target: &str) -> Option<&'a Agent> {
+    agents
+        .iter()
+        .find(|a| a.name.eq_ignore_ascii_case(target) || a.id.as_str() == target)
+}
+
+/// Resolve the exact agent set a usage query may read. This is the causal
+/// authorization boundary and it fails closed:
+///
+/// - privileged callers (operator, root, `public` scope) may read every
+///   agent, or an explicit target with optional descendants;
+/// - any other caller may read only itself and its causal descendants. An
+///   omitted target means "my subtree"; naming a parent, sibling or any
+///   unrelated agent, or asking for `all`, is forbidden and returns no data.
+///
+/// `include_descendants` defaults to `false` for an explicitly named target
+/// and to `true` when the target is omitted for a non-privileged caller.
+pub fn resolve_usage_agents(
+    caller: Option<&Agent>,
+    agents: &[Agent],
+    target: Option<&str>,
+    include_descendants: Option<bool>,
+) -> Result<Vec<AgentId>, UsageAccessError> {
+    let all_ids: Vec<AgentId> = agents.iter().map(|a| a.id.clone()).collect();
+    let target = target.map(str::trim).filter(|t| !t.is_empty());
+    let privileged = usage_caller_is_privileged(caller);
+
+    if target.is_none_or(|t| t == "all" || t == "*") {
+        if privileged {
+            return Ok(all_ids);
+        }
+        if target.is_some() {
+            return Err(UsageAccessError::Forbidden(
+                "usage query for all agents requires a public or root caller".to_string(),
+            ));
+        }
+        let caller = caller.expect("a non-privileged caller is an agent");
+        let mut ids = vec![caller.id.clone()];
+        ids.extend(usage_descendants(&caller.id, agents));
+        return Ok(ids);
+    }
+
+    let target = target.expect("target checked above");
+    let target_agent = if target.eq_ignore_ascii_case("self") {
+        match caller {
+            Some(caller) => agents.iter().find(|a| a.id == caller.id),
+            None => None,
+        }
+        .ok_or_else(|| {
+            UsageAccessError::Invalid("agent `self` requires an agent caller".to_string())
+        })?
+    } else {
+        find_agent(agents, target)
+            .ok_or_else(|| UsageAccessError::Invalid(format!("unknown agent `{target}`")))?
+    };
+
+    if !privileged {
+        let caller = caller.expect("a non-privileged caller is an agent");
+        let mut visible = std::collections::HashSet::from([caller.id.clone()]);
+        visible.extend(usage_descendants(&caller.id, agents));
+        if !visible.contains(&target_agent.id) {
+            return Err(UsageAccessError::Forbidden(format!(
+                "agent `{}` cannot query usage for `{}`",
+                caller.name, target_agent.name
+            )));
+        }
+    }
+
+    let mut ids = vec![target_agent.id.clone()];
+    if include_descendants.unwrap_or(false) {
+        ids.extend(usage_descendants(&target_agent.id, agents));
+    }
+    Ok(ids)
 }
 
 /// A capability as it is stored: a digest under this server's key, which lives
@@ -7873,6 +8328,208 @@ mod tests {
         assert_eq!(store.list_usage(Some(&agent.id)).unwrap(), vec![record]);
     }
 
+    fn usage_record(agent_id: &AgentId, at_ms: i64, day: &str, model: &str) -> UsageRecord {
+        UsageRecord {
+            id: UsageId::generate(),
+            agent_id: agent_id.clone(),
+            harness: "harness-a".into(),
+            model: Some(model.into()),
+            input_tokens: 10,
+            output_tokens: 20,
+            cache_read_tokens: 3,
+            cache_write_tokens: 4,
+            reported_cost_micros: Some(5),
+            estimated_cost_micros: None,
+            billing_mode: BillingMode::Subscription,
+            quota_state: None,
+            day: day.into(),
+            recorded_at_ms: at_ms,
+        }
+    }
+
+    #[test]
+    fn aggregate_usage_groups_and_windows() {
+        let (_dir, store) = setup();
+        let alpha = agent(&store, "alpha");
+        let beta = agent(&store, "beta");
+        let now = 1_000_000_000_000i64;
+        let day_ms = 86_400_000i64;
+        let records = vec![
+            usage_record(&alpha.id, now - day_ms, "2026-10-17", "m1"),
+            usage_record(&alpha.id, now, "2026-10-18", "m1"),
+            usage_record(&alpha.id, now, "2026-10-18", "m2"),
+            usage_record(&beta.id, now, "2026-10-18", "m1"),
+        ];
+        let names = std::collections::HashMap::from([
+            (alpha.id.clone(), alpha.name.clone()),
+            (beta.id.clone(), beta.name.clone()),
+        ]);
+        let ids = vec![alpha.id.clone(), beta.id.clone()];
+        // Inclusive window: only the two records at `now`.
+        let report = aggregate_usage(
+            &records,
+            &ids,
+            &names,
+            UsageFilter {
+                since_ms: Some(now),
+                until_ms: Some(now),
+                ..UsageFilter::default()
+            },
+            now,
+        )
+        .unwrap();
+        assert_eq!(report.totals.turns, 3);
+        assert_eq!(report.totals.input_tokens, 30);
+        assert_eq!(report.totals.reported_cost_micros, Some(15));
+        // group_by model -> alpha splits into m1/m2, beta is m1.
+        let by_model = aggregate_usage(
+            &records,
+            &ids,
+            &names,
+            UsageFilter {
+                group_by: UsageGroupBy::Model,
+                ..UsageFilter::default()
+            },
+            now,
+        )
+        .unwrap();
+        assert_eq!(by_model.buckets.len(), 3);
+        assert_eq!(by_model.buckets[0].model.as_deref(), Some("m1"));
+        // group_by day -> alpha has two days.
+        let by_day = aggregate_usage(
+            &records,
+            &ids,
+            &names,
+            UsageFilter {
+                group_by: UsageGroupBy::Day,
+                ..UsageFilter::default()
+            },
+            now,
+        )
+        .unwrap();
+        assert_eq!(by_day.buckets.len(), 3);
+        // days=1 keeps everything recorded within the last day (all four).
+        let by_days = aggregate_usage(
+            &records,
+            &ids,
+            &names,
+            UsageFilter {
+                days: Some(1),
+                ..UsageFilter::default()
+            },
+            now,
+        )
+        .unwrap();
+        assert_eq!(by_days.totals.turns, 4);
+        // group_by harness collapses to one bucket per agent.
+        let by_harness = aggregate_usage(
+            &records,
+            &ids,
+            &names,
+            UsageFilter {
+                group_by: UsageGroupBy::Harness,
+                ..UsageFilter::default()
+            },
+            now,
+        )
+        .unwrap();
+        assert_eq!(by_harness.buckets.len(), 2);
+        assert!(
+            by_harness
+                .buckets
+                .iter()
+                .all(|b| b.harness.as_deref() == Some("harness-a"))
+        );
+        // Bad inputs fail rather than guessing.
+        assert!(
+            UsageFilter {
+                days: Some(0),
+                ..UsageFilter::default()
+            }
+            .window(now)
+            .is_err()
+        );
+        assert!(UsageGroupBy::parse("week").is_err());
+    }
+
+    #[test]
+    fn resolve_usage_agents_enforces_causal_boundary() {
+        let (_dir, store) = setup();
+        let root = agent(&store, "root");
+        let child_new = {
+            let mut n = NewAgent::new("child", "claude-code");
+            n.parent_id = Some(root.id.clone());
+            n
+        };
+        let child = store.create_agent(child_new).unwrap();
+        let grand_new = {
+            let mut n = NewAgent::new("grandchild", "claude-code");
+            n.parent_id = Some(child.id.clone());
+            n
+        };
+        let grandchild = store.create_agent(grand_new).unwrap();
+        let sib_new = {
+            let mut n = NewAgent::new("sibling", "claude-code");
+            n.parent_id = Some(root.id.clone());
+            n
+        };
+        let sibling = store.create_agent(sib_new).unwrap();
+        let agents = store.list_agents().unwrap();
+        let caller = agents.iter().find(|a| a.id == child.id).unwrap();
+
+        // Omitted target: caller's own subtree only.
+        let ids = resolve_usage_agents(Some(caller), &agents, None, None).unwrap();
+        assert!(ids.contains(&child.id));
+        assert!(ids.contains(&grandchild.id));
+        assert!(!ids.contains(&root.id));
+        assert!(!ids.contains(&sibling.id));
+        // Self, child and grandchild are visible; parent and sibling are not.
+        for name in ["self", "child", "grandchild"] {
+            assert!(
+                resolve_usage_agents(Some(caller), &agents, Some(name), None).is_ok(),
+                "{name} should be visible"
+            );
+        }
+        for name in ["root", "sibling", "all", "*"] {
+            assert!(
+                matches!(
+                    resolve_usage_agents(Some(caller), &agents, Some(name), None),
+                    Err(UsageAccessError::Forbidden(_))
+                ),
+                "{name} should be forbidden"
+            );
+        }
+        assert!(matches!(
+            resolve_usage_agents(Some(caller), &agents, Some("ghost"), None),
+            Err(UsageAccessError::Invalid(_))
+        ));
+        // Explicit target without the subtree switch is exact-agent only.
+        let exact = resolve_usage_agents(Some(caller), &agents, Some("child"), None).unwrap();
+        assert_eq!(exact, vec![child.id.clone()]);
+        let subtree =
+            resolve_usage_agents(Some(caller), &agents, Some("child"), Some(true)).unwrap();
+        assert_eq!(subtree.len(), 2);
+        // A public-scope caller and a root caller are privileged.
+        store.set_agent_scope(&child.id, "public").unwrap();
+        let agents = store.list_agents().unwrap();
+        let public_caller = agents.iter().find(|a| a.id == child.id).unwrap();
+        let all = resolve_usage_agents(Some(public_caller), &agents, Some("all"), None).unwrap();
+        assert_eq!(all.len(), 4);
+        assert!(resolve_usage_agents(Some(public_caller), &agents, Some("root"), None).is_ok());
+        let root_caller = agents.iter().find(|a| a.id == root.id).unwrap();
+        assert_eq!(
+            resolve_usage_agents(Some(root_caller), &agents, None, None)
+                .unwrap()
+                .len(),
+            4
+        );
+        // The local operator (`None`) is privileged too.
+        assert_eq!(
+            resolve_usage_agents(None, &agents, Some("sibling"), Some(true)).unwrap(),
+            vec![sibling.id.clone()]
+        );
+    }
+
     #[test]
     fn second_lock_is_busy_until_the_first_drops() {
         let (dir, store) = setup();
@@ -9940,5 +10597,97 @@ mod tests {
         let sleep_after = crate::learned_memory::read_sleep_state(&root);
         assert_eq!(sleep_after.last_inbound_seq, 1);
         assert_eq!(sleep_after.consolidated_topics, 1);
+    }
+
+    #[test]
+    fn steered_active_turn_advances_cursor_without_lag_and_reclaim_rewinds_custody() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store.create_agent(NewAgent::new("steered", "agy")).unwrap();
+
+        let mut first_in = Incoming::new("long running turn");
+        first_in.received_at_ms = Some(1_000);
+        let ReceiveOutcome::New(first) = store.receive(&agent.id, first_in).unwrap() else {
+            panic!("expected new message");
+        };
+        store.note_delivered(&agent.id, first.seq).unwrap();
+
+        let mut steer_in = Incoming::new("mid-turn steer");
+        steer_in.received_at_ms = Some(60_000);
+        let ReceiveOutcome::New(steer) = store.receive(&agent.id, steer_in).unwrap() else {
+            panic!("expected new steer");
+        };
+        store.note_delivered(&agent.id, steer.seq).unwrap();
+
+        assert_eq!(store.delivered_cursor(&agent.id).unwrap(), steer.seq);
+        assert!(store.has_open_turn(&agent.id).unwrap());
+        assert_eq!(
+            store
+                .lag(&agent.id, 3_600_000)
+                .unwrap()
+                .oldest_undelivered_age_ms,
+            None
+        );
+        let open = store.open_turn(&agent.id).unwrap().unwrap();
+        assert_eq!(open.messages.first().unwrap().received_at_ms, 1_000);
+
+        store
+            .reclaim_unconfirmed_steers(&agent.id, &[steer.id.to_string()])
+            .unwrap();
+        assert_eq!(store.delivered_cursor(&agent.id).unwrap(), first.seq);
+        assert!(store.has_open_turn(&agent.id).unwrap());
+        assert_eq!(
+            store.next_undelivered(&agent.id).unwrap().unwrap().id,
+            steer.id
+        );
+        assert!(
+            store
+                .message(&agent.id, steer.id.as_str())
+                .unwrap()
+                .unwrap()
+                .delivered_at_ms
+                .is_none()
+        );
+    }
+    #[test]
+    fn concurrent_turn_completion_never_sees_database_locked() {
+        let (dir, store) = setup();
+        let db = dir.path().join("state.db");
+        let ids: Vec<AgentId> = (0..16)
+            .map(|i| agent(&store, &format!("concurrent-{i}")).id)
+            .collect();
+        // Each worker owns a separate Store (separate connection), mirroring
+        // one supervisor process per agent finishing turns at once.
+        let mut handles = Vec::new();
+        for id in &ids {
+            let db = db.clone();
+            let id = id.clone();
+            handles.push(std::thread::spawn(move || {
+                let store = Store::open(&db).unwrap();
+                for _ in 0..25 {
+                    store.note_turn_completed(&id).unwrap();
+                    store
+                        .record_usage(NewUsage {
+                            agent_id: id.clone(),
+                            harness: "claude-code".into(),
+                            model: Some("m".into()),
+                            input_tokens: 1,
+                            output_tokens: 2,
+                            cache_read_tokens: 0,
+                            cache_write_tokens: 0,
+                            reported_cost_micros: Some(3),
+                            estimated_cost_micros: None,
+                            billing_mode: BillingMode::Subscription,
+                            quota_state: None,
+                            day: "2026-01-01".into(),
+                        })
+                        .unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(store.list_usage(None).unwrap().len(), 16 * 25);
     }
 }

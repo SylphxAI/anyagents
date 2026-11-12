@@ -191,7 +191,16 @@ pub fn ensure_workspace_session(
         ("XDG_STATE_HOME", config_dir.join("state-home")),
         ("XDG_CACHE_HOME", config_dir.join("cache-home")),
         ("HOME", config_dir.to_owned()),
-        ("TMPDIR", config_dir.join("tmp")),
+        (
+            "TMPDIR",
+            anyagents_core::configured_scratch_dir()
+                .and_then(|s| {
+                    anyagents_core::AgentId::parse(agent_id)
+                        .ok()
+                        .map(|id| anyagents_core::agent_scratch_tmp_dir(&s, &id))
+                })
+                .unwrap_or_else(|| config_dir.join("tmp")),
+        ),
     ] {
         environment.push((key.to_owned(), value.display().to_string()));
     }
@@ -339,24 +348,8 @@ fn finish_workspace_session(
     Ok(())
 }
 
-static NEXT_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), Error> {
-    let seq = NEXT_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let pid = std::process::id();
-    let tmp = path.with_file_name(format!(
-        ".{}.{pid}.{seq}.anyagents-new",
-        path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("settings.json")
-    ));
-    std::fs::write(&tmp, bytes)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o664));
-    }
-    std::fs::rename(&tmp, path)?;
+    anyagents_harness::atomic_write_nonempty_file(path, bytes, 0o664)?;
     Ok(())
 }
 
