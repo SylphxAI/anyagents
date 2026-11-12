@@ -1629,12 +1629,14 @@ fn read_stdout(
             continue;
         }
         #[cfg(test)]
-        if let Some(dir) = lock(&shared).state_dir.clone() {
+        {
             use std::io::Write;
+            let path =
+                std::env::temp_dir().join(format!("anya-reader-lines-{}.log", std::process::id()));
             if let Ok(mut f) = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(dir.join("reader-lines.log"))
+                .open(path)
             {
                 let _ = writeln!(f, "line={}", &line[..line.len().min(200)]);
             }

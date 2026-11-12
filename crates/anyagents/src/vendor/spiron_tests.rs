@@ -1013,9 +1013,11 @@ impl SpironRig {
                 tail.trim_end().to_string()
             })
             .unwrap_or_else(|_| "absent".to_string());
-        let lines = std::fs::read_to_string(self.cfg.join("reader-lines.log"))
-            .map(|s| s.lines().count().to_string())
-            .unwrap_or_else(|_| "absent".to_string());
+        let lines = std::fs::read_to_string(
+            std::env::temp_dir().join(format!("anya-reader-lines-{}.log", std::process::id())),
+        )
+        .map(|s| s.lines().count().to_string())
+        .unwrap_or_else(|_| "absent".to_string());
         let reader = std::fs::read_to_string(self.cfg.join("reader-ack.log"))
             .map(|s| {
                 let tail = if s.len() > 800 {
