@@ -819,6 +819,8 @@ fn vendor_launch_inner(
         ));
     }
     if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none() {
+        anyagents_harness::launch_identity::require_configuration()
+            .map_err(|error| error.to_string())?;
         let _ = crate::install::record(&root, &request.agent.harness);
         if let Some(store) = store_opt {
             crate::create::reconcile_agent_runtime_config(

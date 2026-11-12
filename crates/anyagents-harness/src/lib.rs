@@ -6,6 +6,7 @@
 
 mod atomic_fs;
 mod fake;
+pub mod launch_identity;
 pub mod masking;
 mod name;
 mod seat;
@@ -309,6 +310,7 @@ impl Context {
 pub const SERVER_ONLY_ENV: &[&str] = &[
     SEAT_LAUNCH_ENV,
     SEAT_PEERS_ENV,
+    launch_identity::CONFIG_ENV,
     "ANYAGENTS_OPERATOR_TOKEN_FILE",
     "ANYAGENTS_CAPABILITY_KEY",
     "ANYAGENTS_AGENT_UID",
@@ -322,6 +324,13 @@ pub const SERVER_ONLY_ENV: &[&str] = &[
 /// seat, the process is started inside it with `setpriv --reuid … --no-new-privs`,
 /// and no server-only key reaches it.
 pub fn spawn_command(
+    program: &std::path::Path,
+    environment: &[(String, String)],
+) -> Result<std::process::Command, HarnessError> {
+    launch_identity::command(program, environment)
+}
+
+fn spawn_command_unchecked(
     program: &std::path::Path,
     environment: &[(String, String)],
 ) -> Result<std::process::Command, HarnessError> {
