@@ -3288,17 +3288,18 @@ fn agent_view_preloaded(
             last_error = None;
         }
     }
-    if (agent.state == "running" || agent.state == "idle") && quota.is_none_or(|ms| ms <= now) {
-        if let Some(ref err_msg) = last_error {
-            turn_state = if crate::host_memory::is_migration_wait(err_msg) {
-                "idle"
-            } else {
-                "errored"
-            };
-            create::maybe_notify_parent_on_error(store, agent, &cfg, err_msg);
-        }
-        // The parent-error marker is cleared by wake lifecycle owners
-        // (`prepare_agent_wake`, `set_state`), never by a roster read.
+    // The parent-error marker is cleared by wake lifecycle owners
+    // (`prepare_agent_wake`, `set_state`), never by a roster read.
+    if (agent.state == "running" || agent.state == "idle")
+        && quota.is_none_or(|ms| ms <= now)
+        && let Some(ref err_msg) = last_error
+    {
+        turn_state = if crate::host_memory::is_migration_wait(err_msg) {
+            "idle"
+        } else {
+            "errored"
+        };
+        create::maybe_notify_parent_on_error(store, agent, &cfg, err_msg);
     }
     let block_reason = compute_block_reason(quota, last_error.as_deref(), now);
     let open_turn_age_ms = if has_open_turn {

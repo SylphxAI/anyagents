@@ -685,7 +685,6 @@ pub struct Store {
     /// The writer connection's configured busy timeout.
     busy_timeout_ms: AtomicU64,
     /// Count of `read_conn()` calls, for roster statement-count regression tests.
-    #[cfg(test)]
     read_conn_count: AtomicU64,
 }
 
@@ -987,7 +986,6 @@ impl Store {
             capabilities: Mutex::new(None),
             write_retry_budget_ms: AtomicU64::new(WRITE_RETRY_BUDGET.as_millis() as u64),
             busy_timeout_ms: AtomicU64::new(BUSY_TIMEOUT.as_millis() as u64),
-            #[cfg(test)]
             read_conn_count: AtomicU64::new(0),
         })
     }
@@ -5037,18 +5035,15 @@ impl Store {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    #[cfg(test)]
     pub fn read_conn_count(&self) -> u64 {
         self.read_conn_count.load(Ordering::Relaxed)
     }
 
-    #[cfg(test)]
     pub fn reset_read_conn_count(&self) {
         self.read_conn_count.store(0, Ordering::Relaxed);
     }
 
     fn read_conn(&self) -> ReadConn<'_> {
-        #[cfg(test)]
         self.read_conn_count.fetch_add(1, Ordering::Relaxed);
         if !self.db_path.as_os_str().is_empty()
             && let Ok(c) = Connection::open_with_flags(
