@@ -825,11 +825,10 @@ impl Store {
         // Tolerate busy on per-open DDL: a WAL-pinned DB must not make
         // Store::open fail (sandbox skips SEAT_PEERS and denies peer-trees).
         // Defer legacy work to the next open when the WAL frees.
-        if let Err(e) = preserve_legacy_scopes(&mut conn) {
-            if !is_transient_lock_error(&e) {
+        if let Err(e) = preserve_legacy_scopes(&mut conn)
+            && !is_transient_lock_error(&e) {
                 return Err(e);
             }
-        }
         if migrate::current_version(&conn)? < 1 {
             return Err(Error::Message("migrations did not apply".into()));
         }
@@ -845,16 +844,14 @@ impl Store {
             Err(e) if is_transient_sqlite_error(&e) => false,
             Err(e) => return Err(e.into()),
         };
-        if has_legacy_harness {
-            if let Err(e) = conn.execute(
+        if has_legacy_harness
+            && let Err(e) = conn.execute(
                 "UPDATE agents SET harness = 'spiron' WHERE harness IN ('sylphx', 'sylphx-agent', 'sylphx_agent', 'sylphx/default')",
                 [],
-            ) {
-                if !is_transient_sqlite_error(&e) {
+            )
+                && !is_transient_sqlite_error(&e) {
                     return Err(e.into());
                 }
-            }
-        }
         let has_legacy_state: bool = match conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM agents WHERE state NOT IN ('created', 'running', 'idle', 'paused', 'archived'))",
             [],
@@ -864,16 +861,14 @@ impl Store {
             Err(e) if is_transient_sqlite_error(&e) => false,
             Err(e) => return Err(e.into()),
         };
-        if has_legacy_state {
-            if let Err(e) = conn.execute(
+        if has_legacy_state
+            && let Err(e) = conn.execute(
                 "UPDATE agents SET state = 'archived' WHERE state NOT IN ('created', 'running', 'idle', 'paused', 'archived')",
                 [],
-            ) {
-                if !is_transient_sqlite_error(&e) {
+            )
+                && !is_transient_sqlite_error(&e) {
                     return Err(e.into());
                 }
-            }
-        }
         let has_aux_schema: bool = match conn.query_row(
             "SELECT (SELECT count(*) FROM sqlite_master WHERE name IN ('message_versions', 'agent_topology_state', 'idx_rag_chunks_agent_id_time')) = 3",
             [],
@@ -883,8 +878,8 @@ impl Store {
             Err(e) if is_transient_sqlite_error(&e) => true,
             Err(e) => return Err(e.into()),
         };
-        if !has_aux_schema {
-            if let Err(e) = conn.execute_batch(
+        if !has_aux_schema
+            && let Err(e) = conn.execute_batch(
                 "CREATE TABLE IF NOT EXISTS message_versions (
                     agent_id TEXT NOT NULL,
                     chat_id INTEGER NOT NULL,
@@ -900,12 +895,10 @@ impl Store {
                 );
                 CREATE INDEX IF NOT EXISTS idx_rag_chunks_agent_id_time
                     ON rag_chunks(agent_id, timestamp_ms DESC, chunk_id);",
-            ) {
-                if !is_transient_sqlite_error(&e) {
+            )
+                && !is_transient_sqlite_error(&e) {
                     return Err(e.into());
                 }
-            }
-        }
         // UNIQUE(agent_id, seq) already supports reverse mailbox sequence scans.
         // Avoid even idempotent DDL on ordinary opens: it needs the writer lock.
         for (name, sql) in [
@@ -939,13 +932,11 @@ impl Store {
                 Err(e) if is_transient_sqlite_error(&e) => true,
                 Err(e) => return Err(e.into()),
             };
-            if !exists {
-                if let Err(e) = conn.execute_batch(sql) {
-                    if !is_transient_sqlite_error(&e) {
+            if !exists
+                && let Err(e) = conn.execute_batch(sql)
+                    && !is_transient_sqlite_error(&e) {
                         return Err(e.into());
                     }
-                }
-            }
         }
         // Older databases may already have this column from an earlier runtime.
         // Presence, not an arbitrary failed ALTER, is the idempotency condition.
@@ -959,16 +950,14 @@ impl Store {
             Err(e) if is_transient_sqlite_error(&e) => true,
             Err(e) => return Err(e.into()),
         };
-        if !has_public {
-            if let Err(e) = conn.execute(
+        if !has_public
+            && let Err(e) = conn.execute(
                 "ALTER TABLE groups ADD COLUMN public INTEGER NOT NULL DEFAULT 0",
                 [],
-            ) {
-                if !is_transient_sqlite_error(&e) {
+            )
+                && !is_transient_sqlite_error(&e) {
                     return Err(e.into());
                 }
-            }
-        }
         // Current schemas maintain FTS transactionally on every history write.
         // Only legacy upgrades need the full derivative-index validation; doing
         // it on every open scans history and competes with the server writer.
