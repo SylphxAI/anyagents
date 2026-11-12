@@ -1001,15 +1001,15 @@ impl SpironRig {
         let launch = std::fs::read_to_string(self.cfg.join("launch_count"))
             .unwrap_or_else(|_| "absent".to_string());
         let journal = rusqlite::Connection::open(self.cfg.join("sessions.sqlite3"))
-            .and_then(|db| {
-                Ok((
+            .map(|db| {
+                (
                     db.query_row("SELECT COUNT(*) FROM session_entries", [], |r| {
                         r.get::<_, i64>(0)
                     }),
                     db.query_row("SELECT COUNT(*) FROM session_leases", [], |r| {
                         r.get::<_, i64>(0)
                     }),
-                ))
+                )
             })
             .map(|(entries, leases)| format!("entries={entries:?} leases={leases:?}"))
             .unwrap_or_else(|_| "unreadable".to_string());
