@@ -773,10 +773,17 @@ fn vendor_launch_inner(
         request.config_dir.display().to_string(),
     ));
     let reopened;
+    let mut store_reopen_error: Option<anyagents_core::Error> = None;
     let store_opt = if let Some(store) = authority {
         Some(store)
     } else {
-        reopened = anyagents_core::Store::open(request.data_dir.join("state.db")).ok();
+        reopened = match anyagents_core::Store::open(request.data_dir.join("state.db")) {
+            Ok(store) => Some(store),
+            Err(error) => {
+                store_reopen_error = Some(error);
+                None
+            }
+        };
         reopened.as_ref()
     };
     let seat_hint = store_opt
@@ -802,6 +809,18 @@ fn vendor_launch_inner(
         return Err(format!(
             "no admitted execution principal for {}",
             request.agent.id
+        ));
+    }
+    // A seat launch whose state.db could not be reopened would silently
+    // lose the peer projection and every store-backed decision. Fail
+    // closed, naming the reopen error, rather than launching a seat
+    // without it. Single-UID launches keep the previous fallback.
+    if seat_spec.is_some()
+        && let Some(error) = store_reopen_error
+    {
+        return Err(format!(
+            "no seat launch without peers: cannot open state.db {}: {error}",
+            request.data_dir.join("state.db").display()
         ));
     }
     if let Some((_, uid, gid, _)) = resolved_seat.as_ref() {
@@ -895,6 +914,20 @@ fn vendor_launch_inner(
             }
         }
         crate::create::ensure_seat_op_config(&request.config_dir, seat_launch);
+        // Render per-seat gh credentials; never inherit the host gh home.
+        env.retain(|(key, _)| {
+            !matches!(
+                key.as_str(),
+                "GH_CONFIG_DIR" | "GH_TOKEN" | "GITHUB_TOKEN" | "GH_ENTERPRISE_TOKEN"
+            )
+        });
+        if let Some((_, _, seat_gid, _)) = effective_seat.as_ref()
+            && let Some(gh_dir) =
+                crate::sandbox::render_seat_gh_config(&request.config_dir, *seat_gid)
+                    .map_err(|error| error.to_string())?
+        {
+            env.push(("GH_CONFIG_DIR".to_string(), gh_dir.display().to_string()));
+        }
         env.push(("HOME".to_string(), request.config_dir.display().to_string()));
         env.push(("USER".to_string(), seat_user.clone()));
         env.push(("LOGNAME".to_string(), seat_user.clone()));
@@ -3528,6 +3561,65 @@ done
         env.push(("ANYAGENTS_NATIVE_MEMORY_DISABLED".into(), "1".into()));
         enforce_host_memory_env("claude-code", &mut env);
         assert!(env.contains(&("CLAUDE_CODE_DISABLE_AUTO_MEMORY".into(), "1".into())));
+    }
+
+    #[test]
+    fn unopenable_store_refuses_seat_launch() {
+        let _env = crate::server::tests::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let store = anyagents_core::Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(anyagents_core::NewAgent::new("seat-owner", "codex"))
+            .unwrap();
+        // Replace the store file with a directory: the reopen fails at any
+        // uid (root or not), deterministically, instead of downgrading.
+        std::fs::remove_file(dir.path().join("state.db")).unwrap();
+        std::fs::create_dir(dir.path().join("state.db")).unwrap();
+        let config = dir.path().join("config");
+        std::fs::create_dir(&config).unwrap();
+        let keys = [
+            "ANYAGENTS_FAKE_MODE",
+            "ANYAGENTS_AGENT_UID",
+            "ANYAGENTS_AGENT_GID",
+            "ANYAGENTS_SOCKET_GID",
+            "ANYAGENTS_LAUNCHER",
+            "ANYAGENTS_PRINCIPALS",
+        ];
+        let old: Vec<_> = keys.iter().map(|key| std::env::var_os(key)).collect();
+        unsafe {
+            std::env::set_var("ANYAGENTS_FAKE_MODE", "1");
+            std::env::set_var("ANYAGENTS_AGENT_UID", "42001");
+            std::env::set_var("ANYAGENTS_AGENT_GID", "42002");
+            std::env::set_var("ANYAGENTS_SOCKET_GID", "42003");
+            std::env::set_var("ANYAGENTS_LAUNCHER", "/bin/true");
+            std::env::set_var(
+                "ANYAGENTS_PRINCIPALS",
+                serde_json::json!({
+                    agent.id.as_str(): {"user":"synthetic-worker", "uid":42001, "gid":42002, "socket_gid":42003}
+                })
+                .to_string(),
+            );
+        }
+        let error = match vendor_launch(LaunchRequest {
+            agent: agent.clone(),
+            data_dir: dir.path().to_path_buf(),
+            config_dir: config,
+            work_dir: dir.path().join("work"),
+            extra_env: Vec::new(),
+        }) {
+            Ok(_) => panic!("seat launch without a store should be refused"),
+            Err(error) => error,
+        };
+        assert!(error.contains("state.db"), "{error}");
+        assert!(!error.contains("unexpected launch"), "{error}");
+        unsafe {
+            for (key, value) in keys.into_iter().zip(old) {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
     }
 
     #[test]
