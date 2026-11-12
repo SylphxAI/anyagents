@@ -48,19 +48,33 @@ pub(crate) fn set_worktree_identity(path: &Path) -> Result<(), Error> {
         return Err(refusal(path, "consumer did not produce Git metadata"));
     };
     if private == common {
-        return Err(refusal(path, "identity requires a linked worktree"));
-    }
-    validate_config_files(private, common)?;
-    let extension = std::process::Command::new("git")
-        .args(["config", "--no-includes", "--file"])
-        .arg(common.join("config"))
-        .args(["--bool", "--get", "extensions.worktreeConfig"])
-        .output()?;
-    if !extension.status.success() || extension.stdout != b"true\n" {
-        return Err(refusal(
-            path,
-            "consumer must enable extensions.worktreeConfig",
-        ));
+        // Per-seat repositories carry their own identity: the pool never
+        // touches them, so no consumer extension is required. Record the
+        // worktree-config extension and the identity in the seat's own
+        // config.worktree.
+        validate_config_files(private, common)?;
+        let config = common.join("config");
+        let extension = std::process::Command::new("git")
+            .args(["config", "--no-includes", "--file"])
+            .arg(&config)
+            .args(["extensions.worktreeConfig", "true"])
+            .output()?;
+        if !extension.status.success() {
+            return Err(refusal(path, "cannot enable extensions.worktreeConfig"));
+        }
+    } else {
+        validate_config_files(private, common)?;
+        let extension = std::process::Command::new("git")
+            .args(["config", "--no-includes", "--file"])
+            .arg(common.join("config"))
+            .args(["--bool", "--get", "extensions.worktreeConfig"])
+            .output()?;
+        if !extension.status.success() || extension.stdout != b"true\n" {
+            return Err(refusal(
+                path,
+                "consumer must enable extensions.worktreeConfig",
+            ));
+        }
     }
     // No agent has been admitted yet. This parent-controlled private file will
     // receive the read-only ACL/sticky protection before the seat can run.
@@ -103,13 +117,25 @@ pub(crate) fn validate_git_config(path: &Path) -> Result<(), Error> {
 }
 
 fn validate_config_files(private: &Path, common: &Path) -> Result<(), Error> {
-    use std::os::unix::fs::OpenOptionsExt;
-    for path in [
-        common.join("config"),
-        common.join("config.worktree"),
-        private.join("config.worktree"),
-    ] {
-        let file = match if path == common.join("config") {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    // A directory shared as both private and common is a per-seat
+    // repository: git has no separate worktree storage to distinguish.
+    let mut paths = vec![common.join("config")];
+    if private != common {
+        paths.push(common.join("config.worktree"));
+        paths.push(private.join("config.worktree"));
+    } else {
+        paths.push(common.join("config.worktree"));
+    }
+    for path in paths {
+        // Per-seat config.worktree is opened with O_NOFOLLOW directly,
+        // never through the managed symlink; only the legacy common config
+        // goes through the pinned managed open. A per-seat config is
+        // seat-writable by design, so its writes stay allowed and its
+        // contents are refused below instead of its writability.
+        let pinned = path == common.join("config") && private != common;
+        let per_seat_config = path == common.join("config") && private == common;
+        let mut file = match if pinned {
             open_common_config(common, None)
         } else {
             std::fs::OpenOptions::new()
@@ -121,35 +147,79 @@ fn validate_config_files(private: &Path, common: &Path) -> Result<(), Error> {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => return Err(refusal(&path, e)),
         };
-        if !file.metadata()?.is_file() {
+        let meta = file.metadata()?;
+        if !meta.is_file()
+            || per_seat_config && meta.nlink() != 1
+            || meta.len() > 1024 * 1024
+        {
             return Err(refusal(&path, "Git configuration is not a regular file"));
         }
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .map_err(|e| refusal(&path, e))?;
         // --file - and --no-includes inspect only the opened input. Never
         // follow the include or print config values in a diagnostic.
-        let out = std::process::Command::new("git")
-            .args([
-                "-c",
-                "core.hooksPath=/dev/null",
-                "-c",
-                "core.fsmonitor=false",
-                "config",
-                "--no-includes",
-                "--file",
-                "-",
-                "--name-only",
-                "--get-regexp",
-                "^(include\\.path|includeif\\..*\\.path)$",
-            ])
-            .stdin(file)
-            .output()
-            .map_err(|e| refusal(&path, e))?;
-        match out.status.code() {
+        use std::io::Write;
+        let run_check = |args: &[&str]| -> Result<std::process::Output, Error> {
+            let mut child = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-c",
+                    "core.fsmonitor=false",
+                    "config",
+                    "--no-includes",
+                    "--file",
+                    "-",
+                ])
+                .args(args)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .map_err(|e| refusal(&path, e))?;
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(&bytes);
+            }
+            child.wait_with_output().map_err(|e| refusal(&path, e))
+        };
+        let inspect = run_check(&[
+            "--name-only",
+            "--get-regexp",
+            "^(include\\.path|includeif\\..*\\.path)$",
+        ])?;
+        match inspect.status.code() {
             Some(1) => {}
             Some(0) => {
                 return Err(refusal(
                     &path,
                     "Git include/includeIf is unsupported for shared worktrees",
                 ));
+            }
+            _ => {
+                return Err(refusal(
+                    &path,
+                    "cannot validate Git configuration without includes",
+                ));
+            }
+        }
+        // A seat-writable config can name an executable fsmonitor. The
+        // server reads this config as its own uid, so refuse the key
+        // outright: with or without includes, fsmonitor is never inert
+        // once git runs status or diff. Every server-side git invocation
+        // passes core.fsmonitor=false regardless.
+        let fsmonitor = run_check(&["--get", "core.fsmonitor"])?;
+        match fsmonitor.status.code() {
+            Some(1) => {}
+            Some(0) => {
+                let value = String::from_utf8_lossy(&fsmonitor.stdout);
+                if value.trim() != "false" && !value.trim().is_empty() {
+                    return Err(refusal(
+                        &path,
+                        "core.fsmonitor is refused for server-read Git configuration",
+                    ));
+                }
             }
             _ => {
                 return Err(refusal(
@@ -357,6 +427,11 @@ struct Grant {
     private: PathBuf,
     checkout: PathBuf,
     active: bool,
+    /// Shared object-pool repository for per-seat repositories. `None` keeps
+    /// the legacy linked-worktree admission path for checkouts provisioned
+    /// before this field existed; nothing converts them automatically.
+    #[serde(default)]
+    pool: Option<PathBuf>,
     #[serde(default)]
     inspection: bool,
     #[serde(default)]
@@ -910,6 +985,9 @@ impl RecordedWorktree {
     }
 
     pub(crate) fn validate(&self) -> std::io::Result<()> {
+        if self.grant.pool.is_some() {
+            return self.validate_seat();
+        }
         use std::os::unix::fs::MetadataExt;
         let g = &self.grant;
         let current: Grant = serde_json::from_slice(&std::fs::read(&self.journal)?)?;
@@ -950,10 +1028,66 @@ impl RecordedWorktree {
         validate_config_files(&g.private, &g.common).map_err(std::io::Error::other)
     }
 
+    /// Check a per-seat repository against its journal. The seat gitdir is
+    /// exclusive to this seat and seat-writable by design, so there is no
+    /// shared config to protect: the journal plus the config deny-list are
+    /// the trust boundary. Everything the server reads as its own uid stays
+    /// mechanically inert, and a hostile fsmonitor never validates.
+    fn validate_seat(&self) -> std::io::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let g = &self.grant;
+        let Some(pool) = g.pool.as_ref() else {
+            return Err(std::io::Error::other("per-seat grant lacks a pool"));
+        };
+        let current: Grant = serde_json::from_slice(&std::fs::read(&self.journal)?)?;
+        if current.quarantined {
+            return Err(std::io::Error::other(
+                "worktree is quarantined after incomplete ACL recovery",
+            ));
+        }
+        if current.pool.as_ref() != Some(pool) {
+            return Err(std::io::Error::other("per-seat pool changed"));
+        }
+        if g.private != g.common || g.private != g.checkout.join(".git") {
+            return Err(std::io::Error::other("unrecorded seat gitdir layout"));
+        }
+        let git_meta = std::fs::symlink_metadata(&g.private)?;
+        if !git_meta.is_dir()
+            || git_meta.file_type().is_symlink()
+            || git_meta.mode() & 0o002 != 0
+            || std::fs::canonicalize(&g.private)? != g.private
+        {
+            return Err(std::io::Error::other("untrusted seat gitdir"));
+        }
+        let alternates = std::fs::read_to_string(g.private.join("objects/info/alternates"))?;
+        let line = alternates
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty() && !line.starts_with('#'))
+            .ok_or_else(|| std::io::Error::other("seat repository lacks pool alternates"))?;
+        let objects = if Path::new(line).is_absolute() {
+            PathBuf::from(line)
+        } else {
+            g.private.join("objects").join(line)
+        };
+        if std::fs::canonicalize(objects)? != std::fs::canonicalize(pool.join("objects"))? {
+            return Err(std::io::Error::other("seat pool alternates changed"));
+        }
+        if std::fs::read_to_string(pool.join("HEAD")).is_err() {
+            return Err(std::io::Error::other("recorded object pool is missing"));
+        }
+        validate_config_files(&g.private, &g.common).map_err(std::io::Error::other)
+    }
+
     /// Old journals are adopted once under the lifecycle lock. After adoption,
     /// Git's own lock+rename inherits reader ACLs immediately, without a wake.
     fn refresh_config_readers(&self) -> std::io::Result<()> {
         self.validate()?;
+        if self.grant.pool.is_some() {
+            // Per-seat configuration is exclusively the seat's; there are
+            // no shared config readers to refresh.
+            return Ok(());
+        }
         let mut current: Grant = serde_json::from_slice(&std::fs::read(&self.journal)?)?;
         let retained = other_active_grants(&self.journal, &current)?;
         manage_config(&mut current, &self.journal, &retained)
@@ -1116,6 +1250,14 @@ impl RecordedWorktree {
     }
 
     pub(crate) fn checkout_pointer_matches(&self) -> bool {
+        if self.grant.pool.is_some() {
+            let git = self.grant.checkout.join(".git");
+            return std::fs::symlink_metadata(&git).is_ok_and(|meta| {
+                meta.is_dir()
+                    && !meta.file_type().is_symlink()
+                    && std::fs::canonicalize(&git).is_ok_and(|path| path == self.grant.private)
+            });
+        }
         use std::io::Read;
         use std::os::unix::fs::OpenOptionsExt;
         let path = self.grant.checkout.join(".git");
@@ -1157,9 +1299,13 @@ pub(crate) fn revoke_recorded(data: &Path, id: &anyagents_core::AgentId) -> Resu
     if !grant.active && !grant.inspection {
         return Ok(());
     }
-    let retained = other_active_grants(&journal, &grant).map_err(|e| refusal(&journal, e))?;
-    revoke_common(&grant.common, grant.uid, grant.gid, &retained, None)
-        .map_err(|e| refusal(&grant.common, e))?;
+    if grant.pool.is_some() {
+        revoke_seat(&grant.common, grant.uid, grant.gid).map_err(|e| refusal(&grant.common, e))?;
+    } else {
+        let retained = other_active_grants(&journal, &grant).map_err(|e| refusal(&journal, e))?;
+        revoke_common(&grant.common, grant.uid, grant.gid, &retained, None)
+            .map_err(|e| refusal(&grant.common, e))?;
+    }
     grant.active = false;
     grant.inspection = false;
     write_grant(&journal, &grant).map_err(|e| refusal(&journal, e))?;
@@ -1405,6 +1551,15 @@ fn revoke_common(
     })
 }
 
+/// Revoke a per-seat repository's exclusive grants. The seat gitdir belongs
+/// to no other seat, so nothing is retained and no shared config lock is
+/// needed. The pool is world-readable by mode and is never granted.
+fn revoke_seat(common: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
+    walk_tree(common, false, &|_| {}, &|file, path| {
+        revoke_binding(file, path, common, uid, gid, &[], None)
+    })
+}
+
 /// New inspection intents name every opened object before the first ACL write.
 /// Legacy intents require a best-effort no-follow walk; hostile entries never
 /// prevent revocation of the remaining regular files or another worktree.
@@ -1520,15 +1675,19 @@ pub(crate) fn share(path: &Path, uid: u32, gid: u32, journal: &Path) -> Result<(
         return Ok(());
     };
     let private = &dirs[0];
-    // A single-principal ordinary checkout needs no cross-seat metadata grant.
-    // Cross-seat sharing is supported only for linked worktrees.
+    // A single-principal ordinary checkout needs no cross-seat metadata
+    // grant. Cross-seat sharing is supported for linked worktrees and for
+    // per-seat repositories over the pool.
     if private == common {
+        if let Some(pool) = derive_pool(private) {
+            return share_seat(path, private, &pool, uid, gid, journal);
+        }
         if uid == crate::sandbox::server_uid() && gid == crate::sandbox::server_gid() {
             return Ok(());
         }
         return Err(refusal(
             path,
-            "cross-seat sharing requires a linked Git worktree",
+            "cross-seat sharing requires a linked Git worktree or a pool-backed per-seat repository",
         ));
     }
     if private.parent() != Some(common.join("worktrees").as_path()) {
@@ -1567,6 +1726,16 @@ pub(crate) fn restore_recorded(data: &Path, id: &anyagents_core::AgentId) -> Res
     }
     if !grant.checkout.join(".git").exists() {
         return Ok(());
+    }
+    if let Some(pool) = grant.pool.clone() {
+        return share_seat_locked(
+            &grant.checkout.clone(),
+            &grant.private.clone(),
+            &pool,
+            grant.uid,
+            grant.gid,
+            &journal,
+        );
     }
     share_known_locked(
         &grant.checkout,
@@ -1609,6 +1778,7 @@ fn share_known_locked(
         private: private.to_path_buf(),
         checkout: path.to_path_buf(),
         active: true,
+        pool: None,
         inspection: false,
         inspection_paths: None,
         quarantined: false,
@@ -1669,6 +1839,73 @@ fn share_known_locked(
         .map_err(|e| refusal(&head, e))?;
     }
     protect_private_gitdir(private, uid, gid).map_err(|e| refusal(private, e))?;
+    Ok(())
+}
+
+/// Read the object pool a per-seat repository references through its
+/// alternates. Provisioning wrote this file seconds before admission, but
+/// every later use rechecks the canonical path against the journal.
+fn derive_pool(private: &Path) -> Option<PathBuf> {
+    let alternates = std::fs::read_to_string(private.join("objects/info/alternates")).ok()?;
+    let line = alternates
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#'))?;
+    let objects = if Path::new(line).is_absolute() {
+        PathBuf::from(line)
+    } else {
+        private.join("objects").join(line)
+    };
+    let pool = std::fs::canonicalize(objects.parent()?).ok()?;
+    (pool != private && pool.join("HEAD").is_file()).then_some(pool)
+}
+
+fn share_seat(
+    path: &Path,
+    private: &Path,
+    pool: &Path,
+    uid: u32,
+    gid: u32,
+    journal: &Path,
+) -> Result<(), Error> {
+    let _lock = lock_journals(journal).map_err(|e| refusal(journal, e))?;
+    share_seat_locked(path, private, pool, uid, gid, journal)
+}
+
+fn share_seat_locked(
+    path: &Path,
+    private: &Path,
+    pool: &Path,
+    uid: u32,
+    gid: u32,
+    journal: &Path,
+) -> Result<(), Error> {
+    validate_config_files(private, private)?;
+    let grant = Grant {
+        common: private.to_path_buf(),
+        gid,
+        uid,
+        private: private.to_path_buf(),
+        checkout: path.to_path_buf(),
+        active: true,
+        pool: Some(pool.to_path_buf()),
+        inspection: false,
+        inspection_paths: None,
+        quarantined: false,
+        config: None,
+    };
+    write_grant(journal, &grant).map_err(|e| refusal(journal, e))?;
+    // Clear any stale grants for this seat before granting. The seat gitdir
+    // is exclusive to this seat, so nothing else retains access here.
+    revoke_seat(private, uid, gid).map_err(|e| refusal(private, e))?;
+    // The seat writes its own objects, refs, packed-refs, config, index and
+    // HEAD through ordinary lock+rename. Grants cover the whole tree, but
+    // never the pool: seats read pool objects, only the server fetches.
+    walk_tree(private, false, &|_| {}, &|file, _| {
+        restrict_others(file)?;
+        grant_metadata_acl(file, gid)
+    })
+    .map_err(|e| refusal(private, e))?;
     Ok(())
 }
 
@@ -2643,12 +2880,12 @@ probe() {
 check_tree "$1"
 probe "$1"
 if [ -e "$1/.git" ] || [ -L "$1/.git" ]; then
-  private=$(git -c safe.directory="$1" -C "$1" rev-parse --path-format=absolute --git-dir)
-  common=$(git -c safe.directory="$1" -C "$1" rev-parse --path-format=absolute --git-common-dir)
+  private=$(git -c safe.directory="$1" -c core.fsmonitor=false -c core.hooksPath=/dev/null -C "$1" rev-parse --path-format=absolute --git-dir)
+  common=$(git -c safe.directory="$1" -c core.fsmonitor=false -c core.hooksPath=/dev/null -C "$1" rev-parse --path-format=absolute --git-common-dir)
   for d in "$private" "$common/objects" "$common/refs"; do
     probe "$d"
   done
-  git -c safe.directory="$1" -C "$1" status --porcelain >/dev/null
+  git -c safe.directory="$1" -c core.fsmonitor=false -c core.hooksPath=/dev/null -C "$1" status --porcelain >/dev/null
 fi
 "#;
     // Vendor fixtures and deployments may intentionally narrow PATH. Keep their
@@ -2718,6 +2955,7 @@ mod tests {
                 uid: crate::sandbox::server_uid(),
                 gid,
                 active: false,
+                pool: None,
                 inspection: true,
                 quarantined: false,
                 config: None,
@@ -2936,6 +3174,7 @@ mod tests {
                     uid,
                     gid: gid + 2,
                     active: false,
+                    pool: None,
                     inspection: true,
                     inspection_paths: Some(vec![other_target]),
                     quarantined: false,
@@ -3345,6 +3584,7 @@ mod tests {
                 uid: crate::sandbox::server_uid(),
                 gid: crate::sandbox::server_gid(),
                 active: true,
+                pool: None,
                 inspection: false,
                 inspection_paths: None,
                 quarantined: false,
@@ -3608,6 +3848,7 @@ mod tests {
             uid: crate::sandbox::server_uid(),
             gid: crate::sandbox::server_gid(),
             active: true,
+            pool: None,
             inspection: false,
             inspection_paths: None,
             quarantined: false,
@@ -4398,5 +4639,158 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Provision a pool-backed per-seat repository and admit it as the
+    /// server's own principal (the single-uid route). Returns the temp
+    /// root, the seat checkout, the bare remote and the recorded agent id.
+    fn pool_seat_checkout() -> (tempfile::TempDir, PathBuf, PathBuf, anyagents_core::AgentId) {
+        let dir = tempfile::tempdir().unwrap();
+        let remote = crate::worktree::tests::seed_bare_remote(dir.path());
+        let consumer = crate::worktree::tests::pool_consumer(&dir.path().join("pool"));
+        let target = dir.path().join("seat");
+        consumer
+            .remote(
+                &format!("file://{}", remote.display()),
+                &target,
+                "agent/seat",
+                Some("main"),
+            )
+            .unwrap();
+        let id = anyagents_core::AgentId::generate();
+        share(
+            &target,
+            crate::sandbox::server_uid(),
+            crate::sandbox::server_gid(),
+            &grant_path(dir.path(), &id),
+        )
+        .unwrap();
+        (dir, target, remote, id)
+    }
+
+    /// Every operation in the seat receipt exits zero through the recorded
+    /// launch command, and none of them add objects to the pool.
+    #[test]
+    fn per_seat_receipt_ops_exit_zero_through_the_recorded_command() {
+        let (dir, target, _remote, agent) = pool_seat_checkout();
+        let pool_repo = dir.path().join("pool/ExampleOrg/demo.git");
+        let before = crate::worktree::tests::pool_object_count(&pool_repo);
+        let record = RecordedWorktree::load(dir.path(), &agent, &target).unwrap();
+        record.validate().unwrap();
+        let run = |args: &[&str]| -> std::process::Output {
+            record.command().unwrap().args(args).output().unwrap()
+        };
+        let assert_ok = |args: &[&str]| {
+            let out = run(args);
+            assert!(
+                out.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        assert_ok(&[
+            "-c",
+            "user.name=Seat Author",
+            "-c",
+            "user.email=seat@example.test",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "Seat work",
+        ]);
+        assert_ok(&["push", "-q", "-u", "origin", "HEAD:refs/heads/agent/seat"]);
+        assert_eq!(
+            String::from_utf8_lossy(&run(&["config", "--get", "branch.agent/seat.remote"]).stdout)
+                .trim(),
+            "origin"
+        );
+        assert_ok(&["branch", "--set-upstream-to=origin/main"]);
+        assert_ok(&["config", "--worktree", "seat.k", "v"]);
+        assert_eq!(
+            String::from_utf8_lossy(&run(&["config", "--worktree", "--get", "seat.k"]).stdout)
+                .trim(),
+            "v"
+        );
+        assert_ok(&["branch", "packed-local", "origin/packed-local"]);
+        assert_ok(&["pack-refs", "--all"]);
+        crate::worktree::tests::git(&_remote, &["branch", "-D", "stale"]);
+        assert_ok(&["fetch", "-q", "--prune", "origin"]);
+        assert!(
+            !run(&["show-ref", "--verify", "refs/remotes/origin/stale"])
+                .status
+                .success(),
+            "pruned tracking ref must be gone"
+        );
+        assert_ok(&["branch", "-D", "packed-local"]);
+        assert_ok(&["gc"]);
+        assert_ok(&["status", "--porcelain"]);
+        assert_eq!(
+            crate::worktree::tests::pool_object_count(&pool_repo),
+            before,
+            "receipt must not add objects to the pool"
+        );
+        revoke_recorded(dir.path(), &agent).unwrap();
+        assert_eq!(
+            crate::worktree::tests::pool_object_count(&pool_repo),
+            before
+        );
+    }
+
+    /// A seat-owned config naming an executable fsmonitor (and a hooks
+    /// directory) is refused by server-side validation and never executed:
+    /// no marker file appears and launch reads stay refused.
+    #[test]
+    fn hostile_fsmonitor_and_hook_are_refused_and_never_executed() {
+        let (dir, target, _remote, agent) = pool_seat_checkout();
+        let evil = dir.path().join("evil");
+        std::fs::write(
+            &evil,
+            format!("#!/bin/sh\ntouch {}/pwned\n", dir.path().display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&evil, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let hooks = dir.path().join("hooks");
+        std::fs::create_dir(&hooks).unwrap();
+        std::fs::copy(&evil, hooks.join("post-checkout")).unwrap();
+        std::fs::set_permissions(
+            hooks.join("post-checkout"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        crate::worktree::tests::git(
+            &target,
+            &["config", "core.fsmonitor", &evil.display().to_string()],
+        );
+        crate::worktree::tests::git(
+            &target,
+            &["config", "core.hooksPath", &hooks.display().to_string()],
+        );
+        let err = validate_git_config(&target).unwrap_err();
+        assert!(err.to_string().contains("fsmonitor"), "{err}");
+        let record = RecordedWorktree::load(dir.path(), &agent, &target).unwrap();
+        assert!(record.validate().is_err());
+        assert!(record.command().is_err());
+        assert!(!dir.path().join("pwned").exists(), "fsmonitor must not run");
+        // A server-uid status read is refused by validation itself, so the
+        // hook path is not reachable through server commands either.
+        assert!(record.command().is_err());
+        assert!(!dir.path().join("pwned").exists());
+        // The seat can repair its own config; launch works again without
+        // running the hook. `checkout` would run post-checkout if server
+        // commands honored the seat's hooksPath.
+        crate::worktree::tests::git(&target, &["config", "--unset", "core.fsmonitor"]);
+        record.validate().unwrap();
+        let out = record
+            .command()
+            .unwrap()
+            .args(["checkout", "--detach", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!dir.path().join("pwned").exists(), "hook must not run");
     }
 }

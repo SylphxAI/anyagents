@@ -328,8 +328,26 @@ exec "{scripted_bin}" "$@"
         ),
         "true"
     );
-    let common1 = std::fs::canonicalize(git(&wt1, &["rev-parse", "--git-common-dir"])).unwrap();
-    assert_eq!(common1, std::fs::canonicalize(&pool_bare).unwrap());
+    // Pool checkouts are per-seat repositories, never linked worktrees:
+    // private == common == the checkout's own .git directory, reading
+    // pool objects through alternates.
+    let private1 = std::fs::canonicalize(wt1.join(".git")).unwrap();
+    let common1 = std::fs::canonicalize(git(
+        &wt1,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+        ],
+    ))
+    .unwrap();
+    assert_eq!(private1, common1);
+    assert!(wt1.join(".git").is_dir());
+    let alternates = std::fs::read_to_string(wt1.join(".git/objects/info/alternates")).unwrap();
+    assert!(
+        alternates.contains(&format!("{}/objects\n", pool_bare.display())),
+        "alternates: {alternates}"
+    );
 
     // Wait for fake wrapper to run and write env-receipt.json in Tier 3 scratch
     let receipt_path = tier3_scratch
