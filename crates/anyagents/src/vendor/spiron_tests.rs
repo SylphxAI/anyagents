@@ -1143,7 +1143,7 @@ for raw in sys.stdin:
     );
 }
 
-/// Isolated pending the live-process ack stall tracked in the follow-up issue:
+/// Isolated pending [#218](https://github.com/SylphxAI/anyagents/issues/218):
 /// the probe records m1, journals it, and emits accepted, yet the mailbox never
 /// accepts it within 30s while the supervisor stays healthy. Stall-state
 /// instrumentation (probe progress log, stall report) is kept to diagnose it.
