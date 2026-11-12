@@ -624,14 +624,18 @@ policy or built-in role templates.
 
 Callers may supply local Markdown templates through `archetype` (aliases:
 `template`, `type`, `preset`). A name is a single ASCII filename stem containing
-only letters, digits, `-` or `_`, without a `.md` suffix. Lookup searches the
-explicit and parent workspaces' `.agents/agents`, the data directory's
-`agents-templates`, `archetypes` and `.agents/agents`, then the home and owner
-workspaces' `.agents/agents`. Both `<name>.md` and `<name>/agent.md` (or `AGENT.md`)
-are supported. An explicit nonempty selector must resolve; an unknown name is a
-validation error. Without a selector, a matching `role` or its lowercase,
-space-to-hyphen form may supply template defaults; an unmatched label stays a
-label. Templates prepend their Markdown body to caller instructions and supply
+only letters, digits, `-` or `_`, without a `.md` suffix. When
+`ANYAGENTS_OWNER_WORKDIR` is configured, its `.agents/agents` catalog is the
+sole source for discovery, creation and role updates, even if missing or empty;
+unknown roles fail closed. No workspace, home or data-directory fallback is used.
+Without that configuration, lookup searches explicit and ancestor workspaces'
+`.agents/agents`, the data directory's fallback catalogs, and the home catalog
+when no workspace catalog exists. Both `<name>.md` and `<name>/agent.md` (or
+`AGENT.md`) are supported. An explicit archetype must resolve. Without owner
+configuration, creation rejects unknown roles when a catalog exists; role updates
+retain free-form labels when no roles are discovered. A matching `role` or its
+lowercase, space-to-hyphen form supplies defaults.
+Templates prepend their Markdown body to caller instructions and supply
 missing fields from YAML frontmatter (`description`/`summary`, `scope`,
 `workdir`/`workspace`, `harness`, `model`, `role`, `profile`). Unknown keys,
 invalid scopes, malformed or unclosed frontmatter and

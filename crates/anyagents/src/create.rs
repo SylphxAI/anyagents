@@ -8982,6 +8982,36 @@ pub(crate) fn archetype_search_roots_with_ancestors(
     ancestor_workdirs: &[PathBuf],
     data_dir: &Path,
 ) -> Vec<(PathBuf, PathBuf)> {
+    archetype_search_roots_for_owner(
+        explicit_workdir,
+        ancestor_workdirs,
+        data_dir,
+        configured_owner_archetype_workdir().as_deref(),
+    )
+}
+
+fn configured_owner_archetype_workdir() -> Option<PathBuf> {
+    #[cfg(not(test))]
+    {
+        crate::server::owner_workdir()
+    }
+    #[cfg(test)]
+    {
+        None
+    }
+}
+
+fn archetype_search_roots_for_owner(
+    explicit_workdir: Option<&Path>,
+    ancestor_workdirs: &[PathBuf],
+    data_dir: &Path,
+    owner_workdir: Option<&Path>,
+) -> Vec<(PathBuf, PathBuf)> {
+    // Configuration is authoritative even when its catalog is missing or empty.
+    // Do not resurrect removed templates from a workspace, data directory or HOME.
+    if let Some(owner) = owner_workdir {
+        return vec![(owner.to_path_buf(), PathBuf::from(".agents/agents"))];
+    }
     let mut search_roots: Vec<(PathBuf, PathBuf)> = Vec::new();
     if let Some(wd) = explicit_workdir
         && !is_archetype_workdir_keyword(wd)
@@ -9000,12 +9030,6 @@ pub(crate) fn archetype_search_roots_with_ancestors(
                 PathBuf::from(".agents/agents"),
             );
         }
-    }
-    #[cfg(not(test))]
-    if search_roots.is_empty()
-        && let Some(owd) = crate::server::owner_workdir()
-    {
-        push_unique_search_root(&mut search_roots, owd, PathBuf::from(".agents/agents"));
     }
     let has_workspace_agents_dir = search_roots
         .iter()
@@ -9098,9 +9122,10 @@ pub(crate) fn has_configured_archetype_roots_with_ancestors(
     ancestor_workdirs: &[PathBuf],
     data_dir: &Path,
 ) -> bool {
-    archetype_search_roots_with_ancestors(explicit_workdir, ancestor_workdirs, data_dir)
-        .into_iter()
-        .any(|(base, rel_root)| base.join(rel_root).exists())
+    configured_owner_archetype_workdir().is_some()
+        || archetype_search_roots_with_ancestors(explicit_workdir, ancestor_workdirs, data_dir)
+            .into_iter()
+            .any(|(base, rel_root)| base.join(rel_root).exists())
 }
 
 pub(crate) fn discover_available_archetype_templates(
@@ -9553,7 +9578,7 @@ pub(crate) fn normalize_or_validate_agent_role(
             .unwrap_or(slugified));
     }
     let available = discover_available_archetype_slugs(agent_workdir, parent_workdir, data_dir);
-    if !available.is_empty() {
+    if !available.is_empty() || configured_owner_archetype_workdir().is_some() {
         return Err(Error::Message(format!(
             "unknown role template {role:?} (available: {})",
             available.join(", ")
@@ -12683,6 +12708,65 @@ git -c safe.directory="$5" -C "$5" status --porcelain
 #[cfg(test)]
 mod archetype_tests {
     use super::*;
+
+    #[test]
+    fn configured_owner_catalog_excludes_all_other_roots_even_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = dir.path().join("owner");
+        let workspace = dir.path().join("workspace");
+        let ancestor = dir.path().join("ancestor");
+        let data = dir.path().join("data");
+        for base in [&workspace, &ancestor, &data] {
+            std::fs::create_dir_all(base.join(".agents/agents")).unwrap();
+            std::fs::write(base.join(".agents/agents/retired.md"), "Stale.").unwrap();
+        }
+        for root in ["agents-templates", "archetypes"] {
+            std::fs::create_dir_all(data.join(root)).unwrap();
+            std::fs::write(data.join(root).join("retired.md"), "Stale.").unwrap();
+        }
+        let roots = || {
+            archetype_search_roots_for_owner(
+                Some(&workspace),
+                std::slice::from_ref(&ancestor),
+                &data,
+                Some(&owner),
+            )
+        };
+        let expected = vec![(owner.clone(), PathBuf::from(".agents/agents"))];
+        // Missing configuration never widens the search to legacy catalogs.
+        assert_eq!(roots(), expected);
+        std::fs::create_dir_all(owner.join(".agents/agents")).unwrap();
+        assert_eq!(roots(), expected); // Empty catalogs are authoritative too.
+        std::fs::write(owner.join(".agents/agents/worker.md"), "Current.").unwrap();
+        assert_eq!(roots(), expected);
+        for (base, relative) in roots() {
+            assert!(
+                read_archetype_file(&base, &relative.join("retired.md"))
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                read_archetype_file(&base, &relative.join("worker.md"))
+                    .unwrap()
+                    .as_deref(),
+                Some("Current.")
+            );
+        }
+        // Unconfigured installations retain workspace and data fallback behavior.
+        let fallback = archetype_search_roots_for_owner(Some(&workspace), &[ancestor], &data, None);
+        assert!(fallback.contains(&(workspace, PathBuf::from(".agents/agents"))));
+        assert!(fallback.contains(&(data, PathBuf::from("agents-templates"))));
+    }
+
+    #[test]
+    fn empty_unconfigured_catalog_preserves_free_form_role_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".agents/agents")).unwrap();
+        assert_eq!(
+            normalize_or_validate_agent_role("retired", None, None, dir.path()).unwrap(),
+            "retired"
+        );
+    }
 
     #[test]
     fn data_archetypes_accept_name_metadata_and_prefer_shipped_templates() {
