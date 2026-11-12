@@ -4390,21 +4390,20 @@ impl Store {
         let conn = self.conn();
         agent_by_id(&conn, agent_id)?;
         let delivered = cursor(&conn, agent_id)?;
-        let mut stmt = conn.prepare(
-            "SELECT context FROM messages WHERE agent_id = ?1 AND seq > ?2 ORDER BY seq ASC",
+        // Server-side filter (same predicate as the roster query): the
+        // per-row Rust JSON parse would scan and deserialize every
+        // undelivered line on each idle poll, pinning one core per agent
+        // (80 agents x 4 polls/s against a multi-GB mailbox).
+        let found: bool = conn.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM messages
+               WHERE agent_id = ?1 AND seq > ?2
+                 AND (CASE WHEN json_valid(context) THEN json_extract(context, '$.event') END) IS NOT 'reaction_passive'
+             )",
+            params![agent_id.as_str(), delivered],
+            |row| row.get(0),
         )?;
-        let mut rows = stmt.query(params![agent_id.as_str(), delivered])?;
-        while let Some(row) = rows.next()? {
-            let ctx_raw: Option<String> = row.get(0)?;
-            let is_passive = ctx_raw
-                .as_deref()
-                .and_then(|s| serde_json::from_str::<anyagents_harness::Context>(s).ok())
-                .is_some_and(|ctx| ctx.event.as_deref() == Some("reaction_passive"));
-            if !is_passive {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+        Ok(found)
     }
 
     pub fn received_cursor(&self, agent_id: &AgentId) -> Result<i64, Error> {
@@ -4948,22 +4947,19 @@ impl Store {
 
     fn age_at(&self, agent_id: &AgentId, seq: i64, now_ms: i64) -> Result<Option<i64>, Error> {
         let conn = self.read_conn();
-        let mut stmt = conn.prepare(
-            "SELECT received_at_ms, context FROM messages WHERE agent_id = ?1 AND seq >= ?2 ORDER BY seq ASC",
-        )?;
-        let mut rows = stmt.query(params![agent_id.as_str(), seq])?;
-        while let Some(row) = rows.next()? {
-            let received_at: i64 = row.get(0)?;
-            let ctx_raw: Option<String> = row.get(1)?;
-            let is_passive = ctx_raw
-                .as_deref()
-                .and_then(|s| serde_json::from_str::<anyagents_harness::Context>(s).ok())
-                .is_some_and(|ctx| ctx.event.as_deref() == Some("reaction_passive"));
-            if !is_passive {
-                return Ok(Some((now_ms - received_at).max(0)));
-            }
-        }
-        Ok(None)
+        // Server-side filter: per-row JSON parse here pins a core per agent
+        // on every health publish; see `has_actionable_undelivered`.
+        let received_at: Option<i64> = conn
+            .query_row(
+                "SELECT received_at_ms FROM messages
+                 WHERE agent_id = ?1 AND seq >= ?2
+                   AND (CASE WHEN json_valid(context) THEN json_extract(context, '$.event') END) IS NOT 'reaction_passive'
+                 ORDER BY seq ASC LIMIT 1",
+                params![agent_id.as_str(), seq],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(received_at.map(|at| (now_ms - at).max(0)))
     }
 
     pub(crate) fn conn(&self) -> MutexGuard<'_, Connection> {
@@ -10229,6 +10225,29 @@ mod tests {
         );
         assert_eq!(store.agent(&peer_worker.id).unwrap().state, "idle");
         assert!(!store.has_actionable_undelivered(&peer_worker.id).unwrap());
+    }
+
+    #[test]
+    fn invalid_json_context_counts_as_actionable_without_scan_parse() {
+        let (_dir, store) = setup();
+        let worker = agent(&store, "noisy_worker");
+        // Invalid JSON in context must count as actionable (same as the
+        // old per-row parse, which treated unparseable as not-passive).
+        let mut msg = Incoming::new("hello");
+        msg.sender = Some("agent:tester".to_string());
+        let out = store.receive(&worker.id, msg).unwrap();
+        let seq = match out {
+            ReceiveOutcome::New(m) => m.seq,
+            _ => panic!("expected new message"),
+        };
+        store
+            .conn()
+            .execute(
+                "UPDATE messages SET context = 'not-json' WHERE agent_id = ?1 AND seq = ?2",
+                params![worker.id.as_str(), seq],
+            )
+            .unwrap();
+        assert!(store.has_actionable_undelivered(&worker.id).unwrap());
     }
 
     #[test]

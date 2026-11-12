@@ -103,6 +103,8 @@ jobs:
         run: python3 -m unittest discover -s tests -p 'test_deploy_build.py' -v
       - name: Browser fixture tests
         run: npm test
+      - name: Build harness helper binaries
+        run: cargo build -p anyagents-harness-opencode --bin fake_opencode --locked
       - name: Test
         run: cargo test --workspace --locked
       - name: Takeover interaction acceptance
@@ -182,6 +184,8 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Browser fixture cleanup
         run: node --test tests/browser-process-group.test.mjs
+      - name: Build harness helper binaries
+        run: cargo build -p anyagents-harness-opencode --bin fake_opencode --locked
       - name: Test
         run: cargo test --workspace --locked
 

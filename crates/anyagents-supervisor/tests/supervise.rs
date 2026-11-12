@@ -735,18 +735,32 @@ fn a_finished_turn_does_not_receive_a_recovery_note_on_restart() {
         .status()
         .unwrap();
     assert!(killed.success());
-    assert!(wait_until(|| {
-        supervisor
-            .live(&agent.id)
-            .is_some_and(|live| !live.process_alive && live.restart_at_ms.is_some())
-    }));
+    assert!(
+        wait_until(|| {
+            supervisor
+                .live(&agent.id)
+                .is_some_and(|live| !live.process_alive && live.restart_at_ms.is_some())
+        }),
+        "killed finished agent did not schedule restart (old pid={pid}): live={:?}, agent={:?}, child={:?}",
+        supervisor.live(&agent.id),
+        other.agent(&agent.id),
+        other.agent(&child.id),
+    );
     let restart_at = supervisor.live(&agent.id).unwrap().restart_at_ms.unwrap();
     clock.set_ms(restart_at);
-    assert!(wait_until(|| {
-        supervisor
-            .live(&agent.id)
-            .is_some_and(|live| live.process_alive && live.pid != Some(pid))
-    }));
+    assert!(
+        wait_until(|| {
+            supervisor
+                .live(&agent.id)
+                .is_some_and(|live| live.process_alive && live.pid != Some(pid))
+        }),
+        "killed finished agent did not restart after advancing clock to {restart_at} (old pid={pid}): live={:?}, agent={:?}, child={:?}, child_live={:?}, open_turn={:?}",
+        supervisor.live(&agent.id),
+        other.agent(&agent.id),
+        other.agent(&child.id),
+        supervisor.live(&child.id),
+        other.open_turn(&agent.id),
+    );
     std::thread::sleep(Duration::from_millis(150));
     assert!(
         !log_contains(&log, "[Recovery]"),
