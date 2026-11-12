@@ -1166,6 +1166,8 @@ for raw in sys.stdin:
         progress("journaled-model")
         emit("accepted", req_id, mode="turn")
         progress("emitted-accepted")
+        time.sleep(0.2)
+        emit("accepted", req_id, mode="turn")
     elif launch == 1 and active != "done":
         emit("steer_ack", req_id, accepted=True, turn_id=active)
         release()
