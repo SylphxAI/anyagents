@@ -9,6 +9,7 @@ use std::io::{ErrorKind, Read};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
@@ -50,6 +51,28 @@ fn is_scope_env_key(key: &str) -> bool {
     matches!(key, "ANYAGENTS_SCOPE" | "ANYAGENTS_PUBLIC")
 }
 
+fn is_policy_env_key(key: &str) -> bool {
+    is_scope_env_key(key) || key == "ANYAGENTS_LIFECYCLE"
+}
+
+/// Validate and normalize an agent lifecycle (`"task"` or `"standing"`) without persisting state.
+pub fn parse_agent_lifecycle(lifecycle: &str) -> Result<&'static str, Error> {
+    match lifecycle.trim().to_ascii_lowercase().as_str() {
+        "standing" | "permanent" | "daemon" | "resident" => Ok("standing"),
+        "task" | "ephemeral" | "freelance" | "oneshot" => Ok("task"),
+        other => Err(Error::Message(format!(
+            "invalid lifecycle `{other}`; expected `task` or `standing`"
+        ))),
+    }
+}
+
+fn lifecycle_env(agent: &Agent, lifecycle: &str) -> Vec<(String, String)> {
+    let mut env = agent.launch_env.clone();
+    env.retain(|(key, _)| key != "ANYAGENTS_LIFECYCLE");
+    env.push(("ANYAGENTS_LIFECYCLE".to_string(), lifecycle.to_string()));
+    env
+}
+
 /// Validate and normalize an agent scope without persisting any state.
 pub fn parse_agent_scope(scope: &str) -> Result<&'static str, Error> {
     match scope.trim().to_ascii_lowercase().as_str() {
@@ -80,6 +103,15 @@ pub struct AgentQueryMetadata {
     pub oldest_undelivered: HashMap<String, i64>,
     pub open_turns: HashMap<String, i64>,
     pub schedules: HashMap<String, Vec<AgentSchedule>>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TurnOwnershipSnapshot {
+    pub last_delivered_seq: Option<i64>,
+    pub last_delivered_at_ms: Option<i64>,
+    pub last_delivered_sender: Option<String>,
+    pub last_delivered_source_key: Option<String>,
+    pub last_outbound_at_ms: Option<i64>,
 }
 
 /// One agent row.
@@ -196,6 +228,39 @@ impl Agent {
     /// sub-agents default to `false` (`private`) unless their Parent sets `public: true`.
     pub fn is_public(&self) -> bool {
         self.parent_id.is_none() || self.scope() == "public"
+    }
+
+    /// Lifecycle mode (`"standing"` | `"task"`):
+    /// - `"standing"` (default for Root Agents, or sub-agents hired as long-lived team members):
+    ///   remains on standby (`idle`) between assignments without turn-ownership archive reminders.
+    /// - `"task"` (default for Sub-Agents): hired for a bounded mission; must report back (`send`)
+    ///   before exiting a parent-initiated turn, and once reported (`waiting_parent`), awaits
+    ///   either a follow-up `send` or `archive` from its parent.
+    pub fn lifecycle(&self) -> &'static str {
+        if let Some((_, v)) = self
+            .launch_env
+            .iter()
+            .find(|(k, _)| k == "ANYAGENTS_LIFECYCLE")
+        {
+            match v.trim().to_ascii_lowercase().as_str() {
+                "standing" | "permanent" | "daemon" | "resident" => return "standing",
+                "task" | "ephemeral" | "freelance" | "oneshot" => return "task",
+                _ => {}
+            }
+        }
+        self.default_lifecycle()
+    }
+
+    fn default_lifecycle(&self) -> &'static str {
+        if self.parent_id.is_none() {
+            "standing"
+        } else {
+            "task"
+        }
+    }
+
+    pub fn is_task_subagent(&self) -> bool {
+        self.parent_id.is_some() && self.lifecycle() == "task"
     }
 }
 
@@ -624,6 +689,23 @@ pub struct Store {
     data_dir: PathBuf,
     wakes: Mutex<Vec<Sender<Wake>>>,
     capabilities: Mutex<Option<String>>,
+    /// Total time a bounded write may keep retrying transient lock errors.
+    write_retry_budget_ms: AtomicU64,
+}
+
+/// Default per-statement wait for the writer lock.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(30);
+/// Default total budget for writes that must not fail on a transient lock:
+/// several busy-timeout rounds, after which the error is surfaced.
+const WRITE_RETRY_BUDGET: Duration = Duration::from_secs(120);
+
+/// `true` for SQLite lock contention that a later attempt can clear.
+fn is_transient_lock_error(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::Db(rusqlite::Error::SqliteFailure(e, _))
+            if matches!(e.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+    )
 }
 
 enum ReadConn<'a> {
@@ -705,7 +787,7 @@ impl Store {
         // A 30s wait: ~78 agents finishing at once queue here instead of failing
         // with `database is locked`. BEGIN IMMEDIATE (not the DEFERRED default)
         // is what makes the wait apply to read-then-write paths.
-        conn.busy_timeout(Duration::from_secs(30))?;
+        conn.busy_timeout(BUSY_TIMEOUT)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         let mut mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
         if !mode.eq_ignore_ascii_case("wal") {
@@ -821,7 +903,48 @@ impl Store {
             data_dir: data_dir_for(path),
             wakes: Mutex::new(Vec::new()),
             capabilities: Mutex::new(None),
+            write_retry_budget_ms: AtomicU64::new(WRITE_RETRY_BUDGET.as_millis() as u64),
         })
+    }
+
+    /// Set the writer's per-statement lock wait and the total budget that
+    /// retried writes may spend on transient lock errors.
+    pub fn set_lock_wait(
+        &self,
+        busy_timeout: Duration,
+        retry_budget: Duration,
+    ) -> Result<(), Error> {
+        self.conn().busy_timeout(busy_timeout)?;
+        self.write_retry_budget_ms
+            .store(retry_budget.as_millis() as u64, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Run one write transaction, retrying it whole on SQLITE_BUSY/LOCKED until
+    /// the retry budget is spent; then the last error is returned. The writer
+    /// mutex is released between attempts so other writers of this store run.
+    /// A failed attempt rolls back, so `op` must only depend on its inputs.
+    fn write_with_retry<T>(
+        &self,
+        mut op: impl FnMut(&mut Connection) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        let budget = Duration::from_millis(self.write_retry_budget_ms.load(Ordering::Relaxed));
+        let started = std::time::Instant::now();
+        let mut backoff = Duration::from_millis(10);
+        loop {
+            let result = op(&mut self.conn());
+            match result {
+                Err(error) if is_transient_lock_error(&error) => {
+                    let elapsed = started.elapsed();
+                    if elapsed >= budget {
+                        return Err(error);
+                    }
+                    std::thread::sleep(backoff.min(budget - elapsed));
+                    backoff = (backoff * 2).min(Duration::from_secs(1));
+                }
+                other => return other,
+            }
+        }
     }
 
     /// Hold this process's mailbox capability key, so it can mint and check
@@ -2314,14 +2437,14 @@ impl Store {
         self.update_agent_launch_env(id, None, |current| {
             let mut refreshed: Vec<_> = env
                 .iter()
-                .filter(|(key, _)| !is_scope_env_key(key))
+                .filter(|(key, _)| !is_policy_env_key(key))
                 .cloned()
                 .collect();
             refreshed.extend(
                 current
                     .launch_env
                     .iter()
-                    .filter(|(key, _)| is_scope_env_key(key))
+                    .filter(|(key, _)| is_policy_env_key(key))
                     .cloned(),
             );
             refreshed
@@ -2552,6 +2675,59 @@ impl Store {
     }
 
     /// Permanently delete an agent and its associated records from the store.
+    /// A creation that failed before admission (`set_agent_running` is the only
+    /// writer of `workdir`) must not keep its name reserved. When its row has to
+    /// be kept, e.g. as the anchor of a pending revocation journal, archive it
+    /// and rename it to its own id, which can never collide with a chosen name.
+    /// The id, history and journal are untouched. Admitted agents are refused.
+    pub fn release_unadmitted_agent(&self, id: &AgentId) -> Result<Agent, Error> {
+        let released = {
+            let mut conn = self.conn();
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let changed = tx.execute(
+                "UPDATE agents SET name = id, state = 'archived'
+                 WHERE id = ?1 AND workdir IS NULL AND is_admin = 0",
+                [id.as_str()],
+            )?;
+            if changed == 0 {
+                agent_by_id(&tx, id)?;
+                return Err(Error::Message(format!(
+                    "agent {id} was admitted; its name is not a failed reservation"
+                )));
+            }
+            let agent = agent_by_id(&tx, id)?;
+            tx.commit()?;
+            agent
+        };
+        self.notify(Wake::Agent {
+            agent_id: id.clone(),
+        });
+        Ok(released)
+    }
+
+    /// Startup repair, run while the server lock excludes concurrent creation:
+    /// every row that never reached admission is a failed or interrupted
+    /// creation. Release each one's name. Returns the released `(id, name)`s.
+    pub fn release_unadmitted_names(&self) -> Result<Vec<(AgentId, String)>, Error> {
+        let rows: Vec<(String, String)> = {
+            let conn = self.read_conn();
+            let mut stmt = conn.prepare(
+                "SELECT id, name FROM agents
+                 WHERE workdir IS NULL AND is_admin = 0 AND name != id
+                   AND state IN ('created', 'archived')",
+            )?;
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<Result<_, _>>()?
+        };
+        let mut released = Vec::new();
+        for (id, name) in rows {
+            let id = AgentId::parse(&id)?;
+            self.release_unadmitted_agent(&id)?;
+            released.push((id, name));
+        }
+        Ok(released)
+    }
+
     pub fn delete_agent(&self, id: &AgentId) -> Result<Agent, Error> {
         let deleted = {
             let mut conn = self.conn();
@@ -2787,6 +2963,58 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(id)
+    }
+
+    pub fn turn_ownership_snapshot(
+        &self,
+        agent_id: &AgentId,
+    ) -> Result<TurnOwnershipSnapshot, Error> {
+        let conn = self.conn();
+        let last_in: Option<(i64, i64, Option<String>, Option<String>)> = conn
+            .query_row(
+                "SELECT seq, delivered_at_ms, sender, source_key
+                 FROM messages
+                 WHERE agent_id = ?1 AND delivered_at_ms IS NOT NULL
+                 ORDER BY seq DESC LIMIT 1",
+                [agent_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let last_outbound_at_ms: Option<i64> = conn.query_row(
+            "SELECT MAX(sent_at_ms) FROM outbound_messages WHERE agent_id = ?1",
+            [agent_id.as_str()],
+            |row| row.get(0),
+        )?;
+        Ok(match last_in {
+            Some((seq, delivered_at_ms, sender, source_key)) => TurnOwnershipSnapshot {
+                last_delivered_seq: Some(seq),
+                last_delivered_at_ms: Some(delivered_at_ms),
+                last_delivered_sender: sender,
+                last_delivered_source_key: source_key,
+                last_outbound_at_ms,
+            },
+            None => TurnOwnershipSnapshot {
+                last_delivered_seq: None,
+                last_delivered_at_ms: None,
+                last_delivered_sender: None,
+                last_delivered_source_key: None,
+                last_outbound_at_ms,
+            },
+        })
+    }
+
+    pub fn has_message_source_key(
+        &self,
+        agent_id: &AgentId,
+        source_key: &str,
+    ) -> Result<bool, Error> {
+        let conn = self.conn();
+        let exists: i64 = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM messages WHERE agent_id = ?1 AND source_key = ?2)",
+            params![agent_id.as_str(), source_key],
+            |row| row.get(0),
+        )?;
+        Ok(exists != 0)
     }
 
     /// Read the complete two-way (`in` + `out`) conversation of `agent_id` across
@@ -4276,6 +4504,22 @@ impl Store {
         })
     }
 
+    /// Set the agent lifecycle mode (`"task"` or `"standing"`).
+    pub fn set_agent_lifecycle(&self, agent_id: &AgentId, lifecycle: &str) -> Result<Agent, Error> {
+        self.set_agent_lifecycle_as(agent_id, lifecycle, "system")
+    }
+
+    /// Set lifecycle mode (`"task"` or `"standing"`).
+    pub fn set_agent_lifecycle_as(
+        &self,
+        agent_id: &AgentId,
+        lifecycle: &str,
+        _actor: &str,
+    ) -> Result<Agent, Error> {
+        let normalized = parse_agent_lifecycle(lifecycle)?;
+        self.update_agent_launch_env(agent_id, None, |current| lifecycle_env(current, normalized))
+    }
+
     /// Set whether a sub-agent accepts external messages from agents outside its
     /// direct parent/child lineage (`ANYAGENTS_PUBLIC=1` in `launch_env`).
     pub fn set_agent_public(&self, agent_id: &AgentId, public: bool) -> Result<Agent, Error> {
@@ -4360,21 +4604,23 @@ impl Store {
     }
 
     /// Mark the agent's current open turn as completed (`completed_seq = opened_seq`).
+    /// Transient lock errors are retried within the store's write budget.
     pub fn note_turn_completed(&self, agent_id: &AgentId) -> Result<(), Error> {
-        let mut conn = self.conn();
-        // BEGIN IMMEDIATE: a SELECT-then-UPDATE under BEGIN DEFERRED raises
-        // SQLITE_BUSY without honouring busy_timeout when a peer is writing.
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        agent_by_id(&tx, agent_id)?;
-        tx.execute(
-            "UPDATE turn_recovery
-             SET completed_seq = opened_seq,
-                 recovery_count = 0
-             WHERE agent_id = ?1 AND completed_seq < opened_seq",
-            [agent_id.as_str()],
-        )?;
-        tx.commit()?;
-        Ok(())
+        self.write_with_retry(|conn| {
+            // BEGIN IMMEDIATE: a SELECT-then-UPDATE under BEGIN DEFERRED raises
+            // SQLITE_BUSY without honouring busy_timeout when a peer is writing.
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            agent_by_id(&tx, agent_id)?;
+            tx.execute(
+                "UPDATE turn_recovery
+                 SET completed_seq = opened_seq,
+                     recovery_count = 0
+                 WHERE agent_id = ?1 AND completed_seq < opened_seq",
+                [agent_id.as_str()],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
     }
 
     /// Record that one `[Recovery]` wake was delivered for `opened_seq`.
@@ -4506,33 +4752,37 @@ impl Store {
             day: new.day,
             recorded_at_ms: now_ms(),
         };
-        let mut conn = self.conn();
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        agent_by_id(&tx, &record.agent_id)?;
-        tx.execute(
-            "INSERT INTO usage_records (
-                id, agent_id, harness, model, input_tokens, output_tokens,
-                cache_read_tokens, cache_write_tokens, reported_cost_micros,
-                estimated_cost_micros, billing_mode, quota_state, day, recorded_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-            params![
-                record.id.as_str(),
-                record.agent_id.as_str(),
-                record.harness,
-                record.model,
-                record.input_tokens,
-                record.output_tokens,
-                record.cache_read_tokens,
-                record.cache_write_tokens,
-                record.reported_cost_micros,
-                record.estimated_cost_micros,
-                record.billing_mode.as_str(),
-                record.quota_state,
-                record.day,
-                record.recorded_at_ms,
-            ],
-        )?;
-        tx.commit()?;
+        // The id is fixed before the first attempt: a retry can never add a
+        // second row for the same usage.
+        self.write_with_retry(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            agent_by_id(&tx, &record.agent_id)?;
+            tx.execute(
+                "INSERT INTO usage_records (
+                    id, agent_id, harness, model, input_tokens, output_tokens,
+                    cache_read_tokens, cache_write_tokens, reported_cost_micros,
+                    estimated_cost_micros, billing_mode, quota_state, day, recorded_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                params![
+                    record.id.as_str(),
+                    record.agent_id.as_str(),
+                    record.harness,
+                    record.model,
+                    record.input_tokens,
+                    record.output_tokens,
+                    record.cache_read_tokens,
+                    record.cache_write_tokens,
+                    record.reported_cost_micros,
+                    record.estimated_cost_micros,
+                    record.billing_mode.as_str(),
+                    record.quota_state,
+                    record.day,
+                    record.recorded_at_ms,
+                ],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })?;
         Ok(record)
     }
 
@@ -8627,6 +8877,58 @@ mod tests {
     }
 
     #[test]
+    fn failed_creation_releases_its_name_and_admitted_agents_keep_theirs() {
+        let (_dir, store) = setup();
+        let failed = agent(&store, "reserved");
+        let admitted = agent(&store, "admitted");
+        store.set_agent_running(&admitted.id, "/work").unwrap();
+        store.set_agent_state(&admitted.id, "archived").unwrap();
+
+        let released = store.release_unadmitted_agent(&failed.id).unwrap();
+        assert_eq!(released.name, failed.id.as_str());
+        assert_eq!(released.state, "archived");
+        assert!(matches!(
+            store.agent_by_name("reserved"),
+            Err(Error::AgentNotFound(_))
+        ));
+        assert_eq!(store.agent(&failed.id).unwrap().id, failed.id);
+        agent(&store, "reserved");
+
+        let refused = store.release_unadmitted_agent(&admitted.id).unwrap_err();
+        assert!(refused.to_string().contains("was admitted"), "{refused}");
+        assert_eq!(store.agent(&admitted.id).unwrap().name, "admitted");
+    }
+
+    #[test]
+    fn startup_repair_releases_every_ghost_reservation_once() {
+        let (_dir, store) = setup();
+        let interrupted = agent(&store, "interrupted");
+        let ghost = agent(&store, "ghost");
+        store.set_agent_state(&ghost.id, "archived").unwrap();
+        let running = agent(&store, "running");
+        store.set_agent_running(&running.id, "/work").unwrap();
+        let retired = agent(&store, "retired");
+        store.set_agent_running(&retired.id, "/work").unwrap();
+        store.set_agent_state(&retired.id, "archived").unwrap();
+
+        let mut released = store.release_unadmitted_names().unwrap();
+        released.sort_by(|a, b| a.1.cmp(&b.1));
+        assert_eq!(
+            released,
+            vec![
+                (ghost.id.clone(), "ghost".to_string()),
+                (interrupted.id.clone(), "interrupted".to_string()),
+            ]
+        );
+        assert!(store.release_unadmitted_names().unwrap().is_empty());
+        for name in ["ghost", "interrupted"] {
+            agent(&store, name);
+        }
+        assert_eq!(store.agent(&running.id).unwrap().name, "running");
+        assert_eq!(store.agent(&retired.id).unwrap().name, "retired");
+    }
+
+    #[test]
     fn set_agent_running_stores_the_workdir_and_wakes() {
         let (_dir, store) = setup();
         let agent = agent(&store, "alpha");
@@ -10855,5 +11157,104 @@ mod tests {
             h.join().unwrap();
         }
         assert_eq!(store.list_usage(None).unwrap().len(), 16 * 25);
+    }
+
+    fn usage_for(id: &AgentId) -> NewUsage {
+        NewUsage {
+            agent_id: id.clone(),
+            harness: "claude-code".into(),
+            model: Some("m".into()),
+            input_tokens: 1,
+            output_tokens: 2,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            reported_cost_micros: None,
+            estimated_cost_micros: None,
+            billing_mode: BillingMode::Subscription,
+            quota_state: None,
+            day: "2026-01-01".into(),
+        }
+    }
+
+    /// Hold the writer lock from another connection for `hold`, then release.
+    fn hold_writer_lock(db: &Path, hold: Duration) -> std::thread::JoinHandle<()> {
+        let conn = Connection::open(db).unwrap();
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        std::thread::spawn(move || {
+            std::thread::sleep(hold);
+            conn.execute_batch("COMMIT").unwrap();
+        })
+    }
+
+    #[test]
+    fn turn_persistence_outlasts_a_writer_lock_longer_than_busy_timeout() {
+        let (dir, store) = setup();
+        let db = dir.path().join("state.db");
+        let worker = agent(&store, "lock-wait");
+        store.set_agent_running(&worker.id, "/work").unwrap();
+        store.receive(&worker.id, Incoming::new("task")).unwrap();
+        store.note_delivered(&worker.id, 1).unwrap();
+        assert!(store.has_open_turn(&worker.id).unwrap());
+        // Each attempt gives up after 20 ms; the peer holds the lock ~15x longer.
+        store
+            .set_lock_wait(Duration::from_millis(20), Duration::from_secs(10))
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let peer = hold_writer_lock(&db, Duration::from_millis(300));
+        store.note_turn_completed(&worker.id).unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(250));
+        assert!(!store.has_open_turn(&worker.id).unwrap());
+        peer.join().unwrap();
+
+        let peer = hold_writer_lock(&db, Duration::from_millis(300));
+        let record = store.record_usage(usage_for(&worker.id)).unwrap();
+        peer.join().unwrap();
+        let rows = store.list_usage(Some(&worker.id)).unwrap();
+        assert_eq!(rows.len(), 1, "a retried write records exactly one row");
+        assert_eq!(rows[0].id, record.id);
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn turn_persistence_surfaces_the_lock_error_once_the_budget_is_spent() {
+        let (dir, store) = setup();
+        let db = dir.path().join("state.db");
+        let worker = agent(&store, "lock-budget");
+        store.set_agent_running(&worker.id, "/work").unwrap();
+        store.receive(&worker.id, Incoming::new("task")).unwrap();
+        store.note_delivered(&worker.id, 1).unwrap();
+        store
+            .set_lock_wait(Duration::from_millis(10), Duration::from_millis(150))
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let peer = hold_writer_lock(&db, Duration::from_secs(2));
+        let completed = store.note_turn_completed(&worker.id);
+        let usage = store.record_usage(usage_for(&worker.id));
+        let elapsed = started.elapsed();
+        peer.join().unwrap();
+
+        let err = completed.expect_err("lock outlasting the budget must surface");
+        assert!(is_transient_lock_error(&err), "unexpected error: {err}");
+        assert!(usage.is_err_and(|e| is_transient_lock_error(&e)));
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "budget bounds the wait: {elapsed:?}"
+        );
+        assert!(store.has_open_turn(&worker.id).unwrap());
+        assert!(store.list_usage(Some(&worker.id)).unwrap().is_empty());
+    }
+
+    #[test]
+    fn non_lock_errors_are_not_retried() {
+        let (_dir, store) = setup();
+        let missing = AgentId::generate();
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            store.note_turn_completed(&missing),
+            Err(Error::AgentNotFound(_))
+        ));
+        assert!(started.elapsed() < Duration::from_millis(100));
     }
 }

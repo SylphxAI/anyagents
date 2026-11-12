@@ -1298,6 +1298,10 @@ impl<H: Harness + 'static> Session<H> {
         // Persist completion before publishing progress or resetting the usage
         // baseline. On failure the same turn remains eligible for another pass.
         if completed && let Err(err) = delivery.store().note_turn_completed(&self.id) {
+            eprintln!(
+                "anyagents-supervisor: {}: persist turn completion failed: {err}",
+                self.id
+            );
             self.last_error = Some(format!("persist turn completion: {err}"));
             return false;
         }
@@ -1310,8 +1314,12 @@ impl<H: Harness + 'static> Session<H> {
                 if unit.input_tokens == 0 && unit.output_tokens == 0 {
                     break;
                 }
-                if !record_turn(delivery, &self.agent, &self.inner.clock, &unit) {
-                    self.last_error = Some("persist turn usage failed".into());
+                if let Err(err) = record_turn(delivery, &self.agent, &self.inner.clock, &unit) {
+                    eprintln!(
+                        "anyagents-supervisor: {}: persist turn usage failed: {err}",
+                        self.id
+                    );
+                    self.last_error = Some(format!("persist turn usage failed: {err}"));
                     return false;
                 }
             }
@@ -1851,8 +1859,8 @@ fn record_turn<H: Harness>(
     agent: &Agent,
     clock: &Arc<dyn Clock>,
     usage: &TurnUsage,
-) -> bool {
-    let result = delivery.store().record_usage(NewUsage {
+) -> Result<(), anyagents_core::Error> {
+    delivery.store().record_usage(NewUsage {
         agent_id: agent.id.clone(),
         harness: agent.harness.clone(),
         model: agent.model.clone(),
@@ -1865,8 +1873,8 @@ fn record_turn<H: Harness>(
         billing_mode: BillingMode::Subscription,
         quota_state: None,
         day: utc_day(clock.now_ms()),
-    });
-    result.is_ok()
+    })?;
+    Ok(())
 }
 
 /// One unit's share of a difference, spread over `turns` units so the sum of

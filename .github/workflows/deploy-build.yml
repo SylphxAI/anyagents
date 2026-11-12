@@ -1,0 +1,121 @@
+name: deploy-build
+
+# One immutable Linux binary for one exact main commit, for deployments that pin
+# a commit and the SHA-256 of its binary (not a version release; release.yml
+# owns versions, npm and the version tags).
+#
+# The commit must be reachable from main and carry its own successful push/main
+# `ci` run (scripts/deploy_build.py admit). The build is `--locked` from that
+# commit, then the binary is started once to prove its serving identity names
+# the commit and its own digest before anything is published.
+#
+# Output: a prerelease `deploy-<sha>` with `anyagents-linux-x64-gnu`, its
+# `.sha256`, and `identity.json`. An existing complete release is left as is
+# (its digest is what deployments pinned); a partial one is refused.
+#
+# Hosted runners are free only on a public repository: the job carries the
+# visibility guard and names a GitHub-hosted label only. ubuntu-22.04 links
+# glibc 2.35, so the binary runs on glibc 2.35+ hosts.
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: Full 40-hex main commit to build
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-build-${{ inputs.commit }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+
+jobs:
+  build:
+    if: github.event.repository.private == false && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    permissions:
+      contents: write
+      actions: read
+    env:
+      COMMIT: ${{ inputs.commit }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: main
+          path: tooling
+          persist-credentials: false
+      - name: Admit the commit
+        run: python3 tooling/scripts/deploy_build.py admit "$COMMIT"
+      - name: Existing release
+        id: existing
+        run: |
+          set -euo pipefail
+          tag="deploy-$COMMIT"
+          if assets=$(gh release view "$tag" -R "$GITHUB_REPOSITORY" --json assets -q '[.assets[].name] | sort | join(",")' 2>/dev/null); then
+            if [ "$assets" = "anyagents-linux-x64-gnu,anyagents-linux-x64-gnu.sha256,identity.json" ]; then
+              echo "complete=true" >> "$GITHUB_OUTPUT"
+              echo "release $tag is already complete; not rebuilding" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "release $tag exists with assets [$assets]; refusing to replace a partial release" >&2
+            exit 1
+          fi
+          echo "complete=false" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        if: steps.existing.outputs.complete == 'false'
+        with:
+          ref: ${{ inputs.commit }}
+          path: source
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        if: steps.existing.outputs.complete == 'false'
+      - name: Build
+        if: steps.existing.outputs.complete == 'false'
+        working-directory: source
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$COMMIT"
+          cargo build --release --locked -p anyagents --bin anyagents
+      - name: Prove serving identity
+        if: steps.existing.outputs.complete == 'false'
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/out"; data="$RUNNER_TEMP/d"
+          mkdir -p "$out" "$data"
+          cp source/target/release/anyagents "$out/anyagents-linux-x64-gnu"
+          version=$(cargo metadata --manifest-path source/Cargo.toml --format-version 1 --no-deps \
+            | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "anyagents"))')
+          env -i PATH=/usr/bin:/bin HOME="$RUNNER_TEMP" "$out/anyagents-linux-x64-gnu" --data "$data" serve > "$RUNNER_TEMP/serve.log" 2>&1 &
+          pid=$!
+          for _ in $(seq 1 120); do
+            if curl -fsS --unix-socket "$data/anyagents.sock" http://local/v1/webhooks/healthz > "$RUNNER_TEMP/healthz.json" 2>/dev/null \
+              && python3 -c 'import json,sys; sys.exit(json.load(open(sys.argv[1])).get("binary_sha256_state") == "computing")' "$RUNNER_TEMP/healthz.json"; then
+              break
+            fi
+            sleep 1
+          done
+          kill "$pid" 2>/dev/null || true
+          wait "$pid" 2>/dev/null || true
+          cat "$RUNNER_TEMP/healthz.json"
+          python3 tooling/scripts/deploy_build.py identity "$COMMIT" "$out/anyagents-linux-x64-gnu" \
+            "$RUNNER_TEMP/healthz.json" "$version" "$out/identity.json"
+          (cd "$out" && sha256sum anyagents-linux-x64-gnu > anyagents-linux-x64-gnu.sha256)
+      - name: Publish
+        if: steps.existing.outputs.complete == 'false'
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/out"
+          gh release create "deploy-$COMMIT" -R "$GITHUB_REPOSITORY" --target "$COMMIT" \
+            --prerelease --latest=false --title "deploy build ${COMMIT:0:12}" \
+            --notes "Exact-commit Linux x64 (glibc 2.35+) build of $COMMIT for pinned deployments. sha256 $(cut -d' ' -f1 "$out/anyagents-linux-x64-gnu.sha256")" \
+            "$out/anyagents-linux-x64-gnu" "$out/anyagents-linux-x64-gnu.sha256" "$out/identity.json"
+          cat "$out/identity.json" >> "$GITHUB_STEP_SUMMARY"
