@@ -1090,7 +1090,9 @@ for raw in sys.stdin:
     let m2 = rig.receive("mid-turn steer detail");
 
     eventually(|| rig.wire().iter().filter(|v| v["launch"] == 2).count() >= 2);
-    eventually(|| !rig.store.has_open_turn(&rig.agent.id).unwrap());
+    // The redelivered input's own hold shares the file with the reconciled
+    // one; it clears when its turn confirms.
+    eventually(|| !rig.cfg.join("spiron-unconfirmed-steers.json").exists());
     let archived = rig.cfg.join("spiron-unconfirmed-steers.reconciled.json");
     let held =
         anyagents_harness_stream::InputHold::parse(&std::fs::read(&archived).unwrap()).unwrap();
@@ -1184,7 +1186,11 @@ for raw in sys.stdin:
         assert!(Instant::now() < deadline, "{}", rig.stall_report());
         std::thread::sleep(Duration::from_millis(5));
     }
-    eventually(|| !rig.store.has_open_turn(&rig.agent.id).unwrap());
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while rig.cfg.join("spiron-unconfirmed-steers.json").exists() {
+        assert!(Instant::now() < deadline, "{}", rig.stall_report());
+        std::thread::sleep(Duration::from_millis(5));
+    }
     let wire = rig.wire();
     assert!(
         wire.iter().all(|v| v["launch"] == 1),
@@ -1230,7 +1236,7 @@ for raw in sys.stdin:
     let m1 = rig.receive("work cut off by the gateway");
     rig.start();
     eventually(|| rig.wire().iter().any(|v| v["launch"] == 2));
-    eventually(|| !rig.store.has_open_turn(&rig.agent.id).unwrap());
+    eventually(|| !rig.cfg.join("spiron-unconfirmed-steers.json").exists());
     let stranded_until: i64 = std::fs::read_to_string(rig.cfg.join("stranded_until_ms"))
         .unwrap()
         .trim()
@@ -1289,7 +1295,7 @@ for raw in sys.stdin:
         rig.wire()
     );
     assert!(rig.cfg.join("spiron-unconfirmed-steers.json").exists());
-    assert_eq!(rig.store.delivered_cursor(&rig.agent.id).unwrap(), m1.seq);
+    eventually(|| rig.store.delivered_cursor(&rig.agent.id).unwrap() == m1.seq);
 }
 
 #[test]
@@ -1323,7 +1329,7 @@ for raw in sys.stdin:
     );
     rig.start();
     eventually(|| rig.wire().len() >= 2);
-    eventually(|| !rig.store.has_open_turn(&rig.agent.id).unwrap());
+    eventually(|| !rig.cfg.join("spiron-unconfirmed-steers.json").exists());
 
     let wire = rig.wire();
     assert_eq!(wire.len(), 2, "{wire:?}");
@@ -1382,7 +1388,9 @@ for raw in sys.stdin:
         ],
     );
     rig.start();
-    eventually(|| !rig.store.has_open_turn(&rig.agent.id).unwrap());
+    // Reconciliation cleared the lost hold; the recovery turn's own hold
+    // clears when it confirms.
+    eventually(|| !rig.cfg.join("spiron-unconfirmed-steers.json").exists());
 
     let wire = rig.wire();
     assert_eq!(wire.len(), 1, "recovery only: {wire:?}");
