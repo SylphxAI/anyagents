@@ -9,6 +9,7 @@ use std::io::{ErrorKind, Read};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
@@ -679,6 +680,23 @@ pub struct Store {
     data_dir: PathBuf,
     wakes: Mutex<Vec<Sender<Wake>>>,
     capabilities: Mutex<Option<String>>,
+    /// Total time a bounded write may keep retrying transient lock errors.
+    write_retry_budget_ms: AtomicU64,
+}
+
+/// Default per-statement wait for the writer lock.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(30);
+/// Default total budget for writes that must not fail on a transient lock:
+/// several busy-timeout rounds, after which the error is surfaced.
+const WRITE_RETRY_BUDGET: Duration = Duration::from_secs(120);
+
+/// `true` for SQLite lock contention that a later attempt can clear.
+fn is_transient_lock_error(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::Db(rusqlite::Error::SqliteFailure(e, _))
+            if matches!(e.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+    )
 }
 
 enum ReadConn<'a> {
@@ -760,7 +778,7 @@ impl Store {
         // A 30s wait: ~78 agents finishing at once queue here instead of failing
         // with `database is locked`. BEGIN IMMEDIATE (not the DEFERRED default)
         // is what makes the wait apply to read-then-write paths.
-        conn.busy_timeout(Duration::from_secs(30))?;
+        conn.busy_timeout(BUSY_TIMEOUT)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         let mut mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
         if !mode.eq_ignore_ascii_case("wal") {
@@ -876,7 +894,48 @@ impl Store {
             data_dir: data_dir_for(path),
             wakes: Mutex::new(Vec::new()),
             capabilities: Mutex::new(None),
+            write_retry_budget_ms: AtomicU64::new(WRITE_RETRY_BUDGET.as_millis() as u64),
         })
+    }
+
+    /// Set the writer's per-statement lock wait and the total budget that
+    /// retried writes may spend on transient lock errors.
+    pub fn set_lock_wait(
+        &self,
+        busy_timeout: Duration,
+        retry_budget: Duration,
+    ) -> Result<(), Error> {
+        self.conn().busy_timeout(busy_timeout)?;
+        self.write_retry_budget_ms
+            .store(retry_budget.as_millis() as u64, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Run one write transaction, retrying it whole on SQLITE_BUSY/LOCKED until
+    /// the retry budget is spent; then the last error is returned. The writer
+    /// mutex is released between attempts so other writers of this store run.
+    /// A failed attempt rolls back, so `op` must only depend on its inputs.
+    fn write_with_retry<T>(
+        &self,
+        mut op: impl FnMut(&mut Connection) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        let budget = Duration::from_millis(self.write_retry_budget_ms.load(Ordering::Relaxed));
+        let started = std::time::Instant::now();
+        let mut backoff = Duration::from_millis(10);
+        loop {
+            let result = op(&mut self.conn());
+            match result {
+                Err(error) if is_transient_lock_error(&error) => {
+                    let elapsed = started.elapsed();
+                    if elapsed >= budget {
+                        return Err(error);
+                    }
+                    std::thread::sleep(backoff.min(budget - elapsed));
+                    backoff = (backoff * 2).min(Duration::from_secs(1));
+                }
+                other => return other,
+            }
+        }
     }
 
     /// Hold this process's mailbox capability key, so it can mint and check
@@ -4438,21 +4497,23 @@ impl Store {
     }
 
     /// Mark the agent's current open turn as completed (`completed_seq = opened_seq`).
+    /// Transient lock errors are retried within the store's write budget.
     pub fn note_turn_completed(&self, agent_id: &AgentId) -> Result<(), Error> {
-        let mut conn = self.conn();
-        // BEGIN IMMEDIATE: a SELECT-then-UPDATE under BEGIN DEFERRED raises
-        // SQLITE_BUSY without honouring busy_timeout when a peer is writing.
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        agent_by_id(&tx, agent_id)?;
-        tx.execute(
-            "UPDATE turn_recovery
-             SET completed_seq = opened_seq,
-                 recovery_count = 0
-             WHERE agent_id = ?1 AND completed_seq < opened_seq",
-            [agent_id.as_str()],
-        )?;
-        tx.commit()?;
-        Ok(())
+        self.write_with_retry(|conn| {
+            // BEGIN IMMEDIATE: a SELECT-then-UPDATE under BEGIN DEFERRED raises
+            // SQLITE_BUSY without honouring busy_timeout when a peer is writing.
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            agent_by_id(&tx, agent_id)?;
+            tx.execute(
+                "UPDATE turn_recovery
+                 SET completed_seq = opened_seq,
+                     recovery_count = 0
+                 WHERE agent_id = ?1 AND completed_seq < opened_seq",
+                [agent_id.as_str()],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
     }
 
     /// Record that one `[Recovery]` wake was delivered for `opened_seq`.
@@ -4584,33 +4645,37 @@ impl Store {
             day: new.day,
             recorded_at_ms: now_ms(),
         };
-        let mut conn = self.conn();
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        agent_by_id(&tx, &record.agent_id)?;
-        tx.execute(
-            "INSERT INTO usage_records (
-                id, agent_id, harness, model, input_tokens, output_tokens,
-                cache_read_tokens, cache_write_tokens, reported_cost_micros,
-                estimated_cost_micros, billing_mode, quota_state, day, recorded_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-            params![
-                record.id.as_str(),
-                record.agent_id.as_str(),
-                record.harness,
-                record.model,
-                record.input_tokens,
-                record.output_tokens,
-                record.cache_read_tokens,
-                record.cache_write_tokens,
-                record.reported_cost_micros,
-                record.estimated_cost_micros,
-                record.billing_mode.as_str(),
-                record.quota_state,
-                record.day,
-                record.recorded_at_ms,
-            ],
-        )?;
-        tx.commit()?;
+        // The id is fixed before the first attempt: a retry can never add a
+        // second row for the same usage.
+        self.write_with_retry(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            agent_by_id(&tx, &record.agent_id)?;
+            tx.execute(
+                "INSERT INTO usage_records (
+                    id, agent_id, harness, model, input_tokens, output_tokens,
+                    cache_read_tokens, cache_write_tokens, reported_cost_micros,
+                    estimated_cost_micros, billing_mode, quota_state, day, recorded_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                params![
+                    record.id.as_str(),
+                    record.agent_id.as_str(),
+                    record.harness,
+                    record.model,
+                    record.input_tokens,
+                    record.output_tokens,
+                    record.cache_read_tokens,
+                    record.cache_write_tokens,
+                    record.reported_cost_micros,
+                    record.estimated_cost_micros,
+                    record.billing_mode.as_str(),
+                    record.quota_state,
+                    record.day,
+                    record.recorded_at_ms,
+                ],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })?;
         Ok(record)
     }
 
@@ -10689,5 +10754,104 @@ mod tests {
             h.join().unwrap();
         }
         assert_eq!(store.list_usage(None).unwrap().len(), 16 * 25);
+    }
+
+    fn usage_for(id: &AgentId) -> NewUsage {
+        NewUsage {
+            agent_id: id.clone(),
+            harness: "claude-code".into(),
+            model: Some("m".into()),
+            input_tokens: 1,
+            output_tokens: 2,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            reported_cost_micros: None,
+            estimated_cost_micros: None,
+            billing_mode: BillingMode::Subscription,
+            quota_state: None,
+            day: "2026-01-01".into(),
+        }
+    }
+
+    /// Hold the writer lock from another connection for `hold`, then release.
+    fn hold_writer_lock(db: &Path, hold: Duration) -> std::thread::JoinHandle<()> {
+        let conn = Connection::open(db).unwrap();
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        std::thread::spawn(move || {
+            std::thread::sleep(hold);
+            conn.execute_batch("COMMIT").unwrap();
+        })
+    }
+
+    #[test]
+    fn turn_persistence_outlasts_a_writer_lock_longer_than_busy_timeout() {
+        let (dir, store) = setup();
+        let db = dir.path().join("state.db");
+        let worker = agent(&store, "lock-wait");
+        store.set_agent_running(&worker.id, "/work").unwrap();
+        store.receive(&worker.id, Incoming::new("task")).unwrap();
+        store.note_delivered(&worker.id, 1).unwrap();
+        assert!(store.has_open_turn(&worker.id).unwrap());
+        // Each attempt gives up after 20 ms; the peer holds the lock ~15x longer.
+        store
+            .set_lock_wait(Duration::from_millis(20), Duration::from_secs(10))
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let peer = hold_writer_lock(&db, Duration::from_millis(300));
+        store.note_turn_completed(&worker.id).unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(250));
+        assert!(!store.has_open_turn(&worker.id).unwrap());
+        peer.join().unwrap();
+
+        let peer = hold_writer_lock(&db, Duration::from_millis(300));
+        let record = store.record_usage(usage_for(&worker.id)).unwrap();
+        peer.join().unwrap();
+        let rows = store.list_usage(Some(&worker.id)).unwrap();
+        assert_eq!(rows.len(), 1, "a retried write records exactly one row");
+        assert_eq!(rows[0].id, record.id);
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn turn_persistence_surfaces_the_lock_error_once_the_budget_is_spent() {
+        let (dir, store) = setup();
+        let db = dir.path().join("state.db");
+        let worker = agent(&store, "lock-budget");
+        store.set_agent_running(&worker.id, "/work").unwrap();
+        store.receive(&worker.id, Incoming::new("task")).unwrap();
+        store.note_delivered(&worker.id, 1).unwrap();
+        store
+            .set_lock_wait(Duration::from_millis(10), Duration::from_millis(150))
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let peer = hold_writer_lock(&db, Duration::from_secs(2));
+        let completed = store.note_turn_completed(&worker.id);
+        let usage = store.record_usage(usage_for(&worker.id));
+        let elapsed = started.elapsed();
+        peer.join().unwrap();
+
+        let err = completed.expect_err("lock outlasting the budget must surface");
+        assert!(is_transient_lock_error(&err), "unexpected error: {err}");
+        assert!(usage.is_err_and(|e| is_transient_lock_error(&e)));
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "budget bounds the wait: {elapsed:?}"
+        );
+        assert!(store.has_open_turn(&worker.id).unwrap());
+        assert!(store.list_usage(Some(&worker.id)).unwrap().is_empty());
+    }
+
+    #[test]
+    fn non_lock_errors_are_not_retried() {
+        let (_dir, store) = setup();
+        let missing = AgentId::generate();
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            store.note_turn_completed(&missing),
+            Err(Error::AgentNotFound(_))
+        ));
+        assert!(started.elapsed() < Duration::from_millis(100));
     }
 }
