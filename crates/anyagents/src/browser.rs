@@ -18,6 +18,8 @@ use anyagents_core::{Error, now_ms};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+mod proxy;
+
 const DEFAULT_IDLE_TIMEOUT_MS: i64 = 15 * 60 * 1000;
 
 fn deterministic_profile_seed(profile: &str) -> u64 {
@@ -59,6 +61,9 @@ pub struct BrowserRuntimeState {
     pub cdp_port: u16,
     pub headless: bool,
     pub display_mode: String,
+    /// Effective launch proxy; an empty string explicitly disables system proxies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_target_id: Option<String>,
     pub started_at_ms: i64,
@@ -205,6 +210,15 @@ pub struct BrowserRequest {
     /// Optional headless override (`false` by default: runs real headed Chromium inside Xvfb virtual display for maximum anti-detect stealth).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub headless: Option<bool>,
+    /// Launch proxy endpoint: `http://host[:port]`, `https://host[:port]`,
+    /// `socks4://host[:port]`, `socks5://host[:port]`, or `host[:port]` (HTTP).
+    /// Omitted: keep a running profile's proxy, otherwise use `ANYAGENTS_BROWSER_PROXY`.
+    /// Empty string: direct connection, overriding environment/system proxies.
+    /// Credentials, whitespace, paths, and proxy maps are rejected. Close a running
+    /// profile before changing its proxy; cookies and login state stay on disk.
+    /// Applies to actions that start/use the browser, not status/list/close.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<String>,
     /// Optional tab sub-action when `action = "tabs"`: `"list"` (default), `"new"`, `"activate"`, or `"close"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tab_action: Option<String>,
@@ -587,9 +601,18 @@ fn ensure_browser_running(
     data: &Path,
     profile: &str,
     headless_override: Option<bool>,
+    proxy_override: Option<&str>,
 ) -> Result<(BrowserRuntimeState, BrowserFingerprint), Error> {
+    let running = load_runtime(data, profile)?;
+    let proxy = proxy::resolve(proxy_override, running.as_ref(), proxy::environment_default)?;
+    // Do not discard open tabs or interrupt human input to change routing.
+    if running.as_ref().is_some_and(|state| state.proxy != proxy) {
+        return Err(Error::Message(
+            "browser proxy change requires closing the profile first; call close, then reopen with the desired proxy (or an empty string for direct access)".into(),
+        ));
+    }
     let fp = ensure_fingerprint(data, profile)?;
-    if let Some(mut running) = load_runtime(data, profile)? {
+    if let Some(mut running) = running {
         touch_runtime(data, &mut running)?;
         return Ok((running, fp));
     }
@@ -632,6 +655,10 @@ fn ensure_browser_running(
         "--lang=zh-HK".to_string(),
         "about:blank".to_string(),
     ];
+
+    if let Some(arg) = proxy::launch_argument(proxy.as_deref()) {
+        chrome_args.insert(0, arg);
+    }
 
     let (mut cmd, display_mode, actual_headless) = if !want_headless && has_display {
         let mut c = Command::new(&bin);
@@ -693,6 +720,7 @@ fn ensure_browser_running(
         cdp_port: port,
         headless: actual_headless,
         display_mode,
+        proxy,
         active_target_id: None,
         started_at_ms: now,
         last_used_at_ms: now,
@@ -4328,6 +4356,14 @@ fn execute_inner(
     .to_ascii_lowercase();
 
     let profile = sanitize_profile_name(req.profile.as_deref(), default_profile);
+    if req.proxy.is_some()
+        && matches!(
+            action.as_str(),
+            "profiles" | "list" | "close" | "stop" | "shutdown" | "status" | "info" | "fingerprint"
+        )
+    {
+        return Err(Error::Message("proxy applies only to actions that start or use the browser; omit it for status/list/close".into()));
+    }
 
     match action.as_str() {
         "profiles" | "list" => {
@@ -4380,7 +4416,7 @@ fn execute_inner(
         resolve_selector(data, &profile, selector)?;
     }
 
-    let (mut rt, fp) = ensure_browser_running(data, &profile, req.headless)?;
+    let (mut rt, fp) = ensure_browser_running(data, &profile, req.headless, req.proxy.as_deref())?;
 
     if action == "tabs" {
         let sub = req
@@ -5639,6 +5675,7 @@ mod tests {
                     cdp_port: port,
                     headless: true,
                     display_mode: "test".into(),
+                    proxy: None,
                     active_target_id: Some("page".into()),
                     started_at_ms: now_ms(),
                     last_used_at_ms: now_ms(),
@@ -5784,7 +5821,7 @@ mod tests {
             std::fs::write(&path, b"{corrupt").unwrap();
             let error = match file {
                 "runtime.json" => {
-                    ensure_browser_running(dir.path(), "profile", Some(true)).unwrap_err()
+                    ensure_browser_running(dir.path(), "profile", Some(true), None).unwrap_err()
                 }
                 "takeover.json" => {
                     check_human_takeover_fence(dir.path(), "profile", "click").unwrap_err()
@@ -6052,7 +6089,8 @@ mod tests {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
-        let (mut runtime, fp) = ensure_browser_running(dir.path(), "override", Some(true)).unwrap();
+        let (mut runtime, fp) =
+            ensure_browser_running(dir.path(), "override", Some(true), None).unwrap();
         let page = select_page_target(dir.path(), &mut runtime, None).unwrap();
         let mut session =
             CdpSession::connect(runtime.cdp_port, page.ws_url.as_deref().unwrap()).unwrap();
@@ -6077,7 +6115,7 @@ mod tests {
         }
         let data = tempfile::tempdir().unwrap();
         let (mut runtime, _) =
-            ensure_browser_running(data.path(), "input-value", Some(true)).unwrap();
+            ensure_browser_running(data.path(), "input-value", Some(true), None).unwrap();
         let target = select_page_target(data.path(), &mut runtime, None).unwrap();
         let mut session =
             CdpSession::connect(runtime.cdp_port, target.ws_url.as_deref().unwrap()).unwrap();
@@ -6140,7 +6178,7 @@ mod tests {
         );
         let data = tempfile::tempdir().unwrap();
         let (mut runtime, _) =
-            ensure_browser_running(data.path(), "split-code", Some(true)).unwrap();
+            ensure_browser_running(data.path(), "split-code", Some(true), None).unwrap();
         let target = select_page_target(data.path(), &mut runtime, None).unwrap();
         let mut session =
             CdpSession::connect(runtime.cdp_port, target.ws_url.as_deref().unwrap()).unwrap();
