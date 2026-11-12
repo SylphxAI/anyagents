@@ -1258,7 +1258,7 @@ async fn session_reset_prompt_for_a_paused_agent_is_queued_for_the_new_session()
     let parent_mcp = connect(dir.path(), &parent.name).await;
 
     // Without a prompt nothing is queued.
-    ok_json(
+    let _without: serde_json::Value = ok_json(
         call(
             &parent_mcp,
             "agents",

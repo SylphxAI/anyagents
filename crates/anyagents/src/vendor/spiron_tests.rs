@@ -1249,9 +1249,9 @@ for raw in sys.stdin:
     spiron_journal(
         &rig.cfg,
         &[
-            ("probe-session", user_input(&m1.id.to_string())),
+            ("probe-session", user_input(m1.id.as_ref())),
             ("probe-session", tool_call()),
-            ("probe-session", user_input(&m2.id.to_string())),
+            ("probe-session", user_input(m2.id.as_ref())),
             ("probe-session", json!({"type": "done"})),
         ],
     );
@@ -1306,9 +1306,9 @@ for raw in sys.stdin:
     spiron_journal(
         &rig.cfg,
         &[
-            ("probe-session", user_input(&m1.id.to_string())),
+            ("probe-session", user_input(m1.id.as_ref())),
             ("probe-session", tool_call()),
-            ("probe-session", user_input(&m2.id.to_string())),
+            ("probe-session", user_input(m2.id.as_ref())),
             ("probe-session", tool_call()),
         ],
     );
