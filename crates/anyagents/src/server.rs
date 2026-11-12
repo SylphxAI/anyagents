@@ -344,6 +344,10 @@ async fn serve(
             }
         })
         .await;
+    // Close every desktop gracefully: the browser flushes its profile, and no
+    // desktop outlives the server to hold a profile lock.
+    #[cfg(target_os = "linux")]
+    crate::workstation::session::stop_all().await;
     // A long poll ends at Telegram, not here: signal the poller to stop first
     // so released long polls exit instead of re-entering a 30s wait, then
     // release every bot so each bot's last offset is written before shutdown.

@@ -12,7 +12,7 @@
 //! | --- | --- | --- |
 //! | `ANYAGENTS_CHROMIUM_BIN` | Chromium-family browser binary | first installed Chrome/Chromium |
 //! | `ANYAGENTS_BROWSER_SEED_FLAG` | flag that takes the profile's fingerprint seed, e.g. `--fingerprint` | none |
-//! | `ANYAGENTS_BROWSER_ARGS` | extra browser arguments, whitespace separated | `--no-sandbox` |
+//! | `ANYAGENTS_BROWSER_ARGS` | extra browser arguments, whitespace separated | [`DEFAULT_BROWSER_ARGS`] |
 //! | `ANYAGENTS_BROWSER_PROXY` | proxy for sessions started without `proxy` | none |
 //! | `ANYAGENTS_BROWSER_LANGUAGES` / `ANYAGENTS_BROWSER_TIMEZONE` | identity of newly created profiles | `en-US,en` / `UTC` |
 //! | `ANYAGENTS_BROWSER_IDLE_SECS` | idle seconds before a session stops | 900 |
@@ -34,6 +34,12 @@ use super::takeover::{self, Tunnel};
 use super::{ToolError, profile_dir};
 
 const DEFAULT_IDLE_SECS: i64 = 15 * 60;
+/// Browser arguments when `ANYAGENTS_BROWSER_ARGS` is unset. No sandbox, as
+/// before: containers without user namespaces cannot start Chromium's. No
+/// crash-restore prompt: profiles the previous implementation stopped with a
+/// signal are marked crashed, and the prompt would cover every one of their
+/// desktops until someone dismissed it.
+pub const DEFAULT_BROWSER_ARGS: [&str; 2] = ["--no-sandbox", "--hide-crash-restore-bubble"];
 /// How long `stop` waits for in-flight calls before dropping the session.
 const STOP_DRAIN: Duration = Duration::from_secs(30);
 
@@ -228,8 +234,8 @@ fn session_config(
         .ok()
         .map(|f| f.trim().to_string())
         .filter(|f| !f.is_empty());
-    browser.extra_args =
-        env_list("ANYAGENTS_BROWSER_ARGS").unwrap_or_else(|| vec!["--no-sandbox".into()]);
+    browser.extra_args = env_list("ANYAGENTS_BROWSER_ARGS")
+        .unwrap_or_else(|| DEFAULT_BROWSER_ARGS.iter().map(|a| a.to_string()).collect());
     if direct {
         // An explicit empty proxy overrides environment and system proxies.
         browser.extra_args.push("--no-proxy-server".into());
@@ -345,12 +351,31 @@ async fn shutdown(live: Arc<Live>) {
         // Still shared: dropping the last clone kills the processes.
         return;
     };
+    // The watcher holds the session too; it must be gone before the session
+    // can be closed gracefully (a dropped session is killed, which the
+    // browser records as a crash and which skips its profile flush).
     owned.watcher.abort();
+    let _ = owned.watcher.await;
     drop(owned.tunnel);
-    let runtime_dir = owned.runtime_dir.clone();
-    match Arc::try_unwrap(owned.session) {
-        Ok(session) => session.shutdown().await,
-        Err(shared) => drop(shared),
+    let runtime_dir = owned.runtime_dir;
+    let mut session = owned.session;
+    let deadline = tokio::time::Instant::now() + STOP_DRAIN;
+    loop {
+        match Arc::try_unwrap(session) {
+            Ok(s) => {
+                s.shutdown().await;
+                break;
+            }
+            Err(shared) if tokio::time::Instant::now() < deadline => {
+                session = shared;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(shared) => {
+                eprintln!("desktop session still in use after {STOP_DRAIN:?}; killing it");
+                drop(shared);
+                break;
+            }
+        }
     }
     let _ = std::fs::remove_dir_all(runtime_dir);
 }
@@ -362,6 +387,38 @@ pub fn stop_in_background(data: &Path, profile: &str) {
         handle.spawn(async move {
             stop(&data, &profile).await;
         });
+    }
+}
+
+/// Stop every session (server shutdown), concurrently.
+pub async fn stop_all() {
+    let slots: Vec<(PathBuf, Slot)> = SESSIONS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .drain()
+        .collect();
+    let stops = slots.into_iter().map(|(_, slot)| async move {
+        if let Some(live) = slot.lock().await.take() {
+            shutdown(live).await;
+        }
+    });
+    futures::future::join_all(stops).await;
+}
+
+/// Drop every session without a graceful close; their processes are killed
+/// as the last handles go. For paths that cannot await (a panicking test).
+#[cfg(test)]
+pub fn abandon_all() {
+    let slots: Vec<Slot> = SESSIONS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .drain()
+        .map(|(_, s)| s)
+        .collect();
+    for slot in slots {
+        if let Ok(mut g) = slot.try_lock() {
+            g.take();
+        }
     }
 }
 
@@ -439,6 +496,11 @@ mod tests {
                 .iter()
                 .any(|a| a == "--no-proxy-server")
         );
+        if std::env::var_os("ANYAGENTS_BROWSER_ARGS").is_none() {
+            for arg in DEFAULT_BROWSER_ARGS {
+                assert!(cfg.browser.extra_args.iter().any(|a| a == arg), "{arg}");
+            }
+        }
         assert_eq!(cfg.profile.user_data_dir(), dir.path().join("user-data"));
     }
 }

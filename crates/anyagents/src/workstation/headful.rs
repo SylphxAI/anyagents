@@ -169,6 +169,14 @@ async fn existing_profile_opens_with_logins_and_every_operation_works() {
         eprintln!("skipped: set ANYAGENTS_DESKTOP_HEADFUL=1");
         return;
     }
+    // A failed assertion must not leave the desktop running past the test.
+    struct Abandon;
+    impl Drop for Abandon {
+        fn drop(&mut self) {
+            super::session::abandon_all();
+        }
+    }
+    let _abandon = Abandon;
     let data = tempfile::tempdir().unwrap();
     let data = data.path();
     let seen = Arc::new(Mutex::new(Seen::default()));
@@ -332,4 +340,14 @@ async fn existing_profile_opens_with_logins_and_every_operation_works() {
         "{read}"
     );
     call(data, json!({"action": "close"})).await;
+    // `close` is a graceful browser exit: the profile records a clean exit
+    // (no "didn't shut down correctly" prompt next time).
+    let prefs: Value =
+        serde_json::from_slice(&std::fs::read(dir.join("user-data/Default/Preferences")).unwrap())
+            .unwrap();
+    assert_eq!(
+        prefs["profile"]["exit_type"], "Normal",
+        "{}",
+        prefs["profile"]
+    );
 }
