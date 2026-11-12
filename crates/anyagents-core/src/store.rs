@@ -986,7 +986,7 @@ impl Store {
             capabilities: Mutex::new(None),
             write_retry_budget_ms: AtomicU64::new(WRITE_RETRY_BUDGET.as_millis() as u64),
             busy_timeout_ms: AtomicU64::new(BUSY_TIMEOUT.as_millis() as u64),
-                    read_conn_count: AtomicU64::new(0),
+            read_conn_count: AtomicU64::new(0),
         })
     }
 
@@ -5044,7 +5044,7 @@ impl Store {
     }
 
     fn read_conn(&self) -> ReadConn<'_> {
-            self.read_conn_count.fetch_add(1, Ordering::Relaxed);
+        self.read_conn_count.fetch_add(1, Ordering::Relaxed);
         if !self.db_path.as_os_str().is_empty()
             && let Ok(c) = Connection::open_with_flags(
                 &self.db_path,
