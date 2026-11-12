@@ -49,6 +49,13 @@ ureq = { version = "3", features = ["json"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 roxmltree = "0.21"
 
+# Desktop sessions (headless Wayland) exist on Linux only; other hosts answer
+# session calls with a typed `UNSUPPORTED` error.
+[target.'cfg(target_os = "linux")'.dependencies]
+agent-workstation = { git = "https://github.com/SylphxAI/agent-workstation", rev = "55a7eb216055182292a6a9304815a2104d57f38f" }
+async-trait = "0.1"
+url = "2"
+
 [dev-dependencies]
 anyagents-agent = { path = "../anyagents-agent" }
 anyagents-core = { path = "../anyagents-core" }

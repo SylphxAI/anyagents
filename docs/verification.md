@@ -185,249 +185,38 @@ checkpoint must advance to 12 without changing the two mailbox IDs or provider
 origins. This verifies replay after an interrupted checkpoint without relying
 on a sleep to hit the crash window.
 
-## Browser takeover on phones
+## Desktop sessions (browser and computer)
 
-Takeover starts with the original desktop page, fitted to a full-viewport canvas.
-The floating control pill expands to reveal typing, Enter, Backspace, reset/1:1,
-and an opt-in phone layout. A single finger clicks or press-drags the remote page, including sliders.
-Two fingers scroll the remote page or pinch to zoom locally. The explicit
-“Touch: pan view” mode moves the zoomed local view without interacting with
-the page. Mouse press-drag and wheel operate the remote page. Phone layout resizes only the browser window, leaving its
-User-Agent, Client Hints, screen and DPR unchanged. The original window bounds
-and state are restored on Done, agent release, expiry, navigation away, or a
-lost viewer heartbeat (more than 10 seconds). The viewer polls state 800 ms
-after each response. A lost heartbeat restores phone layout only; it does not
-return control to the agent. Human control ends on Done/release, the absolute
-takeover deadline (10 minutes by default), or a dead takeover listener. Viewer
-heartbeats do not extend that deadline.
+`tools.browser` and session `tools.computer` share one desktop per profile: a
+headless Wayland compositor (sway) running one headful Chromium-family browser,
+with wayvnc behind the full-desktop noVNC takeover page. The
+[`agent-workstation`](https://github.com/SylphxAI/agent-workstation) crate owns
+the desktop, browser, takeover and input; AnyAgents owns caller policy
+(profiles, secret references, snapshot ids, idle reaping, takeover delivery).
 
-Takeover state is published by atomic replacement so concurrent listener reads
-see a complete snapshot, never a truncated JSON file mistaken for an ended
-session. The publication regression holds a reader open across replacement;
-the viewport regression advances the reaper's explicit clock without writing
-expired deadlines or stale heartbeats that race its background loop. Neither
-regression needs timing sleeps or retries.
+`workstation::headful::existing_profile_opens_with_logins_and_every_operation_works`
+drives the tool surface end to end. It first writes the profile the way the
+previous implementation did (a plain Chromium process on `user-data/`, plus its
+`runtime.json`), then requires that the new session opens the same directory
+with the cookie and local storage intact and retires the old bookkeeping. It
+fills a `secret://` reference and checks the exact value reaches the form
+without appearing in any response, rejects stale refs, takes a full-desktop
+screenshot and zoom through `tools.computer`, types into the address bar with
+the desktop keyboard, serves the takeover page behind its token, refuses agent
+calls with `HUMAN_IN_CONTROL` until the person hands back, opens and closes
+tabs, and reopens the profile after `close` with its login.
 
-Takeover routes keyboard shortcuts globally, including when the canvas,
-page background, stage or a HUD button has focus. Only local HUD text fields
-keep their own typing and clipboard. Both Control and Command support
-select-all, copy, cut, paste, undo and redo (Shift+Z or Control+Y). The remote
-host maps a Mac viewer’s Command to Control on Linux/Windows. A native paste
-event and a clipboard-read fallback share a single-insertion guard. Clipboard
-permission refusal remains visible; failed inputs are never automatically replayed. Paste inserts local clipboard text into the remote focus;
-copy and cut export the remote selection only after checking that the focus is
-not a password field. The viewer keeps new-tab, close-tab and address-bar
-shortcuts local. The floating pill also exposes Paste, Copy, Select all, Tab and Esc;
-clipboard permission refusal displays a prompt instead of silently losing input.
-On touch devices the native keyboard input overlays the remote field and tracks
-its position through zoom and pan, so the device's Paste menu works in place.
-No typed or pasted text is returned in input acknowledgements.
-
-The server gives input a persistent CDP session independent of screenshots and
-state inspection. At most 32 concurrent HTTP clients are admitted. Frame metadata
-uses short locks; viewport/heartbeat/completion updates share a separate control
-lock that input never waits on. Unsent mouse moves are coalesced without crossing
-press/release/key boundaries, and coalesced wheels preserve total scroll distance.
-The viewer polls JPEGs 32 ms after each completed frame and automatically retries
-frame/state reads on the same URL after disconnection. Each fetch has a 5-second
-deadline. Input failures report connection loss rather than replaying a possibly
-committed action.
-
-`tests/browser-takeover-interaction.mjs` drives the actual Rust HTTP server with
-trusted Chromium input at 1440×900, 834×1194 and 390×844. It covers global focus
-owners, native/fallback single paste, password paste, clipboard/undo/redo, IME,
-local HUD isolation, sign-in clicks, desktop/touch slider drag, mouse/two-finger
-scroll, delayed two-finger pinch, same-URL reconnect and 20 input-to-painted-JPEG
-latency samples with a 150 ms maximum. Frame polling has no successful-capture
-cooldown: capture already waits for the remote compositor, so another delay can
-put input behind two stale capture intervals. Capture failures back off for
-100 ms. Touches resolve as a tap on lift, a drag at 8 CSS px, or a sustained press
-after 150 ms, leaving 50 ms for remote delivery. A five-second stationary touch
-must press within 200 ms, remain held remotely for at least 4800 ms and release
-only at lift. Immediate two-finger gestures send no mouse events; pairs after
-250 or 600 ms cancel a committed press before scrolling or pinching, without
-clicking the original button, including when it holds native pointer capture.
-Cancellation guards are installed and acknowledged in isolated worlds for
-all frames/OOPIFs **before admitting the native press**. Persistent root and
-per-OOPIF CDP connections retain new-document script registrations; temporary
-connections would lose them on disconnect. A real Chromium regression replaces
-the root document after admission but before native press and requires zero
-target clicks plus terminal pointerup/capture release. Failed discovery or
-installation therefore prevents an uncommitted press, not its terminal release.
-Viewer mouse events use no keyboard modifiers; cancellation reserves all four
-modifier bits on its native release. The persistent guard recognizes that marker
-on the resulting click without requiring an observed pointerdown or pointerup.
-An intentional four-modifier press remains usable when its observed native
-pointerup and click share the same timestamp; a stale modified release cannot
-authorize a later click. A real Chromium regression installs an earlier page
-capture listener that stops pointerdown propagation and requires zero additional
-clicks and exactly one terminal release. The guard never consumes terminal
-pointerup/mouseup, including on controls preventing compatibility mouse events. Cancellation performs no discovery,
-installation, deadline check or cleanup round-trip. The next ordinary click and
-an intentionally four-modifier click remain usable; page-world globals are not
-introduced. Protocol tests reject incomplete/failed prepress admission, allow
-slow successful admission, and require exactly one native release even when all
-discovery/script operations would fail slowly. Deterministic shipped-handler
-regressions cover committed pointer cancellation, hidden/zero-size surfaces and
-finite last coordinates, plus obsolete clipboard reads after local focus, blur
-or a newer paste turn. Accepted HTTP workers recheck the live token, holder,
-completion and expiry after reading. Shared HTTP dispatch and exclusive ownership
-transitions use the same profile file lock across processes. Before handback, one
-shared terminal path drains the retained native press on its original page target;
-HTTP/direct completion, agent reclaim, CAPTCHA auto-completion and expiry all use
-it. Their five Chromium regressions each require one release, zero clicks and no
-second release after repeated completion/cleanup. An unfinished old-token request
-cannot dispatch after completion or replacement.
-Emulated touch is not a physical iPhone Safari receipt.
-`npm test` checks bounded move/wheel queues and no replay on input failure. The
-resource-free Rust regression holds an incomplete frame HTTP request open while
-verifying a separate input request completes, distinguishing the old serial
-listener. A manual `ci` dispatch with `takeover=true` executes the full ignored
-Chromium fixture and uploads `takeover-evidence`; it does not remove the existing
-startup quarantine from ordinary PR/merge-group runs.
-
-`takeover_clipboard_ui_acceptance` covers the Chromium viewer clipboard and
-keyboard regressions. It is temporarily quarantined by #118: Linux jobs
-128295856130 (PR #114, run 42336924651) and 128298493004 (PR #115, run
-42337744143) failed before the driver ran because the CDP port did not open
-within the existing 12-second startup budget. Their discarded Chromium logs
-cannot distinguish delayed startup from a crash. The startup path now waits
-for a valid `/json/version` response under that same 12-second ceiling and
-reports the last readiness failure, original child exit status, cleanup status,
-and the final 8192 bytes of Chromium stdout/stderr. Deterministic controls cover
-a TCP listener with incomplete/error responses before readiness, early exit,
-stalled HTTP, missing logs and non-UTF-8 log tails. These controls improve
-readiness and diagnosis; they do not establish the cause of those CI failures.
-Keep the quarantine until captured failure evidence supports a causal repair.
-
-The ordinary real-Chromium Rust fixtures share one in-process scenario guard,
-held through teardown; resource-free startup controls still run concurrently.
-This bounds browser-launch contention without changing the 12-second readiness
-ceiling, skipping assertions or retrying interactions. PR #129 run
-`42402630072`, Linux job `128493544529`, reported simultaneous startup timeouts
-in the iframe, held-key, CAPTCHA and viewport fixtures. Each browser was still
-alive before cleanup, with connection-refused as its last CDP readiness result.
-The same candidate tree passed the workspace and full Chromium takeover fixture
-in dispatch `42402639225`. This shows a nondeterministic startup failure, not its
-underlying cause; the guard limits fixture contention and does not justify
-removing the existing clipboard or OOPIF quarantine. Manual `ci` dispatch with
-`takeover=true` also runs those two ignored fixtures explicitly after the full
-mobile acceptance; any failed fixture fails the job without a retry.
-
-Run the fixture explicitly for takeover changes:
+It runs only with `ANYAGENTS_DESKTOP_HEADFUL=1` and needs `sway`, `wayvnc` and a
+Chromium-family browser. CI runs it on every Linux job:
 
 ```sh
-cargo test -p anyagents --bin anyagents --locked \
-  browser::tests::takeover_clipboard_ui_acceptance -- --ignored --exact --nocapture
+ANYAGENTS_DESKTOP_HEADFUL=1 ANYAGENTS_CHROMIUM_BIN=/usr/bin/google-chrome \
+  cargo test -p anyagents --bin anyagents --locked workstation::headful -- --nocapture
 ```
 
-The 1440×900 and 390×844 cases cover native and synthetic paste (one insertion),
-copy/cut, undo, Tab/Shift+Tab, aligned touch input, permission refusal and password
-export denial. The viewer starts in a dedicated process group. Teardown signals
-the whole group, waits up to 5 seconds for graceful exit, then uses SIGKILL and
-waits up to 5 more seconds if necessary. It removes the disposable profile only
-after no non-zombie group members remain; zombies cannot write the profile. A
-timeout fails cleanup and preserves the profile. There are no deletion or
-interaction retries. This replaces the deletion-retry workaround for the Linux
-`ENOTEMPTY` failure in CI run 42334433646, where Chromium helpers could still
-write after the browser parent exited. `npm test` includes deterministic live-
-descendant and graceful-exit controls; both Linux and macOS CI execute them.
-
-Actual iPhone Safari keyboard and long-press menus require a
-post-deployment device check; Chromium emulation does not certify those OS menus.
-
-Frame metadata supplies the remote CSS viewport alongside the actual JPEG size
-and reported DPR. A screenshot captured by a fresh CDP session can be 1920×1080
-while the document reports DPR 2; dividing image coordinates by DPR alone is
-incorrect. Input uses the measured CSS extent and the current zoom/pan transform.
-
-Run the focused checks without an existing browser profile or external account:
-
-```sh
-npm test
-cargo test -p anyagents --bin anyagents browser::tests:: --locked
-```
-
-The geometry suite covers DPR 1/2/3, zoom anchors and pan limits. The native
-browser tests exercise trusted input, byte-identical browser identity, restored
-metrics on every exit, and expiry before a queued toggle or Done. They require
-Chromium; the existing browser suites skip when it is unavailable.
-
-`takeover_focus_finds_cross_origin_input` is separately quarantined for two
-intermittent Chromium failures: a CDP startup timeout and a post-startup
-`focus.editable = false` assertion. On 2026-11-07, the latter also reproduced in
-the unmodified `52c4432b362ac548434ab30cead122c5e2e244ed` test binary, before
-the clipboard changes, using the same Chromium 156.0.8078.47. A bounded cohort
-restricted eight concurrent fixture processes to one CPU to expose the race;
-this is reproduction evidence, not a retry policy or a supported latency bound.
-Failure-only diagnostics on both revisions found a focused parent iframe but
-an unfocused child `BODY`, with the input present and both documents complete.
-The cause remains unresolved; capturing a screenshot before the click did not
-remove it. The focus detector and click dispatch were unchanged by the clipboard
-feature. Run this test explicitly when reviewing takeover changes, so its
-quarantine cannot hide a new regression:
-
-```sh
-cargo test -p anyagents --bin anyagents --locked \
-  browser::tests::takeover_focus_finds_cross_origin_input -- --ignored --exact --nocapture
-```
-
-A green ordinary suite does not establish this ignored test passed. Its focused
-assertions still require the first click to find the child input at offset
-(60, 80); there is no interaction retry. Remove the quarantine only after both
-failure modes have deterministic fixes.
-
-`cross_origin_iframe_snapshot_fill_and_click_with_secret_ref` is quarantined by
-#200: CI run 43152557810 failed when `browser open` reported an interrupted system
-call (`EINTR`) as a terminal failure. The browser module is scheduled for replacement,
-so the test is deleted with it rather than repaired. Run it explicitly when changing
-iframe or `secret_ref` fill paths:
-
-```sh
-cargo test -p anyagents --bin anyagents --locked \
-  browser::tests::cross_origin_iframe_snapshot_fill_and_click_with_secret_ref -- --ignored --exact --nocapture
-```
-
-Every remaining `browser::tests` fixture that launches real Chromium is quarantined by
-#200 after a second CI `EINTR` failure (run 43189357383,
-`chromium_stealth_override_exception_is_observable`). The browser module is scheduled for
-replacement, so these fixtures are deleted with it rather than repaired. Scripted-CDP,
-resource-free startup and pure unit tests keep running. Run the real-Chromium fixtures
-explicitly when changing the browser module:
-
-```sh
-cargo test -p anyagents --bin anyagents --locked browser::tests:: -- --ignored
-```
-
-Copy assertions first replace the local clipboard with a distinct sentinel.
-The preceding paste may already have left the expected Copy text there, so an
-unchanged-value read is not proof that asynchronous Copy completed. In takeover
-run `42406668267` at head `4ba8682d`, the phone native-paste assertion timed out
-with the previous `pill paste` value. A Chromium 156.0.8078.47 control on
-2026-11-07 held a real `ClipboardItem` selection promise: the old equality
-predicate passed before Copy finished, then the late Copy overwrote the next
-`mobile paste` value. A distinct sentinel held the predicate false until Copy
-completed and preserved the subsequent value. The fixture now requires that
-transition in all three affected copy checks; native paste still must produce
-its original exact expected text without retries or a longer deadline.
-
-The full UI acceptance test additionally requires Node.js 22 or newer (native
-WebSocket support). It launches its own headless Chromium viewer and remote test
-page, records trusted remote click coordinates within 2 CSS pixels, and saves
-collapsed, expanded, zoomed, phone-layout and keyboard captures at 390×844,
-588×1280, 1280×800 and 1440×900. It also checks pagehide restoration and visible
-reconnection/recovery:
-
-```sh
-TAKEOVER_EVIDENCE_DIR="$(mktemp -d)" \
-  cargo test -p anyagents --bin anyagents \
-  browser::tests::mobile_takeover_ui_acceptance --locked -- --ignored --nocapture
-```
-
-Set `TAKEOVER_GOOGLE_ACCEPTANCE=1` for the additional network-dependent,
-unauthenticated `accounts.google.com` phone-layout captures. No credentials are
-entered. This is separate from the deterministic local fixture and does not
-certify Google sign-in, a physical phone's keyboard, or deployed release bytes.
+`ANYAGENTS_LEGACY_CHROMIUM_BIN` writes the legacy profile with a different
+browser than the session uses, e.g. a newer distribution Chromium against an
+older fingerprint build, which checks that a version downgrade keeps logins.
 
 ## Host memory under a managed UID
 

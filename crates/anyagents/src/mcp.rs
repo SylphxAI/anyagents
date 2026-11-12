@@ -2970,11 +2970,11 @@ impl AgentMcp {
     }
 
     #[tool(
-        description = "Native SOTA anti-detect browser with persistent login profiles, interactive human CAPTCHA takeover, and scale-to-zero lifecycle (`action`: `open` | `snapshot` | `click` | `fill` | `press` | `hold` | `key_down` | `key_up` | `eval` | `screenshot` | `cookies` | `tabs` | `takeover` | `takeover_status` | `wait_for_user` | `release_takeover` | `status` | `profiles` | `close`). Runs real headed Chromium on a virtual X11 display (`xvfb-headed`) with deterministic per-profile WebGL/Client-Hints/Canvas stealth fingerprinting and persistent `--user-data-dir` login state. Pass `action: \"open\"` with `url` to navigate and receive interactive `@e1`, `@e2` refs; pass `action: \"click\"` or `\"fill\"` with `selector: \"@e1\"`; pass `action: \"press\"` or `\"hold\"` with `key` (or `keys`: `[\"w\", \"d\"]`) and optional `hold_ms` (e.g. `500`) to hold trusted keyboard input (`isTrusted: true`, W3C `KeyboardEvent.code`) across rendered animation frames and release cleanly on completion; when a CAPTCHA or 2FA challenge (`captcha_detected: true`) requires human assistance, pass `action: \"takeover\"` with optional `reason` to launch a live remote interactive browser takeover session (`takeover_url`) and send `takeover_url` (plus `screenshot_path` via `send` media) to the user; pass `action: \"close\"` when finished to scale the browser process to zero while keeping the profile logged in."
+        description = "Your browser: one headful browser on your own headless desktop, with a persistent login profile (`action`: `open` | `back` | `forward` | `reload` | `snapshot` | `read` | `click` | `fill` | `press` | `screenshot` | `tabs` | `takeover` | `takeover_status` | `wait_for_user` | `release_takeover` | `status` | `profiles` | `close`). Pass `action: \"open\"` with `url` to navigate and receive an accessibility snapshot whose interactive elements carry refs (`@<snapshot_id>:e1`); pass `action: \"click\"` or `\"fill\"` with `selector` set to a ref; fill credentials with `secret_ref` (`op://...`, `op-otp://...`, `secret://...`) so the value never enters your context. `screenshot` captures the whole desktop (browser chrome and dialogs included); `tools.computer` acts on the same desktop's pixels. When a CAPTCHA or 2FA challenge needs a person, call `action: \"takeover\"` with a `reason` and send `takeover_url` (plus `screenshot_path` via `send` media) to the user: they control the whole desktop until they hand back, and you receive `[Browser Takeover Completed]`. Calls fail with `HUMAN_IN_CONTROL` while they hold it. `close` stops the desktop; logins stay on disk."
     )]
     async fn browser(
         &self,
-        Parameters(mut args): Parameters<crate::browser::BrowserRequest>,
+        Parameters(mut args): Parameters<crate::workstation::BrowserRequest>,
     ) -> Result<MultimediaJson, String> {
         if let Some(raw_path) = args
             .path
@@ -3151,19 +3151,24 @@ impl AgentMcp {
     }
 
     #[tool(
-        description = "Desktop GUI Computer Use tool supporting Semantic Accessibility Snapshot Mode (`action: \"snapshot\"`, returning `@<snapshot_id>:e<N>` refs with Web Wrapper Skipping and `STALE_REF` guard), Window/Clipboard management (`list_windows`, `focus_window`, `clipboard_get`, `clipboard_set`), and Visual Pixel Mode (`screenshot`, `cursor_position`, `move`, `click`, `mouse_down`, `mouse_up`, `drag`, `scroll`, `type`, `key`, `hold_key`, `wait`, `zoom`, or Anthropic/OpenAI `action`)."
+        description = "Desktop computer use. Without a host target it drives your own session desktop (the headless desktop your browser runs on): `screenshot`, `zoom`, `move`, `click`, `mouse_down`, `mouse_up`, `drag`, `scroll`, `type`, `key`, `wait`, `snapshot` (the browser's refs), `list_windows`, or an Anthropic/OpenAI computer-use `action`. With `platform` (`linux` | `macos` | `windows` | `chromeos`), `display`, or `wayland_display` it drives that host desktop instead, adding Semantic Accessibility Snapshot Mode (`@<snapshot_id>:e<N>` refs, `STALE_REF` guard), `list_windows`, `focus_window`, `clipboard_get`, `clipboard_set`, `cursor_position`, and `hold_key`; on a non-Linux host the host desktop is the default. `session_id` or `provider: \"cloud\"` forwards to a cloud sandbox."
     )]
     async fn computer(
         &self,
         Parameters(args): Parameters<DynamicObjectArgs>,
     ) -> Result<MultimediaJson, String> {
-        let data_dir = self.client.socket.parent().map(Path::to_path_buf);
-        let mut val = crate::computer::execute_computer_request(
-            data_dir.as_deref(),
-            &self.client.config,
-            args.into_value(),
-        )
-        .await?;
+        let req = args.into_value();
+        let mut val = if crate::computer::target(&req) == crate::computer::Target::Session {
+            self.client
+                .get(
+                    "/v1/computer",
+                    Some(serde_json::to_vec(&req).map_err(|err| err.to_string())?),
+                )
+                .await?
+        } else {
+            let data_dir = self.client.socket.parent().map(Path::to_path_buf);
+            crate::computer::execute_local(data_dir.as_deref(), &self.client.config, req).await?
+        };
         let media = extract_media_blocks_from_tool_value("computer", &mut val);
         Ok(MultimediaJson(val, media))
     }
@@ -4677,7 +4682,7 @@ impl AgentMcp {
                 Ok((self.schedule(Parameters(parsed)).await?.0, Vec::new()))
             }
             "browser" => {
-                let parsed: crate::browser::BrowserRequest = serde_json::from_value(args)
+                let parsed: crate::workstation::BrowserRequest = serde_json::from_value(args)
                     .map_err(|e| format!("invalid `browser` arguments: {e}"))?;
                 let MultimediaJson(val, media) = self.browser(Parameters(parsed)).await?;
                 Ok((val, media))
