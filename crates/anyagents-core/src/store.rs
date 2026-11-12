@@ -15,7 +15,7 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 use anyagents_harness::normalize_harness_name;
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, params_from_iter};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::error::Error;
 use crate::id::{AgentId, ChannelId, MessageId, UsageId};
@@ -689,16 +689,11 @@ pub struct Store {
     read_conn_count: AtomicU64,
 }
 
-/// Authorization data a roster needs in memory, so listing N agents does not
-/// run per-agent store queries. Produced in one read connection; every section
-/// fails closed to empty on error, matching the per-check fallbacks.
+// In-memory roster authz (one read connection; every section fail-closed empty).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RosterAuthz {
-    /// Group membership by agent id.
     pub groups: HashMap<AgentId, std::collections::HashSet<String>>,
-    /// Telegram chat ids attached to each agent.
     pub chats: HashMap<AgentId, std::collections::HashSet<i64>>,
-    /// Recipients that have previously messaged the caller.
     pub has_messaged_caller: std::collections::HashSet<AgentId>,
 }
 
@@ -1755,84 +1750,7 @@ impl Store {
     /// Load roster metadata with a fixed number of SQL statements. Indexed range
     /// seeks avoid scanning the message history of archived agents.
     pub fn agent_query_metadata(&self) -> Result<AgentQueryMetadata, Error> {
-        self.agent_query_metadata_filtered(None)
-    }
-
-    /// Same as [`Self::agent_query_metadata`], restricted to `ids` when given:
-    /// a roster only reads metadata it renders. An empty slice reads nothing.
-    pub fn agent_query_metadata_filtered(
-        &self,
-        ids: Option<&[AgentId]>,
-    ) -> Result<AgentQueryMetadata, Error> {
         let mut metadata = AgentQueryMetadata::default();
-        if let Some(ids) = ids {
-            if ids.is_empty() {
-                return Ok(metadata);
-            }
-            let placeholders = vec!["?"; ids.len()].join(",");
-            let params: Vec<&str> = ids.iter().map(|id| id.as_str()).collect();
-            let conn = self.read_conn();
-            let aliases_sql = format!(
-                "SELECT agent_id, alias FROM agent_aliases WHERE agent_id IN ({placeholders}) ORDER BY alias"
-            );
-            let mut stmt = conn.prepare(&aliases_sql)?;
-            for row in stmt.query_map(params_from_iter(params.iter().copied()), |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })? {
-                let (id, alias) = row?;
-                metadata.aliases.entry(id).or_default().push(alias);
-            }
-            let undelivered_sql = format!(
-                "SELECT a.id, (SELECT m.received_at_ms FROM messages m
-                   WHERE m.agent_id = a.id AND m.seq > COALESCE(d.delivered_seq, 0)
-                     AND (CASE WHEN json_valid(m.context) THEN json_extract(m.context, '$.event') END) IS NOT 'reaction_passive'
-                   ORDER BY m.seq LIMIT 1)
-                 FROM agents a LEFT JOIN mailbox_cursors d ON d.agent_id = a.id
-                 WHERE a.state != 'archived' AND a.id IN ({placeholders})"
-            );
-            let mut stmt = conn.prepare(&undelivered_sql)?;
-            for row in stmt.query_map(params_from_iter(params.iter().copied()), |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?))
-            })? {
-                let (id, timestamp) = row?;
-                if let Some(timestamp) = timestamp {
-                    metadata.oldest_undelivered.insert(id, timestamp);
-                }
-            }
-            let turns_sql = format!(
-                "SELECT t.agent_id, COALESCE((SELECT m.received_at_ms FROM messages m
-                    WHERE m.agent_id = t.agent_id AND m.seq > t.completed_seq AND m.seq <= t.opened_seq
-                    ORDER BY m.seq LIMIT 1), t.opened_at_ms)
-                 FROM turn_recovery t JOIN agents a ON a.id = t.agent_id
-                 WHERE t.opened_seq > t.completed_seq AND a.state != 'archived' AND a.id IN ({placeholders})"
-            );
-            let mut stmt = conn.prepare(&turns_sql)?;
-            for row in stmt.query_map(params_from_iter(params.iter().copied()), |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
-            })? {
-                let (id, timestamp) = row?;
-                metadata.open_turns.insert(id, timestamp);
-            }
-            let schedules_sql = format!(
-                "SELECT id, agent_id, kind, spec, prompt, interval_ms, next_fire_at_ms,
-                        last_fired_at_ms, watch_baseline, last_observed, state, created_at_ms
-                 FROM agent_schedules
-                 WHERE state = 'active' AND agent_id IN ({placeholders})
-                 ORDER BY created_at_ms ASC, id ASC"
-            );
-            let mut stmt = conn.prepare(&schedules_sql)?;
-            for row in
-                stmt.query_map(params_from_iter(params.iter().copied()), schedule_from_row)?
-            {
-                let schedule = row?;
-                metadata
-                    .schedules
-                    .entry(schedule.agent_id.to_string())
-                    .or_default()
-                    .push(schedule);
-            }
-            return Ok(metadata);
-        }
         {
             let conn = self.read_conn();
             let mut stmt =
@@ -4816,10 +4734,7 @@ impl Store {
         .unwrap_or(false)
     }
 
-    /// One-connection export of the roster's authorization inputs: group
-    /// membership, telegram chat attachment and who has messaged `caller`.
-    /// Every section fails closed to empty on error, matching the per-check
-    /// fallbacks in `share_any_group_or_chat` and `has_messaged`.
+    // One-connection authz export matching share_any_group_or_chat / has_messaged.
     pub fn export_roster_authz(&self, caller: &Agent, recipients: &[AgentId]) -> RosterAuthz {
         let mut out = RosterAuthz::default();
         let conn = self.read_conn();
@@ -4834,46 +4749,21 @@ impl Store {
                 }
             }
         }
-        if let Ok(mut stmt) = conn.prepare("SELECT id, state FROM channels ORDER BY created_at_ms")
-        {
-            let mut states: Vec<(String, String)> = Vec::new();
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT ca.agent_id, ch.state FROM channel_agents ca
+             JOIN channels ch ON ch.id = ca.channel_id",
+        ) {
             if let Ok(rows) =
                 stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
             {
                 for row in rows.flatten() {
-                    states.push(row);
-                }
-            }
-            drop(stmt);
-            let mut members: HashMap<String, Vec<AgentId>> = HashMap::new();
-            if let Ok(mut mstmt) = conn.prepare("SELECT channel_id, agent_id FROM channel_agents") {
-                if let Ok(rows) =
-                    mstmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
-                {
-                    for row in rows.flatten() {
-                        if let Ok(id) = AgentId::parse(&row.1) {
-                            members.entry(row.0).or_default().push(id);
-                        }
+                    if let Ok(id) = AgentId::parse(&row.0) {
+                        let chats: Vec<i64> = telegram_chat_links(&row.1)
+                            .into_iter()
+                            .map(|(_, chat_id)| chat_id)
+                            .collect();
+                        out.chats.entry(id).or_default().extend(chats);
                     }
-                }
-            }
-            for (channel_id, state) in &states {
-                let chats: Vec<i64> = telegram_chat_links(state)
-                    .into_iter()
-                    .map(|(_, chat_id)| chat_id)
-                    .collect();
-                if chats.is_empty() {
-                    continue;
-                }
-                for member in members
-                    .get(channel_id.as_str())
-                    .cloned()
-                    .unwrap_or_default()
-                {
-                    out.chats
-                        .entry(member)
-                        .or_default()
-                        .extend(chats.iter().copied());
                 }
             }
         }
@@ -11513,60 +11403,13 @@ mod tests {
         assert_eq!(archived, 60);
         assert!(agents.len() >= 12);
         let live_ids: Vec<_> = agents.iter().map(|a| a.id.clone()).collect();
-        let metadata = store
-            .agent_query_metadata_filtered(Some(&live_ids))
-            .unwrap();
-        assert!(metadata.aliases.len() <= agents.len());
+        let _metadata = store.agent_query_metadata().unwrap();
         let _authz = store.export_roster_authz(&caller, &live_ids);
         let count = store.read_conn_count();
         assert!(
-            count <= 4,
+            count <= 5,
             "roster reads must stay bounded regardless of archive size, got {count}"
         );
-        // An empty selection reads nothing at all.
-        store.reset_read_conn_count();
-        let empty = store.agent_query_metadata_filtered(Some(&[])).unwrap();
-        assert!(empty.aliases.is_empty());
-        assert_eq!(store.read_conn_count(), 0);
-        // The unfiltered path still counts as legacy (schedules add one).
-        store.reset_read_conn_count();
-        let _ = store.agent_query_metadata().unwrap();
-        assert!(store.read_conn_count() <= 3);
-    }
-
-    #[test]
-    fn metadata_filtered_matches_unfiltered_for_selected() {
-        let (_dir, store) = setup();
-        let live = agent(&store, "live");
-        let _archived = agent(&store, "archived");
-        store.set_agent_state(&_archived.id, "archived").unwrap();
-        store.receive(&live.id, Incoming::new("hello")).unwrap();
-        store
-            .create_schedule(NewSchedule {
-                agent_id: live.id.clone(),
-                kind: "at".into(),
-                spec: "2099-01-01T00:00:00Z".into(),
-                prompt: "p".into(),
-                interval_ms: None,
-                next_fire_at_ms: Some(1),
-                watch_baseline: None,
-            })
-            .unwrap();
-        let full = store.agent_query_metadata().unwrap();
-        let filtered = store
-            .agent_query_metadata_filtered(Some(&[live.id.clone()]))
-            .unwrap();
-        assert_eq!(
-            filtered.aliases.get(live.id.as_str()),
-            full.aliases.get(live.id.as_str())
-        );
-        assert!(filtered.oldest_undelivered.contains_key(live.id.as_str()));
-        assert!(
-            !filtered
-                .oldest_undelivered
-                .contains_key(_archived.id.as_str())
-        );
-        assert!(filtered.schedules.contains_key(live.id.as_str()));
     }
 
     fn wal_len(db: &Path) -> u64 {

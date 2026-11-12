@@ -2763,29 +2763,10 @@ async fn list_agents(
 }
 
 fn compute_caller_relationship(store: &Store, caller: &Agent, target: &Agent) -> String {
-    if caller.id == target.id {
-        "self".to_string()
-    } else if caller.parent_id.as_ref() == Some(&target.id) {
-        "parent".to_string()
-    } else if target.parent_id.as_ref() == Some(&caller.id) {
-        "child".to_string()
-    } else if caller.parent_id.is_some() && caller.parent_id == target.parent_id {
-        "sibling".to_string()
-    } else if is_self_or_ancestor(store, &target.id, caller) {
-        "ancestor".to_string()
-    } else if is_self_or_ancestor(store, &caller.id, target) {
-        "descendant".to_string()
-    } else if caller.parent_id.is_none() && target.parent_id.is_none() {
-        "peer".to_string()
-    } else {
-        "other".to_string()
-    }
+    compute_relationship_with(caller, target, |id, t| is_self_or_ancestor(store, id, t))
 }
 
-/// Caller context for roster authorization enrichment. `None` (operator and
-/// offline CLI reads) leaves relationship/can_message unset, exactly as
-/// before; `Some` is filled in from the roster snapshot without per-view
-/// store queries.
+// Roster caller for authorization enrichment (`None` = operator/offline).
 pub(crate) struct RosterCaller<'a> {
     pub agent: &'a Agent,
     pub principal: &'a Principal,
@@ -2793,9 +2774,7 @@ pub(crate) struct RosterCaller<'a> {
 
 type RosterById<'a> = HashMap<&'a str, &'a Agent>;
 
-/// In-memory `is_self_or_ancestor`: walks the roster snapshot instead of
-/// issuing one `store.agent` query per parent level. A parent missing from
-/// the snapshot ends the walk, matching the store version's `ok()` fallback.
+// In-memory `is_self_or_ancestor` over the roster snapshot (missing parent ends the walk).
 fn is_self_or_ancestor_in(by_id: &RosterById<'_>, caller_id: &AgentId, target: &Agent) -> bool {
     if caller_id == &target.id {
         return true;
@@ -2815,43 +2794,6 @@ fn is_self_or_ancestor_in(by_id: &RosterById<'_>, caller_id: &AgentId, target: &
     false
 }
 
-fn compute_caller_relationship_in(
-    by_id: &RosterById<'_>,
-    caller: &Agent,
-    target: &Agent,
-) -> String {
-    if caller.id == target.id {
-        "self".to_string()
-    } else if caller.parent_id.as_ref() == Some(&target.id) {
-        "parent".to_string()
-    } else if target.parent_id.as_ref() == Some(&caller.id) {
-        "child".to_string()
-    } else if caller.parent_id.is_some() && caller.parent_id == target.parent_id {
-        "sibling".to_string()
-    } else if is_self_or_ancestor_in(by_id, &target.id, caller) {
-        "ancestor".to_string()
-    } else if is_self_or_ancestor_in(by_id, &caller.id, target) {
-        "descendant".to_string()
-    } else if caller.parent_id.is_none() && target.parent_id.is_none() {
-        "peer".to_string()
-    } else {
-        "other".to_string()
-    }
-}
-
-fn can_read_private_in(
-    by_id: &RosterById<'_>,
-    caller: &Agent,
-    is_operator: bool,
-    target: &Agent,
-) -> bool {
-    if is_operator {
-        return true;
-    }
-    is_self_or_ancestor_in(by_id, &caller.id, target)
-        || (caller.parent_id.is_none() && caller.is_admin)
-}
-
 fn share_in(authz: &anyagents_core::RosterAuthz, a: &AgentId, b: &AgentId) -> bool {
     let groups = authz.groups.get(a).is_some_and(|ga| {
         authz
@@ -2868,20 +2810,36 @@ fn share_in(authz: &anyagents_core::RosterAuthz, a: &AgentId, b: &AgentId) -> bo
     groups || chats
 }
 
-fn parent_name_in(by_id: &RosterById<'_>, pid: Option<&AgentId>) -> String {
-    pid.and_then(|pid| by_id.get(pid.as_str()))
-        .map(|p| p.name.clone())
-        .unwrap_or_else(|| "parent".to_string())
+fn compute_relationship_with(
+    caller: &Agent,
+    target: &Agent,
+    is_ancestor: impl Fn(&AgentId, &Agent) -> bool,
+) -> String {
+    if caller.id == target.id {
+        "self".to_string()
+    } else if caller.parent_id.as_ref() == Some(&target.id) {
+        "parent".to_string()
+    } else if target.parent_id.as_ref() == Some(&caller.id) {
+        "child".to_string()
+    } else if caller.parent_id.is_some() && caller.parent_id == target.parent_id {
+        "sibling".to_string()
+    } else if is_ancestor(&target.id, caller) {
+        "ancestor".to_string()
+    } else if is_ancestor(&caller.id, target) {
+        "descendant".to_string()
+    } else if caller.parent_id.is_none() && target.parent_id.is_none() {
+        "peer".to_string()
+    } else {
+        "other".to_string()
+    }
 }
 
-/// In-memory `can_sender_message_agent` for the roster: identical allow/deny
-/// branches, with group/chat/message inputs from one exported authz snapshot
-/// instead of one store query per listed agent. Error text is preserved.
-fn can_sender_message_in(
-    by_id: &RosterById<'_>,
-    authz: &anyagents_core::RosterAuthz,
+fn can_sender_message_with(
     sender: &Agent,
     recipient: &Agent,
+    parent_name: impl Fn(Option<&AgentId>) -> String,
+    share: impl Fn(&AgentId, &AgentId) -> bool,
+    messaged: impl Fn(&Agent, &Agent) -> bool,
 ) -> Result<(), ApiError> {
     if sender.id == recipient.id
         || recipient.parent_id.as_ref() == Some(&sender.id)
@@ -2890,15 +2848,13 @@ fn can_sender_message_in(
         return Ok(());
     }
     if sender.is_isolated() || recipient.is_isolated() {
-        let sender_parent = parent_name_in(by_id, sender.parent_id.as_ref());
+        let sender_parent = parent_name(sender.parent_id.as_ref());
         return Err(ApiError::forbidden(format!(
             "sub-agent `{}` or `{}` is isolated (`scope: isolated`) and only communicates 1-to-1 with its direct parent and children; report to your parent `agent:{sender_parent}` (`to: [\"parent\"]`) instead",
             sender.name, recipient.name
         )));
     }
-    if share_in(authz, &sender.id, &recipient.id)
-        || authz.has_messaged_caller.contains(&recipient.id)
-    {
+    if share(&sender.id, &recipient.id) || messaged(recipient, sender) {
         return Ok(());
     }
     let same_parent_siblings = sender.parent_id.is_some()
@@ -2912,13 +2868,13 @@ fn can_sender_message_in(
         return Ok(());
     }
     if recipient.parent_id.is_none() {
-        let sender_parent = parent_name_in(by_id, sender.parent_id.as_ref());
+        let sender_parent = parent_name(sender.parent_id.as_ref());
         return Err(ApiError::forbidden(format!(
             "sub-agent `{}` is private (`public: false`) and cannot message root agent `{}` directly; report to your parent `agent:{sender_parent}` (`to: [\"parent\"]`) instead",
             sender.name, recipient.name
         )));
     }
-    let owner_label = parent_name_in(by_id, recipient.parent_id.as_ref());
+    let owner_label = parent_name(recipient.parent_id.as_ref());
     Err(ApiError::forbidden(format!(
         "cannot message sub-agent `{}` directly because it belongs to parent `agent:{owner_label}` and does not accept external messages (`public: false`); message `agent:{owner_label}` instead, ask `agent:{owner_label}` to set `public: true`, or collaborate in a shared group",
         recipient.name
@@ -2982,8 +2938,7 @@ pub(crate) fn roster_views(
             "invalid agent state",
         ));
     }
-    // Isolated-scope retain rule, evaluated against the roster snapshot
-    // (same rule as before, without per-agent store reads).
+    // Isolated-scope retain rule over the roster snapshot (no per-agent store reads).
     let full_by_id: RosterById = all_agents.iter().map(|a| (a.id.as_str(), a)).collect();
     let authz = caller.as_ref().map(|c| {
         let ids: Vec<AgentId> = all_agents.iter().map(|a| a.id.clone()).collect();
@@ -3061,13 +3016,7 @@ pub(crate) fn roster_views(
             }
         }
     }
-    let selected_ids: Vec<AgentId> = selected
-        .iter()
-        .filter_map(|id| AgentId::parse(id).ok())
-        .collect();
-    let mut metadata = store
-        .agent_query_metadata_filtered(Some(&selected_ids))
-        .map_err(ApiError::from_store)?;
+    let mut metadata = store.agent_query_metadata().map_err(ApiError::from_store)?;
     let seats = crate::sandbox::roster_seats();
     let mut agents = Vec::with_capacity(selected.len());
     for agent in &all_agents {
@@ -3077,11 +3026,28 @@ pub(crate) fn roster_views(
         let mut view =
             agent_view_preloaded(store, health, agent, Some(&mut metadata), Some(&seats))?;
         if let Some(ref c) = caller {
-            view.relationship = Some(compute_caller_relationship_in(&by_id, c.agent, agent));
+            let authz = authz.as_ref().unwrap();
+            view.relationship = Some(compute_relationship_with(c.agent, agent, |id, t| {
+                is_self_or_ancestor_in(&by_id, id, t)
+            }));
             view.can_message = Some(
-                can_sender_message_in(&by_id, authz.as_ref().unwrap(), c.agent, agent).is_ok(),
+                can_sender_message_with(
+                    c.agent,
+                    agent,
+                    |pid| {
+                        pid.and_then(|p| by_id.get(p.as_str()))
+                            .map(|p| p.name.clone())
+                            .unwrap_or_else(|| "parent".to_string())
+                    },
+                    |a, b| share_in(authz, a, b),
+                    |from, _to| authz.has_messaged_caller.contains(&from.id),
+                )
+                .is_ok(),
             );
-            if !can_read_private_in(&by_id, c.agent, c.principal.is_operator(), agent) {
+            if !c.principal.is_operator()
+                && !(is_self_or_ancestor_in(&by_id, &c.agent.id, agent)
+                    || (c.agent.parent_id.is_none() && c.agent.is_admin))
+            {
                 view.instructions = None;
             }
         }
@@ -6183,58 +6149,16 @@ fn can_sender_message_agent(
     sender: &Agent,
     recipient: &Agent,
 ) -> Result<(), ApiError> {
-    if sender.id == recipient.id
-        || recipient.parent_id.as_ref() == Some(&sender.id)
-        || sender.parent_id.as_ref() == Some(&recipient.id)
-    {
-        return Ok(());
-    }
-    if sender.is_isolated() || recipient.is_isolated() {
-        let sender_parent = sender
-            .parent_id
-            .as_ref()
-            .and_then(|pid| store.agent(pid).ok().map(|p| p.name))
-            .unwrap_or_else(|| "parent".to_string());
-        return Err(ApiError::forbidden(format!(
-            "sub-agent `{}` or `{}` is isolated (`scope: isolated`) and only communicates 1-to-1 with its direct parent and children; report to your parent `agent:{sender_parent}` (`to: [\"parent\"]`) instead",
-            sender.name, recipient.name
-        )));
-    }
-    if store.share_any_group_or_chat(&sender.id, &recipient.id)
-        || store.has_messaged(recipient, sender)
-    {
-        return Ok(());
-    }
-    let same_parent_siblings = sender.parent_id.is_some()
-        && sender.parent_id == recipient.parent_id
-        && sender.allows_sibling_messages()
-        && recipient.allows_sibling_messages();
-    if same_parent_siblings
-        || recipient.is_public_subagent()
-        || (recipient.parent_id.is_none() && sender.allows_sibling_messages())
-    {
-        return Ok(());
-    }
-    if recipient.parent_id.is_none() {
-        let sender_parent = sender
-            .parent_id
-            .as_ref()
-            .and_then(|pid| store.agent(pid).ok().map(|p| p.name))
-            .unwrap_or_else(|| "parent".to_string());
-        return Err(ApiError::forbidden(format!(
-            "sub-agent `{}` is private (`public: false`) and cannot message root agent `{}` directly; report to your parent `agent:{sender_parent}` (`to: [\"parent\"]`) instead",
-            sender.name, recipient.name
-        )));
-    }
-    let owner_label = recipient
-        .parent_id
-        .as_ref()
-        .and_then(|pid| store.agent(pid).ok().map(|p| p.name))
-        .unwrap_or_else(|| "parent".to_string());
-    Err(ApiError::forbidden(format!(
-        "cannot message sub-agent `{}` directly because it belongs to parent `agent:{owner_label}` and does not accept external messages (`public: false`); message `agent:{owner_label}` instead, ask `agent:{owner_label}` to set `public: true`, or collaborate in a shared group",
-        recipient.name
-    )))
+    can_sender_message_with(
+        sender,
+        recipient,
+        |pid| {
+            pid.and_then(|p| store.agent(p).ok().map(|a| a.name))
+                .unwrap_or_else(|| "parent".to_string())
+        },
+        |a, b| store.share_any_group_or_chat(a, b),
+        |from, to| store.has_messaged(from, to),
+    )
 }
 
 /// Every destination is checked before any write, so a refused address never
@@ -7414,14 +7338,18 @@ pub(crate) mod tests {
                 name: caller.name.clone(),
             };
             assert_eq!(
-                compute_caller_relationship_in(&by_id, caller, target),
+                compute_relationship_with(caller, target, |id, t| {
+                    is_self_or_ancestor_in(&by_id, id, t)
+                }),
                 compute_caller_relationship(&store, caller, target),
                 "relationship {} -> {}",
                 caller.name,
                 target.name
             );
             assert_eq!(
-                can_read_private_in(&by_id, caller, principal.is_operator(), target),
+                principal.is_operator()
+                    || is_self_or_ancestor_in(&by_id, &caller.id, target)
+                    || (caller.parent_id.is_none() && caller.is_admin),
                 can_actor_read_agent_private(&store, &principal, target),
                 "can_read {} -> {}",
                 caller.name,
@@ -7429,7 +7357,18 @@ pub(crate) mod tests {
             );
             let store_msg = can_sender_message_agent(&store, caller, target).is_ok();
             let authz = store.export_roster_authz(caller, &[target.id.clone()]);
-            let mem_msg = can_sender_message_in(&by_id, &authz, caller, target).is_ok();
+            let mem_msg = can_sender_message_with(
+                caller,
+                target,
+                |pid| {
+                    pid.and_then(|p| by_id.get(p.as_str()))
+                        .map(|p| p.name.clone())
+                        .unwrap_or_else(|| "parent".to_string())
+                },
+                |a, b| share_in(&authz, a, b),
+                |from, _to| authz.has_messaged_caller.contains(&from.id),
+            )
+            .is_ok();
             assert_eq!(
                 mem_msg, store_msg,
                 "can_message {} -> {}",
