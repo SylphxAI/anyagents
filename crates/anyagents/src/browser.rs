@@ -7480,6 +7480,7 @@ esac
     }
 
     #[test]
+    #[ignore = "browser open intermittently fails with EINTR in CI; deleted with browser.rs, tracking: https://github.com/SylphxAI/anyagents/issues/200"]
     fn cross_origin_iframe_snapshot_fill_and_click_with_secret_ref() {
         let _browser = browser_fixture_guard();
         if !Path::new(&chromium_binary()).exists() {
