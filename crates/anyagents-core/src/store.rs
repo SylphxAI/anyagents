@@ -726,6 +726,15 @@ fn is_transient_lock_error(error: &Error) -> bool {
     )
 }
 
+/// Human-readable check for a rusqlite error without wrapping.
+fn is_transient_sqlite_error(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(e, _)
+            if matches!(e.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+    )
+}
+
 enum ReadConn<'a> {
     Owned(Connection),
     Guard(MutexGuard<'a, Connection>),
@@ -822,41 +831,65 @@ impl Store {
         let mut conn = conn;
         let schema_version = migrate::current_version(&conn)?;
         migrate::migrate(&mut conn)?;
-        preserve_legacy_scopes(&mut conn)?;
+        // Tolerate busy on per-open DDL: a WAL-pinned DB must not make
+        // Store::open fail (sandbox skips SEAT_PEERS and denies peer-trees).
+        // Defer legacy work to the next open when the WAL frees.
+        if let Err(e) = preserve_legacy_scopes(&mut conn)
+            && !is_transient_lock_error(&e)
+        {
+            return Err(e);
+        }
         if migrate::current_version(&conn)? < 1 {
             return Err(Error::Message("migrations did not apply".into()));
         }
         // Read first so ordinary opens of current stores do not take the writer
         // lock. The UPDATE is idempotent and changes only the harness selector.
-        let has_legacy_harness: bool = conn.query_row(
+        // Tolerate busy here: defer to next open when WAL is pinned.
+        let has_legacy_harness: bool = match conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM agents WHERE harness IN ('sylphx', 'sylphx-agent', 'sylphx_agent', 'sylphx/default'))",
             [],
             |row| row.get(0),
-        )?;
-        if has_legacy_harness {
-            conn.execute(
+        ) {
+            Ok(v) => v,
+            Err(e) if is_transient_sqlite_error(&e) => false,
+            Err(e) => return Err(e.into()),
+        };
+        if has_legacy_harness
+            && let Err(e) = conn.execute(
                 "UPDATE agents SET harness = 'spiron' WHERE harness IN ('sylphx', 'sylphx-agent', 'sylphx_agent', 'sylphx/default')",
                 [],
-            )?;
-        }
-        let has_legacy_state: bool = conn.query_row(
+            )
+                && !is_transient_sqlite_error(&e) {
+                    return Err(e.into());
+                }
+        let has_legacy_state: bool = match conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM agents WHERE state NOT IN ('created', 'running', 'idle', 'paused', 'archived'))",
             [],
             |row| row.get(0),
-        )?;
-        if has_legacy_state {
-            conn.execute(
+        ) {
+            Ok(v) => v,
+            Err(e) if is_transient_sqlite_error(&e) => false,
+            Err(e) => return Err(e.into()),
+        };
+        if has_legacy_state
+            && let Err(e) = conn.execute(
                 "UPDATE agents SET state = 'archived' WHERE state NOT IN ('created', 'running', 'idle', 'paused', 'archived')",
                 [],
-            )?;
-        }
-        let has_aux_schema: bool = conn.query_row(
+            )
+                && !is_transient_sqlite_error(&e) {
+                    return Err(e.into());
+                }
+        let has_aux_schema: bool = match conn.query_row(
             "SELECT (SELECT count(*) FROM sqlite_master WHERE name IN ('message_versions', 'agent_topology_state', 'idx_rag_chunks_agent_id_time')) = 3",
             [],
             |row| row.get(0),
-        )?;
-        if !has_aux_schema {
-            conn.execute_batch(
+        ) {
+            Ok(v) => v,
+            Err(e) if is_transient_sqlite_error(&e) => true,
+            Err(e) => return Err(e.into()),
+        };
+        if !has_aux_schema
+            && let Err(e) = conn.execute_batch(
                 "CREATE TABLE IF NOT EXISTS message_versions (
                     agent_id TEXT NOT NULL,
                     chat_id INTEGER NOT NULL,
@@ -872,7 +905,10 @@ impl Store {
                 );
                 CREATE INDEX IF NOT EXISTS idx_rag_chunks_agent_id_time
                     ON rag_chunks(agent_id, timestamp_ms DESC, chunk_id);",
-            )?;
+            )
+            && !is_transient_sqlite_error(&e)
+        {
+            return Err(e.into());
         }
         // UNIQUE(agent_id, seq) already supports reverse mailbox sequence scans.
         // Avoid even idempotent DDL on ordinary opens: it needs the writer lock.
@@ -898,27 +934,42 @@ impl Store {
                 "CREATE INDEX IF NOT EXISTS idx_outbound_agent_time ON outbound_messages(agent_id, sent_at_ms DESC, id DESC)",
             ),
         ] {
-            let exists: bool = conn.query_row(
+            let exists: bool = match conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1)",
                 [name],
                 |row| row.get(0),
-            )?;
-            if !exists {
-                conn.execute_batch(sql)?;
+            ) {
+                Ok(v) => v,
+                Err(e) if is_transient_sqlite_error(&e) => true,
+                Err(e) => return Err(e.into()),
+            };
+            if !exists
+                && let Err(e) = conn.execute_batch(sql)
+                && !is_transient_sqlite_error(&e)
+            {
+                return Err(e.into());
             }
         }
         // Older databases may already have this column from an earlier runtime.
         // Presence, not an arbitrary failed ALTER, is the idempotency condition.
-        let has_public: bool = conn.query_row(
+        // Tolerate busy here as well.
+        let has_public: bool = match conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('groups') WHERE name = 'public')",
             [],
             |row| row.get(0),
-        )?;
-        if !has_public {
-            conn.execute(
+        ) {
+            Ok(v) => v,
+            Err(e) if is_transient_sqlite_error(&e) => true,
+            Err(e) => return Err(e.into()),
+        };
+        if !has_public
+            && let Err(e) = conn.execute(
                 "ALTER TABLE groups ADD COLUMN public INTEGER NOT NULL DEFAULT 0",
                 [],
-            )?;
+            )
+            && !is_transient_sqlite_error(&e)
+        {
+            return Err(e.into());
         }
         // Current schemas maintain FTS transactionally on every history write.
         // Only legacy upgrades need the full derivative-index validation; doing
@@ -4348,21 +4399,20 @@ impl Store {
         let conn = self.conn();
         agent_by_id(&conn, agent_id)?;
         let delivered = cursor(&conn, agent_id)?;
-        let mut stmt = conn.prepare(
-            "SELECT context FROM messages WHERE agent_id = ?1 AND seq > ?2 ORDER BY seq ASC",
+        // Server-side filter (same predicate as the roster query): the
+        // per-row Rust JSON parse would scan and deserialize every
+        // undelivered line on each idle poll, pinning one core per agent
+        // (80 agents x 4 polls/s against a multi-GB mailbox).
+        let found: bool = conn.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM messages
+               WHERE agent_id = ?1 AND seq > ?2
+                 AND (CASE WHEN json_valid(context) THEN json_extract(context, '$.event') END) IS NOT 'reaction_passive'
+             )",
+            params![agent_id.as_str(), delivered],
+            |row| row.get(0),
         )?;
-        let mut rows = stmt.query(params![agent_id.as_str(), delivered])?;
-        while let Some(row) = rows.next()? {
-            let ctx_raw: Option<String> = row.get(0)?;
-            let is_passive = ctx_raw
-                .as_deref()
-                .and_then(|s| serde_json::from_str::<anyagents_harness::Context>(s).ok())
-                .is_some_and(|ctx| ctx.event.as_deref() == Some("reaction_passive"));
-            if !is_passive {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+        Ok(found)
     }
 
     pub fn received_cursor(&self, agent_id: &AgentId) -> Result<i64, Error> {
@@ -4952,22 +5002,19 @@ impl Store {
 
     fn age_at(&self, agent_id: &AgentId, seq: i64, now_ms: i64) -> Result<Option<i64>, Error> {
         let conn = self.read_conn();
-        let mut stmt = conn.prepare(
-            "SELECT received_at_ms, context FROM messages WHERE agent_id = ?1 AND seq >= ?2 ORDER BY seq ASC",
-        )?;
-        let mut rows = stmt.query(params![agent_id.as_str(), seq])?;
-        while let Some(row) = rows.next()? {
-            let received_at: i64 = row.get(0)?;
-            let ctx_raw: Option<String> = row.get(1)?;
-            let is_passive = ctx_raw
-                .as_deref()
-                .and_then(|s| serde_json::from_str::<anyagents_harness::Context>(s).ok())
-                .is_some_and(|ctx| ctx.event.as_deref() == Some("reaction_passive"));
-            if !is_passive {
-                return Ok(Some((now_ms - received_at).max(0)));
-            }
-        }
-        Ok(None)
+        // Server-side filter: per-row JSON parse here pins a core per agent
+        // on every health publish; see `has_actionable_undelivered`.
+        let received_at: Option<i64> = conn
+            .query_row(
+                "SELECT received_at_ms FROM messages
+                 WHERE agent_id = ?1 AND seq >= ?2
+                   AND (CASE WHEN json_valid(context) THEN json_extract(context, '$.event') END) IS NOT 'reaction_passive'
+                 ORDER BY seq ASC LIMIT 1",
+                params![agent_id.as_str(), seq],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(received_at.map(|at| (now_ms - at).max(0)))
     }
 
     pub(crate) fn conn(&self) -> MutexGuard<'_, Connection> {
@@ -5268,7 +5315,32 @@ impl Store {
         watch_baseline: Option<&str>,
         last_observed: Option<&str>,
     ) -> Result<(), Error> {
+        // Coalesce unchanged observations: the 1s schedule tick would
+        // otherwise write a WAL frame per watch per second even when both
+        // fields already hold those values.
         let conn = self.conn();
+        let cur: Option<(Option<String>, Option<String>)> = conn
+            .query_row(
+                "SELECT watch_baseline, last_observed FROM agent_schedules WHERE id = ?1 AND state = 'active'",
+                [id],
+                |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?)),
+            )
+            .optional()?;
+        let (cur_baseline, cur_observed) = match cur {
+            Some(v) => v,
+            None => return Ok(()),
+        };
+        let new_baseline = match watch_baseline {
+            Some(v) => Some(v.to_string()),
+            None => cur_baseline.clone(),
+        };
+        let new_observed = match last_observed {
+            Some(v) => Some(v.to_string()),
+            None => cur_observed.clone(),
+        };
+        if new_baseline == cur_baseline && new_observed == cur_observed {
+            return Ok(());
+        }
         conn.execute(
             "UPDATE agent_schedules
              SET watch_baseline = COALESCE(?2, watch_baseline),
@@ -10272,6 +10344,29 @@ mod tests {
         );
         assert_eq!(store.agent(&peer_worker.id).unwrap().state, "idle");
         assert!(!store.has_actionable_undelivered(&peer_worker.id).unwrap());
+    }
+
+    #[test]
+    fn invalid_json_context_counts_as_actionable_without_scan_parse() {
+        let (_dir, store) = setup();
+        let worker = agent(&store, "noisy_worker");
+        // Invalid JSON in context must count as actionable (same as the
+        // old per-row parse, which treated unparseable as not-passive).
+        let mut msg = Incoming::new("hello");
+        msg.sender = Some("agent:tester".to_string());
+        let out = store.receive(&worker.id, msg).unwrap();
+        let seq = match out {
+            ReceiveOutcome::New(m) => m.seq,
+            _ => panic!("expected new message"),
+        };
+        store
+            .conn()
+            .execute(
+                "UPDATE messages SET context = 'not-json' WHERE agent_id = ?1 AND seq = ?2",
+                params![worker.id.as_str(), seq],
+            )
+            .unwrap();
+        assert!(store.has_actionable_undelivered(&worker.id).unwrap());
     }
 
     #[test]

@@ -8,6 +8,7 @@ use rusqlite::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    fs,
     io::{self, Read, Seek, SeekFrom},
     path::Path,
 };
@@ -110,6 +111,24 @@ impl HostIndex {
     }
 
     pub fn open(path: &Path) -> Result<Self, IndexError> {
+        match Self::open_inner(path) {
+            Err(IndexError::Sql(error))
+                if error.to_string().contains("malformed")
+                    || error.to_string().contains("not a database") =>
+            {
+                // Derived projection, not a raw-history authority: a
+                // malformed image (e.g. restored across volumes) is
+                // rebuilt from source instead of failing every verify.
+                let _ = fs::remove_file(path);
+                let _ = fs::remove_file(path.with_extension("db-wal"));
+                let _ = fs::remove_file(path.with_extension("db-shm"));
+                Self::open_inner(path)
+            }
+            other => other,
+        }
+    }
+
+    fn open_inner(path: &Path) -> Result<Self, IndexError> {
         let conn = Connection::open(path)?;
         conn.busy_timeout(std::time::Duration::from_secs(30))?;
         conn.execute_batch(
@@ -1018,6 +1037,21 @@ mod tests {
             std::fs::read(&raw).unwrap(),
             b"{\"content\":\"authoritative history\"}\n"
         );
+    }
+
+    #[test]
+    fn malformed_index_is_rebuilt_from_source_instead_of_failing() {
+        let dir = crate::test_tempdir();
+        let path = dir.path().join("index.db");
+        std::fs::write(&path, b"garbage, not a sqlite database").unwrap();
+        // Must succeed via the rebuild path, not error `malformed`.
+        let index = HostIndex::open(&path).unwrap();
+        // The rebuilt projection is queryable (empty).
+        let count: i64 = index
+            .conn
+            .query_row("SELECT COUNT(*) FROM host_documents", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
     }
 
     #[test]

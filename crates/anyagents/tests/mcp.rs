@@ -328,6 +328,7 @@ async fn canonical_conversation_raw_range_crosses_mcp_and_authenticated_socket()
 }
 
 #[tokio::test]
+#[ignore = "intermittent ENOENT in MCP tool calls on macOS CI (push 43264718226 on 5c7e890a, same tree green in queue 43263904677); tracking: https://github.com/SylphxAI/anyagents/issues/216"]
 async fn mcp_tools_use_the_server_socket() {
     let dir = support::physical_tempdir();
     let socket = dir.path().join("anyagents.sock");
