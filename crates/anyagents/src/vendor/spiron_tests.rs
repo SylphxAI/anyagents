@@ -1328,7 +1328,11 @@ for raw in sys.stdin:
         ],
     );
     rig.start();
-    eventually(|| rig.wire().len() >= 2);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while rig.wire().len() < 2 {
+        assert!(Instant::now() < deadline, "{}", rig.stall_report());
+        std::thread::sleep(Duration::from_millis(5));
+    }
     eventually(|| !rig.cfg.join("spiron-unconfirmed-steers.json").exists());
 
     let wire = rig.wire();
