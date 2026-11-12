@@ -1003,16 +1003,12 @@ impl SpironRig {
         let journal = rusqlite::Connection::open(self.cfg.join("sessions.sqlite3"))
             .and_then(|db| {
                 Ok((
-                    db.query_row(
-                        "SELECT COUNT(*) FROM session_entries",
-                        [],
-                        |r| r.get::<_, i64>(0),
-                    ),
-                    db.query_row(
-                        "SELECT COUNT(*) FROM session_leases",
-                        [],
-                        |r| r.get::<_, i64>(0),
-                    ),
+                    db.query_row("SELECT COUNT(*) FROM session_entries", [], |r| {
+                        r.get::<_, i64>(0)
+                    }),
+                    db.query_row("SELECT COUNT(*) FROM session_leases", [], |r| {
+                        r.get::<_, i64>(0)
+                    }),
                 ))
             })
             .map(|(entries, leases)| format!("entries={entries:?} leases={leases:?}"))
