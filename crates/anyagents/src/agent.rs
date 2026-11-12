@@ -1216,6 +1216,7 @@ pub fn offline_roster(
         &anyagents_supervisor::HealthBoard::default(),
         agents,
         archived_count,
+        None,
         query,
     )
     .map_err(|e| Error::Message(e.message))

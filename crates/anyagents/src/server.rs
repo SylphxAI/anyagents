@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
-use anyagents_core::{Address, Agent, Error, Incoming, ReceiveOutcome, Store, now_ms};
+use anyagents_core::{Address, Agent, AgentId, Error, Incoming, ReceiveOutcome, Store, now_ms};
 use anyagents_gateway::MemoryRoutes;
 use anyagents_installer::{CommandRunner, InstallError, LineSink, builtin_catalog, sign_in};
 use anyagents_supervisor::{HealthBoard, Supervisor, SystemClock, declared, mode_name, steer_name};
@@ -2782,6 +2782,149 @@ fn compute_caller_relationship(store: &Store, caller: &Agent, target: &Agent) ->
     }
 }
 
+/// Caller context for roster authorization enrichment. `None` (operator and
+/// offline CLI reads) leaves relationship/can_message unset, exactly as
+/// before; `Some` is filled in from the roster snapshot without per-view
+/// store queries.
+pub(crate) struct RosterCaller<'a> {
+    pub agent: &'a Agent,
+    pub principal: &'a Principal,
+}
+
+type RosterById<'a> = HashMap<&'a str, &'a Agent>;
+
+/// In-memory `is_self_or_ancestor`: walks the roster snapshot instead of
+/// issuing one `store.agent` query per parent level. A parent missing from
+/// the snapshot ends the walk, matching the store version's `ok()` fallback.
+fn is_self_or_ancestor_in(by_id: &RosterById<'_>, caller_id: &AgentId, target: &Agent) -> bool {
+    if caller_id == &target.id {
+        return true;
+    }
+    let mut cursor = target.parent_id.clone();
+    let mut depth = 0usize;
+    while let Some(pid) = cursor {
+        if &pid == caller_id {
+            return true;
+        }
+        cursor = by_id.get(pid.as_str()).and_then(|a| a.parent_id.clone());
+        depth += 1;
+        if depth > 16 {
+            break;
+        }
+    }
+    false
+}
+
+fn compute_caller_relationship_in(
+    by_id: &RosterById<'_>,
+    caller: &Agent,
+    target: &Agent,
+) -> String {
+    if caller.id == target.id {
+        "self".to_string()
+    } else if caller.parent_id.as_ref() == Some(&target.id) {
+        "parent".to_string()
+    } else if target.parent_id.as_ref() == Some(&caller.id) {
+        "child".to_string()
+    } else if caller.parent_id.is_some() && caller.parent_id == target.parent_id {
+        "sibling".to_string()
+    } else if is_self_or_ancestor_in(by_id, &target.id, caller) {
+        "ancestor".to_string()
+    } else if is_self_or_ancestor_in(by_id, &caller.id, target) {
+        "descendant".to_string()
+    } else if caller.parent_id.is_none() && target.parent_id.is_none() {
+        "peer".to_string()
+    } else {
+        "other".to_string()
+    }
+}
+
+fn can_read_private_in(
+    by_id: &RosterById<'_>,
+    caller: &Agent,
+    is_operator: bool,
+    target: &Agent,
+) -> bool {
+    if is_operator {
+        return true;
+    }
+    is_self_or_ancestor_in(by_id, &caller.id, target)
+        || (caller.parent_id.is_none() && caller.is_admin)
+}
+
+fn share_in(authz: &anyagents_core::RosterAuthz, a: &AgentId, b: &AgentId) -> bool {
+    let groups = authz.groups.get(a).is_some_and(|ga| {
+        authz
+            .groups
+            .get(b)
+            .is_some_and(|gb| ga.intersection(gb).next().is_some())
+    });
+    let chats = authz.chats.get(a).is_some_and(|ca| {
+        authz
+            .chats
+            .get(b)
+            .is_some_and(|cb| ca.intersection(cb).next().is_some())
+    });
+    groups || chats
+}
+
+fn parent_name_in(by_id: &RosterById<'_>, pid: Option<&AgentId>) -> String {
+    pid.and_then(|pid| by_id.get(pid.as_str()))
+        .map(|p| p.name.clone())
+        .unwrap_or_else(|| "parent".to_string())
+}
+
+/// In-memory `can_sender_message_agent` for the roster: identical allow/deny
+/// branches, with group/chat/message inputs from one exported authz snapshot
+/// instead of one store query per listed agent. Error text is preserved.
+fn can_sender_message_in(
+    by_id: &RosterById<'_>,
+    authz: &anyagents_core::RosterAuthz,
+    sender: &Agent,
+    recipient: &Agent,
+) -> Result<(), ApiError> {
+    if sender.id == recipient.id
+        || recipient.parent_id.as_ref() == Some(&sender.id)
+        || sender.parent_id.as_ref() == Some(&recipient.id)
+    {
+        return Ok(());
+    }
+    if sender.is_isolated() || recipient.is_isolated() {
+        let sender_parent = parent_name_in(by_id, sender.parent_id.as_ref());
+        return Err(ApiError::forbidden(format!(
+            "sub-agent `{}` or `{}` is isolated (`scope: isolated`) and only communicates 1-to-1 with its direct parent and children; report to your parent `agent:{sender_parent}` (`to: [\"parent\"]`) instead",
+            sender.name, recipient.name
+        )));
+    }
+    if share_in(authz, &sender.id, &recipient.id)
+        || authz.has_messaged_caller.contains(&recipient.id)
+    {
+        return Ok(());
+    }
+    let same_parent_siblings = sender.parent_id.is_some()
+        && sender.parent_id == recipient.parent_id
+        && sender.allows_sibling_messages()
+        && recipient.allows_sibling_messages();
+    if same_parent_siblings
+        || recipient.is_public_subagent()
+        || (recipient.parent_id.is_none() && sender.allows_sibling_messages())
+    {
+        return Ok(());
+    }
+    if recipient.parent_id.is_none() {
+        let sender_parent = parent_name_in(by_id, sender.parent_id.as_ref());
+        return Err(ApiError::forbidden(format!(
+            "sub-agent `{}` is private (`public: false`) and cannot message root agent `{}` directly; report to your parent `agent:{sender_parent}` (`to: [\"parent\"]`) instead",
+            sender.name, recipient.name
+        )));
+    }
+    let owner_label = parent_name_in(by_id, recipient.parent_id.as_ref());
+    Err(ApiError::forbidden(format!(
+        "cannot message sub-agent `{}` directly because it belongs to parent `agent:{owner_label}` and does not accept external messages (`public: false`); message `agent:{owner_label}` instead, ask `agent:{owner_label}` to set `public: true`, or collaborate in a shared group",
+        recipient.name
+    )))
+}
+
 fn list_agents_sync_for_principal(
     state: &AppState,
     principal: &Principal,
@@ -2802,50 +2945,30 @@ fn list_agents_sync_for_principal(
         .store
         .roster_agents(query.state.as_deref())
         .map_err(ApiError::from_store)?;
-    let all_agents: Vec<_> = all_agents
-        .into_iter()
-        .filter(|agent| {
-            !caller_agent.as_ref().is_some_and(|caller| {
-                caller.is_isolated()
-                    && !is_self_or_ancestor(&state.store, &caller.id, agent)
-                    && caller.parent_id.as_ref() != Some(&agent.id)
-                    && !state.store.share_any_group_or_chat(&caller.id, &agent.id)
-            })
-        })
-        .collect();
-    let mut listed = roster_views(
+    let caller = caller_agent
+        .as_ref()
+        .map(|agent| RosterCaller { agent, principal });
+    let listed = roster_views(
         &state.store,
         &state.health,
         all_agents,
         archived_count,
+        caller,
         query,
     )?;
-    for view in &mut listed.agents {
-        let Some(ref caller) = caller_agent else {
-            continue;
-        };
-        let agent = state
-            .store
-            .agent_by_name(&view.id)
-            .map_err(ApiError::from_store)?;
-        view.relationship = Some(compute_caller_relationship(&state.store, caller, &agent));
-        view.can_message = Some(
-            can_actor_message_agent(&state.store, &Actor::Agent(caller.name.clone()), &agent)
-                .is_ok(),
-        );
-        if !can_actor_read_agent_private(&state.store, principal, &agent) {
-            view.instructions = None;
-        }
-    }
     Ok(Json(listed))
 }
 
 /// Shared by the daemon and offline operator CLI. Filter before runtime reads.
+/// `caller` is `None` for operator/offline reads; a present caller only adds
+/// in-memory authorization enrichment (no per-view store queries) and the
+/// isolated-scope retain rule below.
 pub(crate) fn roster_views(
     store: &Store,
     health: &HealthBoard,
     all_agents: Vec<Agent>,
     archived_count: usize,
+    caller: Option<RosterCaller<'_>>,
     query: &ListAgentsQuery,
 ) -> Result<AgentsResponse, ApiError> {
     if let Some(state) = query.state.as_deref()
@@ -2859,6 +2982,29 @@ pub(crate) fn roster_views(
             "invalid agent state",
         ));
     }
+    // Isolated-scope retain rule, evaluated against the roster snapshot
+    // (same rule as before, without per-agent store reads).
+    let full_by_id: RosterById = all_agents.iter().map(|a| (a.id.as_str(), a)).collect();
+    let authz = caller.as_ref().map(|c| {
+        let ids: Vec<AgentId> = all_agents.iter().map(|a| a.id.clone()).collect();
+        store.export_roster_authz(c.agent, &ids)
+    });
+    let keep: Vec<bool> = all_agents
+        .iter()
+        .map(|agent| {
+            !caller.as_ref().is_some_and(|c| {
+                c.agent.is_isolated()
+                    && !is_self_or_ancestor_in(&full_by_id, &c.agent.id, agent)
+                    && c.agent.parent_id.as_ref() != Some(&agent.id)
+                    && !share_in(authz.as_ref().unwrap(), &c.agent.id, &agent.id)
+            })
+        })
+        .collect();
+    let all_agents: Vec<Agent> = all_agents
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(agent, keep)| keep.then_some(agent))
+        .collect();
     let by_id: HashMap<_, _> = all_agents.iter().map(|a| (a.id.as_str(), a)).collect();
     let selected_name = query
         .name
@@ -2915,14 +3061,30 @@ pub(crate) fn roster_views(
             }
         }
     }
-    let mut metadata = store.agent_query_metadata().map_err(ApiError::from_store)?;
+    let selected_ids: Vec<AgentId> = selected
+        .iter()
+        .filter_map(|id| AgentId::parse(id).ok())
+        .collect();
+    let mut metadata = store
+        .agent_query_metadata_filtered(Some(&selected_ids))
+        .map_err(ApiError::from_store)?;
     let seats = crate::sandbox::roster_seats();
     let mut agents = Vec::with_capacity(selected.len());
     for agent in &all_agents {
         if !selected.contains(agent.id.as_str()) {
             continue;
         }
-        let view = agent_view_preloaded(store, health, agent, Some(&mut metadata), Some(&seats))?;
+        let mut view =
+            agent_view_preloaded(store, health, agent, Some(&mut metadata), Some(&seats))?;
+        if let Some(ref c) = caller {
+            view.relationship = Some(compute_caller_relationship_in(&by_id, c.agent, agent));
+            view.can_message = Some(
+                can_sender_message_in(&by_id, authz.as_ref().unwrap(), c.agent, agent).is_ok(),
+            );
+            if !can_read_private_in(&by_id, c.agent, c.principal.is_operator(), agent) {
+                view.instructions = None;
+            }
+        }
         agents.push(view);
     }
     Ok(AgentsResponse {
@@ -3168,9 +3330,9 @@ fn agent_view_preloaded(
                 "errored"
             };
             create::maybe_notify_parent_on_error(store, agent, &cfg, err_msg);
-        } else {
-            let _ = std::fs::remove_file(cfg.join(".anyagents-notified-parent-error.json"));
         }
+        // The parent-error marker is cleared by wake lifecycle owners
+        // (`prepare_agent_wake`, `set_state`), never by a roster read.
     }
     let block_reason = compute_block_reason(quota, last_error.as_deref(), now);
     let open_turn_age_ms = if has_open_turn {
@@ -7117,6 +7279,258 @@ pub(crate) mod tests {
         assert_eq!(list.agents.len(), 2);
     }
 
+    fn roster_child(store: &Store, name: &str, parent: &Agent) -> Agent {
+        let mut new = anyagents_core::NewAgent::new(name, "opencode");
+        new.parent_id = Some(parent.id.clone());
+        store.create_agent(new).unwrap()
+    }
+
+    #[test]
+    fn roster_reads_use_a_bounded_connection_count() {
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        for n in 0..12 {
+            store
+                .create_agent(anyagents_core::NewAgent::new(
+                    format!("live-{n}"),
+                    "opencode",
+                ))
+                .unwrap();
+        }
+        for n in 0..60 {
+            let archived = store
+                .create_agent(anyagents_core::NewAgent::new(
+                    format!("archived-{n}"),
+                    "opencode",
+                ))
+                .unwrap();
+            store.set_agent_state(&archived.id, "archived").unwrap();
+        }
+        let caller = store.agent_by_name("live-0").unwrap();
+        let principal = Principal::Agent {
+            agent_id: caller.id.clone(),
+            name: caller.name.clone(),
+        };
+        let (agents, archived) = store.roster_agents(None).unwrap();
+        store.reset_read_conn_count();
+        let views = roster_views(
+            &store,
+            &HealthBoard::default(),
+            agents,
+            archived,
+            Some(RosterCaller {
+                agent: &caller,
+                principal: &principal,
+            }),
+            &ListAgentsQuery::default(),
+        )
+        .unwrap();
+        assert_eq!(views.archived_count, 60);
+        assert_eq!(views.agents.len(), 12);
+        assert!(views.agents.iter().all(|v| v.state != "archived"));
+        let count = store.read_conn_count();
+        assert!(
+            count <= 4,
+            "agent roster must open bounded connections regardless of archive size, got {count}"
+        );
+        let (agents, archived) = store.roster_agents(None).unwrap();
+        store.reset_read_conn_count();
+        let _ = roster_views(
+            &store,
+            &HealthBoard::default(),
+            agents,
+            archived,
+            None,
+            &ListAgentsQuery::default(),
+        )
+        .unwrap();
+        assert!(store.read_conn_count() <= 3);
+    }
+
+    #[test]
+    fn roster_in_memory_authz_matches_store_backed_checks() {
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let root = store
+            .create_agent(anyagents_core::NewAgent::new("root", "opencode"))
+            .unwrap();
+        store.set_agent_admin(&root.id, true).unwrap();
+        let root = store.agent(&root.id).unwrap();
+        let child = roster_child(&store, "child", &root);
+        let sibling = roster_child(&store, "sibling", &root);
+        let grandchild = roster_child(&store, "grandchild", &child);
+        let iso = roster_child(&store, "iso", &root);
+        store.set_agent_scope(&iso.id, "isolated").unwrap();
+        let iso = store.agent(&iso.id).unwrap();
+        let pubsub = roster_child(&store, "pubsub", &root);
+        store.set_agent_scope(&pubsub.id, "public").unwrap();
+        let pubsub = store.agent(&pubsub.id).unwrap();
+        let stranger = store
+            .create_agent(anyagents_core::NewAgent::new("stranger", "opencode"))
+            .unwrap();
+        let peer = store
+            .create_agent(anyagents_core::NewAgent::new("peer", "opencode"))
+            .unwrap();
+        let chatmate = store
+            .create_agent(anyagents_core::NewAgent::new("chatmate", "opencode"))
+            .unwrap();
+        let messenger = store
+            .create_agent(anyagents_core::NewAgent::new("messenger", "opencode"))
+            .unwrap();
+        // Shared group: caller(child) <-> peer.
+        store.join_group("team", &child.id).unwrap();
+        store.join_group("team", &peer.id).unwrap();
+        // Shared telegram chat: caller(child) <-> chatmate.
+        let channel = store
+            .create_channel(anyagents_core::NewChannel {
+                kind: "telegram".into(),
+                identity: None,
+                config: "{}".into(),
+                credential_ref: None,
+            })
+            .unwrap();
+        store.attach_channel(&channel.id, &child.id).unwrap();
+        store.attach_channel(&channel.id, &chatmate.id).unwrap();
+        store
+            .set_channel_state(
+                &channel.id,
+                r#"{"chats":[{"agent":"child","chat_id":-1001}]}"#,
+            )
+            .unwrap();
+        // messenger previously messaged the caller.
+        store
+            .record_outbound(&messenger.id, &format!("agent:{}", child.name), None, "hi")
+            .unwrap();
+        // A dangling parent id: tmp-parent is deleted, orphan keeps its row.
+        let tmp_parent = roster_child(&store, "tmp-parent", &root);
+        let orphan = roster_child(&store, "orphan", &tmp_parent);
+        store.delete_agent(&tmp_parent.id).unwrap();
+
+        let all = store.list_agents().unwrap();
+        let by_id: RosterById = all.iter().map(|a| (a.id.as_str(), a)).collect();
+        let check = |caller: &Agent, target: &Agent| {
+            let principal = Principal::Agent {
+                agent_id: caller.id.clone(),
+                name: caller.name.clone(),
+            };
+            assert_eq!(
+                compute_caller_relationship_in(&by_id, caller, target),
+                compute_caller_relationship(&store, caller, target),
+                "relationship {} -> {}",
+                caller.name,
+                target.name
+            );
+            assert_eq!(
+                can_read_private_in(&by_id, caller, principal.is_operator(), target),
+                can_actor_read_agent_private(&store, &principal, target),
+                "can_read {} -> {}",
+                caller.name,
+                target.name
+            );
+            let store_msg = can_sender_message_agent(&store, caller, target).is_ok();
+            let authz = store.export_roster_authz(caller, &[target.id.clone()]);
+            let mem_msg = can_sender_message_in(&by_id, &authz, caller, target).is_ok();
+            assert_eq!(
+                mem_msg, store_msg,
+                "can_message {} -> {}",
+                caller.name, target.name
+            );
+        };
+        check(&child, &child); // self
+        check(&child, &root); // parent
+        check(&root, &child); // child
+        check(&child, &grandchild); // descendant
+        check(&grandchild, &child); // ancestor
+        check(&child, &sibling); // sibling, private scopes
+        check(&child, &pubsub); // public subagent recipient
+        check(&child, &peer); // shared group
+        check(&child, &chatmate); // shared chat
+        check(&child, &messenger); // has-messaged
+        check(&child, &stranger); // unrelated root
+        check(&iso, &root); // isolated -> direct parent
+        check(&iso, &sibling); // isolated -> denied
+        check(&child, &iso); // isolated recipient -> denied
+        check(&root, &stranger); // admin root reads
+        check(&child, &orphan); // dangling parent chain fails closed
+        check(&root, &orphan); // orphan relationship still resolves
+        // Sibling scope both ways: private->denied, siblings->allowed.
+        store.set_agent_scope(&child.id, "siblings").unwrap();
+        store.set_agent_scope(&sibling.id, "siblings").unwrap();
+        let child = store.agent(&child.id).unwrap();
+        let sibling = store.agent(&sibling.id).unwrap();
+        check(&child, &sibling);
+    }
+
+    #[test]
+    fn roster_read_leaves_disk_and_mailbox_untouched() {
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let parent = store
+            .create_agent(anyagents_core::NewAgent::new("parent-agent", "opencode"))
+            .unwrap();
+        let child = roster_child(&store, "worker", &parent);
+        let cfg = anyagents_core::agent_config_dir(dir.path(), &child.id);
+        std::fs::create_dir_all(&cfg).unwrap();
+        let marker = cfg.join(".anyagents-notified-parent-error.json");
+        let marker_body = r#"{"source_key":"subagent-error:old","error":"old","timestamp_ms":1}"#;
+        std::fs::write(&marker, marker_body).unwrap();
+        fn file_set(root: &std::path::Path) -> Vec<(std::path::PathBuf, u64)> {
+            let mut out = Vec::new();
+            let mut stack = vec![root.to_path_buf()];
+            while let Some(current) = stack.pop() {
+                let Ok(entries) = std::fs::read_dir(&current) else {
+                    continue;
+                };
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        stack.push(path);
+                    } else if let Ok(meta) = std::fs::metadata(&path) {
+                        out.push((path.strip_prefix(root).unwrap().to_path_buf(), meta.len()));
+                    }
+                }
+            }
+            out.sort();
+            out
+        }
+        let before = file_set(dir.path());
+        let (agents, archived) = store.roster_agents(None).unwrap();
+        let _ = roster_views(
+            &store,
+            &HealthBoard::default(),
+            agents,
+            archived,
+            None,
+            &ListAgentsQuery::default(),
+        )
+        .unwrap();
+        assert_eq!(before, file_set(dir.path()));
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), marker_body);
+        assert!(store.inbox(&parent.id, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn wake_path_still_clears_parent_error_marker() {
+        let _env = env_lock();
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let parent = store
+            .create_agent(anyagents_core::NewAgent::new("parent-agent", "opencode"))
+            .unwrap();
+        let child = roster_child(&store, "worker", &parent);
+        let cfg = anyagents_core::agent_config_dir(dir.path(), &child.id);
+        std::fs::create_dir_all(&cfg).unwrap();
+        for file in [
+            ".anyagents-last-error.json",
+            ".anyagents-notified-parent-error.json",
+        ] {
+            std::fs::write(cfg.join(file), "old error").unwrap();
+        }
+        prepare_agent_wake(&store, &child).unwrap();
+        assert!(!cfg.join(".anyagents-last-error.json").exists());
+        assert!(!cfg.join(".anyagents-notified-parent-error.json").exists());
+    }
+
     #[test]
     #[ignore = "manual benchmark against an isolated production snapshot"]
     fn production_roster_query_benchmark() {
@@ -7137,6 +7551,7 @@ pub(crate) mod tests {
                 &health,
                 agents,
                 archived,
+                None,
                 &ListAgentsQuery::default(),
             )
             .unwrap();
