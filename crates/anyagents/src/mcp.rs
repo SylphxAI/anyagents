@@ -8404,8 +8404,19 @@ mod spawn_args_tests {
         )
         .unwrap();
         let tools = tool_definitions_with_roles(McpProfile::Full, None, Some(dir.path()));
-        for name in ["agents", "spawn"] {
-            let tool = tools.iter().find(|t| t.name == name).unwrap();
+        let role_tools: Vec<_> = tools
+            .iter()
+            .filter(|t| {
+                t.input_schema
+                    .get("properties")
+                    .and_then(serde_json::Value::as_object)
+                    .is_some_and(|props| props.contains_key("role"))
+            })
+            .map(|t| t.name.to_string())
+            .collect();
+        assert!(role_tools.iter().any(|n| n == "agents"), "{role_tools:?}");
+        for name in &role_tools {
+            let tool = tools.iter().find(|t| t.name == name.as_str()).unwrap();
             let desc = tool.description.as_deref().unwrap_or_default();
             assert!(
                 desc.contains(

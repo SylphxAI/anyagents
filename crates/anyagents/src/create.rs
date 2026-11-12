@@ -14079,8 +14079,16 @@ Connection: close
                 "workdir": "private"
             }))
             .unwrap();
-        apply_archetype_defaults(Some(&store), &data_dir, Some(&l1), &mut retired_role_req)
-            .unwrap();
+        let retired_err =
+            apply_archetype_defaults(Some(&store), &data_dir, Some(&l1), &mut retired_role_req)
+                .unwrap_err()
+                .to_string();
+        assert!(
+            retired_err.contains("unknown archetype template \"retired-director\"")
+                && !retired_err.contains("available: retired-director")
+                && !retired_err.contains(", retired-director"),
+            "stale data_dir/.agents/agents template must not satisfy a workspace role: {retired_err}"
+        );
         assert!(
             retired_role_req.instructions.is_none(),
             "stale data_dir/.agents/agents template must not pollute workspace .agents/agents"
