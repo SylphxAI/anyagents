@@ -1160,6 +1160,13 @@ for raw in sys.stdin:
     );
     let m1 = rig.receive("long running task");
     rig.start();
+    // Delivery reached the probe first (wire capture is the freshest
+    // signal); the mailbox cursor may lag the writer's commit.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while rig.wire().is_empty() {
+        assert!(Instant::now() < deadline, "{}", rig.stall_report());
+        std::thread::sleep(Duration::from_millis(5));
+    }
     let deadline = Instant::now() + Duration::from_secs(30);
     while rig.store.delivered_cursor(&rig.agent.id).unwrap() != m1.seq {
         assert!(Instant::now() < deadline, "{}", rig.stall_report());
