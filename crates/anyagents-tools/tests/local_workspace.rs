@@ -164,7 +164,11 @@ fn edit_and_patch_via_exec_roundtrip() {
     // `-i.bak` is the GNU/BSD-portable in-place form: macOS BSD sed requires
     // an explicit backup suffix for `-i`. The backup is removed right after.
     let out = ws
-        .exec("sed -i.bak 's/beta/BETA/' note.txt && rm -f note.txt.bak", None, None)
+        .exec(
+            "sed -i.bak 's/beta/BETA/' note.txt && rm -f note.txt.bak",
+            None,
+            None,
+        )
         .expect("patch exec");
     assert_eq!(out.exit_code, 0);
     let (_, bytes) = ws.read_file_bytes(Some("note.txt")).expect("read patched");
