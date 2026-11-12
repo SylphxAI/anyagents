@@ -105,15 +105,45 @@ pub fn resolve_workspace_backend(
     Box::new(LocalWorkspace::new(local_root))
 }
 
+/// The environment a local `workspace.exec` command runs in.
+///
+/// `Inherit` keeps today's behaviour (the server's environment). `Exact` is the
+/// agent's materialized environment (credentials and the toolchain `PATH`),
+/// which replaces the server's environment completely (ADR 0004 I12).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum ExecEnv {
+    #[default]
+    Inherit,
+    Exact(Vec<(std::ffi::OsString, std::ffi::OsString)>),
+}
+
+impl ExecEnv {
+    fn apply(&self, cmd: &mut std::process::Command) {
+        if let ExecEnv::Exact(vars) = self {
+            cmd.env_clear().envs(vars.iter().map(|(k, v)| (k, v)));
+        }
+    }
+}
+
 /// Local directory or git worktree workspace on the orchestrator host (default `Sandbox` backend).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LocalWorkspace {
     pub root: PathBuf,
+    pub env: ExecEnv,
 }
 
 impl LocalWorkspace {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            env: ExecEnv::Inherit,
+        }
+    }
+
+    /// Run commands in `env` instead of the server's environment.
+    pub fn with_env(mut self, env: ExecEnv) -> Self {
+        self.env = env;
+        self
     }
 }
 
@@ -144,10 +174,10 @@ impl WorkspaceBackend for LocalWorkspace {
                 cwd_path.display()
             ));
         }
-        let output = std::process::Command::new("/bin/sh")
-            .arg("-c")
-            .arg(cmd_trimmed)
-            .current_dir(&cwd_path)
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.arg("-c").arg(cmd_trimmed).current_dir(&cwd_path);
+        self.env.apply(&mut cmd);
+        let output = cmd
             .output()
             .map_err(|e| format!("failed to spawn command: {e}"))?;
         Ok(ExecOutput {
@@ -378,13 +408,14 @@ impl DockerWorkspace {
         }
     }
 
-    fn docker_cmd(&self) -> std::process::Command {
-        let bin = std::env::var("ANYAGENTS_DOCKER_BIN").unwrap_or_else(|_| "docker".to_string());
-        let mut cmd = std::process::Command::new(bin);
+    fn docker_cmd(&self) -> Result<std::process::Command, String> {
+        let docker = anyagents_toolchain::tool("docker", "workspace.docker")
+            .map_err(|err| err.to_string())?;
+        let mut cmd = docker.command();
         if let Some(ref host) = self.docker_host {
             cmd.env("DOCKER_HOST", host);
         }
-        cmd
+        Ok(cmd)
     }
 }
 
@@ -409,7 +440,7 @@ impl WorkspaceBackend for DockerWorkspace {
         }
         let resolved_cwd = self.resolve_path(cwd, false)?;
         let output = self
-            .docker_cmd()
+            .docker_cmd()?
             .args([
                 "exec",
                 "-w",
@@ -431,7 +462,7 @@ impl WorkspaceBackend for DockerWorkspace {
     fn read_file_bytes(&self, path: Option<&str>) -> Result<(String, Vec<u8>), String> {
         let resolved = self.resolve_path(path, true)?;
         let output = self
-            .docker_cmd()
+            .docker_cmd()?
             .args([
                 "exec",
                 &self.container,
@@ -471,7 +502,7 @@ impl WorkspaceBackend for DockerWorkspace {
             r#"test ! -e "$1" && mkdir -p -- "$(dirname -- "$1")" && cat > "$1""#
         };
         let mut child = self
-            .docker_cmd()
+            .docker_cmd()?
             .args([
                 "exec",
                 "-i",
@@ -853,4 +884,31 @@ fn remote_list_dir(
         "count": count,
         "truncated": truncated,
     }))
+}
+
+#[cfg(all(test, unix))]
+mod exec_env_tests {
+    use super::*;
+
+    #[test]
+    fn an_exact_environment_replaces_the_servers() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = LocalWorkspace::new(dir.path()).with_env(ExecEnv::Exact(vec![
+            ("PATH".into(), "/usr/bin:/bin".into()),
+            ("EXAMPLE_ONLY".into(), "materialized".into()),
+        ]));
+        let out = ws
+            .exec("printf '%s|%s' \"$EXAMPLE_ONLY\" \"${HOME-unset}\"", None, None)
+            .unwrap();
+        assert_eq!(out.stdout, "materialized|unset");
+    }
+
+    #[test]
+    fn the_default_environment_is_inherited() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = LocalWorkspace::new(dir.path())
+            .exec("printf '%s' \"${PATH:+set}\"", None, None)
+            .unwrap();
+        assert_eq!(out.stdout, "set");
+    }
 }
