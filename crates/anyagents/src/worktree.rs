@@ -988,7 +988,6 @@ esac
         assert!(args.contains("worktree"));
     }
 
-
     /// Measurement for the engine-owned pool as a multi-seat store: the server
     /// (root here) owns the pool; a distinct unprivileged seat performs the
     /// ordinary workflow in its admitted checkout. Prints a JSON receipt of
@@ -1308,6 +1307,5 @@ esac
             before
         };
         assert_eq!(pool_object_count(&pool_repo), rate);
-
     }
 }
