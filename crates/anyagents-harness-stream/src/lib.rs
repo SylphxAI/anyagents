@@ -1753,40 +1753,47 @@ fn read_stdout(
             note_markers(&mut state, &value);
             if spec.protocol == LineProtocol::AcknowledgedResult
                 && let Some(id) = value.get("request_id").and_then(Value::as_str)
-                && state
+            {
+                #[cfg(test)]
+                eprintln!(
+                    "reader ack trace: kind={kind:?} id={id} open={:?} followups={:?}",
+                    state.open, state.followups
+                );
+                if state
                     .open
                     .iter()
                     .chain(&state.followups)
                     .any(|open| open == id)
-            {
-                match kind {
-                    Some("accepted") => {
-                        state.acknowledged.insert(id.to_string());
-                        state.input_turns.insert(id.to_string(), id.to_string());
+                {
+                    match kind {
+                        Some("accepted") => {
+                            state.acknowledged.insert(id.to_string());
+                            state.input_turns.insert(id.to_string(), id.to_string());
+                        }
+                        Some("steer_ack")
+                            if value.get("accepted").and_then(Value::as_bool) == Some(true)
+                                && value.get("turn_id").and_then(Value::as_str).is_some() =>
+                        {
+                            state.acknowledged.insert(id.to_string());
+                            state.input_turns.insert(
+                                id.to_string(),
+                                value["turn_id"].as_str().unwrap().to_string(),
+                            );
+                        }
+                        Some("rejected") => {
+                            state.rejected.insert(
+                                id.to_string(),
+                                format!(
+                                    "controller rejected input: {}",
+                                    value
+                                        .get("code")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("unknown")
+                                ),
+                            );
+                        }
+                        _ => {}
                     }
-                    Some("steer_ack")
-                        if value.get("accepted").and_then(Value::as_bool) == Some(true)
-                            && value.get("turn_id").and_then(Value::as_str).is_some() =>
-                    {
-                        state.acknowledged.insert(id.to_string());
-                        state.input_turns.insert(
-                            id.to_string(),
-                            value["turn_id"].as_str().unwrap().to_string(),
-                        );
-                    }
-                    Some("rejected") => {
-                        state.rejected.insert(
-                            id.to_string(),
-                            format!(
-                                "controller rejected input: {}",
-                                value
-                                    .get("code")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("unknown")
-                            ),
-                        );
-                    }
-                    _ => {}
                 }
             }
             if let Some(step_type) = value
