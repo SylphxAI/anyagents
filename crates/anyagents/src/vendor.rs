@@ -914,6 +914,20 @@ fn vendor_launch_inner(
             }
         }
         crate::create::ensure_seat_op_config(&request.config_dir, seat_launch);
+        // Render per-seat gh credentials; never inherit the host gh home.
+        env.retain(|(key, _)| {
+            !matches!(
+                key.as_str(),
+                "GH_CONFIG_DIR" | "GH_TOKEN" | "GITHUB_TOKEN" | "GH_ENTERPRISE_TOKEN"
+            )
+        });
+        if let Some((_, _, seat_gid, _)) = effective_seat.as_ref()
+            && let Some(gh_dir) =
+                crate::sandbox::render_seat_gh_config(&request.config_dir, *seat_gid)
+                    .map_err(|error| error.to_string())?
+        {
+            env.push(("GH_CONFIG_DIR".to_string(), gh_dir.display().to_string()));
+        }
         env.push(("HOME".to_string(), request.config_dir.display().to_string()));
         env.push(("USER".to_string(), seat_user.clone()));
         env.push(("LOGNAME".to_string(), seat_user.clone()));
