@@ -42,6 +42,9 @@ const SOCKET_NAME: &str = "anyagents.sock";
 /// `sockaddr_un.sun_path` holds 108 bytes, including the trailing NUL.
 const MAX_SOCKET_PATH: usize = 107;
 
+/// WAL frame count above which a maintenance checkpoint is logged.
+const WAL_REPORT_FRAMES: i64 = 16_384;
+
 pub fn socket_path(data: &Path) -> PathBuf {
     data.join(SOCKET_NAME)
 }
@@ -251,6 +254,19 @@ async fn serve(
                 let store = Arc::clone(&reaper_store);
                 let health = reaper_health.clone();
                 let _ = tokio::task::spawn_blocking(move || {
+                    // The daemon is the long-lived writer: keep the WAL bounded
+                    // from here so it never grows while readers overlap.
+                    match store.checkpoint_wal() {
+                        Ok(c)
+                            if c.passive_busy
+                                || c.checkpointed_frames < c.log_frames
+                                || c.log_frames > WAL_REPORT_FRAMES => eprintln!(
+                            "anyagents-store: wal checkpoint log={} checkpointed={} busy={} truncated={}",
+                            c.log_frames, c.checkpointed_frames, c.passive_busy, c.truncated
+                        ),
+                        Ok(_) => {}
+                        Err(error) => eprintln!("anyagents-store: wal checkpoint failed: {error}"),
+                    }
                     if let Err(error) = outbound_history::reconcile(&store) {
                         eprintln!("outbound history settlement remains pending: {error}");
                     }
@@ -2780,7 +2796,12 @@ fn list_agents_sync_for_principal(
                 .map_err(|_| ApiError::forbidden("authenticated agent no longer exists"))?,
         ),
     };
-    let all_agents = state.store.list_agents().map_err(ApiError::from_store)?;
+    // Only the selected state and its ancestors are read; the archive is
+    // counted by index instead of being deserialized row by row.
+    let (all_agents, archived_count) = state
+        .store
+        .roster_agents(query.state.as_deref())
+        .map_err(ApiError::from_store)?;
     let all_agents: Vec<_> = all_agents
         .into_iter()
         .filter(|agent| {
@@ -2792,7 +2813,13 @@ fn list_agents_sync_for_principal(
             })
         })
         .collect();
-    let mut listed = roster_views(&state.store, &state.health, all_agents, query)?;
+    let mut listed = roster_views(
+        &state.store,
+        &state.health,
+        all_agents,
+        archived_count,
+        query,
+    )?;
     for view in &mut listed.agents {
         let Some(ref caller) = caller_agent else {
             continue;
@@ -2818,6 +2845,7 @@ pub(crate) fn roster_views(
     store: &Store,
     health: &HealthBoard,
     all_agents: Vec<Agent>,
+    archived_count: usize,
     query: &ListAgentsQuery,
 ) -> Result<AgentsResponse, ApiError> {
     if let Some(state) = query.state.as_deref()
@@ -2832,7 +2860,6 @@ pub(crate) fn roster_views(
         ));
     }
     let by_id: HashMap<_, _> = all_agents.iter().map(|a| (a.id.as_str(), a)).collect();
-    let archived_count = all_agents.iter().filter(|a| a.state == "archived").count();
     let selected_name = query
         .name
         .as_deref()
@@ -7104,10 +7131,12 @@ pub(crate) mod tests {
         let mut times = Vec::new();
         for _ in 0..20 {
             let start = std::time::Instant::now();
+            let (agents, archived) = store.roster_agents(None).unwrap();
             let views = roster_views(
                 &store,
                 &health,
-                store.list_agents().unwrap(),
+                agents,
+                archived,
                 &ListAgentsQuery::default(),
             )
             .unwrap();
