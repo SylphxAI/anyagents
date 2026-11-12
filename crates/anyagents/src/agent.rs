@@ -315,6 +315,7 @@ pub fn harness_cmd(
         "harness": harness,
         "model": model,
         "profile": profile,
+        "source": "cli",
     });
     if client::can_call_server(data) {
         match client::call::<serde_json::Value>(
@@ -332,6 +333,7 @@ pub fn harness_cmd(
                         &store,
                         data,
                         "operator",
+                        "cli:local-mirror",
                         clean_agent,
                         harness,
                         model,
@@ -359,6 +361,7 @@ pub fn harness_cmd(
         &store,
         data,
         "operator",
+        "cli:local",
         clean_agent,
         harness,
         model,

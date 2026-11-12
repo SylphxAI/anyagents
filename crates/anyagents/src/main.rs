@@ -26,6 +26,7 @@ mod identity;
 mod install;
 mod mcp;
 mod mcp_config;
+mod model_catalogue;
 mod muse_config;
 mod opencode_config;
 mod operator;
@@ -87,7 +88,9 @@ enum Command {
     },
     /// Upstream provider profile pool (Subscriptions, Coding Plans, and API Keys) shared across harnesses.
     Profiles {
-        /// Optional action (`list`, `set`) or provider/harness filter.
+        /// Optional action (`list`, `set`, `catalogue`) or provider/harness filter.
+        /// `catalogue` reads each profile's model catalogue from its provider now,
+        /// locally, refreshing its snapshot, and fails when any stays unknown.
         action: Option<String>,
         /// Target `<provider>/<profile>` when `action` is `set` (or filter when `action` is `list`).
         target: Option<String>,
@@ -1972,6 +1975,7 @@ fn model_cmd(
             "base_url": base_url,
             "key": key,
             "profile": clean_profile,
+            "source": "cli",
         });
         match client::call::<serde_json::Value>(
             data,
@@ -2003,6 +2007,7 @@ fn model_cmd(
             &store,
             data,
             "operator",
+            "cli:local",
             agent,
             None,
             clean_model,
@@ -2019,6 +2024,63 @@ fn model_cmd(
         model,
         key_file.ok_or_else(|| Error::Message("key file is required".into()))?,
     )
+}
+
+/// Reads every matching profile's model catalogue from its own provider and
+/// refreshes its snapshot. Runs locally against `<data>/profiles`.
+fn profiles_catalogue_cmd(data: &Path, target: Option<&str>) -> Result<(), anyagents_core::Error> {
+    let filter = target.map(str::trim).filter(|s| !s.is_empty());
+    let mut out = Vec::new();
+    let mut unknown = 0usize;
+    let mut providers: Vec<_> = std::fs::read_dir(data.join("profiles"))?
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .collect();
+    providers.sort_by_key(|e| e.file_name());
+    for prov in providers {
+        let provider = prov.file_name().to_string_lossy().into_owned();
+        let mut profiles: Vec<_> = std::fs::read_dir(prov.path())?
+            .flatten()
+            .filter(|e| e.path().is_dir() && !e.file_name().to_string_lossy().starts_with('.'))
+            .collect();
+        profiles.sort_by_key(|e| e.file_name());
+        for prof in profiles {
+            let profile = prof.file_name().to_string_lossy().into_owned();
+            let full = format!("{provider}/{profile}");
+            if filter.is_some_and(|f| f != provider && f != full) {
+                continue;
+            }
+            // Drop a fresh snapshot so this is a real read from the provider.
+            let snapshot = prof.path().join(model_catalogue::SNAPSHOT_FILE);
+            let previous = std::fs::read(&snapshot).ok();
+            let _ = std::fs::remove_file(&snapshot);
+            match model_catalogue::resolve(data, &provider, &profile) {
+                Ok(cat) => out.push(serde_json::json!({
+                    "profile": full,
+                    "source": cat.source.label(),
+                    "models": cat.models,
+                })),
+                Err(err) => {
+                    if let Some(bytes) = previous {
+                        let _ = std::fs::write(&snapshot, bytes);
+                    }
+                    unknown += 1;
+                    out.push(serde_json::json!({"profile": full, "error": err.to_string()}));
+                }
+            }
+        }
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&out)
+            .map_err(|e| anyagents_core::Error::Message(e.to_string()))?
+    );
+    if unknown > 0 {
+        return Err(anyagents_core::Error::Message(format!(
+            "{unknown} profile catalogue(s) unknown"
+        )));
+    }
+    Ok(())
 }
 
 fn profiles_cmd(
@@ -2076,6 +2138,7 @@ fn profiles_cmd(
             }
             list_profiles_cmd(data, target)
         }
+        Some("catalogue") => profiles_catalogue_cmd(data, target),
         Some("models") | Some("catalog") => {
             let catalogs = if client::can_call_server(data) {
                 let path = match target.map(str::trim).filter(|s| !s.is_empty()) {

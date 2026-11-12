@@ -2981,10 +2981,12 @@ pub(crate) fn poke_agent_wake_socket_mail(data: &Path, agent_id: &AgentId) {
 /// Declaratively update an existing agent's runtime configuration (`harness`, `model`, `profile`)
 /// in `state.db` without deleting or recreating its identity, killing an in-progress turn,
 /// replaying already-delivered messages, or reopening paused scope.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn configure_agent_runtime(
     store: &Store,
     data: &Path,
     actor: &str,
+    source: &str,
     name: &str,
     harness: Option<&str>,
     model: Option<&str>,
@@ -3103,7 +3105,25 @@ pub(crate) fn configure_agent_runtime(
     } else {
         "agents.model"
     };
-    store.record_admin_audit(actor, audit_action, &existing.name)?;
+    let triple = |harness: &str, model: Option<&str>, profile: Option<&str>| {
+        serde_json::json!({"harness": harness, "model": model, "profile": profile}).to_string()
+    };
+    store.record_admin_audit_change(
+        actor,
+        audit_action,
+        &existing.name,
+        &triple(
+            &existing.harness,
+            existing.model.as_deref(),
+            current_bound.as_deref(),
+        ),
+        &triple(
+            &target_harness,
+            resolved_model.as_deref(),
+            Some(&format!("{provider}/{profile_name}")),
+        ),
+        source,
+    )?;
     if existing.harness != target_harness {
         store.set_agent_harness(&existing.id, &target_harness)?;
     }
@@ -3222,10 +3242,12 @@ pub(crate) fn configure_agent_runtime(
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn set_agent_harness(
     store: &Store,
     data: &Path,
     actor: &str,
+    source: &str,
     name: &str,
     harness: &str,
     model: Option<&str>,
@@ -3234,7 +3256,16 @@ pub(crate) fn set_agent_harness(
     if harness.trim().is_empty() {
         return Err(Error::Message("harness is empty".into()));
     }
-    configure_agent_runtime(store, data, actor, name, Some(harness), model, profile)
+    configure_agent_runtime(
+        store,
+        data,
+        actor,
+        source,
+        name,
+        Some(harness),
+        model,
+        profile,
+    )
 }
 
 /// Create or update a named provider profile in `<data>/profiles/<provider>/<profile>`.
@@ -5514,6 +5545,7 @@ fn rebalance_provider_profiles(
                         store,
                         data,
                         "system:profile-rebalance",
+                        "system",
                         &agent_name,
                         None,
                         None,
@@ -5583,6 +5615,7 @@ fn rebalance_provider_profiles(
                 store,
                 data,
                 "system:profile-rebalance",
+                "system",
                 &agent_name,
                 None,
                 None,
@@ -8382,6 +8415,7 @@ pub(crate) fn try_rotate_exhausted_profile(
                 store,
                 data,
                 "system:quota-rotate",
+                "system",
                 &agent.name,
                 None,
                 None,
@@ -8504,7 +8538,7 @@ const PROFILE_HEALTHY_OAUTH_ATTEMPT_FRESHNESS_MS: i64 = 300_000;
 /// most recent refresh attempt also happened recently (so the token cannot silently
 /// recover on its own). Never probes the network and never treats a missing or stale
 /// signal as unhealthy evidence.
-fn profile_has_unhealthy_evidence(dir: &Path) -> bool {
+pub(crate) fn profile_has_unhealthy_evidence(dir: &Path) -> bool {
     let now_ms = anyagents_core::now_ms();
     let usage_path = dir.join(".anyagents-last-usage.txt");
     if let Ok(usage) = std::fs::read_to_string(&usage_path) {
@@ -9574,9 +9608,17 @@ mod tests {
             assert_eq!(created.harness, "spiron");
             assert_eq!(created.model.as_deref(), Some(model));
             assert_eq!(upstream_provider_of(legacy, None), "sylphx");
-            let switched =
-                set_agent_harness(&store, data, "operator", &created.name, legacy, None, None)
-                    .unwrap();
+            let switched = set_agent_harness(
+                &store,
+                data,
+                "operator",
+                "test",
+                &created.name,
+                legacy,
+                None,
+                None,
+            )
+            .unwrap();
             assert_eq!(switched["harness"], "spiron");
             assert_eq!(switched["model"], model);
             assert_eq!(switched["profile"], "sylphx/default");
@@ -10172,6 +10214,7 @@ mod tests {
             &store,
             data,
             "operator",
+            "test",
             "owner-anymd",
             "unknown-harness",
             None,
@@ -10179,14 +10222,30 @@ mod tests {
         );
         assert!(bad_harness.is_err());
 
-        let incompat =
-            set_agent_harness(&store, data, "operator", "owner-anymd", "agy", None, None);
+        let incompat = set_agent_harness(
+            &store,
+            data,
+            "operator",
+            "test",
+            "owner-anymd",
+            "agy",
+            None,
+            None,
+        );
         assert!(incompat.is_err());
         assert_eq!(store.agent(&owner.id).unwrap().harness, "opencode");
 
-        let receipt =
-            set_agent_harness(&store, data, "operator", "owner-anymd", "codex", None, None)
-                .unwrap();
+        let receipt = set_agent_harness(
+            &store,
+            data,
+            "operator",
+            "test",
+            "owner-anymd",
+            "codex",
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(receipt["id"], owner.id.as_str());
         assert_eq!(receipt["name"], "owner-anymd");
         assert_eq!(receipt["previous_harness"], "opencode");
@@ -10234,6 +10293,7 @@ mod tests {
             &store,
             data,
             "operator",
+            "test",
             "owner-anymd",
             Some("opencode"),
             None,
@@ -10258,6 +10318,7 @@ mod tests {
             &store,
             data,
             "operator",
+            "test",
             "owner-anymd",
             Some("codex"),
             Some("sylphx/openai/gpt-5.4-mini#medium"),
@@ -12784,6 +12845,7 @@ mod runtime_config_tests {
                 &store,
                 dir.path(),
                 "operator",
+                "test",
                 &agent.name,
                 None,
                 None,
@@ -14367,16 +14429,30 @@ Connection: close
                 "{name}"
             );
         }
+        // Without a bindings file the provider's own profiles are candidates and
+        // the one whose catalogue serves the model wins.
         std::fs::remove_file(data.join(crate::profile_binding::BINDINGS_FILE)).unwrap();
+        for (name, model, expected) in [
+            ("fallback-a", "openrouter/lab/model-a", "openrouter/general"),
+            ("fallback-b", "openrouter/lab/model-b", "openrouter/special"),
+        ] {
+            let agent = create(&store, data, binding_request(name, model, None)).unwrap();
+            let cfg = agent_config_dir(data, &agent.id);
+            assert_eq!(
+                bound_profile_name(&cfg).as_deref(),
+                Some(expected),
+                "{name}"
+            );
+        }
         let err = create(
             &store,
             data,
-            binding_request("unbound", "openrouter/lab/model-a", None),
+            binding_request("unserved", "openrouter/lab/model-z", None),
         )
         .unwrap_err()
         .to_string();
-        assert!(err.contains("no profile binding"), "{err}");
-        assert!(store.agent_by_name("unbound").is_err());
+        assert!(err.contains("no eligible profile"), "{err}");
+        assert!(store.agent_by_name("unserved").is_err());
     }
 
     #[test]
@@ -14473,6 +14549,7 @@ Connection: close
             &store,
             data,
             "operator",
+            "test",
             "switcher",
             Some("spiron"),
             Some("openrouter/lab/model-a#xhigh"),
@@ -14495,6 +14572,7 @@ Connection: close
             &store,
             data,
             "operator",
+            "test",
             "switcher",
             None,
             Some("openrouter/lab/model-b#xhigh"),
@@ -14505,6 +14583,42 @@ Connection: close
         assert_eq!(
             bound_profile_name(&cfg).as_deref(),
             Some("openrouter/special")
+        );
+
+        let conn = rusqlite::Connection::open(data.join("state.db")).unwrap();
+        let rows: Vec<(String, String, String, String, String)> = conn
+            .prepare(
+                "SELECT actor, action, before_scope, after_scope, source FROM admin_audit
+                 WHERE target = 'switcher' ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "a refused switch writes no audit row: {rows:?}"
+        );
+        let (actor, action, before, after, source) = &rows[0];
+        assert_eq!(
+            (actor.as_str(), action.as_str(), source.as_str()),
+            ("operator", "agents.model", "test")
+        );
+        let before: serde_json::Value = serde_json::from_str(before).unwrap();
+        let after: serde_json::Value = serde_json::from_str(after).unwrap();
+        assert_eq!(
+            before,
+            serde_json::json!({"harness": "spiron", "model": "openrouter/lab/model-a#medium",
+                "profile": "openrouter/general"})
+        );
+        assert_eq!(
+            after,
+            serde_json::json!({"harness": "spiron", "model": "openrouter/lab/model-b#xhigh",
+                "profile": "openrouter/special"})
         );
     }
 }

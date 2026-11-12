@@ -2221,6 +2221,7 @@ impl AgentMcp {
                     "harness": harness,
                     "model": args.model,
                     "profile": args.profile,
+                    "source": "mcp",
                 });
                 let updated: serde_json::Value = self
                     .client
@@ -2624,6 +2625,7 @@ impl AgentMcp {
                     "harness": harness,
                     "model": args.model,
                     "profile": args.profile,
+                    "source": "mcp",
                 });
                 let updated: serde_json::Value = self
                     .client

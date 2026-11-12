@@ -1163,6 +1163,18 @@ struct ModelRequest {
     base_url: Option<String>,
     key: Option<String>,
     profile: Option<String>,
+    #[serde(default)]
+    source: Option<String>,
+}
+
+/// Audit source of a runtime change arriving over the API. The client names
+/// its surface; anything else is recorded as plain `api`.
+fn runtime_change_source(claimed: Option<&str>) -> &'static str {
+    match claimed.map(str::trim) {
+        Some("cli") => "api:cli",
+        Some("mcp") => "api:mcp",
+        _ => "api",
+    }
 }
 
 #[derive(Deserialize)]
@@ -1173,6 +1185,8 @@ struct HarnessRequest {
     model: Option<String>,
     #[serde(default)]
     profile: Option<String>,
+    #[serde(default)]
+    source: Option<String>,
 }
 
 async fn reset_session_route(
@@ -1236,6 +1250,7 @@ async fn harness_route(
             &state.store,
             state.store.data_dir(),
             &actor,
+            runtime_change_source(body.source.as_deref()),
             &found.name,
             &body.harness,
             body.model.as_deref(),
@@ -1678,6 +1693,7 @@ async fn model_route(
                 &state.store,
                 state.store.data_dir(),
                 &actor,
+                runtime_change_source(body.source.as_deref()),
                 &agent.name,
                 body.harness.as_deref(),
                 body.model.as_deref(),

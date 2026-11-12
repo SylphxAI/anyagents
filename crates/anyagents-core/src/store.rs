@@ -1365,6 +1365,25 @@ impl Store {
         Ok(())
     }
 
+    /// Records an administrative change with the state before and after it and
+    /// where the request came from, so a change can be traced to its caller.
+    pub fn record_admin_audit_change(
+        &self,
+        actor: &str,
+        action: &str,
+        target: &str,
+        before: &str,
+        after: &str,
+        source: &str,
+    ) -> Result<(), Error> {
+        self.conn().execute(
+            "INSERT INTO admin_audit (created_at, actor, action, target, before_scope, after_scope, source)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![now_ms(), actor, action, target, before, after, source],
+        )?;
+        Ok(())
+    }
+
     /// Set or clear an agent's public capability/charter description (`description` column, Layer 1).
     pub fn set_agent_description(
         &self,

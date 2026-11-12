@@ -1,24 +1,13 @@
-//! Harness/model/profile triple validation and configured default profile binding.
+//! Harness/model/profile triple validation and default profile selection.
 //!
-//! # Model catalogue
+//! A triple is valid when the profile exists, accepts the harness, and its
+//! model catalogue (see [`crate::model_catalogue`]) serves the model. Create,
+//! spawn and every harness/model switch validate the final triple and refuse
+//! with the reason, so a mismatch never reaches an agent's first turn.
 //!
-//! A provider profile declares the models its endpoint serves in its own
-//! `profile.json` under `models` (an array of model ids). That declaration is
-//! the only catalogue authority: a triple whose model is not listed is refused,
-//! and a profile whose `profile.json` is unreadable, malformed or carries no
-//! `models` array is refused too (fail closed). Harness-written model caches
-//! inside a profile directory are never consulted, because profile provisioning
-//! copies them between profiles and they therefore say nothing about the
-//! endpoint the profile is bound to.
+//! # Default profile (no explicit profile)
 //!
-//! Matching is exact. The effort suffix (`<model>#<effort>`) is dropped, and a
-//! model id carrying the profile's provider as its first path segment also
-//! matches the catalogue entry without that segment.
-//!
-//! # Default binding
-//!
-//! When a create, spawn or harness/model switch names no profile, the profile
-//! comes from `<data>/profile-bindings.json`:
+//! When `<data>/profile-bindings.json` exists it decides:
 //!
 //! ```json
 //! {
@@ -30,24 +19,38 @@
 //! ```
 //!
 //! A binding with a `model` (effort suffix ignored) wins over a harness-only
-//! binding. Candidates must exist, be compatible with the harness, serve the
-//! model and hold usable credentials. `selection: "ordered"` (default) takes
-//! the first eligible candidate; `selection: "quota"` reads every eligible
+//! binding; no matching binding is a refusal. `selection: "ordered"` (default)
+//! takes the first eligible candidate. `selection: "quota"` reads each eligible
 //! candidate's live remaining quota, drops exhausted ones, and picks the best
-//! remaining-quota-per-assigned-agent score. A quota binding refuses when no
-//! candidate's quota can be read. No binding, or no eligible candidate, is a
-//! refusal naming the reason; there is no implicit profile name.
+//! remaining-quota-per-assigned-agent score; it refuses when no candidate's
+//! quota can be read.
+//!
+//! Without the file, the provider's own profiles are candidates in the
+//! existing order (`default` first, then the rest by name), preferring ones
+//! without fresh unhealthy evidence.
+//!
+//! Either way a candidate is eligible only when the triple is valid and the
+//! profile is authenticated: its catalogue was read live with its own
+//! credentials, or it holds usable credential material. No eligible candidate
+//! is a refusal naming every rejection.
 //!
 //! An installation without a `<data>/profiles` directory has no provider
-//! profiles at all; harnesses then use their own native sign-in and none of
-//! these checks apply.
+//! profiles; harnesses use their own native sign-in and none of this applies.
 
 use std::path::{Path, PathBuf};
 
 use anyagents_core::{Agent, Error, agent_config_dir};
 use anyagents_harness::normalize_harness_name;
 
+pub(crate) use crate::model_catalogue::base_model_id;
+use crate::model_catalogue::{Catalogue, Source};
+
 pub(crate) const BINDINGS_FILE: &str = "profile-bindings.json";
+
+/// Reads a profile's catalogue: `(provider, profile)`.
+pub(crate) type CatalogueFn<'a> = &'a dyn Fn(&str, &str) -> Result<Catalogue, Error>;
+/// Reads a profile's remaining quota percent: `(provider, profile)`.
+pub(crate) type QuotaFn<'a> = &'a dyn Fn(&str, &str) -> Option<i64>;
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -80,12 +83,6 @@ pub(crate) fn profiles_enabled(data: &Path) -> bool {
     data.join("profiles").is_dir()
 }
 
-/// `<model>#<effort>` without the effort suffix.
-pub(crate) fn base_model_id(model: &str) -> &str {
-    let model = model.trim();
-    model.split_once('#').map_or(model, |(base, _)| base).trim()
-}
-
 fn profile_dir(data: &Path, provider: &str, profile: &str) -> PathBuf {
     data.join("profiles").join(provider).join(profile)
 }
@@ -102,87 +99,57 @@ fn split_profile(full: &str) -> Result<(&str, &str), Error> {
         })
 }
 
-/// Reads the declared model catalogue of a profile. Fails closed.
-fn read_catalogue(data: &Path, provider: &str, profile: &str) -> Result<Vec<String>, Error> {
-    let path = profile_dir(data, provider, profile).join("profile.json");
-    let text = std::fs::read_to_string(&path).map_err(|err| {
-        Error::Message(format!(
-            "cannot read the model catalogue of profile `{provider}/{profile}` ({err}); refusing"
-        ))
-    })?;
-    let value: serde_json::Value = serde_json::from_str(&text).map_err(|err| {
-        Error::Message(format!(
-            "model catalogue of profile `{provider}/{profile}` is not valid JSON ({err}); refusing"
-        ))
-    })?;
-    let Some(models) = value.get("models") else {
-        return Err(Error::Message(format!(
-            "profile `{provider}/{profile}` declares no model catalogue; list the models it serves under `models` in its profile.json"
-        )));
-    };
-    let list = models.as_array().ok_or_else(|| {
-        Error::Message(format!(
-            "model catalogue of profile `{provider}/{profile}` must be an array of model ids; refusing"
-        ))
-    })?;
-    list.iter()
-        .map(|entry| {
-            entry
-                .as_str()
-                .map(base_model_id)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-                .ok_or_else(|| {
-                    Error::Message(format!(
-                        "model catalogue of profile `{provider}/{profile}` has a non-string or empty entry; refusing"
-                    ))
-                })
-        })
-        .collect()
+fn live_catalogue(data: &Path) -> impl Fn(&str, &str) -> Result<Catalogue, Error> + '_ {
+    move |provider, profile| crate::model_catalogue::resolve(data, provider, profile)
 }
 
-/// Ok when `provider/profile` serves `model` according to its declared catalogue.
-/// An unspecified model (the harness picks its own default) has nothing to check.
+fn serves_with(
+    provider: &str,
+    profile: &str,
+    model: Option<&str>,
+    catalogue: CatalogueFn<'_>,
+) -> Result<Option<Source>, Error> {
+    let Some(model) = model.map(base_model_id).filter(|m| !m.is_empty()) else {
+        // The harness picks its own default model; there is nothing to check.
+        return Ok(None);
+    };
+    let cat = catalogue(provider, profile)?;
+    if crate::model_catalogue::serves(&cat.models, model) {
+        return Ok(Some(cat.source));
+    }
+    let mut listed = cat.models.clone();
+    listed.sort();
+    Err(Error::Message(format!(
+        "profile `{provider}/{profile}` does not serve model `{model}` ({} catalogue: {})",
+        cat.source.label(),
+        if listed.is_empty() {
+            "empty".to_string()
+        } else {
+            listed.join(", ")
+        }
+    )))
+}
+
+/// Ok when `provider/profile` serves `model`. An unspecified model passes.
 pub(crate) fn ensure_profile_serves_model(
     data: &Path,
     provider: &str,
     profile: &str,
     model: Option<&str>,
 ) -> Result<(), Error> {
-    let Some(model) = model.map(base_model_id).filter(|m| !m.is_empty()) else {
-        return Ok(());
-    };
-    let catalogue = read_catalogue(data, provider, profile)?;
-    let unprefixed = model
-        .split_once('/')
-        .filter(|(prefix, rest)| *prefix == provider && !rest.is_empty())
-        .map(|(_, rest)| rest);
-    if catalogue
-        .iter()
-        .any(|entry| entry == model || Some(entry.as_str()) == unprefixed)
-    {
-        return Ok(());
-    }
-    Err(Error::Message(format!(
-        "profile `{provider}/{profile}` does not serve model `{model}` (its catalogue: {})",
-        if catalogue.is_empty() {
-            "empty".to_string()
-        } else {
-            catalogue.join(", ")
-        }
-    )))
+    serves_with(provider, profile, model, &live_catalogue(data)).map(|_| ())
 }
 
-/// Full triple check: the profile exists, accepts the harness and serves the model.
-pub(crate) fn validate_triple(
+fn validate_with(
     data: &Path,
     harness: &str,
     model: Option<&str>,
     provider: &str,
     profile: &str,
-) -> Result<(), Error> {
+    catalogue: CatalogueFn<'_>,
+) -> Result<Option<Source>, Error> {
     if !profiles_enabled(data) {
-        return Ok(());
+        return Ok(None);
     }
     if !profile_dir(data, provider, profile).is_dir() {
         return Err(Error::Message(format!(
@@ -193,15 +160,33 @@ pub(crate) fn validate_triple(
     crate::create::ensure_profile_compatible_and_mapped(
         data, provider, profile, harness, model, None,
     )?;
-    ensure_profile_serves_model(data, provider, profile, model)
+    serves_with(provider, profile, model, catalogue)
 }
 
-/// Positive evidence that a profile holds a credential its harness can use.
+/// Full triple check: the profile exists, accepts the harness and serves the model.
+pub(crate) fn validate_triple(
+    data: &Path,
+    harness: &str,
+    model: Option<&str>,
+    provider: &str,
+    profile: &str,
+) -> Result<(), Error> {
+    validate_with(
+        data,
+        harness,
+        model,
+        provider,
+        profile,
+        &live_catalogue(data),
+    )
+    .map(|_| ())
+}
+
+/// Positive evidence that a profile directory holds a credential a harness can use.
 /// Missing, empty, malformed or expired-without-refresh material is not evidence.
 pub(crate) fn profile_has_usable_credentials(dir: &Path) -> bool {
     let read_json = |rel: &str| -> Option<serde_json::Value> {
-        let text = std::fs::read_to_string(dir.join(rel)).ok()?;
-        serde_json::from_str(&text).ok()
+        serde_json::from_str(&std::fs::read_to_string(dir.join(rel)).ok()?).ok()
     };
     let non_empty = |v: Option<&serde_json::Value>| {
         v.and_then(serde_json::Value::as_str)
@@ -229,23 +214,37 @@ pub(crate) fn profile_has_usable_credentials(dir: &Path) -> bool {
     {
         return true;
     }
-    for rel in ["auth.json", ".codex/auth.json"] {
+    for rel in [
+        "auth.json",
+        ".codex/auth.json",
+        ".spiron/auth.json",
+        ".spiron/credentials.json",
+        "credentials.json",
+    ] {
         if let Some(v) = read_json(rel)
-            && (non_empty(v.pointer("/tokens/refresh_token")) || non_empty(v.get("OPENAI_API_KEY")))
+            && (non_empty(v.pointer("/tokens/refresh_token"))
+                || non_empty(v.get("OPENAI_API_KEY"))
+                || non_empty(v.get("access_token"))
+                || non_empty(v.get("api_key"))
+                || v.get("project_keys")
+                    .and_then(serde_json::Value::as_object)
+                    .is_some_and(|m| m.values().any(|k| non_empty(Some(k)))))
         {
             return true;
         }
     }
-    let key_dirs = [dir.join(".config/opencode"), dir.join(".config/sylphx")];
-    for key_dir in key_dirs {
+    for key_dir in [
+        dir.join(".config/opencode"),
+        dir.join(".config/sylphx"),
+        dir.join(".spiron"),
+    ] {
         let Ok(entries) = std::fs::read_dir(&key_dir) else {
             continue;
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            let is_key = name == "key" || path.extension().is_some_and(|ext| ext == "key");
+            let is_key =
+                entry.file_name() == "key" || path.extension().is_some_and(|ext| ext == "key");
             if is_key
                 && path.is_file()
                 && std::fs::read_to_string(&path).is_ok_and(|s| !s.trim().is_empty())
@@ -297,7 +296,7 @@ fn find_binding<'a>(
     })
 }
 
-/// Number of live agents currently bound to each `provider/profile`.
+/// Number of live agents currently bound to `provider/profile`.
 fn assignment_load(data: &Path, agents: &[Agent], full: &str) -> usize {
     agents
         .iter()
@@ -309,34 +308,56 @@ fn assignment_load(data: &Path, agents: &[Agent], full: &str) -> usize {
         .count()
 }
 
+/// Candidates without a bindings file: the provider's own profiles, `default` first.
+fn provider_candidates(data: &Path, harness: &str, model: Option<&str>) -> Vec<String> {
+    let provider = crate::create::upstream_provider_of(harness, model);
+    let mut out: Vec<String> = crate::create::list_harness_profiles(data, &provider)
+        .into_iter()
+        .filter_map(|(name, dir)| {
+            let prov = dir.parent()?.file_name()?.to_str()?.to_string();
+            // Only real provider profile directories are candidates.
+            (dir == profile_dir(data, &prov, &name)).then(|| format!("{prov}/{name}"))
+        })
+        .collect();
+    out.sort_by_key(|full| (!full.ends_with("/default"), full.clone()));
+    out.dedup();
+    out
+}
+
 /// Picks the default `provider/profile` for a harness/model with no explicit profile.
-///
 /// Returns `Ok(None)` only when the installation has no provider profiles.
-/// `read_quota(provider, profile)` returns the remaining quota percent or `None`
-/// when it cannot be read.
 pub(crate) fn resolve_default_profile_with(
     data: &Path,
     agents: &[Agent],
     harness: &str,
     model: Option<&str>,
-    read_quota: &dyn Fn(&str, &str) -> Option<i64>,
+    catalogue: CatalogueFn<'_>,
+    read_quota: QuotaFn<'_>,
 ) -> Result<Option<String>, Error> {
     if !profiles_enabled(data) {
         return Ok(None);
     }
     let harness = normalize_harness_name(harness);
     let model_label = model.map(base_model_id).unwrap_or("(harness default)");
-    let no_binding = || {
-        Error::Message(format!(
-            "no profile given and no profile binding in {BINDINGS_FILE} for harness `{harness}` model `{model_label}`; name a profile or add a binding"
-        ))
+    let (candidates, selection, from_binding) = match load_bindings(data)? {
+        Some(cfg) => {
+            let binding = find_binding(&cfg, harness, model).ok_or_else(|| {
+                Error::Message(format!(
+                    "no profile given and no binding in {BINDINGS_FILE} for harness `{harness}` model `{model_label}`; name a profile or add a binding"
+                ))
+            })?;
+            (binding.profiles.clone(), binding.selection, true)
+        }
+        None => (
+            provider_candidates(data, harness, model),
+            Selection::Ordered,
+            false,
+        ),
     };
-    let cfg = load_bindings(data)?.ok_or_else(no_binding)?;
-    let binding = find_binding(&cfg, harness, model).ok_or_else(no_binding)?;
 
     let mut rejected: Vec<String> = Vec::new();
     let mut eligible: Vec<(String, String, String)> = Vec::new();
-    for full in &binding.profiles {
+    for full in &candidates {
         let (provider, profile) = match split_profile(full) {
             Ok(pair) => pair,
             Err(err) => {
@@ -344,18 +365,23 @@ pub(crate) fn resolve_default_profile_with(
                 continue;
             }
         };
-        if let Err(err) = validate_triple(data, harness, model, provider, profile) {
-            rejected.push(err.to_string());
-            continue;
-        }
-        if !profile_has_usable_credentials(&profile_dir(data, provider, profile)) {
+        let source = match validate_with(data, harness, model, provider, profile, catalogue) {
+            Ok(source) => source,
+            Err(err) => {
+                rejected.push(err.to_string());
+                continue;
+            }
+        };
+        let authenticated = source.as_ref().is_some_and(Source::authenticated)
+            || profile_has_usable_credentials(&profile_dir(data, provider, profile));
+        if !authenticated {
             rejected.push(format!(
                 "profile `{provider}/{profile}` holds no usable credentials"
             ));
             continue;
         }
         eligible.push((
-            format!("{provider}/{profile}"),
+            full.trim().to_string(),
             provider.to_string(),
             profile.to_string(),
         ));
@@ -371,12 +397,24 @@ pub(crate) fn resolve_default_profile_with(
         ))
     };
     if eligible.is_empty() {
-        return Err(refuse("every bound profile was rejected", &rejected));
+        let why = if candidates.is_empty() {
+            "no candidate profiles"
+        } else {
+            "every candidate was rejected"
+        };
+        return Err(refuse(why, &rejected));
     }
-    match binding.selection {
-        Selection::Ordered => Ok(eligible.into_iter().next().map(|(full, _, _)| full)),
+    match selection {
+        Selection::Ordered if from_binding => Ok(eligible.into_iter().next().map(|e| e.0)),
+        Selection::Ordered => {
+            let healthy = eligible.iter().find(|(_, provider, profile)| {
+                !crate::create::profile_has_unhealthy_evidence(&profile_dir(
+                    data, provider, profile,
+                ))
+            });
+            Ok(healthy.or(eligible.first()).map(|e| e.0.clone()))
+        }
         Selection::Quota => {
-            // (full, score, remaining, list order)
             let mut best: Option<(String, i64, i64)> = None;
             let mut readable = 0usize;
             for (full, provider, profile) in &eligible {
@@ -412,7 +450,7 @@ pub(crate) fn resolve_default_profile_with(
     }
 }
 
-/// Production entry point: quota is read live from each candidate profile.
+/// Production entry point: catalogues and quota are read live from each candidate.
 pub(crate) fn resolve_default_profile(
     data: &Path,
     agents: &[Agent],
@@ -420,9 +458,21 @@ pub(crate) fn resolve_default_profile(
     model: Option<&str>,
 ) -> Result<Option<String>, Error> {
     let model_owned = model.map(str::to_string);
-    resolve_default_profile_with(data, agents, harness, model, &|provider, profile| {
-        crate::create::probe_profile_remaining_pct(data, provider, profile, model_owned.as_deref())
-    })
+    resolve_default_profile_with(
+        data,
+        agents,
+        harness,
+        model,
+        &live_catalogue(data),
+        &|provider, profile| {
+            crate::create::probe_profile_remaining_pct(
+                data,
+                provider,
+                profile,
+                model_owned.as_deref(),
+            )
+        },
+    )
 }
 
 #[cfg(test)]
@@ -434,18 +484,19 @@ mod tests {
         std::fs::write(path, text).unwrap();
     }
 
-    fn profile(data: &Path, full: &str, models: Option<&[&str]>, key: bool) {
+    /// A profile directory; `key` adds credential material.
+    fn profile(data: &Path, full: &str, key: bool) {
         let (provider, name) = full.split_once('/').unwrap();
         let dir = data.join("profiles").join(provider).join(name);
-        let mut meta = serde_json::json!({
-            "provider": provider,
-            "kind": "api-key",
-            "compatible_harnesses": ["alpha", "spiron"],
-        });
-        if let Some(models) = models {
-            meta["models"] = serde_json::json!(models);
-        }
-        write(&dir.join("profile.json"), &meta.to_string());
+        write(
+            &dir.join("profile.json"),
+            &serde_json::json!({
+                "provider": provider,
+                "kind": "api-key",
+                "compatible_harnesses": ["alpha", "spiron"],
+            })
+            .to_string(),
+        );
         if key {
             write(&dir.join(".config/opencode/vendor.key"), "k-123\n");
         }
@@ -455,175 +506,224 @@ mod tests {
         write(&data.join(BINDINGS_FILE), &value.to_string());
     }
 
+    type Entries = &'static [(&'static str, &'static [&'static str])];
+
+    /// Catalogues by profile name; `live` marks them as authenticated reads.
+    fn catalogues(entries: Entries, live: bool) -> impl Fn(&str, &str) -> Result<Catalogue, Error> {
+        move |_provider, profile| {
+            entries
+                .iter()
+                .find(|(name, _)| *name == profile)
+                .map(|(_, models)| Catalogue {
+                    models: models.iter().map(|m| m.to_string()).collect(),
+                    source: if live { Source::Live } else { Source::Declared },
+                })
+                .ok_or_else(|| Error::Message(format!("catalogue of `{profile}` is unknown")))
+        }
+    }
+
     fn no_quota(_: &str, _: &str) -> Option<i64> {
         None
     }
 
     #[test]
-    fn catalogue_accepts_listed_model_with_effort_and_provider_prefix() {
+    fn validate_refuses_unserved_model_and_unknown_catalogue() {
         let dir = crate::test_tempdir();
         let data = dir.path();
-        profile(data, "vendor/one", Some(&["lab/model-a"]), true);
-        ensure_profile_serves_model(data, "vendor", "one", Some("vendor/lab/model-a#xhigh"))
-            .unwrap();
-        ensure_profile_serves_model(data, "vendor", "one", Some("lab/model-a")).unwrap();
-        ensure_profile_serves_model(data, "vendor", "one", None).unwrap();
+        profile(data, "vendor/one", true);
+        let cat = catalogues(&[("one", &["lab/model-a"])], true);
+        validate_with(
+            data,
+            "alpha",
+            Some("vendor/lab/model-a#xhigh"),
+            "vendor",
+            "one",
+            &cat,
+        )
+        .unwrap();
+        validate_with(data, "alpha", None, "vendor", "one", &cat).unwrap();
+        let err = validate_with(data, "alpha", Some("lab/model-b"), "vendor", "one", &cat)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not serve model"), "{err}");
+        let unknown = catalogues(&[], true);
+        let err = validate_with(
+            data,
+            "alpha",
+            Some("lab/model-a"),
+            "vendor",
+            "one",
+            &unknown,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("unknown"), "{err}");
     }
 
     #[test]
-    fn catalogue_refuses_unlisted_model_and_near_matches() {
+    fn validate_refuses_missing_profile_and_incompatible_harness() {
         let dir = crate::test_tempdir();
         let data = dir.path();
-        profile(data, "vendor/one", Some(&["lab/model-a"]), true);
-        for model in [
-            "vendor/lab/model-b",
-            "lab/model-a-pro",
-            "other/lab/model-a",
-            "model-a",
-        ] {
-            let err = ensure_profile_serves_model(data, "vendor", "one", Some(model))
-                .unwrap_err()
-                .to_string();
-            assert!(err.contains("does not serve model"), "{model}: {err}");
-        }
+        profile(data, "vendor/one", true);
+        let cat = catalogues(&[("one", &["lab/m"])], true);
+        let err = validate_with(data, "alpha", Some("lab/m"), "vendor", "gone", &cat)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not found"), "{err}");
+        let err = validate_with(data, "codex", Some("lab/m"), "vendor", "one", &cat)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not compatible"), "{err}");
     }
 
     #[test]
-    fn catalogue_fails_closed_when_missing_or_unreadable() {
+    fn everything_is_inert_without_provider_profiles() {
         let dir = crate::test_tempdir();
-        let data = dir.path();
-        profile(data, "vendor/undeclared", None, true);
-        let err = ensure_profile_serves_model(data, "vendor", "undeclared", Some("lab/m"))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("declares no model catalogue"), "{err}");
-
-        write(
-            &data.join("profiles/vendor/broken/profile.json"),
-            "{not json",
-        );
-        let err = ensure_profile_serves_model(data, "vendor", "broken", Some("lab/m"))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("not valid JSON"), "{err}");
-
-        write(
-            &data.join("profiles/vendor/shape/profile.json"),
-            r#"{"models":"lab/m"}"#,
-        );
-        let err = ensure_profile_serves_model(data, "vendor", "shape", Some("lab/m"))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("must be an array"), "{err}");
-
-        let err = ensure_profile_serves_model(data, "vendor", "absent", Some("lab/m"))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("cannot read the model catalogue"), "{err}");
-    }
-
-    #[test]
-    fn validate_triple_is_inert_without_provider_profiles() {
-        let dir = crate::test_tempdir();
-        validate_triple(dir.path(), "alpha", Some("lab/m"), "vendor", "none").unwrap();
+        let cat = catalogues(&[], true);
+        validate_with(dir.path(), "alpha", Some("lab/m"), "vendor", "none", &cat).unwrap();
         assert_eq!(
-            resolve_default_profile_with(dir.path(), &[], "alpha", Some("lab/m"), &no_quota)
+            resolve_default_profile_with(dir.path(), &[], "alpha", Some("lab/m"), &cat, &no_quota)
                 .unwrap(),
             None
         );
     }
 
     #[test]
-    fn validate_triple_refuses_incompatible_harness_and_missing_profile() {
+    fn without_bindings_the_provider_default_is_kept_only_when_it_serves_the_model() {
         let dir = crate::test_tempdir();
         let data = dir.path();
-        profile(data, "vendor/one", Some(&["lab/m"]), true);
-        let err = validate_triple(data, "codex", Some("lab/m"), "vendor", "one")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("not compatible"), "{err}");
-        let err = validate_triple(data, "alpha", Some("lab/m"), "vendor", "gone")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("not found"), "{err}");
-        validate_triple(data, "alpha", Some("lab/m"), "vendor", "one").unwrap();
+        profile(data, "spiron/default", true);
+        profile(data, "spiron/other", true);
+        let cat = catalogues(
+            &[("default", &["lab/a"]), ("other", &["lab/a", "lab/b"])],
+            true,
+        );
+        let pick = |model: &str| {
+            resolve_default_profile_with(data, &[], "spiron", Some(model), &cat, &no_quota)
+        };
+        assert_eq!(pick("lab/a").unwrap().as_deref(), Some("spiron/default"));
+        assert_eq!(pick("lab/b").unwrap().as_deref(), Some("spiron/other"));
+        let err = pick("lab/c").unwrap_err().to_string();
+        assert!(err.contains("every candidate was rejected"), "{err}");
     }
 
     #[test]
-    fn default_binding_prefers_model_binding_and_skips_ineligible_candidates() {
+    fn unauthenticated_profiles_are_never_picked() {
         let dir = crate::test_tempdir();
         let data = dir.path();
-        profile(data, "vendor/general", Some(&["lab/a", "lab/b"]), true);
-        profile(data, "vendor/signed-out", Some(&["lab/b"]), false);
-        profile(data, "vendor/wrong-catalogue", Some(&["lab/a"]), true);
-        profile(data, "vendor/special", Some(&["lab/b"]), true);
+        profile(data, "spiron/default", false);
+        profile(data, "spiron/signed-in", true);
+        let declared = catalogues(&[("default", &["lab/a"]), ("signed-in", &["lab/a"])], false);
+        let picked =
+            resolve_default_profile_with(data, &[], "spiron", Some("lab/a"), &declared, &no_quota)
+                .unwrap();
+        assert_eq!(picked.as_deref(), Some("spiron/signed-in"));
+
+        std::fs::remove_dir_all(data.join("profiles/spiron/signed-in")).unwrap();
+        let err =
+            resolve_default_profile_with(data, &[], "spiron", Some("lab/a"), &declared, &no_quota)
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("no usable credentials"), "{err}");
+
+        // A catalogue read with the profile's own credentials proves authentication.
+        let live = catalogues(&[("default", &["lab/a"])], true);
+        let picked =
+            resolve_default_profile_with(data, &[], "spiron", Some("lab/a"), &live, &no_quota)
+                .unwrap();
+        assert_eq!(picked.as_deref(), Some("spiron/default"));
+    }
+
+    #[test]
+    fn binding_prefers_model_binding_and_skips_ineligible_candidates() {
+        let dir = crate::test_tempdir();
+        let data = dir.path();
+        for name in ["vendor/general", "vendor/wrong-catalogue", "vendor/special"] {
+            profile(data, name, true);
+        }
+        let cat = catalogues(
+            &[
+                ("general", &["lab/a", "lab/b"]),
+                ("wrong-catalogue", &["lab/a"]),
+                ("special", &["lab/b"]),
+            ],
+            true,
+        );
         bindings(
             data,
             serde_json::json!({"bindings": [
                 {"harness": "alpha", "profiles": ["vendor/general"]},
                 {"harness": "alpha", "model": "lab/b#high",
-                 "profiles": ["vendor/signed-out", "vendor/wrong-catalogue", "vendor/special"]}
+                 "profiles": ["vendor/missing", "vendor/wrong-catalogue", "vendor/special"]}
             ]}),
         );
-        let picked =
-            resolve_default_profile_with(data, &[], "alpha", Some("lab/b#xhigh"), &no_quota)
-                .unwrap();
-        assert_eq!(picked.as_deref(), Some("vendor/special"));
-        let picked =
-            resolve_default_profile_with(data, &[], "alpha", Some("lab/a"), &no_quota).unwrap();
-        assert_eq!(picked.as_deref(), Some("vendor/general"));
+        let pick =
+            |model| resolve_default_profile_with(data, &[], "alpha", Some(model), &cat, &no_quota);
+        assert_eq!(
+            pick("lab/b#xhigh").unwrap().as_deref(),
+            Some("vendor/special")
+        );
+        assert_eq!(pick("lab/a").unwrap().as_deref(), Some("vendor/general"));
     }
 
     #[test]
-    fn default_binding_refuses_without_binding_or_eligible_candidate() {
+    fn binding_refuses_when_absent_for_the_harness_or_malformed() {
         let dir = crate::test_tempdir();
         let data = dir.path();
-        profile(data, "vendor/default", Some(&["lab/a"]), false);
-        let err = resolve_default_profile_with(data, &[], "alpha", Some("lab/a"), &no_quota)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("no profile binding"), "{err}");
-
+        profile(data, "vendor/one", true);
+        let cat = catalogues(&[("one", &["lab/a"])], true);
         bindings(
             data,
-            serde_json::json!({"bindings": [{"harness": "alpha", "profiles": ["vendor/default"]}]}),
+            serde_json::json!({"bindings": [{"harness": "spiron", "profiles": ["vendor/one"]}]}),
         );
-        let err = resolve_default_profile_with(data, &[], "alpha", Some("lab/a"), &no_quota)
+        let err = resolve_default_profile_with(data, &[], "alpha", Some("lab/a"), &cat, &no_quota)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("no usable credentials"), "{err}");
-
+        assert!(err.contains("no binding"), "{err}");
         write(
             &data.join(BINDINGS_FILE),
             "{\"bindings\": [{\"harnes\": 1}]}",
         );
-        let err = resolve_default_profile_with(data, &[], "alpha", Some("lab/a"), &no_quota)
+        let err = resolve_default_profile_with(data, &[], "alpha", Some("lab/a"), &cat, &no_quota)
             .unwrap_err()
             .to_string();
         assert!(err.contains("malformed"), "{err}");
     }
 
-    #[test]
-    fn quota_selection_picks_best_remaining_share_and_skips_unreadable() {
-        let dir = crate::test_tempdir();
-        let data = dir.path();
-        for name in ["vendor/s1", "vendor/s2", "vendor/s3", "vendor/s4"] {
-            profile(data, name, Some(&["lab/a"]), true);
+    fn quota_fixture(data: &Path, names: &[&str]) {
+        for name in names {
+            profile(data, name, true);
         }
         bindings(
             data,
             serde_json::json!({"bindings": [{"harness": "alpha", "selection": "quota",
-                "profiles": ["vendor/s1", "vendor/s2", "vendor/s3", "vendor/s4"]}]}),
+                "profiles": names}]}),
         );
+    }
+
+    const QUOTA_CATALOGUE: Entries = &[
+        ("s1", &["lab/a"]),
+        ("s2", &["lab/a"]),
+        ("s3", &["lab/a"]),
+        ("s4", &["lab/a"]),
+        ("busy", &["lab/a"]),
+        ("idle", &["lab/a"]),
+    ];
+
+    #[test]
+    fn quota_selection_picks_best_remaining_share_and_skips_unreadable() {
+        let dir = crate::test_tempdir();
+        let data = dir.path();
+        quota_fixture(data, &["vendor/s1", "vendor/s2", "vendor/s3", "vendor/s4"]);
+        let cat = catalogues(QUOTA_CATALOGUE, true);
         let quota = |_: &str, profile: &str| match profile {
             "s1" => Some(0),
             "s2" => Some(40),
-            "s3" => None,
             "s4" => Some(90),
             _ => None,
         };
         let picked =
-            resolve_default_profile_with(data, &[], "alpha", Some("lab/a"), &quota).unwrap();
+            resolve_default_profile_with(data, &[], "alpha", Some("lab/a"), &cat, &quota).unwrap();
         assert_eq!(picked.as_deref(), Some("vendor/s4"));
     }
 
@@ -631,14 +731,8 @@ mod tests {
     fn quota_selection_weighs_current_assignment_load() {
         let dir = crate::test_tempdir();
         let data = dir.path();
+        quota_fixture(data, &["vendor/busy", "vendor/idle"]);
         let store = anyagents_core::Store::open(data.join("state.db")).unwrap();
-        profile(data, "vendor/busy", Some(&["lab/a"]), true);
-        profile(data, "vendor/idle", Some(&["lab/a"]), true);
-        bindings(
-            data,
-            serde_json::json!({"bindings": [{"harness": "alpha", "selection": "quota",
-                "profiles": ["vendor/busy", "vendor/idle"]}]}),
-        );
         let mut agents = Vec::new();
         for i in 0..3 {
             let agent = store
@@ -650,13 +744,18 @@ mod tests {
             );
             agents.push(agent);
         }
-        // busy: 90 / 4 = 22.5 share; idle: 50 / 1 = 50 share.
-        let quota = |_: &str, profile: &str| match profile {
-            "busy" => Some(90),
-            _ => Some(50),
+        // busy: 90 / (3 + 1) per agent; idle: 50 / 1.
+        let quota = |_: &str, profile: &str| {
+            if profile == "busy" {
+                Some(90)
+            } else {
+                Some(50)
+            }
         };
+        let cat = catalogues(QUOTA_CATALOGUE, true);
         let picked =
-            resolve_default_profile_with(data, &agents, "alpha", Some("lab/a"), &quota).unwrap();
+            resolve_default_profile_with(data, &agents, "alpha", Some("lab/a"), &cat, &quota)
+                .unwrap();
         assert_eq!(picked.as_deref(), Some("vendor/idle"));
     }
 
@@ -664,14 +763,9 @@ mod tests {
     fn quota_selection_fails_closed_when_no_quota_is_readable_or_left() {
         let dir = crate::test_tempdir();
         let data = dir.path();
-        profile(data, "vendor/s1", Some(&["lab/a"]), true);
-        profile(data, "vendor/s2", Some(&["lab/a"]), true);
-        bindings(
-            data,
-            serde_json::json!({"bindings": [{"harness": "alpha", "selection": "quota",
-                "profiles": ["vendor/s1", "vendor/s2"]}]}),
-        );
-        let err = resolve_default_profile_with(data, &[], "alpha", Some("lab/a"), &no_quota)
+        quota_fixture(data, &["vendor/s1", "vendor/s2"]);
+        let cat = catalogues(QUOTA_CATALOGUE, true);
+        let err = resolve_default_profile_with(data, &[], "alpha", Some("lab/a"), &cat, &no_quota)
             .unwrap_err()
             .to_string();
         assert!(
@@ -679,7 +773,7 @@ mod tests {
             "{err}"
         );
         let empty = |_: &str, _: &str| Some(0);
-        let err = resolve_default_profile_with(data, &[], "alpha", Some("lab/a"), &empty)
+        let err = resolve_default_profile_with(data, &[], "alpha", Some("lab/a"), &cat, &empty)
             .unwrap_err()
             .to_string();
         assert!(err.contains("out of quota"), "{err}");

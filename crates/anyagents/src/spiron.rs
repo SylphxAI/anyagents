@@ -138,7 +138,10 @@ fn model_provider_prefix(model: Option<&str>) -> Option<&str> {
     (!prefix.is_empty() && !rest.is_empty()).then_some(prefix)
 }
 
-fn discover_seat_gateway_url_for_model(config_dir: &Path, model: Option<&str>) -> Option<String> {
+pub(crate) fn discover_seat_gateway_url_for_model(
+    config_dir: &Path,
+    model: Option<&str>,
+) -> Option<String> {
     let explicit_provider =
         coding_plan_provider_for_model(model).or_else(|| model_provider_prefix(model));
     for rel in [
@@ -312,7 +315,10 @@ fn write_spiron_auth_doc(config_dir: &Path, auth_path: &Path, key: &str, org_id:
     }
 }
 
-fn extract_project_bound_key(config_dir: &Path, val: &serde_json::Value) -> Option<String> {
+pub(crate) fn extract_project_bound_key(
+    config_dir: &Path,
+    val: &serde_json::Value,
+) -> Option<String> {
     let map = val.get("project_keys")?.as_object()?;
     if let Ok(ctx_raw) = std::fs::read_to_string(config_dir.join(".spiron/context.json"))
         .or_else(|_| std::fs::read_to_string(config_dir.join(".config/sylphx/context.json")))
