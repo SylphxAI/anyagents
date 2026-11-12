@@ -455,13 +455,10 @@ pub(crate) fn render_seat_gh_config(config_dir: &Path, gid: u32) -> Result<Optio
     let source = operator.join("hosts.yml");
     let bytes = match std::fs::read(&source) {
         Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(Error::Message(format!(
-                "cannot read gh credential {}: {error}",
-                source.display()
-            )));
-        }
+        // An operator credential that cannot be read (missing, restricted
+        // home, sandboxed runner) renders nothing, exactly as if no
+        // credential existed; only write-side failures are loud.
+        Err(_) => return Ok(None),
     };
     let gh_dir = config_dir.join("gh");
     if let Err(error) = std::fs::create_dir_all(&gh_dir) {
