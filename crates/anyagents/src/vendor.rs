@@ -3583,22 +3583,31 @@ done
             "ANYAGENTS_AGENT_GID",
             "ANYAGENTS_SOCKET_GID",
             "ANYAGENTS_LAUNCHER",
-            "ANYAGENTS_PRINCIPALS",
+            "ANYAGENTS_PRINCIPAL_REGISTRY",
         ];
         let old: Vec<_> = keys.iter().map(std::env::var_os).collect();
+        // The file-registry form: production deployments resolve seats
+        // from execution-principals.json, not an inline env map.
+        let registry = dir.path().join("execution-principals.json");
+        std::fs::write(
+            &registry,
+            serde_json::json!({
+                agent.id.as_str(): {"user":"synthetic-worker", "uid":42001, "gid":42002, "socket_gid":42003}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+            std::fs::set_permissions(&registry, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
         unsafe {
             std::env::set_var("ANYAGENTS_FAKE_MODE", "1");
             std::env::set_var("ANYAGENTS_AGENT_UID", "42001");
             std::env::set_var("ANYAGENTS_AGENT_GID", "42002");
             std::env::set_var("ANYAGENTS_SOCKET_GID", "42003");
             std::env::set_var("ANYAGENTS_LAUNCHER", "/bin/true");
-            std::env::set_var(
-                "ANYAGENTS_PRINCIPALS",
-                serde_json::json!({
-                    agent.id.as_str(): {"user":"synthetic-worker", "uid":42001, "gid":42002, "socket_gid":42003}
-                })
-                .to_string(),
-            );
+            std::env::set_var("ANYAGENTS_PRINCIPAL_REGISTRY", &registry);
         }
         let error = match vendor_launch(LaunchRequest {
             agent: agent.clone(),
