@@ -4345,6 +4345,52 @@ fn commit_staged_signin_files(
     Ok(())
 }
 
+/// Remove a failed attempt only when every declared credential/state file is absent
+/// or empty. Unreadable, malformed, or special files are uncertain data: keep them.
+pub(crate) fn cleanup_failed_staged_signin(stage: &Path, provider: &str) -> Result<bool, Error> {
+    if !std::fs::symlink_metadata(stage)?.is_dir() {
+        return Err(Error::Message(
+            "staged sign-in root must be a real directory".into(),
+        ));
+    }
+    let (primary, companions) = staged_signin_manifest(provider)?;
+    for rel in primary.iter().chain(companions.iter()) {
+        if read_staged_regular_file(stage, rel)?.is_some_and(|bytes| !bytes.is_empty()) {
+            return Ok(false);
+        }
+    }
+    std::fs::remove_dir_all(stage)?;
+    Ok(true)
+}
+
+/// Retry promotion of a saved attempt, without invoking the vendor sign-in flow.
+/// Accept only a directory name under this provider, never an arbitrary path/link.
+pub(crate) fn resume_staged_signin(
+    data: &Path,
+    provider: &str,
+    name: &str,
+    profile: Option<&str>,
+) -> Result<(String, PathBuf, Option<String>), Error> {
+    let mut parts = Path::new(name).components();
+    if !name.starts_with(".signin-staging-")
+        || !matches!(parts.next(), Some(std::path::Component::Normal(_)))
+        || parts.next().is_some()
+        || name.contains('/')
+        || name.contains('\\')
+    {
+        return Err(Error::Message(
+            "--resume-staging requires a .signin-staging-* directory name".into(),
+        ));
+    }
+    let stage = data.join("profiles").join(provider).join(name);
+    if !std::fs::symlink_metadata(&stage)?.is_dir() {
+        return Err(Error::Message(
+            "staged sign-in root must be a real directory".into(),
+        ));
+    }
+    resolve_and_commit_staged_signin(data, provider, &stage, profile)
+}
+
 pub(crate) fn resolve_and_commit_staged_signin(
     data: &Path,
     provider: &str,
@@ -4768,10 +4814,13 @@ pub(crate) fn finalize_agent_signin(data: &Path, agent: &Agent) -> Result<(), Er
         Ok(())
     })();
     if let Err(err) = stage_res {
-        let _ = std::fs::remove_dir_all(&stage);
+        let _ = cleanup_failed_staged_signin(&stage, &provider);
         return Err(err);
     }
-    let (resolved_prof, _, _) = resolve_and_commit_staged_signin(data, &provider, &stage, None)?;
+    let (resolved_prof, _, _) = resolve_and_commit_staged_signin(data, &provider, &stage, None)
+        .inspect_err(|_| {
+            let _ = cleanup_failed_staged_signin(&stage, &provider);
+        })?;
     let normalized = format!("{provider}/{resolved_prof}\n");
     write_profile_marker(&cfg, ".anyagents-profile", &normalized)?;
     write_profile_marker(&cfg, ".anyagents-seeded-profile", &normalized)?;
@@ -5910,7 +5959,7 @@ pub(crate) fn sync_fresher_bound_agent_credentials(data: &Path) {
     if let Ok(entries) = std::fs::read_dir(profiles_root.join("google-antigravity")) {
         for entry in entries.flatten() {
             let prof_path = entry.path();
-            if prof_path.is_dir() {
+            if prof_path.is_dir() && !entry.file_name().to_string_lossy().starts_with('.') {
                 let _ = heal_mcp_config_file(&prof_path.join(".gemini/config/mcp_config.json"));
                 let _ = heal_mcp_config_file(&prof_path.join("mcp_config.json"));
             }
@@ -7952,6 +8001,9 @@ pub(crate) fn force_refresh_provider_profiles(
             continue;
         }
         let provider = prov_entry.file_name().to_string_lossy().into_owned();
+        if provider.starts_with('.') {
+            continue;
+        }
         let Ok(prof_dirs) = std::fs::read_dir(&prov_path) else {
             continue;
         };
@@ -7961,6 +8013,9 @@ pub(crate) fn force_refresh_provider_profiles(
                 continue;
             }
             let profile = prof_entry.file_name().to_string_lossy().into_owned();
+            if profile.starts_with('.') {
+                continue;
+            }
             let full_name = format!("{provider}/{profile}");
             if let Some(f) = filter
                 && f != provider
@@ -8312,6 +8367,9 @@ pub(crate) fn probe_profile_models_catalog(data: &Path, target: Option<&str>) ->
                 continue;
             }
             let provider = prov_entry.file_name().to_string_lossy().into_owned();
+            if provider.starts_with('.') {
+                continue;
+            }
             if filter.is_none() && provider != "google-antigravity" {
                 continue;
             }
@@ -8326,6 +8384,9 @@ pub(crate) fn probe_profile_models_catalog(data: &Path, target: Option<&str>) ->
                     continue;
                 }
                 let profile = prof_entry.file_name().to_string_lossy().into_owned();
+                if profile.starts_with('.') {
+                    continue;
+                }
                 let full_name = format!("{provider}/{profile}");
                 if let Some(f) = filter
                     && f != provider
@@ -13080,6 +13141,98 @@ mod runtime_config_tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn staged_signin_cleanup_preserves_partial_credentials_and_removes_only_empty_attempts() {
+        let data = tempfile::tempdir().unwrap();
+        let stage = data.path().join("stage");
+        let token = stage.join(".gemini/antigravity-cli/antigravity-oauth-token");
+        std::fs::create_dir_all(token.parent().unwrap()).unwrap();
+        // Even interrupted/malformed credentials must be recoverable.
+        let bytes = b"{partial-oauth-response";
+        std::fs::write(&token, bytes).unwrap();
+        assert!(!cleanup_failed_staged_signin(&stage, "google-antigravity").unwrap());
+        assert_eq!(std::fs::read(&token).unwrap(), bytes);
+        std::fs::remove_file(&token).unwrap();
+        std::fs::create_dir(&token).unwrap();
+        assert!(cleanup_failed_staged_signin(&stage, "google-antigravity").is_err());
+        assert!(stage.exists());
+        std::fs::remove_dir(&token).unwrap();
+        std::fs::write(&token, b"").unwrap();
+        assert!(cleanup_failed_staged_signin(&stage, "google-antigravity").unwrap());
+        assert!(!stage.exists());
+    }
+
+    #[test]
+    fn staged_signin_resume_validates_name_and_preserves_failed_promotion() {
+        let data = tempfile::tempdir().unwrap();
+        let provider = "openai";
+        let name = ".signin-staging-saved";
+        let stage = data.path().join("profiles").join(provider).join(name);
+        std::fs::create_dir_all(&stage).unwrap();
+        let bytes = br#"{"tokens":{"access_token":"synthetic-staged-token"}}"#;
+        std::fs::write(stage.join("auth.json"), bytes).unwrap();
+        for bad in [
+            "default",
+            "../.signin-staging-saved",
+            ".signin-staging-saved/../default",
+            ".signin-staging-saved/",
+            ".signin-staging-saved\\outside",
+        ] {
+            assert!(resume_staged_signin(data.path(), provider, bad, Some("target")).is_err());
+            assert_eq!(std::fs::read(stage.join("auth.json")).unwrap(), bytes);
+        }
+        let destination = data.path().join("profiles/openai/target");
+        std::fs::create_dir_all(destination.join("auth.json")).unwrap();
+        assert!(resume_staged_signin(data.path(), provider, name, Some("target")).is_err());
+        assert_eq!(std::fs::read(stage.join("auth.json")).unwrap(), bytes);
+        std::fs::remove_dir(destination.join("auth.json")).unwrap();
+        let (profile, destination, _) =
+            resume_staged_signin(data.path(), provider, name, Some("target")).unwrap();
+        assert_eq!(profile, "target");
+        assert_eq!(std::fs::read(destination.join("auth.json")).unwrap(), bytes);
+        assert!(!stage.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_signin_resume_and_cleanup_refuse_root_symlink() {
+        let data = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("auth.json"), b"saved credential").unwrap();
+        let parent = data.path().join("profiles/openai");
+        std::fs::create_dir_all(&parent).unwrap();
+        let name = ".signin-staging-linked";
+        let stage = parent.join(name);
+        std::os::unix::fs::symlink(outside.path(), &stage).unwrap();
+        assert!(resume_staged_signin(data.path(), "openai", name, None).is_err());
+        assert!(cleanup_failed_staged_signin(&stage, "openai").is_err());
+        assert_eq!(
+            std::fs::read(outside.path().join("auth.json")).unwrap(),
+            b"saved credential"
+        );
+    }
+
+    #[test]
+    fn staged_signin_is_not_a_profile_for_catalog_refresh_or_listing() {
+        let data = tempfile::tempdir().unwrap();
+        for name in [".signin-staging-saved", ".merged-old"] {
+            let stage = data.path().join("profiles/google-antigravity").join(name);
+            let token = stage.join(".gemini/antigravity-cli/antigravity-oauth-token");
+            std::fs::create_dir_all(token.parent().unwrap()).unwrap();
+            std::fs::write(&token, b"saved-partial-credential").unwrap();
+            let marker = stage.join(".anyagents-last-usage.txt");
+            std::fs::write(&marker, b"preserve").unwrap();
+            assert!(list_harness_profiles(data.path(), "agy").is_empty());
+            for filter in [None, Some("agy"), Some(name)] {
+                let catalog = probe_profile_models_catalog(data.path(), filter);
+                assert_eq!(catalog["profiles"], serde_json::json!([]));
+                force_refresh_provider_profiles(data.path(), filter).unwrap();
+                assert_eq!(std::fs::read(&marker).unwrap(), b"preserve");
+                assert_eq!(std::fs::read(&token).unwrap(), b"saved-partial-credential");
+            }
+        }
     }
 
     #[test]

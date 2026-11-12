@@ -78,6 +78,9 @@ enum Command {
         /// Optional master profile name (e.g. `acct-1`, `acct-2`, `default`).
         #[arg(long)]
         profile: Option<String>,
+        /// Promote a saved `.signin-staging-*` directory name for this harness without OAuth.
+        #[arg(long)]
+        resume_staging: Option<String>,
     },
     /// Harness catalog: what can be signed in, what installs it, and master profiles.
     Harnesses {
@@ -1008,7 +1011,11 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
     match cli.command {
         Command::Serve => server::run(&data),
         Command::Status { json } => status_cmd(&data, json),
-        Command::SignIn { agent, profile } => sign_in(&data, &agent, profile.as_deref()),
+        Command::SignIn {
+            agent,
+            profile,
+            resume_staging,
+        } => sign_in(&data, &agent, profile.as_deref(), resume_staging.as_deref()),
         Command::Harnesses { action } => match action {
             HarnessesCommand::List => {
                 list_harnesses(&data);
@@ -2107,7 +2114,7 @@ fn profiles_cmd(
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .unwrap_or("claude-code");
-            sign_in(data, prof_target, None)
+            sign_in(data, prof_target, None, None)
         }
         Some("list") => list_profiles_cmd(data, target),
         other => list_profiles_cmd(data, other),
@@ -2117,7 +2124,12 @@ fn profiles_cmd(
 /// The installer's sign-in, run against either a server master profile
 /// (`<data>/profiles/<harness>/<profile>`) when `target` is a harness catalog
 /// ID or `profile` is specified, or against a recorded agent's own config directory.
-fn sign_in(data: &Path, target: &str, profile: Option<&str>) -> Result<(), anyagents_core::Error> {
+fn sign_in(
+    data: &Path,
+    target: &str,
+    profile: Option<&str>,
+    resume_staging: Option<&str>,
+) -> Result<(), anyagents_core::Error> {
     let mut runner = signin::ProcessRunner;
     let mut sink = signin::TerminalSink;
     let raw_target = target.trim();
@@ -2144,12 +2156,39 @@ fn sign_in(data: &Path, target: &str, profile: Option<&str>) -> Result<(), anyag
             .and_then(|p| p.split_once('/').map(|(_, r)| r.trim()).or(Some(p)))
             .filter(|s| !s.is_empty());
         let provider = create::upstream_provider_of(target, None);
-        let staging_dir = data
-            .join("profiles")
-            .join(&provider)
-            .join(format!(".signin-staging-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&staging_dir);
-        std::fs::create_dir_all(&staging_dir)?;
+        if let Some(name) = resume_staging {
+            let (resolved_prof, final_dir, account) =
+                create::resume_staged_signin(data, &provider, name, explicit_prof)?;
+            println!(
+                "signed in\tprofile:{provider}/{resolved_prof}\t{}\t{}",
+                final_dir.display(),
+                account.as_deref().unwrap_or("-")
+            );
+            return Ok(());
+        }
+        // Never delete a previous attempt on PID reuse. create_dir refuses collisions.
+        let staging_dir = data.join("profiles").join(&provider).join(format!(
+            ".signin-staging-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(staging_dir.parent().unwrap())?;
+        std::fs::create_dir(&staging_dir)?;
+        let cleanup_failed_attempt = || {
+            if !matches!(
+                create::cleanup_failed_staged_signin(&staging_dir, &provider),
+                Ok(true)
+            ) {
+                eprintln!(
+                    "sign-in staging retained at {}; retry with: anyagents login {target} --resume-staging {}",
+                    staging_dir.display(),
+                    staging_dir.file_name().unwrap().to_string_lossy()
+                );
+            }
+        };
         let use_native_agy_pkce = target == "agy"
             && std::env::var_os("ANYAGENTS_FAKE_MODE").is_none()
             && std::env::var_os("ANYAGENTS_FAKE_VENDOR_MODE").is_none();
@@ -2157,7 +2196,7 @@ fn sign_in(data: &Path, target: &str, profile: Option<&str>) -> Result<(), anyag
             match signin::google_antigravity_pkce_sign_in(&staging_dir, &mut sink) {
                 Ok(o) => o,
                 Err(err) => {
-                    let _ = std::fs::remove_dir_all(&staging_dir);
+                    cleanup_failed_attempt();
                     return Err(err);
                 }
             }
@@ -2171,13 +2210,16 @@ fn sign_in(data: &Path, target: &str, profile: Option<&str>) -> Result<(), anyag
             ) {
                 Ok(o) => o,
                 Err(err) => {
-                    let _ = std::fs::remove_dir_all(&staging_dir);
+                    cleanup_failed_attempt();
                     return Err(anyagents_core::Error::Message(err.to_string()));
                 }
             }
         };
         let (resolved_prof, final_dir, resolved_acct) =
-            create::resolve_and_commit_staged_signin(data, &provider, &staging_dir, explicit_prof)?;
+            create::resolve_and_commit_staged_signin(data, &provider, &staging_dir, explicit_prof)
+                .inspect_err(|_| {
+                    cleanup_failed_attempt();
+                })?;
         println!(
             "signed in\tprofile:{provider}/{resolved_prof}\t{}\t{}",
             final_dir.display(),
@@ -2187,6 +2229,11 @@ fn sign_in(data: &Path, target: &str, profile: Option<&str>) -> Result<(), anyag
                 .unwrap_or("-")
         );
         return Ok(());
+    }
+    if resume_staging.is_some() {
+        return Err(anyagents_core::Error::Message(
+            "--resume-staging requires a signable harness ID, not an agent".into(),
+        ));
     }
     if let Some(prof) = effective_profile {
         let rec = agent::named(data, target)?;

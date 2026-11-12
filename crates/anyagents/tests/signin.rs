@@ -160,3 +160,87 @@ fn fake_dir() -> std::path::PathBuf {
     }
     dir
 }
+
+#[test]
+fn resume_staged_agy_login_promotes_without_vendor_signin() {
+    let data = tempfile::tempdir().unwrap();
+    let name = ".signin-staging-saved";
+    let stage = data.path().join("profiles/google-antigravity").join(name);
+    let rel = ".gemini/antigravity-cli/antigravity-oauth-token";
+    let token = stage.join(rel);
+    std::fs::create_dir_all(token.parent().unwrap()).unwrap();
+    let credential = b"synthetic-recovery-credential";
+    std::fs::write(&token, credential).unwrap();
+    std::os::unix::fs::symlink("log/cli-123.log", token.parent().unwrap().join("cli.log")).unwrap();
+    // No vendor binary is installed on this PATH; even native OAuth must not run.
+    let out = bin()
+        .current_dir(data.path())
+        .env("PATH", machine_path(data.path()))
+        .env("ANYAGENTS_TESTS", "1")
+        .args([
+            "--data",
+            ".",
+            "login",
+            "agy",
+            "--resume-staging",
+            name,
+            "--profile",
+            "recovered",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let destination = data.path().join("profiles/google-antigravity/recovered");
+    assert_eq!(std::fs::read(destination.join(rel)).unwrap(), credential);
+    assert!(!stage.exists());
+    assert!(
+        std::fs::symlink_metadata(destination.join(".gemini/antigravity-cli/cli.log")).is_err()
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("signed in\tprofile:google-antigravity/recovered"));
+    assert!(!stdout.contains("synthetic-recovery-credential"));
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("synthetic-recovery-credential"));
+}
+
+#[test]
+fn failed_vendor_signin_keeps_written_credentials_but_removes_empty_attempt() {
+    for writes_credential in [false, true] {
+        let data = tempfile::tempdir().unwrap();
+        let mode = if writes_credential {
+            r#"printf '%s' 'partial-credential' > "$CLAUDE_CONFIG_DIR/.credentials.json"; exit 1"#
+        } else {
+            "exit 1"
+        };
+        let out = bin()
+            .current_dir(data.path())
+            .args([
+                "--data",
+                data.path().to_str().unwrap(),
+                "login",
+                "claude-code",
+            ])
+            .env("ANYAGENTS_TESTS", "1")
+            .env("ANYAGENTS_FAKE_VENDOR_MODE", mode)
+            .env("ANYAGENTS_SIGN_IN_LOG", data.path().join("vendor.log"))
+            .env("PATH", format!("{}:/usr/bin:/bin", fake_dir().display()))
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{out:?}");
+        let stages: Vec<_> = std::fs::read_dir(data.path().join("profiles/anthropic"))
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".signin-staging-")
+            })
+            .collect();
+        assert_eq!(stages.len(), usize::from(writes_credential), "{out:?}");
+        if writes_credential {
+            assert_eq!(
+                std::fs::read(stages[0].path().join(".credentials.json")).unwrap(),
+                b"partial-credential"
+            );
+        }
+    }
+}
