@@ -139,6 +139,11 @@ async fn serve(
     let _server_lock = acquire_server_lock(data)?;
     crate::worktree_access::recover_inspections(data)?;
     let store = Arc::new(Store::open(data.join("state.db"))?);
+    // The server lock excludes concurrent creation: no unadmitted row is in
+    // flight, so each is a failed creation still holding its name.
+    for (id, name) in store.release_unadmitted_names()? {
+        eprintln!("released name `{name}` held by failed creation {id}");
+    }
     crate::sandbox::reconcile_principals(&store)?;
     crate::host_memory::on_start(&store);
     let key = capability_key()?;
