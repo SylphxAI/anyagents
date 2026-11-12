@@ -1026,8 +1026,13 @@ impl SpironRig {
             })
             .map(|(entries, leases)| format!("entries={entries:?} leases={leases:?}"))
             .unwrap_or_else(|_| "unreadable".to_string());
+        let supervisor = self
+            .supervisor
+            .as_ref()
+            .map(|s| s.live(&self.agent.id))
+            .unwrap_or(None);
         format!(
-            "wire={:?} launched={launch} progress={progress} hold={hold} last_error={last_error} journal={journal}",
+            "wire={:?} launched={launch} progress={progress} hold={hold} last_error={last_error} journal={journal} supervisor={supervisor:?}",
             self.wire()
         )
     }
@@ -1394,7 +1399,11 @@ for raw in sys.stdin:
     rig.start();
     // Reconciliation cleared the lost hold; the recovery turn's own hold
     // clears when it confirms.
-    eventually(|| !rig.cfg.join("spiron-unconfirmed-steers.json").exists());
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while rig.cfg.join("spiron-unconfirmed-steers.json").exists() {
+        assert!(Instant::now() < deadline, "{}", rig.stall_report());
+        std::thread::sleep(Duration::from_millis(5));
+    }
 
     let wire = rig.wire();
     assert_eq!(wire.len(), 1, "recovery only: {wire:?}");
