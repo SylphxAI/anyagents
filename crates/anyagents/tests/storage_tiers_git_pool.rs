@@ -334,11 +334,7 @@ exec "{scripted_bin}" "$@"
     let private1 = std::fs::canonicalize(wt1.join(".git")).unwrap();
     let common1 = std::fs::canonicalize(git(
         &wt1,
-        &[
-            "rev-parse",
-            "--path-format=absolute",
-            "--git-common-dir",
-        ],
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
     ))
     .unwrap();
     assert_eq!(private1, common1);

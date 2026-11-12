@@ -148,10 +148,7 @@ fn validate_config_files(private: &Path, common: &Path) -> Result<(), Error> {
             Err(e) => return Err(refusal(&path, e)),
         };
         let meta = file.metadata()?;
-        if !meta.is_file()
-            || per_seat_config && meta.nlink() != 1
-            || meta.len() > 1024 * 1024
-        {
+        if !meta.is_file() || per_seat_config && meta.nlink() != 1 || meta.len() > 1024 * 1024 {
             return Err(refusal(&path, "Git configuration is not a regular file"));
         }
         use std::io::Read;
