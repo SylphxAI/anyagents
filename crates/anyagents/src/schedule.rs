@@ -658,7 +658,183 @@ pub fn tick_local_schedules_once(store: &Store, health: &HealthBoard, now: i64) 
         eprintln!("Schedule recovery unavailable: {err}");
         return 0;
     }
-    tick_schedule_partition(store, health, now, false)
+    let fired = tick_schedule_partition(store, health, now, false);
+    let _ = tick_task_subagent_turn_ownership(store, health, now);
+    fired
+}
+
+/// Enforce event-driven Ping-Pong turn ownership between parents and `lifecycle: task`
+/// sub-agents without mutating `SYSTEM_PROMPT.md` (preserving prompt cache):
+/// - **Rule A (Ball in Child's Court)**: If an idle `task` sub-agent with no active schedules
+///   finished a parent-initiated turn (`>= 15s` ago) without calling `send`, nudge it once to
+///   either finish or report to `parent` via `send` (and if it exits a second time without
+///   sending, alert `parent` once).
+/// - **Rule B (Ball in Parent's Court)**: If an idle `task` sub-agent has reported to its
+///   `parent` (`last_outbound >= last_inbound`), has no active schedules, and remains unarchived
+///   for `>= 15m` after both the report and the parent's latest turn completed while the parent
+///   is idle, deliver a single consolidated event notification to `parent` reminding it to either
+///   send follow-up instructions or `archive` the completed task sub-agent(s).
+pub fn tick_task_subagent_turn_ownership(store: &Store, health: &HealthBoard, now: i64) -> usize {
+    let Ok(agents) = store.list_agents() else {
+        return 0;
+    };
+    let agents_by_id: HashMap<AgentId, Agent> =
+        agents.iter().cloned().map(|a| (a.id.clone(), a)).collect();
+    let mut actions = 0usize;
+    let mut waiting_by_parent: HashMap<AgentId, Vec<(String, String, i64)>> = HashMap::new();
+
+    for child in &agents {
+        let Some(parent_id) = child.parent_id.as_ref() else {
+            continue;
+        };
+        let Some(parent) = agents_by_id.get(parent_id) else {
+            continue;
+        };
+        if matches!(child.state.as_str(), "paused" | "archived")
+            || crate::server::is_explicitly_archived(store.data_dir(), child)
+        {
+            continue;
+        }
+        if !child.is_task_subagent() {
+            continue;
+        }
+        if agent_wake_block_reason(store, health, child, now).is_some() {
+            continue;
+        }
+        if store
+            .list_schedules(Some(&child.id), true)
+            .is_ok_and(|s| !s.is_empty())
+        {
+            continue;
+        }
+        let Ok(snap) = store.turn_ownership_snapshot(&child.id) else {
+            continue;
+        };
+        let last_in_ms = snap.last_delivered_at_ms.unwrap_or(0);
+        let last_out_ms = snap.last_outbound_at_ms.unwrap_or(0);
+        let parent_sender = format!("agent:{}", parent.name);
+
+        if last_in_ms > 0
+            && last_in_ms > last_out_ms
+            && now.saturating_sub(last_in_ms) >= 15_000
+            && snap
+                .last_delivered_sender
+                .as_deref()
+                .is_some_and(|s| s == "parent" || s == parent_sender || s == "system:turn-guard")
+        {
+            let seq = snap.last_delivered_seq.unwrap_or(0);
+            let already_nudged = snap
+                .last_delivered_source_key
+                .as_deref()
+                .is_some_and(|k| k.starts_with("turn-guard:child-nudge:"));
+            if already_nudged {
+                if !matches!(parent.state.as_str(), "paused" | "archived")
+                    && !crate::server::is_explicitly_archived(store.data_dir(), parent)
+                    && agent_wake_block_reason(store, health, parent, now).is_none()
+                {
+                    let alert_key = format!("turn-guard:parent-alert:{}:{seq}", child.id);
+                    if store
+                        .has_message_source_key(&parent.id, &alert_key)
+                        .is_ok_and(|exists| !exists)
+                    {
+                        let body = format!(
+                            "[Sub-Agent Turn Ownership Guard] Task sub-agent `{}` (`role: {}`) exited its turn without calling `send` to report back and has no active schedules. Inspect it via `agents(action: \"inspect\", name: \"{}\")`, send it a follow-up instruction, or close it via `agents(action: \"archive\", name: \"{}\")`.",
+                            child.name,
+                            child.role.as_deref().unwrap_or("task"),
+                            child.name,
+                            child.name
+                        );
+                        let mut msg = Incoming::new(body);
+                        msg.sender = Some("system:turn-guard".to_string());
+                        msg.source_key = Some(alert_key);
+                        msg.source_time_ms = Some(now);
+                        if store.receive(&parent.id, msg).is_ok() {
+                            crate::create::poke_agent_wake_socket(store.data_dir(), &parent.id);
+                            crate::create::poke_agent_wake_socket_mail(
+                                store.data_dir(),
+                                &parent.id,
+                            );
+                            actions += 1;
+                        }
+                    }
+                }
+            } else {
+                let nudge_key = format!("turn-guard:child-nudge:{}:{seq}", child.id);
+                if store
+                    .has_message_source_key(&child.id, &nudge_key)
+                    .is_ok_and(|exists| !exists)
+                {
+                    let body = format!(
+                        "[Turn Ownership Guard] You exited your turn as a `lifecycle: task` sub-agent without calling `send` to report to your parent (`agent:{}`) and without an active `schedule`. Complete any remaining work now or call `send` (`to: \"parent\"`) with your verified outcome or blocker.",
+                        parent.name
+                    );
+                    let mut msg = Incoming::new(body);
+                    msg.sender = Some("system:turn-guard".to_string());
+                    msg.source_key = Some(nudge_key);
+                    msg.source_time_ms = Some(now);
+                    if store.receive(&child.id, msg).is_ok() {
+                        crate::create::poke_agent_wake_socket(store.data_dir(), &child.id);
+                        crate::create::poke_agent_wake_socket_mail(store.data_dir(), &child.id);
+                        actions += 1;
+                    }
+                }
+            }
+        } else if last_out_ms > 0
+            && last_out_ms >= last_in_ms
+            && !matches!(parent.state.as_str(), "paused" | "archived")
+            && !crate::server::is_explicitly_archived(store.data_dir(), parent)
+            && agent_wake_block_reason(store, health, parent, now).is_none()
+            && let Ok(parent_snap) = store.turn_ownership_snapshot(&parent.id)
+        {
+            let ref_ms = last_out_ms.max(parent_snap.last_delivered_at_ms.unwrap_or(0));
+            if now.saturating_sub(ref_ms) >= 900_000 {
+                waiting_by_parent
+                    .entry(parent.id.clone())
+                    .or_default()
+                    .push((
+                        child.name.clone(),
+                        child.role.clone().unwrap_or_else(|| "task".to_string()),
+                        last_out_ms,
+                    ));
+            }
+        }
+    }
+
+    for (parent_id, mut children) in waiting_by_parent {
+        children.sort_by(|a, b| a.0.cmp(&b.0));
+        let fingerprint_raw = children
+            .iter()
+            .map(|(name, _, ts)| format!("{name}:{ts}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let digest = anyagents_core::learned_memory::sha256(fingerprint_raw.as_bytes());
+        let hash16 = &digest[..16.min(digest.len())];
+        let reminder_key = format!("turn-guard:waiting-parent:{parent_id}:{hash16}");
+        if store
+            .has_message_source_key(&parent_id, &reminder_key)
+            .is_ok_and(|exists| !exists)
+        {
+            let formatted = children
+                .iter()
+                .map(|(name, role, _)| format!("`{name}` (`{role}`)"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let body = format!(
+                "[Sub-Agent Turn Ownership Guard] The following `lifecycle: task` sub-agent(s) reported to you and are idle with no active schedules (`waiting_parent`): {formatted}. The ball is in your court: for each sub-agent, either send a follow-up instruction via `send` if work remains, or close it via `agents(action: \"archive\", name: \"<name>\")` if its deliverable is accepted."
+            );
+            let mut msg = Incoming::new(body);
+            msg.sender = Some("system:turn-guard".to_string());
+            msg.source_key = Some(reminder_key);
+            msg.source_time_ms = Some(now);
+            if store.receive(&parent_id, msg).is_ok() {
+                crate::create::poke_agent_wake_socket(store.data_dir(), &parent_id);
+                crate::create::poke_agent_wake_socket_mail(store.data_dir(), &parent_id);
+                actions += 1;
+            }
+        }
+    }
+
+    actions
 }
 
 /// Evaluate network-backed watches on a separate loop. Slow external services
@@ -2442,5 +2618,80 @@ mod tests {
                 .state,
             "fired"
         );
+    }
+
+    #[test]
+    fn task_subagent_turn_ownership_nudges_silent_child_and_reminds_parent_on_waiting_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let health = HealthBoard::default();
+        let mut parent_new = NewAgent::new("parent-dir", "agy");
+        parent_new.role = Some("director".to_string());
+        let parent = store.create_agent(parent_new).unwrap();
+        let mut child_new = NewAgent::new("child-eng", "opencode");
+        child_new.role = Some("engineer".to_string());
+        child_new.parent_id = Some(parent.id.clone());
+        let child = store.create_agent(child_new).unwrap();
+        let mut assistant_new = NewAgent::new("child-asst", "agy");
+        assistant_new.role = Some("engineer".to_string());
+        assistant_new.parent_id = Some(parent.id.clone());
+        let assistant = store.create_agent(assistant_new).unwrap();
+        store
+            .set_agent_lifecycle(&assistant.id, "standing")
+            .unwrap();
+
+        // Deliver a task instruction from parent to both child (task) and assistant (standing)
+        let mut task_msg = Incoming::new("Execute task");
+        task_msg.sender = Some(format!("agent:{}", parent.name));
+        store.receive(&child.id, task_msg.clone()).unwrap();
+        store.note_delivered(&child.id, 1).unwrap();
+        store.note_turn_completed(&child.id).unwrap();
+
+        store.receive(&assistant.id, task_msg).unwrap();
+        store.note_delivered(&assistant.id, 1).unwrap();
+        store.note_turn_completed(&assistant.id).unwrap();
+
+        let snap = store.turn_ownership_snapshot(&child.id).unwrap();
+        let delivered_ms = snap.last_delivered_at_ms.unwrap();
+
+        // Rule A: after 20s without calling `send`, task child is nudged once; standing assistant is not.
+        assert_eq!(
+            tick_task_subagent_turn_ownership(&store, &health, delivered_ms + 20_000),
+            1
+        );
+        assert_eq!(
+            tick_task_subagent_turn_ownership(&store, &health, delivered_ms + 25_000),
+            0
+        );
+        let child_inbox = store.inbox(&child.id, None).unwrap();
+        assert_eq!(child_inbox.len(), 2);
+        assert!(child_inbox[1].text.contains("[Turn Ownership Guard]"));
+        assert_eq!(store.inbox(&assistant.id, None).unwrap().len(), 1);
+
+        // Child consumes the nudge and calls `send` (`record_outbound`) to parent
+        store.note_delivered(&child.id, 2).unwrap();
+        store.note_turn_completed(&child.id).unwrap();
+        store
+            .record_outbound(&child.id, "agent:parent-dir", None, "Task completed")
+            .unwrap();
+        let out_ms = store
+            .turn_ownership_snapshot(&child.id)
+            .unwrap()
+            .last_outbound_at_ms
+            .unwrap();
+
+        // Rule B: after 15m of child waiting_parent while parent is idle, parent receives 1 consolidated reminder.
+        assert_eq!(
+            tick_task_subagent_turn_ownership(&store, &health, out_ms + 901_000),
+            1
+        );
+        assert_eq!(
+            tick_task_subagent_turn_ownership(&store, &health, out_ms + 950_000),
+            0
+        );
+        let parent_inbox = store.inbox(&parent.id, None).unwrap();
+        assert_eq!(parent_inbox.len(), 1);
+        assert!(parent_inbox[0].text.contains("waiting_parent"));
+        assert!(parent_inbox[0].text.contains("`child-eng` (`engineer`)"));
     }
 }

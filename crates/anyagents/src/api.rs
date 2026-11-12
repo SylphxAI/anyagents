@@ -23,6 +23,9 @@ pub struct AgentView {
     /// Internal communication and discovery scope (`"isolated"` | `"private"` | `"siblings"` | `"public"`).
     #[serde(default)]
     pub scope: String,
+    /// Lifecycle mode (`"standing"` | `"task"`): `"standing"` stays on idle standby between assignments; `"task"` (default for sub-agents) is a single-mission freelancer closed (`archive`) by its parent upon completion.
+    #[serde(default)]
+    pub lifecycle: String,
     /// Structural relationship of this agent to the authenticated caller (`"self"`, `"parent"`, `"sibling"`, `"child"`, `"descendant"`, `"ancestor"`, `"peer"`, `"other"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relationship: Option<String>,
@@ -124,12 +127,11 @@ pub struct CreateAgentRequest {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
+        alias = "archetype",
         alias = "type",
         alias = "template",
         alias = "preset"
     )]
-    pub archetype: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
     /// Omitted HTTP harness retains the legacy `claude-code` default. An explicit
     /// empty string or `inherit` lets sub-agent defaults select the harness.
@@ -160,6 +162,8 @@ pub struct CreateAgentRequest {
     pub parent: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<String>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -552,21 +556,22 @@ mod create_agent_tests {
 
     #[test]
     fn archetype_aliases_deserialize_and_omit_when_absent() {
-        for key in ["archetype", "type", "template", "preset"] {
+        for key in ["role", "archetype", "type", "template", "preset"] {
             let mut obj = serde_json::Map::new();
             obj.insert("name".into(), json!("worker"));
             obj.insert(key.into(), json!("writer"));
             let req: CreateAgentRequest =
                 serde_json::from_value(serde_json::Value::Object(obj)).unwrap();
-            assert_eq!(req.archetype.as_deref(), Some("writer"));
+            assert_eq!(req.role.as_deref(), Some("writer"));
             assert!(req.harness.is_none());
         }
         let absent: CreateAgentRequest = serde_json::from_value(json!({
             "name": "worker"
         }))
         .unwrap();
-        assert!(absent.archetype.is_none());
+        assert!(absent.role.is_none());
         let serialized = serde_json::to_value(absent).unwrap();
+        assert!(serialized.get("role").is_none());
         assert!(serialized.get("archetype").is_none());
     }
 }

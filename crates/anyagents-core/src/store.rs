@@ -50,6 +50,28 @@ fn is_scope_env_key(key: &str) -> bool {
     matches!(key, "ANYAGENTS_SCOPE" | "ANYAGENTS_PUBLIC")
 }
 
+fn is_policy_env_key(key: &str) -> bool {
+    is_scope_env_key(key) || key == "ANYAGENTS_LIFECYCLE"
+}
+
+/// Validate and normalize an agent lifecycle (`"task"` or `"standing"`) without persisting state.
+pub fn parse_agent_lifecycle(lifecycle: &str) -> Result<&'static str, Error> {
+    match lifecycle.trim().to_ascii_lowercase().as_str() {
+        "standing" | "permanent" | "daemon" | "resident" => Ok("standing"),
+        "task" | "ephemeral" | "freelance" | "oneshot" => Ok("task"),
+        other => Err(Error::Message(format!(
+            "invalid lifecycle `{other}`; expected `task` or `standing`"
+        ))),
+    }
+}
+
+fn lifecycle_env(agent: &Agent, lifecycle: &str) -> Vec<(String, String)> {
+    let mut env = agent.launch_env.clone();
+    env.retain(|(key, _)| key != "ANYAGENTS_LIFECYCLE");
+    env.push(("ANYAGENTS_LIFECYCLE".to_string(), lifecycle.to_string()));
+    env
+}
+
 /// Validate and normalize an agent scope without persisting any state.
 pub fn parse_agent_scope(scope: &str) -> Result<&'static str, Error> {
     match scope.trim().to_ascii_lowercase().as_str() {
@@ -80,6 +102,15 @@ pub struct AgentQueryMetadata {
     pub oldest_undelivered: HashMap<String, i64>,
     pub open_turns: HashMap<String, i64>,
     pub schedules: HashMap<String, Vec<AgentSchedule>>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TurnOwnershipSnapshot {
+    pub last_delivered_seq: Option<i64>,
+    pub last_delivered_at_ms: Option<i64>,
+    pub last_delivered_sender: Option<String>,
+    pub last_delivered_source_key: Option<String>,
+    pub last_outbound_at_ms: Option<i64>,
 }
 
 /// One agent row.
@@ -196,6 +227,39 @@ impl Agent {
     /// sub-agents default to `false` (`private`) unless their Parent sets `public: true`.
     pub fn is_public(&self) -> bool {
         self.parent_id.is_none() || self.scope() == "public"
+    }
+
+    /// Lifecycle mode (`"standing"` | `"task"`):
+    /// - `"standing"` (default for Root Agents, or sub-agents hired as long-lived team members):
+    ///   remains on standby (`idle`) between assignments without turn-ownership archive reminders.
+    /// - `"task"` (default for Sub-Agents): hired for a bounded mission; must report back (`send`)
+    ///   before exiting a parent-initiated turn, and once reported (`waiting_parent`), awaits
+    ///   either a follow-up `send` or `archive` from its parent.
+    pub fn lifecycle(&self) -> &'static str {
+        if let Some((_, v)) = self
+            .launch_env
+            .iter()
+            .find(|(k, _)| k == "ANYAGENTS_LIFECYCLE")
+        {
+            match v.trim().to_ascii_lowercase().as_str() {
+                "standing" | "permanent" | "daemon" | "resident" => return "standing",
+                "task" | "ephemeral" | "freelance" | "oneshot" => return "task",
+                _ => {}
+            }
+        }
+        self.default_lifecycle()
+    }
+
+    fn default_lifecycle(&self) -> &'static str {
+        if self.parent_id.is_none() {
+            "standing"
+        } else {
+            "task"
+        }
+    }
+
+    pub fn is_task_subagent(&self) -> bool {
+        self.parent_id.is_some() && self.lifecycle() == "task"
     }
 }
 
@@ -2305,14 +2369,14 @@ impl Store {
         self.update_agent_launch_env(id, None, |current| {
             let mut refreshed: Vec<_> = env
                 .iter()
-                .filter(|(key, _)| !is_scope_env_key(key))
+                .filter(|(key, _)| !is_policy_env_key(key))
                 .cloned()
                 .collect();
             refreshed.extend(
                 current
                     .launch_env
                     .iter()
-                    .filter(|(key, _)| is_scope_env_key(key))
+                    .filter(|(key, _)| is_policy_env_key(key))
                     .cloned(),
             );
             refreshed
@@ -2778,6 +2842,58 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(id)
+    }
+
+    pub fn turn_ownership_snapshot(
+        &self,
+        agent_id: &AgentId,
+    ) -> Result<TurnOwnershipSnapshot, Error> {
+        let conn = self.conn();
+        let last_in: Option<(i64, i64, Option<String>, Option<String>)> = conn
+            .query_row(
+                "SELECT seq, delivered_at_ms, sender, source_key
+                 FROM messages
+                 WHERE agent_id = ?1 AND delivered_at_ms IS NOT NULL
+                 ORDER BY seq DESC LIMIT 1",
+                [agent_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let last_outbound_at_ms: Option<i64> = conn.query_row(
+            "SELECT MAX(sent_at_ms) FROM outbound_messages WHERE agent_id = ?1",
+            [agent_id.as_str()],
+            |row| row.get(0),
+        )?;
+        Ok(match last_in {
+            Some((seq, delivered_at_ms, sender, source_key)) => TurnOwnershipSnapshot {
+                last_delivered_seq: Some(seq),
+                last_delivered_at_ms: Some(delivered_at_ms),
+                last_delivered_sender: sender,
+                last_delivered_source_key: source_key,
+                last_outbound_at_ms,
+            },
+            None => TurnOwnershipSnapshot {
+                last_delivered_seq: None,
+                last_delivered_at_ms: None,
+                last_delivered_sender: None,
+                last_delivered_source_key: None,
+                last_outbound_at_ms,
+            },
+        })
+    }
+
+    pub fn has_message_source_key(
+        &self,
+        agent_id: &AgentId,
+        source_key: &str,
+    ) -> Result<bool, Error> {
+        let conn = self.conn();
+        let exists: i64 = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM messages WHERE agent_id = ?1 AND source_key = ?2)",
+            params![agent_id.as_str(), source_key],
+            |row| row.get(0),
+        )?;
+        Ok(exists != 0)
     }
 
     /// Read the complete two-way (`in` + `out`) conversation of `agent_id` across
@@ -4220,6 +4336,22 @@ impl Store {
         self.update_agent_launch_env(agent_id, Some((actor, "scope")), |current| {
             scope_env(current, normalized)
         })
+    }
+
+    /// Set the agent lifecycle mode (`"task"` or `"standing"`).
+    pub fn set_agent_lifecycle(&self, agent_id: &AgentId, lifecycle: &str) -> Result<Agent, Error> {
+        self.set_agent_lifecycle_as(agent_id, lifecycle, "system")
+    }
+
+    /// Set lifecycle mode (`"task"` or `"standing"`).
+    pub fn set_agent_lifecycle_as(
+        &self,
+        agent_id: &AgentId,
+        lifecycle: &str,
+        _actor: &str,
+    ) -> Result<Agent, Error> {
+        let normalized = parse_agent_lifecycle(lifecycle)?;
+        self.update_agent_launch_env(agent_id, None, |current| lifecycle_env(current, normalized))
     }
 
     /// Set whether a sub-agent accepts external messages from agents outside its

@@ -325,9 +325,7 @@ pub(crate) fn configure_seat_git(config: &Path, workdir: &Path) -> Result<(), Er
             return Err(std::io::Error::last_os_error().into());
         }
         let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-        if unsafe { libc::fchown(file.as_raw_fd(), u32::MAX, directory.metadata()?.gid()) } != 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
+        descriptor_fchown(&file, None, Some(directory.metadata()?.gid()))?;
         file.write_all(&bytes)?;
         file.sync_all()?;
         if unsafe {
@@ -499,10 +497,7 @@ fn manage_config_with_hook(
     retained: &[Grant],
     before_publish: &dyn Fn() -> std::io::Result<()>,
 ) -> std::io::Result<()> {
-    use std::os::{
-        fd::AsRawFd,
-        unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt},
-    };
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
     let common = &grant.common;
     let path = common.join("config");
     let mut target_lock = None;
@@ -525,9 +520,7 @@ fn manage_config_with_hook(
         clear_default_acl(&dir)?;
         target_lock = Some(lock_config(directory.join("config.lock"))?);
         dir.set_permissions(std::fs::Permissions::from_mode(0o700))?;
-        if unsafe { libc::fchown(dir.as_raw_fd(), meta.uid(), meta.gid()) } != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
+        descriptor_fchown(&dir, Some(meta.uid()), Some(meta.gid()))?;
         let temporary = common.join(format!(
             ".config-link-{}",
             anyagents_core::AgentId::generate()
@@ -596,18 +589,7 @@ fn config_default_readers(directory: &std::fs::File, readers: &[u32]) -> std::io
         bytes.extend(id.to_le_bytes());
     }
     let name = c"system.posix_acl_default";
-    if unsafe {
-        libc::fsetxattr(
-            directory.as_raw_fd(),
-            name.as_ptr(),
-            bytes.as_ptr().cast(),
-            bytes.len(),
-            0,
-        )
-    } != 0
-    {
-        return Err(std::io::Error::last_os_error());
-    }
+    descriptor_fsetxattr(directory, name, &bytes)?;
     let mut readback = vec![0u8; bytes.len() + 1];
     let len = unsafe {
         libc::fgetxattr(
@@ -1457,13 +1439,217 @@ fn with_directory(
 }
 
 #[cfg(target_os = "linux")]
+fn descriptor_privilege_launcher() -> Option<PathBuf> {
+    if !crate::sandbox::is_isolated_test_env()
+        || std::env::var_os("ANYAGENTS_REQUIRE_NATIVE_SEAT_TEST").is_some()
+    {
+        crate::sandbox::descriptor_launcher()
+    } else {
+        None
+    }
+}
+
+#[cfg(unix)]
+fn descriptor_fchown(
+    file: &std::fs::File,
+    uid: Option<u32>,
+    gid: Option<u32>,
+) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    if unsafe {
+        libc::fchown(
+            file.as_raw_fd(),
+            uid.unwrap_or(u32::MAX),
+            gid.unwrap_or(u32::MAX),
+        )
+    } == 0
+    {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    #[cfg(target_os = "linux")]
+    if matches!(err.raw_os_error(), Some(libc::EPERM | libc::EACCES))
+        && let Some(launcher) = descriptor_privilege_launcher()
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = file.metadata()?;
+        if !meta.is_dir() && (!meta.is_file() || meta.nlink() != 1) {
+            return Err(err);
+        }
+        let owner_spec = match (uid, gid) {
+            (Some(u), Some(g)) => format!("{u}:{g}"),
+            (Some(u), None) => u.to_string(),
+            (None, Some(g)) => format!(":{g}"),
+            (None, None) => return Ok(()),
+        };
+        let status = std::process::Command::new(launcher)
+            .args([
+                "--reuid",
+                "0",
+                "--regid",
+                "0",
+                "--clear-groups",
+                "--no-new-privs",
+                "--",
+                "/bin/chown",
+                &owner_spec,
+                "/dev/fd/0",
+            ])
+            .stdin(file.try_clone()?)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()?;
+        if status.success() {
+            return Ok(());
+        }
+    }
+    Err(err)
+}
+
+#[cfg(unix)]
+fn descriptor_fchmod(file: &std::fs::File, mode: libc::mode_t) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    if unsafe { libc::fchmod(file.as_raw_fd(), mode) } == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    #[cfg(target_os = "linux")]
+    if matches!(err.raw_os_error(), Some(libc::EPERM | libc::EACCES))
+        && let Some(launcher) = descriptor_privilege_launcher()
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = file.metadata()?;
+        if !meta.is_dir() && (!meta.is_file() || meta.nlink() != 1) {
+            return Err(err);
+        }
+        let mode_arg = format!("{:04o}", mode & 0o7777);
+        let status = std::process::Command::new(&launcher)
+            .args([
+                "--reuid",
+                &meta.uid().to_string(),
+                "--regid",
+                &meta.gid().to_string(),
+                "--groups",
+                &meta.gid().to_string(),
+                "--no-new-privs",
+                "--",
+                "/bin/chmod",
+                &mode_arg,
+                "/dev/fd/0",
+            ])
+            .stdin(file.try_clone()?)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()?;
+        if status.success() && (file.metadata()?.mode() as libc::mode_t & 0o7777) == (mode & 0o7777)
+        {
+            return Ok(());
+        }
+        let root_status = std::process::Command::new(launcher)
+            .args([
+                "--reuid",
+                "0",
+                "--regid",
+                "0",
+                "--clear-groups",
+                "--no-new-privs",
+                "--",
+                "/bin/chmod",
+                &mode_arg,
+                "/dev/fd/0",
+            ])
+            .stdin(file.try_clone()?)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()?;
+        if root_status.success() {
+            return Ok(());
+        }
+    }
+    Err(err)
+}
+
+#[cfg(target_os = "linux")]
+fn descriptor_fsetxattr(
+    file: &std::fs::File,
+    name: &std::ffi::CStr,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    use std::os::{fd::AsRawFd, unix::fs::MetadataExt};
+    if unsafe {
+        libc::fsetxattr(
+            file.as_raw_fd(),
+            name.as_ptr(),
+            bytes.as_ptr().cast(),
+            bytes.len(),
+            0,
+        )
+    } == 0
+    {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    if matches!(err.raw_os_error(), Some(libc::EPERM | libc::EACCES)) {
+        let meta = file.metadata()?;
+        let orig_uid = meta.uid();
+        let srv_uid = crate::sandbox::server_uid();
+        if orig_uid != srv_uid && (meta.is_dir() || (meta.is_file() && meta.nlink() == 1)) {
+            descriptor_fchown(file, Some(srv_uid), None)?;
+            let res = if unsafe {
+                libc::fsetxattr(
+                    file.as_raw_fd(),
+                    name.as_ptr(),
+                    bytes.as_ptr().cast(),
+                    bytes.len(),
+                    0,
+                )
+            } == 0
+            {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            };
+            let restore = descriptor_fchown(file, Some(orig_uid), None);
+            return res.and(restore);
+        }
+    }
+    Err(err)
+}
+
+#[cfg(target_os = "linux")]
+fn descriptor_fremovexattr(file: &std::fs::File, name: &std::ffi::CStr) -> std::io::Result<()> {
+    use std::os::{fd::AsRawFd, unix::fs::MetadataExt};
+    if unsafe { libc::fremovexattr(file.as_raw_fd(), name.as_ptr()) } == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::ENODATA) {
+        return Ok(());
+    }
+    if matches!(err.raw_os_error(), Some(libc::EPERM | libc::EACCES)) {
+        let meta = file.metadata()?;
+        let orig_uid = meta.uid();
+        let srv_uid = crate::sandbox::server_uid();
+        if orig_uid != srv_uid && (meta.is_dir() || (meta.is_file() && meta.nlink() == 1)) {
+            descriptor_fchown(file, Some(srv_uid), None)?;
+            let res = if unsafe { libc::fremovexattr(file.as_raw_fd(), name.as_ptr()) } == 0
+                || std::io::Error::last_os_error().raw_os_error() == Some(libc::ENODATA)
+            {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            };
+            let restore = descriptor_fchown(file, Some(orig_uid), None);
+            return res.and(restore);
+        }
+    }
+    Err(err)
+}
+
+#[cfg(target_os = "linux")]
 fn clear_default_acl(file: &std::fs::File) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
-    if unsafe { libc::fremovexattr(file.as_raw_fd(), c"system.posix_acl_default".as_ptr()) } != 0
-        && std::io::Error::last_os_error().raw_os_error() != Some(libc::ENODATA)
-    {
-        return Err(std::io::Error::last_os_error());
-    }
+    descriptor_fremovexattr(file, c"system.posix_acl_default")?;
     if unsafe {
         libc::fgetxattr(
             file.as_raw_fd(),
@@ -1488,7 +1674,7 @@ fn clear_default_acl(_file: &std::fs::File) -> std::io::Result<()> {
 
 #[cfg(unix)]
 fn restrict_others(file: &std::fs::File) -> std::io::Result<()> {
-    use std::os::{fd::AsRawFd, unix::fs::MetadataExt};
+    use std::os::unix::fs::MetadataExt;
     let meta = file.metadata()?;
     if !meta.is_dir() && meta.nlink() != 1 {
         return Err(std::io::Error::other(
@@ -1496,9 +1682,7 @@ fn restrict_others(file: &std::fs::File) -> std::io::Result<()> {
         ));
     }
     let mode = meta.mode() & 0o7777 & !0o007;
-    if unsafe { libc::fchmod(file.as_raw_fd(), mode as libc::mode_t) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
+    descriptor_fchmod(file, mode as libc::mode_t)?;
     if file.metadata()?.mode() & 7 != 0 {
         return Err(std::io::Error::other("other-permission readback differs"));
     }
@@ -1507,10 +1691,7 @@ fn restrict_others(file: &std::fs::File) -> std::io::Result<()> {
 
 #[cfg(unix)]
 fn protect_private_gitdir(private: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
-    use std::os::{
-        fd::AsRawFd,
-        unix::fs::{MetadataExt, OpenOptionsExt},
-    };
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     // Sticky + a parent-owned sentinel prevents unlink/rename as well as direct
     // writes. Merely chmod-ing config.worktree read-only would be insufficient.
     let config = private.join("config.worktree");
@@ -1549,9 +1730,7 @@ fn protect_private_gitdir(private: &Path, uid: u32, gid: u32) -> std::io::Result
                 ));
             }
             let sticky_mode = ((meta.mode() & 0o7777) | 0o1000) as libc::mode_t;
-            if unsafe { libc::fchmod(file.as_raw_fd(), sticky_mode) } != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
+            descriptor_fchmod(file, sticky_mode)?;
             if file.metadata()?.mode() & 0o1000 == 0 {
                 return Err(std::io::Error::other("sticky readback differs"));
             }
@@ -1564,8 +1743,8 @@ fn protect_private_gitdir(private: &Path, uid: u32, gid: u32) -> std::io::Result
         {
             // Git replaces HEAD/index through lock+rename. They must belong to
             // B in a sticky parent; A retains its additive named-user ACL.
-            if meta.uid() != uid && unsafe { libc::fchown(file.as_raw_fd(), uid, u32::MAX) } != 0 {
-                return Err(std::io::Error::last_os_error());
+            if meta.uid() != uid {
+                descriptor_fchown(file, Some(uid), None)?;
             }
             if file.metadata()?.uid() != uid {
                 return Err(std::io::Error::other(
@@ -1593,9 +1772,8 @@ fn share_tree_with_hook(
         if preserve_group_grants {
             return grant_metadata_acl(file, gid);
         }
-        use std::os::{fd::AsRawFd, unix::fs::MetadataExt};
+        use std::os::unix::fs::MetadataExt;
         let meta = file.metadata()?;
-        let fd = file.as_raw_fd();
         let mode = meta.mode() & 0o7777;
         let desired = if meta.is_dir() {
             mode | 0o2770
@@ -1608,15 +1786,13 @@ fn share_tree_with_hook(
                 path.display()
             )));
         }
-        if meta.gid() != gid && unsafe { libc::fchown(fd, u32::MAX, gid) } != 0 {
-            return Err(std::io::Error::other(format!(
-                "{}: chgrp to {gid}: {}",
-                path.display(),
-                std::io::Error::last_os_error()
-            )));
+        if meta.gid() != gid {
+            descriptor_fchown(file, None, Some(gid)).map_err(|e| {
+                std::io::Error::other(format!("{}: chgrp to {gid}: {e}", path.display()))
+            })?;
         }
-        if mode != desired && unsafe { libc::fchmod(fd, desired as libc::mode_t) } != 0 {
-            return Err(std::io::Error::last_os_error());
+        if mode != desired {
+            descriptor_fchmod(file, desired as libc::mode_t)?;
         }
         let after = file.metadata()?;
         if after.gid() != gid || after.mode() & 0o7777 != desired {
@@ -1788,7 +1964,54 @@ fn walk_tree_policy(
                     0
                 };
             before_open(&child_path);
-            let child = unsafe { libc::openat(fd, name.as_ptr(), flags) };
+            #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+            let mut child = unsafe { libc::openat(fd, name.as_ptr(), flags) };
+            #[cfg(target_os = "linux")]
+            if child < 0
+                && std::io::Error::last_os_error().kind() == std::io::ErrorKind::PermissionDenied
+                && (kind == libc::S_IFDIR || stat.st_nlink == 1)
+                && descriptor_privilege_launcher().is_some()
+            {
+                let path_fd = unsafe {
+                    libc::openat(
+                        fd,
+                        name.as_ptr(),
+                        libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    )
+                };
+                if path_fd >= 0 {
+                    let bound = unsafe { std::fs::File::from_raw_fd(path_fd) };
+                    #[allow(
+                        clippy::unnecessary_cast,
+                        reason = "stat fields differ across Unix targets"
+                    )]
+                    let (stat_dev, stat_ino) = (stat.st_dev as u64, stat.st_ino as u64);
+                    if let Ok(bmeta) = bound.metadata()
+                        && bmeta.dev() == stat_dev
+                        && bmeta.ino() == stat_ino
+                        && (bmeta.is_dir() || (bmeta.is_file() && bmeta.nlink() == 1))
+                    {
+                        let min_mode = ((bmeta.mode() & 0o7777)
+                            | if bmeta.is_dir() { 0o770 } else { 0o660 })
+                            as libc::mode_t;
+                        let _ = descriptor_fchmod(&bound, min_mode);
+                        child = unsafe { libc::openat(fd, name.as_ptr(), flags) };
+                        if child < 0
+                            && std::io::Error::last_os_error().kind()
+                                == std::io::ErrorKind::PermissionDenied
+                        {
+                            let orig_uid = bmeta.uid();
+                            let srv_uid = crate::sandbox::server_uid();
+                            if orig_uid != srv_uid
+                                && descriptor_fchown(&bound, Some(srv_uid), None).is_ok()
+                            {
+                                child = unsafe { libc::openat(fd, name.as_ptr(), flags) };
+                                let _ = descriptor_fchown(&bound, Some(orig_uid), None);
+                            }
+                        }
+                    }
+                }
+            }
             if child < 0 {
                 record(issues, &child_path, std::io::Error::last_os_error())?;
                 continue;
@@ -1993,18 +2216,7 @@ fn update_metadata_acl(
             bytes.extend(perm.to_le_bytes());
             bytes.extend(id.to_le_bytes());
         }
-        if unsafe {
-            libc::fsetxattr(
-                file.as_raw_fd(),
-                name.as_ptr(),
-                bytes.as_ptr().cast(),
-                bytes.len(),
-                0,
-            )
-        } != 0
-        {
-            return Err(std::io::Error::last_os_error());
-        }
+        descriptor_fsetxattr(file, name, &bytes)?;
         if read(file, name)?.as_ref() != Some(&entries) {
             return Err(std::io::Error::other("POSIX ACL readback differs"));
         }

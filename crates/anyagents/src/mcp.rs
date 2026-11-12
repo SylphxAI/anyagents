@@ -883,12 +883,14 @@ struct AgentsArgs {
     /// New agent name when `action = "rename"`.
     #[serde(default, alias = "to")]
     new_name: Option<String>,
-    /// Optional archetype template name (`.agents/agents/<archetype>.md`, e.g. `"planner"`, `"builder"`, `"tester"`) when `action` is `"spawn"` or `"create"`.
-    #[serde(default, alias = "type", alias = "template", alias = "preset")]
-    archetype: Option<String>,
-    /// Optional display-only role label (for example, `"Researcher"`); never selects lifecycle or scope.
-    /// when `action` is `"spawn"`, `"create"`, `"describe"`, or `"role"`.
-    #[serde(default)]
+    /// Optional agent role template name (`.agents/agents/<role>.md`, e.g. `"planner"`, `"builder"`, `"tester"`) when `action` is `"spawn"`, `"create"`, `"describe"`, or `"role"`.
+    #[serde(
+        default,
+        alias = "archetype",
+        alias = "type",
+        alias = "template",
+        alias = "preset"
+    )]
     role: Option<String>,
     /// Set `true` to clear the description or role label when `action` is `"describe"` or `"role"`.
     #[serde(default)]
@@ -923,6 +925,9 @@ struct AgentsArgs {
     /// Internal communication & visibility scope (`"isolated"` | `"private"` | `"siblings"` | `"public"`) when `action` is `"spawn"`, `"create"`, or `"describe"`.
     #[serde(default)]
     scope: Option<String>,
+    /// Optional agent lifecycle mode (`"task"` | `"standing"`, defaulting to `"task"` for sub-agents and `"standing"` for root agents) when `action` is `"spawn"`, `"create"`, or `"describe"`. `"task"` sub-agents are single-mission freelancers closed (`archive`) by their parent upon completion; `"standing"` agents stay on idle standby between assignments.
+    #[serde(default)]
+    lifecycle: Option<String>,
     /// Whether this sub-agent accepts external messages (`true`) from agents outside its direct parent/child lineage (and allows outside agents to invite it to virtual groups). Defaults to `false` (`private`) when spawning a sub-agent.
     #[serde(default, alias = "allow_external")]
     public: Option<bool>,
@@ -982,11 +987,14 @@ struct SpawnArgs {
         alias = "target"
     )]
     name: Option<String>,
-    /// Optional archetype template name (`.agents/agents/<archetype>.md`, e.g. `"planner"`, `"builder"`, `"tester"`).
-    #[serde(default, alias = "type", alias = "template", alias = "preset")]
-    archetype: Option<String>,
-    /// Optional display-only role label; no effect on lifecycle, scope or prompts.
-    #[serde(default)]
+    /// Optional agent role template name (`.agents/agents/<role>.md`, e.g. `"planner"`, `"builder"`, `"tester"`).
+    #[serde(
+        default,
+        alias = "archetype",
+        alias = "type",
+        alias = "template",
+        alias = "preset"
+    )]
     role: Option<String>,
     /// Harness catalog ID (`opencode`, `codex`, `claude-code`, `agy`, `muse`, `omp`, `dsh`, `grok`).
     /// Defaults to the caller's own harness (or `claude-code` when the caller runs on `agy`).
@@ -1019,6 +1027,9 @@ struct SpawnArgs {
     /// Optional internal communication & visibility scope (`"isolated"` | `"private"` | `"siblings"` | `"public"`).
     #[serde(default)]
     scope: Option<String>,
+    /// Optional agent lifecycle mode (`"task"` | `"standing"`, defaulting to `"task"` for sub-agents). `"task"` sub-agents are single-mission freelancers closed (`archive`) by their parent upon completion; `"standing"` agents stay on idle standby between assignments.
+    #[serde(default)]
+    lifecycle: Option<String>,
     /// Whether this sub-agent accepts external messages (`true`) from agents outside its direct parent/child lineage. Defaults to `false` (`private`).
     #[serde(default, alias = "allow_external")]
     public: Option<bool>,
@@ -1042,12 +1053,21 @@ struct DescribeArgs {
     /// Detailed private standing instructions (`instructions`, Layer 2 — injected only into the agent's own private system prompt).
     #[serde(default, alias = "instruction", alias = "system_prompt")]
     instructions: Option<String>,
-    /// Optional display-only role label; no effect on lifecycle, scope or prompts.
-    #[serde(default)]
+    /// Optional agent role template name (`.agents/agents/<role>.md`).
+    #[serde(
+        default,
+        alias = "archetype",
+        alias = "type",
+        alias = "template",
+        alias = "preset"
+    )]
     role: Option<String>,
     /// Optional internal communication & visibility scope (`"isolated"` | `"private"` | `"siblings"` | `"public"`).
     #[serde(default)]
     scope: Option<String>,
+    /// Optional agent lifecycle mode (`"task"` | `"standing"`, defaulting to `"task"` for sub-agents). `"task"` sub-agents are single-mission freelancers closed (`archive`) by their parent upon completion; `"standing"` agents stay on idle standby between assignments.
+    #[serde(default)]
+    lifecycle: Option<String>,
     /// Optional toggle (`true` or `false`) for whether a sub-agent accepts external messages from agents outside its direct parent/child lineage.
     #[serde(default, alias = "allow_external")]
     public: Option<bool>,
@@ -1085,9 +1105,15 @@ struct SubagentsArgs {
     /// Optional case-insensitive multi-token search query for `list`.
     #[serde(default, alias = "search", alias = "filter", alias = "q")]
     query: Option<String>,
-    /// Optional archetype template name (`.agents/agents/<archetype>.md`, e.g. `"planner"`, `"builder"`, `"tester"`) when `action = "spawn"`.
-    #[serde(default, alias = "type", alias = "template", alias = "preset")]
-    archetype: Option<String>,
+    /// Optional agent role template name (`.agents/agents/<role>.md`, e.g. `"planner"`, `"builder"`, `"tester"`) when `action = "spawn"`.
+    #[serde(
+        default,
+        alias = "archetype",
+        alias = "type",
+        alias = "template",
+        alias = "preset"
+    )]
+    role: Option<String>,
     /// Harness catalog ID when `action = "spawn"` (`opencode`, `codex`, `claude-code`, `agy`, `muse`, `omp`, `dsh`, `grok`).
     #[serde(default)]
     harness: Option<String>,
@@ -1113,16 +1139,14 @@ struct SubagentsArgs {
     #[serde(default)]
     description: Option<String>,
     /// Optional private system/role instructions when `action = "spawn"`.
-    #[serde(
-        default,
-        alias = "role",
-        alias = "instruction",
-        alias = "system_prompt"
-    )]
+    #[serde(default, alias = "instruction", alias = "system_prompt")]
     instructions: Option<String>,
     /// Optional internal communication & visibility scope (`"isolated"` | `"private"` | `"siblings"` | `"public"`).
     #[serde(default)]
     scope: Option<String>,
+    /// Optional agent lifecycle mode (`"task"` | `"standing"`, defaulting to `"task"` for sub-agents). `"task"` sub-agents are single-mission freelancers closed (`archive`) by their parent upon completion; `"standing"` agents stay on idle standby between assignments.
+    #[serde(default)]
+    lifecycle: Option<String>,
     /// Whether this sub-agent accepts external messages (`true`) from agents outside its direct parent/child lineage. Defaults to `false` (`private`).
     #[serde(default, alias = "allow_external")]
     public: Option<bool>,
@@ -1781,7 +1805,7 @@ impl AgentMcp {
     }
 
     #[tool(
-        description = "Unified agent & cross-harness sub-agent manager (`action`: `list` | `inspect` | `spawn` | `create` | `describe` | `redact` | `steer` | `wake` | `pause` | `archive` | `delete` | `rename` | `role` | `harness` | `models`, supporting multi-level sub-agent trees). Use `list` (default, with optional `parent`: `\"self\"` | `\"subagents\"` | `\"root\"` and `state`: `\"running\"` | `\"working\"` | `\"paused\"` | `\"archived\"` | `\"all\"`) to inspect agents and sub-agents; use `inspect` (`name`: `\"<agent-or-id>\"`, `limit`: `10`) to view live status, schedules, and recent turns; use `spawn` (`name`, `repo`: `\"<org>/<repo>\"` | `\"inherit\"`, `branch`, `base`, `workdir`: path | `\"worktree\"` | `\"private\"` | `\"inherit\"`, `description`, `prompt`, `harness`, `model`, `profile`) to launch a sub-agent with an isolated managed Git worktree; use `describe` (`name`: `\"self\"` | `\"all\"` | `\"<agent>\"`, `description`: `\"...\"`) to read role descriptions or update a target's `description`/`instructions`/`role` (updating `description`, `instructions`, `role`, or `rename` requires the target's Parent/Ancestor agent or an Admin); use `steer`, `wake`, `pause`, `archive` (auto-reaps clean/pushed managed worktrees while preserving dirty ones), or `delete` to control lifecycle; use `redact` (`name`, `message_id` or `seq`, optional `span`: {`unit`: `bytes` | `chars`, `start`, `end`}, `reason`) for audited erasure with permission `conversation.redact` (ancestors/admin only, quiescent target); or use `create`, `rename`, `role`, `harness`, `models`."
+        description = "Unified agent & cross-harness sub-agent manager (`action`: `list` | `inspect` | `spawn` | `create` | `describe` | `redact` | `steer` | `wake` | `pause` | `archive` | `delete` | `rename` | `role` | `harness` | `models`, supporting multi-level sub-agent trees). Use `list` (default, with optional `parent`: `\"self\"` | `\"subagents\"` | `\"root\"` and `state`: `\"running\"` | `\"working\"` | `\"paused\"` | `\"archived\"` | `\"all\"`) to inspect agents and sub-agents; use `inspect` (`name`: `\"<agent-or-id>\"`, `limit`: `10`) to view live status, schedules, and recent turns; use `spawn` (`role`, `name`, `repo`: `\"<org>/<repo>\"` | `\"inherit\"`, `branch`, `base`, `workdir`: path | `\"worktree\"` | `\"private\"` | `\"inherit\"`, `description`, `prompt`, `harness`, `model`, `profile`) to launch a sub-agent with an isolated managed Git worktree; use `describe` (`name`: `\"self\"` | `\"all\"` | `\"<agent>\"`, `description`: `\"...\"`) to read role descriptions or update a target's `description`/`instructions`/`role` (updating `description`, `instructions`, `role`, or `rename` requires the target's Parent/Ancestor agent or an Admin); use `steer`, `wake`, `pause`, `archive` (auto-reaps clean/pushed managed worktrees while preserving dirty ones), or `delete` to control lifecycle; use `redact` (`name`, `message_id` or `seq`, optional `span`: {`unit`: `bytes` | `chars`, `start`, `end`}, `reason`) for audited erasure with permission `conversation.redact` (ancestors/admin only, quiescent target); or use `create`, `rename`, `role`, `harness`, `models`."
     )]
     async fn agents(
         &self,
@@ -1973,7 +1997,6 @@ impl AgentMcp {
                 let spawned = self
                     .spawn(Parameters(SpawnArgs {
                         name: args.name,
-                        archetype: args.archetype,
                         role: args.role,
                         harness: args.harness,
                         model: args.model,
@@ -1985,6 +2008,7 @@ impl AgentMcp {
                         description: args.description,
                         instructions: args.instructions,
                         scope: args.scope,
+                        lifecycle: args.lifecycle,
                         public: args.public,
                         group: args.group,
                         prompt: args.prompt,
@@ -2022,7 +2046,6 @@ impl AgentMcp {
                 };
                 let body = CreateAgentRequest {
                     name,
-                    archetype: args.archetype,
                     role: args.role,
                     harness: Some(harness),
                     model: args.model,
@@ -2035,6 +2058,7 @@ impl AgentMcp {
                     instructions: args.instructions,
                     parent: parent_val,
                     scope: args.scope,
+                    lifecycle: args.lifecycle,
                     public: args.public,
                     group: args.group,
                     prompt: args.prompt,
@@ -2057,6 +2081,7 @@ impl AgentMcp {
                     instructions: args.instructions,
                     role: args.role,
                     scope: args.scope,
+                    lifecycle: args.lifecycle,
                     public: args.public,
                     clear: args.clear,
                 }))
@@ -2372,7 +2397,6 @@ impl AgentMcp {
             .to_string();
         let body = CreateAgentRequest {
             name,
-            archetype: args.archetype,
             role: args.role,
             harness: Some(harness),
             model: args.model,
@@ -2385,6 +2409,7 @@ impl AgentMcp {
             instructions: args.instructions,
             parent: Some(self.agent.id.to_string()),
             scope: args.scope,
+            lifecycle: args.lifecycle,
             public: args.public,
             group: args.group,
             prompt: args.prompt,
@@ -2512,8 +2537,7 @@ impl AgentMcp {
                 let spawned = self
                     .spawn(Parameters(SpawnArgs {
                         name: args.agent,
-                        archetype: args.archetype,
-                        role: None,
+                        role: args.role,
                         harness: args.harness,
                         model: args.model,
                         profile: args.profile,
@@ -2524,6 +2548,7 @@ impl AgentMcp {
                         description: args.description,
                         instructions: args.instructions,
                         scope: args.scope,
+                        lifecycle: args.lifecycle,
                         public: args.public,
                         group: args.group,
                         prompt: args.prompt,
@@ -2880,6 +2905,7 @@ impl AgentMcp {
             && args.instructions.is_none()
             && args.role.is_none()
             && args.scope.is_none()
+            && args.lifecycle.is_none()
             && args.public.is_none()
             && !args.clear.unwrap_or(false)
         {
@@ -2896,6 +2922,7 @@ impl AgentMcp {
                         "aliases": a.aliases,
                         "parent": a.parent,
                         "scope": a.scope,
+                        "lifecycle": a.lifecycle,
                         "relationship": a.relationship,
                         "can_message": a.can_message,
                         "harness": a.harness,
@@ -2913,6 +2940,7 @@ impl AgentMcp {
             || args.instructions.is_some()
             || args.role.is_some()
             || args.scope.is_some()
+            || args.lifecycle.is_some()
             || args.public.is_some()
             || args.clear.unwrap_or(false)
         {
@@ -2921,6 +2949,7 @@ impl AgentMcp {
                 "instructions": args.instructions,
                 "role": args.role,
                 "scope": args.scope,
+                "lifecycle": args.lifecycle,
                 "public": args.public,
                 "clear": args.clear.unwrap_or(false),
             });
@@ -3255,6 +3284,50 @@ pub fn tool_definitions(profile: McpProfile) -> Vec<rmcp::model::Tool> {
         .collect()
 }
 
+/// `tool_definitions` plus the role-template catalog discovered under
+/// `.agents/agents/`. The catalog is appended to the tool-level description of
+/// every exposed tool with a `role` argument, because schema prose is stripped
+/// by `compact_tool_definition`.
+pub fn tool_definitions_with_roles(
+    profile: McpProfile,
+    workdir: Option<&Path>,
+    data_dir: Option<&Path>,
+) -> Vec<rmcp::model::Tool> {
+    let mut tools = tool_definitions(profile);
+    let Some(dd) = data_dir else {
+        return tools;
+    };
+    let templates = crate::create::discover_available_archetype_templates(workdir, None, dd);
+    if templates.is_empty() {
+        return tools;
+    }
+    let role_catalog = templates
+        .iter()
+        .map(|(slug, desc)| match desc {
+            Some(d) => format!("`{slug}` ({d})"),
+            None => format!("`{slug}`"),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let append_note = format!(" Available `.agents/agents/*.md` roles: {role_catalog}.");
+    for tool in &mut tools {
+        let has_role_arg = tool
+            .input_schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|props| props.contains_key("role"));
+        if !has_role_arg {
+            continue;
+        }
+        let mut desc = tool.description.as_deref().unwrap_or_default().to_string();
+        if !desc.contains("Available `.agents/agents/*.md` roles:") {
+            desc.push_str(&append_note);
+            tool.description = Some(desc.into());
+        }
+    }
+    tools
+}
+
 impl rmcp::ServerHandler for AgentMcp {
     fn get_info(&self) -> rmcp::model::ServerConfig {
         rmcp::model::ServerConfig::new(
@@ -3273,7 +3346,9 @@ impl rmcp::ServerHandler for AgentMcp {
         let supports_cache_hints = context
             .protocol_version()
             .is_some_and(|version| version >= rmcp::model::ProtocolVersion::V_2026_07_28);
-        let tools = tool_definitions(self.profile);
+        let wd = self.resolve_workdir();
+        let data_dir = self.client.socket.parent();
+        let tools = tool_definitions_with_roles(self.profile, Some(&wd), data_dir);
         Ok(rmcp::model::ListToolsResult {
             result_type: Some(rmcp::model::ResultType::COMPLETE),
             tools,
@@ -4443,7 +4518,9 @@ impl AgentMcp {
                 "result": {}
             })),
             "tools/list" => {
-                let tools = tool_definitions(self.profile);
+                let wd = self.resolve_workdir();
+                let data_dir = self.client.socket.parent();
+                let tools = tool_definitions_with_roles(self.profile, Some(&wd), data_dir);
                 Some(serde_json::json!({
                     "jsonrpc": "2.0",
                     "id": id_val,
@@ -8296,19 +8373,72 @@ mod spawn_args_tests {
             schemars::schema_for!(SubagentsArgs),
         ] {
             let value = serde_json::to_value(schema).unwrap();
-            let archetype = &value["properties"]["archetype"];
-            let description = archetype["description"].as_str().unwrap();
-            assert!(description.contains("`.agents/agents/<archetype>.md`"));
+            assert!(
+                value["properties"].get("archetype").is_none(),
+                "MCP schema must expose only `role`, not a duplicate `archetype` property"
+            );
+            let role = &value["properties"]["role"];
+            let description = role["description"].as_str().unwrap();
+            assert!(description.contains("`.agents/agents/<role>.md`"));
             assert!(description.contains("`\"planner\"`, `\"builder\"`, `\"tester\"`"));
-            assert!(archetype.get("enum").is_none());
+            assert!(role.get("enum").is_none());
         }
-        let input = json!({"archetype": "custom-template"});
-        let agents: AgentsArgs = serde_json::from_value(input.clone()).unwrap();
-        let spawn: SpawnArgs = serde_json::from_value(input.clone()).unwrap();
-        let subagents: SubagentsArgs = serde_json::from_value(input).unwrap();
-        for archetype in [agents.archetype, spawn.archetype, subagents.archetype] {
-            assert_eq!(archetype.as_deref(), Some("custom-template"));
+        for key in ["role", "archetype", "type", "template", "preset"] {
+            let mut obj = serde_json::Map::new();
+            obj.insert(key.into(), json!("custom-template"));
+            let input = serde_json::Value::Object(obj);
+            let agents: AgentsArgs = serde_json::from_value(input.clone()).unwrap();
+            let spawn: SpawnArgs = serde_json::from_value(input.clone()).unwrap();
+            let subagents: SubagentsArgs = serde_json::from_value(input).unwrap();
+            for role in [agents.role, spawn.role, subagents.role] {
+                assert_eq!(role.as_deref(), Some("custom-template"));
+            }
         }
+
+        let dir = tempfile::tempdir().unwrap();
+        let templates_dir = dir.path().join(".agents/agents");
+        std::fs::create_dir_all(&templates_dir).unwrap();
+        std::fs::write(
+            templates_dir.join("builder.md"),
+            "---\nname: builder\ndescription: Isolated builder specialist\n---\nBuild.",
+        )
+        .unwrap();
+        let tools = tool_definitions_with_roles(McpProfile::Full, None, Some(dir.path()));
+        let role_tools: Vec<_> = tools
+            .iter()
+            .filter(|t| {
+                t.input_schema
+                    .get("properties")
+                    .and_then(serde_json::Value::as_object)
+                    .is_some_and(|props| props.contains_key("role"))
+            })
+            .map(|t| t.name.to_string())
+            .collect();
+        assert!(role_tools.iter().any(|n| n == "agents"), "{role_tools:?}");
+        for name in &role_tools {
+            let tool = tools.iter().find(|t| t.name == name.as_str()).unwrap();
+            let desc = tool.description.as_deref().unwrap_or_default();
+            assert!(
+                desc.contains(
+                    "Available `.agents/agents/*.md` roles: `builder` (Isolated builder specialist)."
+                ),
+                "{name}: {desc}"
+            );
+        }
+        let send_tool = tools.iter().find(|t| t.name == "send").unwrap();
+        assert!(
+            !send_tool
+                .description
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Available `.agents/agents/*.md` roles:")
+        );
+        let without_templates =
+            tool_definitions_with_roles(McpProfile::Full, None, Some(&dir.path().join("empty")));
+        assert_eq!(
+            serde_json::to_value(&without_templates).unwrap(),
+            serde_json::to_value(tool_definitions(McpProfile::Full)).unwrap()
+        );
     }
 
     #[test]
@@ -8359,10 +8489,11 @@ mod spawn_args_tests {
     #[test]
     fn subagents_preserves_description_without_synthesizing_instructions() {
         let args: SubagentsArgs = serde_json::from_value(json!({
-            "action": "spawn", "description": "Public role"
+            "action": "spawn", "description": "Public role", "role": "engineer"
         }))
         .unwrap();
         assert_eq!(args.description.as_deref(), Some("Public role"));
+        assert_eq!(args.role.as_deref(), Some("engineer"));
         assert!(args.instructions.is_none());
     }
 
@@ -8383,6 +8514,7 @@ mod spawn_args_tests {
             aliases: Vec::new(),
             parent: Some("agt_parent".to_string()),
             scope: "private".to_string(),
+            lifecycle: "task".to_string(),
             relationship: Some("child".to_string()),
             can_message: Some(true),
             harness: "opencode".to_string(),
