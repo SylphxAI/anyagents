@@ -1082,10 +1082,11 @@ for raw in sys.stdin:
     let m1 = rig.receive("initial assignment");
     rig.start();
     // m1 reached the probe; mailbox cursor reads can trail the writer's WAL.
-    eventually(|| rig
-        .wire()
-        .iter()
-        .any(|v| v["msg"]["request_id"].as_str() == Some(m1.id.as_str())));
+    eventually(|| {
+        rig.wire()
+            .iter()
+            .any(|v| v["msg"]["request_id"].as_str() == Some(m1.id.as_str()))
+    });
     let m2 = rig.receive("mid-turn steer detail");
 
     eventually(|| rig.wire().iter().filter(|v| v["launch"] == 2).count() >= 2);
