@@ -1049,7 +1049,9 @@ impl RecordedWorktree {
         if current.pool.as_ref() != Some(pool) {
             return Err(std::io::Error::other("per-seat pool changed"));
         }
-        if g.private != g.common || g.private != g.checkout.join(".git") {
+        let git = g.checkout.join(".git");
+        let gitdir = std::fs::canonicalize(&git).unwrap_or(git);
+        if g.private != g.common || gitdir != g.private {
             return Err(std::io::Error::other("unrecorded seat gitdir layout"));
         }
         let git_meta = std::fs::symlink_metadata(&g.private)?;
