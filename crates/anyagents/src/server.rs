@@ -7357,7 +7357,7 @@ pub(crate) mod tests {
                 target.name
             );
             let store_msg = can_sender_message_agent(&store, caller, target).is_ok();
-            let authz = store.export_roster_authz(caller, &[target.id.clone()]);
+            let authz = store.export_roster_authz(caller, std::slice::from_ref(&target.id));
             let mem_msg = can_sender_message_with(
                 caller,
                 target,
