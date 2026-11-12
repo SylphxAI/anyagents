@@ -1400,6 +1400,11 @@ for raw in sys.stdin:
     // Reconciliation cleared the lost hold; the recovery turn's own hold
     // clears when it confirms.
     let deadline = Instant::now() + Duration::from_secs(30);
+    while rig.wire().is_empty() {
+        assert!(Instant::now() < deadline, "{}", rig.stall_report());
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
     while rig.cfg.join("spiron-unconfirmed-steers.json").exists() {
         assert!(Instant::now() < deadline, "{}", rig.stall_report());
         std::thread::sleep(Duration::from_millis(5));
