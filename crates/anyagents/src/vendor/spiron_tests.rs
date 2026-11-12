@@ -845,6 +845,9 @@ def journal_model():
     n = db.execute("SELECT COUNT(*) FROM session_entries WHERE session_id = ?", (session,)).fetchone()[0]
     db.execute("INSERT INTO session_entries VALUES(?, ?, ?)", (session, n, json.dumps({"type": "tool_call", "data": {"call": "probe"}})))
     db.commit()
+def progress(note):
+    with (cfg / "probe-progress.log").open("a") as out:
+        out.write(json.dumps({"launch": launch, "t_ms": now_ms(), "note": note}) + "\n")
 def claim(lease_ms):
     row = db.execute("SELECT owner, expires_at_ms FROM session_leases WHERE session_id = ?", (session,)).fetchone()
     if row is not None and row[0] != owner and row[1] > now_ms():
@@ -1000,6 +1003,16 @@ impl SpironRig {
             .unwrap_or_else(|_| "absent".to_string());
         let launch = std::fs::read_to_string(self.cfg.join("launch_count"))
             .unwrap_or_else(|_| "absent".to_string());
+        let progress = std::fs::read_to_string(self.cfg.join("probe-progress.log"))
+            .map(|s| {
+                let tail = if s.len() > 800 {
+                    &s[s.len() - 800..]
+                } else {
+                    &s
+                };
+                tail.trim_end().to_string()
+            })
+            .unwrap_or_else(|_| "absent".to_string());
         let journal = rusqlite::Connection::open(self.cfg.join("sessions.sqlite3"))
             .map(|db| {
                 (
@@ -1014,7 +1027,7 @@ impl SpironRig {
             .map(|(entries, leases)| format!("entries={entries:?} leases={leases:?}"))
             .unwrap_or_else(|_| "unreadable".to_string());
         format!(
-            "wire={:?} launched={launch} hold={hold} last_error={last_error} journal={journal}",
+            "wire={:?} launched={launch} progress={progress} hold={hold} last_error={last_error} journal={journal}",
             self.wire()
         )
     }
@@ -1124,13 +1137,18 @@ active = None
 for raw in sys.stdin:
     msg = json.loads(raw)
     record(msg)
+    progress("recorded")
     req_id = msg.get("request_id")
     if launch == 1 and active is None:
         active = req_id
         claim(180000)
+        progress("claimed")
         journal_user(msg["text"])
+        progress("journaled-user")
         journal_model()
+        progress("journaled-model")
         emit("accepted", req_id, mode="turn")
+        progress("emitted-accepted")
     elif launch == 1 and active != "done":
         emit("steer_ack", req_id, accepted=True, turn_id=active)
         release()
