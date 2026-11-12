@@ -1215,10 +1215,17 @@ impl<H: Harness + 'static> Session<H> {
                 // Store errors (locked/malformed) retry with backoff, not the
                 // fixed 250ms idle poll: a fleet of agents hitting the same
                 // locked store at 4Hz pins the daemon at ~100% per agent.
+                // If the child also died before or during this store failure,
+                // replace it once the backoff clears instead of entering a
+                // second consecutive wait_backoff() on the outer !process_alive
+                // check.
                 self.last_error = Some(format!("store: {err}"));
                 self.publish();
                 if !self.wait_backoff() {
                     return false;
+                }
+                if !self.process_alive() {
+                    self.replace_process();
                 }
                 false
             }
@@ -2301,6 +2308,38 @@ mod persistence_tests {
                 .as_deref()
                 .is_some_and(|e| e.starts_with("store:")),
             "store error must be recorded"
+        );
+    }
+
+    #[test]
+    fn store_error_with_dead_process_replaces_child_after_single_backoff() {
+        let (_dir, mut session, sql) = fixture(TurnUsage::default());
+        sql.execute_batch(
+            "ALTER TABLE messages RENAME TO saved_messages;
+            CREATE VIEW messages AS SELECT * FROM unavailable_messages;",
+        )
+        .unwrap();
+        session
+            .delivery
+            .as_mut()
+            .unwrap()
+            .harness_mut()
+            .inner
+            .kill();
+        assert!(!session.process_alive());
+        session.attempt = 0;
+        session.deliver_once();
+        assert_eq!(
+            session.attempt, 1,
+            "dead process + store error must back off once before replacement"
+        );
+        assert!(
+            session.process_alive(),
+            "dead process must be replaced right after wait_backoff clears"
+        );
+        assert!(
+            session.restart_at.is_none(),
+            "replacement must clear pending restart_at"
         );
     }
 
