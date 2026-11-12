@@ -3598,7 +3598,7 @@ done
         )
         .unwrap();
         {
-            use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+            use std::os::unix::fs::PermissionsExt as _;
             std::fs::set_permissions(&registry, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
         unsafe {
