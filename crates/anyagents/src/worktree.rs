@@ -347,20 +347,12 @@ fn clamp_pool_permissions(pool_repo: &Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        // Per-seat repositories read pool objects through
-        // `objects/info/alternates`. With no seat write access anywhere in the
-        // pool, world read/traverse is enough for seats and no per-seat pool
-        // ACL grant is needed. Legacy linked privates stay under worktrees/,
-        // which keeps no access for other principals.
-        for (dir, mode) in [
-            (pool_repo.to_path_buf(), 0o755),
-            (pool_repo.join("worktrees"), 0o750),
-        ] {
+        for dir in [pool_repo.to_path_buf(), pool_repo.join("worktrees")] {
             if let Ok(meta) = std::fs::symlink_metadata(&dir)
                 && meta.is_dir()
                 && !meta.file_type().is_symlink()
             {
-                let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode));
+                let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o750));
             }
         }
         for file in [pool_repo.join("config"), pool_repo.join("config.worktree")] {
@@ -445,6 +437,72 @@ fn ensure_pool_repo(repo: &str, pool_repo: &Path, remote_url: &str) -> Result<()
     Ok(())
 }
 
+fn ensure_pool_default_ref(repo: &str, pool_repo: &Path) -> Result<String, Error> {
+    if let Ok(sym) = run_git_pool(
+        repo,
+        Some(pool_repo),
+        &["symbolic-ref".as_ref(), "refs/remotes/origin/HEAD".as_ref()],
+    ) && !sym.is_empty()
+    {
+        let branch = sym.strip_prefix("refs/remotes/origin/").unwrap_or("main");
+        let spec = format!("+refs/heads/{branch}:refs/remotes/origin/{branch}");
+        let _ = run_git_pool(
+            repo,
+            Some(pool_repo),
+            &[
+                "fetch".as_ref(),
+                "--no-tags".as_ref(),
+                "--no-auto-maintenance".as_ref(),
+                "origin".as_ref(),
+                spec.as_ref(),
+            ],
+        );
+        return Ok(format!("origin/{branch}"));
+    }
+    if let Ok(advertised) = run_git_pool(
+        repo,
+        Some(pool_repo),
+        &[
+            "ls-remote".as_ref(),
+            "--symref".as_ref(),
+            "origin".as_ref(),
+            "HEAD".as_ref(),
+        ],
+    ) {
+        for line in advertised.lines() {
+            if let Some((target, name)) = line.split_once('\t')
+                && name == "HEAD"
+                && let Some(branch) = target.strip_prefix("ref: refs/heads/")
+            {
+                let spec = format!("+refs/heads/{branch}:refs/remotes/origin/{branch}");
+                run_git_pool(
+                    repo,
+                    Some(pool_repo),
+                    &[
+                        "fetch".as_ref(),
+                        "--no-tags".as_ref(),
+                        "--no-auto-maintenance".as_ref(),
+                        "origin".as_ref(),
+                        spec.as_ref(),
+                    ],
+                )?;
+                let sym_target = format!("refs/remotes/origin/{branch}");
+                run_git_pool(
+                    repo,
+                    Some(pool_repo),
+                    &[
+                        "symbolic-ref".as_ref(),
+                        "refs/remotes/origin/HEAD".as_ref(),
+                        sym_target.as_ref(),
+                    ],
+                )?;
+                return Ok(format!("origin/{branch}"));
+            }
+        }
+    }
+    Ok("HEAD".to_string())
+}
+
 fn pool_fetch(pool_root: &Path, repo: &str, base: &str) -> Result<(), Error> {
     let (pool_repo, lock_path, remote_url) = resolve_pool_slot(pool_root, repo)?;
     let _lock = lock_pool_slot(repo, &lock_path)?;
@@ -472,12 +530,6 @@ fn pool_fetch(pool_root: &Path, repo: &str, base: &str) -> Result<(), Error> {
     Ok(())
 }
 
-/// Provision a per-seat repository over the shared object pool. The pool is
-/// a read-only object store: the seat references pool objects through
-/// `objects/info/alternates` and keeps every object it creates in its own
-/// gitdir, so the pool only ever grows from server-side fetches. The seat's
-/// refs, packed-refs, config and index are exclusively its own; no seat
-/// writes reach shared state.
 fn pool_checkout(
     pool_root: &Path,
     repo: &str,
@@ -488,120 +540,56 @@ fn pool_checkout(
     let (pool_repo, lock_path, remote_url) = resolve_pool_slot(pool_root, repo)?;
     let _lock = lock_pool_slot(repo, &lock_path)?;
     ensure_pool_repo(repo, &pool_repo, &remote_url)?;
+    let default_ref = ensure_pool_default_ref(repo, &pool_repo)?;
+    let start = match base {
+        Some(b) if b != "HEAD" && b != "origin/HEAD" => b,
+        _ => default_ref.as_str(),
+    };
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent).map_err(|e| Error::WorktreeProvisioning {
             repo: repo.into(),
             message: format!("{}: {e}", parent.display()),
         })?;
     }
-    let started_empty = !target.exists()
-        || std::fs::read_dir(target).is_ok_and(|mut entries| entries.next().is_none());
-    let provision =
-        || -> Result<(), Error> {
-            // `--reference` records the pool objects as alternates instead of
-            // copying them: the seat reads upstream history without duplicating
-            // it, and maintenance in the seat can never write pool objects.
-            run_git_pool(
-                repo,
-                None,
-                &[
-                    "clone".as_ref(),
-                    "--reference".as_ref(),
-                    pool_repo.as_os_str(),
-                    "--no-checkout".as_ref(),
-                    remote_url.as_ref(),
-                    target.as_os_str(),
-                ],
-            )?;
-            let start = match base {
-                Some(b) if b != "HEAD" && b != "origin/HEAD" => b.to_string(),
-                _ => {
-                    let sym = run_git_pool(
-                        repo,
-                        Some(target),
-                        &["symbolic-ref".as_ref(), "refs/remotes/origin/HEAD".as_ref()],
-                    )?;
-                    if let Some(name) = sym.strip_prefix("refs/remotes/origin/") {
-                        format!("origin/{name}")
-                    } else {
-                        "HEAD".to_string()
-                    }
-                }
-            };
-            // The clone already materialized the default local branch; reset it
-            // to the requested start like `worktree add -b` would.
-            if branch.trim().is_empty() {
-                run_git_pool(
-                    repo,
-                    Some(target),
-                    &["checkout".as_ref(), "--detach".as_ref(), start.as_ref()],
-                )?;
-            } else {
-                run_git_pool(
-                    repo,
-                    Some(target),
-                    &[
-                        "checkout".as_ref(),
-                        "-B".as_ref(),
-                        branch.as_ref(),
-                        start.as_ref(),
-                    ],
-                )?;
-            }
-            // `config --worktree` writes only the seat's own config.worktree.
-            // Auto-maintenance stays off so retention is explicit.
-            run_git_pool(
-                repo,
-                Some(target),
-                &[
-                    "config".as_ref(),
-                    "extensions.worktreeConfig".as_ref(),
-                    "true".as_ref(),
-                ],
-            )?;
-            run_git_pool(
-                repo,
-                Some(target),
-                &["config".as_ref(), "gc.auto".as_ref(), "0".as_ref()],
-            )?;
-            let gitdir = target.join(".git");
-            let alternates = std::fs::read_to_string(gitdir.join("objects/info/alternates"))
-                .map_err(|e| Error::WorktreeProvisioning {
-                    repo: repo.into(),
-                    message: format!("{}: {e}", gitdir.join("objects/info/alternates").display()),
-                })?;
-            let expected = pool_repo.join("objects");
-            let actual = alternates
-                .lines()
-                .map(str::trim)
-                .find(|line| !line.is_empty() && !line.starts_with('#'))
-                .map(PathBuf::from);
-            if actual
-                .as_ref()
-                .and_then(|raw| std::fs::canonicalize(raw).ok())
-                != std::fs::canonicalize(&expected).ok()
-            {
-                return Err(Error::WorktreeProvisioning {
-                    repo: repo.into(),
-                    message: format!(
-                        "seat alternates {}: expected object pool {}",
-                        actual
-                            .map(|p| p.display().to_string())
-                            .unwrap_or_else(|| "<none>".to_string()),
-                        expected.display()
-                    ),
-                });
-            }
-            Ok(())
-        };
-    let result = provision();
-    // A partial checkout must stay retryable: remove whatever this
-    // provisioning created. The pool never gains seat objects, so nothing
-    // here needs reviving elsewhere.
-    if result.is_err() && started_empty {
-        let _ = std::fs::remove_dir_all(target);
+    if branch.trim().is_empty() {
+        run_git_pool(
+            repo,
+            Some(&pool_repo),
+            &[
+                "worktree".as_ref(),
+                "add".as_ref(),
+                "--detach".as_ref(),
+                target.as_os_str(),
+                start.as_ref(),
+            ],
+        )?;
+    } else {
+        run_git_pool(
+            repo,
+            Some(&pool_repo),
+            &[
+                "worktree".as_ref(),
+                "add".as_ref(),
+                "-b".as_ref(),
+                branch.as_ref(),
+                target.as_os_str(),
+                start.as_ref(),
+            ],
+        )?;
     }
-    result?;
+    // With extensions.worktreeConfig=true on a bare pool, explicitly mark the
+    // linked checkout non-bare in its private config.worktree so work-tree Git
+    // operations (status, diff, commit) succeed while the pool stays bare.
+    run_git_pool(
+        repo,
+        Some(target),
+        &[
+            "config".as_ref(),
+            "--worktree".as_ref(),
+            "core.bare".as_ref(),
+            "false".as_ref(),
+        ],
+    )?;
     clamp_pool_permissions(&pool_repo);
     Ok(())
 }
@@ -1202,110 +1190,5 @@ esac
             serde_json::to_string(&receipt).unwrap()
         );
         assert_eq!(commit, 0, "seat cannot commit in an admitted pool checkout");
-    }
-    /// A pool-backed consumer for tests: bare pool under `pool_dir`,
-    /// upstream reached over file:// from a `remotes_root/ExampleOrg/demo.git`
-    /// bare repository seeded by the caller.
-    pub(crate) fn seed_bare_remote(dir: &Path) -> PathBuf {
-        let seed = dir.join("seed");
-        std::fs::create_dir_all(&seed).unwrap();
-        git(&seed, &["init", "-b", "main"]);
-        git(&seed, &["config", "user.name", "Example Author"]);
-        git(&seed, &["config", "user.email", "author@example.test"]);
-        std::fs::write(seed.join("README.md"), "# Demo\n").unwrap();
-        git(&seed, &["add", "."]);
-        git(&seed, &["commit", "-m", "Initial commit"]);
-        git(&seed, &["branch", "stale"]);
-        git(&seed, &["branch", "packed-local"]);
-        let remote = dir.join("remotes/ExampleOrg/demo.git");
-        git(
-            &seed,
-            &[
-                "clone",
-                "--bare",
-                "--no-hardlinks",
-                ".",
-                remote.to_str().unwrap(),
-            ],
-        );
-        remote
-    }
-
-    pub(crate) fn pool_consumer(pool_dir: &Path) -> Consumer {
-        Consumer {
-            executable: PathBuf::new(),
-            git_pool_dir: Some(pool_dir.to_path_buf()),
-        }
-    }
-
-    /// Object accounting for a bare pool: loose plus packed objects. Seat
-    /// writes must never change this number.
-    pub(crate) fn pool_object_count(pool_repo: &Path) -> u64 {
-        let report = git(pool_repo, &["count-objects", "-v"]);
-        report
-            .lines()
-            .filter_map(|line| {
-                let (key, value) = line.split_once(": ")?;
-                (key == "count" || key == "in-pack").then(|| value.trim().parse::<u64>().ok())
-            })
-            .flatten()
-            .sum()
-    }
-
-    /// Pool-backed checkouts are per-seat repositories, not linked
-    /// worktrees: the seat gitdir is a real directory, refs and objects are
-    /// exclusively the seat's, and the pool only ever gains objects from
-    /// server-side fetches.
-    #[test]
-    fn pool_checkout_is_a_seat_repository_that_never_writes_the_pool() {
-        let dir = tempfile::tempdir().unwrap();
-        let remote = seed_bare_remote(dir.path());
-        let consumer = pool_consumer(&dir.path().join("pool"));
-        let target = dir.path().join("seat");
-        consumer
-            .remote(
-                &format!("file://{}", remote.display()),
-                &target,
-                "agent/seat",
-                Some("main"),
-            )
-            .unwrap();
-        let pool_repo = dir.path().join("pool").join("ExampleOrg/demo.git");
-        assert!(pool_repo.join("HEAD").is_file());
-        // A real gitdir, never a linked-worktree pointer.
-        assert!(target.join(".git").is_dir() && !target.join(".git").is_symlink());
-        assert_eq!(
-            git(&target, &["rev-parse", "--git-common-dir"]),
-            git(&target, &["rev-parse", "--git-dir"])
-        );
-        let alternates =
-            std::fs::read_to_string(target.join(".git/objects/info/alternates")).unwrap();
-        assert!(
-            alternates.contains(&format!("{}/objects\n", pool_repo.display())),
-            "alternates: {alternates}"
-        );
-        assert_eq!(git(&target, &["branch", "--show-current"]), "agent/seat");
-        assert!(target.join("README.md").is_file());
-        let rate = {
-            let before = pool_object_count(&pool_repo);
-            assert!(before > 0, "pool holds upstream history");
-            git(&target, &["config", "user.name", "Seat Author"]);
-            git(&target, &["config", "user.email", "seat@example.test"]);
-            git(&target, &["commit", "--allow-empty", "-m", "Seat work"]);
-            git(&target, &["branch", "tmp-loose"]);
-            git(&target, &["branch", "-d", "tmp-loose"]);
-            git(&target, &["pack-refs", "--all"]);
-            git(&target, &["gc"]);
-            assert_eq!(
-                pool_object_count(&pool_repo),
-                before,
-                "seat commits and gc must not add objects to the pool"
-            );
-            // Seat objects land in the seat gitdir.
-            let seat_objects = pool_object_count(target.join(".git").as_path());
-            assert!(seat_objects > 0, "seat gitdir holds its own objects");
-            before
-        };
-        assert_eq!(pool_object_count(&pool_repo), rate);
     }
 }

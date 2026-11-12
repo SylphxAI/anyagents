@@ -130,11 +130,15 @@ fn validate_config_files(private: &Path, common: &Path) -> Result<(), Error> {
     for path in paths {
         // Per-seat config.worktree is opened with O_NOFOLLOW directly,
         // never through the managed symlink; only the legacy common config
-        // goes through the pinned managed open. A per-seat config is
+        // goes through the pinned managed open. A managed config is a
+        // symlink even when git reports one directory, so route any
+        // symlinked config through the pinned open. A per-seat config is
         // seat-writable by design, so its writes stay allowed and its
         // contents are refused below instead of its writability.
-        let pinned = path == common.join("config") && private != common;
-        let per_seat_config = path == common.join("config") && private == common;
+        let is_symlink = std::fs::symlink_metadata(&path)
+            .is_ok_and(|meta| meta.file_type().is_symlink());
+        let pinned = path == common.join("config") && (private != common || is_symlink);
+        let per_seat_config = path == common.join("config") && private == common && !is_symlink;
         let mut file = match if pinned {
             open_common_config(common, None)
         } else {
