@@ -908,7 +908,7 @@ mod tests {
     /// Sessions created by the daemon as a private 0700 directory (as a harness
     /// switch or an older daemon leaves them) are re-admitted to the agent's
     /// seat group with 0o2770 by the same sharing pass that admits config.
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn config_sharing_readmits_a_private_sessions_directory_to_the_seat() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};

@@ -1072,8 +1072,8 @@ esac
             &work,
             &["rev-parse", "--path-format=absolute", "--git-common-dir"],
         ));
-        // A local branch and remote-tracking refs that exist only packed.
-        git(&common, &["branch", "packed-local", "origin/main"]);
+        // The bare pool already holds `packed-local` and `stale` as branches;
+        // fetch tracking refs too, then make every ref exist only packed.
         git(
             &common,
             &[
