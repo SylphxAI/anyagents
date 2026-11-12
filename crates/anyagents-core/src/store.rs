@@ -11369,8 +11369,8 @@ mod tests {
         assert!(authz.chats[&other.id].contains(&-1001));
         assert!(!authz.chats.contains_key(&stranger.id));
         // Message history agrees.
-        assert_eq!(authz.has_messaged_caller.contains(&peer.id), true);
-        assert_eq!(authz.has_messaged_caller.contains(&other.id), false);
+        assert!(authz.has_messaged_caller.contains(&peer.id));
+        assert!(!authz.has_messaged_caller.contains(&other.id));
         assert_eq!(
             authz.has_messaged_caller.contains(&peer.id),
             store.has_messaged(&peer, &caller)
