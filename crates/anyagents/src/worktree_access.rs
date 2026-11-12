@@ -135,8 +135,8 @@ fn validate_config_files(private: &Path, common: &Path) -> Result<(), Error> {
         // symlinked config through the pinned open. A per-seat config is
         // seat-writable by design, so its writes stay allowed and its
         // contents are refused below instead of its writability.
-        let is_symlink = std::fs::symlink_metadata(&path)
-            .is_ok_and(|meta| meta.file_type().is_symlink());
+        let is_symlink =
+            std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_symlink());
         let pinned = path == common.join("config") && (private != common || is_symlink);
         let per_seat_config = path == common.join("config") && private == common && !is_symlink;
         let mut file = match if pinned {
