@@ -682,6 +682,8 @@ pub struct Store {
     capabilities: Mutex<Option<String>>,
     /// Total time a bounded write may keep retrying transient lock errors.
     write_retry_budget_ms: AtomicU64,
+    /// The writer connection's configured busy timeout.
+    busy_timeout_ms: AtomicU64,
 }
 
 /// Default per-statement wait for the writer lock.
@@ -689,6 +691,22 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default total budget for writes that must not fail on a transient lock:
 /// several busy-timeout rounds, after which the error is surfaced.
 const WRITE_RETRY_BUDGET: Duration = Duration::from_secs(120);
+
+/// Size the WAL file is truncated back to after a checkpoint reset.
+const WAL_SIZE_LIMIT_BYTES: i64 = 64 * 1024 * 1024;
+
+/// Outcome of one [`Store::checkpoint_wal`] pass, in WAL frames.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WalCheckpoint {
+    /// Frames in the WAL when the passive pass ran.
+    pub log_frames: i64,
+    /// Frames copied back into the database by the passive pass.
+    pub checkpointed_frames: i64,
+    /// `true` when a reader held an older snapshot and stopped the backfill.
+    pub passive_busy: bool,
+    /// `true` when the WAL was fully backfilled and truncated to zero bytes.
+    pub truncated: bool,
+}
 
 /// `true` for SQLite lock contention that a later attempt can clear.
 fn is_transient_lock_error(error: &Error) -> bool {
@@ -780,6 +798,9 @@ impl Store {
         // is what makes the wait apply to read-then-write paths.
         conn.busy_timeout(BUSY_TIMEOUT)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        // Without a limit the WAL file keeps its high-water size forever after
+        // one burst; with it, each checkpoint reset truncates the file back.
+        conn.pragma_update(None, "journal_size_limit", WAL_SIZE_LIMIT_BYTES)?;
         let mut mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
         if !mode.eq_ignore_ascii_case("wal") {
             mode = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
@@ -856,6 +877,14 @@ impl Store {
                 "CREATE INDEX IF NOT EXISTS idx_messages_agent_time ON messages(agent_id, received_at_ms DESC, seq DESC)",
             ),
             (
+                "idx_agents_state",
+                "CREATE INDEX IF NOT EXISTS idx_agents_state ON agents(state)",
+            ),
+            (
+                "idx_agents_live_name",
+                "CREATE INDEX IF NOT EXISTS idx_agents_live_name ON agents(name) WHERE state != 'archived'",
+            ),
+            (
                 "idx_outbound_agent_time",
                 "CREATE INDEX IF NOT EXISTS idx_outbound_agent_time ON outbound_messages(agent_id, sent_at_ms DESC, id DESC)",
             ),
@@ -895,6 +924,7 @@ impl Store {
             wakes: Mutex::new(Vec::new()),
             capabilities: Mutex::new(None),
             write_retry_budget_ms: AtomicU64::new(WRITE_RETRY_BUDGET.as_millis() as u64),
+            busy_timeout_ms: AtomicU64::new(BUSY_TIMEOUT.as_millis() as u64),
         })
     }
 
@@ -906,9 +936,47 @@ impl Store {
         retry_budget: Duration,
     ) -> Result<(), Error> {
         self.conn().busy_timeout(busy_timeout)?;
+        self.busy_timeout_ms
+            .store(busy_timeout.as_millis() as u64, Ordering::Relaxed);
         self.write_retry_budget_ms
             .store(retry_budget.as_millis() as u64, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Copy committed WAL frames back into the database without ever making
+    /// readers or writers wait. A passive pass backfills what no reader still
+    /// needs; only when that pass reaches the end of the log is a TRUNCATE
+    /// attempted, with no busy wait, so a concurrent reader or writer makes it
+    /// a cheap no-op instead of a stall. Call it periodically from one place.
+    pub fn checkpoint_wal(&self) -> Result<WalCheckpoint, Error> {
+        let conn = self.conn();
+        let (busy, log_frames, checkpointed_frames): (i64, i64, i64) =
+            conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?;
+        let mut outcome = WalCheckpoint {
+            log_frames,
+            checkpointed_frames,
+            passive_busy: busy != 0,
+            truncated: false,
+        };
+        if busy == 0 && log_frames >= 0 && checkpointed_frames == log_frames {
+            conn.busy_timeout(Duration::ZERO)?;
+            let truncated = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+            });
+            let restored = conn.busy_timeout(Duration::from_millis(
+                self.busy_timeout_ms.load(Ordering::Relaxed),
+            ));
+            match truncated.map_err(Error::from) {
+                Ok((0, 0)) => outcome.truncated = true,
+                Ok(_) => {}
+                Err(error) if is_transient_lock_error(&error) => {}
+                Err(error) => return Err(error),
+            }
+            restored?;
+        }
+        Ok(outcome)
     }
 
     /// Run one write transaction, retrying it whole on SQLITE_BUSY/LOCKED until
@@ -1564,6 +1632,55 @@ impl Store {
             agents.push(agent_from_row(row)?);
         }
         Ok(agents)
+    }
+
+    /// Agents a roster needs, without reading the archive: the agents whose
+    /// state matches (`None` is every non-archived agent, `"all"` every agent),
+    /// plus every ancestor of a match so a tree keeps its path to the root.
+    /// The second value is the number of archived agents. Ordered by name.
+    pub fn roster_agents(&self, state: Option<&str>) -> Result<(Vec<Agent>, usize), Error> {
+        let conn = self.read_conn();
+        let archived: i64 = conn.query_row(
+            "SELECT count(*) FROM agents WHERE state = 'archived'",
+            [],
+            |r| r.get(0),
+        )?;
+        let mut agents = Vec::new();
+        let mut push = |mut rows: rusqlite::Rows<'_>| -> Result<(), Error> {
+            while let Some(row) = rows.next()? {
+                agents.push(agent_from_row(row)?);
+            }
+            Ok(())
+        };
+        match state {
+            Some("all") => {
+                let mut stmt =
+                    conn.prepare(&format!("SELECT {AGENT_COLS} FROM agents ORDER BY name"))?;
+                push(stmt.query([])?)?;
+            }
+            Some("archived") => {
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT {AGENT_COLS} FROM agents WHERE state = 'archived' ORDER BY name"
+                ))?;
+                push(stmt.query([])?)?;
+            }
+            _ => {
+                // UNION (not UNION ALL) deduplicates, so a parent cycle ends.
+                let mut stmt = conn.prepare(&format!(
+                    "WITH RECURSIVE wanted(id) AS (
+                         SELECT id FROM agents
+                          WHERE state != 'archived' AND (?1 IS NULL OR state = ?1)
+                         UNION
+                         SELECT a.parent_id FROM agents a JOIN wanted w ON a.id = w.id
+                          WHERE a.parent_id IS NOT NULL
+                     )
+                     SELECT {AGENT_COLS} FROM agents WHERE id IN (SELECT id FROM wanted)
+                     ORDER BY name"
+                ))?;
+                push(stmt.query([state])?)?;
+            }
+        }
+        Ok((agents, archived as usize))
     }
 
     /// Load roster metadata with a fixed number of SQL statements. Indexed range
@@ -10841,6 +10958,147 @@ mod tests {
         );
         assert!(store.has_open_turn(&worker.id).unwrap());
         assert!(store.list_usage(Some(&worker.id)).unwrap().is_empty());
+    }
+
+    fn child(store: &Store, name: &str, parent: &Agent) -> Agent {
+        let mut new = NewAgent::new(name, "claude-code");
+        new.parent_id = Some(parent.id.clone());
+        store.create_agent(new).unwrap()
+    }
+
+    fn names(agents: &[Agent]) -> Vec<&str> {
+        agents.iter().map(|a| a.name.as_str()).collect()
+    }
+
+    #[test]
+    fn roster_agents_reads_live_agents_and_their_ancestors_but_not_the_archive() {
+        let (_dir, store) = setup();
+        let root = agent(&store, "root");
+        let old = child(&store, "old", &root);
+        let live = child(&store, "live", &old);
+        let gone = child(&store, "gone", &root);
+        let paused = agent(&store, "paused");
+        store.set_agent_state(&old.id, "archived").unwrap();
+        store.set_agent_state(&gone.id, "archived").unwrap();
+        store.set_agent_state(&paused.id, "paused").unwrap();
+        let _ = live;
+
+        // Default: every non-archived agent plus the archived ancestor on a
+        // live agent's path; the unrelated archived leaf is never read.
+        let (agents, archived) = store.roster_agents(None).unwrap();
+        assert_eq!(names(&agents), ["live", "old", "paused", "root"]);
+        assert_eq!(archived, 2);
+
+        let (agents, _) = store.roster_agents(Some("paused")).unwrap();
+        assert_eq!(names(&agents), ["paused"]);
+        let (agents, _) = store.roster_agents(Some("archived")).unwrap();
+        assert_eq!(names(&agents), ["gone", "old"]);
+        let (agents, archived) = store.roster_agents(Some("all")).unwrap();
+        assert_eq!(agents, store.list_agents().unwrap());
+        assert_eq!(archived, 2);
+        let (agents, _) = store.roster_agents(Some("bogus")).unwrap();
+        assert!(agents.is_empty());
+    }
+
+    #[test]
+    fn roster_agents_seeds_from_indexes_instead_of_scanning_agent_rows() {
+        let (_dir, store) = setup();
+        let conn = store.conn();
+        let plan = |sql: &str| -> String {
+            let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(3))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let count = plan("SELECT count(*) FROM agents WHERE state = 'archived'");
+        assert!(count.contains("COVERING INDEX idx_agents_state"), "{count}");
+        let live = plan(
+            "SELECT id FROM agents WHERE state != 'archived' AND (NULL IS NULL OR state = NULL)",
+        );
+        assert!(live.contains("idx_agents_live_name"), "{live}");
+    }
+
+    #[test]
+    fn roster_agents_survives_a_parent_cycle() {
+        let (_dir, store) = setup();
+        let a = agent(&store, "a");
+        let b = child(&store, "b", &a);
+        store
+            .conn()
+            .execute(
+                "UPDATE agents SET parent_id = ?1 WHERE id = ?2",
+                params![b.id.as_str(), a.id.as_str()],
+            )
+            .unwrap();
+        let (agents, _) = store.roster_agents(None).unwrap();
+        assert_eq!(names(&agents), ["a", "b"]);
+    }
+
+    fn wal_len(db: &Path) -> u64 {
+        std::fs::metadata(db.with_extension("db-wal"))
+            .map(|m| m.len())
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn writer_bounds_the_wal_file_size() {
+        let (_dir, store) = setup();
+        let limit: i64 = store
+            .conn()
+            .query_row("PRAGMA journal_size_limit", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(limit, WAL_SIZE_LIMIT_BYTES);
+    }
+
+    #[test]
+    fn wal_checkpoint_truncates_when_no_reader_needs_the_log() {
+        let (dir, store) = setup();
+        let db = dir.path().join("state.db");
+        for i in 0..20 {
+            agent(&store, &format!("wal-{i}"));
+        }
+        assert!(wal_len(&db) > 0);
+        let outcome = store.checkpoint_wal().unwrap();
+        assert!(!outcome.passive_busy);
+        assert_eq!(outcome.checkpointed_frames, outcome.log_frames);
+        assert!(outcome.truncated, "{outcome:?}");
+        assert_eq!(wal_len(&db), 0);
+        // The writer keeps working after the truncate.
+        agent(&store, "after-truncate");
+        assert!(store.agent_by_name("after-truncate").is_ok());
+    }
+
+    #[test]
+    fn wal_checkpoint_never_waits_on_a_pinned_reader_and_recovers_after_it() {
+        let (dir, store) = setup();
+        let db = dir.path().join("state.db");
+        agent(&store, "pin-0");
+        // A reader holds a snapshot while the writer keeps appending frames.
+        let reader = Connection::open(&db).unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        let _: i64 = reader
+            .query_row("SELECT count(*) FROM agents", [], |r| r.get(0))
+            .unwrap();
+        for i in 1..20 {
+            agent(&store, &format!("pin-{i}"));
+        }
+        let started = std::time::Instant::now();
+        let pinned = store.checkpoint_wal().unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "must not busy-wait"
+        );
+        assert!(pinned.passive_busy || pinned.checkpointed_frames < pinned.log_frames);
+        assert!(!pinned.truncated);
+        assert!(wal_len(&db) > 0);
+
+        reader.execute_batch("COMMIT").unwrap();
+        drop(reader);
+        let freed = store.checkpoint_wal().unwrap();
+        assert!(freed.truncated, "{freed:?}");
+        assert_eq!(wal_len(&db), 0);
     }
 
     #[test]

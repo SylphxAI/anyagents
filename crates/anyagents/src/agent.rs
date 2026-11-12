@@ -1210,10 +1210,12 @@ pub fn offline_roster(
         ));
     }
     let store = open(data)?;
+    let (agents, archived_count) = store.roster_agents(query.state.as_deref())?;
     server::roster_views(
         &store,
         &anyagents_supervisor::HealthBoard::default(),
-        store.list_agents()?,
+        agents,
+        archived_count,
         query,
     )
     .map_err(|e| Error::Message(e.message))
