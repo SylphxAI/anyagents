@@ -939,7 +939,6 @@ mod tests {
     use super::*;
     #[test]
     fn runtime_cache_hardlinks_are_tolerated_but_top_level_links_are_refused() {
-        use std::os::unix::fs::PermissionsExt;
         let temp = crate::test_tempdir();
         let own = temp.path().join("config");
         let me = super::super::sandbox::server_uid();
