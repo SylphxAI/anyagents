@@ -67,6 +67,9 @@ The root cause is architectural: AnyAgents already decides which credential an a
    - `GH_CONFIG_DIR` points at a server-written hosts file for `tool:github`. For an App record, the installation token is minted by the server and rewritten before expiry.
    - `GIT_CONFIG_GLOBAL` points at a generated file with `credential.helper = anyagents credential git` and `user.name`/`user.email` from `tool:git_author`. That slot defaults to the identity of `tool:github`, so commit author and pusher cannot diverge. The helper answers only with the bound record.
    - `OP_SERVICE_ACCOUNT_TOKEN` comes from `tool:op`.
+   - Further tool slots (`tool:kube` for a kubeconfig, `tool:build_key` for a build-service key) use the same mechanism: a record kind plus one manifest entry, never a host path.
+
+   **One environment for an agent, used by every process it runs.** `materialize` produces the agent's complete environment: credential files and variables from the bindings, plus the child `PATH` from the toolchain manifest (ADR 0005). The harness process, `workspace.exec` shells, MCP tool subprocesses, and any process AnyAgents spawns on the agent's behalf all start from that same environment. No path runs `/bin/sh -c` with the server's environment, or relies on a shell profile or deployment wrapper to add identity. Seat-specific renderers (for example a per-seat `gh` config written during checkout provisioning) are replaced by this single projection, not kept beside it.
 
    Local mode may keep the real `HOME` for non-credential dotfiles, but no credential is ever read from it, from ambient `gh`, from environment API keys, or from another identity.
 
@@ -103,6 +106,7 @@ The root cause is architectural: AnyAgents already decides which credential an a
 | I9 | Doctor is a live proof | A fake provider returning 401, an identity swap, lock drift or stale staging makes doctor exit non-zero naming the record; all-healthy exits zero |
 | I10 | Seats cannot read the store | The `agent-run` assertion opens `<data>/credentials` as the seat and expects `EACCES` |
 | I11 | Open-source purity | `tests/open_source_purity.rs` also scans manifests, catalog probes and fixtures; identities appear only in `credentials.toml` fixtures under `example.invalid` |
+| I12 | One environment for every process an agent runs | For a bound agent, the environment of the harness process, a `workspace.exec` shell and an MCP tool subprocess is identical for the credential and `PATH` variables (`GH_CONFIG_DIR`, `GIT_CONFIG_GLOBAL`, `OP_SERVICE_ACCOUNT_TOKEN`, kube/build slots, `PATH`); `gh api user` and `git config user.email` give the same identity in all three |
 
 ## Migration (zero-loss)
 
