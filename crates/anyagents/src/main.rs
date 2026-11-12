@@ -1687,6 +1687,7 @@ fn browser_cmd(
         full_page: full_page.then_some(true),
         wait_ms,
         headless,
+        proxy: None,
         tab_action: None,
         target_id: None,
         cookies: None,
