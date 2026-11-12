@@ -4738,32 +4738,29 @@ impl Store {
     pub fn export_roster_authz(&self, caller: &Agent, recipients: &[AgentId]) -> RosterAuthz {
         let mut out = RosterAuthz::default();
         let conn = self.read_conn();
-        if let Ok(mut stmt) = conn.prepare("SELECT agent_id, group_name FROM group_agents") {
-            if let Ok(rows) =
+        if let Ok(mut stmt) = conn.prepare("SELECT agent_id, group_name FROM group_agents")
+            && let Ok(rows) =
                 stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
-            {
-                for row in rows.flatten() {
-                    if let Ok(id) = AgentId::parse(&row.0) {
-                        out.groups.entry(id).or_default().insert(row.1);
-                    }
+        {
+            for row in rows.flatten() {
+                if let Ok(id) = AgentId::parse(&row.0) {
+                    out.groups.entry(id).or_default().insert(row.1);
                 }
             }
         }
         if let Ok(mut stmt) = conn.prepare(
             "SELECT ca.agent_id, ch.state FROM channel_agents ca
              JOIN channels ch ON ch.id = ca.channel_id",
-        ) {
-            if let Ok(rows) =
-                stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
-            {
-                for row in rows.flatten() {
-                    if let Ok(id) = AgentId::parse(&row.0) {
-                        let chats: Vec<i64> = telegram_chat_links(&row.1)
-                            .into_iter()
-                            .map(|(_, chat_id)| chat_id)
-                            .collect();
-                        out.chats.entry(id).or_default().extend(chats);
-                    }
+        ) && let Ok(rows) =
+            stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+        {
+            for row in rows.flatten() {
+                if let Ok(id) = AgentId::parse(&row.0) {
+                    let chats: Vec<i64> = telegram_chat_links(&row.1)
+                        .into_iter()
+                        .map(|(_, chat_id)| chat_id)
+                        .collect();
+                    out.chats.entry(id).or_default().extend(chats);
                 }
             }
         }
