@@ -1756,11 +1756,22 @@ fn read_stdout(
             if spec.protocol == LineProtocol::AcknowledgedResult
                 && let Some(id) = value.get("request_id").and_then(Value::as_str)
             {
-                #[cfg(test)]
-                eprintln!(
-                    "reader ack trace: kind={kind:?} id={id} open={:?} followups={:?}",
-                    state.open, state.followups
-                );
+                // The test capture drops other threads' stderr; log through a
+                // file so the acceptance path stays observable on failure.
+                if let Some(dir) = state.state_dir.clone() {
+                    use std::io::Write;
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(dir.join("reader-ack.log"))
+                    {
+                        let _ = writeln!(
+                            f,
+                            "kind={kind:?} id={id} open={:?} followups={:?} acked={:?}",
+                            state.open, state.followups, state.acknowledged
+                        );
+                    }
+                }
                 if state
                     .open
                     .iter()
