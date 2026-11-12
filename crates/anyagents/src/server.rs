@@ -7326,10 +7326,11 @@ pub(crate) mod tests {
         store
             .record_outbound(&messenger.id, &format!("agent:{}", child.name), None, "hi")
             .unwrap();
-        // A dangling parent id: tmp-parent is deleted, orphan keeps its row.
-        let tmp_parent = roster_child(&store, "tmp-parent", &root);
-        let orphan = roster_child(&store, "orphan", &tmp_parent);
-        store.delete_agent(&tmp_parent.id).unwrap();
+        // A 17-deep chain: both walkers cap at >16 levels and fail closed.
+        let mut deep_parent = root.clone();
+        for n in 0..17 {
+            deep_parent = roster_child(&store, &format!("deep-{n}"), &deep_parent);
+        }
 
         let all = store.list_agents().unwrap();
         let by_id: RosterById = all.iter().map(|a| (a.id.as_str(), a)).collect();
@@ -7391,8 +7392,8 @@ pub(crate) mod tests {
         check(&iso, &sibling); // isolated -> denied
         check(&child, &iso); // isolated recipient -> denied
         check(&root, &stranger); // admin root reads
-        check(&child, &orphan); // dangling parent chain fails closed
-        check(&root, &orphan); // orphan relationship still resolves
+        check(&child, &deep_parent); // 17-deep chain hits the shared cap
+        check(&deep_parent, &stranger); // deep caller, unrelated root
         // Sibling scope both ways: private->denied, siblings->allowed.
         store.set_agent_scope(&child.id, "siblings").unwrap();
         store.set_agent_scope(&sibling.id, "siblings").unwrap();
@@ -7454,6 +7455,9 @@ pub(crate) mod tests {
         let _env = env_lock();
         let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
+        store
+            .hold_capability_key("test-capability-key-0123456789abcdef")
+            .unwrap();
         let parent = store
             .create_agent(anyagents_core::NewAgent::new("parent-agent", "opencode"))
             .unwrap();
