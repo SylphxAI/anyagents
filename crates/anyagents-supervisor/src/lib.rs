@@ -6,7 +6,7 @@ use std::fs;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::UnixDatagram;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
@@ -33,24 +33,35 @@ const PENDING_SWITCH_DRAIN_MS: i64 = 15_000;
 /// Time source. Production uses the wall clock. Tests advance a manual clock.
 pub trait Clock: Send + Sync {
     fn now_ms(&self) -> i64;
-    /// Block until `woken` is set, `deadline` is due, or [`Clock::poke`].
+    /// Block until `woken` is set, `deadline` is due, or [`Clock::poke`] finds
+    /// `woken` set. Consumes the flag; `true` when it was the flag that ended
+    /// the wait, `false` when the deadline did.
     ///
-    /// `None` waits until a poke. A deadline in the past returns at once.
-    fn wait(&self, deadline: Option<i64>, woken: &AtomicBool);
+    /// `None` waits for the flag. A deadline in the past returns at once.
+    fn wait(&self, deadline: Option<i64>, woken: &Arc<AtomicBool>) -> bool;
+    /// Wake every waiter whose flag is set. Set the flag first.
     fn poke(&self);
 }
 
-/// Wall clock. `wait` uses the operating system's timeout.
+/// Wall clock. Each waiter parks its own thread, and [`Clock::poke`] unparks
+/// only the waiters whose flag is set: one agent's mail or vendor activity
+/// never wakes the rest of the fleet.
 pub struct SystemClock {
-    lock: Mutex<()>,
-    wake: Condvar,
+    waiters: Mutex<Vec<Waiter>>,
+    next_waiter: AtomicU64,
+}
+
+struct Waiter {
+    id: u64,
+    woken: Arc<AtomicBool>,
+    thread: thread::Thread,
 }
 
 impl SystemClock {
     pub fn new() -> Self {
         Self {
-            lock: Mutex::new(()),
-            wake: Condvar::new(),
+            waiters: Mutex::new(Vec::new()),
+            next_waiter: AtomicU64::new(0),
         }
     }
 }
@@ -66,43 +77,45 @@ impl Clock for SystemClock {
         anyagents_core::now_ms()
     }
 
-    fn wait(&self, deadline: Option<i64>, woken: &AtomicBool) {
-        let mut guard = lock(&self.lock);
-        loop {
+    fn wait(&self, deadline: Option<i64>, woken: &Arc<AtomicBool>) -> bool {
+        if woken.swap(false, Ordering::SeqCst) {
+            return true;
+        }
+        let id = self.next_waiter.fetch_add(1, Ordering::Relaxed);
+        lock(&self.waiters).push(Waiter {
+            id,
+            woken: Arc::clone(woken),
+            thread: thread::current(),
+        });
+        // Registered before the flag is read again: a poke that ran before
+        // registration left the flag set, one after it unparks this thread
+        // (an unpark before park is kept, so it is never lost).
+        let flagged = loop {
             if woken.swap(false, Ordering::SeqCst) {
-                return;
+                break true;
             }
             let now = self.now_ms();
-            if let Some(deadline) = deadline
-                && now >= deadline
-            {
-                return;
+            match deadline {
+                Some(deadline) if now >= deadline => break false,
+                Some(deadline) => thread::park_timeout(Duration::from_millis(
+                    deadline.saturating_sub(now).max(0) as u64,
+                )),
+                None => thread::park(),
             }
-            guard = park_system(&self.wake, guard, deadline, now);
+        };
+        let mut waiters = lock(&self.waiters);
+        if let Some(at) = waiters.iter().position(|waiter| waiter.id == id) {
+            waiters.swap_remove(at);
         }
+        flagged
     }
 
     fn poke(&self) {
-        let _guard = lock(&self.lock);
-        self.wake.notify_all();
-    }
-}
-
-fn park_system<'a>(
-    wake: &Condvar,
-    guard: MutexGuard<'a, ()>,
-    deadline: Option<i64>,
-    now: i64,
-) -> MutexGuard<'a, ()> {
-    match deadline {
-        Some(deadline) => {
-            let remain = deadline.saturating_sub(now).max(0) as u64;
-            let (guard, _) = wake
-                .wait_timeout(guard, Duration::from_millis(remain))
-                .unwrap_or_else(|err| err.into_inner());
-            guard
+        for waiter in lock(&self.waiters).iter() {
+            if waiter.woken.load(Ordering::SeqCst) {
+                waiter.thread.unpark();
+            }
         }
-        None => wake.wait(guard).unwrap_or_else(|err| err.into_inner()),
     }
 }
 
@@ -138,16 +151,16 @@ impl Clock for ManualClock {
         *lock(&self.state.now_ms)
     }
 
-    fn wait(&self, deadline: Option<i64>, woken: &AtomicBool) {
+    fn wait(&self, deadline: Option<i64>, woken: &Arc<AtomicBool>) -> bool {
         let mut guard = lock(&self.state.now_ms);
         loop {
             if woken.swap(false, Ordering::SeqCst) {
-                return;
+                return true;
             }
             if let Some(deadline) = deadline
                 && *guard >= deadline
             {
-                return;
+                return false;
             }
             guard = self
                 .state
@@ -199,9 +212,16 @@ pub struct LaunchRequest {
 
 pub type Launch<H> = Arc<dyn Fn(LaunchRequest) -> Result<H, String> + Send + Sync>;
 
-/// How often a worker with an empty mailbox looks again. One store read, so
-/// `flush` and a restarted process never leave a line waiting for an arrival.
+/// How soon a worker with an empty mailbox looks again after it last did
+/// work or was woken. One store read, so `flush` and a restarted process never
+/// leave a line waiting for an arrival.
 const IDLE_REVIEW_MS: i64 = 250;
+/// Ceiling of the idle review interval. Each review that finds nothing to do
+/// doubles the interval up to this bound; mail, vendor activity and agent
+/// wakes still end the wait at once and reset it. What only a review notices
+/// (a background command exiting before scale-to-zero, a profile rotation
+/// file) is picked up within this bound.
+const IDLE_REVIEW_MAX_MS: i64 = 15_000;
 
 /// Supervisor view of one agent. Ages stay on the mailbox; this is the process.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -645,6 +665,8 @@ fn run_agent<H: Harness + 'static>(
         process_profile_rotated_ms: 0,
         last_error: None,
         consecutive_turn_errors: 0,
+        idle_review_ms: IDLE_REVIEW_MS,
+        process_scan_logged: false,
     };
     session.run()
 }
@@ -743,6 +765,12 @@ struct Session<H: Harness> {
     process_profile_rotated_ms: i64,
     last_error: Option<String>,
     consecutive_turn_errors: u32,
+    /// Current idle review interval, between `IDLE_REVIEW_MS` and
+    /// `IDLE_REVIEW_MAX_MS`.
+    idle_review_ms: i64,
+    /// Whether the whole-process-table fallback of the in-flight check was
+    /// already reported for this agent.
+    process_scan_logged: bool,
 }
 
 impl<H: Harness + 'static> Session<H> {
@@ -1162,6 +1190,7 @@ impl<H: Harness + 'static> Session<H> {
                     .written
                     .saturating_add(delivered.clamp(0, u64::from(u32::MAX)) as u32);
                 self.attempt = 0;
+                self.idle_review_ms = IDLE_REVIEW_MS;
                 self.wake_unless_more();
                 false
             }
@@ -1211,10 +1240,7 @@ impl<H: Harness + 'static> Session<H> {
                 if self.try_release_idle_agent() {
                     return false;
                 }
-                self.inner.clock.wait(
-                    Some(self.inner.clock.now_ms() + IDLE_REVIEW_MS),
-                    &self.woken,
-                );
+                self.idle_wait();
                 false
             }
             Err(anyagents_agent::Error::HarnessDown) => {
@@ -1379,7 +1405,18 @@ impl<H: Harness + 'static> Session<H> {
             if health.turn_state != TurnState::Idle || health.sign_in_fault.is_some() {
                 return false;
             }
-            if harness_has_inflight_processes(delivery.harness().process_id()) {
+            let mut scanned = false;
+            let inflight =
+                harness_has_inflight_processes(delivery.harness().process_id(), &mut scanned);
+            if scanned && !self.process_scan_logged {
+                self.process_scan_logged = true;
+                eprintln!(
+                    "anyagents-supervisor: {}: /proc/<pid>/task/<tid>/children is unavailable; \
+                     idle release reads the whole process table on each review",
+                    self.id
+                );
+            }
+            if inflight {
                 return false;
             }
             delivery
@@ -1544,6 +1581,22 @@ impl<H: Harness + 'static> Session<H> {
         }
     }
 
+    /// Sleep through one idle review interval. A wake (mail, vendor activity,
+    /// agent change) ends it at once and resets the interval; a review that
+    /// ran out its interval with nothing to do doubles the next one, so an
+    /// idle agent's store reads and process checks fall to one per
+    /// `IDLE_REVIEW_MAX_MS` instead of four a second.
+    fn idle_wait(&mut self) {
+        let deadline = self.inner.clock.now_ms() + self.idle_review_ms;
+        self.idle_review_ms = if self.inner.clock.wait(Some(deadline), &self.woken) {
+            IDLE_REVIEW_MS
+        } else {
+            self.idle_review_ms
+                .saturating_mul(2)
+                .min(IDLE_REVIEW_MAX_MS)
+        };
+    }
+
     /// Sleep until a new line arrives, unless one arrived while this pass ran:
     /// then the next pass runs at once, so two lines in flight are both written.
     fn wake_unless_more(&mut self) {
@@ -1616,59 +1669,34 @@ fn is_transient_turn_fault(error: &str) -> bool {
 /// Return `true` when `root_pid` has any non-zombie descendant process in `/proc`
 /// other than an idle persistent sidecar (`anyagents ... mcp`, `codex-code-mode-host`,
 /// or `language_server_linux`) that itself has no child processes.
-fn harness_has_inflight_processes(root_pid: Option<u32>) -> bool {
+/// `true` when the harness process has a command running under it (any
+/// child other than an idle persistent sidecar). Sets `scanned` when the
+/// kernel offers no per-task `children` file and the whole process table had
+/// to be read instead.
+fn harness_has_inflight_processes(root_pid: Option<u32>, scanned: &mut bool) -> bool {
     let Some(root_pid) = root_pid.filter(|&p| p > 0) else {
         return false;
     };
     #[cfg(unix)]
     {
-        let Ok(entries) = fs::read_dir("/proc") else {
-            return false;
-        };
-        let mut children_of: HashMap<u32, Vec<u32>> = HashMap::new();
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let Some(pid_str) = name.to_str() else {
-                continue;
-            };
-            let Ok(pid) = pid_str.parse::<u32>() else {
-                continue;
-            };
-            let Ok(status) = fs::read_to_string(entry.path().join("status")) else {
-                continue;
-            };
-            let mut ppid = 0u32;
-            let mut state_ch = ' ';
-            for line in status.lines() {
-                if let Some(rest) = line.strip_prefix("PPid:") {
-                    ppid = rest.trim().parse::<u32>().unwrap_or(0);
-                } else if let Some(rest) = line.strip_prefix("State:") {
-                    state_ch = rest.trim().chars().next().unwrap_or(' ');
-                }
+        // Read the harness's own subtree: a whole-/proc scan per idle review
+        // reads every process's status file on the host, per agent.
+        let children = match proc_children(root_pid) {
+            Some(children) => children,
+            None => {
+                *scanned = true;
+                return harness_has_inflight_processes_by_scan(root_pid);
             }
-            if ppid > 0 && !matches!(state_ch, 'Z' | 'X') {
-                children_of.entry(ppid).or_default().push(pid);
-            }
-        }
-        let Some(direct_children) = children_of.get(&root_pid) else {
-            return false;
         };
-        for &cpid in direct_children {
-            let cmdline = fs::read(format!("/proc/{cpid}/cmdline"))
-                .unwrap_or_default()
-                .into_iter()
-                .map(|b| if b == 0 { b' ' } else { b })
-                .collect::<Vec<u8>>();
-            let cmd = String::from_utf8_lossy(&cmdline);
-            let cmd_trimmed = cmd.trim();
-            let is_persistent_sidecar = cmd_trimmed.contains(" mcp ")
-                || cmd_trimmed.ends_with(" mcp")
-                || cmd_trimmed.contains("codex-code-mode-host")
-                || cmd_trimmed.contains("language_server_linux");
-            if is_persistent_sidecar {
-                if children_of
-                    .get(&cpid)
-                    .is_some_and(|grandkids| !grandkids.is_empty())
+        for cpid in children {
+            if !proc_is_live(cpid) {
+                continue;
+            }
+            if is_persistent_sidecar(cpid) {
+                if proc_children(cpid)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .any(proc_is_live)
                 {
                     return true;
                 }
@@ -1680,9 +1708,109 @@ fn harness_has_inflight_processes(root_pid: Option<u32>) -> bool {
     }
     #[cfg(not(unix))]
     {
-        let _ = root_pid;
+        let _ = (root_pid, scanned);
         false
     }
+}
+
+/// Direct children of `pid` from `/proc/<pid>/task/<tid>/children`. A
+/// process that is gone has none. `None` only when the process's tasks are
+/// readable but no task offers a `children` file (a kernel built without
+/// `CONFIG_PROC_CHILDREN`).
+#[cfg(unix)]
+fn proc_children(pid: u32) -> Option<Vec<u32>> {
+    let Ok(tasks) = fs::read_dir(format!("/proc/{pid}/task")) else {
+        return Some(Vec::new());
+    };
+    let mut exposed = false;
+    let mut children = Vec::new();
+    for task in tasks.flatten() {
+        if let Ok(list) = fs::read_to_string(task.path().join("children")) {
+            exposed = true;
+            children.extend(
+                list.split_whitespace()
+                    .filter_map(|p| p.parse::<u32>().ok()),
+            );
+        }
+    }
+    exposed.then_some(children)
+}
+
+/// `true` unless the process is gone, a zombie, or dead.
+#[cfg(unix)]
+fn proc_is_live(pid: u32) -> bool {
+    let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    let state = stat
+        .rfind(')')
+        .and_then(|end| stat[end + 1..].trim_start().chars().next())
+        .unwrap_or(' ');
+    !matches!(state, 'Z' | 'X' | 'x')
+}
+
+#[cfg(unix)]
+fn is_persistent_sidecar(pid: u32) -> bool {
+    let cmdline = fs::read(format!("/proc/{pid}/cmdline"))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|b| if b == 0 { b' ' } else { b })
+        .collect::<Vec<u8>>();
+    let cmd = String::from_utf8_lossy(&cmdline);
+    let cmd_trimmed = cmd.trim();
+    cmd_trimmed.contains(" mcp ")
+        || cmd_trimmed.ends_with(" mcp")
+        || cmd_trimmed.contains("codex-code-mode-host")
+        || cmd_trimmed.contains("language_server_linux")
+}
+
+/// Fallback for kernels without `/proc/<pid>/task/<tid>/children`.
+#[cfg(unix)]
+fn harness_has_inflight_processes_by_scan(root_pid: u32) -> bool {
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return false;
+    };
+    let mut children_of: HashMap<u32, Vec<u32>> = HashMap::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid_str) = name.to_str() else {
+            continue;
+        };
+        let Ok(pid) = pid_str.parse::<u32>() else {
+            continue;
+        };
+        let Ok(status) = fs::read_to_string(entry.path().join("status")) else {
+            continue;
+        };
+        let mut ppid = 0u32;
+        let mut state_ch = ' ';
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("PPid:") {
+                ppid = rest.trim().parse::<u32>().unwrap_or(0);
+            } else if let Some(rest) = line.strip_prefix("State:") {
+                state_ch = rest.trim().chars().next().unwrap_or(' ');
+            }
+        }
+        if ppid > 0 && !matches!(state_ch, 'Z' | 'X') {
+            children_of.entry(ppid).or_default().push(pid);
+        }
+    }
+    let Some(direct_children) = children_of.get(&root_pid) else {
+        return false;
+    };
+    for &cpid in direct_children {
+        if is_persistent_sidecar(cpid) {
+            if children_of
+                .get(&cpid)
+                .is_some_and(|grandkids| !grandkids.is_empty())
+            {
+                return true;
+            }
+        } else {
+            return true;
+        }
+    }
+    false
 }
 
 fn reap_ephemeral_dirs(config_dir: &std::path::Path, managed_work: &std::path::Path) {
@@ -2076,6 +2204,105 @@ mod tests {
     }
 
     #[test]
+    fn vendor_activity_on_one_agent_wakes_only_that_agent() {
+        use std::sync::atomic::AtomicUsize;
+        let clock = Arc::new(SystemClock::new());
+        let flags: Vec<Arc<AtomicBool>> =
+            (0..8).map(|_| Arc::new(AtomicBool::new(false))).collect();
+        let returned = Arc::new(AtomicUsize::new(0));
+        let waiters: Vec<_> = flags
+            .iter()
+            .map(|flag| {
+                let clock = Arc::clone(&clock);
+                let flag = Arc::clone(flag);
+                let returned = Arc::clone(&returned);
+                thread::spawn(move || {
+                    let flagged = clock.wait(None, &flag);
+                    returned.fetch_add(1, Ordering::SeqCst);
+                    flagged
+                })
+            })
+            .collect();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while lock(&clock.waiters).len() < flags.len() && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(lock(&clock.waiters).len(), flags.len());
+        // The callback a harness's activity watcher calls for agent 0.
+        let activity = activity_notify(Arc::clone(&clock) as Arc<dyn Clock>, Arc::clone(&flags[0]));
+        activity();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while returned.load(Ordering::SeqCst) < 1 && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            returned.load(Ordering::SeqCst),
+            1,
+            "a poke for one agent must leave every other waiter parked"
+        );
+        assert_eq!(lock(&clock.waiters).len(), flags.len() - 1);
+        for flag in &flags {
+            flag.store(true, Ordering::SeqCst);
+        }
+        clock.poke();
+        for waiter in waiters {
+            assert!(waiter.join().unwrap(), "each wait ends on its own flag");
+        }
+        assert!(lock(&clock.waiters).is_empty());
+        // A deadline ends a wait without a flag, and says so.
+        let flag = Arc::new(AtomicBool::new(false));
+        assert!(!clock.wait(Some(clock.now_ms() + 20), &flag));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn inflight_check_reads_the_harness_subtree() {
+        use std::process::Command;
+        let mut bare = Command::new("sleep").arg("30").spawn().unwrap();
+        let mut parent = Command::new("sh")
+            .args(["-c", "sleep 30 & wait"])
+            .spawn()
+            .unwrap();
+        assert!(
+            proc_children(bare.id()).is_some(),
+            "this kernel exposes /proc/<pid>/task/<tid>/children"
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !harness_has_inflight_processes(Some(parent.id()), &mut false)
+            && std::time::Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let mut scanned = false;
+        assert!(
+            harness_has_inflight_processes(Some(parent.id()), &mut scanned),
+            "a running command under the harness is in flight"
+        );
+        assert!(
+            !harness_has_inflight_processes(Some(bare.id()), &mut scanned),
+            "a harness with no children has nothing in flight"
+        );
+        assert!(!harness_has_inflight_processes(None, &mut scanned));
+        assert!(
+            !scanned,
+            "the subtree read must not fall back to a full scan"
+        );
+        assert_eq!(
+            proc_children(u32::MAX - 1),
+            Some(Vec::new()),
+            "a process that is gone has no children and needs no scan"
+        );
+        let _ = Command::new("pkill")
+            .args(["-P", &parent.id().to_string()])
+            .status();
+        let _ = parent.kill();
+        let _ = bare.kill();
+        let _ = parent.wait();
+        let _ = bare.wait();
+    }
+
+    #[test]
     fn restart_delay_stays_in_range() {
         assert_eq!(restart_delay_ms(1, 0), 200);
         assert_eq!(restart_delay_ms(1, 39), 297);
@@ -2178,6 +2405,8 @@ mod persistence_tests {
             process_profile_rotated_ms: 0,
             last_error: None,
             consecutive_turn_errors: 0,
+            idle_review_ms: IDLE_REVIEW_MS,
+            process_scan_logged: false,
         };
         store
             .receive(
@@ -2531,6 +2760,8 @@ mod persistence_tests {
             process_profile_rotated_ms: 0,
             last_error: None,
             consecutive_turn_errors: 0,
+            idle_review_ms: IDLE_REVIEW_MS,
+            process_scan_logged: false,
         };
 
         let held = store.try_lock_agent(&session.id).unwrap();

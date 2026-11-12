@@ -52,6 +52,11 @@ fn a_completed_turn_records_usage_and_dedupes() {
     assert_eq!(usage.output_tokens, 7);
     assert_eq!(usage.cache_read_tokens, 3);
     assert_eq!(harness.turns_started(), 1);
+    assert_eq!(
+        harness.health().turn_state,
+        anyagents_harness::TurnState::Idle
+    );
+    assert!(!harness.in_turn());
     harness.deliver(&msg("m1")).unwrap();
     assert_eq!(harness.written_ids(), vec!["m1".to_string()]);
     assert_eq!(harness.turns_started(), 1);
@@ -155,4 +160,72 @@ fn the_launch_is_muse_serve_and_the_first_line_is_the_id() {
     assert!(Instant::now() < deadline, "{text}");
     assert!(text.contains("argv:serve"), "{text}");
     assert!(text.contains("anyagents-message:m1\\nhello"), "{text}");
+}
+
+#[test]
+fn early_turn_completed_before_turn_started_and_reply_leaves_harness_idle() {
+    let dir = TempDir::new().unwrap();
+    let mut harness = start(&dir, "early_complete", None);
+    harness.deliver(&msg("m1")).unwrap();
+    assert!(harness.wait_finished("m1", Duration::from_secs(5)));
+    assert_eq!(
+        harness.health().turn_state,
+        anyagents_harness::TurnState::Idle
+    );
+    assert!(!harness.in_turn());
+    assert_eq!(harness.turns_started(), 1);
+    assert_eq!(harness.turns_served(), 1);
+    assert!(harness.usage_for("m1").is_some());
+}
+
+#[test]
+fn session_resume_already_in_use_retries_until_lock_releases() {
+    let dir = TempDir::new().unwrap();
+    let log = dir.path().join("log");
+    let lock_file = dir.path().join("session.lock");
+    std::fs::write(&lock_file, "locked").unwrap();
+    let lock_releaser = lock_file.clone();
+    let handle = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(350));
+        let _ = std::fs::remove_file(lock_releaser);
+    });
+    let harness = MuseHarness::start(
+        env!("CARGO_BIN_EXE_fake_muse"),
+        Some("sess-lock-1"),
+        &[
+            ("ANYAGENTS_FAKE_MODE", "finish"),
+            ("ANYAGENTS_FAKE_LOG", log.to_str().unwrap()),
+            ("ANYAGENTS_FAKE_STEER", "1"),
+            ("ANYAGENTS_FAKE_MUSE_LOCK_FILE", lock_file.to_str().unwrap()),
+        ],
+    )
+    .expect("session/resume should succeed once transient lock clears");
+    handle.join().unwrap();
+    assert_eq!(harness.session_id().as_deref(), Some("sess-lock-1"));
+}
+
+#[test]
+fn session_resume_fails_closed_when_session_lock_stays_held() {
+    let dir = TempDir::new().unwrap();
+    let log = dir.path().join("log");
+    let lock_file = dir.path().join("session.lock");
+    std::fs::write(&lock_file, "locked").unwrap();
+    let err = match MuseHarness::start(
+        env!("CARGO_BIN_EXE_fake_muse"),
+        Some("sess-lock-held"),
+        &[
+            ("ANYAGENTS_FAKE_MODE", "finish"),
+            ("ANYAGENTS_FAKE_LOG", log.to_str().unwrap()),
+            ("ANYAGENTS_FAKE_STEER", "1"),
+            ("ANYAGENTS_FAKE_MUSE_LOCK_FILE", lock_file.to_str().unwrap()),
+        ],
+    ) {
+        Ok(_) => panic!("held session lock must fail closed"),
+        Err(err) => err,
+    };
+    let text = err.to_string().to_ascii_lowercase();
+    assert!(
+        text.contains("already in use"),
+        "unexpected error for held lock: {err}"
+    );
 }
