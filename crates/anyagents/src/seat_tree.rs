@@ -802,12 +802,17 @@ fn share_open(
             // legitimately hardlinked inside the same tree (uv's archive
             // layout hardlinks wheels across archive dirs). Refusing every
             // hardlink breaks any seat whose tooling populated its cache;
-            // the seat already owns these addresses.
+            // the seat already owns these addresses. Only the grant is
+            // skipped, and only for hardlinked cache files: single-link
+            // cache files still get read/write treatment for their mode.
             let needs_migration = !text.starts_with(".seat-")
                 && (text.starts_with("opencode.db")
                     || text == "serve-exit.jsonl"
                     || text.contains(".sqlite"));
-            if access.runtime_tree && !needs_migration {
+            if access.runtime_tree
+                && !needs_migration
+                && child.metadata().is_ok_and(|meta| meta.nlink() > 1)
+            {
                 continue;
             }
             grant(
