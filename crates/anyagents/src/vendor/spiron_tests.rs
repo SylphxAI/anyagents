@@ -1031,8 +1031,13 @@ impl SpironRig {
             .as_ref()
             .map(|s| s.live(&self.agent.id))
             .unwrap_or(None);
+        let cursor = self.store.delivered_cursor(&self.agent.id);
+        let next = self
+            .store
+            .next_undelivered(&self.agent.id)
+            .map(|m| m.map(|m| m.id.to_string()));
         format!(
-            "wire={:?} launched={launch} progress={progress} hold={hold} last_error={last_error} journal={journal} supervisor={supervisor:?}",
+            "wire={:?} launched={launch} progress={progress} hold={hold} last_error={last_error} journal={journal} cursor={cursor:?} next={next:?} supervisor={supervisor:?}",
             self.wire()
         )
     }
