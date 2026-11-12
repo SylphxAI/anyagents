@@ -537,9 +537,9 @@ fn backpressure_parks_until_the_input_activity_notification() {
         fn now_ms(&self) -> i64 {
             self.inner.now_ms()
         }
-        fn wait(&self, deadline: Option<i64>, woken: &AtomicBool) {
+        fn wait(&self, deadline: Option<i64>, woken: &Arc<AtomicBool>) -> bool {
             let _ = self.parked.send(self.calls.load(Ordering::SeqCst));
-            self.inner.wait(deadline, woken);
+            self.inner.wait(deadline, woken)
         }
         fn poke(&self) {
             self.inner.poke();
@@ -984,9 +984,9 @@ impl Clock for ObservedClock {
     fn now_ms(&self) -> i64 {
         self.clock.now_ms()
     }
-    fn wait(&self, deadline: Option<i64>, woken: &std::sync::atomic::AtomicBool) {
+    fn wait(&self, deadline: Option<i64>, woken: &Arc<std::sync::atomic::AtomicBool>) -> bool {
         self.waits.send((self.now_ms(), deadline)).unwrap();
-        self.clock.wait(deadline, woken);
+        self.clock.wait(deadline, woken)
     }
     fn poke(&self) {
         self.clock.poke();
@@ -1518,13 +1518,13 @@ fn deferred_pending_mail_precedes_interrupted_turn_recovery() {
         fn now_ms(&self) -> i64 {
             self.inner.now_ms()
         }
-        fn wait(&self, deadline: Option<i64>, woken: &AtomicBool) {
+        fn wait(&self, deadline: Option<i64>, woken: &Arc<AtomicBool>) -> bool {
             let snapshot = {
                 let probe = self.probe.lock().unwrap();
                 (probe.offers, probe.given.clone())
             };
             let _ = self.parked.send(snapshot);
-            self.inner.wait(deadline, woken);
+            self.inner.wait(deadline, woken)
         }
         fn poke(&self) {
             self.inner.poke();

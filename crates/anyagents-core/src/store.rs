@@ -2720,6 +2720,18 @@ impl Store {
         {
             return Ok(false);
         }
+        // Read-only precheck: an agent that cannot scale to zero (a running
+        // child, mail past its cursor, no completed turn) is reviewed on every
+        // idle pass and must not take the writer lock each time. The UPDATE
+        // below re-checks the same predicate under the lock.
+        let eligible: bool = self.read_conn().query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM agents WHERE {IDLE_RELEASE_PREDICATE})"),
+            [id.as_str()],
+            |row| row.get(0),
+        )?;
+        if !eligible {
+            return Ok(false);
+        }
         let (transitioned, parent_to_wake, silent_completion) = {
             let mut conn = self.conn();
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2767,29 +2779,7 @@ impl Store {
                 )
                 .optional()?;
             let updated = tx.execute(
-                "UPDATE agents
-                 SET state = 'idle'
-                 WHERE id = ?1
-                   AND state = 'running'
-                   AND NOT EXISTS (
-                       SELECT 1 FROM agents child
-                       WHERE child.parent_id = ?1
-                         AND child.state = 'running'
-                   )
-                   AND EXISTS (
-                       SELECT 1 FROM turn_recovery tr
-                       WHERE tr.agent_id = ?1
-                         AND tr.completed_seq >= tr.opened_seq
-                         AND tr.completed_seq > 0
-                         AND tr.completed_seq >= COALESCE((
-                             SELECT MAX(m.seq) FROM messages m WHERE m.agent_id = ?1
-                         ), 0)
-                   )
-                   AND COALESCE((
-                       SELECT mc.delivered_seq FROM mailbox_cursors mc WHERE mc.agent_id = ?1
-                   ), 0) >= COALESCE((
-                       SELECT MAX(m.seq) FROM messages m WHERE m.agent_id = ?1
-                   ), 0)",
+                &format!("UPDATE agents SET state = 'idle' WHERE {IDLE_RELEASE_PREDICATE}"),
                 [id.as_str()],
             )?;
             tx.commit()?;
@@ -7947,6 +7937,31 @@ fn message_exists(conn: &Connection, agent_id: &AgentId, seq: i64) -> Result<boo
     Ok(count == 1)
 }
 
+/// Rows of `agents` (bound as `?1`) that may scale to zero: running, no
+/// running child, the last turn completed past every mailbox line, and every
+/// line delivered. Shared by the read-only precheck and the guarded UPDATE.
+const IDLE_RELEASE_PREDICATE: &str = "id = ?1
+    AND state = 'running'
+    AND NOT EXISTS (
+        SELECT 1 FROM agents child
+        WHERE child.parent_id = ?1
+          AND child.state = 'running'
+    )
+    AND EXISTS (
+        SELECT 1 FROM turn_recovery tr
+        WHERE tr.agent_id = ?1
+          AND tr.completed_seq >= tr.opened_seq
+          AND tr.completed_seq > 0
+          AND tr.completed_seq >= COALESCE((
+              SELECT MAX(m.seq) FROM messages m WHERE m.agent_id = ?1
+          ), 0)
+    )
+    AND COALESCE((
+        SELECT mc.delivered_seq FROM mailbox_cursors mc WHERE mc.agent_id = ?1
+    ), 0) >= COALESCE((
+        SELECT MAX(m.seq) FROM messages m WHERE m.agent_id = ?1
+    ), 0)";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -9889,6 +9904,34 @@ mod tests {
             assert_eq!(store.agent(&agent.id).unwrap().state, "running");
             assert!(!store.complete_idle_agent(&agent.id).unwrap());
         }
+    }
+
+    #[test]
+    fn idle_release_review_of_an_ineligible_agent_never_takes_the_writer_lock() {
+        let (dir, store) = setup();
+        let parent = agent(&store, "parent");
+        store.set_agent_running(&parent.id, "/work").unwrap();
+        store.receive(&parent.id, Incoming::new("task")).unwrap();
+        store.note_delivered(&parent.id, 1).unwrap();
+        store.note_turn_completed(&parent.id).unwrap();
+        let mut new = NewAgent::new("child", "codex");
+        new.parent_id = Some(parent.id.clone());
+        let child = store.create_agent(new).unwrap();
+        store.set_agent_running(&child.id, "/work").unwrap();
+        // A peer holds the writer lock and this store never waits for it: any
+        // write attempt fails at once with SQLITE_BUSY.
+        store.set_lock_wait(Duration::ZERO, Duration::ZERO).unwrap();
+        let peer = Connection::open(dir.path().join("state.db")).unwrap();
+        peer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        // The parent has a running child: not eligible, answered by a read.
+        assert!(!store.complete_idle_agent(&parent.id).unwrap());
+        // The child never completed a turn: not eligible either.
+        assert!(!store.complete_idle_agent(&child.id).unwrap());
+        // An eligible agent still takes the guarded write once the lock frees.
+        peer.execute_batch("ROLLBACK").unwrap();
+        store.set_agent_state(&child.id, "paused").unwrap();
+        assert!(store.complete_idle_agent(&parent.id).unwrap());
+        assert_eq!(store.agent(&parent.id).unwrap().state, "idle");
     }
 
     #[test]
