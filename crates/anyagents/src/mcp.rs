@@ -832,7 +832,7 @@ struct AgentsArgs {
     /// - `"describe"` (read any agent's role & responsibility `description` / `instructions`, defaulting `name` to `"self"`, or update a target's `description` / `instructions` / `role` / `scope` — mutations require the target's Parent/Ancestor agent or an Admin)
     /// - `"steer"` / `"send"` (send/steer a follow-up `prompt` into an agent or sub-agent, waking it if archived)
     /// - `"wake"` / `"resume"` (wake an archived or paused agent, with optional `prompt`)
-    /// - `"reset_session"` / `"new_session"` (new session for a quiescent managed agent; preserves old pins and raw state)
+    /// - `"reset_session"` / `"new_session"` (new session for a quiescent managed agent; preserves old pins and raw state; an optional `prompt` is queued for the new session)
     /// - `"pause"` (pause an agent)
     /// - `"archive"` (any agent, including roots and labelled children, may self-archive; preserves browser profiles; auto-reaps clean/pushed managed Git worktrees while preserving dirty ones)
     /// - `"delete"` / `"kill"` (permanently delete a sub-agent or agent)
@@ -929,7 +929,7 @@ struct AgentsArgs {
     /// Optional internal virtual group name(s) (comma-separated, e.g. `"auth-migration"`) to atomically join both the parent and the spawned sub-agent into upon creation.
     #[serde(default)]
     group: Option<String>,
-    /// Task prompt or follow-up message when `action` is `"spawn"`, `"create"`, `"steer"`, `"send"`, or `"wake"`.
+    /// Task prompt or follow-up message when `action` is `"spawn"`, `"create"`, `"steer"`, `"send"`, `"wake"`, or `"reset_session"`.
     #[serde(default, alias = "text", alias = "message")]
     prompt: Option<String>,
     /// Suggested Telegram `@username` (or existing spare bot `@username`) when `action = "telegram_bot"` / `"bind_telegram"` / `"channel"`.
@@ -2107,13 +2107,35 @@ impl AgentMcp {
                         "`agents reset_session` requires `name` (or `agent`)".to_string()
                     })?;
                 let clean = target.strip_prefix("agent:").unwrap_or(target);
-                let result: serde_json::Value = self
+                let prompt = args
+                    .prompt
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+                let mut result: serde_json::Value = self
                     .client
                     .get(
                         &format!("/v1/agents/{clean}/session/reset"),
                         Some(b"{}".to_vec()),
                     )
                     .await?;
+                // A prompt given with a reset goes into the mailbox after the
+                // new generation exists, so the new session receives it when
+                // the agent next runs. It is never dropped silently.
+                if let Some(text) = prompt {
+                    let sent = self
+                        .send(Parameters(SendArgs {
+                            to: vec![target.to_string()],
+                            text,
+                            ..SendArgs::default()
+                        }))
+                        .await
+                        .map_err(|err| {
+                            format!("session was reset, but the prompt was not queued: {err}")
+                        })?;
+                    result["prompt"] = sent.0;
+                }
                 Ok(rmcp::handler::server::wrapper::Json(result))
             }
             "pause" => {

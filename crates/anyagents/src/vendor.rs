@@ -206,14 +206,25 @@ impl anyagents_harness::Harness for ContractHarness {
         self.inner.has_unconfirmed_idle_hold()
     }
 
-    fn peek_unconfirmed_request_ids(&self) -> Vec<String> {
-        self.inner.peek_unconfirmed_request_ids()
+    fn classify_unconfirmed_hold(
+        &self,
+    ) -> Result<Option<anyagents_harness::ReconciledUnconfirmed>, HarnessError> {
+        // The contract double keeps no session journal, so a hold can never be
+        // proven consumed or unconsumed: custody stays as it is.
+        match self
+            .inner
+            .read_unconfirmed_hold()
+            .map_err(HarnessError::Failed)?
+        {
+            None => Ok(None),
+            Some(_) => Err(HarnessError::Failed(
+                "input hold cannot be reconciled: this adapter has no session journal".into(),
+            )),
+        }
     }
 
-    fn reconcile_unconfirmed_for_recovery(
-        &mut self,
-    ) -> Result<Option<anyagents_harness::ReconciledUnconfirmed>, HarnessError> {
-        self.inner.reconcile_unconfirmed_for_recovery()
+    fn clear_unconfirmed_hold(&mut self) -> Result<(), HarnessError> {
+        self.inner.clear_unconfirmed_hold()
     }
 
     fn process_id(&self) -> Option<u32> {
@@ -1730,36 +1741,171 @@ fn start_spiron(
     Ok(harness)
 }
 
-fn populate_spiron_journal_reconciliation(
+/// Return which of `request_ids` the Spiron session journal proves consumed.
+/// Spiron journals an input as a `text` event with `data.role == "user"`;
+/// its content starts with the host's `anyagents-message:<id>` line. Being
+/// journaled is not enough: an input counts as consumed only when a model
+/// event (tool call, assistant text, reasoning, or equivalent) follows it in
+/// the same session. A journaled input with no model event after it (for
+/// example one followed only by `done`) was never processed. `session`
+/// restricts the search to the session the hold was written into; a hold
+/// recorded without one is matched against every session in this state
+/// directory (message IDs are unique). A missing journal means Spiron never
+/// recorded anything here. An unreadable journal is an error: nothing is
+/// assumed either way.
+fn spiron_journal_consumed(
     config_dir: &Path,
-    session_id: &str,
-    rec: &mut anyagents_harness::ReconciledUnconfirmed,
-) {
-    let db_path = config_dir.join("sessions.sqlite3");
-    if !db_path.is_file() {
-        return;
+    session: Option<&str>,
+    request_ids: &[String],
+) -> Result<std::collections::HashSet<String>, String> {
+    let mut consumed = std::collections::HashSet::new();
+    if request_ids.is_empty() {
+        return Ok(consumed);
     }
-    let Some(conn) = crate::seat_tree::open_readonly_seat_sqlite(&db_path) else {
-        return;
-    };
-    let Ok(mut stmt) =
-        conn.prepare("SELECT event FROM session_entries WHERE session_id = ?1 ORDER BY idx ASC")
-    else {
-        return;
-    };
-    let Ok(rows) = stmt.query_map([session_id], |row| row.get::<_, String>(0)) else {
-        return;
-    };
-    let events: Vec<String> = rows.flatten().collect();
-    for id in &rec.request_ids {
-        let marker = format!("anyagents-message:{id}");
-        if events
-            .iter()
-            .any(|ev| ev.contains(&marker) || ev.contains(id))
+    let db_path = config_dir.join("sessions.sqlite3");
+    match std::fs::symlink_metadata(&db_path) {
+        Ok(meta) if meta.file_type().is_file() => {}
+        Ok(_) => return Err("Spiron session journal is not a regular file".into()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(consumed),
+        Err(err) => return Err(format!("cannot read Spiron session journal: {err}")),
+    }
+    let conn = crate::seat_tree::open_readonly_seat_sqlite(&db_path)
+        .ok_or_else(|| "cannot open Spiron session journal".to_string())?;
+    // The latest user-input entry per (session, wanted id).
+    let user_sql = "SELECT session_id, idx, json_extract(event, '$.data.content')
+         FROM session_entries
+         WHERE (?1 IS NULL OR session_id = ?1)
+           AND json_extract(event, '$.type') = 'text'
+           AND json_extract(event, '$.data.role') = 'user'";
+    let mut latest_user: std::collections::HashMap<(String, String), i64> =
+        std::collections::HashMap::new();
+    {
+        let mut stmt = conn
+            .prepare(user_sql)
+            .map_err(|err| format!("cannot read Spiron session journal: {err}"))?;
+        let rows = stmt
+            .query_map([session], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .map_err(|err| format!("cannot read Spiron session journal: {err}"))?;
+        let wanted: std::collections::HashSet<&str> =
+            request_ids.iter().map(String::as_str).collect();
+        for row in rows {
+            let (sess, idx, content) =
+                row.map_err(|err| format!("cannot read Spiron session journal: {err}"))?;
+            let Some(content) = content else { continue };
+            let first = content.split('\n').next().unwrap_or_default();
+            let Some(id) = first.strip_prefix(anyagents_harness::MESSAGE_MARKER_PREFIX) else {
+                continue;
+            };
+            if !wanted.contains(id) {
+                continue;
+            }
+            let entry = latest_user.entry((sess, id.to_string())).or_insert(idx);
+            *entry = (*entry).max(idx);
+        }
+    }
+    // The latest model event per session. Tool results, user inputs and
+    // `done` never count: they prove nothing about processing this input.
+    let model_sql = "SELECT session_id, MAX(idx) FROM session_entries
+         WHERE (?1 IS NULL OR session_id = ?1)
+           AND (json_extract(event, '$.type') IN
+                ('tool_call', 'assistant', 'text_delta', 'reasoning', 'message', 'assistant_text')
+                OR (json_extract(event, '$.type') = 'text'
+                    AND json_extract(event, '$.data.role') = 'assistant'))
+         GROUP BY session_id";
+    let mut latest_model: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    {
+        let mut stmt = conn
+            .prepare(model_sql)
+            .map_err(|err| format!("cannot read Spiron session journal: {err}"))?;
+        let rows = stmt
+            .query_map([session], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(|err| format!("cannot read Spiron session journal: {err}"))?;
+        for row in rows {
+            let (sess, idx) =
+                row.map_err(|err| format!("cannot read Spiron session journal: {err}"))?;
+            latest_model.insert(sess, idx);
+        }
+    }
+    for ((sess, id), user_idx) in latest_user {
+        if latest_model
+            .get(&sess)
+            .is_some_and(|model_idx| *model_idx > user_idx)
         {
-            rec.journal_committed_ids.push(id.clone());
-        } else {
-            rec.journal_missing_ids.push(id.clone());
+            consumed.insert(id);
+        }
+    }
+    Ok(consumed)
+}
+
+/// Spiron admits one turn per session under an owner-fenced lease, and a
+/// lease left by a host that stopped mid-turn blocks every turn until it
+/// expires; at that point Spiron itself closes the stranded turn as
+/// interrupted. Return the expiry (ms since epoch) of a lease on `session`
+/// that is still live at `now_ms`, `None` when admission is free.
+fn spiron_live_lease_expiry(
+    config_dir: &Path,
+    session: &str,
+    now_ms: i64,
+) -> Result<Option<i64>, String> {
+    let db_path = config_dir.join("sessions.sqlite3");
+    match std::fs::symlink_metadata(&db_path) {
+        Ok(meta) if meta.file_type().is_file() => {}
+        Ok(_) => return Err("Spiron session store is not a regular file".into()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(format!("cannot read Spiron session store: {err}")),
+    }
+    let conn = crate::seat_tree::open_readonly_seat_sqlite(&db_path)
+        .ok_or_else(|| "cannot open Spiron session store".to_string())?;
+    let expiry: Option<i64> = conn
+        .query_row(
+            "SELECT expires_at_ms FROM session_leases WHERE session_id = ?1",
+            [session],
+            |row| row.get(0),
+        )
+        .map(Some)
+        .or_else(|err| match err {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            err => Err(format!("cannot read Spiron session lease: {err}")),
+        })?;
+    Ok(expiry.filter(|expires| *expires > now_ms))
+}
+
+/// Before this process's first turn, defer delivery while a previous host's
+/// lease still owns the session's turn admission, rather than writing an
+/// input Spiron would refuse. Unreadable admission state fails closed.
+fn spiron_admission(harness: &StreamHarness) -> Result<bool, HarnessError> {
+    if harness.admission_verified() || harness.has_unconfirmed_idle_hold() {
+        // Verified, or the harness itself defers everything behind a hold.
+        return Ok(true);
+    }
+    if harness.new_turns_deferred() {
+        return Ok(false);
+    }
+    let (Some(dir), Some(session)) = (harness.state_dir(), harness.session_id()) else {
+        // No session announced yet: Spiron has not finished starting.
+        return Ok(true);
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    match spiron_live_lease_expiry(&dir, &session, now_ms).map_err(HarnessError::Failed)? {
+        None => {
+            harness.mark_admission_verified();
+            Ok(true)
+        }
+        Some(expires_at_ms) => {
+            let wait = Duration::from_millis((expires_at_ms - now_ms).max(0) as u64 + 1);
+            harness.defer_new_turns_until(std::time::Instant::now() + wait);
+            Ok(false)
         }
     }
 }
@@ -1791,11 +1937,15 @@ impl Harness for VendorHarness {
             Self::Omp(harness, _) => harness.deliver(message),
             Self::Dsh(harness, _) => harness.deliver(message),
             Self::Grok(harness, _) => harness.deliver(message),
-            Self::Spiron(harness, _, _) => harness.deliver(message, &serde_json::json!({
-                "type": "user",
-                "request_id": message.id,
-                "text": anyagents_harness::compose_message(&message.id, &message.context, &message.text),
-            })),
+            Self::Spiron(harness, _, _) => match spiron_admission(harness) {
+                Ok(true) => harness.deliver(message, &serde_json::json!({
+                    "type": "user",
+                    "request_id": message.id,
+                    "text": anyagents_harness::compose_message(&message.id, &message.context, &message.text),
+                })),
+                Ok(false) => Ok(DeliverOutcome::Deferred),
+                Err(err) => Err(err),
+            },
             Self::Contract(harness) => harness.deliver(message),
         };
         self.sync_session().map_err(HarnessError::Failed)?;
@@ -1996,38 +2146,64 @@ impl Harness for VendorHarness {
         }
     }
 
-    fn peek_unconfirmed_request_ids(&self) -> Vec<String> {
+    fn classify_unconfirmed_hold(
+        &self,
+    ) -> Result<Option<anyagents_harness::ReconciledUnconfirmed>, HarnessError> {
         match self {
-            Self::Spiron(harness, _, _) => harness.peek_unconfirmed_request_ids(),
-            Self::Contract(harness) => harness.peek_unconfirmed_request_ids(),
-            _ => Vec::new(),
+            Self::Spiron(harness, _, _) => {
+                let Some(hold) = harness
+                    .read_unconfirmed_hold()
+                    .map_err(HarnessError::Failed)?
+                else {
+                    return Ok(None);
+                };
+                let dir = harness.state_dir().ok_or_else(|| {
+                    HarnessError::Failed("Spiron input hold has no state directory".into())
+                })?;
+                let consumed =
+                    spiron_journal_consumed(&dir, hold.session_id.as_deref(), &hold.request_ids)
+                        .map_err(HarnessError::Failed)?;
+                let (consumed_ids, unconsumed_ids) = hold
+                    .request_ids
+                    .iter()
+                    .cloned()
+                    .partition(|id| consumed.contains(id));
+                Ok(Some(anyagents_harness::ReconciledUnconfirmed {
+                    turn_id: hold.turn_id,
+                    request_ids: hold.request_ids,
+                    consumed_ids,
+                    unconsumed_ids,
+                    hold_lost: hold.lost,
+                }))
+            }
+            Self::Contract(harness) => harness.classify_unconfirmed_hold(),
+            _ => Ok(None),
         }
     }
 
-    fn reconcile_unconfirmed_for_recovery(
-        &mut self,
-    ) -> Result<Option<anyagents_harness::ReconciledUnconfirmed>, HarnessError> {
+    fn classify_request_ids(
+        &self,
+        request_ids: &[String],
+    ) -> Result<std::collections::HashSet<String>, HarnessError> {
         match self {
-            Self::Spiron(harness, marker, _) => {
-                let dir = harness.state_dir();
-                let session_id = harness.session_id().or_else(|| {
-                    std::fs::read_to_string(marker)
-                        .ok()
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                });
-                let Some(mut rec) = harness.reconcile_unconfirmed_for_recovery()? else {
-                    return Ok(None);
-                };
-                if let (Some(dir), Some(sid)) = (dir, session_id)
-                    && !rec.request_ids.is_empty()
-                {
-                    populate_spiron_journal_reconciliation(&dir, &sid, &mut rec);
-                }
-                Ok(Some(rec))
+            Self::Spiron(harness, _, _) => {
+                let dir = harness.state_dir().ok_or_else(|| {
+                    HarnessError::Failed("Spiron input hold has no state directory".into())
+                })?;
+                spiron_journal_consumed(&dir, None, request_ids).map_err(HarnessError::Failed)
             }
-            Self::Contract(harness) => harness.reconcile_unconfirmed_for_recovery(),
-            _ => Ok(None),
+            Self::Contract(harness) => harness.classify_request_ids(request_ids),
+            _ => Err(HarnessError::Failed(
+                "cannot reconcile inputs: this adapter has no session journal".into(),
+            )),
+        }
+    }
+
+    fn clear_unconfirmed_hold(&mut self) -> Result<(), HarnessError> {
+        match self {
+            Self::Spiron(harness, _, _) => harness.clear_unconfirmed_hold(),
+            Self::Contract(harness) => harness.clear_unconfirmed_hold(),
+            _ => Ok(()),
         }
     }
 

@@ -202,6 +202,8 @@ pub type Launch<H> = Arc<dyn Fn(LaunchRequest) -> Result<H, String> + Send + Syn
 /// How often a worker with an empty mailbox looks again. One store read, so
 /// `flush` and a restarted process never leave a line waiting for an arrival.
 const IDLE_REVIEW_MS: i64 = 250;
+/// Pause between attempts to reconcile an input hold whose state is unreadable.
+const HOLD_RETRY_MS: i64 = 5_000;
 
 /// Supervisor view of one agent. Ages stay on the mailbox; this is the process.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -638,6 +640,7 @@ fn run_agent<H: Harness + 'static>(
         written: 0,
         turns_recorded: 0,
         pending_recovery: false,
+        recovery_before_mail: None,
         completed_turn_in_session: false,
         quota_started_at: None,
         pending_switch_started_at: None,
@@ -702,6 +705,10 @@ struct Session<H: Harness> {
     /// so an open turn interrupted by the previous process's exit is resumed
     /// with a `[Recovery]` prompt if no new mailbox message wakes it first.
     pending_recovery: bool,
+    /// Set when an unconfirmed input hold was reconciled into an open turn:
+    /// its `[Recovery]` goes out before any mailbox message, including the
+    /// held inputs returned to the mailbox for redelivery.
+    recovery_before_mail: Option<anyagents_harness::ReconciledUnconfirmed>,
     /// Set once at least one turn has completed during this session, enabling
     /// automatic scale-to-zero (`idle`) for any agent after a completed turn.
     completed_turn_in_session: bool,
@@ -1076,6 +1083,16 @@ impl<H: Harness + 'static> Session<H> {
     ///
     /// `true` when a second loop already holds the agent.
     fn deliver_once(&mut self) -> bool {
+        // Custody first: a hold makes the harness look mid-turn, which would
+        // otherwise park a pending switch forever behind a turn that no
+        // longer exists on the wire.
+        if !self.reconcile_unconfirmed_hold() {
+            self.publish();
+            self.inner
+                .clock
+                .wait(Some(self.inner.clock.now_ms() + HOLD_RETRY_MS), &self.woken);
+            return false;
+        }
         if self.try_apply_pending_switch() {
             return false;
         }
@@ -1097,13 +1114,19 @@ impl<H: Harness + 'static> Session<H> {
             self.inner.clock.wait(Some(wait_until), &self.woken);
             return false;
         }
-        if self.pending_recovery
-            && self
-                .delivery
-                .as_ref()
-                .is_some_and(|d| d.harness().has_unconfirmed_hold())
-        {
+        // An interrupted turn reconstructed from a reconciled hold is resumed
+        // before any mailbox message, including the held inputs that went back
+        // to the mailbox for redelivery.
+        if self.pending_recovery && self.recovery_before_mail.is_some() {
             if self.recover_once() {
+                return false;
+            }
+            if self.recovery_before_mail.is_some() {
+                self.publish();
+                self.inner.clock.wait(
+                    Some(self.inner.clock.now_ms() + IDLE_REVIEW_MS),
+                    &self.woken,
+                );
                 return false;
             }
             if !self.pending_recovery {
@@ -1380,24 +1403,103 @@ impl<H: Harness + 'static> Session<H> {
         is_transient_turn_fault(&fault).then_some(fault)
     }
 
+    /// Reconcile an unconfirmed input hold, re-read from the live harness on
+    /// every call: classify each held input against the vendor's journal,
+    /// record custody durably (consumed inputs form the interrupted turn,
+    /// unconsumed ones return to the mailbox for one redelivery), then release
+    /// the hold. A lost (0-byte truncated) hold carries no IDs: custody is
+    /// enumerated from the host mailbox and classified against the journal
+    /// instead, so a consumed input is never re-presented. Unreadable state
+    /// changes nothing. Returns `false` while a hold remains.
+    fn reconcile_unconfirmed_hold(&mut self) -> bool {
+        let Some(delivery) = self.delivery.as_mut() else {
+            return true;
+        };
+        if !delivery.harness().has_unconfirmed_hold() {
+            return true;
+        }
+        let mut rec = match delivery.harness().classify_unconfirmed_hold() {
+            Ok(Some(rec)) => rec,
+            Ok(None) => return true,
+            Err(err) => {
+                self.last_error = Some(format!(
+                    "reconcile unconfirmed input: {}",
+                    harness_error_text(err)
+                ));
+                return false;
+            }
+        };
+        if rec.hold_lost && rec.request_ids.is_empty() {
+            let candidates = match delivery.store().held_custody_candidates(&self.id) {
+                Ok(candidates) => candidates,
+                Err(err) => {
+                    self.last_error = Some(format!("reconcile unconfirmed input: {err}"));
+                    return false;
+                }
+            };
+            if !candidates.is_empty() {
+                let consumed = match delivery.harness().classify_request_ids(&candidates) {
+                    Ok(consumed) => consumed,
+                    Err(err) => {
+                        self.last_error = Some(format!(
+                            "reconcile unconfirmed input: {}",
+                            harness_error_text(err)
+                        ));
+                        return false;
+                    }
+                };
+                rec.request_ids = candidates.clone();
+                rec.consumed_ids = candidates
+                    .iter()
+                    .filter(|id| consumed.contains(*id))
+                    .cloned()
+                    .collect();
+                rec.unconsumed_ids = candidates
+                    .iter()
+                    .filter(|id| !consumed.contains(*id))
+                    .cloned()
+                    .collect();
+            }
+            rec.hold_lost = false;
+        }
+        if let Err(err) = delivery.store().reconcile_unconfirmed_custody(
+            &self.id,
+            &rec.consumed_ids,
+            &rec.unconsumed_ids,
+        ) {
+            self.last_error = Some(format!("reconcile unconfirmed input: {err}"));
+            return false;
+        }
+        // Custody is durable now. A crash before the release re-applies the
+        // same classification, which changes nothing.
+        if let Err(err) = delivery.harness_mut().clear_unconfirmed_hold() {
+            self.last_error = Some(format!(
+                "reconcile unconfirmed input: {}",
+                harness_error_text(err)
+            ));
+            return false;
+        }
+        if self
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.starts_with("reconcile unconfirmed input:"))
+        {
+            self.last_error = None;
+        }
+        self.pending_recovery = true;
+        self.recovery_before_mail = Some(rec);
+        true
+    }
+
     fn recover_once(&mut self) -> bool {
         let outcome = {
             let Some(delivery) = self.delivery.as_mut() else {
                 self.pending_recovery = false;
                 return false;
             };
-            let has_hold = delivery.harness().has_unconfirmed_hold();
-            if has_hold {
-                let held_ids = delivery.harness().peek_unconfirmed_request_ids();
-                if !held_ids.is_empty()
-                    && let Err(err) = delivery
-                        .store()
-                        .promote_messages_to_open_turn(&self.id, &held_ids)
-                {
-                    self.last_error = Some(format!("read open turn for recovery: {err}"));
-                    return false;
-                }
-            } else if !matches!(delivery.store().next_undelivered(&self.id), Ok(None)) {
+            if self.recovery_before_mail.is_none()
+                && !matches!(delivery.store().next_undelivered(&self.id), Ok(None))
+            {
                 // Idle also covers deferred or passive mail. Recovery must not
                 // overtake any queued message, and a failed read is not emptiness.
                 return false;
@@ -1409,43 +1511,28 @@ impl<H: Harness + 'static> Session<H> {
                     return false;
                 }
             };
-            let reconciled = if has_hold {
-                match delivery.harness_mut().reconcile_unconfirmed_for_recovery() {
-                    Ok(rec) => Ok(rec),
-                    Err(anyagents_harness::HarnessError::Dead) => {
-                        Err(anyagents_agent::Error::HarnessDown)
-                    }
-                    Err(anyagents_harness::HarnessError::Failed(reason)) => {
-                        Err(anyagents_agent::Error::HarnessFailed(reason))
-                    }
-                }
-            } else {
-                Ok(None)
-            };
-            match (reconciled, open) {
-                (Err(err), _) => Err(err),
-                (Ok(_), None) => {
+            match open {
+                None => {
                     self.pending_recovery = false;
-                    if self
-                        .last_error
-                        .as_deref()
-                        .is_some_and(|error| error.starts_with("read open turn for recovery:"))
-                    {
-                        self.last_error = None;
-                    }
-                    if has_hold {
+                    self.recovery_before_mail = None;
+                    if self.last_error.as_deref().is_some_and(|error| {
+                        error.starts_with("read open turn for recovery:")
+                            || error.starts_with("reconcile unconfirmed input:")
+                    }) {
                         self.last_error = None;
                     }
                     return false;
                 }
-                (Ok(rec), Some(open)) => {
-                    delivery.recover_open_turn_with_reconciliation(&open, rec.as_ref())
-                }
+                Some(open) => delivery.recover_open_turn_with_reconciliation(
+                    &open,
+                    self.recovery_before_mail.as_ref(),
+                ),
             }
         };
         match outcome {
             Ok(DeliverOutcome::Accepted { .. }) => {
                 self.pending_recovery = false;
+                self.recovery_before_mail = None;
                 self.last_error = None;
                 self.written = self.written.saturating_add(1);
                 false
@@ -1507,6 +1594,13 @@ impl<H: Harness + 'static> Session<H> {
             Some(self.inner.clock.now_ms() + IDLE_REVIEW_MS),
             &self.woken,
         );
+    }
+}
+
+fn harness_error_text(err: anyagents_harness::HarnessError) -> String {
+    match err {
+        anyagents_harness::HarnessError::Dead => "harness process exited".to_string(),
+        anyagents_harness::HarnessError::Failed(reason) => reason,
     }
 }
 
@@ -2113,6 +2207,7 @@ mod persistence_tests {
             written: 0,
             turns_recorded: 0,
             pending_recovery: true,
+            recovery_before_mail: None,
             completed_turn_in_session: false,
             quota_started_at: None,
             pending_switch_started_at: None,
@@ -2408,6 +2503,7 @@ mod persistence_tests {
             written: 0,
             turns_recorded: 0,
             pending_recovery: false,
+            recovery_before_mail: None,
             completed_turn_in_session: false,
             quota_started_at: None,
             pending_switch_started_at: None,

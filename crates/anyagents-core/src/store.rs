@@ -570,6 +570,15 @@ pub struct OutboundEffect {
     pub sent_at_ms: i64,
 }
 
+/// Where each held input ended up after an unconfirmed input hold was
+/// reconciled: inside the interrupted turn, or back in the mailbox for one
+/// ordinary redelivery. Both lists are in mailbox order.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HeldInputCustody {
+    pub in_turn: Vec<String>,
+    pub redeliver: Vec<String>,
+}
+
 /// An open turn that a harness accepted (`opened_seq > completed_seq`) and had
 /// not yet completed when its process stopped.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -4094,6 +4103,92 @@ impl Store {
         Ok(())
     }
 
+    /// Mailbox message IDs whose custody a lost (0-byte truncated) hold record
+    /// must cover: every input of the open interrupted turn, followed by
+    /// every undelivered message, in mailbox order.
+    pub fn held_custody_candidates(&self, agent_id: &AgentId) -> Result<Vec<String>, Error> {
+        let mut ids = Vec::new();
+        if let Some(open) = self.open_turn(agent_id)? {
+            ids.extend(open.messages.iter().map(|m| m.id.to_string()));
+        }
+        let conn = self.read_conn();
+        agent_by_id(&conn, agent_id)?;
+        let delivered = cursor(&conn, agent_id)?;
+        let mut stmt = conn
+            .prepare("SELECT id FROM messages WHERE agent_id = ?1 AND seq > ?2 ORDER BY seq ASC")?;
+        let mut rows = stmt.query(params![agent_id.as_str(), delivered])?;
+        while let Some(row) = rows.next()? {
+            ids.push(row.get::<_, String>(0)?);
+        }
+        Ok(ids)
+    }
+
+    /// Record the classification of an unconfirmed input hold in one
+    /// transaction. Inputs the vendor session consumed stay delivered and form
+    /// the interrupted turn (resumed with `[Recovery]`, never replayed).
+    /// Unconsumed inputs ordered after every consumed one are rewound for
+    /// ordinary redelivery; an unconsumed input ordered before a consumed one
+    /// cannot be rewound without replaying that consumed input, so it stays in
+    /// the interrupted turn and is presented by `[Recovery]` instead. IDs with
+    /// no mailbox row (synthetic recovery prompts) carry no custody. Applying
+    /// the same classification again changes nothing.
+    pub fn reconcile_unconfirmed_custody(
+        &self,
+        agent_id: &AgentId,
+        consumed: &[String],
+        unconsumed: &[String],
+    ) -> Result<HeldInputCustody, Error> {
+        let mut conn = self.conn();
+        // Fail closed before touching custody: running the custody
+        // transaction on a connection that already holds one (for example
+        // after a panicked writer left it open) must change nothing.
+        if !conn.is_autocommit() {
+            return Err(Error::TransactionActive);
+        }
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        agent_by_id(&tx, agent_id)?;
+        let seq_of = |id: &String| -> Result<Option<i64>, Error> {
+            Ok(tx
+                .query_row(
+                    "SELECT seq FROM messages WHERE agent_id = ?1 AND id = ?2",
+                    params![agent_id.as_str(), id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?)
+        };
+        let mut in_turn = Vec::new();
+        let mut max_consumed: Option<i64> = None;
+        for id in consumed {
+            if let Some(seq) = seq_of(id)? {
+                max_consumed = Some(max_consumed.map_or(seq, |cur| cur.max(seq)));
+                in_turn.push((id.clone(), seq));
+            }
+        }
+        let mut redeliver = Vec::new();
+        for id in unconsumed {
+            if let Some(seq) = seq_of(id)? {
+                if max_consumed.is_some_and(|max| seq < max) {
+                    in_turn.push((id.clone(), seq));
+                } else {
+                    redeliver.push((id.clone(), seq));
+                }
+            }
+        }
+        in_turn.sort_by_key(|(_, seq)| *seq);
+        redeliver.sort_by_key(|(_, seq)| *seq);
+        if let (Some((_, min_seq)), Some((_, max_seq))) = (in_turn.first(), in_turn.last()) {
+            promote_seqs_to_open_turn(&tx, agent_id, *min_seq, *max_seq)?;
+        }
+        if let Some((_, first)) = redeliver.first() {
+            rewind_delivery_custody(&tx, agent_id, *first)?;
+        }
+        tx.commit()?;
+        Ok(HeldInputCustody {
+            in_turn: in_turn.into_iter().map(|(id, _)| id).collect(),
+            redeliver: redeliver.into_iter().map(|(id, _)| id).collect(),
+        })
+    }
+
     /// Ensure message IDs from a reconciled external input hold are recorded in
     /// `turn_recovery` as an open interrupted turn (and past `delivered_seq`)
     /// so recovery resumes them with `[Recovery]` rather than raw replay.
@@ -4124,30 +4219,7 @@ impl Store {
         let (Some(&min_seq), Some(&max_seq)) = (seqs.iter().min(), seqs.iter().max()) else {
             return Ok(());
         };
-        let cur = cursor(&tx, agent_id)?;
-        let now = now_ms();
-        if max_seq > cur {
-            tx.execute(
-                "INSERT INTO mailbox_cursors (agent_id, delivered_seq) VALUES (?1, ?2)
-                 ON CONFLICT(agent_id) DO UPDATE SET delivered_seq = MAX(delivered_seq, ?2)",
-                params![agent_id.as_str(), max_seq],
-            )?;
-            tx.execute(
-                "UPDATE messages
-                 SET delivered_at_ms = COALESCE(delivered_at_ms, ?1)
-                 WHERE agent_id = ?2 AND seq > ?3 AND seq <= ?4",
-                params![now, agent_id.as_str(), cur, max_seq],
-            )?;
-        }
-        let completed_floor = (min_seq - 1).max(0);
-        tx.execute(
-            "INSERT INTO turn_recovery (agent_id, opened_seq, completed_seq, recovery_count, opened_at_ms)
-             VALUES (?1, ?2, ?3, 0, ?4)
-             ON CONFLICT(agent_id) DO UPDATE SET
-                 opened_seq = MAX(turn_recovery.opened_seq, ?2),
-                 completed_seq = MIN(turn_recovery.completed_seq, ?3)",
-            params![agent_id.as_str(), max_seq, completed_floor, now],
-        )?;
+        promote_seqs_to_open_turn(&tx, agent_id, min_seq, max_seq)?;
         tx.commit()?;
         Ok(())
     }
@@ -4180,25 +4252,7 @@ impl Store {
             }
         }
         if let Some(first_reclaimed_seq) = min_seq {
-            let rewind_to = (first_reclaimed_seq - 1).max(0);
-            tx.execute(
-                "UPDATE mailbox_cursors
-                 SET delivered_seq = MIN(delivered_seq, ?1)
-                 WHERE agent_id = ?2",
-                params![rewind_to, agent_id.as_str()],
-            )?;
-            tx.execute(
-                "UPDATE messages
-                 SET delivered_at_ms = NULL
-                 WHERE agent_id = ?1 AND seq >= ?2",
-                params![agent_id.as_str(), first_reclaimed_seq],
-            )?;
-            tx.execute(
-                "UPDATE turn_recovery
-                 SET opened_seq = MIN(opened_seq, ?1)
-                 WHERE agent_id = ?2",
-                params![rewind_to, agent_id.as_str()],
-            )?;
+            rewind_delivery_custody(&tx, agent_id, first_reclaimed_seq)?;
         }
         tx.commit()?;
         Ok(())
@@ -7454,6 +7508,70 @@ fn next_seq(conn: &Connection, agent_id: &AgentId) -> Result<i64, Error> {
     Ok(seq)
 }
 
+/// Mark `min_seq..=max_seq` delivered and record them as the open
+/// interrupted turn. Monotonic, so repeating it is a no-op.
+fn promote_seqs_to_open_turn(
+    tx: &Connection,
+    agent_id: &AgentId,
+    min_seq: i64,
+    max_seq: i64,
+) -> Result<(), Error> {
+    let cur = cursor(tx, agent_id)?;
+    let now = now_ms();
+    if max_seq > cur {
+        tx.execute(
+            "INSERT INTO mailbox_cursors (agent_id, delivered_seq) VALUES (?1, ?2)
+             ON CONFLICT(agent_id) DO UPDATE SET delivered_seq = MAX(delivered_seq, ?2)",
+            params![agent_id.as_str(), max_seq],
+        )?;
+        tx.execute(
+            "UPDATE messages
+             SET delivered_at_ms = COALESCE(delivered_at_ms, ?1)
+             WHERE agent_id = ?2 AND seq > ?3 AND seq <= ?4",
+            params![now, agent_id.as_str(), cur, max_seq],
+        )?;
+    }
+    let completed_floor = (min_seq - 1).max(0);
+    tx.execute(
+        "INSERT INTO turn_recovery (agent_id, opened_seq, completed_seq, recovery_count, opened_at_ms)
+         VALUES (?1, ?2, ?3, 0, ?4)
+         ON CONFLICT(agent_id) DO UPDATE SET
+             opened_seq = MAX(turn_recovery.opened_seq, ?2),
+             completed_seq = MIN(turn_recovery.completed_seq, ?3)",
+        params![agent_id.as_str(), max_seq, completed_floor, now],
+    )?;
+    Ok(())
+}
+
+/// Return mailbox custody of every message from `first_seq` onward so the
+/// delivery loop hands them to the harness again.
+fn rewind_delivery_custody(
+    tx: &Connection,
+    agent_id: &AgentId,
+    first_seq: i64,
+) -> Result<(), Error> {
+    let rewind_to = (first_seq - 1).max(0);
+    tx.execute(
+        "UPDATE mailbox_cursors
+         SET delivered_seq = MIN(delivered_seq, ?1)
+         WHERE agent_id = ?2",
+        params![rewind_to, agent_id.as_str()],
+    )?;
+    tx.execute(
+        "UPDATE messages
+         SET delivered_at_ms = NULL
+         WHERE agent_id = ?1 AND seq >= ?2",
+        params![agent_id.as_str(), first_seq],
+    )?;
+    tx.execute(
+        "UPDATE turn_recovery
+         SET opened_seq = MIN(opened_seq, ?1)
+         WHERE agent_id = ?2",
+        params![rewind_to, agent_id.as_str()],
+    )?;
+    Ok(())
+}
+
 fn cursor(conn: &Connection, agent_id: &AgentId) -> Result<i64, Error> {
     let found = conn
         .query_row(
@@ -10465,6 +10583,186 @@ mod tests {
         let sleep_after = crate::learned_memory::read_sleep_state(&root);
         assert_eq!(sleep_after.last_inbound_seq, 1);
         assert_eq!(sleep_after.consolidated_topics, 1);
+    }
+
+    fn delivered_message(store: &Store, agent: &AgentId, text: &str) -> Message {
+        let ReceiveOutcome::New(message) = store.receive(agent, Incoming::new(text)).unwrap()
+        else {
+            panic!("expected new message");
+        };
+        store.note_delivered(agent, message.seq).unwrap();
+        message
+    }
+
+    fn custody_snapshot(store: &Store, agent: &AgentId) -> (i64, Option<OpenTurn>, Option<String>) {
+        (
+            store.delivered_cursor(agent).unwrap(),
+            store.open_turn(agent).unwrap(),
+            store
+                .next_undelivered(agent)
+                .unwrap()
+                .map(|m| m.id.to_string()),
+        )
+    }
+
+    #[test]
+    fn reconciled_hold_keeps_consumed_in_turn_and_returns_unconsumed_suffix_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store.create_agent(NewAgent::new("held", "spiron")).unwrap();
+        let turn = delivered_message(&store, &agent.id, "turn input");
+        let steer = delivered_message(&store, &agent.id, "steer received");
+        let lost = delivered_message(&store, &agent.id, "steer never received");
+
+        let custody = store
+            .reconcile_unconfirmed_custody(
+                &agent.id,
+                &[turn.id.to_string(), steer.id.to_string()],
+                &[
+                    lost.id.to_string(),
+                    "recovery_without_mailbox_row".to_string(),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            custody,
+            HeldInputCustody {
+                in_turn: vec![turn.id.to_string(), steer.id.to_string()],
+                redeliver: vec![lost.id.to_string()],
+            }
+        );
+        let (cursor, open, next) = custody_snapshot(&store, &agent.id);
+        assert_eq!(cursor, steer.seq, "consumed inputs stay delivered");
+        let open = open.expect("consumed inputs form the interrupted turn");
+        let ids: Vec<_> = open.messages.iter().map(|m| m.id.to_string()).collect();
+        assert_eq!(ids, vec![turn.id.to_string(), steer.id.to_string()]);
+        assert_eq!(
+            next.as_deref(),
+            Some(lost.id.as_str()),
+            "unconsumed returns once"
+        );
+
+        // Idempotent: the same classification applied again changes nothing.
+        let before = custody_snapshot(&store, &agent.id);
+        let again = store
+            .reconcile_unconfirmed_custody(
+                &agent.id,
+                &[turn.id.to_string(), steer.id.to_string()],
+                &[lost.id.to_string()],
+            )
+            .unwrap();
+        assert_eq!(again.redeliver, vec![lost.id.to_string()]);
+        assert_eq!(custody_snapshot(&store, &agent.id), before);
+    }
+
+    #[test]
+    fn reconciled_hold_never_rewinds_below_a_consumed_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store.create_agent(NewAgent::new("held", "spiron")).unwrap();
+        let unread = delivered_message(&store, &agent.id, "first, never received");
+        let read = delivered_message(&store, &agent.id, "second, received");
+
+        let custody = store
+            .reconcile_unconfirmed_custody(
+                &agent.id,
+                &[read.id.to_string()],
+                &[unread.id.to_string()],
+            )
+            .unwrap();
+        assert!(
+            custody.redeliver.is_empty(),
+            "rewinding would replay {}",
+            read.id
+        );
+        assert_eq!(
+            custody.in_turn,
+            vec![unread.id.to_string(), read.id.to_string()]
+        );
+        let (cursor, open, next) = custody_snapshot(&store, &agent.id);
+        assert_eq!(cursor, read.seq);
+        assert_eq!(open.unwrap().messages.len(), 2);
+        assert!(next.is_none());
+    }
+
+    #[test]
+    fn held_custody_candidates_covers_open_turn_then_undelivered() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store.create_agent(NewAgent::new("held", "spiron")).unwrap();
+        let turn = delivered_message(&store, &agent.id, "turn input");
+        let steer = delivered_message(&store, &agent.id, "open steer");
+        let ReceiveOutcome::New(queued) = store
+            .receive(&agent.id, Incoming::new("queued after the crash"))
+            .unwrap()
+        else {
+            panic!("expected new message");
+        };
+
+        assert_eq!(
+            store.held_custody_candidates(&agent.id).unwrap(),
+            vec![
+                turn.id.to_string(),
+                steer.id.to_string(),
+                queued.id.to_string()
+            ],
+            "open turn first, then queued mail, in mailbox order"
+        );
+
+        store.note_turn_completed(&agent.id).unwrap();
+        assert_eq!(
+            store.held_custody_candidates(&agent.id).unwrap(),
+            vec![queued.id.to_string()],
+            "a completed turn contributes nothing"
+        );
+    }
+
+    #[test]
+    fn reconciled_hold_fails_closed_on_open_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store.create_agent(NewAgent::new("held", "spiron")).unwrap();
+        let held = delivered_message(&store, &agent.id, "held input");
+        let before = custody_snapshot(&store, &agent.id);
+        // Leave a write transaction open on the shared connection, as a
+        // panicked writer would, then attempt reconciliation.
+        store.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let err = store
+            .reconcile_unconfirmed_custody(&agent.id, &[], &[held.id.to_string()])
+            .unwrap_err();
+        assert!(matches!(err, Error::TransactionActive), "{err:?}");
+        assert_eq!(
+            custody_snapshot(&store, &agent.id),
+            before,
+            "custody is unchanged"
+        );
+        store.conn().execute_batch("ROLLBACK").unwrap();
+        store
+            .reconcile_unconfirmed_custody(&agent.id, &[], &[held.id.to_string()])
+            .unwrap();
+    }
+
+    #[test]
+    fn reconciled_hold_with_nothing_consumed_returns_every_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store.create_agent(NewAgent::new("held", "spiron")).unwrap();
+        let earlier = delivered_message(&store, &agent.id, "completed earlier");
+        store.note_turn_completed(&agent.id).unwrap();
+        let refused = delivered_message(&store, &agent.id, "refused before admission");
+
+        let custody = store
+            .reconcile_unconfirmed_custody(&agent.id, &[], &[refused.id.to_string()])
+            .unwrap();
+        assert_eq!(custody.redeliver, vec![refused.id.to_string()]);
+        let (cursor, open, next) = custody_snapshot(&store, &agent.id);
+        assert_eq!(cursor, earlier.seq);
+        assert!(
+            open.is_none(),
+            "no consumed input means no interrupted turn"
+        );
+        assert_eq!(next.as_deref(), Some(refused.id.as_str()));
     }
 
     #[test]

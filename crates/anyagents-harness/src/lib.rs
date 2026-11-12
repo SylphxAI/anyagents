@@ -476,14 +476,19 @@ pub struct SteerItem {
     pub order: u64,
 }
 
-/// Reconciled unconfirmed input custody returned when a supervisor prepares
-/// to resume an interrupted turn via explicit `[Recovery]`.
+/// An unconfirmed input hold classified against the vendor's own durable
+/// session journal. Every held request ID lands in exactly one of
+/// `consumed_ids` (the session journal proves it was processed) or
+/// `unconsumed_ids` (it does not). `hold_lost` is true when the hold record
+/// itself was lost (truncated to 0 bytes): `request_ids` is empty and the
+/// caller must enumerate custody from the host mailbox before reconciling.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReconciledUnconfirmed {
     pub turn_id: Option<String>,
     pub request_ids: Vec<String>,
-    pub journal_committed_ids: Vec<String>,
-    pub journal_missing_ids: Vec<String>,
+    pub consumed_ids: Vec<String>,
+    pub unconsumed_ids: Vec<String>,
+    pub hold_lost: bool,
 }
 
 /// Calls every harness adapter implements. The last calls have defaults so a
@@ -555,20 +560,36 @@ pub trait Harness: Send {
         false
     }
 
-    /// Non-destructively read message IDs recorded in an unconfirmed input hold
-    /// so the supervisor can promote them into `turn_recovery` before clearing
-    /// the on-disk hold.
-    fn peek_unconfirmed_request_ids(&self) -> Vec<String> {
-        Vec::new()
+    /// Read the current unconfirmed input hold (re-read from durable state on
+    /// every call) and classify each held request ID against the vendor's
+    /// session journal without changing anything. `Ok(None)` means no hold.
+    /// An error means the hold or the journal cannot be read; the caller must
+    /// keep custody unchanged.
+    fn classify_unconfirmed_hold(&self) -> Result<Option<ReconciledUnconfirmed>, HarnessError> {
+        Ok(None)
     }
 
-    /// Reconcile an unconfirmed input hold against the vendor session journal
-    /// (when present), archive/clear the hold, and return reconciled IDs for
-    /// explicit `[Recovery]` delivery.
-    fn reconcile_unconfirmed_for_recovery(
-        &mut self,
-    ) -> Result<Option<ReconciledUnconfirmed>, HarnessError> {
-        Ok(None)
+    /// Classify arbitrary request IDs against the vendor's session journal
+    /// without reading any hold. Used when the hold record itself was lost
+    /// and the host enumerates custody from its own mailbox. The default
+    /// fails closed: an adapter without a journal can prove nothing.
+    fn classify_request_ids(
+        &self,
+        request_ids: &[String],
+    ) -> Result<std::collections::HashSet<String>, HarnessError> {
+        if request_ids.is_empty() {
+            Ok(std::collections::HashSet::new())
+        } else {
+            Err(HarnessError::Failed(
+                "cannot reconcile inputs: this adapter has no session journal".into(),
+            ))
+        }
+    }
+
+    /// Release the unconfirmed input hold once the host has durably recorded
+    /// the classification returned by [`Harness::classify_unconfirmed_hold`].
+    fn clear_unconfirmed_hold(&mut self) -> Result<(), HarnessError> {
+        Ok(())
     }
 
     /// Take the oldest message that entered input the vendor reads between

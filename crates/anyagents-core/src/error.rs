@@ -42,6 +42,8 @@ pub enum Error {
     },
     #[error("workdir `{path}` is not writable by its seat: {message}")]
     WorkdirPermission { path: String, message: String },
+    #[error("store connection already has an open transaction")]
+    TransactionActive,
     #[error("{0}")]
     Message(String),
 }

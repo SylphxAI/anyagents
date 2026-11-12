@@ -284,6 +284,13 @@ struct State {
     turn_started_at: Option<Instant>,
     last_steer_probe: Option<Instant>,
     reclaimed_steers: Vec<String>,
+    /// The last pre-dispatch hold this process wrote, so custody survives an
+    /// external deletion of the hold file while the process is alive.
+    hold: Option<InputHold>,
+    /// Whether the vendor session's turn admission was found free for this
+    /// process before its first turn.
+    admission_verified: bool,
+    new_turns_deferred_until: Option<Instant>,
     planner_config: Option<Value>,
     http_port: Option<u16>,
     seen: HashSet<String>,
@@ -368,10 +375,7 @@ impl StreamHarness {
     pub fn set_state_dir(&self, dir: &Path) {
         let mut state = lock(&self.shared);
         state.state_dir = Some(dir.to_path_buf());
-        state.unconfirmed |= dir
-            .join("spiron-unconfirmed-steers.json")
-            .try_exists()
-            .unwrap_or(true);
+        state.unconfirmed |= dir.join(HOLD_FILE).try_exists().unwrap_or(true);
         state.refresh_exit_fault();
         state.persist_failure();
     }
@@ -401,10 +405,10 @@ impl StreamHarness {
             return false;
         }
         state.unconfirmed
-            || state.state_dir.as_ref().is_some_and(|dir| {
-                dir.join("spiron-unconfirmed-steers.json").exists()
-                    || dir.join(".anyagents-session-reset-recovery").exists()
-            })
+            || state
+                .state_dir
+                .as_ref()
+                .is_some_and(|dir| dir.join(HOLD_FILE).exists() || dir.join(RESET_MARKER).exists())
     }
 
     pub fn has_unconfirmed_idle_hold(&self) -> bool {
@@ -412,36 +416,70 @@ impl StreamHarness {
         state.unconfirmed && state.open.is_empty() && state.followups.is_empty()
     }
 
-    pub fn peek_unconfirmed_request_ids(&self) -> Vec<String> {
+    /// Re-read the unconfirmed input hold from durable state. The on-disk hold
+    /// is authoritative; when it is gone (or truncated to 0 bytes) while this
+    /// process still holds custody, the copy this process wrote before
+    /// dispatch is used. A 0-byte hold with no in-memory copy has `lost` set
+    /// and carries no IDs. A session reset marker without a hold is an empty
+    /// hold. An unreadable or malformed hold is an error, never an empty one.
+    pub fn read_unconfirmed_hold(&self) -> Result<Option<InputHold>, String> {
         let state = lock(&self.shared);
-        let Some(dir) = &state.state_dir else {
-            return Vec::new();
+        let Some(dir) = state.state_dir.clone() else {
+            return Ok(state
+                .unconfirmed
+                .then(|| state.hold.clone().unwrap_or_default()));
         };
-        parse_hold_file(&dir.join("spiron-unconfirmed-steers.json")).1
+        let hold_path = dir.join(HOLD_FILE);
+        match std::fs::symlink_metadata(&hold_path) {
+            Ok(meta) if !meta.file_type().is_file() => Err(format!(
+                "Spiron input hold {} is not a regular file",
+                hold_path.display()
+            )),
+            Ok(meta) if meta.len() == 0 => {
+                // A 0-byte file lost the record. When this process still holds
+                // the copy it wrote before dispatch, that copy is exact and
+                // wins; otherwise the caller must fall back to host custody.
+                Ok(match &state.hold {
+                    Some(hold) => Some(hold.clone()),
+                    None => Some(InputHold {
+                        lost: true,
+                        ..InputHold::default()
+                    }),
+                })
+            }
+            Ok(_) => {
+                let bytes = std::fs::read(&hold_path)
+                    .map_err(|err| format!("cannot read Spiron input hold: {err}"))?;
+                InputHold::parse(&bytes).map(Some)
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                if state.unconfirmed {
+                    return match &state.hold {
+                        Some(hold) => Ok(Some(hold.clone())),
+                        None => {
+                            Err("Spiron input hold is retained but its record is missing".into())
+                        }
+                    };
+                }
+                match dir.join(RESET_MARKER).try_exists() {
+                    Ok(true) => Ok(Some(InputHold::default())),
+                    Ok(false) => Ok(None),
+                    Err(err) => Err(format!("cannot read session reset marker: {err}")),
+                }
+            }
+            Err(err) => Err(format!("cannot read Spiron input hold: {err}")),
+        }
     }
 
-    pub fn reconcile_unconfirmed_for_recovery(
-        &self,
-    ) -> Result<Option<anyagents_harness::ReconciledUnconfirmed>, HarnessError> {
+    /// Release the hold after the host recorded its reconciliation: archive the
+    /// last hold beside it for audit, then remove the hold, the persisted
+    /// error and any session reset marker.
+    pub fn clear_unconfirmed_hold(&self) -> Result<(), HarnessError> {
         let mut state = lock(&self.shared);
-        let Some(dir) = state.state_dir.clone() else {
-            if !state.unconfirmed {
-                return Ok(None);
-            }
-            state.unconfirmed = false;
-            state.sign_in_fault = None;
-            state.exit_fault = None;
-            state.reclaimed_steers.clear();
-            return Ok(Some(anyagents_harness::ReconciledUnconfirmed::default()));
-        };
-        let hold_path = dir.join("spiron-unconfirmed-steers.json");
-        let reset_marker = dir.join(".anyagents-session-reset-recovery");
-        if !state.unconfirmed && !hold_path.exists() && !reset_marker.exists() {
-            return Ok(None);
-        }
-        let (turn_id, request_ids) = parse_hold_file(&hold_path);
-        if let Ok(meta) = std::fs::symlink_metadata(&hold_path) {
-            if meta.file_type().is_file()
+        if let Some(dir) = state.state_dir.clone() {
+            let hold_path = dir.join(HOLD_FILE);
+            if let Ok(meta) = std::fs::symlink_metadata(&hold_path)
+                && meta.file_type().is_file()
                 && meta.len() > 0
                 && let Ok(bytes) = std::fs::read(&hold_path)
             {
@@ -451,28 +489,49 @@ impl StreamHarness {
                     0o664,
                 );
             }
-            match std::fs::remove_file(&hold_path) {
-                Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => {
-                    return Err(HarnessError::Failed(format!(
-                        "cannot clear reconciled Spiron input hold: {err}"
-                    )));
+            for path in [hold_path, dir.join(RESET_MARKER)] {
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => {
+                        return Err(HarnessError::Failed(format!(
+                            "cannot clear reconciled Spiron input hold: {err}"
+                        )));
+                    }
                 }
             }
+            let _ = std::fs::remove_file(dir.join(".anyagents-last-error.json"));
         }
-        let _ = std::fs::remove_file(dir.join(".anyagents-last-error.json"));
-        let _ = std::fs::remove_file(&reset_marker);
         state.unconfirmed = false;
+        state.hold = None;
         state.sign_in_fault = None;
         state.exit_fault = None;
         state.reclaimed_steers.clear();
-        Ok(Some(anyagents_harness::ReconciledUnconfirmed {
-            turn_id,
-            request_ids,
-            journal_committed_ids: Vec::new(),
-            journal_missing_ids: Vec::new(),
-        }))
+        Ok(())
+    }
+
+    /// Whether this process already established that the vendor session can
+    /// admit a new turn (see [`StreamHarness::mark_admission_verified`]).
+    pub fn admission_verified(&self) -> bool {
+        lock(&self.shared).admission_verified
+    }
+
+    pub fn mark_admission_verified(&self) {
+        let mut state = lock(&self.shared);
+        state.admission_verified = true;
+        state.new_turns_deferred_until = None;
+    }
+
+    /// Defer starting a new turn (not steering an open one) until `until`,
+    /// for an adapter that knows the vendor would refuse admission before it.
+    pub fn defer_new_turns_until(&self, until: Instant) {
+        lock(&self.shared).new_turns_deferred_until = Some(until);
+    }
+
+    pub fn new_turns_deferred(&self) -> bool {
+        lock(&self.shared)
+            .new_turns_deferred_until
+            .is_some_and(|until| Instant::now() < until)
     }
 
     pub fn seed_session_id(&self, session_id: &str) {
@@ -801,6 +860,15 @@ impl StreamHarness {
             if !state.alive {
                 return Err(HarnessError::Dead);
             }
+            if self.pending.is_none()
+                && state.open.is_empty()
+                && state.followups.is_empty()
+                && state
+                    .new_turns_deferred_until
+                    .is_some_and(|until| Instant::now() < until)
+            {
+                return Ok(DeliverOutcome::Deferred);
+            }
             if let Some(pending) = &self.pending {
                 if pending.id != message.id {
                     return Ok(DeliverOutcome::Deferred);
@@ -853,14 +921,17 @@ impl StreamHarness {
                     {
                         // Record uncertainty BEFORE exposing any bytes. If this
                         // fails, the mailbox still owns a provably unsent input.
-                        let turn = state.open.first().unwrap_or(&message.id);
-                        let mut ids: Vec<_> = state.open.iter().collect();
-                        ids.push(&message.id);
+                        let mut request_ids = state.open.clone();
+                        request_ids.push(message.id.clone());
+                        let hold = InputHold {
+                            turn_id: request_ids.first().cloned(),
+                            request_ids,
+                            session_id: state.session_id.clone(),
+                            lost: false,
+                        };
                         if let Err(error) = anyagents_harness::atomic_write_in_existing_dir(
-                            &dir.join("spiron-unconfirmed-steers.json"),
-                            json!({"turn_id": turn, "request_ids": ids})
-                                .to_string()
-                                .as_bytes(),
+                            &dir.join(HOLD_FILE),
+                            hold.to_json().to_string().as_bytes(),
                             0o664,
                         ) {
                             let reason = format!(
@@ -869,6 +940,7 @@ impl StreamHarness {
                             state.sign_in_fault = Some(reason.clone());
                             return Err(HarnessError::Failed(reason));
                         }
+                        state.hold = Some(hold);
                     }
                     // Associate even an immediate result with its owner before the
                     // first byte is visible to the child. This is not acceptance.
@@ -1065,7 +1137,15 @@ impl StreamHarness {
             Ok(true) => {
                 state.input_blocked = false;
                 let pending = self.pending.take().expect("completed write");
-                state.seen.insert(pending.id.clone());
+                // The turn may already have ended with this input unconfirmed
+                // and released it (see `finish_correlated`); it must stay
+                // released so its reconciled redelivery is a fresh write.
+                let released = state.unconfirmed
+                    && !state.open.contains(&pending.id)
+                    && !state.followups.contains(&pending.id);
+                if !released {
+                    state.seen.insert(pending.id.clone());
+                }
                 state.written.push(pending.id);
                 state.written_outcome(self.spec.protocol, &message.id)
             }
@@ -1178,11 +1258,10 @@ impl StreamHarness {
             state.usages.clear();
             state.quota_reset_at_ms = None;
             state.sign_in_fault = None;
+            state.admission_verified = false;
+            state.new_turns_deferred_until = None;
             if let Some(dir) = &state.state_dir {
-                state.unconfirmed = dir
-                    .join("spiron-unconfirmed-steers.json")
-                    .try_exists()
-                    .unwrap_or(true);
+                state.unconfirmed = dir.join(HOLD_FILE).try_exists().unwrap_or(true);
             }
             state.stderr = BoundedStderr::default();
             state.stderr_done = false;
@@ -1353,6 +1432,8 @@ impl Drop for StreamHarness {
 // Retain at most 16 KiB while draining the entire pipe. If retention cuts a
 // line, withhold that partial line rather than publishing a credential prefix.
 const STDERR_LIMIT: usize = 16 * 1024;
+const HOLD_FILE: &str = "spiron-unconfirmed-steers.json";
+const RESET_MARKER: &str = ".anyagents-session-reset-recovery";
 const UNCONFIRMED_STEERS: &str = "Spiron reported unconfirmed steering input; mailbox custody retained. Reconcile spiron-unconfirmed-steers.json before resuming; do not blindly replay.";
 
 #[derive(Default)]
@@ -1513,6 +1594,9 @@ impl State {
             turn_started_at: None,
             last_steer_probe: None,
             reclaimed_steers: Vec::new(),
+            hold: None,
+            admission_verified: false,
+            new_turns_deferred_until: None,
             planner_config: None,
             http_port: None,
             finished: HashSet::new(),
@@ -1976,41 +2060,69 @@ fn finish_open(state: &mut State, usage: TurnUsage) {
     }
 }
 
-fn parse_hold_file(path: &Path) -> (Option<String>, Vec<String>) {
-    let Ok(meta) = std::fs::symlink_metadata(path) else {
-        return (None, Vec::new());
-    };
-    if !meta.file_type().is_file() || meta.len() == 0 {
-        return (None, Vec::new());
+/// A pre-dispatch input hold: the turn and every input written to the vendor
+/// whose consumption is not yet confirmed, and the vendor session they were
+/// written into (absent in holds written before it was recorded). `lost` is
+/// true only for a hold record whose file was truncated to 0 bytes without
+/// this process holding a copy: its IDs are unrecoverable from the hold and
+/// custody must fall back to the host mailbox.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct InputHold {
+    pub turn_id: Option<String>,
+    pub request_ids: Vec<String>,
+    pub session_id: Option<String>,
+    pub lost: bool,
+}
+
+impl InputHold {
+    fn to_json(&self) -> Value {
+        let mut value = json!({"turn_id": self.turn_id, "request_ids": self.request_ids});
+        if let Some(session) = &self.session_id {
+            value["session_id"] = json!(session);
+        }
+        value
     }
-    let Ok(bytes) = std::fs::read(path) else {
-        return (None, Vec::new());
-    };
-    let Ok(val) = serde_json::from_slice::<Value>(&bytes) else {
-        return (None, Vec::new());
-    };
-    let turn_id = val
-        .get("turn_id")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
-    let mut ids: Vec<String> = val
-        .get("request_ids")
-        .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(Value::as_str)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-                .collect()
+
+    /// Parse a hold record. Every held ID is required to be a non-empty
+    /// string; anything else is a malformed hold, not an empty one.
+    pub fn parse(bytes: &[u8]) -> Result<Self, String> {
+        let malformed = |what: &str| format!("malformed Spiron input hold: {what}");
+        let value: Value =
+            serde_json::from_slice(bytes).map_err(|err| malformed(&err.to_string()))?;
+        let text = |key: &str| -> Result<Option<String>, String> {
+            match value.get(key) {
+                None | Some(Value::Null) => Ok(None),
+                Some(Value::String(s)) if !s.is_empty() => Ok(Some(s.clone())),
+                Some(_) => Err(malformed(key)),
+            }
+        };
+        let turn_id = text("turn_id")?;
+        let session_id = text("session_id")?;
+        let mut request_ids = Vec::new();
+        match value.get("request_ids") {
+            None | Some(Value::Null) => {}
+            Some(Value::Array(items)) => {
+                for item in items {
+                    match item.as_str() {
+                        Some(id) if !id.is_empty() => request_ids.push(id.to_string()),
+                        _ => return Err(malformed("request_ids")),
+                    }
+                }
+            }
+            Some(_) => return Err(malformed("request_ids")),
+        }
+        if let Some(turn) = &turn_id
+            && !request_ids.contains(turn)
+        {
+            request_ids.insert(0, turn.clone());
+        }
+        Ok(Self {
+            turn_id,
+            request_ids,
+            session_id,
+            lost: false,
         })
-        .unwrap_or_default();
-    if let Some(ref tid) = turn_id
-        && !ids.iter().any(|id| id == tid)
-    {
-        ids.insert(0, tid.clone());
     }
-    (turn_id, ids)
 }
 
 fn finish_correlated(state: &mut State, turn: &str, usage: TurnUsage, unconfirmed: bool) {
@@ -2038,6 +2150,14 @@ fn finish_correlated(state: &mut State, turn: &str, usage: TurnUsage, unconfirme
     }
     for id in ids {
         if unconfirmed && id != turn {
+            // The turn is over, so this input is no longer on the wire. It
+            // stays held (hold record + reclaimed steers) until the host
+            // reconciles it, and a redelivery is written as a fresh input.
+            state.open.retain(|open| open != &id);
+            state.followups.retain(|open| open != &id);
+            state.seen.remove(&id);
+            state.acknowledged.remove(&id);
+            state.input_turns.remove(&id);
             continue;
         }
         state.open.retain(|open| open != &id);
@@ -2052,15 +2172,17 @@ fn finish_correlated(state: &mut State, turn: &str, usage: TurnUsage, unconfirme
             },
         ));
     }
-    if !state.unconfirmed
-        && state.open.is_empty()
-        && state.followups.is_empty()
-        && let Some(dir) = &state.state_dir
-        && let Err(error) = std::fs::remove_file(dir.join("spiron-unconfirmed-steers.json"))
-        && error.kind() != std::io::ErrorKind::NotFound
-    {
-        state.unconfirmed = true;
-        state.sign_in_fault = Some(format!("cannot clear confirmed Spiron input hold: {error}"));
+    if !state.unconfirmed && state.open.is_empty() && state.followups.is_empty() {
+        if let Some(dir) = &state.state_dir
+            && let Err(error) = std::fs::remove_file(dir.join(HOLD_FILE))
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            state.unconfirmed = true;
+            state.sign_in_fault =
+                Some(format!("cannot clear confirmed Spiron input hold: {error}"));
+        } else {
+            state.hold = None;
+        }
     }
 }
 

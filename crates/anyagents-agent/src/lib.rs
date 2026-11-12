@@ -342,14 +342,41 @@ pub fn recovery_outbound_with_reconciliation(
         }
     }
     if let Some(rec) = reconciled
-        && (!rec.journal_committed_ids.is_empty() || !rec.journal_missing_ids.is_empty())
+        && (!rec.consumed_ids.is_empty() || !rec.unconsumed_ids.is_empty())
     {
+        let in_turn: std::collections::HashSet<&str> =
+            open.messages.iter().map(|m| m.id.as_str()).collect();
+        let (not_received, redelivered): (Vec<&String>, Vec<&String>) = rec
+            .unconsumed_ids
+            .iter()
+            .partition(|id| in_turn.contains(id.as_str()));
+        let list = |ids: &[&String]| {
+            ids.iter()
+                .map(|id| id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let consumed: Vec<&String> = rec.consumed_ids.iter().collect();
         lines.push(String::new());
-        lines.push(format!(
-            "Session journal reconciliation: committed=[{}], unconfirmed_before_journal=[{}].",
-            rec.journal_committed_ids.join(", "),
-            rec.journal_missing_ids.join(", "),
-        ));
+        lines.push("Input reconciliation against the session journal:".to_string());
+        if !consumed.is_empty() {
+            lines.push(format!(
+                "- received by the session before the interruption: [{}]",
+                list(&consumed)
+            ));
+        }
+        if !not_received.is_empty() {
+            lines.push(format!(
+                "- never received by the session (quoted above, handle it now): [{}]",
+                list(&not_received)
+            ));
+        }
+        if !redelivered.is_empty() {
+            lines.push(format!(
+                "- never received by the session, delivered again after this message: [{}]",
+                list(&redelivered)
+            ));
+        }
     }
     lines.push(String::new());
     lines.push(

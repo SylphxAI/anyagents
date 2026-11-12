@@ -675,13 +675,37 @@ completion without `undelivered_steers` clears the hold. Standalone adapter and
 `DeliveryLoop::run_once` passes never silently replay raw input while a hold is
 present.
 
-Under `Supervisor`, mid-turn process exits, coordinator restarts, unconfirmed
-`undelivered_steers` receipts, and transient upstream stream/server failures
-automatically reconcile `spiron-unconfirmed-steers.json` against Spiron's local
-`sessions.sqlite3` (`session_entries`), promote all messages of the interrupted
-turn into `turn_recovery`, archive/clear the hold and stale error state, and
-resume via an explicit `[Recovery]` turn instructing the agent to verify actual
-state before repeating side effects. An explicit `reset-session` similarly
+The hold records the request IDs and the Spiron session they were written
+into. `Supervisor` re-reads it from the live harness on every delivery pass
+(before any pending harness/model/profile switch), so it is reconciled after a
+mid-turn exit, a coordinator restart, or an `undelivered_steers` receipt in a
+process that stays alive; deleting the file by hand neither releases nor loses
+custody. Reconciliation classifies each held ID against Spiron's own journal:
+an input is consumed only when `session_entries` holds a `text` event with
+`data.role == "user"` whose first line is `anyagents-message:<id>` and a model
+event follows it in the same session (a journaled input with no model event
+after it was never processed). The search is restricted to the hold's session;
+holds written without one are matched across the state directory. A hold file
+truncated to 0 bytes carries no IDs: custody is then enumerated from the host
+mailbox (open-turn inputs, then undelivered mail) and classified against the
+journal instead, so a consumed input is never re-presented. In one store
+transaction consumed inputs stay delivered and form the interrupted turn, and
+unconsumed inputs ordered after every consumed one return to the mailbox for
+exactly one redelivery (an unconsumed input ordered before a consumed one
+stays in the turn, since rewinding would replay the consumed one). Only then
+is the hold archived to `spiron-unconfirmed-steers.reconciled.json` and
+cleared. The interrupted turn resumes with one `[Recovery]` turn that lists
+which inputs the session received and which follow, before any other mail.
+Repeating the reconciliation is a no-op; an unreadable hold or journal changes
+nothing and is retried.
+
+Spiron admits one turn per session under an owner-fenced lease
+(`session_leases`) and closes a turn stranded by a dead host as interrupted
+once that host's lease expires. Before a new process's first turn, AnyAgents
+reads that lease and defers delivery until it lapses instead of writing an
+input Spiron would refuse with "already has an active turn".
+
+An explicit `reset-session` similarly
 archives any retired-generation hold under `sessions/retired-<generation>/`,
 clears `.anyagents-last-error.json`, and retains unfinished mail in
 `turn_recovery` so the new session generation starts cleanly with `[Recovery]`.

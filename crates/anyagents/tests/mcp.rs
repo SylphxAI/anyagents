@@ -1237,6 +1237,60 @@ async fn redaction_mcp_and_cli_share_authenticated_audited_api() {
 }
 
 #[tokio::test]
+async fn session_reset_prompt_for_a_paused_agent_is_queued_for_the_new_session() {
+    use anyagents_core::{NewAgent, Store, host_session};
+    let dir = support::physical_tempdir();
+    let store = Store::open(dir.path().join("state.db")).unwrap();
+    let parent = store
+        .create_agent(NewAgent::new("reset-prompt-parent", "spiron"))
+        .unwrap();
+    let mut input = NewAgent::new("reset-prompt-child", "spiron");
+    input.parent_id = Some(parent.id.clone());
+    let child = store.create_agent(input).unwrap();
+    for agent in [&parent, &child] {
+        store.set_agent_state(&agent.id, "paused").unwrap();
+    }
+    let root = dir.path().join("agents").join(child.id.as_str());
+    std::fs::create_dir_all(root.join("config")).unwrap();
+    std::fs::create_dir_all(root.join("memory")).unwrap();
+    let old = host_session::ensure_active(&root, "spiron").unwrap();
+    let server = start_server(dir.path());
+    let parent_mcp = connect(dir.path(), &parent.name).await;
+
+    // Without a prompt nothing is queued.
+    ok_json(
+        call(
+            &parent_mcp,
+            "agents",
+            serde_json::json!({"action":"reset_session","name":child.name}),
+        )
+        .await,
+    );
+    assert!(store.next_undelivered(&child.id).unwrap().is_none());
+
+    let result: serde_json::Value = ok_json(
+        call(
+            &parent_mcp,
+            "agents",
+            serde_json::json!({"action":"reset_session","name":child.name,"prompt":"start over from the saved plan"}),
+        )
+        .await,
+    );
+    let generation = host_session::active(&root).unwrap().unwrap().generation;
+    assert_ne!(generation, old.generation);
+    assert_eq!(result["generation"], generation);
+    assert!(result.get("prompt").is_some(), "{result}");
+    let queued = store
+        .next_undelivered(&child.id)
+        .unwrap()
+        .expect("the reset prompt waits in the mailbox for the new session");
+    assert!(queued.text.contains("start over from the saved plan"));
+    assert_eq!(store.agent(&child.id).unwrap().state, "paused");
+    parent_mcp.cancel().await.unwrap();
+    drop(server);
+}
+
+#[tokio::test]
 async fn session_reset_mcp_and_cli_share_quiescent_authorized_api() {
     use anyagents_core::{NewAgent, Store, host_session};
     let dir = support::physical_tempdir();

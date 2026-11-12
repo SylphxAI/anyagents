@@ -1356,3 +1356,219 @@ fn agy_rpc_discovers_running_turn_one_trajectory_and_accepts_steer_before_stdout
     stop.store(true, std::sync::atomic::Ordering::SeqCst);
     let _ = server.join();
 }
+
+/// Re-offer one input the way the delivery loop does until the harness takes it.
+#[cfg(unix)]
+fn deliver_until_accepted(
+    harness: &mut super::StreamHarness,
+    id: &str,
+) -> anyagents_harness::DeliverOutcome {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let outcome = harness
+            .deliver(
+                &receipt_message(id),
+                &json!({"type":"user","request_id":id}),
+            )
+            .unwrap();
+        if matches!(outcome, anyagents_harness::DeliverOutcome::Accepted { .. })
+            || std::time::Instant::now() > deadline
+        {
+            return outcome;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+const UNDELIVERED_STEER_SCRIPT: &str = r#"
+import json,sys,time
+time.sleep(int(sys.argv[1])/1000)
+print(json.dumps({'type':'ready','session_id':'fixture-ready'}),flush=True)
+first=None
+for line in sys.stdin:
+ m=json.loads(line)
+ rid=m.get('request_id')
+ if first is None:
+  first=rid
+  print(json.dumps({'type':'accepted','request_id':rid}),flush=True)
+ else:
+  print(json.dumps({'type':'steer_ack','request_id':rid,'accepted':True,'turn_id':first}),flush=True)
+  print(json.dumps({'type':'result','request_id':first,'status':'failed','is_error':True,'error':'upstream unavailable','undelivered_steers':['acknowledged input']}),flush=True)
+"#;
+
+#[test]
+fn input_hold_parse_requires_well_formed_ids() {
+    let hold =
+        super::InputHold::parse(br#"{"turn_id":"m1","request_ids":["m1","m2"],"session_id":"s1"}"#)
+            .unwrap();
+    assert_eq!(hold.turn_id.as_deref(), Some("m1"));
+    assert_eq!(hold.request_ids, vec!["m1", "m2"]);
+    assert_eq!(hold.session_id.as_deref(), Some("s1"));
+
+    // A hold written before session IDs were recorded is still valid, and its
+    // turn input is always part of the held set.
+    let legacy = super::InputHold::parse(br#"{"turn_id":"m1","request_ids":["m2"]}"#).unwrap();
+    assert_eq!(legacy.request_ids, vec!["m1", "m2"]);
+    assert_eq!(legacy.session_id, None);
+
+    for malformed in [
+        &b"not json"[..],
+        br#"{"turn_id":"m1","request_ids":"m1"}"#,
+        br#"{"turn_id":"m1","request_ids":["m1",7]}"#,
+        br#"{"turn_id":"m1","request_ids":[""]}"#,
+        br#"{"turn_id":5,"request_ids":[]}"#,
+    ] {
+        assert!(
+            super::InputHold::parse(malformed).is_err(),
+            "malformed hold must not read as empty: {}",
+            String::from_utf8_lossy(malformed)
+        );
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn live_process_hold_survives_file_deletion_and_clears_only_on_release() {
+    use anyagents_harness::DeliverOutcome::{Accepted, Deferred};
+    let dir = tempfile::tempdir().unwrap();
+    let mut harness = immediate_receipt_fixture(UNDELIVERED_STEER_SCRIPT, 0).unwrap();
+    harness.set_state_dir(dir.path());
+    let hold_path = dir.path().join("spiron-unconfirmed-steers.json");
+
+    assert_eq!(
+        deliver_until_accepted(&mut harness, "m1"),
+        Accepted {
+            turn_finished: false
+        }
+    );
+    let _ = harness.deliver(
+        &receipt_message("m2"),
+        &json!({"type":"user","request_id":"m2"}),
+    );
+    assert!(
+        harness.wait_pred(std::time::Duration::from_secs(10), |state| state
+            .unconfirmed)
+    );
+    let on_disk = super::InputHold::parse(&std::fs::read(&hold_path).unwrap()).unwrap();
+    assert_eq!(on_disk.request_ids, vec!["m1", "m2"]);
+    assert_eq!(
+        on_disk.session_id.as_deref(),
+        Some("fixture-ready"),
+        "the hold names the session its inputs were written into"
+    );
+    assert!(harness.has_unconfirmed_hold());
+
+    // Deleting the hold file while the process lives neither releases custody
+    // nor loses the record of what was held.
+    std::fs::remove_file(&hold_path).unwrap();
+    assert!(harness.has_unconfirmed_hold());
+    assert_eq!(harness.read_unconfirmed_hold().unwrap(), Some(on_disk));
+    assert_eq!(
+        harness
+            .deliver(
+                &receipt_message("m3"),
+                &json!({"type":"user","request_id":"m3"})
+            )
+            .unwrap(),
+        Deferred
+    );
+
+    harness.clear_unconfirmed_hold().unwrap();
+    assert!(!harness.has_unconfirmed_hold());
+    assert_eq!(harness.read_unconfirmed_hold().unwrap(), None);
+    assert!(harness.health().sign_in_fault.is_none());
+}
+
+#[test]
+#[cfg(unix)]
+fn truncated_hold_without_a_live_copy_reports_lost() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("spiron-unconfirmed-steers.json"), b"").unwrap();
+    let harness = immediate_receipt_fixture(UNDELIVERED_STEER_SCRIPT, 0).unwrap();
+    harness.set_state_dir(dir.path());
+    assert!(harness.has_unconfirmed_hold());
+    let hold = harness.read_unconfirmed_hold().unwrap().unwrap();
+    assert!(
+        hold.lost,
+        "a 0-byte hold with no in-memory copy has lost IDs: {hold:?}"
+    );
+    assert!(hold.request_ids.is_empty());
+}
+
+#[test]
+#[cfg(unix)]
+fn truncated_hold_with_a_live_copy_keeps_exact_ids() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut harness = immediate_receipt_fixture(UNDELIVERED_STEER_SCRIPT, 0).unwrap();
+    harness.set_state_dir(dir.path());
+    let hold_path = dir.path().join("spiron-unconfirmed-steers.json");
+
+    assert!(matches!(
+        deliver_until_accepted(&mut harness, "m1"),
+        anyagents_harness::DeliverOutcome::Accepted { .. }
+    ));
+    let _ = harness.deliver(
+        &receipt_message("m2"),
+        &json!({"type":"user","request_id":"m2"}),
+    );
+    assert!(
+        harness.wait_pred(std::time::Duration::from_secs(10), |state| state
+            .unconfirmed)
+    );
+    let on_disk = super::InputHold::parse(&std::fs::read(&hold_path).unwrap()).unwrap();
+
+    // External ENOSPC truncation while the process lives must not lose the
+    // record it wrote before dispatch.
+    std::fs::write(&hold_path, b"").unwrap();
+    assert!(harness.has_unconfirmed_hold());
+    let current = harness.read_unconfirmed_hold().unwrap().unwrap();
+    assert!(!current.lost);
+    assert_eq!(current, on_disk);
+
+    harness.clear_unconfirmed_hold().unwrap();
+    assert!(!harness.has_unconfirmed_hold());
+}
+
+#[test]
+#[cfg(unix)]
+fn unreadable_hold_is_an_error_not_an_empty_hold() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("spiron-unconfirmed-steers.json"),
+        b"{truncated",
+    )
+    .unwrap();
+    let harness = immediate_receipt_fixture(UNDELIVERED_STEER_SCRIPT, 0).unwrap();
+    harness.set_state_dir(dir.path());
+    assert!(harness.has_unconfirmed_hold());
+    assert!(harness.read_unconfirmed_hold().is_err());
+}
+
+#[test]
+#[cfg(unix)]
+fn deferred_admission_holds_new_turns_but_not_after_it_is_verified() {
+    use anyagents_harness::DeliverOutcome::{Accepted, Deferred};
+    let mut harness = immediate_receipt_harness();
+    harness.defer_new_turns_until(std::time::Instant::now() + std::time::Duration::from_secs(60));
+    assert!(harness.new_turns_deferred());
+    assert_eq!(
+        harness
+            .deliver(
+                &receipt_message("first"),
+                &json!({"type":"user","request_id":"first"})
+            )
+            .unwrap(),
+        Deferred,
+        "a new turn waits while admission is deferred"
+    );
+    harness.mark_admission_verified();
+    assert!(harness.admission_verified());
+    assert!(!harness.new_turns_deferred());
+    assert_eq!(
+        deliver_until_accepted(&mut harness, "first"),
+        Accepted {
+            turn_finished: false
+        }
+    );
+}
