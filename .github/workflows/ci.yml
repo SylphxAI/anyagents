@@ -104,7 +104,7 @@ jobs:
       - name: Browser fixture tests
         run: npm test
       - name: Test
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --all-targets --locked
       - name: Takeover interaction acceptance
         if: github.event_name == 'workflow_dispatch' && inputs.takeover && github.event.repository.visibility == 'public'
         env:
@@ -182,7 +182,7 @@ jobs:
       - name: Browser fixture cleanup
         run: node --test tests/browser-process-group.test.mjs
       - name: Test
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --all-targets --locked
 
   # The required check name. Skipped lanes pass; a failed or cancelled lane
   # fails. It reads results only and runs no repository code.
