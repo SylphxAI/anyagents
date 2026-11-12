@@ -2182,6 +2182,15 @@ fn finish_correlated(state: &mut State, turn: &str, usage: TurnUsage, unconfirme
                 Some(format!("cannot clear confirmed Spiron input hold: {error}"));
         } else {
             state.hold = None;
+            // A confirmed completion releases every custody artefact that
+            // accompanied the hold, not just the hold file: a lingering
+            // reset marker would re-flag the hold on the next pass. The
+            // last-error file is best-effort here; the reader repersists it
+            // when the turn failed right after this.
+            if let Some(dir) = &state.state_dir {
+                let _ = std::fs::remove_file(dir.join(RESET_MARKER));
+                let _ = std::fs::remove_file(dir.join(".anyagents-last-error.json"));
+            }
         }
     }
 }

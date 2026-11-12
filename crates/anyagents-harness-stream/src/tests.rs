@@ -1530,6 +1530,93 @@ fn truncated_hold_with_a_live_copy_keeps_exact_ids() {
     assert!(!harness.has_unconfirmed_hold());
 }
 
+#[cfg(unix)]
+const CONFIRMED_TURN_SCRIPT: &str = r#"
+import json,sys,time
+time.sleep(int(sys.argv[1])/1000)
+print(json.dumps({'type':'ready','session_id':'fixture-ready'}),flush=True)
+first=None
+for line in sys.stdin:
+ m=json.loads(line)
+ if first is None:
+  first=m.get('request_id')
+  print(json.dumps({'type':'accepted','request_id':first}),flush=True)
+  print(json.dumps({'type':'result','request_id':first,'status':'completed'}),flush=True)
+"#;
+
+#[test]
+#[cfg(unix)]
+fn reconcile_clear_releases_hold_marker_error_and_restart_stays_clear() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut harness = immediate_receipt_fixture(UNDELIVERED_STEER_SCRIPT, 0).unwrap();
+    harness.set_state_dir(dir.path());
+
+    assert!(matches!(
+        deliver_until_accepted(&mut harness, "m1"),
+        anyagents_harness::DeliverOutcome::Accepted { .. }
+    ));
+    let _ = harness.deliver(
+        &receipt_message("m2"),
+        &json!({"type":"user","request_id":"m2"}),
+    );
+    assert!(
+        harness.wait_pred(std::time::Duration::from_secs(10), |state| state
+            .unconfirmed)
+    );
+    // Accompanying artefacts exist beside the hold (e.g. a session reset
+    // plus a persisted turn error). They must go together with it.
+    let marker = dir.path().join(".anyagents-session-reset-recovery");
+    let last_error = dir.path().join(".anyagents-last-error.json");
+    std::fs::write(&marker, b"").unwrap();
+    std::fs::write(&last_error, b"{}").unwrap();
+
+    harness.clear_unconfirmed_hold().unwrap();
+    assert!(!harness.has_unconfirmed_hold());
+    assert!(!dir.path().join("spiron-unconfirmed-steers.json").exists());
+    assert!(!marker.exists());
+    assert!(!last_error.exists());
+
+    // A new process over the same state directory must not re-flag the
+    // hold: the in-memory bool and every file were released together.
+    drop(harness);
+    let restarted = immediate_receipt_fixture(UNDELIVERED_STEER_SCRIPT, 0).unwrap();
+    restarted.set_state_dir(dir.path());
+    assert!(!restarted.has_unconfirmed_hold());
+}
+
+#[test]
+#[cfg(unix)]
+fn confirmed_turn_completion_clears_marker_and_error_artifacts() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join(".anyagents-session-reset-recovery");
+    let last_error = dir.path().join(".anyagents-last-error.json");
+    std::fs::write(&marker, b"").unwrap();
+    std::fs::write(&last_error, b"{}").unwrap();
+    let mut harness = immediate_receipt_fixture(CONFIRMED_TURN_SCRIPT, 0).unwrap();
+    harness.set_state_dir(dir.path());
+
+    assert!(matches!(
+        deliver_until_accepted(&mut harness, "m1"),
+        anyagents_harness::DeliverOutcome::Accepted { .. }
+    ));
+    assert!(
+        harness.wait_pred(std::time::Duration::from_secs(10), |state| state
+            .finished
+            .contains("m1")),
+        "the confirmed result must be processed"
+    );
+    assert!(!dir.path().join("spiron-unconfirmed-steers.json").exists());
+    assert!(
+        !marker.exists(),
+        "a confirmed turn must not leave the marker"
+    );
+    assert!(
+        !last_error.exists(),
+        "a confirmed turn must not leave its error file"
+    );
+    assert!(!harness.has_unconfirmed_hold());
+}
+
 #[test]
 #[cfg(unix)]
 fn unreadable_hold_is_an_error_not_an_empty_hold() {
