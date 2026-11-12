@@ -1300,7 +1300,7 @@ mod tests {
             "ANYAGENTS_LAUNCHER",
             "ANYAGENTS_PRINCIPALS",
         ];
-        let old: Vec<_> = keys.iter().map(|key| std::env::var_os(*key)).collect();
+        let old: Vec<_> = keys.iter().map(std::env::var_os).collect();
         unsafe {
             std::env::set_var("ANYAGENTS_AGENT_UID", uid.to_string());
             std::env::set_var("ANYAGENTS_AGENT_GID", "42003");
