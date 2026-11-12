@@ -694,6 +694,8 @@ pub enum Wake {
 /// Open database. Methods take a shared reference; writes serialize on the mutex.
 pub struct Store {
     conn: Mutex<Connection>,
+    /// Idle read-only connections; see [`MAX_IDLE_READERS`].
+    readers: Mutex<Vec<Connection>>,
     db_path: PathBuf,
     data_dir: PathBuf,
     wakes: Mutex<Vec<Sender<Wake>>>,
@@ -744,8 +746,48 @@ fn is_transient_sqlite_error(error: &rusqlite::Error) -> bool {
     )
 }
 
+/// Idle read-only connections kept for reuse. Opening a connection per read
+/// discards SQLite's page cache and re-reads the schema every time; on a
+/// multi-GB store that turned every read into a burst of `pread` syscalls and
+/// pinned the daemon in the kernel. Readers beyond this many simply close.
+const MAX_IDLE_READERS: usize = 32;
+/// Upper bound for memory-mapped I/O (SQLite clamps it to its compile-time
+/// maximum). Mapped pages come straight from the shared OS page cache, so
+/// reads cost no syscalls and no per-connection copy.
+const MMAP_SIZE_BYTES: i64 = 64 * 1024 * 1024 * 1024;
+/// Per-connection page cache, in KiB (negative `cache_size` units).
+const CACHE_SIZE_KIB: i64 = 32 * 1024;
+/// Prepared statements kept per connection; read paths reuse a few dozen.
+const STATEMENT_CACHE: usize = 128;
+
+/// Apply the shared performance settings to any store connection. Failures
+/// are ignored: each setting is an optimisation, never a correctness need.
+fn tune_connection(conn: &Connection) {
+    let _ = conn.pragma_update(None, "mmap_size", MMAP_SIZE_BYTES);
+    let _ = conn.pragma_update(None, "cache_size", -CACHE_SIZE_KIB);
+    let _ = conn.pragma_update(None, "temp_store", "MEMORY");
+    conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE);
+}
+
+/// Open one read-only connection for the reader pool.
+fn open_reader(path: &Path) -> Option<Connection> {
+    let conn = Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    let _ = conn.busy_timeout(BUSY_TIMEOUT);
+    let _ = conn.pragma_update(None, "query_only", "ON");
+    tune_connection(&conn);
+    Some(conn)
+}
+
 enum ReadConn<'a> {
-    Owned(Connection),
+    /// A reader borrowed from the pool; returned on drop.
+    Pooled {
+        conn: Option<Connection>,
+        pool: &'a Mutex<Vec<Connection>>,
+    },
     Guard(MutexGuard<'a, Connection>),
 }
 
@@ -753,8 +795,24 @@ impl std::ops::Deref for ReadConn<'_> {
     type Target = Connection;
     fn deref(&self) -> &Connection {
         match self {
-            Self::Owned(c) => c,
+            Self::Pooled { conn, .. } => conn.as_ref().expect("pooled reader present until drop"),
             Self::Guard(g) => g,
+        }
+    }
+}
+
+impl Drop for ReadConn<'_> {
+    fn drop(&mut self) {
+        if let Self::Pooled { conn, pool } = self
+            && let Some(conn) = conn.take()
+            // Never pool a connection left inside a transaction: its stale
+            // snapshot would hide later commits from the next borrower.
+            && conn.is_autocommit()
+        {
+            let mut idle = pool.lock().unwrap_or_else(|p| p.into_inner());
+            if idle.len() < MAX_IDLE_READERS {
+                idle.push(conn);
+            }
         }
     }
 }
@@ -838,6 +896,7 @@ impl Store {
             )));
         }
         let mut conn = conn;
+        tune_connection(&conn);
         let schema_version = migrate::current_version(&conn)?;
         migrate::migrate(&mut conn)?;
         // Tolerate busy on per-open DDL: a WAL-pinned DB must not make
@@ -988,6 +1047,7 @@ impl Store {
         }
         let store = Self {
             conn: Mutex::new(conn),
+            readers: Mutex::new(Vec::new()),
             db_path: path.to_path_buf(),
             data_dir: data_dir_for(path),
             wakes: Mutex::new(Vec::new()),
@@ -1726,6 +1786,23 @@ impl Store {
     pub fn list_agents(&self) -> Result<Vec<Agent>, Error> {
         let conn = self.read_conn();
         let mut stmt = conn.prepare(&format!("SELECT {AGENT_COLS} FROM agents ORDER BY name"))?;
+        let mut rows = stmt.query([])?;
+        let mut agents = Vec::new();
+        while let Some(row) = rows.next()? {
+            agents.push(agent_from_row(row)?);
+        }
+        Ok(agents)
+    }
+
+    /// Every agent that is not archived, ordered by name. Hot paths use this
+    /// instead of [`Store::list_agents`] so their cost follows the live fleet,
+    /// not the ever-growing archive (served by `idx_agents_state`).
+    pub fn list_live_agents(&self) -> Result<Vec<Agent>, Error> {
+        let conn = self.read_conn();
+        let mut stmt = conn.prepare_cached(&format!(
+            "SELECT {AGENT_COLS} FROM agents \
+             WHERE state IN ('created', 'running', 'idle', 'paused') ORDER BY name"
+        ))?;
         let mut rows = stmt.query([])?;
         let mut agents = Vec::new();
         while let Some(row) = rows.next()? {
@@ -5022,16 +5099,18 @@ impl Store {
     }
 
     fn read_conn(&self) -> ReadConn<'_> {
-        if !self.db_path.as_os_str().is_empty()
-            && let Ok(c) = Connection::open_with_flags(
-                &self.db_path,
-                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-            )
-        {
-            let _ = c.busy_timeout(Duration::from_secs(30));
-            let _ = c.pragma_update(None, "query_only", "ON");
-            return ReadConn::Owned(c);
+        if !self.db_path.as_os_str().is_empty() {
+            let idle = self
+                .readers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .pop();
+            if let Some(conn) = idle.or_else(|| open_reader(&self.db_path)) {
+                return ReadConn::Pooled {
+                    conn: Some(conn),
+                    pool: &self.readers,
+                };
+            }
         }
         ReadConn::Guard(self.conn())
     }

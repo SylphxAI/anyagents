@@ -675,10 +675,12 @@ pub fn tick_local_schedules_once(store: &Store, health: &HealthBoard, now: i64) 
 ///   is idle, deliver a single consolidated event notification to `parent` reminding it to either
 ///   send follow-up instructions or `archive` the completed task sub-agent(s).
 pub fn tick_task_subagent_turn_ownership(store: &Store, health: &HealthBoard, now: i64) -> usize {
-    let Ok(agents) = store.list_agents() else {
+    // Archived children never act, so only the live fleet is read each tick;
+    // an archived parent of a live child is fetched on demand below.
+    let Ok(agents) = store.list_live_agents() else {
         return 0;
     };
-    let agents_by_id: HashMap<AgentId, Agent> =
+    let mut agents_by_id: HashMap<AgentId, Agent> =
         agents.iter().cloned().map(|a| (a.id.clone(), a)).collect();
     let mut actions = 0usize;
     let mut waiting_by_parent: HashMap<AgentId, Vec<(String, String, i64)>> = HashMap::new();
@@ -687,6 +689,12 @@ pub fn tick_task_subagent_turn_ownership(store: &Store, health: &HealthBoard, no
         let Some(parent_id) = child.parent_id.as_ref() else {
             continue;
         };
+        if !agents_by_id.contains_key(parent_id) {
+            let Ok(parent) = store.agent(parent_id) else {
+                continue;
+            };
+            agents_by_id.insert(parent_id.clone(), parent);
+        }
         let Some(parent) = agents_by_id.get(parent_id) else {
             continue;
         };

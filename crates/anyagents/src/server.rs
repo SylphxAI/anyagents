@@ -127,7 +127,7 @@ fn acquire_server_lock(data: &Path) -> Result<std::fs::File, Error> {
 
 fn active_seat_ids(store: &Store) -> Result<Vec<String>, Error> {
     Ok(store
-        .list_agents()?
+        .list_live_agents()?
         .into_iter()
         .filter(|agent| agent.state != "archived")
         .map(|agent| agent.id.to_string())
@@ -505,7 +505,7 @@ fn reap_archived_agents(store: &Store, data_dir: &Path, health: &HealthBoard) {
 /// Consolidate idle agents' topic files without changing the active session's
 /// immutable snapshot. Updated files are pinned only at the next explicit session.
 fn consolidate_idle_agent_memory(store: &Store, data_dir: &Path, health: &HealthBoard) {
-    let Ok(agents) = store.list_agents() else {
+    let Ok(agents) = store.list_live_agents() else {
         return;
     };
     let mut llm_consolidated_count = 0usize;
@@ -6459,7 +6459,7 @@ fn room_recipients(store: &Store, body: &SendRequest, room: &str) -> Vec<Agent> 
         Err(_) => return Vec::new(),
     };
     store
-        .list_agents()
+        .list_live_agents()
         .unwrap_or_default()
         .into_iter()
         .filter(|agent| {
@@ -6481,7 +6481,7 @@ fn room_skipped(store: &Store, body: &SendRequest, room: &str) -> Vec<crate::api
     let name = room.strip_prefix("group:").unwrap_or(room);
     if name == "all" || name == "peers" {
         return store
-            .list_agents()
+            .list_live_agents()
             .unwrap_or_default()
             .into_iter()
             .filter(|agent| agent.parent_id.is_none())
