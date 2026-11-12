@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and release idle processes under the same rules. Preserve legacy effective scopes
   on upgrade, default all new children to private, and retain browser profiles until
   deletion. Discovery and generated lifecycle instructions no longer depend on roles.
+- Schedule wakes share the one mailbox: a due `at` or `every` tick, or a triggered
+  watch, is written at once like any other message and reaches a busy owner by
+  steering, or a paused or quota-blocked owner on resume. Recurring ticks are no
+  longer dropped as `skipped:busy`; a schedule keeps at most one undelivered wake.
 
 ## 0.1.3
 

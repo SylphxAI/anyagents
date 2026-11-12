@@ -596,9 +596,15 @@ future timer and the pending external watch remain undelivered.
 
 `overdue_at_delivers_on_first_local_tick_after_restart` reopens the database and
 checks first-pass delivery of a one-day-overdue timer without duplicate delivery.
-`overdue_at_records_busy_and_paused_deferrals_until_fired` verifies durable
-`deferred:busy` and `deferred:paused` observations while preserving the due time,
-then checks the transition to `fired` after the owner becomes eligible.
+Schedules share the one mailbox with every other message: a due tick or a
+triggered watch is written to it immediately, and mailbox delivery alone handles a
+busy, paused or quota-blocked owner. `overdue_at_enters_mailbox_while_owner_busy_or_paused`,
+`watch_schedule_enters_mailbox_while_owner_busy` and
+`every_ticks_reach_idle_busy_and_quota_blocked_owners_until_cancel` check one
+wake per tick for each owner state, with no duplicate after restart.
+`long_pause_leaves_one_pending_every_tick` runs a thousand intervals against a
+paused owner and checks that a schedule never queues a second wake while its
+previous one is undelivered (`last_observed = coalesced`), then resumes normally.
 
 Readiness and sign-in server fixtures explicitly clear all six seat/principal
 environment selectors and assert single-UID admission. They exercise token
