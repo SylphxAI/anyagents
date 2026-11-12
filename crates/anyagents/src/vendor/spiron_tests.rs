@@ -991,6 +991,38 @@ impl SpironRig {
             .collect()
     }
 
+    /// Snapshot for diagnosing a stall (the supervisor makes no progress).
+    fn stall_report(&self) -> String {
+        let hold = std::fs::read_to_string(self.cfg.join("spiron-unconfirmed-steers.json"))
+            .map(|s| format!("{} bytes", s.len()))
+            .unwrap_or_else(|_| "absent".to_string());
+        let last_error = std::fs::read_to_string(self.cfg.join(".anyagents-last-error.json"))
+            .unwrap_or_else(|_| "absent".to_string());
+        let launch = std::fs::read_to_string(self.cfg.join("launch_count"))
+            .unwrap_or_else(|_| "absent".to_string());
+        let journal = rusqlite::Connection::open(self.cfg.join("sessions.sqlite3"))
+            .and_then(|db| {
+                Ok((
+                    db.query_row(
+                        "SELECT COUNT(*) FROM session_entries",
+                        [],
+                        |r| r.get::<_, i64>(0),
+                    ),
+                    db.query_row(
+                        "SELECT COUNT(*) FROM session_leases",
+                        [],
+                        |r| r.get::<_, i64>(0),
+                    ),
+                ))
+            })
+            .map(|(entries, leases)| format!("entries={entries:?} leases={leases:?}"))
+            .unwrap_or_else(|_| "unreadable".to_string());
+        format!(
+            "wire={:?} launched={launch} hold={hold} last_error={last_error} journal={journal}",
+            self.wire()
+        )
+    }
+
     /// How many times the session journal recorded `id` as user input.
     fn journaled(&self, id: &str) -> usize {
         let db = rusqlite::Connection::open(self.cfg.join("sessions.sqlite3")).unwrap();
@@ -1114,10 +1146,18 @@ for raw in sys.stdin:
     );
     let m1 = rig.receive("long running task");
     rig.start();
-    eventually(|| rig.store.delivered_cursor(&rig.agent.id).unwrap() == m1.seq);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while rig.store.delivered_cursor(&rig.agent.id).unwrap() != m1.seq {
+        assert!(Instant::now() < deadline, "{}", rig.stall_report());
+        std::thread::sleep(Duration::from_millis(5));
+    }
     let m2 = rig.receive("steer cut off by the gateway");
 
-    eventually(|| rig.wire().len() >= 4);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while rig.wire().len() < 4 {
+        assert!(Instant::now() < deadline, "{}", rig.stall_report());
+        std::thread::sleep(Duration::from_millis(5));
+    }
     eventually(|| !rig.store.has_open_turn(&rig.agent.id).unwrap());
     let wire = rig.wire();
     assert!(
@@ -1279,7 +1319,8 @@ for raw in sys.stdin:
     // The consumed input never re-appears as a raw request; the unconsumed
     // one arrives once more after the fixture's pre-crash journal entry.
     assert_eq!(rig.journaled(m1.id.as_str()), 1);
-    assert_eq!(rig.journaled(m2.id.as_str()), 2);
+    // The probe journals the redelivery just after recording it on the wire.
+    eventually(|| rig.journaled(m2.id.as_str()) == 2);
     assert!(!rig.cfg.join("spiron-unconfirmed-steers.json").exists());
     assert_eq!(rig.store.delivered_cursor(&rig.agent.id).unwrap(), m2.seq);
 }
