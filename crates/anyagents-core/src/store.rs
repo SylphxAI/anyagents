@@ -11231,7 +11231,9 @@ mod tests {
         store.set_agent_running(&worker.id, "/work").unwrap();
         let mut ids: Vec<String> = Vec::new();
         for i in 1..=6 {
-            let out = store.receive(&worker.id, Incoming::new(format!("task {i}"))).unwrap();
+            let out = store
+                .receive(&worker.id, Incoming::new(format!("task {i}")))
+                .unwrap();
             let id = match out {
                 ReceiveOutcome::New(m) => m.id.to_string(),
                 ReceiveOutcome::Duplicate(m) => m.id.to_string(),
@@ -11248,8 +11250,14 @@ mod tests {
         let started = std::time::Instant::now();
         let peer = hold_writer_lock(&db, Duration::from_millis(400));
         store.note_turn_recovered(&worker.id, 1).unwrap();
-        assert!(started.elapsed() >= Duration::from_millis(350), "must wait for lock");
-        assert_eq!(store.open_turn(&worker.id).unwrap().unwrap().recovery_count, 1);
+        assert!(
+            started.elapsed() >= Duration::from_millis(350),
+            "must wait for lock"
+        );
+        assert_eq!(
+            store.open_turn(&worker.id).unwrap().unwrap().recovery_count,
+            1
+        );
         peer.join().unwrap();
 
         // advance_delivered: the next cursor step.
@@ -11288,7 +11296,10 @@ mod tests {
             .unwrap();
         assert!(started.elapsed() >= Duration::from_millis(350));
         peer.join().unwrap();
-        assert!(started.elapsed() < Duration::from_secs(10), "budget bounds the wait");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "budget bounds the wait"
+        );
     }
 
     #[test]
@@ -11299,7 +11310,9 @@ mod tests {
         store.set_agent_running(&worker.id, "/work").unwrap();
         let mut ids: Vec<String> = Vec::new();
         for i in 1..=3 {
-            let out = store.receive(&worker.id, Incoming::new(format!("task {i}"))).unwrap();
+            let out = store
+                .receive(&worker.id, Incoming::new(format!("task {i}")))
+                .unwrap();
             let id = match out {
                 ReceiveOutcome::New(m) => m.id.to_string(),
                 ReceiveOutcome::Duplicate(m) => m.id.to_string(),
@@ -11334,9 +11347,15 @@ mod tests {
                 "{name} unexpected error: {err:?}"
             );
         }
-        assert!(elapsed < Duration::from_secs(2), "budget bounds the wait: {elapsed:?}");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "budget bounds the wait: {elapsed:?}"
+        );
         // No partial state change escaped the failed attempts.
-        assert_eq!(store.open_turn(&worker.id).unwrap().unwrap().recovery_count, 0);
+        assert_eq!(
+            store.open_turn(&worker.id).unwrap().unwrap().recovery_count,
+            0
+        );
     }
 
     #[test]
@@ -11347,32 +11366,62 @@ mod tests {
         {
             let started = std::time::Instant::now();
             let result = store.note_turn_recovered(&missing, 1);
-            assert!(matches!(result, Err(Error::AgentNotFound(_))), "note_turn_recovered: {result:?}");
-            assert!(started.elapsed() < Duration::from_millis(200), "note_turn_recovered must not retry");
+            assert!(
+                matches!(result, Err(Error::AgentNotFound(_))),
+                "note_turn_recovered: {result:?}"
+            );
+            assert!(
+                started.elapsed() < Duration::from_millis(200),
+                "note_turn_recovered must not retry"
+            );
         }
         {
             let started = std::time::Instant::now();
             let result = store.advance_delivered(&missing, 1).map(|_| ());
-            assert!(matches!(result, Err(Error::AgentNotFound(_))), "advance_delivered: {result:?}");
-            assert!(started.elapsed() < Duration::from_millis(200), "advance_delivered must not retry");
+            assert!(
+                matches!(result, Err(Error::AgentNotFound(_))),
+                "advance_delivered: {result:?}"
+            );
+            assert!(
+                started.elapsed() < Duration::from_millis(200),
+                "advance_delivered must not retry"
+            );
         }
         {
             let started = std::time::Instant::now();
             let result = store.note_delivered(&missing, 1);
-            assert!(matches!(result, Err(Error::AgentNotFound(_))), "note_delivered: {result:?}");
-            assert!(started.elapsed() < Duration::from_millis(200), "note_delivered must not retry");
+            assert!(
+                matches!(result, Err(Error::AgentNotFound(_))),
+                "note_delivered: {result:?}"
+            );
+            assert!(
+                started.elapsed() < Duration::from_millis(200),
+                "note_delivered must not retry"
+            );
         }
         {
             let started = std::time::Instant::now();
             let result = store.promote_messages_to_open_turn(&missing, &["x".to_string()]);
-            assert!(matches!(result, Err(Error::AgentNotFound(_))), "promote: {result:?}");
-            assert!(started.elapsed() < Duration::from_millis(200), "promote must not retry");
+            assert!(
+                matches!(result, Err(Error::AgentNotFound(_))),
+                "promote: {result:?}"
+            );
+            assert!(
+                started.elapsed() < Duration::from_millis(200),
+                "promote must not retry"
+            );
         }
         {
             let started = std::time::Instant::now();
             let result = store.reclaim_unconfirmed_steers(&missing, &["x".to_string()]);
-            assert!(matches!(result, Err(Error::AgentNotFound(_))), "reclaim: {result:?}");
-            assert!(started.elapsed() < Duration::from_millis(200), "reclaim must not retry");
+            assert!(
+                matches!(result, Err(Error::AgentNotFound(_))),
+                "reclaim: {result:?}"
+            );
+            assert!(
+                started.elapsed() < Duration::from_millis(200),
+                "reclaim must not retry"
+            );
         }
     }
 }
