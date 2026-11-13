@@ -83,6 +83,38 @@ impl Store {
         }
         Ok(ids)
     }
+
+    /// Every archived agent that has a parent, through the state index.
+    pub fn archived_subagent_ids(&self) -> Result<Vec<AgentId>, Error> {
+        let conn = self.read_conn();
+        let mut stmt = conn.prepare_cached(
+            "SELECT id FROM agents WHERE state = 'archived' AND parent_id IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut ids = Vec::new();
+        for id in rows {
+            ids.push(AgentId::parse(&id?)?);
+        }
+        Ok(ids)
+    }
+
+    /// `(id, workdir)` of every agent that is not archived and names a workdir,
+    /// without decoding rows. The two ranges let the state index skip the
+    /// archive.
+    pub fn unarchived_workdirs(&self) -> Result<Vec<(AgentId, String)>, Error> {
+        let conn = self.read_conn();
+        let mut stmt = conn.prepare_cached(
+            "SELECT id, workdir FROM agents
+             WHERE (state < 'archived' OR state > 'archived') AND workdir IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        let mut workdirs = Vec::new();
+        for row in rows {
+            let (id, workdir) = row?;
+            workdirs.push((AgentId::parse(&id)?, workdir));
+        }
+        Ok(workdirs)
+    }
 }
 
 #[cfg(test)]
@@ -215,5 +247,48 @@ mod tests {
             .collect();
         assert_eq!(listed.len(), 6);
         assert_eq!(store.agent_ids().unwrap(), listed);
+    }
+
+    #[test]
+    fn unarchived_workdirs_skip_the_archive_and_rows_without_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let with_workdir = |name: &str, workdir: Option<&str>| {
+            let mut new = NewAgent::new(name, "codex");
+            new.workdir = workdir.map(str::to_string);
+            store.create_agent(new).unwrap()
+        };
+        let live = with_workdir("live", Some("/work/live"));
+        let paused = with_workdir("paused", Some("/work/paused"));
+        let archived = with_workdir("archived", Some("/work/archived"));
+        with_workdir("none", None);
+        store.set_agent_state(&paused.id, "paused").unwrap();
+        store.set_agent_state(&archived.id, "archived").unwrap();
+        let mut workdirs = store.unarchived_workdirs().unwrap();
+        workdirs.sort_by(|a, b| a.1.cmp(&b.1));
+        assert_eq!(
+            workdirs,
+            [
+                (live.id, "/work/live".to_string()),
+                (paused.id, "/work/paused".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn archived_subagents_skip_live_children_and_archived_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let root = store.create_agent(NewAgent::new("root", "codex")).unwrap();
+        let child = |name: &str| {
+            let mut new = NewAgent::new(name, "codex");
+            new.parent_id = Some(root.id.clone());
+            store.create_agent(new).unwrap()
+        };
+        let archived = child("archived");
+        child("live");
+        store.set_agent_state(&archived.id, "archived").unwrap();
+        store.set_agent_state(&root.id, "archived").unwrap();
+        assert_eq!(store.archived_subagent_ids().unwrap(), [archived.id]);
     }
 }

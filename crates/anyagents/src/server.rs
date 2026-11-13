@@ -38,6 +38,7 @@ use crate::vendor::{self, VendorHarness};
 
 mod outbound_history;
 mod quota_rotation;
+mod reap_queue;
 
 const SOCKET_NAME: &str = "anyagents.sock";
 /// `sockaddr_un.sun_path` holds 108 bytes, including the trailing NUL.
@@ -426,6 +427,9 @@ fn mark_archive_generation_locked(store: &Store, data_dir: &Path, agent: &Agent)
     ) {
         eprintln!("cannot persist {}: {err}", archived_marker.display());
     }
+    if agent.parent_id.is_some() {
+        reap_queue::enqueue(data_dir, &agent.id);
+    }
     if let Ok(schedules) = store.list_schedules(Some(&agent.id), true) {
         for sched in schedules {
             let _ = store.cancel_schedule(Some(&agent.id), &sched.id);
@@ -441,11 +445,13 @@ pub(crate) fn reap_archived_agent_locked(
     data_dir: &Path,
     agent_id: &anyagents_core::AgentId,
 ) {
-    let Ok(agent) = store.agent(agent_id) else {
-        return;
+    let agent = match store.agent(agent_id) {
+        Ok(agent) => agent,
+        Err(Error::AgentNotFound(_)) => return reap_queue::dequeue(data_dir, agent_id),
+        Err(_) => return reap_queue::note_failure(data_dir, agent_id, now_ms()),
     };
     if agent.state != "archived" || agent.parent_id.is_none() {
-        return;
+        return reap_queue::dequeue(data_dir, agent_id);
     }
     let cfg = anyagents_core::agent_config_dir(data_dir, agent_id);
     let archived = cfg.join(".anyagents-archived");
@@ -456,50 +462,45 @@ pub(crate) fn reap_archived_agent_locked(
         // Upgrade legacy or interrupted empty archive markers under the wake lock.
         mark_archive_generation_locked(store, data_dir, &agent);
     }
-    let Ok(generation) = std::fs::read(&archived) else {
-        return;
-    };
+    let generation = std::fs::read(&archived).unwrap_or_default();
     if generation.is_empty() {
-        return;
+        return reap_queue::note_failure(data_dir, agent_id, now_ms());
     }
     let reaped = cfg.join(".anyagents-reaped");
     if std::fs::read(&reaped).is_ok_and(|done| done == generation) {
-        return;
+        return reap_queue::dequeue(data_dir, agent_id);
     }
-    if reap_subagent_ephemeral_dirs(data_dir, agent_id)
-        && let Err(err) = anyagents_harness::atomic_write_nonempty_file(&reaped, &generation, 0o644)
-    {
-        eprintln!("cannot persist {}: {err}", reaped.display());
+    if !reap_subagent_ephemeral_dirs_in(store, data_dir, agent_id) {
+        return reap_queue::note_failure(data_dir, agent_id, now_ms());
+    }
+    match anyagents_harness::atomic_write_nonempty_file(&reaped, &generation, 0o644) {
+        Ok(()) => reap_queue::dequeue(data_dir, agent_id),
+        Err(err) => {
+            eprintln!("cannot persist {}: {err}", reaped.display());
+            reap_queue::note_failure(data_dir, agent_id, now_ms());
+        }
     }
 }
 
 /// The maintenance worker runs this at startup and each minute without waiting
-/// for an agent lock.
+/// for an agent lock. It visits only archives whose cleanup is owed and due.
 fn reap_archived_agents(store: &Store, data_dir: &Path, health: &HealthBoard) {
-    let Ok(agents) = store.list_agents() else {
-        return;
-    };
-    let large_pop = agents.len() > 32 && std::env::var_os("ANYAGENTS_TESTS").is_none();
-    for agent in agents {
-        if agent.state != "archived" || agent.parent_id.is_none() {
-            continue;
-        }
-        if large_pop {
-            let cfg = anyagents_core::agent_config_dir(data_dir, &agent.id);
-            if cfg.join(".anyagents-reaped").is_file() {
-                continue;
-            }
-        }
-        let Ok(_lifecycle) = store.try_lock_agent_lifecycle(&agent.id) else {
+    reap_archived_agents_at(store, data_dir, health, now_ms());
+}
+
+fn reap_archived_agents_at(store: &Store, data_dir: &Path, health: &HealthBoard, now: i64) {
+    reap_queue::backfill(store, data_dir);
+    for agent_id in reap_queue::due(data_dir, now) {
+        let Ok(_lifecycle) = store.try_lock_agent_lifecycle(&agent_id) else {
             continue;
         };
-        // A wake followed by a new self-archive may have started a process since
-        // the population read. Check current health only after taking the lock.
-        if health.get(&agent.id).is_some_and(|live| live.process_alive) {
+        // A wake followed by a new self-archive may have started a process
+        // since the archive. Check current health only after taking the lock.
+        if health.get(&agent_id).is_some_and(|live| live.process_alive) {
             continue;
         }
-        // Re-read under the lock: this population may predate a direct wake.
-        reap_archived_agent_locked(store, data_dir, &agent.id);
+        // Re-read under the lock: the queue may predate a direct wake.
+        reap_archived_agent_locked(store, data_dir, &agent_id);
     }
 }
 
@@ -540,6 +541,7 @@ pub(crate) fn clear_explicitly_archived(data_dir: &Path, agent_id: &anyagents_co
     let cfg = anyagents_core::agent_config_dir(data_dir, agent_id);
     let _ = std::fs::remove_file(cfg.join(".anyagents-reaped"));
     let _ = std::fs::remove_file(cfg.join(".anyagents-archived"));
+    reap_queue::dequeue(data_dir, agent_id);
 }
 
 /// Both intervals tick immediately at startup. Each loop owns its blocking
@@ -3670,6 +3672,7 @@ async fn archive_agent_route(
     .await
 }
 
+#[cfg(test)]
 pub(crate) fn reap_subagent_ephemeral_dirs(
     data_dir: &Path,
     agent_id: &anyagents_core::AgentId,
@@ -3677,13 +3680,33 @@ pub(crate) fn reap_subagent_ephemeral_dirs(
     let Ok(store) = Store::open(data_dir.join("state.db")) else {
         return false;
     };
-    let Ok(agents) = store.list_agents() else {
-        return false;
-    };
+    reap_subagent_ephemeral_dirs_in(&store, data_dir, agent_id)
+}
+
+fn reap_subagent_ephemeral_dirs_in(
+    store: &Store,
+    data_dir: &Path,
+    agent_id: &anyagents_core::AgentId,
+) -> bool {
     // Delete calls this after removing the row; all surviving references still
     // protect their workdirs. A failed read must never mean no shared workdirs.
-    let agent = agents.iter().find(|agent| &agent.id == agent_id);
-    let parent_id = agent.and_then(|agent| agent.parent_id.as_ref());
+    let agent = match store.agent(agent_id) {
+        Ok(agent) => Some(agent),
+        Err(Error::AgentNotFound(_)) => None,
+        Err(_) => return false,
+    };
+    let parent = match agent.as_ref().and_then(|agent| agent.parent_id.as_ref()) {
+        Some(parent_id) => match store.agent(parent_id) {
+            Ok(parent) => Some(parent),
+            Err(Error::AgentNotFound(_)) => None,
+            Err(_) => return false,
+        },
+        None => None,
+    };
+    let Ok(unarchived) = store.unarchived_workdirs() else {
+        return false;
+    };
+    let agent = agent.as_ref();
     let mut complete = true;
     let agent_root = data_dir.join("agents").join(agent_id.as_str());
     let config_dir = agent_root.join("config");
@@ -3756,16 +3779,24 @@ pub(crate) fn reap_subagent_ephemeral_dirs(
     if let Some(agent) = agent {
         let _ = crate::browser::stop_profile(data_dir, &agent.name);
     }
-    for other in &agents {
-        let keep_protected =
-            &other.id != agent_id && (other.state != "archived" || parent_id == Some(&other.id));
-        if keep_protected && let Some(wd) = &other.workdir {
-            let wd_path = PathBuf::from(&wd);
-            if let Ok(abs) = std::path::absolute(&wd_path) {
-                shared_workdirs.insert(abs);
-            }
-            shared_workdirs.insert(wd_path);
+    // Every other agent that is not archived, and the parent even when it is,
+    // keeps its workdir.
+    let protected = unarchived
+        .iter()
+        .filter(|(id, _)| id != agent_id)
+        .map(|(_, workdir)| workdir.as_str())
+        .chain(
+            parent
+                .as_ref()
+                .filter(|parent| &parent.id != agent_id)
+                .and_then(|parent| parent.workdir.as_deref()),
+        );
+    for wd in protected {
+        let wd_path = PathBuf::from(wd);
+        if let Ok(abs) = std::path::absolute(&wd_path) {
+            shared_workdirs.insert(abs);
         }
+        shared_workdirs.insert(wd_path);
     }
     let marker_path = config_dir.join(".anyagents-managed-worktree.json");
     let marker_val = std::fs::read_to_string(&marker_path)
@@ -4213,7 +4244,7 @@ async fn delete_agent_route(
                 .join(&deleted.name),
             seat_ids,
         );
-        reap_subagent_ephemeral_dirs(state.store.data_dir(), &deleted.id);
+        reap_subagent_ephemeral_dirs_in(&state.store, state.store.data_dir(), &deleted.id);
         for private_tree in ["config", "memory", "skills"] {
             let tree_path = agent_dir.join(private_tree);
             remove_path_with_seat(&tree_path, seat_ids);
@@ -9108,7 +9139,8 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&blocked).unwrap();
         std::fs::write(blocked.join("keep"), b"partial cleanup").unwrap();
         std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
-        reap_archived_agents(&store, dir.path(), &HealthBoard::default());
+        let failed_at = now_ms();
+        reap_archived_agents_at(&store, dir.path(), &HealthBoard::default(), failed_at);
         // Restore access before asserting so failed tests don't leak fixtures.
         std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(
@@ -9124,12 +9156,76 @@ pub(crate) mod tests {
             other_cfg.join(".anyagents-reaped").exists(),
             "failure starved an independent archive"
         );
-        reap_archived_agents(&store, dir.path(), &HealthBoard::default());
+        // A failed cleanup waits out its backoff instead of the next minute.
+        reap_archived_agents_at(
+            &store,
+            dir.path(),
+            &HealthBoard::default(),
+            failed_at + 30_000,
+        );
+        assert!(blocked.exists(), "retried before its backoff");
+        assert!(!cfg.join(".anyagents-reaped").exists());
+        reap_archived_agents_at(
+            &store,
+            dir.path(),
+            &HealthBoard::default(),
+            now_ms() + 60_000,
+        );
         assert!(!blocked.exists());
         assert_eq!(
             std::fs::read(cfg.join(".anyagents-reaped")).unwrap(),
             std::fs::read(cfg.join(".anyagents-archived")).unwrap()
         );
+    }
+
+    #[test]
+    fn reap_queue_backfills_once_and_idle_maintenance_visits_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let parent = store
+            .create_agent(anyagents_core::NewAgent::new("parent", "opencode"))
+            .unwrap();
+        // Finished under an earlier binary: its marker matches its archive.
+        let finished = archived_reap_fixture(&store, "finished", &parent);
+        let finished_cfg = anyagents_core::agent_config_dir(dir.path(), &finished.id);
+        std::fs::copy(
+            finished_cfg.join(".anyagents-archived"),
+            finished_cfg.join(".anyagents-reaped"),
+        )
+        .unwrap();
+        // Archived by an earlier binary that wrote no marker at all.
+        let mut new = anyagents_core::NewAgent::new("legacy", "opencode");
+        new.parent_id = Some(parent.id.clone());
+        let legacy = store.create_agent(new).unwrap();
+        store.set_agent_state(&legacy.id, "archived").unwrap();
+        let legacy_cfg = anyagents_core::agent_config_dir(dir.path(), &legacy.id);
+        // Forget what this binary queued, as if the archives predated the queue.
+        std::fs::remove_dir_all(dir.path().join("reap-pending")).unwrap();
+        for cfg in [&finished_cfg, &legacy_cfg] {
+            std::fs::create_dir_all(cfg.join(".claude")).unwrap();
+        }
+
+        reap_archived_agents(&store, dir.path(), &HealthBoard::default());
+        assert!(
+            finished_cfg.join(".claude").exists(),
+            "finished archive revisited"
+        );
+        assert!(
+            !legacy_cfg.join(".claude").exists(),
+            "legacy archive not backfilled"
+        );
+        assert_eq!(
+            std::fs::read(legacy_cfg.join(".anyagents-reaped")).unwrap(),
+            std::fs::read(legacy_cfg.join(".anyagents-archived")).unwrap()
+        );
+
+        // Nothing is owed now, so maintenance visits no agent at all.
+        std::fs::create_dir_all(legacy_cfg.join(".claude")).unwrap();
+        std::fs::remove_file(finished_cfg.join(".anyagents-reaped")).unwrap();
+        reap_archived_agents(&store, dir.path(), &HealthBoard::default());
+        assert!(legacy_cfg.join(".claude").exists());
+        assert!(finished_cfg.join(".claude").exists());
+        assert!(reap_queue::due(dir.path(), i64::MAX).is_empty());
     }
 
     #[test]
