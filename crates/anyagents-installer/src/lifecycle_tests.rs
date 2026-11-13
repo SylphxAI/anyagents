@@ -10,7 +10,7 @@ use base64::Engine as _;
 use sha2::{Digest as _, Sha256, Sha512};
 
 use super::*;
-use crate::catalog::{DoctorSpec, InstallMethod, SubscriptionTerms};
+use crate::catalog::{DoctorSpec, SubscriptionTerms};
 use crate::source::{PinnedArtifact, Source};
 use crate::unpack::Format;
 use crate::unpack::tests::{tar_gz, zip};
@@ -141,7 +141,6 @@ fn make_entry(
 ) -> CatalogEntry {
     CatalogEntry {
         id: id.to_string(),
-        install: InstallMethod::Vendored,
         sign_in_command: sign_in_command.into_iter().map(str::to_string).collect(),
         api_key_variable: None,
         subscription: SubscriptionTerms {

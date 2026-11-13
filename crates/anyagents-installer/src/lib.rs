@@ -21,37 +21,10 @@ use std::path::{Path, PathBuf};
 use anyagents_harness::normalize_harness_name;
 
 pub use catalog::{
-    Catalog, CatalogEntry, DoctorSpec, EntryOverride, InstallMethod, OVERRIDES, SubscriptionTerms,
+    Catalog, CatalogEntry, DoctorSpec, EntryOverride, OVERRIDES, SubscriptionTerms,
     builtin_catalog, builtin_runtimes, config_dir_variable,
 };
 pub use lifecycle::{HarnessStatus, Installed, Invocation, LeaseView, Lifecycle, NoLeases, Tick};
-
-#[cfg(test)]
-fn entry(
-    id: &str,
-    install: InstallMethod,
-    sign_in_command: Vec<String>,
-    api_key_variable: Option<String>,
-    models: Vec<String>,
-    source: &str,
-) -> CatalogEntry {
-    CatalogEntry {
-        id: id.to_string(),
-        install,
-        sign_in_command,
-        api_key_variable,
-        subscription: SubscriptionTerms {
-            models,
-            source: source.to_string(),
-        },
-        source: source::Source::Unconfigured,
-        launcher: id.to_string(),
-        runtime: None,
-        doctor: DoctorSpec::default(),
-        config_var: config_dir_variable(id).map(str::to_string),
-        self_update_off: BTreeMap::new(),
-    }
-}
 
 /// Whether a (harness, model, auth) triple may be offered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -145,137 +118,6 @@ pub fn install_dir(root: &Path, id: &str, version: &str) -> PathBuf {
         .join(version)
 }
 
-/// Install `version` of `harness` if that exact directory is not already there.
-///
-/// A second call for the same id and version does nothing. The agent that asked
-/// waits; this returns once the install has finished or failed.
-pub fn ensure_installed(
-    catalog: &[CatalogEntry],
-    root: &Path,
-    harness: &str,
-    version: &str,
-    runner: &mut dyn CommandRunner,
-) -> Result<PathBuf, InstallError> {
-    let harness = normalize_harness_name(harness);
-    let entry = catalog
-        .iter()
-        .find(|e| e.id == harness)
-        .ok_or_else(|| InstallError::UnknownHarness(harness.to_string()))?;
-    let dir = install_dir(root, harness, version);
-    if dir.join(".installed").exists() {
-        return Ok(dir);
-    }
-    std::fs::create_dir_all(&dir).map_err(|e| InstallError::Failed(e.to_string()))?;
-    if let Some((program, args)) = install_command(&entry.install, version) {
-        runner.run(&program, &args, &dir, &[], &mut NopLines)?;
-    }
-    anyagents_harness::atomic_write_nonempty_file(
-        &dir.join(".installed"),
-        version.as_bytes(),
-        0o644,
-    )
-    .map_err(|e| InstallError::Failed(e.to_string()))?;
-    Ok(dir)
-}
-
-/// The command that installs one method. `None` means the tool is already on
-/// the machine and only its version is recorded.
-fn install_command(method: &InstallMethod, version: &str) -> Option<(String, Vec<String>)> {
-    Some(match method {
-        InstallMethod::Npm { package } => (
-            "npm".to_string(),
-            vec![
-                "install".to_string(),
-                "--prefix".to_string(),
-                ".".to_string(),
-                format!("{package}@{version}"),
-            ],
-        ),
-        InstallMethod::VendorScript { url } => (
-            "sh".to_string(),
-            vec!["-c".to_string(), format!("curl -fsSL {url} | sh")],
-        ),
-        InstallMethod::ReleaseBinary { url, sha256 } => (
-            "sh".to_string(),
-            vec![
-                "-c".to_string(),
-                format!("curl -fsSL -o bin {url} && printf '%s  bin\\n' {sha256} | sha256sum -c -"),
-            ],
-        ),
-        InstallMethod::Vendored => return None,
-    })
-}
-
-/// The version an install records for a harness. `npm` is asked which version
-/// it would install; a vendored tool is whatever the machine has. Unreadable
-/// count as `unpinned`: the harness still runs, from the machine's own copy.
-pub fn catalog_version(
-    catalog: &[CatalogEntry],
-    harness: &str,
-    runner: &mut dyn CommandRunner,
-) -> Result<String, InstallError> {
-    let harness = normalize_harness_name(harness);
-    let entry = catalog
-        .iter()
-        .find(|e| e.id == harness)
-        .ok_or_else(|| InstallError::UnknownHarness(harness.to_string()))?;
-    match &entry.install {
-        InstallMethod::Npm { package } => {
-            let mut out = String::new();
-            let dir = std::env::temp_dir();
-            let mut sink = TextSink(&mut out);
-            match runner.run(
-                "npm",
-                &["view".to_string(), package.clone(), "version".to_string()],
-                &dir,
-                &[],
-                &mut sink,
-            ) {
-                Ok(()) => {
-                    let version = out.trim();
-                    if version.is_empty() {
-                        Ok(UNPINNED.to_string())
-                    } else {
-                        Ok(version.to_string())
-                    }
-                }
-                Err(_) => Ok(UNPINNED.to_string()),
-            }
-        }
-        _ => Ok(UNPINNED.to_string()),
-    }
-}
-
-/// Recorded when the machine's copy of a tool is used at whatever version it is.
-pub const UNPINNED: &str = "unpinned";
-
-/// The launcher a harness's own copy is called when the machine has one.
-fn launcher_name(harness: &str) -> &str {
-    match normalize_harness_name(harness) {
-        "claude-code" => "claude",
-        other => other,
-    }
-}
-
-/// Whether the harness's launcher is already on `PATH` (or built-in).
-pub fn machine_has(harness: &str) -> bool {
-    let name = launcher_name(harness);
-    std::env::var_os("PATH").is_some_and(|path| {
-        std::env::split_paths(&path)
-            .map(|dir| dir.join(name))
-            .any(|candidate| candidate.is_file())
-    })
-}
-
-struct TextSink<'a>(&'a mut String);
-
-impl LineSink for TextSink<'_> {
-    fn line(&mut self, line: &str) {
-        self.0.push_str(line);
-        self.0.push('\n');
-    }
-}
-
 /// What a sign-in is waiting on the user for.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SignInPrompt {
@@ -299,12 +141,6 @@ pub struct SignInOutcome {
 pub trait SignInSink {
     fn prompt(&mut self, prompt: &SignInPrompt);
     fn done(&mut self, outcome: &SignInOutcome);
-}
-
-struct NopLines;
-
-impl LineSink for NopLines {
-    fn line(&mut self, _: &str) {}
 }
 
 /// Where a harness writes its own sign-in credential.
@@ -486,14 +322,6 @@ mod tests {
             "sylphx_agent",
             "sylphx/default",
         ] {
-            assert_eq!(launcher_name(legacy), "spiron");
-            assert_eq!(
-                catalog_version(&catalog, legacy, &mut runner).unwrap(),
-                UNPINNED
-            );
-            let dir =
-                ensure_installed(&catalog, root.path(), legacy, UNPINNED, &mut runner).unwrap();
-            assert_eq!(dir, root.path().join("harnesses/spiron/unpinned"));
             let outcome = sign_in(
                 &catalog,
                 root.path(),
@@ -543,71 +371,18 @@ mod tests {
     }
 
     #[test]
-    fn the_second_install_of_the_same_version_does_nothing() {
+    fn sign_in_refuses_an_unknown_harness() {
         let root = tempfile::tempdir().unwrap();
         let mut runner = ScriptedRunner::default();
-        ensure_installed(&catalog(), root.path(), "codex", "1.0.0", &mut runner).unwrap();
-        ensure_installed(&catalog(), root.path(), "codex", "1.0.0", &mut runner).unwrap();
-        assert_eq!(runner.calls.len(), 1);
-        assert!(
-            install_dir(root.path(), "codex", "1.0.0")
-                .join(".installed")
-                .exists()
-        );
-    }
-
-    #[test]
-    fn an_install_lands_in_a_private_prefix() {
-        let root = tempfile::tempdir().unwrap();
-        let mut runner = ScriptedRunner::default();
-        ensure_installed(&catalog(), root.path(), "claude-code", "2.0.0", &mut runner).unwrap();
-        let call = &runner.calls[0];
-        assert_eq!(call.program, "npm");
-        assert!(
-            call.args
-                .iter()
-                .any(|a| a.contains("@anthropic-ai/claude-code@2.0.0"))
-        );
-        assert!(call.dir.ends_with("harnesses/claude-code/2.0.0"));
-    }
-
-    #[test]
-    fn a_vendored_harness_installs_nothing_and_records_the_machine_copy() {
-        let root = tempfile::tempdir().unwrap();
-        let catalog = vec![entry(
-            "opencode",
-            InstallMethod::Vendored,
-            vec!["opencode".to_string()],
-            None,
-            vec![],
-            "",
-        )];
-        let mut runner = ScriptedRunner::default();
-        let dir =
-            ensure_installed(&catalog, root.path(), "opencode", UNPINNED, &mut runner).unwrap();
-        assert!(runner.calls.is_empty(), "{:?}", runner.calls);
-        assert_eq!(
-            std::fs::read_to_string(dir.join(".installed")).unwrap(),
-            UNPINNED
-        );
-        ensure_installed(&catalog, root.path(), "opencode", UNPINNED, &mut runner).unwrap();
-        assert!(runner.calls.is_empty(), "{:?}", runner.calls);
-    }
-
-    #[test]
-    fn an_npm_harness_is_pinned_to_the_version_npm_reports() {
-        let mut runner = ScriptedRunner::default();
-        runner.answer("npm", "1.2.3\n");
-        let version = catalog_version(&catalog(), "codex", &mut runner).unwrap();
-        assert_eq!(version, "1.2.3");
-        assert_eq!(runner.calls[0].args, ["view", "@openai/codex", "version"]);
-    }
-
-    #[test]
-    fn an_unknown_harness_is_refused() {
-        let root = tempfile::tempdir().unwrap();
-        let mut runner = ScriptedRunner::default();
-        let err = ensure_installed(&catalog(), root.path(), "nope", "1", &mut runner).unwrap_err();
+        let err = sign_in(
+            &catalog(),
+            root.path(),
+            "nope",
+            "default",
+            &mut runner,
+            &mut NopSignIn,
+        )
+        .unwrap_err();
         assert_eq!(err, InstallError::UnknownHarness("nope".to_string()));
         assert!(runner.calls.is_empty());
     }
