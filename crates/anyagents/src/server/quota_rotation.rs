@@ -28,6 +28,12 @@ use anyagents_core::{AgentId, Store, agent_config_dir, now_ms};
 /// from its last check (`.anyagents-last-quota-check-ms`) instead of probing.
 const COOLDOWN_MS: i64 = 120_000;
 
+/// A waiting hold is also checked again after this long. Nothing reports a
+/// vendor resetting a window early, a candidate profile that is exhausted
+/// without a recorded reset, or a usage probe that failed; a long safety net
+/// covers those without a recheck cadence.
+const SAFETY_NET_MS: i64 = 30 * 60_000;
+
 /// A profile's recorded reset, written while an agent bound to it is held.
 const RESET_MARKER: &str = ".anyagents-quota-reset-ms";
 
@@ -351,9 +357,10 @@ impl Schedule {
                 }
             }
             // Events before this act are answered by it; later ones are not.
+            // Unobservable changes are covered by the safety net.
             Outcome::Waiting => {
                 if let Some(hold) = self.holds.get_mut(agent_id) {
-                    hold.due_ms = None;
+                    hold.due_ms = Some(now.saturating_add(SAFETY_NET_MS));
                 }
             }
         }
@@ -600,7 +607,7 @@ mod tests {
     }
 
     /// A hold whose reset is days away is acted on once, then not again until
-    /// something can change the answer: no fixed recheck cadence.
+    /// something can change the answer or the long safety net comes due.
     #[test]
     fn a_waiting_hold_sleeps_until_its_providers_next_availability() {
         let now = 1_000_000;
@@ -614,15 +621,22 @@ mod tests {
         );
         waiting(&mut schedule, &id, now);
         schedule.plan(now, |_| Vec::new());
-        assert_eq!(schedule.next_wake(), Some(now + 3 * DAY));
-        assert!(schedule.take_due(now + 2 * DAY).is_empty());
+        assert_eq!(schedule.next_wake(), Some(now + SAFETY_NET_MS));
+        assert!(schedule.take_due(now + SAFETY_NET_MS - 1).is_empty());
+        assert_eq!(
+            schedule.take_due(now + SAFETY_NET_MS),
+            std::slice::from_ref(&id),
+            "the safety net rechecks a waiting hold"
+        );
+        waiting(&mut schedule, &id, now + SAFETY_NET_MS);
 
-        // Another profile of the provider recorded an earlier reset.
+        // Another profile of the provider recorded an earlier reset: the
+        // provider wakes then, independently of the safety net.
         schedule.plan(now, |provider| {
             assert_eq!(provider, "openai");
             vec![now - HOUR, now + 5 * HOUR]
         });
-        assert_eq!(schedule.next_wake(), Some(now + 5 * HOUR));
+        assert_eq!(schedule.wake.get("openai"), Some(&(now + 5 * HOUR)));
         assert_eq!(schedule.take_due(now + 5 * HOUR), std::slice::from_ref(&id));
     }
 
@@ -637,17 +651,20 @@ mod tests {
         waiting(&mut schedule, &openai, now);
         waiting(&mut schedule, &google, now);
         schedule.plan(now, |_| Vec::new());
-        schedule.provider_changed(Some("openai"), now + HOUR);
-        assert_eq!(schedule.take_due(now + HOUR), std::slice::from_ref(&openai));
-        waiting(&mut schedule, &openai, now + HOUR);
-        schedule.provider_changed(Some("codex"), now + HOUR);
+        // Events inside the safety net's window.
+        let soon = now + SAFETY_NET_MS / 3;
+        schedule.provider_changed(Some("openai"), soon);
+        assert_eq!(schedule.take_due(soon), std::slice::from_ref(&openai));
+        waiting(&mut schedule, &openai, soon);
+        schedule.provider_changed(Some("codex"), soon);
         assert_eq!(
-            schedule.take_due(now + HOUR),
+            schedule.take_due(soon),
             std::slice::from_ref(&openai),
             "a compatible profile directory"
         );
-        schedule.provider_changed(None, now + 2 * HOUR);
-        let due: HashSet<AgentId> = schedule.take_due(now + 2 * HOUR).into_iter().collect();
+        let later = now + 2 * SAFETY_NET_MS / 3;
+        schedule.provider_changed(None, later);
+        let due: HashSet<AgentId> = schedule.take_due(later).into_iter().collect();
         assert_eq!(due, HashSet::from([google, openai]));
     }
 
@@ -678,22 +695,27 @@ mod tests {
             AgentId::generate(),
             AgentId::generate(),
         );
-        schedule.start(early.clone(), now + HOUR, "openai".into(), now);
+        let reset = now + SAFETY_NET_MS / 2;
+        schedule.start(early.clone(), reset, "openai".into(), now);
         schedule.start(late.clone(), now + DAY, "openai".into(), now);
-        schedule.start(other.clone(), now + HOUR, "google".into(), now);
+        schedule.start(other.clone(), reset, "google".into(), now);
         for id in schedule.take_due(now) {
             waiting(&mut schedule, &id, now);
         }
         schedule.plan(now, |_| Vec::new());
-        assert_eq!(schedule.next_wake(), Some(now + HOUR));
-        let due = schedule.take_due(now + HOUR);
+        assert_eq!(schedule.next_wake(), Some(reset));
+        let due = schedule.take_due(reset);
         assert_eq!(due.len(), 3, "both providers have a reset passing");
-        schedule.settle(&early, Outcome::Ended { freed: true }, now + HOUR);
-        schedule.settle(&other, Outcome::Ended { freed: true }, now + HOUR);
-        assert_eq!(schedule.take_due(now + HOUR), std::slice::from_ref(&late));
-        waiting(&mut schedule, &late, now + HOUR);
-        schedule.plan(now + HOUR, |_| Vec::new());
-        assert_eq!(schedule.next_wake(), Some(now + DAY));
+        schedule.settle(&early, Outcome::Ended { freed: true }, reset);
+        schedule.settle(&other, Outcome::Ended { freed: true }, reset);
+        assert_eq!(schedule.take_due(reset), std::slice::from_ref(&late));
+        waiting(&mut schedule, &late, reset);
+        schedule.plan(reset, |_| Vec::new());
+        assert_eq!(
+            schedule.next_wake(),
+            Some(reset + SAFETY_NET_MS),
+            "the remaining hold waits for the safety net, before its own reset a day out"
+        );
         assert_eq!(schedule.holds.len(), 1);
     }
 
@@ -708,11 +730,12 @@ mod tests {
         schedule.take_due(now);
         waiting(&mut schedule, &waiting_id, now);
         schedule.plan(now, |_| Vec::new());
-        schedule.start(new_id.clone(), now + HOUR, "openai".into(), now + 1);
+        let reset = now + SAFETY_NET_MS / 2;
+        schedule.start(new_id.clone(), reset, "openai".into(), now + 1);
         assert_eq!(schedule.take_due(now + 1), std::slice::from_ref(&new_id));
         waiting(&mut schedule, &new_id, now + 1);
-        assert_eq!(schedule.next_wake(), Some(now + HOUR));
-        let due: HashSet<AgentId> = schedule.take_due(now + HOUR).into_iter().collect();
+        assert_eq!(schedule.next_wake(), Some(reset));
+        let due: HashSet<AgentId> = schedule.take_due(reset).into_iter().collect();
         assert_eq!(due, HashSet::from([waiting_id, new_id]));
     }
 
