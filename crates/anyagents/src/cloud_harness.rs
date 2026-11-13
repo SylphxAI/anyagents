@@ -8,11 +8,8 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
-};
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use anyagents_core::Error;
 use anyagents_harness::normalize_harness_name;
@@ -107,7 +104,7 @@ pub fn run_with_io<R: BufRead, W: Write + Send + 'static>(
     let writer = Arc::new(Mutex::new(writer));
 
     type ActiveTurn = (
-        Arc<AtomicBool>,
+        Arc<TurnCancel>,
         Arc<Mutex<Option<String>>>,
         std::thread::JoinHandle<()>,
     );
@@ -130,7 +127,7 @@ pub fn run_with_io<R: BufRead, W: Write + Send + 'static>(
                     .and_then(Value::as_str)
                     .is_some_and(|s| s == "interrupt" || s == "cancel");
             if is_interrupt && let Some((cancel_flag, active_job_id, handle)) = active_turn.take() {
-                cancel_flag.store(true, Ordering::SeqCst);
+                cancel_flag.cancel();
                 if let Some(job_id) = active_job_id.lock().unwrap().clone() {
                     let base_url = resolve_cloud_base_url(&config, &harness);
                     let auth_token = resolve_cloud_auth_token(&config, &harness);
@@ -157,7 +154,7 @@ pub fn run_with_io<R: BufRead, W: Write + Send + 'static>(
         }
 
         let prompt_text = extract_user_prompt(&event);
-        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let cancel_flag = Arc::new(TurnCancel::default());
         let active_job_id = Arc::new(Mutex::new(None));
 
         let cfg_clone = config.clone();
@@ -671,7 +668,7 @@ pub fn dispatch_cloud_turn(
     session_id: Option<&str>,
     prompt_text: &str,
 ) -> Result<CloudTurnOutcome, String> {
-    let cancel_flag = AtomicBool::new(false);
+    let cancel_flag = TurnCancel::default();
     let active_job_id = Mutex::new(None);
     dispatch_cloud_turn_with_cancel(
         config,
@@ -690,10 +687,10 @@ pub fn dispatch_cloud_turn_with_cancel(
     model: Option<&str>,
     session_id: Option<&str>,
     prompt_text: &str,
-    cancel_flag: &AtomicBool,
+    cancel_flag: &TurnCancel,
     active_job_id: &Mutex<Option<String>>,
 ) -> Result<CloudTurnOutcome, String> {
-    if cancel_flag.load(Ordering::SeqCst) {
+    if cancel_flag.is_cancelled() {
         return Err("cancelled by supervisor interrupt".to_string());
     }
 
@@ -980,31 +977,69 @@ pub fn cancel_cloud_turn(
     Ok(())
 }
 
+/// A turn's cancellation: set once when the supervisor interrupts the turn,
+/// and waited on by the turn between status polls, so an interrupt ends the
+/// wait at once instead of at the next poll.
+#[derive(Default)]
+pub struct TurnCancel {
+    cancelled: Mutex<bool>,
+    signal: Condvar,
+}
+
+impl TurnCancel {
+    pub fn cancel(&self) {
+        *self.cancelled.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        self.signal.notify_all();
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        *self.cancelled.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Wait up to `timeout`; `true` when the turn was cancelled.
+    fn wait(&self, timeout: Duration) -> bool {
+        let cancelled = self.cancelled.lock().unwrap_or_else(|e| e.into_inner());
+        *self
+            .signal
+            .wait_timeout_while(cancelled, timeout, |cancelled| !*cancelled)
+            .unwrap_or_else(|e| e.into_inner())
+            .0
+    }
+}
+
+/// The longest wait between two status polls of one cloud job. Polls start
+/// at the configured interval and double up to this, so a short job is seen
+/// at once and a long one costs a request a second, not twenty.
+const MAX_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Polls a job may make at its first interval: the whole wait a job gets.
+const POLL_BUDGET: u32 = 6_000;
+
 fn poll_cloud_job_until_done(
     agent: &ureq::Agent,
     base_url: &str,
     canonical: &str,
     auth_token: Option<&str>,
     job_id: &str,
-    cancel_flag: &AtomicBool,
+    cancel_flag: &TurnCancel,
 ) -> Result<Value, String> {
     let status_url = cloud_job_status_url(base_url, canonical, job_id);
-    let poll_ms = std::env::var("ANYAGENTS_CLOUD_POLL_INTERVAL_MS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(50)
-        .clamp(10, 5_000);
+    let first = Duration::from_millis(
+        std::env::var("ANYAGENTS_CLOUD_POLL_INTERVAL_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(50)
+            .clamp(10, 5_000),
+    );
+    let deadline = Instant::now() + first * POLL_BUDGET;
+    let mut interval = first;
 
-    for _ in 0..6_000 {
-        if cancel_flag.load(Ordering::SeqCst) {
+    while Instant::now() < deadline {
+        if cancel_flag.wait(interval) {
             let _ = cancel_cloud_turn(base_url, canonical, auth_token, job_id);
             return Err("cancelled by supervisor interrupt".to_string());
         }
-        std::thread::sleep(Duration::from_millis(poll_ms));
-        if cancel_flag.load(Ordering::SeqCst) {
-            let _ = cancel_cloud_turn(base_url, canonical, auth_token, job_id);
-            return Err("cancelled by supervisor interrupt".to_string());
-        }
+        interval = (interval * 2).min(MAX_POLL_INTERVAL.max(first));
 
         let mut req = agent.get(&status_url);
         if let Some(tok) = auth_token {
@@ -1240,6 +1275,7 @@ mod tests {
         http::{HeaderMap, StatusCode},
         routing::post,
     };
+    use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
 
     #[tokio::test]
@@ -1819,5 +1855,101 @@ mod tests {
         {
             assert_eq!(tok.as_deref(), Some("sp_tok_abc123"));
         }
+    }
+
+    /// A job status endpoint that reports `running` until `done_after` has
+    /// passed, counts its polls, and records a cancel.
+    fn job_server(done_after: Option<Duration>) -> (String, Arc<Mutex<(usize, bool)>>) {
+        use std::io::{BufRead as _, Read as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let seen = Arc::new(Mutex::new((0usize, false)));
+        let recorded = Arc::clone(&seen);
+        let started = Instant::now();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                let _ = reader.read_line(&mut request_line);
+                let mut length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0u8; length];
+                let _ = reader.read_exact(&mut body);
+                let answer = if request_line.contains("/cancel") {
+                    recorded.lock().unwrap().1 = true;
+                    json!({"status": "cancelled"})
+                } else {
+                    recorded.lock().unwrap().0 += 1;
+                    if done_after.is_some_and(|after| started.elapsed() >= after) {
+                        json!({"id": "run_1", "status": "completed", "result": "done"})
+                    } else {
+                        json!({"id": "run_1", "status": "running"})
+                    }
+                }
+                .to_string();
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{answer}",
+                    answer.len()
+                );
+            }
+        });
+        (base, seen)
+    }
+
+    fn poll_agent() -> ureq::Agent {
+        ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(10)))
+            .http_status_as_error(false)
+            .build()
+            .into()
+    }
+
+    #[test]
+    fn a_long_job_is_polled_less_often_as_it_runs() {
+        let (base, seen) = job_server(Some(Duration::from_millis(1_500)));
+        let done = poll_cloud_job_until_done(
+            &poll_agent(),
+            &base,
+            "spiron-cloud",
+            None,
+            "run_1",
+            &TurnCancel::default(),
+        )
+        .unwrap();
+        assert_eq!(done["result"], "done");
+        // A fixed 50 ms interval asks about thirty times in 1.5 s.
+        let polls = seen.lock().unwrap().0;
+        assert!((2..=10).contains(&polls), "polled {polls} times");
+    }
+
+    #[test]
+    fn an_interrupt_ends_the_wait_between_polls_at_once() {
+        let (base, seen) = job_server(None);
+        let cancel = Arc::new(TurnCancel::default());
+        let interrupt = Arc::clone(&cancel);
+        let interrupter = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(1_200));
+            interrupt.cancel();
+            Instant::now()
+        });
+        let error =
+            poll_cloud_job_until_done(&poll_agent(), &base, "spiron-cloud", None, "run_1", &cancel)
+                .unwrap_err();
+        let ended = Instant::now();
+        let interrupted = interrupter.join().unwrap();
+        assert!(error.contains("cancelled"), "{error}");
+        // The wait between polls is a second by now; the interrupt cuts it.
+        assert!(ended.duration_since(interrupted) < Duration::from_millis(500));
+        assert!(seen.lock().unwrap().1, "the remote job was not cancelled");
     }
 }

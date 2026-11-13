@@ -1687,6 +1687,7 @@ fn browser_cmd(
         full_page: full_page.then_some(true),
         wait_ms,
         headless,
+        proxy: None,
         tab_action: None,
         target_id: None,
         cookies: None,
@@ -1796,15 +1797,17 @@ fn print_boundary(data: &Path) -> Result<(), anyagents_core::Error> {
 /// Print the catalog: id, the variable that points the vendor at its private
 /// config directory, and the command that installs it. Never a credential.
 fn list_harnesses(data: &Path) {
+    let catalog = anyagents_installer::Catalog::load(data)
+        .unwrap_or_else(|_| anyagents_installer::Catalog::builtin());
     if ui::is_pretty() {
         println!("\n  {}\n", ui::bold_cyan("Supported Harnesses"));
         let mut table = ui::Table::new(&[
             ("HARNESS", false),
             ("VERSION", false),
             ("CONFIG ENV", false),
-            ("INSTALL COMMAND", false),
+            ("INSTALL SOURCE", false),
         ]);
-        for entry in anyagents_installer::builtin_catalog() {
+        for entry in catalog.harnesses() {
             let ver = install::detect_version(data, &entry.id);
             let ver_cell = if ver == "-" {
                 ui::dim("-")
@@ -1815,35 +1818,49 @@ fn list_harnesses(data: &Path) {
                 ui::bold(&ui::cyan(&entry.id)),
                 ver_cell,
                 ui::dim(signin::config_variable(&entry.id).unwrap_or("-")),
-                signin::install_hint(&entry.id).unwrap_or_else(|| "-".to_string()),
+                entry.source.label(),
             ]);
         }
         table.print();
         println!();
         return;
     }
-    for entry in anyagents_installer::builtin_catalog() {
+    for entry in catalog.harnesses() {
         println!(
             "{}\t{}\t{}",
             entry.id,
             signin::config_variable(&entry.id).unwrap_or("-"),
-            signin::install_hint(&entry.id).unwrap_or_else(|| "-".to_string())
+            entry.source.label()
         );
     }
 }
 
 fn update_harnesses_cmd(data: &Path, target: Option<&str>) -> Result<(), anyagents_core::Error> {
-    let catalog = anyagents_installer::builtin_catalog();
+    let catalog = anyagents_installer::Catalog::load(data)
+        .map_err(|err| anyagents_core::Error::Message(err.to_string()))?;
     let targets: Vec<String> = match target.map(str::trim).filter(|s| !s.is_empty()) {
         Some(t) => {
-            if !catalog.iter().any(|c| c.id == t) {
+            let normalized = anyagents_harness::normalize_harness_name(t);
+            if catalog.get(normalized).is_none() {
                 return Err(anyagents_core::Error::Message(format!(
                     "unknown harness `{t}`"
                 )));
             }
-            vec![t.to_string()]
+            vec![normalized.to_string()]
         }
-        None => catalog.into_iter().map(|c| c.id).collect(),
+        None => catalog
+            .harnesses()
+            .iter()
+            .chain(catalog.runtimes())
+            .filter(|entry| {
+                entry.source.is_managed()
+                    && !matches!(
+                        entry.source,
+                        anyagents_installer::source::Source::Unconfigured
+                    )
+            })
+            .map(|entry| entry.id.clone())
+            .collect(),
     };
 
     let mut rows = Vec::new();
@@ -2548,10 +2565,12 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
         .map(|s| create::sync_and_list_provider_profiles_with_options(&s, data, false))
         .unwrap_or_default();
 
+    let catalog = anyagents_installer::Catalog::load(data)
+        .unwrap_or_else(|_| anyagents_installer::Catalog::builtin());
     let mut harness_rows = Vec::new();
-    for entry in anyagents_installer::builtin_catalog() {
+    for entry in catalog.harnesses() {
         let bin_path = install::program(data, &entry.id);
-        let present = bin_path.is_file() || anyagents_installer::machine_has(&entry.id);
+        let present = install::is_healthy(data, &entry.id) || bin_path.is_file();
         let version = install::recorded_version(data, &entry.id);
         let (mode, steer) = anyagents_supervisor::declared(&entry.id);
         let profiles: Vec<String> = provider_profiles

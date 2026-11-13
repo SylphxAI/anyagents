@@ -16,31 +16,12 @@ fn bin() -> Command {
     cmd.env("ANYAGENTS_TESTS", "1")
         .env_remove("ANYAGENTS_AGENT_ROUTE")
         .env_remove("ANYAGENTS_DATA")
-        .env_remove("ANYAGENTS_AGENT_ID");
+        .env_remove("ANYAGENTS_AGENT_ID")
+        .env_remove("ANYAGENTS_OWNER_WORKDIR");
     cmd
 }
 
-/// A `PATH` where creating an agent installs nothing: `npm` answers a version
-/// and a no-op install, and `claude` is this binary.
-fn machine_path(dir: &std::path::Path) -> std::ffi::OsString {
-    use std::os::unix::fs::PermissionsExt;
-    let bin = dir.join("bin");
-    std::fs::create_dir_all(&bin).unwrap();
-    let launcher = bin.join("claude");
-    if !launcher.exists() {
-        std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_anyagents"), &launcher).unwrap();
-    }
-    let npm = bin.join("npm");
-    if !npm.exists() {
-        std::fs::write(
-            &npm,
-            "#!/bin/sh\ncase \"$1\" in view) echo 0.0.0 ;; esac\nexit 0\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&npm, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-    std::env::join_paths([bin]).unwrap()
-}
+use support::machine_path;
 
 #[derive(Deserialize)]
 struct AgentsResponse {
@@ -212,6 +193,14 @@ async fn connect(
     data: &std::path::Path,
     agent: &str,
 ) -> rmcp::service::RunningService<rmcp::RoleClient, ()> {
+    connect_with_owner(data, agent, None).await
+}
+
+async fn connect_with_owner(
+    data: &std::path::Path,
+    agent: &str,
+    owner: Option<&std::path::Path>,
+) -> rmcp::service::RunningService<rmcp::RoleClient, ()> {
     let id = created_id(data, agent);
     let config = data.join("agents").join(&id).join("config");
 
@@ -220,6 +209,10 @@ async fn connect(
             // The single-user route: this deployment has no operator token, so
             // its own agent route names the agent. The server still resolves
             // the name itself, and a tool call never sends as anyone else.
+            cmd.env_remove("ANYAGENTS_OWNER_WORKDIR");
+            if let Some(owner) = owner {
+                cmd.env("ANYAGENTS_OWNER_WORKDIR", owner);
+            }
             cmd.env("ANYAGENTS_TESTS", "1")
                 .env("ANYAGENTS_AGENT_ROUTE", data)
                 .env("ANYAGENTS_DATA", data)
@@ -262,6 +255,61 @@ fn error_text(result: &CallToolResult) -> String {
     match result.content.first() {
         Some(ContentBlock::Text(text)) => text.text.clone(),
         other => panic!("expected text error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn configured_owner_catalog_controls_mcp_discovery_after_removal() {
+    let dir = support::physical_tempdir();
+    let owner = dir.path().join("owner");
+    let created = bin()
+        .env("PATH", machine_path(dir.path()))
+        .arg("--data")
+        .arg(dir.path())
+        .args(["agents", "create", "catalog-reader"])
+        .output()
+        .unwrap();
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    for root in [".agents/agents", "agents-templates", "archetypes"] {
+        let root = dir.path().join(root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("retired.md"), "Stale role.").unwrap();
+        std::fs::write(root.join("worker.md"), "Wrong role.").unwrap();
+    }
+    let _server = start_server(dir.path());
+    let client = connect_with_owner(dir.path(), "catalog-reader", Some(&owner)).await;
+    for state in ["missing", "empty", "populated", "removed"] {
+        let catalog = owner.join(".agents/agents");
+        match state {
+            "empty" => std::fs::create_dir_all(&catalog).unwrap(),
+            "populated" => std::fs::write(catalog.join("worker.md"), "Current role.").unwrap(),
+            "removed" => std::fs::remove_file(catalog.join("worker.md")).unwrap(),
+            _ => {}
+        }
+        let tools = client.list_all_tools().await.unwrap();
+        let role_tools: Vec<_> = tools
+            .iter()
+            .filter(|tool| {
+                tool.input_schema
+                    .get("properties")
+                    .and_then(serde_json::Value::as_object)
+                    .is_some_and(|props| props.contains_key("role"))
+            })
+            .collect();
+        assert!(!role_tools.is_empty());
+        for tool in role_tools {
+            let description = tool.description.as_deref().unwrap_or_default();
+            assert!(!description.contains("`retired`"), "{state}: {description}");
+            assert_eq!(
+                description.contains("`worker`"),
+                state == "populated",
+                "{state}: {description}"
+            );
+        }
     }
 }
 
@@ -328,6 +376,7 @@ async fn canonical_conversation_raw_range_crosses_mcp_and_authenticated_socket()
 }
 
 #[tokio::test]
+#[ignore = "intermittent ENOENT in MCP tool calls on macOS CI (push 43264718226 on 5c7e890a, same tree green in queue 43263904677); tracking: https://github.com/SylphxAI/anyagents/issues/216"]
 async fn mcp_tools_use_the_server_socket() {
     let dir = support::physical_tempdir();
     let socket = dir.path().join("anyagents.sock");

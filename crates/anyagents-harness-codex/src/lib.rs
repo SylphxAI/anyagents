@@ -53,6 +53,8 @@ pub struct CodexHarness {
 struct State {
     child: Option<Child>,
     alive: bool,
+    /// Bumped when something the host reads changes: what the activity
+    /// watcher waits on.
     epoch: u64,
     seen: HashSet<String>,
     written: Vec<String>,
@@ -73,6 +75,36 @@ struct State {
     fault_error: Option<String>,
     last_turn_input: Option<(String, Value, String)>,
     retry_turn_start: bool,
+}
+
+/// What the host reads through the harness API and the session pointer.
+#[derive(PartialEq, Eq)]
+struct Observed {
+    alive: bool,
+    open: usize,
+    seen: usize,
+    finished: usize,
+    usages: usize,
+    quota_reset_at_ms: Option<i64>,
+    fault_error: Option<String>,
+    thread_id: Option<String>,
+    thread_invalidated: bool,
+}
+
+impl State {
+    fn observed(&self) -> Observed {
+        Observed {
+            alive: self.alive,
+            open: self.open.len(),
+            seen: self.seen.len(),
+            finished: self.finished.len(),
+            usages: self.usages.len(),
+            quota_reset_at_ms: self.quota_reset_at_ms,
+            fault_error: self.fault_error.clone(),
+            thread_id: self.thread_id.clone(),
+            thread_invalidated: self.thread_invalidated,
+        }
+    }
 }
 
 enum Pending {
@@ -819,6 +851,7 @@ fn read_stdout(
         }
         let retry_payload = {
             let mut state = lock(&shared);
+            let before = state.observed();
             apply_line(&mut state, &value);
             let retry = if state.retry_turn_start {
                 state.retry_turn_start = false;
@@ -839,7 +872,11 @@ fn read_stdout(
             } else {
                 None
             };
-            state.epoch = state.epoch.wrapping_add(1);
+            // An item delta or progress event changes nothing the host reads,
+            // and wakes nobody.
+            if state.observed() != before {
+                state.epoch = state.epoch.wrapping_add(1);
+            }
             retry
         };
         if let Some(req) = retry_payload {
@@ -866,15 +903,15 @@ fn watch_child(shared: Arc<Mutex<State>>, wake: Arc<Condvar>, notify: Arc<dyn Fn
         .name("anyagents-codex-watch".into())
         .spawn(move || {
             let mut state = lock(&shared);
-            let mut seen = 0u64;
+            let mut seen = None;
             loop {
                 if !state.alive {
                     drop(state);
                     notify();
                     break;
                 }
-                if state.epoch != seen {
-                    seen = state.epoch;
+                if seen != Some(state.epoch) {
+                    seen = Some(state.epoch);
                     drop(state);
                     notify();
                     state = lock(&shared);

@@ -53,6 +53,8 @@ pub const MIGRATIONS: &[(i64, &str)] = &[
         25,
         include_str!("../migrations/026_full_mailbox_history.sql"),
     ),
+    (26, include_str!("../migrations/027_runtime_state.sql")),
+    (27, include_str!("../migrations/028_hot_path_indexes.sql")),
 ];
 
 /// Apply pending migrations. Each migration commits on its own, in order.
@@ -111,6 +113,7 @@ mod tests {
 
     #[test]
     fn redaction_migration_upgrades_scope_audit_and_group_owner_without_replacing_them() {
+        let latest = MIGRATIONS.last().unwrap().0;
         for baseline in [22, 23, 24] {
             let mut conn = Connection::open_in_memory().unwrap();
             conn.execute_batch(
@@ -126,7 +129,7 @@ mod tests {
                     .unwrap();
             }
             migrate(&mut conn).unwrap();
-            assert_eq!(current_version(&conn).unwrap(), 25);
+            assert_eq!(current_version(&conn).unwrap(), latest);
             conn.prepare("SELECT before_scope, after_scope, source FROM admin_audit")
                 .unwrap();
             conn.prepare("SELECT owner_agent_id FROM groups").unwrap();
@@ -142,7 +145,7 @@ mod tests {
             conn.prepare("SELECT agent_id, target_id, identity_id FROM message_identities")
                 .unwrap();
             migrate(&mut conn).unwrap();
-            assert_eq!(current_version(&conn).unwrap(), 25);
+            assert_eq!(current_version(&conn).unwrap(), latest);
         }
     }
 }

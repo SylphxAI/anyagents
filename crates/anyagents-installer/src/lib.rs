@@ -5,217 +5,26 @@
 //! is the only way a command leaves the process, and tests supply one that
 //! records what it was asked and answers without touching the network.
 
+pub mod catalog;
+pub mod exec;
+pub mod fetch;
+pub mod lifecycle;
+pub mod platform;
+pub mod receipt;
+pub mod source;
+pub mod unpack;
+pub mod verify;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyagents_harness::normalize_harness_name;
-use serde::{Deserialize, Serialize};
 
-/// How a harness is installed on one platform.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum InstallMethod {
-    /// `npm install` into a private prefix, never the user's global one.
-    Npm { package: String },
-    /// The vendor's own install script, given a private prefix.
-    VendorScript { url: String },
-    /// A release binary checked against a published checksum.
-    ReleaseBinary { url: String, sha256: String },
-    /// The vendor tool is already on the machine and AnyAgents only records it.
-    Vendored,
-}
-
-/// Which models a subscription on this harness may run, and where that was read.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SubscriptionTerms {
-    /// The models the vendor's own terms allow under a subscription.
-    pub models: Vec<String>,
-    /// Where the terms were read. Empty means unread: offer an API key only.
-    pub source: String,
-}
-
-/// One vendor tool, as shipped with the binary.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CatalogEntry {
-    pub id: String,
-    pub install: InstallMethod,
-    /// The vendor command that signs the user in.
-    pub sign_in_command: Vec<String>,
-    /// The variable an API key is passed through, when the vendor documents one.
-    pub api_key_variable: Option<String>,
-    pub subscription: SubscriptionTerms,
-}
-
-/// The catalog shipped with the binary. A user override replaces an entry by id.
-pub fn builtin_catalog() -> Vec<CatalogEntry> {
-    vec![
-        entry(
-            "spiron",
-            InstallMethod::Vendored,
-            vec!["spiron".to_string(), "login".to_string()],
-            Some("SYLPHX_API_KEY".to_string()),
-            vec![],
-            "",
-        ),
-        entry(
-            "claude-code",
-            InstallMethod::Npm {
-                package: "@anthropic-ai/claude-code".to_string(),
-            },
-            vec![
-                "claude".to_string(),
-                "auth".to_string(),
-                "login".to_string(),
-            ],
-            Some("ANTHROPIC_API_KEY".to_string()),
-            vec!["claude-opus".to_string(), "claude-sonnet".to_string()],
-            "",
-        ),
-        entry(
-            "codex",
-            InstallMethod::Npm {
-                package: "@openai/codex".to_string(),
-            },
-            vec!["codex".to_string(), "login".to_string()],
-            Some("OPENAI_API_KEY".to_string()),
-            vec!["gpt".to_string()],
-            "",
-        ),
-        entry(
-            "opencode",
-            InstallMethod::Vendored,
-            vec![
-                "opencode".to_string(),
-                "auth".to_string(),
-                "login".to_string(),
-            ],
-            Some("OPENAI_API_KEY".to_string()),
-            vec![],
-            "",
-        ),
-        // The Antigravity CLI signs in the first time it runs and keeps the
-        // token in its own store under `AGY_CONFIG_DIR`, so running it with
-        // that directory is the sign-in.
-        // The Antigravity CLI is on the machine already and signed in; the
-        // adapter runs that copy, as the OpenCode adapter does.
-        entry(
-            "agy",
-            InstallMethod::Vendored,
-            vec![
-                "agy".to_string(),
-                "--print".to_string(),
-                "reply with the word signed-in".to_string(),
-            ],
-            Some("ANTIGRAVITY_API_KEY".to_string()),
-            vec!["gemini".to_string()],
-            "",
-        ),
-        // Muse is on the machine already and signed in, as Antigravity is.
-        entry(
-            "muse",
-            InstallMethod::Vendored,
-            vec!["muse".to_string(), "login".to_string()],
-            Some("META_API_KEY".to_string()),
-            vec!["muse-wonder-full-1.0".to_string()],
-            "",
-        ),
-        entry(
-            "omp",
-            InstallMethod::Vendored,
-            vec!["omp".to_string(), "login".to_string()],
-            Some("OPENAI_API_KEY".to_string()),
-            vec![],
-            "",
-        ),
-        entry(
-            "dsh",
-            InstallMethod::Vendored,
-            vec![
-                "dsh".to_string(),
-                "--profile".to_string(),
-                "web".to_string(),
-            ],
-            Some("DEEPSEEK_API_KEY".to_string()),
-            vec!["deepseek-v3.2-exp-think".to_string()],
-            "",
-        ),
-        entry(
-            "grok",
-            InstallMethod::Vendored,
-            vec!["grok".to_string(), "login".to_string()],
-            Some("XAI_API_KEY".to_string()),
-            vec!["grok-4.20".to_string()],
-            "",
-        ),
-        entry(
-            "spiron-cloud",
-            InstallMethod::Vendored,
-            vec!["spiron".to_string(), "login".to_string()],
-            Some("SYLPHX_API_KEY".to_string()),
-            vec![
-                "claude-opus-4.6".to_string(),
-                "claude-sonnet-4.6".to_string(),
-                "gpt-5.4".to_string(),
-            ],
-            "https://sylphx.com/terms",
-        ),
-        entry(
-            "claude-cloud",
-            InstallMethod::Vendored,
-            vec![
-                "claude".to_string(),
-                "auth".to_string(),
-                "login".to_string(),
-            ],
-            Some("ANTHROPIC_API_KEY".to_string()),
-            vec![
-                "claude-opus-4-6".to_string(),
-                "claude-sonnet-4-6".to_string(),
-                "claude-haiku-4-5".to_string(),
-            ],
-            "https://www.anthropic.com/legal/consumer-terms",
-        ),
-        entry(
-            "openai-cloud",
-            InstallMethod::Vendored,
-            vec!["codex".to_string(), "login".to_string()],
-            Some("OPENAI_API_KEY".to_string()),
-            vec![
-                "gpt-5.4".to_string(),
-                "gpt-5.4-mini".to_string(),
-                "gpt-5.3-codex".to_string(),
-            ],
-            "https://openai.com/policies/row-terms-of-use/",
-        ),
-        entry(
-            "cursor-cloud",
-            InstallMethod::Vendored,
-            vec!["cursor".to_string(), "login".to_string()],
-            Some("CURSOR_API_KEY".to_string()),
-            vec!["claude-4.6-opus".to_string(), "gpt-5.4".to_string()],
-            "https://www.cursor.com/terms-of-service",
-        ),
-    ]
-}
-
-fn entry(
-    id: &str,
-    install: InstallMethod,
-    sign_in_command: Vec<String>,
-    api_key_variable: Option<String>,
-    models: Vec<String>,
-    source: &str,
-) -> CatalogEntry {
-    CatalogEntry {
-        id: id.to_string(),
-        install,
-        sign_in_command,
-        api_key_variable,
-        subscription: SubscriptionTerms {
-            models,
-            source: source.to_string(),
-        },
-    }
-}
+pub use catalog::{
+    Catalog, CatalogEntry, DoctorSpec, EntryOverride, OVERRIDES, SubscriptionTerms,
+    builtin_catalog, builtin_runtimes, config_dir_variable,
+};
+pub use lifecycle::{HarnessStatus, Installed, Invocation, LeaseView, Lifecycle, NoLeases, Tick};
 
 /// Whether a (harness, model, auth) triple may be offered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -272,6 +81,34 @@ pub enum InstallError {
     UnknownHarness(String),
     #[error("install failed: {0}")]
     Failed(String),
+    #[error("unverifiable source for {harness}: {reason}")]
+    UnverifiableSource { harness: String, reason: String },
+    #[error("fetch {url}: {reason}")]
+    Fetch { url: String, reason: String },
+    #[error("checksum mismatch for {url}: expected {expected}, got {actual}")]
+    ChecksumMismatch {
+        url: String,
+        expected: String,
+        actual: String,
+    },
+    #[error("unpack failed: {0}")]
+    Unpack(String),
+    #[error("i/o error: {0}")]
+    Io(String),
+    #[error("corrupt install record: {0}")]
+    Corrupt(String),
+    #[error("invalid configuration: {0}")]
+    Config(String),
+    #[error("unsupported platform: {0}")]
+    UnsupportedPlatform(String),
+    #[error("no healthy version for {0}")]
+    NoHealthyVersion(String),
+    #[error("doctor failed: {0}")]
+    Doctor(String),
+    #[error("lease read failed: {0}")]
+    Leases(String),
+    #[error("harness {0} is not managed on disk")]
+    NotManaged(String),
 }
 
 /// Where one harness version lives: `<root>/harnesses/<id>/<version>/`.
@@ -279,137 +116,6 @@ pub fn install_dir(root: &Path, id: &str, version: &str) -> PathBuf {
     root.join("harnesses")
         .join(normalize_harness_name(id))
         .join(version)
-}
-
-/// Install `version` of `harness` if that exact directory is not already there.
-///
-/// A second call for the same id and version does nothing. The agent that asked
-/// waits; this returns once the install has finished or failed.
-pub fn ensure_installed(
-    catalog: &[CatalogEntry],
-    root: &Path,
-    harness: &str,
-    version: &str,
-    runner: &mut dyn CommandRunner,
-) -> Result<PathBuf, InstallError> {
-    let harness = normalize_harness_name(harness);
-    let entry = catalog
-        .iter()
-        .find(|e| e.id == harness)
-        .ok_or_else(|| InstallError::UnknownHarness(harness.to_string()))?;
-    let dir = install_dir(root, harness, version);
-    if dir.join(".installed").exists() {
-        return Ok(dir);
-    }
-    std::fs::create_dir_all(&dir).map_err(|e| InstallError::Failed(e.to_string()))?;
-    if let Some((program, args)) = install_command(&entry.install, version) {
-        runner.run(&program, &args, &dir, &[], &mut NopLines)?;
-    }
-    anyagents_harness::atomic_write_nonempty_file(
-        &dir.join(".installed"),
-        version.as_bytes(),
-        0o644,
-    )
-    .map_err(|e| InstallError::Failed(e.to_string()))?;
-    Ok(dir)
-}
-
-/// The command that installs one method. `None` means the tool is already on
-/// the machine and only its version is recorded.
-fn install_command(method: &InstallMethod, version: &str) -> Option<(String, Vec<String>)> {
-    Some(match method {
-        InstallMethod::Npm { package } => (
-            "npm".to_string(),
-            vec![
-                "install".to_string(),
-                "--prefix".to_string(),
-                ".".to_string(),
-                format!("{package}@{version}"),
-            ],
-        ),
-        InstallMethod::VendorScript { url } => (
-            "sh".to_string(),
-            vec!["-c".to_string(), format!("curl -fsSL {url} | sh")],
-        ),
-        InstallMethod::ReleaseBinary { url, sha256 } => (
-            "sh".to_string(),
-            vec![
-                "-c".to_string(),
-                format!("curl -fsSL -o bin {url} && printf '%s  bin\\n' {sha256} | sha256sum -c -"),
-            ],
-        ),
-        InstallMethod::Vendored => return None,
-    })
-}
-
-/// The version an install records for a harness. `npm` is asked which version
-/// it would install; a vendored tool is whatever the machine has. Unreadable
-/// count as `unpinned`: the harness still runs, from the machine's own copy.
-pub fn catalog_version(
-    catalog: &[CatalogEntry],
-    harness: &str,
-    runner: &mut dyn CommandRunner,
-) -> Result<String, InstallError> {
-    let harness = normalize_harness_name(harness);
-    let entry = catalog
-        .iter()
-        .find(|e| e.id == harness)
-        .ok_or_else(|| InstallError::UnknownHarness(harness.to_string()))?;
-    match &entry.install {
-        InstallMethod::Npm { package } => {
-            let mut out = String::new();
-            let dir = std::env::temp_dir();
-            let mut sink = TextSink(&mut out);
-            match runner.run(
-                "npm",
-                &["view".to_string(), package.clone(), "version".to_string()],
-                &dir,
-                &[],
-                &mut sink,
-            ) {
-                Ok(()) => {
-                    let version = out.trim();
-                    if version.is_empty() {
-                        Ok(UNPINNED.to_string())
-                    } else {
-                        Ok(version.to_string())
-                    }
-                }
-                Err(_) => Ok(UNPINNED.to_string()),
-            }
-        }
-        _ => Ok(UNPINNED.to_string()),
-    }
-}
-
-/// Recorded when the machine's copy of a tool is used at whatever version it is.
-pub const UNPINNED: &str = "unpinned";
-
-/// The launcher a harness's own copy is called when the machine has one.
-fn launcher_name(harness: &str) -> &str {
-    match normalize_harness_name(harness) {
-        "claude-code" => "claude",
-        other => other,
-    }
-}
-
-/// Whether the harness's launcher is already on `PATH` (or built-in).
-pub fn machine_has(harness: &str) -> bool {
-    let name = launcher_name(harness);
-    std::env::var_os("PATH").is_some_and(|path| {
-        std::env::split_paths(&path)
-            .map(|dir| dir.join(name))
-            .any(|candidate| candidate.is_file())
-    })
-}
-
-struct TextSink<'a>(&'a mut String);
-
-impl LineSink for TextSink<'_> {
-    fn line(&mut self, line: &str) {
-        self.0.push_str(line);
-        self.0.push('\n');
-    }
 }
 
 /// What a sign-in is waiting on the user for.
@@ -437,12 +143,6 @@ pub trait SignInSink {
     fn done(&mut self, outcome: &SignInOutcome);
 }
 
-struct NopLines;
-
-impl LineSink for NopLines {
-    fn line(&mut self, _: &str) {}
-}
-
 /// Where a harness writes its own sign-in credential.
 ///
 /// `<root>/config/<harness>/<profile>/`. The vendor tool is pointed at this
@@ -451,19 +151,6 @@ pub fn config_dir(root: &Path, harness: &str, profile: &str) -> PathBuf {
     root.join("config")
         .join(normalize_harness_name(harness))
         .join(profile)
-}
-
-/// The variable that points this harness at its private config directory.
-pub fn config_dir_variable(harness: &str) -> Option<&'static str> {
-    match normalize_harness_name(harness) {
-        "claude-code" => Some("CLAUDE_CONFIG_DIR"),
-        "codex" => Some("CODEX_HOME"),
-        "agy" => Some("AGY_CONFIG_DIR"),
-        "muse" => Some("MUSE_CONFIG_HOME"),
-        "omp" => Some("PI_CODING_AGENT_DIR"),
-        "dsh" | "grok" | "spiron" => Some("HOME"),
-        _ => None,
-    }
 }
 
 struct CollectingSink<'a> {
@@ -635,14 +322,6 @@ mod tests {
             "sylphx_agent",
             "sylphx/default",
         ] {
-            assert_eq!(launcher_name(legacy), "spiron");
-            assert_eq!(
-                catalog_version(&catalog, legacy, &mut runner).unwrap(),
-                UNPINNED
-            );
-            let dir =
-                ensure_installed(&catalog, root.path(), legacy, UNPINNED, &mut runner).unwrap();
-            assert_eq!(dir, root.path().join("harnesses/spiron/unpinned"));
             let outcome = sign_in(
                 &catalog,
                 root.path(),
@@ -692,71 +371,18 @@ mod tests {
     }
 
     #[test]
-    fn the_second_install_of_the_same_version_does_nothing() {
+    fn sign_in_refuses_an_unknown_harness() {
         let root = tempfile::tempdir().unwrap();
         let mut runner = ScriptedRunner::default();
-        ensure_installed(&catalog(), root.path(), "codex", "1.0.0", &mut runner).unwrap();
-        ensure_installed(&catalog(), root.path(), "codex", "1.0.0", &mut runner).unwrap();
-        assert_eq!(runner.calls.len(), 1);
-        assert!(
-            install_dir(root.path(), "codex", "1.0.0")
-                .join(".installed")
-                .exists()
-        );
-    }
-
-    #[test]
-    fn an_install_lands_in_a_private_prefix() {
-        let root = tempfile::tempdir().unwrap();
-        let mut runner = ScriptedRunner::default();
-        ensure_installed(&catalog(), root.path(), "claude-code", "2.0.0", &mut runner).unwrap();
-        let call = &runner.calls[0];
-        assert_eq!(call.program, "npm");
-        assert!(
-            call.args
-                .iter()
-                .any(|a| a.contains("@anthropic-ai/claude-code@2.0.0"))
-        );
-        assert!(call.dir.ends_with("harnesses/claude-code/2.0.0"));
-    }
-
-    #[test]
-    fn a_vendored_harness_installs_nothing_and_records_the_machine_copy() {
-        let root = tempfile::tempdir().unwrap();
-        let catalog = vec![entry(
-            "opencode",
-            InstallMethod::Vendored,
-            vec!["opencode".to_string()],
-            None,
-            vec![],
-            "",
-        )];
-        let mut runner = ScriptedRunner::default();
-        let dir =
-            ensure_installed(&catalog, root.path(), "opencode", UNPINNED, &mut runner).unwrap();
-        assert!(runner.calls.is_empty(), "{:?}", runner.calls);
-        assert_eq!(
-            std::fs::read_to_string(dir.join(".installed")).unwrap(),
-            UNPINNED
-        );
-        ensure_installed(&catalog, root.path(), "opencode", UNPINNED, &mut runner).unwrap();
-        assert!(runner.calls.is_empty(), "{:?}", runner.calls);
-    }
-
-    #[test]
-    fn an_npm_harness_is_pinned_to_the_version_npm_reports() {
-        let mut runner = ScriptedRunner::default();
-        runner.answer("npm", "1.2.3\n");
-        let version = catalog_version(&catalog(), "codex", &mut runner).unwrap();
-        assert_eq!(version, "1.2.3");
-        assert_eq!(runner.calls[0].args, ["view", "@openai/codex", "version"]);
-    }
-
-    #[test]
-    fn an_unknown_harness_is_refused() {
-        let root = tempfile::tempdir().unwrap();
-        let mut runner = ScriptedRunner::default();
-        let err = ensure_installed(&catalog(), root.path(), "nope", "1", &mut runner).unwrap_err();
+        let err = sign_in(
+            &catalog(),
+            root.path(),
+            "nope",
+            "default",
+            &mut runner,
+            &mut NopSignIn,
+        )
+        .unwrap_err();
         assert_eq!(err, InstallError::UnknownHarness("nope".to_string()));
         assert!(runner.calls.is_empty());
     }

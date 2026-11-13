@@ -25,17 +25,9 @@ fn msg(id: &str) -> OutboundMessage {
     }
 }
 
-/// A scripted `opencode` beside this test binary. The server crate ships the
-/// same program as `scripted_opencode`; this copy is built with the tests.
+/// A scripted `opencode` built with these tests.
 fn scripted_opencode() -> std::path::PathBuf {
-    let exe = std::env::current_exe().expect("the test binary path");
-    // The test binary lives in `deps/`; a bin of the crate is one level up.
-    let deps = exe.parent().expect("a directory");
-    deps.parent()
-        .map(|dir| dir.join("fake_opencode"))
-        .filter(|path| path.is_file())
-        .or_else(|| Some(deps.join("fake_opencode")).filter(|path| path.is_file()))
-        .expect("the scripted opencode is built with these tests")
+    std::path::PathBuf::from(env!("CARGO_BIN_EXE_fake_opencode"))
 }
 
 fn start(dir: &TempDir, mode: &str) -> OpenCodeHarness {

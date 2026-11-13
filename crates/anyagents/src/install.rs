@@ -1,19 +1,26 @@
-//! The first time a harness is needed, the server installs it. This is the one
-//! place a vendor tool is downloaded: the installer keeps the copy under
-//! `<data>/harnesses/<id>/<version>/` and records it with `.installed`.
+//! Managed harness installation, resolution, and upgrade orchestration.
 //!
-//! The record also remembers a failure, so a missing `npm` is reported on the
-//! first create and not retried on every one.
+//! Harnesses are installed and promoted atomically by
+//! `anyagents_installer::Lifecycle` under `<data>/harnesses/<id>/<version>/`
+//! with receipts (`receipt.json`, `current.json`). `PATH` fallback and legacy
+//! `.installed` markers are retired; unresolved harnesses fail closed rather
+//! than silently picking up an unmanaged binary.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::{Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
+use anyagents_core::Store;
 use anyagents_harness::normalize_harness_name;
-use anyagents_installer::{
-    CommandRunner, InstallError, LineSink, builtin_catalog, catalog_version, ensure_installed,
-};
+use anyagents_installer::receipt::{ReceiptState, read_current, read_receipt, version_dir};
+use anyagents_installer::{Catalog, InstallError, LeaseView, Lifecycle, NoLeases, Tick};
+
+const BUILTIN_HARNESSES: [&str; 4] = [
+    "spiron-cloud",
+    "claude-cloud",
+    "openai-cloud",
+    "cursor-cloud",
+];
 
 /// What one harness install ended as.
 #[derive(Clone, Debug)]
@@ -23,16 +30,50 @@ pub struct Install {
     pub dir: PathBuf,
 }
 
-/// The harnesses one server has installed, keyed by harness id.
+/// Fail-closed [`LeaseView`] used when `<data>/state.db` exists on disk but
+/// could not be opened. Returning `Err` makes garbage collection retain all
+/// versions rather than assuming zero active leases.
+struct FailClosedLeases(String);
+
+impl LeaseView for FailClosedLeases {
+    fn leased_versions(
+        &self,
+        _harness: &str,
+    ) -> Result<std::collections::BTreeSet<String>, String> {
+        Err(self.0.clone())
+    }
+}
+
+fn leases_for_root(root: &Path) -> Arc<dyn LeaseView> {
+    let db_path = root.join("state.db");
+    if !db_path.exists() {
+        return Arc::new(NoLeases);
+    }
+    match Store::open(&db_path) {
+        Ok(store) => Arc::new(store) as Arc<dyn LeaseView>,
+        Err(err) => Arc::new(FailClosedLeases(format!(
+            "open {} for harness leases: {err}",
+            db_path.display()
+        ))) as Arc<dyn LeaseView>,
+    }
+}
+
+/// The harnesses one server has installed, keyed by canonical harness id.
 pub struct Installer {
     root: PathBuf,
+    leases: Arc<dyn LeaseView>,
     done: Mutex<HashMap<String, Result<Install, String>>>,
 }
 
 impl Installer {
     pub fn new(root: &Path) -> Self {
+        Self::with_leases(root, leases_for_root(root))
+    }
+
+    pub fn with_leases(root: &Path, leases: Arc<dyn LeaseView>) -> Self {
         Self {
             root: root.to_path_buf(),
+            leases,
             done: Mutex::new(HashMap::new()),
         }
     }
@@ -45,260 +86,33 @@ impl Installer {
         if let Some(answer) = done.get(harness) {
             return answer.clone();
         }
-        // The lock is held across the install, so two creates of one harness
-        // never run two installs at once; the second is answered by the first.
-        let answer = self.install(harness);
-        done.insert(harness.to_string(), answer.clone());
-        answer
+        let outcome = self.ensure_uncached(harness);
+        done.insert(harness.to_string(), outcome.clone());
+        outcome
     }
 
-    fn install(&self, harness: &str) -> Result<Install, String> {
-        let dirs = self.root.join("harnesses").join(harness);
-        if let Ok(versions) = std::fs::read_dir(&dirs) {
-            let mut installed: Vec<PathBuf> = versions
-                .flatten()
-                .map(|entry| entry.path())
-                .filter(|dir| dir.join(".installed").exists())
-                .collect();
-            installed.sort_by_key(|p| version_sort_key(p));
-            for dir in installed.into_iter().rev() {
-                if launcher(harness, &dir).is_file() {
-                    return Ok(Install { dir });
-                }
-            }
-        }
-        let catalog = builtin_catalog();
-        let mut runner = ProcessRunner;
-        let version = match catalog_version(&catalog, harness, &mut runner) {
-            Ok(version) => version,
-            Err(InstallError::UnknownHarness(id)) => return Err(format!("unknown harness: {id}")),
-            Err(err) => return Err(err.to_string()),
-        };
-        ensure_vendored_binary(&self.root, harness);
-        let dir = ensure_installed(&catalog, &self.root, harness, &version, &mut runner)
+    fn ensure_uncached(&self, harness: &str) -> Result<Install, String> {
+        let lifecycle = Lifecycle::production(&self.root, Arc::clone(&self.leases))
             .map_err(|err| err.to_string())?;
-        // A copy of this version may already be in the private prefix from a
-        // build without a launcher on `PATH`; either way this version is there.
-        Ok(Install { dir })
+        match lifecycle.ensure(harness) {
+            Ok(installed) => Ok(Install { dir: installed.dir }),
+            Err(InstallError::NotManaged(_)) => Ok(Install {
+                dir: self.root.join("harnesses").join(harness).join("builtin"),
+            }),
+            Err(err) => Err(err.to_string()),
+        }
     }
 }
 
-fn version_sort_key(path: &Path) -> (u64, u64, u64, String) {
-    let raw = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or_default()
-        .trim_start_matches('v');
-    let core = raw.split('-').next().unwrap_or(raw);
-    let mut parts = core.split('.');
-    let major = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-    let minor = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-    let patch = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-    (major, minor, patch, raw.to_string())
-}
-
-/// Detect the currently active version string of `harness`.
-pub fn recorded_version(root: &Path, harness: &str) -> String {
-    let harness = normalize_harness_name(harness);
-    let dirs = root.join("harnesses").join(harness);
-    if let Ok(versions) = std::fs::read_dir(&dirs) {
-        let mut installed: Vec<PathBuf> = versions
-            .flatten()
-            .map(|entry| entry.path())
-            .filter(|dir| dir.join(".installed").exists())
-            .collect();
-        installed.sort_by_key(|p| version_sort_key(p));
-        for dir in installed.into_iter().rev() {
-            if launcher(harness, &dir).is_file()
-                && let Some(ver) = dir.file_name().and_then(|s| s.to_str())
-                && ver != "unpinned"
-                && ver != "seat-bin"
-            {
-                return ver.to_string();
-            }
-        }
-    }
-    "-".to_string()
-}
-
-pub fn detect_version(root: &Path, harness: &str) -> String {
-    let recorded = recorded_version(root, harness);
-    if recorded != "-" {
-        return recorded;
-    }
-    let bin = program(root, harness);
-    if let Ok(out) = Command::new(&bin)
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-    {
-        let combined = format!(
-            "{}\n{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-        for token in combined.split_whitespace() {
-            let cleaned = token
-                .trim_matches(|c: char| c == '(' || c == ')' || c == '[' || c == ']')
-                .trim_start_matches("omp/")
-                .trim_start_matches('v');
-            if cleaned.chars().next().is_some_and(|c| c.is_ascii_digit()) && cleaned.contains('.') {
-                return cleaned.to_string();
-            }
-        }
-    }
-    "-".to_string()
-}
-
-/// Check upstream for the latest version of `harness`, install it into
-/// `<root>/harnesses/<harness>/<version>/` (or update its host/staged binary),
-/// and prune superseded version directories.
-pub fn update_harness(root: &Path, harness: &str) -> Result<(String, String, bool), String> {
-    let harness = normalize_harness_name(harness);
-    let before = detect_version(root, harness);
-    let catalog = builtin_catalog();
-    let mut runner = ProcessRunner;
-    let version = match catalog_version(&catalog, harness, &mut runner) {
-        Ok(ver) => ver,
-        Err(InstallError::UnknownHarness(id)) => return Err(format!("unknown harness: {id}")),
-        Err(err) => return Err(err.to_string()),
-    };
-    if version != anyagents_installer::UNPINNED {
-        let dir = ensure_installed(&catalog, root, harness, &version, &mut runner)
-            .map_err(|err| err.to_string())?;
-        if let Some(inst) = INSTALLER.get() {
-            let mut done = inst.done.lock().unwrap_or_else(PoisonError::into_inner);
-            done.insert(harness.to_string(), Ok(Install { dir: dir.clone() }));
-        }
-        // Remove older version directories under `<root>/harnesses/<harness>/` so
-        // `program()` always resolves the latest version and disk stays clean.
-        let dirs = root.join("harnesses").join(harness);
-        if let Ok(entries) = std::fs::read_dir(&dirs) {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if p == dir || !p.is_dir() {
-                    continue;
-                }
-                let name = entry.file_name();
-                let name_s = name.to_string_lossy();
-                if name_s != "seat-bin" && name_s != "unpinned" {
-                    let _ = std::fs::remove_dir_all(&p);
-                }
-            }
-        }
-    } else {
-        ensure_vendored_binary(root, harness);
-        let _ = program(root, harness);
-    }
-    let after = detect_version(root, harness);
-    let changed = before != after;
-    Ok((before, after, changed))
-}
-
-/// Ensures a vendored or script-installed harness binary (`omp`, `dsh`, `grok`)
-/// is present on the host when an agent first requests it in real mode.
-fn ensure_vendored_binary(root: &Path, harness: &str) {
-    if std::env::var_os("ANYAGENTS_FAKE_MODE").is_some() {
-        return;
-    }
-    if std::env::var_os(format!(
-        "ANYAGENTS_{}_BIN",
-        harness.to_uppercase().replace('-', "_")
-    ))
-    .is_some()
-    {
-        return;
-    }
-    let name = match harness {
-        "claude-code" => "claude",
-        other => other,
-    };
-    if which(name).is_some() {
-        return;
-    }
-    let Some(home) = crate::sandbox::host_home_dir() else {
-        return;
-    };
-    let local_bin = home.join(".local/bin");
-    match harness {
-        "omp" => {
-            let _ = Command::new("bun")
-                .args(["install", "-g", "@oh-my-pi/pi-coding-agent"])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-            let bun_omp = home.join(".bun/bin/omp");
-            if bun_omp.is_file() && local_bin.is_dir() {
-                let dst = local_bin.join("omp");
-                #[cfg(unix)]
-                if !dst.exists() {
-                    let _ = std::os::unix::fs::symlink(bun_omp, &dst);
-                }
-            }
-        }
-        "dsh" => {
-            if let Ok(entries) = std::fs::read_dir(home.join(".dsh")) {
-                let mut candidates: Vec<PathBuf> = entries
-                    .flatten()
-                    .map(|e| e.path().join("node_modules/.bin/dsh"))
-                    .filter(|p| p.is_file())
-                    .collect();
-                candidates.sort();
-                if let Some(src) = candidates.pop() {
-                    let dst = if local_bin.is_dir() {
-                        local_bin.join("dsh")
-                    } else {
-                        root.join("harnesses/dsh/seat-bin/dsh")
-                    };
-                    if let Some(parent) = dst.parent() {
-                        let _ = std::fs::create_dir_all(parent);
-                    }
-                    #[cfg(unix)]
-                    if !dst.exists() {
-                        let _ = std::os::unix::fs::symlink(&src, &dst);
-                    }
-                }
-            }
-        }
-        "grok" => {
-            if let Ok(entries) = std::fs::read_dir(home.join(".local/share/grok/versions")) {
-                let mut candidates: Vec<PathBuf> = entries
-                    .flatten()
-                    .map(|e| e.path().join("grok"))
-                    .filter(|p| p.is_file())
-                    .collect();
-                candidates.sort();
-                if let Some(src) = candidates.pop()
-                    && local_bin.is_dir()
-                {
-                    let dst = local_bin.join("grok");
-                    #[cfg(unix)]
-                    if !dst.exists() {
-                        let _ = std::os::unix::fs::symlink(&src, &dst);
-                    }
-                    return;
-                }
-            }
-            let _ = Command::new("sh")
-                .args(["-c", "curl -fsSL https://cli.grok.com/install.sh | bash"])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-        }
-        _ => {}
-    }
-}
-
-/// Whether any adapter can run this harness, and the reason when none can.
+/// Verify that `harness` names a known catalog entry.
 pub fn adapter(harness: &str) -> Result<(), anyagents_core::Error> {
-    match normalize_harness_name(harness) {
-        "claude-code" | "codex" | "opencode" | "agy" | "muse" | "omp" | "dsh" | "grok"
-        | "spiron" | "spiron-cloud" | "claude-cloud" | "openai-cloud" | "cursor-cloud" => Ok(()),
-        other => Err(anyagents_core::Error::Message(format!(
-            "unknown harness: {other}"
-        ))),
+    let harness = normalize_harness_name(harness);
+    if Catalog::builtin().get(harness).is_some() {
+        Ok(())
+    } else {
+        Err(anyagents_core::Error::Message(format!(
+            "unknown harness: {harness}"
+        )))
     }
 }
 
@@ -328,229 +142,139 @@ pub fn recorded(harness: &str) -> Option<Result<(), String>> {
     })
 }
 
-/// The program for a harness: the launcher of the copy the server installed,
-/// else the vendor program the machine already has, else the binary name the
-/// operating system looks up. `ANYAGENTS_<ID>_BIN` wins, so tests never start a
-/// real vendor and an unusual install can be pointed at.
+/// Deprecated per-harness binary override variable name for `harness`.
+fn env_override_var(harness: &str) -> String {
+    format!("ANYAGENTS_{}_BIN", harness.to_uppercase().replace('-', "_"))
+}
+
+/// Return the verified launcher path for `harness`, if `current.json` points
+/// to an `Ok` receipt whose launcher file exists on disk.
+fn verified_launcher(root: &Path, harness: &str) -> Option<(String, PathBuf)> {
+    let harnesses = root.join("harnesses");
+    let current = read_current(&harnesses, harness).ok()??;
+    let receipt = read_receipt(&harnesses, harness, &current.version).ok()??;
+    if receipt.state != ReceiptState::Ok {
+        return None;
+    }
+    let launcher = version_dir(&harnesses, harness, &current.version).join(&receipt.launcher);
+    if launcher.is_file() {
+        Some((current.version, launcher))
+    } else {
+        None
+    }
+}
+
+/// Whether `harness` has a healthy verified installation on disk (or runs
+/// built-in inside this binary).
+pub fn is_healthy(root: &Path, harness: &str) -> bool {
+    let harness = normalize_harness_name(harness);
+    BUILTIN_HARNESSES.contains(&harness) || verified_launcher(root, harness).is_some()
+}
+
+/// Version recorded by the current healthy managed receipt, `"builtin"` for
+/// built-in cloud harnesses, or `"-"` when nothing is installed.
+pub fn recorded_version(root: &Path, harness: &str) -> String {
+    let harness = normalize_harness_name(harness);
+    if BUILTIN_HARNESSES.contains(&harness) {
+        return "builtin".to_string();
+    }
+    verified_launcher(root, harness)
+        .map(|(version, _)| version)
+        .unwrap_or_else(|| "-".to_string())
+}
+
+/// Version of `harness` as recorded in the managed registry.
+pub fn detect_version(root: &Path, harness: &str) -> String {
+    recorded_version(root, harness)
+}
+
+/// Launcher program for `harness`:
+/// 1. Deprecated `ANYAGENTS_<ID>_BIN` environment override (logged once per call;
+///    scheduled for removal in W2 Harness-boundary — no new caller may rely on it).
+/// 2. Current executable for built-in cloud harnesses.
+/// 3. Verified `current.json` + `Ok` receipt launcher under `<root>/harnesses/`.
+/// 4. Uninstalled sentinel path under `<root>/harnesses/<id>/current/<id>` so
+///    callers never silently fall back to `PATH`.
 pub fn program(root: &Path, harness: &str) -> PathBuf {
     let harness = normalize_harness_name(harness);
-    if let Some(named) = std::env::var_os(format!(
-        "ANYAGENTS_{}_BIN",
-        harness.to_uppercase().replace('-', "_")
-    )) {
+    let var = env_override_var(harness);
+    if let Some(named) = std::env::var_os(&var) {
+        eprintln!("anyagents-install: {var} is declared-by-env (deprecated; removed in W2)");
         return PathBuf::from(named);
     }
-    if matches!(
-        harness,
-        "spiron-cloud" | "claude-cloud" | "openai-cloud" | "cursor-cloud"
-    ) {
+    if BUILTIN_HARNESSES.contains(&harness) {
         return std::env::current_exe().unwrap_or_else(|_| PathBuf::from("anyagents"));
     }
-    let dirs = root.join("harnesses").join(harness);
-    if let Ok(versions) = std::fs::read_dir(&dirs) {
-        let mut installed: Vec<PathBuf> = versions
-            .flatten()
-            .map(|entry| entry.path())
-            .filter(|dir| dir.join(".installed").exists())
-            .collect();
-        installed.sort_by_key(|p| version_sort_key(p));
-        for dir in installed.into_iter().rev() {
-            let launcher = launcher(harness, &dir);
-            if launcher.is_file() {
-                return launcher;
-            }
-        }
+    if let Some((_, launcher)) = verified_launcher(root, harness) {
+        return launcher;
     }
-    let name = match harness {
-        "claude-code" => "claude",
-        "agy" => "agy",
-        "muse" => "muse",
-        other => other,
-    };
-    match which(name) {
-        Some(found) => ensure_seat_accessible(root, harness, name, found),
-        None => PathBuf::from(name),
-    }
+    root.join("harnesses")
+        .join(harness)
+        .join("current")
+        .join(harness)
 }
 
-/// When OS seats are configured and a `PATH` binary resolves through a private
-/// (`0700`) directory (such as `~/.local/bin/codex -> ~/.codex/packages/...`),
-/// stage a world-executable copy under `<root>/harnesses/<harness>/seat-bin/`
-/// so confined seat users can execute it without relaxing `~/.codex`.
-#[cfg(unix)]
-fn ensure_seat_accessible(root: &Path, harness: &str, name: &str, candidate: PathBuf) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt as _;
-    if std::env::var_os("ANYAGENTS_FAKE_MODE").is_some() {
-        return candidate;
-    }
-    let Ok(canonical) = std::fs::canonicalize(&candidate) else {
-        return candidate;
-    };
-    let blocked = canonical.ancestors().skip(1).any(|dir| {
-        std::fs::metadata(dir)
-            .map(|meta| (meta.permissions().mode() & 0o001) == 0)
-            .unwrap_or(false)
-    });
-    if !blocked {
-        return candidate;
-    }
-    let stage_dir = root.join("harnesses").join(harness).join("seat-bin");
-    if std::fs::create_dir_all(&stage_dir).is_err() {
-        return candidate;
-    }
-    let _ = std::fs::set_permissions(&stage_dir, std::fs::Permissions::from_mode(0o755));
-    if let Some(parent) = canonical.parent()
-        && let Ok(entries) = std::fs::read_dir(parent)
-    {
-        for entry in entries.flatten() {
-            let src = entry.path();
-            let Ok(src_meta) = std::fs::metadata(&src) else {
-                continue;
-            };
-            if !src_meta.is_file() {
-                continue;
-            }
-            let dst = stage_dir.join(entry.file_name());
-            let same_size = std::fs::metadata(&dst)
-                .map(|m| m.is_file() && m.len() == src_meta.len())
-                .unwrap_or(false);
-            if !same_size {
-                let tmp = stage_dir.join(format!(
-                    ".{}.{}.tmp",
-                    entry.file_name().to_string_lossy(),
-                    std::process::id()
-                ));
-                if std::fs::copy(&src, &tmp).is_ok() {
-                    let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755));
-                    let _ = std::fs::rename(&tmp, &dst);
-                }
-            }
-        }
-    }
-    let staged = stage_dir.join(name);
-    if staged.is_file() { staged } else { candidate }
+/// Check for and promote an updated release of `harness` using store leases
+/// loaded from `<root>/state.db` (failing closed if `state.db` is unreadable).
+/// Returns `(before, after, updated)`.
+pub fn update_harness(root: &Path, harness: &str) -> Result<(String, String, bool), String> {
+    update_harness_with_store(root, harness, leases_for_root(root))
 }
 
-#[cfg(not(unix))]
-fn ensure_seat_accessible(
-    _root: &Path,
-    _harness: &str,
-    _name: &str,
-    candidate: PathBuf,
-) -> PathBuf {
-    candidate
-}
-
-/// The launcher a package installed into `installed`, or the plain binary name.
-fn launcher(harness: &str, installed: &Path) -> PathBuf {
-    if harness == "codex" {
-        // Prefer the native static Rust binary shipped in `@openai/codex-linux-x64`
-        // over the `#!/usr/bin/env node` wrapper in `node_modules/.bin/codex`, so
-        // isolated agent seats with custom `HOME` do not depend on a per-seat Node
-        // wrapper installation.
-        let native = installed
-            .join("node_modules")
-            .join("@openai")
-            .join("codex-linux-x64")
-            .join("vendor")
-            .join("x86_64-unknown-linux-musl")
-            .join("bin")
-            .join("codex");
-        if native.is_file() {
-            return native;
+/// Check for and promote an updated release of `harness` against an explicit
+/// [`LeaseView`] (such as the server's live `Store`).
+pub fn update_harness_with_store(
+    root: &Path,
+    harness: &str,
+    leases: Arc<dyn LeaseView>,
+) -> Result<(String, String, bool), String> {
+    let harness = normalize_harness_name(harness);
+    let lifecycle = Lifecycle::production(root, leases).map_err(|err| err.to_string())?;
+    match lifecycle.tick(harness) {
+        Ok(Tick::Promoted { from, to }) => Ok((from.unwrap_or_else(|| "-".to_string()), to, true)),
+        Ok(Tick::Unchanged { version }) => Ok((version.clone(), version, false)),
+        Ok(Tick::Refused { version, reason }) => {
+            Err(format!("refused upgrade to {version}: {reason}"))
         }
-    }
-    let names: &[&str] = match harness {
-        "claude-code" => &["claude"],
-        "codex" => &["codex"],
-        // The OpenCode package ships its launcher under either name.
-        "opencode" => &["opencode", "opencode-ai"],
-        "agy" => &["agy"],
-        "omp" => &["omp"],
-        "dsh" => &["dsh"],
-        "grok" => &["grok"],
-        other => &[other],
-    };
-    let bin = installed.join("node_modules").join(".bin");
-    names
-        .iter()
-        .map(|name| bin.join(name))
-        .find(|path| path.is_file())
-        .unwrap_or_else(|| PathBuf::from(names[0]))
-}
-
-/// The first `program` on `PATH`.
-fn which(program: &str) -> Option<PathBuf> {
-    if program.contains('/') {
-        return Some(PathBuf::from(program));
-    }
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join(program))
-        .find(|candidate| candidate.is_file())
-}
-
-/// Runs a vendor install for real.
-struct ProcessRunner;
-
-impl CommandRunner for ProcessRunner {
-    fn run(
-        &mut self,
-        program: &str,
-        args: &[String],
-        dir: &Path,
-        env: &[(&str, &str)],
-        on_line: &mut dyn LineSink,
-    ) -> Result<(), InstallError> {
-        std::fs::create_dir_all(dir).map_err(|err| InstallError::Failed(err.to_string()))?;
-        let mut command = Command::new(program);
-        command
-            .args(args)
-            .current_dir(dir)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        for (key, value) in env {
-            command.env(key, value);
+        Ok(Tick::SkippedBad { version }) => Err(format!("skipped bad version {version}")),
+        Err(InstallError::NotManaged(_)) => {
+            Ok(("builtin".to_string(), "builtin".to_string(), false))
         }
-        let output = command
-            .output()
-            .map_err(|err| InstallError::Failed(format!("{program}: {err}")))?;
-        for line in String::from_utf8_lossy(&output.stdout).lines() {
-            on_line.line(line);
-        }
-        if output.status.success() {
-            Ok(())
-        } else {
-            Err(InstallError::Failed(format!(
-                "{program} exited {}",
-                output.status
-            )))
-        }
+        Err(err) => Err(err.to_string()),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anyagents_installer::UNPINNED;
+    use anyagents_installer::receipt::{
+        Current, DoctorRecord, Receipt, write_current, write_receipt,
+    };
+    use sha2::{Digest, Sha256};
 
-    #[test]
-    fn a_vendored_harness_is_recorded_and_started_from_the_machine() {
-        let root = tempfile::tempdir().unwrap();
-        let installer = Installer::new(root.path());
-        let install = installer.ensure("opencode").unwrap();
-        assert_eq!(
-            std::fs::read_to_string(install.dir.join(".installed")).unwrap(),
-            UNPINNED
+    fn sha256_hex(bytes: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        format!("{:x}", hasher.finalize())
+    }
+
+    #[cfg(unix)]
+    fn write_local_override(root: &Path, harness: &str, version: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let src = root.join(format!("{harness}-{version}.sh"));
+        let script = format!("#!/bin/sh\necho \"{harness} {version}\"\n");
+        std::fs::write(&src, script.as_bytes()).unwrap();
+        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let digest = sha256_hex(script.as_bytes());
+        let toml = format!(
+            "[harness.{harness}]\n\
+             launcher = \"{harness}\"\n\
+             source = {{ kind = \"local\", version = \"{version}\", path = {:?}, sha256 = \"{digest}\" }}\n\
+             doctor = {{ version_args = [\"--version\"] }}\n",
+            src.display().to_string()
         );
-        // Nothing was installed, so the program is the machine's own copy. The
-        // test never starts a real vendor: the override names this binary.
-        let double = std::env::current_exe().unwrap();
-        // SAFETY: this test process owns the variable, sets it and removes it
-        // inside one test, and reads it nowhere else.
-        unsafe { std::env::set_var("ANYAGENTS_OPENCODE_BIN", &double) };
-        assert_eq!(program(root.path(), "opencode"), double);
-        unsafe { std::env::remove_var("ANYAGENTS_OPENCODE_BIN") };
+        std::fs::write(root.join("harnesses.toml"), toml).unwrap();
+        src
     }
 
     #[test]
@@ -570,12 +294,13 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn legacy_first_party_install_and_program_selectors_use_spiron() {
         let _environment = crate::server::tests::env_lock();
         let root = crate::test_tempdir();
-        let expected = root.path().join("synthetic-spiron-probe");
-        unsafe { std::env::set_var("ANYAGENTS_SPIRON_BIN", &expected) };
+        write_local_override(root.path(), "spiron", "1.0.0");
+
         let installer = Installer::new(root.path());
         for legacy in [
             "spiron",
@@ -585,21 +310,22 @@ mod tests {
             "sylphx/default",
         ] {
             adapter(legacy).unwrap();
-            assert_eq!(program(root.path(), legacy), expected);
-            assert_eq!(
-                installer.ensure(legacy).unwrap().dir,
-                root.path().join("harnesses/spiron/unpinned")
-            );
+            let installed = installer.ensure(legacy).unwrap();
+            assert_eq!(installed.dir, root.path().join("harnesses/spiron/1.0.0"));
+            assert!(program(root.path(), legacy).starts_with(&installed.dir));
+            assert!(is_healthy(root.path(), legacy));
+            assert_eq!(recorded_version(root.path(), legacy), "1.0.0");
         }
         let done = installer.done.lock().unwrap();
         assert_eq!(done.len(), 1);
         assert!(done.contains_key("spiron"));
-        unsafe { std::env::remove_var("ANYAGENTS_SPIRON_BIN") };
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_harness_that_answered_once_keeps_that_answer() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_tempdir();
+        write_local_override(root.path(), "opencode", "1.0.0");
         let installer = Installer::new(root.path());
         let first = installer.ensure("opencode").unwrap();
         let second = installer.ensure("opencode").unwrap();
@@ -608,34 +334,113 @@ mod tests {
     }
 
     #[test]
-    fn npm_is_asked_which_version_to_pin() {
-        struct Answers;
-        impl CommandRunner for Answers {
-            fn run(
-                &mut self,
-                _: &str,
-                _: &[String],
-                _: &Path,
-                _: &[(&str, &str)],
-                on_line: &mut dyn LineSink,
-            ) -> Result<(), InstallError> {
-                on_line.line("1.2.3");
-                Ok(())
-            }
-        }
-        let version = catalog_version(&builtin_catalog(), "codex", &mut Answers).unwrap();
-        assert_eq!(version, "1.2.3");
+    fn unconfigured_harness_fails_closed_without_path_fallback() {
+        let _environment = crate::server::tests::env_lock();
+        let root = crate::test_tempdir();
+        let installer = Installer::new(root.path());
+        let err = installer.ensure("agy").unwrap_err();
+        assert!(!err.is_empty());
+        let resolved = program(root.path(), "agy");
+        assert!(resolved.starts_with(root.path().join("harnesses/agy")));
+        assert!(!resolved.is_file());
+        assert!(!is_healthy(root.path(), "agy"));
+        assert_eq!(recorded_version(root.path(), "agy"), "-");
     }
 
     #[test]
-    fn an_installed_copy_is_started_before_the_same_name_on_the_path() {
-        let root = tempfile::tempdir().unwrap();
-        let version = root.path().join("harnesses/codex/1.2.3");
-        let launcher = version.join("node_modules/.bin/codex");
+    fn program_resolves_only_healthy_receipted_current_version() {
+        let _environment = crate::server::tests::env_lock();
+        let root = crate::test_tempdir();
+        let harnesses = root.path().join("harnesses");
+        let ver_dir = version_dir(&harnesses, "codex", "1.2.3");
+        let launcher = ver_dir.join("bin/codex");
         std::fs::create_dir_all(launcher.parent().unwrap()).unwrap();
         std::fs::write(&launcher, "").unwrap();
-        std::fs::write(version.join(".installed"), "1.2.3").unwrap();
+
+        // Without current.json + Ok receipt, binary is not resolved.
+        assert!(!is_healthy(root.path(), "codex"));
+        assert!(!program(root.path(), "codex").is_file());
+
+        write_current(
+            &harnesses,
+            "codex",
+            &Current {
+                version: "1.2.3".to_string(),
+                previous: None,
+            },
+        )
+        .unwrap();
+        write_receipt(
+            &harnesses,
+            "codex",
+            &Receipt {
+                version: "1.2.3".to_string(),
+                source: "pinned".to_string(),
+                digest: "sha256:00".to_string(),
+                launcher: "bin/codex".to_string(),
+                installed_at: 1,
+                doctor: Some(DoctorRecord {
+                    ok: false,
+                    at: 1,
+                    detail: "boom".to_string(),
+                }),
+                confirmed_at: None,
+                state: ReceiptState::Bad,
+                reason: "doctor failed".to_string(),
+            },
+        )
+        .unwrap();
+        assert!(!is_healthy(root.path(), "codex"));
+        assert_eq!(recorded_version(root.path(), "codex"), "-");
+
+        write_receipt(
+            &harnesses,
+            "codex",
+            &Receipt {
+                version: "1.2.3".to_string(),
+                source: "pinned".to_string(),
+                digest: "sha256:00".to_string(),
+                launcher: "bin/codex".to_string(),
+                installed_at: 1,
+                doctor: Some(DoctorRecord {
+                    ok: true,
+                    at: 1,
+                    detail: "ok".to_string(),
+                }),
+                confirmed_at: Some(2),
+                state: ReceiptState::Ok,
+                reason: String::new(),
+            },
+        )
+        .unwrap();
+        assert!(is_healthy(root.path(), "codex"));
+        assert_eq!(recorded_version(root.path(), "codex"), "1.2.3");
         assert_eq!(program(root.path(), "codex"), launcher);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn update_harness_promotes_local_override_upgrade() {
+        let root = crate::test_tempdir();
+        write_local_override(root.path(), "spiron", "1.0.0");
+        let first = update_harness(root.path(), "spiron").unwrap();
+        assert_eq!(first, ("-".to_string(), "1.0.0".to_string(), true));
+
+        let same = update_harness(root.path(), "spiron").unwrap();
+        assert_eq!(same, ("1.0.0".to_string(), "1.0.0".to_string(), false));
+
+        write_local_override(root.path(), "spiron", "1.1.0");
+        let second = update_harness(root.path(), "spiron").unwrap();
+        assert_eq!(second, ("1.0.0".to_string(), "1.1.0".to_string(), true));
+        assert_eq!(recorded_version(root.path(), "spiron"), "1.1.0");
+    }
+
+    #[test]
+    fn fail_closed_leases_rejects_corrupt_state_db() {
+        let root = crate::test_tempdir();
+        std::fs::write(root.path().join("state.db"), b"not a sqlite db").unwrap();
+        let leases = leases_for_root(root.path());
+        assert!(leases.leased_versions("codex").is_err());
     }
 
     #[test]

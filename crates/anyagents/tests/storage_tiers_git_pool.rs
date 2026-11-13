@@ -136,6 +136,8 @@ exec "{scripted_bin}" "$@"
     std::fs::create_dir_all(&sccache_dir).unwrap();
     let remote_base = format!("file://{}", remotes_root.display());
 
+    support::managed_harnesses(&tier1_state);
+
     // Create root parent agent using ANYAGENTS_STATE_DIR (without passing --data!)
     let create_parent = Command::new(bin)
         .env("HOME", &home_dir)

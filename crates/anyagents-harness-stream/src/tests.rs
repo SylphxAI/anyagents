@@ -1356,3 +1356,434 @@ fn agy_rpc_discovers_running_turn_one_trajectory_and_accepts_steer_before_stdout
     stop.store(true, std::sync::atomic::Ordering::SeqCst);
     let _ = server.join();
 }
+
+/// Re-offer one input the way the delivery loop does until the harness takes it.
+#[cfg(unix)]
+fn deliver_until_accepted(
+    harness: &mut super::StreamHarness,
+    id: &str,
+) -> anyagents_harness::DeliverOutcome {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let outcome = harness
+            .deliver(
+                &receipt_message(id),
+                &json!({"type":"user","request_id":id}),
+            )
+            .unwrap();
+        if matches!(outcome, anyagents_harness::DeliverOutcome::Accepted { .. })
+            || std::time::Instant::now() > deadline
+        {
+            return outcome;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+const UNDELIVERED_STEER_SCRIPT: &str = r#"
+import json,sys,time
+time.sleep(int(sys.argv[1])/1000)
+print(json.dumps({'type':'ready','session_id':'fixture-ready'}),flush=True)
+first=None
+for line in sys.stdin:
+ m=json.loads(line)
+ rid=m.get('request_id')
+ if first is None:
+  first=rid
+  print(json.dumps({'type':'accepted','request_id':rid}),flush=True)
+ else:
+  print(json.dumps({'type':'steer_ack','request_id':rid,'accepted':True,'turn_id':first}),flush=True)
+  print(json.dumps({'type':'result','request_id':first,'status':'failed','is_error':True,'error':'upstream unavailable','undelivered_steers':['acknowledged input']}),flush=True)
+"#;
+
+#[cfg(unix)]
+const CONFIRMED_TURN_SCRIPT: &str = r#"
+import json,sys,time
+time.sleep(int(sys.argv[1])/1000)
+print(json.dumps({'type':'ready','session_id':'fixture-ready'}),flush=True)
+first=None
+for line in sys.stdin:
+ m=json.loads(line)
+ if first is None:
+  first=m.get('request_id')
+  print(json.dumps({'type':'accepted','request_id':first}),flush=True)
+  print(json.dumps({'type':'result','request_id':first,'status':'completed'}),flush=True)
+"#;
+
+#[test]
+#[cfg(unix)]
+fn reconcile_clear_releases_hold_marker_error_and_restart_stays_clear() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut harness = immediate_receipt_fixture(UNDELIVERED_STEER_SCRIPT, 0).unwrap();
+    harness.set_state_dir(dir.path());
+
+    assert!(matches!(
+        deliver_until_accepted(&mut harness, "m1"),
+        anyagents_harness::DeliverOutcome::Accepted { .. }
+    ));
+    let _ = harness.deliver(
+        &receipt_message("m2"),
+        &json!({"type":"user","request_id":"m2"}),
+    );
+    assert!(
+        harness.wait_pred(std::time::Duration::from_secs(10), |state| state
+            .unconfirmed)
+    );
+    // Accompanying artefacts exist beside the hold (e.g. a session reset
+    // plus a persisted turn error). They must go together with it.
+    let marker = dir.path().join(".anyagents-session-reset-recovery");
+    let last_error = dir.path().join(".anyagents-last-error.json");
+    std::fs::write(&marker, b"").unwrap();
+    std::fs::write(&last_error, b"{}").unwrap();
+
+    let reconciled = harness
+        .reconcile_unconfirmed_for_recovery()
+        .unwrap()
+        .expect("a held turn reconciles");
+    assert_eq!(
+        reconciled.request_ids,
+        vec!["m1".to_string(), "m2".to_string()]
+    );
+    assert!(!harness.has_unconfirmed_hold());
+    assert!(!dir.path().join("spiron-unconfirmed-steers.json").exists());
+    assert!(!marker.exists());
+    assert!(!last_error.exists());
+
+    // A new process over the same state directory must not re-flag the
+    // hold: the in-memory bool and every file were released together.
+    drop(harness);
+    let restarted = immediate_receipt_fixture(UNDELIVERED_STEER_SCRIPT, 0).unwrap();
+    restarted.set_state_dir(dir.path());
+    assert!(!restarted.has_unconfirmed_hold());
+}
+
+#[test]
+#[cfg(unix)]
+fn confirmed_turn_completion_clears_marker_and_error_artifacts() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join(".anyagents-session-reset-recovery");
+    let last_error = dir.path().join(".anyagents-last-error.json");
+    std::fs::write(&marker, b"").unwrap();
+    std::fs::write(&last_error, b"{}").unwrap();
+    let mut harness = immediate_receipt_fixture(CONFIRMED_TURN_SCRIPT, 0).unwrap();
+    harness.set_state_dir(dir.path());
+
+    assert!(matches!(
+        deliver_until_accepted(&mut harness, "m1"),
+        anyagents_harness::DeliverOutcome::Accepted { .. }
+    ));
+    assert!(
+        harness.wait_pred(std::time::Duration::from_secs(10), |state| state
+            .finished
+            .contains("m1")),
+        "the confirmed result must be processed"
+    );
+    assert!(!dir.path().join("spiron-unconfirmed-steers.json").exists());
+    assert!(
+        !marker.exists(),
+        "a confirmed turn must not leave the marker"
+    );
+    assert!(
+        !last_error.exists(),
+        "a confirmed turn must not leave its error file"
+    );
+    assert!(!harness.has_unconfirmed_hold());
+}
+
+#[cfg(target_os = "linux")]
+fn plain_message(id: &str) -> anyagents_harness::OutboundMessage {
+    anyagents_harness::OutboundMessage {
+        id: id.into(),
+        seq: 1,
+        text: format!("text of {id}"),
+        sender: None,
+        reply_to: None,
+        source_time_ms: None,
+        context: anyagents_harness::Context::default(),
+    }
+}
+
+#[cfg(target_os = "linux")]
+/// Counts the activity watcher's calls.
+fn counted_watch(harness: &super::StreamHarness) -> std::sync::mpsc::Receiver<()> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let tx = std::sync::Mutex::new(tx);
+    harness.watch_activity(std::sync::Arc::new(move || {
+        let _ = tx.lock().unwrap().send(());
+    }));
+    rx
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn streamed_lines_wake_the_host_only_on_transitions() {
+    use std::time::Duration;
+    let spec = StreamSpec::for_program("omp");
+    let mut harness = super::StreamHarness::launch(super::Launch {
+        spec: spec.clone(),
+        program: "/bin/sh".into(),
+        args: vec![
+            "-c".into(),
+            r#"read line
+i=0
+while [ "$i" -lt 200 ]; do
+    printf '%s\n' "{\"type\":\"text_delta\",\"text\":\"chunk $i\"}"
+    i=$((i + 1))
+    case "$i" in *0) sleep 0.01 ;; esac
+done
+printf '%s\n' '{"type":"done","session_id":"sess-stream","usage":{"input_tokens":1,"output_tokens":1}}'
+exec sleep 30"#
+                .into(),
+        ],
+        environment: vec![],
+        work_dir: None,
+        session_id: None,
+        mode: anyagents_harness::DeliveryMode::Followup,
+        steer: anyagents_harness::SteerSupport::Unproven,
+    })
+    .unwrap();
+    let wakes = counted_watch(&harness);
+    wakes
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the watcher wakes the host once at start");
+    let message = plain_message("m1");
+    assert!(matches!(
+        harness
+            .deliver(&message, &super::message_line(&spec, &message))
+            .unwrap(),
+        anyagents_harness::DeliverOutcome::Accepted { .. }
+    ));
+    assert!(harness.wait_finished("m1", Duration::from_secs(10)));
+    // The closing line is the one transition: it ends the turn and names
+    // the session. The 200 streamed lines change nothing the host reads.
+    wakes
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the turn end wakes the host");
+    std::thread::sleep(Duration::from_millis(200));
+    let extra = wakes.try_iter().count();
+    assert!(extra <= 1, "{extra} more wakes for streamed lines");
+    assert_eq!(
+        harness.health().turn_state,
+        anyagents_harness::TurnState::Idle
+    );
+    assert_eq!(harness.session_id().as_deref(), Some("sess-stream"));
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn an_idle_agy_cascade_closes_its_turn_on_its_own_timer_without_polling_while_it_streams() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let polls = Arc::new(AtomicUsize::new(0));
+    let served = Arc::clone(&polls);
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut stream = stream;
+            let mut data = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let n = stream.read(&mut chunk).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                data.extend_from_slice(&chunk[..n]);
+                if let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&data[..pos]).to_ascii_lowercase();
+                    let length = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if data.len() >= pos + 4 + length {
+                        break;
+                    }
+                }
+            }
+            let request = String::from_utf8_lossy(&data);
+            let body = if request.contains("GetAllCascadeTrajectories") {
+                served.fetch_add(1, Ordering::SeqCst);
+                json!({"trajectorySummaries": {"sess-idle": {"status": "CASCADE_RUN_STATUS_IDLE"}}})
+                    .to_string()
+            } else {
+                "{}".to_string()
+            };
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+        }
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let spec = StreamSpec::for_program("agy");
+    // The cascade streams steps for about a second and a half, then goes
+    // quiet without the closing `result`, as one held open by a background
+    // task does.
+    let mut harness = super::StreamHarness::launch_with_agy_rpc(
+        super::Launch {
+            spec: spec.clone(),
+            program: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                r#"printf '%s\n' '{"event":"init","session_id":"sess-idle"}'
+read line
+printf '%s\n' '{"event":"step_update","step_update":{"conversation_id":"sess-idle","step_type":"user_input"}}'
+i=0
+while [ "$i" -lt 30 ]; do
+    sleep 0.05
+    printf '%s\n' '{"event":"step_update","step_update":{"conversation_id":"sess-idle","step_type":"planner_response"}}'
+    i=$((i + 1))
+done
+exec sleep 30"#
+                    .into(),
+            ],
+            environment: vec![],
+            work_dir: Some(dir.path().to_path_buf()),
+            session_id: None,
+            mode: anyagents_harness::DeliveryMode::Steer,
+            steer: anyagents_harness::SteerSupport::Yes,
+        },
+        Some(super::AgyRpcConfig {
+            config_dir: dir.path().to_path_buf(),
+            csrf_token: "csrf-idle".into(),
+            port_override: Some(port),
+        }),
+    )
+    .unwrap();
+    assert!(harness.wait_pred(Duration::from_secs(5), |state| state.session_id.is_some()));
+    let wakes = counted_watch(&harness);
+    let message = plain_message("m1");
+    assert_eq!(
+        harness
+            .deliver(&message, &super::message_line(&spec, &message))
+            .unwrap(),
+        anyagents_harness::DeliverOutcome::Accepted {
+            turn_finished: false
+        }
+    );
+    // While steps stream, the cascade evidently runs: nobody asks.
+    assert!(harness.wait_pred(Duration::from_secs(5), |state| state.turn_user_inputs > 0));
+    std::thread::sleep(Duration::from_millis(1_000));
+    assert_eq!(
+        polls.load(Ordering::SeqCst),
+        0,
+        "no request while it streams"
+    );
+    // Once quiet, its own timer asks, sees it idle twice, and closes the
+    // turn, waking the host: no health read drives it.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while harness.wait_pred(Duration::ZERO, |state| !state.open.is_empty()) {
+        assert!(
+            Instant::now() < deadline,
+            "the idle cascade's turn never closed"
+        );
+        let _ = wakes.recv_timeout(Duration::from_millis(100));
+    }
+    assert!(harness.wait_finished("m1", Duration::ZERO));
+    let asked = polls.load(Ordering::SeqCst);
+    assert!(
+        (2..=4).contains(&asked),
+        "{asked} status requests to close one quiet turn"
+    );
+    assert_eq!(
+        harness.health().turn_state,
+        anyagents_harness::TurnState::Idle
+    );
+}
+
+#[test]
+fn the_agy_quota_finding_is_kept_until_a_file_it_reads_changes() {
+    use std::io::Write as _;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    let dir = tempfile::tempdir().unwrap();
+    let logs = dir.path().join(".gemini/antigravity-cli/log");
+    std::fs::create_dir_all(&logs).unwrap();
+    let log = logs.join("cli-1.log");
+    std::fs::write(
+        &log,
+        "Sending user message to conversation c1\n\
+         run ended with error and no response: RESOURCE_EXHAUSTED: quota resets in 2h\n",
+    )
+    .unwrap();
+    let mtime_ms = |path: &std::path::Path| {
+        std::fs::metadata(path)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let (reset, error) = super::detect_agy_session_quota_and_error(dir.path(), now);
+    let reset = reset.expect("a quota reset in the newest log");
+    assert_eq!(reset, mtime_ms(&log) + 7_200_000);
+    assert!(error.unwrap().contains("RESOURCE_EXHAUSTED"));
+    // The kept finding still applies the current time.
+    assert_eq!(
+        super::detect_agy_session_quota_and_error(dir.path(), reset + 1),
+        (None, None)
+    );
+    // A clearing newer than the log hides it.
+    std::fs::write(
+        dir.path().join(".anyagents-quota-cleared-ms"),
+        format!("{}\n", mtime_ms(&log) + 1),
+    )
+    .unwrap();
+    assert_eq!(
+        super::detect_agy_session_quota_and_error(dir.path(), now),
+        (None, None)
+    );
+    // The same log, appended to after the clearing, counts again.
+    std::thread::sleep(Duration::from_millis(20));
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&log)
+        .unwrap()
+        .write_all(b"run ended with error and no response: overloaded\n")
+        .unwrap();
+    assert_eq!(
+        super::detect_agy_session_quota_and_error(dir.path(), now),
+        (None, Some("overloaded".to_string()))
+    );
+    // A persisted error newer than the clearing takes precedence.
+    std::fs::write(
+        dir.path().join(".anyagents-last-error.json"),
+        json!({"error": "persisted", "timestamp_ms": i64::MAX - 1}).to_string(),
+    )
+    .unwrap();
+    assert_eq!(
+        super::detect_agy_session_quota_and_error(dir.path(), now),
+        (None, Some("persisted".to_string()))
+    );
+}
+
+#[test]
+fn quota_of_parses_rfc3339_resets_at_timestamp() {
+    let ev = serde_json::json!({
+        "type": "result",
+        "is_error": true,
+        "error": "Sylphx AI failure Some(\"rate_limit_exceeded\"): Subscription quota exhausted. Your usage window resets at 2026-11-16T00:00:00Z."
+    });
+    assert_eq!(super::quota_of(&ev), Some(1_794_787_200_000));
+
+    let offset_ev = serde_json::json!({
+        "type": "result",
+        "is_error": true,
+        "error": "Quota exhausted; resets at 2026-11-15T19:00:00.250-05:00"
+    });
+    assert_eq!(super::quota_of(&offset_ev), Some(1_794_787_200_250));
+}

@@ -175,23 +175,7 @@ fn the_real_server_refuses_a_matching_uid_but_accepts_the_fixture() {
     }
 }
 
-/// A `PATH` where creating an agent installs nothing: `npm` answers a version
-/// and a no-op install. The harnesses the tests run are on the machine already.
-fn machine_path(dir: &Path) -> std::ffi::OsString {
-    use std::os::unix::fs::PermissionsExt;
-    let bin = dir.join("bin");
-    std::fs::create_dir_all(&bin).unwrap();
-    let npm = bin.join("npm");
-    if !npm.exists() {
-        std::fs::write(
-            &npm,
-            "#!/bin/sh\ncase \"$1\" in view) echo 0.0.0 ;; esac\nexit 0\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&npm, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-    std::env::join_paths([bin]).unwrap()
-}
+use support::machine_path;
 
 fn bin() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_anyagents"));

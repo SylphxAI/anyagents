@@ -62,10 +62,40 @@ struct State {
     seen: HashSet<String>,
     written: Vec<String>,
     finished: HashSet<String>,
+    completed_turns: HashSet<String>,
     turns_started: usize,
     usages: Vec<(String, TurnUsage)>,
     quota_reset_at_ms: Option<i64>,
     last_usage: Option<TurnUsage>,
+}
+
+/// What the host reads through this adapter. A notification that changes
+/// none of it (a streamed delta, a progress note) wakes nobody.
+#[derive(PartialEq, Eq)]
+struct Observed {
+    turn: Option<String>,
+    taken: usize,
+    open: usize,
+    seen: usize,
+    finished: usize,
+    usages: usize,
+    quota_reset_at_ms: Option<i64>,
+    session: String,
+}
+
+impl State {
+    fn observed(&self) -> Observed {
+        Observed {
+            turn: self.turn.clone(),
+            taken: self.taken.len(),
+            open: self.open.len(),
+            seen: self.seen.len(),
+            finished: self.finished.len(),
+            usages: self.usages.len(),
+            quota_reset_at_ms: self.quota_reset_at_ms,
+            session: self.session.clone(),
+        }
+    }
 }
 
 impl MuseHarness {
@@ -114,7 +144,13 @@ impl MuseHarness {
                     .collect(),
                 work_dir: work_dir.map(Path::to_path_buf),
             },
-            Arc::new(move |line| on_notification(&mut lock(&on_shared), line)),
+            Arc::new(move |line| {
+                let mut state = lock(&on_shared);
+                let before = state.observed();
+                let mut effect = on_notification(&mut state, line);
+                effect.unobserved = state.observed() == before;
+                effect
+            }),
             Arc::new(on_request),
         )?;
         {
@@ -219,31 +255,19 @@ impl MuseHarness {
             }
             p
         };
-        let (method, params) = match &wanted {
-            Some(session) => {
-                let mut p = json!({
-                    "commandId": command_id(),
-                    "sessionId": session,
-                    "excludeItems": true
-                });
-                if !is_fake {
-                    p["permissionProfile"] = json!(":unrestricted");
+        let mut result = match &wanted {
+            Some(session) => match self.resume_session(session, !is_fake) {
+                Ok(result) => result,
+                Err(err)
+                    if !is_fake
+                        && (err.to_string().contains("not found")
+                            || err.to_string().contains("sessionNotFound")) =>
+                {
+                    self.call("session/start", build_start_params(&work_dir), RESUME_WAIT)?
                 }
-                ("session/resume", p)
-            }
-            None => ("session/start", build_start_params(&work_dir)),
-        };
-        let mut result = match self.call(method, params, RESUME_WAIT) {
-            Ok(result) => result,
-            Err(err)
-                if wanted.is_some()
-                    && !is_fake
-                    && (err.to_string().contains("not found")
-                        || err.to_string().contains("sessionNotFound")) =>
-            {
-                self.call("session/start", build_start_params(&work_dir), RESUME_WAIT)?
-            }
-            Err(err) => return Err(err),
+                Err(err) => return Err(err),
+            },
+            None => self.call("session/start", build_start_params(&work_dir), RESUME_WAIT)?,
         };
         if wanted.is_some()
             && !is_fake
@@ -285,6 +309,43 @@ impl MuseHarness {
 
     fn call(&self, method: &str, params: Value, wait: Duration) -> Result<Value, HarnessError> {
         self.rpc.request(method, params, wait).map_err(fail)
+    }
+
+    fn resume_session(
+        &self,
+        session: &str,
+        include_permission_profile: bool,
+    ) -> Result<Value, HarnessError> {
+        const LOCK_RETRY_WAITS_MS: &[u64] = &[200, 400, 800, 1200, 1500];
+        for wait_ms in LOCK_RETRY_WAITS_MS
+            .iter()
+            .copied()
+            .map(Some)
+            .chain(std::iter::once(None))
+        {
+            let mut params = json!({
+                "commandId": command_id(),
+                "sessionId": session,
+                "excludeItems": true
+            });
+            if include_permission_profile {
+                params["permissionProfile"] = json!(":unrestricted");
+            }
+            match self.call("session/resume", params, RESUME_WAIT) {
+                Ok(result) => return Ok(result),
+                Err(err) if is_session_lock_conflict(&err) => {
+                    let Some(delay_ms) = wait_ms else {
+                        return Err(err);
+                    };
+                    if !self.rpc.alive() {
+                        return Err(HarnessError::Dead);
+                    }
+                    std::thread::sleep(Duration::from_millis(delay_ms));
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        unreachable!("retry loop always returns on the final attempt")
     }
 }
 
@@ -344,7 +405,9 @@ impl Harness for MuseHarness {
                 let mut state = lock(&self.shared);
                 state.written.push(message.id.clone());
                 state.seen.insert(message.id.clone());
-                if let Some(turn_id) = result.get("turnId").and_then(Value::as_str) {
+                if let Some(turn_id) = result.get("turnId").and_then(Value::as_str)
+                    && !state.completed_turns.contains(turn_id)
+                {
                     state.turn = Some(turn_id.to_string());
                 }
                 Ok(DeliverOutcome::Accepted {
@@ -382,15 +445,7 @@ impl Harness for MuseHarness {
         if !self.rpc.alive() {
             return Err(HarnessError::Dead);
         }
-        let result = self.call(
-            "session/resume",
-            json!({
-                "commandId": command_id(),
-                "sessionId": session,
-                "excludeItems": true
-            }),
-            RESUME_WAIT,
-        )?;
+        let result = self.resume_session(session, false)?;
         let mut state = lock(&self.shared);
         state.session = result
             .pointer("/session/sessionId")
@@ -481,6 +536,11 @@ impl Harness for MuseHarness {
     }
 }
 
+fn is_session_lock_conflict(err: &HarnessError) -> bool {
+    let text = err.to_string().to_ascii_lowercase();
+    text.contains("already in use") || text.contains("-32021")
+}
+
 fn fail(fail: RpcFail) -> HarnessError {
     match fail {
         RpcFail::Dead => HarnessError::Dead,
@@ -511,6 +571,13 @@ fn on_notification(state: &mut State, value: &Value) -> NotificationEffect {
                 .get("turnId")
                 .and_then(Value::as_str)
                 .map(str::to_string);
+            if let Some(turn_id) = turn.as_deref()
+                && state.completed_turns.contains(turn_id)
+            {
+                // Completion arrived before `turn/started`; count once without reopening.
+                state.turns_started += 1;
+                return NotificationEffect::default();
+            }
             // A steer joins the open turn; anything else opens a new one.
             let same = turn.is_some() && turn == state.turn;
             if !same {
@@ -523,7 +590,18 @@ fn on_notification(state: &mut State, value: &Value) -> NotificationEffect {
         }
         "turn/completed" => {
             let turn = params.get("turnId").and_then(Value::as_str);
-            if turn.is_none() || turn == state.turn.as_deref() {
+            if let Some(turn_id) = turn {
+                state.completed_turns.insert(turn_id.to_string());
+            }
+            let matches_active_or_pending = match turn {
+                None => true,
+                Some(turn_id) => {
+                    state.turn.as_deref() == Some(turn_id)
+                        || (state.turn.is_none()
+                            && (!state.taken.is_empty() || !state.open.is_empty()))
+                }
+            };
+            if matches_active_or_pending {
                 finish_turn(state, &params);
             }
         }

@@ -9,6 +9,7 @@ mod fake;
 pub mod masking;
 mod name;
 mod seat;
+mod stamp;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -20,6 +21,7 @@ pub use atomic_fs::{
 };
 pub use fake::FakeHarness;
 pub use name::normalize_harness_name;
+pub use stamp::FileStamp;
 
 /// Internal environment key the server sets when an agent has an OS seat. It
 /// carries `<launcher>\t<uid>\t<gid>\t<groups>` and is removed from the child's
@@ -320,7 +322,8 @@ pub const SERVER_ONLY_ENV: &[&str] = &[
 
 /// Build the command that starts a harness process. When `environment` names a
 /// seat, the process is started inside it with `setpriv --reuid … --no-new-privs`,
-/// and no server-only key reaches it.
+/// and no server-only key reaches it. On Unix, places the child in its own
+/// process group so wrapper scripts and their descendants can be torn down together.
 pub fn spawn_command(
     program: &std::path::Path,
     environment: &[(String, String)],
@@ -333,6 +336,11 @@ pub fn spawn_command(
         Some((_, spec)) => seat::admitted_command(program, spec, environment)?,
         None => std::process::Command::new(program),
     };
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
     for (key, value) in environment {
         if !SERVER_ONLY_ENV.contains(&key.as_str()) {
             command.env(key, value);
@@ -344,56 +352,227 @@ pub fn spawn_command(
     Ok(command)
 }
 
+#[cfg(unix)]
+mod unix_signal {
+    pub(super) const TERM: i32 = 15;
+    pub(super) const KILL: i32 = 9;
+    const EPERM: i32 = 1;
+
+    unsafe extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+
+    pub(super) fn signal_number(signal: &str) -> Option<i32> {
+        match signal {
+            "-TERM" | "TERM" => Some(TERM),
+            "-KILL" | "KILL" => Some(KILL),
+            _ => None,
+        }
+    }
+
+    pub(super) fn signal_target(target: i32, sig: i32) -> Result<(), i32> {
+        // SAFETY: POSIX `kill(2)` on a validated PID/PGID target and signal number.
+        let rc = unsafe { kill(target, sig) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
+        }
+    }
+
+    pub(super) fn pgid_alive(pgid: i32) -> bool {
+        match signal_target(-pgid, 0) {
+            Ok(()) => true,
+            Err(errno) => errno == EPERM,
+        }
+    }
+}
+
+fn seat_spec(environment: &[(String, String)]) -> Option<(&str, &str, &str)> {
+    let spec = environment
+        .iter()
+        .rev()
+        .find(|(k, _)| k == SEAT_LAUNCH_ENV)
+        .map(|(_, v)| v.as_str())?;
+    let mut parts = spec.split('\t');
+    let (Some(launcher), Some(uid), Some(gid), Some(_), None) = (
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    ) else {
+        return None;
+    };
+    Some((launcher, uid, gid))
+}
+
+fn run_seat_kill(launcher: &str, uid: &str, gid: &str, args: &[&str]) -> bool {
+    use std::process::Stdio;
+    let mut cmd_args = vec![
+        "--reuid",
+        uid,
+        "--regid",
+        gid,
+        "--clear-groups",
+        "--no-new-privs",
+        "--",
+        "/bin/kill",
+    ];
+    cmd_args.extend_from_slice(args);
+    std::process::Command::new(launcher)
+        .args(cmd_args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
 /// Send `signal` (e.g. `"-TERM"` or `"-KILL"`) to a harness child process PID,
 /// running as the child's seat UID when `environment` names one.
 pub fn kill_pid(pid: u32, signal: &str, environment: &[(String, String)]) {
     use std::process::Stdio;
-    let seat = environment
-        .iter()
-        .find(|(k, _)| k == SEAT_LAUNCH_ENV)
-        .map(|(_, v)| v.as_str());
-    if let Some(spec) = seat
-        && let [launcher, uid, gid, _] = spec.split('\t').collect::<Vec<_>>().as_slice()
-    {
-        let _ = std::process::Command::new(launcher)
-            .args([
-                "--reuid",
-                uid,
-                "--regid",
-                gid,
-                "--clear-groups",
-                "--no-new-privs",
-                "--",
-                "/bin/kill",
-                signal,
-                &pid.to_string(),
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    } else {
-        let _ = std::process::Command::new("kill")
-            .args([signal, &pid.to_string()])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+    if let Some((launcher, uid, gid)) = seat_spec(environment) {
+        let pid_str = pid.to_string();
+        let _ = run_seat_kill(launcher, uid, gid, &[signal, &pid_str]);
+        return;
+    }
+    #[cfg(unix)]
+    if let (Some(raw_pid), Some(sig)) = (
+        i32::try_from(pid).ok().filter(|pid| *pid > 0),
+        unix_signal::signal_number(signal),
+    ) {
+        let _ = unix_signal::signal_target(raw_pid, sig);
+        return;
+    }
+    let _ = std::process::Command::new("kill")
+        .args([signal, &pid.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+fn kill_process_group(pid: u32, signal: &str, environment: &[(String, String)]) {
+    if let Some((launcher, uid, gid)) = seat_spec(environment) {
+        let pgid_str = format!("-{pid}");
+        let pid_str = pid.to_string();
+        let _ = run_seat_kill(launcher, uid, gid, &[signal, "--", &pgid_str, &pid_str]);
+        return;
+    }
+    #[cfg(unix)]
+    if let (Ok(raw_pid), Some(sig)) = (i32::try_from(pid), unix_signal::signal_number(signal)) {
+        let _ = unix_signal::signal_target(-raw_pid, sig);
+        let _ = unix_signal::signal_target(raw_pid, sig);
+        return;
+    }
+    kill_pid(pid, signal, environment);
+}
+
+/// Whether any process is left in the group `pid` leads. A probe with signal
+/// 0 needs no permission to answer: a group of another uid (a seat) answers
+/// `EPERM`, which still means it exists, so no seat launcher is spawned.
+fn pgid_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    if let Ok(raw_pid) = i32::try_from(pid) {
+        return unix_signal::pgid_alive(raw_pid);
+    }
+    false
+}
+
+#[cfg(target_os = "linux")]
+mod pidfd {
+    use std::ffi::{c_int, c_long, c_ulong};
+    use std::time::Duration;
+
+    const SYS_PIDFD_OPEN: c_long = 434;
+    const POLLIN: i16 = 0x1;
+
+    #[repr(C)]
+    struct PollFd {
+        fd: c_int,
+        events: i16,
+        revents: i16,
+    }
+
+    unsafe extern "C" {
+        fn syscall(number: c_long, ...) -> c_long;
+        fn poll(fds: *mut PollFd, count: c_ulong, timeout: c_int) -> c_int;
+        fn close(fd: c_int) -> c_int;
+    }
+
+    /// Wait until `pid` exits or `timeout` passes: `Some(true)` when it has
+    /// exited, `Some(false)` on timeout, `None` when the kernel offers no
+    /// pidfd for it or the wait failed.
+    pub(super) fn wait_exit(pid: u32, timeout: Duration) -> Option<bool> {
+        let pid = c_int::try_from(pid).ok()?;
+        // SAFETY: pidfd_open takes a pid and flags and returns a new
+        // descriptor or -1.
+        let fd = unsafe { syscall(SYS_PIDFD_OPEN, pid, 0 as c_int) };
+        let fd = c_int::try_from(fd).ok().filter(|fd| *fd >= 0)?;
+        let mut polled = PollFd {
+            fd,
+            events: POLLIN,
+            revents: 0,
+        };
+        let millis = c_int::try_from(timeout.as_millis()).unwrap_or(c_int::MAX);
+        // SAFETY: `polled` is one valid entry; `fd` is owned here.
+        let ready = unsafe { poll(&mut polled, 1, millis) };
+        // SAFETY: `fd` was opened above and is closed once.
+        unsafe { close(fd) };
+        (ready >= 0).then_some(ready > 0)
     }
 }
 
-/// Kill `child` inside its seat UID boundary when `environment` names one.
+/// Wait up to `grace` for `child` to exit and its process group to empty.
+/// The child's own exit is an event (its pidfd); only the descendants left in
+/// its group, which nothing reports, are probed on a short interval.
+fn wait_child_or_group_exit(
+    child: &mut std::process::Child,
+    pid: u32,
+    grace: std::time::Duration,
+) -> bool {
+    const GROUP_PROBE: std::time::Duration = std::time::Duration::from_millis(25);
+    let deadline = std::time::Instant::now() + grace;
+    while !matches!(child.try_wait(), Ok(Some(_))) {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return false;
+        }
+        #[cfg(target_os = "linux")]
+        if pidfd::wait_exit(pid, left).is_some() {
+            continue;
+        }
+        std::thread::sleep(left.min(GROUP_PROBE));
+    }
+    loop {
+        if !pgid_alive(pid) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(GROUP_PROBE);
+    }
+}
+
+/// Kill `child` and its process group inside its seat UID boundary when `environment` names one.
 pub fn kill_child(child: &mut std::process::Child, environment: &[(String, String)]) {
-    if matches!(child.try_wait(), Ok(Some(_))) {
-        return;
-    }
+    const TERM_GRACE: std::time::Duration = std::time::Duration::from_millis(800);
+    const KILL_REAP_GRACE: std::time::Duration = std::time::Duration::from_millis(100);
+
     let pid = child.id();
-    kill_pid(pid, "-TERM", environment);
-    if matches!(child.try_wait(), Ok(Some(_))) {
+    if matches!(child.try_wait(), Ok(Some(_))) && !pgid_alive(pid) {
         return;
     }
-    kill_pid(pid, "-KILL", environment);
+    kill_process_group(pid, "-TERM", environment);
+    if wait_child_or_group_exit(child, pid, TERM_GRACE) {
+        return;
+    }
+    kill_process_group(pid, "-KILL", environment);
     let _ = child.kill();
+    let _ = wait_child_or_group_exit(child, pid, KILL_REAP_GRACE);
 }
 
 /// How a harness takes input that arrives during a turn.
@@ -938,5 +1117,34 @@ mod tests {
         queue.release_for("m2");
         let ids: Vec<String> = queue.lines().into_iter().map(|line| line.id).collect();
         assert_eq!(ids, vec!["m1", "m2"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kill_child_reaps_wrapper_and_descendant_process_group() {
+        use std::io::{BufRead as _, BufReader};
+        use std::process::Stdio;
+        let mut cmd = spawn_command(std::path::Path::new("/bin/sh"), &[]).unwrap();
+        cmd.args(["-c", "sleep 30 & echo $!; wait"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut child = cmd.spawn().unwrap();
+        let wrapper_pid = child.id();
+        let mut line = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let grandchild_pid: i32 = line.trim().parse().expect("grandchild pid");
+        assert!(pgid_alive(wrapper_pid));
+        kill_child(&mut child, &[]);
+        assert!(matches!(child.try_wait(), Ok(Some(_))));
+        assert!(
+            !pgid_alive(wrapper_pid),
+            "process group still alive after kill_child"
+        );
+        assert!(
+            matches!(unix_signal::signal_target(grandchild_pid, 0), Err(3)),
+            "grandchild pid {grandchild_pid} still alive after kill_child"
+        );
     }
 }

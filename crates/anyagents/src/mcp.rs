@@ -8,6 +8,7 @@
 //! from, so a name the model writes can only choose a destination.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyagents_core::{AgentId, Error};
 use bytes::Bytes;
@@ -498,13 +499,8 @@ pub fn run(data: &Path, config: Option<&Path>, profile: Option<McpProfile>) -> R
     let socket = server::socket_path(data);
     let capability = capability_of(config)?;
     let config_buf = config.to_path_buf();
-    let runtime = tokio::runtime::Runtime::new()?;
-    runtime.block_on(async {
-        let client = Client {
-            socket,
-            config: config_buf.clone(),
-            capability,
-        };
+    tool_server_runtime()?.block_on(async {
+        let client = Client::new(socket, config_buf.clone(), capability);
         let (who, harness) = client.whoami_with_harness().await.map_err(Error::Message)?;
         // A harness names the agent id it was given; the server already
         // answered with the agent this session acts as, and the two may not
@@ -536,6 +532,18 @@ pub fn run(data: &Path, config: Option<&Path>, profile: Option<McpProfile>) -> R
     })
 }
 
+/// The runtime one agent's tool server runs on. Every agent has its own tool
+/// server, so its fixed cost is paid once per agent: one thread drives every
+/// call, and blocking work (file tools, local web fetches, stdio reads) goes
+/// to tokio's on-demand blocking pool, whose idle threads exit by themselves.
+/// A worker per CPU in each of a hundred tool servers is thousands of idle
+/// threads on a shared machine.
+fn tool_server_runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+}
+
 /// The capability an agent's harness reads: a file only that agent's own
 /// config directory holds.
 fn capability_of(config: &Path) -> Result<String, Error> {
@@ -559,35 +567,155 @@ fn capability_of(config: &Path) -> Result<String, Error> {
 pub(crate) struct Client {
     pub(crate) socket: PathBuf,
     pub(crate) config: PathBuf,
+    /// The capability read at start, used while the file cannot be read.
     pub(crate) capability: String,
+    /// What every clone of this client shares: idle connections to the
+    /// server and the capability file as last read.
+    link: Arc<ServerLink>,
+}
+
+/// Connections kept open between calls, at most this many while idle. A
+/// burst of parallel calls opens what it needs; the rest close after it.
+const MAX_IDLE_CONNECTIONS: usize = 4;
+
+#[derive(Default)]
+struct ServerLink {
+    idle: std::sync::Mutex<Vec<http1::SendRequest<Full<Bytes>>>>,
+    capability: std::sync::Mutex<Option<(CapabilityStamp, String)>>,
+}
+
+/// The identity of one version of the capability file. A rotation writes a
+/// new file and renames it into place, which changes the inode; an in-place
+/// rewrite changes the size or a timestamp.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CapabilityStamp {
+    dev: u64,
+    ino: u64,
+    len: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+impl CapabilityStamp {
+    fn of(meta: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt as _;
+        Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            len: meta.len(),
+            mtime: (meta.mtime(), meta.mtime_nsec()),
+            ctime: (meta.ctime(), meta.ctime_nsec()),
+        }
+    }
+}
+
+fn locked<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 impl Client {
+    pub(crate) fn new(socket: PathBuf, config: PathBuf, capability: String) -> Self {
+        Self {
+            socket,
+            config,
+            capability,
+            link: Arc::default(),
+        }
+    }
+
+    /// The capability in the agent's config directory now. The server may
+    /// rotate it while this process runs, so every call presents what the
+    /// file holds; the file is read again only when its identity changed.
     fn current_capability(&self) -> String {
-        capability_of(&self.config).unwrap_or_else(|_| self.capability.clone())
+        let Ok(meta) = std::fs::metadata(self.config.join(CAPABILITY_FILE)) else {
+            return self.capability.clone();
+        };
+        let stamp = CapabilityStamp::of(&meta);
+        let mut cached = locked(&self.link.capability);
+        if let Some((seen, token)) = cached.as_ref()
+            && *seen == stamp
+        {
+            return token.clone();
+        }
+        match capability_of(&self.config) {
+            Ok(token) => {
+                *cached = Some((stamp, token.clone()));
+                token
+            }
+            Err(_) => self.capability.clone(),
+        }
+    }
+
+    /// One call on a kept-alive connection to the server. A connection the
+    /// server closed (it restarted, or it is stopping) is dropped and the
+    /// call goes on a new one; a call is sent again only when hyper hands it
+    /// back unsent, so nothing the server may have received is repeated.
+    async fn send(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Vec<u8>>,
+        capability: &str,
+        agent_id: Option<&str>,
+    ) -> Result<(hyper::StatusCode, Vec<u8>), String> {
+        let mut request = build_request(method, path, body, Some(capability), None, agent_id)?;
+        loop {
+            let (mut sender, reused) = match self.idle_connection().await {
+                Some(sender) => (sender, true),
+                None => (connect(&self.socket).await?, false),
+            };
+            let response = match sender.try_send_request(request).await {
+                Ok(response) => response,
+                Err(mut error) => match error.take_message() {
+                    Some(unsent) if reused => {
+                        request = unsent;
+                        continue;
+                    }
+                    _ => return Err(error.into_error().to_string()),
+                },
+            };
+            let status = response.status();
+            let bytes = response
+                .into_body()
+                .collect()
+                .await
+                .map_err(|err| err.to_string())?
+                .to_bytes()
+                .to_vec();
+            let mut idle = locked(&self.link.idle);
+            if idle.len() < MAX_IDLE_CONNECTIONS {
+                idle.push(sender);
+            }
+            return Ok((status, bytes));
+        }
+    }
+
+    /// An idle connection that can take a request now, if one is open.
+    async fn idle_connection(&self) -> Option<http1::SendRequest<Full<Bytes>>> {
+        loop {
+            let mut sender = locked(&self.link.idle).pop()?;
+            if sender.ready().await.is_ok() {
+                return Some(sender);
+            }
+        }
     }
 
     /// The agent this capability authenticates, as the server resolved it.
     async fn whoami_with_harness(&self) -> Result<(AgentRef, Option<String>), String> {
         let named = crate::client::agent_identity().map(|id| id.to_string());
         let cap = self.current_capability();
-        let who: serde_json::Value = request_naming(
-            &self.socket,
-            "GET",
-            "/v1/whoami",
-            None,
-            Some(&cap),
-            None,
-            named.as_deref(),
-        )
-        .await
-        .and_then(|(status, bytes)| {
-            if status.is_success() {
-                serde_json::from_slice(&bytes).map_err(|err| err.to_string())
-            } else {
-                Err(error_message(&bytes))
-            }
-        })?;
+        let who: serde_json::Value = self
+            .send("GET", "/v1/whoami", None, &cap, named.as_deref())
+            .await
+            .and_then(|(status, bytes)| {
+                if status.is_success() {
+                    serde_json::from_slice(&bytes).map_err(|err| err.to_string())
+                } else {
+                    Err(error_message(&bytes))
+                }
+            })?;
         let id = who
             .get("agent_id")
             .and_then(serde_json::Value::as_str)
@@ -635,16 +763,9 @@ impl Client {
     ) -> Result<T, String> {
         let named = crate::client::agent_identity().map(|id| id.to_string());
         let cap = self.current_capability();
-        let (status, bytes) = request_naming(
-            &self.socket,
-            method,
-            path,
-            body,
-            Some(&cap),
-            None,
-            named.as_deref(),
-        )
-        .await?;
+        let (status, bytes) = self
+            .send(method, path, body, &cap, named.as_deref())
+            .await?;
         if !status.is_success() {
             return Err(error_message(&bytes));
         }
@@ -883,12 +1004,14 @@ struct AgentsArgs {
     /// New agent name when `action = "rename"`.
     #[serde(default, alias = "to")]
     new_name: Option<String>,
-    /// Optional archetype template name (`.agents/agents/<archetype>.md`, e.g. `"planner"`, `"builder"`, `"tester"`) when `action` is `"spawn"` or `"create"`.
-    #[serde(default, alias = "type", alias = "template", alias = "preset")]
-    archetype: Option<String>,
-    /// Optional display-only role label (for example, `"Researcher"`); never selects lifecycle or scope.
-    /// when `action` is `"spawn"`, `"create"`, `"describe"`, or `"role"`.
-    #[serde(default)]
+    /// Optional agent role template name (`.agents/agents/<role>.md`, e.g. `"planner"`, `"builder"`, `"tester"`) when `action` is `"spawn"`, `"create"`, `"describe"`, or `"role"`.
+    #[serde(
+        default,
+        alias = "archetype",
+        alias = "type",
+        alias = "template",
+        alias = "preset"
+    )]
     role: Option<String>,
     /// Set `true` to clear the description or role label when `action` is `"describe"` or `"role"`.
     #[serde(default)]
@@ -923,6 +1046,9 @@ struct AgentsArgs {
     /// Internal communication & visibility scope (`"isolated"` | `"private"` | `"siblings"` | `"public"`) when `action` is `"spawn"`, `"create"`, or `"describe"`.
     #[serde(default)]
     scope: Option<String>,
+    /// Optional agent lifecycle mode (`"task"` | `"standing"`, defaulting to `"task"` for sub-agents and `"standing"` for root agents) when `action` is `"spawn"`, `"create"`, or `"describe"`. `"task"` sub-agents are single-mission freelancers closed (`archive`) by their parent upon completion; `"standing"` agents stay on idle standby between assignments.
+    #[serde(default)]
+    lifecycle: Option<String>,
     /// Whether this sub-agent accepts external messages (`true`) from agents outside its direct parent/child lineage (and allows outside agents to invite it to virtual groups). Defaults to `false` (`private`) when spawning a sub-agent.
     #[serde(default, alias = "allow_external")]
     public: Option<bool>,
@@ -982,11 +1108,14 @@ struct SpawnArgs {
         alias = "target"
     )]
     name: Option<String>,
-    /// Optional archetype template name (`.agents/agents/<archetype>.md`, e.g. `"planner"`, `"builder"`, `"tester"`).
-    #[serde(default, alias = "type", alias = "template", alias = "preset")]
-    archetype: Option<String>,
-    /// Optional display-only role label; no effect on lifecycle, scope or prompts.
-    #[serde(default)]
+    /// Optional agent role template name (`.agents/agents/<role>.md`, e.g. `"planner"`, `"builder"`, `"tester"`).
+    #[serde(
+        default,
+        alias = "archetype",
+        alias = "type",
+        alias = "template",
+        alias = "preset"
+    )]
     role: Option<String>,
     /// Harness catalog ID (`opencode`, `codex`, `claude-code`, `agy`, `muse`, `omp`, `dsh`, `grok`).
     /// Defaults to the caller's own harness (or `claude-code` when the caller runs on `agy`).
@@ -1019,6 +1148,9 @@ struct SpawnArgs {
     /// Optional internal communication & visibility scope (`"isolated"` | `"private"` | `"siblings"` | `"public"`).
     #[serde(default)]
     scope: Option<String>,
+    /// Optional agent lifecycle mode (`"task"` | `"standing"`, defaulting to `"task"` for sub-agents). `"task"` sub-agents are single-mission freelancers closed (`archive`) by their parent upon completion; `"standing"` agents stay on idle standby between assignments.
+    #[serde(default)]
+    lifecycle: Option<String>,
     /// Whether this sub-agent accepts external messages (`true`) from agents outside its direct parent/child lineage. Defaults to `false` (`private`).
     #[serde(default, alias = "allow_external")]
     public: Option<bool>,
@@ -1042,12 +1174,21 @@ struct DescribeArgs {
     /// Detailed private standing instructions (`instructions`, Layer 2 — injected only into the agent's own private system prompt).
     #[serde(default, alias = "instruction", alias = "system_prompt")]
     instructions: Option<String>,
-    /// Optional display-only role label; no effect on lifecycle, scope or prompts.
-    #[serde(default)]
+    /// Optional agent role template name (`.agents/agents/<role>.md`).
+    #[serde(
+        default,
+        alias = "archetype",
+        alias = "type",
+        alias = "template",
+        alias = "preset"
+    )]
     role: Option<String>,
     /// Optional internal communication & visibility scope (`"isolated"` | `"private"` | `"siblings"` | `"public"`).
     #[serde(default)]
     scope: Option<String>,
+    /// Optional agent lifecycle mode (`"task"` | `"standing"`, defaulting to `"task"` for sub-agents). `"task"` sub-agents are single-mission freelancers closed (`archive`) by their parent upon completion; `"standing"` agents stay on idle standby between assignments.
+    #[serde(default)]
+    lifecycle: Option<String>,
     /// Optional toggle (`true` or `false`) for whether a sub-agent accepts external messages from agents outside its direct parent/child lineage.
     #[serde(default, alias = "allow_external")]
     public: Option<bool>,
@@ -1085,9 +1226,15 @@ struct SubagentsArgs {
     /// Optional case-insensitive multi-token search query for `list`.
     #[serde(default, alias = "search", alias = "filter", alias = "q")]
     query: Option<String>,
-    /// Optional archetype template name (`.agents/agents/<archetype>.md`, e.g. `"planner"`, `"builder"`, `"tester"`) when `action = "spawn"`.
-    #[serde(default, alias = "type", alias = "template", alias = "preset")]
-    archetype: Option<String>,
+    /// Optional agent role template name (`.agents/agents/<role>.md`, e.g. `"planner"`, `"builder"`, `"tester"`) when `action = "spawn"`.
+    #[serde(
+        default,
+        alias = "archetype",
+        alias = "type",
+        alias = "template",
+        alias = "preset"
+    )]
+    role: Option<String>,
     /// Harness catalog ID when `action = "spawn"` (`opencode`, `codex`, `claude-code`, `agy`, `muse`, `omp`, `dsh`, `grok`).
     #[serde(default)]
     harness: Option<String>,
@@ -1113,16 +1260,14 @@ struct SubagentsArgs {
     #[serde(default)]
     description: Option<String>,
     /// Optional private system/role instructions when `action = "spawn"`.
-    #[serde(
-        default,
-        alias = "role",
-        alias = "instruction",
-        alias = "system_prompt"
-    )]
+    #[serde(default, alias = "instruction", alias = "system_prompt")]
     instructions: Option<String>,
     /// Optional internal communication & visibility scope (`"isolated"` | `"private"` | `"siblings"` | `"public"`).
     #[serde(default)]
     scope: Option<String>,
+    /// Optional agent lifecycle mode (`"task"` | `"standing"`, defaulting to `"task"` for sub-agents). `"task"` sub-agents are single-mission freelancers closed (`archive`) by their parent upon completion; `"standing"` agents stay on idle standby between assignments.
+    #[serde(default)]
+    lifecycle: Option<String>,
     /// Whether this sub-agent accepts external messages (`true`) from agents outside its direct parent/child lineage. Defaults to `false` (`private`).
     #[serde(default, alias = "allow_external")]
     public: Option<bool>,
@@ -1235,7 +1380,7 @@ struct ScheduleArgs {
     /// One-off wake time: relative duration (`"1m"`, `"30s"`, `"2h"`) or ISO-8601 / Unix timestamp (`"2026-10-29T16:30:00Z"`).
     #[serde(default)]
     at: Option<String>,
-    /// Recurring wake interval (`"1m"`, `"5m"`, `"15m"`, `"30m"`, `"1h"`). Fires only when idle and not quota-blocked; a missed wake never double-fires.
+    /// Recurring wake interval (`"1m"`, `"5m"`, `"15m"`, `"30m"`, `"1h"`). Each tick enters your mailbox like any other message; ticks missed while one is still undelivered coalesce into it.
     #[serde(default)]
     every: Option<String>,
     /// Event watch specification:
@@ -1781,7 +1926,7 @@ impl AgentMcp {
     }
 
     #[tool(
-        description = "Unified agent & cross-harness sub-agent manager (`action`: `list` | `inspect` | `spawn` | `create` | `describe` | `redact` | `steer` | `wake` | `pause` | `archive` | `delete` | `rename` | `role` | `harness` | `models`, supporting multi-level sub-agent trees). Use `list` (default, with optional `parent`: `\"self\"` | `\"subagents\"` | `\"root\"` and `state`: `\"running\"` | `\"working\"` | `\"paused\"` | `\"archived\"` | `\"all\"`) to inspect agents and sub-agents; use `inspect` (`name`: `\"<agent-or-id>\"`, `limit`: `10`) to view live status, schedules, and recent turns; use `spawn` (`name`, `repo`: `\"<org>/<repo>\"` | `\"inherit\"`, `branch`, `base`, `workdir`: path | `\"worktree\"` | `\"private\"` | `\"inherit\"`, `description`, `prompt`, `harness`, `model`, `profile`) to launch a sub-agent with an isolated managed Git worktree; use `describe` (`name`: `\"self\"` | `\"all\"` | `\"<agent>\"`, `description`: `\"...\"`) to read role descriptions or update a target's `description`/`instructions`/`role` (updating `description`, `instructions`, `role`, or `rename` requires the target's Parent/Ancestor agent or an Admin); use `steer`, `wake`, `pause`, `archive` (auto-reaps clean/pushed managed worktrees while preserving dirty ones), or `delete` to control lifecycle; use `redact` (`name`, `message_id` or `seq`, optional `span`: {`unit`: `bytes` | `chars`, `start`, `end`}, `reason`) for audited erasure with permission `conversation.redact` (ancestors/admin only, quiescent target); or use `create`, `rename`, `role`, `harness`, `models`."
+        description = "Unified agent & cross-harness sub-agent manager (`action`: `list` | `inspect` | `spawn` | `create` | `describe` | `redact` | `steer` | `wake` | `pause` | `archive` | `delete` | `rename` | `role` | `harness` | `models`, supporting multi-level sub-agent trees). Use `list` (default, with optional `parent`: `\"self\"` | `\"subagents\"` | `\"root\"` and `state`: `\"running\"` | `\"working\"` | `\"paused\"` | `\"archived\"` | `\"all\"`) to inspect agents and sub-agents; use `inspect` (`name`: `\"<agent-or-id>\"`, `limit`: `10`) to view live status, schedules, and recent turns; use `spawn` (`role`, `name`, `repo`: `\"<org>/<repo>\"` | `\"inherit\"`, `branch`, `base`, `workdir`: path | `\"worktree\"` | `\"private\"` | `\"inherit\"`, `description`, `prompt`, `harness`, `model`, `profile`) to launch a sub-agent with an isolated managed Git worktree; use `describe` (`name`: `\"self\"` | `\"all\"` | `\"<agent>\"`, `description`: `\"...\"`) to read role descriptions or update a target's `description`/`instructions`/`role` (updating `description`, `instructions`, `role`, or `rename` requires the target's Parent/Ancestor agent or an Admin); use `steer`, `wake`, `pause`, `archive` (auto-reaps clean/pushed managed worktrees while preserving dirty ones), or `delete` to control lifecycle; use `redact` (`name`, `message_id` or `seq`, optional `span`: {`unit`: `bytes` | `chars`, `start`, `end`}, `reason`) for audited erasure with permission `conversation.redact` (ancestors/admin only, quiescent target); or use `create`, `rename`, `role`, `harness`, `models`."
     )]
     async fn agents(
         &self,
@@ -1973,7 +2118,6 @@ impl AgentMcp {
                 let spawned = self
                     .spawn(Parameters(SpawnArgs {
                         name: args.name,
-                        archetype: args.archetype,
                         role: args.role,
                         harness: args.harness,
                         model: args.model,
@@ -1985,6 +2129,7 @@ impl AgentMcp {
                         description: args.description,
                         instructions: args.instructions,
                         scope: args.scope,
+                        lifecycle: args.lifecycle,
                         public: args.public,
                         group: args.group,
                         prompt: args.prompt,
@@ -2022,7 +2167,6 @@ impl AgentMcp {
                 };
                 let body = CreateAgentRequest {
                     name,
-                    archetype: args.archetype,
                     role: args.role,
                     harness: Some(harness),
                     model: args.model,
@@ -2035,6 +2179,7 @@ impl AgentMcp {
                     instructions: args.instructions,
                     parent: parent_val,
                     scope: args.scope,
+                    lifecycle: args.lifecycle,
                     public: args.public,
                     group: args.group,
                     prompt: args.prompt,
@@ -2057,6 +2202,7 @@ impl AgentMcp {
                     instructions: args.instructions,
                     role: args.role,
                     scope: args.scope,
+                    lifecycle: args.lifecycle,
                     public: args.public,
                     clear: args.clear,
                 }))
@@ -2372,7 +2518,6 @@ impl AgentMcp {
             .to_string();
         let body = CreateAgentRequest {
             name,
-            archetype: args.archetype,
             role: args.role,
             harness: Some(harness),
             model: args.model,
@@ -2385,6 +2530,7 @@ impl AgentMcp {
             instructions: args.instructions,
             parent: Some(self.agent.id.to_string()),
             scope: args.scope,
+            lifecycle: args.lifecycle,
             public: args.public,
             group: args.group,
             prompt: args.prompt,
@@ -2512,8 +2658,7 @@ impl AgentMcp {
                 let spawned = self
                     .spawn(Parameters(SpawnArgs {
                         name: args.agent,
-                        archetype: args.archetype,
-                        role: None,
+                        role: args.role,
                         harness: args.harness,
                         model: args.model,
                         profile: args.profile,
@@ -2524,6 +2669,7 @@ impl AgentMcp {
                         description: args.description,
                         instructions: args.instructions,
                         scope: args.scope,
+                        lifecycle: args.lifecycle,
                         public: args.public,
                         group: args.group,
                         prompt: args.prompt,
@@ -2880,6 +3026,7 @@ impl AgentMcp {
             && args.instructions.is_none()
             && args.role.is_none()
             && args.scope.is_none()
+            && args.lifecycle.is_none()
             && args.public.is_none()
             && !args.clear.unwrap_or(false)
         {
@@ -2896,6 +3043,7 @@ impl AgentMcp {
                         "aliases": a.aliases,
                         "parent": a.parent,
                         "scope": a.scope,
+                        "lifecycle": a.lifecycle,
                         "relationship": a.relationship,
                         "can_message": a.can_message,
                         "harness": a.harness,
@@ -2913,6 +3061,7 @@ impl AgentMcp {
             || args.instructions.is_some()
             || args.role.is_some()
             || args.scope.is_some()
+            || args.lifecycle.is_some()
             || args.public.is_some()
             || args.clear.unwrap_or(false)
         {
@@ -2921,6 +3070,7 @@ impl AgentMcp {
                 "instructions": args.instructions,
                 "role": args.role,
                 "scope": args.scope,
+                "lifecycle": args.lifecycle,
                 "public": args.public,
                 "clear": args.clear.unwrap_or(false),
             });
@@ -2970,7 +3120,7 @@ impl AgentMcp {
     }
 
     #[tool(
-        description = "Schedule your own wakes (`at` or `every` with `prompt`) and external event watches (`watch` with `prompt`), or `list` and `cancel` (`id`: `<sch_...>` | `\"all\"`) your schedules. Supported `watch` specs: `github:pr:<owner>/<repo>#<num>` (PR or checks terminal), `github:check:<owner>/<repo>@<ref>` (check runs terminal), `spiron:promise:<id>` (Spiron promise state change pulled from the public API), and `agent:idle:<name_or_id>` (AnyAgents agent going idle). Wakes fire only when you are idle and not quota-blocked, and a missed wake never fires twice."
+        description = "Schedule your own wakes (`at` or `every` with `prompt`) and external event watches (`watch` with `prompt`), or `list` and `cancel` (`id`: `<sch_...>` | `\"all\"`) your schedules. Supported `watch` specs: `github:pr:<owner>/<repo>#<num>` (PR or checks terminal), `github:check:<owner>/<repo>@<ref>` (check runs terminal), `spiron:promise:<id>` (Spiron promise state change pulled from the public API), and `agent:idle:<name_or_id>` (AnyAgents agent going idle). A due wake or triggered watch enters your mailbox like any other message (steered into a running turn, or held while you are paused or quota-blocked), and a schedule never queues a second wake while its previous one is undelivered."
     )]
     async fn schedule(
         &self,
@@ -3040,7 +3190,7 @@ impl AgentMcp {
     }
 
     #[tool(
-        description = "Schedule your own wakes (`at` or `every` with `prompt`) and external event watches (`watch` with `prompt`), or `list` and `cancel` (`id`: `<sch_...>` | `\"all\"`) your schedules. Supported `watch` specs: `github:pr:<owner>/<repo>#<num>` (PR or checks terminal), `github:check:<owner>/<repo>@<ref>` (check runs terminal), `spiron:promise:<id>` (Spiron promise state change pulled from the public API), and `agent:idle:<name_or_id>` (AnyAgents agent going idle). Wakes fire only when you are idle and not quota-blocked, and a missed wake never fires twice."
+        description = "Schedule your own wakes (`at` or `every` with `prompt`) and external event watches (`watch` with `prompt`), or `list` and `cancel` (`id`: `<sch_...>` | `\"all\"`) your schedules. Supported `watch` specs: `github:pr:<owner>/<repo>#<num>` (PR or checks terminal), `github:check:<owner>/<repo>@<ref>` (check runs terminal), `spiron:promise:<id>` (Spiron promise state change pulled from the public API), and `agent:idle:<name_or_id>` (AnyAgents agent going idle). A due wake or triggered watch enters your mailbox like any other message (steered into a running turn, or held while you are paused or quota-blocked), and a schedule never queues a second wake while its previous one is undelivered."
     )]
     async fn schedules(
         &self,
@@ -3255,6 +3405,50 @@ pub fn tool_definitions(profile: McpProfile) -> Vec<rmcp::model::Tool> {
         .collect()
 }
 
+/// `tool_definitions` plus the role-template catalog discovered under
+/// `.agents/agents/`. The catalog is appended to the tool-level description of
+/// every exposed tool with a `role` argument, because schema prose is stripped
+/// by `compact_tool_definition`.
+pub fn tool_definitions_with_roles(
+    profile: McpProfile,
+    workdir: Option<&Path>,
+    data_dir: Option<&Path>,
+) -> Vec<rmcp::model::Tool> {
+    let mut tools = tool_definitions(profile);
+    let Some(dd) = data_dir else {
+        return tools;
+    };
+    let templates = crate::create::discover_available_archetype_templates(workdir, None, dd);
+    if templates.is_empty() {
+        return tools;
+    }
+    let role_catalog = templates
+        .iter()
+        .map(|(slug, desc)| match desc {
+            Some(d) => format!("`{slug}` ({d})"),
+            None => format!("`{slug}`"),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let append_note = format!(" Available `.agents/agents/*.md` roles: {role_catalog}.");
+    for tool in &mut tools {
+        let has_role_arg = tool
+            .input_schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|props| props.contains_key("role"));
+        if !has_role_arg {
+            continue;
+        }
+        let mut desc = tool.description.as_deref().unwrap_or_default().to_string();
+        if !desc.contains("Available `.agents/agents/*.md` roles:") {
+            desc.push_str(&append_note);
+            tool.description = Some(desc.into());
+        }
+    }
+    tools
+}
+
 impl rmcp::ServerHandler for AgentMcp {
     fn get_info(&self) -> rmcp::model::ServerConfig {
         rmcp::model::ServerConfig::new(
@@ -3273,7 +3467,9 @@ impl rmcp::ServerHandler for AgentMcp {
         let supports_cache_hints = context
             .protocol_version()
             .is_some_and(|version| version >= rmcp::model::ProtocolVersion::V_2026_07_28);
-        let tools = tool_definitions(self.profile);
+        let wd = self.resolve_workdir();
+        let data_dir = self.client.socket.parent();
+        let tools = tool_definitions_with_roles(self.profile, Some(&wd), data_dir);
         Ok(rmcp::model::ListToolsResult {
             result_type: Some(rmcp::model::ResultType::COMPLETE),
             tools,
@@ -3650,43 +3846,12 @@ impl Drop for CodeChildGuard {
     }
 }
 
-static CACHED_JS_RUNTIME: std::sync::OnceLock<Option<(PathBuf, bool)>> = std::sync::OnceLock::new();
-
-fn find_js_runtime() -> Option<(PathBuf, bool)> {
-    CACHED_JS_RUNTIME
-        .get_or_init(|| {
-            let mut dirs = Vec::new();
-            if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-                dirs.push(home.join(".local/opt/node/bin"));
-                dirs.push(home.join(".local/opt/bun/bin"));
-                if let Some(host_home) = crate::sandbox::host_home_dir() {
-                    dirs.push(host_home.join(".local/opt/node/bin"));
-                    dirs.push(host_home.join(".local/opt/bun/bin"));
-                }
-                dirs.push(home.join(".local/bin"));
-                dirs.push(home.join(".bun/bin"));
-            } else if let Some(host_home) = crate::sandbox::host_home_dir() {
-                dirs.push(host_home.join(".local/opt/node/bin"));
-                dirs.push(host_home.join(".local/opt/bun/bin"));
-            }
-            if let Some(path_os) = std::env::var_os("PATH") {
-                dirs.extend(std::env::split_paths(&path_os));
-            }
-            dirs.push(PathBuf::from("/usr/local/bin"));
-            dirs.push(PathBuf::from("/usr/bin"));
-            dirs.push(PathBuf::from("/bin"));
-
-            for (bin_name, is_node) in [("node", true), ("bun", false)] {
-                for dir in &dirs {
-                    let candidate = dir.join(bin_name);
-                    if candidate.is_file() {
-                        return Some((candidate, is_node));
-                    }
-                }
-            }
-            None
-        })
-        .clone()
+fn find_js_runtime() -> Result<(PathBuf, bool), String> {
+    let resolved = anyagents_toolchain::global()
+        .first_of(&["node", "bun"], "mcp.js")
+        .map_err(|err| err.to_string())?;
+    let is_node = resolved.name == "node";
+    Ok((resolved.path, is_node))
 }
 
 impl AgentMcp {
@@ -4193,11 +4358,7 @@ impl AgentMcp {
     ) -> Self {
         Self {
             agent,
-            client: Client {
-                socket,
-                config,
-                capability,
-            },
+            client: Client::new(socket, config, capability),
             profile,
         }
     }
@@ -4443,7 +4604,9 @@ impl AgentMcp {
                 "result": {}
             })),
             "tools/list" => {
-                let tools = tool_definitions(self.profile);
+                let wd = self.resolve_workdir();
+                let data_dir = self.client.socket.parent();
+                let tools = tool_definitions_with_roles(self.profile, Some(&wd), data_dir);
                 Some(serde_json::json!({
                     "jsonrpc": "2.0",
                     "id": id_val,
@@ -4703,9 +4866,7 @@ impl AgentMcp {
             .timeout_ms
             .unwrap_or(DEFAULT_CODE_TIMEOUT_MS)
             .clamp(100, MAX_CODE_TIMEOUT_MS);
-        let (runtime_bin, is_node) = find_js_runtime().ok_or_else(|| {
-            "neither `node` nor `bun` was found on this machine to execute `code` mode".to_string()
-        })?;
+        let (runtime_bin, is_node) = find_js_runtime()?;
 
         let started = Instant::now();
         let mut cmd = Command::new(&runtime_bin);
@@ -5195,7 +5356,9 @@ impl Drop for ScopedTempDir {
 fn transcode_image_to_png_bytes(path: &Path) -> Option<Vec<u8>> {
     let dir = ScopedTempDir::new().ok()?;
     let out_png = dir.path().join("converted.png");
-    let status = std::process::Command::new("convert")
+    let convert = anyagents_toolchain::tool("convert", "mcp.read").ok()?;
+    let status = convert
+        .command()
         .arg(format!("{}[0]", path.display()))
         .arg(&out_png)
         .stdout(std::process::Stdio::null())
@@ -5364,17 +5527,21 @@ fn read_multimedia_file(
             .max(start_page)
             .min(start_page + 9);
 
-        let extracted_text = std::process::Command::new("pdftotext")
-            .args([
-                "-f",
-                &start_page.to_string(),
-                "-l",
-                &end_page.to_string(),
-                &resolved.display().to_string(),
-                "-",
-            ])
-            .output()
+        let extracted_text = anyagents_toolchain::tool("pdftotext", "mcp.read")
             .ok()
+            .and_then(|tool| {
+                tool.command()
+                    .args([
+                        "-f",
+                        &start_page.to_string(),
+                        "-l",
+                        &end_page.to_string(),
+                        &resolved.display().to_string(),
+                        "-",
+                    ])
+                    .output()
+                    .ok()
+            })
             .filter(|out| out.status.success())
             .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
             .unwrap_or_default();
@@ -5382,21 +5549,23 @@ fn read_multimedia_file(
         let mut pages_rendered = 0usize;
         if let Ok(tmp_dir) = ScopedTempDir::new() {
             let prefix = tmp_dir.path().join("page");
-            if let Ok(status) = std::process::Command::new("pdftoppm")
-                .args([
-                    "-jpeg",
-                    "-r",
-                    "100",
-                    "-f",
-                    &start_page.to_string(),
-                    "-l",
-                    &end_page.to_string(),
-                    &resolved.display().to_string(),
-                    &prefix.display().to_string(),
-                ])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
+            if let Ok(pdftoppm) = anyagents_toolchain::tool("pdftoppm", "mcp.read")
+                && let Ok(status) = pdftoppm
+                    .command()
+                    .args([
+                        "-jpeg",
+                        "-r",
+                        "100",
+                        "-f",
+                        &start_page.to_string(),
+                        "-l",
+                        &end_page.to_string(),
+                        &resolved.display().to_string(),
+                        &prefix.display().to_string(),
+                    ])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
                 && status.success()
                 && let Ok(entries) = std::fs::read_dir(tmp_dir.path())
             {
@@ -8001,7 +8170,9 @@ fn error_message(bytes: &[u8]) -> String {
         .unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned())
 }
 
-/// One call on the socket: the status code and the body.
+/// One call on its own connection to the socket: the status code and the
+/// body. For a one-shot command; a tool server keeps its connections open
+/// between calls (see [`Client`]).
 pub(crate) async fn request(
     socket: &Path,
     method: &str,
@@ -8010,23 +8181,35 @@ pub(crate) async fn request(
     capability: Option<&str>,
     operator: Option<&str>,
 ) -> Result<(hyper::StatusCode, Vec<u8>), String> {
-    request_naming(socket, method, path, body, capability, operator, None).await
+    let request = build_request(method, path, body, capability, operator, None)?;
+    let response = connect(socket)
+        .await?
+        .send_request(request)
+        .await
+        .map_err(|err| err.to_string())?;
+    let status = response.status();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .map_err(|err| err.to_string())?
+        .to_bytes()
+        .to_vec();
+    Ok((status, bytes))
 }
 
-/// One call on the socket, with the agent id this tool server was given. The id
-/// is what a deployment without the boundary uses to name its one route; with
-/// the boundary only the capability decides, and an operator token alone is
-/// accepted beside it.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn request_naming(
-    socket: &Path,
+/// One request to the server's API, with whichever credentials the caller
+/// presents. The agent id is what a deployment without the boundary uses to
+/// name its one route; with the boundary only the capability decides, and an
+/// operator token alone is accepted beside it.
+fn build_request(
     method: &str,
     path: &str,
     body: Option<Vec<u8>>,
     capability: Option<&str>,
     operator: Option<&str>,
     agent_id: Option<&str>,
-) -> Result<(hyper::StatusCode, Vec<u8>), String> {
+) -> Result<hyper::Request<Full<Bytes>>, String> {
     let payload = body.unwrap_or_default();
     let mut builder = hyper::Request::builder()
         .method(method)
@@ -8042,31 +8225,24 @@ pub(crate) async fn request_naming(
     if let Some(id) = agent_id {
         builder = builder.header(crate::auth::AGENT_ID_HEADER, id);
     }
-    let request = builder
+    builder
         .body(Full::new(Bytes::from(payload)))
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| err.to_string())
+}
+
+/// A new HTTP/1 connection to the server's socket. Its driver runs as a task
+/// until the server closes it or the last sender is dropped.
+async fn connect(socket: &Path) -> Result<http1::SendRequest<Full<Bytes>>, String> {
     let stream = tokio::net::UnixStream::connect(socket)
         .await
         .map_err(|err| format!("cannot reach the server: {err}"))?;
-    let (mut sender, connection) = http1::handshake(TokioIo::new(stream))
+    let (sender, connection) = http1::handshake(TokioIo::new(stream))
         .await
         .map_err(|err| err.to_string())?;
     tokio::spawn(async move {
         let _ = connection.await;
     });
-    let response = sender
-        .send_request(request)
-        .await
-        .map_err(|err| err.to_string())?;
-    let status = response.status();
-    let bytes = response
-        .into_body()
-        .collect()
-        .await
-        .map_err(|err| err.to_string())?
-        .to_bytes()
-        .to_vec();
-    Ok((status, bytes))
+    Ok(sender)
 }
 
 /// Parse an explicit bounded read without turning malformed bounds into absence.
@@ -8132,11 +8308,7 @@ mod spawn_args_tests {
                 stream.write_all(response.as_bytes()).await.unwrap();
             }
         });
-        let client = Client {
-            socket,
-            config: dir.path().join("config"),
-            capability: "test-capability".into(),
-        };
+        let client = Client::new(socket, dir.path().join("config"), "test-capability".into());
         assert_eq!(
             client
                 .request_method::<serde_json::Value>("POST", "/v1/agents", None)
@@ -8296,19 +8468,72 @@ mod spawn_args_tests {
             schemars::schema_for!(SubagentsArgs),
         ] {
             let value = serde_json::to_value(schema).unwrap();
-            let archetype = &value["properties"]["archetype"];
-            let description = archetype["description"].as_str().unwrap();
-            assert!(description.contains("`.agents/agents/<archetype>.md`"));
+            assert!(
+                value["properties"].get("archetype").is_none(),
+                "MCP schema must expose only `role`, not a duplicate `archetype` property"
+            );
+            let role = &value["properties"]["role"];
+            let description = role["description"].as_str().unwrap();
+            assert!(description.contains("`.agents/agents/<role>.md`"));
             assert!(description.contains("`\"planner\"`, `\"builder\"`, `\"tester\"`"));
-            assert!(archetype.get("enum").is_none());
+            assert!(role.get("enum").is_none());
         }
-        let input = json!({"archetype": "custom-template"});
-        let agents: AgentsArgs = serde_json::from_value(input.clone()).unwrap();
-        let spawn: SpawnArgs = serde_json::from_value(input.clone()).unwrap();
-        let subagents: SubagentsArgs = serde_json::from_value(input).unwrap();
-        for archetype in [agents.archetype, spawn.archetype, subagents.archetype] {
-            assert_eq!(archetype.as_deref(), Some("custom-template"));
+        for key in ["role", "archetype", "type", "template", "preset"] {
+            let mut obj = serde_json::Map::new();
+            obj.insert(key.into(), json!("custom-template"));
+            let input = serde_json::Value::Object(obj);
+            let agents: AgentsArgs = serde_json::from_value(input.clone()).unwrap();
+            let spawn: SpawnArgs = serde_json::from_value(input.clone()).unwrap();
+            let subagents: SubagentsArgs = serde_json::from_value(input).unwrap();
+            for role in [agents.role, spawn.role, subagents.role] {
+                assert_eq!(role.as_deref(), Some("custom-template"));
+            }
         }
+
+        let dir = tempfile::tempdir().unwrap();
+        let templates_dir = dir.path().join(".agents/agents");
+        std::fs::create_dir_all(&templates_dir).unwrap();
+        std::fs::write(
+            templates_dir.join("builder.md"),
+            "---\nname: builder\ndescription: Isolated builder specialist\n---\nBuild.",
+        )
+        .unwrap();
+        let tools = tool_definitions_with_roles(McpProfile::Full, None, Some(dir.path()));
+        let role_tools: Vec<_> = tools
+            .iter()
+            .filter(|t| {
+                t.input_schema
+                    .get("properties")
+                    .and_then(serde_json::Value::as_object)
+                    .is_some_and(|props| props.contains_key("role"))
+            })
+            .map(|t| t.name.to_string())
+            .collect();
+        assert!(role_tools.iter().any(|n| n == "agents"), "{role_tools:?}");
+        for name in &role_tools {
+            let tool = tools.iter().find(|t| t.name == name.as_str()).unwrap();
+            let desc = tool.description.as_deref().unwrap_or_default();
+            assert!(
+                desc.contains(
+                    "Available `.agents/agents/*.md` roles: `builder` (Isolated builder specialist)."
+                ),
+                "{name}: {desc}"
+            );
+        }
+        let send_tool = tools.iter().find(|t| t.name == "send").unwrap();
+        assert!(
+            !send_tool
+                .description
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Available `.agents/agents/*.md` roles:")
+        );
+        let without_templates =
+            tool_definitions_with_roles(McpProfile::Full, None, Some(&dir.path().join("empty")));
+        assert_eq!(
+            serde_json::to_value(&without_templates).unwrap(),
+            serde_json::to_value(tool_definitions(McpProfile::Full)).unwrap()
+        );
     }
 
     #[test]
@@ -8359,10 +8584,11 @@ mod spawn_args_tests {
     #[test]
     fn subagents_preserves_description_without_synthesizing_instructions() {
         let args: SubagentsArgs = serde_json::from_value(json!({
-            "action": "spawn", "description": "Public role"
+            "action": "spawn", "description": "Public role", "role": "engineer"
         }))
         .unwrap();
         assert_eq!(args.description.as_deref(), Some("Public role"));
+        assert_eq!(args.role.as_deref(), Some("engineer"));
         assert!(args.instructions.is_none());
     }
 
@@ -8383,6 +8609,7 @@ mod spawn_args_tests {
             aliases: Vec::new(),
             parent: Some("agt_parent".to_string()),
             scope: "private".to_string(),
+            lifecycle: "task".to_string(),
             relationship: Some("child".to_string()),
             can_message: Some(true),
             harness: "opencode".to_string(),
@@ -8673,11 +8900,11 @@ mod spawn_args_tests {
                 name: "parent".into(),
                 workdir: None,
             },
-            client: Client {
+            client: Client::new(
                 socket,
-                config: dir.path().join("config"),
-                capability: "synthetic-test-capability".into(),
-            },
+                dir.path().join("config"),
+                "synthetic-test-capability".into(),
+            ),
             profile: McpProfile::Full,
         };
         for legacy in [false, true] {
@@ -8770,11 +8997,11 @@ mod spawn_args_tests {
                 name: "tester".into(),
                 workdir: Some(workdir.clone()),
             },
-            client: Client {
-                socket: dir.path().join("unused.sock"),
-                config: dir.path().join("config"),
-                capability: "test-cap".into(),
-            },
+            client: Client::new(
+                dir.path().join("unused.sock"),
+                dir.path().join("config"),
+                "test-cap".into(),
+            ),
             profile: McpProfile::Full,
         };
 
@@ -8941,11 +9168,11 @@ mod spawn_args_tests {
                 name: "receipt-worker".into(),
                 workdir: Some(dir.path().into()),
             },
-            client: Client {
+            client: Client::new(
                 socket,
-                config: dir.path().join("config"),
-                capability: "synthetic-receipt-capability".into(),
-            },
+                dir.path().join("config"),
+                "synthetic-receipt-capability".into(),
+            ),
             profile: McpProfile::Full,
         };
         let fabricated = mcp
@@ -9063,11 +9290,11 @@ mod spawn_args_tests {
                 name: "parent".into(),
                 workdir: Some(workdir.clone()),
             },
-            client: Client {
+            client: Client::new(
                 socket,
-                config: dir.path().join("config"),
-                capability: "synthetic-test-capability".into(),
-            },
+                dir.path().join("config"),
+                "synthetic-test-capability".into(),
+            ),
             profile: McpProfile::Full,
         };
 
@@ -9326,11 +9553,11 @@ mod spawn_args_tests {
                 name: "multimedia-worker".into(),
                 workdir: Some(workdir.clone()),
             },
-            client: Client {
-                socket: dir.path().join("unused.sock"),
-                config: dir.path().join("config"),
-                capability: "test-cap".into(),
-            },
+            client: Client::new(
+                dir.path().join("unused.sock"),
+                dir.path().join("config"),
+                "test-cap".into(),
+            ),
             profile: McpProfile::Full,
         };
         assert!(
@@ -9606,11 +9833,11 @@ mod spawn_args_tests {
                 name: "remote-sandbox-worker".into(),
                 workdir: Some(host_workdir.clone()),
             },
-            client: Client {
-                socket: dir.path().join("unused.sock"),
-                config: config_dir.clone(),
-                capability: "test-cap".into(),
-            },
+            client: Client::new(
+                dir.path().join("unused.sock"),
+                config_dir.clone(),
+                "test-cap".into(),
+            ),
             profile: McpProfile::Full,
         };
 
@@ -9692,5 +9919,217 @@ mod spawn_args_tests {
         assert_eq!(code_res["result"]["execExit"], 0);
 
         server_handle.abort();
+    }
+}
+
+#[cfg(test)]
+mod tool_server_runtime_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// A server that answers every call with an empty JSON object.
+    async fn answering_server(socket: &Path) -> tokio::task::JoinHandle<()> {
+        let listener = tokio::net::UnixListener::bind(socket).unwrap();
+        let app = axum::Router::new().fallback(|| async { axum::Json(serde_json::json!({})) });
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        })
+    }
+
+    #[test]
+    fn one_thread_answers_a_call_while_another_waits_on_blocking_work() {
+        let runtime = tool_server_runtime().unwrap();
+        assert_eq!(
+            runtime.handle().runtime_flavor(),
+            tokio::runtime::RuntimeFlavor::CurrentThread
+        );
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let socket = dir.path().join("anyagents.sock");
+            let server = answering_server(&socket).await;
+            let mcp = AgentMcp {
+                agent: AgentRef {
+                    id: AgentId::generate(),
+                    name: "worker".into(),
+                    workdir: Some(dir.path().to_path_buf()),
+                },
+                client: Client::new(socket, dir.path().join("config"), "test-cap".into()),
+                profile: McpProfile::Full,
+            };
+            // A command that blocks for two seconds runs on the blocking
+            // pool, so the one runtime thread keeps answering other calls.
+            let slow = mcp.dispatch_any_tool(
+                "files",
+                serde_json::json!({"action": "exec", "cmd": "sleep 2"}),
+            );
+            let quick = async {
+                let started = Instant::now();
+                mcp.dispatch_any_tool("schedule", serde_json::json!({"action": "list"}))
+                    .await
+                    .unwrap();
+                started.elapsed()
+            };
+            let (slow, quick) = tokio::join!(slow, quick);
+            slow.unwrap();
+            assert!(quick < Duration::from_secs(1), "quick call took {quick:?}");
+            server.abort();
+        });
+    }
+}
+
+#[cfg(test)]
+mod client_link_tests {
+    use super::*;
+    use axum::serve::ListenerExt as _;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    /// A stand-in for the server: counts the connections it accepted and
+    /// records the capability each call presented.
+    struct Recorder {
+        accepted: Arc<AtomicUsize>,
+        presented: Arc<Mutex<Vec<String>>>,
+    }
+
+    /// Serve on `socket` from whichever runtime is current.
+    fn serve(socket: &Path) -> (Recorder, impl std::future::Future<Output = ()> + use<>) {
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let presented = Arc::new(Mutex::new(Vec::new()));
+        let counted = Arc::clone(&accepted);
+        let listener = tokio::net::UnixListener::bind(socket)
+            .unwrap()
+            .tap_io(move |_| {
+                counted.fetch_add(1, Ordering::SeqCst);
+            });
+        let recorded = Arc::clone(&presented);
+        let app = axum::Router::new().fallback(move |headers: axum::http::HeaderMap| {
+            let recorded = Arc::clone(&recorded);
+            async move {
+                if let Some(token) = headers
+                    .get(crate::operator::AGENT_HEADER)
+                    .and_then(|value| value.to_str().ok())
+                {
+                    recorded.lock().unwrap().push(token.to_string());
+                }
+                axum::Json(serde_json::json!({"ok": true}))
+            }
+        });
+        let server = async move {
+            let _ = axum::serve(listener, app).await;
+        };
+        (
+            Recorder {
+                accepted,
+                presented,
+            },
+            server,
+        )
+    }
+
+    async fn call(client: &Client) -> serde_json::Value {
+        client
+            .request_method("GET", "/v1/whoami", None)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn sequential_calls_share_one_connection_and_parallel_calls_open_what_they_need() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("anyagents.sock");
+        let (recorder, server) = serve(&socket);
+        let server = tokio::spawn(server);
+        let client = Client::new(socket, dir.path().join("config"), "cap".into());
+        for _ in 0..5 {
+            assert_eq!(call(&client).await["ok"], true);
+        }
+        assert_eq!(recorder.accepted.load(Ordering::SeqCst), 1);
+
+        let calls = (0..8).map(|_| call(&client));
+        for answer in futures::future::join_all(calls).await {
+            assert_eq!(answer["ok"], true);
+        }
+        let opened = recorder.accepted.load(Ordering::SeqCst);
+        assert!((1..=9).contains(&opened), "opened {opened}");
+        assert!(locked(&client.link.idle).len() <= MAX_IDLE_CONNECTIONS);
+        // The connections kept after the burst serve the next calls.
+        call(&client).await;
+        assert_eq!(recorder.accepted.load(Ordering::SeqCst), opened);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_restarted_server_is_reached_on_a_new_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("anyagents.sock");
+        let client = Client::new(socket.clone(), dir.path().join("config"), "cap".into());
+
+        // The first server runs on its own runtime, so stopping that runtime
+        // closes its connections the way a server process exit does.
+        let first = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (before, server) = {
+            let _entered = first.enter();
+            serve(&socket)
+        };
+        first.spawn(server);
+        call(&client).await;
+        assert_eq!(before.accepted.load(Ordering::SeqCst), 1);
+        assert_eq!(locked(&client.link.idle).len(), 1);
+        first.shutdown_background();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !locked(&client.link.idle)
+            .iter()
+            .all(|sender| sender.is_closed())
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the closed connection was never seen"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        std::fs::remove_file(&socket).unwrap();
+        let (after, server) = serve(&socket);
+        let server = tokio::spawn(server);
+        assert_eq!(call(&client).await["ok"], true);
+        assert_eq!(after.accepted.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn every_call_presents_the_capability_the_file_holds_now() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("anyagents.sock");
+        let config = dir.path().join("config");
+        std::fs::create_dir_all(&config).unwrap();
+        let file = config.join(CAPABILITY_FILE);
+        std::fs::write(&file, "first\n").unwrap();
+        let (recorder, server) = serve(&socket);
+        let server = tokio::spawn(server);
+        let client = Client::new(socket, config.clone(), "at-start".into());
+
+        call(&client).await;
+        call(&client).await;
+        // A rotation writes a new file and renames it into place.
+        let staged = config.join("mcp-capability.new");
+        std::fs::write(&staged, "second\n").unwrap();
+        std::fs::rename(&staged, &file).unwrap();
+        call(&client).await;
+        // A rewrite in place that changes the size is seen too.
+        std::fs::write(&file, "third-and-longer\n").unwrap();
+        call(&client).await;
+        // With no readable file the capability read at start is presented.
+        std::fs::remove_file(&file).unwrap();
+        call(&client).await;
+        assert_eq!(
+            *recorder.presented.lock().unwrap(),
+            ["first", "first", "second", "third-and-longer", "at-start"]
+        );
+        server.abort();
     }
 }

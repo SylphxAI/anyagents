@@ -117,29 +117,7 @@ fn serve_one(mut stream: std::net::TcpStream, seen: &std::sync::Mutex<Vec<String
     let _ = stream.flush();
 }
 
-/// A `PATH` carrying the test double as the `claude` the machine already has,
-/// so nothing is downloaded for an install on this machine.
-fn machine_path(dir: &Path) -> std::ffi::OsString {
-    let bin = dir.join("bin");
-    std::fs::create_dir_all(&bin).unwrap();
-    let launcher = bin.join("claude");
-    if !launcher.exists() {
-        std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_anyagents"), &launcher).unwrap();
-    }
-    let npm = bin.join("npm");
-    if !npm.exists() {
-        // Creating an agent installs its harness here; this test runs none of
-        // it, so `view` answers a version and an install does nothing.
-        std::fs::write(
-            &npm,
-            "#!/bin/sh\ncase \"$1\" in view) echo 0.0.0 ;; esac\nexit 0\n",
-        )
-        .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&npm, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-    std::env::join_paths([bin]).unwrap()
-}
+use support::machine_path;
 
 fn bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_anyagents"))

@@ -34,16 +34,31 @@ pub fn format_agent_display(name: &str, role: Option<&str>) -> String {
 }
 
 /// New config roots are private before credentials or a seat grant exist.
-/// DirBuilder leaves an existing root's admitted group/mode unchanged.
+/// Parent directories are created first with umask-governed traversable
+/// permissions; only the target directory itself is restricted to `0o700`,
+/// leaving an existing root's admitted group/mode unchanged.
 fn create_private_config_dir(config: &Path) -> std::io::Result<()> {
+    if let Some(parent) = config.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
     let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
         builder.mode(0o700);
     }
-    builder.create(config)
+    match builder.create(config) {
+        Ok(()) => Ok(()),
+        Err(err)
+            if err.kind() == std::io::ErrorKind::AlreadyExists
+                && std::fs::symlink_metadata(config).is_ok_and(|m| m.is_dir()) =>
+        {
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
 }
 
 pub fn create(store: &Store, data: &Path, request: CreateRequest) -> Result<Agent, Error> {
@@ -102,6 +117,10 @@ fn create_with_seat(
     new.parent_id = request.parent_id;
     let agent = store.create_agent(new)?;
     let data = std::path::absolute(data)?;
+    // A checkout the consumer produced for this creation; rollback removes it.
+    let provisioned: std::cell::RefCell<Option<PathBuf>> = std::cell::RefCell::new(None);
+    // A managed workspace directory created by this call; rollback removes it.
+    let created_managed: std::cell::RefCell<Option<PathBuf>> = std::cell::RefCell::new(None);
     let finish = (|| -> Result<Agent, Error> {
         crate::sandbox::bind_principal(store, &agent)?;
         // Nothing is installed until an agent needs it: this is that moment. A
@@ -123,7 +142,6 @@ fn create_with_seat(
         }
         store.set_agent_launch_env(&agent.id, &pairs)?;
         let managed = agent_work_dir(&data, &agent.id);
-        std::fs::create_dir_all(&managed)?;
         let config = agent_config_dir(&data, &agent.id);
         create_private_config_dir(&config)?;
         let _ = std::fs::create_dir_all(config.join("tmp"));
@@ -171,12 +189,19 @@ fn create_with_seat(
             "private" | "sandbox" | "self" | "cloud" | "cloud-agent"
         );
         let wd_is_inherit_keyword = matches!(wd_lower.as_str(), "inherit" | "parent");
+        let parent_has_git_workdir = agent
+            .parent_id
+            .as_ref()
+            .and_then(|pid| store.agent(pid).ok())
+            .and_then(|p| p.workdir)
+            .map(PathBuf::from)
+            .is_some_and(|pwd| pwd.is_dir() && is_git_repo_dir(&pwd));
         let effective_repo = request
             .repo
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .or(if wd_is_worktree_keyword {
+            .or(if wd_is_worktree_keyword && parent_has_git_workdir {
                 Some("inherit")
             } else {
                 None
@@ -244,10 +269,11 @@ fn create_with_seat(
                     request.base.as_deref(),
                     &target_wt,
                     parent_name.as_deref(),
+                    &provisioned,
                 )?;
                 target_wt
             }
-        } else if wd_is_private_keyword {
+        } else if wd_is_private_keyword || wd_is_worktree_keyword {
             if crate::vendor::is_spiron_harness(&agent.harness) && is_cloud_agent_mode {
                 provision_cloud_sandbox_worktree_marker(
                     store,
@@ -318,6 +344,10 @@ fn create_with_seat(
                 }
             }
         };
+        if cwd == managed_abs && !managed_abs.exists() {
+            std::fs::create_dir_all(&managed_abs)?;
+            *created_managed.borrow_mut() = Some(managed_abs.clone());
+        }
         if let Some((_, uid, gid, launch)) = seat_override
             .clone()
             .or_else(|| resolved_agent_seat_info(store, &agent))
@@ -366,17 +396,171 @@ fn create_with_seat(
         let running = store.set_agent_running(&agent.id, &cwd.display().to_string())?;
         Ok(running)
     })();
-    if finish.is_err() {
-        // Keep the row and recovery journal if revocation fails; otherwise no
-        // later maintenance could find and remove a partial admission's grant.
-        if let Err(error) = crate::worktree_access::revoke_recorded(&data, &agent.id) {
-            let _ = store.set_agent_state(&agent.id, "archived");
-            return Err(error);
-        }
-        let _ = store.delete_agent(&agent.id);
-        let _ = std::fs::remove_dir_all(data.join("agents").join(agent.id.as_str()));
+    if let Err(error) = finish {
+        return Err(roll_back_failed_creation(
+            store,
+            &data,
+            &agent,
+            provisioned.into_inner().as_deref(),
+            created_managed.into_inner().as_deref(),
+            error,
+        ));
     }
     finish
+}
+
+/// Undo a creation that failed after its name was reserved. The same name must
+/// always be retryable. If revocation of a partial worktree grant fails, the
+/// row, journal and checkout are kept (maintenance needs them to finish the
+/// revocation) but the row releases its name. Otherwise the row and the
+/// agent's directory are removed; a row that cannot be deleted releases its
+/// name the same way.
+fn roll_back_failed_creation(
+    store: &Store,
+    data: &Path,
+    agent: &Agent,
+    provisioned: Option<&Path>,
+    created_managed: Option<&Path>,
+    error: Error,
+) -> Error {
+    if let Err(revocation) = crate::worktree_access::revoke_recorded(data, &agent.id) {
+        if let Err(release) = store.release_unadmitted_agent(&agent.id) {
+            eprintln!(
+                "warning: failed creation of {} kept its name: {release}",
+                agent.name
+            );
+        }
+        eprintln!(
+            "warning: failed creation {} keeps its worktree grant journal for recovery: {revocation}",
+            agent.id
+        );
+        return error;
+    }
+    if let Some(checkout) = provisioned
+        && let Err(cleanup) = remove_provisioned_checkout(checkout)
+    {
+        eprintln!(
+            "warning: cannot remove checkout {} of failed creation {}: {cleanup}",
+            checkout.display(),
+            agent.id
+        );
+    }
+    if let Err(delete) = store.delete_agent(&agent.id) {
+        eprintln!(
+            "warning: cannot delete failed creation of {}: {delete}",
+            agent.name
+        );
+        if let Err(release) = store.release_unadmitted_agent(&agent.id) {
+            eprintln!(
+                "warning: failed creation of {} kept its name: {release}",
+                agent.name
+            );
+        }
+        return error;
+    }
+    if let Err(remove) = std::fs::remove_dir_all(data.join("agents").join(agent.id.as_str()))
+        && remove.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!(
+            "warning: cannot remove partial directory of failed creation {}: {remove}",
+            agent.id
+        );
+    }
+    if let Some(managed_dir) = created_managed
+        && let Err(remove) = std::fs::remove_dir_all(managed_dir)
+        && remove.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!(
+            "warning: cannot remove managed workdir {} of failed creation {}: {remove}",
+            managed_dir.display(),
+            agent.id
+        );
+    }
+    error
+}
+
+/// Undo a checkout made for a failed creation so the same name (and so the
+/// same default branch) can be provisioned again. Only this worktree's
+/// registration is removed. Its branch is deleted only by compare-and-delete
+/// when the tip is unchanged and still reachable from another ref, so no
+/// commit can be lost; otherwise the branch is kept.
+fn remove_provisioned_checkout(checkout: &Path) -> std::io::Result<()> {
+    let git = |dir: &Path, args: &[&std::ffi::OsStr]| -> std::io::Result<Option<String>> {
+        let out = std::process::Command::new("git")
+            .args([
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-C",
+            ])
+            .arg(dir)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .output()?;
+        Ok(out
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string()))
+    };
+    let os = |s: &'static str| std::ffi::OsStr::new(s);
+    if !checkout.join(".git").exists() {
+        return Ok(());
+    }
+    let Some(common) = git(
+        checkout,
+        &[
+            os("rev-parse"),
+            os("--path-format=absolute"),
+            os("--git-common-dir"),
+        ],
+    )?
+    else {
+        return Err(std::io::Error::other(
+            "checkout has no readable common store",
+        ));
+    };
+    let common = PathBuf::from(common);
+    let branch = git(checkout, &[os("symbolic-ref"), os("--quiet"), os("HEAD")])?;
+    let tip = git(checkout, &[os("rev-parse"), os("--verify"), os("HEAD")])?;
+    if git(
+        &common,
+        &[
+            os("worktree"),
+            os("remove"),
+            os("--force"),
+            checkout.as_os_str(),
+        ],
+    )?
+    .is_none()
+    {
+        return Err(std::io::Error::other("git worktree remove refused"));
+    }
+    let (Some(branch), Some(tip)) = (branch, tip) else {
+        return Ok(());
+    };
+    let containing = git(
+        &common,
+        &[
+            os("for-each-ref"),
+            os("--format=%(refname)"),
+            os("--contains"),
+            std::ffi::OsStr::new(&tip),
+        ],
+    )?
+    .unwrap_or_default();
+    if containing.lines().any(|name| name != branch) {
+        git(
+            &common,
+            &[
+                os("update-ref"),
+                os("-d"),
+                std::ffi::OsStr::new(&branch),
+                std::ffi::OsStr::new(&tip),
+            ],
+        )?;
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -390,6 +574,7 @@ fn provision_managed_worktree(
     base_opt: Option<&str>,
     target_wt: &Path,
     _parent_name: Option<&str>,
+    provisioned: &std::cell::RefCell<Option<PathBuf>>,
 ) -> Result<(), Error> {
     if target_wt.exists() {
         let is_empty = std::fs::read_dir(target_wt)
@@ -435,6 +620,8 @@ fn provision_managed_worktree(
     } else {
         consumer.remote(repo_raw, target_wt, &branch, base)?;
     }
+    // The target was absent or empty above: this checkout belongs to us.
+    *provisioned.borrow_mut() = Some(target_wt.to_path_buf());
 
     // Identity belongs to this checkout, not A's common config. Replacing the
     // common file as the server would drop its owner and existing named ACLs.
@@ -755,6 +942,8 @@ pub(crate) fn write_agent_instructions_with_continuity(
         doc.push_str("- **Parent**: none (root)\n");
     }
 
+    doc.push_str("- **Lifecycle**: Role templates may declare `lifecycle: standing | task`. Sub-agents never archive themselves; the spawning parent closes/archives a task sub-agent (`action: \"archive\"`) once its deliverable is accepted. Idle processes release after mailbox/child/background work drains; identity and session persist.\n");
+
     if let Some(custom) = agent
         .instructions
         .as_deref()
@@ -772,6 +961,32 @@ pub(crate) fn write_agent_instructions_with_continuity(
     if let Some(parent) = parent_name {
         doc.push_str(&format!(
             "- Direct parent: `agent:{parent}`; report via `send` to `parent`.\n"
+        ));
+    }
+    let data_dir_guess = config
+        .parent()
+        .and_then(|agent_dir| {
+            let parent = agent_dir.parent()?;
+            if parent.file_name().and_then(|s| s.to_str()) == Some("agents") {
+                parent.parent()
+            } else {
+                Some(agent_dir)
+            }
+        })
+        .unwrap_or(config);
+    let available_roles = discover_available_archetype_slugs(
+        agent.workdir.as_deref().map(Path::new),
+        config.parent(),
+        data_dir_guess,
+    );
+    if !available_roles.is_empty() {
+        let formatted_roles = available_roles
+            .iter()
+            .map(|slug| format!("`{slug}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        doc.push_str(&format!(
+            "- Available sub-agent roles (`role` in `agents`/`spawn`): {formatted_roles} (see `spawn` tool `role` schema for details).\n"
         ));
     }
 
@@ -1071,42 +1286,66 @@ pub(crate) fn read_shared_agents_md(config: &Path) -> Option<String> {
         .filter(|text| !text.is_empty())
 }
 
+/// Fast-forward the checkout that holds the shared `skills` and `AGENTS.md`.
+/// One `ls-remote` names origin's `main`; while it is the commit this process
+/// last pulled, the checkout is neither scanned nor pulled.
 #[cfg(unix)]
 pub(crate) fn sync_canonical_skills(data_dir: &Path) {
-    for rel in ["skills", "AGENTS.md"] {
-        let target_path = data_dir.join(rel);
-        if let Ok(resolved) = std::fs::canonicalize(&target_path)
-            && let Some(repo_root) = resolved.parent()
-            && repo_root.join(".git").exists()
-        {
-            let is_clean = std::process::Command::new("git")
-                .args([
-                    "-c",
-                    "core.fsmonitor=false",
-                    "-c",
-                    "core.hooksPath=/dev/null",
-                ])
-                .arg("-C")
-                .arg(repo_root)
-                .args(["status", "--porcelain"])
-                .output()
-                .ok()
-                .is_some_and(|o| o.status.success() && o.stdout.is_empty());
-            if is_clean {
-                let _ = std::process::Command::new("git")
-                    .args([
-                        "-c",
-                        "core.fsmonitor=false",
-                        "-c",
-                        "core.hooksPath=/dev/null",
-                    ])
-                    .arg("-C")
-                    .arg(repo_root)
-                    .args(["pull", "--ff-only", "--quiet", "origin", "main"])
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status();
-            }
+    use std::collections::BTreeMap;
+    use std::sync::{Mutex, PoisonError};
+    static PULLED: Mutex<BTreeMap<PathBuf, String>> = Mutex::new(BTreeMap::new());
+    let git = |repo_root: &Path| {
+        let mut command = std::process::Command::new("git");
+        command
+            .args([
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+            ])
+            .arg("-C")
+            .arg(repo_root);
+        command
+    };
+    let repo_roots: std::collections::BTreeSet<PathBuf> = ["skills", "AGENTS.md"]
+        .into_iter()
+        .filter_map(|rel| std::fs::canonicalize(data_dir.join(rel)).ok())
+        .filter_map(|resolved| resolved.parent().map(Path::to_path_buf))
+        .filter(|repo_root| repo_root.join(".git").exists())
+        .collect();
+    for repo_root in repo_roots {
+        let remote_main = git(&repo_root)
+            .args(["ls-remote", "--quiet", "origin", "refs/heads/main"])
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .and_then(|out| {
+                String::from_utf8_lossy(&out.stdout)
+                    .split_whitespace()
+                    .next()
+                    .map(str::to_string)
+            });
+        let pulled = || PULLED.lock().unwrap_or_else(PoisonError::into_inner);
+        if remote_main.is_some() && pulled().get(&repo_root) == remote_main.as_ref() {
+            continue;
+        }
+        let is_clean = git(&repo_root)
+            .args(["status", "--porcelain"])
+            .output()
+            .ok()
+            .is_some_and(|o| o.status.success() && o.stdout.is_empty());
+        if !is_clean {
+            continue;
+        }
+        let fast_forwarded = git(&repo_root)
+            .args(["pull", "--ff-only", "--quiet", "origin", "main"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        if fast_forwarded && let Some(commit) = remote_main {
+            pulled().insert(repo_root, commit);
         }
     }
 }
@@ -1899,6 +2138,10 @@ pub(crate) fn seed_harness_credentials(
             ".grok/settings_cache.json",
         ],
         "spiron" | "spiron-cloud" => &[
+            "spiron-agent.json",
+            "sylphx-agent.json",
+            "opencode.json",
+            "opencode/opencode.json",
             "auth.json",
             "credentials.json",
             "config.toml",
@@ -2040,10 +2283,12 @@ pub(crate) fn seed_harness_credentials(
                     | ".omp/agent/agent.db"
                     | "agent.db"
             );
+        let is_seat_selector = matches!(rel.as_str(), "spiron-agent.json" | "sylphx-agent.json");
         let dst_non_empty = dst.metadata().is_ok_and(|m| m.len() > 0);
-        if dst_non_empty && !is_auth_cred {
+        if !profile_changed && !is_seat_selector && dst_non_empty && !is_auth_cred {
             continue;
         }
+        let mut found_in_profile = false;
         for profile_root in &profile_roots {
             let mut src = profile_root.join(rel);
             if !src.is_file() {
@@ -2076,12 +2321,22 @@ pub(crate) fn seed_harness_credentials(
                 } else {
                     raw_src_bytes
                 };
+                if src_bytes.is_empty() && !is_auth_cred {
+                    let already_empty = dst.is_file() && dst.metadata().is_ok_and(|m| m.len() == 0);
+                    if !already_empty {
+                        anyagents_harness::atomic_write_file(&dst, &src_bytes, 0o660)
+                            .map_err(Error::from)?;
+                    }
+                    found_in_profile = true;
+                    break;
+                }
                 if dst_non_empty {
                     if std::fs::read(&dst).is_err() {
                         chmod_seat_file_readable(&dst);
                     }
                     if let Ok(dst_bytes) = std::fs::read(&dst) {
                         if src_bytes == dst_bytes {
+                            found_in_profile = true;
                             break;
                         }
                         if !profile_changed && !is_anthropic_cred {
@@ -2102,16 +2357,43 @@ pub(crate) fn seed_harness_credentials(
                                 || (src_exp.is_some_and(|s_exp| s_exp > now_ms)
                                     && dst_exp.is_none());
                             if !newer_oauth {
+                                found_in_profile = true;
                                 break;
                             }
                         }
                     } else if !profile_changed && !is_anthropic_cred {
+                        found_in_profile = true;
                         break;
                     }
                 }
-                write_required_file(&dst, &src_bytes, 0o660)?;
+                if !(dst_non_empty
+                    && !is_auth_cred
+                    && std::fs::read(&dst).is_ok_and(|cur| cur == src_bytes))
+                {
+                    write_required_file(&dst, &src_bytes, 0o660)?;
+                }
+                found_in_profile = true;
                 break;
             }
+        }
+        if !found_in_profile
+            && !profile_roots.is_empty()
+            && dst.exists()
+            && (is_seat_selector
+                || (profile_changed
+                    && (is_auth_cred
+                        || matches!(
+                            rel.as_str(),
+                            "config.toml"
+                                | "opencode.json"
+                                | "opencode/opencode.json"
+                                | ".config/opencode/opencode.json"
+                                | "settings.json"
+                                | "models_cache.json"
+                                | "model-catalog-direct.json"
+                        ))))
+        {
+            let _ = std::fs::remove_file(&dst);
         }
     }
     if crate::vendor::is_spiron_harness(&agent.harness) {
@@ -3268,11 +3550,37 @@ fn write_profile_key_file(dir: &Path, filename: &str, key: &str) -> Result<(), E
     write_required_file(&key_path, format!("{key}\n").as_bytes(), 0o600)
 }
 
+/// How a credential write relates to the processes already running on it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CredentialChange {
+    /// New credentials: running processes move to them at their next boundary.
+    Replaced,
+    /// The same account renewed its token. The harness renews tokens by itself,
+    /// so this only refreshes files for future launches.
+    Renewed,
+}
+
 pub(crate) fn propagate_profile_files_to_bound_agents(
     data: &Path,
     provider: &str,
     profile: &str,
     rel_paths: &[&str],
+) -> Result<(), Error> {
+    propagate_credentials(
+        data,
+        provider,
+        profile,
+        rel_paths,
+        CredentialChange::Replaced,
+    )
+}
+
+fn propagate_credentials(
+    data: &Path,
+    provider: &str,
+    profile: &str,
+    rel_paths: &[&str],
+    change: CredentialChange,
 ) -> Result<(), Error> {
     let prof_dir = data.join("profiles").join(provider).join(profile);
     let target_tag = format!("{provider}/{profile}");
@@ -3353,28 +3661,29 @@ pub(crate) fn propagate_profile_files_to_bound_agents(
             ".anyagents-seeded-profile",
             &format!("{target_tag}\n"),
         )?;
-        let now_prop = anyagents_core::now_ms();
-        let _ = write_profile_marker(
-            &cfg,
-            ".anyagents-quota-cleared-ms",
-            &format!("{now_prop}\n"),
-        );
-        let has_open = store_opt
-            .as_ref()
-            .is_some_and(|s| s.has_open_turn(&agent_rec.id).unwrap_or(false));
-        if !has_open {
+        if change == CredentialChange::Replaced {
+            let now_prop = anyagents_core::now_ms();
+            let _ = write_profile_marker(
+                &cfg,
+                ".anyagents-quota-cleared-ms",
+                &format!("{now_prop}\n"),
+            );
+            // A profile change holds no mail and never preempts a live turn:
+            // the supervisor moves the process at its next idle or faulted point.
             write_profile_marker(
                 &cfg,
                 ".anyagents-profile-rotated-ms",
                 &format!("{now_prop}\n"),
             )?;
+            let _ = std::fs::remove_file(cfg.join(".anyagents-last-error.json"));
         }
-        let _ = std::fs::remove_file(cfg.join(".anyagents-last-error.json"));
         if let Some(s) = store_opt.as_ref() {
             if let Some((_, uid, gid, _)) = resolved_agent_seat_info(s, agent_rec) {
                 crate::sandbox::share_config_with_seat_uid(&cfg, uid, gid);
             }
-            poke_agent_wake_socket(data, &agent_rec.id);
+            if change == CredentialChange::Replaced {
+                poke_agent_wake_socket(data, &agent_rec.id);
+            }
         }
     }
     Ok(())
@@ -4922,17 +5231,82 @@ fn merge_preserved_oauth_metadata(src_bytes: &[u8], dst_bytes: &[u8]) -> Option<
     changed.then(|| serde_json::to_vec(&src_val).ok()).flatten()
 }
 
+/// A file's identity and content stamp: any rewrite, rename or chmod changes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileStamp {
+    dev: u64,
+    ino: u64,
+    len: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+impl FileStamp {
+    fn of(meta: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            len: meta.len(),
+            mtime: (meta.mtime(), meta.mtime_nsec()),
+            ctime: (meta.ctime(), meta.ctime_nsec()),
+        }
+    }
+}
+
+type CopyStamps = (FileStamp, FileStamp);
+
+/// `(source, destination)` pairs a copy last found nothing to do for, with the
+/// stamps both files had then. The decision depends only on the two files, so
+/// while neither changes it stands without reading them again.
+static SETTLED_COPIES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<(PathBuf, PathBuf), CopyStamps>>,
+> = std::sync::LazyLock::new(Default::default);
+
+fn settled_copies()
+-> std::sync::MutexGuard<'static, std::collections::HashMap<(PathBuf, PathBuf), CopyStamps>> {
+    SETTLED_COPIES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(test)]
+thread_local! {
+    static COPY_EVALUATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn copy_seat_file_if_newer(src: &Path, dst: &Path) -> bool {
+    let key = (src.to_path_buf(), dst.to_path_buf());
+    let stamps = std::fs::symlink_metadata(src)
+        .ok()
+        .zip(std::fs::metadata(dst).ok())
+        .map(|(src_meta, dst_meta)| (FileStamp::of(&src_meta), FileStamp::of(&dst_meta)));
+    if stamps.is_some() && settled_copies().get(&key) == stamps.as_ref() {
+        return false;
+    }
+    let copied = copy_seat_file_if_newer_uncached(src, dst);
+    // Stamps taken before the read: a change during it is seen next time.
+    match stamps.filter(|_| !copied) {
+        Some(stamps) => settled_copies().insert(key, stamps),
+        None => settled_copies().remove(&key),
+    };
+    copied
+}
+
+fn copy_seat_file_if_newer_uncached(src: &Path, dst: &Path) -> bool {
+    #[cfg(test)]
+    COPY_EVALUATIONS.with(|count| count.set(count.get() + 1));
     let Ok(src_meta) = std::fs::symlink_metadata(src) else {
         return false;
     };
     if src_meta.file_type().is_symlink() || !src_meta.file_type().is_file() || src_meta.len() == 0 {
         return false;
     }
-    if std::fs::read(src).is_err() {
+    let read = std::fs::read(src).or_else(|_| {
         chmod_seat_file_readable(src);
-    }
-    let Ok(mut src_bytes) = std::fs::read(src) else {
+        std::fs::read(src)
+    });
+    let Ok(mut src_bytes) = read else {
         return false;
     };
     if src_bytes.is_empty() {
@@ -5713,6 +6087,15 @@ fn overlay_active_quota_reset_on_cached_usage(
 }
 
 pub(crate) fn sync_fresher_bound_agent_credentials(data: &Path) {
+    if let Ok(store) = Store::open(data.join("state.db")) {
+        sync_fresher_bound_agent_credentials_in(&store, data);
+    }
+}
+
+/// Copy fresher credentials between live agents' seats and their bound
+/// profiles. Archived agents run no harness, so their seats never refresh a
+/// token; a pair of files unchanged since the last pass is not read again.
+pub(crate) fn sync_fresher_bound_agent_credentials_in(store: &Store, data: &Path) {
     let profiles_root = data.join("profiles");
     let now_ms = anyagents_core::now_ms();
     let sync_stamp = profiles_root.join(".last-agent-cred-sync-ms");
@@ -5733,20 +6116,9 @@ pub(crate) fn sync_fresher_bound_agent_credentials(data: &Path) {
             }
         }
     }
-    if let Ok(store) = Store::open(data.join("state.db"))
-        && let Ok(agents) = store.list_agents()
-    {
+    if let Ok(agents) = store.list_live_agents() {
         for agent in &agents {
-            if agent.state == "archived" {
-                continue;
-            }
             let cfg = agent_config_dir(data, &agent.id);
-            if agent.harness == "claude-code"
-                && let Some(reset_ms) =
-                    anyagents_harness_claude::detect_session_quota_reset_ms(&cfg, now_ms)
-            {
-                record_profile_quota_reset(data, agent, reset_ms);
-            }
             let bound = bound_profile_name(&cfg);
             let seeded = seeded_profile_name(&cfg);
             if seeded.is_some() && bound.is_some() && seeded != bound {
@@ -5779,11 +6151,16 @@ pub(crate) fn sync_fresher_bound_agent_credentials(data: &Path) {
                 }
             }
             if updated_any {
-                propagate_profile_files_to_bound_agents(data, &provider, &prof_name, rels)
+                let change = if provider == "google-antigravity" {
+                    CredentialChange::Renewed
+                } else {
+                    CredentialChange::Replaced
+                };
+                propagate_credentials(data, &provider, &prof_name, rels, change)
                     .unwrap_or_else(|err| eprintln!("runtime persistence failed: {err}"));
             } else if provider == "anthropic" {
                 sync_anthropic_agent_credentials_from_profile(
-                    Some(&store),
+                    Some(store),
                     data,
                     agent,
                     &cfg,
@@ -6899,18 +7276,25 @@ pub(crate) fn probe_one_profile_usage(
                         .and_then(|s| s.trim().parse::<i64>().ok())
                         .unwrap_or(0);
                     if now_ms.saturating_sub(last_attempt_ms) < 300_000 {
+                        let cached_expired = std::fs::read_to_string(&last_usage_path)
+                            .ok()
+                            .is_some_and(|s| s.trim().starts_with("oauth expired"));
+                        if cached_expired {
+                            return Some("oauth expired".to_string());
+                        }
                         write_seat_shared_file(&last_usage_path, b"__NONE__\n", 0o600);
                         return None;
                     }
                     let rtok = tok_val
                         .pointer("/token/refresh_token")
                         .or_else(|| tok_val.get("refresh_token"))
-                        .and_then(serde_json::Value::as_str)?
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
                         .trim()
                         .to_string();
                     if rtok.is_empty() {
-                        write_seat_shared_file(&last_usage_path, b"__NONE__\n", 0o600);
-                        return None;
+                        write_seat_shared_file(&last_usage_path, b"oauth expired\n", 0o600);
+                        return Some("oauth expired".to_string());
                     }
                     let reservation = match OAuthRefreshDiskReservation::acquire(
                         &prof_dir,
@@ -6955,8 +7339,8 @@ pub(crate) fn probe_one_profile_usage(
                         }
                     }
                     let Some((new_acc, new_ref)) = refreshed_tokens else {
-                        write_seat_shared_file(&last_usage_path, b"__NONE__\n", 0o600);
-                        return None;
+                        write_seat_shared_file(&last_usage_path, b"oauth expired\n", 0o600);
+                        return Some("oauth expired".to_string());
                     };
                     if let Some(tok_obj) = tok_val
                         .get_mut("token")
@@ -6987,11 +7371,12 @@ pub(crate) fn probe_one_profile_usage(
                                 eprintln!("credential refresh persistence failed: {err}")
                             })
                             .ok()?;
-                        propagate_profile_files_to_bound_agents(
+                        propagate_credentials(
                             data,
                             provider,
                             profile,
                             &[tok_rel],
+                            CredentialChange::Renewed,
                         )
                         .map_err(|err| eprintln!("runtime persistence failed: {err}"))
                         .ok()?;
@@ -8295,7 +8680,7 @@ pub(crate) fn try_rotate_exhausted_profile(
     if has_active_quota_hold && cur_pct.is_some_and(|pct| pct <= 0) {
         let bound_counts = count_bound_profile_agents(
             data,
-            &store.list_agents().unwrap_or_default(),
+            &store.list_live_agents().unwrap_or_default(),
             &provider,
             &agent.id,
         );
@@ -8445,10 +8830,35 @@ const PROFILE_HEALTHY_OAUTH_ATTEMPT_FRESHNESS_MS: i64 = 300_000;
 /// most recent refresh attempt also happened recently (so the token cannot silently
 /// recover on its own). Never probes the network and never treats a missing or stale
 /// signal as unhealthy evidence.
+fn google_oauth_expiry_ms(val: &serde_json::Value) -> Option<i64> {
+    for ptr in ["/token/expiry", "/expiry"] {
+        if let Some(raw) = val.pointer(ptr).and_then(serde_json::Value::as_str)
+            && let Ok(dt) = chrono::DateTime::parse_from_rfc3339(raw.trim())
+        {
+            return Some(dt.timestamp_millis());
+        }
+    }
+    for ptr in [
+        "/token/expires_at",
+        "/expires_at",
+        "/token/expiry_date",
+        "/expiry_date",
+    ] {
+        if let Some(n) = val.pointer(ptr).and_then(serde_json::Value::as_i64) {
+            return Some(if n > 0 && n < 10_000_000_000 {
+                n.saturating_mul(1_000)
+            } else {
+                n
+            });
+        }
+    }
+    None
+}
+
 fn profile_has_unhealthy_evidence(dir: &Path) -> bool {
     let now_ms = anyagents_core::now_ms();
     let usage_path = dir.join(".anyagents-last-usage.txt");
-    if let Ok(usage) = std::fs::read_to_string(&usage_path) {
+    let usage_text_and_age = std::fs::read_to_string(&usage_path).ok().map(|usage| {
         let age_ms = std::fs::metadata(&usage_path)
             .and_then(|meta| meta.modified())
             .map(|mtime| {
@@ -8458,32 +8868,63 @@ fn profile_has_unhealthy_evidence(dir: &Path) -> bool {
                     .unwrap_or(0)
             })
             .unwrap_or(i64::MAX);
-        if parse_remaining_pct_from_usage(&usage, None) == Some(0)
+        (usage, age_ms)
+    });
+    if let Some((ref usage, age_ms)) = usage_text_and_age {
+        let trimmed = usage.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.starts_with("oauth expired") && age_ms < PROFILE_HEALTHY_OAUTH_ATTEMPT_FRESHNESS_MS
+        {
+            return true;
+        }
+        if parse_remaining_pct_from_usage(trimmed, None) == Some(0)
             && age_ms < PROFILE_HEALTHY_USAGE_FRESHNESS_MS
         {
             return true;
         }
     }
-    let cred_text = std::fs::read_to_string(dir.join(".credentials.json"))
-        .or_else(|_| std::fs::read_to_string(dir.join(".claude/.credentials.json")));
-    let Ok(cred_text) = cred_text else {
-        return false;
-    };
-    let Ok(cred) = serde_json::from_str::<serde_json::Value>(&cred_text) else {
-        return false;
-    };
-    let expires_at = cred
-        .pointer("/claudeAiOauth/expiresAt")
-        .and_then(serde_json::Value::as_i64)
-        .unwrap_or(i64::MAX);
-    if expires_at > now_ms {
-        return false;
-    }
     let last_attempt_ms = std::fs::read_to_string(dir.join(OAUTH_REFRESH_ATTEMPT_FILE))
         .ok()
         .and_then(|s| s.trim().parse::<i64>().ok())
         .unwrap_or(0);
-    now_ms.saturating_sub(last_attempt_ms) < PROFILE_HEALTHY_OAUTH_ATTEMPT_FRESHNESS_MS
+    let recent_refresh_attempt = last_attempt_ms > 0
+        && now_ms.saturating_sub(last_attempt_ms) < PROFILE_HEALTHY_OAUTH_ATTEMPT_FRESHNESS_MS;
+
+    if let Ok(cred_text) = std::fs::read_to_string(dir.join(".credentials.json"))
+        .or_else(|_| std::fs::read_to_string(dir.join(".claude/.credentials.json")))
+        && let Ok(cred) = serde_json::from_str::<serde_json::Value>(&cred_text)
+    {
+        let expires_at = cred
+            .pointer("/claudeAiOauth/expiresAt")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(i64::MAX);
+        if expires_at <= now_ms && recent_refresh_attempt {
+            return true;
+        }
+    }
+
+    if let Ok(tok_text) =
+        std::fs::read_to_string(dir.join(".gemini/antigravity-cli/antigravity-oauth-token"))
+            .or_else(|_| std::fs::read_to_string(dir.join(".gemini/oauth_creds.json")))
+        && let Ok(tok) = serde_json::from_str::<serde_json::Value>(&tok_text)
+    {
+        let expires_at = google_oauth_expiry_ms(&tok).unwrap_or(i64::MAX);
+        let has_refresh_token = tok
+            .pointer("/token/refresh_token")
+            .or_else(|| tok.get("refresh_token"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty());
+        let usage_failed = usage_text_and_age.as_ref().is_none_or(|(u, _)| {
+            u.trim() == "__NONE__" || u.trim().to_ascii_lowercase().starts_with("oauth expired")
+        });
+        if (expires_at <= now_ms && (!has_refresh_token || recent_refresh_attempt))
+            || (recent_refresh_attempt && usage_failed)
+        {
+            return true;
+        }
+    }
+
+    false
 }
 
 /// Selects (or reuses the already-bound) Upstream Provider Profile for `agent`
@@ -8687,6 +9128,7 @@ pub(crate) fn parse_archetype_markdown(raw: &str) -> Result<ArchetypeTemplate, E
                 "archetype template frontmatter requires fields or a markdown body".to_string(),
             ));
         }
+        let mut frontmatter_stem: Option<String> = None;
         for (key, value) in fields {
             let value = value.trim();
             if key.trim().is_empty() || value.is_empty() {
@@ -8702,13 +9144,20 @@ pub(crate) fn parse_archetype_markdown(raw: &str) -> Result<ArchetypeTemplate, E
                 "model" => tpl.model = Some(value.to_string()),
                 "role" => tpl.role = Some(value.to_string()),
                 "profile" => tpl.profile = Some(value.to_string()),
-                "name" | "archetype" => {}
+                "name" | "archetype" => {
+                    if frontmatter_stem.is_none() && valid_template_stem(value) {
+                        frontmatter_stem = Some(value.to_string());
+                    }
+                }
                 _ => {
                     return Err(Error::Message(format!(
                         "unknown archetype template frontmatter key {key:?}"
                     )));
                 }
             }
+        }
+        if tpl.role.is_none() {
+            tpl.role = frontmatter_stem;
         }
         &rest[end..]
     } else {
@@ -8791,6 +9240,36 @@ pub(crate) fn archetype_search_roots_with_ancestors(
     ancestor_workdirs: &[PathBuf],
     data_dir: &Path,
 ) -> Vec<(PathBuf, PathBuf)> {
+    archetype_search_roots_for_owner(
+        explicit_workdir,
+        ancestor_workdirs,
+        data_dir,
+        configured_owner_archetype_workdir().as_deref(),
+    )
+}
+
+fn configured_owner_archetype_workdir() -> Option<PathBuf> {
+    #[cfg(not(test))]
+    {
+        crate::server::owner_workdir()
+    }
+    #[cfg(test)]
+    {
+        None
+    }
+}
+
+fn archetype_search_roots_for_owner(
+    explicit_workdir: Option<&Path>,
+    ancestor_workdirs: &[PathBuf],
+    data_dir: &Path,
+    owner_workdir: Option<&Path>,
+) -> Vec<(PathBuf, PathBuf)> {
+    // Configuration is authoritative even when its catalog is missing or empty.
+    // Do not resurrect removed templates from a workspace, data directory or HOME.
+    if let Some(owner) = owner_workdir {
+        return vec![(owner.to_path_buf(), PathBuf::from(".agents/agents"))];
+    }
     let mut search_roots: Vec<(PathBuf, PathBuf)> = Vec::new();
     if let Some(wd) = explicit_workdir
         && !is_archetype_workdir_keyword(wd)
@@ -8809,12 +9288,6 @@ pub(crate) fn archetype_search_roots_with_ancestors(
                 PathBuf::from(".agents/agents"),
             );
         }
-    }
-    #[cfg(not(test))]
-    if search_roots.is_empty()
-        && let Some(owd) = crate::server::owner_workdir()
-    {
-        push_unique_search_root(&mut search_roots, owd, PathBuf::from(".agents/agents"));
     }
     let has_workspace_agents_dir = search_roots
         .iter()
@@ -8853,7 +9326,85 @@ pub(crate) fn archetype_search_roots(
     archetype_search_roots_with_ancestors(explicit_workdir, &ancestors, data_dir)
 }
 
-#[cfg(test)]
+pub(crate) fn discover_available_archetype_slugs_with_ancestors(
+    explicit_workdir: Option<&Path>,
+    ancestor_workdirs: &[PathBuf],
+    data_dir: &Path,
+) -> Vec<String> {
+    let mut slugs = std::collections::BTreeSet::new();
+    for (base, rel_root) in
+        archetype_search_roots_with_ancestors(explicit_workdir, ancestor_workdirs, data_dir)
+    {
+        let dir = base.join(rel_root);
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
+            if ft.is_symlink() {
+                continue;
+            }
+            let path = entry.path();
+            if ft.is_file() {
+                if path.extension().and_then(|e| e.to_str()) == Some("md")
+                    && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+                    && valid_template_stem(stem)
+                {
+                    slugs.insert(stem.to_string());
+                }
+            } else if ft.is_dir()
+                && let Some(stem) = path.file_name().and_then(|s| s.to_str())
+                && valid_template_stem(stem)
+                && (path.join("agent.md").is_file() || path.join("AGENT.md").is_file())
+            {
+                slugs.insert(stem.to_string());
+            }
+        }
+    }
+    slugs.into_iter().collect()
+}
+
+pub(crate) fn discover_available_archetype_slugs(
+    explicit_workdir: Option<&Path>,
+    parent_workdir: Option<&Path>,
+    data_dir: &Path,
+) -> Vec<String> {
+    let ancestors: Vec<PathBuf> = parent_workdir.map(Path::to_path_buf).into_iter().collect();
+    discover_available_archetype_slugs_with_ancestors(explicit_workdir, &ancestors, data_dir)
+}
+
+pub(crate) fn has_configured_archetype_roots_with_ancestors(
+    explicit_workdir: Option<&Path>,
+    ancestor_workdirs: &[PathBuf],
+    data_dir: &Path,
+) -> bool {
+    configured_owner_archetype_workdir().is_some()
+        || archetype_search_roots_with_ancestors(explicit_workdir, ancestor_workdirs, data_dir)
+            .into_iter()
+            .any(|(base, rel_root)| base.join(rel_root).exists())
+}
+
+pub(crate) fn discover_available_archetype_templates(
+    explicit_workdir: Option<&Path>,
+    parent_workdir: Option<&Path>,
+    data_dir: &Path,
+) -> Vec<(String, Option<String>)> {
+    let slugs = discover_available_archetype_slugs(explicit_workdir, parent_workdir, data_dir);
+    let mut out = Vec::with_capacity(slugs.len());
+    for slug in slugs {
+        let desc = resolve_archetype_template(&slug, explicit_workdir, parent_workdir, data_dir)
+            .ok()
+            .flatten()
+            .and_then(|tpl| tpl.description)
+            .map(|d| d.trim().to_string())
+            .filter(|d| !d.is_empty());
+        out.push((slug, desc));
+    }
+    out
+}
+
 pub(crate) fn resolve_archetype_template(
     archetype: &str,
     explicit_workdir: Option<&Path>,
@@ -8888,7 +9439,17 @@ pub(crate) fn resolve_archetype_template_with_ancestors(
     for (base, root) in search_roots {
         for rel in &candidates {
             if let Some(raw) = read_archetype_file(&base, &root.join(rel))? {
-                return parse_archetype_markdown(&raw).map(Some);
+                let mut tpl = parse_archetype_markdown(&raw)?;
+                if tpl
+                    .role
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|r| valid_template_stem(r))
+                    .is_none()
+                {
+                    tpl.role = Some(slug.to_string());
+                }
+                return Ok(Some(tpl));
             }
         }
     }
@@ -9079,9 +9640,9 @@ fn open_archetype_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
 }
 
 /// Apply archetype template defaults (`.agents/agents/<archetype>.md`) to a `CreateAgentRequest`
-/// in-place before agent creation. When `archetype` is omitted, also checks whether `role`
-/// matches a template slug (e.g. `role: "code-reviewer"` when `.agents/agents/code-reviewer.md`
-/// exists) while keeping `role` methodology-neutral when no template matches.
+/// in-place before agent creation. Unifies `role` and `archetype`: resolving a template sets
+/// `body.role` to the canonical template stem `<slug>`, and when templates are configured in
+/// `.agents/agents/`, unknown `role` names are rejected before persistence.
 pub(crate) fn apply_archetype_defaults(
     store: Option<&Store>,
     data_dir: &Path,
@@ -9095,71 +9656,77 @@ pub(crate) fn apply_archetype_defaults(
         .filter(|s| !s.is_empty())
         .map(PathBuf::from);
     let ancestor_wds = ancestor_archetype_workdirs(store, data_dir, parent)?;
-    let tpl = if let Some(arch) = body
-        .archetype
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        match resolve_archetype_template_with_ancestors(
-            arch,
-            explicit_wd.as_deref(),
-            &ancestor_wds,
-            data_dir,
-        )? {
-            Some(template) => Some(template),
-            None => {
-                return Err(Error::Message(format!(
-                    "unknown archetype template {arch:?}"
-                )));
-            }
-        }
-    } else if let Some(role) = body
+    let resolved = if let Some(role) = body
         .role
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
         let slugified = role.to_ascii_lowercase().replace(' ', "-");
-        let direct = if valid_template_stem(role) {
+        if !valid_template_stem(role) && !valid_template_stem(&slugified) {
             resolve_archetype_template_with_ancestors(
                 role,
                 explicit_wd.as_deref(),
                 &ancestor_wds,
                 data_dir,
-            )?
-        } else {
+            )?;
             None
-        };
-        let resolved = if direct.is_some() {
-            direct
-        } else if valid_template_stem(&slugified) {
-            resolve_archetype_template_with_ancestors(
-                &slugified,
-                explicit_wd.as_deref(),
-                &ancestor_wds,
-                data_dir,
-            )?
         } else {
-            None
-        };
-        if resolved.is_some() {
-            resolved
-        } else if let Some(fallback_slug) = fallback_archetype_slug_from_role(role) {
-            resolve_archetype_template_with_ancestors(
-                fallback_slug,
-                explicit_wd.as_deref(),
-                &ancestor_wds,
-                data_dir,
-            )?
-        } else {
-            // A display label is not required to be a template stem.
-            None
+            let direct = if valid_template_stem(role) {
+                resolve_archetype_template_with_ancestors(
+                    role,
+                    explicit_wd.as_deref(),
+                    &ancestor_wds,
+                    data_dir,
+                )?
+                .map(|tpl| (role.to_string(), tpl))
+            } else {
+                None
+            };
+            let matched = if direct.is_some() {
+                direct
+            } else if valid_template_stem(&slugified) {
+                resolve_archetype_template_with_ancestors(
+                    &slugified,
+                    explicit_wd.as_deref(),
+                    &ancestor_wds,
+                    data_dir,
+                )?
+                .map(|tpl| (slugified, tpl))
+            } else {
+                None
+            };
+            if matched.is_some() {
+                matched
+            } else {
+                let available = discover_available_archetype_slugs_with_ancestors(
+                    explicit_wd.as_deref(),
+                    &ancestor_wds,
+                    data_dir,
+                );
+                if !available.is_empty()
+                    || has_configured_archetype_roots_with_ancestors(
+                        explicit_wd.as_deref(),
+                        &ancestor_wds,
+                        data_dir,
+                    )
+                {
+                    let suffix = if available.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" (available: {})", available.join(", "))
+                    };
+                    return Err(Error::Message(format!(
+                        "unknown archetype template {role:?}{suffix}"
+                    )));
+                }
+                None
+            }
         }
     } else {
         None
     };
-    let Some(tpl) = tpl else {
+    let Some((resolved_slug, tpl)) = resolved else {
         return Ok(());
     };
 
@@ -9196,32 +9763,7 @@ pub(crate) fn apply_archetype_defaults(
     {
         body.workdir = Some(wd);
     }
-    let sub_cfg = load_subagent_defaults(data_dir);
-    let sub_spec = parent
-        .and_then(|p| sub_cfg.agents.get(&p.name))
-        .unwrap_or(&sub_cfg.default);
-    let preset_subagent = parent.is_some() && !sub_spec.mode.eq_ignore_ascii_case("inherit");
-    let preset_has_harness = preset_subagent
-        && sub_spec
-            .harness
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|s| !s.is_empty() && !s.eq_ignore_ascii_case("inherit"));
-    let preset_has_model = preset_subagent
-        && sub_spec
-            .model
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|s| !s.is_empty() && !s.eq_ignore_ascii_case("inherit"));
-    let preset_has_profile = preset_subagent
-        && sub_spec
-            .profile
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|s| !s.is_empty() && !s.eq_ignore_ascii_case("inherit"));
-
     if body.harness.as_deref().is_none_or(|h| h.trim().is_empty())
-        && !preset_has_harness
         && let Some(h) = tpl.harness
     {
         body.harness = Some(h);
@@ -9231,7 +9773,6 @@ pub(crate) fn apply_archetype_defaults(
         .as_deref()
         .map(str::trim)
         .is_none_or(str::is_empty)
-        && !preset_has_model
         && let Some(m) = tpl.model
     {
         body.model = Some(m);
@@ -9241,20 +9782,18 @@ pub(crate) fn apply_archetype_defaults(
         .as_deref()
         .map(str::trim)
         .is_none_or(str::is_empty)
-        && !preset_has_profile
         && let Some(p) = tpl.profile
     {
         body.profile = Some(p);
     }
-    if body
+    let canonical_role = tpl
         .role
         .as_deref()
         .map(str::trim)
-        .is_none_or(str::is_empty)
-        && let Some(r) = tpl.role
-    {
-        body.role = Some(r);
-    }
+        .filter(|r| valid_template_stem(r))
+        .unwrap_or(&resolved_slug)
+        .to_string();
+    body.role = Some(canonical_role);
     if !tpl.body.is_empty() {
         body.instructions = match body
             .instructions
@@ -9269,19 +9808,41 @@ pub(crate) fn apply_archetype_defaults(
     Ok(())
 }
 
-fn fallback_archetype_slug_from_role(role: &str) -> Option<&'static str> {
-    let lower = role.to_ascii_lowercase();
-    if lower.contains("director") || role.contains("總監") || role.contains("總管") {
-        Some("director")
-    } else if lower.contains("manager") || role.contains("主管") {
-        Some("manager")
-    } else if lower.contains("assistant") || role.contains("專屬助理") {
-        Some("assistant")
-    } else if lower.contains("worker") || role.contains("專員") {
-        Some("worker")
-    } else {
-        None
+pub(crate) fn normalize_or_validate_agent_role(
+    raw_role: &str,
+    agent_workdir: Option<&Path>,
+    parent_workdir: Option<&Path>,
+    data_dir: &Path,
+) -> Result<String, Error> {
+    let role = raw_role.trim();
+    let slugified = role.to_ascii_lowercase().replace(' ', "-");
+    if valid_template_stem(role)
+        && let Some(tpl) =
+            resolve_archetype_template(role, agent_workdir, parent_workdir, data_dir)?
+    {
+        return Ok(tpl
+            .role
+            .filter(|r| valid_template_stem(r))
+            .unwrap_or_else(|| role.to_string()));
     }
+    if slugified != role
+        && valid_template_stem(&slugified)
+        && let Some(tpl) =
+            resolve_archetype_template(&slugified, agent_workdir, parent_workdir, data_dir)?
+    {
+        return Ok(tpl
+            .role
+            .filter(|r| valid_template_stem(r))
+            .unwrap_or(slugified));
+    }
+    let available = discover_available_archetype_slugs(agent_workdir, parent_workdir, data_dir);
+    if !available.is_empty() || configured_owner_archetype_workdir().is_some() {
+        return Err(Error::Message(format!(
+            "unknown role template {role:?} (available: {})",
+            available.join(", ")
+        )));
+    }
+    Ok(role.to_string())
 }
 
 fn valid_template_stem(value: &str) -> bool {
@@ -9586,6 +10147,11 @@ mod tests {
         let config = dir.path().join("created/config");
         create_private_config_dir(&config).unwrap();
         assert_eq!(std::fs::metadata(&config).unwrap().mode() & 0o777, 0o700);
+        assert_ne!(
+            std::fs::metadata(config.parent().unwrap()).unwrap().mode() & 0o011,
+            0,
+            "agent root parent must remain traversable when config is created"
+        );
         std::fs::write(config.join("credential"), "retained credential").unwrap();
         std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o2770)).unwrap();
         create_private_config_dir(&config).unwrap();
@@ -9598,6 +10164,191 @@ mod tests {
         std::fs::write(&blocked, "preserved").unwrap();
         assert!(create_private_config_dir(&blocked).is_err());
         assert_eq!(std::fs::read_to_string(blocked).unwrap(), "preserved");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspaces_dir_keeps_agent_root_traversable_and_avoids_unused_managed_dirs() {
+        use std::os::unix::fs::MetadataExt;
+        const PROBE: &str = "ANYAGENTS_WORKSPACES_CREATE_PROBE";
+        if std::env::var_os(PROBE).is_none() {
+            let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+            for key in [
+                "ANYAGENTS_PRINCIPAL_REGISTRY",
+                "ANYAGENTS_PRINCIPALS",
+                "ANYAGENTS_AGENTS",
+                "ANYAGENTS_AGENT_UID",
+                "ANYAGENTS_AGENT_GID",
+                "ANYAGENTS_SOCKET_GID",
+                "ANYAGENTS_LAUNCHER",
+                "ANYAGENTS_SETPRIV",
+                "ANYAGENTS_DATA",
+                "ANYAGENTS_STATE_DIR",
+                "ANYAGENTS_WORKSPACES_DIR",
+                "ANYAGENTS_SCRATCH_DIR",
+                "ANYAGENTS_GIT_POOL_DIR",
+                "ANYAGENTS_PROTECTED_ROOTS",
+            ] {
+                cmd.env_remove(key);
+            }
+            let output = cmd
+                .env(PROBE, "1")
+                .env("ANYAGENTS_TEST_STORAGE_TIERS", "1")
+                .args([
+                    "--exact",
+                    "create::tests::workspaces_dir_keeps_agent_root_traversable_and_avoids_unused_managed_dirs",
+                    "--nocapture",
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "probe failed:
+stdout: {}
+stderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        unsafe {
+            libc::umask(0o022);
+        }
+        let tmp = crate::test_tempdir();
+        let data = tmp.path().join("data");
+        let workspaces = tmp.path().join("workspaces");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&workspaces).unwrap();
+        unsafe {
+            std::env::set_var("ANYAGENTS_WORKSPACES_DIR", &workspaces);
+        }
+        let store = Store::open(data.join("state.db")).unwrap();
+        store
+            .hold_capability_key("0123456789abcdef0123456789abcdef")
+            .unwrap();
+
+        let managed_agent = create(
+            &store,
+            &data,
+            CreateRequest {
+                name: "managed-worker".to_string(),
+                role: None,
+                harness: "codex".to_string(),
+                model: Some("test-model".to_string()),
+                profile: None,
+                repo: None,
+                branch: None,
+                base: None,
+                workdir: None,
+                workdir_default: None,
+                description: None,
+                instructions: None,
+                parent_id: None,
+            },
+        )
+        .unwrap();
+        let expected_managed = workspaces.join(managed_agent.id.as_str());
+        assert_eq!(
+            managed_agent.workdir.as_deref(),
+            Some(expected_managed.to_str().unwrap())
+        );
+        assert!(expected_managed.is_dir());
+
+        let managed_config = agent_config_dir(&data, &managed_agent.id);
+        let managed_root = managed_config.parent().unwrap();
+        assert_ne!(
+            std::fs::metadata(managed_root).unwrap().mode() & 0o011,
+            0,
+            "<data>/agents/<id> must be traversable with ANYAGENTS_WORKSPACES_DIR set"
+        );
+        // Simulate a fresh unshared private config before seat sharing.
+        let unshared_root = data.join("agents/unshared-probe");
+        let unshared_config = unshared_root.join("config");
+        create_private_config_dir(&unshared_config).unwrap();
+        assert_eq!(
+            std::fs::metadata(&unshared_root).unwrap().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(
+            std::fs::metadata(&unshared_config).unwrap().mode() & 0o777,
+            0o700
+        );
+        let (uid, gid) = (crate::sandbox::server_uid(), crate::sandbox::server_gid());
+        crate::sandbox::prepare_config_with_seat_uid(&unshared_config, uid, gid).unwrap();
+        assert_ne!(std::fs::metadata(&unshared_root).unwrap().mode() & 0o011, 0);
+        assert_eq!(
+            std::fs::metadata(&unshared_config).unwrap().mode() & 0o7777,
+            0o2770
+        );
+
+        let explicit_dir = tmp.path().join("explicit-work");
+        let explicit_agent = create(
+            &store,
+            &data,
+            CreateRequest {
+                name: "explicit-worker".to_string(),
+                role: None,
+                harness: "codex".to_string(),
+                model: Some("test-model".to_string()),
+                profile: None,
+                repo: None,
+                branch: None,
+                base: None,
+                workdir: Some(explicit_dir.clone()),
+                workdir_default: None,
+                description: None,
+                instructions: None,
+                parent_id: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            explicit_agent.workdir.as_deref(),
+            Some(explicit_dir.to_str().unwrap())
+        );
+        assert!(
+            !workspaces.join(explicit_agent.id.as_str()).exists(),
+            "explicit workdir must not eagerly create unused dir in ANYAGENTS_WORKSPACES_DIR"
+        );
+        let explicit_root = agent_config_dir(&data, &explicit_agent.id)
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        assert_ne!(std::fs::metadata(&explicit_root).unwrap().mode() & 0o011, 0);
+
+        // If creation fails after creating managed workspace in ANYAGENTS_WORKSPACES_DIR,
+        // rollback must remove both <data>/agents/<id> and <workspaces>/<id>.
+        unsafe {
+            std::env::set_var("ANYAGENTS_PROTECTED_ROOTS", &workspaces);
+        }
+        let failed = create(
+            &store,
+            &data,
+            CreateRequest {
+                name: "rollback-worker".to_string(),
+                role: None,
+                harness: "codex".to_string(),
+                model: Some("test-model".to_string()),
+                profile: None,
+                repo: None,
+                branch: None,
+                base: None,
+                workdir: None,
+                workdir_default: None,
+                description: None,
+                instructions: None,
+                parent_id: None,
+            },
+        );
+        assert!(failed.is_err());
+        let workspace_entries: Vec<_> = std::fs::read_dir(&workspaces)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            workspace_entries,
+            vec![expected_managed.file_name().unwrap().to_os_string()]
+        );
     }
 
     #[test]
@@ -9765,7 +10516,7 @@ mod tests {
     }
 
     #[test]
-    fn propagate_profile_files_defers_rotated_marker_during_open_turn() {
+    fn propagate_profile_files_marks_working_seats_without_holding_their_turn() {
         let tmp = tempfile::tempdir().unwrap();
         let data = tmp.path();
         let store = Store::open(data.join("state.db")).unwrap();
@@ -9793,9 +10544,11 @@ mod tests {
             idle_cfg.join(".anyagents-profile-rotated-ms").exists(),
             "idle seat should receive rotated marker on credential refresh"
         );
+        // The supervisor applies a profile change at the next idle point, so
+        // the marker never preempts the open turn or holds its mail.
         assert!(
-            !working_cfg.join(".anyagents-profile-rotated-ms").exists(),
-            "working seat with open turn must not receive rotated marker mid-turn"
+            working_cfg.join(".anyagents-profile-rotated-ms").exists(),
+            "working seat should learn of the profile change"
         );
         assert!(
             working_cfg.join(".anyagents-quota-cleared-ms").exists(),
@@ -10436,35 +11189,25 @@ mod tests {
         .unwrap();
 
         let child_cfg = anyagents_core::agent_config_dir(data, &child.id);
-        let sess_dir = child_cfg.join("sessions/2026/10/29");
-        std::fs::create_dir_all(&sess_dir).unwrap();
-        let rollout_path = sess_dir.join("rollout-2026-10-29T18-51-32-test.jsonl");
-        let rollout_line = serde_json::json!({
-            "timestamp": "2026-10-29T18:51:40.000Z",
-            "ordinal": 4,
-            "type": "event_msg",
-            "payload": {
-                "type": "task_complete",
-                "root_turn_id": "t1",
-                "turn_id": "t1",
-                "last_agent_message": null,
-                "error": {
-                    "message": "workspace routing discovery unauthorized (401)"
-                }
-            }
-        });
-        std::fs::write(&rollout_path, format!("{rollout_line}\n")).unwrap();
-        let rotated_at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        // The Codex adapter persists a 401 turn fault as this record.
+        let persist_fault = |timestamp_ms: i64| {
+            std::fs::write(
+                child_cfg.join(".anyagents-last-error.json"),
+                serde_json::json!({
+                    "error": "workspace routing discovery unauthorized (401)",
+                    "quota_reset_at_ms": null,
+                    "timestamp_ms": timestamp_ms,
+                })
+                .to_string(),
+            )
+            .unwrap();
+        };
         std::fs::write(
             child_cfg.join(".anyagents-profile-rotated-ms"),
             "1700000000000\n",
         )
         .unwrap();
-        let rollout = std::fs::File::options()
-            .write(true)
-            .open(&rollout_path)
-            .unwrap();
-        rollout.set_modified(rotated_at).unwrap();
+        persist_fault(1_700_000_000_000);
 
         let health = anyagents_supervisor::HealthBoard::default();
         let (delivery_mode, steer_support) = anyagents_supervisor::declared(&child.harness);
@@ -10486,16 +11229,14 @@ mod tests {
         );
         let mut views;
 
-        // A rollout at the rotation boundary is stale, even if it contains an
-        // error. Do not let wall-clock or filesystem precision decide freshness.
+        // A fault recorded at the rotation boundary is stale. Do not let
+        // wall-clock precision decide freshness.
         views = vec![crate::server::agent_view(&store, &health, &child).unwrap()];
         assert_eq!(views[0].turn_state, "working");
         assert!(views[0].last_error.is_none());
         assert!(store.next_undelivered(&parent.id).unwrap().is_none());
 
-        rollout
-            .set_modified(rotated_at + std::time::Duration::from_secs(1))
-            .unwrap();
+        persist_fault(1_700_000_001_000);
         views = vec![crate::server::agent_view(&store, &health, &child).unwrap()];
         assert_eq!(views[0].turn_state, "errored");
         assert_eq!(
@@ -11451,6 +12192,184 @@ git -c safe.directory="$5" -C "$5" status --porcelain
         assert_eq!(std::fs::read_to_string(&fixture.log).unwrap(), before);
     }
 
+    /// A refused admission after the name was reserved rolls back completely:
+    /// no row, no directory, no grant journal, and the same name is retryable.
+    #[test]
+    fn refused_admission_rolls_back_and_the_same_name_is_retryable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path();
+        let fixture = crate::worktree::tests::Fixture::new(data);
+        let store = Store::open(data.join("state.db")).unwrap();
+        store
+            .hold_capability_key("0123456789abcdef0123456789abcdef")
+            .unwrap();
+        let probe = data.join("probe");
+        fixture
+            .consumer
+            .remote("ExampleOrg/demo", &probe, "probe", None)
+            .unwrap();
+        let common = PathBuf::from(crate::worktree::tests::git(
+            &probe,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        ));
+        let mode = std::fs::metadata(&common).unwrap().permissions().mode();
+        std::fs::set_permissions(&common, std::fs::Permissions::from_mode(mode | 0o020)).unwrap();
+        let err = create_with_consumer(
+            &store,
+            data,
+            worktree_request("retryable", Some("ExampleOrg/demo".into())),
+            &fixture.consumer,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::WorkdirPermission { .. }), "{err}");
+        assert!(
+            err.to_string().contains("untrusted Git metadata directory"),
+            "{err}"
+        );
+        assert!(matches!(
+            store.agent_by_name("retryable"),
+            Err(Error::AgentNotFound(_))
+        ));
+        assert_eq!(std::fs::read_dir(data.join("agents")).unwrap().count(), 0);
+        let journals = std::fs::read_dir(data.join("worktree-grants"))
+            .map(|d| {
+                d.filter(|e| {
+                    e.as_ref()
+                        .is_ok_and(|e| e.path().extension().is_some_and(|x| x == "json"))
+                })
+                .count()
+            })
+            .unwrap_or(0);
+        assert_eq!(journals, 0, "refused admission left a grant journal");
+        std::fs::set_permissions(&common, std::fs::Permissions::from_mode(mode)).unwrap();
+        let agent = create_with_consumer(
+            &store,
+            data,
+            worktree_request("retryable", Some("ExampleOrg/demo".into())),
+            &fixture.consumer,
+        )
+        .unwrap();
+        assert_eq!(agent.name, "retryable");
+        assert_eq!(agent.state, "running");
+        let worktrees = crate::worktree::tests::git(&probe, &["worktree", "list", "--porcelain"]);
+        assert_eq!(
+            worktrees
+                .matches("branch refs/heads/agent/retryable")
+                .count(),
+            1,
+            "the refused attempt left a worktree registration: {worktrees}"
+        );
+    }
+
+    /// Rollback removes only its own checkout registration and never loses a
+    /// commit: an untouched branch is deleted, a branch with unique work stays.
+    #[test]
+    fn provisioned_checkout_rollback_never_deletes_unique_commits() {
+        use crate::worktree::tests::git;
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        git(&source, &["init", "-q", "-b", "main"]);
+        git(
+            &source,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.invalid",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "base",
+            ],
+        );
+        let untouched = dir.path().join("untouched");
+        let worked = dir.path().join("worked");
+        let sibling = dir.path().join("sibling");
+        for (path, branch) in [
+            (&untouched, "agent/untouched"),
+            (&worked, "agent/worked"),
+            (&sibling, "agent/sibling"),
+        ] {
+            git(
+                &source,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    branch,
+                    path.to_str().unwrap(),
+                ],
+            );
+        }
+        git(
+            &worked,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.invalid",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "unique",
+            ],
+        );
+        remove_provisioned_checkout(&untouched).unwrap();
+        remove_provisioned_checkout(&worked).unwrap();
+        assert!(!untouched.exists() && !worked.exists());
+        let branches = git(&source, &["branch", "--format=%(refname:short)"]);
+        assert!(
+            !branches.lines().any(|b| b == "agent/untouched"),
+            "{branches}"
+        );
+        assert!(
+            branches.lines().any(|b| b == "agent/worked"),
+            "unique work lost: {branches}"
+        );
+        let worktrees = git(&source, &["worktree", "list", "--porcelain"]);
+        assert!(
+            worktrees.contains(sibling.to_str().unwrap()),
+            "sibling registration removed"
+        );
+        assert!(!worktrees.contains(untouched.to_str().unwrap()));
+        assert!(sibling.join(".git").exists());
+    }
+
+    /// When a partial grant cannot be revoked, rollback keeps the row and
+    /// journal for recovery but still releases the name for an immediate retry.
+    #[test]
+    fn unrevocable_rollback_keeps_recovery_state_and_releases_the_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path();
+        let store = Store::open(data.join("state.db")).unwrap();
+        let agent = store
+            .create_agent(NewAgent::new("held", "claude-code"))
+            .unwrap();
+        let journal = crate::worktree_access::grant_path(data, &agent.id);
+        std::fs::create_dir_all(journal.parent().unwrap()).unwrap();
+        std::fs::write(&journal, b"not a journal").unwrap();
+        let original = Error::Message("injected admission failure".into());
+        let returned = roll_back_failed_creation(&store, data, &agent, None, None, original);
+        assert_eq!(returned.to_string(), "injected admission failure");
+        let kept = store.agent(&agent.id).unwrap();
+        assert_eq!(kept.state, "archived");
+        assert_eq!(kept.name, agent.id.as_str());
+        assert!(journal.exists(), "the recovery journal must be kept");
+        assert!(matches!(
+            store.agent_by_name("held"),
+            Err(Error::AgentNotFound(_))
+        ));
+        let retried = store
+            .create_agent(NewAgent::new("held", "claude-code"))
+            .unwrap();
+        assert_ne!(retried.id, agent.id);
+    }
+
     #[test]
     fn existing_git_target_is_not_adopted_or_modified() {
         let dir = tempfile::tempdir().unwrap();
@@ -11946,6 +12865,117 @@ git -c safe.directory="$5" -C "$5" status --porcelain
     }
 
     #[test]
+    #[cfg(unix)]
+    fn canonical_skills_pull_only_when_origin_main_moves() {
+        use crate::worktree::tests::git;
+        let dir = tempfile::tempdir().unwrap();
+        let commit = |repo: &Path, file: &str| {
+            std::fs::create_dir_all(repo.join("skills")).unwrap();
+            std::fs::write(repo.join("skills").join(file), file).unwrap();
+            git(repo, &["add", "."]);
+            git(
+                repo,
+                &[
+                    "-c",
+                    "user.name=Example",
+                    "-c",
+                    "user.email=example@example.org",
+                    "commit",
+                    "-qm",
+                    file,
+                ],
+            );
+        };
+        let origin = dir.path().join("origin.git");
+        let author = dir.path().join("author");
+        let checkout = dir.path().join("checkout");
+        let data = dir.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        git(
+            dir.path(),
+            &[
+                "init",
+                "-q",
+                "--bare",
+                "-b",
+                "main",
+                origin.to_str().unwrap(),
+            ],
+        );
+        git(
+            dir.path(),
+            &[
+                "clone",
+                "-q",
+                origin.to_str().unwrap(),
+                author.to_str().unwrap(),
+            ],
+        );
+        git(&author, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        commit(&author, "one.md");
+        commit(&author, "two.md");
+        git(&author, &["push", "-q", "origin", "main"]);
+        git(
+            dir.path(),
+            &[
+                "clone",
+                "-q",
+                origin.to_str().unwrap(),
+                checkout.to_str().unwrap(),
+            ],
+        );
+        std::os::unix::fs::symlink(checkout.join("skills"), data.join("skills")).unwrap();
+
+        sync_canonical_skills(&data);
+        let synced = git(&checkout, &["rev-parse", "HEAD"]);
+        // Origin has not moved since the last pull: the checkout is left alone,
+        // even one a local reset put behind.
+        git(&checkout, &["reset", "-q", "--hard", "HEAD~1"]);
+        sync_canonical_skills(&data);
+        assert_ne!(git(&checkout, &["rev-parse", "HEAD"]), synced);
+
+        commit(&author, "three.md");
+        git(&author, &["push", "-q", "origin", "main"]);
+        sync_canonical_skills(&data);
+        assert_eq!(
+            git(&checkout, &["rev-parse", "HEAD"]),
+            git(&author, &["rev-parse", "HEAD"])
+        );
+        assert!(checkout.join("skills/three.md").is_file());
+    }
+
+    #[test]
+    fn unchanged_credential_pairs_are_not_read_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("seat/.credentials.json");
+        let dst = dir.path().join("profile/.credentials.json");
+        std::fs::create_dir_all(src.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
+        let cred = |token: &str, expires_at: i64| {
+            serde_json::json!({"claudeAiOauth": {
+                "accessToken": token,
+                "refreshToken": "refresh",
+                "expiresAt": expires_at,
+            }})
+            .to_string()
+        };
+        std::fs::write(&src, cred("same", 2_000_000_000_000)).unwrap();
+        std::fs::write(&dst, cred("same", 2_000_000_000_000)).unwrap();
+        let evaluations = || COPY_EVALUATIONS.with(std::cell::Cell::get);
+        let start = evaluations();
+        assert!(!copy_seat_file_if_newer(&src, &dst));
+        assert!(!copy_seat_file_if_newer(&src, &dst));
+        assert_eq!(evaluations() - start, 1, "an unchanged pair was read again");
+
+        std::fs::write(&src, cred("fresher", 2_000_000_100_000)).unwrap();
+        assert!(copy_seat_file_if_newer(&src, &dst));
+        assert!(std::fs::read_to_string(&dst).unwrap().contains("fresher"));
+        assert!(!copy_seat_file_if_newer(&src, &dst));
+        assert!(!copy_seat_file_if_newer(&src, &dst));
+        assert_eq!(evaluations() - start, 3);
+    }
+
+    #[test]
     fn copy_seat_file_if_newer_syncs_rotated_refresh_token_and_preserves_metadata() {
         let tmp = tempfile::tempdir().unwrap();
         let prof_cred = tmp.path().join("profile-credentials.json");
@@ -12229,6 +13259,65 @@ mod archetype_tests {
     use super::*;
 
     #[test]
+    fn configured_owner_catalog_excludes_all_other_roots_even_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = dir.path().join("owner");
+        let workspace = dir.path().join("workspace");
+        let ancestor = dir.path().join("ancestor");
+        let data = dir.path().join("data");
+        for base in [&workspace, &ancestor, &data] {
+            std::fs::create_dir_all(base.join(".agents/agents")).unwrap();
+            std::fs::write(base.join(".agents/agents/retired.md"), "Stale.").unwrap();
+        }
+        for root in ["agents-templates", "archetypes"] {
+            std::fs::create_dir_all(data.join(root)).unwrap();
+            std::fs::write(data.join(root).join("retired.md"), "Stale.").unwrap();
+        }
+        let roots = || {
+            archetype_search_roots_for_owner(
+                Some(&workspace),
+                std::slice::from_ref(&ancestor),
+                &data,
+                Some(&owner),
+            )
+        };
+        let expected = vec![(owner.clone(), PathBuf::from(".agents/agents"))];
+        // Missing configuration never widens the search to legacy catalogs.
+        assert_eq!(roots(), expected);
+        std::fs::create_dir_all(owner.join(".agents/agents")).unwrap();
+        assert_eq!(roots(), expected); // Empty catalogs are authoritative too.
+        std::fs::write(owner.join(".agents/agents/worker.md"), "Current.").unwrap();
+        assert_eq!(roots(), expected);
+        for (base, relative) in roots() {
+            assert!(
+                read_archetype_file(&base, &relative.join("retired.md"))
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                read_archetype_file(&base, &relative.join("worker.md"))
+                    .unwrap()
+                    .as_deref(),
+                Some("Current.")
+            );
+        }
+        // Unconfigured installations retain workspace and data fallback behavior.
+        let fallback = archetype_search_roots_for_owner(Some(&workspace), &[ancestor], &data, None);
+        assert!(fallback.contains(&(workspace, PathBuf::from(".agents/agents"))));
+        assert!(fallback.contains(&(data, PathBuf::from("agents-templates"))));
+    }
+
+    #[test]
+    fn empty_unconfigured_catalog_preserves_free_form_role_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".agents/agents")).unwrap();
+        assert_eq!(
+            normalize_or_validate_agent_role("retired", None, None, dir.path()).unwrap(),
+            "retired"
+        );
+    }
+
+    #[test]
     fn data_archetypes_accept_name_metadata_and_prefer_shipped_templates() {
         let dir = tempfile::tempdir().unwrap();
         for root in [".agents/agents", "agents-templates", "archetypes"] {
@@ -12269,55 +13358,116 @@ mod archetype_tests {
     }
 
     #[test]
-    fn composite_role_labels_resolve_fallback_archetype_templates() {
+    fn role_and_archetype_unify_on_canonical_template_slug_and_reject_unknown_roles() {
         let dir = tempfile::tempdir().unwrap();
         let templates_dir = dir.path().join(".agents/agents");
         std::fs::create_dir_all(&templates_dir).unwrap();
         for (slug, scope, body_text) in [
             ("director", "public", "Director template body."),
-            ("manager", "siblings", "Manager template body."),
+            ("engineer", "private", "Engineer template body."),
             ("assistant", "isolated", "Assistant template body."),
-            ("worker", "private", "Worker template body."),
+            ("code-reviewer", "siblings", "Reviewer template body."),
         ] {
             std::fs::write(
                 templates_dir.join(format!("{slug}.md")),
                 format!(
-                    "---\nname: {slug}\nscope: {scope}\ndescription: Default {slug}\n---\n{body_text}"
+                    "---\nname: {slug}\nscope: {scope}\nharness: spiron\nmodel: gpt-6.1-sol#high\ndescription: Default {slug}\n---\n{body_text}"
                 ),
             )
             .unwrap();
         }
+        std::fs::write(
+            dir.path().join("subagent-defaults.json"),
+            serde_json::json!({
+                "default": {"mode": "custom", "harness": "muse", "model": "muse-ember-1.0"}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let parent_agent = store
+            .create_agent(anyagents_core::NewAgent::new("parent", "agy"))
+            .unwrap();
 
-        for (role_label, expected_scope, expected_body) in [
+        for (selector_key, selector_val, expected_slug, expected_scope, expected_body) in [
             (
-                "工作總監 (Work Director)",
+                "role",
+                "director",
+                "director",
                 "public",
                 "Director template body.",
             ),
-            ("項目總管", "public", "Director template body."),
             (
-                "商業化與數值經濟主管 (Monetization & Economy Manager)",
-                "siblings",
-                "Manager template body.",
+                "archetype",
+                "engineer",
+                "engineer",
+                "private",
+                "Engineer template body.",
             ),
-            ("外部聯絡專屬助理", "isolated", "Assistant template body."),
-            ("專員 / Worker", "private", "Worker template body."),
+            (
+                "role",
+                "assistant",
+                "assistant",
+                "isolated",
+                "Assistant template body.",
+            ),
+            (
+                "role",
+                "Code Reviewer",
+                "code-reviewer",
+                "siblings",
+                "Reviewer template body.",
+            ),
         ] {
             let mut req: crate::api::CreateAgentRequest =
                 serde_json::from_value(serde_json::json!({
                     "name": "sample-agent",
-                    "role": role_label,
+                    selector_key: selector_val,
                     "instructions": "Custom assignment instructions."
                 }))
                 .unwrap();
-            apply_archetype_defaults(None, dir.path(), None, &mut req).unwrap();
-            assert_eq!(req.role.as_deref(), Some(role_label));
+            apply_archetype_defaults(None, dir.path(), Some(&parent_agent), &mut req).unwrap();
+            assert_eq!(req.role.as_deref(), Some(expected_slug));
             assert_eq!(req.scope.as_deref(), Some(expected_scope));
+            assert_eq!(req.harness.as_deref(), Some("spiron"));
+            assert_eq!(req.model.as_deref(), Some("gpt-6.1-sol#high"));
             assert_eq!(
                 req.instructions.as_deref(),
                 Some(format!("{expected_body}\n\nCustom assignment instructions.").as_str())
             );
         }
+
+        let mut bad_req: crate::api::CreateAgentRequest =
+            serde_json::from_value(serde_json::json!({
+                "name": "sample-agent",
+                "role": "nonexistent-role",
+            }))
+            .unwrap();
+        let err = apply_archetype_defaults(None, dir.path(), None, &mut bad_req)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("unknown archetype template \"nonexistent-role\""),
+            "{err}"
+        );
+        assert!(
+            normalize_or_validate_agent_role("nonexistent-role", None, None, dir.path()).is_err()
+        );
+        assert_eq!(
+            normalize_or_validate_agent_role("Code Reviewer", None, None, dir.path()).unwrap(),
+            "code-reviewer"
+        );
+
+        let cfg = agent_config_dir(dir.path(), &parent_agent.id);
+        std::fs::create_dir_all(&cfg).unwrap();
+        write_agent_instructions_with_continuity(&cfg, &parent_agent, None, None).unwrap();
+        let prompt = std::fs::read_to_string(cfg.join("SYSTEM_PROMPT.md")).unwrap();
+        assert!(
+            prompt.contains(
+                "- Available sub-agent roles (`role` in `agents`/`spawn`): `assistant`, `code-reviewer`, `director`, `engineer` (see `spawn` tool `role` schema for details)."
+            ),
+            "{prompt}"
+        );
     }
 
     #[test]
@@ -12622,6 +13772,43 @@ mod runtime_config_tests {
             .unwrap();
         assert_eq!(seeded_profile_name(&cfg).as_deref(), Some("openai/target"));
         assert!(prof.join("auth.json").is_file());
+    }
+
+    #[test]
+    fn a_renewed_token_refreshes_files_without_rotating_the_running_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        store
+            .hold_capability_key("0123456789abcdef0123456789abcdef")
+            .unwrap();
+        let agent = store
+            .create_agent(anyagents_core::NewAgent::new("sample", "agy"))
+            .unwrap();
+        let cfg = agent_config_dir(dir.path(), &agent.id);
+        let rel = ".gemini/antigravity-cli/antigravity-oauth-token";
+        std::fs::create_dir_all(cfg.join(".gemini/antigravity-cli")).unwrap();
+        write_profile_marker(&cfg, ".anyagents-profile", "google-antigravity/target\n").unwrap();
+        std::fs::write(cfg.join(".anyagents-last-error.json"), b"{}").unwrap();
+        let prof = dir.path().join("profiles/google-antigravity/target");
+        std::fs::create_dir_all(prof.join(".gemini/antigravity-cli")).unwrap();
+        std::fs::write(prof.join(rel), b"renewed-token").unwrap();
+
+        propagate_credentials(
+            dir.path(),
+            "google-antigravity",
+            "target",
+            &[rel],
+            CredentialChange::Renewed,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(cfg.join(rel)).unwrap(), b"renewed-token");
+        assert!(!cfg.join(".anyagents-profile-rotated-ms").exists());
+        assert!(cfg.join(".anyagents-last-error.json").exists());
+
+        propagate_profile_files_to_bound_agents(dir.path(), "google-antigravity", "target", &[rel])
+            .unwrap();
+        assert!(cfg.join(".anyagents-profile-rotated-ms").exists());
+        assert!(!cfg.join(".anyagents-last-error.json").exists());
     }
 
     #[test]
@@ -13888,8 +15075,16 @@ Connection: close
                 "workdir": "private"
             }))
             .unwrap();
-        apply_archetype_defaults(Some(&store), &data_dir, Some(&l1), &mut retired_role_req)
-            .unwrap();
+        let retired_err =
+            apply_archetype_defaults(Some(&store), &data_dir, Some(&l1), &mut retired_role_req)
+                .unwrap_err()
+                .to_string();
+        assert!(
+            retired_err.contains("unknown archetype template \"retired-director\"")
+                && !retired_err.contains("available: retired-director")
+                && !retired_err.contains(", retired-director"),
+            "stale data_dir/.agents/agents template must not satisfy a workspace role: {retired_err}"
+        );
         assert!(
             retired_role_req.instructions.is_none(),
             "stale data_dir/.agents/agents template must not pollute workspace .agents/agents"
@@ -14171,5 +15366,285 @@ Connection: close
         std::fs::write(cfg.join(".anyagents-profile"), marker).unwrap();
         let picked = select_or_bind_profile(data, &[], &agent, &cfg);
         assert_eq!(picked, vec![explicit]);
+    }
+
+    #[test]
+    fn worktree_keyword_without_repo_falls_back_to_private_workdir_when_parent_not_git_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path();
+        let store = anyagents_core::Store::open(data.join("anyagents.db")).unwrap();
+        store
+            .hold_capability_key("0123456789abcdef0123456789abcdef")
+            .unwrap();
+
+        let non_git_parent = create(
+            &store,
+            data,
+            CreateRequest {
+                name: "non-git-parent".to_string(),
+                role: Some("director".to_string()),
+                harness: "agy".to_string(),
+                model: None,
+                profile: None,
+                repo: None,
+                branch: None,
+                base: None,
+                workdir: None,
+                workdir_default: None,
+                description: None,
+                instructions: None,
+                parent_id: None,
+            },
+        )
+        .unwrap();
+        assert!(!is_git_repo_dir(Path::new(
+            non_git_parent.workdir.as_deref().unwrap()
+        )));
+
+        let child_under_non_git = create(
+            &store,
+            data,
+            CreateRequest {
+                name: "child-non-git".to_string(),
+                role: Some("engineer".to_string()),
+                harness: "agy".to_string(),
+                model: None,
+                profile: None,
+                repo: None,
+                branch: None,
+                base: None,
+                workdir: Some(PathBuf::from("worktree")),
+                workdir_default: None,
+                description: None,
+                instructions: None,
+                parent_id: Some(non_git_parent.id.clone()),
+            },
+        )
+        .unwrap();
+        let expected_private_wd = anyagents_core::agent_config_dir(data, &child_under_non_git.id)
+            .parent()
+            .unwrap()
+            .join("work");
+        assert_eq!(
+            PathBuf::from(child_under_non_git.workdir.as_deref().unwrap()),
+            expected_private_wd
+        );
+        assert!(!is_git_repo_dir(&expected_private_wd));
+
+        let explicit_inherit_err = create(
+            &store,
+            data,
+            CreateRequest {
+                name: "child-explicit-inherit".to_string(),
+                role: Some("engineer".to_string()),
+                harness: "agy".to_string(),
+                model: None,
+                profile: None,
+                repo: Some("inherit".to_string()),
+                branch: None,
+                base: None,
+                workdir: Some(PathBuf::from("worktree")),
+                workdir_default: None,
+                description: None,
+                instructions: None,
+                parent_id: Some(non_git_parent.id.clone()),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            explicit_inherit_err
+                .to_string()
+                .contains("not a git repository"),
+            "unexpected error: {explicit_inherit_err}"
+        );
+
+        let fixture = crate::worktree::tests::Fixture::new(data);
+        let git_parent = create_with_consumer(
+            &store,
+            data,
+            CreateRequest {
+                name: "git-parent".to_string(),
+                role: Some("director".to_string()),
+                harness: "agy".to_string(),
+                model: None,
+                profile: None,
+                repo: None,
+                branch: None,
+                base: None,
+                workdir: Some(fixture.source.clone()),
+                workdir_default: None,
+                description: None,
+                instructions: None,
+                parent_id: None,
+            },
+            &fixture.consumer,
+        )
+        .unwrap();
+
+        let child_under_git = create_with_consumer(
+            &store,
+            data,
+            CreateRequest {
+                name: "child-git".to_string(),
+                role: Some("engineer".to_string()),
+                harness: "agy".to_string(),
+                model: None,
+                profile: None,
+                repo: None,
+                branch: None,
+                base: None,
+                workdir: Some(PathBuf::from("worktree")),
+                workdir_default: None,
+                description: None,
+                instructions: None,
+                parent_id: Some(git_parent.id.clone()),
+            },
+            &fixture.consumer,
+        )
+        .unwrap();
+        let child_git_wd = PathBuf::from(child_under_git.workdir.as_deref().unwrap());
+        fixture.assert_checkout(&child_git_wd);
+    }
+
+    #[test]
+    fn spiron_profile_switch_removes_stale_seat_selector_and_refreshes_gateway_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path();
+        let store = Store::open(data.join("state.db")).unwrap();
+        let mut new_agent = NewAgent::new("spiron-switch", "spiron");
+        new_agent.model = Some("openrouter/model-a".to_string());
+        let agent = store.create_agent(new_agent).unwrap();
+        let cfg = agent_config_dir(data, &agent.id);
+        std::fs::create_dir_all(&cfg).unwrap();
+
+        let alt = data.join("profiles/gw/alt");
+        std::fs::create_dir_all(&alt).unwrap();
+        std::fs::write(
+            alt.join("sylphx-agent.json"),
+            br#"{"gateway_base_url":"https://alt.example/v1"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            alt.join("config.toml"),
+            b"sylphx_ai_url = \"https://alt.example/v1\"\nalways_approve = true\n",
+        )
+        .unwrap();
+        std::fs::write(alt.join("auth.json"), br#"{"access_token":"tok-a"}"#).unwrap();
+
+        let primary = data.join("profiles/gw/default");
+        std::fs::create_dir_all(primary.join(".config/opencode")).unwrap();
+        std::fs::write(
+            primary.join(".config/opencode/opencode.json"),
+            br#"{"provider":{"openrouter":{"options":{"baseURL":"https://gw.example/v1"}}}}"#,
+        )
+        .unwrap();
+        std::fs::write(primary.join("auth.json"), br#"{"access_token":"tok-b"}"#).unwrap();
+
+        write_profile_marker(&cfg, ".anyagents-profile", "gw/alt\n").unwrap();
+        seed_harness_credentials(&store, data, &agent, &cfg).unwrap();
+        assert!(cfg.join("sylphx-agent.json").exists());
+
+        write_profile_marker(&cfg, ".anyagents-profile", "gw/default\n").unwrap();
+        seed_harness_credentials(&store, data, &agent, &cfg).unwrap();
+        crate::spiron::write_spiron_config(
+            &cfg,
+            agent.model.as_deref(),
+            std::path::Path::new("/usr/bin/anyagents"),
+            &["mcp".to_string()],
+        )
+        .unwrap();
+
+        assert!(!cfg.join("sylphx-agent.json").exists());
+        let toml = std::fs::read_to_string(cfg.join("config.toml")).unwrap();
+        assert!(toml.contains("https://gw.example/v1"), "{toml}");
+        assert!(!toml.contains("https://alt.example/v1"), "{toml}");
+    }
+
+    #[test]
+    fn seed_harness_credentials_writes_empty_gemini_migrated_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path();
+        let store = Store::open(data.join("state.db")).unwrap();
+        let agent = store
+            .create_agent(NewAgent::new("agy-migrated", "agy"))
+            .unwrap();
+        let cfg = agent_config_dir(data, &agent.id);
+        std::fs::create_dir_all(&cfg).unwrap();
+
+        let prof = data.join("profiles/google-antigravity/default");
+        std::fs::create_dir_all(prof.join(".gemini/antigravity-cli")).unwrap();
+        std::fs::create_dir_all(prof.join(".gemini/config")).unwrap();
+        std::fs::write(
+            prof.join(".gemini/antigravity-cli/antigravity-oauth-token"),
+            br#"{"email":"a@example.com","token":{"access_token":"ya29.ok","refresh_token":"1//r"}}"#,
+        )
+        .unwrap();
+        std::fs::write(prof.join(".gemini/config/.migrated"), b"").unwrap();
+
+        seed_harness_credentials(&store, data, &agent, &cfg).unwrap();
+        assert!(
+            cfg.join(".gemini/antigravity-cli/antigravity-oauth-token")
+                .is_file()
+        );
+        let migrated = cfg.join(".gemini/config/.migrated");
+        assert!(migrated.is_file());
+        assert_eq!(std::fs::metadata(&migrated).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn initial_bind_skips_google_default_with_expired_oauth_and_refresh_failure() {
+        let (dir, store) = bind_test_store();
+        let data = dir.path();
+        let default = data.join("profiles/google-antigravity/default");
+        let healthy = data.join("profiles/google-antigravity/team-alpha");
+        std::fs::create_dir_all(default.join(".gemini/antigravity-cli")).unwrap();
+        std::fs::create_dir_all(healthy.join(".gemini/antigravity-cli")).unwrap();
+
+        let past_expiry = (chrono::Utc::now() - chrono::Duration::hours(2))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        std::fs::write(
+            default.join(".gemini/antigravity-cli/antigravity-oauth-token"),
+            serde_json::json!({
+                "email": "expired@example.com",
+                "token": {
+                    "access_token": "ya29.expired",
+                    "expiry": past_expiry,
+                    "refresh_token": "1//revoked"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            default.join(OAUTH_REFRESH_ATTEMPT_FILE),
+            anyagents_core::now_ms().to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            default.join(".anyagents-last-usage.txt"),
+            b"__NONE__
+",
+        )
+        .unwrap();
+
+        std::fs::write(
+            healthy.join(".gemini/antigravity-cli/antigravity-oauth-token"),
+            br#"{"email":"healthy@example.com","token":{"access_token":"ya29.ok","refresh_token":"1//ok"}}"#,
+        )
+        .unwrap();
+
+        let mut new_agent = NewAgent::new("agy-expired-default", "agy");
+        new_agent.model = Some("google-antigravity/gemini-3-flash".to_string());
+        let agent = store.create_agent(new_agent).unwrap();
+        let cfg = agent_config_dir(data, &agent.id);
+        std::fs::create_dir_all(&cfg).unwrap();
+
+        let picked = select_or_bind_profile(data, &[], &agent, &cfg);
+        assert_eq!(picked, vec![healthy]);
+        assert_eq!(
+            bound_profile_name(&cfg).as_deref(),
+            Some("google-antigravity/team-alpha")
+        );
     }
 }
