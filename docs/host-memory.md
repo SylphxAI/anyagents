@@ -314,8 +314,10 @@ distilled from a 4B reranker, 384 tokens per pair): on the 5-day window it
 lifts the reranked hybrid's MRR@10 from 0.176 (`hs-rerank-1`) to 0.203.
 Reranking 20 passages took about 2.8 s on four threads of the loaded host
 against 1.3 s for `hs-rerank-1`, inside the server's 8 s bound; `hs-rerank-1`
-(MIT) stays pinned as the faster choice. Larger cross-encoders
-(`bge-reranker-v2-m3`) take several times longer per query on CPU. Every candidate in `pins.rs` can be selected with
+(MIT) stays pinned as the faster choice. The larger `bge-reranker-v2-m3`
+(int8) took about 7 s per query on four threads, too close to the bound, and
+on the first 100 queries lifted the hybrid list's MRR@10 by 0.034, less than
+the default's 0.054 over all 170. Every candidate in `pins.rs` can be selected with
 `--embedder` / `--reranker` and evaluated with the same command.
 
 ## Incremental indexing and migration
