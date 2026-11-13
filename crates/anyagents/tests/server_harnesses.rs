@@ -352,6 +352,18 @@ fn repeated_replies(harness: &str) {
     let _server = Server::start(&data, Path::new(env!("CARGO_BIN_EXE_anyagents")));
     one_round(&data, name, harness);
     one_round(&data, name, harness);
+    // The double ends each turn with a `result` line: the turn closes, and
+    // nothing is left open for a recovery note.
+    let store = Store::open(data.join("state.db")).unwrap();
+    let responder = store.agent_by_name(name).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while let Some(open) = store.open_turn(&responder.id).unwrap() {
+        assert!(
+            Instant::now() < deadline,
+            "{harness}: an answered turn stayed open: {open:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 macro_rules! reply_cases {

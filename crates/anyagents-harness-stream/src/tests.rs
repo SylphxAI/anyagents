@@ -16,19 +16,21 @@ fn each_catalog_entry_starts_and_resumes_with_its_own_arguments() {
 
     let omp = StreamSpec::for_program("omp");
     assert_eq!(omp.name, "anyagents-omp");
-    assert_eq!(omp.protocol, LineProtocol::Done);
+    assert_eq!(omp.protocol, LineProtocol::Result);
     assert_eq!(omp.resume_args(Some("s1")), ["--session", "s1"]);
     assert_eq!(omp.resume_args(None), Vec::<String>::new());
 }
 
 #[test]
 fn the_closing_line_decides_the_turn_and_carries_its_usage() {
-    let done = json!({
-        "type": "done",
+    let result = json!({
+        "type": "result",
         "session_id": "sess-1",
         "usage": {"input_tokens": 11, "output_tokens": 7, "cache_read_tokens": 3, "cache_write_tokens": 2}
     });
-    let effect = StreamSpec::for_program("omp").effect(&done);
+    // The contract double, like any `adapter.json` program, ends a turn with
+    // a `result` line.
+    let effect = StreamSpec::for_program("contract").effect(&result);
     assert!(effect.finishes_turn);
     let usage = effect.usage.expect("usage on the closing line");
     assert_eq!((usage.input_tokens, usage.output_tokens), (11, 7));
@@ -37,12 +39,11 @@ fn the_closing_line_decides_the_turn_and_carries_its_usage() {
     assert_eq!(effect.session_id.as_deref(), Some("sess-1"));
     assert_eq!(effect.text, None);
 
-    // `result` does not close a harness that ends on `done`.
-    let other = StreamSpec::for_program("omp").effect(&json!({"type": "result"}));
-    assert!(!other.finishes_turn);
-    // A result-only harness ignores `done`.
-    let agy = StreamSpec::for_program("agy").effect(&json!({"type": "done"}));
-    assert!(!agy.finishes_turn);
+    // No line protocol ends a turn on `done`.
+    for program in ["contract", "agy"] {
+        let done = StreamSpec::for_program(program).effect(&json!({"type": "done"}));
+        assert!(!done.finishes_turn, "{program}");
+    }
 }
 
 #[test]
@@ -76,8 +77,8 @@ fn a_rate_limit_anywhere_is_a_wait_with_its_reset_time() {
         assert_eq!(effect.quota_reset_at_ms, Some(1_700_000_000_000));
         assert!(!effect.finishes_turn);
     }
-    let done = StreamSpec::for_program("omp").effect(&json!({"type": "done"}));
-    assert_eq!(done.quota_reset_at_ms, None);
+    let result = StreamSpec::for_program("contract").effect(&json!({"type": "result"}));
+    assert_eq!(result.quota_reset_at_ms, None);
 }
 
 #[cfg(target_os = "linux")]
@@ -1733,7 +1734,7 @@ while [ "$i" -lt 200 ]; do
     i=$((i + 1))
     case "$i" in *0) sleep 0.01 ;; esac
 done
-printf '%s\n' '{"type":"done","session_id":"sess-stream","usage":{"input_tokens":1,"output_tokens":1}}'
+printf '%s\n' '{"type":"result","session_id":"sess-stream","usage":{"input_tokens":1,"output_tokens":1}}'
 exec sleep 30"#
                 .into(),
         ],

@@ -47,8 +47,6 @@ pub struct LineEffect {
 pub enum LineProtocol {
     /// `result` closes the turn and reports usage but no cost.
     Result,
-    /// `done` closes the turn and reports usage but no cost.
-    Done,
     /// A persistent controller acknowledges each correlated input before the
     /// mailbox releases custody. `result` is the only terminal frame.
     AcknowledgedResult,
@@ -82,13 +80,16 @@ impl StreamSpec {
                 cancel: "interrupt",
                 protocol: LineProtocol::Result,
             },
+            // The adapter contract (`docs/architecture.md`): one JSON line on
+            // stdin per message, a `result` line when its turn ends. The
+            // contract double and an `adapter.json` program speak it.
             _ => Self {
                 name: format!("anyagents-{program}"),
                 args: Vec::new(),
                 resume_flag: "--session",
                 start_line: "user",
                 cancel: "cancel",
-                protocol: LineProtocol::Done,
+                protocol: LineProtocol::Result,
             },
         }
     }
@@ -131,7 +132,6 @@ impl StreamSpec {
                 LineProtocol::Result => {
                     kind == Some("result") && (!is_error || self.name == "anyagents-agy")
                 }
-                LineProtocol::Done => !is_error && kind == Some("done"),
             };
         LineEffect {
             finishes_turn: finishes,
