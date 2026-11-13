@@ -71,6 +71,10 @@ struct IngressHistory {
     reacted_to: Option<(String, String)>,
     /// The original text of an edited message that has no recorded version.
     edited_from: Option<String>,
+    /// For a reaction in a group chat: how many agents the chat is attached
+    /// to, capped at the 16 the lookup reads. One or none makes the reaction
+    /// targeted rather than passive.
+    reaction_chat_agents: Option<usize>,
 }
 
 #[cfg(test)]
@@ -2363,9 +2367,17 @@ impl Store {
             }
             original_message_text(&reader, agent_id, chat_id, message_id, source_key)
         });
+        // Only a group chat's reaction needs the count; a private chat's is
+        // always targeted.
+        let reaction_chat_agents = origin
+            .filter(|_| reacted)
+            .and_then(|o| o.chat_id)
+            .filter(|&chat_id| chat_id <= 0)
+            .map(|chat_id| chat_attached_agent_count(&reader, chat_id));
         IngressHistory {
             reacted_to,
             edited_from,
+            reaction_chat_agents,
         }
     }
 
@@ -2578,7 +2590,7 @@ impl Store {
                             || rta.eq_ignore_ascii_case(&a.name)
                     })
                 })
-                || chat_id_val.is_some_and(|cid| chat_attached_agent_count(tx, cid) <= 1);
+                || history.reaction_chat_agents.is_some_and(|agents| agents <= 1);
             if is_targeted_reaction {
                 Some("reaction".to_string())
             } else {
@@ -7448,7 +7460,12 @@ pub fn format_edited_message_diff(old: &str, new: &str) -> String {
     out.join("\n")
 }
 
+/// Agents attached to a Telegram chat: those its channel links name, and
+/// up to 16 that received a line from it. The second part matches origins by
+/// text pattern and can read every stored message, so ingress counts on a
+/// read snapshot before it takes the writer.
 fn chat_attached_agent_count(conn: &Connection, chat_id: i64) -> usize {
+    history_read_probe();
     let mut distinct_agents = std::collections::HashSet::new();
     if let Ok(mut stmt) = conn.prepare(
         "SELECT c.state, ca.agent_id
@@ -10570,8 +10587,9 @@ mod tests {
 
     /// A Telegram reply, reaction or edit makes ingress look the referenced
     /// message up in the stored history by text pattern, which can read every
-    /// stored message. That read ran inside the ingress transaction, so the
-    /// daemon's single writer, and every other write, waited for it (a reply
+    /// stored message, and a group reaction also counts the chat's agents the
+    /// same way. Those reads ran inside the ingress transaction, so the
+    /// daemon's single writer, and every other write, waited for them (a reply
     /// to apollo on 2026-11-13 held it for 100 s). Here another thread writes
     /// while each lookup runs; it must finish while the lookup is still going.
     /// Lock order: file locks that can wait (an agent's lifecycle, the
@@ -10670,14 +10688,17 @@ mod tests {
         };
         HISTORY_READ_PROBE.with(|probe| probe.borrow_mut().take());
 
-        assert_eq!(lookups.load(Ordering::SeqCst), 3);
+        // Reply, reaction target, reaction chat's agents, edit original.
+        assert_eq!(lookups.load(Ordering::SeqCst), 4);
         assert_eq!(
             concurrent.load(Ordering::SeqCst),
-            3,
+            4,
             "a write waited for an ingress history lookup"
         );
-        // The lookups still shape what is delivered.
+        // The lookups still shape what is delivered: the group has two
+        // agents and the reaction targets neither, so it is passive.
         assert!(reacted.text.contains("the referenced line"));
+        assert_eq!(reacted.context.event.as_deref(), Some("reaction_passive"));
         assert!(edited.text.starts_with("[Edited message #8]"));
     }
 
