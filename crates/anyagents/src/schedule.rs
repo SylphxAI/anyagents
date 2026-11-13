@@ -1449,18 +1449,24 @@ pub fn probe_spiron_state(id: &str, kind: &str) -> Result<String, SpironProbeErr
     probe_spiron_at(&base, spiron_api_key().as_deref(), id, kind)
 }
 
+/// One client for every Spiron probe, so repeated probes reuse its pooled
+/// keep-alive connections instead of a new TLS handshake per watch per pass.
+static SPIRON_HTTP: LazyLock<ureq::Agent> = LazyLock::new(|| {
+    ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(5)))
+        .max_redirects(0)
+        .http_status_as_error(false)
+        .build()
+        .new_agent()
+});
+
 fn probe_spiron_at(
     base: &str,
     key: Option<&str>,
     id: &str,
     kind: &str,
 ) -> Result<String, SpironProbeError> {
-    let agent = ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(5)))
-        .max_redirects(0)
-        .http_status_as_error(false)
-        .build()
-        .new_agent();
+    let agent = &*SPIRON_HTTP;
     let kinds = if kind == "task" {
         ["tasks", "promises"]
     } else {
@@ -2490,6 +2496,46 @@ mod tests {
             assert_eq!(probe_spiron_at(&base, None, "id", "promise"), expected);
             task.join().unwrap();
         }
+    }
+
+    #[test]
+    fn spiron_probes_share_one_keep_alive_connection() {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        // The peer accepts exactly one connection and answers two requests on
+        // it; a probe that dialed again would find no listener and fail.
+        let peer = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            drop(listener);
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(socket.try_clone().unwrap());
+            let mut writer = socket;
+            for state in ["pending", "complete"] {
+                let mut line = String::new();
+                while reader.read_line(&mut line).unwrap() > 0 && line != "\r\n" {
+                    line.clear();
+                }
+                let body = format!(r#"{{"state":"{state}"}}"#);
+                write!(
+                    writer,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+        assert_eq!(
+            probe_spiron_at(&base, None, "id", "promise"),
+            Ok("pending".into())
+        );
+        assert_eq!(
+            probe_spiron_at(&base, None, "id", "promise"),
+            Ok("complete".into())
+        );
+        peer.join().unwrap();
     }
 
     #[test]
