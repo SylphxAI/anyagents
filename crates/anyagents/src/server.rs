@@ -37,6 +37,7 @@ use crate::operator;
 use crate::vendor::{self, VendorHarness};
 
 mod file_cache;
+mod hybrid;
 #[cfg(test)]
 mod latency_tests;
 mod outbound_history;
@@ -5055,6 +5056,7 @@ async fn conversation_route(
                     seq: 1,
                 };
                 return Ok(Json(ConversationResponse {
+                    retrieval: None,
                     agent: target.name.clone(),
                     agent_id: target.id.to_string(),
                     turns: vec![ConversationTurnView {
@@ -5190,6 +5192,7 @@ async fn conversation_route(
                 }
             };
             return Ok(Json(ConversationResponse {
+                retrieval: None,
                 agent: target.name,
                 agent_id: target.id.to_string(),
                 turns: vec![turn],
@@ -5274,6 +5277,7 @@ async fn conversation_route(
                 .agent_by_name(&hit.metadata.agent_id)
                 .map_err(ApiError::from_store)?;
             return Ok(Json(ConversationResponse {
+                retrieval: None,
                 agent: agent.name,
                 agent_id: agent.id.to_string(),
                 turns: vec![ConversationTurnView {
@@ -5378,6 +5382,46 @@ async fn conversation_route(
                 .map_err(|e| ApiError::from_store(Error::Message(e.to_string())))?
         } else {
             Vec::new()
+        };
+        // A relevance search for text also ranks by meaning: dense candidates
+        // from the memory service join the lexical ones, and the fused list
+        // is reranked below. Reads in time order rank nothing.
+        let text_query = clean_q
+            .map(str::to_string)
+            .or_else(|| (!extra_queries.is_empty()).then(|| extra_queries.join(" ")));
+        let ranks_by_relevance = should_search_host_files
+            && file_request.sort == anyagents_core::HistorySort::Relevance
+            && file_request.radius == 0;
+        let mut retrieval = None;
+        let file_hits = match text_query.as_deref().filter(|_| ranks_by_relevance) {
+            Some(text) => {
+                let owners: Vec<String> = if is_all {
+                    authorized.clone()
+                } else {
+                    let selected = state
+                        .store
+                        .agent_by_name(&name)
+                        .map_err(ApiError::from_store)?
+                        .id
+                        .to_string();
+                    authorized
+                        .iter()
+                        .filter(|id| **id == selected)
+                        .cloned()
+                        .collect()
+                };
+                let hybrid = hybrid::search(
+                    &state.store,
+                    text,
+                    &owners,
+                    query.scope,
+                    &file_request,
+                    file_hits,
+                );
+                retrieval = Some(hybrid.retrieval);
+                hybrid.hits
+            }
+            None => file_hits,
         };
 
         let (agent_name, agent_id_str, raw_turns) =
@@ -5528,6 +5572,9 @@ async fn conversation_route(
                 b.0.total_cmp(&a.0)
                     .then_with(|| b.1.timestamp_ms.cmp(&a.1.timestamp_ms))
             });
+            if let (Some(retrieval), Some(text)) = (retrieval.as_mut(), text_query.as_deref()) {
+                hybrid::rerank(state.store.data_dir(), text, &mut ranked, retrieval);
+            }
         } else {
             ranked.sort_by_key(|(_, t)| t.timestamp_ms);
             if file_request.sort == anyagents_core::HistorySort::Newest {
@@ -5547,6 +5594,7 @@ async fn conversation_route(
             agent: agent_name,
             agent_id: agent_id_str,
             turns,
+            retrieval,
         }))
     })
     .await
@@ -8471,6 +8519,172 @@ pub(crate) mod tests {
                 old
             );
         });
+    }
+
+    #[test]
+    fn hybrid_search_fuses_cited_dense_ranges_reranks_and_never_widens_access() {
+        use anyagents_memory::protocol::{self, DenseHit, Reply, Request, Status};
+        use std::io::{BufRead, Write as _};
+        let dir = crate::test_tempdir();
+        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        let parent = store
+            .create_agent(anyagents_core::NewAgent::new("hybrid-parent", "spiron"))
+            .unwrap();
+        let peer = store
+            .create_agent(anyagents_core::NewAgent::new("hybrid-peer", "spiron"))
+            .unwrap();
+        let lexical = "{\"role\":\"user\",\"content\":\"lexicalneedle about deploys\"}\n";
+        let semantic = "{\"role\":\"assistant\",\"content\":\"完全唔同嘅講法 semantic target\"}\n";
+        let write = |agent: &Agent, text: &str| {
+            let path = dir
+                .path()
+                .join("agents")
+                .join(agent.id.as_str())
+                .join("transcripts/history.jsonl");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, text).unwrap();
+            path
+        };
+        let parent_file = write(&parent, &format!("{lexical}{semantic}"));
+        let peer_file = write(&peer, "{\"content\":\"peer secret target\"}\n");
+        let doc = |agent: &Agent, path: &std::path::Path, seq: u64| {
+            format!(
+                "transcript:{}:{}:{seq}",
+                agent.id,
+                anyagents_core::learned_memory::sha256(path.as_os_str().as_encoded_bytes())
+            )
+        };
+        let cite = |document_id: String, agent: &Agent, offset: usize, text: &str| DenseHit {
+            document_id,
+            agent_id: agent.id.to_string(),
+            offset: offset as u64,
+            length: text.len() as u64,
+            sha256: anyagents_core::learned_memory::sha256(text.as_bytes()),
+            score: 0.9,
+        };
+        let target = semantic.find("semantic target").unwrap() + lexical.len();
+        let hits = vec![
+            cite(
+                doc(&parent, &parent_file, 2),
+                &parent,
+                target,
+                "semantic target",
+            ),
+            // Another owner's document, a range outside its document and a
+            // range whose bytes do not match: none may surface.
+            cite(doc(&peer, &peer_file, 1), &peer, 13, "peer secret"),
+            cite(doc(&parent, &parent_file, 1), &parent, 0, &"x".repeat(9999)),
+            DenseHit {
+                sha256: "0".repeat(64),
+                ..cite(doc(&parent, &parent_file, 1), &parent, 1, "\"role")
+            },
+        ];
+        let listener =
+            std::os::unix::net::UnixListener::bind(protocol::socket_path(dir.path())).unwrap();
+        let seen = Arc::new(Mutex::new(Vec::<Request>::new()));
+        let recorded = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let stream = stream.unwrap();
+                let mut line = String::new();
+                std::io::BufReader::new(&stream)
+                    .read_line(&mut line)
+                    .unwrap();
+                let request = protocol::decode_request(line.trim()).unwrap();
+                recorded.lock().unwrap().push(request.clone());
+                let reply = match request {
+                    Request::Search { .. } => Reply::Search {
+                        hits: hits.clone(),
+                        status: Status::default(),
+                    },
+                    // The cross-encoder prefers the semantic answer.
+                    Request::Rerank { passages, .. } => Reply::Rerank {
+                        scores: passages
+                            .iter()
+                            .map(|p| {
+                                if p.contains("semantic target") {
+                                    5.0
+                                } else {
+                                    -1.0
+                                }
+                            })
+                            .collect(),
+                    },
+                    Request::Status => Reply::Status {
+                        status: Status::default(),
+                    },
+                };
+                (&stream)
+                    .write_all(protocol::encode_reply(&Ok(reply)).as_bytes())
+                    .unwrap();
+            }
+        });
+        let state = AppState {
+            store: Arc::clone(&store),
+            health: HealthBoard::default(),
+            sign_in: Arc::new(Mutex::new(ProcessRunner)),
+            auth: auth::Mode::Trusted {
+                data_dir: dir.path().into(),
+            },
+            identity: Arc::new(ServingIdentity::capture()),
+            profiles: Default::default(),
+        };
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let principal = Principal::Agent {
+                agent_id: parent.id.clone(),
+                name: parent.name.clone(),
+            };
+            let Json(response) = conversation_route(
+                principal,
+                State(state.clone()),
+                AxumPath("all".into()),
+                Query(
+                    serde_json::from_value(
+                        serde_json::json!({"scope":"transcripts","query":"lexicalneedle"}),
+                    )
+                    .unwrap(),
+                ),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{}", e.message));
+            let retrieval = response.retrieval.clone().unwrap();
+            assert_eq!(
+                retrieval.stages,
+                vec!["lexical", "dense", "rerank"],
+                "{retrieval:?}"
+            );
+            assert!(retrieval.degraded.is_empty());
+            assert_eq!(
+                response.turns.len(),
+                2,
+                "{:?}",
+                response.turns.iter().map(|t| &t.text).collect::<Vec<_>>()
+            );
+            // Reranked first: the dense-only answer, cited to its exact bytes.
+            let first = &response.turns[0];
+            assert_eq!(first.text, "semantic target");
+            let window = first.window.as_ref().unwrap();
+            assert_eq!(
+                (window.offset, window.length),
+                (target as u64, "semantic target".len() as u64)
+            );
+            assert!(response.turns[1].text.contains("lexicalneedle"));
+            assert!(
+                response
+                    .turns
+                    .iter()
+                    .all(|t| !t.text.contains("peer secret"))
+            );
+        });
+        let requests = seen.lock().unwrap();
+        let Some(Request::Search { owners, .. }) = requests.first() else {
+            panic!("no dense search: {requests:?}");
+        };
+        assert_eq!(
+            owners,
+            &vec![parent.id.to_string()],
+            "only authorized owners reach the service"
+        );
     }
 
     #[test]

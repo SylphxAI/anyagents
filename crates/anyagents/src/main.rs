@@ -26,6 +26,7 @@ mod identity;
 mod install;
 mod mcp;
 mod mcp_config;
+mod memory_service;
 mod muse_config;
 mod opencode_config;
 mod operator;
@@ -620,6 +621,9 @@ enum Command {
     /// Run a local CLI harness inside a remote sandbox (`POST /v1/sandboxes/{id}/exec`) speaking `stream-json`.
     #[command(name = "sandbox-exec")]
     SandboxExec(sandbox_exec::SandboxExecArgs),
+    /// Dense retrieval and reranking over raw history, as its own process.
+    #[command(name = "memory-service")]
+    MemoryService(memory_service::MemoryServiceArgs),
 }
 
 #[derive(Subcommand)]
@@ -1491,6 +1495,7 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
         Command::Inspect { agent, limit, json } => inspect_cmd(&data, agent, limit, json),
         Command::CloudHarness(args) => cloud_harness::run(args),
         Command::SandboxExec(args) => sandbox_exec::run(args),
+        Command::MemoryService(args) => memory_service::run(&data, args),
     }
 }
 

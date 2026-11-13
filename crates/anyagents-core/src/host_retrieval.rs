@@ -18,6 +18,16 @@ use std::{
 
 pub const INDEX_FILE: &str = "host-history-index-v1.db";
 
+/// A raw byte range another retriever cites inside an indexed document:
+/// absolute offsets in the document's segment and the range's SHA-256.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CitedRange {
+    pub document_id: String,
+    pub offset: u64,
+    pub length: u64,
+    pub sha256: String,
+}
+
 /// ID and expected digest come from a search result; offsets are event-relative.
 pub struct HostRawRead<'a> {
     pub id: &'a str,
@@ -313,6 +323,88 @@ impl Store {
             // Return the matching bounded window, not an unbounded tool payload.
             // The whole-event coordinate remains available for explicit readback.
             let bytes = read_raw(&hit.window)?;
+            out.push((hit, bytes));
+        }
+        Ok(out)
+    }
+
+    /// Raw ranges another retriever cited (a dense index, for example),
+    /// resolved exactly as lexical hits are: only documents of the authorized
+    /// owners and scope that still match every structured filter of `query`,
+    /// with the cited range inside its document, re-checked under the owner's
+    /// lifecycle lock and redaction exclusions, and read back against the
+    /// range's own digest. A candidate failing any check is dropped. The
+    /// result keeps the cited order and returns the cited range as `window`.
+    pub fn resolve_host_ranges(
+        &self,
+        authorized: &[String],
+        scope: MemoryScope,
+        query: &HistorySearchQuery,
+        cited: &[CitedRange],
+    ) -> Result<Vec<(IndexHit, Vec<u8>)>, IndexError> {
+        let index_path = self.data_dir().join(INDEX_FILE);
+        if cited.is_empty() || !index_path.exists() {
+            return Ok(Vec::new());
+        }
+        let selected = query
+            .agent
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| *s != "*" && !s.eq_ignore_ascii_case("all"))
+            .map(|s| self.agent_by_name(s).map(|a| a.id.to_string()))
+            .transpose()
+            .map_err(store_error)?;
+        let visible: Vec<String> = authorized
+            .iter()
+            .filter(|id| selected.as_ref().is_none_or(|s| s == *id))
+            .cloned()
+            .collect();
+        let index = HostIndex::shared(&index_path)?;
+        let ids: Vec<String> = cited.iter().map(|c| c.document_id.clone()).collect();
+        let mut request = query.clone();
+        request.agent = None;
+        let allowed: HashMap<String, IndexHit> = index
+            .filter_documents(&visible, scope, &request, &ids)?
+            .into_iter()
+            .map(|hit| (hit.id.clone(), hit))
+            .collect();
+        let mut out = Vec::new();
+        for range in cited {
+            let Some(hit) = allowed.get(&range.document_id) else {
+                continue;
+            };
+            let end = range.offset.checked_add(range.length);
+            if range.length == 0
+                || range.offset < hit.raw.offset
+                || end.is_none_or(|end| end > hit.raw.offset + hit.raw.length)
+            {
+                continue;
+            }
+            let owner = crate::AgentId::parse(&hit.metadata.agent_id).map_err(store_error)?;
+            let _guard = self.lock_agent_lifecycle(&owner).map_err(store_error)?;
+            let Some(current) =
+                index.document(std::slice::from_ref(&hit.metadata.agent_id), scope, &hit.id)?
+            else {
+                continue;
+            };
+            if current.raw.sha256 != hit.raw.sha256
+                || self.is_host_path_redacted(&hit.metadata.agent_id, &hit.raw.segment)?
+            {
+                continue;
+            }
+            let window = crate::raw_segment::RawCoordinate {
+                segment: hit.raw.segment.clone(),
+                offset: range.offset,
+                length: range.length,
+                sha256: range.sha256.clone(),
+                seq: hit.raw.seq,
+            };
+            let Ok(bytes) = read_raw(&window) else {
+                continue;
+            };
+            let mut hit = hit.clone();
+            hit.window = window;
+            hit.lexical_score = 0.0;
             out.push((hit, bytes));
         }
         Ok(out)

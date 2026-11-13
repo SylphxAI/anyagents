@@ -21,6 +21,7 @@ anyagents-harness-muse = { path = "../anyagents-harness-muse" }
 anyagents-harness-codex = { path = "../anyagents-harness-codex" }
 anyagents-harness-opencode = { path = "../anyagents-harness-opencode" }
 anyagents-supervisor = { path = "../anyagents-supervisor" }
+anyagents-memory = { path = "../anyagents-memory", features = ["service"] }
 anyagents-tools = { path = "../anyagents-tools" }
 axum = { version = "0.8", features = ["json"] }
 bytes = "1"

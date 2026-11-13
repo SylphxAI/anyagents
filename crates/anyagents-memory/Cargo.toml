@@ -1,0 +1,37 @@
+[package]
+name = "anyagents-memory"
+version.workspace = true
+edition = "2024"
+license = "MIT"
+rust-version = "1.98"
+description = "Dense retrieval and reranking over raw agent history, as a service beside the AnyAgents kernel"
+
+[features]
+default = []
+# The service itself: local ONNX inference, the dense index and the offline
+# evaluation. Without it the crate is the protocol, its client and the fusion
+# the kernel uses.
+service = ["dep:ort", "dep:tokenizers", "dep:anyagents-installer", "dep:flate2", "dep:tar", "dep:libc"]
+
+[dependencies]
+anyagents-core = { path = "../anyagents-core" }
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+anyagents-installer = { path = "../anyagents-installer", optional = true }
+flate2 = { version = "1", optional = true }
+libc = { version = "0.2", optional = true }
+# ONNX Runtime is loaded at run time from the pinned, verified release
+# library: no build-time download and no linked copy.
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["load-dynamic", "std", "api-31"], optional = true }
+tar = { version = "0.4", default-features = false, optional = true }
+# Oniguruma for the pre-tokenizer regexes: the pure-Rust backend made
+# regex-heavy tokenizers the bottleneck of embedding.
+tokenizers = { version = "0.23", default-features = false, features = ["onig"], optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[package.metadata.cargo-machete]
+ignored = []

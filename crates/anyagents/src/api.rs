@@ -311,6 +311,21 @@ pub struct ConversationResponse {
     pub agent: String,
     pub agent_id: String,
     pub turns: Vec<ConversationTurnView>,
+    /// How a relevance search was ranked; absent for reads that rank nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retrieval: Option<RetrievalView>,
+}
+
+/// The ranking stages a relevance search ran. Every turn cites its raw record
+/// whichever stage found it.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct RetrievalView {
+    /// `lexical` (BM25), then `dense` and `rerank` when the memory service
+    /// answered.
+    pub stages: Vec<String>,
+    /// Why a stage that applies did not run.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub degraded: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]

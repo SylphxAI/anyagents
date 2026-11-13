@@ -847,7 +847,7 @@ impl HostIndex {
 
     /// Resolve an opaque document ID only within the host-authorized owner set.
     /// This lookup performs no filesystem reads and accepts no caller path.
-    pub(crate) fn document(
+    pub fn document(
         &self,
         visible: &[String],
         scope: MemoryScope,
@@ -915,7 +915,30 @@ impl HostIndex {
         scope: MemoryScope,
         query: &HistorySearchQuery,
     ) -> Result<Vec<IndexHit>, IndexError> {
-        self.search_in_segment(visible_agents, scope, query, None)
+        self.search_in_segment(visible_agents, scope, query, None, None)
+    }
+
+    /// Of the named documents, those of the authorized owners and scope that
+    /// match every structured filter of `query` (its text terms are not
+    /// applied): how another retriever's candidates meet the same rules as a
+    /// lexical hit. Ordering is left to the caller.
+    pub fn filter_documents(
+        &self,
+        visible_agents: &[String],
+        scope: MemoryScope,
+        query: &HistorySearchQuery,
+        ids: &[String],
+    ) -> Result<Vec<IndexHit>, IndexError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut filters = query.clone();
+        filters.query = None;
+        filters.queries.clear();
+        filters.radius = 0;
+        filters.sort = HistorySort::Oldest;
+        filters.limit = ids.len().min(200);
+        self.search_in_segment(visible_agents, scope, &filters, None, Some(ids))
     }
 
     fn search_in_segment(
@@ -924,6 +947,7 @@ impl HostIndex {
         scope: MemoryScope,
         query: &HistorySearchQuery,
         segment: Option<&Path>,
+        ids: Option<&[String]>,
     ) -> Result<Vec<IndexHit>, IndexError> {
         if visible_agents.is_empty() {
             return Ok(Vec::new());
@@ -931,6 +955,13 @@ impl HostIndex {
         let mut values: Vec<Value> = visible_agents.iter().cloned().map(Value::Text).collect();
         let placeholders = vec!["?"; values.len()].join(",");
         let mut where_sql = format!("d.agent_id IN ({placeholders})");
+        if let Some(ids) = ids {
+            where_sql.push_str(&format!(
+                " AND d.id IN ({})",
+                vec!["?"; ids.len()].join(",")
+            ));
+            values.extend(ids.iter().cloned().map(Value::Text));
+        }
         let terms: Vec<String> = query
             .query
             .iter()
@@ -1114,6 +1145,7 @@ impl HostIndex {
                     scope,
                     &neighbors,
                     Some(&hit.raw.segment),
+                    None,
                 )? {
                     // Sequence coordinates are local to one source.
                     if crate::host_sqlite::source_of(&neighbor.raw.segment)
