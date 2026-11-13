@@ -4,8 +4,12 @@
 //! wake (`every`), or event watch (`watch`: GitHub PR/check terminal state, Spiron
 //! promise state change pulled from the public API, or an AnyAgents agent going idle).
 //!
-//! Wakes fire only when the owning agent is idle and not quota-blocked.
-//! A missed wake never fires twice, and cancelling a schedule takes effect immediately.
+//! A due tick or a triggered watch is written to the owner's mailbox at once, like
+//! any other message. Mailbox delivery alone decides when the owner sees it: it is
+//! steered into a running turn, or held while the owner is paused or quota-blocked
+//! and delivered on resume. A schedule adds no new tick while its previous one is
+//! still undelivered, so missed recurring ticks coalesce into one. Cancelling a
+//! schedule takes effect immediately.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -566,8 +570,9 @@ fn initial_watch_baseline(
     }
 }
 
-/// Returns `Some(reason)` when the owning agent must NOT receive a scheduled wake
-/// right now (`"paused"`, `"quota_blocked"`, or `"busy"`), or `None` when idle and eligible.
+/// Returns `Some(reason)` when the agent cannot act on a turn-ownership nudge right
+/// now (`"paused"`, `"archived"`, `"quota_blocked"` or `"busy"`), or `None` when idle
+/// and eligible. Schedule wakes never consult it: they always enter the mailbox.
 pub fn agent_wake_block_reason(
     store: &Store,
     health: &HealthBoard,
@@ -580,39 +585,20 @@ pub fn agent_wake_block_reason(
     if agent.state == "archived" || crate::server::is_explicitly_archived(store.data_dir(), agent) {
         return Some("archived");
     }
+    // The typed reset deadline is the only quota authority: an error text that
+    // mentions a quota or rate limit says nothing once its deadline has passed.
     let cfg = anyagents_core::agent_config_dir(store.data_dir(), &agent.id);
-    let (session_quota, session_error) = if agent.harness == "claude-code" {
-        let (_, persisted_err) =
-            anyagents_harness_agy::detect_agy_session_quota_and_error(&cfg, now);
-        (
-            anyagents_harness_claude::detect_session_quota_reset_ms(&cfg, now),
-            persisted_err,
-        )
+    let session_quota = if agent.harness == "claude-code" {
+        anyagents_harness_claude::detect_session_quota_reset_ms(&cfg, now)
     } else {
-        anyagents_harness_agy::detect_agy_session_quota_and_error(&cfg, now)
+        anyagents_harness_agy::detect_agy_session_quota_and_error(&cfg, now).0
     };
-    let live = health.get(&agent.id);
-    let effective_quota = live
-        .as_ref()
-        .and_then(|l| l.quota_reset_at_ms)
+    let effective_quota = health
+        .get(&agent.id)
+        .and_then(|live| live.quota_reset_at_ms)
         .or(session_quota);
-    let effective_err = live
-        .as_ref()
-        .and_then(|l| l.last_error.clone())
-        .or(session_error);
     if effective_quota.is_some_and(|ms| ms > now) {
         return Some("quota_blocked");
-    }
-    if let Some(ref err) = effective_err {
-        let lower = err.to_ascii_lowercase();
-        if lower.contains("quota")
-            || lower.contains("rate limit")
-            || lower.contains("429")
-            || lower.contains("credit balance is too low")
-            || lower.contains("usage limit")
-        {
-            return Some("quota_blocked");
-        }
     }
     if is_agent_busy(store, health, agent, now) {
         return Some("busy");
@@ -654,7 +640,7 @@ pub fn is_agent_busy(store: &Store, health: &HealthBoard, agent: &Agent, now: i6
 /// Evaluate local timers and watches without issuing any external probe.
 /// This is called on its own one-second loop, including the startup tick.
 pub fn tick_local_schedules_once(store: &Store, health: &HealthBoard, now: i64) -> usize {
-    if let Err(err) = store.restore_skipped_at_schedules(now.saturating_sub(3_600_000)) {
+    if let Err(err) = store.restore_checks_completed_pr_watches() {
         eprintln!("Schedule recovery unavailable: {err}");
         return 0;
     }
@@ -883,7 +869,6 @@ fn tick_schedule_partition(store: &Store, health: &HealthBoard, now: i64, extern
         github::begin_cycle(&schedules, now);
     }
     let mut fired_count = 0;
-    let mut wake_blocks: HashMap<AgentId, Option<&'static str>> = HashMap::new();
     for sched in schedules {
         if (sched.kind == "at" || sched.kind == "every")
             && sched.next_fire_at_ms.is_none_or(|due| now < due)
@@ -909,32 +894,12 @@ fn tick_schedule_partition(store: &Store, health: &HealthBoard, now: i64, extern
             }
             continue;
         }
-        // Wakes admitted in this pass must not make later schedules for the
-        // same initially idle agent appear busy because of our own mailbox writes.
-        let block = *wake_blocks
-            .entry(agent.id.clone())
-            .or_insert_with(|| agent_wake_block_reason(store, health, &agent, now));
         match sched.kind.as_str() {
             "at" => {
                 let Some(due) = sched.next_fire_at_ms else {
                     continue;
                 };
                 if now < due {
-                    continue;
-                }
-                if let Some(reason) = block {
-                    // Preserve the due time and make the outstanding hold visible. A later
-                    // local tick delivers exactly once as soon as the owner is eligible.
-                    let observed = format!("deferred:{reason}");
-                    if sched.last_observed.as_deref() != Some(observed.as_str())
-                        && let Err(err) = store.update_schedule_watch_observation(
-                            &sched.id,
-                            sched.watch_baseline.as_deref(),
-                            Some(&observed),
-                        )
-                    {
-                        eprintln!("Schedule {} deferral write failed: {err}", sched.id);
-                    }
                     continue;
                 }
                 if deliver_scheduled_wake(
@@ -959,8 +924,12 @@ fn tick_schedule_partition(store: &Store, health: &HealthBoard, now: i64, extern
                 while next_due <= now {
                     next_due = next_due.saturating_add(interval);
                 }
-                if let Some(reason) = block {
-                    // Advance next_fire_at_ms past `now` without firing so missed ticks never queue or double-fire.
+                let Some(previous_pending) = previous_wake_pending(store, &agent, &sched) else {
+                    continue;
+                };
+                if previous_pending {
+                    // The undelivered tick already stands for this one; the owner
+                    // receives a single wake and the schedule moves to its next slot.
                     if let Err(err) = store.claim_schedule_tick(
                         &sched.id,
                         Some(due),
@@ -968,9 +937,9 @@ fn tick_schedule_partition(store: &Store, health: &HealthBoard, now: i64, extern
                         Some(next_due),
                         None,
                         None,
-                        Some(&format!("skipped:{reason}")),
+                        Some("coalesced"),
                     ) {
-                        eprintln!("Schedule {} skip write failed: {err}", sched.id);
+                        eprintln!("Schedule {} coalesce write failed: {err}", sched.id);
                     }
                     continue;
                 }
@@ -992,9 +961,17 @@ fn tick_schedule_partition(store: &Store, health: &HealthBoard, now: i64, extern
             }
             "watch" => {
                 let eval = evaluate_watch(store, health, &sched, now);
-                if block.is_some() {
-                    // Record latest observation while the owning agent is busy/paused without
-                    // consuming a terminal transition or mutating the baseline.
+                let previous_pending = if eval.triggered {
+                    let Some(pending) = previous_wake_pending(store, &agent, &sched) else {
+                        continue;
+                    };
+                    pending
+                } else {
+                    false
+                };
+                if previous_pending {
+                    // Record the latest observation without consuming the transition or
+                    // moving the baseline; it is written once the pending wake is taken.
                     if eval.observed.is_some()
                         && eval.observed != sched.last_observed
                         && let Err(err) = store.update_schedule_watch_observation(
@@ -1099,8 +1076,7 @@ fn claim_and_deliver_scheduled_wake(
             return Ok(false);
         };
         let agent = store.agent(&agent.id)?;
-        if agent.state == "paused"
-            || agent.state == "archived"
+        if agent.state == "archived"
             || crate::server::is_explicitly_archived(store.data_dir(), &agent)
         {
             return Ok(false);
@@ -1116,7 +1092,7 @@ fn claim_and_deliver_scheduled_wake(
             &agent.id,
             Incoming {
                 text: prompt.into(),
-                sender: Some(format!("schedule:{}", sched.id)),
+                sender: Some(schedule_sender(&sched.id)),
                 source_time_ms: Some(now),
                 source_key: Some(source_key.into()),
                 reply_to: None,
@@ -1138,6 +1114,23 @@ fn claim_and_deliver_scheduled_wake(
             false
         }
     }
+}
+
+/// Whether the schedule's previous wake still waits in the owner's mailbox, or
+/// `None` when the mailbox cannot be read (the tick then waits for a later pass).
+fn previous_wake_pending(store: &Store, agent: &Agent, sched: &AgentSchedule) -> Option<bool> {
+    match store.has_undelivered_message_from(&agent.id, &schedule_sender(&sched.id)) {
+        Ok(pending) => Some(pending),
+        Err(err) => {
+            eprintln!("Schedule {} mailbox state unavailable: {err}", sched.id);
+            None
+        }
+    }
+}
+
+/// Mailbox sender of every wake a schedule writes.
+fn schedule_sender(schedule_id: &str) -> String {
+    format!("schedule:{schedule_id}")
 }
 
 struct WatchEval {
@@ -1529,6 +1522,30 @@ mod tests {
     use anyagents_harness::{DeliveryMode, SteerSupport, TurnState};
     use anyagents_supervisor::LiveState;
 
+    fn publish_turn(
+        health: &HealthBoard,
+        agent_id: &AgentId,
+        turn_state: TurnState,
+        quota_reset_at_ms: Option<i64>,
+    ) {
+        health.publish(
+            agent_id,
+            LiveState {
+                process_alive: true,
+                turn_state,
+                delivery_mode: DeliveryMode::Steer,
+                steer_support: SteerSupport::Yes,
+                quota_reset_at_ms,
+                restart_at_ms: None,
+                pid: None,
+                live_harness: None,
+                live_model: None,
+                process_started_at_ms: Some(1000),
+                last_error: quota_reset_at_ms.map(|_| "quota exceeded".to_string()),
+            },
+        );
+    }
+
     #[test]
     fn parses_durations_and_watch_specs() {
         assert_eq!(parse_duration_ms("1m").unwrap(), 60_000);
@@ -1680,8 +1697,8 @@ mod tests {
     }
 
     #[test]
-    fn same_agent_ready_local_watches_fire_together_unless_initially_blocked() {
-        for blocked in [false, true] {
+    fn same_agent_ready_local_watches_enter_mailbox_together_even_when_paused() {
+        for paused in [false, true] {
             let dir = tempfile::tempdir().unwrap();
             let store = Store::open(dir.path().join("state.db")).unwrap();
             let health = HealthBoard::default();
@@ -1714,20 +1731,16 @@ mod tests {
                     })
                     .unwrap();
             }
-            if blocked {
+            if paused {
                 store.set_agent_state(&owner.id, "paused").unwrap();
             }
             let fired = tick_local_schedules_once(&store, &health, anyagents_core::now_ms());
-            assert_eq!(fired, if blocked { 0 } else { 3 });
+            assert_eq!(fired, 3);
             let inbox = store.inbox(&owner.id, None).unwrap();
             assert_eq!(inbox.len(), fired);
             let schedules = store.list_schedules(Some(&owner.id), false).unwrap();
             assert_eq!(schedules.len(), 3);
-            assert!(
-                schedules
-                    .iter()
-                    .all(|s| s.state == if blocked { "active" } else { "fired" })
-            );
+            assert!(schedules.iter().all(|s| s.state == "fired"));
             assert_eq!(
                 tick_local_schedules_once(&store, &health, anyagents_core::now_ms()),
                 0
@@ -1775,13 +1788,13 @@ mod tests {
     }
 
     #[test]
-    fn overdue_at_records_busy_and_paused_deferrals_until_fired() {
+    fn overdue_at_enters_mailbox_while_owner_busy_or_paused() {
         for reason in ["busy", "paused"] {
             let dir = tempfile::tempdir().unwrap();
             let db = dir.path().join("state.db");
             let store = Store::open(&db).unwrap();
             let owner = store
-                .create_agent(NewAgent::new("deferred-owner", "codex"))
+                .create_agent(NewAgent::new("held-owner", "codex"))
                 .unwrap();
             let now = anyagents_core::now_ms();
             let due = now - 1000;
@@ -1790,7 +1803,7 @@ mod tests {
                     agent_id: owner.id.clone(),
                     kind: "at".into(),
                     spec: "past".into(),
-                    prompt: "deferred wake".into(),
+                    prompt: "held wake".into(),
                     interval_ms: None,
                     next_fire_at_ms: Some(due),
                     watch_baseline: None,
@@ -1800,54 +1813,34 @@ mod tests {
             if reason == "paused" {
                 store.set_agent_state(&owner.id, "paused").unwrap();
             } else {
-                health.publish(
-                    &owner.id,
-                    LiveState {
-                        process_alive: true,
-                        turn_state: TurnState::InTurn,
-                        delivery_mode: DeliveryMode::Steer,
-                        steer_support: SteerSupport::Yes,
-                        quota_reset_at_ms: None,
-                        restart_at_ms: None,
-                        pid: None,
-                        live_harness: Some("codex".into()),
-                        live_model: None,
-                        process_started_at_ms: Some(now),
-                        last_error: None,
-                    },
-                );
+                publish_turn(&health, &owner.id, TurnState::InTurn, None);
             }
-            for at in [now, now + 1000] {
-                assert_eq!(tick_local_schedules_once(&store, &health, at), 0);
-                let saved = store.list_schedules(Some(&owner.id), false).unwrap();
-                assert_eq!(saved[0].state, "active");
-                assert_eq!(saved[0].next_fire_at_ms, Some(due));
-                assert_eq!(saved[0].last_fired_at_ms, None);
-                assert_eq!(saved[0].last_observed, Some(format!("deferred:{reason}")));
-                assert!(store.inbox(&owner.id, None).unwrap().is_empty());
-            }
-            // The visible reason is durable; an independent store sees it too.
-            drop(store);
-            let store = Store::open(&db).unwrap();
             assert_eq!(
-                store.list_schedules(Some(&owner.id), false).unwrap()[0].last_observed,
-                Some(format!("deferred:{reason}"))
+                tick_local_schedules_once(&store, &health, now),
+                1,
+                "{reason}"
             );
-            store.set_agent_running(&owner.id, "/work").unwrap();
-            let idle = HealthBoard::default();
-            assert_eq!(tick_local_schedules_once(&store, &idle, now + 2000), 1);
             let saved = store.list_schedules(Some(&owner.id), false).unwrap();
             assert_eq!(saved[0].state, "fired");
             assert_eq!(saved[0].last_observed.as_deref(), Some("fired"));
-            assert_eq!(saved[0].last_fired_at_ms, Some(now + 2000));
-            assert_eq!(store.inbox(&owner.id, None).unwrap().len(), 1);
-            assert_eq!(tick_local_schedules_once(&store, &idle, now + 3000), 0);
+            assert_eq!(saved[0].last_fired_at_ms, Some(now));
+            let inbox = store.inbox(&owner.id, None).unwrap();
+            assert_eq!(inbox.len(), 1);
+            assert_eq!(inbox[0].text, "held wake");
+            // The mailbox, not the scheduler, holds it for a paused owner.
+            if reason == "paused" {
+                assert_eq!(store.agent(&owner.id).unwrap().state, "paused");
+            }
+            assert_eq!(tick_local_schedules_once(&store, &health, now + 1000), 0);
+            drop(store);
+            let store = Store::open(&db).unwrap();
+            assert_eq!(tick_local_schedules_once(&store, &health, now + 2000), 0);
             assert_eq!(store.inbox(&owner.id, None).unwrap().len(), 1);
         }
     }
 
     #[test]
-    fn local_schedule_watch_fires_with_idle_delivery_loop_lock() {
+    fn local_schedule_watch_fires_with_delivery_loop_lock_held() {
         for harness in ["agy", "claude-code", "codex", "opencode", "muse", "omp"] {
             let dir = tempfile::tempdir().unwrap();
             let store = Store::open(dir.path().join("state.db")).unwrap();
@@ -1886,17 +1879,11 @@ mod tests {
             .unwrap();
             assert_eq!(tick_schedules_once(&store, &health, now), 0);
             std::fs::write(&path, "after with different length").unwrap();
+            // A turn in progress does not hold the wake back: it enters the mailbox.
             live.turn_state = TurnState::InTurn;
-            health.publish(&owner.id, live.clone());
-            assert!(is_agent_busy(&store, &health, &owner, now));
-            assert_eq!(tick_schedules_once(&store, &health, now + 1000), 0);
-            assert_eq!(
-                store.list_schedules(Some(&owner.id), true).unwrap().len(),
-                1
-            );
-            live.turn_state = TurnState::Idle;
             health.publish(&owner.id, live);
-            assert_eq!(tick_schedules_once(&store, &health, now + 2000), 1);
+            assert!(is_agent_busy(&store, &health, &owner, now));
+            assert_eq!(tick_schedules_once(&store, &health, now + 1000), 1);
             let inbox = store.inbox(&owner.id, None).unwrap();
             assert_eq!(inbox.len(), 1);
             assert_eq!(inbox[0].text, "file changed");
@@ -1936,7 +1923,7 @@ mod tests {
     }
 
     #[test]
-    fn watch_schedule_defers_while_owner_busy_and_fires_when_idle() {
+    fn watch_schedule_enters_mailbox_while_owner_busy() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let health = HealthBoard::default();
@@ -1949,7 +1936,7 @@ mod tests {
             .unwrap();
         store.set_agent_running(&child.id, "/work").unwrap();
 
-        let _sched = create_agent_schedule(
+        create_agent_schedule(
             &store,
             &health,
             &owner,
@@ -1960,56 +1947,26 @@ mod tests {
         )
         .unwrap();
 
-        // While owner is busy (InTurn), even though worker-sub is idle, the one-shot watch
-        // is deferred rather than swallowed as `skipped:busy`.
-        health.publish(
-            &owner.id,
-            LiveState {
-                process_alive: true,
-                turn_state: TurnState::InTurn,
-                delivery_mode: DeliveryMode::Steer,
-                steer_support: SteerSupport::Yes,
-                quota_reset_at_ms: None,
-                restart_at_ms: None,
-                pid: None,
-                live_harness: Some("codex".to_string()),
-                live_model: None,
-                process_started_at_ms: Some(1000),
-                last_error: None,
-            },
-        );
+        // The owner is mid-turn; the triggered watch is written to its mailbox
+        // at once, where delivery steers it into the running turn.
+        publish_turn(&health, &owner.id, TurnState::InTurn, None);
         let now = anyagents_core::now_ms();
-        assert_eq!(tick_schedules_once(&store, &health, now), 0);
-        assert_eq!(store.inbox(&owner.id, None).unwrap().len(), 0);
-        let active = store.list_schedules(Some(&owner.id), true).unwrap();
-        assert_eq!(active.len(), 1);
-        assert_eq!(active[0].state, "active");
-
-        // Once owner finishes its turn and is Idle, the watch fires and wakes the owner.
-        health.publish(
-            &owner.id,
-            LiveState {
-                process_alive: true,
-                turn_state: TurnState::Idle,
-                delivery_mode: DeliveryMode::Steer,
-                steer_support: SteerSupport::Yes,
-                quota_reset_at_ms: None,
-                restart_at_ms: None,
-                pid: None,
-                live_harness: Some("codex".to_string()),
-                live_model: None,
-                process_started_at_ms: Some(1000),
-                last_error: None,
-            },
-        );
-        assert_eq!(tick_schedules_once(&store, &health, now + 5_000), 1);
+        assert_eq!(tick_schedules_once(&store, &health, now), 1);
         let inbox = store.inbox(&owner.id, None).unwrap();
         assert_eq!(inbox.len(), 1);
         assert_eq!(inbox[0].text, "subagent finished");
+        assert!(
+            store
+                .list_schedules(Some(&owner.id), true)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(tick_schedules_once(&store, &health, now + 5_000), 0);
+        assert_eq!(store.inbox(&owner.id, None).unwrap().len(), 1);
     }
 
     #[test]
-    fn positive_and_negative_schedule_wakes_respect_busy_quota_and_cancel() {
+    fn every_ticks_reach_idle_busy_and_quota_blocked_owners_until_cancel() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let health = HealthBoard::default();
@@ -2017,8 +1974,13 @@ mod tests {
             .create_agent(NewAgent::new("owner-opencode", "opencode"))
             .unwrap();
         store.set_agent_running(&owner.id, "/work").unwrap();
+        let next_due = |store: &Store| {
+            store.list_schedules(Some(&owner.id), true).unwrap()[0]
+                .next_fire_at_ms
+                .unwrap()
+        };
 
-        // 1. Positive test: idle OpenCode owner schedules a 1-minute wake and receives 1 prompt.
+        // Idle owner: a 1-minute schedule writes one wake when due.
         let sched = create_agent_schedule(
             &store,
             &health,
@@ -2032,108 +1994,150 @@ mod tests {
         let due = sched.next_fire_at_ms.unwrap();
         assert_eq!(tick_schedules_once(&store, &health, due - 1), 0);
         assert_eq!(store.inbox(&owner.id, None).unwrap().len(), 0);
-
         assert_eq!(tick_schedules_once(&store, &health, due), 1);
         let inbox = store.inbox(&owner.id, None).unwrap();
         assert_eq!(inbox.len(), 1);
         assert_eq!(inbox[0].text, "run outcome loop");
-
-        // Consume turn 1 so owner is idle again
+        assert_eq!(next_due(&store), due + 60_000);
         store.note_delivered(&owner.id, 1).unwrap();
         store.note_turn_completed(&owner.id).unwrap();
 
-        // 2. Negative test: busy owner gets NO wake, and missed wake never fires twice.
-        let next_due = store.list_schedules(Some(&owner.id), true).unwrap()[0]
-            .next_fire_at_ms
-            .unwrap();
-        health.publish(
-            &owner.id,
-            LiveState {
-                process_alive: true,
-                turn_state: TurnState::InTurn,
-                delivery_mode: DeliveryMode::Steer,
-                steer_support: SteerSupport::Yes,
-                quota_reset_at_ms: None,
-                restart_at_ms: None,
-                pid: None,
-                live_harness: Some("opencode".to_string()),
-                live_model: None,
-                process_started_at_ms: Some(1000),
-                last_error: None,
-            },
-        );
-        assert_eq!(tick_schedules_once(&store, &health, next_due), 0);
-        assert_eq!(store.inbox(&owner.id, None).unwrap().len(), 1);
+        // Busy owner: the tick is written to the mailbox for steering, exactly once.
+        publish_turn(&health, &owner.id, TurnState::InTurn, None);
+        let busy_due = next_due(&store);
+        assert_eq!(tick_schedules_once(&store, &health, busy_due), 1);
+        assert_eq!(tick_schedules_once(&store, &health, busy_due + 5_000), 0);
+        let inbox = store.inbox(&owner.id, None).unwrap();
+        assert_eq!(inbox.len(), 2);
+        assert_eq!(inbox[1].text, "run outcome loop");
+        let saved = &store.list_schedules(Some(&owner.id), true).unwrap()[0];
+        assert_eq!(saved.last_observed.as_deref(), Some("fired"));
+        assert_eq!(saved.next_fire_at_ms, Some(busy_due + 60_000));
+        store.note_delivered(&owner.id, 2).unwrap();
 
-        // Even when owner becomes idle 5s later, the missed wake does NOT fire late.
-        health.publish(
+        // Quota-blocked owner: the tick still enters the mailbox; delivery holds it.
+        let quota_due = next_due(&store);
+        publish_turn(
+            &health,
             &owner.id,
-            LiveState {
-                process_alive: true,
-                turn_state: TurnState::Idle,
-                delivery_mode: DeliveryMode::Steer,
-                steer_support: SteerSupport::Yes,
-                quota_reset_at_ms: None,
-                restart_at_ms: None,
-                pid: None,
-                live_harness: Some("opencode".to_string()),
-                live_model: None,
-                process_started_at_ms: Some(1000),
-                last_error: None,
-            },
+            TurnState::Idle,
+            Some(quota_due + 3_600_000),
         );
-        assert_eq!(tick_schedules_once(&store, &health, next_due + 5_000), 0);
-        assert_eq!(store.inbox(&owner.id, None).unwrap().len(), 1);
+        assert_eq!(tick_schedules_once(&store, &health, quota_due), 1);
+        assert_eq!(store.inbox(&owner.id, None).unwrap().len(), 3);
 
-        // 3. Negative test: quota-blocked owner gets NO wake.
-        let third_due = store.list_schedules(Some(&owner.id), true).unwrap()[0]
-            .next_fire_at_ms
-            .unwrap();
-        health.publish(
-            &owner.id,
-            LiveState {
-                process_alive: true,
-                turn_state: TurnState::Idle,
-                delivery_mode: DeliveryMode::Steer,
-                steer_support: SteerSupport::Yes,
-                quota_reset_at_ms: Some(third_due + 3_600_000),
-                restart_at_ms: None,
-                pid: None,
-                live_harness: Some("opencode".to_string()),
-                live_model: None,
-                process_started_at_ms: Some(1000),
-                last_error: Some("quota exceeded".to_string()),
-            },
-        );
-        assert_eq!(tick_schedules_once(&store, &health, third_due), 0);
-        assert_eq!(store.inbox(&owner.id, None).unwrap().len(), 1);
-
-        // 4. Negative test: none after cancel.
-        health.publish(
-            &owner.id,
-            LiveState {
-                process_alive: true,
-                turn_state: TurnState::Idle,
-                delivery_mode: DeliveryMode::Steer,
-                steer_support: SteerSupport::Yes,
-                quota_reset_at_ms: None,
-                restart_at_ms: None,
-                pid: None,
-                live_harness: Some("opencode".to_string()),
-                live_model: None,
-                process_started_at_ms: Some(1000),
-                last_error: None,
-            },
-        );
-        let fourth_due = store.list_schedules(Some(&owner.id), true).unwrap()[0]
-            .next_fire_at_ms
-            .unwrap();
+        // Cancelled: nothing more.
+        publish_turn(&health, &owner.id, TurnState::Idle, None);
+        store.note_delivered(&owner.id, 3).unwrap();
+        let cancelled_due = next_due(&store);
         assert_eq!(
             store.cancel_schedule(Some(&owner.id), &sched.id).unwrap(),
             1
         );
-        assert_eq!(tick_schedules_once(&store, &health, fourth_due + 1_000), 0);
-        assert_eq!(store.inbox(&owner.id, None).unwrap().len(), 1);
+        assert_eq!(
+            tick_schedules_once(&store, &health, cancelled_due + 1_000),
+            0
+        );
+        assert_eq!(store.inbox(&owner.id, None).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn expired_quota_deadline_with_stale_rate_limit_text_is_not_blocked() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let health = HealthBoard::default();
+        let owner = store
+            .create_agent(NewAgent::new("recovered-owner", "codex"))
+            .unwrap();
+        store.set_agent_running(&owner.id, "/work").unwrap();
+        let now = anyagents_core::now_ms();
+        let mut live = LiveState {
+            process_alive: true,
+            turn_state: TurnState::Idle,
+            delivery_mode: DeliveryMode::Steer,
+            steer_support: SteerSupport::Yes,
+            quota_reset_at_ms: Some(now - 1_000),
+            restart_at_ms: None,
+            pid: None,
+            live_harness: None,
+            live_model: None,
+            process_started_at_ms: Some(1000),
+            last_error: Some("HTTP 429: rate limit, quota exceeded".into()),
+        };
+        health.publish(&owner.id, live.clone());
+        let owner = store.agent(&owner.id).unwrap();
+        assert_eq!(agent_wake_block_reason(&store, &health, &owner, now), None);
+        live.quota_reset_at_ms = Some(now + 60_000);
+        health.publish(&owner.id, live.clone());
+        assert_eq!(
+            agent_wake_block_reason(&store, &health, &owner, now),
+            Some("quota_blocked")
+        );
+        live.quota_reset_at_ms = Some(now - 1_000);
+        health.publish(&owner.id, live);
+
+        let sched = create_agent_schedule(
+            &store,
+            &health,
+            &owner,
+            None,
+            Some("1m"),
+            None,
+            "recovered check",
+        )
+        .unwrap();
+        let due = sched.next_fire_at_ms.unwrap();
+        assert_eq!(tick_schedules_once(&store, &health, due), 1);
+        let inbox = store.inbox(&owner.id, None).unwrap();
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].text, "recovered check");
+    }
+
+    #[test]
+    fn long_pause_leaves_one_pending_every_tick() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let health = HealthBoard::default();
+        let owner = store
+            .create_agent(NewAgent::new("paused-owner", "codex"))
+            .unwrap();
+        store.set_agent_running(&owner.id, "/work").unwrap();
+        let sched = create_agent_schedule(
+            &store,
+            &health,
+            &owner,
+            None,
+            Some("1m"),
+            None,
+            "hourly check",
+        )
+        .unwrap();
+        let due = sched.next_fire_at_ms.unwrap();
+        store.set_agent_state(&owner.id, "paused").unwrap();
+
+        // A thousand intervals pass while the owner is paused: one wake waits.
+        let mut fired = 0;
+        for step in 0..1_000 {
+            fired += tick_schedules_once(&store, &health, due + step * 60_000);
+        }
+        assert_eq!(fired, 1);
+        let inbox = store.inbox(&owner.id, None).unwrap();
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].text, "hourly check");
+        let saved = &store.list_schedules(Some(&owner.id), true).unwrap()[0];
+        assert_eq!(saved.last_observed.as_deref(), Some("coalesced"));
+        assert_eq!(saved.last_fired_at_ms, Some(due));
+        let resume_at = due + 999 * 60_000;
+        assert_eq!(saved.next_fire_at_ms, Some(resume_at + 60_000));
+
+        // Resume: the mailbox delivers the one pending tick, and the next slot
+        // after it writes exactly one new wake.
+        store.set_agent_running(&owner.id, "/work").unwrap();
+        store.note_delivered(&owner.id, 1).unwrap();
+        assert_eq!(tick_schedules_once(&store, &health, resume_at + 30_000), 0);
+        assert_eq!(tick_schedules_once(&store, &health, resume_at + 60_000), 1);
+        assert_eq!(tick_schedules_once(&store, &health, resume_at + 61_000), 0);
+        assert_eq!(store.inbox(&owner.id, None).unwrap().len(), 2);
     }
 
     #[test]
