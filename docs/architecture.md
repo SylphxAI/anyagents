@@ -510,7 +510,7 @@ Each row keeps the harness, model, role and profile the agent ran with. `skill_r
 ## Security model
 
 - The API listens on a Unix socket readable only by the user. A TCP listener is opt-in and requires a bearer token.
-- Each keeper listens on `<data>/keepers/<instance>/s`, in a `0700` directory, and closes any connection whose peer runs as another uid; a harness, which runs as its seat, cannot reach it. A harness's launch, environment included, reaches its keeper through a pipe and is never written to disk.
+- Each keeper listens on `<data>/keepers/<instance>/s`, in a directory that must be the server user's own with mode `0700`, and refuses (with an explicit `forbidden`) a peer of another uid; a harness, which runs as its seat, cannot reach it. Only the keeper's current owner, the server that took it over last, may act on it. A harness's launch, environment included, reaches its keeper through a pipe and is never written to disk. A recorded pid is signalled only when its boot id, pid namespace and start time prove it the recorded process.
 - Each agent's MCP capability is scoped to that agent, and minted fresh for each of its instances; the last one stops working at once.
 - The operator's authority is its own token, never an agent's.
 - Secrets (channel tokens, API keys, the capability itself) live in the OS keychain or a 0600 file, never in the database, logs, tool arguments or usage records.
