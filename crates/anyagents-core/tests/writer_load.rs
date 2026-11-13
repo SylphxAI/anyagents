@@ -49,13 +49,13 @@ fn usage(agent_id: &anyagents_core::AgentId) -> NewUsage {
 
 /// Descriptors this process holds on `file` opened for writing. SQLite opens
 /// a read-only connection's file `O_RDONLY`, so this counts read-write
-/// connections.
-fn read_write_descriptors(file: &Path) -> usize {
+/// connections. `None` where the platform has no `/proc/self/fd`.
+fn read_write_descriptors(file: &Path) -> Option<usize> {
     // Compare inodes, not link text: /proc may render a live file's link
     // differently, and a replaced file must not count.
     let file = std::fs::metadata(file).unwrap();
-    std::fs::read_dir("/proc/self/fd")
-        .unwrap()
+    let fds = std::fs::read_dir("/proc/self/fd").ok()?;
+    let count = fds
         .filter_map(Result::ok)
         .filter(|entry| {
             std::fs::metadata(entry.path())
@@ -70,7 +70,8 @@ fn read_write_descriptors(file: &Path) -> usize {
                 .filter_map(|flags| i64::from_str_radix(flags.trim(), 8).ok())
                 .any(|flags| flags & i64::from(libc::O_ACCMODE) == i64::from(libc::O_RDWR))
         })
-        .count()
+        .count();
+    Some(count)
 }
 
 /// The external writer. Run as a child of the test below; a no-op otherwise.
@@ -167,7 +168,7 @@ fn hundred_actors_and_an_external_writer_never_see_a_lock_error() {
         start.wait();
         // Sample this process's read-write descriptors while the actors run.
         let sampler = scope.spawn(|| {
-            let mut most = 0;
+            let mut most = None;
             while !done.load(Ordering::Relaxed) {
                 most = most.max(read_write_descriptors(&db));
                 std::thread::sleep(Duration::from_millis(5));
@@ -192,8 +193,13 @@ fn hundred_actors_and_an_external_writer_never_see_a_lock_error() {
     assert!(stdout.contains("external writes:"), "{stdout}");
 
     assert_eq!(failures.load(Ordering::Relaxed), 0);
-    assert_eq!(most_writers, 1, "one read-write connection in this process");
-    assert_eq!(read_write_descriptors(&db), 1);
+    // Descriptor counts need /proc; elsewhere the lock-error checks stand alone.
+    if let Some(most) = most_writers {
+        assert_eq!(most, 1, "one read-write connection in this process");
+    }
+    if let Some(count) = read_write_descriptors(&db) {
+        assert_eq!(count, 1);
+    }
     for id in &agents {
         assert_eq!(setup.delivered_cursor(id).unwrap(), ops as i64);
         assert_eq!(setup.list_usage(Some(id)).unwrap().len(), ops);

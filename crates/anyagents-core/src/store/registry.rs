@@ -387,13 +387,13 @@ mod tests {
 
     /// Descriptors this process holds on `file` opened for writing. SQLite
     /// opens a read-only connection's file `O_RDONLY`, so this counts
-    /// read-write connections.
-    fn read_write_descriptors(file: &Path) -> usize {
+    /// read-write connections. `None` where the platform has no `/proc/self/fd`.
+    fn read_write_descriptors(file: &Path) -> Option<usize> {
         // Compare inodes, not link text: /proc may render a live file's link
         // differently, and a replaced file must not count.
         let file = std::fs::metadata(file).unwrap();
-        std::fs::read_dir("/proc/self/fd")
-            .unwrap()
+        let fds = std::fs::read_dir("/proc/self/fd").ok()?;
+        let count = fds
             .filter_map(Result::ok)
             .filter(|entry| {
                 std::fs::metadata(entry.path())
@@ -408,7 +408,8 @@ mod tests {
                     .filter_map(|flags| i64::from_str_radix(flags.trim(), 8).ok())
                     .any(|flags| flags & i64::from(libc::O_ACCMODE) == i64::from(libc::O_RDWR))
             })
-            .count()
+            .count();
+        Some(count)
     }
 
     /// Every descriptor under `dir` with its open flags, for failure messages.
@@ -462,7 +463,9 @@ mod tests {
             );
         }
         assert_eq!(first.list_agents().unwrap().len(), handles.len());
-        assert_eq!(read_write_descriptors(&db), 1);
+        if let Some(count) = read_write_descriptors(&db) {
+            assert_eq!(count, 1);
+        }
         // A handle keeps its own spelling of the path and its own data dir.
         assert_eq!(handles[1].data_dir(), link.as_path());
     }
@@ -491,13 +494,15 @@ mod tests {
                 .iter()
                 .all(|s| Arc::ptr_eq(&s.shared, &stores[0].shared))
         );
-        assert_eq!(
-            read_write_descriptors(&db),
-            1,
-            "file ino {}: {:?}",
-            std::fs::metadata(&db).unwrap().ino(),
-            descriptors_under(dir.path())
-        );
+        if let Some(count) = read_write_descriptors(&db) {
+            assert_eq!(
+                count,
+                1,
+                "file ino {}: {:?}",
+                std::fs::metadata(&db).unwrap().ino(),
+                descriptors_under(dir.path())
+            );
+        }
     }
 
     #[test]
@@ -512,7 +517,9 @@ mod tests {
         assert!(weak.upgrade().is_some(), "a live handle keeps the writer");
         drop(second);
         assert!(weak.upgrade().is_none(), "the last handle closes it");
-        assert_eq!(read_write_descriptors(&db), 0);
+        if let Some(count) = read_write_descriptors(&db) {
+            assert_eq!(count, 0);
+        }
         // Opening any path forgets entries whose handles are all gone.
         let other = crate::test_tempdir();
         let _other = Store::open(other.path().join("state.db")).unwrap();
