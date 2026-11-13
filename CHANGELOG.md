@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+- Raw history is the only source of truth for memory. LLM sleep consolidation,
+  which rewrote and deleted learned-memory topics through a hosted model, is
+  removed; the `memory` tool's `consolidate` action is now a deterministic
+  `reindex`.
+- `conversation` searches every harness's native history: Spiron's
+  `sessions.sqlite3`, OpenCode's `opencode.db` (tool parts included), Claude
+  Code subagents, Codex rollouts, AGY, Muse, OMP and Grok sessions, read
+  without ever creating a file beside a harness's store.
+- Hybrid retrieval: BM25 fused with dense candidates from a local multilingual
+  embedder and reranked by a local cross-encoder, run by the new
+  `anyagents memory-service` process. Every result cites its raw bytes; without
+  the service the server ranks lexically and reports it in `retrieval`.
 - Keep role labels methodology-neutral: roots and labelled children can self-archive
   and release idle processes under the same rules. Preserve legacy effective scopes
   on upgrade, default all new children to private, and retain browser profiles until

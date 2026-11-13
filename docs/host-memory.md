@@ -1,9 +1,88 @@
 # Host memory and history
 
 AnyAgents pins learned memory across harnesses and searches authorized learned
-facts, mailbox bodies and retained native history through `conversation`.
-Native transcript and runtime-state writers remain unchanged in this delivery;
-there is no dense model, embedding dependency or background inference service.
+facts, mailbox bodies and every harness's native history through
+`conversation`. Raw history is the only source of truth: apart from the
+audited [redaction operation](redaction.md), AnyAgents never rewrites,
+summarizes or deletes it, and every index over it is a rebuildable
+projection whose results cite the raw bytes they came from. Native transcript
+and runtime-state writers remain the harnesses' own.
+
+Retrieval is hybrid: BM25 over the host index, dense candidates from a local
+multilingual embedder fused by reciprocal rank, and a local cross-encoder
+reranking the fused head. The model work runs in a separate process,
+`anyagents memory-service`; without it the server ranks lexically and says so
+in each response.
+
+## Native history coverage
+
+The host index reads each harness's history where AnyAgents points the
+harness's configuration, below the agent root and never through a symlink:
+
+| Harness | Source | Format |
+| --- | --- | --- |
+| any | `transcripts/**` | JSONL written by AnyAgents; a malformed line fails the refresh |
+| Spiron | `config/sessions.sqlite3`, table `session_entries` | one event per row |
+| Spiron (before 2026-11-08) | `config/sylphx-transcript.jsonl` | JSONL |
+| Claude Code | `config/{,.claude/}projects/*/*.jsonl`, `projects/*/*/subagents/*.jsonl` | JSONL |
+| Codex | `config/sessions/**/*.jsonl` (`CODEX_HOME`) | JSONL, item under `payload` |
+| OpenCode | `config/data-home/opencode/opencode.db`, `config/.local/share/opencode/opencode.db`, table `session_message` | one message per row, tool parts included |
+| AGY | `config/.gemini/antigravity-cli/brain/*/.system_generated/logs/transcript_full.jsonl` | JSONL, time in `created_at` |
+| Muse | `config/data-home/muse/sessions/**/session.jsonl`, subagents included | JSONL frames |
+| OMP | `config/.omp/agent/sessions/*/*.jsonl` (`PI_CODING_AGENT_DIR`) | JSONL |
+| Grok | `config/.grok/sessions/*/*/chat_history.jsonl` | JSONL |
+
+History is read where its harness keeps it; AnyAgents writes no copy. Spiron's
+journal in `sessions.sqlite3` is its complete record, tool calls and results
+included; a copy of the headless stream written beside it would be a second,
+masked record that could disagree with the first. A `spiron-cloud` agent's
+history lives with the cloud service and is not on the host; only its mailbox
+is searchable here.
+
+A harness's own JSONL can carry a line its writer tore or concatenated; such a
+complete line is indexed as text with unknown metadata instead of failing the
+agent's search. AGY's `transcript.jsonl` and the `chunks/` copies duplicate
+`transcript_full.jsonl` and are not read; Muse's hidden `.msp-view-*`
+snapshots are not history. dsh writes zstd-compressed `session.jsonl.zstd`,
+which is not read until a raw coordinate can address bytes inside a compressed
+frame; no dsh agent exists today.
+
+A SQLite store is opened read-only. A reader of a WAL database creates the
+`-wal` and `-shm` files when they are absent, owned by the reader, which could
+leave the harness unable to open its own store; a store without both files is
+therefore read as immutable (no lock, no new file), and a store with a live
+writer is read through its WAL. A row's coordinate is
+`<database>/<table>/<rowid>` with offset 0, the row's length and SHA-256: a
+database is a regular file, so no real path collides with it. A refresh reads
+rows past the published rowid frontier, plus, for OpenCode, rows rewritten
+after the published `time_updated` mark, in one snapshot of the store. A
+replaced database, a lower frontier or a changed frontier row rebuilds the
+store; deleted rows remain published until hourly full verification and are
+refused at readback by their digest. A store with an unknown layout is not
+read. The walk stamps the store and its `-wal`, so new rows in the log are
+seen before a checkpoint touches the database file.
+
+## Learned memory
+
+Learned memory is what an agent chooses to write with the `memory` tool:
+topic files under `memory/`, and the `MEMORY.md` catalog AnyAgents rebuilds
+deterministically from them on every write (`memory` action `reindex` rebuilds
+it after an out-of-band edit). No model reads, merges, rewrites or deletes a
+topic.
+
+Sleep consolidation, which asked a hosted model every ten minutes per idle
+agent to upsert and delete topics from the last 30 mailbox turns, was removed
+rather than turned into a citation-backed note layer. Raw-history retrieval
+with dense retrieval and reranking ranks first against agentic memory systems,
+and even complete access to a transformed memory store trails raw evidence
+(arXiv:2610.30755); short working contexts lose little when raw history can be
+retrieved on demand (arXiv:2611.05306). The pass saw a clipped slice of the
+mailbox and none of the tool history, replaced the agent's own notes in place,
+and spent a paid model call per pass. A derived layer would need a generator
+model again and could only add staleness between it and the evidence.
+`memory/.sleep-state.json` files written by older builds are inert dotfiles,
+never indexed; an operator may delete them.
+
 
 ## Files and session boundaries
 
@@ -14,7 +93,7 @@ there is no dense model, embedding dependency or background inference service.
 | `skills/**` | Agent-authored overlay; shared global skills remain read-only |
 | `history/archive/**` | Reconciled progress pages; searchable history, never prompt memory |
 | `sessions/**` | Host generation, saved memory pins and vendor session aliases |
-| `config/*transcript*.jsonl`, retained transcript paths | Native history indexed in place; existing writer keeps ownership |
+| `transcripts/**`, harness history under `config/` | Native history indexed in place ([coverage](#native-history-coverage)); each writer keeps ownership |
 
 The rendered memory section, including its wrapper and visible truncation
 marker, is at most **150 lines and 4096 UTF-8 bytes**. All instruction mirrors
@@ -98,6 +177,137 @@ payload strings are discarded only in the derivative metadata projection; raw
 bytes and lexical coverage remain unchanged. Excessive tool-block metadata
 refuses and rolls back the source refresh rather than publishing a partial
 cursor. These fixtures are not captured vendor-runtime conformance evidence.
+
+## Hybrid retrieval and the memory service
+
+`anyagents memory-service` is a separate process beside `anyagents serve`. It
+reads the server's host index and raw sources read-only, writes only its own
+dense index (`<data>/memory-service/dense-v1.db`, rebuildable, never
+`state.db`), and answers on an owner-only socket
+(`<data>/memory-service.sock`, mode `0600`) with one newline-delimited JSON
+request and reply per connection:
+
+| Request | Reply |
+| --- | --- |
+| `search {query, owners, source?, since_ms?, until_ms?, limit}` | dense candidates: document id, owner, cited raw range (absolute offset, length, SHA-256), score |
+| `rerank {query, passages}` | one cross-encoder score per passage |
+| `status` | model pair, embedded and pending documents, vectors |
+
+The server decides access. It sends only the owners the caller may read, and
+resolves each candidate the way it resolves a lexical hit: the document must
+belong to an authorized owner and scope, match every structured filter of the
+request, still have the digest the candidate was built from, not be excluded by
+a pending redaction, and contain the cited range, whose bytes are read back and
+checked against the range's own SHA-256 under the owner's lifecycle lock. A
+candidate failing any check is dropped. Lexical and dense hits are fused by
+reciprocal rank (k = 60); a document found by both keeps its lexical window.
+The fused list is merged with mailbox results, and its first 20 turns are
+reordered by the cross-encoder. A relevance search's response carries
+`retrieval.stages` (`lexical`, `dense`, `rerank`) and, for a stage that did
+not run, `retrieval.degraded` with the reason. Search waits at most 3 s for
+the service and rerank 8 s; past that the server answers without the stage
+and says so. Reads in time order, range reads and neighbor expansion rank
+nothing and do not call the service.
+
+Mailbox rows are ranked lexically and by the reranker, not embedded: the
+messages a harness received and the `send` calls it made reach dense
+retrieval through that harness's own history.
+
+What is embedded: each host-index document's raw event is read through its
+verified coordinate; its JSON string values (not keys, ids, digests,
+timestamps or numbers; nested JSON strings are read for their own values) are
+packed into pieces of at most the model's token budget, up to 16 pieces per
+document, each piece citing the raw byte range of the values it holds. The
+rest of a very large event stays reachable lexically. Identical text is
+embedded once. Vectors are L2-normalised and stored as per-vector int8.
+
+The background embedder takes new documents first and then the backlog newest
+first; both marks commit with each document, so a restart resumes where it
+stopped. It runs on one thread at nice 19 by default (`--index-threads`,
+`--nice`); query embedding and reranking run on their own threads at normal
+priority (`--query-threads`). An idle embedder checks for new documents every
+30 s. Every 10 minutes it drops vectors of documents the host index no longer
+holds at the same digest, so removed, redacted or rewritten history leaves
+the dense index within that interval; until then the server's resolution
+step refuses such candidates.
+
+Models and runtime are pinned in `crates/anyagents-memory/src/pins.rs` by
+Hugging Face commit and per-file SHA-256, and ONNX Runtime 1.31.0 by the
+official release archive's SHA-256. `anyagents memory-service fetch`
+downloads and verifies them into `<data>/memory-service/models`; `serve`
+refuses to start unless every file matches its pin. ONNX Runtime is loaded at
+run time (`ort` with `load-dynamic`); the server binary links no model
+runtime.
+
+## Retrieval quality on real history
+
+`anyagents memory-service eval-sample --source <data> --agent <id>... --out <dir>`
+copies chosen agents' mailboxes out of `state.db`, opened read-only, and
+derives queries from the history itself: when the operator replies in
+Telegram to an earlier message, the reply without its quote is a later
+message that refers back to an earlier fact, and the quoted message (matched
+on normalized text, earlier in the same mailbox, ignoring other replies'
+quotes) is the document that answers it. `anyagents memory-service eval
+--sample <dir>` indexes the sample with the production host index and the
+production dense pipeline, searches only history before each query, and
+scores five rankings of the same candidates: BM25 alone, dense alone, their
+reciprocal-rank fusion, the fusion reranked (first 20), and BM25 reranked.
+Nothing in the live system is written. The same code runs as
+`cargo run -p anyagents-memory --features service --release --example
+memory-eval` for development.
+
+Results on 2026-11-13, from two lead agents whose operator talks to them in
+Telegram, mostly in Cantonese. Recall@k counts a query as answered when the
+quoted message is in the first k; MRR@10 and nDCG@10 use the same single
+relevant message. The reranker is `hs-rerank-1` throughout.
+
+5-day window: 6,941 messages, 170 queries (154 Cantonese, 5 Chinese, 11 English).
+
+| Ranking | 311M-r2: R@10 | MRR@10 | nDCG@10 | 97M-r2: R@10 | MRR@10 | nDCG@10 |
+| --- | --- | --- | --- | --- | --- | --- |
+| BM25 | 0.253 | 0.131 | 0.160 | 0.253 | 0.131 | 0.160 |
+| Dense | 0.294 | 0.134 | 0.172 | 0.235 | 0.106 | 0.136 |
+| Hybrid (RRF) | 0.324 | 0.149 | 0.190 | 0.288 | 0.138 | 0.173 |
+| BM25 + rerank | 0.265 | 0.147 | 0.174 | 0.265 | 0.147 | 0.174 |
+| Hybrid + rerank | **0.347** | **0.176** | **0.216** | 0.335 | 0.169 | 0.208 |
+
+10-day window: 13,656 messages, 380 queries (335 Cantonese, 16 Chinese, 29
+English).
+
+| Ranking | 97M-r2: R@10 | MRR@10 | nDCG@10 |
+| --- | --- | --- | --- |
+| BM25 | 0.226 | 0.114 | 0.139 |
+| Dense | 0.176 | 0.081 | 0.104 |
+| Hybrid (RRF) | 0.245 | 0.110 | 0.142 |
+| BM25 + rerank | 0.245 | 0.127 | 0.154 |
+| Hybrid + rerank | **0.300** | **0.146** | **0.182** |
+
+The absolute numbers are low because the task is hard and strictly scored: a
+short reply such as `點解又要再註冊多次嘅？` must find the one message it quoted
+among thousands of status reports on the same subjects, and another message
+carrying the same fact scores nothing. What the numbers show: hybrid
+retrieval with reranking beats BM25 alone at every cutoff, by about a third in
+MRR@10; fusion helps even when dense alone is weaker than BM25 (97M); the
+reranker adds most of the gain at the top ranks. With 170 queries a
+difference below about 0.03 is within noise. Reranking 20 passages took about
+1.2 s on five threads of a shared, loaded host.
+
+Embedding throughput in the same runs (model time per thread, nice 19, host
+load about 26 on 70 cores): 311M-r2 int8 437 tokens/s, 97M-r2 int8 about
+1,500 tokens/s. The dense index takes about 1.6 KB per 768-dimension vector
+and 1.2 KB per 384-dimension vector, indexes included.
+
+The default embedder is `granite-embedding-311m-multilingual-r2` (int8, IBM's
+ONNX export, Apache-2.0): it is the better dense retriever on this history
+(dense MRR@10 0.134 against 0.106) and keeps Cantonese-only characters whole,
+where the 97M model's pruned vocabulary breaks all 26 tested ones into bytes;
+the cost is about 3.4 times the CPU per token. The default reranker is
+`hs-rerank-1` (MIT, mmBERT-small, about 5 pairs/s per thread at 512 tokens),
+fast enough to rerank 20 passages inside the server's 8 s bound on two
+threads. Larger cross-encoders (`bge-reranker-v2-m3`, Apache-2.0) score
+higher on published multilingual benchmarks but take several seconds per
+query on CPU. Every candidate in `pins.rs` can be selected with
+`--embedder` / `--reranker` and evaluated with the same command.
 
 ## Incremental indexing and migration
 

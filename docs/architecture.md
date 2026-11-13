@@ -22,7 +22,7 @@ The established pattern for running vendor agents is a long-lived gateway that d
                     vendor processes: claude, codex, opencode, gemini, ...
 ```
 
-Everything runs in one process, `anyagents serve`, with one embedded database. Each module below is one crate with one public interface; the protocol gateway is a sixth module used only in API-key mode.
+Everything runs in one process, `anyagents serve`, with one embedded database. Each module below is one crate with one public interface; the protocol gateway is a sixth module used only in API-key mode. Dense retrieval and reranking run beside it as a separate, optional process, `anyagents memory-service` ([host-memory.md](host-memory.md#hybrid-retrieval-and-the-memory-service)); without it the server ranks history lexically and says so.
 
 ## Three-axis vendor-neutral model (`Harness × Profile × Sandbox`)
 
@@ -484,12 +484,12 @@ require an authenticated server rather than an offline database fallback.
 
 - `send(to: [address], text, reply_to?)`. An address is an agent (`agent:<name>`, or a bare name), a named group of agents (`group:<name>`), or a channel target (`telegram:chat:<id>[:<topic>]`, `telegram:user:<id>[:<message>]`). A list of one is a direct message; a mixed list delivers once per address. There is no default address.
 - `inbox(since?)` reads this agent's own mailbox. It never sends.
-- `conversation(...)` / `search(...)` run **Zero-Embedding Lossless Lexical + Structured Agentic History Search (`Raw-RAG`)**:
+- `conversation(...)` / `search(...)` run **hybrid retrieval over raw history (`Raw-RAG`)**: BM25 over the host index, dense candidates from the memory service fused by reciprocal rank, and a cross-encoder rerank of the fused head. Every result cites its raw record: a raw coordinate (segment, offset, length, SHA-256) for native history and memory, the message id for mailbox rows. The response's `retrieval` names the stages that ran and why any did not:
   - **Read authorization:** Non-admin agents read only their own and descendant mailboxes/transcripts. `agent: "all"` and `"*"` mean that authorized tree, not the workspace. Messaging scope, public reachability and shared groups do not grant private history access; explicit parent/sibling/peer reads return forbidden. `with`, sender, range and radius can only narrow the authorized rows. Operator and explicitly privileged root-admin reads are unrestricted and audited. Agent CLI reads require the authenticated server, without an offline SQLite fallback.
-  - **No vector embeddings and no LLM-written memory mutations:** History stays 100% lossless in the append-only transcript and SQLite `rag_chunks_fts` (`unicode61` over raw text + hybrid ASCII identifier sub-tokens + CJK unigrams & bigrams). There is zero embedding API cost, zero embedding latency, and zero model-lock degradation. Exceptional erasure uses the permissioned, audited [redaction operation](redaction.md), preserving ids/order and replacing only explicitly selected content; ordinary coordinator history reads remain lossless.
+  - **Raw history is the only source of truth; no model writes memory:** History stays lossless in each harness's own files and stores and in the mailbox; the lexical indexes (`rag_chunks_fts` for the mailbox, the host index for native history: `unicode61` over raw text + hybrid ASCII identifier sub-tokens + CJK unigrams & bigrams) and the dense index are rebuildable projections. Embedding and reranking run locally on CPU with pinned open models; no embedding API is called. Exceptional erasure uses the permissioned, audited [redaction operation](redaction.md), preserving ids/order and replacing only explicitly selected content; ordinary coordinator history reads remain lossless.
   - **Multi-query & negative filtering:** `query` plus `queries: [...]` (OR-combined keyword/synonym sets) and `exclude: [...]` (negative filters).
   - **Tool history toggles:** `include_tools` (default `true`; `false` restricts search to messages without tool/system noise), `only_tools` (`true` restricts search to tool calls and outputs), and `tool_name` (filters tool history to a specific tool such as `"bash"`, `"browser"`, `"agents"`, `"schedule"`, `"send"`).
-  - **Structured filters & ordering:** Filter by `with` (peer/channel/group), `direction` (`"in"` / `"out"`), `sender`, `role` (`"user"` / `"assistant"` / `"tool"`), `since_ms` / `until_ms`, and order by `sort = "relevance"` (BM25 + CJK bigram + exact-match boost + query coverage + recency), `"newest"` (`timestamp DESC`), or `"oldest"` (`timestamp ASC`).
+  - **Structured filters & ordering:** Filter by `with` (peer/channel/group), `direction` (`"in"` / `"out"`), `sender`, `role` (`"user"` / `"assistant"` / `"tool"`), `since_ms` / `until_ms`, and order by `sort = "relevance"` (hybrid: BM25 and dense fused, then reranked; filters apply to dense candidates exactly as to lexical ones), `"newest"` (`timestamp DESC`), or `"oldest"` (`timestamp ASC`).
   - **Range reads & contiguous episode windows:** Read transcript ranges (`range = "seq:<from>-<to>"` or `"transcript:<from>-<to>"`, or `from_seq` / `to_seq`) and expand `radius` (`0..=10`) contiguous neighboring events around each hit to preserve causal paths `P(path | result)`.
 - Harness-local recall, context windowing and compaction belong to the external CLI, not AnyAgents. Spiron receives `--state-dir` and `--instructions-file` pointing into the existing agent configuration directory, plus workspace, skills and MCP paths. The adapter reads `spiron-session-id` or legacy `sylphx-session-id` and writes only the canonical session marker. Legacy transcript, window, cloud-session and Goal files remain available to Spiron's continuity reader; AnyAgents never rewrites or summarizes them.
 - `agents()` lists the agents on the server with their harness, state and lag, so agents can see each other.
@@ -586,7 +586,11 @@ verification try the lock and skip a busy agent.
 
 ### Host history index refresh
 
-Host history keeps raw text in its source files. The rebuildable contentless FTS
+Host history keeps raw text in its sources: JSONL files, and the SQLite stores
+Spiron (`sessions.sqlite3`) and OpenCode (`opencode.db`) keep, read through a
+read-only connection that never creates a file beside the store. A store row is
+addressed as `<database>/<table>/<rowid>`; its bytes are the row's event text.
+The rebuildable contentless FTS
 index stores metadata, bounded search windows and SHA-256 raw coordinates, not a
 second raw transcript. Each source frontier and its documents/windows commit
 atomically. A source changing during publication defers that snapshot without
