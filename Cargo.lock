@@ -86,6 +86,7 @@ dependencies = [
  "anyagents-harness-stream",
  "anyagents-installer",
  "anyagents-invariants",
+ "anyagents-keeper",
  "anyagents-supervisor",
  "anyagents-toolchain",
  "anyagents-tools",

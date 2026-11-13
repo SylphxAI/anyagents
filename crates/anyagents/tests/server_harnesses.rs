@@ -22,31 +22,63 @@ use serde_json::{Value, json};
 
 struct Server {
     child: Child,
+    _keepers: support::Keepers,
 }
 
 impl Server {
     fn start(dir: &Path, harness_bin: &Path) -> Self {
-        let child = support::contract_server()
+        Self::start_from(dir, harness_bin, Path::new(env!("CARGO_BIN_EXE_anyagents")))
+    }
+
+    /// A server run from `server_bin`, appending to the shared log so a test
+    /// that restarts it keeps the whole story.
+    fn start_from(dir: &Path, harness_bin: &Path, server_bin: &Path) -> Self {
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("shared.log"))
+            .unwrap();
+        let mut child = support::contract_server_at(server_bin)
             .env("ANYAGENTS_HARNESS_BIN", harness_bin)
             .arg("--data")
             .arg(dir)
             .arg("serve")
             .stdout(Stdio::null())
-            .stderr(std::fs::File::create(dir.join("shared.log")).unwrap())
+            .stderr(log)
             .env("ANYAGENTS_SHARED_LOG", dir.join("shared.log"))
             .spawn()
             .expect("server");
+        // A server that died leaves its socket file: ready is a connection.
         let socket = dir.join("anyagents.sock");
         let deadline = Instant::now() + Duration::from_secs(10);
-        while !socket.exists() {
+        while std::os::unix::net::UnixStream::connect(&socket).is_err() {
             assert!(
-                Instant::now() < deadline,
+                Instant::now() < deadline && child.try_wait().unwrap().is_none(),
                 "no socket: {}",
                 std::fs::read_to_string(dir.join("shared.log")).unwrap_or_default()
             );
             std::thread::sleep(Duration::from_millis(20));
         }
-        Self { child }
+        Self {
+            child,
+            _keepers: support::Keepers::of(dir),
+        }
+    }
+
+    /// The server dies without a word, as a crash or an OOM kill does. Its
+    /// keepers are left running.
+    fn crash(mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        std::mem::forget(self);
+    }
+
+    /// A clean stop, as a deployment's restart sends.
+    fn terminate(mut self) {
+        // SAFETY: SIGTERM to the server this test started.
+        unsafe { libc::kill(self.child.id() as i32, libc::SIGTERM) };
+        let _ = self.child.wait();
+        std::mem::forget(self);
     }
 }
 
@@ -129,7 +161,10 @@ fn the_real_server_refuses_a_matching_uid_but_accepts_the_fixture() {
         .stderr(std::fs::File::create(&log).unwrap())
         .spawn()
         .unwrap();
-    let mut refused = Server { child };
+    let mut refused = Server {
+        child,
+        _keepers: support::Keepers::of(&data),
+    };
     let deadline = Instant::now() + Duration::from_secs(10);
     let status = loop {
         if let Some(status) = refused.child.try_wait().unwrap() {
@@ -163,7 +198,10 @@ fn the_real_server_refuses_a_matching_uid_but_accepts_the_fixture() {
         .stderr(std::fs::File::create(&accepted_log).unwrap())
         .spawn()
         .unwrap();
-    let mut accepted = Server { child };
+    let mut accepted = Server {
+        child,
+        _keepers: support::Keepers::of(&data),
+    };
     let deadline = Instant::now() + Duration::from_secs(10);
     while !data.join("anyagents.sock").exists() {
         assert!(
@@ -429,4 +467,158 @@ fn an_agy_agent_and_a_muse_agent_each_answer_a_mailbox_message() {
     assert!(text.contains("agy\tAGY_CONFIG_DIR\t"), "{text}");
     assert!(text.contains("muse\tMUSE_CONFIG_HOME\t"), "{text}");
     drop(server);
+}
+
+/// Send `text` to `name` as the asker; the id of the message it became.
+fn send(data: &Path, name: &str) -> String {
+    let sent = call(
+        &data.join("anyagents.sock"),
+        &json!({"to": [name], "text": "ping", "sender": "agent:kind"}).to_string(),
+    );
+    let text = sent.to_string();
+    sent["deliveries"][0]["id"]
+        .as_str()
+        .expect(&text)
+        .to_string()
+}
+
+/// How many answers to `sent_id` reached the asker.
+fn answers(data: &Path, sent_id: &str) -> usize {
+    let store = Store::open(data.join("state.db")).unwrap();
+    let asker = store.agent_by_name("kind").unwrap();
+    store
+        .inbox(&asker.id, None)
+        .unwrap()
+        .iter()
+        .filter(|message| message.text == "pong" && message.reply_to.as_deref() == Some(sent_id))
+        .count()
+}
+
+/// Make the agent's contract double hold each turn open while `hold` exists.
+fn hold_turns(data: &Path, agent_id: &str, hold: &Path) {
+    let path = data
+        .join("agents")
+        .join(agent_id)
+        .join("config")
+        .join("adapter.json");
+    let mut adapter: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    adapter["hold_while"] = json!(hold.display().to_string());
+    std::fs::write(&path, serde_json::to_vec_pretty(&adapter).unwrap()).unwrap();
+}
+
+/// The harness process the agent's newest live keeper holds.
+fn kept_harness(data: &Path, agent_id: &str) -> u32 {
+    let mut found = None;
+    support::wait_for(
+        || {
+            let Ok(entries) = std::fs::read_dir(data.join("keepers")) else {
+                return false;
+            };
+            let mut dirs: Vec<_> = entries.flatten().map(|entry| entry.path()).collect();
+            dirs.sort();
+            found = dirs.iter().rev().find_map(|dir| {
+                let agent = std::fs::read_to_string(dir.join("agent")).ok()?;
+                if agent.trim() != agent_id {
+                    return None;
+                }
+                let record: Value =
+                    serde_json::from_slice(&std::fs::read(dir.join("keeper.json")).ok()?).ok()?;
+                let pid = u32::try_from(record["harness_pid"].as_u64()?).ok()?;
+                alive(pid).then_some(pid)
+            });
+            found.is_some()
+        },
+        "no keeper holds a live harness for the agent",
+    );
+    found.unwrap()
+}
+
+fn alive(pid: u32) -> bool {
+    // SAFETY: signal 0 only asks whether the process exists.
+    unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+fn shared_log(data: &Path) -> String {
+    std::fs::read_to_string(data.join("shared.log")).unwrap_or_default()
+}
+
+/// A running agent's harness outlives its server. The server crashes in the
+/// middle of a turn with a second message already handed over, and comes back
+/// as another binary (an upgrade); later it stops cleanly in the middle of a
+/// turn and starts again. Each time the same vendor process finishes the turn,
+/// every message is answered exactly once, and delivery resumes from the
+/// mailbox cursor.
+#[test]
+fn a_harness_outlives_a_server_crash_an_upgrade_and_a_clean_stop() {
+    let _env = support::lock();
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    support::operator_for_contract(&data);
+    create_asker(&data);
+    let name = "responder";
+    let agent_file = data.join("responder-name");
+    std::fs::write(&agent_file, name).unwrap();
+    let id = create(&data, name, "claude-code", &agent_file);
+    let hold = data.join("hold-turn");
+    hold_turns(&data, &id, &hold);
+    let anyagents = Path::new(env!("CARGO_BIN_EXE_anyagents"));
+    let agent_id = anyagents_core::AgentId::parse(&id).unwrap();
+
+    // A turn in progress, and a second message handed over behind it.
+    std::fs::write(&hold, b"").unwrap();
+    let server = Server::start(&data, anyagents);
+    let first = send(&data, name);
+    support::wait_for(
+        || shared_log(&data).contains(&format!("holding {first}")),
+        "the first turn did not start",
+    );
+    let second = send(&data, name);
+    let store = Store::open(data.join("state.db")).unwrap();
+    support::wait_for(
+        || store.next_undelivered(&agent_id).unwrap().is_none(),
+        "the second message was not handed over",
+    );
+    let harness = kept_harness(&data, &id);
+
+    server.crash();
+    assert!(alive(harness), "the server's crash ended the harness");
+    let upgraded = dir.path().join("anyagents-next");
+    std::fs::copy(anyagents, &upgraded).unwrap();
+    let server = Server::start_from(&data, anyagents, &upgraded);
+    assert_eq!(
+        kept_harness(&data, &id),
+        harness,
+        "the upgraded server started another harness"
+    );
+    std::fs::remove_file(&hold).unwrap();
+    ask(&data, name, "claude-code", &first);
+    ask(&data, name, "claude-code", &second);
+
+    // A clean stop in the middle of the next turn.
+    std::fs::write(&hold, b"").unwrap();
+    let third = send(&data, name);
+    support::wait_for(
+        || shared_log(&data).contains(&format!("holding {third}")),
+        "the third turn did not start",
+    );
+    let harness = kept_harness(&data, &id);
+    server.terminate();
+    assert!(alive(harness), "a clean stop ended the harness");
+    let server = Server::start(&data, anyagents);
+    assert_eq!(kept_harness(&data, &id), harness);
+    std::fs::remove_file(&hold).unwrap();
+    ask(&data, name, "claude-code", &third);
+
+    for sent in [&first, &second, &third] {
+        assert_eq!(
+            answers(&data, sent),
+            1,
+            "{sent} was not answered exactly once"
+        );
+    }
+    let starts = shared_log(&data).matches("harness: start").count();
+    assert!(starts <= 2, "the harness double started {starts} times");
+    drop(server);
+    support::wait_for(|| !alive(harness), "stopping the keepers left the harness");
 }

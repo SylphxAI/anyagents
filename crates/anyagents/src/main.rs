@@ -24,6 +24,7 @@ mod harness_double;
 mod host_memory;
 mod identity;
 mod install;
+mod keeper;
 mod mcp;
 mod mcp_config;
 mod muse_config;
@@ -457,6 +458,11 @@ enum Command {
     /// The deployment's boundary contract: what an agent may read, and what it
     /// may write.
     Boundary,
+    /// The keepers that hold harness processes across server restarts.
+    Keepers {
+        #[command(subcommand)]
+        action: KeepersCommand,
+    },
     /// Test double for a streaming vendor. It prints text and no result line,
     /// and records its argv and stdin when `ANYAGENTS_FAKE_LOG` names a file.
     #[command(hide = true)]
@@ -648,6 +654,22 @@ enum GroupsCommand {
     Members { group: String },
     /// List all named groups and their members.
     List,
+}
+
+#[derive(Subcommand)]
+enum KeepersCommand {
+    /// List every keeper: its agent, its harness process and the binary it runs.
+    List,
+    /// End keepers and their harness processes: one agent's, or all of them.
+    /// A running server starts a running agent's harness again in a new
+    /// keeper; use this before rolling back to a binary without keepers.
+    Stop {
+        /// Agent name or `agt_...` id.
+        agent: Option<String>,
+        /// Every keeper.
+        #[arg(long, conflicts_with = "agent")]
+        all: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -997,6 +1019,9 @@ fn main() -> ExitCode {
     }
     sandbox::hydrate_operator_groups_if_needed();
     let raw_argv: Vec<String> = std::env::args().collect();
+    if let Some(code) = keeper::try_run(&raw_argv) {
+        return ExitCode::from(u8::try_from(code).unwrap_or(1));
+    }
     if let Some(cloud_args) = cloud_harness::try_parse_from_raw_argv(&raw_argv) {
         return match cloud_harness::run(cloud_args) {
             Ok(()) => ExitCode::SUCCESS,
@@ -1088,6 +1113,17 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
         Command::Mcp { config, profile } => mcp::run(&data, config.as_deref(), profile),
         Command::AgentRun { config, command } => sandbox::run(&data, config.as_deref(), &command),
         Command::Boundary => print_boundary(&data),
+        Command::Keepers { action } => match action {
+            KeepersCommand::List => keeper::list(&data),
+            KeepersCommand::Stop { agent, all } => {
+                if agent.is_none() && !all {
+                    return Err(anyagents_core::Error::Message(
+                        "name an agent, or pass --all".into(),
+                    ));
+                }
+                keeper::stop(&data, agent.as_deref())
+            }
+        },
         Command::FakeOpencode => fake_opencode::run(),
         Command::Harness {
             config,

@@ -34,7 +34,7 @@ use crate::auth::{self, Principal};
 use crate::create::{self, CreateRequest};
 use crate::identity::ServingIdentity;
 use crate::operator;
-use crate::vendor::{self, VendorHarness};
+use crate::vendor::{self, HarnessHost, VendorHarness};
 
 mod file_cache;
 #[cfg(test)]
@@ -58,19 +58,36 @@ pub fn socket_path(data: &Path) -> PathBuf {
     data.join(SOCKET_NAME)
 }
 
+/// Run the server. Every harness runs in a keeper started from this binary,
+/// so stopping, crashing or upgrading the server ends no agent's work.
 pub fn run(data: &Path) -> Result<(), Error> {
     let (_stop_tx, stop_rx) = tokio::sync::oneshot::channel();
-    run_with(data, Arc::new(Mutex::new(ProcessRunner)), stop_rx)
+    let host = crate::keeper::host().map_err(Error::Message)?;
+    run_with_identity(
+        data,
+        Arc::new(Mutex::new(ProcessRunner)),
+        stop_rx,
+        Arc::new(ServingIdentity::capture()),
+        host,
+    )
 }
 
-/// Run the server with a sign-in runner the caller supplies. Tests use this so
-/// no vendor command is started. `stop` ends the server when the caller drops it.
+/// Run the server with a sign-in runner the caller supplies, so no vendor
+/// command is started. `stop` ends the server when the caller drops it.
+/// Harnesses run in this process: a test binary has no keeper mode.
+#[cfg(test)]
 pub fn run_with(
     data: &Path,
     runner: Arc<Mutex<dyn CommandRunner + Send>>,
     stop: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<(), Error> {
-    run_with_identity(data, runner, stop, Arc::new(ServingIdentity::capture()))
+    run_with_identity(
+        data,
+        runner,
+        stop,
+        Arc::new(ServingIdentity::capture()),
+        HarnessHost::InProcess,
+    )
 }
 
 fn run_with_identity(
@@ -78,14 +95,36 @@ fn run_with_identity(
     runner: Arc<Mutex<dyn CommandRunner + Send>>,
     mut stop: tokio::sync::oneshot::Receiver<()>,
     identity: Arc<ServingIdentity>,
+    host: HarnessHost,
 ) -> Result<(), Error> {
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async {
         tokio::select! {
-            result = serve(data, runner, identity) => result,
+            result = serve(data, runner, identity, host) => result,
             _ = &mut stop => Ok(()),
         }
     })
+}
+
+/// The supervisor of a serving kernel. However the kernel stops (a signal, an
+/// error, a test dropping it), its harness processes are left to the next
+/// kernel when they live in keepers; hosted in this process, they end.
+struct Retaining(Option<Supervisor<VendorHarness>>);
+
+impl std::ops::Deref for Retaining {
+    type Target = Supervisor<VendorHarness>;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref().expect("supervisor until drop")
+    }
+}
+
+impl Drop for Retaining {
+    fn drop(&mut self) {
+        if let Some(supervisor) = self.0.take() {
+            supervisor.retain_processes();
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -149,6 +188,7 @@ async fn serve(
     data: &Path,
     sign_in: Arc<Mutex<dyn CommandRunner + Send>>,
     identity: Arc<ServingIdentity>,
+    host: HarnessHost,
 ) -> Result<(), Error> {
     let _server_lock = acquire_server_lock(data)?;
     anyagents_toolchain::init_server(data, crate::sandbox::host_home_dir());
@@ -229,13 +269,17 @@ async fn serve(
         crate::sandbox::share_socket_with_seats(&path);
     }
     let launch_store = Arc::clone(&store);
-    let supervisor = Supervisor::<VendorHarness>::start(
-        Arc::clone(&store),
-        Arc::new(SystemClock::new()),
-        Arc::new(move |request| vendor::vendor_launch_with_store(request, &launch_store)),
-        vendor::child_env(),
-    )
-    .map_err(Error::Message)?;
+    let custody = crate::keeper::custody(data, &host);
+    let supervisor = Retaining(Some(
+        Supervisor::<VendorHarness>::start_with_custody(
+            Arc::clone(&store),
+            Arc::new(SystemClock::new()),
+            Arc::new(move |request| vendor::vendor_launch_hosted(request, &launch_store, &host)),
+            vendor::child_env(),
+            custody,
+        )
+        .map_err(Error::Message)?,
+    ));
     if auth.is_confined() {
         crate::sandbox::share_socket_with_seats(&data.join("wake.sock"));
     }
@@ -9223,7 +9267,13 @@ pub(crate) mod tests {
         let path = data.path().to_path_buf();
         let serving = Arc::clone(&identity);
         let server = std::thread::spawn(move || {
-            run_with_identity(&path, Arc::new(Mutex::new(ProcessRunner)), stopped, serving)
+            run_with_identity(
+                &path,
+                Arc::new(Mutex::new(ProcessRunner)),
+                stopped,
+                serving,
+                HarnessHost::InProcess,
+            )
         });
         struct Stop(
             Option<tokio::sync::oneshot::Sender<()>>,

@@ -87,6 +87,7 @@ struct ConversationTurnView {
 
 struct Serve {
     child: Child,
+    _keepers: support::Keepers,
 }
 
 impl Drop for Serve {
@@ -136,7 +137,10 @@ fn start_server(data: &std::path::Path) -> Serve {
         if socket.exists() {
             let mode = socket.metadata().unwrap().permissions().mode() & 0o777;
             if mode == 0o600 {
-                return Serve { child };
+                return Serve {
+                    child,
+                    _keepers: support::Keepers::of(data),
+                };
             }
         }
         if let Some(status) = child.try_wait().unwrap() {
