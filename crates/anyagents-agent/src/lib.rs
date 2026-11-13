@@ -4,7 +4,7 @@
 //! holds in flight never stops the lines behind it. It never looks at a turn.
 
 use anyagents_core::{AgentId, Message, Store};
-use anyagents_harness::{DeliverOutcome, Harness, HarnessError, OutboundMessage, SteerItem};
+use anyagents_harness::{DeliverOutcome, Harness, HarnessError, OutboundMessage};
 
 pub use anyagents_harness::{DeliveryMode, SteerSupport, TurnState};
 
@@ -203,42 +203,6 @@ impl<H: Harness> DeliveryLoop<H> {
         }
     }
 
-    /// Put every new mailbox message into the harness through its between-steps
-    /// channel, in sequence order, and move the cursor behind each one it takes.
-    pub fn steer_next(&mut self) -> Result<Option<SteerItem>, Error> {
-        let Some(message) = self.store.next_undelivered(&self.agent_id)? else {
-            return Ok(None);
-        };
-        // An older line the channel pushed before the mailbox stored it is
-        // written first; anything else waits for its own turn.
-        if let Some(item) = self.harness.poll_steer().map_err(inject_error)?
-            && item.message.id != message.id.as_str()
-        {
-            let id = item.message.id.clone();
-            match self.harness.inject(&item.message) {
-                Ok(true) => {}
-                Ok(false) => self.harness.release_steer(&id),
-                Err(HarnessError::Dead) => return Err(Error::HarnessDown),
-                Err(HarnessError::Failed(reason)) => return Err(Error::HarnessFailed(reason)),
-            }
-        }
-        let item = SteerItem {
-            order: 0,
-            message: outbound(&message),
-        };
-        let taken = match self.harness.inject(&item.message) {
-            Ok(taken) => taken,
-            Err(HarnessError::Dead) => return Err(Error::HarnessDown),
-            Err(HarnessError::Failed(reason)) => return Err(Error::HarnessFailed(reason)),
-        };
-        if !taken {
-            self.harness.release_steer(message.id.as_str());
-            return Ok(None);
-        }
-        self.store.note_delivered(&self.agent_id, message.seq)?;
-        Ok(Some(item))
-    }
-
     pub fn delivered_cursor(&self) -> Result<i64, Error> {
         Ok(self.store.delivered_cursor(&self.agent_id)?)
     }
@@ -416,13 +380,6 @@ fn clip_chars(text: &str, max: usize) -> String {
         format!("{head}…")
     } else {
         head
-    }
-}
-
-fn inject_error(err: HarnessError) -> Error {
-    match err {
-        HarnessError::Dead => Error::HarnessDown,
-        HarnessError::Failed(reason) => Error::HarnessFailed(reason),
     }
 }
 

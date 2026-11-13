@@ -16,10 +16,6 @@
 //! written during a turn reaches the agent before its next model step; the
 //! echo is what marks it taken, and an id already echoed is never written twice.
 //!
-//! A [`SteerQueue`] ([`ClaudeHarness::with_steer`]) holds lines a channel pushed
-//! between model steps even when the mailbox has not stored them yet; they are
-//! written by [`Harness::inject`] with the same acknowledgement.
-//!
 //! Resume starts the child again with `--resume` when the session id changed or the
 //! process has exited. Cancel sends a `control_request` whose subtype is `interrupt`.
 
@@ -34,8 +30,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyagents_harness::{
-    DeliverOutcome, DeliveryMode, Harness, HarnessError, HarnessHealth, OutboundMessage, SteerItem,
-    SteerQueue, SteerSupport, TurnState, TurnUsage, compose_message, message_id_in_text,
+    DeliverOutcome, DeliveryMode, Harness, HarnessError, HarnessHealth, OutboundMessage,
+    SteerSupport, TurnState, TurnUsage, compose_message, message_id_in_text,
 };
 use serde_json::{Value, json};
 
@@ -50,7 +46,6 @@ pub struct ClaudeHarness {
     wake: Arc<Condvar>,
     reader: Option<JoinHandle<()>>,
     stderr_reader: Option<JoinHandle<()>>,
-    steer: Option<SteerQueue>,
 }
 
 #[derive(Default)]
@@ -157,16 +152,9 @@ impl ClaudeHarness {
             wake: Arc::new(Condvar::new()),
             reader: None,
             stderr_reader: None,
-            steer: None,
         };
         harness.launch(session_id)?;
         Ok(harness)
-    }
-
-    /// Also watch `queue` for lines a channel pushed between model steps.
-    pub fn with_steer(mut self, queue: SteerQueue) -> Self {
-        self.steer = Some(queue);
-        self
     }
 
     /// The create input line Claude Code reads: one `user` event whose text is
@@ -584,73 +572,6 @@ impl Harness for ClaudeHarness {
 
     fn clear_quota(&mut self) {
         lock(&self.shared).quota_reset_at_ms = None;
-    }
-
-    fn poll_steer(&mut self) -> Result<Option<SteerItem>, HarnessError> {
-        let Some(queue) = &self.steer else {
-            return Ok(None);
-        };
-        if !lock(&self.shared).alive {
-            return Err(HarnessError::Dead);
-        }
-        // A line the child already echoed, or whose turn already finished, is
-        // taken off the queue without a second write.
-        while let Some(line) = queue.lines().into_iter().next() {
-            let settled = {
-                let state = lock(&self.shared);
-                state.echoed.contains(&line.id) || state.finished.contains(&line.id)
-            };
-            if !settled {
-                break;
-            }
-            queue.consume(&line.id);
-        }
-        Ok(queue.take())
-    }
-
-    fn inject(&mut self, message: &OutboundMessage) -> Result<bool, HarnessError> {
-        {
-            let mut state = lock(&self.shared);
-            if !state.alive {
-                return Err(HarnessError::Dead);
-            }
-            if state.echoed.contains(&message.id) || state.finished.contains(&message.id) {
-                return Ok(true);
-            }
-            // An id the mailbox already handed over is not written twice. The line
-            // stays held for the step where the host settles it.
-            if state.seen.contains(&message.id) {
-                return Ok(false);
-            }
-            state.seen.insert(message.id.clone());
-            state.written.push(message.id.clone());
-            if state.open.is_empty() {
-                state.turns_started += 1;
-                state.open.push(message.id.clone());
-            } else {
-                state.followups.push(message.id.clone());
-            }
-        }
-        let line = Self::steer_input_line(message);
-        let write_res = write_stdin(&self.stdin, &line);
-        if write_res.is_err() {
-            let mut state = lock(&self.shared);
-            state.alive = false;
-            state.open.clear();
-            state.followups.clear();
-            state.seen.remove(&message.id);
-            self.wake.notify_all();
-            return Err(HarnessError::Dead);
-        }
-        Ok(true)
-    }
-
-    /// The ids the host settled are `keep`; every other held line goes back on
-    /// the queue, so a line the child never took is offered again.
-    fn release_steer(&mut self, keep: &str) {
-        if let Some(queue) = &self.steer {
-            queue.release_for(keep);
-        }
     }
 
     fn process_id(&self) -> Option<u32> {

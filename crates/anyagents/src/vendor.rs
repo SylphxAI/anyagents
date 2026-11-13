@@ -2071,53 +2071,6 @@ impl Harness for VendorHarness {
             Self::Contract(harness) => harness.watch_activity(notify),
         }
     }
-
-    fn poll_steer(&mut self) -> Result<Option<anyagents_harness::SteerItem>, HarnessError> {
-        match self {
-            Self::Claude(harness, _) => harness.poll_steer(),
-            Self::Codex(harness, _) => harness.poll_steer(),
-            Self::OpenCode(harness, _) => harness.poll_steer(),
-            Self::Agy(harness, _) => harness.poll_steer(),
-            Self::Muse(harness, _) => harness.poll_steer(),
-            Self::Omp(harness, _) => harness.poll_steer(),
-            Self::Dsh(harness, _) => harness.poll_steer(),
-            Self::Grok(harness, _) => harness.poll_steer(),
-            Self::Spiron(..) => Ok(None),
-            Self::Contract(harness) => harness.poll_steer(),
-        }
-    }
-
-    fn inject(&mut self, message: &OutboundMessage) -> Result<bool, HarnessError> {
-        let out = match self {
-            Self::Claude(harness, _) => harness.inject(message),
-            Self::Codex(harness, _) => harness.inject(message),
-            Self::OpenCode(harness, _) => harness.inject(message),
-            Self::Agy(harness, _) => harness.inject(message),
-            Self::Muse(harness, _) => harness.inject(message),
-            Self::Omp(harness, _) => harness.inject(message),
-            Self::Dsh(harness, _) => harness.inject(message),
-            Self::Grok(harness, _) => harness.inject(message),
-            Self::Spiron(..) => Ok(false),
-            Self::Contract(harness) => harness.inject(message),
-        };
-        self.sync_session().map_err(HarnessError::Failed)?;
-        out
-    }
-
-    fn release_steer(&mut self, keep: &str) {
-        match self {
-            Self::Claude(harness, _) => harness.release_steer(keep),
-            Self::Codex(harness, _) => harness.release_steer(keep),
-            Self::OpenCode(harness, _) => harness.release_steer(keep),
-            Self::Agy(harness, _) => harness.release_steer(keep),
-            Self::Muse(harness, _) => harness.release_steer(keep),
-            Self::Omp(harness, _) => harness.release_steer(keep),
-            Self::Dsh(harness, _) => harness.release_steer(keep),
-            Self::Grok(harness, _) => harness.release_steer(keep),
-            Self::Spiron(..) => {}
-            Self::Contract(harness) => harness.release_steer(keep),
-        }
-    }
 }
 
 /// The session id this agent last ran, kept beside its config.

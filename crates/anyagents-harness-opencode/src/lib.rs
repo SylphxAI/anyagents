@@ -27,8 +27,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use anyagents_harness::{
-    DeliverOutcome, DeliveryMode, Harness, HarnessError, HarnessHealth, OutboundMessage, SteerItem,
-    SteerQueue, SteerSupport, TurnState, TurnUsage, compose_message,
+    DeliverOutcome, DeliveryMode, Harness, HarnessError, HarnessHealth, OutboundMessage,
+    SteerSupport, TurnState, TurnUsage, compose_message,
 };
 use serde_json::{Value, json};
 
@@ -54,7 +54,6 @@ pub struct OpenCodeHarness {
     child: Option<Child>,
     port: Option<port::PortLease>,
     shared: Arc<Mutex<State>>,
-    steer: Option<SteerQueue>,
 }
 
 #[derive(Clone, Debug)]
@@ -133,7 +132,6 @@ impl OpenCodeHarness {
             child: None,
             port: None,
             shared: Arc::new(Mutex::new(State::default())),
-            steer: None,
         };
         if let Some(dir) = config_dir {
             // Override inherited host roots, including OpenCode's explicit
@@ -164,12 +162,6 @@ impl OpenCodeHarness {
         config_dir: &Path,
     ) -> Result<Self, HarnessError> {
         Self::start_with(program, session_id, environment, work_dir, Some(config_dir))
-    }
-
-    /// Also watch `queue` for lines a channel pushed between model steps.
-    pub fn with_steer(mut self, queue: SteerQueue) -> Self {
-        self.steer = Some(queue);
-        self
     }
 
     /// Ids the prompt API took, in the order they were written.
@@ -1009,47 +1001,6 @@ impl Harness for OpenCodeHarness {
         state.last_usage_written = written_len;
         state.cached_usage = usage.clone();
         usage
-    }
-
-    fn poll_steer(&mut self) -> Result<Option<SteerItem>, HarnessError> {
-        let Some(queue) = &self.steer else {
-            return Ok(None);
-        };
-        queue
-            .try_take()
-            .map_err(|err| HarnessError::Failed(format!("steer queue: {err}")))
-    }
-
-    fn inject(&mut self, message: &OutboundMessage) -> Result<bool, HarnessError> {
-        // A mailbox line already written is not written a second time. The
-        // prompt API told the session it has it, so this is a success.
-        if self.seen(&message.id) {
-            return Ok(true);
-        }
-        if !self.lock().alive {
-            return Err(HarnessError::Dead);
-        }
-        if self.lock().session.is_none() {
-            return Ok(false);
-        }
-        // The same prompt `deliver` writes: the session decides where it goes.
-        match self.send_prompt(message) {
-            Ok(answer) => {
-                if answer.get("data").is_some() {
-                    self.record_prompt_accepted(message);
-                    Ok(true)
-                } else {
-                    Ok(false)
-                }
-            }
-            Err(_) => Ok(false),
-        }
-    }
-
-    fn release_steer(&mut self, keep: &str) {
-        if let Some(queue) = &self.steer {
-            queue.release_for(keep);
-        }
     }
 }
 

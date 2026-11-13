@@ -183,29 +183,6 @@ fn a_delivered_line_is_taken_even_when_the_session_reports_a_failed_turn() {
 }
 
 #[test]
-fn a_pushed_line_joins_the_open_turn() {
-    let dir = TempDir::new().unwrap();
-    let path = dir.path().join("steer.jsonl");
-    std::fs::write(&path, "{\"id\":\"m7\",\"seq\":7,\"message\":\"later\"}\n").unwrap();
-    let mut harness = start(&dir, "steer").with_steer(anyagents_harness::SteerQueue::new(&path, 4));
-    harness.deliver(&msg("m1")).unwrap();
-    let item = harness.poll_steer().unwrap().expect("taken");
-    assert_eq!(item.message.id, "m7");
-    assert!(harness.inject(&item.message).unwrap());
-    // A mailbox line the prompt API already took is taken, not written again.
-    assert!(harness.inject(&msg("m1")).unwrap());
-    let text = log_of(&dir);
-    assert!(text.contains("steered:anyagents-message:m7"), "{text}");
-    assert!(text.contains("\"delivery\":\"steer\""), "{text}");
-    // One turn, not two: the steer joined the open one.
-    assert_eq!(
-        text.matches("api:POST /api/session/ses_fake/prompt")
-            .count(),
-        2
-    );
-}
-
-#[test]
 fn a_missing_session_is_created_again() {
     let dir = TempDir::new().unwrap();
     let harness = start(&dir, "finish");

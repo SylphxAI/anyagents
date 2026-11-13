@@ -357,30 +357,6 @@ fn a_line_steered_mid_turn_is_echoed_and_never_written_twice() {
 }
 
 #[test]
-fn a_pushed_line_is_injected_once_and_settled_on_its_echo() {
-    use anyagents_harness::SteerQueue;
-
-    let dir = TempDir::new().unwrap();
-    let path = dir.path().join("steer.jsonl");
-    std::fs::write(&path, "{\"id\":\"m7\",\"seq\":7,\"message\":\"later\"}\n").unwrap();
-    let queue = SteerQueue::new(&path, 4);
-    let mut harness = start(&dir, "steer", None).with_steer(queue.clone());
-    harness.deliver(&msg("m1")).unwrap();
-    let item = harness.poll_steer().unwrap().expect("taken");
-    // Still held while nothing is settled: it is not taken a second time into
-    // the same turn.
-    assert!(harness.poll_steer().unwrap().is_none());
-    // Once the host releases it, the line goes back on the queue and is offered
-    // again rather than being lost.
-    harness.release_steer("settled-elsewhere");
-    let lines = std::fs::read_to_string(&path).unwrap();
-    assert!(lines.contains("\"m7\""), "{lines}");
-    let again = harness.poll_steer().unwrap().expect("offered again");
-    assert_eq!(again.message.id, "m7");
-    let _ = item;
-}
-
-#[test]
 fn claude_code_2_1_assistant_rate_limit_event_and_session_jsonl_detection() {
     use anyagents_harness_claude::{detect_session_quota_reset_ms, quota_from_claude};
     use serde_json::json;

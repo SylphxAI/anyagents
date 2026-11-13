@@ -11,7 +11,6 @@ mod name;
 mod seat;
 mod stamp;
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -656,14 +655,6 @@ pub enum HarnessError {
     Failed(String),
 }
 
-/// A mailbox message that entered an adapter's between-steps input, with the
-/// order it arrived in.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SteerItem {
-    pub message: OutboundMessage,
-    pub order: u64,
-}
-
 /// Reconciled unconfirmed input custody returned when a supervisor prepares
 /// to resume an interrupted turn via explicit `[Recovery]`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -759,28 +750,6 @@ pub trait Harness: Send {
         Ok(None)
     }
 
-    /// Take the oldest message that entered input the vendor reads between
-    /// model steps (a before-step hook, a steering socket), for the host to
-    /// write into the next step with [`Harness::inject`]. `None` means this
-    /// harness has no such channel, or nothing new arrived. A taken message
-    /// stays held until `inject` reports the vendor took it, so a crash loses
-    /// nothing.
-    fn poll_steer(&mut self) -> Result<Option<SteerItem>, HarnessError> {
-        Ok(None)
-    }
-
-    /// Put one message taken by [`Harness::poll_steer`] into the live process
-    /// through the harness's own mid-turn mechanism. `Ok(true)` means the vendor
-    /// took it: the host advances the delivered cursor exactly once. `Ok(false)`
-    /// means it is still held for the next step, cursor unchanged.
-    fn inject(&mut self, _message: &OutboundMessage) -> Result<bool, HarnessError> {
-        Ok(false)
-    }
-
-    /// Put the held messages back for the next step, except `keep`, which an
-    /// `inject` is still holding. Called when `inject` cannot take them now.
-    fn release_steer(&mut self, _keep: &str) {}
-
     /// Secret-safe process-exit evidence, never unfiltered vendor output.
     /// Kept separate from sign-in state and delivery/restart decisions.
     fn exit_diagnostic(&self) -> Option<String> {
@@ -833,179 +802,6 @@ pub struct TurnUsage {
     pub reported_cost_micros: Option<i64>,
 }
 
-/// One line handed over by a between-steps channel: the mailbox id, its
-/// sequence, and the text.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct SteerLine {
-    pub id: String,
-    pub seq: i64,
-    pub message: String,
-}
-
-/// The messages a before-step hook or a steering socket pushed, in arrival
-/// order, held until the vendor takes them.
-///
-/// The pushing side appends one JSON [`SteerLine`] per message to the file.
-/// The host takes the oldest `limit` lines and keeps them, so a crash between
-/// the take and the vendor's acceptance loses nothing: they are still held by
-/// the host that took them and, after a crash, [`SteerQueue::release_for`] puts
-/// them back. A file read or write failure leaves the cursor where it is.
-#[derive(Clone, Debug)]
-pub struct SteerQueue {
-    path: std::path::PathBuf,
-    limit: usize,
-    held: std::sync::Arc<std::sync::Mutex<Vec<SteerItem>>>,
-    order: std::sync::Arc<AtomicU64>,
-}
-
-impl SteerQueue {
-    /// `path` is the push file. `limit` is the most lines one step takes.
-    pub fn new(path: impl Into<std::path::PathBuf>, limit: usize) -> Self {
-        Self {
-            path: path.into(),
-            limit: limit.max(1),
-            held: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-            order: std::sync::Arc::new(AtomicU64::new(0)),
-        }
-    }
-
-    pub fn path(&self) -> &std::path::Path {
-        &self.path
-    }
-
-    /// The push file's lines, oldest first. Failures are diagnosed and leave
-    /// pending bytes untouched. Use [`Self::try_lines`] to handle them directly.
-    pub fn lines(&self) -> Vec<SteerLine> {
-        self.try_lines().unwrap_or_else(|err| {
-            eprintln!("steer queue {}: {err}", self.path.display());
-            Vec::new()
-        })
-    }
-
-    /// Read every pending record, refusing corrupt input rather than skipping it.
-    pub fn try_lines(&self) -> std::io::Result<Vec<SteerLine>> {
-        let text = match std::fs::read_to_string(&self.path) {
-            Ok(text) => text,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(err) => return Err(err),
-        };
-        text.lines()
-            .enumerate()
-            .map(|(index, line)| {
-                serde_json::from_str::<SteerLine>(line).map_err(|err| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("invalid pending record at line {}: {err}", index + 1),
-                    )
-                })
-            })
-            .collect()
-    }
-
-    /// Take the oldest lines, unless one taken earlier is still held.
-    /// Errors are diagnosed; no pending record is consumed on a failed read.
-    pub fn take(&self) -> Option<SteerItem> {
-        self.try_take().unwrap_or_else(|err| {
-            eprintln!("steer queue {}: {err}", self.path.display());
-            None
-        })
-    }
-
-    pub fn try_take(&self) -> std::io::Result<Option<SteerItem>> {
-        let mut held = self.lock();
-        if !held.is_empty() {
-            return Ok(None);
-        }
-        let mut lines = self.try_lines()?;
-        if lines.is_empty() {
-            return Ok(None);
-        }
-        let rest = lines.split_off(lines.len().min(self.limit));
-        write_lines(&self.path, &rest)?;
-        *held = lines
-            .into_iter()
-            .map(|line| SteerItem {
-                order: self.order.fetch_add(1, Ordering::SeqCst),
-                message: OutboundMessage {
-                    id: line.id,
-                    seq: line.seq,
-                    text: line.message,
-                    sender: None,
-                    reply_to: None,
-                    source_time_ms: None,
-                    context: Context::default(),
-                },
-            })
-            .collect();
-        Ok(held.first().cloned())
-    }
-
-    /// Records the vendor's acceptance of `id`, keeping the older held ones.
-    pub fn settle(&self, id: &str) {
-        let mut held = self.lock();
-        held.retain(|item| item.message.id != id);
-    }
-
-    /// Drop a held line the state proves already taken, without writing it again.
-    pub fn consume(&self, id: &str) {
-        self.lock().retain(|item| item.message.id != id);
-    }
-
-    /// Put every held line except `except` back at the front of the push file,
-    /// oldest first, so the next step, or a restarted host, takes it again.
-    pub fn release_for(&self, except: &str) {
-        if let Err(err) = self.try_release_for(except) {
-            eprintln!("steer queue {}: {err}", self.path.display());
-        }
-    }
-
-    pub fn try_release_for(&self, except: &str) -> std::io::Result<()> {
-        let mut held = self.lock();
-        let back_lines: Vec<SteerItem> = held
-            .iter()
-            .filter(|item| item.message.id != except)
-            .cloned()
-            .collect();
-        if back_lines.is_empty() {
-            return Ok(());
-        }
-        let mut lines: Vec<SteerLine> = back_lines
-            .iter()
-            .map(|item| SteerLine {
-                id: item.message.id.clone(),
-                seq: item.message.seq,
-                message: item.message.text.clone(),
-            })
-            .collect();
-        let ids: std::collections::HashSet<String> = back_lines
-            .iter()
-            .map(|item| item.message.id.clone())
-            .collect();
-        let rest: Vec<SteerLine> = self
-            .try_lines()?
-            .into_iter()
-            .filter(|line| !ids.contains(&line.id))
-            .collect();
-        lines.extend(rest);
-        write_lines(&self.path, &lines)?;
-        held.retain(|item| item.message.id == except);
-        Ok(())
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<SteerItem>> {
-        self.held.lock().unwrap_or_else(|err| err.into_inner())
-    }
-}
-
-fn write_lines(path: &std::path::Path, lines: &[SteerLine]) -> std::io::Result<()> {
-    let mut text = String::new();
-    for line in lines {
-        text.push_str(&serde_json::to_string(line).map_err(std::io::Error::other)?);
-        text.push('\n');
-    }
-    atomic_write_file(path, text.as_bytes(), 0o600)
-}
-
 /// First line of user text. The rest of the text is the mailbox body.
 pub const MESSAGE_MARKER_PREFIX: &str = "anyagents-message:";
 
@@ -1035,97 +831,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn corrupt_pending_records_are_diagnosed_without_rewriting_any_bytes() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("steer.jsonl");
-        let queue = SteerQueue::new(&path, 1);
-        let original = "{\"id\":\"m1\",\"seq\":1,\"message\":\"one\"}\n{broken\n";
-        std::fs::write(&path, original).unwrap();
-        let error = queue.try_take().unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-        assert!(error.to_string().contains("line 2"));
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
-        assert!(queue.take().is_none()); // Legacy path diagnoses the same error.
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
-        std::fs::write(&path, original.lines().next().unwrap()).unwrap();
-        assert_eq!(queue.try_take().unwrap().unwrap().message.id, "m1");
-    }
-
-    #[test]
-    fn release_refuses_corrupt_pending_data_and_keeps_held_work_retryable() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("steer.jsonl");
-        let queue = SteerQueue::new(&path, 1);
-        std::fs::write(&path, "{\"id\":\"m1\",\"seq\":1,\"message\":\"one\"}\n").unwrap();
-        queue.try_take().unwrap().unwrap();
-        std::fs::write(&path, "corrupt\n").unwrap();
-        assert_eq!(
-            queue.try_release_for("").unwrap_err().kind(),
-            std::io::ErrorKind::InvalidData
-        );
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "corrupt\n");
-        assert!(queue.try_take().unwrap().is_none());
-        std::fs::write(&path, "").unwrap();
-        queue.try_release_for("").unwrap();
-        assert_eq!(queue.try_take().unwrap().unwrap().message.id, "m1");
-    }
-
-    #[test]
-    fn missing_queue_is_empty_but_unreadable_queue_is_an_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let queue = SteerQueue::new(dir.path().join("missing"), 1);
-        assert!(queue.try_take().unwrap().is_none());
-        std::fs::create_dir(queue.path()).unwrap();
-        assert!(queue.try_take().is_err());
-    }
-
-    #[test]
     fn marker_is_only_the_first_line() {
         let text = marked_message("msg_1", "hello\nanyagents-message:other");
         assert_eq!(message_id_in_text(&text), Some("msg_1"));
         assert_eq!(message_id_in_text("hello"), None);
         assert_eq!(message_id_in_text("anyagents-message:"), None);
-    }
-
-    #[test]
-    fn a_queue_take_settle_and_release_never_duplicates_a_line() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("steer.jsonl");
-        let queue = SteerQueue::new(&path, 2);
-        std::fs::write(
-            &path,
-            "{\"id\":\"m1\",\"seq\":1,\"message\":\"one\"}\n{\"id\":\"m2\",\"seq\":2,\"message\":\"two\"}\n{\"id\":\"m3\",\"seq\":3,\"message\":\"three\"}\n",
-        )
-        .unwrap();
-        let first = queue.take().expect("first");
-        assert_eq!(first.message.id, "m1");
-        assert!(
-            queue.take().is_none(),
-            "a held line is not taken twice into one step"
-        );
-        queue.settle("m1");
-        assert!(queue.take().is_none(), "m2 and m3 are already held");
-        queue.settle("m2");
-        // Taking m2 had already taken m3 with it, as one step takes a batch.
-        queue.release_for("m3");
-        queue.settle("m3");
-        let lines = queue.lines();
-        let ids: Vec<&str> = lines.iter().map(|line| line.id.as_str()).collect();
-        assert_eq!(ids, vec!["m3"]);
-        assert_eq!(queue.take().unwrap().message.id, "m3");
-    }
-
-    #[test]
-    fn a_release_puts_an_unsent_line_back_first() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("steer.jsonl");
-        std::fs::write(&path, "{\"id\":\"m1\",\"seq\":1,\"message\":\"one\"}\n").unwrap();
-        let queue = SteerQueue::new(&path, 4);
-        queue.take().expect("taken");
-        std::fs::write(&path, "{\"id\":\"m2\",\"seq\":2,\"message\":\"two\"}\n").unwrap();
-        queue.release_for("m2");
-        let ids: Vec<String> = queue.lines().into_iter().map(|line| line.id).collect();
-        assert_eq!(ids, vec!["m1", "m2"]);
     }
 
     #[cfg(unix)]
