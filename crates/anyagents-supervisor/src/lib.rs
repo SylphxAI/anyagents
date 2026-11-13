@@ -1733,7 +1733,13 @@ impl<H: Harness + 'static> Session<H> {
                 self.written = self.written.saturating_add(1);
                 false
             }
-            Ok(DeliverOutcome::Deferred) | Ok(DeliverOutcome::Quota { .. }) => false,
+            // The delivery loop answers a recovery note only as taken or not.
+            Ok(
+                DeliverOutcome::Deferred
+                | DeliverOutcome::InFlight
+                | DeliverOutcome::Duplicate
+                | DeliverOutcome::Quota { .. },
+            ) => false,
             Err(anyagents_agent::Error::HarnessDown) => {
                 if !self.wait_backoff() {
                     return true;

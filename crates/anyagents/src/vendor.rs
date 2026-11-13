@@ -1666,8 +1666,17 @@ fn start_spiron(
     })
     .map_err(|err| err.to_string())?;
     harness.set_state_dir(config_dir);
+    // Its `ready` says whether every input may be steered at once; nothing
+    // is offered before it, so recovery and mail start on the right rules.
+    harness
+        .wait_ready(SPIRON_READY_WAIT)
+        .map_err(|err| err.to_string())?;
     Ok(harness)
 }
+
+/// How long a Spiron process may take to announce itself before its launch
+/// fails, as Codex's `initialize` handshake. An exit ends the wait at once.
+const SPIRON_READY_WAIT: Duration = Duration::from_secs(60);
 
 fn populate_spiron_journal_reconciliation(
     config_dir: &Path,
