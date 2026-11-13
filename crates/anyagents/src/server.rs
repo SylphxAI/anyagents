@@ -36,6 +36,7 @@ use crate::identity::ServingIdentity;
 use crate::operator;
 use crate::vendor::{self, VendorHarness};
 
+mod memory_backlog;
 mod outbound_history;
 mod quota_rotation;
 mod reap_queue;
@@ -243,6 +244,7 @@ async fn serve(
     if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none() && !crate::sandbox::is_isolated_test_env()
     {
         quota_rotation::start(Arc::clone(&store));
+        let memory_backlog = memory_backlog::start(&store);
         let reaper_root = data.to_path_buf();
         let reaper_store = Arc::clone(&store);
         let reaper_health = state.health.clone();
@@ -256,6 +258,7 @@ async fn serve(
                 let root = reaper_root.clone();
                 let store = Arc::clone(&reaper_store);
                 let health = reaper_health.clone();
+                let memory_backlog = Arc::clone(&memory_backlog);
                 let _ = tokio::task::spawn_blocking(move || {
                     // The daemon is the long-lived writer: keep the WAL bounded
                     // from here so it never grows while readers overlap.
@@ -274,7 +277,7 @@ async fn serve(
                         eprintln!("outbound history settlement remains pending: {error}");
                     }
                     reap_archived_agents(&store, &root, &health);
-                    consolidate_idle_agent_memory(&store, &root, &health);
+                    consolidate_idle_agent_memory(&store, &root, &health, &memory_backlog);
                     if run_verify
                         && let Err(error) =
                             store.verify_one_host_history_source(anyagents_core::now_ms())
@@ -506,17 +509,27 @@ fn reap_archived_agents_at(store: &Store, data_dir: &Path, health: &HealthBoard,
 
 /// Consolidate idle agents' topic files without changing the active session's
 /// immutable snapshot. Updated files are pinned only at the next explicit session.
-fn consolidate_idle_agent_memory(store: &Store, data_dir: &Path, health: &HealthBoard) {
-    let Ok(agents) = store.list_live_agents() else {
-        return;
-    };
+/// Only agents in the backlog are visited; one leaves once its consolidation
+/// has caught up with its mailbox.
+fn consolidate_idle_agent_memory(
+    store: &Store,
+    data_dir: &Path,
+    health: &HealthBoard,
+    backlog: &memory_backlog::MemoryBacklog,
+) {
     let mut llm_consolidated_count = 0usize;
-    for agent in agents {
-        if agent.state == "archived" {
-            continue;
-        }
+    for agent_id in backlog.pending() {
+        let agent = match store.agent(&agent_id) {
+            Ok(agent) if agent.state != "archived" => agent,
+            Err(err) if !matches!(err, Error::AgentNotFound(_)) => continue,
+            _ => {
+                backlog.settle(&agent_id);
+                continue;
+            }
+        };
         let agent_root = data_dir.join("agents").join(agent.id.as_str());
         if !agent_root.join("memory").is_dir() {
+            backlog.settle(&agent_id);
             continue;
         }
         let Ok(_lifecycle) = store.try_lock_agent_lifecycle(&agent.id) else {
@@ -529,10 +542,12 @@ fn consolidate_idle_agent_memory(store: &Store, data_dir: &Path, health: &Health
             continue;
         }
         let allow_llm = llm_consolidated_count < 1;
-        if let Ok((_, true)) =
-            store.consolidate_agent_sleep_memory_with_options(&agent.id, allow_llm)
-        {
+        let consolidated = store.consolidate_agent_sleep_memory_with_options(&agent.id, allow_llm);
+        if let Ok((_, true)) = consolidated {
             llm_consolidated_count += 1;
+        }
+        if consolidated.is_ok() && store.sleep_memory_caught_up(&agent.id).unwrap_or(false) {
+            backlog.settle(&agent_id);
         }
     }
 }
@@ -4805,6 +4820,7 @@ async fn conversation_route(
                 .store
                 .lock_agent_lifecycle(&target.id)
                 .map_err(ApiError::from_store)?;
+            memory_backlog::mark(&target.id);
             let agent_root = state
                 .store
                 .data_dir()
@@ -7070,6 +7086,53 @@ pub fn owner_workdir() -> Option<std::path::PathBuf> {
 #[cfg(test)]
 pub(crate) mod tests {
     #[test]
+    fn memory_backlog_follows_wakes_and_idle_consolidation_visits_nothing() {
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(anyagents_core::NewAgent::new("sleeper", "codex"))
+            .unwrap();
+        let root = dir.path().join("agents").join(agent.id.as_str());
+        let sleep_state = root.join("memory/.sleep-state.json");
+        let write_topic = |topic: &str| {
+            anyagents_core::learned_memory::upsert_memory_topic(
+                &root,
+                "sleeper",
+                None,
+                topic,
+                Some("fact"),
+                "learned",
+                anyagents_core::now_ms(),
+            )
+            .unwrap();
+        };
+        write_topic("first");
+        let backlog = memory_backlog::start(&store);
+        assert_eq!(backlog.pending(), std::slice::from_ref(&agent.id));
+        consolidate_idle_agent_memory(&store, dir.path(), &HealthBoard::default(), &backlog);
+        assert!(sleep_state.exists());
+        assert!(backlog.pending().is_empty());
+
+        // Nothing woke the agent, so a pass does not look at it.
+        write_topic("second");
+        std::fs::remove_file(&sleep_state).unwrap();
+        consolidate_idle_agent_memory(&store, dir.path(), &HealthBoard::default(), &backlog);
+        assert!(!sleep_state.exists(), "idle agent was visited");
+
+        store
+            .receive(&agent.id, anyagents_core::Incoming::new("new work"))
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while backlog.pending().is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(backlog.pending(), std::slice::from_ref(&agent.id));
+        consolidate_idle_agent_memory(&store, dir.path(), &HealthBoard::default(), &backlog);
+        assert!(sleep_state.exists(), "woken agent was not consolidated");
+        assert!(backlog.pending().is_empty());
+    }
+
+    #[test]
     fn idle_memory_consolidation_preserves_selected_and_disabled_session_pins() {
         let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
@@ -7099,7 +7162,10 @@ pub(crate) mod tests {
             )
             .unwrap();
             std::fs::write(root.join("selected.md"), "changed selected").unwrap();
-            consolidate_idle_agent_memory(&store, dir.path(), &HealthBoard::default());
+            let backlog = memory_backlog::MemoryBacklog::default();
+            backlog.mark(&agent.id);
+            consolidate_idle_agent_memory(&store, dir.path(), &HealthBoard::default(), &backlog);
+            assert!(backlog.pending().is_empty(), "caught-up agent stays queued");
             assert_eq!(
                 anyagents_core::host_session::active(&root).unwrap(),
                 Some(pinned.clone())
