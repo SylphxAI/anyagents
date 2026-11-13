@@ -4,7 +4,7 @@
 //! are the row's event text exactly as stored. A database is a regular file, so
 //! no filesystem path lies below it and the row namespace never collides with a
 //! real file. Stores are opened read-only; AnyAgents never writes them.
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use std::{
     io,
     path::{Path, PathBuf},
@@ -39,10 +39,10 @@ impl StoreKind {
     fn select(self) -> &'static str {
         match self {
             Self::SpironSessions => {
-                "SELECT rowid, CAST(event AS BLOB), NULL, NULL FROM session_entries"
+                "SELECT rowid, CAST(event AS BLOB), NULL, NULL, 0 FROM session_entries"
             }
             Self::OpenCodeMessages => {
-                "SELECT rowid, CAST(data AS BLOB), type, time_created FROM session_message"
+                "SELECT rowid, CAST(data AS BLOB), type, time_created, COALESCE(time_updated, 0) FROM session_message"
             }
         }
     }
@@ -120,6 +120,8 @@ pub(crate) struct StoreRow {
     pub bytes: Vec<u8>,
     pub role: Option<String>,
     pub timestamp_ms: Option<i64>,
+    /// The store's change mark for the row (0 where rows never change).
+    pub changed: i64,
 }
 
 /// A read-only connection to one store whose layout was checked.
@@ -210,8 +212,93 @@ impl Store {
             .map_err(io::Error::other)
     }
 
+    fn read_rows(
+        &self,
+        sql: &str,
+        bind: &[&dyn rusqlite::ToSql],
+        limit_bytes: u64,
+    ) -> io::Result<Vec<StoreRow>> {
+        let mut statement = self.conn.prepare(sql).map_err(io::Error::other)?;
+        let mut rows = statement.query(bind).map_err(io::Error::other)?;
+        let mut out = Vec::new();
+        let mut bytes_read = 0u64;
+        while let Some(row) = rows.next().map_err(io::Error::other)? {
+            let bytes: Vec<u8> = row.get(1).map_err(io::Error::other)?;
+            bytes_read += bytes.len() as u64;
+            out.push(StoreRow {
+                rowid: row.get(0).map_err(io::Error::other)?,
+                bytes,
+                role: row.get(2).map_err(io::Error::other)?,
+                timestamp_ms: row.get(3).map_err(io::Error::other)?,
+                changed: row.get(4).map_err(io::Error::other)?,
+            });
+            if bytes_read >= limit_bytes {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Rows after `after_rowid` up to `upto_rowid`, in rowid order: at most
+    /// `limit` rows, stopping after the row that crosses `limit_bytes`.
+    pub(crate) fn rows_after(
+        &self,
+        after_rowid: i64,
+        upto_rowid: i64,
+        limit: usize,
+        limit_bytes: u64,
+    ) -> io::Result<Vec<StoreRow>> {
+        let sql = format!(
+            "{} WHERE rowid>?1 AND rowid<=?2 ORDER BY rowid LIMIT ?3",
+            self.kind.select()
+        );
+        self.read_rows(
+            &sql,
+            &[&after_rowid, &upto_rowid, &(limit as i64)],
+            limit_bytes,
+        )
+    }
+
+    /// Rows up to `upto_rowid` the store rewrote after `changed_since`, in
+    /// change order. A store that never rewrites a row has none.
+    pub(crate) fn rows_changed(
+        &self,
+        upto_rowid: i64,
+        changed_since: i64,
+        limit: usize,
+        limit_bytes: u64,
+    ) -> io::Result<Vec<StoreRow>> {
+        let Some(changed) = self.kind.changed_column() else {
+            return Ok(Vec::new());
+        };
+        let sql = format!(
+            "{} WHERE rowid<=?1 AND {changed}>?2 ORDER BY {changed}, rowid LIMIT ?3",
+            self.kind.select()
+        );
+        self.read_rows(
+            &sql,
+            &[&upto_rowid, &changed_since, &(limit as i64)],
+            limit_bytes,
+        )
+    }
+
+    /// Every rowid up to `upto_rowid`: what a completed rebuild keeps.
+    pub(crate) fn rowids(&self, upto_rowid: i64) -> io::Result<Vec<i64>> {
+        self.conn
+            .prepare(&format!(
+                "SELECT rowid FROM {} WHERE rowid<=?1",
+                self.kind.table()
+            ))
+            .and_then(|mut s| {
+                s.query_map([upto_rowid], |r| r.get(0))?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .map_err(io::Error::other)
+    }
+
     /// Rows added after `after_rowid` or rewritten after `changed_since`, up to
     /// the frontier, in rowid order. `None` bounds read every row.
+    #[cfg(test)]
     pub(crate) fn rows(
         &self,
         after: Option<(i64, i64)>,
@@ -224,21 +311,8 @@ impl Store {
             "{} WHERE rowid<=?1 AND (rowid>?2 OR {changed}>?3) ORDER BY rowid",
             self.kind.select()
         );
-        let mut statement = self.conn.prepare(&sql).map_err(io::Error::other)?;
-        let mut rows = statement
-            .query(params![upto_rowid, after_rowid, changed_since])
-            .map_err(io::Error::other)?;
-        while let Some(row) = rows.next().map_err(io::Error::other)? {
-            let rowid: i64 = row.get(0).map_err(io::Error::other)?;
-            let bytes: Vec<u8> = row.get(1).map_err(io::Error::other)?;
-            let role: Option<String> = row.get(2).map_err(io::Error::other)?;
-            let timestamp_ms: Option<i64> = row.get(3).map_err(io::Error::other)?;
-            each(StoreRow {
-                rowid,
-                bytes,
-                role,
-                timestamp_ms,
-            })?;
+        for row in self.read_rows(&sql, &[&upto_rowid, &after_rowid, &changed_since], u64::MAX)? {
+            each(row)?;
         }
         Ok(())
     }

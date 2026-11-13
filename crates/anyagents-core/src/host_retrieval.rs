@@ -98,7 +98,7 @@ impl Store {
         if !index_path.exists() {
             return Ok(false);
         }
-        let mut index = HostIndex::shared(&index_path)?;
+        let index = HostIndex::shared(&index_path)?;
         let Some((owner, path)) = index.verification_candidate(now_ms)? else {
             return Ok(false);
         };
@@ -112,40 +112,35 @@ impl Store {
             return Ok(true);
         };
         let agent = Owner { id, name };
-        // Maintenance never waits for a lifecycle: the same worker runs the WAL
-        // checkpoint and outbound settlement, which must not queue behind a
-        // delivery, search or archive holding this owner. A busy owner keeps
-        // its place in the rotation and is verified on a later pass.
-        let _guard = match self.try_lock_agent_lifecycle(&agent.id) {
-            Ok(guard) => guard,
-            Err(crate::Error::AgentBusy) => return Ok(false),
-            Err(error) => return Err(store_error(error)),
-        };
         let Some(mut cursor) = index.source_cursor(&owner, &path)? else {
             return Ok(false);
         };
-        cursor.verification_attempt_ms = now_ms;
-        index.save_source(&owner, &path, &cursor)?;
         let root = self.data_dir().join("agents").join(agent.id.as_str());
         let mut walk = Walk::new(&root);
-        let format = if safe_components(&mut walk, self.data_dir(), &root)? {
-            native_sources(&mut walk, &root)?
-                .into_iter()
-                .find(|s| s.path == path)
-                .map(|s| s.format)
-        } else {
-            None
-        };
-        let Some(format) = format.filter(|_| {
-            self.unresolved_host_paths(&owner)
-                .is_ok_and(|blocked| !blocked.iter().any(|p| path.starts_with(p)))
-        }) else {
+        let found = safe_components(&mut walk, self.data_dir(), &root)?
+            && native_sources(&mut walk, &root)?
+                .iter()
+                .any(|s| s.path == path)
+            && !self
+                .unresolved_host_paths(&owner)?
+                .iter()
+                .any(|p| path.starts_with(p));
+        if !found {
             index.clear_source(&owner, &path)?;
             index.checkpoint()?;
             return Ok(true);
-        };
-        let tolerant = is_external_harness_transcript(&root, &path);
-        refresh_source_at(&mut index, &agent, &path, format, tolerant, true, now_ms)?;
+        }
+        // Maintenance neither reads the source nor waits for a lifecycle: the
+        // same worker runs the WAL checkpoint and outbound settlement. It
+        // records the attempt, so the rotation moves on, and hands the source
+        // to the background indexer, which reads it in bounded batches with
+        // no lock held and records the verification when it has read it all.
+        cursor.verification_attempt_ms = now_ms;
+        index.save_source(&owner, &path, &cursor)?;
+        enqueue_job(
+            self.data_dir(),
+            Job::Verify(agent.id.to_string(), path, now_ms),
+        );
         Ok(true)
     }
 
@@ -238,28 +233,66 @@ impl Store {
     /// Immediately synchronize an agent's `memory/` directory into `HostIndex`
     /// so newly upserted, read, or
     /// deleted topics are immediately readable via `raw_id` and `search_host_files`.
+    /// The caller holds the agent's lifecycle lock, so publishing needs no
+    /// other; learned-memory topics are small whole files.
     pub fn sync_agent_memory_index(&self, agent: &Agent) -> Result<(), IndexError> {
         let mut index = HostIndex::shared(&self.data_dir().join(INDEX_FILE))?;
         let unresolved = self.unresolved_host_paths(agent.id.as_str())?;
+        let mut budget = u64::MAX;
+        let mut held =
+            || -> Result<Option<Box<dyn std::any::Any>>, IndexError> { Ok(Some(Box::new(()))) };
         self.refresh_class(
             &mut index,
             &Owner::from(agent),
             MemoryScope::Memory,
             &unresolved,
             agents_identity(self.data_dir())?,
+            crate::now_ms(),
+            &mut budget,
+            &mut held,
         )?;
         Ok(())
     }
 
-    /// The caller has already resolved the authorized immutable ID set. Locks
-    /// serialize refresh/readback against redaction, rename and lifecycle changes.
+    /// The caller has already resolved the authorized immutable ID set.
+    /// Indexing reads with no lock held; publishing each batch and reading
+    /// back each hit hold the owner's lifecycle lock, which serializes them
+    /// against redaction, rename and lifecycle changes. At most
+    /// [`REQUEST_INDEX_BYTES`] of new history is indexed before answering.
     pub fn search_host_files(
         &self,
         authorized: &[String],
         scope: MemoryScope,
         query: &HistorySearchQuery,
     ) -> Result<Vec<(IndexHit, Vec<u8>)>, IndexError> {
-        self.search_host_files_at(authorized, scope, query, crate::now_ms())
+        self.search_host_files_at(
+            authorized,
+            scope,
+            query,
+            crate::now_ms(),
+            REQUEST_INDEX_BYTES,
+        )
+        .map(|(hits, _)| hits)
+    }
+
+    /// [`Store::search_host_files`] that also says what history it could not
+    /// index before answering: at most [`REQUEST_INDEX_BYTES`] of new history
+    /// is indexed on the request path; classes with more are queued for the
+    /// background indexer, and their unindexed history is missing from these
+    /// hits.
+    pub fn search_host_files_reporting(
+        &self,
+        authorized: &[String],
+        scope: MemoryScope,
+        query: &HistorySearchQuery,
+    ) -> Result<(HostHits, PendingHistory), IndexError> {
+        self.search_host_files_at(
+            authorized,
+            scope,
+            query,
+            crate::now_ms(),
+            REQUEST_INDEX_BYTES,
+        )
     }
 
     fn search_host_files_at(
@@ -268,7 +301,8 @@ impl Store {
         scope: MemoryScope,
         query: &HistorySearchQuery,
         now_ms: i64,
-    ) -> Result<Vec<(IndexHit, Vec<u8>)>, IndexError> {
+        budget: u64,
+    ) -> Result<(HostHits, PendingHistory), IndexError> {
         let selected = query
             .agent
             .as_deref()
@@ -292,14 +326,27 @@ impl Store {
         let mut index = HostIndex::shared(&self.data_dir().join(INDEX_FILE))?;
         let unresolved = self.unresolved_host_paths_of(&owners)?;
         let agents = agents_identity(self.data_dir())?;
+        let mut remaining = budget;
+        let mut pending = PendingHistory::default();
         for owner in &owners {
             let unresolved = unresolved
                 .get(owner.id.as_str())
                 .map_or(&[][..], Vec::as_slice);
             for &class in classes(scope) {
-                self.refresh_class_if_changed(
-                    &mut index, owner, class, unresolved, agents, now_ms,
+                let refresh = self.refresh_class_if_changed(
+                    &mut index,
+                    owner,
+                    class,
+                    unresolved,
+                    agents,
+                    now_ms,
+                    &mut remaining,
                 )?;
+                if !refresh.complete {
+                    pending.sources += refresh.pending_sources.max(1);
+                    pending.bytes += refresh.pending_bytes;
+                    enqueue(self.data_dir(), owner.id.as_str(), class);
+                }
             }
         }
         let visible: Vec<_> = owners.iter().map(|a| a.id.to_string()).collect();
@@ -325,7 +372,7 @@ impl Store {
             let bytes = read_raw(&hit.window)?;
             out.push((hit, bytes));
         }
-        Ok(out)
+        Ok((out, pending))
     }
 
     /// Raw ranges another retriever cited (a dense index, for example),
@@ -410,10 +457,28 @@ impl Store {
         Ok(out)
     }
 
+    /// A digest of the owner's redaction receipts: a refresh that read its
+    /// history at one value publishes only while it still holds.
+    fn redaction_epoch(&self, owner: &str) -> Result<String, IndexError> {
+        let mut receipts: Vec<String> = self
+            .redaction_receipts(Some(owner))
+            .map_err(store_error)?
+            .into_iter()
+            .map(|(_, receipt)| receipt)
+            .collect();
+        receipts.sort();
+        Ok(sha256(receipts.join("\n").as_bytes()))
+    }
+
     /// Skip a class whose recorded walk still matches the filesystem and the
     /// policy: it has nothing new to index, so it costs a stat per recorded
     /// entry, with no lock, no directory listing, no file open and no query
-    /// besides its own record. Otherwise refresh it under the lifecycle lock.
+    /// besides its own record. Otherwise refresh it within `budget` bytes of
+    /// new history. Walking, reading and projecting hold no lock; each
+    /// published batch holds the owner's lifecycle lock only while it
+    /// publishes, and is dropped if a redaction happened since it was read.
+    /// The walk is recorded only once every source is complete.
+    #[allow(clippy::too_many_arguments)]
     fn refresh_class_if_changed(
         &self,
         index: &mut HostIndex,
@@ -422,7 +487,8 @@ impl Store {
         unresolved: &[PathBuf],
         agents: Option<(u64, u64)>,
         now_ms: i64,
-    ) -> Result<(), IndexError> {
+        budget: &mut u64,
+    ) -> Result<ClassRefresh, IndexError> {
         let class_name = class
             .source()
             .ok_or_else(|| io::Error::other("a history class is memory or transcripts"))?;
@@ -431,29 +497,50 @@ impl Store {
             && recorded == tree_policy(owner, unresolved)?
             && serde_json::from_str::<Tree>(&tree).is_ok_and(|t| t.is_current(&root, agents))
         {
-            return Ok(());
+            return Ok(ClassRefresh::complete());
         }
         #[cfg(test)]
         tests::CLASS_WALKS.with(|n| n.set(n.get() + 1));
-        let _guard = self.lock_agent_lifecycle(&owner.id).map_err(store_error)?;
-        // Exclusions are read again under the lock, as a refresh always has.
+        let epoch = self.redaction_epoch(owner.id.as_str())?;
         let unresolved = self.unresolved_host_paths(owner.id.as_str())?;
         let policy = tree_policy(owner, &unresolved)?;
-        let walk = self.refresh_class(index, owner, class, &unresolved, agents)?;
-        let tree = Tree {
-            started_ms: now_ms,
-            agents,
-            entries: walk.entries,
+        let mut gate = || -> Result<Option<Box<dyn std::any::Any>>, IndexError> {
+            let guard = self.lock_agent_lifecycle(&owner.id).map_err(store_error)?;
+            if self.redaction_epoch(owner.id.as_str())? != epoch {
+                return Ok(None);
+            }
+            Ok(Some(Box::new(guard)))
         };
-        // A path that cannot be recorded (not UTF-8) only costs a walk later.
-        if let Ok(tree) = serde_json::to_string(&tree) {
-            index.save_agent_tree(owner.id.as_str(), class_name, &policy, &tree)?;
+        let (walk, refresh) = self.refresh_class(
+            index,
+            owner,
+            class,
+            &unresolved,
+            agents,
+            now_ms,
+            budget,
+            &mut gate,
+        )?;
+        if refresh.complete {
+            let tree = Tree {
+                started_ms: now_ms,
+                agents,
+                entries: walk.entries,
+            };
+            // A path that cannot be recorded (not UTF-8) only costs a walk later.
+            if let Ok(tree) = serde_json::to_string(&tree)
+                && let Some(_guard) = gate()?
+            {
+                index.save_agent_tree(owner.id.as_str(), class_name, &policy, &tree)?;
+            }
         }
-        Ok(())
+        Ok(refresh)
     }
 
-    /// Index what one class's walk finds and forget the class's sources it no
-    /// longer finds. The other class and its cursors are never touched.
+    /// Index what one class's walk finds, within `budget`, and forget the
+    /// class's sources it no longer finds. The other class and its cursors
+    /// are never touched.
+    #[allow(clippy::too_many_arguments)]
     fn refresh_class(
         &self,
         index: &mut HostIndex,
@@ -461,10 +548,14 @@ impl Store {
         class: MemoryScope,
         unresolved: &[PathBuf],
         agents: Option<(u64, u64)>,
-    ) -> Result<Walk, IndexError> {
+        now_ms: i64,
+        budget: &mut u64,
+        gate: &mut Gate<'_>,
+    ) -> Result<(Walk, ClassRefresh), IndexError> {
         let root = self.data_dir().join("agents").join(owner.id.as_str());
         let mut walk = Walk::new(&root);
         let mut keep = HashSet::new();
+        let mut refresh = ClassRefresh::complete();
         // The durable redactor is the only text mutation authority. A
         // pending/failed copy excludes precisely that path and descendants;
         // an unrelated unsupported store does not hide scrubbed local data.
@@ -482,8 +573,20 @@ impl Store {
                             sha256(path.as_os_str().as_encoded_bytes())
                         );
                         let metadata = memory_metadata(owner, Some(modified_ms(&path)?));
-                        let stamp = refresh_document(index, &id, &metadata, &path)?;
-                        walk.note(&path, Some(stamp));
+                        let stats = retry_later(
+                            refresh_document_ctx(
+                                index,
+                                &id,
+                                &metadata,
+                                &path,
+                                budget,
+                                gate,
+                                || Ok(()),
+                            ),
+                            &path,
+                        )?;
+                        walk.note(&path, Some(stats.stamp.clone()));
+                        refresh.add(&stats);
                         keep.insert(path.to_string_lossy().into_owned());
                     }
                 }
@@ -500,17 +603,22 @@ impl Store {
                             let wal = crate::host_sqlite::wal_path(&path);
                             walk.note(&wal, FileStamp::of_path(&wal)?);
                         }
-                        let stamp = refresh_source_at(
-                            index,
-                            owner,
+                        let stats = retry_later(
+                            refresh_source_ctx(
+                                index,
+                                owner,
+                                &path,
+                                source.format,
+                                is_external_harness_transcript(&root, &path),
+                                now_ms,
+                                budget,
+                                gate,
+                            ),
                             &path,
-                            source.format,
-                            is_external_harness_transcript(&root, &path),
-                            false,
-                            crate::now_ms(),
                         )?;
-                        walk.note(&path, Some(stamp.stamp));
-                        if stamp.indexed {
+                        walk.note(&path, Some(stats.stamp.clone()));
+                        refresh.add(&stats);
+                        if stats.indexed {
                             keep.insert(path.to_string_lossy().into_owned());
                         }
                     }
@@ -525,8 +633,20 @@ impl Store {
                             owner.id,
                             sha256(path.as_os_str().as_encoded_bytes())
                         );
-                        let stamp = refresh_document(index, &id, &history_metadata(owner), &path)?;
-                        walk.note(&path, Some(stamp));
+                        let stats = retry_later(
+                            refresh_document_ctx(
+                                index,
+                                &id,
+                                &history_metadata(owner),
+                                &path,
+                                budget,
+                                gate,
+                                || Ok(()),
+                            ),
+                            &path,
+                        )?;
+                        walk.note(&path, Some(stats.stamp.clone()));
+                        refresh.add(&stats);
                         keep.insert(path.to_string_lossy().into_owned());
                     }
                 }
@@ -543,8 +663,272 @@ impl Store {
             })
             .map(|(segment, _)| segment)
             .collect();
-        index.forget_sources(owner.id.as_str(), &stale)?;
-        Ok(walk)
+        if !stale.is_empty() {
+            match gate()? {
+                Some(_guard) => index.forget_sources(owner.id.as_str(), &stale)?,
+                None => refresh.complete = false,
+            }
+        }
+        Ok((walk, refresh))
+    }
+}
+
+/// A source that changed under its read is not an error: it is left for a
+/// later refresh, which reads it again.
+fn retry_later(
+    result: Result<RefreshStats, IndexError>,
+    path: &Path,
+) -> Result<RefreshStats, IndexError> {
+    match result {
+        Err(IndexError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock => {
+            let stamp = FileStamp::read(&open_readonly(path)?)?;
+            let len = stamp.len;
+            Ok(RefreshStats::new(stamp).pending(len))
+        }
+        other => other,
+    }
+}
+
+/// What refreshing one class left: everything published, or bytes still to
+/// index in the background.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ClassRefresh {
+    complete: bool,
+    pending_sources: usize,
+    pending_bytes: u64,
+}
+impl ClassRefresh {
+    fn complete() -> Self {
+        Self {
+            complete: true,
+            ..Self::default()
+        }
+    }
+    fn add(&mut self, stats: &RefreshStats) {
+        if !stats.complete {
+            self.complete = false;
+            self.pending_sources += 1;
+            self.pending_bytes += stats.pending_bytes;
+        }
+    }
+}
+
+/// Hits with the raw bytes each window read back.
+pub type HostHits = Vec<(IndexHit, Vec<u8>)>;
+
+/// History a search could not index before answering: it is being indexed
+/// in the background, so results from it may be missing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PendingHistory {
+    pub sources: usize,
+    pub bytes: u64,
+}
+
+/// Background work: a class a search left incomplete, or a source due for
+/// full verification.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Job {
+    Class(String, MemoryScope),
+    /// Owner, source, and when the verifier scheduled it: the time recorded.
+    Verify(String, PathBuf, i64),
+}
+
+/// Jobs by data directory, for the background indexer; and its pre-warm
+/// pass over every agent after the process starts.
+struct Backlog {
+    queue: std::collections::VecDeque<Job>,
+    prewarm: Option<Vec<String>>,
+    prewarm_next: usize,
+}
+static BACKLOG: std::sync::LazyLock<(
+    std::sync::Mutex<HashMap<PathBuf, Backlog>>,
+    std::sync::Condvar,
+)> = std::sync::LazyLock::new(Default::default);
+
+fn backlog() -> std::sync::MutexGuard<'static, HashMap<PathBuf, Backlog>> {
+    BACKLOG
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+fn backlog_entry<'a>(map: &'a mut HashMap<PathBuf, Backlog>, data: &Path) -> &'a mut Backlog {
+    map.entry(data.to_owned()).or_insert_with(|| Backlog {
+        queue: std::collections::VecDeque::new(),
+        prewarm: None,
+        prewarm_next: 0,
+    })
+}
+
+fn enqueue_job(data: &Path, job: Job) {
+    let mut map = backlog();
+    let entry = backlog_entry(&mut map, data);
+    if !entry.queue.contains(&job) {
+        entry.queue.push_back(job);
+    }
+    BACKLOG.1.notify_all();
+}
+fn enqueue(data: &Path, owner: &str, class: MemoryScope) {
+    enqueue_job(data, Job::Class(owner.to_owned(), class));
+}
+
+impl Store {
+    /// History classes waiting for the background indexer in this process.
+    pub fn host_history_backlog(&self) -> usize {
+        backlog().get(self.data_dir()).map_or(0, |b| b.queue.len())
+    }
+
+    /// One bounded step of background indexing: a queued job first (a class
+    /// a search left incomplete, or a source due for verification),
+    /// otherwise the next agent of the pre-warm pass that covers every agent
+    /// once per process, live agents first. A class still incomplete after
+    /// `budget` bytes is queued again behind the others. Returns whether
+    /// there was work.
+    pub fn index_host_history_step(&self, budget: u64) -> Result<bool, IndexError> {
+        let data = self.data_dir().to_owned();
+        let next = backlog_entry(&mut backlog(), &data).queue.pop_front();
+        let jobs: Vec<Job> = match next {
+            Some(job) => vec![job],
+            None => {
+                let listed = backlog().get(&data).and_then(|b| b.prewarm.clone());
+                let list = match listed {
+                    Some(list) => list,
+                    None => {
+                        let mut live = Vec::new();
+                        let mut archived = Vec::new();
+                        for agent in self.list_agents().map_err(store_error)? {
+                            if agent.state == "archived" {
+                                archived.push(agent.id.to_string());
+                            } else {
+                                live.push(agent.id.to_string());
+                            }
+                        }
+                        live.extend(archived);
+                        backlog_entry(&mut backlog(), &data).prewarm = Some(live.clone());
+                        live
+                    }
+                };
+                let at = {
+                    let mut map = backlog();
+                    let entry = backlog_entry(&mut map, &data);
+                    entry.prewarm_next += 1;
+                    entry.prewarm_next - 1
+                };
+                match list.get(at) {
+                    Some(owner) => CLASSES
+                        .iter()
+                        .map(|c| Job::Class(owner.clone(), *c))
+                        .collect(),
+                    None => return Ok(false),
+                }
+            }
+        };
+        let index_path = data.join(INDEX_FILE);
+        let mut index = HostIndex::shared(&index_path)?;
+        let agents = agents_identity(&data)?;
+        for job in jobs {
+            let owner = match &job {
+                Job::Class(owner, _) | Job::Verify(owner, _, _) => owner.as_str(),
+            };
+            let Some((id, name)) = self.agent_names([owner]).map_err(store_error)?.pop() else {
+                continue;
+            };
+            let owner = Owner { id, name };
+            match job {
+                Job::Class(_, class) => {
+                    let unresolved = self.unresolved_host_paths(owner.id.as_str())?;
+                    let mut remaining = budget;
+                    let refresh = self.refresh_class_if_changed(
+                        &mut index,
+                        &owner,
+                        class,
+                        &unresolved,
+                        agents,
+                        crate::now_ms(),
+                        &mut remaining,
+                    )?;
+                    if !refresh.complete {
+                        enqueue(&data, owner.id.as_str(), class);
+                    }
+                }
+                Job::Verify(_, path, at) => {
+                    self.verify_host_history_source(&mut index, &owner, &path, at)?;
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    /// Fully verify one source the verifier scheduled, if it is still one of
+    /// the owner's sources and not withheld by a pending redaction.
+    fn verify_host_history_source(
+        &self,
+        index: &mut HostIndex,
+        owner: &Owner,
+        path: &Path,
+        now_ms: i64,
+    ) -> Result<bool, IndexError> {
+        let root = self.data_dir().join("agents").join(owner.id.as_str());
+        let mut walk = Walk::new(&root);
+        let found = if safe_components(&mut walk, self.data_dir(), &root)? {
+            native_sources(&mut walk, &root)?
+                .into_iter()
+                .find(|s| s.path == path)
+        } else {
+            None
+        };
+        let Some(found) = found else {
+            return Ok(false);
+        };
+        let epoch = self.redaction_epoch(owner.id.as_str())?;
+        if self
+            .unresolved_host_paths(owner.id.as_str())?
+            .iter()
+            .any(|p| path.starts_with(p))
+        {
+            return Ok(false);
+        }
+        let mut gate = || -> Result<Option<Box<dyn std::any::Any>>, IndexError> {
+            let guard = self.lock_agent_lifecycle(&owner.id).map_err(store_error)?;
+            if self.redaction_epoch(owner.id.as_str())? != epoch {
+                return Ok(None);
+            }
+            Ok(Some(Box::new(guard)))
+        };
+        verify_source_ctx(
+            index,
+            owner,
+            path,
+            found.format,
+            is_external_harness_transcript(&root, path),
+            now_ms,
+            &mut gate,
+        )
+    }
+
+    /// Run the background indexer on the calling thread for as long as the
+    /// process lives: classes searches left incomplete, then a pre-warm pass
+    /// over every agent, then nothing until a search queues more. The caller
+    /// runs it at the lowest CPU priority. A failing class is reported and
+    /// left for the next search to queue again.
+    pub fn run_host_history_indexer(&self) {
+        loop {
+            match self.index_host_history_step(BACKGROUND_STEP_BYTES) {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(error) => {
+                    eprintln!("anyagents-host-history: background indexing: {error}");
+                    std::thread::sleep(std::time::Duration::from_secs(10));
+                    continue;
+                }
+            }
+            let map = backlog();
+            let _idle = BACKLOG
+                .1
+                .wait_while(map, |map| {
+                    map.get(self.data_dir()).is_none_or(|b| b.queue.is_empty())
+                })
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
     }
 }
 
@@ -747,6 +1131,39 @@ fn agent_root_safe(walk: &mut Walk, agents: Option<(u64, u64)>) -> io::Result<bo
     Ok(agents.is_some() && metadata.is_some_and(|m| !m.file_type().is_symlink()))
 }
 
+/// Raw bytes one batch reads before it publishes. Every read, hash and token
+/// projection of a batch happens with no lock and no index write held; only
+/// publishing a batch holds the owner's lifecycle lock and the index write,
+/// so this bounds how long either is held.
+const BATCH_BYTES: u64 = 2 * 1024 * 1024;
+fn batch_bytes() -> u64 {
+    #[cfg(test)]
+    if let Some(bytes) = tests::BATCH_BYTES_OVERRIDE.with(std::cell::Cell::get) {
+        return bytes;
+    }
+    BATCH_BYTES
+}
+/// Store rows one batch reads.
+const BATCH_ROWS: usize = 512;
+/// New history one search may index before it answers. A class with more is
+/// handed to the background indexer and the answer says it is partial.
+pub const REQUEST_INDEX_BYTES: u64 = 4 * 1024 * 1024;
+/// What one background step may index before it yields to the next class.
+pub const BACKGROUND_STEP_BYTES: u64 = 64 * 1024 * 1024;
+
+/// May a batch publish now? `Some(guard)` is what must be held while it does
+/// (the owner's lifecycle lock, unless the caller already holds it); `None`
+/// means the owner's history changed under the read (a redaction), so the
+/// batch is dropped and the class is left for a later refresh.
+pub(crate) type Gate<'a> = dyn FnMut() -> Result<Option<Box<dyn std::any::Any>>, IndexError> + 'a;
+
+/// A gate for a caller that already holds what publishing needs.
+#[cfg(test)]
+fn open_gate() -> Result<Option<Box<dyn std::any::Any>>, IndexError> {
+    Ok(Some(Box::new(())))
+}
+
+#[derive(Clone, Debug)]
 pub struct RefreshStats {
     /// The stamp of the file the published frontier describes.
     stamp: FileStamp,
@@ -754,7 +1171,55 @@ pub struct RefreshStats {
     pub boundary_capture_bytes: u64,
     pub suffix_scanned_bytes: u64,
     pub indexed_records: usize,
+    /// Everything the source held when read is published.
+    pub complete: bool,
+    /// Bytes still to index when not complete (an estimate for a store).
+    pub pending_bytes: u64,
+    /// A source this reader understands; a store of another layout is not.
+    indexed: bool,
 }
+impl RefreshStats {
+    fn new(stamp: FileStamp) -> Self {
+        Self {
+            stamp,
+            prefix_verified_bytes: 0,
+            boundary_capture_bytes: 0,
+            suffix_scanned_bytes: 0,
+            indexed_records: 0,
+            complete: false,
+            pending_bytes: 0,
+            indexed: true,
+        }
+    }
+    fn done(mut self) -> Self {
+        self.complete = true;
+        self.pending_bytes = 0;
+        self
+    }
+    fn pending(mut self, bytes: u64) -> Self {
+        self.complete = false;
+        self.pending_bytes = bytes.max(1);
+        self
+    }
+}
+
+/// The published cursor a batch was planned from must still be the
+/// published one when it publishes; anything else means another refresh
+/// moved the frontier first, and this batch is planned again.
+fn same_cursor(a: &Option<SourceCursor>, b: &Option<SourceCursor>) -> bool {
+    let key = |c: &Option<SourceCursor>| c.as_ref().and_then(|c| serde_json::to_string(c).ok());
+    key(a) == key(b)
+}
+
+fn changed_during_refresh(what: &str) -> IndexError {
+    io::Error::new(
+        io::ErrorKind::WouldBlock,
+        format!("{what} changed during refresh; retry"),
+    )
+    .into()
+}
+
+#[cfg(test)]
 fn refresh_document(
     index: &mut HostIndex,
     id: &str,
@@ -763,6 +1228,7 @@ fn refresh_document(
 ) -> Result<FileStamp, IndexError> {
     refresh_document_before_publish(index, id, metadata, path, || Ok(()))
 }
+#[cfg(test)]
 fn refresh_document_before_publish(
     index: &mut HostIndex,
     id: &str,
@@ -770,44 +1236,91 @@ fn refresh_document_before_publish(
     path: &Path,
     before_publish: impl FnOnce() -> io::Result<()>,
 ) -> Result<FileStamp, IndexError> {
+    let mut budget = u64::MAX;
+    refresh_document_ctx(
+        index,
+        id,
+        metadata,
+        path,
+        &mut budget,
+        &mut open_gate,
+        before_publish,
+    )
+    .map(|stats| stats.stamp)
+}
+
+/// Index one whole-file document (a learned-memory topic or an archive
+/// page). It is read and projected with no lock held; publishing checks
+/// that the file still has the stamp it was read at.
+fn refresh_document_ctx(
+    index: &mut HostIndex,
+    id: &str,
+    metadata: &IndexMetadata,
+    path: &Path,
+    budget: &mut u64,
+    gate: &mut Gate<'_>,
+    before_publish: impl FnOnce() -> io::Result<()>,
+) -> Result<RefreshStats, IndexError> {
     // One path walk; the stamp, hash and projection share this descriptor.
     let mut source = RawSource::open(path)?;
     let stamp = source.stamp().clone();
+    let stats = RefreshStats::new(stamp.clone());
     let policy = serde_json::to_string(metadata)?;
     if index
         .source_cursor(&metadata.agent_id, path)?
         .is_some_and(|old| old.stamp == stamp && old.policy == policy)
     {
-        return Ok(stamp);
+        return Ok(stats.done());
+    }
+    // A whole document is one batch. One larger than what is left of the
+    // budget waits, unless no smaller budget would ever take it.
+    if stamp.len > *budget && *budget < BACKGROUND_STEP_BYTES {
+        return Ok(stats.pending(stamp.len));
     }
     let raw = source.whole()?;
+    let prepared = if index.is_current(id, metadata, &raw)? {
+        None
+    } else {
+        Some(crate::host_index::prepare_document(
+            &mut source,
+            id,
+            metadata,
+            &raw,
+        )?)
+    };
+    drop(source);
+    let Some(_guard) = gate()? else {
+        return Ok(stats.pending(stamp.len));
+    };
     index.refresh_source(|index| {
-        index.index_from(&mut source, id, metadata, &raw)?;
-        before_publish()?;
-        if FileStamp::read(&open_readonly(path)?)? == stamp {
-            index.save_source(
-                &metadata.agent_id,
-                path,
-                &SourceCursor {
-                    stamp: stamp.clone(),
-                    policy,
-                    end: raw.length,
-                    next_seq: 2,
-                    boundary_sha256: String::new(),
-                    full_verified_ms: 0,
-                    verification_attempt_ms: 0,
-                },
-            )?;
-        } else {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "memory source changed during refresh; retry",
-            )
-            .into());
+        if let Some(doc) = &prepared {
+            index.publish_document(doc)?;
         }
-        Ok(stamp)
-    })
+        before_publish()?;
+        if FileStamp::read(&open_readonly(path)?)? != stamp {
+            return Err(changed_during_refresh("memory source"));
+        }
+        index.save_source(
+            &metadata.agent_id,
+            path,
+            &SourceCursor {
+                stamp: stamp.clone(),
+                policy,
+                end: raw.length,
+                next_seq: 2,
+                boundary_sha256: String::new(),
+                full_verified_ms: 0,
+                verification_attempt_ms: 0,
+                complete: true,
+                rebuilding: false,
+            },
+        )?;
+        Ok(())
+    })?;
+    *budget = budget.saturating_sub(raw.length);
+    Ok(stats.done())
 }
+
 /// A history file a harness writes, not AnyAgents. Its writer may crash
 /// mid-line or concatenate records, so a malformed complete line is indexed
 /// as text with unknown metadata instead of failing the agent's search.
@@ -830,14 +1343,8 @@ fn refresh_native(
         crate::now_ms(),
     )
 }
-
-/// What a refresh published for one source: the stamp taken before it was
-/// read, and whether it is a source this reader indexes at all.
-struct Published {
-    stamp: FileStamp,
-    indexed: bool,
-}
-fn refresh_source_at(
+#[cfg(test)]
+fn refresh_native_at(
     index: &mut HostIndex,
     owner: &Owner,
     path: &Path,
@@ -845,22 +1352,68 @@ fn refresh_source_at(
     tolerate_malformed: bool,
     force_full: bool,
     now_ms: i64,
-) -> Result<Published, IndexError> {
+) -> Result<RefreshStats, IndexError> {
+    let mut budget = u64::MAX;
+    refresh_native_ctx(
+        index,
+        owner,
+        path,
+        format,
+        tolerate_malformed,
+        force_full,
+        now_ms,
+        &mut budget,
+        &mut open_gate,
+    )
+}
+#[cfg(test)]
+fn refresh_store_at(
+    index: &mut HostIndex,
+    owner: &Owner,
+    db: &Path,
+    kind: StoreKind,
+    force_full: bool,
+    now_ms: i64,
+) -> Result<RefreshStats, IndexError> {
+    let mut budget = u64::MAX;
+    refresh_store_ctx(
+        index,
+        owner,
+        db,
+        kind,
+        force_full,
+        now_ms,
+        &mut budget,
+        &mut open_gate,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn refresh_source_ctx(
+    index: &mut HostIndex,
+    owner: &Owner,
+    path: &Path,
+    format: NativeFormat,
+    tolerate_malformed: bool,
+    now_ms: i64,
+    budget: &mut u64,
+    gate: &mut Gate<'_>,
+) -> Result<RefreshStats, IndexError> {
     match format {
-        NativeFormat::Store(kind) => refresh_store_at(index, owner, path, kind, force_full, now_ms),
-        _ => Ok(Published {
-            stamp: refresh_native_at(
-                index,
-                owner,
-                path,
-                format,
-                tolerate_malformed,
-                force_full,
-                now_ms,
-            )?
-            .stamp,
-            indexed: true,
-        }),
+        NativeFormat::Store(kind) => {
+            refresh_store_ctx(index, owner, path, kind, false, now_ms, budget, gate)
+        }
+        _ => refresh_native_ctx(
+            index,
+            owner,
+            path,
+            format,
+            tolerate_malformed,
+            false,
+            now_ms,
+            budget,
+            gate,
+        ),
     }
 }
 
@@ -872,6 +1425,7 @@ fn native_metadata(
     source: &Path,
     header: &EventHeader,
     format: NativeFormat,
+    batch: &Prepared,
 ) -> Result<(IndexMetadata, Vec<(String, String)>), IndexError> {
     let mut metadata = event_metadata(owner, header, format);
     let records = header.tool_records(format.envelope());
@@ -891,8 +1445,8 @@ fn native_metadata(
         });
         let name = match (name, call_id) {
             (Some(name), _) => name,
-            (None, Some(id)) => index
-                .call_tool(owner.id.as_str(), source, id)?
+            (None, Some(id)) => batch
+                .call(index, owner.id.as_str(), source, id)?
                 .unwrap_or_else(|| "unknown".into()),
             (None, None) => "unknown".into(),
         };
@@ -909,139 +1463,388 @@ fn native_metadata(
     Ok((metadata, defined))
 }
 
-/// Index what is new in one native SQLite store: rows past the published
-/// rowid frontier and rows the store rewrote after the published change mark.
-/// The frontier and the rows are read in one snapshot of the store; rows,
-/// documents and the new frontier publish in one index transaction. A
-/// replaced database, a lower frontier or a changed frontier row rebuilds the
-/// store. Deleted rows stay published until full verification, and a stale
-/// row is refused at readback by its digest.
-fn refresh_store_at(
+/// A batch read and projected with no lock held, waiting to publish.
+struct Prepared {
+    docs: Vec<crate::host_index::PreparedDocument>,
+    calls: Vec<(String, String, String)>,
+    /// The batch starts a rebuild: publishing it first drops every document
+    /// of the source, so nothing published may be reused.
+    clearing: bool,
+}
+impl Prepared {
+    fn new(clearing: bool) -> Self {
+        Self {
+            docs: Vec::new(),
+            calls: Vec::new(),
+            clearing,
+        }
+    }
+    /// The tool a call defined earlier in this batch or, unless the batch
+    /// starts a rebuild, by a published document.
+    fn call(
+        &self,
+        index: &HostIndex,
+        owner: &str,
+        source: &Path,
+        id: &str,
+    ) -> Result<Option<String>, IndexError> {
+        if let Some(name) = self
+            .calls
+            .iter()
+            .rev()
+            .find_map(|(call, name, _)| (call == id).then_some(name))
+        {
+            return Ok(Some(name.clone()));
+        }
+        if self.clearing {
+            return Ok(None);
+        }
+        index.call_tool(owner, source, id)
+    }
+    /// Project one event unless the index already holds it exactly, and
+    /// record the calls it defines.
+    fn add(
+        &mut self,
+        index: &HostIndex,
+        source: &mut RawSource,
+        id: String,
+        metadata: IndexMetadata,
+        raw: &crate::raw_segment::RawCoordinate,
+        calls: Vec<(String, String)>,
+    ) -> Result<(), IndexError> {
+        if self.clearing || !index.is_current(&id, &metadata, raw)? {
+            self.docs.push(crate::host_index::prepare_document(
+                source, &id, &metadata, raw,
+            )?);
+        }
+        for (call, name) in calls {
+            self.calls.push((call, name, id.clone()));
+        }
+        Ok(())
+    }
+    /// Write the batch. The caller holds the gate and the write scope.
+    fn publish(&self, index: &mut HostIndex, owner: &str, source: &Path) -> Result<(), IndexError> {
+        if self.clearing {
+            index.clear_source(owner, source)?;
+        }
+        for doc in &self.docs {
+            index.publish_document(doc)?;
+        }
+        for (call, name, id) in &self.calls {
+            index.save_call(owner, source, call, name, id)?;
+        }
+        Ok(())
+    }
+}
+
+/// One store row as a document ready to publish.
+fn prepare_row(
+    index: &HostIndex,
+    owner: &Owner,
+    db: &Path,
+    kind: StoreKind,
+    row: crate::host_sqlite::StoreRow,
+    prepared: &mut Prepared,
+) -> Result<(), IndexError> {
+    let reference = RowRef::new(db, kind, row.rowid);
+    let raw = crate::raw_segment::RawCoordinate {
+        segment: reference.segment(),
+        offset: 0,
+        length: row.bytes.len() as u64,
+        sha256: sha256(&row.bytes),
+        seq: row.rowid.max(0) as u64,
+    };
+    // A row the store accepted but this reader cannot frame still indexes
+    // its text, with unknown metadata.
+    let header: EventHeader =
+        serde_json::from_reader(MetadataReader::new(&row.bytes[..])).unwrap_or_default();
+    let (mut metadata, calls) = native_metadata(
+        index,
+        owner,
+        db,
+        &header,
+        NativeFormat::Store(kind),
+        prepared,
+    )?;
+    if let Some(role) = row.role.as_deref().filter(|r| !r.is_empty()) {
+        metadata.direction = if role == "user" { "in" } else { "out" }.into();
+        metadata.role = Some(role.into());
+    }
+    if row.timestamp_ms.is_some() {
+        metadata.timestamp_ms = row.timestamp_ms;
+    }
+    let id = format!(
+        "transcript:{}:{}:{}",
+        owner.id,
+        sha256(db.as_os_str().as_encoded_bytes()),
+        row.rowid
+    );
+    let mut source = RawSource::from_row(&reference, row.bytes)?;
+    prepared.add(index, &mut source, id, metadata, &raw, calls)
+}
+
+/// The digest of one store row, or empty for no row.
+fn row_digest(store: &crate::host_sqlite::Store, rowid: i64) -> io::Result<String> {
+    Ok(match rowid {
+        rowid if rowid > 0 => store.row(rowid)?.map(|b| sha256(&b)).unwrap_or_default(),
+        _ => String::new(),
+    })
+}
+
+/// The rows a batch read must still be the store's when it publishes: the
+/// same database file, with the batch's last row unchanged.
+fn check_store(
+    db: &Path,
+    kind: StoreKind,
+    stamp: &FileStamp,
+    last: i64,
+    digest: &str,
+) -> Result<(), IndexError> {
+    if !FileStamp::read(&open_readonly(db)?)?.same_file(stamp) {
+        return Err(changed_during_refresh("native store"));
+    }
+    if last > 0 {
+        let check = crate::host_sqlite::Store::open(db, kind)?
+            .ok_or_else(|| changed_during_refresh("native store"))?;
+        if row_digest(&check, last)? != digest {
+            return Err(changed_during_refresh("native store"));
+        }
+    }
+    Ok(())
+}
+
+/// Index what is new in one native SQLite store, in batches. Rows past the
+/// published rowid frontier are read in rowid order, a bounded batch at a
+/// time from one snapshot of the store each, projected with no lock held,
+/// and published under the gate after checking that the store is the same
+/// database and the batch's last row is unchanged. Once the frontier reaches
+/// the store's last row, rows the store rewrote after the published change
+/// mark are read the same way. A replaced database, a lower frontier or a
+/// changed frontier row rebuilds the store: its first batch drops the old
+/// documents. Deleted rows otherwise stay published until full verification
+/// and are refused at readback by their digest.
+#[allow(clippy::too_many_arguments)]
+fn refresh_store_ctx(
     index: &mut HostIndex,
     owner: &Owner,
     db: &Path,
     kind: StoreKind,
     force_full: bool,
     now_ms: i64,
-) -> Result<Published, IndexError> {
-    let stamp = FileStamp::read(&open_readonly(db)?)?;
-    let Some(store) = crate::host_sqlite::Store::open(db, kind)? else {
-        // Not this harness's layout: nothing in it is history this reader
-        // understands. Whatever an earlier layout published is forgotten by
-        // the caller's walk.
-        return Ok(Published {
-            stamp,
-            indexed: false,
-        });
-    };
+    budget: &mut u64,
+    gate: &mut Gate<'_>,
+) -> Result<RefreshStats, IndexError> {
     let policy = NativeFormat::Store(kind).policy(owner);
-    let old = index
-        .source_cursor(owner.id.as_str(), db)?
-        .filter(|old| old.policy == policy);
-    store.snapshot()?;
-    let (top, changed) = store.frontier()?;
-    let row_digest = |rowid: u64| -> io::Result<String> {
-        Ok(match i64::try_from(rowid).ok().filter(|&r| r > 0) {
-            Some(rowid) => store.row(rowid)?.map(|b| sha256(&b)).unwrap_or_default(),
-            None => String::new(),
-        })
-    };
-    let after = match &old {
-        Some(old)
-            if !force_full
-                && old.stamp.same_file(&stamp)
-                && old.end <= top.max(0) as u64
-                && row_digest(old.end)? == old.boundary_sha256 =>
-        {
-            if old.end == top.max(0) as u64 && old.next_seq == changed.max(0) as u64 {
-                return Ok(Published {
-                    stamp,
-                    indexed: true,
-                });
+    let mut force = force_full;
+    let mut indexed_records = 0;
+    loop {
+        let stamp = FileStamp::read(&open_readonly(db)?)?;
+        let mut stats = RefreshStats::new(stamp.clone());
+        stats.indexed_records = indexed_records;
+        let Some(store) = crate::host_sqlite::Store::open(db, kind)? else {
+            // Not this harness's layout: nothing in it is history this reader
+            // understands. Whatever an earlier layout published is forgotten
+            // by the caller's walk.
+            stats.indexed = false;
+            return Ok(stats.done());
+        };
+        let old = index
+            .source_cursor(owner.id.as_str(), db)?
+            .filter(|old| old.policy == policy);
+        store.snapshot()?;
+        let (top, changed) = store.frontier()?;
+        let top = top.max(0);
+        let resume = match &old {
+            Some(old)
+                if !force
+                    && old.stamp.same_file(&stamp)
+                    && old.end <= top as u64
+                    && row_digest(&store, old.end as i64)? == old.boundary_sha256 =>
+            {
+                Some(old.clone())
             }
-            Some((old.end as i64, old.next_seq as i64))
+            _ => None,
+        };
+        // Nothing past the frontier and nothing rewritten since its mark.
+        if let Some(r) = &resume
+            && r.complete
+            && r.end == top as u64
+            && r.next_seq == changed.max(0) as u64
+        {
+            return Ok(stats.done());
         }
-        _ => None,
-    };
-    let boundary_sha256 = row_digest(top.max(0) as u64)?;
-    let envelope = NativeFormat::Store(kind);
-    index.refresh_source(|index| {
-        if after.is_none() {
-            index.clear_source(owner.id.as_str(), db)?;
+        let clearing = resume.is_none();
+        let rebuilding = clearing || resume.as_ref().is_some_and(|r| r.rebuilding);
+        let (after, mark) = match &resume {
+            Some(r) => (r.end as i64, r.next_seq as i64),
+            // A rebuild remembers the change mark it started at, so a row
+            // rewritten while it runs is read again afterwards.
+            None => (0, changed.max(0)),
+        };
+        let average = if top > 0 { stamp.len / top as u64 } else { 0 }.max(1);
+        let rewrites = after >= top;
+        if !rewrites && *budget == 0 {
+            return Ok(stats.pending((top - after) as u64 * average));
         }
-        let mut failure = None;
-        store
-            .rows(after, top, |row| {
-                let result = (|| -> Result<(), IndexError> {
-                    let reference = RowRef::new(db, kind, row.rowid);
-                    let raw = crate::raw_segment::RawCoordinate {
-                        segment: reference.segment(),
-                        offset: 0,
-                        length: row.bytes.len() as u64,
-                        sha256: sha256(&row.bytes),
-                        seq: row.rowid.max(0) as u64,
-                    };
-                    // A row the store accepted but this reader cannot frame
-                    // still indexes its text, with unknown metadata.
-                    let header: EventHeader =
-                        serde_json::from_reader(MetadataReader::new(&row.bytes[..]))
-                            .unwrap_or_default();
-                    let (mut metadata, calls) =
-                        native_metadata(index, owner, db, &header, envelope)?;
-                    if let Some(role) = row.role.as_deref().filter(|r| !r.is_empty()) {
-                        metadata.direction = if role == "user" { "in" } else { "out" }.into();
-                        metadata.role = Some(role.into());
-                    }
-                    if row.timestamp_ms.is_some() {
-                        metadata.timestamp_ms = row.timestamp_ms;
-                    }
-                    let id = format!(
-                        "transcript:{}:{}:{}",
-                        owner.id,
-                        sha256(db.as_os_str().as_encoded_bytes()),
-                        row.rowid
-                    );
-                    let mut source = RawSource::from_row(&reference, row.bytes)?;
-                    index.index_from(&mut source, &id, &metadata, &raw)?;
-                    for (call, name) in calls {
-                        index.save_call(owner.id.as_str(), db, &call, &name, &id)?;
-                    }
-                    Ok(())
-                })();
-                result.map_err(|error| {
-                    let message = error.to_string();
-                    failure = Some(error);
-                    io::Error::other(message)
-                })
-            })
-            .map_err(|error| failure.take().unwrap_or_else(|| error.into()))?;
-        index.save_source(
-            owner.id.as_str(),
-            db,
-            &SourceCursor {
-                stamp: stamp.clone(),
-                policy,
-                end: top.max(0) as u64,
-                next_seq: changed.max(0) as u64,
-                boundary_sha256,
-                full_verified_ms: match (&old, after) {
-                    (Some(old), Some(_)) => old.full_verified_ms,
-                    _ => now_ms,
+        let rows = if rewrites {
+            store.rows_changed(top, mark, BATCH_ROWS, batch_bytes().min(*budget))?
+        } else {
+            store.rows_after(after, top, BATCH_ROWS, batch_bytes().min(*budget))?
+        };
+        if rewrites && rows.is_empty() && resume.as_ref().is_some_and(|r| r.complete) {
+            return Ok(stats.done());
+        }
+        if rewrites && !rows.is_empty() && *budget == 0 {
+            return Ok(stats.pending(average * rows.len() as u64));
+        }
+        let read: u64 = rows.iter().map(|r| r.bytes.len() as u64).sum();
+        let end = if rewrites {
+            after
+        } else {
+            rows.last().map_or(after, |r| r.rowid)
+        };
+        // The rewrites of a full batch continue from its last change mark;
+        // a short batch reads every rewrite there is.
+        let (new_mark, caught_up) = if !rewrites {
+            (mark, false)
+        } else if rows.len() < BATCH_ROWS && read < batch_bytes().min(*budget) {
+            (rows.iter().map(|r| r.changed).fold(mark, i64::max), true)
+        } else {
+            // Rows sharing the last mark past this batch are read again
+            // from the mark below it; reading one twice costs no write.
+            let last = rows.last().map_or(mark, |r| r.changed);
+            let below = rows
+                .iter()
+                .map(|r| r.changed)
+                .filter(|c| *c < last)
+                .max()
+                .unwrap_or(last);
+            (below.max(mark), false)
+        };
+        let boundary_sha256 = row_digest(&store, end)?;
+        drop(store);
+        // Project every row with no lock held.
+        let mut prepared = Prepared::new(clearing);
+        for row in rows {
+            prepare_row(index, owner, db, kind, row, &mut prepared)?;
+            stats.indexed_records += 1;
+        }
+        indexed_records = stats.indexed_records;
+        let Some(_guard) = gate()? else {
+            return Ok(stats.pending(read.max(average)));
+        };
+        let published = index.refresh_source(|index| {
+            let current = index
+                .source_cursor(owner.id.as_str(), db)?
+                .filter(|old| old.policy == policy);
+            if !same_cursor(&current, &old) {
+                return Ok(false);
+            }
+            check_store(db, kind, &stamp, end, &boundary_sha256)?;
+            prepared.publish(index, owner.id.as_str(), db)?;
+            let completed = rebuilding && caught_up;
+            index.save_source(
+                owner.id.as_str(),
+                db,
+                &SourceCursor {
+                    stamp: stamp.clone(),
+                    policy: policy.clone(),
+                    end: end.max(0) as u64,
+                    next_seq: new_mark.max(0) as u64,
+                    boundary_sha256: boundary_sha256.clone(),
+                    full_verified_ms: match (&old, completed) {
+                        (_, true) => now_ms,
+                        (Some(old), false) => old.full_verified_ms,
+                        (None, false) => 0,
+                    },
+                    verification_attempt_ms: match (&old, completed) {
+                        (_, true) => now_ms,
+                        (Some(old), false) => old.verification_attempt_ms,
+                        (None, false) => 0,
+                    },
+                    complete: caught_up,
+                    rebuilding: rebuilding && !caught_up,
                 },
-                verification_attempt_ms: match (&old, after) {
-                    (Some(old), Some(_)) => old.verification_attempt_ms,
-                    _ => now_ms,
-                },
-            },
-        )?;
-        Ok(Published {
-            stamp,
-            indexed: true,
-        })
-    })
+            )?;
+            Ok(true)
+        })?;
+        *budget = budget.saturating_sub(read.max(1));
+        force = false;
+        if published && caught_up {
+            return Ok(stats.done());
+        }
+    }
 }
 
-fn refresh_native_at(
+/// The records a batch read must still be the file's when it publishes: the
+/// same file, unchanged, or grown by appends with the batch's boundary (the
+/// 64 KiB before its end) unchanged.
+fn check_jsonl(path: &Path, stamp: &FileStamp, end: u64, boundary: &str) -> Result<(), IndexError> {
+    let mut check = RawSource::open(path)?;
+    let now = check.stamp().clone();
+    if now == *stamp {
+        return Ok(());
+    }
+    if !now.same_file(stamp)
+        || now.len <= stamp.len
+        || crate::host_cursor::boundary_hash(&mut check, end)?.0 != boundary
+    {
+        return Err(changed_during_refresh("native source"));
+    }
+    Ok(())
+}
+
+/// Read and project one scanned batch of JSONL records with no lock held.
+#[allow(clippy::too_many_arguments)]
+fn prepare_records(
+    index: &HostIndex,
+    owner: &Owner,
+    path: &Path,
+    format: NativeFormat,
+    tolerate_malformed: bool,
+    source: &mut RawSource,
+    records: &[crate::raw_segment::RawCoordinate],
+    prepared: &mut Prepared,
+) -> Result<(), IndexError> {
+    for raw in records {
+        // EventHeader is derivative metadata; malformed/torn external JSONL
+        // records must not break lexical indexing or fail whole-agent search.
+        let header: EventHeader = match serde_json::from_reader(MetadataReader::new(
+            source.range(raw.offset, raw.length),
+        )) {
+            Ok(header) => header,
+            Err(error)
+                if tolerate_malformed
+                    && matches!(
+                        error.classify(),
+                        serde_json::error::Category::Syntax | serde_json::error::Category::Eof
+                    ) =>
+            {
+                EventHeader::default()
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let (metadata, calls) = native_metadata(index, owner, path, &header, format, prepared)?;
+        let id = format!(
+            "transcript:{}:{}:{}",
+            owner.id,
+            sha256(path.as_os_str().as_encoded_bytes()),
+            raw.seq
+        );
+        prepared.add(index, source, id, metadata, raw, calls)?;
+    }
+    Ok(())
+}
+
+/// Index what is new in one native JSONL file, in batches. Each batch scans
+/// a bounded run of complete records from the published frontier (checking
+/// the 64 KiB boundary before it, as every incremental refresh does), reads
+/// and projects them with no lock held, then publishes under the gate after
+/// checking the file still holds them ([`check_jsonl`]). A changed boundary,
+/// a replaced file or a forced refresh rebuilds the source: its first batch
+/// drops the old documents.
+#[allow(clippy::too_many_arguments)]
+fn refresh_native_ctx(
     index: &mut HostIndex,
     owner: &Owner,
     path: &Path,
@@ -1049,102 +1852,274 @@ fn refresh_native_at(
     tolerate_malformed: bool,
     force_full: bool,
     now_ms: i64,
+    budget: &mut u64,
+    gate: &mut Gate<'_>,
 ) -> Result<RefreshStats, IndexError> {
-    // One path walk; scan, metadata and projection share this descriptor.
-    let mut source = RawSource::open(path)?;
-    let stamp = source.stamp().clone();
     let policy = format.policy(owner);
-    let old = index
-        .source_cursor(owner.id.as_str(), path)?
-        .filter(|old| old.policy == policy);
-    if !force_full && old.as_ref().is_some_and(|old| old.stamp == stamp) {
-        return Ok(RefreshStats {
-            stamp,
-            prefix_verified_bytes: 0,
-            boundary_capture_bytes: 0,
-            suffix_scanned_bytes: 0,
-            indexed_records: 0,
-        });
-    }
-    let scan =
-        crate::host_cursor::scan_jsonl(&mut source, old.as_ref(), force_full, tolerate_malformed)?;
-    index.refresh_source(|index| {
-        if scan.replace {
-            index.clear_source(owner.id.as_str(), path)?;
+    let mut force = force_full;
+    let mut total: Option<RefreshStats> = None;
+    loop {
+        // One path walk; scan, metadata and projection share this descriptor.
+        let mut source = RawSource::open(path)?;
+        let stamp = source.stamp().clone();
+        let mut stats = total
+            .take()
+            .unwrap_or_else(|| RefreshStats::new(stamp.clone()));
+        stats.stamp = stamp.clone();
+        let old = index
+            .source_cursor(owner.id.as_str(), path)?
+            .filter(|old| old.policy == policy);
+        if !force
+            && old
+                .as_ref()
+                .is_some_and(|old| old.complete && old.stamp == stamp)
+        {
+            return Ok(stats.done());
         }
-        // There cannot be committed documents beyond the atomically published
-        // frontier. An interrupted outer transaction is rolled back by SQLite.
-        for raw in &scan.records {
-            // EventHeader is derivative metadata; malformed/torn external JSONL
-            // records must not break lexical indexing or fail whole-agent search.
-            let header: EventHeader = match serde_json::from_reader(MetadataReader::new(
-                source.range(raw.offset, raw.length),
-            )) {
-                Ok(header) => header,
-                Err(error)
-                    if tolerate_malformed
-                        && matches!(
-                            error.classify(),
-                            serde_json::error::Category::Syntax | serde_json::error::Category::Eof
-                        ) =>
-                {
-                    EventHeader::default()
-                }
-                Err(error) => return Err(error.into()),
-            };
-            let (metadata, calls) = native_metadata(index, owner, path, &header, format)?;
-            let id = format!(
-                "transcript:{}:{}:{}",
-                owner.id,
-                sha256(path.as_os_str().as_encoded_bytes()),
-                raw.seq
-            );
-            index.index_from(&mut source, &id, &metadata, raw)?;
-            for (call, name) in calls {
-                index.save_call(owner.id.as_str(), path, &call, &name, &id)?;
+        if *budget == 0 {
+            let from = old
+                .as_ref()
+                .filter(|o| o.stamp.same_file(&stamp))
+                .map_or(0, |o| o.end);
+            return Ok(stats.pending(stamp.len.saturating_sub(from)));
+        }
+        let scan = crate::host_cursor::scan_jsonl_bounded(
+            &mut source,
+            old.as_ref(),
+            force,
+            tolerate_malformed,
+            batch_bytes().min(*budget),
+        )?;
+        stats.prefix_verified_bytes += scan.prefix_verified_bytes;
+        stats.boundary_capture_bytes += scan.boundary_capture_bytes;
+        stats.suffix_scanned_bytes += scan.suffix_scanned_bytes;
+        stats.indexed_records += scan.records.len();
+        let rebuilding = scan.replace || old.as_ref().is_some_and(|o| o.rebuilding);
+        let mut prepared = Prepared::new(scan.replace);
+        prepare_records(
+            index,
+            owner,
+            path,
+            format,
+            tolerate_malformed,
+            &mut source,
+            &scan.records,
+            &mut prepared,
+        )?;
+        drop(source);
+        let Some(_guard) = gate()? else {
+            return Ok(stats.pending(stamp.len.saturating_sub(scan.start)));
+        };
+        let published = index.refresh_source(|index| {
+            let current = index
+                .source_cursor(owner.id.as_str(), path)?
+                .filter(|old| old.policy == policy);
+            if !same_cursor(&current, &old) {
+                return Ok(false);
             }
-        }
-        // A live append racing this snapshot is not corruption. Do not advance
-        // the frontier; the next refresh revalidates and retries that suffix.
-        if FileStamp::read(&open_readonly(path)?)? == stamp {
+            check_jsonl(path, &stamp, scan.end, &scan.boundary_sha256)?;
+            prepared.publish(index, owner.id.as_str(), path)?;
+            let completed = rebuilding && scan.reached_end;
             index.save_source(
                 owner.id.as_str(),
                 path,
                 &SourceCursor {
                     stamp: stamp.clone(),
-                    policy,
+                    policy: policy.clone(),
                     end: scan.end,
                     next_seq: scan.next_seq,
                     boundary_sha256: scan.boundary_sha256.clone(),
-                    full_verified_ms: if scan.replace {
-                        now_ms
-                    } else {
-                        old.as_ref().map_or(0, |c| c.full_verified_ms)
+                    full_verified_ms: match (&old, completed) {
+                        (_, true) => now_ms,
+                        (Some(old), false) => old.full_verified_ms,
+                        (None, false) => 0,
                     },
-                    verification_attempt_ms: if scan.replace {
-                        now_ms
-                    } else {
-                        old.as_ref().map_or(0, |c| c.verification_attempt_ms)
+                    verification_attempt_ms: match (&old, completed) {
+                        (_, true) => now_ms,
+                        (Some(old), false) => old.verification_attempt_ms,
+                        (None, false) => 0,
                     },
+                    complete: scan.reached_end,
+                    rebuilding: rebuilding && !scan.reached_end,
                 },
             )?;
-        } else {
-            // Roll back the whole publication, leaving the prior committed
-            // frontier and documents consistent for the next snapshot.
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "native source changed during refresh; retry",
-            )
-            .into());
+            Ok(true)
+        })?;
+        *budget = budget.saturating_sub(scan.suffix_scanned_bytes.max(1));
+        force = false;
+        if published && scan.reached_end {
+            return Ok(stats.done());
         }
-        Ok(RefreshStats {
-            stamp,
-            prefix_verified_bytes: scan.prefix_verified_bytes,
-            boundary_capture_bytes: scan.boundary_capture_bytes,
-            suffix_scanned_bytes: scan.suffix_scanned_bytes,
-            indexed_records: scan.records.len(),
-        })
-    })
+        total = Some(stats);
+    }
+}
+
+/// Fully verify one published source, in the background: read it from the
+/// first record in bounded batches with no lock held, publish under the gate
+/// only the documents whose bytes no longer match what is indexed, and when
+/// the whole source has been read, drop documents past its last record and
+/// record the verification. The published frontier is not touched until
+/// then, so a source that fails to read keeps its frontier and documents.
+/// Returns whether the verification was recorded.
+fn verify_source_ctx(
+    index: &mut HostIndex,
+    owner: &Owner,
+    path: &Path,
+    format: NativeFormat,
+    tolerate_malformed: bool,
+    now_ms: i64,
+    gate: &mut Gate<'_>,
+) -> Result<bool, IndexError> {
+    let policy = format.policy(owner);
+    match format {
+        NativeFormat::Store(kind) => {
+            let mut after = 0i64;
+            let mut first: Option<FileStamp> = None;
+            loop {
+                let stamp = FileStamp::read(&open_readonly(path)?)?;
+                if !first.get_or_insert_with(|| stamp.clone()).same_file(&stamp) {
+                    return Ok(false);
+                }
+                let Some(store) = crate::host_sqlite::Store::open(path, kind)? else {
+                    return Ok(false);
+                };
+                store.snapshot()?;
+                let (top, _) = store.frontier()?;
+                let rows = store.rows_after(after, top.max(0), BATCH_ROWS, batch_bytes())?;
+                let last = rows.last().map_or(after, |r| r.rowid);
+                let digest = row_digest(&store, last)?;
+                let present = if last >= top {
+                    Some(store.rowids(top.max(0))?)
+                } else {
+                    None
+                };
+                drop(store);
+                let mut prepared = Prepared::new(false);
+                for row in rows {
+                    prepare_row(index, owner, path, kind, row, &mut prepared)?;
+                }
+                let Some(_guard) = gate()? else {
+                    return Ok(false);
+                };
+                let recorded = index.refresh_source(|index| {
+                    check_store(path, kind, &stamp, last, &digest)?;
+                    prepared.publish(index, owner.id.as_str(), path)?;
+                    let Some(present) = &present else {
+                        return Ok(false);
+                    };
+                    let Some(mut cursor) = index
+                        .source_cursor(owner.id.as_str(), path)?
+                        .filter(|c| c.policy == policy)
+                    else {
+                        return Ok(false);
+                    };
+                    let present: HashSet<u64> = present.iter().map(|r| *r as u64).collect();
+                    let stale: Vec<u64> = index
+                        .source_sequences(owner.id.as_str(), path)?
+                        .into_iter()
+                        .filter(|seq| *seq <= last.max(0) as u64 && !present.contains(seq))
+                        .collect();
+                    index.forget_sequences(owner.id.as_str(), path, &stale)?;
+                    cursor.full_verified_ms = now_ms;
+                    index.save_source(owner.id.as_str(), path, &cursor)?;
+                    Ok(true)
+                })?;
+                if present.is_some() {
+                    return Ok(recorded);
+                }
+                after = last;
+            }
+        }
+        _ => {
+            let mut at: Option<SourceCursor> = None;
+            loop {
+                let mut source = RawSource::open(path)?;
+                let stamp = source.stamp().clone();
+                if let Some(at) = &mut at {
+                    if !at.stamp.same_file(&stamp) {
+                        return Ok(false);
+                    }
+                    at.stamp = stamp.clone();
+                }
+                let scan = crate::host_cursor::scan_jsonl_bounded(
+                    &mut source,
+                    at.as_ref(),
+                    at.is_none(),
+                    tolerate_malformed,
+                    batch_bytes(),
+                )?;
+                if at.is_some() && scan.replace {
+                    // Rewritten under the read: the next refresh rebuilds it.
+                    return Ok(false);
+                }
+                let mut prepared = Prepared::new(false);
+                prepare_records(
+                    index,
+                    owner,
+                    path,
+                    format,
+                    tolerate_malformed,
+                    &mut source,
+                    &scan.records,
+                    &mut prepared,
+                )?;
+                drop(source);
+                let Some(_guard) = gate()? else {
+                    return Ok(false);
+                };
+                let recorded = index.refresh_source(|index| {
+                    check_jsonl(path, &stamp, scan.end, &scan.boundary_sha256)?;
+                    prepared.publish(index, owner.id.as_str(), path)?;
+                    if !scan.reached_end {
+                        return Ok(false);
+                    }
+                    let Some(current) = index
+                        .source_cursor(owner.id.as_str(), path)?
+                        .filter(|c| c.policy == policy)
+                    else {
+                        return Ok(false);
+                    };
+                    // A refresh that published past this read keeps its
+                    // frontier and documents; this read verified all before.
+                    let cursor = if current.end > scan.end {
+                        SourceCursor {
+                            full_verified_ms: now_ms,
+                            ..current
+                        }
+                    } else {
+                        index.forget_documents_from(owner.id.as_str(), path, scan.next_seq)?;
+                        SourceCursor {
+                            stamp: stamp.clone(),
+                            policy: policy.clone(),
+                            end: scan.end,
+                            next_seq: scan.next_seq,
+                            boundary_sha256: scan.boundary_sha256.clone(),
+                            full_verified_ms: now_ms,
+                            verification_attempt_ms: current.verification_attempt_ms,
+                            complete: true,
+                            rebuilding: false,
+                        }
+                    };
+                    index.save_source(owner.id.as_str(), path, &cursor)?;
+                    Ok(true)
+                })?;
+                if scan.reached_end {
+                    return Ok(recorded);
+                }
+                at = Some(SourceCursor {
+                    stamp,
+                    policy: policy.clone(),
+                    end: scan.end,
+                    next_seq: scan.next_seq,
+                    boundary_sha256: scan.boundary_sha256,
+                    full_verified_ms: 0,
+                    verification_attempt_ms: 0,
+                    complete: false,
+                    rebuilding: false,
+                });
+            }
+        }
+    }
 }
 
 /// No component below `root` may be a symlink or missing. Directories on the
@@ -1452,8 +2427,10 @@ mod tests {
     use std::cell::Cell;
 
     thread_local! {
-        /// Class refreshes that took the lifecycle lock and walked the tree.
+        /// Class refreshes that walked the tree.
         pub(super) static CLASS_WALKS: Cell<usize> = const { Cell::new(0) };
+        /// A smaller batch, so a small fixture spans several batches.
+        pub(super) static BATCH_BYTES_OVERRIDE: Cell<Option<u64>> = const { Cell::new(None) };
     }
 
     /// A search touches an unchanged agent with a stat per recorded entry:
@@ -1500,8 +2477,10 @@ mod tests {
                         ..Default::default()
                     },
                     at,
+                    u64::MAX,
                 )
                 .unwrap()
+                .0
                 .into_iter()
                 .map(|(hit, bytes)| (hit.id, hit.metadata.sender, bytes))
                 .collect::<Vec<_>>()
@@ -1563,8 +2542,10 @@ mod tests {
                         ..Default::default()
                     },
                     now,
+                    u64::MAX,
                 )
-                .unwrap();
+                .unwrap()
+                .0;
             assert_eq!(hits.len(), 3);
         }
         assert_eq!(walks() - start, 2);
@@ -1703,8 +2684,7 @@ mod tests {
         let excessive = serde_json::json!({"content": (0..1025).map(|_| serde_json::json!({"type":"tool_use","id":"too-many","name":"wrong"})).collect::<Vec<_>>()});
         fs::OpenOptions::new().append(true).open(&native).unwrap().write_all(format!("{{\"type\":\"function_call\",\"call_id\":\"partial\",\"name\":\"not-published\"}}\n{excessive}\n").as_bytes()).unwrap();
         let failure = refresh_native(&mut index, &Owner::from(&own), &native)
-            .err()
-            .expect("metadata cap must refuse refresh");
+            .expect_err("metadata cap must refuse refresh");
         assert!(
             failure
                 .to_string()
@@ -2091,6 +3071,9 @@ mod tests {
                 .verify_one_host_history_source(t0 + 3_600_003)
                 .unwrap()
         );
+        // The maintenance tick only schedules it; the background indexer
+        // reads the source and repairs what changed.
+        assert!(store.index_host_history_step(u64::MAX).unwrap());
         let mut index = HostIndex::open(&index_path).unwrap();
         assert!(
             index
@@ -2148,12 +3131,336 @@ mod tests {
         );
     }
 
+    /// A transcript of `count` records, each naming its number.
+    fn numbered_transcript(path: &Path, count: usize) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for i in 0..count {
+            bytes.extend_from_slice(
+                format!(
+                    "{{\"role\":\"user\",\"content\":\"record{i:04} {}\"}}\n",
+                    "padding ".repeat(24)
+                )
+                .as_bytes(),
+            );
+        }
+        fs::write(path, &bytes).unwrap();
+        bytes
+    }
+
+    /// (a) Reading and projecting a source happen with no lifecycle lock and
+    /// no index write transaction held: the gate that takes the lock for a
+    /// batch is called only once the batch is read, the index accepts
+    /// another writer at that moment, and each batch reads a bounded share.
+    /// While the gate is held, the only read is the boundary check.
+    #[test]
+    fn indexing_reads_with_no_lock_or_write_and_publishes_bounded_batches() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        BATCH_BYTES_OVERRIDE.with(|b| b.set(Some(4096)));
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(NewAgent::new("batches", "spiron"))
+            .unwrap();
+        let root = dir
+            .path()
+            .join("agents")
+            .join(agent.id.as_str())
+            .join("transcripts");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("a.jsonl");
+        let bytes = numbered_transcript(&path, 60);
+        let index_path = dir.path().join(INDEX_FILE);
+        let mut index = HostIndex::open(&index_path).unwrap();
+
+        let prepared = || crate::host_index::PREPARED.with(Cell::get);
+        struct Held(Rc<RefCell<Vec<(usize, usize)>>>, usize);
+        impl Drop for Held {
+            fn drop(&mut self) {
+                let now = crate::host_index::PREPARED.with(Cell::get);
+                self.0.borrow_mut().push((self.1, now));
+            }
+        }
+        let holds = Rc::new(RefCell::new(Vec::new()));
+        let mut published_before = Vec::new();
+        let mut gate = || -> Result<Option<Box<dyn std::any::Any>>, IndexError> {
+            // Nothing holds this owner's lifecycle while a batch is read.
+            let lock = store.try_lock_agent_lifecycle(&agent.id).unwrap();
+            // Nor the index's write lock: another writer gets it at once.
+            let other = rusqlite::Connection::open(&index_path).unwrap();
+            other.busy_timeout(std::time::Duration::ZERO).unwrap();
+            other.execute_batch("BEGIN IMMEDIATE; ROLLBACK;").unwrap();
+            published_before.push(
+                HostIndex::open(&index_path)
+                    .unwrap()
+                    .source_documents(agent.id.as_str(), &path)
+                    .unwrap()
+                    .len(),
+            );
+            // This batch was read and projected before the gate.
+            let at = prepared();
+            let last = holds.borrow().last().map_or(0, |h: &(usize, usize)| h.1);
+            assert!(at > last, "a batch is projected before its gate");
+            Ok(Some(Box::new((lock, Held(Rc::clone(&holds), at)))))
+        };
+        let mut budget = u64::MAX;
+        let stats = refresh_native_ctx(
+            &mut index,
+            &Owner::from(&agent),
+            &path,
+            NativeFormat::Jsonl,
+            false,
+            false,
+            crate::now_ms(),
+            &mut budget,
+            &mut gate,
+        )
+        .unwrap();
+        assert!(stats.complete);
+        assert_eq!(stats.indexed_records, 60);
+        let record = bytes.len() as u64 / 60;
+        let batches = bytes.len() as u64 / (4096 + record) + 1;
+        let holds = holds.borrow();
+        assert!(holds.len() as u64 >= batches, "{} batches", holds.len());
+        // Every batch read its records before taking the gate, and published
+        // after: documents grow batch by batch, never all at once.
+        assert_eq!(published_before[0], 0);
+        assert!(published_before.windows(2).all(|w| w[0] < w[1]));
+        assert!(published_before.last().unwrap() < &60);
+        for (taken, released) in holds.iter() {
+            assert_eq!(
+                taken, released,
+                "nothing is read or projected under the gate"
+            );
+        }
+        let cursor = index
+            .source_cursor(agent.id.as_str(), &path)
+            .unwrap()
+            .unwrap();
+        assert!(cursor.complete && !cursor.rebuilding);
+        assert_eq!(cursor.end, bytes.len() as u64);
+        assert_eq!(
+            index
+                .source_documents(agent.id.as_str(), &path)
+                .unwrap()
+                .len(),
+            60
+        );
+        BATCH_BYTES_OVERRIDE.with(|b| b.set(None));
+    }
+
+    /// (a) A batch is published only if the source still holds what was
+    /// read. A batch read before a redaction (the gate refuses it) or before
+    /// an in-place rewrite is dropped and its frontier kept; an append by a
+    /// live writer is not a change to the records read. The next refresh
+    /// resumes from the last published batch.
+    #[test]
+    fn a_batch_publishes_only_while_its_source_and_owner_are_unchanged() {
+        use std::io::Write;
+        BATCH_BYTES_OVERRIDE.with(|b| b.set(Some(4096)));
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(NewAgent::new("gated", "spiron"))
+            .unwrap();
+        let owner = Owner::from(&agent);
+        let root = dir
+            .path()
+            .join("agents")
+            .join(agent.id.as_str())
+            .join("transcripts");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("a.jsonl");
+        let bytes = numbered_transcript(&path, 60);
+        let mut index = HostIndex::open(&dir.path().join(INDEX_FILE)).unwrap();
+        let refresh = |index: &mut HostIndex, gate: &mut Gate<'_>| {
+            let mut budget = u64::MAX;
+            refresh_native_ctx(
+                index,
+                &owner,
+                &path,
+                NativeFormat::Jsonl,
+                false,
+                false,
+                crate::now_ms(),
+                &mut budget,
+                gate,
+            )
+        };
+        // The owner changed under the second batch: it is dropped.
+        let mut calls = 0;
+        let stats = refresh(&mut index, &mut || {
+            calls += 1;
+            Ok((calls == 1).then(|| Box::new(()) as Box<dyn std::any::Any>))
+        })
+        .unwrap();
+        assert!(!stats.complete);
+        assert!(stats.pending_bytes > 0);
+        let first = index
+            .source_cursor(agent.id.as_str(), &path)
+            .unwrap()
+            .unwrap();
+        assert!(!first.complete);
+        assert!(first.end > 0 && first.end < bytes.len() as u64);
+        let published = index
+            .source_documents(agent.id.as_str(), &path)
+            .unwrap()
+            .len();
+        assert!(published > 0 && published < 60);
+
+        // A rewrite of the records being read refuses the batch.
+        let mut edited = bytes.clone();
+        let at = first.end as usize + 20;
+        edited[at..at + 6].copy_from_slice(b"EDITED");
+        let error = refresh(&mut index, &mut || {
+            fs::write(&path, &edited).unwrap();
+            Ok(Some(Box::new(())))
+        })
+        .unwrap_err();
+        assert!(matches!(error, IndexError::Io(ref e) if e.kind() == io::ErrorKind::WouldBlock));
+        assert_eq!(
+            serde_json::to_string(&index.source_cursor(agent.id.as_str(), &path).unwrap()).unwrap(),
+            serde_json::to_string(&Some(first.clone())).unwrap()
+        );
+        assert_eq!(
+            index
+                .source_documents(agent.id.as_str(), &path)
+                .unwrap()
+                .len(),
+            published
+        );
+        fs::write(&path, &bytes).unwrap();
+
+        // A live append under the read publishes, and the refresh resumes
+        // from the published frontier to the end.
+        let mut appended = false;
+        let stats = refresh(&mut index, &mut || {
+            if !appended {
+                appended = true;
+                fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap()
+                    .write_all(b"{\"role\":\"user\",\"content\":\"lateneedle\"}\n")
+                    .unwrap();
+            }
+            Ok(Some(Box::new(())))
+        })
+        .unwrap();
+        assert!(stats.complete);
+        assert_eq!(
+            index
+                .source_documents(agent.id.as_str(), &path)
+                .unwrap()
+                .len(),
+            61
+        );
+        BATCH_BYTES_OVERRIDE.with(|b| b.set(None));
+    }
+
+    /// (b) A search indexes at most its budget of new history before it
+    /// answers. The rest is queued for the background indexer and the answer
+    /// says what is pending; once the indexer has run, the same search finds
+    /// everything and nothing is pending. The pre-warm pass covers an agent
+    /// no search has touched.
+    #[test]
+    fn a_search_indexes_a_bounded_delta_and_the_background_indexes_the_rest() {
+        BATCH_BYTES_OVERRIDE.with(|b| b.set(Some(4096)));
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(NewAgent::new("large", "spiron"))
+            .unwrap();
+        let quiet = store
+            .create_agent(NewAgent::new("unsearched", "spiron"))
+            .unwrap();
+        let root = dir
+            .path()
+            .join("agents")
+            .join(agent.id.as_str())
+            .join("transcripts");
+        fs::create_dir_all(&root).unwrap();
+        let bytes = numbered_transcript(&root.join("a.jsonl"), 200);
+        let quiet_root = dir
+            .path()
+            .join("agents")
+            .join(quiet.id.as_str())
+            .join("transcripts");
+        fs::create_dir_all(&quiet_root).unwrap();
+        numbered_transcript(&quiet_root.join("q.jsonl"), 10);
+        let ids = [agent.id.to_string()];
+        let search = |term: &str, budget: u64| {
+            store
+                .search_host_files_at(
+                    &ids,
+                    MemoryScope::Transcripts,
+                    &HistorySearchQuery {
+                        query: Some(term.into()),
+                        ..Default::default()
+                    },
+                    crate::now_ms() + 10_000,
+                    budget,
+                )
+                .unwrap()
+        };
+        let budget = 8 * 1024;
+        let (hits, pending) = search("record0000", budget);
+        assert_eq!(hits.len(), 1, "the first records are indexed");
+        assert_eq!(pending.sources, 1);
+        assert!(pending.bytes >= bytes.len() as u64 - budget - 4096);
+        let index = HostIndex::open(&dir.path().join(INDEX_FILE)).unwrap();
+        let cursor = index
+            .source_cursor(agent.id.as_str(), &root.join("a.jsonl"))
+            .unwrap()
+            .unwrap();
+        let record = bytes.len() as u64 / 200;
+        assert!(cursor.end <= budget + record, "{} > budget", cursor.end);
+        assert_eq!(store.host_history_backlog(), 1);
+        // A later search does not wait for the rest either.
+        let (hits, pending) = search("record0199", budget);
+        assert!(hits.is_empty());
+        assert_eq!(pending.sources, 1);
+        // The background indexer completes it in bounded steps.
+        let mut steps = 0;
+        while store.host_history_backlog() > 0 {
+            assert!(store.index_host_history_step(16 * 1024).unwrap());
+            steps += 1;
+            assert!(steps < 100);
+        }
+        assert!(steps > 1, "a step stays within its budget");
+        let (hits, pending) = search("record0199", 0);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(pending, PendingHistory::default());
+
+        // Pre-warm: with nothing queued, steps cover every agent once.
+        while store.index_host_history_step(u64::MAX).unwrap() {}
+        let quiet_ids = [quiet.id.to_string()];
+        let (hits, pending) = store
+            .search_host_files_at(
+                &quiet_ids,
+                MemoryScope::Transcripts,
+                &HistorySearchQuery {
+                    query: Some("record0009".into()),
+                    ..Default::default()
+                },
+                crate::now_ms() + 10_000,
+                0,
+            )
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(pending, PendingHistory::default());
+        assert!(!store.index_host_history_step(u64::MAX).unwrap());
+        BATCH_BYTES_OVERRIDE.with(|b| b.set(None));
+    }
+
     /// The verifier runs on the maintenance worker beside the WAL checkpoint
     /// and outbound settlement. A held lifecycle (a delivery, search or archive
-    /// of that owner) must make it skip the source, not wait: before, it
-    /// blocked in `flock` for as long as the holder kept the lock.
+    /// of that owner) must not make it wait: before, it blocked in `flock` for
+    /// as long as the holder kept the lock. It now never reads the source or
+    /// takes the lock; it schedules the verification for the background
+    /// indexer, which publishes once the owner is free.
     #[test]
-    fn periodic_verifier_skips_a_busy_owner_instead_of_waiting() {
+    fn periodic_verifier_never_waits_for_a_busy_owner() {
         let dir = crate::test_tempdir();
         let store = std::sync::Arc::new(Store::open(dir.path().join("state.db")).unwrap());
         let agent = store
@@ -2169,7 +3476,7 @@ mod tests {
         fs::write(&path, "{\"content\":\"busyneedle\"}\n").unwrap();
         let index_path = dir.path().join(INDEX_FILE);
         let t0 = crate::now_ms();
-        let before = {
+        {
             let mut index = HostIndex::open(&index_path).unwrap();
             refresh_native_at(
                 &mut index,
@@ -2181,43 +3488,35 @@ mod tests {
                 t0,
             )
             .unwrap();
-            index
-                .source_cursor(agent.id.as_str(), &path)
-                .unwrap()
-                .unwrap()
-        };
+        }
         let held = store.lock_agent_lifecycle(&agent.id).unwrap();
         let (done, outcome) = std::sync::mpsc::channel();
         let verifier = std::sync::Arc::clone(&store);
         std::thread::spawn(move || {
             let _ = done.send(verifier.verify_one_host_history_source(t0 + 3_600_001));
         });
-        let skipped = outcome
+        let scheduled = outcome
             .recv_timeout(std::time::Duration::from_secs(20))
             .expect("the verifier waited for a held lifecycle");
-        assert!(!skipped.unwrap());
+        assert!(scheduled.unwrap());
+        assert_eq!(store.host_history_backlog(), 1);
         let index = HostIndex::open(&index_path).unwrap();
         let cursor = index
             .source_cursor(agent.id.as_str(), &path)
             .unwrap()
             .unwrap();
-        assert_eq!(
-            cursor.verification_attempt_ms, before.verification_attempt_ms,
-            "a skipped source keeps its turn"
-        );
+        assert_eq!(cursor.verification_attempt_ms, t0 + 3_600_001);
+        assert!(cursor.full_verified_ms < t0 + 3_600_001);
         drop(index);
         drop(held);
-        assert!(
-            store
-                .verify_one_host_history_source(t0 + 3_600_002)
-                .unwrap()
-        );
+        assert!(store.index_host_history_step(u64::MAX).unwrap());
         let index = HostIndex::open(&index_path).unwrap();
         let cursor = index
             .source_cursor(agent.id.as_str(), &path)
             .unwrap()
             .unwrap();
-        assert_eq!(cursor.full_verified_ms, t0 + 3_600_002);
+        assert_eq!(cursor.full_verified_ms, t0 + 3_600_001);
+        assert_eq!(store.host_history_backlog(), 0);
     }
 
     #[test]
@@ -2265,15 +3564,19 @@ mod tests {
             .unwrap();
         fs::write(&bad, "malformed complete line\n").unwrap();
         drop(index);
-        let error = store
-            .verify_one_host_history_source(t0 + 3_600_001)
-            .unwrap_err();
+        assert!(
+            store
+                .verify_one_host_history_source(t0 + 3_600_001)
+                .unwrap()
+        );
+        let error = store.index_host_history_step(u64::MAX).unwrap_err();
         assert!(matches!(error, IndexError::Io(ref e) if e.kind() == io::ErrorKind::InvalidData));
         assert!(
             store
                 .verify_one_host_history_source(t0 + 3_600_002)
                 .unwrap()
         );
+        assert!(store.index_host_history_step(u64::MAX).unwrap());
         let index = HostIndex::open(&dir.path().join(INDEX_FILE)).unwrap();
         let after = index
             .source_cursor(agent.id.as_str(), &bad)
