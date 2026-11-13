@@ -2104,9 +2104,6 @@ impl AgentMcp {
                     args.limit,
                     args.cursor,
                 );
-                for a in &mut response.agents {
-                    a.instructions = None;
-                }
                 let mut val = serde_json::to_value(&response).map_err(|e| e.to_string())?;
                 if let Some(obj) = val.as_object_mut() {
                     obj.insert("next_cursor".to_string(), summary["next_cursor"].clone());
@@ -2607,9 +2604,6 @@ impl AgentMcp {
                     args.limit,
                     args.cursor,
                 );
-                for a in &mut resp.agents {
-                    a.instructions = None;
-                }
                 Ok(rmcp::handler::server::wrapper::Json(serde_json::json!({
                     "parent": self.agent.name,
                     "next_cursor": summary["next_cursor"],
@@ -8142,6 +8136,11 @@ pub(crate) fn filter_and_summarize_agent_list(
     let next_cursor = (end < matched).then_some(end);
     agents.drain(..start);
     agents.truncate(cap);
+    // List responses stay compact; full instructions and schedules live on `agents inspect` / `schedules list`.
+    for a in agents.iter_mut() {
+        a.instructions = None;
+        a.schedules.clear();
+    }
 
     serde_json::json!({
         "total": total,
@@ -8858,6 +8857,20 @@ mod spawn_args_tests {
         ));
         for a in &mut population {
             a.instructions = Some("PRIVATE_PROMPT".into());
+            a.schedules = vec![crate::api::ScheduleView {
+                id: "sch_test".into(),
+                agent_id: a.id.clone(),
+                kind: "at".into(),
+                spec: "2026-11-14T00:00:00Z".into(),
+                prompt: "LONG_SCHEDULE_PROMPT".into(),
+                interval_ms: None,
+                next_fire_at_ms: Some(1_794_614_400_000),
+                last_fired_at_ms: None,
+                watch_baseline: None,
+                last_observed: None,
+                state: "active".into(),
+                created_at_ms: 1_794_500_000_000,
+            }];
             a.parent = Some(parent_id.to_string());
         }
         let body = serde_json::to_vec(&AgentsResponse {
@@ -8938,7 +8951,10 @@ mod spawn_args_tests {
                     .unwrap();
                 assert_eq!(rows.len(), expected_len);
                 assert_eq!(rows[0]["name"], first);
-                assert!(rows.iter().all(|a| a["instructions"].is_null()));
+                assert!(
+                    rows.iter()
+                        .all(|a| a["instructions"].is_null() && a.get("schedules").is_none())
+                );
                 assert_eq!(result["next_cursor"], json!(next));
                 assert_eq!(result["summary"]["total"], 105);
                 assert_eq!(result["summary"]["matched"], 105);
