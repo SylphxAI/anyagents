@@ -5195,9 +5195,17 @@ impl AgentMcp {
 pub struct MultimediaJson(pub serde_json::Value, pub Vec<rmcp::model::ContentBlock>);
 
 impl rmcp::handler::server::tool::IntoCallToolResult for MultimediaJson {
+    /// The JSON as text, then each media block. With media the JSON is not
+    /// also sent as `structuredContent`: a client that prefers structured
+    /// content gives its model that alone and drops the media (Codex does),
+    /// and no tool that returns media declares an output schema that would
+    /// require it.
     fn into_call_tool_result(self) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
         let mut res = rmcp::model::CallToolResult::structured(self.0);
-        res.content.extend(self.1);
+        if !self.1.is_empty() {
+            res.structured_content = None;
+            res.content.extend(self.1);
+        }
         Ok(res.into())
     }
 }
@@ -5527,23 +5535,38 @@ fn read_multimedia_file(
 
     if mime_type.starts_with("image/") {
         let dims = parse_image_dimensions(mime_type, full_bytes);
-        let (b64, attached_mime) = if matches!(
-            mime_type,
-            "image/png" | "image/jpeg" | "image/gif" | "image/webp"
-        ) {
-            (crate::computer::base64_encode(full_bytes), mime_type)
-        } else if let Some(png_bytes) = transcode_image_to_png_bytes(resolved) {
-            (crate::computer::base64_encode(&png_bytes), "image/png")
-        } else {
-            (crate::computer::base64_encode(full_bytes), mime_type)
-        };
-        media_blocks.push(rmcp::model::ContentBlock::image(b64, attached_mime));
+        // What a model is given: within every provider's limits, scaled or
+        // converted here when it is not (a format only the toolchain's
+        // converter reads goes through it first).
+        let prepared = anyagents_harness::media::model_image(full_bytes).or_else(|err| {
+            transcode_image_to_png_bytes(resolved)
+                .ok_or(err)
+                .and_then(|png| anyagents_harness::media::model_image(&png))
+        });
         let (width, height) = dims.unwrap_or((0, 0));
         let dim_str = if width > 0 && height > 0 {
             format!("{width}x{height}, ")
         } else {
             String::new()
         };
+        let content = match &prepared {
+            Ok(image) if image.converted => format!(
+                "[Native {mime_type} image ({dim_str}{total_bytes} bytes) attached as MCP image content block, as {} {}x{} ({} bytes)]",
+                image.mime,
+                image.width,
+                image.height,
+                image.data.len()
+            ),
+            Ok(_) => format!(
+                "[Native {mime_type} image ({dim_str}{total_bytes} bytes) attached as MCP image content block]"
+            ),
+            Err(err) => {
+                format!("[{mime_type} image ({dim_str}{total_bytes} bytes) not attached: {err}]")
+            }
+        };
+        if let Ok(image) = &prepared {
+            media_blocks.push(rmcp::model::ContentBlock::image(image.base64(), image.mime));
+        }
         return Ok((
             serde_json::json!({
                 "action": "read",
@@ -5556,10 +5579,8 @@ fn read_multimedia_file(
                 "total_bytes": total_bytes,
                 "truncated": false,
                 "sha256": sha256,
-                "image_attached": true,
-                "content": format!(
-                    "[Native {mime_type} image ({dim_str}{total_bytes} bytes) attached as MCP image content block]"
-                ),
+                "image_attached": prepared.is_ok(),
+                "content": content,
             }),
             media_blocks,
         ));
@@ -9606,14 +9627,12 @@ mod spawn_args_tests {
         let workdir = dir.path().join("work");
         std::fs::create_dir_all(&workdir).unwrap();
 
-        // 1. Write a valid PNG header (640x480), WAV header, and minimal PDF file.
-        let mut png_bytes = Vec::new();
-        png_bytes.extend_from_slice(b"\x89PNG\r\n\x1a\n");
-        png_bytes.extend_from_slice(&13u32.to_be_bytes());
-        png_bytes.extend_from_slice(b"IHDR");
-        png_bytes.extend_from_slice(&640u32.to_be_bytes());
-        png_bytes.extend_from_slice(&480u32.to_be_bytes());
-        png_bytes.extend_from_slice(&[8, 6, 0, 0, 0, 0, 0, 0, 0]);
+        // 1. Write a 640x480 PNG, a WAV header, and a minimal PDF file.
+        let mut png_bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::new(640, 480))
+            .write_to(&mut png_bytes, image::ImageFormat::Png)
+            .unwrap();
+        let png_bytes = png_bytes.into_inner();
         std::fs::write(workdir.join("frame.png"), &png_bytes).unwrap();
 
         let mut wav_bytes = Vec::new();
@@ -9706,7 +9725,13 @@ mod spawn_args_tests {
         let rmcp::model::CallToolResponse::Complete(call_res) = call_tool_resp else {
             panic!("expected CallToolResponse::Complete");
         };
-        assert!(call_res.structured_content.is_some());
+        // The JSON goes as text, not also as structured content, which a
+        // client that prefers it would give its model instead of the media.
+        assert!(call_res.structured_content.is_none());
+        assert!(matches!(
+            &call_res.content[0],
+            rmcp::model::ContentBlock::Text(text) if text.text.contains("\"imgDims\":[640,480]")
+        ));
         assert!(call_res.content.iter().any(
             |c| matches!(c, rmcp::model::ContentBlock::Image(i) if i.mime_type == "image/png")
         ));
@@ -9722,6 +9747,115 @@ mod spawn_args_tests {
                         if m == "application/pdf"
                 )
         )));
+    }
+
+    /// What each harness's model is given when its agent reads a media path
+    /// with `code`, by that vendor's MCP client rules
+    /// (`tests/invariants/fakes/mcp_client.py`): the photo itself on every
+    /// harness whose client gives MCP images to its model; on AGY, which
+    /// gives one only up to 10,240 bytes, the path of the file it offloaded,
+    /// which its native `read_file` opens; and a small image inline there.
+    #[tokio::test]
+    async fn an_image_an_agent_reads_from_the_media_directory_reaches_each_model() {
+        use rmcp::handler::server::tool::IntoCallToolResult as _;
+        use sha2::Digest as _;
+        let dir = tempfile::tempdir().unwrap();
+        let workdir = dir.path().join("work");
+        let media = dir.path().join(anyagents_harness::media::MEDIA_DIR);
+        std::fs::create_dir_all(&workdir).unwrap();
+        std::fs::create_dir_all(&media).unwrap();
+        // A Telegram photo's shape: a 1280x697 JPEG of tens of kilobytes.
+        let jpeg = |width: u32, height: u32| {
+            let image = image::RgbImage::from_fn(width, height, |x, y| {
+                let noise = (x.wrapping_mul(2_654_435_761) ^ y.wrapping_mul(40_503)) >> 13;
+                image::Rgb([(x % 251) as u8, (y % 241) as u8, noise as u8])
+            });
+            let mut bytes = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgb8(image)
+                .write_to(&mut bytes, image::ImageFormat::Jpeg)
+                .unwrap();
+            bytes.into_inner()
+        };
+        let photo = jpeg(1280, 697);
+        assert!(photo.len() > 10_240, "{} bytes", photo.len());
+        let thumb = jpeg(32, 32);
+        assert!(thumb.len() <= 10_240, "{} bytes", thumb.len());
+        let digest = |bytes: &[u8]| {
+            sha2::Sha256::digest(bytes)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        };
+        let mcp = AgentMcp {
+            agent: AgentRef {
+                id: AgentId::generate(),
+                name: "media-reader".into(),
+                workdir: Some(workdir.clone()),
+            },
+            client: Client::new(
+                dir.path().join("unused.sock"),
+                dir.path().join("config"),
+                "test-cap".into(),
+            ),
+            profile: McpProfile::Full,
+        };
+        let read = |name: &str, bytes: &[u8]| {
+            let path = media.join(name);
+            std::fs::write(&path, bytes).unwrap();
+            let line = anyagents_harness::media::local_media_line("photo", &path);
+            assert!(line.contains(&path.display().to_string()));
+            let mcp = mcp.clone();
+            async move {
+                let result = mcp
+                    .code(Parameters(CodeArgs {
+                        code: format!(
+                            "const img = await workspace.read({{ path: {:?} }}); return img.mime_type;",
+                            path.display().to_string()
+                        ),
+                        timeout_ms: Some(15_000),
+                    }))
+                    .await
+                    .unwrap();
+                let rmcp::model::CallToolResponse::Complete(result) =
+                    result.into_call_tool_result().unwrap()
+                else {
+                    panic!("expected a complete result");
+                };
+                serde_json::to_vec(&result).unwrap()
+            }
+        };
+        let seen_by = |harness: &str, result: &[u8]| -> serde_json::Value {
+            use std::io::Write as _;
+            let mut child = std::process::Command::new("python3")
+                .args(["-I", anyagents_invariants::conformance::MCP_CLIENT, harness])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            child.stdin.take().unwrap().write_all(result).unwrap();
+            let out = child.wait_with_output().unwrap();
+            assert!(out.status.success(), "{harness}");
+            serde_json::from_slice(&out.stdout).unwrap()
+        };
+        let photo_result = read("complete_photo_large.jpg", &photo).await;
+        for harness in ["claude-code", "codex", "muse", "omp", "opencode"] {
+            let seen = seen_by(harness, &photo_result);
+            assert_eq!(
+                seen["images"],
+                json!([{"mime": "image/jpeg", "sha256": digest(&photo)}]),
+                "{harness}: {seen}"
+            );
+        }
+        let agy = seen_by("agy", &photo_result);
+        assert_eq!(agy["images"], json!([]), "{agy}");
+        assert_eq!(agy["offloaded"].as_array().unwrap().len(), 1, "{agy}");
+        let thumb_result = read("complete_photo_small.jpg", &thumb).await;
+        let agy = seen_by("agy", &thumb_result);
+        assert_eq!(
+            agy["images"],
+            json!([{"mime": "image/jpeg", "sha256": digest(&thumb)}]),
+            "{agy}"
+        );
     }
 
     #[tokio::test]

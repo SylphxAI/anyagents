@@ -59,6 +59,7 @@ anyagents-core = { path = "../anyagents-core" }
 anyagents-harness-agy = { path = "../anyagents-harness-agy" }
 anyagents-harness-muse = { path = "../anyagents-harness-muse" }
 anyagents-invariants = { path = "../../tests/invariants" }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 rmcp = { version = "3.5", features = ["client", "transport-child-process"] }
 serde_json = "1"
 tempfile = "3"

@@ -25,6 +25,11 @@ use anyagents_harness::{DeliverOutcome, Delivery, DeliveryLevel, Harness, TurnSt
 
 const VENDOR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/fakes/vendor.py");
 
+/// What each vendor's MCP client gives its model for a tool result
+/// (`fakes/mcp_client.py HARNESS < CallToolResult`), by the vendor's own
+/// rules.
+pub const MCP_CLIENT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/fakes/mcp_client.py");
+
 /// How long one scenario step may take before the suite calls it stuck.
 const PATIENCE: Duration = Duration::from_secs(30);
 
