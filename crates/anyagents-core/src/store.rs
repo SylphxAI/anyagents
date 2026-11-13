@@ -2678,6 +2678,7 @@ impl Store {
             mentions,
             participants,
             topology,
+            reply_to_message: None,
         };
         let message = Message {
             id: MessageId::generate(),

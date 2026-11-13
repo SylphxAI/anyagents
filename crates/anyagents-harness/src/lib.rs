@@ -187,6 +187,11 @@ pub struct Context {
     /// when peers, siblings, children, or groups change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub topology: Option<String>,
+    /// The stored message a reply to this line names, when the line is not
+    /// one itself: a `[Recovery]` note names the last message of the turn it
+    /// covers, which the mailbox holds and a reply can bind to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to_message: Option<String>,
 }
 
 impl Context {
@@ -256,7 +261,7 @@ impl Context {
         }
         out.push_str(&format!(
             " reply_to=\"{}\"",
-            xml_attr_escape(&reply_ref(id))
+            xml_attr_escape(&reply_ref(self.reply_to_message.as_deref().unwrap_or(id)))
         ));
         if let Some(destination) = &self.destination {
             out.push_str(&format!(" answer_to=\"{}\"", xml_attr_escape(destination)));
@@ -266,7 +271,7 @@ impl Context {
     }
 
     /// The lines a model reads, in a fixed order. The reply reference is this
-    /// message's own id, so it is always there.
+    /// message's own id, or the stored message it names, so it is always there.
     pub fn lines(&self, id: &str) -> String {
         let mut out = String::from("----- message -----\n");
         out.push_str(&format!(
@@ -297,7 +302,10 @@ impl Context {
         if !self.participants.is_empty() {
             out.push_str(&format!("participants: {}\n", self.participants.join(", ")));
         }
-        out.push_str(&format!("{REPLY_HINT_PREFIX}{}\n", reply_ref(id)));
+        out.push_str(&format!(
+            "{REPLY_HINT_PREFIX}{}\n",
+            reply_ref(self.reply_to_message.as_deref().unwrap_or(id))
+        ));
         if let Some(destination) = &self.destination {
             out.push_str(&format!("answer to: {destination}\n"));
         }

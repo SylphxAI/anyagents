@@ -416,7 +416,12 @@ pub fn recovery_outbound(open: &anyagents_core::OpenTurn) -> OutboundMessage {
         sender: last.sender.clone(),
         reply_to: last.reply_to.clone(),
         source_time_ms: last.source_time_ms,
-        context: last.context.clone(),
+        // The note is no stored message: a reply to it answers the last
+        // message of the turn it covers.
+        context: anyagents_harness::Context {
+            reply_to_message: Some(last.id.to_string()),
+            ..last.context.clone()
+        },
     }
 }
 
