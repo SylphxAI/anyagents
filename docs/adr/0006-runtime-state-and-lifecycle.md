@@ -121,8 +121,10 @@ Superseded 2026-11-13: steer custody needs no state machine of its own. A
 harness that proves consumption commits each input on its own proof over the
 contiguous cursor, and a harness that cannot is held to a lower level
 ([delivery.md](../delivery.md)). The JSON hold is retired, an agent directory's
-leftover hold is settled against the Spiron journal at launch, and migration
-030 drops the never-wired `steer_holds` table. The table below records the
+leftover hold is settled against the Spiron journal at launch, and the
+never-wired `steer_holds` table stays, still cleared when an agent is
+deleted, for one release, so a rollback to a binary that deletes from it can
+still delete agents; a later release drops it. The table below records the
 proposal.
 
 | From | Event | To | Mailbox effect |

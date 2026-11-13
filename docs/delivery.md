@@ -19,7 +19,8 @@ adapter answers with what the vendor has shown about that message:
 | `Accepted` | The vendor took it, with the proof the harness's level requires. | Commits it, when every earlier message is committed. |
 | `Duplicate` | The vendor's session already holds it from an earlier process. | Commits it as delivered; it starts no new work. |
 | `InFlight` | Written to the vendor, not yet proved. | Keeps offering the messages behind it, commits none of them yet. |
-| `Deferred` | The vendor cannot take it now, or refused it without applying it. | Ends the pass; the message stays in the mailbox. |
+| `Deferred` | The vendor cannot take it now, or refused it without applying it, in a way a later offer can clear. | Ends the pass; the message stays in the mailbox. |
+| `Rejected` | The vendor refused it for good, without applying it: no retry or new process can make it take this message. | Parks it past the cursor in `rejected_messages`, with the vendor's reason, tells an agent sender in its own mailbox (`[Undeliverable]`), and shows the reason as the agent's error. The messages behind it flow on. |
 | `Quota` | The vendor asked to wait until a reset time. | Ends the pass. |
 | `Dead` | The vendor process is gone. | The supervisor starts a new process. |
 | `Failed` | A fault no retry can fix. | The supervisor restarts the process. |
@@ -29,6 +30,27 @@ message the vendor has not proved is visible as the oldest undelivered one
 and never skipped. Behind an `InFlight` message the loop writes the rest of
 the inbox at once, which is how a whole inbox reaches a running turn as one
 batch.
+
+An adapter also answers `proven(id)`: what it already proved about a
+message, without writing anything, whether or not its process still runs.
+The supervisor commits those proofs (`DeliveryLoop::commit_proven`) whenever
+it would otherwise skip a delivery pass: while a quota holds, while a harness
+switch drains the old process, when the process has died, and before any
+replacement. Before it hands mail to a replacement it stops the old process
+and reads it to the end (`Harness::stop`), so a proof still in the pipe is
+committed, not lost with the adapter that read it. An adapter reports its
+process dead only once its output has ended, for the same reason.
+
+### Interrupted turns
+
+When a process exits, or the server restarts, while a turn is open, the next
+process is offered one `[Recovery]` note before any mail: it lists the
+interrupted turn's messages, whole, and the outbound messages already sent,
+and asks the agent to check the actual state before repeating anything that
+may have taken effect. Those messages are older than any mail behind them,
+so the note goes first, and new mail follows it once it is written. A
+message a `mid-turn` vendor accepted but never read reaches the agent this
+way.
 
 ## Rules every level keeps
 
@@ -44,9 +66,12 @@ batch.
 3. **Mailbox order.** Messages reach the vendor, and its model, in sequence
    order.
 4. **A refusal costs no restart.** A vendor that refuses a message without
-   applying it gets it again later (`Deferred`). An answer that leaves it
-   unknown whether the vendor applied it is settled from the vendor's own
-   record, or by an idempotent resend, before anything is written again.
+   applying it gets it again later (`Deferred`) when a later offer can clear
+   the refusal; a refusal nothing can clear parks it (`Rejected`) and tells
+   its sender, rather than retrying forever or restarting the process. An
+   answer that leaves it unknown whether the vendor applied it is settled
+   from the vendor's own record, or by an idempotent resend, before anything
+   is written again.
 5. **No delivery timeouts.** A delivery request is never re-sent because it
    was slow; a vendor that does not answer is stuck, and its health says so.
 
@@ -72,9 +97,8 @@ vendor's business. Committed on the vendor's acceptance (a written line, an
 answered request, a durable inbox admission), which is the only proof.
 
 If the vendor process dies with accepted messages its turn never read, the
-interrupted turn's messages reach the next process inside a `[Recovery]`
-note, never as input of their own; a vendor with a durable inbox delivers
-them itself.
+interrupted turn's messages reach the next process inside the `[Recovery]`
+note (above), never as input of their own.
 
 ### `next-step`
 
@@ -98,12 +122,14 @@ process again.
 
 ## The conformance suite
 
-`tests/invariants/src/conformance.rs` runs the same eight scenarios against
+`tests/invariants/src/conformance.rs` runs the same ten scenarios against
 every adapter, through a real `DeliveryLoop` and a scripted vendor process
 that speaks the vendor's own protocol (`tests/invariants/fakes/`: the shared
 session engine in `engine.py`, one `proto_<vendor>.py` per protocol). The
 vendor's journal of what its model saw is the evidence; the cursor is the
-commit.
+commit. A restart in the suite does what the supervisor does: it stops the
+old process and commits its proofs first, and offers the recovery note
+ahead of mail.
 
 | Scenario | Holds the adapter to |
 | --- | --- |
@@ -111,6 +137,8 @@ commit.
 | five messages reach a busy turn | `next-step`: all five written at once, none committed before the next step, then committed after one step consumed them together, in order; `mid-turn`: all five accepted at once; `turn-end`: the running turn never sees them |
 | mail keeps its order across steps | sequence order over several steps |
 | a crash after partial consumption loses nothing | the vendor dies after consuming two of five: each message reaches the model once, the unconsumed ones as input of their own (`next-step`, `turn-end`) or inside the recovery note (`mid-turn`) |
+| a crash between consumption and proof applies nothing twice | the vendor journals two of five messages, then dies before it writes their proof: nothing is lost, and an idempotent harness's next process recognises the two |
+| a long interrupted message reaches the next process whole | a 4,000-character prompt is interrupted by a crash: the recovery note carries it whole |
 | a host restart redelivers without applying twice | `idempotent`: the cursor is lost after the vendor consumed three messages; a new process recognises all three |
 | an offer twice reaches the vendor once | a message offered again to the process that took it is not written again |
 | a refused message waits without a restart | the vendor refuses a message for its running turn: no restart, applied once later |
@@ -120,6 +148,14 @@ A new harness gets the suite by implementing `Subject` (how to start the
 adapter against the scripted vendor) and invoking `conformance_suite!` once,
 and by teaching the scripted vendor its protocol.
 
+`crates/anyagents-supervisor/tests/proofs.rs` holds the supervisor to the
+same rules over a scripted adapter: a harness switch and a profile rotation
+during a quota wait commit the proofs the old process gave before it
+stopped; a crash puts the recovery note ahead of later mail and keeps long
+messages whole; a crash between consumption and proof hands the line to the
+next process; a poison message is parked, its sender told, and the mail
+behind it flows without a restart.
+
 ## Harnesses
 
 Each adapter crate exports the level it holds (`DELIVERY`); the server shows
@@ -128,14 +164,14 @@ the running process's, with what its handshake named, in `agents list`,
 
 | Harness | Level | Idempotent | How a message reaches it, and the proof |
 | --- | --- | --- | --- |
-| `spiron` (legacy `sylphx`), `ready` names `steer_consumed` and `idempotent_input` | `next-step` | yes | `spiron --headless --json`. The whole inbox is written at once: a `prompt` when no turn runs, a `steer` into the running one. Spiron journals every pending input together, in order, at its next step; `accepted` (the turn journaled its prompt) and `steer_consumed` prove each, by `request_id`. Refusals (`turn_closed`, `no_active_turn`, `turn_not_started`) and `undelivered_steer_ids` go back to the mailbox. Spiron drops an input its journal already holds under `input:<request_id>` and answers it as a duplicate. Handshake: the `ready` frame's protocol and capabilities. |
+| `spiron` (legacy `sylphx`), `ready` names `steer_consumed` and `idempotent_input` | `next-step` | yes | `spiron --headless --json`. The whole inbox is written at once: a `prompt` when no turn runs, a `steer` into the running one. Spiron journals every pending input together, in order, at its next step; `accepted` (the turn journaled its prompt) and `steer_consumed` prove each, by `request_id`. `turn_closed` and `no_active_turn` go back to the mailbox, woken by the turn's `result` or the refusal itself; `turn_not_started` (the session is still leased) is offered again after a backoff from 1 s doubling to 30 s, and fails the process once refusals outlast Spiron's 180 s session lease; `empty_prompt`, `wrong_session`, `unknown_command`, `upgrade_retired` and any code Spiron adds later are rejected. `undelivered_steer_ids` go back to the mailbox. Spiron drops an input its journal already holds under `input:<request_id>` and answers it as a duplicate. Handshake: the `ready` frame's protocol and capabilities. |
 | `spiron`, older `ready` | `turn-end` | no | One input per turn, none while a turn runs; `accepted` commits it. Gated on the capabilities, for a Spiron built before them. |
-| `claude-code` | `next-step` | yes | `claude -p` with stream-json in and out and `--replay-user-messages`. Each line carries a `uuid` derived from its mailbox id. Claude Code queues a line that reaches a running turn and folds every queued line, in order, into the conversation at the next step; a line still queued when the turn ends starts the next turn. `command_lifecycle` `started`, the replay echo (`isReplay`) and the result's `user_message_uuids` prove each line by its uuid. Claude Code drops a line whose uuid its transcript holds as a user row; at launch on a resumed session the adapter reads the transcript (`$CLAUDE_CONFIG_DIR/projects/*/<session>.jsonl`), including lines folded in mid-turn, which Claude Code's own check misses. Handshake: `system` `init` `claude_code_version`. |
-| `codex` | `next-step` | yes | `codex app-server` (JSON-RPC). `turn/start` when no turn runs, else `turn/steer` naming `expectedTurnId`; each carries the mailbox id as `clientUserMessageId`, and is sent without waiting for its answer. The answer only queues it; the `userMessage` item whose `clientId` is that id proves the turn consumed it at its next step. `-32600` refusals go back to the mailbox; any other error, or a message its turn ended without proving, is settled from `thread/items/list` before anything is written again; a resumed thread's newest turns are read first, and a message found there is a duplicate. Handshake: `initialize` `userAgent`. |
-| `muse` | `next-step` | yes | `muse serve` (JSON-RPC). Every message is `turn/start` with `ifBusy: "steer"` and a `commandId` derived from its mailbox id; Muse replays a known command's acknowledgement, so a resend is safe. The `userMessage` `item/completed` carrying that `commandId` proves it; `turn/completed` settles the inputs its turn consumed, and a steer the turn never consumed stays in flight until the successor turn Muse names after its command proves it. `-32030` moves to the next command id; admission refusals and unknown outcomes wait under the same one. Handshake: `initialize` `serverInfo`. |
-| `omp` | `next-step` | yes | `omp --mode rpc`, with steering mode `all`. A `prompt` with `streamingBehavior: "steer"` is proved by the user `message_end` whose text carries its marker, which OMP emits as the next step takes every queued steer in order; `success: false` hands it back, and a `prompt_result` for a message never proved means OMP dropped it, which also hands it back. At start the session file `get_state` names is read; a message it holds is a duplicate. Handshake: the `ready` frame's protocol version. |
-| `grok` | `mid-turn` | no | `grok agent … stdio` (ACP), `follow_up_behavior = "steer"`. `session/prompt` is committed when Grok shows it admitted: its marker in `x.ai/queue/changed` or a `user_message_chunk`, or the answer to its request. A refusal before admission goes back to the mailbox; any other error counts as taken. A prompt is written only after every earlier one is admitted. Grok's consumption notice names no input and Grok deduplicates nothing. Handshake: `initialize` `agentInfo`. |
-| `agy` | `mid-turn` | no | `agy --output-format stream-json`; a line on stdin runs a turn, committed once the cascade shows it took it. A message for a running cascade goes through the language server's `SendUserCascadeMessage` (`NEXT_INVOCATION`), one at a time, without blocking delivery; its answer proves the message is queued in the cascade's durable mailbox, which the next step takes in order. A refusal returns the message to the mailbox and it opens the next turn; a send whose answer never arrived is settled from the cascade mailbox and transcript before it is sent again. Nothing in AGY's answers names the message it consumed, and nothing deduplicates by an id we send. Without the language server the adapter reports `turn-end`. Handshake: the language server version in `cli.log`. |
-| `opencode` | `mid-turn` | yes | `opencode serve` (HTTP), called through one-shot `opencode api` processes. Each message is `POST /api/session/{id}/prompt` with `delivery: "steer"` and its mailbox id as `id` (prefixed `msg_` when it is not already), one call at a time, in mailbox order, with no timeout. The answer is the session's durable inbox admitting it, which is the proof; OpenCode takes every pending steer into its running turn at the next step, in admission order. OpenCode admits an id once, from any process: an answer naming a record created before the call, which the conversation already holds (`GET …/message/{id}`), is a duplicate. A 400 or 409 goes back to the mailbox; a 5xx or a lost answer is settled by sending the same id once more; a 401 or 403 fails the process. The turn ends when `POST /api/experimental/session/{id}/wait`, asked after the newest admission, answers. OpenCode announces consumption only on its event stream (`session.inbox.delivered`), which the adapter does not read. Handshake: `GET /api/info`. |
-| `dsh` | `mid-turn` | yes | The dsh web gateway. Each message is `session/prompt` with `mode: "steer"` and its mailbox id as `requestId`, one call at a time, in mailbox order, with no timeout; `accepted: true` is the session's inbox admitting it. dsh admits a `requestId` once, so an answer that leaves it unknown (`session/agent-busy`, `gateway/internal`, a 5xx, a lost connection) is settled by sending the same request once more. Errors dsh raises before its inbox go back to the mailbox; a 401 buys a new cookie first. Its answer does not say whether the request was new, so a message an earlier process applied is accepted again, never applied twice, rather than reported as a duplicate. Handshake: `dsh -V`. |
+| `claude-code` | `next-step` | yes | `claude -p` with stream-json in and out and `--replay-user-messages`, and `CLAUDE_CODE_EAGER_FLUSH=1`. Each line carries a `uuid` derived from its mailbox id. Claude Code queues a line that reaches a running turn and folds every queued line, in order, into the conversation at the next step; a line still queued when the turn ends starts the next turn. `command_lifecycle` `started` and the replay echo (`isReplay`) show it took a line, but Claude Code prints them before it appends the line to the session transcript (a queue drained every 100 ms), so a line is committed only once its transcript row is on disk (`$CLAUDE_CONFIG_DIR/projects/*/<session>.jsonl`: a user row's `uuid` or `mergedSendUuids`, a folded line's `queued_command` `source_uuid`), or once a result names it in `user_message_uuids` (the eager flush appends every row before the result). A line `cancelled` after `started` goes back to the mailbox; one Claude Code `refused` or `discarded` is rejected. Claude Code drops a line whose uuid its transcript holds as a user row; at launch on a resumed session the adapter reads the transcript for the same marks, including lines folded in mid-turn, which Claude Code's own check misses. Handshake: `system` `init` `claude_code_version`. |
+| `codex` | `next-step` | yes | `codex app-server` (JSON-RPC). `turn/start` when no turn runs, else `turn/steer` naming `expectedTurnId`; each carries the mailbox id as `clientUserMessageId`, and is sent without waiting for its answer. The answer only queues it; the `userMessage` item whose `clientId` is that id proves the turn consumed it at its next step. A `-32600` refusal the running turn clears goes back to the mailbox and is offered again when the turn's events say it changed; `-32602`, and a `-32600` on `turn/start`, are rejected. Any other error, or a message its turn ended without proving, is settled from `thread/items/list` before anything is written again; a resumed thread's newest turns are read first, and a message found there is a duplicate. A resume starts a new thread only when Codex says the thread does not exist (`no rollout found for thread id`, `invalid thread id`); any other failure fails the start. Handshake: `initialize` `userAgent`. |
+| `muse` | `next-step` | yes | `muse serve` (JSON-RPC). Every message is `turn/start` with `ifBusy: "steer"` and a `commandId` derived from its mailbox id alone, the same in every process; Muse replays a known command's recorded decision, so a resend is safe. The `userMessage` `item/completed` carrying that `commandId` proves it (Muse stores input before it announces it); `turn/completed` settles the inputs its turn consumed, and a steer the turn never consumed stays in flight until the successor turn Muse names after its command proves it. On resume the adapter reads the session's record (the history `session/resume` returns, paged with `view/page` when over budget): a message it holds is a duplicate, never written again. `-32030` with reason `command_id_conflict` means the command was admitted before: it waits for its proof under the same id. Any other `-32030`, `-32002` (over the limit) and `-32602` (malformed) are rejected; admission refusals (`-32031`, `-32001`, …) wait under the same id. Handshake: `initialize` `serverInfo`. |
+| `omp` | `next-step` | yes | `omp --mode rpc`, with steering mode `all`. A `prompt` with `streamingBehavior: "steer"` is proved by the user `message_end` whose text carries its marker, which OMP emits as the next step takes every queued steer in order (it queues the message's persistence first); `success: false` hands it back, and a `prompt_result` for a message never proved means OMP dropped it, which also hands it back. At start the session file `get_state` names is read; a message it holds is a duplicate. OMP writes a new session's file only with its first assistant message, so a missing file holds nothing, and the session is named for the next process only once its file exists (OMP exits on `--session` for one it never wrote). A file that exists and cannot be read, or a refused `get_state`, stops delivery. Handshake: the `ready` frame's protocol version. |
+| `grok` | `mid-turn` | no | `grok agent … stdio` (ACP), `follow_up_behavior = "steer"`. `session/prompt` is committed when Grok shows it admitted: its marker in `x.ai/queue/changed` or a `user_message_chunk`, or the answer to its request. Grok has no refusal a later offer clears, so an error before admission rejects the message, never writing it twice. A prompt is written only after every earlier one is admitted. Grok's consumption notice names no input and Grok deduplicates nothing. Handshake: `initialize` `agentInfo`. |
+| `agy` | `turn-end` | yes | `agy --output-format stream-json`; a line on stdin runs a turn. A message for a running cascade goes through the language server's `SendUserCascadeMessage` (`NEXT_INVOCATION`), which only queues it in the cascade's mailbox (`messages/`, with an `undelivered/` marker until taken): its answer proves nothing, and a cascade that errors or is retired never takes it. A message is committed only once the cascade took it: a `USER_INPUT` row in its transcript opening with the message's marker, or its mail in the cascade's `read.json`. While a cascade holds untaken mail, later mail is queued behind it in the same mailbox, never opened as a turn that could run first. Before a process resumes a cascade the adapter reads its record: a message its transcript holds is a duplicate, one still undelivered is held, not written again. Until a running turn's mailbox reads are proven against the vendor, the level reported is `turn-end`. Handshake: the language server version in `cli.log`. |
+| `opencode` | `mid-turn` | yes | `opencode serve` 2.x (HTTP), called through one-shot `opencode api` processes; a 1.x service fails the start. Each message is `POST /api/session/{id}/prompt` with `delivery: "steer"` and its mailbox id as `id` (prefixed `msg_` when it is not already), one call at a time, in mailbox order, with no timeout. The answer is the session's durable inbox admitting it, which is the proof; OpenCode takes every pending steer into its running turn at the next step, in admission order. OpenCode admits an id once, from any process: an answer naming a record created before the call, which the conversation already holds (`GET …/message/{id}`), is a duplicate. A 400 or 409 is rejected; the readiness gate's 503 (`service_starting`) waits a second and is offered again; a 5xx or a lost answer is settled by sending the same id once more; a 401 or 403 fails the process. The turn ends when `POST /api/experimental/session/{id}/wait`, asked after the newest admission, answers. OpenCode announces consumption only on its event stream (`session.inbox.delivered`), which the adapter does not read. Handshake: `GET /api/info`. |
+| `dsh` | `mid-turn` | yes | The dsh web gateway. Each message is `session/prompt` with `mode: "steer"` and its mailbox id as `requestId`, one call at a time, in mailbox order, with no timeout; `accepted: true` is dsh's in-memory inbox taking it. The admission is not durable: dsh writes its inbox to disk afterwards, and SIGTERM clears it, so mail accepted and never read reaches the next process inside the `[Recovery]` note. dsh admits a `requestId` once, so an answer that leaves it unknown (`session/agent-busy`, `gateway/internal`, a 5xx, a lost connection) is settled by sending the same request once more. A malformed request (`gateway/bad-request`, `arguments-invalid`, `input-invalid`, HTTP 400, 413, 415) is rejected; `session/not-found` re-creates the session and a 401 buys a new cookie before the same request goes once more; 403 and `session/writer-held` fail the process. Its answer does not say whether the request was new, so a message an earlier process applied is accepted again, never applied twice, rather than reported as a duplicate. Handshake: none (the gateway names no version). |
 | `spiron-cloud`, `claude-cloud`, `openai-cloud`, `cursor-cloud` | `turn-end` | no | `anyagents cloud-harness` speaks Claude Code's stream-json for a cloud agent: one turn per line, the replay echo when the line's turn starts. |
