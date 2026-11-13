@@ -37,6 +37,7 @@ use crate::operator;
 use crate::vendor::{self, VendorHarness};
 
 mod outbound_history;
+mod quota_rotation;
 
 const SOCKET_NAME: &str = "anyagents.sock";
 /// `sockaddr_un.sun_path` holds 108 bytes, including the trailing NUL.
@@ -240,6 +241,7 @@ async fn serve(
         .map_err(Error::Message)?;
     if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none() && !crate::sandbox::is_isolated_test_env()
     {
+        quota_rotation::start(Arc::clone(&store));
         let reaper_root = data.to_path_buf();
         let reaper_store = Arc::clone(&store);
         let reaper_health = state.health.clone();
@@ -2763,6 +2765,16 @@ async fn list_agents(
 }
 
 fn compute_caller_relationship(store: &Store, caller: &Agent, target: &Agent) -> String {
+    relationship_with(caller, target, |ancestor, agent| {
+        is_self_or_ancestor(store, ancestor, agent)
+    })
+}
+
+fn relationship_with(
+    caller: &Agent,
+    target: &Agent,
+    is_self_or_ancestor: impl Fn(&anyagents_core::AgentId, &Agent) -> bool,
+) -> String {
     if caller.id == target.id {
         "self".to_string()
     } else if caller.parent_id.as_ref() == Some(&target.id) {
@@ -2771,14 +2783,87 @@ fn compute_caller_relationship(store: &Store, caller: &Agent, target: &Agent) ->
         "child".to_string()
     } else if caller.parent_id.is_some() && caller.parent_id == target.parent_id {
         "sibling".to_string()
-    } else if is_self_or_ancestor(store, &target.id, caller) {
+    } else if is_self_or_ancestor(&target.id, caller) {
         "ancestor".to_string()
-    } else if is_self_or_ancestor(store, &caller.id, target) {
+    } else if is_self_or_ancestor(&caller.id, target) {
         "descendant".to_string()
     } else if caller.parent_id.is_none() && target.parent_id.is_none() {
         "peer".to_string()
     } else {
         "other".to_string()
+    }
+}
+
+/// An agent caller's view of one roster, read once per request instead of
+/// once per listed agent. Every check is the predicate the single-agent routes
+/// use; only where the rows come from differs.
+struct RosterCaller<'a> {
+    store: &'a Store,
+    caller: &'a Agent,
+    /// The roster rows, so an ancestor walk reads the store only for a parent
+    /// outside the roster.
+    rows: HashMap<&'a str, &'a Agent>,
+    /// Agents that share a group or Telegram chat with the caller.
+    sharing: HashSet<anyagents_core::AgentId>,
+}
+
+impl<'a> RosterCaller<'a> {
+    fn new(store: &'a Store, caller: &'a Agent, roster: &'a [Agent]) -> Self {
+        Self {
+            store,
+            caller,
+            rows: roster.iter().map(|a| (a.id.as_str(), a)).collect(),
+            sharing: store.agents_sharing_group_or_chat(&caller.id),
+        }
+    }
+
+    /// [`is_self_or_ancestor`] over the roster rows.
+    fn is_self_or_ancestor(&self, ancestor: &anyagents_core::AgentId, target: &Agent) -> bool {
+        if ancestor == &target.id {
+            return true;
+        }
+        let mut cursor = target.parent_id.clone();
+        let mut depth = 0usize;
+        while let Some(pid) = cursor {
+            if &pid == ancestor {
+                return true;
+            }
+            cursor = match self.rows.get(pid.as_str()) {
+                Some(parent) => parent.parent_id.clone(),
+                None => self.store.agent(&pid).ok().and_then(|a| a.parent_id),
+            };
+            depth += 1;
+            if depth > 16 {
+                break;
+            }
+        }
+        false
+    }
+
+    /// The isolated-scope rule of [`get_agent`].
+    fn sees(&self, agent: &Agent) -> bool {
+        !(self.caller.is_isolated()
+            && !self.is_self_or_ancestor(&self.caller.id, agent)
+            && self.caller.parent_id.as_ref() != Some(&agent.id)
+            && !self.sharing.contains(&agent.id))
+    }
+
+    fn annotate(&self, view: &mut AgentView, agent: &Agent) {
+        view.relationship = Some(relationship_with(self.caller, agent, |ancestor, target| {
+            self.is_self_or_ancestor(ancestor, target)
+        }));
+        view.can_message = Some(
+            can_sender_message_agent_with(self.store, self.caller, agent, || {
+                self.sharing.contains(&agent.id)
+            })
+            .is_ok(),
+        );
+        // [`can_actor_read_agent_private`] for this caller.
+        let reads_private = self.is_self_or_ancestor(&self.caller.id, agent)
+            || (self.caller.is_admin && self.caller.parent_id.is_none());
+        if !reads_private {
+            view.instructions = None;
+        }
     }
 }
 
@@ -2798,43 +2883,26 @@ fn list_agents_sync_for_principal(
     };
     // Only the selected state and its ancestors are read; the archive is
     // counted by index instead of being deserialized row by row.
-    let (all_agents, archived_count) = state
+    let (roster, archived_count) = state
         .store
         .roster_agents(query.state.as_deref())
         .map_err(ApiError::from_store)?;
-    let all_agents: Vec<_> = all_agents
-        .into_iter()
-        .filter(|agent| {
-            !caller_agent.as_ref().is_some_and(|caller| {
-                caller.is_isolated()
-                    && !is_self_or_ancestor(&state.store, &caller.id, agent)
-                    && caller.parent_id.as_ref() != Some(&agent.id)
-                    && !state.store.share_any_group_or_chat(&caller.id, &agent.id)
-            })
-        })
+    let caller = caller_agent
+        .as_ref()
+        .map(|caller| RosterCaller::new(&state.store, caller, &roster));
+    let visible: Vec<&Agent> = roster
+        .iter()
+        .filter(|agent| caller.as_ref().is_none_or(|caller| caller.sees(agent)))
         .collect();
-    let mut listed = roster_views(
-        &state.store,
-        &state.health,
-        all_agents,
-        archived_count,
-        query,
-    )?;
-    for view in &mut listed.agents {
-        let Some(ref caller) = caller_agent else {
-            continue;
-        };
-        let agent = state
-            .store
-            .agent_by_name(&view.id)
-            .map_err(ApiError::from_store)?;
-        view.relationship = Some(compute_caller_relationship(&state.store, caller, &agent));
-        view.can_message = Some(
-            can_actor_message_agent(&state.store, &Actor::Agent(caller.name.clone()), &agent)
-                .is_ok(),
-        );
-        if !can_actor_read_agent_private(&state.store, principal, &agent) {
-            view.instructions = None;
+    let mut listed = roster_views(&state.store, &state.health, &visible, archived_count, query)?;
+    if let Some(caller) = &caller {
+        let by_id: HashMap<&str, &Agent> = visible.iter().map(|a| (a.id.as_str(), *a)).collect();
+        for view in &mut listed.agents {
+            let agent = by_id
+                .get(view.id.as_str())
+                .copied()
+                .expect("every view comes from a visible row");
+            caller.annotate(view, agent);
         }
     }
     Ok(Json(listed))
@@ -2844,7 +2912,7 @@ fn list_agents_sync_for_principal(
 pub(crate) fn roster_views(
     store: &Store,
     health: &HealthBoard,
-    all_agents: Vec<Agent>,
+    all_agents: &[&Agent],
     archived_count: usize,
     query: &ListAgentsQuery,
 ) -> Result<AgentsResponse, ApiError> {
@@ -2859,7 +2927,7 @@ pub(crate) fn roster_views(
             "invalid agent state",
         ));
     }
-    let by_id: HashMap<_, _> = all_agents.iter().map(|a| (a.id.as_str(), a)).collect();
+    let by_id: HashMap<_, _> = all_agents.iter().map(|a| (a.id.as_str(), *a)).collect();
     let selected_name = query
         .name
         .as_deref()
@@ -2874,7 +2942,7 @@ pub(crate) fn roster_views(
         .transpose()
         .map_err(ApiError::from_store)?;
     let mut selected = HashSet::new();
-    for agent in &all_agents {
+    for agent in all_agents {
         let state_matches = match query.state.as_deref() {
             Some("all") => true,
             Some(state) => agent.state == state,
@@ -2918,7 +2986,7 @@ pub(crate) fn roster_views(
     let mut metadata = store.agent_query_metadata().map_err(ApiError::from_store)?;
     let seats = crate::sandbox::roster_seats();
     let mut agents = Vec::with_capacity(selected.len());
-    for agent in &all_agents {
+    for agent in all_agents {
         if !selected.contains(agent.id.as_str()) {
             continue;
         }
@@ -2960,6 +3028,59 @@ pub(crate) fn compute_block_reason(
         return Some("delivery_error".to_string());
     }
     None
+}
+
+/// A millisecond timestamp an operator or rotation marker holds; 0 when absent.
+fn read_ms_marker(path: &Path) -> i64 {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .unwrap_or(0)
+}
+
+/// The quota reset and fault text an adapter or the launcher last persisted in
+/// `.anyagents-last-error.json`. A record from before the last profile rotation
+/// (for AGY, also before the last quota clear) is stale, and an expired reset
+/// clears its record. Claude Code persists no reset, so only its text counts.
+fn persisted_fault(
+    harness: &str,
+    cfg: &Path,
+    rotated_ms: i64,
+    now: i64,
+) -> (Option<i64>, Option<String>) {
+    let Some(record) = std::fs::read_to_string(cfg.join(".anyagents-last-error.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+    else {
+        return (None, None);
+    };
+    let floor = if harness == "agy" {
+        rotated_ms.max(read_ms_marker(&cfg.join(".anyagents-quota-cleared-ms")))
+    } else {
+        rotated_ms
+    };
+    let recorded_at = record
+        .get("timestamp_ms")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    if recorded_at <= floor {
+        return (None, None);
+    }
+    let error = record
+        .get("error")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    if harness == "claude-code" {
+        return (None, error);
+    }
+    match record
+        .get("quota_reset_at_ms")
+        .and_then(serde_json::Value::as_i64)
+    {
+        Some(reset_ms) if reset_ms > now => (Some(reset_ms), error),
+        Some(_) => (None, None),
+        None => (None, error),
+    }
 }
 
 fn archived_agent_view_fast(agent: &Agent) -> AgentView {
@@ -3051,41 +3172,22 @@ fn agent_view_preloaded(
             .map_err(ApiError::from_store)?
     };
     let cfg = anyagents_core::agent_config_dir(store.data_dir(), &agent.id);
-    let rotated_ms = std::fs::read_to_string(cfg.join(".anyagents-profile-rotated-ms"))
-        .ok()
-        .and_then(|s| s.trim().parse::<i64>().ok())
-        .unwrap_or(0);
-    let (session_quota, mut session_error) = if agent.state == "archived" {
-        (None, None)
-    } else if agent.harness == "claude-code" {
-        let persisted_err = crate::vendor::read_persisted_last_error(&cfg).and_then(|(e, _)| e);
-        (
-            anyagents_harness_claude::detect_session_quota_reset_ms(&cfg, now),
-            persisted_err,
-        )
-    } else if agent.harness == "agy" {
-        anyagents_harness_agy::detect_agy_session_quota_and_error(&cfg, now)
-    } else {
-        match crate::vendor::read_persisted_last_error(&cfg) {
-            Some((err, Some(reset_ms))) if reset_ms > now => (Some(reset_ms), err),
-            Some((err, None)) => (None, err),
-            _ => (None, None),
-        }
-    };
-    if agent.state != "archived" && session_error.is_none() && agent.harness == "codex" {
-        session_error = crate::vendor::detect_codex_session_turn_error(&cfg, rotated_ms);
-    }
+    let rotated_ms = read_ms_marker(&cfg.join(".anyagents-profile-rotated-ms"));
+    // The supervisor's board is the live state; a fault outlives its process
+    // only as the record an adapter persisted. A view never reads a vendor
+    // transcript, log or session store.
+    let (session_quota, session_error) = persisted_fault(&agent.harness, &cfg, rotated_ms, now);
     let (
         process,
         mut turn_state,
         mode,
         steer,
-        mut quota,
+        quota,
         live_harness,
         live_model,
         process_started_at_ms,
         pending_switch,
-        mut last_error,
+        last_error,
     ) = match health.get(&agent.id) {
         Some(live) if !crate::vendor::is_spiron_harness(&agent.harness) || live.process_alive => {
             let effective_quota = live.quota_reset_at_ms.or(session_quota);
@@ -3154,11 +3256,7 @@ fn agent_view_preloaded(
         }
     };
     if let Some(reset_ms) = quota.filter(|&ms| ms > now) {
-        create::record_profile_quota_reset(store.data_dir(), agent, reset_ms);
-        if create::try_rotate_exhausted_profile(store, store.data_dir(), agent, true).is_some() {
-            quota = None;
-            last_error = None;
-        }
+        quota_rotation::queue(&agent.id, reset_ms);
     }
     if (agent.state == "running" || agent.state == "idle") && quota.is_none_or(|ms| ms <= now) {
         if let Some(ref err_msg) = last_error {
@@ -6021,6 +6119,19 @@ fn can_sender_message_agent(
     sender: &Agent,
     recipient: &Agent,
 ) -> Result<(), ApiError> {
+    can_sender_message_agent_with(store, sender, recipient, || {
+        store.share_any_group_or_chat(&sender.id, &recipient.id)
+    })
+}
+
+/// [`can_sender_message_agent`] with the group-or-chat share answered by the
+/// caller, so a roster can answer it once for every recipient.
+fn can_sender_message_agent_with(
+    store: &Store,
+    sender: &Agent,
+    recipient: &Agent,
+    share_group_or_chat: impl FnOnce() -> bool,
+) -> Result<(), ApiError> {
     if sender.id == recipient.id
         || recipient.parent_id.as_ref() == Some(&sender.id)
         || sender.parent_id.as_ref() == Some(&recipient.id)
@@ -6038,9 +6149,7 @@ fn can_sender_message_agent(
             sender.name, recipient.name
         )));
     }
-    if store.share_any_group_or_chat(&sender.id, &recipient.id)
-        || store.has_messaged(recipient, sender)
-    {
+    if share_group_or_chat() || store.has_messaged(recipient, sender) {
         return Ok(());
     }
     let same_parent_siblings = sender.parent_id.is_some()
@@ -7135,7 +7244,7 @@ pub(crate) mod tests {
             let views = roster_views(
                 &store,
                 &health,
-                agents,
+                &agents.iter().collect::<Vec<_>>(),
                 archived,
                 &ListAgentsQuery::default(),
             )
@@ -7171,7 +7280,149 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn agent_views_only_read_agy_logs_for_the_agy_harness() {
+    fn roster_authorization_matches_the_single_agent_checks() {
+        let dir = crate::test_tempdir();
+        let state = archetype_validation_state(dir.path());
+        let store = &state.store;
+        let make = |name: &str, parent: Option<&Agent>, scope: Option<&str>| {
+            let mut new = anyagents_core::NewAgent::new(name, "codex");
+            new.parent_id = parent.map(|p| p.id.clone());
+            new.instructions = Some(format!("{name} private instructions"));
+            let agent = store.create_agent(new).unwrap();
+            match scope {
+                Some(scope) => store.set_agent_scope(&agent.id, scope).unwrap(),
+                None => agent,
+            }
+        };
+        let root = make("root", None, None);
+        let admin = make("admin", None, None);
+        store.set_agent_admin(&admin.id, true).unwrap();
+        let peer = make("peer", None, None);
+        let lead = make("lead", Some(&root), Some("siblings"));
+        let sib = make("sib", Some(&root), Some("siblings"));
+        let worker = make("worker", Some(&lead), None);
+        let iso = make("iso", Some(&root), Some("isolated"));
+        let iso_child = make("iso-child", Some(&iso), None);
+        let public = make("public", Some(&peer), Some("public"));
+        let private = make("private", Some(&peer), None);
+        let gone = make("gone", Some(&lead), None);
+        store.set_agent_state(&gone.id, "archived").unwrap();
+        store.join_group("team", &iso.id).unwrap();
+        store.join_group("team", &private.id).unwrap();
+        store
+            .record_outbound(&private.id, "agent:worker", None, "hello")
+            .unwrap();
+        let callers = [
+            &root, &admin, &peer, &lead, &sib, &worker, &iso, &iso_child, &public, &private,
+        ];
+        for caller in callers {
+            let caller = store.agent(&caller.id).unwrap();
+            let principal = Principal::Agent {
+                agent_id: caller.id.clone(),
+                name: caller.name.clone(),
+            };
+            for filter in [None, Some("all"), Some("archived")] {
+                let query = ListAgentsQuery {
+                    state: filter.map(str::to_string),
+                    ..Default::default()
+                };
+                let Json(listed) =
+                    list_agents_sync_for_principal(&state, &principal, &query).unwrap();
+                // The isolated-scope rule, checked row by row against the store.
+                let (roster, archived) = store.roster_agents(filter).unwrap();
+                let visible: Vec<&Agent> = roster
+                    .iter()
+                    .filter(|agent| {
+                        !(caller.is_isolated()
+                            && !is_self_or_ancestor(store, &caller.id, agent)
+                            && caller.parent_id.as_ref() != Some(&agent.id)
+                            && !store.share_any_group_or_chat(&caller.id, &agent.id))
+                    })
+                    .collect();
+                let expected =
+                    roster_views(store, &state.health, &visible, archived, &query).unwrap();
+                let ids = |views: &[AgentView]| -> Vec<String> {
+                    views.iter().map(|view| view.id.clone()).collect()
+                };
+                assert_eq!(
+                    ids(&listed.agents),
+                    ids(&expected.agents),
+                    "{}",
+                    caller.name
+                );
+                for view in &listed.agents {
+                    let target = store.agent_by_name(&view.id).unwrap();
+                    let context = format!("{} -> {}", caller.name, target.name);
+                    assert_eq!(
+                        view.relationship,
+                        Some(compute_caller_relationship(store, &caller, &target)),
+                        "{context}"
+                    );
+                    assert_eq!(
+                        view.can_message,
+                        Some(
+                            can_actor_message_agent(
+                                store,
+                                &Actor::Agent(caller.name.clone()),
+                                &target
+                            )
+                            .is_ok()
+                        ),
+                        "{context}"
+                    );
+                    assert_eq!(
+                        view.instructions.is_some(),
+                        can_actor_read_agent_private(store, &principal, &target),
+                        "{context}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Vendor history each harness leaves behind that the view once scanned:
+    /// a Claude Code session ending in a rate-limit rejection, an AGY CLI log
+    /// ending in an error, and Codex rollouts ending in a 401 turn fault.
+    fn write_vendor_history(cfg: &Path) {
+        let reset_s = now_ms() / 1000 + 3600;
+        let projects = cfg.join("projects/-work");
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::write(
+            projects.join("session.jsonl"),
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "type": "assistant",
+                    "apiError": "usage_limit_reached",
+                    "quotaLimits": {"status": "rejected", "resetsAt": reset_s},
+                    "error": "rate_limit",
+                    "apiErrorStatus": 429
+                })
+            ),
+        )
+        .unwrap();
+        let logs = cfg.join(".gemini/antigravity-cli/log");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(
+            logs.join("cli-previous-session.log"),
+            "run ended with error and no response: previous agy session failed\n",
+        )
+        .unwrap();
+        let sessions = cfg.join("sessions/2026/11/13");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let fault = serde_json::json!({
+            "type": "event_msg",
+            "payload": {"type": "task_complete", "error": {"message": "unauthorized (401)"}}
+        });
+        std::fs::write(
+            sessions.join("rollout-2026-11-13T00-00-00-x.jsonl"),
+            format!("{fault}\n{fault}\n{fault}\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn agent_views_never_read_vendor_history() {
         let _env = env_lock();
         let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
@@ -7189,35 +7440,99 @@ pub(crate) mod tests {
                 .create_agent(anyagents_core::NewAgent::new(harness, harness))
                 .unwrap();
             let cfg = anyagents_core::agent_config_dir(dir.path(), &agent.id);
-            let logs = cfg.join(".gemini/antigravity-cli/log");
-            std::fs::create_dir_all(&logs).unwrap();
-            std::fs::write(
-                logs.join("cli-previous-session.log"),
-                "run ended with error and no response: previous agy session failed\n",
+            write_vendor_history(&cfg);
+            for view in [
+                agent_view(&store, &health, &agent).unwrap(),
+                crate::agent::view_named(dir.path(), &agent.name).unwrap(),
+            ] {
+                assert_eq!(view.last_error, None, "{harness}");
+                assert_eq!(view.quota_reset_at_ms, None, "{harness}");
+                assert_eq!(view.block_reason, None, "{harness}");
+            }
+            let (agents, archived) = store.roster_agents(None).unwrap();
+            let roster = roster_views(
+                &store,
+                &health,
+                &agents.iter().collect::<Vec<_>>(),
+                archived,
+                &ListAgentsQuery::default(),
             )
             .unwrap();
-            let mut view = agent_view(&store, &health, &agent).unwrap();
-            let expected = (harness == "agy").then_some("previous agy session failed");
-            assert_eq!(view.last_error.as_deref(), expected, "server: {harness}");
-            view.last_error = None;
-            view = crate::agent::view_named(dir.path(), &agent.name).unwrap();
-            assert_eq!(view.last_error.as_deref(), expected, "client: {harness}");
+            assert!(
+                roster
+                    .agents
+                    .iter()
+                    .all(|view| view.last_error.is_none() && view.quota_reset_at_ms.is_none()),
+                "{harness}"
+            );
 
+            // What the adapter persisted is what the view reports.
+            let reset_ms = now_ms() + 3_600_000;
             std::fs::write(
                 cfg.join(".anyagents-last-error.json"),
                 serde_json::json!({
-                    "timestamp_ms": anyagents_core::now_ms(),
+                    "timestamp_ms": now_ms(),
                     "error": "current harness failed",
+                    "quota_reset_at_ms": reset_ms,
                 })
                 .to_string(),
             )
             .unwrap();
-            view = agent_view(&store, &health, &agent).unwrap();
-            assert_eq!(view.last_error.as_deref(), Some("current harness failed"));
-            view.last_error = None;
-            view = crate::agent::view_named(dir.path(), &agent.name).unwrap();
-            assert_eq!(view.last_error.as_deref(), Some("current harness failed"));
+            let expected_quota = (harness != "claude-code").then_some(reset_ms);
+            for view in [
+                agent_view(&store, &health, &agent).unwrap(),
+                crate::agent::view_named(dir.path(), &agent.name).unwrap(),
+            ] {
+                assert_eq!(view.last_error.as_deref(), Some("current harness failed"));
+                assert_eq!(view.quota_reset_at_ms, expected_quota, "{harness}");
+            }
+            std::fs::remove_file(cfg.join(".anyagents-last-error.json")).unwrap();
         }
+    }
+
+    #[test]
+    fn agent_view_reports_the_live_board_over_persisted_faults() {
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let health = HealthBoard::default();
+        let agent = store
+            .create_agent(anyagents_core::NewAgent::new("claude", "claude-code"))
+            .unwrap();
+        store.set_agent_state(&agent.id, "running").unwrap();
+        let agent = store.agent(&agent.id).unwrap();
+        let cfg = anyagents_core::agent_config_dir(dir.path(), &agent.id);
+        write_vendor_history(&cfg);
+        let reset_ms = now_ms() + 3_600_000;
+        let live = |quota: Option<i64>, error: Option<&str>| anyagents_supervisor::LiveState {
+            process_alive: true,
+            turn_state: anyagents_harness::TurnState::Idle,
+            delivery_mode: anyagents_harness::DeliveryMode::Steer,
+            steer_support: anyagents_harness::SteerSupport::Yes,
+            quota_reset_at_ms: quota,
+            restart_at_ms: None,
+            pid: Some(42),
+            live_harness: Some("claude-code".into()),
+            live_model: None,
+            process_started_at_ms: Some(1),
+            last_error: error.map(str::to_string),
+        };
+        health.publish(&agent.id, live(Some(reset_ms), None));
+        let view = agent_view(&store, &health, &agent).unwrap();
+        assert_eq!(view.process, "alive");
+        assert_eq!(view.quota_reset_at_ms, Some(reset_ms));
+        assert_eq!(view.block_reason.as_deref(), Some("quota_exhausted"));
+        assert_eq!(view.turn_state, "idle");
+
+        health.publish(&agent.id, live(None, None));
+        let view = agent_view(&store, &health, &agent).unwrap();
+        assert_eq!(view.quota_reset_at_ms, None);
+        assert_eq!(view.block_reason, None);
+        assert_eq!(view.turn_state, "idle");
+
+        health.publish(&agent.id, live(None, Some("not logged in")));
+        let view = agent_view(&store, &health, &agent).unwrap();
+        assert_eq!(view.turn_state, "errored");
+        assert_eq!(view.block_reason.as_deref(), Some("sign_in_required"));
     }
 
     #[test]

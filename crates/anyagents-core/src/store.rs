@@ -32,6 +32,7 @@ mod runtime;
 #[cfg(test)]
 #[path = "store/runtime_tests.rs"]
 mod runtime_tests;
+mod server_ops;
 pub use credentials::{
     CredentialBinding, CredentialBindingAudit, CredentialKind, CredentialObservation,
     CredentialSlot, CredentialTarget,

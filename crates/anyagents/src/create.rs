@@ -8511,7 +8511,7 @@ pub(crate) fn try_rotate_exhausted_profile(
     if has_active_quota_hold && cur_pct.is_some_and(|pct| pct <= 0) {
         let bound_counts = count_bound_profile_agents(
             data,
-            &store.list_agents().unwrap_or_default(),
+            &store.list_live_agents().unwrap_or_default(),
             &provider,
             &agent.id,
         );
@@ -10747,35 +10747,25 @@ mod tests {
         .unwrap();
 
         let child_cfg = anyagents_core::agent_config_dir(data, &child.id);
-        let sess_dir = child_cfg.join("sessions/2026/10/29");
-        std::fs::create_dir_all(&sess_dir).unwrap();
-        let rollout_path = sess_dir.join("rollout-2026-10-29T18-51-32-test.jsonl");
-        let rollout_line = serde_json::json!({
-            "timestamp": "2026-10-29T18:51:40.000Z",
-            "ordinal": 4,
-            "type": "event_msg",
-            "payload": {
-                "type": "task_complete",
-                "root_turn_id": "t1",
-                "turn_id": "t1",
-                "last_agent_message": null,
-                "error": {
-                    "message": "workspace routing discovery unauthorized (401)"
-                }
-            }
-        });
-        std::fs::write(&rollout_path, format!("{rollout_line}\n")).unwrap();
-        let rotated_at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        // The Codex adapter persists a 401 turn fault as this record.
+        let persist_fault = |timestamp_ms: i64| {
+            std::fs::write(
+                child_cfg.join(".anyagents-last-error.json"),
+                serde_json::json!({
+                    "error": "workspace routing discovery unauthorized (401)",
+                    "quota_reset_at_ms": null,
+                    "timestamp_ms": timestamp_ms,
+                })
+                .to_string(),
+            )
+            .unwrap();
+        };
         std::fs::write(
             child_cfg.join(".anyagents-profile-rotated-ms"),
             "1700000000000\n",
         )
         .unwrap();
-        let rollout = std::fs::File::options()
-            .write(true)
-            .open(&rollout_path)
-            .unwrap();
-        rollout.set_modified(rotated_at).unwrap();
+        persist_fault(1_700_000_000_000);
 
         let health = anyagents_supervisor::HealthBoard::default();
         let (delivery_mode, steer_support) = anyagents_supervisor::declared(&child.harness);
@@ -10797,16 +10787,14 @@ mod tests {
         );
         let mut views;
 
-        // A rollout at the rotation boundary is stale, even if it contains an
-        // error. Do not let wall-clock or filesystem precision decide freshness.
+        // A fault recorded at the rotation boundary is stale. Do not let
+        // wall-clock precision decide freshness.
         views = vec![crate::server::agent_view(&store, &health, &child).unwrap()];
         assert_eq!(views[0].turn_state, "working");
         assert!(views[0].last_error.is_none());
         assert!(store.next_undelivered(&parent.id).unwrap().is_none());
 
-        rollout
-            .set_modified(rotated_at + std::time::Duration::from_secs(1))
-            .unwrap();
+        persist_fault(1_700_000_001_000);
         views = vec![crate::server::agent_view(&store, &health, &child).unwrap()];
         assert_eq!(views[0].turn_state, "errored");
         assert_eq!(
