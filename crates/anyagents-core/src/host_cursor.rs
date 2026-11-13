@@ -7,6 +7,7 @@ use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File},
     io::{self, BufRead},
+    path::Path,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -31,8 +32,27 @@ impl FileStamp {
             changed: (m.ctime(), m.ctime_nsec()),
         }
     }
+    /// The entry itself, never a symlink target. `None` when it is absent.
+    pub fn of_path(path: &Path) -> io::Result<Option<Self>> {
+        match fs::symlink_metadata(path) {
+            Ok(m) => Ok(Some(Self::from_metadata(&m))),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
     pub fn same_file(&self, other: &Self) -> bool {
         self.device == other.device && self.inode == other.inode
+    }
+    /// The last change predates `ms` by more than any filesystem timestamp
+    /// granularity, so a later change cannot reuse this exact stamp.
+    pub fn settled_before(&self, ms: i64) -> bool {
+        const GRANULARITY_MS: i64 = 2_000;
+        let changed_ms = self
+            .changed
+            .0
+            .saturating_mul(1_000)
+            .saturating_add(self.changed.1 / 1_000_000);
+        changed_ms < ms.saturating_sub(GRANULARITY_MS)
     }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]

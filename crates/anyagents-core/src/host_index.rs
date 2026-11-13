@@ -38,7 +38,7 @@ pub enum MemoryScope {
     Transcripts,
 }
 impl MemoryScope {
-    fn source(self) -> Option<&'static str> {
+    pub(crate) fn source(self) -> Option<&'static str> {
         match self {
             Self::All => None,
             Self::Memory => Some("memory"),
@@ -95,9 +95,9 @@ impl HostIndex {
         let already_initialized = !old_required_time
             && conn
                 .query_row(
-                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='host_fts'",
+                    "SELECT count(*)=2 FROM sqlite_master WHERE type='table' AND name IN ('host_fts','host_agent_trees')",
                     [],
-                    |_| Ok(true),
+                    |r| r.get(0),
                 )
                 .optional()?
                 .unwrap_or(false)
@@ -161,6 +161,7 @@ impl HostIndex {
                 DROP TABLE IF EXISTS host_document_tools;
                 DROP TABLE IF EXISTS host_documents;
                 DROP TABLE IF EXISTS host_sources;
+                DROP TABLE IF EXISTS host_agent_trees;
                 DROP TABLE IF EXISTS host_fts;",
                 )?;
             }
@@ -180,6 +181,9 @@ impl HostIndex {
             CREATE TABLE IF NOT EXISTS host_sources (
                 agent_id TEXT NOT NULL, segment TEXT NOT NULL, cursor TEXT NOT NULL,
                 PRIMARY KEY(agent_id,segment));
+            CREATE TABLE IF NOT EXISTS host_agent_trees (
+                agent_id TEXT NOT NULL, class TEXT NOT NULL, policy TEXT NOT NULL,
+                tree TEXT NOT NULL, PRIMARY KEY(agent_id,class));
             CREATE INDEX IF NOT EXISTS host_documents_owner ON host_documents(agent_id,source,timestamp_ms);
             CREATE TABLE IF NOT EXISTS host_windows (
                 id INTEGER PRIMARY KEY, document_id TEXT NOT NULL REFERENCES host_documents(id) ON DELETE CASCADE,
@@ -211,27 +215,17 @@ impl HostIndex {
     }
 
     /// Delete stale filesystem coordinates after a complete authorized scan.
+    /// Documents can vanish here while their files stay unchanged, so the
+    /// agent's recorded walks go too and its next search walks again.
     pub fn retain_agent_documents(
         &mut self,
         owner: &str,
         keep: &std::collections::HashSet<String>,
     ) -> Result<(), IndexError> {
-        self.retain_agent_scope(owner, MemoryScope::All, keep)
-    }
-
-    /// A scoped refresh must not prune the other source class or its cursors.
-    pub(crate) fn retain_agent_scope(
-        &mut self,
-        owner: &str,
-        scope: MemoryScope,
-        keep: &std::collections::HashSet<String>,
-    ) -> Result<(), IndexError> {
         let ids = self
             .conn
-            .prepare(
-                "SELECT id FROM host_documents WHERE agent_id=?1 AND (?2 IS NULL OR source=?2)",
-            )?
-            .query_map(params![owner, scope.source()], |r| r.get::<_, String>(0))?
+            .prepare("SELECT id FROM host_documents WHERE agent_id=?1")?
+            .query_map([owner], |r| r.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
         let stale: Vec<String> = ids.into_iter().filter(|id| !keep.contains(id)).collect();
         if stale.is_empty() {
@@ -255,7 +249,75 @@ impl HostIndex {
             (SELECT segment FROM host_documents WHERE agent_id=?1)",
             [owner],
         )?;
+        tx.execute("DELETE FROM host_agent_trees WHERE agent_id=?1", [owner])?;
         tx.commit()?;
+        Ok(())
+    }
+
+    /// Every published source of one agent with its cursor: one row per file,
+    /// never one per document.
+    pub(crate) fn agent_sources(&self, owner: &str) -> Result<Vec<(String, String)>, IndexError> {
+        Ok(self
+            .conn
+            .prepare_cached("SELECT segment, cursor FROM host_sources WHERE agent_id=?1")?
+            .query_map([owner], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<_, _>>()?)
+    }
+
+    /// Drop sources whose files a complete walk no longer finds, with all
+    /// their documents. Every document belongs to a published source.
+    pub(crate) fn forget_sources(
+        &mut self,
+        owner: &str,
+        segments: &[String],
+    ) -> Result<(), IndexError> {
+        if segments.is_empty() {
+            return Ok(());
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for segment in segments {
+            tx.execute(
+                "DELETE FROM host_documents WHERE agent_id=?1 AND segment=?2",
+                params![owner, segment],
+            )?;
+            tx.execute(
+                "DELETE FROM host_sources WHERE agent_id=?1 AND segment=?2",
+                params![owner, segment],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The walk last recorded for one class of an agent: `(policy, tree)`.
+    pub(crate) fn agent_tree(
+        &self,
+        owner: &str,
+        class: &str,
+    ) -> Result<Option<(String, String)>, IndexError> {
+        Ok(self
+            .conn
+            .prepare_cached(
+                "SELECT policy, tree FROM host_agent_trees WHERE agent_id=?1 AND class=?2",
+            )?
+            .query_row([owner, class], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?)
+    }
+    pub(crate) fn save_agent_tree(
+        &self,
+        owner: &str,
+        class: &str,
+        policy: &str,
+        tree: &str,
+    ) -> Result<(), IndexError> {
+        self.conn
+            .prepare_cached(
+                "INSERT INTO host_agent_trees VALUES(?1,?2,?3,?4)
+                ON CONFLICT(agent_id,class) DO UPDATE SET policy=excluded.policy, tree=excluded.tree",
+            )?
+            .execute([owner, class, policy, tree])?;
         Ok(())
     }
 
@@ -312,6 +374,7 @@ impl HostIndex {
         raw.map(|s| serde_json::from_str(&s).map_err(IndexError::from))
             .transpose()
     }
+    #[cfg(test)]
     pub(crate) fn source_documents(
         &self,
         owner: &str,
