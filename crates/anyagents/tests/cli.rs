@@ -635,7 +635,8 @@ fn create_registers_mcp_only_in_the_agent_config() {
         agent.workdir.as_deref(),
         Some(std::path::absolute(&custom).unwrap().to_str().unwrap())
     );
-    assert!(dir.path().join("agents").join(&id).join("work").is_dir());
+    assert!(custom.is_dir());
+    assert!(!dir.path().join("agents").join(&id).join("work").exists());
     assert!(!custom.join(".mcp.json").exists());
     assert!(!dir.path().join(".claude.json").exists());
     assert!(!dir.path().join("config.toml").exists());
@@ -680,10 +681,17 @@ fn create_registers_mcp_only_in_the_agent_config() {
         .next()
         .unwrap()
         .to_string();
+    assert!(
+        dir.path()
+            .join("agents")
+            .join(&codex_id)
+            .join("work")
+            .is_dir()
+    );
     let toml = std::fs::read_to_string(
         dir.path()
             .join("agents")
-            .join(codex_id)
+            .join(&codex_id)
             .join("config")
             .join("config.toml"),
     )

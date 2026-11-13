@@ -34,16 +34,31 @@ pub fn format_agent_display(name: &str, role: Option<&str>) -> String {
 }
 
 /// New config roots are private before credentials or a seat grant exist.
-/// DirBuilder leaves an existing root's admitted group/mode unchanged.
+/// Parent directories are created first with umask-governed traversable
+/// permissions; only the target directory itself is restricted to `0o700`,
+/// leaving an existing root's admitted group/mode unchanged.
 fn create_private_config_dir(config: &Path) -> std::io::Result<()> {
+    if let Some(parent) = config.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
     let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
         builder.mode(0o700);
     }
-    builder.create(config)
+    match builder.create(config) {
+        Ok(()) => Ok(()),
+        Err(err)
+            if err.kind() == std::io::ErrorKind::AlreadyExists
+                && std::fs::symlink_metadata(config).is_ok_and(|m| m.is_dir()) =>
+        {
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
 }
 
 pub fn create(store: &Store, data: &Path, request: CreateRequest) -> Result<Agent, Error> {
@@ -104,6 +119,8 @@ fn create_with_seat(
     let data = std::path::absolute(data)?;
     // A checkout the consumer produced for this creation; rollback removes it.
     let provisioned: std::cell::RefCell<Option<PathBuf>> = std::cell::RefCell::new(None);
+    // A managed workspace directory created by this call; rollback removes it.
+    let created_managed: std::cell::RefCell<Option<PathBuf>> = std::cell::RefCell::new(None);
     let finish = (|| -> Result<Agent, Error> {
         crate::sandbox::bind_principal(store, &agent)?;
         // Nothing is installed until an agent needs it: this is that moment. A
@@ -125,7 +142,6 @@ fn create_with_seat(
         }
         store.set_agent_launch_env(&agent.id, &pairs)?;
         let managed = agent_work_dir(&data, &agent.id);
-        std::fs::create_dir_all(&managed)?;
         let config = agent_config_dir(&data, &agent.id);
         create_private_config_dir(&config)?;
         let _ = std::fs::create_dir_all(config.join("tmp"));
@@ -328,6 +344,10 @@ fn create_with_seat(
                 }
             }
         };
+        if cwd == managed_abs && !managed_abs.exists() {
+            std::fs::create_dir_all(&managed_abs)?;
+            *created_managed.borrow_mut() = Some(managed_abs.clone());
+        }
         if let Some((_, uid, gid, launch)) = seat_override
             .clone()
             .or_else(|| resolved_agent_seat_info(store, &agent))
@@ -382,6 +402,7 @@ fn create_with_seat(
             &data,
             &agent,
             provisioned.into_inner().as_deref(),
+            created_managed.into_inner().as_deref(),
             error,
         ));
     }
@@ -399,6 +420,7 @@ fn roll_back_failed_creation(
     data: &Path,
     agent: &Agent,
     provisioned: Option<&Path>,
+    created_managed: Option<&Path>,
     error: Error,
 ) -> Error {
     if let Err(revocation) = crate::worktree_access::revoke_recorded(data, &agent.id) {
@@ -441,6 +463,16 @@ fn roll_back_failed_creation(
     {
         eprintln!(
             "warning: cannot remove partial directory of failed creation {}: {remove}",
+            agent.id
+        );
+    }
+    if let Some(managed_dir) = created_managed
+        && let Err(remove) = std::fs::remove_dir_all(managed_dir)
+        && remove.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!(
+            "warning: cannot remove managed workdir {} of failed creation {}: {remove}",
+            managed_dir.display(),
             agent.id
         );
     }
@@ -10115,6 +10147,11 @@ mod tests {
         let config = dir.path().join("created/config");
         create_private_config_dir(&config).unwrap();
         assert_eq!(std::fs::metadata(&config).unwrap().mode() & 0o777, 0o700);
+        assert_ne!(
+            std::fs::metadata(config.parent().unwrap()).unwrap().mode() & 0o011,
+            0,
+            "agent root parent must remain traversable when config is created"
+        );
         std::fs::write(config.join("credential"), "retained credential").unwrap();
         std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o2770)).unwrap();
         create_private_config_dir(&config).unwrap();
@@ -10127,6 +10164,191 @@ mod tests {
         std::fs::write(&blocked, "preserved").unwrap();
         assert!(create_private_config_dir(&blocked).is_err());
         assert_eq!(std::fs::read_to_string(blocked).unwrap(), "preserved");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspaces_dir_keeps_agent_root_traversable_and_avoids_unused_managed_dirs() {
+        use std::os::unix::fs::MetadataExt;
+        const PROBE: &str = "ANYAGENTS_WORKSPACES_CREATE_PROBE";
+        if std::env::var_os(PROBE).is_none() {
+            let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+            for key in [
+                "ANYAGENTS_PRINCIPAL_REGISTRY",
+                "ANYAGENTS_PRINCIPALS",
+                "ANYAGENTS_AGENTS",
+                "ANYAGENTS_AGENT_UID",
+                "ANYAGENTS_AGENT_GID",
+                "ANYAGENTS_SOCKET_GID",
+                "ANYAGENTS_LAUNCHER",
+                "ANYAGENTS_SETPRIV",
+                "ANYAGENTS_DATA",
+                "ANYAGENTS_STATE_DIR",
+                "ANYAGENTS_WORKSPACES_DIR",
+                "ANYAGENTS_SCRATCH_DIR",
+                "ANYAGENTS_GIT_POOL_DIR",
+                "ANYAGENTS_PROTECTED_ROOTS",
+            ] {
+                cmd.env_remove(key);
+            }
+            let output = cmd
+                .env(PROBE, "1")
+                .env("ANYAGENTS_TEST_STORAGE_TIERS", "1")
+                .args([
+                    "--exact",
+                    "create::tests::workspaces_dir_keeps_agent_root_traversable_and_avoids_unused_managed_dirs",
+                    "--nocapture",
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "probe failed:
+stdout: {}
+stderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        unsafe {
+            libc::umask(0o022);
+        }
+        let tmp = crate::test_tempdir();
+        let data = tmp.path().join("data");
+        let workspaces = tmp.path().join("workspaces");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&workspaces).unwrap();
+        unsafe {
+            std::env::set_var("ANYAGENTS_WORKSPACES_DIR", &workspaces);
+        }
+        let store = Store::open(data.join("state.db")).unwrap();
+        store
+            .hold_capability_key("0123456789abcdef0123456789abcdef")
+            .unwrap();
+
+        let managed_agent = create(
+            &store,
+            &data,
+            CreateRequest {
+                name: "managed-worker".to_string(),
+                role: None,
+                harness: "codex".to_string(),
+                model: Some("test-model".to_string()),
+                profile: None,
+                repo: None,
+                branch: None,
+                base: None,
+                workdir: None,
+                workdir_default: None,
+                description: None,
+                instructions: None,
+                parent_id: None,
+            },
+        )
+        .unwrap();
+        let expected_managed = workspaces.join(managed_agent.id.as_str());
+        assert_eq!(
+            managed_agent.workdir.as_deref(),
+            Some(expected_managed.to_str().unwrap())
+        );
+        assert!(expected_managed.is_dir());
+
+        let managed_config = agent_config_dir(&data, &managed_agent.id);
+        let managed_root = managed_config.parent().unwrap();
+        assert_ne!(
+            std::fs::metadata(managed_root).unwrap().mode() & 0o011,
+            0,
+            "<data>/agents/<id> must be traversable with ANYAGENTS_WORKSPACES_DIR set"
+        );
+        // Simulate a fresh unshared private config before seat sharing.
+        let unshared_root = data.join("agents/unshared-probe");
+        let unshared_config = unshared_root.join("config");
+        create_private_config_dir(&unshared_config).unwrap();
+        assert_eq!(
+            std::fs::metadata(&unshared_root).unwrap().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(
+            std::fs::metadata(&unshared_config).unwrap().mode() & 0o777,
+            0o700
+        );
+        let (uid, gid) = (crate::sandbox::server_uid(), crate::sandbox::server_gid());
+        crate::sandbox::prepare_config_with_seat_uid(&unshared_config, uid, gid).unwrap();
+        assert_ne!(std::fs::metadata(&unshared_root).unwrap().mode() & 0o011, 0);
+        assert_eq!(
+            std::fs::metadata(&unshared_config).unwrap().mode() & 0o7777,
+            0o2770
+        );
+
+        let explicit_dir = tmp.path().join("explicit-work");
+        let explicit_agent = create(
+            &store,
+            &data,
+            CreateRequest {
+                name: "explicit-worker".to_string(),
+                role: None,
+                harness: "codex".to_string(),
+                model: Some("test-model".to_string()),
+                profile: None,
+                repo: None,
+                branch: None,
+                base: None,
+                workdir: Some(explicit_dir.clone()),
+                workdir_default: None,
+                description: None,
+                instructions: None,
+                parent_id: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            explicit_agent.workdir.as_deref(),
+            Some(explicit_dir.to_str().unwrap())
+        );
+        assert!(
+            !workspaces.join(explicit_agent.id.as_str()).exists(),
+            "explicit workdir must not eagerly create unused dir in ANYAGENTS_WORKSPACES_DIR"
+        );
+        let explicit_root = agent_config_dir(&data, &explicit_agent.id)
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        assert_ne!(std::fs::metadata(&explicit_root).unwrap().mode() & 0o011, 0);
+
+        // If creation fails after creating managed workspace in ANYAGENTS_WORKSPACES_DIR,
+        // rollback must remove both <data>/agents/<id> and <workspaces>/<id>.
+        unsafe {
+            std::env::set_var("ANYAGENTS_PROTECTED_ROOTS", &workspaces);
+        }
+        let failed = create(
+            &store,
+            &data,
+            CreateRequest {
+                name: "rollback-worker".to_string(),
+                role: None,
+                harness: "codex".to_string(),
+                model: Some("test-model".to_string()),
+                profile: None,
+                repo: None,
+                branch: None,
+                base: None,
+                workdir: None,
+                workdir_default: None,
+                description: None,
+                instructions: None,
+                parent_id: None,
+            },
+        );
+        assert!(failed.is_err());
+        let workspace_entries: Vec<_> = std::fs::read_dir(&workspaces)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            workspace_entries,
+            vec![expected_managed.file_name().unwrap().to_os_string()]
+        );
     }
 
     #[test]
@@ -12132,7 +12354,7 @@ git -c safe.directory="$5" -C "$5" status --porcelain
         std::fs::create_dir_all(journal.parent().unwrap()).unwrap();
         std::fs::write(&journal, b"not a journal").unwrap();
         let original = Error::Message("injected admission failure".into());
-        let returned = roll_back_failed_creation(&store, data, &agent, None, original);
+        let returned = roll_back_failed_creation(&store, data, &agent, None, None, original);
         assert_eq!(returned.to_string(), "injected admission failure");
         let kept = store.agent(&agent.id).unwrap();
         assert_eq!(kept.state, "archived");
