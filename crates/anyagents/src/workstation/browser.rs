@@ -4,7 +4,9 @@
 //! only caller policy: profile selection, snapshot ids for stale-ref checks,
 //! secret references, screenshot files, and the response shape.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(target_os = "linux")]
+use std::path::PathBuf;
 
 use anyagents_core::Error;
 use schemars::JsonSchema;

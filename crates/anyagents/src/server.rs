@@ -3691,8 +3691,8 @@ pub(crate) fn reap_subagent_ephemeral_dirs(
         );
     }
     let mut shared_workdirs = std::collections::HashSet::new();
+    #[cfg(target_os = "linux")]
     if let Some(agent) = agent {
-        #[cfg(target_os = "linux")]
         crate::workstation::session::stop_in_background(data_dir, &agent.name);
     }
     for other in &agents {

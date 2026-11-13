@@ -1607,12 +1607,12 @@ async fn code_mode_supports_memory_sdk_workspace_patch_list_exec_and_computer_sn
                 const listed = await workspace.list("src");
                 const execOut = await workspace.exec({ cmd: "printf 'exec-ok'" });
 
-                // 3. Semantic Accessibility Snapshot & STALE_REF guard on tools.computer
-                const snap = await tools.computer.snapshot();
-                const windows = await tools.computer.list_windows();
+                // 3. Semantic Accessibility Snapshot & STALE_REF guard on host tools.computer
+                const snap = await tools.computer.snapshot({ display: ":0" });
+                const windows = await tools.computer.list_windows({ display: ":0" });
                 let staleCaught = false;
                 try {
-                    await tools.computer.click("@e1");
+                    await tools.computer.click({ ref: "@e1", display: ":0" });
                 } catch (err: any) {
                     staleCaught = String(err).includes("STALE_REF") && String(err).includes("stale_ref");
                 }
