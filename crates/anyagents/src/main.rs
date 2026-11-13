@@ -484,6 +484,14 @@ enum Command {
         /// The agent name, or `all`.
         agent: String,
     },
+    /// List the messages an agent's harness refused for good, or put one
+    /// back in its mailbox as a new message.
+    Requeue {
+        /// The agent name.
+        agent: String,
+        /// A parked message id (`msg_...`). Without it, list the parked ones.
+        message: Option<String>,
+    },
     /// Record a channel. The secret is copied into the credential store.
     Channels {
         #[command(subcommand)]
@@ -1206,6 +1214,7 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
         Command::Resume { name, prompt } => agent::resume_cmd(&data, &name, prompt),
         Command::Delete { name } => agent::delete_cmd(&data, &name),
         Command::Flush { agent } => agent::flush(&data, &agent),
+        Command::Requeue { agent, message } => agent::requeue(&data, &agent, message.as_deref()),
         Command::Model {
             agent,
             target_model,

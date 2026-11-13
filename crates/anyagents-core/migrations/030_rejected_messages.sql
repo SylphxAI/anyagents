@@ -7,7 +7,10 @@ CREATE TABLE rejected_messages (
     agent_id TEXT NOT NULL,
     seq INTEGER NOT NULL,
     reason TEXT NOT NULL,
-    rejected_at_ms INTEGER NOT NULL
+    rejected_at_ms INTEGER NOT NULL,
+    -- When its sender was told; NULL until then, and sent again at the next
+    -- delivery loop's start.
+    notified_at_ms INTEGER
 );
 
 CREATE INDEX rejected_messages_agent ON rejected_messages (agent_id, seq);

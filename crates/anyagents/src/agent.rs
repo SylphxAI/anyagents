@@ -1426,6 +1426,35 @@ fn show_optional(value: Option<i64>) -> String {
 /// Hand every line the running server may have left to the harness, through the
 /// vendor's own input API. A line the harness already took is not written again:
 /// the adapter remembers the ids in the session it resumed.
+/// List an agent's parked messages, or put one back in its mailbox.
+pub fn requeue(
+    data: &Path,
+    name: &str,
+    message: Option<&str>,
+) -> Result<(), anyagents_core::Error> {
+    let store = open(data)?;
+    let agent = store.agent_by_name(name)?;
+    let Some(message) = message else {
+        for parked in store.rejected_messages(&agent.id)? {
+            println!(
+                "{}\t{}\t{}\t{}",
+                parked.message_id,
+                parked.seq,
+                parked.sender.as_deref().unwrap_or("-"),
+                parked.reason
+            );
+        }
+        return Ok(());
+    };
+    let requeued = store.requeue_rejected(&agent.id, message)?;
+    println!(
+        "{}\trequeued\t{message}\t{}",
+        agent.name,
+        requeued.id.as_str()
+    );
+    Ok(())
+}
+
 pub fn flush(data: &Path, name: &str) -> Result<(), anyagents_core::Error> {
     let store = open(data)?;
     let agents = if name == "all" {
@@ -1459,6 +1488,9 @@ pub fn flush(data: &Path, name: &str) -> Result<(), anyagents_core::Error> {
         };
         let mut flushed = 0u32;
         let mut failure = None;
+        // The delivery loop's breaker: the same refusal twice is a vendor that
+        // refuses everything, so nothing more is parked.
+        let mut last_rejection: Option<String> = None;
         loop {
             let message = store.next_undelivered(&agent.id)?;
             let Some(message) = message else {
@@ -1483,6 +1515,7 @@ pub fn flush(data: &Path, name: &str) -> Result<(), anyagents_core::Error> {
                 ) => {
                     store.note_delivered(&agent.id, message.seq)?;
                     flushed += 1;
+                    last_rejection = None;
                 }
                 Ok(anyagents_harness::DeliverOutcome::InFlight) => {
                     failure = Some("not yet consumed by the harness; left queued".into());
@@ -1498,12 +1531,19 @@ pub fn flush(data: &Path, name: &str) -> Result<(), anyagents_core::Error> {
                 }
                 // Refused for good: parked past the cursor, its sender told.
                 Ok(anyagents_harness::DeliverOutcome::Rejected { reason }) => {
+                    if last_rejection.as_deref() == Some(reason.as_str()) {
+                        failure = Some(format!(
+                            "the harness refuses message after message ({reason}); left queued"
+                        ));
+                        break;
+                    }
                     store.reject_message(&agent.id, message.seq, &reason)?;
                     println!(
                         "{}\trejected\t{}\t{reason}",
                         agent.name,
                         message.id.as_str()
                     );
+                    last_rejection = Some(reason);
                 }
                 Err(err) => {
                     failure = Some(err.to_string());

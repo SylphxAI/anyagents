@@ -552,6 +552,8 @@ pub struct RejectedMessage {
     pub sender: Option<String>,
     pub reason: String,
     pub rejected_at_ms: i64,
+    /// When its sender was told, if it was.
+    pub notified_at_ms: Option<i64>,
 }
 
 /// One mailbox entry. `ack` is derived from the cursors, not stored.
@@ -4856,8 +4858,24 @@ impl Store {
                 sender,
                 reason: reason.to_string(),
                 rejected_at_ms: now,
+                notified_at_ms: None,
             })
         })?;
+        // The message is parked either way; a notice that fails is sent again
+        // when the agent's delivery loop next starts.
+        if let Err(err) = self.notify_rejection(&rejected) {
+            eprintln!(
+                "anyagents: notice for parked message {}: {err}",
+                rejected.message_id
+            );
+        }
+        Ok(rejected)
+    }
+
+    /// Tell the sender of a parked message, once: the notice is keyed by the
+    /// message, and the parked row records that it was sent. A notice a crash
+    /// cut off is sent by `send_pending_rejection_notices`.
+    fn notify_rejection(&self, rejected: &RejectedMessage) -> Result<(), Error> {
         if let Some(name) = rejected
             .sender
             .as_deref()
@@ -4865,9 +4883,9 @@ impl Store {
             && let Ok(sender) = self.agent_by_name(name)
         {
             let recipient = self
-                .agent(agent_id)
+                .agent(&rejected.agent_id)
                 .map(|agent| agent.name)
-                .unwrap_or_else(|_| agent_id.as_str().to_string());
+                .unwrap_or_else(|_| rejected.agent_id.as_str().to_string());
             let mut note = Incoming::new(format!(
                 "[Undeliverable] Your message anyagents-message:{} to {recipient} was refused by its harness and will not be delivered: {}",
                 rejected.message_id, rejected.reason
@@ -4876,14 +4894,78 @@ impl Store {
             note.source_key = Some(format!("anyagents:rejected:{}", rejected.message_id));
             self.receive(&sender.id, note)?;
         }
-        Ok(rejected)
+        self.write_tx(|tx| {
+            tx.execute(
+                "UPDATE rejected_messages SET notified_at_ms = ?1 WHERE message_id = ?2",
+                params![now_ms(), rejected.message_id],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Send every notice for this agent's parked messages that a crash cut
+    /// off.
+    pub fn send_pending_rejection_notices(&self, agent_id: &AgentId) -> Result<(), Error> {
+        let pending: Vec<RejectedMessage> = self
+            .rejected_messages(agent_id)?
+            .into_iter()
+            .filter(|rejected| rejected.notified_at_ms.is_none())
+            .collect();
+        for rejected in pending {
+            self.notify_rejection(&rejected)?;
+        }
+        Ok(())
+    }
+
+    /// Put a parked message back in the mailbox: the same body, author and
+    /// origin, as a new message at the end, and the parked record removed.
+    /// Re-queueing the same parking twice adds it once.
+    pub fn requeue_rejected(&self, agent_id: &AgentId, message_id: &str) -> Result<Message, Error> {
+        let rejected_at_ms: Option<i64> = self
+            .read_conn()
+            .query_row(
+                "SELECT rejected_at_ms FROM rejected_messages
+                 WHERE agent_id = ?1 AND message_id = ?2",
+                params![agent_id.as_str(), message_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(rejected_at_ms) = rejected_at_ms else {
+            return Err(Error::Message(format!(
+                "{message_id} is not a parked message of this agent"
+            )));
+        };
+        let Some(original) = self.message(agent_id, message_id)? else {
+            return Err(Error::Message(format!("{message_id} is no longer stored")));
+        };
+        let incoming = Incoming {
+            text: original.text.clone(),
+            sender: original.sender.clone(),
+            source_time_ms: original.source_time_ms,
+            source_key: Some(format!("anyagents:requeue:{message_id}:{rejected_at_ms}")),
+            reply_to: original.reply_to.clone(),
+            quote: None,
+            origin: original.origin,
+            received_at_ms: None,
+        };
+        let message = match self.receive(agent_id, incoming)? {
+            ReceiveOutcome::New(message) | ReceiveOutcome::Duplicate(message) => message,
+        };
+        self.write_tx(|tx| {
+            tx.execute(
+                "DELETE FROM rejected_messages WHERE agent_id = ?1 AND message_id = ?2",
+                params![agent_id.as_str(), message_id],
+            )?;
+            Ok(())
+        })?;
+        Ok(message)
     }
 
     /// Messages the harness refused for good, oldest first.
     pub fn rejected_messages(&self, agent_id: &AgentId) -> Result<Vec<RejectedMessage>, Error> {
         let conn = self.read_conn();
         let mut stmt = conn.prepare_cached(
-            "SELECT r.message_id, r.seq, m.sender, r.reason, r.rejected_at_ms
+            "SELECT r.message_id, r.seq, m.sender, r.reason, r.rejected_at_ms, r.notified_at_ms
              FROM rejected_messages r LEFT JOIN messages m ON m.id = r.message_id
              WHERE r.agent_id = ?1 ORDER BY r.seq",
         )?;
@@ -4896,6 +4978,7 @@ impl Store {
                     sender: row.get(2)?,
                     reason: row.get(3)?,
                     rejected_at_ms: row.get(4)?,
+                    notified_at_ms: row.get(5)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -4953,8 +5036,10 @@ impl Store {
             message_cols!(),
             " FROM messages
              WHERE agent_id = ?1 AND seq > ?2 AND seq <= ?3
+               AND id NOT IN (SELECT message_id FROM rejected_messages WHERE agent_id = ?1)
              ORDER BY seq ASC"
         ))?;
+        // A message the harness refused for good was never in any turn.
         let mut msg_rows = msg_stmt.query(params![agent_id.as_str(), completed_seq, opened_seq])?;
         let mut messages = Vec::new();
         while let Some(r) = msg_rows.next()? {
@@ -8174,6 +8259,28 @@ mod tests {
     }
 
     #[test]
+    fn an_open_turn_never_quotes_a_message_parked_inside_it() {
+        let (_dir, store) = setup();
+        let bob = store.create_agent(NewAgent::new("bob", "codex")).unwrap();
+        let mut seqs = Vec::new();
+        for text in ["first", "refused", "third"] {
+            let ReceiveOutcome::New(message) = store.receive(&bob.id, Incoming::new(text)).unwrap()
+            else {
+                panic!("new message");
+            };
+            seqs.push(message);
+        }
+        store.note_delivered(&bob.id, seqs[0].seq).unwrap();
+        store
+            .reject_message(&bob.id, seqs[1].seq, "too large")
+            .unwrap();
+        store.note_delivered(&bob.id, seqs[2].seq).unwrap();
+        let open = store.open_turn(&bob.id).unwrap().expect("open turn");
+        let quoted: Vec<_> = open.messages.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(quoted, [seqs[0].id.as_str(), seqs[2].id.as_str()]);
+    }
+
+    #[test]
     fn a_rejected_message_is_parked_past_the_cursor_and_its_agent_sender_told_once() {
         let (_dir, store) = setup();
         let alice = store.create_agent(NewAgent::new("alice", "codex")).unwrap();
@@ -8194,6 +8301,9 @@ mod tests {
         assert_eq!(parked.len(), 1);
         assert_eq!(parked[0].reason, "invalid params (-32602)");
         assert_eq!(parked[0].sender.as_deref(), Some("agent:alice"));
+        assert!(parked[0].notified_at_ms.is_some(), "the notice is recorded");
+        // A notice already sent is not sent again.
+        store.send_pending_rejection_notices(&bob.id).unwrap();
         let told = store.inbox(&alice.id, None).unwrap();
         assert_eq!(told.len(), 1);
         assert!(told[0].text.starts_with("[Undeliverable]"));
@@ -8202,6 +8312,27 @@ mod tests {
         // A message that is not next in line is not parked.
         assert!(store.reject_message(&bob.id, message.seq, "again").is_err());
         assert_eq!(store.inbox(&alice.id, None).unwrap().len(), 1);
+        // Re-queued, it is a new message at the end of the mailbox, from the
+        // same author with the same body, and no longer parked.
+        let requeued = store
+            .requeue_rejected(&bob.id, message.id.as_str())
+            .unwrap();
+        assert!(requeued.seq > message.seq);
+        assert_eq!(requeued.text, message.text);
+        assert_eq!(requeued.sender.as_deref(), Some("agent:alice"));
+        assert_eq!(
+            store.next_undelivered(&bob.id).unwrap().unwrap().id,
+            requeued.id
+        );
+        assert!(store.rejected_messages(&bob.id).unwrap().is_empty());
+        assert!(
+            store
+                .requeue_rejected(&bob.id, message.id.as_str())
+                .is_err()
+        );
+        store
+            .reject_message(&bob.id, requeued.seq, "again")
+            .unwrap();
         // Deleting the agent clears its parked rows.
         store.delete_agent_by(&bob.id, "test").unwrap();
         assert!(store.rejected_messages(&bob.id).unwrap().is_empty());

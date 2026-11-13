@@ -72,7 +72,15 @@ pub struct DeliveryLoop<H: Harness> {
     recovery: Option<OutboundMessage>,
     /// Rejections parked since the host last asked.
     rejections: Vec<Rejection>,
+    /// The reason the last message was parked for, until a message is taken.
+    /// The same reason again means the vendor refuses everything, not one
+    /// message: the breaker stops parking.
+    last_rejection: Option<String>,
 }
+
+/// More refusals than this in one pass are a vendor that refuses everything:
+/// the breaker stops parking and fails the harness instead.
+pub const MAX_REJECTIONS_PER_PASS: u32 = 2;
 
 impl<H: Harness> DeliveryLoop<H> {
     /// Take the per-agent lock and refuse a second loop for the same agent.
@@ -90,6 +98,10 @@ impl<H: Harness> DeliveryLoop<H> {
         harness: H,
     ) -> Result<Self, Error> {
         store.agent(&agent_id)?;
+        // A sender notice a crash cut off is sent now.
+        if let Err(err) = store.send_pending_rejection_notices(&agent_id) {
+            eprintln!("anyagents: notices for parked messages: {err}");
+        }
         Ok(Self {
             store,
             agent_id,
@@ -98,6 +110,7 @@ impl<H: Harness> DeliveryLoop<H> {
             quota_reset_at_ms: None,
             recovery: None,
             rejections: Vec::new(),
+            last_rejection: None,
         })
     }
 
@@ -135,6 +148,7 @@ impl<H: Harness> DeliveryLoop<H> {
         // The last line handed over that is not committed: once there is one,
         // later lines are written behind it and none of them is committed.
         let mut behind: Option<i64> = None;
+        let mut rejected = 0u32;
         loop {
             if delivered > 0
                 && behind.is_none()
@@ -167,7 +181,20 @@ impl<H: Harness> DeliveryLoop<H> {
                     | DeliverOutcome::Rejected { .. },
                 ) if behind.is_some() => behind = Some(seq),
                 Ok(DeliverOutcome::Rejected { reason }) => {
+                    // A breaker: a vendor that refuses message after message
+                    // for one reason refuses everything. That is the
+                    // harness's fault, not the mail's; nothing more is parked.
+                    rejected += 1;
+                    if self.last_rejection.as_deref() == Some(reason.as_str())
+                        || rejected > MAX_REJECTIONS_PER_PASS
+                    {
+                        return Err(Error::HarnessFailed(format!(
+                            "the harness refuses message after message ({reason}); \
+                             the mail stays in the mailbox"
+                        )));
+                    }
                     self.reject(&message, &reason)?;
+                    self.last_rejection = Some(reason);
                 }
                 Ok(DeliverOutcome::InFlight) => behind = Some(seq),
                 Ok(DeliverOutcome::Duplicate) => {
@@ -175,9 +202,11 @@ impl<H: Harness> DeliveryLoop<H> {
                     // that turn and never completes it.
                     self.store.note_delivered(&self.agent_id, seq)?;
                     self.quota_reset_at_ms = None;
+                    self.last_rejection = None;
                 }
                 Ok(DeliverOutcome::Accepted { turn_finished }) => {
                     self.store.note_delivered(&self.agent_id, seq)?;
+                    self.last_rejection = None;
                     if turn_finished && self.harness.health().sign_in_fault.is_none() {
                         self.store.note_turn_completed(&self.agent_id)?;
                     }
@@ -224,6 +253,7 @@ impl<H: Harness> DeliveryLoop<H> {
                 None => break,
             }
             committed += 1;
+            self.last_rejection = None;
         }
         Ok(committed)
     }
@@ -790,6 +820,44 @@ mod tests {
                 .written_ids()
                 .contains(&poison_id.as_str().to_string())
         );
+    }
+
+    #[test]
+    fn a_vendor_refusing_message_after_message_trips_the_breaker_instead_of_parking_them() {
+        let (_dir, mut loop_, id) = setup(DeliveryMode::Steer);
+        let seqs: Vec<i64> = ["one", "two", "three"]
+            .iter()
+            .map(|text| recv(loop_.store(), &id, text))
+            .collect();
+        let ids: Vec<String> = loop_
+            .store()
+            .inbox(&id, None)
+            .unwrap()
+            .into_iter()
+            .map(|message| message.id.as_str().to_string())
+            .collect();
+        for message in &ids {
+            loop_
+                .harness_mut()
+                .refuse_forever(message, "invalid params (-32602)");
+        }
+        // The first is parked; the second, refused for the same reason, is a
+        // vendor that refuses everything: it stays, and the harness failed.
+        assert!(matches!(loop_.run_once(), Err(Error::HarnessFailed(_))));
+        assert_eq!(loop_.delivered_cursor().unwrap(), seqs[0]);
+        assert_eq!(loop_.store().rejected_messages(&id).unwrap().len(), 1);
+        assert!(matches!(loop_.run_once(), Err(Error::HarnessFailed(_))));
+        assert_eq!(loop_.store().rejected_messages(&id).unwrap().len(), 1);
+        // Once a message is taken, a single refusal parks again.
+        let mut fresh = FakeHarness::new(DeliveryMode::Steer);
+        fresh.refuse_forever(&ids[2], "too large");
+        loop_.replace_harness(fresh);
+        assert_eq!(
+            loop_.run_once().unwrap(),
+            RunOutcome::Delivered { delivered: 1 }
+        );
+        assert_eq!(loop_.delivered_cursor().unwrap(), seqs[2]);
+        assert_eq!(loop_.store().rejected_messages(&id).unwrap().len(), 2);
     }
 
     #[test]
