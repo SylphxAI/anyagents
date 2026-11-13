@@ -36,6 +36,8 @@ use crate::identity::ServingIdentity;
 use crate::operator;
 use crate::vendor::{self, VendorHarness};
 
+#[cfg(test)]
+mod latency_tests;
 mod memory_backlog;
 mod outbound_history;
 mod quota_rotation;
@@ -675,15 +677,18 @@ async fn mint_capability(
     State(state): State<AppState>,
     AxumPath(name): AxumPath<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_admin_or_operator(&state.store, &principal, "agents.mint_capability", &name)?;
-    let agent = state
-        .store
-        .agent_by_name(&name)
-        .map_err(ApiError::from_store)?;
-    operator::mint(&state.store, &agent.id).map_err(ApiError::from_store)?;
-    Ok(Json(
-        serde_json::json!({ "agent": agent.name, "minted": true }),
-    ))
+    spawn_store(move || {
+        require_admin_or_operator(&state.store, &principal, "agents.mint_capability", &name)?;
+        let agent = state
+            .store
+            .agent_by_name(&name)
+            .map_err(ApiError::from_store)?;
+        operator::mint(&state.store, &agent.id).map_err(ApiError::from_store)?;
+        Ok(Json(
+            serde_json::json!({ "agent": agent.name, "minted": true }),
+        ))
+    })
+    .await
 }
 
 /// `GET /v1/webhooks/healthz`: unauthenticated readiness probe for the public
@@ -897,14 +902,19 @@ async fn mcp_get_route(
     headers: axum::http::HeaderMap,
     Query(query): Query<McpRouteQuery>,
 ) -> Result<axum::response::Response, ApiError> {
-    let (agent, _token) = authenticate_mcp_request(&state.store, &headers)?;
-    let config_dir = anyagents_core::agent_config_dir(state.store.data_dir(), &agent.id);
-    let profile = crate::mcp::McpProfile::resolve_http_with_config(
-        query.profile.as_deref(),
-        &agent.harness,
-        Some(&config_dir),
-    )
-    .map_err(|msg| ApiError::new(StatusCode::BAD_REQUEST, msg))?;
+    let presented = headers.clone();
+    let (agent, profile) = spawn_store(move || {
+        let (agent, _token) = authenticate_mcp_request(&state.store, &presented)?;
+        let config_dir = anyagents_core::agent_config_dir(state.store.data_dir(), &agent.id);
+        let profile = crate::mcp::McpProfile::resolve_http_with_config(
+            query.profile.as_deref(),
+            &agent.harness,
+            Some(&config_dir),
+        )
+        .map_err(|msg| ApiError::new(StatusCode::BAD_REQUEST, msg))?;
+        Ok((agent, profile))
+    })
+    .await?;
     let accept = headers
         .get(axum::http::header::ACCEPT)
         .and_then(|v| v.to_str().ok())
@@ -948,28 +958,39 @@ async fn mcp_post_route(
     Query(query): Query<McpRouteQuery>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<axum::response::Response, ApiError> {
-    let (agent, token) = authenticate_mcp_request(&state.store, &headers)?;
-    let config_dir = anyagents_core::agent_config_dir(state.store.data_dir(), &agent.id);
-    let profile = crate::mcp::McpProfile::resolve_http_with_config(
-        query.profile.as_deref(),
-        &agent.harness,
-        Some(&config_dir),
-    )
-    .map_err(|msg| ApiError::new(StatusCode::BAD_REQUEST, msg))?;
-    let sock = ensure_internal_socket_listener(&state);
-    let _ = std::fs::create_dir_all(&config_dir);
-    let mcp = crate::mcp::AgentMcp::new_for_http(
-        crate::mcp::AgentRef {
-            id: agent.id.clone(),
-            name: agent.name.clone(),
-            workdir: agent.workdir.as_deref().map(PathBuf::from),
-        },
-        sock,
-        config_dir,
-        token,
-        profile,
-    );
-    match mcp.handle_jsonrpc_request(payload).await {
+    let mcp = spawn_store(move || {
+        let (agent, token) = authenticate_mcp_request(&state.store, &headers)?;
+        let config_dir = anyagents_core::agent_config_dir(state.store.data_dir(), &agent.id);
+        let profile = crate::mcp::McpProfile::resolve_http_with_config(
+            query.profile.as_deref(),
+            &agent.harness,
+            Some(&config_dir),
+        )
+        .map_err(|msg| ApiError::new(StatusCode::BAD_REQUEST, msg))?;
+        let sock = ensure_internal_socket_listener(&state);
+        let _ = std::fs::create_dir_all(&config_dir);
+        Ok(crate::mcp::AgentMcp::new_for_http(
+            crate::mcp::AgentRef {
+                id: agent.id.clone(),
+                name: agent.name.clone(),
+                workdir: agent.workdir.as_deref().map(PathBuf::from),
+            },
+            sock,
+            config_dir,
+            token,
+            profile,
+        ))
+    })
+    .await?;
+    // A tool call mixes file, process and socket work into its async steps
+    // (`crate::mcp`), so the whole call is driven from a blocking-pool thread:
+    // whatever it waits on holds that thread, never an async worker.
+    let runtime = tokio::runtime::Handle::current();
+    let answered =
+        tokio::task::spawn_blocking(move || runtime.block_on(mcp.handle_jsonrpc_request(payload)))
+            .await
+            .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    match answered {
         Some(response_json) => Ok(axum::response::IntoResponse::into_response((
             StatusCode::OK,
             Json(response_json),
@@ -1063,15 +1084,18 @@ async fn whoami(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     match ctx.principal {
         Principal::Agent { agent_id, name } => {
-            let agent_record = state.store.agent(&agent_id).ok();
-            let workdir = agent_record.as_ref().and_then(|a| a.workdir.clone());
-            let harness = agent_record.as_ref().map(|a| a.harness.clone());
-            Ok(Json(serde_json::json!({
-                "agent_id": agent_id.as_str(),
-                "name": name,
-                "workdir": workdir,
-                "harness": harness,
-            })))
+            spawn_store(move || {
+                let agent_record = state.store.agent(&agent_id).ok();
+                let workdir = agent_record.as_ref().and_then(|a| a.workdir.clone());
+                let harness = agent_record.as_ref().map(|a| a.harness.clone());
+                Ok(Json(serde_json::json!({
+                    "agent_id": agent_id.as_str(),
+                    "name": name,
+                    "workdir": workdir,
+                    "harness": harness,
+                })))
+            })
+            .await
         }
         Principal::Operator => Err(ApiError::new(
             StatusCode::BAD_REQUEST,
@@ -1103,8 +1127,9 @@ impl axum::extract::FromRequestParts<AppState> for Whoami {
             // A machine without the boundary: the tool server says which agent
             // its own config directory belongs to, and the server checks that
             // the agent exists. Only here, and only for this read.
-            let principal =
-                auth::agent_by_name(&state.store, id.trim()).map_err(auth::AuthRejection)?;
+            let store = Arc::clone(&state.store);
+            let id = id.trim().to_string();
+            let principal = auth::off_worker(move || auth::agent_by_name(&store, &id)).await?;
             return Ok(Self { principal });
         }
         use axum::extract::FromRequestParts;
@@ -1123,12 +1148,12 @@ async fn operator_inbox(
     AxumPath(name): AxumPath<String>,
     Query(query): Query<Since>,
 ) -> Result<Json<InboxResponse>, ApiError> {
-    require_admin_or_operator(&state.store, &principal, "agents.operator_inbox", &name)?;
-    let agent = state
-        .store
-        .agent_by_name(&name)
-        .map_err(ApiError::from_store)?;
     spawn_store(move || {
+        require_admin_or_operator(&state.store, &principal, "agents.operator_inbox", &name)?;
+        let agent = state
+            .store
+            .agent_by_name(&name)
+            .map_err(ApiError::from_store)?;
         inbox_of(
             &state.store,
             &agent.id,
@@ -1188,29 +1213,32 @@ async fn set_admin_route(
     Json(body): Json<AdminRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_operator(&principal)?;
-    let agent = state
-        .store
-        .agent_by_name(&name)
-        .map_err(ApiError::from_store)?;
-    state
-        .store
-        .set_agent_admin(&agent.id, body.admin)
-        .map_err(ApiError::from_store)?;
-    state
-        .store
-        .record_admin_audit(
-            "operator",
-            if body.admin {
-                "agents.grant_admin"
-            } else {
-                "agents.revoke_admin"
-            },
-            &agent.name,
-        )
-        .map_err(ApiError::from_store)?;
-    Ok(Json(
-        serde_json::json!({"agent": agent.name, "admin": body.admin}),
-    ))
+    spawn_store(move || {
+        let agent = state
+            .store
+            .agent_by_name(&name)
+            .map_err(ApiError::from_store)?;
+        state
+            .store
+            .set_agent_admin(&agent.id, body.admin)
+            .map_err(ApiError::from_store)?;
+        state
+            .store
+            .record_admin_audit(
+                "operator",
+                if body.admin {
+                    "agents.grant_admin"
+                } else {
+                    "agents.revoke_admin"
+                },
+                &agent.name,
+            )
+            .map_err(ApiError::from_store)?;
+        Ok(Json(
+            serde_json::json!({"agent": agent.name, "admin": body.admin}),
+        ))
+    })
+    .await
 }
 
 // Socket requests carry secret values, never host filesystem paths.
@@ -1703,37 +1731,37 @@ async fn model_route(
     AxumPath(name): AxumPath<String>,
     Json(body): Json<ModelRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let actor = require_admin_or_operator(&state.store, &principal, "agents.model", &name)?;
-    let agent = state
-        .store
-        .agent_by_name(&name)
-        .map_err(ApiError::from_store)?;
-    if body.profile.is_some() && (body.key.is_some() || body.base_url.is_some()) {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "profile cannot be combined with a key or base URL",
-        ));
-    }
-    if body.key.is_none() && body.base_url.is_none() {
-        let has_harness = body
-            .harness
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|s| !s.is_empty());
-        let has_model = body
-            .model
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|s| !s.is_empty());
-        let has_profile = body
-            .profile
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|s| !s.is_empty());
-        if !has_harness && !has_model && !has_profile {
-            return Err(ApiError::new(StatusCode::BAD_REQUEST, "model is required"));
+    spawn_store(move || {
+        let actor = require_admin_or_operator(&state.store, &principal, "agents.model", &name)?;
+        let agent = state
+            .store
+            .agent_by_name(&name)
+            .map_err(ApiError::from_store)?;
+        if body.profile.is_some() && (body.key.is_some() || body.base_url.is_some()) {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "profile cannot be combined with a key or base URL",
+            ));
         }
-        return spawn_store(move || {
+        if body.key.is_none() && body.base_url.is_none() {
+            let has_harness = body
+                .harness
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|s| !s.is_empty());
+            let has_model = body
+                .model
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|s| !s.is_empty());
+            let has_profile = body
+                .profile
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|s| !s.is_empty());
+            if !has_harness && !has_model && !has_profile {
+                return Err(ApiError::new(StatusCode::BAD_REQUEST, "model is required"));
+            }
             let out = create::configure_agent_runtime(
                 &state.store,
                 state.store.data_dir(),
@@ -1744,32 +1772,32 @@ async fn model_route(
                 body.profile.as_deref(),
             )
             .map_err(ApiError::from_store)?;
-            Ok(Json(out))
-        })
-        .await;
-    }
-    let model_str = body
-        .model
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "model is required"))?;
-    let key = body.key.as_deref().unwrap_or("").trim();
-    if key.is_empty() || key.contains(char::is_whitespace) {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "a nonempty single-line key is required",
-        ));
-    }
-    let base_url = body
-        .base_url
-        .as_deref()
-        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "base URL is required"))?;
-    crate::gateway::store_key(state.store.data_dir(), &agent, base_url, model_str, key)
-        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "could not bind provider key"))?;
-    Ok(Json(
-        serde_json::json!({"agent": agent.name, "model": model_str}),
-    ))
+            return Ok(Json(out));
+        }
+        let model_str = body
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "model is required"))?;
+        let key = body.key.as_deref().unwrap_or("").trim();
+        if key.is_empty() || key.contains(char::is_whitespace) {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "a nonempty single-line key is required",
+            ));
+        }
+        let base_url = body
+            .base_url
+            .as_deref()
+            .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "base URL is required"))?;
+        crate::gateway::store_key(state.store.data_dir(), &agent, base_url, model_str, key)
+            .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "could not bind provider key"))?;
+        Ok(Json(
+            serde_json::json!({"agent": agent.name, "model": model_str}),
+        ))
+    })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -1914,13 +1942,11 @@ async fn profile_models_route(
     State(state): State<AppState>,
     Query(query): Query<ProfileModelsQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_admin_or_operator(&state.store, &principal, "profiles.models", "profiles")?;
-    let data = state.store.data_dir().to_path_buf();
-    let prof = query.profile;
     spawn_store(move || {
+        require_admin_or_operator(&state.store, &principal, "profiles.models", "profiles")?;
         Ok(Json(create::probe_profile_models_catalog(
-            &data,
-            prof.as_deref(),
+            state.store.data_dir(),
+            query.profile.as_deref(),
         )))
     })
     .await
@@ -1930,11 +1956,14 @@ async fn profiles_route(
     principal: Principal,
     State(state): State<AppState>,
 ) -> Result<Json<Vec<create::ProviderProfileEntry>>, ApiError> {
-    require_admin_or_operator(&state.store, &principal, "profiles.list", "profiles")?;
-    Ok(Json(create::list_provider_profiles_fast(
-        &state.store,
-        state.store.data_dir(),
-    )))
+    spawn_store(move || {
+        require_admin_or_operator(&state.store, &principal, "profiles.list", "profiles")?;
+        Ok(Json(create::list_provider_profiles_fast(
+            &state.store,
+            state.store.data_dir(),
+        )))
+    })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -1949,21 +1978,24 @@ async fn set_profile_route(
     State(state): State<AppState>,
     Json(body): Json<SetProfileRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_admin_or_operator(&state.store, &principal, "profiles.set", &body.profile)?;
-    let (provider, profile) =
-        create::set_provider_profile(state.store.data_dir(), &body.profile, &body.key)
-            .map_err(ApiError::from_store)?;
-    Ok(Json(serde_json::json!({
-        "provider": provider,
-        "profile": profile,
-    })))
+    spawn_store(move || {
+        require_admin_or_operator(&state.store, &principal, "profiles.set", &body.profile)?;
+        let (provider, profile) =
+            create::set_provider_profile(state.store.data_dir(), &body.profile, &body.key)
+                .map_err(ApiError::from_store)?;
+        Ok(Json(serde_json::json!({
+            "provider": provider,
+            "profile": profile,
+        })))
+    })
+    .await
 }
 
 async fn get_subagent_defaults_route(
     _principal: Principal,
     State(state): State<AppState>,
 ) -> Result<Json<create::SubagentDefaultsConfig>, ApiError> {
-    Ok(Json(create::load_subagent_defaults(state.store.data_dir())))
+    spawn_store(move || Ok(Json(create::load_subagent_defaults(state.store.data_dir())))).await
 }
 
 #[derive(Deserialize)]
@@ -1982,50 +2014,54 @@ async fn set_subagent_defaults_route(
     State(state): State<AppState>,
     Json(body): Json<SetSubagentDefaultsRequest>,
 ) -> Result<Json<create::SubagentDefaultsConfig>, ApiError> {
-    let target_label = body.agent.as_deref().unwrap_or("global");
-    require_admin_or_operator(
-        &state.store,
-        &principal,
-        "subagents.set_default",
-        target_label,
-    )?;
-    let mut cfg = create::load_subagent_defaults(state.store.data_dir());
-    if body.clear.unwrap_or(false) {
-        if let Some(ref ag) = body.agent {
-            cfg.agents.remove(ag.trim());
+    spawn_store(move || {
+        let target_label = body.agent.as_deref().unwrap_or("global");
+        require_admin_or_operator(
+            &state.store,
+            &principal,
+            "subagents.set_default",
+            target_label,
+        )?;
+        let mut cfg = create::load_subagent_defaults(state.store.data_dir());
+        if body.clear.unwrap_or(false) {
+            if let Some(ref ag) = body.agent {
+                cfg.agents.remove(ag.trim());
+            } else {
+                cfg.default = create::SubagentDefaultSpec {
+                    mode: "inherit".to_string(),
+                    harness: None,
+                    model: None,
+                    profile: None,
+                };
+            }
         } else {
-            cfg.default = create::SubagentDefaultSpec {
-                mode: "inherit".to_string(),
-                harness: None,
-                model: None,
-                profile: None,
+            let spec = create::SubagentDefaultSpec {
+                mode: body.mode,
+                harness: body
+                    .harness
+                    .as_deref()
+                    .map(anyagents_harness::normalize_harness_name)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string),
+                model: body.model.filter(|s| !s.trim().is_empty()),
+                profile: body.profile.filter(|s| !s.trim().is_empty()),
             };
-        }
-    } else {
-        let spec = create::SubagentDefaultSpec {
-            mode: body.mode,
-            harness: body
-                .harness
+            if let Some(ag) = body
+                .agent
                 .as_deref()
-                .map(anyagents_harness::normalize_harness_name)
+                .map(str::trim)
                 .filter(|s| !s.is_empty())
-                .map(str::to_string),
-            model: body.model.filter(|s| !s.trim().is_empty()),
-            profile: body.profile.filter(|s| !s.trim().is_empty()),
-        };
-        if let Some(ag) = body
-            .agent
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            cfg.agents.insert(ag.to_string(), spec);
-        } else {
-            cfg.default = spec;
+            {
+                cfg.agents.insert(ag.to_string(), spec);
+            } else {
+                cfg.default = spec;
+            }
         }
-    }
-    create::save_subagent_defaults(state.store.data_dir(), &cfg).map_err(ApiError::from_store)?;
-    Ok(Json(cfg))
+        create::save_subagent_defaults(state.store.data_dir(), &cfg)
+            .map_err(ApiError::from_store)?;
+        Ok(Json(cfg))
+    })
+    .await
 }
 
 #[derive(Deserialize, Default)]
@@ -2306,42 +2342,45 @@ async fn channels_route(
     principal: Principal,
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_admin_or_operator(&state.store, &principal, "channels.list", "channels")?;
-    let channels: Vec<_> = state
-        .store
-        .list_channels()
-        .map_err(ApiError::from_store)?
-        .into_iter()
-        .map(|c| {
-            let mem = anyagents_channel_telegram::Memory::try_from_state(&c.state)
-                .map_err(ApiError::from_store)?;
-            let bot_username = c
-                .identity
-                .clone()
-                .or_else(|| {
-                    mem.bot
-                        .as_deref()
-                        .and_then(|b| b.split_once(':').map(|(_, u)| u.to_string()))
-                })
-                .map(|u| {
-                    let clean = u.trim().trim_start_matches('@');
-                    format!("@{clean}")
-                });
-            let agents: Vec<String> = c
-                .agents
-                .iter()
-                .filter_map(|id| state.store.agent(id).ok().map(|a| a.name))
-                .collect();
-            Ok(serde_json::json!({
-                "id": c.id.to_string(),
-                "kind": c.kind,
-                "bot": bot_username,
-                "agents": agents,
-                "pending_managed_bots": mem.pending_managed_bots,
-            }))
-        })
-        .collect::<Result<Vec<_>, ApiError>>()?;
-    Ok(Json(serde_json::json!({"channels": channels})))
+    spawn_store(move || {
+        require_admin_or_operator(&state.store, &principal, "channels.list", "channels")?;
+        let channels: Vec<_> = state
+            .store
+            .list_channels()
+            .map_err(ApiError::from_store)?
+            .into_iter()
+            .map(|c| {
+                let mem = anyagents_channel_telegram::Memory::try_from_state(&c.state)
+                    .map_err(ApiError::from_store)?;
+                let bot_username = c
+                    .identity
+                    .clone()
+                    .or_else(|| {
+                        mem.bot
+                            .as_deref()
+                            .and_then(|b| b.split_once(':').map(|(_, u)| u.to_string()))
+                    })
+                    .map(|u| {
+                        let clean = u.trim().trim_start_matches('@');
+                        format!("@{clean}")
+                    });
+                let agents: Vec<String> = c
+                    .agents
+                    .iter()
+                    .filter_map(|id| state.store.agent(id).ok().map(|a| a.name))
+                    .collect();
+                Ok(serde_json::json!({
+                    "id": c.id.to_string(),
+                    "kind": c.kind,
+                    "bot": bot_username,
+                    "agents": agents,
+                    "pending_managed_bots": mem.pending_managed_bots,
+                }))
+            })
+            .collect::<Result<Vec<_>, ApiError>>()?;
+        Ok(Json(serde_json::json!({"channels": channels})))
+    })
+    .await
 }
 
 fn default_channel_kind() -> String {
@@ -4590,34 +4629,34 @@ async fn inbox(
     // An agent's `inbox` is strictly its own incoming queue. To inspect another
     // agent's full two-way communication (`in` + `out` with users, groups, and
     // peers), agents use `/v1/agents/{name}/conversation`.
-    let agent_id = match &principal {
-        Principal::Operator => {
-            state
-                .store
-                .agent_by_name(&name)
-                .map_err(ApiError::from_store)?
-                .id
-        }
-        Principal::Agent {
-            agent_id,
-            name: own_name,
-        } => {
-            let matches_self = name == "self"
-                || name == agent_id.as_str()
-                || name == own_name.as_str()
-                || state
+    spawn_store(move || {
+        let agent_id = match &principal {
+            Principal::Operator => {
+                state
                     .store
                     .agent_by_name(&name)
-                    .is_ok_and(|a| a.id == *agent_id);
-            if !matches_self {
-                return Err(ApiError::forbidden(
-                    "a session reads its own inbox, not another agent's; use conversation to read another agent's conversation",
-                ));
+                    .map_err(ApiError::from_store)?
+                    .id
             }
-            agent_id.clone()
-        }
-    };
-    spawn_store(move || {
+            Principal::Agent {
+                agent_id,
+                name: own_name,
+            } => {
+                let matches_self = name == "self"
+                    || name == agent_id.as_str()
+                    || name == own_name.as_str()
+                    || state
+                        .store
+                        .agent_by_name(&name)
+                        .is_ok_and(|a| a.id == *agent_id);
+                if !matches_self {
+                    return Err(ApiError::forbidden(
+                        "a session reads its own inbox, not another agent's; use conversation to read another agent's conversation",
+                    ));
+                }
+                agent_id.clone()
+            }
+        };
         inbox_of(
             &state.store,
             &agent_id,
@@ -5329,72 +5368,67 @@ async fn send(
     // On a machine without the boundary, its own agent route names the sender;
     // that is the one place a body chooses the author, and an inbox is still
     // only ever its own.
-    let route_named = match &principal {
-        Principal::Agent { name, .. } if state.auth.is_trusted() => body
-            .sender
-            .as_deref()
-            .and_then(|named| Actor::parse(named).ok())
-            .filter(|named| named.as_address() != Actor::Agent(name.clone()).as_address()),
-        _ => None,
-    };
-    let actor = match (&principal, route_named) {
-        (_, Some(named)) => named,
-        (Principal::Agent { agent_id, name }, None) => {
-            if let Some(named) = body.sender.as_deref() {
-                Actor::parse(named).and_then(|named| {
-                    let matches_self = named.as_address()
-                        == Actor::Agent(name.clone()).as_address()
-                        || match &named {
-                            Actor::Agent(n) => state
-                                .store
-                                .agent_by_name(n)
-                                .is_ok_and(|a| a.id == *agent_id),
-                            _ => false,
-                        };
-                    if matches_self {
-                        Ok(())
-                    } else {
-                        Err(ApiError::forbidden(
-                            "a session sends as itself, not as the sender it names",
-                        ))
-                    }
-                })?;
+    spawn_store(move || {
+        let route_named = match &principal {
+            Principal::Agent { name, .. } if state.auth.is_trusted() => body
+                .sender
+                .as_deref()
+                .and_then(|named| Actor::parse(named).ok())
+                .filter(|named| named.as_address() != Actor::Agent(name.clone()).as_address()),
+            _ => None,
+        };
+        let actor = match (&principal, route_named) {
+            (_, Some(named)) => named,
+            (Principal::Agent { agent_id, name }, None) => {
+                if let Some(named) = body.sender.as_deref() {
+                    Actor::parse(named).and_then(|named| {
+                        let matches_self = named.as_address()
+                            == Actor::Agent(name.clone()).as_address()
+                            || match &named {
+                                Actor::Agent(n) => state
+                                    .store
+                                    .agent_by_name(n)
+                                    .is_ok_and(|a| a.id == *agent_id),
+                                _ => false,
+                            };
+                        if matches_self {
+                            Ok(())
+                        } else {
+                            Err(ApiError::forbidden(
+                                "a session sends as itself, not as the sender it names",
+                            ))
+                        }
+                    })?;
+                }
+                Actor::Agent(name.clone())
             }
-            Actor::Agent(name.clone())
-        }
-        (Principal::Operator, _) => {
-            let sender = body.sender.as_deref().ok_or_else(|| {
-                ApiError::new(
-                    StatusCode::BAD_REQUEST,
-                    "an operator send needs an explicit sender",
-                )
-            })?;
-            Actor::parse(sender)?
-        }
-    };
-    let body = SendRequest {
-        sender: Some(actor.as_address()),
-        ..body
-    };
-    let store = Arc::clone(&state.store);
-    let principal_for_plan = principal.clone();
-    let actor_for_plan = actor.clone();
-    let body_for_plan = body.clone();
-    let plan = spawn_store(move || {
-        plan_send(&store, &principal_for_plan, &actor_for_plan, &body_for_plan)
+            (Principal::Operator, _) => {
+                let sender = body.sender.as_deref().ok_or_else(|| {
+                    ApiError::new(
+                        StatusCode::BAD_REQUEST,
+                        "an operator send needs an explicit sender",
+                    )
+                })?;
+                Actor::parse(sender)?
+            }
+        };
+        let body = SendRequest {
+            sender: Some(actor.as_address()),
+            ..body
+        };
+        let plan = plan_send(&state.store, &principal, &actor, &body)?;
+        let key_body = SendRequest {
+            sender: plan
+                .sender_id
+                .as_ref()
+                .map(|id| format!("agent:{id}"))
+                .or_else(|| body.sender.clone()),
+            ..body.clone()
+        };
+        let key = send_key(&key_body);
+        send_sync(&state.store, &actor, body, plan, key)
     })
-    .await?;
-    let key_body = SendRequest {
-        sender: plan
-            .sender_id
-            .as_ref()
-            .map(|id| format!("agent:{id}"))
-            .or_else(|| body.sender.clone()),
-        ..body.clone()
-    };
-    let key = send_key(&key_body);
-    let store = Arc::clone(&state.store);
-    spawn_store(move || send_sync(&store, &actor, body, plan, key)).await
+    .await
 }
 
 async fn interact_route(
