@@ -38,6 +38,7 @@ pub use storage::{
     agent_scratch_build_dir, agent_scratch_tmp_dir, configured_git_pool_dir,
     configured_scratch_dir, configured_state_dir, configured_workspaces_dir, storage_env_enabled,
 };
+pub use store::holds_store_writer;
 pub use store::{
     Ack, Agent, AgentLock, AgentQueryMetadata, AgentSchedule, AgentSummary, BillingMode, Channel,
     ConversationTurn, Group, GroupAction, GroupActor, HistorySearchQuery, HistorySort, Incoming,

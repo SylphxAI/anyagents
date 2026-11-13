@@ -295,6 +295,10 @@ fn open_managed_config(data: &Path, target: &AgentId) -> std::io::Result<File> {
 // settle history through Store. Erasure must never invert that lock order.
 fn lock_history_publication(data: &Path) -> std::io::Result<(File, File)> {
     use std::os::fd::{AsRawFd, FromRawFd};
+    debug_assert!(
+        !crate::store::holds_store_writer(),
+        "the publication barrier is waited for while this thread holds the Store writer"
+    );
     let root = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)

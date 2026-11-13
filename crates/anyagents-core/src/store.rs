@@ -11,7 +11,7 @@ use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyagents_harness::normalize_harness_name;
@@ -32,6 +32,7 @@ mod lifecycle;
 mod mcp_ops;
 mod outcomes;
 mod registry;
+pub use registry::holds_store_writer;
 mod runtime;
 #[cfg(test)]
 #[path = "store/runtime_tests.rs"]
@@ -892,7 +893,7 @@ pub(crate) enum ReadConn<'a> {
         pool: Arc<Mutex<Vec<Connection>>>,
     },
     Owned(Option<Connection>),
-    Guard(MutexGuard<'a, Connection>),
+    Guard(registry::WriterGuard<'a>),
 }
 
 impl std::ops::Deref for ReadConn<'_> {
@@ -1353,6 +1354,14 @@ impl Store {
             .read(true)
             .write(true)
             .open(dir.join(format!("{}.lifecycle", agent_id.as_str())))?;
+        // Lock order: lifecycle before the Store writer. Waiting here while
+        // holding the writer stalls every write of the process for as long
+        // as the lifecycle's holder keeps it (and deadlocks if that holder
+        // waits for the writer). A non-blocking attempt never waits.
+        debug_assert!(
+            nonblocking || !registry::holds_store_writer(),
+            "a lifecycle lock is waited for while this thread holds the Store writer"
+        );
         let operation = libc::LOCK_EX | if nonblocking { libc::LOCK_NB } else { 0 };
         loop {
             let rc = unsafe { libc::flock(file.as_raw_fd(), operation) };
@@ -5106,7 +5115,7 @@ impl Store {
 
     /// The process's one read-write connection to this database. Use it only
     /// to write: reads go through [`Store::read_conn`] and never wait here.
-    pub(crate) fn conn(&self) -> MutexGuard<'_, Connection> {
+    pub(crate) fn conn(&self) -> registry::WriterGuard<'_> {
         self.shared.writer()
     }
 
@@ -10565,6 +10574,31 @@ mod tests {
     /// daemon's single writer, and every other write, waited for it (a reply
     /// to apollo on 2026-11-13 held it for 100 s). Here another thread writes
     /// while each lookup runs; it must finish while the lookup is still going.
+    /// Lock order: file locks that can wait (an agent's lifecycle, the
+    /// outbound barrier and key locks) come before the Store writer. A thread
+    /// holding the writer that waits for one is refused in debug builds; a
+    /// non-blocking attempt never waits and stays allowed.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn waiting_for_a_lifecycle_while_holding_the_writer_is_refused() {
+        let (_dir, store) = setup();
+        let held = agent(&store, "lock_order");
+        assert!(!holds_store_writer());
+        let writer = store.conn();
+        assert!(holds_store_writer());
+        drop(store.try_lock_agent_lifecycle(&held.id).unwrap());
+        let waited = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            store.lock_agent_lifecycle(&held.id)
+        }));
+        assert!(
+            waited.is_err(),
+            "a lifecycle wait under the writer was allowed"
+        );
+        drop(writer);
+        assert!(!holds_store_writer());
+        drop(store.lock_agent_lifecycle(&held.id).unwrap());
+    }
+
     #[test]
     fn ingress_reads_reply_reaction_and_edit_history_without_holding_the_writer() {
         use std::sync::atomic::{AtomicUsize, Ordering};

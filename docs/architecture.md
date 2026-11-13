@@ -559,6 +559,31 @@ ORDER BY id;
 
 One embedded SQLite database in WAL mode under the data directory holds every resource, the mailboxes and the usage records. A message is `received` when its insert has committed. Schema changes are versioned migrations applied at server start.
 
+### Locks and their order
+
+A process has one read-write connection per database (the Store writer); every
+write of the daemon queues on it. Locks are taken in this order and never the
+other way round:
+
+1. the outbound-history publication barrier (`outbound-history/.publication.lock`,
+   shared by sends and settlement, exclusive for an erasure);
+2. one outbound effect key (`outbound-history/<key>.lock`);
+3. one agent's lifecycle lock (`locks/<id>.lifecycle`); an archive takes its
+   descendants' locks only downward and without waiting;
+4. the Store writer;
+5. the host history index's write transaction.
+
+A thread holding the Store writer never waits for a file lock (debug builds assert
+it); a non-blocking attempt, which cannot wait, is allowed. Every write of the
+process waits while one holds the writer, so whole-history reads stay outside it:
+ingress reads the stored history a channel line refers to (a reply's quoted
+message, a reaction's target, an edit's original) on a read snapshot before it
+takes the writer, because those lookups match text patterns and can read every
+stored message. Waiting file locks are taken on blocking-pool
+or dedicated threads, never on an async worker. Maintenance never waits for a
+lifecycle: the archived-agent reaper, sleep-memory consolidation and history
+verification try the lock and skip a busy agent.
+
 ### Host history index refresh
 
 Host history keeps raw text in its source files. The rebuildable contentless FTS

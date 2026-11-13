@@ -179,8 +179,10 @@ impl Shared {
         &self.wakes
     }
 
-    pub(super) fn writer(&self) -> MutexGuard<'_, Connection> {
-        lock(&self.writer)
+    pub(super) fn writer(&self) -> WriterGuard<'_> {
+        let guard = lock(&self.writer);
+        WRITERS_HELD.with(|held| held.set(held.get() + 1));
+        WriterGuard(guard)
     }
 
     /// A pooled read-only connection, or `None` when none can be opened.
@@ -211,6 +213,41 @@ impl Shared {
     #[cfg(test)]
     pub(super) fn mark_repairs_pending(&self) {
         self.repairs_pending.store(true, Ordering::Release);
+    }
+}
+
+thread_local! {
+    /// Writers this thread holds, on any database.
+    static WRITERS_HELD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Whether this thread holds a Store writer now. Lock order puts every file
+/// lock that can wait (the outbound publication barrier and key locks, an
+/// agent's lifecycle lock) before the writer, so a thread holding the writer
+/// never waits for one; the waiting acquisitions assert this.
+pub fn holds_store_writer() -> bool {
+    WRITERS_HELD.with(|held| held.get() > 0)
+}
+
+/// The held writer connection of one database.
+pub(crate) struct WriterGuard<'a>(MutexGuard<'a, Connection>);
+
+impl std::ops::Deref for WriterGuard<'_> {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for WriterGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Connection {
+        &mut self.0
+    }
+}
+
+impl Drop for WriterGuard<'_> {
+    fn drop(&mut self) {
+        WRITERS_HELD.with(|held| held.set(held.get().saturating_sub(1)));
     }
 }
 

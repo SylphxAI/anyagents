@@ -132,6 +132,10 @@ impl Drop for FileLock {
 
 /// Shared with core redaction; acquire before entering any Store transaction.
 fn publication_barrier(store: &Store) -> Result<FileLock, Error> {
+    debug_assert!(
+        !anyagents_core::holds_store_writer(),
+        "the publication barrier is waited for while this thread holds the Store writer"
+    );
     let directory = directory(store);
     std::fs::create_dir_all(&directory)?;
     let file = OpenOptions::new()
@@ -158,6 +162,10 @@ struct KeyLock {
 impl KeyLock {
     /// `wait` blocks for a holder; otherwise a held key yields `None`.
     fn acquire(path: &Path, wait: bool) -> Result<Option<KeyLock>, Error> {
+        debug_assert!(
+            !wait || !anyagents_core::holds_store_writer(),
+            "an outbound key lock is waited for while this thread holds the Store writer"
+        );
         loop {
             let file = OpenOptions::new()
                 .create(true)
