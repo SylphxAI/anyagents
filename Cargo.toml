@@ -13,6 +13,7 @@ members = [
     "crates/anyagents-agent",
     "crates/anyagents-supervisor",
     "crates/anyagents-installer",
+    "crates/anyagents-toolchain",
     "crates/anyagents-channel-telegram",
     "crates/anyagents-gateway",
     "crates/anyagents-tools",
