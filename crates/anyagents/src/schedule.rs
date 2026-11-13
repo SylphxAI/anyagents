@@ -11,7 +11,9 @@
 //! still undelivered, so missed recurring ticks coalesce into one. Cancelling a
 //! schedule takes effect immediately.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
 use anyagents_core::{Agent, AgentId, AgentSchedule, Incoming, NewSchedule, Store};
@@ -640,13 +642,34 @@ pub fn is_agent_busy(store: &Store, health: &HealthBoard, agent: &Agent, now: i6
 /// Evaluate local timers and watches without issuing any external probe.
 /// This is called on its own one-second loop, including the startup tick.
 pub fn tick_local_schedules_once(store: &Store, health: &HealthBoard, now: i64) -> usize {
-    if let Err(err) = store.restore_checks_completed_pr_watches() {
-        eprintln!("Schedule recovery unavailable: {err}");
+    if !restore_legacy_pr_watches_once(store) {
         return 0;
     }
     let fired = tick_schedule_partition(store, health, now, false);
     let _ = tick_task_subagent_turn_ownership(store, health, now);
     fired
+}
+
+/// Reopen the PR watches an earlier release retired when checks completed, once
+/// per database in this process. No current path retires a PR watch that way, so
+/// the repair (a full scan of every schedule ever made) has nothing to do after
+/// its first run. Returns false while the store cannot run it.
+fn restore_legacy_pr_watches_once(store: &Store) -> bool {
+    static DONE: LazyLock<Mutex<HashSet<PathBuf>>> = LazyLock::new(Mutex::default);
+    let mut done = DONE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if done.contains(store.data_dir()) {
+        return true;
+    }
+    match store.restore_checks_completed_pr_watches() {
+        Ok(_) => {
+            done.insert(store.data_dir().to_path_buf());
+            true
+        }
+        Err(err) => {
+            eprintln!("Schedule recovery unavailable: {err}");
+            false
+        }
+    }
 }
 
 /// Enforce event-driven Ping-Pong turn ownership between parents and `lifecycle: task`
@@ -2467,6 +2490,53 @@ mod tests {
             assert_eq!(probe_spiron_at(&base, None, "id", "promise"), expected);
             task.join().unwrap();
         }
+    }
+
+    #[test]
+    fn legacy_pr_watch_repair_runs_once_per_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("state.db");
+        let store = Store::open(&db).unwrap();
+        let health = HealthBoard::default();
+        let owner = store
+            .create_agent(NewAgent::new("legacy-owner", "codex"))
+            .unwrap();
+        let watch = store
+            .create_schedule(NewSchedule {
+                agent_id: owner.id.clone(),
+                kind: "watch".into(),
+                spec: "github:pr:o/r#7".into(),
+                prompt: "verify".into(),
+                interval_ms: None,
+                next_fire_at_ms: None,
+                watch_baseline: Some("pending".into()),
+            })
+            .unwrap();
+        let retire = |conn: &rusqlite::Connection| {
+            conn.execute(
+                "UPDATE agent_schedules SET state='fired', last_observed='checks_completed' WHERE id=?1",
+                [watch.id.as_str()],
+            )
+            .unwrap();
+        };
+        let raw = rusqlite::Connection::open(&db).unwrap();
+        retire(&raw);
+        // The first local pass reopens what an earlier release retired.
+        assert!(restore_legacy_pr_watches_once(&store));
+        let reopened = store.get_schedule(&watch.id).unwrap().unwrap();
+        assert_eq!(reopened.state, "active");
+        assert_eq!(reopened.watch_baseline.as_deref(), Some("checks_completed"));
+        // Later passes, including from a reopened handle, never rescan.
+        retire(&raw);
+        drop(store);
+        let store = Store::open(&db).unwrap();
+        for at in 0..3 {
+            tick_local_schedules_once(&store, &health, anyagents_core::now_ms() + at);
+        }
+        assert_eq!(
+            store.get_schedule(&watch.id).unwrap().unwrap().state,
+            "fired"
+        );
     }
 
     #[test]
