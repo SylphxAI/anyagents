@@ -1520,9 +1520,6 @@ fn translate_agent_mentions_for_telegram(store: &Store, text: &str) -> String {
     let Ok(channels) = store.list_channels() else {
         return text.to_string();
     };
-    let Ok(agents) = store.list_agents() else {
-        return text.to_string();
-    };
     let mut agent_to_bot: Vec<(String, String)> = Vec::new();
     for channel in channels {
         if channel.kind != "telegram" {
@@ -1545,10 +1542,7 @@ fn translate_agent_mentions_for_telegram(store: &Store, text: &str) -> String {
             continue;
         };
         for aid in &channel.agents {
-            if let Some(agent) = agents
-                .iter()
-                .find(|a| &a.id == aid || a.name.eq_ignore_ascii_case(aid.as_str()))
-            {
+            if let Ok(agent) = store.agent(aid) {
                 let name_lower = agent.name.to_ascii_lowercase();
                 if !name_lower.eq_ignore_ascii_case(bot_username)
                     && !agent_to_bot.iter().any(|(n, _)| n == &name_lower)
