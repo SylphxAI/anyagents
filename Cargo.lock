@@ -289,6 +289,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "anyagents-keeper"
+version = "0.1.8"
+dependencies = [
+ "anyagents-harness",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "anyagents-supervisor"
 version = "0.1.8"
 dependencies = [
