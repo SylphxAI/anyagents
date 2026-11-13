@@ -6,6 +6,10 @@
 //! answers, and answers a repeat from what it remembers, as a vendor adapter
 //! with consumption proof does. `--protocol <min>-<max>` before the keeper's
 //! own arguments changes the protocol versions this keeper advertises.
+//!
+//! Two faults on purpose: a launch with `"hang_start": true` never finishes
+//! starting, and the message id `wedge` is never answered (its call holds the
+//! adapter for good), as a blocking write into a stuck vendor would.
 
 use std::collections::HashSet;
 use std::io::{BufRead as _, BufReader, Write as _};
@@ -44,6 +48,11 @@ struct LineAdapter {
 
 impl LineAdapter {
     fn start(spec: &Spec) -> Result<Self, String> {
+        if spec.launch["hang_start"].as_bool() == Some(true) {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(3600));
+            }
+        }
         let script = spec.launch["script"]
             .as_str()
             .ok_or("launch names no script")?;
@@ -97,6 +106,11 @@ impl LineAdapter {
 
 impl Harness for LineAdapter {
     fn deliver(&mut self, message: &OutboundMessage) -> Result<DeliverOutcome, HarnessError> {
+        if message.id == "wedge" {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(3600));
+            }
+        }
         let mut state = self.state.lock().unwrap();
         if state.taken.contains(&message.id) {
             return Ok(DeliverOutcome::Accepted {

@@ -42,6 +42,12 @@ pub enum Fault {
     BadRequest { message: String },
     /// The adapter is gone: the keeper is stopping.
     Stopped,
+    /// This connection may not do that: its peer is another user, or it is
+    /// not the keeper's current owner. The keeper is alive.
+    Forbidden { message: String },
+    /// The keeper cannot serve this connection now (it could not start a
+    /// thread for it). The keeper is alive.
+    Busy,
 }
 
 /// One line from the keeper: the answer to a request, or an event.

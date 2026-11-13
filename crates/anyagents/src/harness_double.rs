@@ -185,19 +185,30 @@ mod tool_server {
         // The model answers the message it was handed: by the mailbox
         // reference in the server's trusted context when its config says so, as
         // a real model does, else by the target its config names.
-        let hinted = user
-            .lines()
-            .find_map(|line| {
-                line.strip_prefix(anyagents_harness::REPLY_HINT_PREFIX)
-                    .or_else(|| {
-                        let (_, rest) = line.split_once(" reply_to=\"")?;
-                        let (val, _) = rest.split_once('"')?;
-                        Some(val)
-                    })
-            })
-            .map(str::to_string)
-            .filter(|hint| !hint.is_empty());
-        let configured = (!reply_to.is_empty()).then(|| reply_to.to_string());
+        // A recovery note names the messages of the turn it resumes; the
+        // model answers the last of them by id, as it would have. (The note's
+        // own id and reply hint name the note, which is no message in the
+        // mailbox.)
+        let recovered = user.lines().rev().find_map(|line| {
+            let rest = line.trim_start().strip_prefix("- anyagents-message:")?;
+            rest.split(' ').next().filter(|id| !id.is_empty())
+        });
+        let hinted = recovered.map(str::to_string).or_else(|| {
+            user.lines()
+                .find_map(|line| {
+                    line.strip_prefix(anyagents_harness::REPLY_HINT_PREFIX)
+                        .or_else(|| {
+                            let (_, rest) = line.split_once(" reply_to=\"")?;
+                            let (val, _) = rest.split_once('"')?;
+                            Some(val)
+                        })
+                })
+                .map(str::to_string)
+                .filter(|hint| !hint.is_empty())
+        });
+        let configured = recovered
+            .or((!reply_to.is_empty()).then_some(reply_to))
+            .map(str::to_string);
         let reference = if context_reply_to {
             hinted.or(configured)
         } else {

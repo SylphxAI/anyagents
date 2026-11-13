@@ -1,12 +1,16 @@
 //! The keeper process: `anyagents keeper --dir <dir> [--lock-fd <n>]`.
 //!
 //! It reads its [`Spec`] from stdin, starts the adapter (which starts the
-//! harness), binds its socket, says `ready` on stdout and then serves kernels
-//! until one asks it to `stop`. A kernel that disconnects, cleanly or not,
-//! changes nothing: the keeper never ends its harness for that. A request
+//! harness), binds its socket, says `ready` on its start pipe and then serves
+//! kernels until one asks it to `stop`. A kernel that disconnects, cleanly or
+//! not, changes nothing: the keeper never ends its harness for that. A request
 //! already read is carried out even if the kernel that sent it is gone; its
 //! answer is lost, and the next kernel's repeat of it is answered from the
 //! adapter's memory.
+//!
+//! Only the current owner (the kernel whose `hello` asked to own the keeper
+//! most recently) may do anything but `hello`. Every refusal is an explicit
+//! fault, so a client never mistakes a live keeper for a dead one.
 
 use std::io::{Read as _, Write as _};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -14,16 +18,23 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
 use std::time::Duration;
 
-use anyagents_harness::HarnessError;
+use anyagents_harness::{HarnessError, HarnessHealth};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
+use crate::identity::ProcessIdentity;
 use crate::wire::{self, Event, Fault, FrameReader, Reply, Request};
-use crate::{Hello, Hosted, RECORD, SOCKET, Spec};
+use crate::{Hello, Hosted, LOG, RECORD, SOCKET, Spec};
+
+/// The most a keeper's log holds before it is rotated to `keeper.log.1`.
+const LOG_LIMIT: u64 = 1 << 20;
+
+/// How long a refusal may take to write before the connection is dropped.
+const REFUSAL_WRITE: Duration = Duration::from_secs(2);
 
 /// What a keeper advertises.
 #[derive(Clone, Debug)]
@@ -37,19 +48,18 @@ pub struct KeeperOptions {
 impl Default for KeeperOptions {
     fn default() -> Self {
         Self {
-            protocol: (crate::PROTOCOL_MIN, crate::PROTOCOL),
+            protocol: crate::protocol(),
             binary: String::new(),
         }
     }
 }
 
-/// What a keeper records about itself in its directory.
+/// What a keeper records about itself in its directory. A kernel that finds
+/// the keeper unreachable acts on the identities, never on bare pids.
 #[derive(Clone, Debug, Serialize, serde::Deserialize)]
 pub(crate) struct Record {
     pub protocol: (u32, u32),
     pub binary: String,
-    pub keeper_pid: u32,
-    pub harness_pid: Option<u32>,
     pub agent: String,
     pub harness: String,
     pub model: Option<String>,
@@ -57,6 +67,9 @@ pub(crate) struct Record {
     /// can still end the harness group as that seat.
     pub seat: Option<String>,
     pub started_at_ms: i64,
+    pub keeper: Option<ProcessIdentity>,
+    /// The harness process, which leads its own process group.
+    pub harness_process: Option<ProcessIdentity>,
 }
 
 /// Parse `--dir <dir> [--lock-fd <n>]` and run the keeper. Returns the exit
@@ -83,6 +96,9 @@ where
         eprintln!("anyagents keeper: --dir is required");
         return 2;
     };
+    // Nothing the kernel had open reaches the keeper or its harness, beyond
+    // its standard streams and the lock it was handed.
+    close_inherited(lock);
     // A write to a harness pipe or a kernel socket whose reader left is an
     // error the adapter handles, never a signal that ends the keeper.
     // SAFETY: setting a signal disposition before any thread starts.
@@ -103,6 +119,44 @@ where
     run_keeper(&dir, lock, options, start)
 }
 
+/// Close every descriptor from 3 up except `keep`.
+fn close_inherited(keep: Option<RawFd>) {
+    #[cfg(target_os = "linux")]
+    {
+        const SYS_CLOSE_RANGE: libc::c_long = 436;
+        let first: u32 = match keep {
+            Some(3) => 4,
+            Some(_) => 3,
+            None => 3,
+        };
+        if keep.is_none_or(|fd| fd == 3) {
+            // SAFETY: close_range on this process's own descriptor table.
+            let rc = unsafe { libc::syscall(SYS_CLOSE_RANGE, first, u32::MAX, 0u32) };
+            if rc == 0 {
+                return;
+            }
+        }
+    }
+    #[cfg(target_os = "linux")]
+    let listing = "/proc/self/fd";
+    #[cfg(not(target_os = "linux"))]
+    let listing = "/dev/fd";
+    let Ok(entries) = std::fs::read_dir(listing) else {
+        return;
+    };
+    let open: Vec<RawFd> = entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse().ok())
+        .filter(|fd| *fd >= 3 && Some(*fd) != keep)
+        .collect();
+    for fd in open {
+        // SAFETY: closing an inherited descriptor nothing in this process
+        // uses yet (no thread has started). The directory's own descriptor
+        // is among them and is closed harmlessly after its listing was read.
+        unsafe { libc::close(fd) };
+    }
+}
+
 /// Run a keeper in `dir`, holding `lock` (the agent's process lock) for as
 /// long as it lives. Returns the exit code; a `stop` exits the process.
 pub fn run_keeper<A, F>(dir: &Path, lock: Option<OwnedFd>, options: KeeperOptions, start: F) -> i32
@@ -119,6 +173,7 @@ where
             return 1;
         }
     };
+    bound_log(&dir.join(LOG));
     let mut input = Vec::new();
     if let Err(error) = std::io::stdin().read_to_end(&mut input) {
         report(
@@ -161,17 +216,21 @@ where
             return 1;
         }
     };
+    let harness_pid = adapter.process_id();
     let shared = Arc::new(Shared {
-        harness_pid: Mutex::new(adapter.process_id()),
+        harness_process: Mutex::new(harness_pid.and_then(ProcessIdentity::of)),
+        harness_pid: Mutex::new(harness_pid),
+        health: Mutex::new(adapter.health()),
         adapter: Mutex::new(Some(adapter)),
         owner: Mutex::new(None),
         note: Mutex::new(None),
         activity: Mutex::new(0),
         changed: Condvar::new(),
         generation: AtomicU64::new(0),
-        lock,
+        lock: Mutex::new(lock),
         dir: dir.to_path_buf(),
         started_at_ms: crate::now_ms(),
+        keeper: ProcessIdentity::of(std::process::id()),
         keeper_pid: std::process::id(),
         spec,
         options,
@@ -204,11 +263,20 @@ where
                 continue;
             }
         };
+        if wire::quiet_pipe(&stream).is_err() {
+            continue;
+        }
         // Only this user (the server's) may drive the keeper; a harness runs
-        // as its own seat and never reaches this socket.
+        // as its own seat. Another user is told so, never silently dropped.
         // SAFETY: geteuid takes no arguments and cannot fail.
         let me = unsafe { libc::geteuid() };
-        if wire::peer_uid(&stream).ok() != Some(me) || wire::quiet_pipe(&stream).is_err() {
+        if wire::peer_uid(&stream).ok() != Some(me) {
+            refuse(
+                &stream,
+                Fault::Forbidden {
+                    message: "the keeper serves only its own user".into(),
+                },
+            );
             continue;
         }
         let conn = Arc::new(Conn {
@@ -216,11 +284,23 @@ where
             write: Mutex::new(()),
         });
         let serving = Arc::clone(&shared);
-        let _ = std::thread::Builder::new()
+        let refused = Arc::clone(&conn);
+        if std::thread::Builder::new()
             .name("keeper-conn".into())
-            .spawn(move || serving.serve(conn));
+            .spawn(move || serving.serve(conn))
+            .is_err()
+        {
+            refuse(&refused.stream, Fault::Busy);
+        }
     }
     0
+}
+
+/// Answer a connection the keeper will not serve, then close it.
+fn refuse(stream: &UnixStream, fault: Fault) {
+    let _ = stream.set_write_timeout(Some(REFUSAL_WRITE));
+    let _ = wire::send_frame(stream, &Reply::Err { id: 0, err: fault }, &[]);
+    let _ = stream.shutdown(std::net::Shutdown::Both);
 }
 
 fn bind(path: &Path) -> std::io::Result<UnixListener> {
@@ -252,6 +332,61 @@ fn take_stdout() -> std::io::Result<std::fs::File> {
     let pipe = unsafe { std::fs::File::from_raw_fd(fd) };
     redirect_to_null(libc::STDOUT_FILENO);
     Ok(pipe)
+}
+
+/// Standard error goes through a pipe into `path`, which is rotated once it
+/// passes [`LOG_LIMIT`]: what the adapter and its harness print is bounded.
+/// Left as it is when the pipe cannot be made.
+fn bound_log(path: &Path) {
+    let mut fds = [0 as RawFd; 2];
+    // SAFETY: pipe fills two descriptors.
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return;
+    }
+    // SAFETY: both were just created and are owned here.
+    let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    let _ = wire::set_cloexec(read.as_raw_fd());
+    let path = path.to_path_buf();
+    let copied = std::thread::Builder::new()
+        .name("keeper-log".into())
+        .spawn(move || copy_log(std::fs::File::from(read), &path));
+    if copied.is_ok() {
+        // SAFETY: dup2 onto this process's own standard error.
+        unsafe { libc::dup2(write.as_raw_fd(), libc::STDERR_FILENO) };
+    }
+}
+
+fn copy_log(mut from: std::fs::File, path: &Path) {
+    let open = |path: &Path| {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(path)
+    };
+    let Ok(mut log) = open(path) else { return };
+    let mut written = log.metadata().map(|meta| meta.len()).unwrap_or(0);
+    let mut chunk = [0u8; 8192];
+    loop {
+        let read = match from.read(&mut chunk) {
+            Ok(0) => return,
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return,
+        };
+        if written + read as u64 > LOG_LIMIT {
+            let _ = std::fs::rename(path, path.with_extension("log.1"));
+            match open(path) {
+                Ok(fresh) => log = fresh,
+                Err(_) => return,
+            }
+            written = 0;
+        }
+        if log.write_all(&chunk[..read]).is_ok() {
+            written += read as u64;
+        }
+    }
 }
 
 /// One line for the kernel waiting on this keeper's start.
@@ -287,6 +422,14 @@ impl Conn {
         let _guard = lock_unpoisoned(&self.write);
         wire::send_frame(&self.stream, reply, fds)
     }
+
+    fn answer(&self, id: u64, answer: Result<Value, Fault>) {
+        let reply = match answer {
+            Ok(ok) => Reply::Ok { id, ok },
+            Err(err) => Reply::Err { id, err },
+        };
+        let _ = self.send(&reply, &[]);
+    }
 }
 
 struct Owner {
@@ -296,15 +439,21 @@ struct Owner {
 
 struct Shared<A> {
     adapter: Mutex<Option<A>>,
+    /// The adapter's health as last read, so `hello` answers even while a
+    /// call holds the adapter.
+    health: Mutex<HarnessHealth>,
     owner: Mutex<Option<Owner>>,
     note: Mutex<Option<String>>,
     activity: Mutex<u64>,
     changed: Condvar,
     generation: AtomicU64,
     harness_pid: Mutex<Option<u32>>,
-    lock: Option<OwnedFd>,
+    harness_process: Mutex<Option<ProcessIdentity>>,
+    /// The keeper's copy of the agent lock, closed once its harness is gone.
+    lock: Mutex<Option<OwnedFd>>,
     dir: PathBuf,
     started_at_ms: i64,
+    keeper: Option<ProcessIdentity>,
     keeper_pid: u32,
     spec: Spec,
     options: KeeperOptions,
@@ -325,7 +474,8 @@ impl<A: Hosted + 'static> Shared<A> {
 
     /// Tell the owning kernel each time something it reads changed. Changes
     /// with no kernel connected are not queued: a kernel that connects reads
-    /// the whole state anyway.
+    /// the whole state anyway. The cached health is refreshed when no call
+    /// holds the adapter.
     fn send_events(&self) {
         let mut seen = 0;
         loop {
@@ -338,6 +488,11 @@ impl<A: Hosted + 'static> Shared<A> {
                         .unwrap_or_else(|error| error.into_inner());
                 }
                 seen = *count;
+            }
+            if let Ok(adapter) = self.adapter.try_lock()
+                && let Some(adapter) = adapter.as_ref()
+            {
+                *lock_unpoisoned(&self.health) = adapter.health();
             }
             let owner = lock_unpoisoned(&self.owner)
                 .as_ref()
@@ -357,13 +512,13 @@ impl<A: Hosted + 'static> Shared<A> {
         Record {
             protocol: self.options.protocol,
             binary: self.options.binary.clone(),
-            keeper_pid: self.keeper_pid,
-            harness_pid: *lock_unpoisoned(&self.harness_pid),
             agent: self.spec.agent.clone(),
             harness: self.spec.harness.clone(),
             model: self.spec.model.clone(),
             seat: self.spec.seat.clone(),
             started_at_ms: self.started_at_ms,
+            keeper: self.keeper.clone(),
+            harness_process: lock_unpoisoned(&self.harness_process).clone(),
         }
     }
 
@@ -373,61 +528,58 @@ impl<A: Hosted + 'static> Shared<A> {
         }
     }
 
+    fn is_owner(&self, owned: Option<u64>) -> bool {
+        owned.is_some_and(|generation| {
+            lock_unpoisoned(&self.owner)
+                .as_ref()
+                .is_some_and(|owner| owner.generation == generation)
+        })
+    }
+
     fn serve(self: Arc<Self>, conn: Arc<Conn>) {
         let mut reader = FrameReader::new(&conn.stream);
-        let mut greeted = false;
         let mut owned = None;
         while let Ok(Some(frame)) = reader.next_frame() {
             let request: Request = match serde_json::from_slice(&frame) {
                 Ok(request) => request,
                 Err(error) => {
-                    let _ = conn.send(
-                        &Reply::Err {
-                            id: 0,
-                            err: Fault::BadRequest {
-                                message: error.to_string(),
-                            },
-                        },
-                        &[],
+                    conn.answer(
+                        0,
+                        Err(Fault::BadRequest {
+                            message: error.to_string(),
+                        }),
                     );
                     continue;
                 }
             };
             let id = request.id;
+            if request.op == "hello" {
+                let (generation, answer) = self.hello(&conn, id, &request.args);
+                if generation.is_some() {
+                    owned = generation;
+                }
+                if let Err(fault) = answer {
+                    conn.answer(id, Err(fault));
+                }
+                continue;
+            }
+            // Everything but `hello` is the owner's alone: an observer, or a
+            // kernel a newer one superseded, changes nothing.
+            if !self.is_owner(owned) {
+                conn.answer(
+                    id,
+                    Err(Fault::Forbidden {
+                        message: "only the keeper's current owner may do that".into(),
+                    }),
+                );
+                continue;
+            }
             match request.op.as_str() {
-                // Frozen in every protocol version: a kernel that speaks no
+                // Frozen in every protocol version: an owner that speaks no
                 // version this keeper speaks can still end it.
                 "stop" => self.stop(&conn, id),
-                "hello" => match self.hello(&conn, id, &request.args) {
-                    Ok(generation) => {
-                        greeted = true;
-                        if generation.is_some() {
-                            owned = generation;
-                        }
-                    }
-                    Err(fault) => {
-                        let _ = conn.send(&Reply::Err { id, err: fault }, &[]);
-                    }
-                },
-                _ if !greeted => {
-                    let _ = conn.send(
-                        &Reply::Err {
-                            id,
-                            err: Fault::BadRequest {
-                                message: "hello first".into(),
-                            },
-                        },
-                        &[],
-                    );
-                }
                 "detach" => {
-                    let _ = conn.send(
-                        &Reply::Ok {
-                            id,
-                            ok: Value::Null,
-                        },
-                        &[],
-                    );
+                    conn.answer(id, Ok(Value::Null));
                     break;
                 }
                 "note" => {
@@ -437,21 +589,9 @@ impl<A: Hosted + 'static> Shared<A> {
                         .and_then(Value::as_str)
                         .map(str::to_string);
                     *lock_unpoisoned(&self.note) = note;
-                    let _ = conn.send(
-                        &Reply::Ok {
-                            id,
-                            ok: Value::Null,
-                        },
-                        &[],
-                    );
+                    conn.answer(id, Ok(Value::Null));
                 }
-                op => {
-                    let reply = match self.call(op, &request.args) {
-                        Ok(ok) => Reply::Ok { id, ok },
-                        Err(err) => Reply::Err { id, err },
-                    };
-                    let _ = conn.send(&reply, &[]);
-                }
+                op => conn.answer(id, self.call(op, &request.args)),
             }
         }
         if let Some(generation) = owned {
@@ -465,24 +605,22 @@ impl<A: Hosted + 'static> Shared<A> {
         }
     }
 
-    /// Agree on a protocol version; an owning kernel supersedes the last one
-    /// and receives a copy of the process lock with the answer. Returns the
-    /// owner generation when this connection took ownership.
-    fn hello(&self, conn: &Arc<Conn>, id: u64, args: &Value) -> Result<Option<u64>, Fault> {
-        let args: HelloArgs =
-            serde_json::from_value(args.clone()).map_err(|error| Fault::BadRequest {
-                message: error.to_string(),
-            })?;
-        let (keeper_min, keeper_max) = self.options.protocol;
-        let protocol = args.protocol.1.min(keeper_max);
-        if protocol < args.protocol.0.max(keeper_min) {
-            return Err(Fault::Protocol {
-                keeper: self.options.protocol,
-            });
-        }
-        let health = match lock_unpoisoned(&self.adapter).as_ref() {
-            Some(adapter) => adapter.health(),
-            None => return Err(Fault::Stopped),
+    /// An owning `hello` supersedes the last owner, whatever version it
+    /// speaks, so that it can always `stop` the keeper. It then agrees on a
+    /// protocol version and receives a copy of the process lock with the
+    /// answer, sent here. Never takes the adapter: a wedged call cannot hang
+    /// it.
+    fn hello(&self, conn: &Arc<Conn>, id: u64, args: &Value) -> (Option<u64>, Result<(), Fault>) {
+        let args: HelloArgs = match serde_json::from_value(args.clone()) {
+            Ok(args) => args,
+            Err(error) => {
+                return (
+                    None,
+                    Err(Fault::BadRequest {
+                        message: error.to_string(),
+                    }),
+                );
+            }
         };
         let generation = args.owner.then(|| {
             let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
@@ -501,7 +639,18 @@ impl<A: Hosted + 'static> Shared<A> {
             }
             generation
         });
-        let lock = match (&self.lock, args.owner) {
+        let (keeper_min, keeper_max) = self.options.protocol;
+        let protocol = args.protocol.1.min(keeper_max);
+        if protocol < args.protocol.0.max(keeper_min) {
+            return (
+                generation,
+                Err(Fault::Protocol {
+                    keeper: self.options.protocol,
+                }),
+            );
+        }
+        let held = lock_unpoisoned(&self.lock);
+        let lock = match (held.as_ref(), args.owner) {
             (Some(lock), true) => Some(lock.as_raw_fd()),
             _ => None,
         };
@@ -509,6 +658,7 @@ impl<A: Hosted + 'static> Shared<A> {
             protocol,
             binary: self.options.binary.clone(),
             keeper_pid: self.keeper_pid,
+            keeper: self.keeper.clone(),
             harness_pid: *lock_unpoisoned(&self.harness_pid),
             agent: self.spec.agent.clone(),
             harness: self.spec.harness.clone(),
@@ -517,15 +667,21 @@ impl<A: Hosted + 'static> Shared<A> {
             started_at_ms: self.started_at_ms,
             labels: self.spec.labels.clone(),
             note: lock_unpoisoned(&self.note).clone(),
-            health,
+            health: lock_unpoisoned(&self.health).clone(),
             lock: lock.is_some(),
         };
-        let ok = serde_json::to_value(&hello).map_err(|error| Fault::BadRequest {
-            message: error.to_string(),
-        })?;
-        let fds: Vec<RawFd> = lock.into_iter().collect();
-        let _ = conn.send(&Reply::Ok { id, ok }, &fds);
-        Ok(generation)
+        let answer = serde_json::to_value(&hello)
+            .map_err(|error| Fault::BadRequest {
+                message: error.to_string(),
+            })
+            .map(|ok| {
+                // Sent while the guard holds the descriptor open: `stop` cannot
+                // close it under this answer.
+                let fds: Vec<RawFd> = lock.into_iter().collect();
+                let _ = conn.send(&Reply::Ok { id, ok }, &fds);
+            });
+        drop(held);
+        (generation, answer)
     }
 
     fn call(&self, op: &str, args: &Value) -> Result<Value, Fault> {
@@ -534,6 +690,7 @@ impl<A: Hosted + 'static> Shared<A> {
             return Err(Fault::Stopped);
         };
         let answer = dispatch(adapter, op, args);
+        *lock_unpoisoned(&self.health) = adapter.health();
         let pid = adapter.process_id();
         let changed = {
             let mut known = lock_unpoisoned(&self.harness_pid);
@@ -542,26 +699,41 @@ impl<A: Hosted + 'static> Shared<A> {
             changed
         };
         if changed {
+            *lock_unpoisoned(&self.harness_process) = pid.and_then(ProcessIdentity::of);
             self.write_record();
         }
         answer
     }
 
-    /// End the harness (the adapter's drop ends its process group), answer,
-    /// remove the keeper's directory and exit. The process lock is released
-    /// when the last copy of it closes.
+    /// End the harness, answer, remove the keeper's directory and exit. When
+    /// no call holds the adapter, its drop ends the harness group as it
+    /// always does; when one does (a call that never returns), the group is
+    /// ended directly from its recorded identity. The process lock is
+    /// released when the last copy of it closes.
     fn stop(&self, conn: &Conn, id: u64) -> ! {
-        let adapter = lock_unpoisoned(&self.adapter).take();
-        drop(adapter);
+        match self.adapter.try_lock() {
+            Ok(mut adapter) => drop(adapter.take()),
+            Err(TryLockError::Poisoned(poisoned)) => drop(poisoned.into_inner().take()),
+            Err(TryLockError::WouldBlock) => self.end_harness_group(),
+        }
+        // The harness is gone: the keeper's copy of the lock goes before the
+        // answer, so whoever reads `stopped` finds no copy here.
+        drop(lock_unpoisoned(&self.lock).take());
         let _ = std::fs::remove_dir_all(&self.dir);
-        let _ = conn.send(
-            &Reply::Ok {
-                id,
-                ok: json!({"stopped": true}),
-            },
-            &[],
-        );
+        conn.answer(id, Ok(json!({"stopped": true})));
         std::process::exit(0)
+    }
+
+    fn end_harness_group(&self) {
+        let seat: Vec<(String, String)> = self
+            .spec
+            .seat
+            .iter()
+            .map(|seat| (anyagents_harness::SEAT_LAUNCH_ENV.to_string(), seat.clone()))
+            .collect();
+        if let Some(harness) = lock_unpoisoned(&self.harness_process).as_ref() {
+            harness.end_group(&seat);
+        }
     }
 
     /// The keeper cannot serve: end the harness and exit.
@@ -643,5 +815,30 @@ fn dispatch<A: Hosted>(adapter: &mut A, op: &str, args: &Value) -> Result<Value,
         "session_invalidated" => value(adapter.session_invalidated()),
         "state_dir" => value(adapter.state_dir()),
         _ => Err(Fault::UnknownOp),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What a harness prints through its keeper is bounded: past the limit
+    /// the log is rotated, and only the newest output stays beside it.
+    #[test]
+    fn the_keeper_log_is_rotated_at_its_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("printed");
+        std::fs::write(&source, vec![b'x'; (LOG_LIMIT + LOG_LIMIT / 2) as usize]).unwrap();
+        let log = dir.path().join(LOG);
+        copy_log(std::fs::File::open(&source).unwrap(), &log);
+        let current = std::fs::metadata(&log).unwrap().len();
+        let rotated = std::fs::metadata(log.with_extension("log.1"))
+            .unwrap()
+            .len();
+        assert!(
+            current <= LOG_LIMIT && rotated <= LOG_LIMIT,
+            "{current} {rotated}"
+        );
+        assert_eq!(current + rotated, LOG_LIMIT + LOG_LIMIT / 2);
     }
 }

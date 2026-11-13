@@ -269,7 +269,7 @@ async fn serve(
         crate::sandbox::share_socket_with_seats(&path);
     }
     let launch_store = Arc::clone(&store);
-    let custody = crate::keeper::custody(data, &host);
+    let custody = crate::keeper::custody(data, &host, Vec::new());
     let supervisor = Retaining(Some(
         Supervisor::<VendorHarness>::start_with_custody(
             Arc::clone(&store),

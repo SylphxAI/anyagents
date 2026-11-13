@@ -56,6 +56,7 @@ impl Fixture {
             model: Some("m-1".into()),
             seat: None,
             labels: [("pointer".to_string(), "p".to_string())].into(),
+            lock_path: None,
             launch: json!({
                 "script": HARNESS,
                 "args": [self.log.display().to_string(), self.hold.display().to_string()],
@@ -95,10 +96,10 @@ fn short_base() -> PathBuf {
 }
 
 fn program(extra: &[&str]) -> Program {
-    Program {
-        path: PathBuf::from(env!("CARGO_BIN_EXE_kept_line")),
-        args: extra.iter().map(|arg| arg.to_string()).collect(),
-    }
+    Program::new(
+        PathBuf::from(env!("CARGO_BIN_EXE_kept_line")),
+        extra.iter().map(|arg| arg.to_string()).collect(),
+    )
 }
 
 fn message(id: &str) -> OutboundMessage {
@@ -222,12 +223,14 @@ fn a_detached_keeper_keeps_the_note_and_the_process_lock_for_the_next_kernel() {
     assert_eq!(next.hello().model.as_deref(), Some("m-1"));
     assert_eq!(next.process_id(), Some(pid));
     let adopted = next.take_lock().expect("the keeper hands its lock over");
-    next.stop();
+    next.stop().unwrap();
     assert!(!probe(), "the adopted copy no longer holds the lock");
     drop(adopted);
     eventually("the lock is free once every copy closed", probe);
 }
 
+// Ending a harness group needs a provable identity: Linux only.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_keeper_that_dies_takes_its_harness_with_it() {
     let fx = Fixture::new();
@@ -244,6 +247,8 @@ fn a_keeper_that_dies_takes_its_harness_with_it() {
     assert!(attach(&fx.root, "agt_test").unwrap().is_none());
 }
 
+// Ending a harness group needs a provable identity: Linux only.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_keeper_found_dead_by_the_next_kernel_has_its_harness_ended() {
     let fx = Fixture::new();
@@ -375,6 +380,314 @@ fn a_second_kernel_supersedes_the_first_without_ending_the_harness() {
     // The superseded handle lets go without stopping anything.
     drop(first);
     assert!(group_alive(pid));
-    second.stop();
+    second.stop().unwrap();
     assert!(!group_alive(pid));
+}
+
+/// Why attach refused to take over (or clear) the keeper there.
+#[cfg(target_os = "linux")]
+fn refused_attach(root: &std::path::Path) -> String {
+    match attach(root, "agt_test") {
+        Err(error) => error,
+        Ok(_) => panic!("attach went ahead where it had no proof"),
+    }
+}
+
+/// A process outside any keeper, leading its own group, that a stale record
+/// could name.
+#[cfg(target_os = "linux")]
+fn bystander() -> std::process::Child {
+    use std::os::unix::process::CommandExt as _;
+    std::process::Command::new("sleep")
+        .arg("600")
+        .process_group(0)
+        .spawn()
+        .unwrap()
+}
+
+/// A keeper directory a dead kernel's keeper left, with `record` as its
+/// record and no socket.
+#[cfg(target_os = "linux")]
+fn left_behind(root: &std::path::Path, record: serde_json::Value) -> PathBuf {
+    use std::os::unix::fs::DirBuilderExt as _;
+    std::fs::DirBuilder::new().mode(0o700).create(root).ok();
+    let dir = root.join("000000000001");
+    std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+    std::fs::write(dir.join("agent"), "agt_test").unwrap();
+    std::fs::write(dir.join("keeper.json"), record.to_string()).unwrap();
+    dir
+}
+
+#[cfg(target_os = "linux")]
+fn identity(pid: u32) -> serde_json::Value {
+    serde_json::to_value(anyagents_keeper::ProcessIdentity::of(pid).unwrap()).unwrap()
+}
+
+/// The identity of a process that has ended and been reaped.
+#[cfg(target_os = "linux")]
+fn ended_identity() -> serde_json::Value {
+    let mut gone = std::process::Command::new("true").spawn().unwrap();
+    let recorded = identity(gone.id());
+    gone.wait().unwrap();
+    recorded
+}
+
+/// After a pod restart, a reboot or a restore, a recorded pid names another
+/// process. A record whose harness identity does not match the process now
+/// at that pid (another start time, another boot) signals nothing; the
+/// directory is cleared.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_stale_record_never_signals_the_process_that_now_has_its_pid() {
+    let fx = Fixture::new();
+    let mut other = bystander();
+    let mut harness = identity(other.id());
+    harness["start_ticks"] = json!(harness["start_ticks"].as_u64().unwrap() + 1);
+    let mut rebooted = identity(other.id());
+    rebooted["boot_id"] = json!("a-boot-before-the-restore");
+    for recorded in [harness, rebooted] {
+        let dir = left_behind(
+            &fx.root,
+            json!({
+                "protocol": [1, 1], "binary": "old", "agent": "agt_test", "harness": "line",
+                "model": null, "seat": null, "started_at_ms": 1,
+                "keeper": ended_identity(), "harness_process": recorded,
+            }),
+        );
+        assert!(attach(&fx.root, "agt_test").unwrap().is_none());
+        assert!(!dir.exists(), "the stale directory stays");
+        assert!(
+            alive(other.id()),
+            "a stale record signalled another process"
+        );
+    }
+    other.kill().unwrap();
+    other.wait().unwrap();
+}
+
+/// A keeper is never taken for dead on anything short of proof. One whose
+/// process still runs, one that holds the agent's lock, and a socket that
+/// closes without answering all leave the harness and the directory alone,
+/// and attach refuses rather than starting another.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_keeper_that_does_not_answer_is_never_treated_as_dead() {
+    let fx = Fixture::new();
+    let mut other = bystander();
+    let harness = identity(other.id());
+
+    // Its socket is gone, but its process runs.
+    let keeper = fx.spawn();
+    let pid = keeper.process_id().unwrap();
+    let dir = keeper.dir().to_path_buf();
+    let process = keeper.crash();
+    std::fs::remove_file(dir.join("s")).unwrap();
+    let refused = refused_attach(&fx.root);
+    assert!(refused.contains("still runs"), "{refused}");
+    assert!(group_alive(pid) && dir.exists());
+    let mut process = process.unwrap();
+    process.kill().unwrap();
+    process.wait().unwrap();
+    // SAFETY: ending the harness group this test's keeper started.
+    unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+    // Its process ended, but its lock is held (by a keeper this record
+    // misnames, say).
+    std::fs::remove_dir_all(&dir).unwrap();
+    let lock_file = fx.root.with_file_name("agent.lock");
+    let held = std::fs::File::create(&lock_file).unwrap();
+    // SAFETY: flock on a file this test owns.
+    assert_eq!(
+        unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    let dir = left_behind(
+        &fx.root,
+        json!({
+            "protocol": [1, 1], "binary": "old", "agent": "agt_test", "harness": "line",
+            "model": null, "seat": null, "started_at_ms": 1,
+            "keeper": ended_identity(), "harness_process": harness,
+        }),
+    );
+    std::fs::write(dir.join("lock"), lock_file.display().to_string()).unwrap();
+    let refused = refused_attach(&fx.root);
+    assert!(refused.contains("still held"), "{refused}");
+    assert!(alive(other.id()) && dir.exists());
+    // A socket that closes before answering hello.
+    drop(held);
+    let listener = std::os::unix::net::UnixListener::bind(dir.join("s")).unwrap();
+    let closer = std::thread::spawn(move || {
+        use std::io::BufRead as _;
+        let (stream, _) = listener.accept().unwrap();
+        let mut hello = String::new();
+        std::io::BufReader::new(&stream)
+            .read_line(&mut hello)
+            .unwrap();
+        drop(stream);
+    });
+    let refused = refused_attach(&fx.root);
+    assert!(refused.contains("without answering"), "{refused}");
+    closer.join().unwrap();
+    assert!(alive(other.id()) && dir.exists());
+    other.kill().unwrap();
+    other.wait().unwrap();
+}
+
+/// A call that never returns (a write into a stuck vendor) does not hang the
+/// kernel: it fails at its deadline, the harness reads as dead, `hello`
+/// still answers from the cached health, and stop ends the harness without
+/// the adapter.
+#[test]
+fn a_wedged_adapter_is_bounded_and_still_stopped() {
+    let fx = Fixture::new();
+    let mut kernel = fx.spawn();
+    let pid = kernel.process_id().unwrap();
+    let dir = kernel.dir().to_path_buf();
+    kernel.set_call_deadline(Duration::from_millis(500));
+    let started = Instant::now();
+    let refused = kernel.deliver(&message("wedge")).unwrap_err();
+    assert!(
+        matches!(&refused, anyagents_harness::HarnessError::Failed(why) if why.contains("did not answer")),
+        "{refused:?}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert!(
+        !kernel.health().process_alive,
+        "a wedged keeper reads as alive"
+    );
+    let observed = anyagents_keeper::inspect(&dir).unwrap();
+    assert_eq!(observed.harness_pid, Some(pid));
+    drop(kernel);
+    assert!(!dir.exists(), "the wedged keeper did not stop");
+    // Ended from its recorded identity, which only Linux proves.
+    #[cfg(target_os = "linux")]
+    eventually("the wedged keeper's harness ends", || !group_alive(pid));
+    #[cfg(not(target_os = "linux"))]
+    let _ = pid;
+}
+
+/// A keeper whose adapter never finishes starting is ended with everything
+/// it started, and its directory cleared.
+#[test]
+fn a_keeper_that_never_becomes_ready_is_ended() {
+    let fx = Fixture::new();
+    let mut spec = fx.spec();
+    spec.launch["hang_start"] = json!(true);
+    let mut slow = program(&[]);
+    slow.ready = Duration::from_secs(2);
+    let refused = anyagents_keeper::spawn(&slow, &fx.root, &spec, None)
+        .err()
+        .expect("a keeper that never got ready was accepted");
+    assert!(refused.contains("not ready"), "{refused}");
+    assert!(anyagents_keeper::instances(&fx.root).is_empty());
+}
+
+/// Only the keeper's current owner may act on it: an observer, or any other
+/// connection, is refused, and says so.
+#[test]
+fn only_the_owner_may_act_on_a_keeper() {
+    let fx = Fixture::new();
+    let mut kernel = fx.spawn();
+    let observer = testing::raw_connection(kernel.dir(), false);
+    let request = json!({"id": 5, "op": "deliver", "args": {"message": message("sneaked")}});
+    (&observer)
+        .write_all(format!("{request}\n").as_bytes())
+        .unwrap();
+    let mut answer = String::new();
+    use std::io::BufRead as _;
+    std::io::BufReader::new(&observer)
+        .read_line(&mut answer)
+        .unwrap();
+    assert!(answer.contains("forbidden"), "{answer}");
+    assert_eq!(
+        kernel.deliver(&message("m1")).unwrap(),
+        DeliverOutcome::InFlight
+    );
+    eventually("the owner's line is read", || fx.read() == ["m1"]);
+}
+
+/// Nothing the kernel had open reaches the keeper (or its harness).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_keeper_closes_what_it_inherits() {
+    let fx = Fixture::new();
+    let leaked_path = fx.root.with_file_name("leaked");
+    let leaked = std::fs::File::create(&leaked_path).unwrap();
+    // SAFETY: clearing close-on-exec on a descriptor this test owns.
+    unsafe {
+        let flags = libc::fcntl(leaked.as_raw_fd(), libc::F_GETFD);
+        libc::fcntl(leaked.as_raw_fd(), libc::F_SETFD, flags & !libc::FD_CLOEXEC);
+    }
+    let kernel = fx.spawn();
+    let open: Vec<PathBuf> = std::fs::read_dir(format!("/proc/{}/fd", kernel.keeper_pid()))
+        .unwrap()
+        .flatten()
+        .filter_map(|entry| std::fs::read_link(entry.path()).ok())
+        .collect();
+    assert!(
+        !open.contains(&leaked_path),
+        "the keeper holds a descriptor it inherited: {open:?}"
+    );
+    drop(leaked);
+}
+
+/// Keepers live only under this user's private directory.
+#[test]
+fn keepers_refuse_a_directory_that_is_not_private() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let fx = Fixture::new();
+    let real = fx.root.with_file_name("elsewhere");
+    std::fs::create_dir(&real).unwrap();
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::os::unix::fs::symlink(&real, &fx.root).unwrap();
+    let refused = anyagents_keeper::spawn(&program(&[]), &fx.root, &fx.spec(), None)
+        .err()
+        .expect("a symlinked keeper directory was used");
+    assert!(refused.contains("not a directory"), "{refused}");
+    std::fs::remove_file(&fx.root).unwrap();
+    std::fs::create_dir(&fx.root).unwrap();
+    std::fs::set_permissions(&fx.root, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let refused = anyagents_keeper::spawn(&program(&[]), &fx.root, &fx.spec(), None)
+        .err()
+        .expect("a keeper directory open to others was used");
+    assert!(refused.contains("open to other users"), "{refused}");
+}
+
+/// An answer the kernel cannot read is an error to its caller, never a wait
+/// without end.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_unreadable_answer_fails_the_call_that_waits_for_it() {
+    use std::io::BufRead as _;
+    let fx = Fixture::new();
+    let dir = left_behind(&fx.root, json!({}));
+    let listener = std::os::unix::net::UnixListener::bind(dir.join("s")).unwrap();
+    let keeper = ended_identity();
+    let fake = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut lines = std::io::BufReader::new(stream.try_clone().unwrap()).lines();
+        let _hello = lines.next();
+        let hello = json!({"id": 1, "ok": {
+            "protocol": 1, "binary": "fake", "keeper_pid": 1, "keeper": keeper,
+            "harness_pid": null, "agent": "agt_test", "harness": "line", "model": null,
+            "seat": null, "started_at_ms": 1, "labels": {}, "note": null, "lock": false,
+            "health": {"process_alive": true, "turn_state": "idle", "delivery_mode": "steer",
+                "steer_support": "yes", "quota_reset_at_ms": null, "sign_in_fault": null},
+        }});
+        (&stream)
+            .write_all(format!("{hello}\n").as_bytes())
+            .unwrap();
+        let _deliver = lines.next();
+        (&stream)
+            .write_all(b"{\"id\":2,\"ok\":{\"accepted\n")
+            .unwrap();
+        // Hold the connection open: only the unreadable answer ends the wait.
+        let _ = lines.next();
+    });
+    let mut kernel = attach(&fx.root, "agt_test").unwrap().unwrap();
+    let started = Instant::now();
+    let refused = kernel.deliver(&message("m1")).unwrap_err();
+    assert!(format!("{refused:?}").contains("unreadable"), "{refused:?}");
+    assert!(started.elapsed() < Duration::from_secs(10));
+    drop(kernel);
+    fake.join().unwrap();
 }

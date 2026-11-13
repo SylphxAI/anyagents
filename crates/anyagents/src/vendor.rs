@@ -160,6 +160,10 @@ impl VendorHarness {
                     model: request.agent.model.clone(),
                     seat,
                     labels,
+                    lock_path: Some(anyagents_core::agent_lock_path(
+                        &request.data_dir,
+                        &request.agent.id,
+                    )),
                     launch: serde_json::to_value(&launch).map_err(|error| error.to_string())?,
                 };
                 let lock = request.lock.as_deref().map(|lock| lock.as_fd());
@@ -219,6 +223,11 @@ impl VendorHarness {
         if let Host::Kept(remote) = self.host {
             (*remote).detach();
         }
+    }
+
+    /// Another kernel took this harness's keeper over.
+    pub(crate) fn superseded(&self) -> bool {
+        matches!(&self.host, Host::Kept(remote) if remote.superseded())
     }
 
     /// Keep `note` with a kept harness for the next kernel.

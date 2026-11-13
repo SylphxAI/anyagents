@@ -22,6 +22,7 @@
 //! contract must be added to both; until it is, a kept adapter answers the
 //! contract's default for it.
 
+mod identity;
 mod keeper;
 mod remote;
 pub mod wire;
@@ -31,9 +32,11 @@ use std::path::{Path, PathBuf};
 use anyagents_harness::{Harness, HarnessHealth};
 use serde::{Deserialize, Serialize};
 
+pub use identity::{Presence, ProcessIdentity};
 pub use keeper::{KeeperOptions, keeper_main, run_keeper};
 pub use remote::{
-    Instance, Program, RemoteHarness, attach, inspect, instances, spawn, stop_agent, testing,
+    CALL_DEADLINE, HELLO_DEADLINE, Instance, Program, READY_DEADLINE, RemoteHarness, STOP_DEADLINE,
+    attach, check_root, inspect, instances, lock_path, spawn, stop_agent, testing,
 };
 
 /// The protocol version this build speaks. A kernel and a keeper agree on the
@@ -47,6 +50,25 @@ pub const PROTOCOL: u32 = 1;
 /// The oldest protocol version this build still speaks.
 pub const PROTOCOL_MIN: u32 = 1;
 
+/// The environment variable that pins the protocol versions this binary
+/// speaks, as `<min>-<max>`, on both sides. It exists to run a kernel and its
+/// keepers as two binaries of different versions would, and is read nowhere
+/// else.
+pub const PROTOCOL_ENV: &str = "ANYAGENTS_KEEPER_PROTOCOL";
+
+/// The protocol versions this binary speaks: [`PROTOCOL_MIN`]..=[`PROTOCOL`],
+/// unless [`PROTOCOL_ENV`] pins another range.
+pub fn protocol() -> (u32, u32) {
+    std::env::var(PROTOCOL_ENV)
+        .ok()
+        .and_then(|range| {
+            let (min, max) = range.split_once('-')?;
+            let (min, max) = (min.trim().parse().ok()?, max.trim().parse().ok()?);
+            (min <= max).then_some((min, max))
+        })
+        .unwrap_or((PROTOCOL_MIN, PROTOCOL))
+}
+
 /// Name of the socket in a keeper's directory. Short, as the directory is:
 /// a socket path must fit in 104 bytes on every supported platform, and the
 /// data directory comes first.
@@ -54,6 +76,10 @@ pub const SOCKET: &str = "s";
 /// The agent a keeper serves, written by the kernel before the keeper starts,
 /// so a keeper that dies early is still attributed.
 pub const AGENT: &str = "agent";
+/// The path of the agent's process lock, written by the kernel beside
+/// [`AGENT`]: a live keeper always holds that lock, so a lock nobody holds
+/// proves its keeper gone.
+pub const LOCK: &str = "lock";
 /// What a keeper records about itself, for an operator and for `list`.
 pub const RECORD: &str = "keeper.json";
 /// The keeper's own diagnostics. Never harness output.
@@ -97,6 +123,9 @@ pub struct Spec {
     /// What the kernel wants back when it takes the keeper over, as written.
     #[serde(default)]
     pub labels: std::collections::BTreeMap<String, String>,
+    /// The agent's process lock, whose copy the keeper holds.
+    #[serde(default)]
+    pub lock_path: Option<PathBuf>,
     pub launch: serde_json::Value,
 }
 
@@ -108,6 +137,9 @@ pub struct Hello {
     /// The binary the keeper runs, for an operator.
     pub binary: String,
     pub keeper_pid: u32,
+    /// The keeper process, when its platform can prove an identity.
+    #[serde(default)]
+    pub keeper: Option<ProcessIdentity>,
     pub harness_pid: Option<u32>,
     pub agent: String,
     pub harness: String,

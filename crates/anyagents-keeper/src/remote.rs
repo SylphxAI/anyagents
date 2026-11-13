@@ -1,16 +1,24 @@
 //! The kernel's side: start a keeper, take one over, and drive its adapter as
 //! a [`Harness`].
+//!
+//! Every wait has a deadline: the keeper's start, `hello`, each call and
+//! `stop`. A keeper that answers nothing within one is treated as wedged and
+//! ended through a fresh connection, then, failing that, by signal. A keeper
+//! is only ever treated as gone on proof: a socket that refuses (or no
+//! socket), then a keeper process that is provably not running and an agent
+//! lock that nobody holds. Recorded pids are only signalled when their
+//! identity proves them the recorded processes ([`ProcessIdentity`]).
 
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
-use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyagents_harness::{
     DeliverOutcome, Harness, HarnessError, HarnessHealth, OutboundMessage, ReconciledUnconfirmed,
@@ -19,12 +27,29 @@ use anyagents_harness::{
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
+use crate::identity::{Presence, ProcessIdentity, session_groups};
 use crate::keeper::Record;
 use crate::wire::{self, Event, Fault, FrameReader, Reply, Request};
-use crate::{AGENT, Hello, Hosted, LOG, PROTOCOL, PROTOCOL_MIN, RECORD, SOCKET, Spec};
+use crate::{AGENT, Hello, Hosted, LOCK, LOG, RECORD, SOCKET, Spec};
 
 /// The descriptor number the process lock has in a keeper.
 const KEEPER_LOCK_FD: i32 = 3;
+
+/// The longest a keeper may take to start its adapter and say `ready`. A
+/// vendor's own handshake is bounded inside this (Spiron's `ready`: 60 s).
+pub const READY_DEADLINE: Duration = Duration::from_secs(180);
+/// The longest a keeper may take to answer `hello` (it never waits on the
+/// adapter to answer it).
+pub const HELLO_DEADLINE: Duration = Duration::from_secs(10);
+/// The longest one adapter call may take before its keeper is treated as
+/// wedged. `quiet_for` gets its own patience on top.
+pub const CALL_DEADLINE: Duration = Duration::from_secs(120);
+/// The longest a keeper may take to end its harness and exit on `stop`.
+pub const STOP_DEADLINE: Duration = Duration::from_secs(30);
+
+/// How often a wait for a process to exit looks again: nothing reports a
+/// non-child's exit, and these waits are bounded by their deadline.
+const EXIT_PROBE: Duration = Duration::from_millis(20);
 
 /// The command that runs a keeper: the kernel's own binary and the arguments
 /// that select keeper mode (`anyagents keeper`).
@@ -32,6 +57,18 @@ const KEEPER_LOCK_FD: i32 = 3;
 pub struct Program {
     pub path: PathBuf,
     pub args: Vec<String>,
+    /// How long its start may take ([`READY_DEADLINE`]).
+    pub ready: Duration,
+}
+
+impl Program {
+    pub fn new(path: PathBuf, args: Vec<String>) -> Self {
+        Self {
+            path,
+            args,
+            ready: READY_DEADLINE,
+        }
+    }
 }
 
 /// One keeper directory: `<root>/<instance>`, with the agent it serves.
@@ -41,8 +78,47 @@ pub struct Instance {
     pub dir: PathBuf,
 }
 
-/// Every keeper directory under `root`, newest first.
+fn euid() -> u32 {
+    // SAFETY: geteuid takes no arguments and cannot fail.
+    unsafe { libc::geteuid() }
+}
+
+/// `root` is this user's private directory, or absent: not a symlink, owned
+/// by this effective user, open to nobody else. Every keeper operation checks
+/// it before trusting anything inside.
+pub fn check_root(root: &Path) -> Result<(), String> {
+    let meta = match std::fs::symlink_metadata(root) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("cannot read {}: {error}", root.display())),
+    };
+    if !meta.file_type().is_dir() {
+        return Err(format!("{} is not a directory", root.display()));
+    }
+    if meta.uid() != euid() {
+        return Err(format!(
+            "{} belongs to uid {}, not this user ({})",
+            root.display(),
+            meta.uid(),
+            euid()
+        ));
+    }
+    if meta.mode() & 0o077 != 0 {
+        return Err(format!(
+            "{} is open to other users (mode {:o})",
+            root.display(),
+            meta.mode() & 0o777
+        ));
+    }
+    Ok(())
+}
+
+/// Every keeper directory under `root`, newest first. Empty when `root` is
+/// not this user's private directory.
 pub fn instances(root: &Path) -> Vec<Instance> {
+    if check_root(root).is_err() {
+        return Vec::new();
+    }
     let Ok(entries) = std::fs::read_dir(root) else {
         return Vec::new();
     };
@@ -60,6 +136,13 @@ pub fn instances(root: &Path) -> Vec<Instance> {
         .collect();
     found.sort_by(|left, right| right.dir.cmp(&left.dir));
     found
+}
+
+/// The agent lock a keeper directory names.
+pub fn lock_path(dir: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(dir.join(LOCK)).ok()?;
+    let path = PathBuf::from(text.trim());
+    path.is_absolute().then_some(path)
 }
 
 /// The keeper directories of `agent`, newest first.
@@ -84,9 +167,8 @@ pub fn spawn(
     lock: Option<BorrowedFd<'_>>,
 ) -> Result<RemoteHarness, String> {
     private_dir(root)?;
-    let dir = new_instance(root, &spec.agent)?;
-    let started = start_keeper(program, &dir, spec, lock);
-    let child = match started {
+    let dir = new_instance(root, spec)?;
+    let mut child = match start_keeper(program, &dir, spec, lock) {
         Ok(child) => child,
         Err(error) => {
             let _ = std::fs::remove_dir_all(&dir);
@@ -96,33 +178,37 @@ pub fn spawn(
     match connect(&dir, true) {
         Ok(link) => Ok(RemoteHarness::new(link, dir, Some(child))),
         Err(error) => {
-            let mut child = child;
-            let _ = child.kill();
-            let _ = child.wait();
-            clean_dead(&dir);
+            end_start(&mut child, spec.seat.as_deref());
+            let _ = std::fs::remove_dir_all(&dir);
             Err(match error {
-                ConnectError::Protocol { keeper, .. } => format!(
-                    "keeper speaks protocol {}..={}, this kernel {PROTOCOL_MIN}..={PROTOCOL}",
-                    keeper.0, keeper.1
-                ),
-                ConnectError::Gone => "keeper exited after it was ready".into(),
+                ConnectError::Protocol { keeper, .. } => {
+                    let (min, max) = crate::protocol();
+                    format!(
+                        "keeper speaks protocol {}..={}, this kernel {min}..={max}",
+                        keeper.0, keeper.1
+                    )
+                }
+                ConnectError::MaybeGone => "keeper exited after it was ready".into(),
                 ConnectError::Io(error) => error,
             })
         }
     }
 }
 
+/// Create `path` as this user's private directory, or check that it is one.
 fn private_dir(path: &Path) -> Result<(), String> {
     match std::fs::DirBuilder::new().mode(0o700).create(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-        Err(error) => Err(format!("cannot create {}: {error}", path.display())),
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(format!("cannot create {}: {error}", path.display())),
     }
+    check_root(path)
 }
 
 /// A fresh directory named by its start time (twelve hex digits of
-/// milliseconds, so a name sorts with its age), recording `agent`.
-fn new_instance(root: &Path, agent: &str) -> Result<PathBuf, String> {
+/// milliseconds, so a name sorts with its age), recording the agent and the
+/// agent's lock before anything starts.
+fn new_instance(root: &Path, spec: &Spec) -> Result<PathBuf, String> {
     let start = crate::now_ms();
     for offset in 0..1000 {
         let dir = root.join(format!("{:012x}", start + offset));
@@ -135,7 +221,12 @@ fn new_instance(root: &Path, agent: &str) -> Result<PathBuf, String> {
         }
         match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
             Ok(()) => {
-                if let Err(error) = std::fs::write(dir.join(AGENT), agent) {
+                let lock = spec
+                    .lock_path
+                    .as_ref()
+                    .map(|path| std::fs::write(dir.join(LOCK), path.as_os_str().as_encoded_bytes()))
+                    .transpose();
+                if let Err(error) = std::fs::write(dir.join(AGENT), &spec.agent).and(lock) {
                     let _ = std::fs::remove_dir_all(&dir);
                     return Err(format!("cannot record the keeper's agent: {error}"));
                 }
@@ -202,17 +293,35 @@ fn start_keeper(
             .write_all(&bytes)
             .map_err(|error| format!("cannot hand the launch to the keeper: {error}"))
     });
-    let mut line = String::new();
-    let read = match (&written, child.stdout.take()) {
-        (Ok(()), Some(stdout)) => BufReader::new(stdout)
-            .read_line(&mut line)
-            .map_err(|error| error.to_string()),
-        (Err(error), _) => Err(error.clone()),
-        (Ok(()), None) => Err("keeper stdout missing".into()),
-    };
-    let failure = match read {
-        Ok(_) if line.trim_end() == "ready" => return Ok(child),
-        Ok(0) => {
+    let (sent, started) = std::sync::mpsc::channel();
+    match (written, child.stdout.take()) {
+        (Ok(()), Some(stdout)) => {
+            let reading = std::thread::Builder::new()
+                .name("anyagents-keeper-start".into())
+                .spawn(move || {
+                    let mut line = String::new();
+                    let read = BufReader::new(stdout)
+                        .read_line(&mut line)
+                        .map(|count| (count, line));
+                    let _ = sent.send(read);
+                });
+            if let Err(error) = reading {
+                end_start(&mut child, spec.seat.as_deref());
+                return Err(format!("cannot read the keeper's start: {error}"));
+            }
+        }
+        (Err(error), _) => {
+            end_start(&mut child, spec.seat.as_deref());
+            return Err(error);
+        }
+        (Ok(()), None) => {
+            end_start(&mut child, spec.seat.as_deref());
+            return Err("keeper stdout missing".into());
+        }
+    }
+    let failure = match started.recv_timeout(program.ready) {
+        Ok(Ok((_, line))) if line.trim_end() == "ready" => return Ok(child),
+        Ok(Ok((0, _))) => {
             let tail = log_tail(dir);
             if tail.is_empty() {
                 "keeper exited before it was ready".to_string()
@@ -220,16 +329,34 @@ fn start_keeper(
                 format!("keeper exited before it was ready: {tail}")
             }
         }
-        Ok(_) => line
+        Ok(Ok((_, line))) => line
             .trim_end()
             .strip_prefix("error ")
             .unwrap_or(line.trim_end())
             .to_string(),
-        Err(error) => error,
+        Ok(Err(error)) => error.to_string(),
+        Err(_) => format!(
+            "keeper was not ready within {} s (its harness did not finish starting)",
+            program.ready.as_secs()
+        ),
     };
-    let _ = child.kill();
-    let _ = child.wait();
+    end_start(&mut child, spec.seat.as_deref());
     Err(failure)
+}
+
+/// End a keeper this kernel started and has not reaped, with everything in
+/// the session it leads: its harness and whatever that started. Its pid, and
+/// with it the session id, cannot have been reused before the reap here.
+fn end_start(child: &mut Child, seat: Option<&str>) {
+    let keeper = child.id();
+    let groups = session_groups(keeper);
+    let _ = child.kill();
+    if let Some(environment) = trusted_seat_env(seat) {
+        for group in groups.into_iter().filter(|group| *group != keeper) {
+            anyagents_harness::terminate_group(group, &environment);
+        }
+    }
+    let _ = child.wait();
 }
 
 fn log_tail(dir: &Path) -> String {
@@ -239,35 +366,58 @@ fn log_tail(dir: &Path) -> String {
 }
 
 /// Take over the keeper a previous kernel left for `agent`: the newest one
-/// that answers in a protocol this kernel speaks. Older live keepers of the
-/// same agent (a crash in the middle of a replacement) are stopped, a keeper
-/// that speaks no shared protocol is stopped, and a directory whose keeper is
-/// gone is cleared after the harness group it recorded is ended.
+/// that answers. An older live keeper of the same agent (a crash in the
+/// middle of a replacement) is stopped, and so is one that speaks no protocol
+/// this kernel speaks. A keeper that does not answer is cleared only once it
+/// is proven gone; otherwise this is an error, and nothing is started beside
+/// it.
 pub fn attach(root: &Path, agent: &str) -> Result<Option<RemoteHarness>, String> {
+    check_root(root)?;
     let mut found: Option<RemoteHarness> = None;
     for dir in agent_instances(root, agent) {
-        match connect(&dir, found.is_none()) {
-            Ok(link) if found.is_none() => found = Some(RemoteHarness::new(link, dir, None)),
-            Ok(link) => RemoteHarness::new(link, dir, None).stop(),
-            Err(ConnectError::Gone) => clean_dead(&dir),
-            Err(ConnectError::Protocol { stream, .. }) => stop_unspoken(stream),
-            Err(ConnectError::Io(error)) => {
-                return Err(format!("keeper {}: {error}", dir.display()));
+        let outcome = match connect(&dir, true) {
+            Ok(link) if found.is_none() => {
+                found = Some(RemoteHarness::new(link, dir.clone(), None));
+                Ok(())
             }
+            Ok(link) => RemoteHarness::new(link, dir.clone(), None).stop(),
+            Err(ConnectError::MaybeGone) => clear_if_gone(&dir),
+            Err(ConnectError::Protocol { stream, .. }) => stop_unspoken(stream, &dir),
+            Err(ConnectError::Io(error)) => Err(error),
+        };
+        if let Err(error) = outcome {
+            let error = format!("keeper {}: {error}", dir.display());
+            if found.is_none() {
+                return Err(error);
+            }
+            // The newest keeper is taken; an older one that cannot be
+            // settled now is left for the operator, and said so.
+            eprintln!("anyagents-keeper: {error}");
         }
     }
     Ok(found)
 }
 
-/// Stop every keeper of `agent`, ending its harness.
-pub fn stop_agent(root: &Path, agent: &str) {
+/// Stop every keeper of `agent`, ending its harness. Every keeper that could
+/// not be stopped, or proven gone, is an error.
+pub fn stop_agent(root: &Path, agent: &str) -> Result<(), String> {
+    check_root(root)?;
+    let mut failures = Vec::new();
     for dir in agent_instances(root, agent) {
-        match connect(&dir, false) {
-            Ok(link) => RemoteHarness::new(link, dir, None).stop(),
-            Err(ConnectError::Gone) => clean_dead(&dir),
-            Err(ConnectError::Protocol { stream, .. }) => stop_unspoken(stream),
-            Err(ConnectError::Io(_)) => {}
+        let outcome = match connect(&dir, true) {
+            Ok(link) => RemoteHarness::new(link, dir.clone(), None).stop(),
+            Err(ConnectError::MaybeGone) => clear_if_gone(&dir),
+            Err(ConnectError::Protocol { stream, .. }) => stop_unspoken(stream, &dir),
+            Err(ConnectError::Io(error)) => Err(error),
+        };
+        if let Err(error) = outcome {
+            failures.push(format!("{}: {error}", dir.display()));
         }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
     }
 }
 
@@ -279,7 +429,7 @@ pub fn inspect(dir: &Path) -> Result<Hello, String> {
             let _ = link.stream.shutdown(std::net::Shutdown::Both);
             Ok(hello)
         }
-        Err(ConnectError::Gone) => Err("gone".into()),
+        Err(ConnectError::MaybeGone) => Err("does not answer".into()),
         Err(ConnectError::Protocol { keeper, .. }) => {
             Err(format!("speaks protocol {}..={} only", keeper.0, keeper.1))
         }
@@ -287,15 +437,64 @@ pub fn inspect(dir: &Path) -> Result<Hello, String> {
     }
 }
 
-/// A keeper that cannot answer is gone: end the harness group it recorded,
-/// which nothing can reach any more, and clear its directory.
-fn clean_dead(dir: &Path) {
-    if let Some(record) = read_record(dir)
-        && let Some(pid) = record.harness_pid
+/// A keeper whose socket refuses is gone only on proof: its process is not
+/// running, and nobody holds the agent lock it held for its whole life. Then
+/// the harness group it recorded is ended (when its identity proves it the
+/// same group) and its directory cleared. Without proof nothing is touched.
+fn clear_if_gone(dir: &Path) -> Result<(), String> {
+    let record = read_record(dir);
+    let keeper = record.as_ref().and_then(|record| record.keeper.as_ref());
+    if keeper.is_some_and(|keeper| keeper.presence() == Presence::Running) {
+        return Err("does not answer, but its process still runs".into());
+    }
+    let lock = match lock_path(dir) {
+        Some(path) => Some(lock_if_free(&path).ok_or_else(|| {
+            format!(
+                "does not answer, and the agent lock {} is still held",
+                path.display()
+            )
+        })?),
+        None if keeper.is_some_and(|keeper| keeper.presence() == Presence::Ended) => None,
+        None => {
+            return Err("does not answer, and nothing proves its keeper gone".into());
+        }
+    };
+    if let Some(record) = &record
+        && let Some(harness) = &record.harness_process
     {
-        anyagents_harness::terminate_group(pid, &seat_env(record.seat.as_deref()));
+        match trusted_seat_env(record.seat.as_deref()) {
+            Some(environment) => {
+                harness.end_group(&environment);
+            }
+            None => eprintln!(
+                "anyagents-keeper: {}: the recorded seat launcher is not trusted; its harness group is left alone",
+                dir.display()
+            ),
+        }
     }
     let _ = std::fs::remove_dir_all(dir);
+    drop(lock);
+    Ok(())
+}
+
+/// Take the lock at `path` on a fresh descriptor, when nobody holds it. The
+/// returned file holds it until dropped.
+fn lock_if_free(path: &Path) -> Option<std::fs::File> {
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+    {
+        Ok(file) => file,
+        // Never created: nobody ever held it.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return std::fs::File::open("/dev/null").ok();
+        }
+        Err(_) => return None,
+    };
+    // SAFETY: flock on a descriptor this function owns.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    (rc == 0).then_some(file)
 }
 
 fn read_record(dir: &Path) -> Option<Record> {
@@ -303,38 +502,66 @@ fn read_record(dir: &Path) -> Option<Record> {
     serde_json::from_slice(&bytes).ok()
 }
 
-fn seat_env(seat: Option<&str>) -> Vec<(String, String)> {
-    seat.map(|seat| {
+/// The environment that signals a seat's processes as that seat, when its
+/// launcher can be trusted to run: an absolute path to a regular file owned
+/// by root or by this user and writable by nobody else. `None` when not.
+fn trusted_seat_env(seat: Option<&str>) -> Option<Vec<(String, String)>> {
+    let Some(seat) = seat else {
+        return Some(Vec::new());
+    };
+    let launcher = Path::new(seat.split('\t').next()?);
+    let meta = std::fs::metadata(launcher).ok()?;
+    let trusted = launcher.is_absolute()
+        && meta.is_file()
+        && (meta.uid() == 0 || meta.uid() == euid())
+        && meta.mode() & 0o022 == 0;
+    trusted.then(|| {
         vec![(
             anyagents_harness::SEAT_LAUNCH_ENV.to_string(),
             seat.to_string(),
         )]
     })
-    .unwrap_or_default()
 }
 
-/// `stop` is frozen in every protocol version, so a keeper this kernel cannot
-/// otherwise speak to can still be ended. It exits after answering.
-fn stop_unspoken(stream: UnixStream) {
+/// `stop` from an owner that shares no protocol version with the keeper:
+/// the owning `hello` already took the keeper over, and `stop` is frozen.
+fn stop_unspoken(stream: UnixStream, dir: &Path) -> Result<(), String> {
     let request = Request {
         id: u64::MAX,
         op: "stop".into(),
         args: Value::Null,
     };
-    if wire::send_frame(&stream, &request, &[]).is_ok() {
-        let mut reader = FrameReader::new(&stream);
-        while let Ok(Some(_)) = reader.next_frame() {}
+    let _ = stream.set_read_timeout(Some(STOP_DEADLINE));
+    let _ = stream.set_write_timeout(Some(HELLO_DEADLINE));
+    wire::send_frame(&stream, &request, &[])
+        .map_err(|error| format!("cannot ask it to stop: {error}"))?;
+    let mut reader = FrameReader::new(&stream);
+    loop {
+        match reader.next_frame() {
+            Ok(Some(_)) => continue,
+            Ok(None) => break,
+            Err(error) => return Err(format!("did not stop: {error}")),
+        }
+    }
+    if dir.exists() {
+        Err("did not stop".into())
+    } else {
+        Ok(())
     }
 }
 
 enum ConnectError {
-    /// Nothing listens: the keeper is gone.
-    Gone,
-    /// It answers, but in no protocol this kernel speaks.
+    /// Nothing listens (no socket, or it refuses): the keeper may be gone.
+    /// Only proof makes it so ([`clear_if_gone`]).
+    MaybeGone,
+    /// It answers, but in no protocol this kernel speaks. This connection
+    /// owns the keeper, so it can still `stop` it.
     Protocol {
         keeper: (u32, u32),
         stream: UnixStream,
     },
+    /// Anything else, including a refusal or no answer in time: the keeper
+    /// may well be alive.
     Io(String),
 }
 
@@ -354,42 +581,55 @@ fn connect(dir: &Path, owner: bool) -> Result<Connected, ConnectError> {
                 std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
             ) =>
         {
-            return Err(ConnectError::Gone);
+            return Err(ConnectError::MaybeGone);
         }
-        Err(error) => return Err(ConnectError::Io(error.to_string())),
+        Err(error) => return Err(ConnectError::Io(format!("cannot connect: {error}"))),
     };
-    wire::quiet_pipe(&stream).map_err(|error| ConnectError::Io(error.to_string()))?;
+    let io = |what: &str, error: std::io::Error| ConnectError::Io(format!("{what}: {error}"));
+    wire::quiet_pipe(&stream).map_err(|error| io("cannot set up the socket", error))?;
+    stream
+        .set_read_timeout(Some(HELLO_DEADLINE))
+        .and_then(|()| stream.set_write_timeout(Some(HELLO_DEADLINE)))
+        .map_err(|error| io("cannot bound the greeting", error))?;
+    let (min, max) = crate::protocol();
     let hello = Request {
         id: 1,
         op: "hello".into(),
-        args: json!({"protocol": [PROTOCOL_MIN, PROTOCOL], "owner": owner}),
+        args: json!({"protocol": [min, max], "owner": owner}),
     };
-    if wire::send_frame(&stream, &hello, &[]).is_err() {
-        return Err(ConnectError::Gone);
-    }
+    wire::send_frame(&stream, &hello, &[]).map_err(|error| io("cannot greet the keeper", error))?;
     let mut reader = FrameReader::new(&stream);
     // An owner may be told of activity before its hello is answered.
     let reply = loop {
         let frame = match reader.next_frame() {
             Ok(Some(frame)) => frame,
-            Ok(None) => return Err(ConnectError::Gone),
-            Err(error) => return Err(ConnectError::Io(error.to_string())),
+            Ok(None) => {
+                return Err(ConnectError::Io(
+                    "the keeper closed the connection without answering".into(),
+                ));
+            }
+            Err(error) => return Err(io("the keeper did not answer hello", error)),
         };
-        let reply: Reply =
-            serde_json::from_slice(&frame).map_err(|error| ConnectError::Io(error.to_string()))?;
+        let reply: Reply = serde_json::from_slice(&frame)
+            .map_err(|error| ConnectError::Io(format!("unreadable hello: {error}")))?;
         if !matches!(reply, Reply::Event { .. }) {
             break reply;
         }
     };
     match reply {
         Reply::Ok { ok, .. } => {
-            let hello: Hello =
-                serde_json::from_value(ok).map_err(|error| ConnectError::Io(error.to_string()))?;
+            let hello: Hello = serde_json::from_value(ok)
+                .map_err(|error| ConnectError::Io(format!("unreadable hello: {error}")))?;
             let lock = if hello.lock {
                 reader.take_fds().into_iter().next()
             } else {
                 None
             };
+            // Calls carry their own deadlines from here.
+            stream
+                .set_read_timeout(None)
+                .and_then(|()| stream.set_write_timeout(Some(HELLO_DEADLINE)))
+                .map_err(|error| io("cannot set up the socket", error))?;
             Ok(Connected {
                 stream,
                 reader,
@@ -401,10 +641,6 @@ fn connect(dir: &Path, owner: bool) -> Result<Connected, ConnectError> {
             err: Fault::Protocol { keeper },
             ..
         } => Err(ConnectError::Protocol { keeper, stream }),
-        Reply::Err {
-            err: Fault::Stopped,
-            ..
-        } => Err(ConnectError::Gone),
         Reply::Err { err, .. } => Err(ConnectError::Io(format!("hello refused: {err:?}"))),
         Reply::Event { .. } => unreachable!("events are skipped above"),
     }
@@ -414,6 +650,8 @@ fn connect(dir: &Path, owner: bool) -> Result<Connected, ConnectError> {
 enum CallError {
     /// The keeper is gone (or going): the harness is dead to this kernel.
     Dead,
+    /// No answer within the call's deadline: the keeper is wedged.
+    Timeout(Duration),
     /// The keeper does not know the op; use the contract's default.
     Unknown,
     Fault(Fault),
@@ -422,10 +660,14 @@ enum CallError {
 #[derive(Default)]
 struct LinkState {
     answer: Option<(u64, Result<Value, Fault>)>,
+    /// The call waiting for an answer.
+    waiting: Option<u64>,
     closed: bool,
     /// The reader has finished what an unasked close requires.
     settled: bool,
     superseded: bool,
+    /// A call went unanswered past its deadline: no further call is sent.
+    wedged: bool,
     /// This kernel asked for the connection to end (stop or detach).
     ending: bool,
 }
@@ -448,9 +690,11 @@ struct Link {
     notify: Mutex<Option<Notify>>,
     child: Mutex<Option<Child>>,
     harness_pid: Mutex<Option<u32>>,
+    keeper: Option<ProcessIdentity>,
     seat: Option<String>,
     dir: PathBuf,
     cache: Mutex<Cache>,
+    deadline: Mutex<Duration>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -459,28 +703,44 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 impl Link {
     fn call(&self, op: &str, args: Value) -> Result<Value, CallError> {
+        let deadline = *lock(&self.deadline);
+        self.call_within(op, args, deadline)
+    }
+
+    fn call_within(&self, op: &str, args: Value, within: Duration) -> Result<Value, CallError> {
         let mut next = lock(&self.calls);
-        if lock(&self.state).closed {
-            self.wait_settled();
-            return Err(CallError::Dead);
+        {
+            let state = lock(&self.state);
+            if state.wedged {
+                return Err(CallError::Dead);
+            }
+            if state.closed {
+                drop(state);
+                self.wait_settled();
+                return Err(CallError::Dead);
+            }
         }
         *next += 1;
         let id = *next;
+        lock(&self.state).waiting = Some(id);
         let request = Request {
             id,
             op: op.to_string(),
             args,
         };
         if wire::send_frame(&self.stream, &request, &[]).is_err() {
+            lock(&self.state).waiting = None;
             self.wait_settled();
             return Err(CallError::Dead);
         }
+        let deadline = Instant::now() + within;
         let mut state = lock(&self.state);
         loop {
             if let Some((answered, _)) = &state.answer
                 && *answered == id
             {
                 let (_, answer) = state.answer.take().expect("answer present");
+                state.waiting = None;
                 return match answer {
                     Ok(value) => Ok(value),
                     Err(Fault::UnknownOp) => Err(CallError::Unknown),
@@ -489,14 +749,39 @@ impl Link {
                 };
             }
             if state.closed {
+                state.waiting = None;
                 drop(state);
                 self.wait_settled();
                 return Err(CallError::Dead);
             }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                state.waiting = None;
+                state.wedged = true;
+                return Err(CallError::Timeout(within));
+            }
             state = self
                 .changed
-                .wait(state)
-                .unwrap_or_else(|error| error.into_inner());
+                .wait_timeout(state, left)
+                .unwrap_or_else(|error| error.into_inner())
+                .0;
+        }
+    }
+
+    /// Wait, up to `within`, for the keeper to close its end.
+    fn await_close(&self, within: Duration) {
+        let deadline = Instant::now() + within;
+        let mut state = lock(&self.state);
+        while !state.closed {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return;
+            }
+            state = self
+                .changed
+                .wait_timeout(state, left)
+                .unwrap_or_else(|error| error.into_inner())
+                .0;
         }
     }
 
@@ -521,8 +806,26 @@ impl Link {
     /// activity callback, and the end of the connection.
     fn read(self: Arc<Self>, mut reader: FrameReader) {
         while let Ok(Some(frame)) = reader.next_frame() {
-            let Ok(reply) = serde_json::from_slice::<Reply>(&frame) else {
-                continue;
+            let reply = match serde_json::from_slice::<Reply>(&frame) {
+                Ok(reply) => reply,
+                Err(error) => {
+                    // An answer this kernel cannot read is still the answer:
+                    // its caller gets an error, never a wait without end.
+                    let id = serde_json::from_slice::<Value>(&frame)
+                        .ok()
+                        .and_then(|value| value.get("id").and_then(Value::as_u64))
+                        .or(lock(&self.state).waiting);
+                    if let Some(id) = id {
+                        lock(&self.state).answer = Some((
+                            id,
+                            Err(Fault::BadRequest {
+                                message: format!("unreadable answer from the keeper: {error}"),
+                            }),
+                        ));
+                        self.changed.notify_all();
+                    }
+                    continue;
+                }
             };
             match reply {
                 Reply::Ok { id, ok } => {
@@ -548,28 +851,90 @@ impl Link {
         };
         self.changed.notify_all();
         if !asked && !superseded {
-            // Nobody asked the keeper to close this connection and no newer
-            // kernel took it over: the keeper died. Its harness group has no
-            // owner now, so it is ended before anything starts a replacement.
-            self.bury();
+            if self.keeper_exits_within(HELLO_DEADLINE) {
+                // The keeper died. Its harness group has no owner now, so it
+                // is ended before anything starts a replacement.
+                self.bury();
+            } else {
+                // A live keeper closed the owner's connection without being
+                // asked: another kernel holds it. Stand down; never start a
+                // second harness beside it.
+                lock(&self.state).superseded = true;
+            }
         }
         lock(&self.state).settled = true;
         self.changed.notify_all();
         self.fire();
     }
 
-    /// End what a dead keeper left: its harness group, its directory, and
-    /// (when this kernel started it) its process entry.
+    /// Whether the keeper process ends within `within`: by its exit status
+    /// when this kernel started it, else by its recorded identity.
+    fn keeper_exits_within(&self, within: Duration) -> bool {
+        let deadline = Instant::now() + within;
+        loop {
+            let gone = match lock(&self.child).as_mut() {
+                Some(child) => !matches!(child.try_wait(), Ok(None)),
+                None => match &self.keeper {
+                    Some(keeper) => keeper.presence() != Presence::Running,
+                    // Nothing can prove it gone.
+                    None => false,
+                },
+            };
+            if gone {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(EXIT_PROBE);
+        }
+    }
+
+    /// End a keeper that does not end: by signal, as a child or by its
+    /// proven identity. `false` when it can be neither ended nor proven gone.
+    fn force_end_keeper(&self) -> bool {
+        if let Some(child) = lock(&self.child).as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return true;
+        }
+        match &self.keeper {
+            Some(keeper) if keeper.presence() == Presence::Running => {
+                // SAFETY: SIGKILL to the process its identity proves is the
+                // keeper this link spoke to.
+                unsafe { libc::kill(keeper.pid as i32, libc::SIGKILL) };
+                self.keeper_exits_within(STOP_DEADLINE)
+            }
+            Some(_) => true,
+            None => false,
+        }
+    }
+
+    /// End what a dead keeper left: its harness group (when its recorded
+    /// identity proves it the same group), its directory, and (when this
+    /// kernel started it) its process entry.
     fn bury(&self) {
-        let recorded = read_record(&self.dir).and_then(|record| record.harness_pid);
-        let pid = recorded.or(*lock(&self.harness_pid));
-        if let Some(pid) = pid {
-            anyagents_harness::terminate_group(pid, &seat_env(self.seat.as_deref()));
+        let seat = trusted_seat_env(self.seat.as_deref());
+        if let Some(record) = read_record(&self.dir)
+            && let Some(harness) = &record.harness_process
+            && let Some(environment) = &seat
+        {
+            harness.end_group(environment);
         }
         if let Some(mut child) = lock(&self.child).take() {
             let _ = child.wait();
         }
         let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Ask the keeper in `dir` to stop over a fresh owner connection, for when
+/// the usual one is wedged or gone.
+fn stop_afresh(dir: &Path) -> bool {
+    match connect(dir, true) {
+        Ok(connected) => stop_unspoken(connected.stream, dir).is_ok(),
+        Err(ConnectError::Protocol { stream, .. }) => stop_unspoken(stream, dir).is_ok(),
+        Err(_) => false,
     }
 }
 
@@ -602,12 +967,14 @@ impl RemoteHarness {
             notify: Mutex::new(None),
             child: Mutex::new(child),
             harness_pid: Mutex::new(hello.harness_pid),
+            keeper: hello.keeper.clone(),
             seat: hello.seat.clone(),
             dir,
             cache: Mutex::new(Cache {
                 health: Some(hello.health.clone()),
                 ..Cache::default()
             }),
+            deadline: Mutex::new(CALL_DEADLINE),
         });
         let reading = Arc::clone(&link);
         let reader = std::thread::Builder::new()
@@ -615,12 +982,11 @@ impl RemoteHarness {
             .spawn(move || reading.read(reader))
             .ok();
         if reader.is_none() {
-            // Without a reader no answer arrives: the link is unusable, and
-            // the keeper is left as it is for the next attach.
+            // Without a reader no answer can arrive: the link is wedged from
+            // the start, and stop goes through a fresh connection.
             let mut state = lock(&link.state);
-            state.closed = true;
+            state.wedged = true;
             state.settled = true;
-            state.ending = true;
         }
         Self {
             link,
@@ -652,14 +1018,24 @@ impl RemoteHarness {
         match self.link.call("note", json!({"note": note})) {
             Ok(_) => Ok(()),
             Err(CallError::Dead) => Err("keeper is gone".into()),
+            Err(CallError::Timeout(within)) => Err(format!(
+                "keeper did not answer within {} s",
+                within.as_secs()
+            )),
             Err(CallError::Unknown) => Err("keeper keeps no notes".into()),
             Err(CallError::Fault(fault)) => Err(format!("{fault:?}")),
         }
     }
 
-    /// The keeper ended without being asked (or is ending).
+    /// The keeper's connection to this kernel ended (or is ending).
     pub fn keeper_gone(&self) -> bool {
         lock(&self.link.state).closed
+    }
+
+    /// Another kernel owns the keeper now: this one must stand down for the
+    /// agent, and neither stop the keeper nor start another harness.
+    pub fn superseded(&self) -> bool {
+        lock(&self.link.state).superseded
     }
 
     /// Leave the keeper and its harness running for the next kernel. The
@@ -667,7 +1043,7 @@ impl RemoteHarness {
     pub fn detach(mut self) {
         self.done = true;
         lock(&self.link.state).ending = true;
-        let _ = self.link.call("detach", Value::Null);
+        let _ = self.link.call_within("detach", Value::Null, HELLO_DEADLINE);
         let _ = self.link.stream.shutdown(std::net::Shutdown::Both);
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
@@ -678,37 +1054,60 @@ impl RemoteHarness {
     }
 
     /// End the harness and its keeper, and wait until both are gone.
-    pub fn stop(mut self) {
-        self.stop_now();
+    pub fn stop(mut self) -> Result<(), String> {
+        self.stop_now()
     }
 
-    fn stop_now(&mut self) {
+    fn stop_now(&mut self) -> Result<(), String> {
         if self.done {
-            return;
+            return Ok(());
         }
         self.done = true;
-        let already_closed = {
+        let (closed, wedged) = {
             let mut state = lock(&self.link.state);
             state.ending = true;
-            state.closed
+            (state.closed, state.wedged)
         };
-        let answered = !already_closed && self.link.call("stop", Value::Null).is_ok();
+        let mut answered = false;
+        if !closed && !wedged {
+            answered = self
+                .link
+                .call_within("stop", Value::Null, STOP_DEADLINE)
+                .is_ok();
+        }
+        if !answered && !closed && !self.superseded() {
+            // The usual connection cannot carry `stop` (it is wedged in a call
+            // that never returns): a fresh owner connection can.
+            answered = stop_afresh(&self.link.dir);
+        }
+        if answered {
+            // The keeper exits right after its answer: its end of this
+            // connection closing is that exit.
+            self.link.await_close(STOP_DEADLINE);
+        }
         let _ = self.link.stream.shutdown(std::net::Shutdown::Both);
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
         }
-        if lock(&self.link.state).superseded {
-            // A newer kernel owns the keeper now: let go of it, end nothing.
+        if self.superseded() && !answered {
+            // Another kernel owns the keeper now: let go of it, end nothing.
             drop(lock(&self.link.child).take());
-            return;
+            return Ok(());
         }
-        if !answered && !already_closed {
-            // It died while being stopped: nothing ended its harness.
+        if !answered {
+            // It did not answer `stop`: it died, or it does not end. Either
+            // way nothing ended its harness.
+            if !self.link.keeper_exits_within(STOP_DEADLINE) && !self.link.force_end_keeper() {
+                return Err("the keeper did not stop, and cannot be proven gone".into());
+            }
             self.link.bury();
         }
+        // A keeper answers `stop` only once its harness group is gone, and
+        // exits right after: its end of the socket closing is that exit.
         if let Some(mut child) = lock(&self.link.child).take() {
             let _ = child.wait();
         }
+        Ok(())
     }
 
     fn call(&self, op: &str, args: Value) -> Result<Value, CallError> {
@@ -716,12 +1115,12 @@ impl RemoteHarness {
     }
 
     /// An answer of a plain type: the contract default when the keeper does
-    /// not know the op, `dead` when the keeper is gone.
+    /// not know the op, `dead` when the keeper is gone or wedged.
     fn plain<T: DeserializeOwned>(&self, op: &str, args: Value, default: T, dead: T) -> T {
         match self.call(op, args) {
             Ok(value) => serde_json::from_value(value).unwrap_or(default),
             Err(CallError::Unknown) => default,
-            Err(CallError::Dead | CallError::Fault(_)) => dead,
+            Err(CallError::Dead | CallError::Timeout(_) | CallError::Fault(_)) => dead,
         }
     }
 
@@ -737,6 +1136,10 @@ impl RemoteHarness {
                 .map_err(|error| HarnessError::Failed(format!("keeper answer: {error}"))),
             Err(CallError::Unknown) => Ok(default),
             Err(CallError::Dead) => Err(HarnessError::Dead),
+            Err(CallError::Timeout(within)) => Err(HarnessError::Failed(format!(
+                "the keeper did not answer {op} within {} s",
+                within.as_secs()
+            ))),
             Err(CallError::Fault(Fault::Harness { error })) => Err(error),
             Err(CallError::Fault(fault)) => {
                 Err(HarnessError::Failed(format!("keeper refused: {fault:?}")))
@@ -751,7 +1154,9 @@ impl RemoteHarness {
 
 impl Drop for RemoteHarness {
     fn drop(&mut self) {
-        self.stop_now();
+        if let Err(error) = self.stop_now() {
+            eprintln!("anyagents-keeper: {}: {error}", self.link.dir.display());
+        }
     }
 }
 
@@ -776,22 +1181,21 @@ impl Harness for RemoteHarness {
         self.fallible("cancel", Value::Null, ())
     }
 
+    /// A keeper that is gone or wedged reports its harness dead, so the
+    /// supervisor replaces it (or, superseded, stands down).
     fn health(&self) -> HarnessHealth {
-        match self.call("health", Value::Null) {
-            Ok(value) => {
-                if let Ok(health) = serde_json::from_value::<HarnessHealth>(value) {
-                    lock(&self.link.cache).health = Some(health.clone());
-                    return health;
-                }
-            }
-            Err(CallError::Unknown | CallError::Fault(_)) => {}
-            Err(CallError::Dead) => {}
+        if let Ok(value) = self.call("health", Value::Null)
+            && let Ok(health) = serde_json::from_value::<HarnessHealth>(value)
+        {
+            lock(&self.link.cache).health = Some(health.clone());
+            return health;
         }
         let mut health = lock(&self.link.cache)
             .health
             .clone()
             .unwrap_or_else(|| self.hello.health.clone());
-        if self.keeper_gone() {
+        let state = lock(&self.link.state);
+        if state.closed || state.wedged {
             health.process_alive = false;
             health.turn_state = TurnState::Idle;
         }
@@ -809,12 +1213,15 @@ impl Harness for RemoteHarness {
 
     fn quiet_for(&self, id: &str, quiet: Duration, patience: Duration) -> bool {
         let millis = |duration: Duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
-        self.plain(
+        let within = patience.saturating_add(*lock(&self.link.deadline));
+        match self.link.call_within(
             "quiet_for",
             json!({"id": id, "quiet_ms": millis(quiet), "patience_ms": millis(patience)}),
-            false,
-            false,
-        )
+            within,
+        ) {
+            Ok(value) => serde_json::from_value(value).unwrap_or(false),
+            Err(_) => false,
+        }
     }
 
     fn served_usage(&self) -> TurnUsage {
@@ -840,7 +1247,7 @@ impl Harness for RemoteHarness {
                 usage
             }
             Err(CallError::Unknown) => self.served_usage(),
-            Err(CallError::Dead | CallError::Fault(_)) => known,
+            Err(CallError::Dead | CallError::Timeout(_) | CallError::Fault(_)) => known,
         }
     }
 
@@ -934,17 +1341,23 @@ pub mod testing {
     /// after starting it would.
     pub fn start_unattached(program: &Program, root: &Path, spec: &Spec) -> (PathBuf, Child) {
         private_dir(root).unwrap();
-        let dir = new_instance(root, &spec.agent).unwrap();
+        let dir = new_instance(root, spec).unwrap();
         let child = start_keeper(program, &dir, spec, None).unwrap();
         (dir, child)
     }
 
-    /// Connect to the keeper in `dir` as its owner and return the raw socket.
-    pub fn raw_owner(dir: &Path) -> UnixStream {
-        match connect(dir, true) {
+    /// Connect to the keeper in `dir` and return the raw socket, as its
+    /// owner or as an observer.
+    pub fn raw_connection(dir: &Path, owner: bool) -> UnixStream {
+        match connect(dir, owner) {
             Ok(connected) => connected.stream,
             Err(_) => panic!("keeper in {} does not answer", dir.display()),
         }
+    }
+
+    /// Connect to the keeper in `dir` as its owner and return the raw socket.
+    pub fn raw_owner(dir: &Path) -> UnixStream {
+        raw_connection(dir, true)
     }
 
     impl RemoteHarness {
@@ -965,12 +1378,18 @@ pub mod testing {
             self.hello.keeper_pid
         }
 
+        /// Shorten every call's deadline, to see a wedged keeper in a test.
+        pub fn set_call_deadline(&self, within: Duration) {
+            *lock(&self.link.deadline) = within;
+        }
+
         /// Send an op this kernel may not know, for protocol tests.
         pub fn raw_call(&self, op: &str) -> Result<Value, String> {
             match self.call(op, Value::Null) {
                 Ok(value) => Ok(value),
                 Err(CallError::Unknown) => Err("unknown_op".into()),
                 Err(CallError::Dead) => Err("dead".into()),
+                Err(CallError::Timeout(_)) => Err("timeout".into()),
                 Err(CallError::Fault(fault)) => Err(format!("{fault:?}")),
             }
         }
