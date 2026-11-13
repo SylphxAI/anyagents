@@ -498,8 +498,7 @@ pub fn run(data: &Path, config: Option<&Path>, profile: Option<McpProfile>) -> R
     let socket = server::socket_path(data);
     let capability = capability_of(config)?;
     let config_buf = config.to_path_buf();
-    let runtime = tokio::runtime::Runtime::new()?;
-    runtime.block_on(async {
+    tool_server_runtime()?.block_on(async {
         let client = Client {
             socket,
             config: config_buf.clone(),
@@ -534,6 +533,18 @@ pub fn run(data: &Path, config: Option<&Path>, profile: Option<McpProfile>) -> R
             .map_err(|err| Error::Message(err.to_string()))?;
         Ok(())
     })
+}
+
+/// The runtime one agent's tool server runs on. Every agent has its own tool
+/// server, so its fixed cost is paid once per agent: one thread drives every
+/// call, and blocking work (file tools, local web fetches, stdio reads) goes
+/// to tokio's on-demand blocking pool, whose idle threads exit by themselves.
+/// A worker per CPU in each of a hundred tool servers is thousands of idle
+/// threads on a shared machine.
+fn tool_server_runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
 }
 
 /// The capability an agent's harness reads: a file only that agent's own
@@ -9824,5 +9835,64 @@ mod spawn_args_tests {
         assert_eq!(code_res["result"]["execExit"], 0);
 
         server_handle.abort();
+    }
+}
+
+#[cfg(test)]
+mod tool_server_runtime_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// A server that answers every call with an empty JSON object.
+    async fn answering_server(socket: &Path) -> tokio::task::JoinHandle<()> {
+        let listener = tokio::net::UnixListener::bind(socket).unwrap();
+        let app = axum::Router::new().fallback(|| async { axum::Json(serde_json::json!({})) });
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        })
+    }
+
+    #[test]
+    fn one_thread_answers_a_call_while_another_waits_on_blocking_work() {
+        let runtime = tool_server_runtime().unwrap();
+        assert_eq!(
+            runtime.handle().runtime_flavor(),
+            tokio::runtime::RuntimeFlavor::CurrentThread
+        );
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let socket = dir.path().join("anyagents.sock");
+            let server = answering_server(&socket).await;
+            let mcp = AgentMcp {
+                agent: AgentRef {
+                    id: AgentId::generate(),
+                    name: "worker".into(),
+                    workdir: Some(dir.path().to_path_buf()),
+                },
+                client: Client {
+                    socket,
+                    config: dir.path().join("config"),
+                    capability: "test-cap".into(),
+                },
+                profile: McpProfile::Full,
+            };
+            // A command that blocks for two seconds runs on the blocking
+            // pool, so the one runtime thread keeps answering other calls.
+            let slow = mcp.dispatch_any_tool(
+                "files",
+                serde_json::json!({"action": "exec", "cmd": "sleep 2"}),
+            );
+            let quick = async {
+                let started = Instant::now();
+                mcp.dispatch_any_tool("schedule", serde_json::json!({"action": "list"}))
+                    .await
+                    .unwrap();
+                started.elapsed()
+            };
+            let (slow, quick) = tokio::join!(slow, quick);
+            slow.unwrap();
+            assert!(quick < Duration::from_secs(1), "quick call took {quick:?}");
+            server.abort();
+        });
     }
 }
