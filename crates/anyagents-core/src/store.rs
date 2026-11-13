@@ -28,6 +28,7 @@ mod credentials;
 mod group_policy;
 mod harness_leases;
 mod lifecycle;
+mod mcp_ops;
 mod runtime;
 #[cfg(test)]
 #[path = "store/runtime_tests.rs"]
