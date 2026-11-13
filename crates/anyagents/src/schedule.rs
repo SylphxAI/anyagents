@@ -21,7 +21,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
-use anyagents_core::{Agent, AgentId, AgentSchedule, Incoming, NewSchedule, Store};
+use anyagents_core::{
+    Agent, AgentId, AgentSchedule, Incoming, NewOutcome, NewSchedule, OutcomeKind, Store,
+};
 use anyagents_supervisor::HealthBoard;
 
 use crate::api::ScheduleView;
@@ -1162,7 +1164,7 @@ fn guard_family(memo: &mut GuardMemo<'_>, family: &Family) -> GuardOutcome {
                 .collect::<Vec<_>>()
                 .join(", ");
             let body = format!(
-                "[Sub-Agent Turn Ownership Guard] The following `lifecycle: task` sub-agent(s) reported to you and are idle with no active schedules (`waiting_parent`): {formatted}. The ball is in your court: for each sub-agent, either send a follow-up instruction via `send` if work remains, or close it via `agents(action: \"archive\", name: \"<name>\")` if its deliverable is accepted."
+                "[Sub-Agent Turn Ownership Guard] The following `lifecycle: task` sub-agent(s) reported to you and are idle with no active schedules (`waiting_parent`): {formatted}. The ball is in your court: for each sub-agent, judge its work with `agents(action: \"verdict\", name: \"<name>\", verdict: \"accepted\" | \"rework\" | \"rejected\" | \"abandoned\", reason: \"...\")`, then either send a follow-up instruction via `send` if work remains, or close it via `agents(action: \"archive\", name: \"<name>\")`."
             );
             if send_guard_message(store, &parent.id, body, reminder_key, now) {
                 out.actions += 1;
@@ -1684,11 +1686,20 @@ fn evaluate_watch_entry(
         entry.check_at = entry.check_at.min(recheck_at);
         return EntryOutcome::default();
     };
+    // A pull request outcome is a fact about GitHub, not about the wake: it is
+    // stored when first seen, even while an earlier wake waits, and always
+    // before the wake that reports it is claimed.
+    let watch = entry.watch.as_ref();
+    let fact = || pull_request_outcome(store, &agent, sched, watch, &eval, now);
     if previous_pending {
         // Record the latest observation without consuming the transition or
         // moving the baseline; it is written once the pending wake is taken.
         entry.check_at = entry.check_at.min(recheck_at);
         if eval.observed.is_some() && eval.observed != sched.last_observed {
+            if !record_outcome(store, sched, fact()) {
+                entry.check_at = entry.check_at.min(now.saturating_add(RETRY_MS));
+                return EntryOutcome::default();
+            }
             if let Err(err) = store.update_schedule_watch_observation(
                 &sched.id,
                 sched.watch_baseline.as_deref(),
@@ -1698,6 +1709,10 @@ fn evaluate_watch_entry(
             }
             return EntryOutcome::WROTE;
         }
+        return EntryOutcome::default();
+    }
+    if !record_outcome(store, sched, fact()) {
+        entry.check_at = entry.check_at.min(now.saturating_add(RETRY_MS));
         return EntryOutcome::default();
     }
     let (wake_prompt, source_key) = if let Some(ref tr) = eval.transition {
@@ -1725,6 +1740,61 @@ fn evaluate_watch_entry(
         entry.check_at = entry.check_at.min(now.saturating_add(RETRY_MS));
     }
     EntryOutcome { fired, wrote: true }
+}
+
+/// The outcome a pull request watch transition records for its owner
+/// (ADR 0008): a merge, a close, or a review failure on one head.
+fn pull_request_outcome(
+    store: &Store,
+    agent: &Agent,
+    sched: &AgentSchedule,
+    target: Option<&WatchTarget>,
+    eval: &WatchEval,
+    now: i64,
+) -> Option<NewOutcome> {
+    let Some(WatchTarget::GitHubPr {
+        owner,
+        repo,
+        number,
+    }) = target
+    else {
+        return None;
+    };
+    let kind = match eval.transition.as_deref()? {
+        "merged" => OutcomeKind::PrMerged,
+        "closed" => OutcomeKind::PrClosed,
+        "review_failed" => OutcomeKind::ReviewFailed,
+        _ => return None,
+    };
+    let (_, head) = parse_pr_baseline(eval.baseline.as_deref());
+    let config = anyagents_core::agent_config_dir(store.data_dir(), &agent.id);
+    Some(NewOutcome::pull_request(
+        agent.id.clone(),
+        owner,
+        repo,
+        *number,
+        kind,
+        head,
+        sched.created_at_ms,
+        now,
+        crate::create::bound_profile_name(&config),
+    ))
+}
+
+/// Store `fact`, if there is one. False when it could not be stored: the
+/// caller then leaves the transition unconsumed, so a later pass stores it
+/// before anything else happens.
+fn record_outcome(store: &Store, sched: &AgentSchedule, fact: Option<NewOutcome>) -> bool {
+    let Some(fact) = fact else {
+        return true;
+    };
+    match store.record_outcome(fact) {
+        Ok(_) => true,
+        Err(err) => {
+            eprintln!("Schedule {} outcome not recorded: {err}", sched.id);
+            false
+        }
+    }
 }
 
 fn deliver_scheduled_wake(
@@ -3186,6 +3256,22 @@ mod tests {
             store.list_schedules(Some(&owner.id), false).unwrap()[0].id,
             sched.id
         );
+        // The review failure and the merge are outcomes of the owner's work.
+        let outcomes = store
+            .outcome_report(
+                std::slice::from_ref(&owner.id),
+                None,
+                now + 700_000,
+                anyagents_core::OutcomeGroupBy::Agent,
+            )
+            .unwrap();
+        let group = &outcomes.groups[0];
+        assert_eq!(group.events.get("review_failed"), Some(&1));
+        assert_eq!(group.events.get("pr_merged"), Some(&1));
+        assert_eq!(
+            (group.succeeded, group.reworked, group.recovered),
+            (1, 1, 1)
+        );
         *stage.lock().unwrap() = 99;
         let _ = std::net::TcpStream::connect(addr);
         server.join().unwrap();
@@ -3193,6 +3279,115 @@ mod tests {
         unsafe {
             std::env::remove_var("ANYAGENTS_GITHUB_API_BASE");
         }
+    }
+
+    #[test]
+    fn pull_request_merge_is_recorded_while_an_earlier_wake_waits() {
+        let _env = crate::server::tests::env_lock();
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let mut buf = [0u8; 2048];
+                let len = stream.read(&mut buf).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..len]);
+                if request.contains("/stop") {
+                    break;
+                }
+                assert!(request.contains("/pulls/"), "{request}");
+                let body = r#"{"state":"closed","merged":true,"head":{"sha":"abc"}}"#;
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            }
+        });
+        struct EnvGuard;
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                github::reset_probes_for_test();
+                unsafe {
+                    std::env::remove_var("ANYAGENTS_GITHUB_API_BASE");
+                }
+            }
+        }
+        github::reset_probes_for_test();
+        unsafe {
+            std::env::set_var("ANYAGENTS_GITHUB_API_BASE", format!("http://{addr}"));
+        }
+        let _guard = EnvGuard;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let health = HealthBoard::default();
+        let owner = store
+            .create_agent(NewAgent::new("owner-pending-merge", "codex"))
+            .unwrap();
+        store.set_agent_running(&owner.id, "/work").unwrap();
+        let sched = create_agent_schedule(
+            &store,
+            &health,
+            &owner,
+            None,
+            None,
+            Some("github:pr:ExampleOrg/project#454"),
+            "verify PR 454",
+        )
+        .unwrap();
+        // An earlier wake from this watch is still in the mailbox.
+        let mut earlier = Incoming::new("[watch: earlier]");
+        earlier.sender = Some(schedule_sender(&sched.id));
+        store.receive(&owner.id, earlier).unwrap();
+
+        let now = anyagents_core::now_ms();
+        let watched = store.list_schedules(None, true).unwrap();
+        let targets: Vec<_> = watched
+            .iter()
+            .map(|s| (s.id.as_str(), parse_watch_spec(&s.spec).unwrap()))
+            .collect();
+        github::begin_cycle(targets.iter().map(|(id, t)| (*id, t)), now);
+        let tick =
+            |at| github::with_completion_clock(at, || tick_schedules_once(&store, &health, at));
+        let merged = |until| {
+            store
+                .outcome_report(
+                    std::slice::from_ref(&owner.id),
+                    None,
+                    until,
+                    anyagents_core::OutcomeGroupBy::Agent,
+                )
+                .unwrap()
+                .groups
+                .first()
+                .and_then(|group| group.events.get("pr_merged").copied())
+        };
+
+        assert_eq!(tick(now), 0);
+        assert_eq!(merged(now), Some(1));
+        assert_eq!(store.inbox(&owner.id, None).unwrap().len(), 1);
+        let active = store.list_schedules(Some(&owner.id), true).unwrap();
+        assert_eq!(active[0].last_observed.as_deref(), Some("merged"));
+
+        // Once the earlier wake is taken, the merge wakes the owner; the fact
+        // stays one row.
+        let pending = store.inbox(&owner.id, None).unwrap();
+        store.note_delivered(&owner.id, pending[0].seq).unwrap();
+        store.note_turn_completed(&owner.id).unwrap();
+        assert_eq!(tick(now + 60_000), 1);
+        assert!(
+            store
+                .inbox(&owner.id, None)
+                .unwrap()
+                .last()
+                .unwrap()
+                .text
+                .contains("transition=merged]")
+        );
+        assert_eq!(merged(now + 60_000), Some(1));
+
+        let _ = std::net::TcpStream::connect(addr)
+            .and_then(|mut stream| stream.write_all(b"GET /stop HTTP/1.1\r\n\r\n"));
+        server.join().unwrap();
     }
 
     #[test]

@@ -401,6 +401,37 @@ enum Command {
         #[arg(long)]
         days: Option<i64>,
     },
+    /// Outcomes, recovery and cost per successful outcome (ADR 0008).
+    /// Queried through the daemon socket when it is running; the operator
+    /// falls back to a read of the store otherwise.
+    Outcomes {
+        #[arg(long)]
+        agent: Option<String>,
+        /// `model` (harness and model, the default), `harness`, `role`,
+        /// `profile`, `agent` or `skill`.
+        #[arg(long = "group-by")]
+        group_by: Option<String>,
+        /// Include causal descendants of `--agent`.
+        #[arg(long)]
+        include_descendants: bool,
+        /// Outcomes observed from, inclusive (unix ms).
+        #[arg(long = "since-ms")]
+        since_ms: Option<i64>,
+        /// Outcomes observed until, inclusive (unix ms).
+        #[arg(long = "until-ms")]
+        until_ms: Option<i64>,
+        /// Trailing window in days.
+        #[arg(long)]
+        days: Option<i64>,
+    },
+    /// Record a verdict on an agent's work: `accepted`, `rework`, `rejected`
+    /// or `abandoned`. Only its ancestor, a root admin or the operator may.
+    Verdict {
+        agent: String,
+        verdict: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
     /// Speak MCP for one agent. Its capability comes from its config
     /// directory, never from a name.
     Mcp {
@@ -1386,6 +1417,33 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
             agent::UsageError::Store(err) => err,
             agent::UsageError::Refused(text) => anyagents_core::Error::Message(text),
         }),
+        Command::Outcomes {
+            agent,
+            group_by,
+            include_descendants,
+            since_ms,
+            until_ms,
+            days,
+        } => agent::outcomes(
+            &data,
+            &agent::UsageParams {
+                agent,
+                group_by,
+                since_ms,
+                until_ms,
+                days,
+                include_descendants: include_descendants.then_some(true),
+            },
+        )
+        .map_err(|err| match err {
+            agent::UsageError::Store(err) => err,
+            agent::UsageError::Refused(text) => anyagents_core::Error::Message(text),
+        }),
+        Command::Verdict {
+            agent,
+            verdict,
+            reason,
+        } => agent::verdict_cmd(&data, &agent, &verdict, reason.as_deref()),
         Command::Channels { action } => channel::channels(&data, action),
         Command::Groups { action } => groups(&data, action),
         Command::Describe {

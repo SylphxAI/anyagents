@@ -1548,36 +1548,7 @@ pub fn usage(data: &Path, params: &UsageParams) -> Result<(), UsageError> {
 
     // 1) Socket-first: the daemon resolves the caller from its credential
     // and enforces the causal authorization boundary server-side.
-    let mut qs: Vec<(String, String)> = Vec::new();
-    if let Some(agent) = params.agent.as_deref().filter(|a| !a.trim().is_empty()) {
-        qs.push(("agent".into(), agent.to_string()));
-    }
-    if let Some(v) = params.include_descendants {
-        qs.push(("include_descendants".into(), v.to_string()));
-    }
-    if let Some(v) = params.since_ms {
-        qs.push(("since_ms".into(), v.to_string()));
-    }
-    if let Some(v) = params.until_ms {
-        qs.push(("until_ms".into(), v.to_string()));
-    }
-    if let Some(v) = params.days {
-        qs.push(("days".into(), v.to_string()));
-    }
-    if let Some(g) = group_by {
-        qs.push(("group_by".into(), g.to_string()));
-    }
-    let path = if qs.is_empty() {
-        "/v1/usage".to_string()
-    } else {
-        let q = qs
-            .iter()
-            .map(|(k, v)| format!("{k}={}", crate::mcp::urlencoding_simple_pub(v)))
-            .collect::<Vec<_>>()
-            .join("&");
-        format!("/v1/usage?{q}")
-    };
-    match crate::client::get::<UsageReport>(data, &path) {
+    match crate::client::get::<UsageReport>(data, &usage_path("/v1/usage", params)) {
         Ok(Some(report)) => {
             print_report(&report);
             return Ok(());
@@ -1659,6 +1630,230 @@ pub fn usage(data: &Path, params: &UsageParams) -> Result<(), UsageError> {
         );
     }
     Ok(())
+}
+
+/// `route` with the target, window and grouping of `params` as its query.
+fn usage_path(route: &str, params: &UsageParams) -> String {
+    let group_by = params
+        .group_by
+        .as_deref()
+        .map(str::trim)
+        .filter(|g| !g.is_empty());
+    let mut qs: Vec<(&str, String)> = Vec::new();
+    if let Some(agent) = params.agent.as_deref().filter(|a| !a.trim().is_empty()) {
+        qs.push(("agent", agent.to_string()));
+    }
+    if let Some(v) = params.include_descendants {
+        qs.push(("include_descendants", v.to_string()));
+    }
+    if let Some(v) = params.since_ms {
+        qs.push(("since_ms", v.to_string()));
+    }
+    if let Some(v) = params.until_ms {
+        qs.push(("until_ms", v.to_string()));
+    }
+    if let Some(v) = params.days {
+        qs.push(("days", v.to_string()));
+    }
+    if let Some(g) = group_by {
+        qs.push(("group_by", g.to_string()));
+    }
+    if qs.is_empty() {
+        return route.to_string();
+    }
+    let q = qs
+        .iter()
+        .map(|(k, v)| format!("{k}={}", crate::mcp::urlencoding_simple_pub(v)))
+        .collect::<Vec<_>>()
+        .join("&");
+    format!("{route}?{q}")
+}
+
+/// Outcomes, recovery and cost per successful outcome (ADR 0008). Prefers
+/// the daemon socket (`GET /v1/outcomes`), which applies the caller's
+/// boundary; only the operator falls back to a read of the store when the
+/// daemon is unavailable.
+pub fn outcomes(data: &Path, params: &UsageParams) -> Result<(), UsageError> {
+    use anyagents_core::{OutcomeGroupBy, OutcomeReport, UsageFilter, UsageGroupBy};
+    let report =
+        match crate::client::get::<OutcomeReport>(data, &usage_path("/v1/outcomes", params)) {
+            Ok(Some(report)) => report,
+            // An agent reads only through the server, which applies its boundary.
+            Ok(None) if client::agent_identity().is_some() => {
+                return Err(UsageError::Refused(
+                    "the outcome report needs the running server".to_string(),
+                ));
+            }
+            Ok(None) => {
+                let store = open(data)?;
+                let agents = store.list_agents()?;
+                let ids = anyagents_core::resolve_usage_agents(
+                    None,
+                    &agents,
+                    params.agent.as_deref(),
+                    params.include_descendants,
+                )
+                .map_err(|err| UsageError::Refused(err.to_string()))?;
+                let group_by = OutcomeGroupBy::parse(params.group_by.as_deref().unwrap_or(""))
+                    .map_err(UsageError::Refused)?;
+                let now = anyagents_core::now_ms();
+                let (since, until) = UsageFilter {
+                    since_ms: params.since_ms,
+                    until_ms: params.until_ms,
+                    days: params.days,
+                    group_by: UsageGroupBy::Agent,
+                }
+                .window(now)
+                .map_err(UsageError::Refused)?;
+                store.outcome_report(&ids, since, until.unwrap_or(now), group_by)?
+            }
+            Err(err) => return Err(UsageError::Refused(err)),
+        };
+    print_outcomes(&report);
+    Ok(())
+}
+
+/// The grouping a report row stands for, as one label.
+fn outcome_label(group: &anyagents_core::OutcomeGroup) -> String {
+    let parts: Vec<&str> = [
+        group.harness.as_deref(),
+        group.model.as_deref(),
+        group.role.as_deref(),
+        group.profile.as_deref(),
+        group.agent_name.as_deref(),
+        group.skill.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if parts.is_empty() {
+        "-".to_string()
+    } else {
+        parts.join("/")
+    }
+}
+
+fn print_outcomes(report: &anyagents_core::OutcomeReport) {
+    let money = |micros: Option<i64>| match micros {
+        Some(micros) => format!("${:.4}", micros as f64 / 1_000_000.0),
+        None => "-".to_string(),
+    };
+    let cost = |cost: &anyagents_core::OutcomeCost| {
+        if cost.turns_with_cost == 0 {
+            "-".to_string()
+        } else if cost.turns_with_cost == cost.turns {
+            money(Some(cost.reported_cost_micros))
+        } else {
+            format!(
+                "{} ({}/{} turns)",
+                money(Some(cost.reported_cost_micros)),
+                cost.turns_with_cost,
+                cost.turns
+            )
+        }
+    };
+    let minutes = |ms: Option<i64>| ms.map_or("-".to_string(), |ms| format!("{}m", ms / 60_000));
+    if crate::ui::is_pretty() {
+        if report.groups.is_empty() {
+            println!("  {}", crate::ui::dim("No outcomes recorded."));
+        } else {
+            println!("\n  {}\n", crate::ui::bold_cyan("Outcomes"));
+            let mut table = crate::ui::Table::new(&[
+                ("GROUP", false),
+                ("AGENTS", true),
+                ("SUCCEEDED", true),
+                ("FAILED", true),
+                ("ABANDONED", true),
+                ("RECOVERED", true),
+                ("COST", true),
+                ("COST/SUCCESS", true),
+                ("TO SUCCESS", true),
+            ]);
+            for group in &report.groups {
+                table.add_row(vec![
+                    crate::ui::bold(&outcome_label(group)),
+                    group.agents.to_string(),
+                    crate::ui::green(&group.succeeded.to_string()),
+                    group.failed.to_string(),
+                    group.abandoned.to_string(),
+                    format!("{}/{}", group.recovered, group.reworked),
+                    cost(&group.cost),
+                    money(group.cost_per_success_micros),
+                    minutes(group.median_ms_to_success),
+                ]);
+            }
+            table.print();
+        }
+        println!(
+            "  {} {}\n",
+            crate::ui::dim("Unattributed usage:"),
+            cost(&report.unattributed)
+        );
+        return;
+    }
+    for group in &report.groups {
+        println!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            outcome_label(group),
+            group.agents,
+            group.succeeded,
+            group.failed,
+            group.abandoned,
+            group.reworked,
+            group.recovered,
+            group.cost.turns,
+            group.cost.turns_with_cost,
+            group.cost.reported_cost_micros,
+            group
+                .cost_per_success_micros
+                .map_or("-".to_string(), |micros| micros.to_string()),
+            group
+                .median_ms_to_success
+                .map_or("-".to_string(), |ms| ms.to_string()),
+        );
+    }
+    println!(
+        "unattributed\t\t\t\t\t\t\t{}\t{}\t{}\t\t",
+        report.unattributed.turns,
+        report.unattributed.turns_with_cost,
+        report.unattributed.reported_cost_micros
+    );
+}
+
+/// Record a verdict on `agent`'s work through the server, which checks that
+/// the caller is its ancestor, a root admin or the operator.
+pub fn verdict_cmd(
+    data: &Path,
+    agent: &str,
+    verdict: &str,
+    reason: Option<&str>,
+) -> Result<(), Error> {
+    let clean_agent = agent.trim().strip_prefix("agent:").unwrap_or(agent.trim());
+    if !client::can_call_server(data) {
+        return Err(Error::Message(
+            "recording a verdict needs the running server".into(),
+        ));
+    }
+    let body = serde_json::json!({ "verdict": verdict, "reason": reason });
+    match client::call::<anyagents_core::Outcome>(
+        data,
+        "POST",
+        &format!("/v1/agents/{clean_agent}/verdict"),
+        Some(body.to_string().into_bytes()),
+        &client::authority(data),
+    ) {
+        Ok(Some(outcome)) => {
+            println!(
+                "{}\t{clean_agent}\t{}\t{}",
+                outcome.id,
+                outcome.kind.as_str(),
+                outcome.actor
+            );
+            Ok(())
+        }
+        Ok(None) => Err(Error::Message("the server answered nothing".into())),
+        Err(err) => Err(Error::Message(err)),
+    }
 }
 
 /// Render a socket `UsageReport` in the historical table/TSV shape.

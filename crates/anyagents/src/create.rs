@@ -1098,7 +1098,7 @@ pub(crate) fn write_agent_instructions_with_continuity(
         doc.push_str("- **Parent**: none (root)\n");
     }
 
-    doc.push_str("- **Lifecycle**: Role templates may declare `lifecycle: standing | task`. Sub-agents never archive themselves; the spawning parent closes/archives a task sub-agent (`action: \"archive\"`) once its deliverable is accepted. Idle processes release after mailbox/child/background work drains; identity and session persist.\n");
+    doc.push_str("- **Lifecycle**: Role templates may declare `lifecycle: standing | task`. Sub-agents never archive themselves; the spawning parent records its verdict on the deliverable (`action: \"verdict\"`) and closes/archives a task sub-agent (`action: \"archive\"`) once it is accepted. Idle processes release after mailbox/child/background work drains; identity and session persist.\n");
 
     if let Some(custom) = agent
         .instructions
