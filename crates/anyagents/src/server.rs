@@ -4367,6 +4367,12 @@ fn prepare_agent_wake(store: &Store, found: &Agent) -> Result<(), ApiError> {
     crate::worktree_access::restore_recorded(store.data_dir(), &found.id)
         .map_err(ApiError::from_store)?;
     clear_explicitly_archived(store.data_dir(), &found.id);
+    // The gateway starts with routes for the live fleet only.
+    if found.state == "archived"
+        && let Err(err) = crate::gateway::add_route(store.data_dir(), found)
+    {
+        eprintln!("agent {}: gateway route not restored: {err}", found.id);
+    }
     Ok(())
 }
 
