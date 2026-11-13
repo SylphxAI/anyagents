@@ -1086,46 +1086,37 @@ fn vendor_launch_inner(
         ));
         let program = crate::install::program(&root, &request.agent.harness);
         let session = session_from_file(&request.config_dir, "omp-session-id")?;
-        let harness = if std::env::var_os("ANYAGENTS_FAKE_MODE").is_some() {
-            OmpHarness::start(
-                program.display().to_string(),
-                session.as_deref(),
-                &pairs(&env),
-            )
-            .map_err(|err| err.to_string())?
-        } else {
-            let mut spec = anyagents_harness_stream::StreamSpec::for_program("omp");
-            if let Some(model) = request
-                .agent
-                .model
-                .as_deref()
-                .map(str::trim)
-                .filter(|m| !m.is_empty())
-            {
-                spec.args.push("--model".to_string());
-                spec.args.push(model.to_string());
-            }
-            if std::env::var_os("ANYAGENTS_ALLOW_NATIVE_SUBAGENTS").is_none() {
-                let policy_path = crate::grok::ensure_omp_policy(&omp_agent_dir)
-                    .map_err(|err| err.to_string())?;
-                spec.args.push("--config".to_string());
-                spec.args.push(policy_path.display().to_string());
-                spec.args.push("--no-extensions".to_string());
-            }
-            let sys_prompt = request.config_dir.join("SYSTEM_PROMPT.md");
-            if sys_prompt.is_file() {
-                spec.args.push("--append-system-prompt".to_string());
-                spec.args.push(sys_prompt.display().to_string());
-            }
-            OmpHarness::start_with_spec(
-                spec,
-                program.display().to_string(),
-                session.as_deref(),
-                &pairs(&env),
-                Some(&request.work_dir),
-            )
-            .map_err(|err| err.to_string())?
-        };
+        let mut spec = anyagents_harness_stream::StreamSpec::for_program("omp");
+        if let Some(model) = request
+            .agent
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+        {
+            spec.args.push("--model".to_string());
+            spec.args.push(model.to_string());
+        }
+        if std::env::var_os("ANYAGENTS_ALLOW_NATIVE_SUBAGENTS").is_none() {
+            let policy_path =
+                crate::grok::ensure_omp_policy(&omp_agent_dir).map_err(|err| err.to_string())?;
+            spec.args.push("--config".to_string());
+            spec.args.push(policy_path.display().to_string());
+            spec.args.push("--no-extensions".to_string());
+        }
+        let sys_prompt = request.config_dir.join("SYSTEM_PROMPT.md");
+        if sys_prompt.is_file() {
+            spec.args.push("--append-system-prompt".to_string());
+            spec.args.push(sys_prompt.display().to_string());
+        }
+        let harness = OmpHarness::start_with_spec(
+            spec,
+            program.display().to_string(),
+            session.as_deref(),
+            &pairs(&env),
+            Some(&request.work_dir),
+        )
+        .map_err(|err| err.to_string())?;
         let vh = VendorHarness::Omp(
             Box::new(harness),
             request.config_dir.join("omp-session-id").into(),
