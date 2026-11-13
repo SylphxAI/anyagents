@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use anyagents_agent::{DeliveryLoop, Error, RunOutcome};
 use anyagents_core::{AgentId, Incoming, Message, NewAgent, ReceiveOutcome, Store};
-use anyagents_harness::{Delivery, DeliveryLevel, Harness, TurnState};
+use anyagents_harness::{DeliverOutcome, Delivery, DeliveryLevel, Harness, TurnState};
 
 const VENDOR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/fakes/vendor.py");
 
@@ -192,6 +192,9 @@ pub struct World<S: Subject> {
     _db: tempfile::TempDir,
     received: usize,
     served: u32,
+    /// A restart left an open turn whose recovery note is not yet proven:
+    /// it goes ahead of any mail, as the supervisor sends it.
+    pending_recovery: bool,
 }
 
 impl<S: Subject> World<S> {
@@ -212,6 +215,7 @@ impl<S: Subject> World<S> {
             _db: db,
             received: 0,
             served: 0,
+            pending_recovery: false,
         }
     }
 
@@ -253,6 +257,23 @@ impl<S: Subject> World<S> {
     /// One supervisor pass: hand the mailbox to the harness, then record a
     /// turn the harness finished, as the supervisor does when it goes idle.
     pub fn pass(&mut self) -> Result<RunOutcome, Error> {
+        if self.pending_recovery {
+            let store = self.delivery.store();
+            match store.open_turn(&self.agent).expect("open turn") {
+                None => self.pending_recovery = false,
+                Some(open) => match self.delivery.recover_open_turn(&open)? {
+                    DeliverOutcome::Accepted { .. }
+                    | DeliverOutcome::Duplicate
+                    | DeliverOutcome::Rejected { .. } => self.pending_recovery = false,
+                    // Written: mail may follow it.
+                    DeliverOutcome::InFlight => {}
+                    // Not written: mail waits behind it.
+                    DeliverOutcome::Deferred | DeliverOutcome::Quota { .. } => {
+                        return Ok(RunOutcome::Idle);
+                    }
+                },
+            }
+        }
         let outcome = self.delivery.run_once();
         let served = self.delivery.harness().turns_served();
         if self.harness_idle() && served > self.served {
@@ -312,12 +333,19 @@ impl<S: Subject> World<S> {
         }
     }
 
-    /// A new vendor process on the same session, behind the same mailbox.
+    /// A new vendor process on the same session, behind the same mailbox,
+    /// as the supervisor starts one: the old process is stopped and what it
+    /// proved is committed first, and an interrupted turn's recovery note
+    /// goes ahead of any mail.
     pub fn restart(&mut self) {
         let session = S::session(self.delivery.harness());
+        self.delivery
+            .retire_harness()
+            .unwrap_or_else(|err| panic!("{}: retiring failed: {err}", S::HARNESS));
         let harness = S::launch(&self.fixture, session.as_deref());
         self.delivery.replace_harness(harness);
         self.served = 0;
+        self.pending_recovery = true;
     }
 
     /// The prompt that opens a turn: delivered, committed, and still running.
@@ -327,28 +355,20 @@ impl<S: Subject> World<S> {
         first
     }
 
-    /// Drive the vendor until every message is committed and nothing runs:
-    /// steps and finishes its turns, and offers a recovery note for a turn a
-    /// crash cut short once the mailbox is empty, as the supervisor does.
+    /// Drive the vendor until every message is committed, the recovery note
+    /// of a turn a crash cut short is taken, and nothing runs: steps and
+    /// finishes its turns.
     pub fn drain(&mut self, last: i64) {
         let deadline = Instant::now() + PATIENCE;
         loop {
             if let Err(err) = self.pass() {
                 panic!("{}: a pass failed while draining: {err}", S::HARNESS);
             }
-            let store = self.delivery.store();
             if self.cursor() >= last
-                && store.next_undelivered(&self.agent).expect("next").is_none()
-                && let Some(open) = store.open_turn(&self.agent).expect("open turn")
+                && !self.pending_recovery
                 && self.harness_idle()
                 && !self.fixture.in_turn()
-                && open.recovery_count == 0
             {
-                self.delivery
-                    .recover_open_turn(&open)
-                    .unwrap_or_else(|err| panic!("{}: recovery failed: {err}", S::HARNESS));
-            }
-            if self.cursor() >= last && self.harness_idle() && !self.fixture.in_turn() {
                 return;
             }
             if self.fixture.in_turn() {
@@ -383,9 +403,18 @@ fn message_ids(messages: &[Message]) -> Vec<String> {
 }
 
 /// How many times the model saw each message as input of its own.
+/// How many times each message reached the model as input its session kept.
+/// A recovery note is no input of its own; an input `lost` with a process
+/// that died before it stored it (a vendor that stores input after proving
+/// it) is not in the session the next process resumes, and no step of the
+/// dead process acted on it: the model request that would act on it takes
+/// longer than the vendor takes to store it.
 fn applied(journal: &[Seen]) -> BTreeMap<String, usize> {
     let mut counts = BTreeMap::new();
-    for seen in journal.iter().filter(|seen| seen.kind != "note") {
+    for seen in journal
+        .iter()
+        .filter(|seen| seen.kind != "note" && seen.kind != "lost")
+    {
         *counts.entry(seen.id.clone()).or_insert(0) += 1;
     }
     counts
@@ -593,6 +622,99 @@ pub fn a_crash_after_partial_consumption_loses_nothing<S: Subject>() {
     }
 }
 
+/// The vendor takes two of five messages into its turn and journals them,
+/// then dies before it writes their proof. Nothing is lost: each message
+/// reaches the model raw, or inside the recovery note where the level says
+/// a crash may leave it there. An idempotent harness applies none twice: the
+/// next process recognises the two from the vendor's record.
+pub fn a_crash_between_consumption_and_proof_applies_nothing_twice<S: Subject>() {
+    let mut world = World::<S>::new();
+    let first = world.prompt();
+    let five = world.receive(5);
+    let last = five.last().unwrap().seq;
+    let level = world.delivery_level();
+    if level.level == DeliveryLevel::TurnEnd {
+        // Mail waits for the turn to end: nothing is consumed mid-turn.
+        return;
+    }
+    let expected = message_ids(&five);
+    world.pump_until("all five reach the vendor", |w| {
+        let wire = w.fixture.wire();
+        expected.iter().all(|id| wire.contains(id))
+    });
+    world.fixture.command("unproven-2");
+    world.pump_until_down();
+    world.restart();
+    world.drain(last);
+    let journal = world.fixture.journal();
+    let counts = applied(&journal);
+    let mut all = vec![first];
+    all.extend(five);
+    for message in &all {
+        let raw = counts.get(message.id.as_str()).copied().unwrap_or(0);
+        if level.idempotent {
+            assert!(
+                raw <= 1,
+                "{}: {} applied {raw} times; journal {:?}",
+                S::HARNESS,
+                message.id,
+                ids(&journal)
+            );
+        }
+        let in_note = journal
+            .iter()
+            .any(|seen| seen.kind == "note" && seen.text.contains(message.id.as_str()));
+        assert!(
+            raw >= 1 || (level.level == DeliveryLevel::MidTurn && in_note),
+            "{}: {} was lost; journal {:?}",
+            S::HARNESS,
+            message.id,
+            ids(&journal)
+        );
+    }
+}
+
+/// A recovery note carries every message of the interrupted turn whole,
+/// however long: the vendor may never have read them.
+pub fn a_long_interrupted_message_reaches_the_next_process_whole<S: Subject>() {
+    let mut world = World::<S>::new();
+    let tail = "the end of a long message";
+    let long = format!("{}{tail}", "x".repeat(4_000));
+    let message = match world
+        .delivery
+        .store()
+        .receive(&world.agent, Incoming::new(&long))
+        .expect("receive")
+    {
+        ReceiveOutcome::New(message) => message,
+        ReceiveOutcome::Duplicate(_) => panic!("duplicate"),
+    };
+    world.received += 1;
+    world.pump_until("the long prompt is committed", |w| {
+        w.cursor() == message.seq
+    });
+    world.fixture.command("crash");
+    world.pump_until_down();
+    world.restart();
+    world.drain(message.seq);
+    let journal = world.fixture.journal();
+    let note = journal
+        .iter()
+        .find(|seen| seen.kind == "note")
+        .unwrap_or_else(|| {
+            panic!(
+                "{}: no recovery note; journal {:?}",
+                S::HARNESS,
+                ids(&journal)
+            )
+        });
+    assert!(
+        note.text.contains(message.id.as_str()) && note.text.contains(tail),
+        "{}: the note does not carry the interrupted message whole",
+        S::HARNESS
+    );
+}
+
 /// The host restarts after the vendor consumed messages but before their
 /// commit was recorded. An idempotent harness recognises them when they are
 /// handed over again and commits them without applying them twice.
@@ -686,6 +808,18 @@ macro_rules! conformance_suite {
         #[test]
         fn a_crash_after_partial_consumption_loses_nothing() {
             $crate::conformance::a_crash_after_partial_consumption_loses_nothing::<$subject>();
+        }
+        #[test]
+        fn a_crash_between_consumption_and_proof_applies_nothing_twice() {
+            $crate::conformance::a_crash_between_consumption_and_proof_applies_nothing_twice::<
+                $subject,
+            >();
+        }
+        #[test]
+        fn a_long_interrupted_message_reaches_the_next_process_whole() {
+            $crate::conformance::a_long_interrupted_message_reaches_the_next_process_whole::<
+                $subject,
+            >();
         }
         #[test]
         fn a_host_restart_redelivers_without_applying_twice() {

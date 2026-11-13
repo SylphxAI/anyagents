@@ -47,11 +47,12 @@ class Engine:
         with (self.root / name).open("a") as out:
             out.write(json.dumps(value) + "\n")
 
-    def journal_ids(self):
+    def journal_ids(self, kept_only=False):
         path = self.root / "journal.jsonl"
         if not path.exists():
             return set()
-        return {json.loads(line)["id"] for line in path.read_text().splitlines()}
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        return {row["id"] for row in rows if not (kept_only and row["kind"] == "lost")}
 
     def received(self, inp):
         self.append("wire.jsonl", {"id": inp.id, "launch": self.launch, "kind": inp.kind})
@@ -64,8 +65,9 @@ class Engine:
     def journal(self, inp, kind):
         """Record that the model saw `inp`. A vendor that deduplicates by our
         id answers False, and records nothing, for an input already there.
-        A recovery note is recorded as a note: it carries no input of its own."""
-        if self.idempotent and inp.id in self.journal_ids():
+        A recovery note is recorded as a note: it carries no input of its own.
+        An input `lost` with its process is no input the session holds."""
+        if self.idempotent and inp.id in self.journal_ids(kept_only=True):
             return False
         if "[Recovery]" in (inp.text or ""):
             kind = "note"
@@ -90,7 +92,7 @@ class Engine:
         self.pending.append(inp)
         self.save()
 
-    def step(self, limit=None):
+    def step(self, limit=None, kind="steer"):
         """The running turn's next step: the pending inputs it consumed, each
         with whether it was new to the journal."""
         if self.turn is None:
@@ -98,7 +100,7 @@ class Engine:
         take = self.pending if limit is None else self.pending[:limit]
         self.pending = self.pending[len(take):]
         self.step_no += 1
-        taken = [(inp, self.journal(inp, "steer")) for inp in take]
+        taken = [(inp, self.journal(inp, kind)) for inp in take]
         self.save()
         return taken
 
@@ -113,6 +115,9 @@ class Protocol:
     """One vendor's wire format over the engine."""
 
     idempotent = False
+    # The vendor writes an input's proof before it stores the input (Claude
+    # Code appends its transcript up to 100 ms after it announces a line).
+    stores_after_proof = False
 
     def __init__(self, engine, args):
         self.engine = engine
@@ -192,6 +197,16 @@ def drive(engine, protocol):
                 count = int(path.name.split("-", 1)[1])
                 protocol.consumed(engine.step(count))
                 protocol.flush()
+                path.unlink()
+                os._exit(1)
+            # The model takes the inputs, then the process dies before it
+            # writes a word of proof. A vendor that stores input only after
+            # proving it (`stores_after_proof`) never stored them: the next
+            # process's session does not hold them, so they are journaled as
+            # lost, not as input the session kept.
+            for path in sorted(root.glob("unproven-*")):
+                count = int(path.name.split("-", 1)[1])
+                taken = engine.step(count, kind="lost" if protocol.stores_after_proof else "steer")
                 path.unlink()
                 os._exit(1)
             if (root / "crash").exists():
