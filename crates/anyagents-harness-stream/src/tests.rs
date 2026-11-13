@@ -698,7 +698,7 @@ for line in sys.stdin:
   print(json.dumps({'type':'result','request_id':first,'status':'completed'}),flush=True)
   first=None
  elif m['request_id']=='refused':
-  print(json.dumps({'type':'rejected','request_id':'refused','code':'fixture-refusal'}),flush=True)
+  print(json.dumps({'type':'rejected','request_id':'refused','code':'unknown_command'}),flush=True)
  elif m['request_id']=='self-ack':
   print(json.dumps({'type':'accepted','request_id':'self-ack'}),flush=True)
  elif first is None:
@@ -844,7 +844,7 @@ fn immediate_rejection_before_post_write_is_rejected_without_replay() {
         assert_eq!(
             harness.deliver(&message, &line).unwrap(),
             anyagents_harness::DeliverOutcome::Rejected {
-                reason: "spiron rejected the input: fixture-refusal".into()
+                reason: "spiron rejected the input: unknown_command".into()
             }
         );
     }

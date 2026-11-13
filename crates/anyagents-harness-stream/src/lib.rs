@@ -277,6 +277,9 @@ struct State {
     stderr: BoundedStderr,
     stderr_done: bool,
     exit_status: Option<ExitStatus>,
+    /// When the child was seen to have exited while its stdout stayed open
+    /// (a descendant holds it).
+    exited_at: Option<Instant>,
     exit_fault: Option<String>,
     state_dir: Option<PathBuf>,
     alive: bool,
@@ -358,6 +361,9 @@ struct State {
     /// when the next one may be offered.
     refused_turns: u32,
     turn_retry_at: Option<Instant>,
+    /// Inputs Spiron refused with a code this adapter does not know: each is
+    /// offered again after its own backoff, with how many refusals led to it.
+    held_inputs: HashMap<String, (Instant, u32)>,
     /// When the first of those refusals came, and the reason the last one
     /// gave.
     turn_refused_since: Option<Instant>,
@@ -672,6 +678,10 @@ impl StreamHarness {
         let mut state = lock(&self.shared);
         if !state.alive {
             state.reap_child();
+        } else if state.exited_past_grace() {
+            // The child exited, and a descendant keeps its stdout open: past
+            // the grace no proof can still arrive from it.
+            state.alive = false;
         }
         HarnessHealth {
             process_alive: state.alive,
@@ -957,6 +967,15 @@ impl StreamHarness {
                 if let Some(reset_at_ms) = state.quota_reset_at_ms {
                     return Ok(DeliverOutcome::Quota { reset_at_ms });
                 }
+                // Refused with a code nothing here knows: offered again once
+                // its backoff ends, which the reader's nudge marks.
+                if state
+                    .held_inputs
+                    .get(id)
+                    .is_some_and(|(until, _)| Instant::now() < *until)
+                {
+                    return Ok(DeliverOutcome::Deferred);
+                }
                 let starts_turn = state.open.is_empty();
                 // A turn starts only once every earlier input has its answer,
                 // so a line still on its way to a closed turn cannot land
@@ -1220,6 +1239,7 @@ impl StreamHarness {
             state.stderr = BoundedStderr::default();
             state.stderr_done = false;
             state.exit_status = None;
+            state.exited_at = None;
             state.exit_fault = None;
             state.child = Some(child);
             state.alive = true;
@@ -1336,6 +1356,13 @@ impl StreamHarness {
     /// known (`proven`) and kept until the next process starts.
     pub fn stop(&mut self) {
         self.stop_child();
+        // A cascade may have taken held mail in its last moments, after the
+        // watcher's last look: its record is read once more, so `proven`
+        // answers from it before the host commits and replaces the process.
+        if let Some(rpc) = &self.agy_rpc {
+            let generation = lock(&self.shared).generation;
+            agy_settle(&self.shared, &self.wake, rpc, generation);
+        }
     }
 
     fn stop_child(&mut self) {
@@ -1571,6 +1598,19 @@ impl State {
         }
     }
 
+    /// Whether the child exited more than [`EXIT_GRACE`] ago while its
+    /// stdout never ended. Dead is otherwise only declared at that end.
+    fn exited_past_grace(&mut self) -> bool {
+        if self.exited_at.is_none()
+            && let Some(child) = self.child.as_mut()
+            && let Ok(Some(_)) = child.try_wait()
+        {
+            self.exited_at = Some(Instant::now());
+        }
+        self.exited_at
+            .is_some_and(|exited| exited.elapsed() >= EXIT_GRACE)
+    }
+
     fn reap_child(&mut self) {
         if let Some(child) = self.child.as_mut()
             && let Ok(Some(status)) = child.try_wait()
@@ -1607,6 +1647,7 @@ impl State {
             stderr: BoundedStderr::default(),
             stderr_done: false,
             exit_status: None,
+            exited_at: None,
             exit_fault: None,
             state_dir: None,
             alive: false,
@@ -1652,6 +1693,7 @@ impl State {
             turn_closing: false,
             refused_turns: 0,
             turn_retry_at: None,
+            held_inputs: HashMap::new(),
             turn_refused_since: None,
             turn_refusal: None,
         }
@@ -1828,7 +1870,9 @@ fn read_stdout(
                     Some("rejected") => match spiron_refusal(&value) {
                         // Never taken: it is offered again once the turn
                         // that refused it is gone.
-                        SpironRefusal::NotStarted | SpironRefusal::TurnClosed => {
+                        SpironRefusal::NotStarted
+                        | SpironRefusal::TurnClosed
+                        | SpironRefusal::Unknown(_) => {
                             let id = id.to_string();
                             state.open.retain(|open| *open != id);
                             state.followups.retain(|open| *open != id);
@@ -2263,24 +2307,52 @@ fn note_consumption_receipt(
             let id = request
                 .filter(|id| state.in_flight.contains(*id))?
                 .to_string();
-            match spiron_refusal(value) {
+            let refusal = spiron_refusal(value);
+            let unknown = match &refusal {
+                SpironRefusal::Unknown(reason) => Some(reason.clone()),
+                _ => None,
+            };
+            match refusal {
                 // The turn could not start: nothing given to it was
                 // journaled. Spiron starts a turn only once it holds the
                 // session's lease, which a process that died keeps for up to
                 // `SPIRON_LEASE`, so the same input is offered again after a
                 // backoff; the reader wakes the host then. Refusals past
-                // that lease are a fault (`deliver_consumed`).
-                SpironRefusal::NotStarted => {
+                // that lease are a fault (`deliver_consumed`). An unknown code
+                // waits the same way, never parked, and names itself in that
+                // fault.
+                SpironRefusal::NotStarted | SpironRefusal::Unknown(_) => {
                     let opened = state.open.first().is_some_and(|owner| *owner == id);
                     release_input(state, &id);
-                    state.turn_closing |= !state.open.is_empty();
+                    if let Some(reason) = &unknown {
+                        eprintln!("anyagents-spiron: {reason}; the input waits in the mailbox");
+                        // A steer refused so says nothing about its turn: it
+                        // waits its own backoff and goes into the same turn.
+                        if !opened {
+                            let refusals = state
+                                .held_inputs
+                                .get(&id)
+                                .map_or(1, |(_, refusals)| refusals.saturating_add(1));
+                            let wait = TURN_RETRY_FIRST
+                                .saturating_mul(1 << (refusals - 1).min(5))
+                                .min(TURN_RETRY_MAX);
+                            state
+                                .held_inputs
+                                .insert(id, (Instant::now() + wait, refusals));
+                            return Some(wait);
+                        }
+                    } else {
+                        state.turn_closing |= !state.open.is_empty();
+                    }
                     if opened {
                         state.refused_turns = state.refused_turns.saturating_add(1);
                         state.turn_refused_since.get_or_insert_with(Instant::now);
-                        state.turn_refusal = value
-                            .get("error")
-                            .and_then(Value::as_str)
-                            .map(str::to_string);
+                        state.turn_refusal = unknown.or_else(|| {
+                            value
+                                .get("error")
+                                .and_then(Value::as_str)
+                                .map(str::to_string)
+                        });
                         let wait = TURN_RETRY_FIRST
                             .saturating_mul(1 << (state.refused_turns - 1).min(5))
                             .min(TURN_RETRY_MAX);
@@ -2307,6 +2379,10 @@ fn note_consumption_receipt(
     None
 }
 
+/// How long a child that exited may keep its stdout open (a descendant
+/// holding it) before it is declared dead anyway.
+const EXIT_GRACE: Duration = Duration::from_secs(5);
+
 /// The first wait before a turn the peer could not start is offered again;
 /// each refusal in a row doubles it up to [`TURN_RETRY_MAX`].
 const TURN_RETRY_FIRST: Duration = Duration::from_secs(1);
@@ -2327,24 +2403,33 @@ enum SpironRefusal {
     /// `turn_closed` (the turn sealed before the steer reached it) or
     /// `no_active_turn` (a steer with no turn): the next turn takes it.
     TurnClosed,
-    /// Every other code, and a code this adapter does not know: no offer
-    /// makes Spiron take this input as it is written (`empty_prompt`,
-    /// `wrong_session`, `unknown_command`, `upgrade_retired`).
+    /// No offer makes Spiron take this input as it is written
+    /// (`empty_prompt`, `wrong_session`, `unknown_command`,
+    /// `upgrade_retired`).
     ForGood(String),
+    /// A code this adapter does not know, or none: nothing says the input
+    /// can never be taken, so it is not parked. It waits as a turn that could
+    /// not start does, and a refusal that outlasts the lease fails the
+    /// process with this reason, which the host shows.
+    Unknown(String),
 }
 
 fn spiron_refusal(value: &Value) -> SpironRefusal {
     match value.get("code").and_then(Value::as_str) {
         Some("turn_not_started") => SpironRefusal::NotStarted,
         Some("turn_closed" | "no_active_turn") => SpironRefusal::TurnClosed,
-        code => SpironRefusal::ForGood(format!(
-            "spiron rejected the input: {}",
-            code.unwrap_or("no code")
+        Some(code @ ("empty_prompt" | "wrong_session" | "unknown_command" | "upgrade_retired")) => {
+            SpironRefusal::ForGood(format!("spiron rejected the input: {code}"))
+        }
+        code => SpironRefusal::Unknown(format!(
+            "spiron refused the input with {}",
+            code.map_or("no code".to_string(), |code| format!("code {code}"))
         )),
     }
 }
 
 fn settle_consumed(state: &mut State, id: &str, turn: &str) {
+    state.held_inputs.remove(id);
     state.in_flight.remove(id);
     state.consumed.insert(id.to_string());
     state.acknowledged.insert(id.to_string());

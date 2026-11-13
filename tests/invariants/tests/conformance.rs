@@ -119,9 +119,38 @@ mod spiron {
         parked_for_good("unknown_command");
     }
 
+    /// A code the adapter does not know says nothing about whether the input
+    /// can ever be taken: it waits and is offered again, never parked, and
+    /// nothing restarts.
     #[test]
-    fn a_refusal_code_the_adapter_does_not_know_is_parked_without_a_restart() {
-        parked_for_good("some_later_code");
+    fn a_refusal_code_the_adapter_does_not_know_waits_and_is_never_parked() {
+        let mut world = World::<Spiron>::new();
+        let first = world.prompt();
+        refuse_next(&world, "some_later_code");
+        let refused = world.receive(1).remove(0);
+        world.pump_until("the refused message is taken on a later offer", |w| {
+            if w.fixture.in_turn() {
+                w.fixture.command("step");
+            }
+            w.cursor() == refused.seq
+        });
+        assert!(world.delivery.take_rejections().is_empty());
+        assert!(
+            world
+                .delivery
+                .store()
+                .rejected_messages(&world.agent)
+                .expect("rejected")
+                .is_empty()
+        );
+        world.drain(refused.seq);
+        let journal = world.fixture.journal();
+        assert_eq!(
+            ids(&journal),
+            [first.id.to_string(), refused.id.to_string()],
+            "{journal:?}"
+        );
+        assert_eq!(world.fixture.launches(), 1, "restarted");
     }
 
     /// A turn Spiron could not start (a dead process still holds the
