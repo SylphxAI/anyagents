@@ -278,7 +278,8 @@ async fn serve(
                     {
                         eprintln!("anyagents-host-history: deferred full verification: {error}");
                     }
-                    crate::browser::reap_idle_browsers(&root);
+                    #[cfg(target_os = "linux")]
+                    crate::workstation::session::reap_idle(&root);
                     crate::create::sync_fresher_bound_agent_credentials(&root);
                     #[cfg(unix)]
                     crate::create::sync_canonical_skills(&root);
@@ -343,6 +344,10 @@ async fn serve(
             }
         })
         .await;
+    // Close every desktop gracefully: the browser flushes its profile, and no
+    // desktop outlives the server to hold a profile lock.
+    #[cfg(target_os = "linux")]
+    crate::workstation::session::stop_all().await;
     // A long poll ends at Telegram, not here: signal the poller to stop first
     // so released long polls exit instead of re-entering a 30s wait, then
     // release every bot so each bot's last offset is written before shutdown.
@@ -754,6 +759,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
             get(get_description_route).post(set_description_route),
         )
         .route("/v1/browser", post(browser_route))
+        .route("/v1/computer", post(computer_route))
         .route("/v1/web", post(web_route))
         .route("/v1/profiles", get(profiles_route).post(set_profile_route))
         .route("/v1/profiles/models", get(profile_models_route))
@@ -2246,21 +2252,48 @@ async fn set_description_route(
     .await
 }
 
+/// The caller's own browser profile: an agent's name, or `default`.
+fn default_browser_profile(principal: &Principal) -> String {
+    match principal {
+        Principal::Agent { name, .. } => name.clone(),
+        Principal::Operator => "default".to_string(),
+    }
+}
+
 async fn browser_route(
     principal: Principal,
     State(state): State<AppState>,
-    Json(body): Json<crate::browser::BrowserRequest>,
+    Json(body): Json<crate::workstation::BrowserRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let default_profile = match &principal {
-        Principal::Agent { name, .. } => name.clone(),
-        Principal::Operator => "default".to_string(),
-    };
-    spawn_store(move || {
-        let out = crate::browser::execute(state.store.data_dir(), &default_profile, body)
-            .map_err(ApiError::from_store)?;
-        Ok(Json(out))
-    })
-    .await
+    let profile = default_browser_profile(&principal);
+    crate::workstation::browser::execute(state.store.data_dir(), &profile, body)
+        .await
+        .map(Json)
+        .map_err(ApiError::from_store)
+}
+
+/// Session-desktop `tools.computer` requests (host and cloud requests run in
+/// the caller's process).
+async fn computer_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    #[cfg(target_os = "linux")]
+    {
+        let profile = default_browser_profile(&principal);
+        crate::workstation::desktop::execute(state.store.data_dir(), &profile, body)
+            .await
+            .map(Json)
+            .map_err(ApiError::from_store)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (principal, state, body);
+        Err(ApiError::from_store(
+            crate::workstation::unsupported_host().into(),
+        ))
+    }
 }
 
 async fn channels_route(
@@ -3658,8 +3691,9 @@ pub(crate) fn reap_subagent_ephemeral_dirs(
         );
     }
     let mut shared_workdirs = std::collections::HashSet::new();
+    #[cfg(target_os = "linux")]
     if let Some(agent) = agent {
-        let _ = crate::browser::stop_profile(data_dir, &agent.name);
+        crate::workstation::session::stop_in_background(data_dir, &agent.name);
     }
     for other in &agents {
         let keep_protected =
@@ -4109,7 +4143,9 @@ async fn delete_agent_route(
             let _ = anyagents_tools::SandboxProvider::destroy(&sbx);
         }
         let seat_ids = detect_seat_ids(&agent_dir.join("config"));
-        let _ = crate::browser::stop_profile(state.store.data_dir(), &deleted.name);
+        // The browser must be gone before its profile directory is removed.
+        #[cfg(target_os = "linux")]
+        crate::workstation::session::stop_blocking(state.store.data_dir(), &deleted.name);
         remove_path_with_seat(
             &state
                 .store

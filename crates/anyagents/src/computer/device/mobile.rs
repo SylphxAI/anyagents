@@ -422,7 +422,7 @@ async fn idb(req: &Value, args: &[&str], timeout: u64) -> Result<Vec<u8>, String
     let udid = req["udid"].as_str().ok_or("idb requires udid")?;
     let mut argv = args.to_vec();
     argv.extend(["--udid", udid]);
-    desktop::checked_output(run_cmd("idb", &argv, &[], timeout).await?, "idb")
+    checked_output(run_cmd("idb", &argv, &[], timeout).await?, "idb")
 }
 
 async fn simctl(
@@ -434,7 +434,7 @@ async fn simctl(
     let udid = req["udid"].as_str().ok_or("simctl requires udid")?;
     let mut argv = vec!["simctl", command, udid];
     argv.extend_from_slice(args);
-    desktop::checked_output(run_cmd("xcrun", &argv, &[], timeout).await?, "simctl")
+    checked_output(run_cmd("xcrun", &argv, &[], timeout).await?, "simctl")
 }
 
 async fn wda_http(url: String, method: &'static str, payload: Value) -> Result<Value, String> {

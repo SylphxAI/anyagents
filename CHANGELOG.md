@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Changed
+
+- The browser and session computer tools now run on one desktop per profile
+  from the open-source `agent-workstation` crate: a headless Wayland desktop
+  (sway) with one headful browser, web operations over loopback DevTools,
+  full-desktop screenshots and input, and a noVNC takeover of the whole desktop.
+  The previous Xvfb/CDP browser, its injected fingerprint scripts and its
+  screencast takeover page are removed. Existing profiles under
+  `browser-profiles/` open with their logins; browsers left running by the
+  previous version are stopped once and their bookkeeping files removed.
+  Linux hosts need `sway`, `wayvnc` and a Chromium-family browser
+  (`ANYAGENTS_CHROMIUM_BIN`, optional `ANYAGENTS_BROWSER_SEED_FLAG`).
+- **macOS and Windows hosts:** `tools.browser` (and `tools.computer` requests
+  for the session desktop) now return a typed `UNSUPPORTED` error naming
+  `ANYAGENTS_WORKSTATION_URL`, the setting remote routing to a Linux workstation
+  will use; this release does not route yet. Host desktop control
+  (`tools.computer` with `platform`, the default on these hosts) is unchanged.
+- `tools.computer` without `platform`, `display` or `wayland_display` drives the
+  agent's session desktop on Linux; host desktops are selected explicitly.
+- Browser refs are snapshot outlines with `@eN` refs; the response no longer
+  lists per-element geometry. `headless`, `ttl_ms` and `tunnel` are gone, and the
+  CLI drops `--headless`, `--script`, `--full-page`, `--hold-ms` and `--repeat`;
+  `anyagents browser` needs a running server.
+- Until upstream support lands, these return `UNSUPPORTED`: browser `eval`,
+  `cookies`, key holding, `fill` with `submit`, CSS selectors and `full_page`
+  screenshots; session `clipboard_get`/`clipboard_set`, `cursor_position`,
+  `hold_key`, modifier-held pointer input and back/forward mouse buttons.
+- `ANYAGENTS_TAKEOVER_URL` is no longer read; the takeover page is published
+  through a `cloudflared` quick tunnel when installed
+  (`ANYAGENTS_TAKEOVER_TUNNEL=0` disables it), otherwise on loopback.
+
 - Keep role labels methodology-neutral: roots and labelled children can self-archive
   and release idle processes under the same rules. Preserve legacy effective scopes
   on upgrade, default all new children to private, and retain browser profiles until

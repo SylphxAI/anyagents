@@ -9,7 +9,6 @@ use clap::{Args, Parser, Subcommand};
 mod agent;
 mod api;
 mod auth;
-mod browser;
 mod channel;
 mod client;
 mod cloud_harness;
@@ -41,6 +40,7 @@ mod telegram;
 mod ui;
 mod vendor;
 mod web;
+mod workstation;
 mod worktree;
 mod worktree_access;
 
@@ -498,10 +498,10 @@ enum Command {
     },
     /// Native SOTA anti-detect browser with persistent login profiles (`open`, `snapshot`, `click`, `fill`, `press`, `eval`, `screenshot`, `cookies`, `tabs`, `status`, `profiles`, `close`).
     Browser {
-        /// Action: `open` / `goto`, `snapshot`, `click`, `fill` / `type`, `press`, `eval`, `screenshot`, `cookies`, `tabs`, `status`, `profiles`, or `close` / `stop`.
+        /// Action: `open` / `goto`, `back`, `forward`, `reload`, `snapshot`, `read`, `click`, `fill` / `type`, `press`, `screenshot`, `tabs`, `takeover`, `wait_for_user`, `release_takeover`, `status`, `profiles`, or `close` / `stop`. Runs in the server's desktop session for the profile.
         #[arg(default_value = "status")]
         action: String,
-        /// Primary argument: URL (for `open`), `@e1` / CSS selector (for `click` / `fill`), key name (for `press`), JS code (for `eval`), or output path (for `screenshot`).
+        /// Primary argument: URL (for `open`), snapshot ref such as `@e1` (for `click` / `fill`), key name (for `press`), or output path (for `screenshot`).
         target: Option<String>,
         /// Secondary argument: text to enter when `action` is `fill` / `type`.
         value: Option<String>,
@@ -511,42 +511,27 @@ enum Command {
         /// Explicit URL override.
         #[arg(long)]
         url: Option<String>,
-        /// Explicit `@e1` or CSS selector override.
+        /// Explicit snapshot ref override (`@e1` or `@<snapshot_id>:e1`).
         #[arg(long)]
         selector: Option<String>,
         /// Explicit text override for `fill` / `type`.
         #[arg(long)]
         text: Option<String>,
-        /// Secret reference (`op://vault/item/field` or `op-otp://vault/item`) resolved in memory for `fill` / `type`.
+        /// Secret reference (`op://vault/item/field`, `op-otp://vault/item`, or `secret://key`) resolved in memory for `fill` / `type`.
         #[arg(long = "secret-ref")]
         secret_ref: Option<String>,
-        /// Explicit JS code override for `eval`.
-        #[arg(long)]
-        script: Option<String>,
         /// Explicit output path for `screenshot`.
         #[arg(long)]
         path: Option<String>,
         /// Press Enter / submit form after `fill` / `type`.
         #[arg(long)]
         submit: bool,
-        /// Capture full scrollable page on `screenshot`.
-        #[arg(long = "full-page")]
-        full_page: bool,
         /// Wait duration in milliseconds after `open` or `click`.
         #[arg(long = "wait-ms")]
         wait_ms: Option<u64>,
-        /// Hold duration in milliseconds for `press` / `hold` (`keydown` held across rendered frames, then `keyup`).
-        #[arg(long = "hold-ms", alias = "duration-ms")]
-        hold_ms: Option<u64>,
-        /// Key name override for `press` / `hold` / `key_down` / `key_up`.
+        /// Key or chord override for `press` (e.g. `Enter`, `ctrl+l`).
         #[arg(long)]
         key: Option<String>,
-        /// Emit repeated `keydown` events (`autoRepeat: true`) while holding a key.
-        #[arg(long)]
-        repeat: bool,
-        /// Force headless mode (`false` by default: uses `xvfb-run` real headed GUI for anti-detect stealth).
-        #[arg(long)]
-        headless: Option<bool>,
     },
     /// Schedule one-off (`--at`), recurring (`--every`), or event-watch (`--watch`) wakes, or list/cancel (`--cancel`) schedules.
     #[command(visible_alias = "schedules", alias = "cron")]
@@ -1406,18 +1391,13 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
             selector,
             text,
             secret_ref,
-            script,
             path,
             submit,
-            full_page,
             wait_ms,
-            hold_ms,
             key,
-            repeat,
-            headless,
         } => browser_cmd(
-            &data, action, target, value, profile, url, selector, text, secret_ref, script, path,
-            submit, full_page, wait_ms, hold_ms, key, repeat, headless,
+            &data, action, target, value, profile, url, selector, text, secret_ref, path, submit,
+            wait_ms, key,
         ),
         Command::Schedule {
             agent,
@@ -1658,18 +1638,13 @@ fn browser_cmd(
     selector: Option<String>,
     text: Option<String>,
     secret_ref: Option<String>,
-    script: Option<String>,
     path: Option<String>,
     submit: bool,
-    full_page: bool,
     wait_ms: Option<u64>,
-    hold_ms: Option<u64>,
     key: Option<String>,
-    repeat: bool,
-    headless: Option<bool>,
 ) -> Result<(), anyagents_core::Error> {
     let act = action.trim().to_ascii_lowercase();
-    let mut req = browser::BrowserRequest {
+    let mut req = workstation::BrowserRequest {
         action: act.clone(),
         profile,
         url,
@@ -1677,23 +1652,10 @@ fn browser_cmd(
         text,
         secret_ref,
         key,
-        keys: None,
-        hold_ms,
-        duration_ms: None,
-        repeat: repeat.then_some(true),
-        script,
         path,
         submit: submit.then_some(true),
-        full_page: full_page.then_some(true),
         wait_ms,
-        headless,
-        proxy: None,
-        tab_action: None,
-        target_id: None,
-        cookies: None,
-        reason: None,
-        ttl_ms: None,
-        tunnel: None,
+        ..Default::default()
     };
     match act.as_str() {
         "takeover" | "human_takeover" | "user_takeover" => {
@@ -1719,21 +1681,9 @@ fn browser_cmd(
                 req.text = value;
             }
         }
-        "press" | "key" | "hold" | "key_down" | "keydown" | "key_up" | "keyup" | "release"
-        | "release_keys" => {
+        "press" | "key" => {
             if req.key.is_none() {
                 req.key = target;
-            }
-            if req.hold_ms.is_none()
-                && let Some(ms_str) = value.as_deref()
-                && let Ok(parsed) = ms_str.trim().parse::<u64>()
-            {
-                req.hold_ms = Some(parsed);
-            }
-        }
-        "eval" | "evaluate" | "js" => {
-            if req.script.is_none() {
-                req.script = target;
             }
         }
         "screenshot" | "shot" => {
@@ -1748,6 +1698,11 @@ fn browser_cmd(
                 req.url = value;
             }
         }
+        "release_takeover" | "end_takeover" | "resume_agent" => {
+            if req.reason.is_none() {
+                req.reason = target;
+            }
+        }
         "close" | "stop" | "status" | "info" | "fingerprint"
             if req.profile.is_none() && target.is_some() =>
         {
@@ -1755,27 +1710,29 @@ fn browser_cmd(
         }
         _ => {}
     }
-    let out = if client::can_call_server(data) {
-        let bytes = serde_json::to_vec(&req)
-            .map_err(|err| anyagents_core::Error::Message(err.to_string()))?;
-        match client::call::<serde_json::Value>(
-            data,
-            "POST",
-            "/v1/browser",
-            Some(bytes),
-            &client::authority(data),
-        ) {
-            Ok(Some(val)) => val,
-            Ok(None) => {
-                return Err(anyagents_core::Error::Message(
-                    "the server answered nothing".into(),
-                ));
-            }
-            Err(err) if err.contains("404") => browser::execute(data, "default", req)?,
-            Err(err) => return Err(anyagents_core::Error::Message(err)),
+    // Desktop sessions live in the server; a one-shot CLI process would stop
+    // the browser as soon as it printed.
+    if !client::can_call_server(data) {
+        return Err(anyagents_core::Error::Message(
+            "the browser runs in the AnyAgents server's desktop session; start the server (`anyagents serve`) and run this again".into(),
+        ));
+    }
+    let bytes =
+        serde_json::to_vec(&req).map_err(|err| anyagents_core::Error::Message(err.to_string()))?;
+    let out = match client::call::<serde_json::Value>(
+        data,
+        "POST",
+        "/v1/browser",
+        Some(bytes),
+        &client::authority(data),
+    ) {
+        Ok(Some(val)) => val,
+        Ok(None) => {
+            return Err(anyagents_core::Error::Message(
+                "the server answered nothing".into(),
+            ));
         }
-    } else {
-        browser::execute(data, "default", req)?
+        Err(err) => return Err(anyagents_core::Error::Message(err)),
     };
     println!(
         "{}",
