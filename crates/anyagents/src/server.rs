@@ -36,6 +36,7 @@ use crate::identity::ServingIdentity;
 use crate::operator;
 use crate::vendor::{self, VendorHarness};
 
+mod file_cache;
 #[cfg(test)]
 mod latency_tests;
 mod memory_backlog;
@@ -3058,13 +3059,15 @@ pub(crate) fn roster_views(
         }
     }
     let mut metadata = store.agent_query_metadata().map_err(ApiError::from_store)?;
-    let seats = crate::sandbox::roster_seats();
+    let files = file_cache::cache();
+    files.catch_up();
+    let seats = view_seats(files);
     let mut agents = Vec::with_capacity(selected.len());
     for agent in all_agents {
         if !selected.contains(agent.id.as_str()) {
             continue;
         }
-        let view = agent_view_preloaded(store, health, agent, Some(&mut metadata), Some(&seats))?;
+        let view = agent_view_preloaded(store, health, agent, Some(&mut metadata), &seats)?;
         agents.push(view);
     }
     Ok(AgentsResponse {
@@ -3104,12 +3107,62 @@ pub(crate) fn compute_block_reason(
     None
 }
 
-/// A millisecond timestamp an operator or rotation marker holds; 0 when absent.
-fn read_ms_marker(path: &Path) -> i64 {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|s| s.trim().parse::<i64>().ok())
-        .unwrap_or(0)
+/// The marker files an agent view shows, all in the agent's config directory.
+const LAST_ERROR: &str = ".anyagents-last-error.json";
+const PROFILE_ROTATED: &str = ".anyagents-profile-rotated-ms";
+const QUOTA_CLEARED: &str = ".anyagents-quota-cleared-ms";
+const NOTIFIED_PARENT: &str = ".anyagents-notified-parent-error.json";
+const BOUND_PROFILE: &str = ".anyagents-profile";
+
+/// One agent's marker files, as the view cache holds them.
+struct Markers<'a> {
+    files: &'a file_cache::FileCache,
+    cfg: &'a Path,
+}
+
+impl Markers<'_> {
+    fn read(&self, name: &str) -> Option<std::sync::Arc<str>> {
+        self.files.file(&self.cfg.join(name))
+    }
+
+    /// A millisecond timestamp an operator or rotation marker holds; 0 when
+    /// absent.
+    fn ms(&self, name: &str) -> i64 {
+        self.read(name)
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .unwrap_or(0)
+    }
+
+    /// [`create::bound_profile_name`] from the cached marker.
+    fn bound_profile(&self) -> Option<String> {
+        self.read(BOUND_PROFILE)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Whether [`create::maybe_notify_parent_on_error`] would act for this
+    /// error: the same early returns and the same episode key it compares with
+    /// the notice marker. Only then does the view call it, and it re-checks
+    /// both files before it writes or sends anything.
+    fn parent_notice_due(&self, agent: &Agent, rotated_ms: i64, err_msg: &str) -> bool {
+        let trimmed = err_msg.trim();
+        if agent.parent_id.is_none()
+            || trimmed.is_empty()
+            || crate::host_memory::is_migration_wait(trimmed)
+        {
+            return false;
+        }
+        let source_key = format!(
+            "subagent-error:{}:{rotated_ms}:{trimmed}",
+            agent.id.as_str()
+        );
+        !self
+            .read(NOTIFIED_PARENT)
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+            .is_some_and(|val| {
+                val.get("source_key").and_then(|v| v.as_str()) == Some(source_key.as_str())
+            })
+    }
 }
 
 /// The quota reset and fault text an adapter or the launcher last persisted in
@@ -3118,18 +3171,18 @@ fn read_ms_marker(path: &Path) -> i64 {
 /// clears its record. Claude Code persists no reset, so only its text counts.
 fn persisted_fault(
     harness: &str,
-    cfg: &Path,
+    markers: &Markers<'_>,
     rotated_ms: i64,
     now: i64,
 ) -> (Option<i64>, Option<String>) {
-    let Some(record) = std::fs::read_to_string(cfg.join(".anyagents-last-error.json"))
-        .ok()
+    let Some(record) = markers
+        .read(LAST_ERROR)
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
     else {
         return (None, None);
     };
     let floor = if harness == "agy" {
-        rotated_ms.max(read_ms_marker(&cfg.join(".anyagents-quota-cleared-ms")))
+        rotated_ms.max(markers.ms(QUOTA_CLEARED))
     } else {
         rotated_ms
     };
@@ -3203,17 +3256,34 @@ pub(crate) fn agent_view(
     health: &HealthBoard,
     agent: &Agent,
 ) -> Result<AgentView, ApiError> {
-    agent_view_preloaded(store, health, agent, None, None)
+    let files = file_cache::cache();
+    files.catch_up();
+    agent_view_preloaded(store, health, agent, None, &view_seats(files))
 }
 
 type RosterSeats = HashMap<String, (String, u32, u32, u32)>;
+
+/// [`crate::sandbox::roster_seats`], kept by the view cache: the admitted
+/// principals come from the environment or from the registry file it names.
+fn view_seats(files: &file_cache::FileCache) -> std::sync::Arc<RosterSeats> {
+    let registry = std::env::var_os("ANYAGENTS_PRINCIPAL_REGISTRY").map(PathBuf::from);
+    match registry {
+        Some(registry) if std::env::var("ANYAGENTS_PRINCIPALS").is_err() => files.fact(
+            format!("seats:{}", registry.display()),
+            file_cache::Dep::File(registry),
+            || std::sync::Arc::new(crate::sandbox::roster_seats()),
+        ),
+        // Read from the environment, or nothing to read.
+        _ => std::sync::Arc::new(crate::sandbox::roster_seats()),
+    }
+}
 
 fn agent_view_preloaded(
     store: &Store,
     health: &HealthBoard,
     agent: &Agent,
     mut metadata: Option<&mut anyagents_core::AgentQueryMetadata>,
-    seats: Option<&RosterSeats>,
+    seats: &RosterSeats,
 ) -> Result<AgentView, ApiError> {
     if agent.state == "archived" {
         let mut view = archived_agent_view_fast(agent);
@@ -3246,11 +3316,13 @@ fn agent_view_preloaded(
             .map_err(ApiError::from_store)?
     };
     let cfg = anyagents_core::agent_config_dir(store.data_dir(), &agent.id);
-    let rotated_ms = read_ms_marker(&cfg.join(".anyagents-profile-rotated-ms"));
+    let files = file_cache::cache();
+    let markers = Markers { files, cfg: &cfg };
+    let rotated_ms = markers.ms(PROFILE_ROTATED);
     // The supervisor's board is the live state; a fault outlives its process
     // only as the record an adapter persisted. A view never reads a vendor
     // transcript, log or session store.
-    let (session_quota, session_error) = persisted_fault(&agent.harness, &cfg, rotated_ms, now);
+    let (session_quota, session_error) = persisted_fault(&agent.harness, &markers, rotated_ms, now);
     let (
         process,
         mut turn_state,
@@ -3339,9 +3411,11 @@ fn agent_view_preloaded(
             } else {
                 "errored"
             };
-            create::maybe_notify_parent_on_error(store, agent, &cfg, err_msg);
-        } else {
-            let _ = std::fs::remove_file(cfg.join(".anyagents-notified-parent-error.json"));
+            if markers.parent_notice_due(agent, rotated_ms, err_msg) {
+                create::maybe_notify_parent_on_error(store, agent, &cfg, err_msg);
+            }
+        } else if markers.read(NOTIFIED_PARENT).is_some() {
+            let _ = std::fs::remove_file(cfg.join(NOTIFIED_PARENT));
         }
     }
     let block_reason = compute_block_reason(quota, last_error.as_deref(), now);
@@ -3379,13 +3453,9 @@ fn agent_view_preloaded(
     } else {
         store.agent_aliases(&agent.id).unwrap_or_default()
     };
-    let seat_info = if let Some(seats) = seats {
-        seats
-            .get(agent.id.as_str())
-            .map(|(user, uid, gid, _)| (user.clone(), *uid, *gid, None))
-    } else {
-        create::resolved_agent_seat_info(store, agent)
-    };
+    let seat_info = seats
+        .get(agent.id.as_str())
+        .map(|(user, uid, gid, _)| (user.clone(), *uid, *gid));
     let schedules = if let Some(metadata) = metadata.as_mut() {
         metadata
             .schedules
@@ -3402,7 +3472,7 @@ fn agent_view_preloaded(
     Ok(AgentView {
         has_open_turn,
         open_turn_age_ms,
-        profile: create::bound_profile_name(&cfg),
+        profile: markers.bound_profile(),
         id: agent.id.to_string(),
         name: agent.name.clone(),
         role: agent.role.clone(),
@@ -3428,32 +3498,55 @@ fn agent_view_preloaded(
         block_reason,
         last_error,
         oldest_undelivered_age_ms,
-        install: install_state(store, agent),
+        install: install_state(store, files, agent),
         description: agent.public_description(),
         instructions: agent.instructions.clone(),
-        seat_user: seat_info.as_ref().map(|(u, _, _, _)| u.clone()),
-        seat_uid: seat_info.as_ref().map(|(_, uid, _, _)| *uid),
-        seat_gid: seat_info.as_ref().map(|(_, _, gid, _)| *gid),
+        seat_user: seat_info.as_ref().map(|(u, _, _)| u.clone()),
+        seat_uid: seat_info.as_ref().map(|(_, uid, _)| *uid),
+        seat_gid: seat_info.as_ref().map(|(_, _, gid)| *gid),
         schedules,
     })
 }
 
 /// `installed` once this harness is on the machine, `needed` when the reason it
 /// is not, `pending` when nothing has been recorded yet.
-fn install_state(store: &Store, agent: &Agent) -> String {
+fn install_state(store: &Store, files: &file_cache::FileCache, agent: &Agent) -> String {
     match crate::install::recorded(&agent.harness) {
         Some(Ok(())) => "installed".to_string(),
         Some(Err(reason)) => reason,
         None => {
-            if crate::install::is_healthy(store.data_dir(), &agent.harness)
-                || crate::install::program(store.data_dir(), &agent.harness).is_file()
-            {
+            if installed_on_disk(files, store.data_dir(), &agent.harness) {
                 "installed".to_string()
             } else {
                 "pending".to_string()
             }
         }
     }
+}
+
+/// Whether a harness this server has not recorded is on disk: its managed
+/// receipt or launcher, all under `<root>/harnesses/<id>/`. The deprecated
+/// `ANYAGENTS_<ID>_BIN` override names a program outside that tree, so it is
+/// checked directly.
+fn installed_on_disk(files: &file_cache::FileCache, root: &Path, harness: &str) -> bool {
+    let harness = anyagents_harness::normalize_harness_name(harness).to_string();
+    let check = {
+        let root = root.to_path_buf();
+        let harness = harness.clone();
+        move || {
+            crate::install::is_healthy(&root, &harness)
+                || crate::install::program(&root, &harness).is_file()
+        }
+    };
+    let override_var = format!("ANYAGENTS_{}_BIN", harness.to_uppercase().replace('-', "_"));
+    if std::env::var_os(override_var).is_some() {
+        return check();
+    }
+    files.fact(
+        format!("installed:{}:{harness}", root.display()),
+        file_cache::Dep::Dir(root.join("harnesses").join(&harness)),
+        check,
+    )
 }
 
 async fn create_agent_route(
