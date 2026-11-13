@@ -328,6 +328,12 @@ struct State {
     last_steer_probe: Option<Instant>,
     planner_config: Option<Value>,
     http_port: Option<u16>,
+    /// The one Antigravity steer under way, and once the language server
+    /// settled it, whether it queued the message.
+    agy_steer: Option<AgySteer>,
+    /// The Antigravity turn (its `turns_started`) whose cascade refused a
+    /// steer: it is given no more, and the next input waits for its end.
+    agy_refused_turn: Option<usize>,
     seen: HashSet<String>,
     acknowledged: HashSet<String>,
     input_turns: HashMap<String, String>,
@@ -733,11 +739,21 @@ impl StreamHarness {
                 return Ok(DeliverOutcome::Deferred);
             }
         }
+        // A steer this process sent for the message answers first, before
+        // liveness: what the language server queued stays queued after the
+        // process exits.
+        let steered = self
+            .agy_rpc
+            .as_ref()
+            .and_then(|_| agy_steer_answer(&mut lock(&self.shared), &message.id));
+        if let Some(answer) = steered {
+            return answer;
+        }
         let bytes = self
             .pending
             .is_none()
             .then(|| format!("{line}\n").into_bytes());
-        let mut agy_steer_ctx = None;
+        let mut agy_steer = None;
         {
             let mut state = lock(&self.shared);
             if !state.alive {
@@ -757,13 +773,21 @@ impl StreamHarness {
                     return Err(HarnessError::Failed(reason.clone()));
                 }
                 if state.seen.contains(&message.id) {
+                    if self.agy_rpc.is_some() && agy_prompt_untaken(&state, &message.id) {
+                        return Ok(DeliverOutcome::InFlight);
+                    }
                     return state.written_outcome(self.spec.protocol, &message.id);
                 }
                 if let Some(reset_at_ms) = state.quota_reset_at_ms {
                     return Ok(DeliverOutcome::Quota { reset_at_ms });
                 }
-                if (!state.open.is_empty() || state.turn_user_inputs > 0)
-                    && let Some(ref rpc) = self.agy_rpc
+                // One Antigravity steer at a time, and nothing written past
+                // it until it is settled: mail reaches the cascade in order.
+                if state.agy_steer.is_some() {
+                    return Ok(DeliverOutcome::Deferred);
+                }
+                if let Some(rpc) = &self.agy_rpc
+                    && agy_steers(&state)
                 {
                     if let Some(reopens_in) = agy_input_gate(&state) {
                         // A gate that opens with time, not with a line, wakes
@@ -773,19 +797,20 @@ impl StreamHarness {
                         }
                         return Ok(DeliverOutcome::Deferred);
                     }
-                    let session_id = state.session_id.clone().unwrap_or_default();
-                    let child_pid = state.child.as_ref().map(Child::id);
-                    let cached_port = state.http_port;
-                    let cached_planner = state.planner_config.clone();
-                    let generation = state.generation;
-                    agy_steer_ctx = Some((
-                        rpc.clone(),
-                        session_id,
-                        child_pid,
-                        cached_port,
-                        cached_planner,
-                        generation,
-                    ));
+                    state.agy_steer = Some(AgySteer {
+                        id: message.id.clone(),
+                        outcome: None,
+                    });
+                    agy_steer = Some(AgySteerJob {
+                        rpc: rpc.clone(),
+                        id: message.id.clone(),
+                        text: compose_message(&message.id, &message.context, &message.text),
+                        session_id: state.session_id.clone().unwrap_or_default(),
+                        child_pid: state.child.as_ref().map(Child::id),
+                        cached_port: state.http_port,
+                        planner_config: state.planner_config.clone(),
+                        generation: state.generation,
+                    });
                 } else {
                     // Associate even an immediate result with its owner before the
                     // first byte is visible to the child. This is not acceptance.
@@ -811,148 +836,13 @@ impl StreamHarness {
                 }
             }
         }
-        if let Some((rpc, mut session_id, child_pid, cached_port, mut planner_config, generation)) =
-            agy_steer_ctx
-        {
-            let Some(port) = resolve_agy_http_port(&rpc, cached_port, child_pid) else {
-                let mut state = lock(&self.shared);
-                if state.generation == generation {
-                    state.last_steer_probe = Some(Instant::now());
-                    if state.turn_user_inputs > 0 && !state.open.is_empty() {
-                        state.idle_since = Some(Instant::now());
-                    }
-                }
-                drop(state);
-                nudge_after(&self.shared, &self.wake, generation, AGY_STEER_PROBE_GAP);
-                return Ok(DeliverOutcome::Deferred);
-            };
-            {
-                let mut state = lock(&self.shared);
-                if state.generation != generation || !state.alive {
-                    return Err(HarnessError::Dead);
-                }
-                state.http_port = Some(port);
-            }
-            let (resolved_sid, running) = agy_rpc_is_running(port, &rpc.csrf_token, &session_id)
-                .map_err(HarnessError::Failed)?;
-            if resolved_sid.is_empty() {
-                let mut state = lock(&self.shared);
-                if state.generation == generation {
-                    state.last_steer_probe = Some(Instant::now());
-                }
-                drop(state);
-                nudge_after(&self.shared, &self.wake, generation, AGY_STEER_PROBE_GAP);
-                return Ok(DeliverOutcome::Deferred);
-            }
-            if resolved_sid != session_id {
-                session_id = resolved_sid;
-                let mut state = lock(&self.shared);
-                if state.generation == generation && state.alive {
-                    state.session_id = Some(session_id.clone());
-                }
-            }
-            if running {
-                let mut state = lock(&self.shared);
-                if state.generation != generation || !state.alive {
-                    return Err(HarnessError::Dead);
-                }
-                state.idle_since = None;
-                state.last_steer_probe = None;
-                state.turn_user_inputs = state.turn_user_inputs.max(1);
-            } else {
-                let mut state = lock(&self.shared);
-                if state.generation != generation || !state.alive {
-                    return Err(HarnessError::Dead);
-                }
-                if state.turn_user_inputs == 0 {
-                    state.idle_since = None;
-                    state.last_steer_probe = Some(Instant::now());
-                    drop(state);
-                    nudge_after(&self.shared, &self.wake, generation, AGY_STEER_PROBE_GAP);
-                    return Ok(DeliverOutcome::Deferred);
-                }
-                if !state.open.is_empty() {
-                    let now = Instant::now();
-                    let first_idle = state.idle_since.is_none();
-                    let idle_since = *state.idle_since.get_or_insert(now);
-                    if now.duration_since(idle_since) < AGY_TURN_CLOSE_GRACE {
-                        let remain =
-                            AGY_TURN_CLOSE_GRACE.saturating_sub(now.duration_since(idle_since));
-                        drop(state);
-                        if first_idle {
-                            nudge_after(&self.shared, &self.wake, generation, remain);
-                        }
-                        return Ok(DeliverOutcome::Deferred);
-                    }
-                }
-                drop(state);
-                if planner_config.is_none() {
-                    planner_config =
-                        agy_rpc_fetch_planner_config(port, &rpc.csrf_token, &session_id)
-                            .map_err(HarnessError::Failed)?;
-                    let mut state = lock(&self.shared);
-                    if state.generation != generation || !state.alive {
-                        return Err(HarnessError::Dead);
-                    }
-                    if planner_config.is_some() {
-                        state.planner_config = planner_config.clone();
-                    }
-                }
-            }
-            let composed = compose_message(&message.id, &message.context, &message.text);
-            let had_open_before_rpc = {
-                let mut state = lock(&self.shared);
-                if state.generation != generation || !state.alive {
-                    return Err(HarnessError::Dead);
-                }
-                if state.open.is_empty() && state.turn_user_inputs == 0 {
-                    return Ok(DeliverOutcome::Deferred);
-                }
-                let had_open = !state.open.is_empty();
-                if !running && had_open {
-                    // The previous turn in `agy` already finished (`CASCADE_RUN_STATUS_IDLE`)
-                    // while held open by a background task. Close those open messages now
-                    // so `turn_recovery.completed_seq` advances and never replays stale
-                    // completed turns on restart.
-                    finish_open(&mut state, TurnUsage::default());
-                    state.turns_started += 1;
-                } else if !had_open {
-                    state.turns_started += 1;
-                }
-                if !state.open.contains(&message.id) {
-                    state.open.push(message.id.clone());
-                }
-                had_open
-            };
-            if let Err(err) = agy_rpc_send_steer(
-                port,
-                &rpc.csrf_token,
-                &session_id,
-                &composed,
-                planner_config.as_ref(),
-            ) {
-                let mut state = lock(&self.shared);
-                state.open.retain(|id| id != &message.id);
-                if err.contains("plan model not specified") {
-                    if !state.open.is_empty() {
-                        state.idle_since = Some(Instant::now());
-                    }
-                    return Ok(DeliverOutcome::Deferred);
-                }
-                return Err(HarnessError::Failed(err));
-            }
-            let mut state = lock(&self.shared);
-            if state.generation != generation || !state.alive {
-                return Err(HarnessError::Dead);
-            }
-            state.idle_since = None;
-            state.turn_user_inputs = state.turn_user_inputs.saturating_add(1);
-            state.seen.insert(message.id.clone());
-            state.written.push(message.id.clone());
-            return Ok(DeliverOutcome::Accepted {
-                turn_finished: (!running && had_open_before_rpc)
-                    || state.finished.contains(&message.id),
-            });
+        if let Some(job) = agy_steer {
+            return Ok(agy_start_steer(
+                &self.shared,
+                &self.wake,
+                &self.spec.name,
+                job,
+            ));
         }
         // Never hold shared state across pipe I/O. On Linux stdin is
         // nonblocking: backpressure returns custody to the mailbox immediately.
@@ -979,6 +869,9 @@ impl StreamHarness {
                 let pending = self.pending.take().expect("completed write");
                 state.seen.insert(pending.id.clone());
                 state.written.push(pending.id);
+                if self.agy_rpc.is_some() && agy_prompt_untaken(&state, &message.id) {
+                    return Ok(DeliverOutcome::InFlight);
+                }
                 state.written_outcome(self.spec.protocol, &message.id)
             }
             Err(_) => {
@@ -1143,16 +1036,17 @@ impl StreamHarness {
         {
             return false;
         }
+        // An Antigravity prompt its cascade has not shown taking, a steer
+        // under way, or a steer gate is not input the host can give: the
+        // turn's first step, the steer's settling, the gate's line or its
+        // nudge wakes it.
         if self.agy_rpc.is_some()
-            && !state.open.is_empty()
-            && (state
-                .idle_since
-                .is_some_and(|t| t.elapsed() < AGY_TURN_CLOSE_GRACE)
-                || (state.turn_user_inputs == 0 && state.session_id.is_some())
-                || (state.session_id.is_none()
-                    && state
-                        .last_steer_probe
-                        .is_some_and(|t| t.elapsed() < AGY_STEER_PROBE_GAP)))
+            && (agy_steer_running(&state)
+                || state
+                    .open
+                    .first()
+                    .is_some_and(|opener| agy_prompt_untaken(&state, opener))
+                || (agy_steers(&state) && agy_input_gate(&state).is_some()))
         {
             return false;
         }
@@ -1264,6 +1158,8 @@ impl StreamHarness {
             state.last_steer_probe = None;
             state.planner_config = None;
             state.http_port = self.agy_rpc.as_ref().and_then(|r| r.port_override);
+            state.agy_steer = None;
+            state.agy_refused_turn = None;
             state.text = None;
             state.last_line_at = None;
             state.generation
@@ -1646,6 +1542,8 @@ impl State {
             last_steer_probe: None,
             planner_config: None,
             http_port: None,
+            agy_steer: None,
+            agy_refused_turn: None,
             finished: HashSet::new(),
             turns_started: 0,
             quota_reset_at_ms: None,
@@ -2577,20 +2475,66 @@ fn resolve_agy_http_port_from_proc(pid: u32, csrf_token: &str) -> Option<u16> {
     None
 }
 
+/// How long a probe of the language server may take. A probe only reads: one
+/// that times out is asked again later. A send has no such limit.
+const AGY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// One read-only request to the language server, decoded.
 fn agy_rpc_post(
     port: u16,
     csrf_token: &str,
     method: &str,
     payload: &Value,
 ) -> Result<Value, String> {
+    let body = agy_rpc_exchange(port, csrf_token, method, payload, Some(AGY_PROBE_TIMEOUT))
+        .map_err(|err| err.to_string())?;
+    if body.trim().is_empty() {
+        return Ok(json!({}));
+    }
+    serde_json::from_str::<Value>(body.trim()).map_err(|err| format!("decode {method}: {err}"))
+}
+
+/// Why a language server request left no answer to use, by what the server
+/// can have done with it.
+#[derive(Debug)]
+enum AgyRpcError {
+    /// It never reached the server whole (no connection, or cut off while
+    /// written): the server did nothing with it.
+    Unreached(String),
+    /// The server answered with an error (a Connect error, a non-2xx status).
+    Refused(String),
+    /// It reached the server, and no complete answer came back: the server
+    /// may have acted on it.
+    Unanswered(String),
+}
+
+impl std::fmt::Display for AgyRpcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unreached(why) | Self::Refused(why) | Self::Unanswered(why) => f.write_str(why),
+        }
+    }
+}
+
+/// One Connect request (`POST /exa.language_server_pb.LanguageServerService/
+/// <method>`, JSON) and the body of its 2xx answer. `read_timeout` bounds
+/// the wait for the answer; `None` waits until the server answers or closes.
+fn agy_rpc_exchange(
+    port: u16,
+    csrf_token: &str,
+    method: &str,
+    payload: &Value,
+    read_timeout: Option<Duration>,
+) -> Result<String, AgyRpcError> {
     use std::io::Read as _;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream};
 
-    let body = serde_json::to_vec(payload).map_err(|err| err.to_string())?;
+    let body =
+        serde_json::to_vec(payload).map_err(|err| AgyRpcError::Unreached(err.to_string()))?;
     let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))
-        .map_err(|err| format!("connect 127.0.0.1:{port}: {err}"))?;
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+        .map_err(|err| AgyRpcError::Unreached(format!("connect 127.0.0.1:{port}: {err}")))?;
+    let _ = stream.set_read_timeout(read_timeout);
     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
     let mut request = format!(
         "POST /exa.language_server_pb.LanguageServerService/{method} HTTP/1.0\r\n\
@@ -2606,27 +2550,29 @@ fn agy_rpc_post(
     stream
         .write_all(&request)
         .and_then(|_| stream.flush())
-        .map_err(|err| format!("write {method}: {err}"))?;
-    let mut response = String::new();
+        .map_err(|err| AgyRpcError::Unreached(format!("write {method}: {err}")))?;
+    let mut response = Vec::new();
     stream
-        .read_to_string(&mut response)
-        .map_err(|err| format!("read {method}: {err}"))?;
-    let (head, resp_body) = response
-        .split_once("\r\n\r\n")
-        .ok_or_else(|| format!("malformed HTTP response from {method}"))?;
-    let status_line = head.lines().next().unwrap_or_default();
-    let status_code = status_line
+        .read_to_end(&mut response)
+        .map_err(|err| AgyRpcError::Unanswered(format!("read {method}: {err}")))?;
+    let response = String::from_utf8_lossy(&response);
+    let malformed = || AgyRpcError::Unanswered(format!("malformed HTTP response from {method}"));
+    let (head, resp_body) = response.split_once("\r\n\r\n").ok_or_else(malformed)?;
+    let status_code = head
+        .lines()
+        .next()
+        .unwrap_or_default()
         .split_whitespace()
         .nth(1)
         .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(0);
+        .ok_or_else(malformed)?;
     if !(200..300).contains(&status_code) {
-        return Err(format!("{method} HTTP {status_code}: {}", resp_body.trim()));
+        return Err(AgyRpcError::Refused(format!(
+            "{method} HTTP {status_code}: {}",
+            resp_body.trim()
+        )));
     }
-    if resp_body.trim().is_empty() {
-        return Ok(json!({}));
-    }
-    serde_json::from_str::<Value>(resp_body.trim()).map_err(|err| format!("decode {method}: {err}"))
+    Ok(resp_body.to_string())
 }
 
 /// Grace window when an `agy` cascade transitions to `CASCADE_RUN_STATUS_IDLE`.
@@ -2636,32 +2582,525 @@ fn agy_rpc_post(
 /// accept a new invocation via `SendUserCascadeMessage` with `plannerConfig`.
 const AGY_TURN_CLOSE_GRACE: Duration = Duration::from_millis(200);
 
-/// The pause after a steer probe found no cascade to steer into.
+/// The pause after a steer probe found no cascade to steer into, or could
+/// not ask, and after a steer that never reached the language server.
 const AGY_STEER_PROBE_GAP: Duration = Duration::from_millis(400);
 
-/// Whether a steer must wait: `Some(None)` until the next stdout line,
+/// Whether a steer must wait: `Some(None)` until an event wakes the host,
 /// `Some(Some(d))` for `d`.
 ///
-/// Two waits remain, and both come from the vendor. A steer goes through the
-/// language server, while the turn it joins was started on stdin, and nothing
-/// orders the two:
-/// - A known cascade that has not shown the turn's first step may still be
-///   idle; a steer sent now would start its own invocation ahead of the turn's
-///   own message. The first step line ends this wait.
+/// - A steer under way: its settling wakes the host.
+/// - A turn whose cascade refused a steer takes no more: its end does.
+/// - A steer goes through the language server, while the turn it joins was
+///   started on stdin, and nothing orders the two. A known cascade that has
+///   not shown the turn's first step may still be idle; a steer sent now
+///   would start its own invocation ahead of the turn's own message. The
+///   first step line ends this wait.
 /// - A cascade that just went idle may be ending its turn, whose `result`
 ///   names no invocation: a steer sent as a new invocation now would have that
 ///   late `result` close it. [`AGY_TURN_CLOSE_GRACE`] is the vendor's
 ///   `pollResponse` bound on that line.
+/// - A probe that found nothing to steer into, or failed, is not repeated
+///   for [`AGY_STEER_PROBE_GAP`].
 ///
 /// A fresh session has no cascade to steer into until the language server
 /// shows one, and the steer path asks it at once rather than after a delay.
 fn agy_input_gate(state: &State) -> Option<Option<Duration>> {
+    if agy_steer_running(state) || (agy_held(state) && !state.open.is_empty()) {
+        return Some(None);
+    }
     if let Some(idle) = state.idle_since
         && idle.elapsed() < AGY_TURN_CLOSE_GRACE
     {
         return Some(Some(AGY_TURN_CLOSE_GRACE - idle.elapsed()));
     }
+    if let Some(probe) = state.last_steer_probe
+        && probe.elapsed() < AGY_STEER_PROBE_GAP
+    {
+        return Some(Some(AGY_STEER_PROBE_GAP - probe.elapsed()));
+    }
     (state.turn_user_inputs == 0 && state.session_id.is_some()).then_some(None)
+}
+
+/// Whether the next input goes into the cascade through the language server
+/// rather than to stdin as a turn of its own: a turn is open, or the cascade
+/// is held open past its turn. A cascade held open that refused a steer gets
+/// the next input on stdin.
+fn agy_steers(state: &State) -> bool {
+    !state.open.is_empty() || (state.turn_user_inputs > 0 && !agy_held(state))
+}
+
+/// `id` opened the running turn on stdin and its cascade has not shown taking
+/// it: no step of the turn yet, and the language server has not reported the
+/// cascade running. Until it does, the prompt is in flight, not committed: a
+/// line the process never read is offered again as input of its own.
+fn agy_prompt_untaken(state: &State, id: &str) -> bool {
+    state.turn_user_inputs == 0
+        && state.seen.contains(id)
+        && state.open.first().is_some_and(|opener| opener == id)
+        && !state.finished.contains(id)
+}
+
+/// The running turn's cascade refused a steer.
+fn agy_held(state: &State) -> bool {
+    state.agy_refused_turn == Some(state.turns_started)
+}
+
+fn agy_steer_running(state: &State) -> bool {
+    state
+        .agy_steer
+        .as_ref()
+        .is_some_and(|steer| steer.outcome.is_none())
+}
+
+/// One message on its way into an Antigravity cascade.
+struct AgySteer {
+    id: String,
+    /// `None` while the request runs.
+    outcome: Option<AgySteered>,
+}
+
+/// How a steer settled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AgySteered {
+    /// The language server queued the message in the cascade's durable
+    /// mailbox: it answered `{}`, or, after an answer that never came, the
+    /// mailbox or the transcript holds the message. The cascade takes it at
+    /// its next step boundary; nothing proves which.
+    Queued { turn_finished: bool },
+    /// Not sent, or certainly not queued: it goes back to the mailbox.
+    Returned,
+}
+
+/// What one steer needs, taken from the state when it starts.
+struct AgySteerJob {
+    rpc: AgyRpcConfig,
+    id: String,
+    text: String,
+    session_id: String,
+    child_pid: Option<u32>,
+    cached_port: Option<u16>,
+    planner_config: Option<Value>,
+    generation: u64,
+}
+
+/// What this process's steer of `id` answers: `InFlight` while its request
+/// runs, `Accepted` once queued (even if the process has exited since), and
+/// `None` once returned, for the message to be judged afresh.
+fn agy_steer_answer(state: &mut State, id: &str) -> Option<Result<DeliverOutcome, HarnessError>> {
+    let steer = state.agy_steer.as_ref().filter(|steer| steer.id == id)?;
+    match steer.outcome {
+        None => Some(Ok(DeliverOutcome::InFlight)),
+        Some(AgySteered::Queued { turn_finished }) => {
+            state.agy_steer = None;
+            Some(Ok(DeliverOutcome::Accepted { turn_finished }))
+        }
+        Some(AgySteered::Returned) => {
+            state.agy_steer = None;
+            None
+        }
+    }
+}
+
+/// Run `job` off the delivery path; its message is in flight until the steer
+/// settles, which wakes the host.
+fn agy_start_steer(
+    shared: &Arc<Mutex<State>>,
+    wake: &Arc<Condvar>,
+    name: &str,
+    job: AgySteerJob,
+) -> DeliverOutcome {
+    let generation = job.generation;
+    let (thread_shared, thread_wake) = (Arc::clone(shared), Arc::clone(wake));
+    // Detached: the send waits for its answer without a timeout, and ends
+    // with the language server's process at the latest. A steer of a
+    // process that was replaced settles nothing.
+    let started = thread::Builder::new()
+        .name(format!("{name}-steer"))
+        .spawn(move || agy_steer(thread_shared, thread_wake, job));
+    if started.is_ok() {
+        return DeliverOutcome::InFlight;
+    }
+    lock(shared).agy_steer = None;
+    agy_back_off(shared, wake, generation);
+    DeliverOutcome::Deferred
+}
+
+fn agy_steer(shared: Arc<Mutex<State>>, wake: Arc<Condvar>, job: AgySteerJob) {
+    let (id, generation) = (job.id.clone(), job.generation);
+    let outcome = agy_steer_attempt(&shared, &wake, job);
+    let mut state = lock(&shared);
+    if state.generation == generation
+        && let Some(steer) = state.agy_steer.as_mut()
+        && steer.id == id
+    {
+        steer.outcome = Some(outcome);
+        state.touch();
+    }
+    drop(state);
+    wake.notify_all();
+}
+
+/// The message goes back to the mailbox and the next steer waits
+/// [`AGY_STEER_PROBE_GAP`].
+fn agy_back_off(shared: &Arc<Mutex<State>>, wake: &Arc<Condvar>, generation: u64) -> AgySteered {
+    {
+        let mut state = lock(shared);
+        if state.generation == generation {
+            state.last_steer_probe = Some(Instant::now());
+        }
+    }
+    nudge_after(shared, wake, generation, AGY_STEER_PROBE_GAP);
+    AgySteered::Returned
+}
+
+/// The refusals the language server answers before it queues anything.
+const AGY_REFUSALS: [&str; 3] = [
+    "plan model not specified",
+    "cascade not found",
+    "there is an ongoing battle",
+];
+
+/// One steer: ask the language server whether the cascade runs (and for its
+/// planner config when it does not), then `SendUserCascadeMessage` with
+/// `NEXT_INVOCATION`, which queues the message in the cascade's durable
+/// mailbox and answers `{}`. The answer is waited for without a timeout. A
+/// probe that fails, or a refusal, returns the message; an answer that
+/// never came is settled from the mailbox, never by sending again blindly.
+fn agy_steer_attempt(
+    shared: &Arc<Mutex<State>>,
+    wake: &Arc<Condvar>,
+    job: AgySteerJob,
+) -> AgySteered {
+    let AgySteerJob {
+        rpc,
+        id,
+        text,
+        mut session_id,
+        child_pid,
+        cached_port,
+        mut planner_config,
+        generation,
+    } = job;
+    let Some(port) = agy_port(shared, &rpc, cached_port, child_pid, generation) else {
+        return agy_back_off(shared, wake, generation);
+    };
+    let Ok((resolved_sid, running)) = agy_rpc_is_running(port, &rpc.csrf_token, &session_id) else {
+        agy_forget_port(shared, &rpc, generation);
+        return agy_back_off(shared, wake, generation);
+    };
+    if resolved_sid.is_empty() {
+        return agy_back_off(shared, wake, generation);
+    }
+    {
+        let mut state = lock(shared);
+        if state.generation != generation || !state.alive {
+            return AgySteered::Returned;
+        }
+        if resolved_sid != session_id {
+            session_id = resolved_sid;
+            state.session_id = Some(session_id.clone());
+        }
+        if running {
+            state.idle_since = None;
+            state.last_steer_probe = None;
+            state.turn_user_inputs = state.turn_user_inputs.max(1);
+        } else {
+            if state.turn_user_inputs == 0 {
+                state.idle_since = None;
+                drop(state);
+                return agy_back_off(shared, wake, generation);
+            }
+            if !state.open.is_empty() {
+                let now = Instant::now();
+                let first_idle = state.idle_since.is_none();
+                let idle_for = now.duration_since(*state.idle_since.get_or_insert(now));
+                if idle_for < AGY_TURN_CLOSE_GRACE {
+                    drop(state);
+                    if first_idle {
+                        nudge_after(shared, wake, generation, AGY_TURN_CLOSE_GRACE - idle_for);
+                    }
+                    return AgySteered::Returned;
+                }
+            }
+        }
+    }
+    if !running && planner_config.is_none() {
+        let Ok(found) = agy_rpc_fetch_planner_config(port, &rpc.csrf_token, &session_id) else {
+            return agy_back_off(shared, wake, generation);
+        };
+        planner_config = found;
+        let mut state = lock(shared);
+        if state.generation == generation && planner_config.is_some() {
+            state.planner_config = planner_config.clone();
+        }
+    }
+    let had_open = {
+        let mut state = lock(shared);
+        if state.generation != generation || !state.alive {
+            return AgySteered::Returned;
+        }
+        // The turn ended while it was asked: the message opens the next one
+        // on stdin.
+        if state.open.is_empty() && state.turn_user_inputs == 0 {
+            return AgySteered::Returned;
+        }
+        let had_open = !state.open.is_empty();
+        if !running && had_open {
+            // The previous turn in `agy` already finished (`CASCADE_RUN_STATUS_IDLE`)
+            // while held open by a background task. Close those open messages now
+            // so `turn_recovery.completed_seq` advances and never replays stale
+            // completed turns on restart.
+            finish_open(&mut state, TurnUsage::default());
+            state.turns_started += 1;
+        } else if !had_open {
+            state.turns_started += 1;
+        }
+        if !state.open.contains(&id) {
+            state.open.push(id.clone());
+        }
+        had_open
+    };
+    // What the server writes for this message is written after this.
+    let since = SystemTime::now();
+    let transcript_from = agy_conversation_dir(&rpc, &session_id)
+        .and_then(|dir| std::fs::metadata(dir.join("logs/transcript_full.jsonl")).ok())
+        .map_or(0, |meta| meta.len());
+    let sent = agy_rpc_send_steer(
+        port,
+        &rpc.csrf_token,
+        &session_id,
+        &text,
+        planner_config.as_ref(),
+    );
+    let queued = match &sent {
+        Ok(()) => true,
+        Err(AgyRpcError::Unreached(_)) => false,
+        Err(AgyRpcError::Refused(reason))
+            if AGY_REFUSALS.iter().any(|known| reason.contains(known)) =>
+        {
+            false
+        }
+        // No answer, or one that does not say what happened: the cascade's
+        // own record does.
+        Err(_) => agy_took(&rpc, &session_id, &id, since, transcript_from),
+    };
+    let mut state = lock(shared);
+    if state.generation != generation {
+        return AgySteered::Returned;
+    }
+    if queued {
+        state.idle_since = None;
+        state.turn_user_inputs = state.turn_user_inputs.saturating_add(1);
+        state.seen.insert(id.clone());
+        state.written.push(id.clone());
+        return AgySteered::Queued {
+            turn_finished: (!running && had_open) || state.finished.contains(&id),
+        };
+    }
+    state.open.retain(|open| open != &id);
+    match sent {
+        // The cascade went idle after it was asked, and a new invocation
+        // needs the planner config: the next steer waits out the turn's
+        // close and sends it.
+        Err(AgyRpcError::Refused(reason))
+            if reason.contains("plan model not specified")
+                && running
+                && planner_config.is_none() =>
+        {
+            if !state.open.is_empty() {
+                state.idle_since = Some(Instant::now());
+            }
+            drop(state);
+            nudge_after(shared, wake, generation, AGY_TURN_CLOSE_GRACE);
+            AgySteered::Returned
+        }
+        // The cascade refused it: the turn takes no more steers, and the
+        // message waits for its end.
+        Err(AgyRpcError::Refused(_)) => {
+            state.agy_refused_turn = Some(state.turns_started);
+            AgySteered::Returned
+        }
+        Err(AgyRpcError::Unreached(_)) => {
+            drop(state);
+            agy_forget_port(shared, &rpc, generation);
+            agy_back_off(shared, wake, generation)
+        }
+        _ => {
+            drop(state);
+            agy_back_off(shared, wake, generation)
+        }
+    }
+}
+
+/// A language server that could not be reached at the port this process
+/// kept is looked for again by the next steer.
+fn agy_forget_port(shared: &Arc<Mutex<State>>, rpc: &AgyRpcConfig, generation: u64) {
+    let mut state = lock(shared);
+    if state.generation == generation {
+        state.http_port = rpc.port_override;
+    }
+}
+
+/// The language server's HTTP port, kept for this process, and its version
+/// as the peer, read once from the head of `cli.log`.
+fn agy_port(
+    shared: &Arc<Mutex<State>>,
+    rpc: &AgyRpcConfig,
+    cached_port: Option<u16>,
+    child_pid: Option<u32>,
+    generation: u64,
+) -> Option<u16> {
+    let port = resolve_agy_http_port(rpc, cached_port, child_pid)?;
+    let version = lock(shared)
+        .peer
+        .is_none()
+        .then(|| agy_server_version(rpc, child_pid))
+        .flatten();
+    let mut state = lock(shared);
+    if state.generation == generation && state.alive {
+        state.http_port = Some(port);
+        if let Some(version) = version {
+            state.peer.get_or_insert(format!("agy {version}"));
+        }
+    }
+    Some(port)
+}
+
+/// How much of `cli.log` the version is looked for in: it is the second line
+/// of the language server's start.
+const AGY_LOG_HEAD: u64 = 64 * 1024;
+
+/// `Language server version: 1.5.8`, from the block of `cli.log` that starts
+/// `child_pid`'s language server, or else from the first block (a child
+/// started through a wrapper names another pid).
+fn agy_server_version(rpc: &AgyRpcConfig, child_pid: Option<u32>) -> Option<String> {
+    const START: &str = "Starting language server process with pid ";
+    let log = std::fs::File::open(rpc.config_dir.join(".gemini/antigravity-cli/cli.log")).ok()?;
+    let mut ours = child_pid.is_none();
+    let mut first = None;
+    for line in BufReader::new(log.take(AGY_LOG_HEAD)).lines() {
+        let Ok(line) = line else { break };
+        if let Some((_, pid)) = line.split_once(START) {
+            ours = child_pid.is_none_or(|child| pid.trim().parse::<u32>() == Ok(child));
+            continue;
+        }
+        if let Some((_, version)) = line.split_once("Language server version: ") {
+            let version = version.trim().to_string();
+            if ours {
+                return Some(version);
+            }
+            first.get_or_insert(version);
+        }
+    }
+    first
+}
+
+/// `brain/<cascade>/.system_generated` under the agent's config directory,
+/// for a cascade id that names one directory.
+fn agy_conversation_dir(rpc: &AgyRpcConfig, cascade: &str) -> Option<PathBuf> {
+    let plain = !cascade.is_empty()
+        && cascade
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_');
+    plain.then(|| {
+        rpc.config_dir
+            .join(".gemini/antigravity-cli/brain")
+            .join(cascade)
+            .join(".system_generated")
+    })
+}
+
+/// Allowance for file times against the clock read before a send.
+const AGY_MAILBOX_SLACK: Duration = Duration::from_secs(2);
+
+/// Whether `cascade` holds the message `id` that a send which began at
+/// `since` may have queued: a mailbox file written since then carries its
+/// marker line (in its base64 `CortexStep`), or the transcript does past
+/// `transcript_from`, where the cascade records a message it already took.
+/// Each mailbox file outlives its delivery (`read.json` marks it read).
+fn agy_took(
+    rpc: &AgyRpcConfig,
+    cascade: &str,
+    id: &str,
+    since: SystemTime,
+    transcript_from: u64,
+) -> bool {
+    use std::io::{Seek as _, SeekFrom};
+    let Some(dir) = agy_conversation_dir(rpc, cascade) else {
+        return false;
+    };
+    let earliest = since
+        .checked_sub(AGY_MAILBOX_SLACK)
+        .unwrap_or(std::time::UNIX_EPOCH);
+    for entry in std::fs::read_dir(dir.join("messages"))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let path = entry.path();
+        if path.extension().is_none_or(|ext| ext != "json")
+            || path.file_name().is_some_and(|name| name == "read.json")
+            || entry
+                .metadata()
+                .and_then(|meta| meta.modified())
+                .is_ok_and(|written| written < earliest)
+        {
+            continue;
+        }
+        let Ok(raw) = std::fs::read(&path) else {
+            continue;
+        };
+        let payload = serde_json::from_slice::<Value>(&raw)
+            .ok()
+            .and_then(|mail| mail.get("stepPayload")?.as_str().and_then(agy_base64));
+        if agy_holds_marker(&raw, id) || payload.is_some_and(|step| agy_holds_marker(&step, id)) {
+            return true;
+        }
+    }
+    let Ok(mut transcript) = std::fs::File::open(dir.join("logs/transcript_full.jsonl")) else {
+        return false;
+    };
+    let mut tail = Vec::new();
+    transcript.seek(SeekFrom::Start(transcript_from)).is_ok()
+        && transcript.read_to_end(&mut tail).is_ok()
+        && agy_holds_marker(&tail, id)
+}
+
+/// Whether `bytes` carry the marker line of `id`: the marker, then the end of
+/// its line, raw or as JSON escapes it.
+fn agy_holds_marker(bytes: &[u8], id: &str) -> bool {
+    let marker = format!("{}{id}", anyagents_harness::MESSAGE_MARKER_PREFIX);
+    let marker = marker.as_bytes();
+    bytes.windows(marker.len()).enumerate().any(|(at, window)| {
+        let rest = &bytes[at + marker.len()..];
+        window == marker && (rest.starts_with(b"\n") || rest.starts_with(b"\\n"))
+    })
+}
+
+/// Base64, standard or URL-safe, padded or not: protobuf JSON's `bytes`.
+fn agy_base64(text: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(text.len() / 4 * 3);
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for byte in text.bytes() {
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            b'=' => break,
+            _ => return None,
+        };
+        acc = (acc << 6) | u32::from(value);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    Some(out)
 }
 
 /// How long an open cascade's stdout stays quiet before its run status is
@@ -2901,13 +3340,15 @@ fn agy_rpc_fetch_planner_config(
         .cloned())
 }
 
+/// `SendUserCascadeMessage`, waiting for its answer however long it takes:
+/// an answer that is late is not a reason to send again.
 fn agy_rpc_send_steer(
     port: u16,
     csrf_token: &str,
     session_id: &str,
     text: &str,
     planner_config: Option<&Value>,
-) -> Result<(), String> {
+) -> Result<(), AgyRpcError> {
     let cascade_config = match planner_config {
         Some(cfg) => json!({ "plannerConfig": cfg }),
         None => json!({}),
@@ -2919,7 +3360,7 @@ fn agy_rpc_send_steer(
         "blocking": false,
         "deliveryStrategy": "MESSAGE_DELIVERY_STRATEGY_NEXT_INVOCATION"
     });
-    agy_rpc_post(port, csrf_token, "SendUserCascadeMessage", &payload).map(|_| ())
+    agy_rpc_exchange(port, csrf_token, "SendUserCascadeMessage", &payload, None).map(|_| ())
 }
 
 fn agy_rpc_cancel(port: u16, csrf_token: &str, session_id: &str) -> Result<(), String> {

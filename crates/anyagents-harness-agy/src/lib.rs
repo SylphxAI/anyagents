@@ -4,6 +4,19 @@
 //! The Antigravity harness is one catalog entry, not a copied adapter: this
 //! crate is the thin name the supervisor starts it by. Its launch shape, closing
 //! line and usage come from `StreamSpec::for_program("agy")`.
+//!
+//! Delivery (`docs/delivery.md`): an idle agent's message is a stdin line that
+//! opens a turn. With the agent's config directory and a work directory, mail
+//! for a busy agent goes into the running cascade through the language
+//! server's `SendUserCascadeMessage` (`NEXT_INVOCATION`), which queues it in
+//! the cascade's durable mailbox and answers `{}`; the cascade takes it at its
+//! next step boundary, which nothing reports per message, so the level is
+//! `mid-turn`. The request runs off the delivery path and waits for its answer
+//! without a timeout. A refusal is not a fault: the message goes back to the
+//! mailbox. An answer that never came is settled from the cascade's mailbox
+//! and transcript, never by sending again blindly. Nothing deduplicates a
+//! message handed to a later process, so it is not idempotent. Without the
+//! language server a line written mid-turn waits for the turn to end.
 
 use std::path::{Path, PathBuf};
 
@@ -21,7 +34,7 @@ use anyagents_harness_stream::{
 pub const DELIVERY: Delivery = Delivery {
     level: DeliveryLevel::MidTurn,
     idempotent: false,
-    proof: "SendUserCascadeMessage answered",
+    proof: "SendUserCascadeMessage queued it (its answer, or the cascade mailbox)",
     peer: None,
 };
 
@@ -62,14 +75,6 @@ impl AgyHarness {
             args.push(spec.resume_flag.to_string());
             args.push(id.to_string());
         }
-        let (mode, delivery) = if work_dir.is_some() {
-            (DeliveryMode::Steer, DELIVERY)
-        } else {
-            (
-                DeliveryMode::Followup,
-                anyagents_harness_stream::LINE_PER_TURN,
-            )
-        };
         let fake_mode = std::env::var_os("ANYAGENTS_FAKE_MODE").is_some()
             || environment.iter().any(|(k, _)| k == "ANYAGENTS_FAKE_MODE");
         let agy_rpc = if work_dir.is_some() && !fake_mode {
@@ -104,6 +109,16 @@ impl AgyHarness {
                 })
         } else {
             None
+        };
+        // Mid-turn mail needs the language server; without it a line written
+        // mid-turn waits for the turn to end.
+        let (mode, delivery) = if agy_rpc.is_some() {
+            (DeliveryMode::Steer, DELIVERY)
+        } else {
+            (
+                DeliveryMode::Followup,
+                anyagents_harness_stream::LINE_PER_TURN,
+            )
         };
         let inner = StreamHarness::launch_with_agy_rpc(
             Launch {

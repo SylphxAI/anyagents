@@ -453,12 +453,11 @@ line3 = sys.stdin.readline()
     m1.id = "m1".into();
     m1.text = "first".into();
     let line1 = super::message_line(&spec, &m1);
-    assert!(matches!(
+    // The prompt is in flight until the cascade shows its turn's first step.
+    assert_eq!(
         harness.deliver(&m1, &line1).unwrap(),
-        anyagents_harness::DeliverOutcome::Accepted {
-            turn_finished: false
-        }
-    ));
+        anyagents_harness::DeliverOutcome::InFlight
+    );
 
     // The cascade is known from `init`. Before the turn's first
     // `step_update` (`step_type: "user_input"`) arrives, m2 is deferred: the
@@ -480,10 +479,17 @@ line3 = sys.stdin.readline()
         thread::sleep(Duration::from_millis(10));
     }
     assert!(harness.input_ready());
-
-    // Now delivering m2 steers natively via SendUserCascadeMessage!
     assert_eq!(
-        harness.deliver(&m2, &line2).unwrap(),
+        harness.deliver(&m1, &line1).unwrap(),
+        anyagents_harness::DeliverOutcome::Accepted {
+            turn_finished: false
+        }
+    );
+
+    // Now delivering m2 steers natively via SendUserCascadeMessage, off the
+    // delivery path: in flight until the language server answered.
+    assert_eq!(
+        settled(&mut harness, &m2, &line2),
         anyagents_harness::DeliverOutcome::Accepted {
             turn_finished: false
         }
@@ -512,7 +518,7 @@ line3 = sys.stdin.readline()
     m3.text = "third-after-turn".into();
     let line3 = super::message_line(&spec, &m3);
     assert_eq!(
-        harness.deliver(&m3, &line3).unwrap(),
+        settled(&mut harness, &m3, &line3),
         anyagents_harness::DeliverOutcome::Deferred
     );
     assert!(!harness.input_ready());
@@ -524,7 +530,7 @@ line3 = sys.stdin.readline()
     thread::sleep(Duration::from_millis(220));
     assert!(harness.input_ready());
     assert_eq!(
-        harness.deliver(&m3, &line3).unwrap(),
+        settled(&mut harness, &m3, &line3),
         anyagents_harness::DeliverOutcome::Accepted {
             turn_finished: true
         }
@@ -548,7 +554,7 @@ line3 = sys.stdin.readline()
     m4.text = "fourth-after-rpc-wake".into();
     let line4 = super::message_line(&spec, &m4);
     assert_eq!(
-        harness.deliver(&m4, &line4).unwrap(),
+        settled(&mut harness, &m4, &line4),
         anyagents_harness::DeliverOutcome::Accepted {
             turn_finished: false
         }
@@ -1068,7 +1074,8 @@ fn poisoned_agy_result_retires_the_session_without_acknowledging_the_turn() {
         let line = super::message_line(&spec, &message);
         assert!(matches!(
             harness.deliver(&message, &line),
-            Ok(anyagents_harness::DeliverOutcome::Accepted { .. })
+            Ok(anyagents_harness::DeliverOutcome::Accepted { .. }
+                | anyagents_harness::DeliverOutcome::InFlight)
                 | Err(anyagents_harness::HarnessError::Dead)
         ));
         assert!(harness.wait_pred(Duration::from_secs(3), |state| state.epoch > 0));
@@ -1276,16 +1283,14 @@ fn agy_rpc_discovers_running_turn_one_trajectory_and_accepts_steer_before_stdout
         source_time_ms: None,
         context: anyagents_harness::Context::default(),
     };
+    let first_line = super::message_line(&spec, &first);
+    // Written, and in flight until the cascade shows it took it: the host
+    // is woken by that, not by asking again.
     assert_eq!(
-        harness
-            .deliver(&first, &super::message_line(&spec, &first))
-            .unwrap(),
-        anyagents_harness::DeliverOutcome::Accepted {
-            turn_finished: false
-        }
+        harness.deliver(&first, &first_line).unwrap(),
+        anyagents_harness::DeliverOutcome::InFlight
     );
-    // No time gate: a fresh session asks the language server at once.
-    assert!(harness.input_ready());
+    assert!(!harness.input_ready());
 
     let second = anyagents_harness::OutboundMessage {
         id: "m2".into(),
@@ -1297,14 +1302,19 @@ fn agy_rpc_discovers_running_turn_one_trajectory_and_accepts_steer_before_stdout
         context: anyagents_harness::Context::default(),
     };
     assert_eq!(
-        harness
-            .deliver(&second, &super::message_line(&spec, &second))
-            .unwrap(),
+        settled(&mut harness, &second, &super::message_line(&spec, &second)),
         anyagents_harness::DeliverOutcome::Accepted {
             turn_finished: false
         }
     );
     assert_eq!(harness.session_id().as_deref(), Some("conv-turn-1"));
+    // The language server reported the cascade running: the prompt is taken.
+    assert_eq!(
+        harness.deliver(&first, &first_line).unwrap(),
+        anyagents_harness::DeliverOutcome::Accepted {
+            turn_finished: false
+        }
+    );
     let recorded = steered.lock().unwrap().clone();
     assert_eq!(recorded.len(), 1);
     assert!(recorded[0].contains("conv-turn-1"));
@@ -1312,6 +1322,226 @@ fn agy_rpc_discovers_running_turn_one_trajectory_and_accepts_steer_before_stdout
     drop(harness);
     stop.store(true, std::sync::atomic::Ordering::SeqCst);
     let _ = server.join();
+}
+
+/// Offer `message` as the delivery loop does until its Antigravity steer is
+/// settled: a steer is in flight until the language server has answered it.
+fn settled(
+    harness: &mut super::StreamHarness,
+    message: &anyagents_harness::OutboundMessage,
+    line: &serde_json::Value,
+) -> anyagents_harness::DeliverOutcome {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let outcome = harness.deliver(message, line).unwrap();
+        if outcome != anyagents_harness::DeliverOutcome::InFlight {
+            return outcome;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the steer of {} never settled",
+            message.id
+        );
+        harness.wait_pred(std::time::Duration::from_secs(1), |state| {
+            state
+                .agy_steer
+                .as_ref()
+                .is_none_or(|steer| steer.outcome.is_some())
+        });
+    }
+}
+
+#[test]
+fn an_agy_marker_is_found_whole_raw_or_as_json_escapes_it() {
+    use super::agy_holds_marker;
+    assert!(agy_holds_marker(
+        b"\x12\x05anyagents-message:m1\nbody",
+        "m1"
+    ));
+    assert!(agy_holds_marker(
+        br#"{"content":"<USER_REQUEST>\nanyagents-message:m1\nbody"}"#,
+        "m1"
+    ));
+    assert!(!agy_holds_marker(b"anyagents-message:m12\nbody", "m1"));
+    assert!(!agy_holds_marker(b"see anyagents-message:m1", "m1"));
+    assert!(!agy_holds_marker(b"", "m1"));
+}
+
+#[test]
+fn agy_mailbox_bytes_decode_as_protobuf_json_writes_them() {
+    use super::agy_base64;
+    assert_eq!(agy_base64("aGVsbG8=").unwrap(), b"hello");
+    assert_eq!(agy_base64("aGVsbG8").unwrap(), b"hello");
+    assert_eq!(agy_base64("CA4gAw==").unwrap(), [0x08, 0x0e, 0x20, 0x03]);
+    assert_eq!(agy_base64("+/8=").unwrap(), [0xfb, 0xff]);
+    assert_eq!(agy_base64("-_8").unwrap(), [0xfb, 0xff]);
+    assert!(agy_base64("not base64!").is_none());
+}
+
+/// A send that left no answer is settled from what the cascade wrote since
+/// it began: a mailbox file carrying the message, or a transcript step.
+#[test]
+fn an_unanswered_agy_steer_is_settled_from_the_cascade_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let rpc = super::AgyRpcConfig {
+        config_dir: dir.path().into(),
+        csrf_token: "csrf".into(),
+        port_override: None,
+    };
+    let generated = dir
+        .path()
+        .join(".gemini/antigravity-cli/brain/cid-1/.system_generated");
+    let messages = generated.join("messages");
+    std::fs::create_dir_all(&messages).unwrap();
+    std::fs::create_dir_all(generated.join("logs")).unwrap();
+    let transcript = generated.join("logs/transcript_full.jsonl");
+    std::fs::write(
+        &transcript,
+        "{\"type\":\"USER_INPUT\",\"content\":\"<USER_REQUEST>\\nanyagents-message:m2\\nold\"}\n",
+    )
+    .unwrap();
+    let since = std::time::SystemTime::now();
+    let from = std::fs::metadata(&transcript).unwrap().len();
+    for id in ["m1", "m2"] {
+        assert!(!super::agy_took(&rpc, "cid-1", id, since, from), "{id}");
+    }
+
+    // m1 queued: its text inside the base64 `CortexStep` of a mailbox file.
+    std::fs::write(
+        messages.join("8f1c.json"),
+        json!({
+            "id": "8f1c", "recipient": "cid-1", "sender": "user",
+            "priority": "MESSAGE_PRIORITY_HIGH",
+            "stepPayload": "CA6aAUASPmFueWFnZW50cy1tZXNzYWdlOm0xCjxtZXNzYWdlPgo8Ym9keT4KaGVsbG8KPC9ib2R5Pgo8L21lc3NhZ2U+",
+        })
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(messages.join("read.json"), r#"{"8f1c":true}"#).unwrap();
+    assert!(super::agy_took(&rpc, "cid-1", "m1", since, from));
+    assert!(!super::agy_took(&rpc, "cid-1", "m2", since, from));
+    // A file from before the send is not its answer.
+    let old = std::fs::File::options()
+        .write(true)
+        .open(messages.join("8f1c.json"))
+        .unwrap();
+    old.set_modified(since - std::time::Duration::from_secs(60))
+        .unwrap();
+    assert!(!super::agy_took(&rpc, "cid-1", "m1", since, from));
+
+    // m2 taken by the cascade since: a step of the transcript past `from`.
+    let mut log = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&transcript)
+        .unwrap();
+    std::io::Write::write_all(
+        &mut log,
+        b"{\"type\":\"USER_INPUT\",\"content\":\"<USER_REQUEST>\\nanyagents-message:m2\\nnew\"}\n",
+    )
+    .unwrap();
+    assert!(super::agy_took(&rpc, "cid-1", "m2", since, from));
+    // A cascade id that names more than one directory is never read.
+    assert!(!super::agy_took(&rpc, "../cid-1", "m2", since, 0));
+    assert!(!super::agy_took(&rpc, "", "m2", since, 0));
+}
+
+#[test]
+fn the_agy_peer_is_the_language_server_this_process_started() {
+    let dir = tempfile::tempdir().unwrap();
+    let rpc = super::AgyRpcConfig {
+        config_dir: dir.path().into(),
+        csrf_token: "csrf".into(),
+        port_override: None,
+    };
+    assert_eq!(super::agy_server_version(&rpc, Some(42)), None);
+    let home = dir.path().join(".gemini/antigravity-cli");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        home.join("cli.log"),
+        "I1113 17:04:37.460819      68 server.go:2531] Starting language server process with pid 4242\n\
+         I1113 17:04:37.462199      68 server.go:2590] Language server version: 1.5.7\n\
+         I1113 17:04:37.462677      68 server.go:1282] Language server listening on random port at 46219 for HTTP\n\
+         I1113 17:05:37.460819      68 server.go:2531] Starting language server process with pid 42\n\
+         I1113 17:05:37.462199      68 server.go:2590] Language server version: 1.5.8\n",
+    )
+    .unwrap();
+    assert_eq!(
+        super::agy_server_version(&rpc, Some(42)).as_deref(),
+        Some("1.5.8")
+    );
+    assert_eq!(
+        super::agy_server_version(&rpc, Some(4242)).as_deref(),
+        Some("1.5.7")
+    );
+    // No block names the child (a wrapper's pid): the first one does.
+    assert_eq!(
+        super::agy_server_version(&rpc, Some(424)).as_deref(),
+        Some("1.5.7")
+    );
+    assert_eq!(
+        super::agy_server_version(&rpc, None).as_deref(),
+        Some("1.5.7")
+    );
+}
+
+/// What the server can have done with a request decides what the steer
+/// does next: a refusal applied nothing, a request that never reached it
+/// applied nothing, one left unanswered may have been applied.
+#[test]
+fn agy_requests_tell_a_refusal_from_no_answer_and_from_no_server() {
+    use std::io::{BufRead, Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        for reply in [
+            Some(
+                "HTTP/1.0 500 Internal Server Error\r\nContent-Type: application/json\r\n\r\n\
+                 {\"code\":\"unknown\",\"message\":\"cannot send message: there is an ongoing battle\"}",
+            ),
+            None,
+            Some("HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n{}"),
+        ] {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).unwrap() > 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.strip_prefix("Content-Length: ") {
+                    length = value.trim().parse::<usize>().unwrap();
+                }
+            }
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            if let Some(reply) = reply {
+                stream.write_all(reply.as_bytes()).unwrap();
+            }
+        }
+    });
+    let send = || super::agy_rpc_exchange(port, "csrf", "SendUserCascadeMessage", &json!({}), None);
+    match send() {
+        Err(super::AgyRpcError::Refused(why)) => assert!(why.contains("ongoing battle"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    assert!(matches!(send(), Err(super::AgyRpcError::Unanswered(_))));
+    assert_eq!(send().unwrap().trim(), "{}");
+    server.join().unwrap();
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let closed_port = closed.local_addr().unwrap().port();
+    drop(closed);
+    assert!(matches!(
+        super::agy_rpc_exchange(
+            closed_port,
+            "csrf",
+            "SendUserCascadeMessage",
+            &json!({}),
+            None
+        ),
+        Err(super::AgyRpcError::Unreached(_))
+    ));
 }
 
 /// Re-offer one input the way the delivery loop does until the harness takes it.
@@ -1548,16 +1778,19 @@ exec sleep 30"#
     assert!(harness.wait_pred(Duration::from_secs(5), |state| state.session_id.is_some()));
     let wakes = counted_watch(&harness);
     let message = plain_message("m1");
+    let line = super::message_line(&spec, &message);
     assert_eq!(
-        harness
-            .deliver(&message, &super::message_line(&spec, &message))
-            .unwrap(),
+        harness.deliver(&message, &line).unwrap(),
+        anyagents_harness::DeliverOutcome::InFlight
+    );
+    // While steps stream, the cascade evidently runs: nobody asks.
+    assert!(harness.wait_pred(Duration::from_secs(5), |state| state.turn_user_inputs > 0));
+    assert_eq!(
+        harness.deliver(&message, &line).unwrap(),
         anyagents_harness::DeliverOutcome::Accepted {
             turn_finished: false
         }
     );
-    // While steps stream, the cascade evidently runs: nobody asks.
-    assert!(harness.wait_pred(Duration::from_secs(5), |state| state.turn_user_inputs > 0));
     std::thread::sleep(Duration::from_millis(1_000));
     assert_eq!(
         polls.load(Ordering::SeqCst),
