@@ -58,6 +58,8 @@ struct State {
     child: Option<Child>,
     stderr: diagnostics::Evidence,
     alive: bool,
+    /// Bumped when something the host reads changes: what the activity
+    /// watcher waits on.
     epoch: u64,
     seen: HashSet<String>,
     written: Vec<String>,
@@ -76,6 +78,38 @@ struct State {
     echoed: HashSet<String>,
     /// For each written id, whether no turn was open when it was written.
     phases: std::collections::HashMap<String, &'static str>,
+}
+
+/// What the host reads through the harness API.
+#[derive(PartialEq, Eq)]
+struct Observed {
+    alive: bool,
+    open: usize,
+    followups: usize,
+    seen: usize,
+    finished: usize,
+    failures: usize,
+    usages: usize,
+    quota_reset_at_ms: Option<i64>,
+    sign_in_fault: Option<String>,
+    session_id: Option<String>,
+}
+
+impl State {
+    fn observed(&self) -> Observed {
+        Observed {
+            alive: self.alive,
+            open: self.open.len(),
+            followups: self.followups.len(),
+            seen: self.seen.len(),
+            finished: self.finished.len(),
+            failures: self.failures.len(),
+            usages: self.usages.len(),
+            quota_reset_at_ms: self.quota_reset_at_ms,
+            sign_in_fault: self.sign_in_fault.clone(),
+            session_id: self.session_id.clone(),
+        }
+    }
 }
 
 impl ClaudeHarness {
@@ -676,6 +710,7 @@ fn read_stdout(stdout: ChildStdout, shared: Arc<Mutex<State>>, wake: Arc<Condvar
         };
         {
             let mut state = lock(&shared);
+            let before = state.observed();
             // An id the vendor wrote or echoed starts no second turn. An id that
             // only appears inside an error or a system notice is not proof it
             // wrote the message: the turn that failed must be able to try again.
@@ -705,7 +740,11 @@ fn read_stdout(stdout: ChildStdout, shared: Arc<Mutex<State>>, wake: Arc<Condvar
             if value.get("type").and_then(Value::as_str) == Some("result") {
                 apply_result(&mut state, &value);
             }
-            state.epoch = state.epoch.wrapping_add(1);
+            // A streamed assistant or tool event changes nothing the host
+            // reads, and wakes nobody.
+            if state.observed() != before {
+                state.epoch = state.epoch.wrapping_add(1);
+            }
         }
         wake.notify_all();
     }
@@ -722,15 +761,15 @@ fn watch_child(shared: Arc<Mutex<State>>, wake: Arc<Condvar>, notify: Arc<dyn Fn
         .name("anyagents-claude-watch".into())
         .spawn(move || {
             let mut state = lock(&shared);
-            let mut seen = 0u64;
+            let mut seen = None;
             loop {
                 if !state.alive {
                     drop(state);
                     notify();
                     break;
                 }
-                if state.epoch != seen {
-                    seen = state.epoch;
+                if seen != Some(state.epoch) {
+                    seen = Some(state.epoch);
                     drop(state);
                     notify();
                     state = lock(&shared);
