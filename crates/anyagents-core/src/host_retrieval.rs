@@ -101,7 +101,15 @@ impl Store {
             return Ok(true);
         };
         let agent = Owner { id, name };
-        let _guard = self.lock_agent_lifecycle(&agent.id).map_err(store_error)?;
+        // Maintenance never waits for a lifecycle: the same worker runs the WAL
+        // checkpoint and outbound settlement, which must not queue behind a
+        // delivery, search or archive holding this owner. A busy owner keeps
+        // its place in the rotation and is verified on a later pass.
+        let _guard = match self.try_lock_agent_lifecycle(&agent.id) {
+            Ok(guard) => guard,
+            Err(crate::Error::AgentBusy) => return Ok(false),
+            Err(error) => return Err(store_error(error)),
+        };
         let Some(mut cursor) = index.source_cursor(&owner, &path)? else {
             return Ok(false);
         };
@@ -1633,6 +1641,69 @@ mod tests {
             ),
             (0, prefix.len() as u64, 1)
         );
+    }
+
+    /// The verifier runs on the maintenance worker beside the WAL checkpoint
+    /// and outbound settlement. A held lifecycle (a delivery, search or archive
+    /// of that owner) must make it skip the source, not wait: before, it
+    /// blocked in `flock` for as long as the holder kept the lock.
+    #[test]
+    fn periodic_verifier_skips_a_busy_owner_instead_of_waiting() {
+        let dir = crate::test_tempdir();
+        let store = std::sync::Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        let agent = store
+            .create_agent(NewAgent::new("busy-owner", "spiron"))
+            .unwrap();
+        let root = dir
+            .path()
+            .join("agents")
+            .join(agent.id.as_str())
+            .join("transcripts");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("a.jsonl");
+        fs::write(&path, "{\"content\":\"busyneedle\"}\n").unwrap();
+        let index_path = dir.path().join(INDEX_FILE);
+        let t0 = crate::now_ms();
+        let before = {
+            let mut index = HostIndex::open(&index_path).unwrap();
+            refresh_native_at(&mut index, &Owner::from(&agent), &path, false, t0).unwrap();
+            index
+                .source_cursor(agent.id.as_str(), &path)
+                .unwrap()
+                .unwrap()
+        };
+        let held = store.lock_agent_lifecycle(&agent.id).unwrap();
+        let (done, outcome) = std::sync::mpsc::channel();
+        let verifier = std::sync::Arc::clone(&store);
+        std::thread::spawn(move || {
+            let _ = done.send(verifier.verify_one_host_history_source(t0 + 3_600_001));
+        });
+        let skipped = outcome
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("the verifier waited for a held lifecycle");
+        assert!(!skipped.unwrap());
+        let index = HostIndex::open(&index_path).unwrap();
+        let cursor = index
+            .source_cursor(agent.id.as_str(), &path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            cursor.verification_attempt_ms, before.verification_attempt_ms,
+            "a skipped source keeps its turn"
+        );
+        drop(index);
+        drop(held);
+        assert!(
+            store
+                .verify_one_host_history_source(t0 + 3_600_002)
+                .unwrap()
+        );
+        let index = HostIndex::open(&index_path).unwrap();
+        let cursor = index
+            .source_cursor(agent.id.as_str(), &path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(cursor.full_verified_ms, t0 + 3_600_002);
     }
 
     #[test]
