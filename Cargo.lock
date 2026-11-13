@@ -85,6 +85,7 @@ dependencies = [
  "anyagents-harness-spiron",
  "anyagents-harness-stream",
  "anyagents-installer",
+ "anyagents-invariants",
  "anyagents-supervisor",
  "anyagents-toolchain",
  "anyagents-tools",
