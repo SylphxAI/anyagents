@@ -4,16 +4,27 @@ version.workspace = true
 edition = "2024"
 license = "MIT"
 rust-version = "1.98"
-description = "Crash-injection tests for the delivery guarantees"
+description = "Delivery guarantees: crash-injection tests and the harness conformance suite"
 publish = false
 
-# The guarantees are integration tests, so every dependency below exists for the
-# tests in `tests/`.
-[dev-dependencies]
+# The conformance scenarios are a library, so a harness adapter outside this
+# package can run them against itself (`conformance_suite!`).
+[dependencies]
 anyagents-agent = { path = "../../crates/anyagents-agent" }
 anyagents-core = { path = "../../crates/anyagents-core" }
 anyagents-harness = { path = "../../crates/anyagents-harness" }
+serde_json = "1"
 tempfile = "3"
+
+[dev-dependencies]
+anyagents-harness-agy = { path = "../../crates/anyagents-harness-agy" }
+anyagents-harness-claude = { path = "../../crates/anyagents-harness-claude" }
+anyagents-harness-codex = { path = "../../crates/anyagents-harness-codex" }
+anyagents-harness-muse = { path = "../../crates/anyagents-harness-muse" }
+anyagents-harness-omp = { path = "../../crates/anyagents-harness-omp" }
+anyagents-harness-opencode = { path = "../../crates/anyagents-harness-opencode" }
+anyagents-harness-spiron = { path = "../../crates/anyagents-harness-spiron" }
+anyagents-harness-stream = { path = "../../crates/anyagents-harness-stream" }
 
 # `cargo test --workspace --all-targets` reports a test crate's own dependencies
 # as unused in the target it tests. Only a workspace member that is built as a

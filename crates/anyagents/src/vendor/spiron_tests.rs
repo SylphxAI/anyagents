@@ -210,36 +210,26 @@ for line in sys.stdin:
                 })
             )
         });
+        // A peer whose ready names no consumption proof is given nothing
+        // while its turn runs.
         assert_eq!(
             vendor.deliver(&message("steer")).unwrap(),
             DeliverOutcome::Deferred
-        );
-        eventually(|| config.join("steer-ack").exists());
-        assert_eq!(
-            vendor.deliver(&message("steer")).unwrap(),
-            DeliverOutcome::Deferred,
-            "socket acknowledgement is not journal commit"
-        );
-        assert_eq!(
-            vendor.turns_served(),
-            0,
-            "unrelated result cannot close this turn"
         );
         vendor.cancel().unwrap();
         eventually(|| config.join("cancel-ack").exists());
         assert_eq!(vendor.turns_served(), 0, "cancel_ack is not completion");
         std::fs::write(config.join("cancel-complete"), "").unwrap();
-        eventually(|| vendor.turns_served() == 2);
-        assert_eq!(
-            vendor.deliver(&message("steer")).unwrap(),
-            DeliverOutcome::Accepted {
-                turn_finished: true
-            }
-        );
-        assert!(
-            !config.join("spiron-unconfirmed-steers.json").exists(),
-            "confirmed terminal completion releases the pre-dispatch hold"
-        );
+        eventually(|| vendor.turns_served() == 1);
+        eventually(|| {
+            matches!(
+                vendor.deliver(&message("steer")),
+                Ok(DeliverOutcome::Accepted {
+                    turn_finished: false
+                })
+            )
+        });
+        assert!(!config.join("spiron-unconfirmed-steers.json").exists());
         assert_eq!(vendor.served_usage().input_tokens, 11);
         assert_eq!(vendor.served_usage().cache_read_tokens, 3);
         assert_eq!(vendor.served_usage().cache_write_tokens, 2);
@@ -351,9 +341,9 @@ for line in sys.stdin:
             "each mailbox request crosses stdin only once"
         );
         assert_eq!(inputs[0]["request_id"], "first");
-        assert_eq!(inputs[1]["request_id"], "steer");
-        assert!(inputs[1]["text"].as_str().unwrap().contains("body-steer"));
-        assert_eq!(inputs[2]["type"], "cancel");
+        assert_eq!(inputs[1]["type"], "cancel");
+        assert_eq!(inputs[2]["request_id"], "steer");
+        assert!(inputs[2]["text"].as_str().unwrap().contains("body-steer"));
         assert_eq!(inputs[3]["request_id"], "wake");
         assert_eq!(inputs[4]["request_id"], "failure");
         assert_eq!(store.agent(&agent.id).unwrap(), agent);
@@ -386,7 +376,7 @@ fn external_probe(
     std::sync::MutexGuard<'static, ()>,
     Store,
     anyagents_core::Agent,
-    StreamHarness,
+    SpironHarness,
 ) {
     // A child inherits process-global environment even when this fixture never
     // mutates it. Keep the shared guard until its harness and restart are done,
@@ -405,248 +395,6 @@ fn external_probe(
         .unwrap();
     let harness = start_spiron(&program, &config, &work, &agent, None, &[]).unwrap();
     (environment, store, agent, harness)
-}
-
-#[test]
-fn spiron_external_cancelled_unconfirmed_steer_retains_mailbox_custody_across_restart() {
-    use anyagents_agent::DeliveryLoop;
-    let temp = crate::test_tempdir();
-    // Vesta's exact cancel/cancel_ack/cancelled-result shape: acknowledged
-    // steering text is returned verbatim in undelivered_steers, without IDs.
-    let script = r#"
-import sys,json,pathlib,os
-pending=None
-first=None
-print(json.dumps({'type':'ready'}),flush=True)
-for line in sys.stdin:
- m=json.loads(line)
- if m['type']=='cancel':
-  print(json.dumps({'type':'cancel_ack','turn_id':first,'status':'cancelling'}),flush=True)
-  print(json.dumps({'type':'result','request_id':first,'status':'cancelled','is_error':False,'undelivered_steers':[pending]}),flush=True)
- elif first is None:
-  first=m['request_id']
-  print(json.dumps({'type':'accepted','request_id':first}),flush=True)
- else:
-  pending=m['text']
-  print(json.dumps({'type':'steer_ack','request_id':m['request_id'],'accepted':True,'turn_id':first}),flush=True)
-  pathlib.Path(os.environ['HOME'],'steer-ack').touch()
-"#;
-    let (_environment, store, agent, harness) = external_probe(temp.path(), script);
-    let ReceiveOutcome::New(first) = store.receive(&agent.id, Incoming::new("first")).unwrap()
-    else {
-        panic!("fresh mailbox message expected")
-    };
-    let mut delivery = DeliveryLoop::start(
-        store,
-        agent.id.clone(),
-        VendorHarness::Spiron(
-            Box::new(harness),
-            temp.path().join("config/spiron-session-id").into(),
-            "spiron".into(),
-        ),
-    )
-    .unwrap();
-    eventually(|| {
-        delivery.run_once().unwrap();
-        delivery.store().delivered_cursor(&agent.id).unwrap() == first.seq
-    });
-    let ReceiveOutcome::New(steer) = delivery
-        .store()
-        .receive(&agent.id, Incoming::new("steering work"))
-        .unwrap()
-    else {
-        panic!("fresh mailbox message expected")
-    };
-    delivery.run_once().unwrap();
-    eventually(|| temp.path().join("config/steer-ack").exists());
-    delivery.run_once().unwrap();
-    assert_eq!(
-        delivery.store().delivered_cursor(&agent.id).unwrap(),
-        first.seq
-    );
-    assert!(
-        delivery
-            .store()
-            .message(&agent.id, steer.id.as_str())
-            .unwrap()
-            .unwrap()
-            .delivered_at_ms
-            .is_none()
-    );
-    delivery.harness_mut().cancel().unwrap();
-    eventually(|| delivery.harness().turns_served() > 0);
-    delivery.run_once().unwrap();
-    let health = delivery.harness().health();
-    assert_eq!(health.turn_state, anyagents_harness::TurnState::InTurn);
-    assert!(
-        health
-            .sign_in_fault
-            .unwrap()
-            .contains("unconfirmed steering input")
-    );
-    assert_eq!(delivery.harness().turns_served(), 1);
-    assert!(delivery.store().has_open_turn(&agent.id).unwrap());
-    assert_eq!(
-        delivery
-            .store()
-            .next_undelivered(&agent.id)
-            .unwrap()
-            .unwrap()
-            .id,
-        steer.id
-    );
-    assert!(
-        temp.path()
-            .join("config/spiron-unconfirmed-steers.json")
-            .exists()
-    );
-    drop(delivery);
-    let program = temp.path().join("peer");
-    let mut restarted = start_spiron(
-        &program,
-        &temp.path().join("config"),
-        &temp.path().join("work"),
-        &agent,
-        None,
-        &[],
-    )
-    .unwrap();
-    assert_eq!(
-        restarted
-            .deliver(
-                &message("steer"),
-                &json!({"type":"user","request_id":"steer","text":"must not replay"})
-            )
-            .unwrap(),
-        DeliverOutcome::Deferred
-    );
-    assert!(restarted.written_ids().is_empty());
-    assert!(
-        restarted
-            .health()
-            .sign_in_fault
-            .unwrap()
-            .contains("Reconcile")
-    );
-}
-
-#[test]
-fn spiron_external_hold_write_failure_refuses_unsent_steer_and_restart_keeps_custody() {
-    use anyagents_agent::DeliveryLoop;
-    let temp = crate::test_tempdir();
-    let script = r#"
-import sys,json,pathlib
-print(json.dumps({'type':'ready'}),flush=True)
-for line in sys.stdin:
- m=json.loads(line)
- with pathlib.Path(__file__).with_name('wire.jsonl').open('a') as out:
-  out.write(json.dumps(m)+'\n')
- print(json.dumps({'type':'accepted','request_id':m['request_id']}),flush=True)
-"#;
-    let (_environment, store, agent, harness) = external_probe(temp.path(), script);
-    let ReceiveOutcome::New(first) = store.receive(&agent.id, Incoming::new("first")).unwrap()
-    else {
-        panic!("fresh mailbox message expected")
-    };
-    let mut delivery = DeliveryLoop::start(
-        store,
-        agent.id.clone(),
-        VendorHarness::Spiron(
-            Box::new(harness),
-            temp.path().join("config/spiron-session-id").into(),
-            "spiron".into(),
-        ),
-    )
-    .unwrap();
-    eventually(|| {
-        delivery.run_once().unwrap();
-        delivery.store().delivered_cursor(&agent.id).unwrap() == first.seq
-    });
-    let ReceiveOutcome::New(steer) = delivery
-        .store()
-        .receive(&agent.id, Incoming::new("steering work"))
-        .unwrap()
-    else {
-        panic!("fresh mailbox message expected")
-    };
-    // A missing configured directory deterministically returns NotFound even
-    // under root. Existing accepted work and its hold remain in the moved dir;
-    // only the hold write for the new input fails (no chmod/ENOSPC assumptions).
-    let config = temp.path().join("config");
-    let offline = temp.path().join("offline-config");
-    std::fs::rename(&config, &offline).unwrap();
-    let error = delivery.run_once().unwrap_err();
-    assert!(
-        matches!(error, anyagents_agent::Error::HarnessFailed(ref reason)
-        if reason.contains("cannot persist Spiron input hold before dispatch")),
-        "{error}"
-    );
-    assert_eq!(
-        delivery.store().delivered_cursor(&agent.id).unwrap(),
-        first.seq
-    );
-    assert!(
-        delivery
-            .store()
-            .message(&agent.id, steer.id.as_str())
-            .unwrap()
-            .unwrap()
-            .delivered_at_ms
-            .is_none()
-    );
-    let wire = temp.path().join("wire.jsonl");
-    assert_eq!(std::fs::read_to_string(&wire).unwrap().lines().count(), 1);
-    assert!(offline.join("spiron-unconfirmed-steers.json").exists());
-    drop(delivery);
-    std::fs::rename(&offline, &config).unwrap();
-
-    let store = Store::open(temp.path().join("state.db")).unwrap();
-    let restarted = start_spiron(
-        &temp.path().join("peer"),
-        &config,
-        &temp.path().join("work"),
-        &agent,
-        None,
-        &[],
-    )
-    .unwrap();
-    let mut restarted = DeliveryLoop::start(
-        store,
-        agent.id.clone(),
-        VendorHarness::Spiron(
-            Box::new(restarted),
-            config.join("spiron-session-id").into(),
-            "spiron".into(),
-        ),
-    )
-    .unwrap();
-    restarted.run_once().unwrap();
-    assert_eq!(
-        restarted.store().delivered_cursor(&agent.id).unwrap(),
-        first.seq
-    );
-    assert_eq!(
-        restarted
-            .store()
-            .next_undelivered(&agent.id)
-            .unwrap()
-            .unwrap()
-            .id,
-        steer.id
-    );
-    assert!(
-        restarted
-            .harness()
-            .health()
-            .sign_in_fault
-            .unwrap()
-            .contains("Reconcile")
-    );
-    assert_eq!(
-        std::fs::read_to_string(wire).unwrap().lines().count(),
-        1,
-        "fresh real delivery loop cannot resend unreconciled input"
-    );
 }
 
 #[test]
@@ -671,10 +419,7 @@ for line in sys.stdin:
     let (_environment, store, agent, mut harness) = external_probe(temp.path(), script);
     eventually(|| {
         matches!(
-            harness.deliver(
-                &message("mask"),
-                &json!({"type":"user","request_id":"mask","text":"go"})
-            ),
+            harness.deliver(&message("mask")),
             Ok(DeliverOutcome::Accepted {
                 turn_finished: true
             })
@@ -729,10 +474,7 @@ sys.exit({exit})
         let (_environment, _, _, mut harness) = external_probe(temp.path(), &script);
         if after_input {
             // The peer can die between writing and observing acceptance.
-            let _ = harness.deliver(
-                &message("startup"),
-                &json!({"type":"user","request_id":"startup","text":"go"}),
-            );
+            let _ = harness.deliver(&message("startup"));
         }
         eventually(|| !harness.health().process_alive);
         if exit == 0 {
@@ -808,171 +550,6 @@ fn spiron_runtime_config_writes_always_approve_and_materializes_seat_auth() {
     let auth_json: serde_json::Value = serde_json::from_str(&auth_raw).unwrap();
     assert_eq!(auth_json["access_token"], "sk-sylphx-seat-key");
     assert_eq!(auth_json["org_id"], "org_test_1");
-}
-
-#[test]
-fn spiron_supervisor_reconciles_interrupted_turn_hold_and_journal_into_recovery() {
-    use anyagents_supervisor::{Supervisor, SystemClock};
-    use std::sync::Arc;
-
-    let _lock = crate::server::tests::env_lock();
-    let temp = crate::test_tempdir();
-    let probe = temp.path().join("spiron-recovery-probe");
-    std::fs::write(
-        &probe,
-        r#"#!/usr/bin/env python3
-import json, os, pathlib, sqlite3, sys, time
-cfg = pathlib.Path(sys.argv[sys.argv.index("--state-dir") + 1])
-args = sys.argv[1:]
-session = args[args.index("--session") + 1] if "--session" in args else "spiron-sess-1"
-launch_file = cfg / "launch_count"
-launch_num = int(launch_file.read_text()) + 1 if launch_file.exists() else 1
-launch_file.write_text(str(launch_num))
-
-db = sqlite3.connect(cfg / "sessions.sqlite3")
-db.execute("CREATE TABLE IF NOT EXISTS session_entries(session_id TEXT NOT NULL, idx INTEGER NOT NULL, event TEXT NOT NULL, PRIMARY KEY(session_id, idx))")
-db.commit()
-
-def emit(kind, req_id=None, **fields):
-    payload = {"type": kind, "session_id": session}
-    if req_id is not None:
-        payload["request_id"] = req_id
-    payload.update(fields)
-    print(json.dumps(payload), flush=True)
-
-emit("ready")
-active = None
-for raw in sys.stdin:
-    msg = json.loads(raw)
-    with (cfg / "wire.jsonl").open("a") as out:
-        out.write(json.dumps({"launch": launch_num, "msg": msg}) + "\n")
-    req_id = msg.get("request_id")
-    text = msg.get("text", "")
-    if launch_num == 1:
-        if active is None:
-            active = req_id
-            row_count = db.execute("SELECT COUNT(*) FROM session_entries WHERE session_id = ?", (session,)).fetchone()[0]
-            db.execute("INSERT INTO session_entries(session_id, idx, event) VALUES(?, ?, ?)", (session, row_count, json.dumps({"text": text})))
-            db.commit()
-            emit("accepted", req_id, mode="turn")
-        else:
-            # Accept steer on socket WITHOUT committing to sessions.sqlite3, then crash mid-turn!
-            emit("steer_ack", req_id, accepted=True, turn_id=active)
-            time.sleep(0.05)
-            sys.exit(1)
-    else:
-        emit("accepted", req_id, mode="turn")
-        emit("text_delta", req_id, text="recovered-ok")
-        emit("result", req_id, status="completed", usage={"input_tokens": 10, "output_tokens": 4})
-"#,
-    )
-    .unwrap();
-    std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let _env = Environment::set(&[
-        ("ANYAGENTS_SPIRON_BIN", probe.as_os_str()),
-        ("ANYAGENTS_FAKE_MODE", std::ffi::OsStr::new("1")),
-    ]);
-
-    let data = temp.path().join("data");
-    std::fs::create_dir_all(&data).unwrap();
-    let store = Arc::new(Store::open(data.join("state.db")).unwrap());
-    let mut spec = NewAgent::new("spiron-worker", "spiron");
-    spec.model = Some("sylphx/openai/gpt-6.1-sol#xhigh".into());
-    let agent = store.create_agent(spec).unwrap();
-    let agent_root = data.join("agents").join(agent.id.as_str());
-    let cfg = agent_root.join("config");
-    let work = agent_root.join("work");
-    std::fs::create_dir_all(cfg.join(".agents/skills")).unwrap();
-    std::fs::create_dir_all(&work).unwrap();
-    crate::spiron::write_spiron_config(
-        &cfg,
-        agent.model.as_deref(),
-        Path::new("/probe/anyagents"),
-        &["mcp".into()],
-    )
-    .unwrap();
-    store
-        .set_agent_running(&agent.id, &work.display().to_string())
-        .unwrap();
-
-    let ReceiveOutcome::New(m1) = store
-        .receive(&agent.id, Incoming::new("initial assignment"))
-        .unwrap()
-    else {
-        panic!("expected m1");
-    };
-
-    let probe_launch = probe.clone();
-    let supervisor = Supervisor::<VendorHarness>::start(
-        Arc::clone(&store),
-        Arc::new(SystemClock::new()),
-        Arc::new(move |req| {
-            anyagents_core::host_session::ensure_active(req.config_dir.parent().unwrap(), "spiron")
-                .map_err(|e| e.to_string())?;
-            let session = session_from_file(&req.config_dir, "spiron-session-id")?;
-            let h = start_spiron(
-                &probe_launch,
-                &req.config_dir,
-                &req.work_dir,
-                &req.agent,
-                session.as_deref(),
-                &[],
-            )?;
-            let vh = VendorHarness::Spiron(
-                Box::new(h),
-                req.config_dir.join("spiron-session-id").into(),
-                "spiron".into(),
-            );
-            vh.sync_session()?;
-            Ok(vh)
-        }),
-        vec![],
-    )
-    .unwrap();
-
-    eventually(|| store.delivered_cursor(&agent.id).unwrap() == m1.seq);
-    let ReceiveOutcome::New(m2) = store
-        .receive(&agent.id, Incoming::new("mid-turn steer detail"))
-        .unwrap()
-    else {
-        panic!("expected m2");
-    };
-    store.poke(anyagents_core::Wake::Agent {
-        agent_id: agent.id.clone(),
-    });
-
-    eventually(|| !store.has_open_turn(&agent.id).unwrap());
-    assert!(!cfg.join("spiron-unconfirmed-steers.json").exists());
-    assert!(
-        cfg.join("spiron-unconfirmed-steers.reconciled.json")
-            .is_file()
-    );
-    assert!(!cfg.join(".anyagents-last-error.json").exists());
-
-    let wire_lines: Vec<serde_json::Value> = std::fs::read_to_string(cfg.join("wire.jsonl"))
-        .unwrap()
-        .lines()
-        .map(|l| serde_json::from_str(l).unwrap())
-        .collect();
-    let launch2: Vec<&serde_json::Value> = wire_lines.iter().filter(|v| v["launch"] == 2).collect();
-    assert_eq!(
-        launch2.len(),
-        1,
-        "replacement session must receive exactly one [Recovery] turn without raw replay: {wire_lines:?}"
-    );
-    let recovery_text = launch2[0]["msg"]["text"].as_str().unwrap();
-    assert!(recovery_text.contains("[Recovery] Your previous turn was interrupted"));
-    assert!(recovery_text.contains("initial assignment"));
-    assert!(recovery_text.contains("mid-turn steer detail"));
-    assert!(
-        recovery_text.contains(&format!("committed=[{}]", m1.id)),
-        "expected journal committed m1 in recovery prompt: {recovery_text}"
-    );
-    assert!(
-        recovery_text.contains(&format!("unconfirmed_before_journal=[{}]", m2.id)),
-        "expected journal unconfirmed m2 in recovery prompt: {recovery_text}"
-    );
-    drop(supervisor);
 }
 
 #[test]
@@ -1100,149 +677,6 @@ for raw in sys.stdin:
             .unwrap()
             .contains("[Recovery] Your previous turn was interrupted")
     );
-    drop(supervisor);
-}
-
-#[test]
-fn spiron_pause_and_reset_session_clears_hold_and_resumes_new_generation_via_recovery() {
-    use anyagents_supervisor::{Supervisor, SystemClock};
-    use std::sync::Arc;
-
-    let _lock = crate::server::tests::env_lock();
-    let temp = crate::test_tempdir();
-    let probe = temp.path().join("spiron-reset-probe");
-    std::fs::write(
-        &probe,
-        r#"#!/usr/bin/env python3
-import json, os, pathlib, sys
-cfg = pathlib.Path(sys.argv[sys.argv.index("--state-dir") + 1])
-args = sys.argv[1:]
-session = args[args.index("--session") + 1] if "--session" in args else "brand-new-spiron-session"
-with (cfg / "sessions_seen.txt").open("a") as out:
-    out.write(session + "\n")
-print(json.dumps({"type": "ready", "session_id": session}), flush=True)
-for raw in sys.stdin:
-    msg = json.loads(raw)
-    with (cfg / "wire.jsonl").open("a") as out:
-        out.write(json.dumps(msg) + "\n")
-    req_id = msg["request_id"]
-    print(json.dumps({"type": "accepted", "session_id": session, "request_id": req_id, "mode": "turn"}), flush=True)
-    print(json.dumps({"type": "result", "session_id": session, "request_id": req_id, "status": "completed", "usage": {"input_tokens": 6, "output_tokens": 2}}), flush=True)
-"#,
-    )
-    .unwrap();
-    std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let _env = Environment::set(&[
-        ("ANYAGENTS_SPIRON_BIN", probe.as_os_str()),
-        ("ANYAGENTS_FAKE_MODE", std::ffi::OsStr::new("1")),
-    ]);
-
-    let data = temp.path().join("data");
-    std::fs::create_dir_all(&data).unwrap();
-    let store = Arc::new(Store::open(data.join("state.db")).unwrap());
-    let mut spec = NewAgent::new("spiron-reset-node", "spiron");
-    spec.model = Some("sylphx/openai/gpt-6.1-sol#xhigh".into());
-    let agent = store.create_agent(spec).unwrap();
-    let agent_root = data.join("agents").join(agent.id.as_str());
-    let cfg = agent_root.join("config");
-    let work = agent_root.join("work");
-    std::fs::create_dir_all(cfg.join(".agents/skills")).unwrap();
-    std::fs::create_dir_all(&work).unwrap();
-    crate::spiron::write_spiron_config(
-        &cfg,
-        agent.model.as_deref(),
-        Path::new("/probe/anyagents"),
-        &["mcp".into()],
-    )
-    .unwrap();
-
-    anyagents_core::host_session::ensure_active(&agent_root, "spiron").unwrap();
-    anyagents_core::host_session::bind_vendor(&agent_root, "spiron", "old-stuck-session").unwrap();
-    std::fs::write(cfg.join("spiron-session-id"), "old-stuck-session\n").unwrap();
-
-    let ReceiveOutcome::New(m1) = store
-        .receive(&agent.id, Incoming::new("task part 1"))
-        .unwrap()
-    else {
-        panic!("expected m1");
-    };
-    store.note_delivered(&agent.id, m1.seq).unwrap();
-    let ReceiveOutcome::New(m2) = store
-        .receive(&agent.id, Incoming::new("task part 2"))
-        .unwrap()
-    else {
-        panic!("expected m2");
-    };
-    // Simulate unconfirmed steer hold where m2 cursor had even been rewound!
-    std::fs::write(
-        cfg.join("spiron-unconfirmed-steers.json"),
-        json!({"turn_id": m1.id, "request_ids": [m1.id, m2.id]}).to_string(),
-    )
-    .unwrap();
-    std::fs::write(
-        cfg.join(".anyagents-last-error.json"),
-        r#"{"error":"Spiron reported unconfirmed steering input; Reconcile spiron-unconfirmed-steers.json","timestamp_ms":1}"#,
-    )
-    .unwrap();
-    let paused = store.set_agent_state(&agent.id, "paused").unwrap();
-    let reset_out = crate::create::reset_agent_session_locked(&store, &paused).unwrap();
-    let new_gen = reset_out["generation"].as_str().unwrap();
-    assert!(!cfg.join("spiron-unconfirmed-steers.json").exists());
-    assert!(!cfg.join(".anyagents-last-error.json").exists());
-    assert!(!cfg.join("spiron-session-id").exists());
-    assert!(
-        agent_root
-            .join("sessions")
-            .join(format!("retired-{new_gen}"))
-            .join("spiron-unconfirmed-steers.json")
-            .is_file()
-    );
-
-    store
-        .set_agent_running(&agent.id, &work.display().to_string())
-        .unwrap();
-    let probe_launch = probe.clone();
-    let supervisor = Supervisor::<VendorHarness>::start(
-        Arc::clone(&store),
-        Arc::new(SystemClock::new()),
-        Arc::new(move |req| {
-            anyagents_core::host_session::ensure_active(req.config_dir.parent().unwrap(), "spiron")
-                .map_err(|e| e.to_string())?;
-            let session = session_from_file(&req.config_dir, "spiron-session-id")?;
-            let h = start_spiron(
-                &probe_launch,
-                &req.config_dir,
-                &req.work_dir,
-                &req.agent,
-                session.as_deref(),
-                &[],
-            )?;
-            let vh = VendorHarness::Spiron(
-                Box::new(h),
-                req.config_dir.join("spiron-session-id").into(),
-                "spiron".into(),
-            );
-            vh.sync_session()?;
-            Ok(vh)
-        }),
-        vec![],
-    )
-    .unwrap();
-
-    eventually(|| !store.has_open_turn(&agent.id).unwrap());
-    let seen_sessions = std::fs::read_to_string(cfg.join("sessions_seen.txt")).unwrap();
-    assert_eq!(seen_sessions.trim(), "brand-new-spiron-session");
-    let wire_lines: Vec<serde_json::Value> = std::fs::read_to_string(cfg.join("wire.jsonl"))
-        .unwrap()
-        .lines()
-        .map(|l| serde_json::from_str(l).unwrap())
-        .collect();
-    assert_eq!(wire_lines.len(), 1);
-    let text = wire_lines[0]["text"].as_str().unwrap();
-    assert!(text.contains("[Recovery] Your previous turn was interrupted"));
-    assert!(text.contains("task part 1"));
-    assert!(text.contains("task part 2"));
-    assert!(!cfg.join(".anyagents-session-reset-recovery").exists());
     drop(supervisor);
 }
 
@@ -1409,7 +843,6 @@ fn spiron_steers_five_mid_turn_messages_into_its_next_step_and_commits_them_in_o
         assert!(stored.delivered_at_ms.is_some(), "{}", message.id);
     }
     assert_eq!(fake.wire().len(), 6, "nothing was written twice");
-    assert!(!fake.config.join("spiron-unconfirmed-steers.json").exists());
     fake.act("finish");
     eventually(|| {
         delivery.run_once().unwrap();
@@ -1509,28 +942,29 @@ fn spiron_undelivered_steer_ids_are_redelivered_as_the_next_turn() {
     );
     let health = delivery.harness().health();
     assert!(health.sign_in_fault.is_none());
-    assert!(!delivery.harness().has_unconfirmed_hold());
-    assert!(!fake.config.join("spiron-unconfirmed-steers.json").exists());
 }
 
 #[test]
-fn spiron_without_the_capabilities_keeps_one_steer_in_flight_until_its_turn_ends() {
+fn spiron_without_the_capabilities_gets_one_input_per_turn() {
     let temp = crate::test_tempdir();
     let (fake, store) = FakeSpiron::new(temp.path(), false);
     let first = fake.receive(&store, "start the work");
     let mut delivery = fake.delivery(store);
+    assert_eq!(
+        delivery.harness().health().delivery.level,
+        anyagents_harness::DeliveryLevel::TurnEnd
+    );
     deliver_through(&mut delivery, first.seq);
-    let second = fake.receive(delivery.store(), "steer while busy");
+    let second = fake.receive(delivery.store(), "waits for the turn to end");
     let third = fake.receive(delivery.store(), "waits behind it");
+    // Nothing reaches the running turn: nothing would prove it took it.
     delivery.run_once().unwrap();
-    eventually(|| fake.wire().len() == 2);
-    // Only one steer is in flight, under the pre-dispatch hold, and a step
-    // proves nothing to this peer's host.
-    assert!(fake.config.join("spiron-unconfirmed-steers.json").exists());
     fake.act("step");
     delivery.run_once().unwrap();
     assert_eq!(delivery.delivered_cursor().unwrap(), first.seq);
-    assert_eq!(fake.wire().len(), 2);
+    assert_eq!(fake.wire().len(), 1);
+    fake.act("finish");
+    deliver_through(&mut delivery, second.seq);
     fake.act("finish");
     deliver_through(&mut delivery, third.seq);
     let written: Vec<_> = fake
@@ -1546,6 +980,47 @@ fn spiron_without_the_capabilities_keeps_one_steer_in_flight_until_its_turn_ends
             ("user".to_string(), third.id.to_string()),
         ]
     );
+    assert!(!fake.config.join("spiron-unconfirmed-steers.json").exists());
+}
+
+#[test]
+fn a_hold_an_older_anyagents_left_is_settled_against_the_spiron_journal_at_launch() {
+    let temp = crate::test_tempdir();
+    let (fake, store) = FakeSpiron::new(temp.path(), false);
+    let applied = fake.receive(&store, "journaled by the old process");
+    let lost = fake.receive(&store, "acknowledged, never journaled");
+    // The hold names both; only the first reached the session journal.
+    std::fs::write(
+        fake.config.join("spiron-unconfirmed-steers.json"),
+        json!({"turn_id": applied.id, "request_ids": [applied.id, lost.id]}).to_string(),
+    )
+    .unwrap();
+    let journal = rusqlite::Connection::open(fake.config.join("sessions.sqlite3")).unwrap();
+    journal
+        .execute_batch("CREATE TABLE session_entries (session_id TEXT, idx INTEGER, event TEXT);")
+        .unwrap();
+    journal
+        .execute(
+            "INSERT INTO session_entries VALUES ('old-session', 1, ?1)",
+            [format!(
+                r#"{{"role":"user","text":"anyagents-message:{}\nbody"}}"#,
+                applied.id
+            )],
+        )
+        .unwrap();
+    drop(journal);
+    let mut delivery = fake.delivery(store);
+    assert!(!fake.config.join("spiron-unconfirmed-steers.json").exists());
+    assert!(
+        fake.config
+            .join("spiron-unconfirmed-steers.reconciled.json")
+            .is_file()
+    );
+    deliver_through(&mut delivery, lost.seq);
+    // The applied one is committed without being written again; the other
+    // is delivered as new input.
+    let written: Vec<_> = fake.wire().into_iter().map(|(_, _, id)| id).collect();
+    assert_eq!(written, [lost.id.to_string()]);
 }
 
 #[test]

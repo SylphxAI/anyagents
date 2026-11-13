@@ -206,51 +206,22 @@ fn complete_reset(root: &Path, registry: &mut Registry) -> io::Result<()> {
         fs::File::open(&retired_dir)?.sync_all()?;
         fs::File::open(root.join("config"))?.sync_all()?;
     }
-    retire_session_hold_and_errors(root, &pending.session.generation)?;
+    retire_session_errors(root)?;
     registry.active = Some(pending.session);
     registry.pending_reset = None;
     write(root, registry)
 }
-fn retire_session_hold_and_errors(root: &Path, generation: &str) -> io::Result<()> {
+fn retire_session_errors(root: &Path) -> io::Result<()> {
     let config_dir = root.join("config");
-    let Ok(cfg_meta) = fs::symlink_metadata(&config_dir) else {
+    // Never through a symlink: the config directory itself must be a directory.
+    if !fs::symlink_metadata(&config_dir).is_ok_and(|meta| meta.file_type().is_dir()) {
         return Ok(());
-    };
-    if !cfg_meta.file_type().is_dir() {
-        return Ok(());
-    }
-    let hold_path = config_dir.join("spiron-unconfirmed-steers.json");
-    if let Ok(meta) = fs::symlink_metadata(&hold_path) {
-        if meta.file_type().is_file() && meta.len() > 0 {
-            let retired_dir = root.join("sessions").join(format!("retired-{generation}"));
-            fs::create_dir_all(&retired_dir)?;
-            let archived = retired_dir.join("spiron-unconfirmed-steers.json");
-            if fs::rename(&hold_path, &archived).is_err() {
-                let _ = fs::copy(&hold_path, &archived);
-                match fs::remove_file(&hold_path) {
-                    Ok(()) => {}
-                    Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-                    Err(err) => return Err(err),
-                }
-            }
-        } else {
-            match fs::remove_file(&hold_path) {
-                Ok(()) => {}
-                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-                Err(err) => return Err(err),
-            }
-        }
     }
     match fs::remove_file(config_dir.join(".anyagents-last-error.json")) {
-        Ok(()) => {}
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-        Err(err) => return Err(err),
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
     }
-    let marker_tmp = config_dir.join(".anyagents-session-reset-recovery.tmp");
-    let marker_dst = config_dir.join(".anyagents-session-reset-recovery");
-    fs::write(&marker_tmp, format!("{generation}\n"))?;
-    fs::rename(&marker_tmp, &marker_dst)?;
-    Ok(())
 }
 
 fn read_ready(root: &Path) -> io::Result<Registry> {

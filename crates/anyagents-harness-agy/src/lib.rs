@@ -183,10 +183,6 @@ impl Harness for AgyHarness {
         self.inner.clear_quota();
     }
 
-    fn take_reclaimed_steers(&mut self) -> Vec<String> {
-        self.inner.take_reclaimed_steers()
-    }
-
     fn process_id(&self) -> Option<u32> {
         self.inner.process_id()
     }

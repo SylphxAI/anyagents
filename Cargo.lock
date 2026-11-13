@@ -82,6 +82,7 @@ dependencies = [
  "anyagents-harness-muse",
  "anyagents-harness-omp",
  "anyagents-harness-opencode",
+ "anyagents-harness-spiron",
  "anyagents-harness-stream",
  "anyagents-installer",
  "anyagents-supervisor",
@@ -229,6 +230,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "anyagents-harness-spiron"
+version = "0.1.8"
+dependencies = [
+ "anyagents-harness",
+ "anyagents-harness-stream",
+ "serde_json",
+]
+
+[[package]]
 name = "anyagents-harness-stream"
 version = "0.1.8"
 dependencies = [
@@ -265,6 +275,15 @@ dependencies = [
  "anyagents-agent",
  "anyagents-core",
  "anyagents-harness",
+ "anyagents-harness-agy",
+ "anyagents-harness-claude",
+ "anyagents-harness-codex",
+ "anyagents-harness-muse",
+ "anyagents-harness-omp",
+ "anyagents-harness-opencode",
+ "anyagents-harness-spiron",
+ "anyagents-harness-stream",
+ "serde_json",
  "tempfile",
 ]
 

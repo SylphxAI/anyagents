@@ -1268,20 +1268,6 @@ impl<H: Harness + 'static> Session<H> {
             self.sleep(Some(wait_until));
             return false;
         }
-        if self.pending_recovery
-            && self
-                .delivery
-                .as_ref()
-                .is_some_and(|d| d.harness().has_unconfirmed_hold())
-        {
-            if self.recover_once() {
-                return false;
-            }
-            if !self.pending_recovery {
-                self.wake_unless_more();
-                return false;
-            }
-        }
         let outcome = {
             let Some(delivery) = self.delivery.as_mut() else {
                 return false;
@@ -1322,10 +1308,10 @@ impl<H: Harness + 'static> Session<H> {
                     return false;
                 }
                 if !health.process_alive
-                    && self.delivery.as_ref().is_some_and(|d| {
-                        d.store().has_open_turn(&self.id).unwrap_or(false)
-                            || d.harness().has_unconfirmed_hold()
-                    })
+                    && self
+                        .delivery
+                        .as_ref()
+                        .is_some_and(|d| d.store().has_open_turn(&self.id).unwrap_or(false))
                 {
                     if !self.wait_backoff() {
                         return false;
@@ -1620,9 +1606,6 @@ impl<H: Harness + 'static> Session<H> {
     fn recoverable_mid_turn_fault(&self, health: &HarnessHealth) -> Option<String> {
         let delivery = self.delivery.as_ref()?;
         let fault = health.sign_in_fault.clone()?;
-        if delivery.harness().has_unconfirmed_idle_hold() {
-            return Some(fault);
-        }
         if health.turn_state != TurnState::Idle
             || !delivery.store().has_open_turn(&self.id).unwrap_or(false)
         {
@@ -1637,18 +1620,7 @@ impl<H: Harness + 'static> Session<H> {
                 self.pending_recovery = false;
                 return false;
             };
-            let has_hold = delivery.harness().has_unconfirmed_hold();
-            if has_hold {
-                let held_ids = delivery.harness().peek_unconfirmed_request_ids();
-                if !held_ids.is_empty()
-                    && let Err(err) = delivery
-                        .store()
-                        .promote_messages_to_open_turn(&self.id, &held_ids)
-                {
-                    self.last_error = Some(format!("read open turn for recovery: {err}"));
-                    return false;
-                }
-            } else if !matches!(delivery.store().next_undelivered(&self.id), Ok(None)) {
+            if !matches!(delivery.store().next_undelivered(&self.id), Ok(None)) {
                 // Idle also covers deferred or passive mail. Recovery must not
                 // overtake any queued message, and a failed read is not emptiness.
                 return false;
@@ -1660,22 +1632,8 @@ impl<H: Harness + 'static> Session<H> {
                     return false;
                 }
             };
-            let reconciled = if has_hold {
-                match delivery.harness_mut().reconcile_unconfirmed_for_recovery() {
-                    Ok(rec) => Ok(rec),
-                    Err(anyagents_harness::HarnessError::Dead) => {
-                        Err(anyagents_agent::Error::HarnessDown)
-                    }
-                    Err(anyagents_harness::HarnessError::Failed(reason)) => {
-                        Err(anyagents_agent::Error::HarnessFailed(reason))
-                    }
-                }
-            } else {
-                Ok(None)
-            };
-            match (reconciled, open) {
-                (Err(err), _) => Err(err),
-                (Ok(_), None) => {
+            match open {
+                None => {
                     self.pending_recovery = false;
                     if self
                         .last_error
@@ -1684,14 +1642,9 @@ impl<H: Harness + 'static> Session<H> {
                     {
                         self.last_error = None;
                     }
-                    if has_hold {
-                        self.last_error = None;
-                    }
                     return false;
                 }
-                (Ok(rec), Some(open)) => {
-                    delivery.recover_open_turn_with_reconciliation(&open, rec.as_ref())
-                }
+                Some(open) => delivery.recover_open_turn(&open),
             }
         };
         match outcome {

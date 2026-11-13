@@ -56,8 +56,7 @@ pub use store::{
     CredentialObservation, CredentialSlot, CredentialTarget, Fault, FaultKind, HarnessLease,
     LifecycleKind, LifecycleOp, LifecyclePhase, NewLifecycleOp, ProcessIdentity, QUOTA_ESTIMATE_MS,
     QuotaBlock, QuotaReset, QuotaSource, RecoveryOffer, RuntimeChange, RuntimeState,
-    SchedulePending, SessionLease, SteerHold, SteerState, Turn, TurnOutcome, TurnState,
-    steer_allows,
+    SchedulePending, SessionLease, Turn, TurnOutcome, TurnState,
 };
 
 /// The token a client presents as an agent, when it has one. A capability is

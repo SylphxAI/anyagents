@@ -100,16 +100,6 @@ impl<H: Harness> DeliveryLoop<H> {
         }
     }
 
-    /// Rewind the cursor over steers the harness gave back as unconfirmed.
-    fn drain_reclaimed_steers(&mut self) -> Result<(), Error> {
-        let reclaimed = self.harness.take_reclaimed_steers();
-        if !reclaimed.is_empty() {
-            self.store
-                .reclaim_unconfirmed_steers(&self.agent_id, &reclaimed)?;
-        }
-        Ok(())
-    }
-
     /// One pass over the mailbox, in sequence order. Every line the harness
     /// can take is handed over in this pass; the cursor moves only over the
     /// contiguous prefix the harness proved consumed. Behind a line it holds
@@ -121,7 +111,6 @@ impl<H: Harness> DeliveryLoop<H> {
     /// already consumed in an earlier process (`Duplicate`) is committed too,
     /// but it woke nothing, so an interrupted turn still gets its recovery note.
     pub fn run_once(&mut self) -> Result<RunOutcome, Error> {
-        self.drain_reclaimed_steers()?;
         let mut delivered = 0u64;
         if self.harness.health().turn_state == TurnState::Idle
             && !self.store.has_actionable_undelivered(&self.agent_id)?
@@ -178,7 +167,6 @@ impl<H: Harness> DeliveryLoop<H> {
                 // The pass ends with what it did take, never with the line
                 // claimed as delivered.
                 Ok(DeliverOutcome::Deferred) => {
-                    self.drain_reclaimed_steers()?;
                     return Ok(if delivered == 0 {
                         RunOutcome::Idle
                     } else {
@@ -186,18 +174,11 @@ impl<H: Harness> DeliveryLoop<H> {
                     });
                 }
                 Ok(DeliverOutcome::Quota { reset_at_ms }) => {
-                    self.drain_reclaimed_steers()?;
                     self.quota_reset_at_ms = Some(reset_at_ms);
                     return Ok(RunOutcome::Quota { reset_at_ms });
                 }
-                Err(HarnessError::Dead) => {
-                    let _ = self.drain_reclaimed_steers();
-                    return Err(Error::HarnessDown);
-                }
-                Err(HarnessError::Failed(reason)) => {
-                    let _ = self.drain_reclaimed_steers();
-                    return Err(Error::HarnessFailed(reason));
-                }
+                Err(HarnessError::Dead) => return Err(Error::HarnessDown),
+                Err(HarnessError::Failed(reason)) => return Err(Error::HarnessFailed(reason)),
             }
         }
     }
@@ -259,17 +240,7 @@ impl<H: Harness> DeliveryLoop<H> {
         &mut self,
         open: &anyagents_core::OpenTurn,
     ) -> Result<DeliverOutcome, Error> {
-        self.recover_open_turn_with_reconciliation(open, None)
-    }
-
-    /// Deliver a synthetic `[Recovery]` message annotated with external session
-    /// journal reconciliation details when available.
-    pub fn recover_open_turn_with_reconciliation(
-        &mut self,
-        open: &anyagents_core::OpenTurn,
-        reconciled: Option<&anyagents_harness::ReconciledUnconfirmed>,
-    ) -> Result<DeliverOutcome, Error> {
-        let note = recovery_outbound_with_reconciliation(open, reconciled);
+        let note = recovery_outbound(open);
         match self.harness.deliver(&note) {
             // A note an earlier process already consumed was delivered then.
             Ok(DeliverOutcome::Duplicate) => {
@@ -305,13 +276,6 @@ impl<H: Harness> DeliveryLoop<H> {
 /// Build the synthetic `[Recovery]` user message that wakes a resumed CLI
 /// session when its previous process died mid-turn (`opened_seq > completed_seq`).
 pub fn recovery_outbound(open: &anyagents_core::OpenTurn) -> OutboundMessage {
-    recovery_outbound_with_reconciliation(open, None)
-}
-
-pub fn recovery_outbound_with_reconciliation(
-    open: &anyagents_core::OpenTurn,
-    reconciled: Option<&anyagents_harness::ReconciledUnconfirmed>,
-) -> OutboundMessage {
     let last = open
         .messages
         .last()
@@ -344,16 +308,6 @@ pub fn recovery_outbound_with_reconciliation(
                 clip_chars(&out.body, 300).replace('\n', " ")
             ));
         }
-    }
-    if let Some(rec) = reconciled
-        && (!rec.journal_committed_ids.is_empty() || !rec.journal_missing_ids.is_empty())
-    {
-        lines.push(String::new());
-        lines.push(format!(
-            "Session journal reconciliation: committed=[{}], unconfirmed_before_journal=[{}].",
-            rec.journal_committed_ids.join(", "),
-            rec.journal_missing_ids.join(", "),
-        ));
     }
     lines.push(String::new());
     lines.push(

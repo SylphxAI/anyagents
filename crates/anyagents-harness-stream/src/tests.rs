@@ -656,7 +656,7 @@ fn bounded_stderr_withholds_partial_lines_and_decodes_invalid_utf8() {
 }
 
 #[test]
-fn partial_stderr_prefix_is_withheld_until_eof_and_uncertainty_keeps_exit_diagnostic() {
+fn partial_stderr_prefix_is_withheld_until_eof_and_the_exit_diagnostic_is_kept() {
     let mut capture = super::BoundedStderr::default();
     capture.push(b"safe diagnostic\nsk-SYNTH");
     assert_eq!(capture.masked(false), "safe diagnostic\n");
@@ -667,11 +667,9 @@ fn partial_stderr_prefix_is_withheld_until_eof_and_uncertainty_keeps_exit_diagno
     assert_eq!(safe.masked(false), "");
     assert_eq!(safe.masked(true), "config.toml is invalid; 測試🙂");
     let mut state = super::State::new(None);
-    state.unconfirmed = true;
     state.exit_fault =
         Some("harness exited with exit status: 1; stderr: failed to parse config.toml".into());
     let error = state.failure().unwrap();
-    assert!(error.contains("unconfirmed steering input"));
     assert!(error.contains("exit status: 1"));
     assert!(error.contains("failed to parse config.toml"));
 }
@@ -691,6 +689,7 @@ for line in sys.stdin:
  m=json.loads(line)
  if m['type']=='cancel':
   print(json.dumps({'type':'result','request_id':first,'status':'completed'}),flush=True)
+  first=None
  elif m['request_id']=='refused':
   print(json.dumps({'type':'rejected','request_id':'refused','code':'fixture-refusal'}),flush=True)
  elif m['request_id']=='self-ack':
@@ -790,7 +789,7 @@ fn receipt_message(id: &str) -> anyagents_harness::OutboundMessage {
 
 #[test]
 #[cfg(unix)]
-fn immediate_steer_ack_before_post_write_keeps_custody_until_terminal_receipt() {
+fn an_older_peer_takes_the_next_input_only_after_its_turn_ends() {
     use anyagents_harness::DeliverOutcome::{Accepted, Deferred};
     let mut harness = immediate_receipt_harness();
     let first = receipt_message("first");
@@ -802,37 +801,26 @@ fn immediate_steer_ack_before_post_write_keeps_custody_until_terminal_receipt() 
         Accepted {
             turn_finished: false
         },
-        "an acknowledged initial input remains an allowed control"
+        "an accepted turn commits its input"
     );
-    let steer = receipt_message("steer");
-    let line = json!({"type":"user","request_id":"steer"});
-    await_receipt_before_post_write(&mut harness, |state| {
-        state.acknowledged.contains("steer")
-            && state
-                .input_turns
-                .get("steer")
-                .is_some_and(|turn| turn == "first")
-    });
-    assert_eq!(
-        harness.deliver(&steer, &line).unwrap(),
-        Deferred,
-        "first write cannot accept a busy steer even when its ack wins the lock"
-    );
-    assert_eq!(harness.deliver(&steer, &line).unwrap(), Deferred);
-    assert_eq!(harness.written_ids(), ["first", "steer"]);
-    harness.cancel(&json!({"type":"cancel"})).unwrap();
-    assert!(harness.wait_finished("steer", std::time::Duration::from_secs(3)));
-    assert_eq!(
-        harness.deliver(&steer, &line).unwrap(),
-        Accepted {
-            turn_finished: true
-        }
-    );
+    let next = receipt_message("next");
+    let line = json!({"type":"user","request_id":"next"});
+    assert_eq!(harness.deliver(&next, &line).unwrap(), Deferred);
+    assert_eq!(harness.deliver(&next, &line).unwrap(), Deferred);
     assert_eq!(
         harness.written_ids(),
-        ["first", "steer"],
-        "no replay after completion"
+        ["first"],
+        "nothing reaches a busy turn"
     );
+    harness.cancel(&json!({"type":"cancel"})).unwrap();
+    assert!(harness.wait_finished("first", std::time::Duration::from_secs(3)));
+    assert_eq!(
+        deliver_until_accepted(&mut harness, "next"),
+        Accepted {
+            turn_finished: false
+        }
+    );
+    assert_eq!(harness.written_ids(), ["first", "next"], "no replay");
 }
 
 #[test]
@@ -851,36 +839,6 @@ fn immediate_rejection_before_post_write_is_a_typed_failure_without_replay() {
         );
     }
     assert_eq!(harness.written_ids(), ["refused"]);
-}
-
-#[test]
-#[cfg(unix)]
-fn immediate_self_ack_cannot_release_an_input_behind_an_open_turn() {
-    use anyagents_harness::DeliverOutcome::{Accepted, Deferred};
-    let mut harness = immediate_receipt_harness();
-    await_receipt_before_post_write(&mut harness, |state| state.acknowledged.contains("first"));
-    assert_eq!(
-        harness
-            .deliver(
-                &receipt_message("first"),
-                &json!({"type":"user","request_id":"first"})
-            )
-            .unwrap(),
-        Accepted {
-            turn_finished: false
-        }
-    );
-    await_receipt_before_post_write(&mut harness, |state| {
-        state
-            .input_turns
-            .get("self-ack")
-            .is_some_and(|turn| turn == "self-ack")
-    });
-    let message = receipt_message("self-ack");
-    let line = json!({"type":"user","request_id":"self-ack"});
-    assert_eq!(harness.deliver(&message, &line).unwrap(), Deferred);
-    assert_eq!(harness.deliver(&message, &line).unwrap(), Deferred);
-    assert_eq!(harness.written_ids(), ["first", "self-ack"]);
 }
 
 #[test]
@@ -1380,23 +1338,6 @@ fn deliver_until_accepted(
 }
 
 #[cfg(unix)]
-const UNDELIVERED_STEER_SCRIPT: &str = r#"
-import json,sys,time
-time.sleep(int(sys.argv[1])/1000)
-print(json.dumps({'type':'ready','session_id':'fixture-ready'}),flush=True)
-first=None
-for line in sys.stdin:
- m=json.loads(line)
- rid=m.get('request_id')
- if first is None:
-  first=rid
-  print(json.dumps({'type':'accepted','request_id':rid}),flush=True)
- else:
-  print(json.dumps({'type':'steer_ack','request_id':rid,'accepted':True,'turn_id':first}),flush=True)
-  print(json.dumps({'type':'result','request_id':first,'status':'failed','is_error':True,'error':'upstream unavailable','undelivered_steers':['acknowledged input']}),flush=True)
-"#;
-
-#[cfg(unix)]
 const CONFIRMED_TURN_SCRIPT: &str = r#"
 import json,sys,time
 time.sleep(int(sys.argv[1])/1000)
@@ -1412,58 +1353,9 @@ for line in sys.stdin:
 
 #[test]
 #[cfg(unix)]
-fn reconcile_clear_releases_hold_marker_error_and_restart_stays_clear() {
+fn confirmed_turn_completion_clears_the_error_artifact() {
     let dir = tempfile::tempdir().unwrap();
-    let mut harness = immediate_receipt_fixture(UNDELIVERED_STEER_SCRIPT, 0).unwrap();
-    harness.set_state_dir(dir.path());
-
-    assert!(matches!(
-        deliver_until_accepted(&mut harness, "m1"),
-        anyagents_harness::DeliverOutcome::Accepted { .. }
-    ));
-    let _ = harness.deliver(
-        &receipt_message("m2"),
-        &json!({"type":"user","request_id":"m2"}),
-    );
-    assert!(
-        harness.wait_pred(std::time::Duration::from_secs(10), |state| state
-            .unconfirmed)
-    );
-    // Accompanying artefacts exist beside the hold (e.g. a session reset
-    // plus a persisted turn error). They must go together with it.
-    let marker = dir.path().join(".anyagents-session-reset-recovery");
     let last_error = dir.path().join(".anyagents-last-error.json");
-    std::fs::write(&marker, b"").unwrap();
-    std::fs::write(&last_error, b"{}").unwrap();
-
-    let reconciled = harness
-        .reconcile_unconfirmed_for_recovery()
-        .unwrap()
-        .expect("a held turn reconciles");
-    assert_eq!(
-        reconciled.request_ids,
-        vec!["m1".to_string(), "m2".to_string()]
-    );
-    assert!(!harness.has_unconfirmed_hold());
-    assert!(!dir.path().join("spiron-unconfirmed-steers.json").exists());
-    assert!(!marker.exists());
-    assert!(!last_error.exists());
-
-    // A new process over the same state directory must not re-flag the
-    // hold: the in-memory bool and every file were released together.
-    drop(harness);
-    let restarted = immediate_receipt_fixture(UNDELIVERED_STEER_SCRIPT, 0).unwrap();
-    restarted.set_state_dir(dir.path());
-    assert!(!restarted.has_unconfirmed_hold());
-}
-
-#[test]
-#[cfg(unix)]
-fn confirmed_turn_completion_clears_marker_and_error_artifacts() {
-    let dir = tempfile::tempdir().unwrap();
-    let marker = dir.path().join(".anyagents-session-reset-recovery");
-    let last_error = dir.path().join(".anyagents-last-error.json");
-    std::fs::write(&marker, b"").unwrap();
     std::fs::write(&last_error, b"{}").unwrap();
     let mut harness = immediate_receipt_fixture(CONFIRMED_TURN_SCRIPT, 0).unwrap();
     harness.set_state_dir(dir.path());
@@ -1478,16 +1370,10 @@ fn confirmed_turn_completion_clears_marker_and_error_artifacts() {
             .contains("m1")),
         "the confirmed result must be processed"
     );
-    assert!(!dir.path().join("spiron-unconfirmed-steers.json").exists());
-    assert!(
-        !marker.exists(),
-        "a confirmed turn must not leave the marker"
-    );
     assert!(
         !last_error.exists(),
         "a confirmed turn must not leave its error file"
     );
-    assert!(!harness.has_unconfirmed_hold());
 }
 
 #[cfg(target_os = "linux")]

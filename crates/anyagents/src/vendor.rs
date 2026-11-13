@@ -15,7 +15,8 @@ use anyagents_harness_codex::CodexHarness;
 use anyagents_harness_muse::MuseHarness;
 use anyagents_harness_omp::OmpHarness;
 use anyagents_harness_opencode::OpenCodeHarness;
-use anyagents_harness_stream::{Launch, LineProtocol, StreamHarness, StreamSpec};
+use anyagents_harness_spiron::{SpironHarness, SpironLaunch};
+use anyagents_harness_stream::{Launch, StreamHarness};
 use anyagents_supervisor::LaunchRequest;
 
 use crate::dsh::DshHarness;
@@ -32,7 +33,7 @@ pub enum VendorHarness {
     Grok(Box<GrokHarness>, SessionPointer),
     /// The external Spiron CLI.  The pointer is the canonical session file;
     /// legacy `sylphx-session-id` is read once when this adapter starts.
-    Spiron(Box<StreamHarness>, SessionPointer, String),
+    Spiron(Box<SpironHarness>, SessionPointer, String),
     Contract(Box<ContractHarness>),
 }
 
@@ -270,28 +271,6 @@ impl anyagents_harness::Harness for ContractHarness {
 
     fn clear_quota(&mut self) {
         self.inner.clear_quota()
-    }
-
-    fn take_reclaimed_steers(&mut self) -> Vec<String> {
-        self.inner.take_reclaimed_steers()
-    }
-
-    fn has_unconfirmed_hold(&self) -> bool {
-        self.inner.has_unconfirmed_hold()
-    }
-
-    fn has_unconfirmed_idle_hold(&self) -> bool {
-        self.inner.has_unconfirmed_idle_hold()
-    }
-
-    fn peek_unconfirmed_request_ids(&self) -> Vec<String> {
-        self.inner.peek_unconfirmed_request_ids()
-    }
-
-    fn reconcile_unconfirmed_for_recovery(
-        &mut self,
-    ) -> Result<Option<anyagents_harness::ReconciledUnconfirmed>, HarnessError> {
-        self.inner.reconcile_unconfirmed_for_recovery()
     }
 
     fn process_id(&self) -> Option<u32> {
@@ -536,6 +515,10 @@ fn prepare_host_session(request: &LaunchRequest) -> Result<(), String> {
     // Also render in contract-test mode, exercising the shipping launch boundary.
     crate::create::write_agent_instructions(&request.config_dir, &request.agent, None)
         .map_err(|err| err.to_string())?;
+    // A session reset used to leave this marker to force a recovery note
+    // ahead of new mail; nothing reads it now. Remove once no agent
+    // directory carries one.
+    let _ = std::fs::remove_file(request.config_dir.join(".anyagents-session-reset-recovery"));
     Ok(())
 }
 
@@ -1680,7 +1663,7 @@ fn start_spiron(
     agent: &anyagents_core::Agent,
     session: Option<&str>,
     env: &[(String, String)],
-) -> Result<StreamHarness, String> {
+) -> Result<SpironHarness, String> {
     let mcp_config = config_dir.join("spiron-mcp.json");
     let skills = config_dir.join(".agents/skills");
     let mut args = vec![
@@ -1710,18 +1693,6 @@ fn start_spiron(
         let normalized = crate::spiron::strip_coding_plan_prefix(model);
         args.extend(["--model".to_string(), normalized.to_string()]);
     }
-    let base_args = args.clone();
-    if let Some(session) = session {
-        args.extend(["--session".to_string(), session.to_string()]);
-    }
-    let spec = StreamSpec {
-        name: "anyagents-spiron".to_string(),
-        args: base_args,
-        resume_flag: "--session",
-        start_line: "user",
-        cancel: "cancel",
-        protocol: LineProtocol::AcknowledgedResult,
-    };
     let mut environment = env.to_vec();
     environment.push(("HOME".to_string(), config_dir.display().to_string()));
     // Profiles are materialized into the seat config by create.rs. Do not pass
@@ -1737,23 +1708,22 @@ fn start_spiron(
         ),
         ("SPIRON_SKILLS".to_string(), skills.display().to_string()),
     ]);
-    let harness = StreamHarness::launch(Launch {
-        spec,
-        program: program.to_path_buf(),
-        args,
-        environment,
-        work_dir: Some(work_dir.to_path_buf()),
-        session_id: session.map(str::to_string),
-        mode: anyagents_harness::DeliveryMode::Steer,
-        delivery: anyagents_harness_stream::SPIRON,
-    })
-    .map_err(|err| err.to_string())?;
-    harness.set_state_dir(config_dir);
+    let applied = settle_legacy_spiron_hold(config_dir)?;
     // Its `ready` says whether every input may be steered at once; nothing
-    // is offered before it, so recovery and mail start on the right rules.
-    harness
-        .wait_ready(SPIRON_READY_WAIT)
-        .map_err(|err| err.to_string())?;
+    // is offered before it, so mail starts on the right rules.
+    let harness = SpironHarness::start(
+        SpironLaunch {
+            program: program.to_path_buf(),
+            args,
+            environment,
+            work_dir: work_dir.to_path_buf(),
+            session: session.map(str::to_string),
+            state_dir: config_dir.to_path_buf(),
+        },
+        SPIRON_READY_WAIT,
+    )
+    .map_err(|err| err.to_string())?;
+    harness.recognise_applied(applied);
     Ok(harness)
 }
 
@@ -1761,38 +1731,71 @@ fn start_spiron(
 /// fails, as Codex's `initialize` handshake. An exit ends the wait at once.
 const SPIRON_READY_WAIT: Duration = Duration::from_secs(60);
 
-fn populate_spiron_journal_reconciliation(
-    config_dir: &Path,
-    session_id: &str,
-    rec: &mut anyagents_harness::ReconciledUnconfirmed,
-) {
+/// The hold a Spiron process from before `steer_consumed` could leave:
+/// AnyAgents wrote it before it gave such a process input, naming input it
+/// could not yet prove reached the session journal.
+const LEGACY_SPIRON_HOLD: &str = "spiron-unconfirmed-steers.json";
+
+/// Settle a hold an earlier AnyAgents left beside a Spiron agent's config. An
+/// id the agent's Spiron journal (`sessions.sqlite3`, any session) holds was
+/// applied: it is returned, to be committed without being written again. Any
+/// other id was never journaled and is delivered as new input. The hold is
+/// archived as `spiron-unconfirmed-steers.reconciled.json`.
+///
+/// Compatibility for agent directories written before the hold was retired;
+/// remove once no agent directory carries one.
+fn settle_legacy_spiron_hold(config_dir: &Path) -> Result<Vec<String>, String> {
+    let hold = config_dir.join(LEGACY_SPIRON_HOLD);
+    let bytes = match std::fs::read(&hold) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(format!("cannot read {}: {err}", hold.display())),
+    };
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+    let mut ids: Vec<String> = value
+        .get("request_ids")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .chain(value.get("turn_id").and_then(serde_json::Value::as_str))
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .collect();
+    ids.sort();
+    ids.dedup();
+    let applied = spiron_journal_holds(config_dir, &ids);
+    crate::create::write_required_file(
+        &config_dir.join("spiron-unconfirmed-steers.reconciled.json"),
+        &bytes,
+        0o664,
+    )
+    .map_err(|err| err.to_string())?;
+    std::fs::remove_file(&hold)
+        .map_err(|err| format!("cannot retire {}: {err}", hold.display()))?;
+    Ok(applied)
+}
+
+/// The ids among `ids` that any session in the agent's Spiron journal names.
+/// An unreadable journal names none, so that input is delivered rather than
+/// lost.
+fn spiron_journal_holds(config_dir: &Path, ids: &[String]) -> Vec<String> {
     let db_path = config_dir.join("sessions.sqlite3");
-    if !db_path.is_file() {
-        return;
+    if ids.is_empty() || !db_path.is_file() {
+        return Vec::new();
     }
     let Some(conn) = crate::seat_tree::open_readonly_seat_sqlite(&db_path) else {
-        return;
+        return Vec::new();
     };
     let Ok(mut stmt) =
-        conn.prepare("SELECT event FROM session_entries WHERE session_id = ?1 ORDER BY idx ASC")
+        conn.prepare("SELECT 1 FROM session_entries WHERE instr(event, ?1) > 0 LIMIT 1")
     else {
-        return;
+        return Vec::new();
     };
-    let Ok(rows) = stmt.query_map([session_id], |row| row.get::<_, String>(0)) else {
-        return;
-    };
-    let events: Vec<String> = rows.flatten().collect();
-    for id in &rec.request_ids {
-        let marker = format!("anyagents-message:{id}");
-        if events
-            .iter()
-            .any(|ev| ev.contains(&marker) || ev.contains(id))
-        {
-            rec.journal_committed_ids.push(id.clone());
-        } else {
-            rec.journal_missing_ids.push(id.clone());
-        }
-    }
+    ids.iter()
+        .filter(|id| stmt.exists([id.as_str()]).unwrap_or(false))
+        .cloned()
+        .collect()
 }
 
 fn start_codex(
@@ -1822,11 +1825,7 @@ impl Harness for VendorHarness {
             Self::Omp(harness, _) => harness.deliver(message),
             Self::Dsh(harness, _) => harness.deliver(message),
             Self::Grok(harness, _) => harness.deliver(message),
-            Self::Spiron(harness, _, _) => harness.deliver(message, &serde_json::json!({
-                "type": "user",
-                "request_id": message.id,
-                "text": anyagents_harness::compose_message(&message.id, &message.context, &message.text),
-            })),
+            Self::Spiron(harness, _, _) => harness.deliver(message),
             Self::Contract(harness) => harness.deliver(message),
         };
         self.sync_session().map_err(HarnessError::Failed)?;
@@ -1875,7 +1874,7 @@ impl Harness for VendorHarness {
             Self::Omp(harness, _) => harness.cancel(),
             Self::Dsh(harness, _) => harness.cancel(),
             Self::Grok(harness, _) => harness.cancel(),
-            Self::Spiron(harness, _, _) => harness.cancel(&serde_json::json!({"type": "cancel"})),
+            Self::Spiron(harness, _, _) => harness.cancel(),
             Self::Contract(harness) => harness.cancel(),
         }
     }
@@ -1999,66 +1998,6 @@ impl Harness for VendorHarness {
             Self::Grok(harness, _) => harness.clear_quota(),
             Self::Spiron(harness, _, _) => harness.clear_quota(),
             Self::Contract(harness) => harness.clear_quota(),
-        }
-    }
-
-    fn take_reclaimed_steers(&mut self) -> Vec<String> {
-        match self {
-            Self::Agy(harness, _) => harness.take_reclaimed_steers(),
-            Self::Spiron(harness, _, _) => harness.take_reclaimed_steers(),
-            Self::Contract(harness) => harness.take_reclaimed_steers(),
-            _ => Vec::new(),
-        }
-    }
-
-    fn has_unconfirmed_hold(&self) -> bool {
-        match self {
-            Self::Spiron(harness, _, _) => harness.has_unconfirmed_hold(),
-            Self::Contract(harness) => harness.has_unconfirmed_hold(),
-            _ => false,
-        }
-    }
-
-    fn has_unconfirmed_idle_hold(&self) -> bool {
-        match self {
-            Self::Spiron(harness, _, _) => harness.has_unconfirmed_idle_hold(),
-            Self::Contract(harness) => harness.has_unconfirmed_idle_hold(),
-            _ => false,
-        }
-    }
-
-    fn peek_unconfirmed_request_ids(&self) -> Vec<String> {
-        match self {
-            Self::Spiron(harness, _, _) => harness.peek_unconfirmed_request_ids(),
-            Self::Contract(harness) => harness.peek_unconfirmed_request_ids(),
-            _ => Vec::new(),
-        }
-    }
-
-    fn reconcile_unconfirmed_for_recovery(
-        &mut self,
-    ) -> Result<Option<anyagents_harness::ReconciledUnconfirmed>, HarnessError> {
-        match self {
-            Self::Spiron(harness, marker, _) => {
-                let dir = harness.state_dir();
-                let session_id = harness.session_id().or_else(|| {
-                    std::fs::read_to_string(marker)
-                        .ok()
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                });
-                let Some(mut rec) = harness.reconcile_unconfirmed_for_recovery()? else {
-                    return Ok(None);
-                };
-                if let (Some(dir), Some(sid)) = (dir, session_id)
-                    && !rec.request_ids.is_empty()
-                {
-                    populate_spiron_journal_reconciliation(&dir, &sid, &mut rec);
-                }
-                Ok(Some(rec))
-            }
-            Self::Contract(harness) => harness.reconcile_unconfirmed_for_recovery(),
-            _ => Ok(None),
         }
     }
 
@@ -3046,16 +2985,21 @@ done
         let config = root.join("config");
         std::fs::create_dir_all(&config).unwrap();
         let first = host_session::new_session(&root, "spiron").unwrap();
-        let harness = StreamHarness::launch(anyagents_harness_stream::Launch {
-            spec: StreamSpec::for_program("spiron"),
-            program: "/bin/sh".into(),
-            args: vec!["-c".into(), "exec sleep 30".into()],
-            environment: vec![],
-            work_dir: None,
-            session_id: Some("vendor-1".into()),
-            mode: anyagents_harness::DeliveryMode::Steer,
-            delivery: anyagents_harness_stream::LINE_INTO_TURN,
-        })
+        let harness = SpironHarness::start(
+            SpironLaunch {
+                program: "/bin/sh".into(),
+                args: vec![
+                    "-c".into(),
+                    r#"echo '{"type":"ready","protocol":"spiron.headless/v1"}'; exec sleep 30"#
+                        .into(),
+                ],
+                environment: vec![],
+                work_dir: config.clone(),
+                session: Some("vendor-1".into()),
+                state_dir: config.clone(),
+            },
+            Duration::from_secs(10),
+        )
         .unwrap();
         let pointer = config.join("spiron-session-id");
         let vendor =

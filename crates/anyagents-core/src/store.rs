@@ -51,8 +51,8 @@ pub use outcomes::{
 };
 pub use runtime::{
     AgentRuntime, BackfillReport, Fault, FaultKind, ProcessIdentity, QUOTA_ESTIMATE_MS, QuotaBlock,
-    QuotaReset, QuotaSource, RecoveryOffer, RuntimeChange, RuntimeState, SessionLease, SteerHold,
-    SteerState, Turn, TurnOutcome, TurnState, steer_allows,
+    QuotaReset, QuotaSource, RecoveryOffer, RuntimeChange, RuntimeState, SessionLease, Turn,
+    TurnOutcome, TurnState,
 };
 
 /// A line's provider coordinates: the chat, the forum topic and the message id.
@@ -3072,6 +3072,9 @@ impl Store {
             for table in [
                 "agent_runtime",
                 "turns",
+                // Never written; kept, and kept cleared, for one release so a
+                // rollback to a binary that still deletes from it can delete
+                // agents. Drop the table and this entry together after that.
                 "steer_holds",
                 "session_leases",
                 "quota_blocks",
@@ -4669,114 +4672,6 @@ impl Store {
                      recovery_count = 0",
                 params![agent_id.as_str(), seq, prev_seq, now],
             )?;
-            Ok(())
-        })
-    }
-
-    /// Ensure message IDs from a reconciled external input hold are recorded in
-    /// `turn_recovery` as an open interrupted turn (and past `delivered_seq`)
-    /// so recovery resumes them with `[Recovery]` rather than raw replay.
-    pub fn promote_messages_to_open_turn(
-        &self,
-        agent_id: &AgentId,
-        message_ids: &[String],
-    ) -> Result<(), Error> {
-        if message_ids.is_empty() {
-            return Ok(());
-        }
-        self.write_tx(|tx| {
-            agent_exists(tx, agent_id)?;
-            let mut seqs = Vec::new();
-            for msg_id in message_ids {
-                if let Some(seq) = tx
-                    .query_row(
-                        "SELECT seq FROM messages WHERE agent_id = ?1 AND id = ?2",
-                        params![agent_id.as_str(), msg_id],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .optional()?
-                {
-                    seqs.push(seq);
-                }
-            }
-            let (Some(&min_seq), Some(&max_seq)) = (seqs.iter().min(), seqs.iter().max()) else {
-                return Ok(());
-            };
-            let cur = cursor(tx, agent_id)?;
-            let now = now_ms();
-            if max_seq > cur {
-                tx.execute(
-                    "INSERT INTO mailbox_cursors (agent_id, delivered_seq) VALUES (?1, ?2)
-                     ON CONFLICT(agent_id) DO UPDATE SET delivered_seq = MAX(delivered_seq, ?2)",
-                    params![agent_id.as_str(), max_seq],
-                )?;
-                tx.execute(
-                    "UPDATE messages
-                     SET delivered_at_ms = COALESCE(delivered_at_ms, ?1)
-                     WHERE agent_id = ?2 AND seq > ?3 AND seq <= ?4",
-                    params![now, agent_id.as_str(), cur, max_seq],
-                )?;
-            }
-            let completed_floor = (min_seq - 1).max(0);
-            tx.execute(
-                "INSERT INTO turn_recovery (agent_id, opened_seq, completed_seq, recovery_count, opened_at_ms)
-                 VALUES (?1, ?2, ?3, 0, ?4)
-                 ON CONFLICT(agent_id) DO UPDATE SET
-                     opened_seq = MAX(turn_recovery.opened_seq, ?2),
-                     completed_seq = MIN(turn_recovery.completed_seq, ?3)",
-                params![agent_id.as_str(), max_seq, completed_floor, now],
-            )?;
-            Ok(())
-        })
-    }
-
-    /// Rewind mailbox delivery custody for mid-turn steered messages whose
-    /// execution became unconfirmed (e.g. cancelled before terminal commit).
-    pub fn reclaim_unconfirmed_steers(
-        &self,
-        agent_id: &AgentId,
-        message_ids: &[String],
-    ) -> Result<(), Error> {
-        if message_ids.is_empty() {
-            return Ok(());
-        }
-        self.write_tx(|tx| {
-            agent_exists(tx, agent_id)?;
-            let mut min_seq: Option<i64> = None;
-            for msg_id in message_ids {
-                if let Some(seq) = tx
-                    .query_row(
-                        "SELECT seq FROM messages
-                         WHERE agent_id = ?1 AND id = ?2 AND delivered_at_ms IS NOT NULL",
-                        params![agent_id.as_str(), msg_id],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .optional()?
-                {
-                    min_seq = Some(min_seq.map_or(seq, |cur| cur.min(seq)));
-                }
-            }
-            if let Some(first_reclaimed_seq) = min_seq {
-                let rewind_to = (first_reclaimed_seq - 1).max(0);
-                tx.execute(
-                    "UPDATE mailbox_cursors
-                     SET delivered_seq = MIN(delivered_seq, ?1)
-                     WHERE agent_id = ?2",
-                    params![rewind_to, agent_id.as_str()],
-                )?;
-                tx.execute(
-                    "UPDATE messages
-                     SET delivered_at_ms = NULL
-                     WHERE agent_id = ?1 AND seq >= ?2",
-                    params![agent_id.as_str(), first_reclaimed_seq],
-                )?;
-                tx.execute(
-                    "UPDATE turn_recovery
-                     SET opened_seq = MIN(opened_seq, ?1)
-                     WHERE agent_id = ?2",
-                    params![rewind_to, agent_id.as_str()],
-                )?;
-            }
             Ok(())
         })
     }
@@ -11439,7 +11334,7 @@ mod tests {
     }
 
     #[test]
-    fn steered_active_turn_advances_cursor_without_lag_and_reclaim_rewinds_custody() {
+    fn steered_active_turn_advances_cursor_without_lag() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let agent = store.create_agent(NewAgent::new("steered", "agy")).unwrap();
@@ -11469,24 +11364,6 @@ mod tests {
         );
         let open = store.open_turn(&agent.id).unwrap().unwrap();
         assert_eq!(open.messages.first().unwrap().received_at_ms, 1_000);
-
-        store
-            .reclaim_unconfirmed_steers(&agent.id, &[steer.id.to_string()])
-            .unwrap();
-        assert_eq!(store.delivered_cursor(&agent.id).unwrap(), first.seq);
-        assert!(store.has_open_turn(&agent.id).unwrap());
-        assert_eq!(
-            store.next_undelivered(&agent.id).unwrap().unwrap().id,
-            steer.id
-        );
-        assert!(
-            store
-                .message(&agent.id, steer.id.as_str())
-                .unwrap()
-                .unwrap()
-                .delivered_at_ms
-                .is_none()
-        );
     }
     #[test]
     fn concurrent_turn_completion_never_sees_database_locked() {
@@ -11872,16 +11749,10 @@ mod tests {
         let db = dir.path().join("state.db");
         let worker = agent(&store, "recovery-lock-wait");
         store.set_agent_running(&worker.id, "/work").unwrap();
-        let mut ids: Vec<String> = Vec::new();
         for i in 1..=6 {
-            let out = store
+            store
                 .receive(&worker.id, Incoming::new(format!("task {i}")))
                 .unwrap();
-            let id = match out {
-                ReceiveOutcome::New(m) => m.id.to_string(),
-                ReceiveOutcome::Duplicate(m) => m.id.to_string(),
-            };
-            ids.push(id);
         }
         store.note_delivered(&worker.id, 1).unwrap();
         assert!(store.has_open_turn(&worker.id).unwrap());
@@ -11919,26 +11790,6 @@ mod tests {
         assert!(store.has_open_turn(&worker.id).unwrap());
         peer.join().unwrap();
 
-        // promote_messages_to_open_turn: reconciled external holds.
-        let started = std::time::Instant::now();
-        let peer = hold_writer_lock(&db, Duration::from_millis(400));
-        let promote_ids: Vec<String> = vec![ids[3].clone(), ids[4].clone()];
-        store
-            .promote_messages_to_open_turn(&worker.id, &promote_ids)
-            .unwrap();
-        assert!(started.elapsed() >= Duration::from_millis(350));
-        assert!(store.has_open_turn(&worker.id).unwrap());
-        peer.join().unwrap();
-
-        // reclaim_unconfirmed_steers: rewind custody for unconfirmed steers.
-        let started = std::time::Instant::now();
-        let peer = hold_writer_lock(&db, Duration::from_millis(400));
-        let reclaim_ids: Vec<String> = vec![ids[2].clone()];
-        store
-            .reclaim_unconfirmed_steers(&worker.id, &reclaim_ids)
-            .unwrap();
-        assert!(started.elapsed() >= Duration::from_millis(350));
-        peer.join().unwrap();
         assert!(
             started.elapsed() < Duration::from_secs(10),
             "budget bounds the wait"
@@ -11951,16 +11802,10 @@ mod tests {
         let db = dir.path().join("state.db");
         let worker = agent(&store, "recovery-lock-budget");
         store.set_agent_running(&worker.id, "/work").unwrap();
-        let mut ids: Vec<String> = Vec::new();
         for i in 1..=3 {
-            let out = store
+            store
                 .receive(&worker.id, Incoming::new(format!("task {i}")))
                 .unwrap();
-            let id = match out {
-                ReceiveOutcome::New(m) => m.id.to_string(),
-                ReceiveOutcome::Duplicate(m) => m.id.to_string(),
-            };
-            ids.push(id);
         }
         store.note_delivered(&worker.id, 1).unwrap();
         store
@@ -11972,8 +11817,6 @@ mod tests {
         let recovered = store.note_turn_recovered(&worker.id, 1);
         let advanced: Result<(), Error> = store.advance_delivered(&worker.id, 2).map(|_| ());
         let noted = store.note_delivered(&worker.id, 2);
-        let promoted = store.promote_messages_to_open_turn(&worker.id, &[ids[1].clone()]);
-        let reclaimed = store.reclaim_unconfirmed_steers(&worker.id, &[ids[0].clone()]);
         let elapsed = started.elapsed();
         peer.join().unwrap();
 
@@ -11981,8 +11824,6 @@ mod tests {
             ("note_turn_recovered", recovered),
             ("advance_delivered", advanced),
             ("note_delivered", noted),
-            ("promote", promoted),
-            ("reclaim", reclaimed),
         ] {
             let err = res.expect_err(&format!("{name} must surface lock after budget"));
             assert!(
@@ -12040,30 +11881,6 @@ mod tests {
             assert!(
                 started.elapsed() < Duration::from_millis(200),
                 "note_delivered must not retry"
-            );
-        }
-        {
-            let started = std::time::Instant::now();
-            let result = store.promote_messages_to_open_turn(&missing, &["x".to_string()]);
-            assert!(
-                matches!(result, Err(Error::AgentNotFound(_))),
-                "promote: {result:?}"
-            );
-            assert!(
-                started.elapsed() < Duration::from_millis(200),
-                "promote must not retry"
-            );
-        }
-        {
-            let started = std::time::Instant::now();
-            let result = store.reclaim_unconfirmed_steers(&missing, &["x".to_string()]);
-            assert!(
-                matches!(result, Err(Error::AgentNotFound(_))),
-                "reclaim: {result:?}"
-            );
-            assert!(
-                started.elapsed() < Duration::from_millis(200),
-                "reclaim must not retry"
             );
         }
     }

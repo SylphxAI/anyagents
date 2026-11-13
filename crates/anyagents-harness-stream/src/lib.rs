@@ -244,12 +244,14 @@ pub const LINE_INTO_TURN: Delivery = Delivery {
     peer: None,
 };
 
-/// An older Spiron peer: one steer per turn, held in
-/// `spiron-unconfirmed-steers.json` until its turn's result confirms it.
+/// A Spiron peer whose `ready` names no consumption proof: it is given one
+/// input per turn, never one while a turn runs, and `accepted` commits it.
+/// Gated on the capability for peers built before it; it goes when no such
+/// Spiron is installed.
 const OLDER_SPIRON: Delivery = Delivery {
-    level: DeliveryLevel::MidTurn,
+    level: DeliveryLevel::TurnEnd,
     idempotent: false,
-    proof: "steer_ack; unconfirmed-steer hold",
+    proof: "accepted (one input per turn)",
     peer: None,
 };
 
@@ -309,7 +311,6 @@ struct State {
     exit_status: Option<ExitStatus>,
     exit_fault: Option<String>,
     state_dir: Option<PathBuf>,
-    unconfirmed: bool,
     alive: bool,
     /// Bumped by every stdout line: what [`StreamHarness::quiet`] measures.
     epoch: u64,
@@ -325,7 +326,6 @@ struct State {
     idle_since: Option<Instant>,
     last_rpc_health_poll: Option<Instant>,
     last_steer_probe: Option<Instant>,
-    reclaimed_steers: Vec<String>,
     planner_config: Option<Value>,
     http_port: Option<u16>,
     seen: HashSet<String>,
@@ -357,6 +357,9 @@ struct State {
     consumed: HashSet<String>,
     /// Consumed inputs it answered as journaled by an earlier process.
     duplicates: HashSet<String>,
+    /// Inputs the session's own journal shows an earlier process applied.
+    /// They belong to the session, so a new process keeps them.
+    applied_before: HashSet<String>,
     /// The open turn refused a steer as closed: it takes no more, and the
     /// next input waits for its result to start the next turn.
     turn_closing: bool,
@@ -424,15 +427,10 @@ impl StreamHarness {
         })
     }
 
-    /// Persist transport failures and unconfirmed steering custody for the
-    /// external adapter. A terminal uncertainty hold is never an auto-retry.
+    /// Persist the child's exit fault into `dir` for the server to show.
     pub fn set_state_dir(&self, dir: &Path) {
         let mut state = lock(&self.shared);
         state.state_dir = Some(dir.to_path_buf());
-        state.unconfirmed |= dir
-            .join("spiron-unconfirmed-steers.json")
-            .try_exists()
-            .unwrap_or(true);
         state.refresh_exit_fault();
         state.persist_failure();
     }
@@ -445,95 +443,14 @@ impl StreamHarness {
         lock(&self.shared).written.clone()
     }
 
-    pub fn take_reclaimed_steers(&self) -> Vec<String> {
-        std::mem::take(&mut lock(&self.shared).reclaimed_steers)
-    }
-
     pub fn state_dir(&self) -> Option<PathBuf> {
         lock(&self.shared).state_dir.clone()
     }
 
-    pub fn has_unconfirmed_hold(&self) -> bool {
-        if self.pending.is_some() {
-            return false;
-        }
-        let state = lock(&self.shared);
-        if !state.open.is_empty() || !state.followups.is_empty() {
-            return false;
-        }
-        state.unconfirmed
-            || state.state_dir.as_ref().is_some_and(|dir| {
-                dir.join("spiron-unconfirmed-steers.json").exists()
-                    || dir.join(".anyagents-session-reset-recovery").exists()
-            })
-    }
-
-    pub fn has_unconfirmed_idle_hold(&self) -> bool {
-        let state = lock(&self.shared);
-        state.unconfirmed && state.open.is_empty() && state.followups.is_empty()
-    }
-
-    pub fn peek_unconfirmed_request_ids(&self) -> Vec<String> {
-        let state = lock(&self.shared);
-        let Some(dir) = &state.state_dir else {
-            return Vec::new();
-        };
-        parse_hold_file(&dir.join("spiron-unconfirmed-steers.json")).1
-    }
-
-    pub fn reconcile_unconfirmed_for_recovery(
-        &self,
-    ) -> Result<Option<anyagents_harness::ReconciledUnconfirmed>, HarnessError> {
-        let mut state = lock(&self.shared);
-        let Some(dir) = state.state_dir.clone() else {
-            if !state.unconfirmed {
-                return Ok(None);
-            }
-            state.unconfirmed = false;
-            state.sign_in_fault = None;
-            state.exit_fault = None;
-            state.reclaimed_steers.clear();
-            return Ok(Some(anyagents_harness::ReconciledUnconfirmed::default()));
-        };
-        let hold_path = dir.join("spiron-unconfirmed-steers.json");
-        let reset_marker = dir.join(".anyagents-session-reset-recovery");
-        if !state.unconfirmed && !hold_path.exists() && !reset_marker.exists() {
-            return Ok(None);
-        }
-        let (turn_id, request_ids) = parse_hold_file(&hold_path);
-        if let Ok(meta) = std::fs::symlink_metadata(&hold_path) {
-            if meta.file_type().is_file()
-                && meta.len() > 0
-                && let Ok(bytes) = std::fs::read(&hold_path)
-            {
-                let _ = anyagents_harness::atomic_write_in_existing_dir(
-                    &dir.join("spiron-unconfirmed-steers.reconciled.json"),
-                    &bytes,
-                    0o664,
-                );
-            }
-            match std::fs::remove_file(&hold_path) {
-                Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => {
-                    return Err(HarnessError::Failed(format!(
-                        "cannot clear reconciled Spiron input hold: {err}"
-                    )));
-                }
-            }
-        }
-        let _ = std::fs::remove_file(dir.join(".anyagents-last-error.json"));
-        let _ = std::fs::remove_file(&reset_marker);
-        state.unconfirmed = false;
-        state.sign_in_fault = None;
-        state.exit_fault = None;
-        state.reclaimed_steers.clear();
-        Ok(Some(anyagents_harness::ReconciledUnconfirmed {
-            turn_id,
-            request_ids,
-            journal_committed_ids: Vec::new(),
-            journal_missing_ids: Vec::new(),
-        }))
+    /// Inputs the session's journal shows an earlier process applied: each
+    /// is answered `Duplicate` and never written again.
+    pub fn recognise_applied(&self, ids: impl IntoIterator<Item = String>) {
+        lock(&self.shared).applied_before.extend(ids);
     }
 
     pub fn seed_session_id(&self, session_id: &str) {
@@ -751,8 +668,7 @@ impl StreamHarness {
         }
         HarnessHealth {
             process_alive: state.alive,
-            turn_state: if state.open.is_empty() && !state.unconfirmed && state.in_flight.is_empty()
-            {
+            turn_state: if state.open.is_empty() && state.in_flight.is_empty() {
                 TurnState::Idle
             } else {
                 TurnState::InTurn
@@ -796,16 +712,25 @@ impl StreamHarness {
         message: &OutboundMessage,
         line: &Value,
     ) -> Result<DeliverOutcome, HarnessError> {
+        if lock(&self.shared).applied_before.contains(&message.id) {
+            return Ok(DeliverOutcome::Duplicate);
+        }
         if self.spec.protocol == LineProtocol::AcknowledgedResult {
             let state = lock(&self.shared);
             // The peer says what it can do before it is given anything: its
             // `ready` decides which custody rules every input follows.
-            if state.ready.is_none() && state.alive && !state.unconfirmed {
+            if state.ready.is_none() && state.alive {
                 return Ok(DeliverOutcome::Deferred);
             }
             if state.ready == Some(true) {
                 drop(state);
                 return self.deliver_consumed(message, line);
+            }
+            // An older peer proves nothing about input it takes mid-turn: it
+            // is given the next input only once the running turn has ended.
+            let unwritten = self.pending.as_ref().is_none_or(|p| p.id != message.id);
+            if unwritten && !state.seen.contains(&message.id) && !state.open.is_empty() {
+                return Ok(DeliverOutcome::Deferred);
             }
         }
         let bytes = self
@@ -815,9 +740,6 @@ impl StreamHarness {
         let mut agy_steer_ctx = None;
         {
             let mut state = lock(&self.shared);
-            if state.unconfirmed {
-                return Ok(DeliverOutcome::Deferred);
-            }
             if !state.alive {
                 return Err(HarnessError::Dead);
             }
@@ -865,28 +787,6 @@ impl StreamHarness {
                         generation,
                     ));
                 } else {
-                    if self.spec.protocol == LineProtocol::AcknowledgedResult
-                        && let Some(dir) = &state.state_dir
-                    {
-                        // Record uncertainty BEFORE exposing any bytes. If this
-                        // fails, the mailbox still owns a provably unsent input.
-                        let turn = state.open.first().unwrap_or(&message.id);
-                        let mut ids: Vec<_> = state.open.iter().collect();
-                        ids.push(&message.id);
-                        if let Err(error) = anyagents_harness::atomic_write_in_existing_dir(
-                            &dir.join("spiron-unconfirmed-steers.json"),
-                            json!({"turn_id": turn, "request_ids": ids})
-                                .to_string()
-                                .as_bytes(),
-                            0o664,
-                        ) {
-                            let reason = format!(
-                                "cannot persist Spiron input hold before dispatch: {error}"
-                            );
-                            state.sign_in_fault = Some(reason.clone());
-                            return Err(HarnessError::Failed(reason));
-                        }
-                    }
                     // Associate even an immediate result with its owner before the
                     // first byte is visible to the child. This is not acceptance.
                     if state.open.is_empty() {
@@ -1100,8 +1000,7 @@ impl StreamHarness {
     /// process had already journaled it. An input the peer refuses or ends
     /// its turn without consuming returns to the mailbox and is written again;
     /// it was certainly not journaled, and a second copy would be dropped by
-    /// its request id anyway. Nothing waits for a turn to end, and no hold
-    /// file is written.
+    /// its request id anyway. Nothing waits for a turn to end.
     fn deliver_consumed(
         &mut self,
         message: &OutboundMessage,
@@ -1110,9 +1009,12 @@ impl StreamHarness {
         let id = message.id.as_str();
         {
             let mut state = lock(&self.shared);
-            // A hold an older peer left is reconciled before anything else.
-            if state.unconfirmed {
-                return Ok(DeliverOutcome::Deferred);
+            // A consumption the peer proved stays proved after it exits.
+            if let Some(Ok(
+                proved @ (DeliverOutcome::Accepted { .. } | DeliverOutcome::Duplicate),
+            )) = state.consumption_outcome(id)
+            {
+                return Ok(proved);
             }
             if !state.alive {
                 return Err(HarnessError::Dead);
@@ -1229,7 +1131,7 @@ impl StreamHarness {
 
     pub fn input_ready(&self) -> bool {
         let state = lock(&self.shared);
-        if state.input_blocked || state.unconfirmed {
+        if state.input_blocked {
             return false;
         }
         if self.spec.protocol == LineProtocol::AcknowledgedResult
@@ -1347,12 +1249,6 @@ impl StreamHarness {
             state.turn_retry_at = None;
             state.quota_reset_at_ms = None;
             state.sign_in_fault = None;
-            if let Some(dir) = &state.state_dir {
-                state.unconfirmed = dir
-                    .join("spiron-unconfirmed-steers.json")
-                    .try_exists()
-                    .unwrap_or(true);
-            }
             state.stderr = BoundedStderr::default();
             state.stderr_done = false;
             state.exit_status = None;
@@ -1534,7 +1430,6 @@ impl Drop for StreamHarness {
 // Retain at most 16 KiB while draining the entire pipe. If retention cuts a
 // line, withhold that partial line rather than publishing a credential prefix.
 const STDERR_LIMIT: usize = 16 * 1024;
-const UNCONFIRMED_STEERS: &str = "Spiron reported unconfirmed steering input; mailbox custody retained. Reconcile spiron-unconfirmed-steers.json before resuming; do not blindly replay.";
 
 #[derive(Default)]
 struct BoundedStderr {
@@ -1576,7 +1471,6 @@ impl BoundedStderr {
 #[derive(PartialEq, Eq)]
 struct Observed {
     alive: bool,
-    unconfirmed: bool,
     input_blocked: bool,
     awaiting_first_step: bool,
     agy_idle: bool,
@@ -1586,7 +1480,6 @@ struct Observed {
     finished: usize,
     acknowledged: usize,
     rejected: usize,
-    reclaimed: usize,
     ready: Option<bool>,
     in_flight: usize,
     consumed: usize,
@@ -1599,7 +1492,6 @@ impl State {
     fn observed(&self) -> Observed {
         Observed {
             alive: self.alive,
-            unconfirmed: self.unconfirmed,
             input_blocked: self.input_blocked,
             awaiting_first_step: self.turn_user_inputs == 0,
             agy_idle: self.idle_since.is_some(),
@@ -1609,7 +1501,6 @@ impl State {
             finished: self.finished.len(),
             acknowledged: self.acknowledged.len(),
             rejected: self.rejected.len(),
-            reclaimed: self.reclaimed_steers.len(),
             ready: self.ready,
             in_flight: self.in_flight.len(),
             consumed: self.consumed.len(),
@@ -1647,15 +1538,13 @@ impl State {
     }
 
     // Both a fresh pipe write and an already-written retry consult the same
-    // receipt state. Transport acknowledgement alone never commits a busy steer.
+    // receipt state. An older Spiron's input is taken once its turn is
+    // `accepted`.
     fn written_outcome(
         &self,
         protocol: LineProtocol,
         id: &str,
     ) -> Result<DeliverOutcome, HarnessError> {
-        if self.unconfirmed {
-            return Ok(DeliverOutcome::Deferred);
-        }
         if let Some(reset_at_ms) = self.quota_reset_at_ms
             && !self.finished.contains(id)
         {
@@ -1665,12 +1554,7 @@ impl State {
             return Err(HarnessError::Failed(reason.clone()));
         }
         let finished = self.finished.contains(id);
-        if protocol == LineProtocol::AcknowledgedResult
-            && (!self.acknowledged.contains(id)
-                || ((self.input_turns.get(id).is_some_and(|turn| turn != id)
-                    || self.open.first().is_some_and(|turn| turn != id))
-                    && !finished))
-        {
+        if protocol == LineProtocol::AcknowledgedResult && !self.acknowledged.contains(id) {
             return Ok(DeliverOutcome::Deferred);
         }
         Ok(DeliverOutcome::Accepted {
@@ -1679,18 +1563,9 @@ impl State {
     }
 
     fn failure(&self) -> Option<String> {
-        let diagnostic = self
-            .exit_fault
+        self.exit_fault
             .clone()
-            .or_else(|| self.sign_in_fault.clone());
-        if self.unconfirmed {
-            Some(match diagnostic {
-                Some(error) => format!("{UNCONFIRMED_STEERS}; {error}"),
-                None => UNCONFIRMED_STEERS.to_string(),
-            })
-        } else {
-            diagnostic
-        }
+            .or_else(|| self.sign_in_fault.clone())
     }
 
     fn persist_failure(&self) {
@@ -1751,7 +1626,6 @@ impl State {
             exit_status: None,
             exit_fault: None,
             state_dir: None,
-            unconfirmed: false,
             alive: false,
             epoch: 0,
             changes: 0,
@@ -1770,7 +1644,6 @@ impl State {
             idle_since: None,
             last_rpc_health_poll: None,
             last_steer_probe: None,
-            reclaimed_steers: Vec::new(),
             planner_config: None,
             http_port: None,
             finished: HashSet::new(),
@@ -1786,6 +1659,7 @@ impl State {
             in_flight: HashSet::new(),
             consumed: HashSet::new(),
             duplicates: HashSet::new(),
+            applied_before: HashSet::new(),
             turn_closing: false,
             refused_turns: 0,
             turn_retry_at: None,
@@ -1961,16 +1835,6 @@ fn read_stdout(
                         state.acknowledged.insert(id.to_string());
                         state.input_turns.insert(id.to_string(), id.to_string());
                     }
-                    Some("steer_ack")
-                        if value.get("accepted").and_then(Value::as_bool) == Some(true)
-                            && value.get("turn_id").and_then(Value::as_str).is_some() =>
-                    {
-                        state.acknowledged.insert(id.to_string());
-                        state.input_turns.insert(
-                            id.to_string(),
-                            value["turn_id"].as_str().unwrap().to_string(),
-                        );
-                    }
                     Some("rejected") => {
                         state.rejected.insert(
                             id.to_string(),
@@ -2072,15 +1936,7 @@ fn read_stdout(
                         &value,
                     );
                 } else if spec.protocol == LineProtocol::AcknowledgedResult {
-                    let unconfirmed = value.get("undelivered_steers").is_some_and(|items| {
-                        items.as_array().is_none_or(|items| !items.is_empty())
-                    });
-                    finish_correlated(
-                        &mut state,
-                        value["request_id"].as_str().unwrap(),
-                        usage,
-                        unconfirmed,
-                    );
+                    finish_correlated(&mut state, value["request_id"].as_str().unwrap(), usage);
                 } else {
                     finish_open(&mut state, usage);
                 }
@@ -2290,104 +2146,17 @@ fn finish_open(state: &mut State, usage: TurnUsage) {
     }
 }
 
-fn parse_hold_file(path: &Path) -> (Option<String>, Vec<String>) {
-    let Ok(meta) = std::fs::symlink_metadata(path) else {
-        return (None, Vec::new());
-    };
-    if !meta.file_type().is_file() || meta.len() == 0 {
-        return (None, Vec::new());
+/// The result that closes an older Spiron's turn: its one input is finished.
+fn finish_correlated(state: &mut State, turn: &str, usage: TurnUsage) {
+    if !state.open.iter().any(|id| id == turn) {
+        return;
     }
-    let Ok(bytes) = std::fs::read(path) else {
-        return (None, Vec::new());
-    };
-    let Ok(val) = serde_json::from_slice::<Value>(&bytes) else {
-        return (None, Vec::new());
-    };
-    let turn_id = val
-        .get("turn_id")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
-    let mut ids: Vec<String> = val
-        .get("request_ids")
-        .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(Value::as_str)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
-    if let Some(ref tid) = turn_id
-        && !ids.iter().any(|id| id == tid)
-    {
-        ids.insert(0, tid.clone());
-    }
-    (turn_id, ids)
-}
-
-fn finish_correlated(state: &mut State, turn: &str, usage: TurnUsage, unconfirmed: bool) {
-    let ids: Vec<String> = state
-        .open
-        .iter()
-        .chain(&state.followups)
-        .filter(|id| {
-            state
-                .input_turns
-                .get(*id)
-                .is_some_and(|owner| owner == turn)
-        })
-        .cloned()
-        .collect();
-    if unconfirmed {
-        state.unconfirmed = true;
-        // The pre-dispatch hold already exists. No terminal write (which could
-        // fail after effects became uncertain) is required to retain custody.
-        for id in &ids {
-            if id != turn && !state.reclaimed_steers.contains(id) {
-                state.reclaimed_steers.push(id.clone());
-            }
-        }
-    }
-    for id in ids {
-        if unconfirmed && id != turn {
-            continue;
-        }
-        state.open.retain(|open| open != &id);
-        state.followups.retain(|open| open != &id);
-        state.finished.insert(id.clone());
-        state.usages.push((
-            id.clone(),
-            if id == turn {
-                usage.clone()
-            } else {
-                TurnUsage::default()
-            },
-        ));
-    }
-    if !state.unconfirmed
-        && state.open.is_empty()
-        && state.followups.is_empty()
-        && let Some(dir) = &state.state_dir
-        && let Err(error) = std::fs::remove_file(dir.join("spiron-unconfirmed-steers.json"))
-        && error.kind() != std::io::ErrorKind::NotFound
-    {
-        state.unconfirmed = true;
-        state.sign_in_fault = Some(format!("cannot clear confirmed Spiron input hold: {error}"));
-    } else if !state.unconfirmed
-        && state.open.is_empty()
-        && state.followups.is_empty()
-        && let Some(dir) = &state.state_dir
-    {
-        // A confirmed completion releases every custody artefact that
-        // accompanied the hold, not just the hold file: a lingering
-        // reset marker would re-flag the hold on the next pass. The
-        // last-error file is best-effort here; the reader repersists it
-        // when the turn failed right after this.
-        let _ = std::fs::remove_file(dir.join(".anyagents-session-reset-recovery"));
-        let _ = std::fs::remove_file(dir.join(".anyagents-last-error.json"));
-    }
+    state.open.retain(|id| id != turn);
+    state.finished.insert(turn.to_string());
+    state.usages.push((turn.to_string(), usage));
+    state.turn_user_inputs = 0;
+    state.last_turn_step_type = None;
+    state.idle_since = None;
 }
 
 /// The `ready` frame names both capabilities the pipelined path relies on:
@@ -2599,14 +2368,6 @@ fn finish_consumed(state: &mut State, turn: &str, usage: TurnUsage, value: &Valu
     state.turn_user_inputs = 0;
     state.last_turn_step_type = None;
     state.idle_since = None;
-    if state.open.is_empty()
-        && !state.unconfirmed
-        && let Some(dir) = &state.state_dir
-    {
-        // As a confirmed legacy completion: a lingering reset marker would
-        // ask for a recovery the session no longer needs.
-        let _ = std::fs::remove_file(dir.join(".anyagents-session-reset-recovery"));
-    }
 }
 
 fn note_markers(state: &mut State, value: &Value) {
