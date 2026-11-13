@@ -794,17 +794,71 @@ pub struct OpenTurn {
 
 /// Held for one vendor loop or lifecycle mutation. Drop explicitly releases the
 /// flock even while a fork-inherited descriptor remains open.
+///
+/// A process lock can be shared with the keeper that owns the agent's harness
+/// process (see `docs/adr/0007-process-architecture.md`): every copy is a
+/// descriptor of the same open file description, so the lock is held while
+/// any copy, in any process, is open. Only the descriptor that took the lock
+/// (or adopted it from a keeper) unlocks on drop, and not once
+/// [`AgentLock::retain`] said the keeper keeps holding it after this process.
 #[derive(Debug)]
 pub struct AgentLock {
-    _file: File,
+    file: File,
+    /// This descriptor took the lock (or adopted it), so its drop releases it.
+    owner: bool,
+    /// Cleared by [`AgentLock::retain`] on any copy: no copy in this process
+    /// releases the lock, because a keeper holds it on after this process.
+    release: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl AgentLock {
+    fn taken(file: File) -> Self {
+        Self {
+            file,
+            owner: true,
+            release: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        }
+    }
+
+    /// Another descriptor of this lock, for a keeper process to inherit or
+    /// for a later launch to hand on. The copy never unlocks on drop.
+    pub fn share(&self) -> std::io::Result<AgentLock> {
+        Ok(Self {
+            file: self.file.try_clone()?,
+            owner: false,
+            release: Arc::clone(&self.release),
+        })
+    }
+
+    /// The lock a keeper passed back on reattach: the same open file
+    /// description it holds. This process now owns releasing it, unless it
+    /// retains it again.
+    pub fn adopt(fd: std::os::fd::OwnedFd) -> AgentLock {
+        Self::taken(File::from(fd))
+    }
+
+    /// A keeper keeps holding this lock after this process lets go: no copy
+    /// in this process releases it on drop; each only closes its descriptor.
+    pub fn retain(&self) {
+        self.release.store(false, Ordering::SeqCst);
+    }
+}
+
+impl std::os::fd::AsFd for AgentLock {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.file.as_fd()
+    }
 }
 
 impl Drop for AgentLock {
     fn drop(&mut self) {
+        if !self.owner || !self.release.load(Ordering::SeqCst) {
+            return;
+        }
         // Closing only our descriptor leaves flock held by a concurrent fork's
         // inherited copy until exec. Release the open-file-description lock
         // explicitly so the next turn and busy probe see the intended lifetime.
-        let _ = unsafe { libc::flock(self._file.as_raw_fd(), libc::LOCK_UN) };
+        let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
     }
 }
 
@@ -1342,7 +1396,7 @@ impl Store {
             }
             return Err(Error::Io(err));
         }
-        Ok(AgentLock { _file: file })
+        Ok(AgentLock::taken(file))
     }
 
     /// Serialize lifecycle state and archive-marker changes across API/server
@@ -1383,7 +1437,7 @@ impl Store {
         loop {
             let rc = unsafe { libc::flock(file.as_raw_fd(), operation) };
             if rc == 0 {
-                return Ok(AgentLock { _file: file });
+                return Ok(AgentLock::taken(file));
             }
             let error = std::io::Error::last_os_error();
             if error.kind() == ErrorKind::WouldBlock {
@@ -9259,10 +9313,56 @@ mod tests {
         let lock = store.try_lock_agent(&owner.id).unwrap();
         // A concurrent fork can inherit this open file description until exec.
         // A clone deterministically models that lifetime without timing a fork.
-        let inherited = lock._file.try_clone().unwrap();
+        let inherited = lock.file.try_clone().unwrap();
         drop(lock);
         let _next_turn = store.try_lock_agent(&owner.id).unwrap();
         drop(inherited);
+    }
+
+    #[test]
+    fn a_shared_copy_holds_the_lock_only_until_the_owner_releases_it() {
+        let (_dir, store) = setup();
+        let owner = agent(&store, "owner");
+        let lock = store.try_lock_agent(&owner.id).unwrap();
+        let keeper = lock.share().unwrap();
+        // A copy never unlocks: dropping it leaves the owner holding the lock.
+        drop(keeper);
+        assert!(matches!(
+            store.try_lock_agent(&owner.id),
+            Err(Error::AgentBusy)
+        ));
+        let keeper = lock.share().unwrap();
+        drop(lock);
+        // The owner released the open file description for every copy.
+        let _next = store.try_lock_agent(&owner.id).unwrap();
+        drop(keeper);
+    }
+
+    #[test]
+    fn a_retained_lock_stays_held_by_the_copy_a_keeper_keeps() {
+        let (_dir, store) = setup();
+        let owner = agent(&store, "owner");
+        let lock = store.try_lock_agent(&owner.id).unwrap();
+        let keeper = lock.share().unwrap();
+        let kernel_copy = lock.share().unwrap();
+        kernel_copy.retain();
+        drop(kernel_copy);
+        drop(lock);
+        // The keeper's descriptor still holds it after the kernel let go.
+        assert!(matches!(
+            store.try_lock_agent(&owner.id),
+            Err(Error::AgentBusy)
+        ));
+        // The next kernel adopts the keeper's descriptor and owns release.
+        let adopted =
+            AgentLock::adopt(std::os::fd::OwnedFd::from(keeper.file.try_clone().unwrap()));
+        drop(keeper);
+        assert!(matches!(
+            store.try_lock_agent(&owner.id),
+            Err(Error::AgentBusy)
+        ));
+        drop(adopted);
+        let _next = store.try_lock_agent(&owner.id).unwrap();
     }
 
     #[test]
@@ -9277,7 +9377,7 @@ mod tests {
             };
             // A duplicate shares the open file description inherited by fork,
             // even when the descriptor is close-on-exec. No fork timing needed.
-            let inherited = lock._file.try_clone().unwrap();
+            let inherited = lock.file.try_clone().unwrap();
             assert!(matches!(
                 store.try_lock_agent_lifecycle(&owner.id),
                 Err(Error::AgentBusy)
