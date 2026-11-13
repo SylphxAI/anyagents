@@ -1190,17 +1190,31 @@ impl<H: Harness + 'static> Session<H> {
         if !self.record_usage() {
             return false;
         }
+        // A replacement on the same harness resumes the same vendor session,
+        // so the old process is stopped and read to the end first: what it
+        // proved in its last moments is committed, its transcript or journal
+        // is no longer written while the new one reads it, and it releases
+        // the session for the new one to take. A launch that then fails
+        // leaves a dead process, which the dead-process backoff replaces. A
+        // switch to another harness starts another session: the old process
+        // keeps serving until the new one is up.
+        let running = self.agent.harness.clone();
+        let same_session = self
+            .configured()
+            .is_none_or(|configured| configured.harness == running);
+        if same_session && let Some(delivery) = self.delivery.as_mut() {
+            if let Err(err) = delivery.retire_harness() {
+                self.last_error = Some(format!("commit proven mail: {err}"));
+            }
+            self.publish();
+        }
         match self.launch_harness() {
             Ok(mut harness) => {
                 harness.watch_activity(Arc::clone(&self.notify));
                 // A quota wait belonged to the process that is gone.
                 harness.clear_quota();
                 if let Some(delivery) = self.delivery.as_mut() {
-                    // Stop the old process and read it to the end before the
-                    // new one takes any mail: what it proved in its last
-                    // moments is committed, never handed to its successor. A
-                    // launch that failed left the old process serving.
-                    if let Err(err) = delivery.retire_harness() {
+                    if !same_session && let Err(err) = delivery.retire_harness() {
                         self.last_error = Some(format!("commit proven mail: {err}"));
                     }
                     self.pending_recovery = true;

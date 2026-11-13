@@ -1330,6 +1330,7 @@ struct SwitchProbe {
     offers: usize,
     given: Vec<String>,
     health_reads: usize,
+    stopped: bool,
 }
 
 impl Default for SwitchProbe {
@@ -1352,6 +1353,7 @@ impl Default for SwitchProbe {
             offers: 0,
             given: Vec::new(),
             health_reads: 0,
+            stopped: false,
         }
     }
 }
@@ -1377,6 +1379,11 @@ impl anyagents_harness::Harness for SwitchHarness {
     fn resume(&mut self, _: &str) -> Result<(), anyagents_harness::HarnessError> {
         panic!("a switch must not resume the retiring harness session")
     }
+    fn stop(&mut self) {
+        let mut probe = self.probe.lock().unwrap();
+        probe.stopped = true;
+        probe.health.process_alive = false;
+    }
     fn cancel(&mut self) -> Result<(), anyagents_harness::HarnessError> {
         Ok(())
     }
@@ -1388,7 +1395,10 @@ impl anyagents_harness::Harness for SwitchHarness {
 }
 
 #[test]
-fn a_replacement_that_fails_to_launch_leaves_the_old_process_serving_mail() {
+/// A switch to another harness starts another session, so the old process
+/// keeps serving until the new one is up: a launch that fails leaves it
+/// serving mail.
+fn a_switch_to_another_harness_that_fails_to_launch_leaves_the_old_process_serving_mail() {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -1419,7 +1429,10 @@ fn a_replacement_that_fails_to_launch_leaves_the_old_process_serving_mail() {
                 if !launch_works.load(Ordering::SeqCst) {
                     return Err("launch refused".to_string());
                 }
-                launched_models.lock().unwrap().push(request.agent.model);
+                launched_models
+                    .lock()
+                    .unwrap()
+                    .push(Some(request.agent.harness));
                 let probe = Arc::new(Mutex::new(SwitchProbe::default()));
                 probes.lock().unwrap().push(Arc::clone(&probe));
                 Ok(SwitchHarness { probe })
@@ -1447,7 +1460,7 @@ fn a_replacement_that_fails_to_launch_leaves_the_old_process_serving_mail() {
         assert!(wait_until(|| old.lock().unwrap().health_reads > reads + 1));
     };
     let start = clock.now_ms();
-    store.set_agent_model(&agent.id, "new-model").unwrap();
+    store.set_agent_harness(&agent.id, "codex").unwrap();
     settle();
     // The drain ends and the replacement fails to launch.
     clock.set_ms(start + 15_001);
@@ -1479,8 +1492,76 @@ fn a_replacement_that_fails_to_launch_leaves_the_old_process_serving_mail() {
     assert!(wait_until(|| probes.lock().unwrap().len() == 2));
     assert_eq!(
         launched_models.lock().unwrap().last().unwrap().as_deref(),
-        Some("new-model")
+        Some("codex")
     );
+}
+
+/// A model switch resumes the same vendor session: the old process is
+/// stopped and read to the end before the new one launches, so the two never
+/// share the session. A launch that fails leaves a dead process, which the
+/// dead-process backoff replaces.
+#[test]
+fn a_model_switch_stops_the_old_process_before_the_new_one_launches() {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let dir = short_dir();
+    let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+    let mut spec = NewAgent::new("switch-target", "sylphx");
+    spec.model = Some("old-model".into());
+    let agent = store.create_agent(spec).unwrap();
+    store
+        .set_agent_running(&agent.id, &dir.path().join("work").display().to_string())
+        .unwrap();
+    let probes = Arc::new(Mutex::new(Vec::<Arc<Mutex<SwitchProbe>>>::new()));
+    let launch_works = Arc::new(AtomicBool::new(true));
+    let old_stopped_at_launch = Arc::new(Mutex::new(Vec::new()));
+    let clock = ManualClock::new(1_700_000_000_000);
+    let supervisor = Supervisor::start(
+        Arc::clone(&store),
+        Arc::new(clock.clone()),
+        {
+            let probes = Arc::clone(&probes);
+            let launch_works = Arc::clone(&launch_works);
+            let seen = Arc::clone(&old_stopped_at_launch);
+            Arc::new(move |_: LaunchRequest| {
+                let previous = probes.lock().unwrap().last().cloned();
+                if let Some(previous) = previous {
+                    seen.lock().unwrap().push(previous.lock().unwrap().stopped);
+                }
+                if !launch_works.load(Ordering::SeqCst) {
+                    return Err("launch refused".to_string());
+                }
+                let probe = Arc::new(Mutex::new(SwitchProbe::default()));
+                probes.lock().unwrap().push(Arc::clone(&probe));
+                Ok(SwitchHarness { probe })
+            })
+        },
+        Vec::new(),
+    )
+    .unwrap();
+    assert!(wait_until(|| supervisor.live(&agent.id).is_some()));
+    launch_works.store(false, Ordering::SeqCst);
+    store.set_agent_model(&agent.id, "new-model").unwrap();
+    store.poke(Wake::Agent {
+        agent_id: agent.id.clone(),
+    });
+    // The first launch fails after the old process was stopped.
+    assert!(wait_until(|| !old_stopped_at_launch
+        .lock()
+        .unwrap()
+        .is_empty()));
+    assert!(old_stopped_at_launch.lock().unwrap()[0]);
+    assert!(probes.lock().unwrap()[0].lock().unwrap().stopped);
+    // The dead process is replaced after its backoff.
+    launch_works.store(true, Ordering::SeqCst);
+    let mut ticks = 0;
+    assert!(wait_until(|| {
+        ticks += 1;
+        clock.set_ms(1_700_000_000_000 + ticks * 1_000);
+        probes.lock().unwrap().len() == 2
+    }));
+    drop(supervisor);
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
