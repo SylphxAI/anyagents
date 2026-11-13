@@ -4,8 +4,31 @@
 use crate::model::{Head, ModelPin, PinnedFile, RuntimePin};
 
 /// Embedders with a published ONNX export and a permissive licence, compared
-/// on real history (docs/host-memory.md). The first is the default.
+/// on real history (docs/host-memory.md). The first is the default: on
+/// Cantonese-heavy history it retrieves best alone and keeps Cantonese
+/// characters whole; the 97M model costs about a third of the CPU and is the
+/// documented cheaper choice (`--embedder`).
 pub const EMBEDDERS: &[ModelPin] = &[
+    ModelPin {
+        name: "granite-embedding-311m-multilingual-r2-int8",
+        repo: "ibm-granite/granite-embedding-311m-multilingual-r2",
+        revision: "44399559930365213510b1ee2eb15ded83374f0e",
+        onnx: PinnedFile {
+            path: "onnx/model_quint8_avx2.onnx",
+            size: 313_421_909,
+            sha256: "f1fdd44e7e1ac51f12ab7957c7bd092e064d596c288513bf9d326842f669edee",
+        },
+        tokenizer: PinnedFile {
+            path: "tokenizer.json",
+            size: 33_384_821,
+            sha256: "0087c868b33bad550a78a08d19798cfd7f713cde4f020803b8f51f405503e15f",
+        },
+        head: Head::Cls,
+        max_tokens: 512,
+        query_prefix: "",
+        passage_prefix: "",
+        dims: 768,
+    },
     ModelPin {
         name: "granite-embedding-97m-multilingual-r2-int8",
         repo: "ibm-granite/granite-embedding-97m-multilingual-r2",
@@ -45,26 +68,6 @@ pub const EMBEDDERS: &[ModelPin] = &[
         query_prefix: "",
         passage_prefix: "",
         dims: 384,
-    },
-    ModelPin {
-        name: "granite-embedding-311m-multilingual-r2-int8",
-        repo: "ibm-granite/granite-embedding-311m-multilingual-r2",
-        revision: "44399559930365213510b1ee2eb15ded83374f0e",
-        onnx: PinnedFile {
-            path: "onnx/model_quint8_avx2.onnx",
-            size: 313_421_909,
-            sha256: "f1fdd44e7e1ac51f12ab7957c7bd092e064d596c288513bf9d326842f669edee",
-        },
-        tokenizer: PinnedFile {
-            path: "tokenizer.json",
-            size: 33_384_821,
-            sha256: "0087c868b33bad550a78a08d19798cfd7f713cde4f020803b8f51f405503e15f",
-        },
-        head: Head::Cls,
-        max_tokens: 512,
-        query_prefix: "",
-        passage_prefix: "",
-        dims: 768,
     },
     ModelPin {
         name: "granite-embedding-107m-multilingual",
