@@ -30,6 +30,9 @@ def text_of(content):
 
 class Claude(Protocol):
     idempotent = False
+    # `started` and the echo leave before the transcript append (a queue
+    # drained every 100 ms): rows are recorded after the proofs.
+    stores_after_proof = True
 
     def start(self):
         if "--resume" in self.args:
@@ -66,9 +69,6 @@ class Claude(Protocol):
         engine.open_turn(inputs[0])
         for inp in inputs[1:]:
             engine.journal(inp, "prompt")
-        for inp in inputs:
-            self.record({"type": "user", "uuid": inp.meta["uuid"],
-                         "message": {"role": "user", "content": inp.meta["content"]}})
         self.turn_uuids = [inp.meta["uuid"] for inp in inputs]
 
         def frames():
@@ -81,6 +81,14 @@ class Claude(Protocol):
                                    "content": [{"type": "text", "text": "working"}]}})
             for inp in inputs:
                 self.echo(inp)
+            # One merged row: the last member's uuid, the others named in
+            # `mergedSendUuids`, one text block per line.
+            content = [block for inp in inputs for block in (inp.meta["content"] or [])]
+            row = {"type": "user", "uuid": inputs[-1].meta["uuid"],
+                   "message": {"role": "user", "content": content}}
+            if len(inputs) > 1:
+                row["mergedSendUuids"] = [inp.meta["uuid"] for inp in inputs[:-1]]
+            self.record(row)
         self.later(frames)
 
     def on_line(self, msg):
@@ -111,16 +119,19 @@ class Claude(Protocol):
 
     def consumed(self, taken):
         for inp, _ in taken:
-            self.record({"type": "attachment",
-                         "attachment": {"type": "queued_command", "prompt": inp.meta["content"],
-                                        "source_uuid": inp.meta["uuid"],
-                                        "commandMode": "prompt"}})
             self.turn_uuids.append(inp.meta["uuid"])
 
         def frames():
             for inp, _ in taken:
-                self.started(inp)
                 self.echo(inp)
+            for inp, _ in taken:
+                self.started(inp)
+            for inp, _ in taken:
+                self.record({"type": "attachment",
+                             "attachment": {"type": "queued_command",
+                                            "prompt": inp.meta["content"],
+                                            "source_uuid": inp.meta["uuid"],
+                                            "commandMode": "prompt"}})
         self.later(frames)
 
     def finish(self):

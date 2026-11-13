@@ -1,8 +1,14 @@
 //! Speaks just enough stream-json for the adapter tests.
 //!
 //! `ANYAGENTS_FAKE_MODE` selects the script: `hold`, `finish`, `batch`,
-//! `batch_late`, `quota`, `failed_turn`, `synthetic_401`, `steer`, `die` or
-//! `prove_exit` (proves its first line, then exits).
+//! `batch_late`, `quota`, `failed_turn`, `synthetic_401`, `steer`, `die`,
+//! `prove_exit` (proves its first line, then exits) or `unpersisted` (proves
+//! its first line, then exits before its transcript row is written).
+//!
+//! With `CLAUDE_CONFIG_DIR` set, it announces its session in a `system`
+//! `init` line and, as Claude Code does, appends each line it proved to the
+//! session transcript `$CLAUDE_CONFIG_DIR/projects/fake/<session>.jsonl`
+//! after printing the proof.
 //! `ANYAGENTS_FAKE_LOG` is a file that receives argv and stdin.
 //!
 //! Every line enters the conversation as soon as it is read: the child proves
@@ -48,6 +54,23 @@ fn main() {
     }
 
     let mut stdout = io::stdout();
+    let args: Vec<String> = env::args().collect();
+    let session = args
+        .iter()
+        .position(|arg| arg == "--resume")
+        .and_then(|at| args.get(at + 1).cloned())
+        .unwrap_or_else(|| "sess-from-vendor".to_string());
+    let transcript = env::var_os("CLAUDE_CONFIG_DIR").map(|config| {
+        let project = PathBuf::from(config).join("projects").join("fake");
+        let _ = std::fs::create_dir_all(&project);
+        project.join(format!("{session}.jsonl"))
+    });
+    if transcript.is_some() {
+        let init = json!({"type": "system", "subtype": "init", "session_id": session,
+                          "claude_code_version": "fake"});
+        let _ = writeln!(stdout, "{init}");
+        let _ = stdout.flush();
+    }
     if mode == "quota" {
         let _ = writeln!(stdout, "{QUOTA}");
         let _ = stdout.flush();
@@ -76,6 +99,23 @@ fn main() {
             let _ = writeln!(stdout, "{RESULT}");
         }
         prove(&mut stdout, &value);
+        if mode == "unpersisted" {
+            // Killed between announcing the line and storing it.
+            let _ = stdout.flush();
+            return;
+        }
+        if let Some(transcript) = &transcript {
+            let _ = stdout.flush();
+            let row = json!({"type": "user", "uuid": value.get("uuid"),
+                             "message": value.get("message"), "sessionId": session});
+            if let Ok(mut file) = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(transcript)
+            {
+                let _ = writeln!(file, "{row}");
+            }
+        }
         if mode == "finish" || (mode == "batch" && users == 2) {
             let _ = writeln!(stdout, "{RESULT}");
         }

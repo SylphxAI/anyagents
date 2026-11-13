@@ -645,3 +645,43 @@ fn the_session_quota_reset_is_kept_until_a_transcript_or_marker_changes() {
         None
     );
 }
+
+/// Claude Code announces a line (`started`, the replay echo) before it
+/// stores it in the session transcript. A line is committed only once it is
+/// stored: a process killed in between leaves it uncommitted, for the next
+/// process.
+#[test]
+fn a_line_is_committed_only_once_claude_code_stored_it() {
+    let dir = TempDir::new().unwrap();
+    let config = dir.path().join("config");
+    let log = log_path(&dir);
+    let config_text = config.display().to_string();
+    let env = |mode: &'static str| {
+        vec![
+            ("ANYAGENTS_FAKE_MODE", mode),
+            ("ANYAGENTS_FAKE_LOG", log.to_str().unwrap()),
+            ("CLAUDE_CONFIG_DIR", config_text.as_str()),
+        ]
+    };
+    let mut harness =
+        ClaudeHarness::start(env!("CARGO_BIN_EXE_fake_claude"), None, &env("unpersisted")).unwrap();
+    assert_eq!(
+        harness.deliver(&msg("m1")).unwrap(),
+        DeliverOutcome::InFlight
+    );
+    assert!(
+        harness.wait_dead(Duration::from_secs(5)),
+        "the fake exits after announcing the line"
+    );
+    // Announced, never stored: not committed, and no proof survives.
+    assert!(harness.proven("m1").is_none());
+    assert!(!harness.consumed("m1"));
+
+    let mut stored =
+        ClaudeHarness::start(env!("CARGO_BIN_EXE_fake_claude"), None, &env("hold")).unwrap();
+    assert!(matches!(
+        taken(&mut stored, "m2"),
+        DeliverOutcome::Accepted { .. }
+    ));
+    assert!(stored.consumed("m2"));
+}
