@@ -909,7 +909,8 @@ impl Store {
 
     /// Drop every session lease whose holder `is_alive` reports gone, and
     /// return the dropped leases. A live orphaned holder must be stopped by the
-    /// caller first; its lease stays.
+    /// caller first; its lease stays. `is_alive` runs while this process's
+    /// writer is held: it must not use the store.
     pub fn reclaim_session_leases(
         &self,
         is_alive: impl Fn(&ProcessIdentity) -> bool,

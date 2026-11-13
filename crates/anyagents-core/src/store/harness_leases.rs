@@ -121,6 +121,7 @@ impl Store {
     }
 
     /// Drop every lease whose holder `is_alive` reports gone. Returns the count.
+    /// `is_alive` runs while this process's writer is held: it must not use the store.
     pub fn reclaim_harness_leases(
         &self,
         is_alive: impl Fn(&ProcessIdentity) -> bool,
