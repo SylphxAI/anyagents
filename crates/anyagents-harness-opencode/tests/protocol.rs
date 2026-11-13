@@ -8,7 +8,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyagents_harness::{
-    Context, DeliverOutcome, DeliveryLevel, Harness, HarnessError, OutboundMessage, TurnState,
+    Context, DeliverOutcome, DeliveryLevel, Harness, HarnessError, OutboundMessage, Proof,
+    TurnState,
 };
 use anyagents_harness_opencode::OpenCodeHarness;
 use tempfile::TempDir;
@@ -792,7 +793,11 @@ fn prompt_404_after_prior_turn_restores_in_memory_history_and_topology_on_new_se
 
 #[test]
 fn non_404_prompt_errors_and_repeated_404_fail_closed_without_minting_duplicate_sessions() {
-    for (mode, refused) in [("prompt-500", false), ("prompt-400", true)] {
+    for (mode, refused) in [
+        ("prompt-500", false),
+        ("prompt-400", true),
+        ("prompt-409", true),
+    ] {
         let dir = TempDir::new().unwrap();
         let config = dir.path().join("config");
         std::fs::create_dir_all(&config).unwrap();
@@ -814,9 +819,13 @@ fn non_404_prompt_errors_and_repeated_404_fail_closed_without_minting_duplicate_
 
         let outcome = settle(&mut harness, &msg("m1"));
         if refused {
-            // Nothing was admitted: the line waits in the mailbox, and the
-            // process is not at fault.
-            assert_eq!(outcome, Ok(DeliverOutcome::Deferred));
+            // Nothing was admitted, and nothing ever will be: the line is
+            // rejected, and the process is not at fault.
+            assert!(
+                matches!(&outcome, Ok(DeliverOutcome::Rejected { reason }) if reason.contains("HTTP 4")),
+                "{mode}: {outcome:?}"
+            );
+            assert!(harness.health().process_alive, "{mode}");
         } else {
             // A server error may or may not have admitted the line: the same
             // id is written once more, and a second one is a fault.
@@ -981,17 +990,181 @@ fn an_unknown_outcome_is_settled_by_writing_the_same_id_once_more() {
 }
 
 #[test]
-fn a_refused_line_waits_and_is_written_again_when_offered_again() {
+fn a_line_the_readiness_gate_turned_away_waits_its_retry_after_and_the_host_is_woken() {
+    // OpenCode's readiness gate answers 503 `service_starting` before any
+    // route: nothing is admitted, and it asks to be called again after one
+    // second. The line goes back to the mailbox once that second is over, and
+    // the host is told so, which brings the next offer.
     let dir = TempDir::new().unwrap();
-    let mut harness = start(&dir, "prompt-409-once");
+    let mut harness = start(&dir, "prompt-503-once");
+    let woken = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = std::sync::Arc::clone(&woken);
+    harness.watch_activity(std::sync::Arc::new(move || {
+        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }));
+    let before = woken.load(std::sync::atomic::Ordering::SeqCst);
+    let sent = std::time::Instant::now();
     assert_eq!(
         settle(&mut harness, &msg("m1")).unwrap(),
         DeliverOutcome::Deferred
     );
+    assert!(
+        sent.elapsed() >= Duration::from_millis(900),
+        "no retry-after"
+    );
+    eventually(&harness, "the host is woken", |_| {
+        woken.load(std::sync::atomic::Ordering::SeqCst) > before
+    });
     assert!(harness.written_ids().is_empty());
     assert!(harness.health().process_alive);
     assert_eq!(settle(&mut harness, &msg("m1")).unwrap(), accepted());
     assert_eq!(harness.written_ids(), vec!["m1".to_string()]);
+    let log = log_of(&dir);
+    assert_eq!(log.matches("\"id\":\"msg_m1\"").count(), 2, "{log}");
+}
+
+#[test]
+fn a_poison_line_is_rejected_once_and_never_written_again() {
+    // A 409 (`ConflictError`: the id belongs to another durable record) or a
+    // 400 admits nothing and never will. The line is rejected; every later
+    // offer gets the same answer without another call, even once the
+    // process is gone, and the next line is not held behind it.
+    for (mode, status) in [("prompt-409", "HTTP 409"), ("prompt-400", "HTTP 400")] {
+        let dir = TempDir::new().unwrap();
+        let mut harness = start(&dir, mode);
+        let rejected = match settle(&mut harness, &msg("m1")) {
+            Ok(DeliverOutcome::Rejected { reason }) => reason,
+            other => panic!("{mode}: {other:?}"),
+        };
+        assert!(rejected.contains(status), "{mode}: {rejected}");
+        for _ in 0..5 {
+            assert_eq!(
+                harness.deliver(&msg("m1")),
+                Ok(DeliverOutcome::Rejected {
+                    reason: rejected.clone()
+                }),
+                "{mode}"
+            );
+        }
+        assert_eq!(
+            harness.proven("m1"),
+            None,
+            "{mode}: a rejection proves nothing"
+        );
+        assert!(harness.health().process_alive, "{mode}: no restart");
+        assert!(harness.written_ids().is_empty(), "{mode}");
+        // The send slot is free: the next line is written at once.
+        assert_eq!(
+            harness.deliver(&msg("m2")),
+            Ok(DeliverOutcome::InFlight),
+            "{mode}"
+        );
+        assert!(matches!(
+            settle(&mut harness, &msg("m2")),
+            Ok(DeliverOutcome::Rejected { .. })
+        ));
+        harness.stop();
+        assert_eq!(
+            harness.deliver(&msg("m1")),
+            Ok(DeliverOutcome::Rejected { reason: rejected }),
+            "{mode}: a rejection stands after the process"
+        );
+        let log = log_of(&dir);
+        assert_eq!(
+            log.matches("\"id\":\"msg_m1\"").count(),
+            1,
+            "{mode}: written once: {log}"
+        );
+    }
+}
+
+#[test]
+fn a_failed_service_behind_the_readiness_gate_is_a_fault() {
+    let dir = TempDir::new().unwrap();
+    let mut harness = start(&dir, "prompt-503-failed");
+    let err = settle(&mut harness, &msg("m1")).unwrap_err();
+    assert!(
+        matches!(&err, HarnessError::Failed(reason) if reason.contains("HTTP 503")),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn an_opencode_1x_service_fails_the_start_and_no_session_is_touched() {
+    for mode in ["v1", "info-404", "info-1x"] {
+        let dir = TempDir::new().unwrap();
+        let log = dir.path().join("log");
+        let started = OpenCodeHarness::start(
+            scripted_opencode(),
+            Some("ses_fake"),
+            &[
+                ("ANYAGENTS_FAKE_MODE", mode),
+                ("ANYAGENTS_FAKE_LOG", log.to_str().unwrap()),
+                ("ANYAGENTS_FAKE_STATE", dir.path().to_str().unwrap()),
+            ],
+        );
+        let Err(HarnessError::Failed(reason)) = started else {
+            panic!("{mode}: a 1.x service started: {}", log_of(&dir));
+        };
+        assert!(
+            reason.contains("1.x") && reason.contains("2.x"),
+            "{mode}: {reason}"
+        );
+        let text = log_of(&dir);
+        assert!(
+            !text.contains("api:GET /api/session/ses_fake")
+                && !text.contains("api:POST /api/session"),
+            "{mode}: a session was touched: {text}"
+        );
+        if mode == "v1" {
+            // Known from its announcement: no `opencode api` call at all.
+            assert!(!text.contains("api:"), "{mode}: {text}");
+        } else {
+            assert!(text.contains("api:GET /api/info"), "{mode}: {text}");
+        }
+    }
+}
+
+#[test]
+fn a_proof_given_just_before_stop_is_still_proven_after_it() {
+    // The prompt call is still out when the host stops the process: `stop`
+    // waits for its answer, so the admission is known before a new process
+    // starts, and it stays readable after the service is gone.
+    let dir = TempDir::new().unwrap();
+    let log = dir.path().join("log");
+    let mut harness = OpenCodeHarness::start(
+        scripted_opencode(),
+        Some("ses_fake"),
+        &[
+            ("ANYAGENTS_FAKE_MODE", "hold"),
+            ("ANYAGENTS_FAKE_LOG", log.to_str().unwrap()),
+            ("ANYAGENTS_FAKE_DELAY_MS", "300"),
+        ],
+    )
+    .unwrap();
+    assert_eq!(harness.deliver(&msg("m1")), Ok(DeliverOutcome::InFlight));
+    assert_eq!(harness.proven("m1"), None);
+    harness.stop();
+    assert_eq!(
+        harness.proven("m1"),
+        Some(Proof::Taken {
+            turn_finished: false
+        })
+    );
+    assert!(!harness.health().process_alive);
+    assert_eq!(harness.deliver(&msg("m1")), Ok(accepted()));
+    assert_eq!(harness.deliver(&msg("m2")), Err(HarnessError::Dead));
+
+    // A line an earlier process applied is proven a duplicate the same way.
+    let dir = TempDir::new().unwrap();
+    let mut harness = start(&dir, "applied");
+    assert_eq!(
+        settle(&mut harness, &msg("m1")).unwrap(),
+        DeliverOutcome::Duplicate
+    );
+    harness.stop();
+    assert_eq!(harness.proven("m1"), Some(Proof::Duplicate));
+    assert_eq!(harness.deliver(&msg("m1")), Ok(DeliverOutcome::Duplicate));
 }
 
 #[test]

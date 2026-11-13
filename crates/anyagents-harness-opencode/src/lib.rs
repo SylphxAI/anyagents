@@ -2,8 +2,15 @@
 //!
 //! `opencode serve` is an HTTP server, not a line protocol on stdin. This
 //! adapter starts one private service per agent and drives it with `opencode
-//! api`, one process per request, as the desk's own worker does:
+//! api`, one process per request, as the desk's own worker does. It speaks the
+//! OpenCode 2.x API:
 //!
+//! - the service must be 2.x. A 1.x `serve` announces `opencode server
+//!   listening on …` and no password, and has neither `opencode api` nor `GET
+//!   /api/info`: the start fails at once, saying so. A service whose `GET
+//!   /api/info` answers 404 (OpenCode's own sign of an incompatible service) or
+//!   names a version below 2 fails the start the same way, before any session
+//!   is touched;
 //! - the session is a fixed id (`--session`), resumed across restarts;
 //! - a mailbox line is a prompt: `POST /api/session/{id}/prompt` with the text
 //!   `anyagents-message:<id>` on its first line, `delivery: "steer"`, and the
@@ -20,12 +27,24 @@
 //!   conversation is answered as a duplicate;
 //! - prompts are written one at a time, in mailbox order, each on a thread of
 //!   its own: a slow service holds the mailbox, never the host, and no prompt
-//!   call has a timeout. A refusal (400, 401, 403, 409: nothing admitted)
-//!   leaves the line in the mailbox; an outcome that may or may not have
-//!   admitted it (a server error, a lost connection) is settled by writing the
-//!   same id again; a second such outcome is a fault of the service;
+//!   call has a timeout. What the service answers decides the line:
+//!   - a 400 (a malformed request) or a 409 (the id belongs to another durable
+//!     record) refuses it for good: it is `Rejected`, and answered so again
+//!     whenever it is offered again, without another call;
+//!   - a 503 `service_starting` or `service_stopping` is the service's
+//!     readiness gate, which answers before any route and admits nothing: the
+//!     line waits out the one-second `retry-after` the service asks for, goes
+//!     back to the mailbox, and the host is woken to offer it again;
+//!   - an outcome that may or may not have admitted it (another server error,
+//!     a lost connection) is settled by writing the same id again; a second
+//!     such outcome is a fault of the service;
+//!   - a 401 or 403, or a 503 `service_failed`, is a fault of the process;
 //! - a turn ends when `POST /api/experimental/session/{id}/wait`, asked after
-//!   the newest admission, answers: the service's own idle signal.
+//!   the newest admission, answers: the service's own idle signal;
+//! - before the host replaces the process (`stop`), a prompt call that is out
+//!   is waited for, up to a minute, so what it proved is known; one still
+//!   unanswered then is unknown, and the next process writes its id again.
+//!   The proofs outlive the process.
 //!
 //! The mailbox id on the prompt's first line also makes the agent's own `send`
 //! (its MCP tool) the reply path, recorded against the same agent. Nothing
@@ -44,12 +63,13 @@ use std::time::{Duration, Instant};
 
 use anyagents_harness::{
     DeliverOutcome, Delivery, DeliveryLevel, Harness, HarnessError, HarnessHealth, OutboundMessage,
-    TurnState, TurnUsage, compose_message,
+    Proof, TurnState, TurnUsage, compose_message,
 };
 use serde_json::{Value, json};
 
 /// How long a call off the delivery path may take: startup, usage, answers and
-/// cancel. A prompt, and the wait for a turn to end, have no limit.
+/// cancel; and how long `stop` lets a prompt call that is out answer before
+/// the service goes. A prompt, and the wait for a turn to end, have no limit.
 const CALL_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long the adapter waits for a started service to announce itself.
 ///
@@ -63,6 +83,15 @@ const READY_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// How often an open turn is checked when the service cannot wait for it.
 const TURN_POLL: Duration = Duration::from_secs(1);
+
+/// The `retry-after` OpenCode's readiness gate sends with a 503
+/// `service_starting` or `service_stopping` (one second, always). `opencode
+/// api` prints no header, so the service's fixed value is kept here.
+const RETRY_AFTER: Duration = Duration::from_secs(1);
+
+/// The prefix a 1.x `opencode serve` announces its address with. A 2.x
+/// service prints `server listening on <url>` and then `server password …`.
+const LEGACY_ANNOUNCEMENT: &str = "opencode server listening on ";
 
 /// What this adapter guarantees for mail that reaches a busy agent
 /// (`docs/delivery.md`).
@@ -78,6 +107,16 @@ pub struct OpenCodeHarness {
     vendor: Arc<Vendor>,
     child: Option<Child>,
     port: Option<port::PortLease>,
+}
+
+/// What a started service printed before it was waited for no longer.
+enum Announcement {
+    /// Its private address and password: a 2.x service.
+    Ready,
+    /// A 1.x service's address line, with no password.
+    Legacy(String),
+    /// Nothing usable before the start deadline, or it exited.
+    Silent,
 }
 
 /// What every call to the service needs, shared with the threads that carry a
@@ -109,8 +148,11 @@ enum Prompt {
     Admitted,
     /// An earlier process wrote it and the session already consumed it.
     Applied,
-    /// The service refused it and admitted nothing.
+    /// The service's readiness gate turned it away and admitted nothing; it
+    /// waits for its next offer.
     Refused,
+    /// The service refused it for good and admitted nothing.
+    Rejected(String),
     /// The call ended without saying whether the service admitted it.
     Unknown,
     /// The service failed in a way only a new process can clear.
@@ -319,8 +361,15 @@ impl OpenCodeHarness {
             )?);
             let port = self.port.as_ref().expect("allocated port").port;
             let (announced, collision) = self.launch_service(port)?;
-            if announced {
-                return self.resume_session();
+            match announced {
+                Announcement::Ready => return self.resume_session(),
+                Announcement::Legacy(line) => {
+                    self.stop_child();
+                    return Err(HarnessError::Failed(format!(
+                        "OpenCode 1.x service ({line:?}, no password): this adapter speaks the OpenCode 2.x API (`opencode api`, the session inbox); install OpenCode 2.x. The session is untouched"
+                    )));
+                }
+                Announcement::Silent => {}
             }
             self.stop_child();
             // The holder may already have released the port. Preserve the
@@ -346,7 +395,7 @@ impl OpenCodeHarness {
     fn launch_service(
         &mut self,
         port: u16,
-    ) -> Result<(bool, std::sync::mpsc::Receiver<bool>), HarnessError> {
+    ) -> Result<(Announcement, std::sync::mpsc::Receiver<bool>), HarnessError> {
         let vendor = Arc::clone(&self.vendor);
         let mut command = anyagents_harness::spawn_command(&vendor.program, &vendor.environment)?;
         command
@@ -417,6 +466,7 @@ impl OpenCodeHarness {
             reader_vendor.changed.notify_all();
         });
         let deadline = Instant::now() + START_TIMEOUT;
+        let mut legacy = None;
         while Instant::now() < deadline {
             let left = deadline.saturating_duration_since(Instant::now());
             let line = match heard.recv_timeout(left.min(Duration::from_millis(500))) {
@@ -425,6 +475,12 @@ impl OpenCodeHarness {
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
             };
             let line = line.trim();
+            // A 1.x service says who it is in its first line; nothing it
+            // prints later makes it one this adapter can drive.
+            if line.starts_with(LEGACY_ANNOUNCEMENT) {
+                legacy = Some(line.to_string());
+                break;
+            }
             let mut state = vendor.lock();
             if let Some(rest) = line.strip_prefix("server listening on ") {
                 let endpoint = rest.trim_end_matches('/');
@@ -440,8 +496,13 @@ impl OpenCodeHarness {
             }
         }
         let mut state = vendor.lock();
-        let announced = state.service.is_some() && state.password.is_some();
-        state.alive = announced && !state.launch_ended;
+        let ready = legacy.is_none() && state.service.is_some() && state.password.is_some();
+        state.alive = ready && !state.launch_ended;
+        let announced = match legacy {
+            Some(line) => Announcement::Legacy(line),
+            None if ready => Announcement::Ready,
+            None => Announcement::Silent,
+        };
         Ok((announced, collision))
     }
 
@@ -464,6 +525,33 @@ impl OpenCodeHarness {
                 "the OpenCode service did not answer; the session is untouched".into(),
             ));
         }
+        // Who answers, as the service names itself, before any session is
+        // looked up or created: an adapter that speaks 2.x must never drive
+        // an older service.
+        let peer = match vendor.call("GET", "/api/info", None, Some(CALL_TIMEOUT)) {
+            Ok(info) => info
+                .get("version")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            Err(err) if err.status == Some(404) => {
+                return Err(HarnessError::Failed(
+                    "OpenCode service without GET /api/info (HTTP 404): an OpenCode 1.x service; this adapter speaks the OpenCode 2.x API. The session is untouched".into(),
+                ));
+            }
+            Err(err) => {
+                return Err(HarnessError::Failed(format!(
+                    "cannot learn the OpenCode service's version: {err}; the session is untouched"
+                )));
+            }
+        };
+        if let Some(version) = &peer
+            && major_version(version).is_none_or(|major| major < 2)
+        {
+            return Err(HarnessError::Failed(format!(
+                "OpenCode {version} speaks the OpenCode 1.x API; this adapter speaks 2.x. The session is untouched"
+            )));
+        }
+        vendor.lock().peer = peer.map(|version| format!("opencode {version}"));
         // The stored session is resumed. A new one is created only when it is
         // truly gone from this agent's own store, and that is said out loud so
         // a lost conversation is never silent.
@@ -531,12 +619,6 @@ impl OpenCodeHarness {
                 break;
             }
             thread::sleep(Duration::from_millis(200));
-        }
-        // Who answers, as the service names itself.
-        if let Ok(info) = vendor.call("GET", "/api/info", None, Some(CALL_TIMEOUT))
-            && let Some(version) = info.get("version").and_then(Value::as_str)
-        {
-            vendor.lock().peer = Some(format!("opencode {version}"));
         }
         // The inbox is durable: a service that picked up where an earlier one
         // stopped is running a turn already, and its end is waited for too.
@@ -920,20 +1002,27 @@ impl Vendor {
             None,
         ) {
             Ok(answer) => answer,
-            Err(err) if err.status == Some(404) => return Err(err),
-            // A refused credential is the process's fault, not the line's:
-            // the host's sign-in handling takes it.
-            Err(err) if matches!(err.status, Some(401 | 403)) => {
-                return Ok(Prompt::Fault(err.to_string()));
-            }
-            Err(err) if err.refused() => {
-                self.note(&format!("{err}; the line stays in the mailbox"));
-                return Ok(Prompt::Refused);
-            }
-            Err(err) if replay => return Ok(Prompt::Fault(err.to_string())),
             Err(err) => {
-                self.note(&format!("{err}; the same id is written again"));
-                return Ok(Prompt::Unknown);
+                return match err.refusal() {
+                    Refusal::SessionGone => Err(err),
+                    Refusal::Permanent => {
+                        self.note(&format!("{err}; the line is rejected"));
+                        Ok(Prompt::Rejected(err.to_string()))
+                    }
+                    Refusal::NotReady => {
+                        self.note(&format!(
+                            "{err}; the line goes back to the mailbox after {}s",
+                            RETRY_AFTER.as_secs()
+                        ));
+                        Ok(Prompt::Refused)
+                    }
+                    Refusal::Fault => Ok(Prompt::Fault(err.to_string())),
+                    Refusal::Unknown if replay => Ok(Prompt::Fault(err.to_string())),
+                    Refusal::Unknown => {
+                        self.note(&format!("{err}; the same id is written again"));
+                        Ok(Prompt::Unknown)
+                    }
+                };
             }
         };
         let Some(record) = answer.get("data").filter(|record| record.is_object()) else {
@@ -966,14 +1055,22 @@ impl Vendor {
     }
 }
 
-/// Write one line on this thread and record what became of it.
+/// Write one line on this thread and record what became of it. Whatever the
+/// answer, the host is woken to offer the line, or the next one, again.
 fn carry(vendor: &Arc<Vendor>, message: &OutboundMessage, replay: bool) {
     let outcome = vendor.write_prompt(message, replay);
+    if outcome == Prompt::Refused {
+        // The service asked to be called again after its `retry-after`. The
+        // line still holds the send slot, so nothing overtakes it meanwhile.
+        thread::sleep(RETRY_AFTER);
+    }
     let mut state = vendor.lock();
     if state.sending.as_deref() == Some(message.id.as_str()) {
         state.sending = None;
     }
     if state.closing {
+        drop(state);
+        vendor.changed.notify_all();
         return;
     }
     if outcome == Prompt::Admitted {
@@ -996,15 +1093,10 @@ fn carry(vendor: &Arc<Vendor>, message: &OutboundMessage, replay: bool) {
         state.turn_open = true;
         watch(vendor, &mut state);
     }
-    // A refusal wakes nobody: the line is offered again on the host's next
-    // pass, and a refusal that holds is not retried in a loop.
-    let wake = outcome != Prompt::Refused;
     state.prompts.insert(message.id.clone(), outcome);
-    if wake {
-        state.epoch += 1;
-        drop(state);
-        vendor.changed.notify_all();
-    }
+    state.epoch += 1;
+    drop(state);
+    vendor.changed.notify_all();
 }
 
 /// Wait for the open turn to end on a thread of its own, unless one already does.
@@ -1101,6 +1193,11 @@ impl Harness for OpenCodeHarness {
                 });
             }
             Some(Prompt::Applied) => return Ok(DeliverOutcome::Duplicate),
+            Some(Prompt::Rejected(reason)) => {
+                return Ok(DeliverOutcome::Rejected {
+                    reason: reason.clone(),
+                });
+            }
             _ => {}
         }
         if !state.alive {
@@ -1109,8 +1206,9 @@ impl Harness for OpenCodeHarness {
         let replay = match state.prompts.get(&message.id) {
             Some(Prompt::Sending) => return Ok(DeliverOutcome::InFlight),
             Some(Prompt::Refused) => {
-                // Nothing was admitted. The line waits in the mailbox and is
-                // written again when it is offered again.
+                // Nothing was admitted, and the service's wait is over: the
+                // line goes back to the mailbox and is written again on its
+                // next offer, which the wake that recorded this asks for.
                 state.prompts.remove(&message.id);
                 return Ok(DeliverOutcome::Deferred);
             }
@@ -1145,6 +1243,36 @@ impl Harness for OpenCodeHarness {
             )));
         }
         Ok(DeliverOutcome::InFlight)
+    }
+
+    /// What the service admitted, by this process or (as a record already in
+    /// the conversation) by an earlier one. Read only.
+    fn proven(&self, message_id: &str) -> Option<Proof> {
+        match self.vendor.lock().prompts.get(message_id)? {
+            Prompt::Admitted => Some(Proof::Taken {
+                turn_finished: false,
+            }),
+            Prompt::Applied => Some(Proof::Duplicate),
+            _ => None,
+        }
+    }
+
+    /// Wait for the prompt call that is out to answer or fail, so what it
+    /// proved is known, then stop the service. The proofs stay readable. A
+    /// service that does not answer within [`CALL_TIMEOUT`] is stopped
+    /// anyway, so a stuck service never holds its replacement: the call then
+    /// fails, its outcome is unknown, and the next process writes the same id
+    /// once more, which OpenCode admits once.
+    fn stop(&mut self) {
+        {
+            let state = self.vendor.lock();
+            let _state = self
+                .vendor
+                .changed
+                .wait_timeout_while(state, CALL_TIMEOUT, |state| state.sending.is_some())
+                .unwrap_or_else(|err| err.into_inner());
+        }
+        self.stop_child();
     }
 
     fn background(&mut self) -> Result<(), HarnessError> {
@@ -1364,8 +1492,11 @@ impl OpenCodeHarness {
         }
     }
 
+    /// Stop the service. It is reported gone once it has exited (or never
+    /// ran); its stdout reader says the same at end of file. Nothing it proves
+    /// arrives on stdout: a proof is a prompt call's answer, which `stop`
+    /// waits for first.
     fn stop_child(&mut self) {
-        self.vendor.lock().alive = false;
         if let Some(mut child) = self.child.take() {
             let environment = &self.vendor.environment;
             let pid = child.id();
@@ -1395,6 +1526,7 @@ impl OpenCodeHarness {
             self.clear_service_pid(Some(pid));
         }
         let mut state = self.vendor.lock();
+        state.alive = false;
         state.service = None;
         state.password = None;
         state.epoch += 1;
@@ -1571,7 +1703,24 @@ struct ApiError {
     status: Option<u16>,
     /// The error's `_tag`, from the answer's body.
     tag: Option<String>,
+    /// The error's `code`, from the answer's body (the readiness gate's 503).
+    code: Option<String>,
     reason: String,
+}
+
+/// What a prompt call that did not answer 2xx says about the line.
+#[derive(Debug, PartialEq, Eq)]
+enum Refusal {
+    /// 404: the session does not exist.
+    SessionGone,
+    /// 400 or 409: admitted nothing, and never will.
+    Permanent,
+    /// 503 `service_starting` or `service_stopping`: admitted nothing yet.
+    NotReady,
+    /// 401, 403, 503 `service_failed`: the process is at fault.
+    Fault,
+    /// Anything else, or no answer: it may or may not have been admitted.
+    Unknown,
 }
 
 impl ApiError {
@@ -1580,6 +1729,7 @@ impl ApiError {
             call: format!("{method} {path}"),
             status: None,
             tag: None,
+            code: None,
             reason: reason.into(),
         }
     }
@@ -1602,6 +1752,7 @@ impl ApiError {
                 .map(str::to_string)
         };
         let reason = field("message")
+            .or_else(|| field("code"))
             .or_else(|| {
                 stderr
                     .lines()
@@ -1614,14 +1765,29 @@ impl ApiError {
             call: format!("{method} {path}"),
             status,
             tag: field("_tag"),
+            code: field("code"),
             reason,
         }
     }
 
-    /// The service answered and admitted nothing: a malformed request or an
-    /// id that belongs to another record.
-    fn refused(&self) -> bool {
-        matches!(self.status, Some(400 | 409))
+    /// What this answer to `POST /api/session/{id}/prompt` means for the line.
+    /// OpenCode 2.x declares 400 (`BadRequest`: a payload that does not
+    /// decode, an attachment or a skill it cannot take), 409
+    /// (`PromptConflictError`: the id belongs to another durable record) and
+    /// 404 (`Session.NotFoundError`) for the route; its readiness gate answers
+    /// 503 before any route.
+    fn refusal(&self) -> Refusal {
+        match self.status {
+            Some(404) => Refusal::SessionGone,
+            Some(400 | 409) => Refusal::Permanent,
+            Some(401 | 403) => Refusal::Fault,
+            Some(503) => match self.code.as_deref() {
+                Some("service_starting" | "service_stopping") => Refusal::NotReady,
+                Some("service_failed") => Refusal::Fault,
+                _ => Refusal::Unknown,
+            },
+            _ => Refusal::Unknown,
+        }
     }
 }
 
@@ -1644,6 +1810,17 @@ fn vendor_message_id(id: &str) -> String {
     } else {
         format!("msg_{id}")
     }
+}
+
+/// The major number of a version such as `2.1.4`.
+fn major_version(version: &str) -> Option<u64> {
+    version
+        .trim()
+        .trim_start_matches('v')
+        .split('.')
+        .next()?
+        .parse()
+        .ok()
 }
 
 /// Milliseconds since the Unix epoch, the clock the service stamps its records with.

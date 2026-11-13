@@ -9,10 +9,11 @@ error's body is `{"_tag": <error>, "message": ...}`.
 
 `POST /api/session/{id}/prompt` (`{id?, text, delivery}`) admits one input
 to the session's durable inbox and answers with that inbox record. Given an
-`id` (it must start with `msg_`) the session already holds, as an inbox
-record or as a message it consumed, it answers with that record, created
-when it was first admitted, and admits nothing (`SessionInbox.reconcile`); an
-id another session holds is a 409 `ConflictError`. A steer joins the running
+`id` (it must start with `msg_`, or the payload does not decode: 400) the
+session already holds, as an inbox record or as a message it consumed, it
+answers with that record, created when it was first admitted, and admits
+nothing (`SessionInbox.reconcile`); an id another session holds is a 409
+`ConflictError` (`Session.PromptConflictError`), for good. A steer joins the running
 turn at its next step, every pending steer together, in admission order, and
 a turn with steers pending at its end runs another step for them. An idle
 session opens a turn with the input. Consumption is announced only on the
@@ -21,10 +22,13 @@ event stream (`session.inbox.delivered`), which this fake does not serve:
 own id. `POST /api/experimental/session/{id}/wait` answers 204 once the
 session is idle.
 
-The refusal the test asks for is a 409 `ConflictError`, raised before
-anything is admitted. Not modelled: the inbox records a process left
-pending when it died (the real inbox keeps them; here they go with it), and
-the event stream.
+The refusal the test asks for is the service's readiness gate: while it is
+(re)starting, every route but `GET /api/info` answers 503 `{"code":
+"service_starting"}` with `retry-after: 1`, after the password check and
+before any route, so nothing is admitted. OpenCode declares no other
+transient refusal for a prompt: its 400 and 409 are permanent. Not modelled:
+the inbox records a process left pending when it died (the real inbox keeps
+them; here they go with it), and the event stream.
 """
 import base64
 import http.client
@@ -101,6 +105,16 @@ class Failure(Exception):
         super().__init__(message)
         self.status = status
         self.body = dict({"_tag": tag, "message": message}, **fields)
+        self.headers = {}
+
+
+class NotReady(Failure):
+    """The readiness gate's answer, which carries no `_tag` and no message."""
+
+    def __init__(self):
+        super().__init__(503, None, "service_starting")
+        self.body = {"code": "service_starting"}
+        self.headers = {"retry-after": "1"}
 
 
 def session_not_found(session):
@@ -163,9 +177,11 @@ class OpenCode(Protocol):
             def log_message(self, *_):
                 pass
 
-            def answer(self, status, body=None):
+            def answer(self, status, body=None, headers=None):
                 data = b"" if body is None else json.dumps(body).encode()
                 self.send_response(status)
+                for name, value in (headers or {}).items():
+                    self.send_header(name, value)
                 if body is not None:
                     self.send_header("content-type", "application/json")
                 self.send_header("content-length", str(len(data)))
@@ -178,11 +194,12 @@ class OpenCode(Protocol):
                 if self.headers.get("authorization") != authorization(protocol.password):
                     self.answer(401, {"_tag": "UnauthorizedError", "message": "Unauthorized"})
                     return
+                headers = None
                 try:
                     status, body = protocol.route(method, self.path, raw)
                 except Failure as failure:
-                    status, body = failure.status, failure.body
-                self.answer(status, body)
+                    status, body, headers = failure.status, failure.body, failure.headers
+                self.answer(status, body, headers)
 
             def do_GET(self):
                 self.handle_one("GET")
@@ -264,12 +281,11 @@ class OpenCode(Protocol):
             inp = Input(marker_id(text) or vid, text, "prompt" if engine.turn is None else "steer",
                         {"vid": vid, "session": session, "created": now_ms()})
             engine.received(inp)
+            if engine.turn is not None and self.take_refusal():
+                # The gate answers before the route reads the inbox.
+                raise NotReady()
             record = self.reconcile(vid, session)
             if record is None:
-                if engine.turn is not None and self.take_refusal():
-                    raise Failure(409, "ConflictError",
-                                  "Prompt message ID conflicts with an existing durable record: "
-                                  + vid, resource=vid)
                 self.session = session
                 record = self.record(inp, delivery)
                 if engine.turn is None:

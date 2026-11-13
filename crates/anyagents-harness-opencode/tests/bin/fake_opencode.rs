@@ -21,9 +21,15 @@
 //!
 //! - `applied`: every prompt names a line an earlier process wrote and the
 //!   session already consumed; `parked`: one it admitted and has not yet.
-//! - `prompt-409-once` / `prompt-502-once`: the first prompt is refused, or
+//! - `prompt-503-once`: the first prompt meets the readiness gate (503
+//!   `{"code":"service_starting"}`, nothing admitted); `prompt-502-once`: it
 //!   fails without saying whether it was admitted.
-//! - `prompt-400` / `prompt-401` / `prompt-500`: every prompt fails so.
+//! - `prompt-400` / `prompt-409` / `prompt-401` / `prompt-500` /
+//!   `prompt-503-failed`: every prompt fails so, with the body OpenCode 2.1.4
+//!   gives (`InvalidRequestError`, `ConflictError`, …).
+//! - `v1`: `serve` announces itself as OpenCode 1.19.5 does (`opencode server
+//!   listening on …`, no password) and `api` is not a command; `info-404` and
+//!   `info-1x`: a service whose `GET /api/info` answers 404, or names 1.19.5.
 //!
 //! `ANYAGENTS_FAKE_DELAY_MS` holds every prompt's answer back that long.
 //!
@@ -42,6 +48,11 @@ fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("serve") => serve(&args[1..]),
+        // OpenCode 1.x has no `api` command.
+        Some("api") if env::var("ANYAGENTS_FAKE_MODE").as_deref() == Ok("v1") => {
+            log("api:unknown command");
+            exit(1)
+        }
         Some("api") => {
             // A missing explicit endpoint would discover a managed service.
             // Refuse that in the fixture instead of masking isolation bugs.
@@ -68,6 +79,20 @@ fn serve(args: &[String]) {
     ));
     if env::var("ANYAGENTS_FAKE_MODE").as_deref() == Ok("no-announcement") {
         return;
+    }
+    // OpenCode 1.19.5: a warning when no password is set, its address with
+    // its name in front, and never a password.
+    if env::var("ANYAGENTS_FAKE_MODE").as_deref() == Ok("v1") {
+        let port = args
+            .windows(2)
+            .find(|pair| pair[0] == "--port")
+            .map_or("4096", |pair| pair[1].as_str());
+        println!("Warning: OPENCODE_SERVER_PASSWORD is not set; server is unsecured.");
+        println!("opencode server listening on http://127.0.0.1:{port}");
+        let _ = std::io::stdout().flush();
+        loop {
+            thread::sleep(Duration::from_secs(3600));
+        }
     }
     let port = args
         .windows(2)
@@ -154,6 +179,14 @@ fn api(args: &[String], endpoint: &str) {
 
     let mode = env::var("ANYAGENTS_FAKE_MODE").unwrap_or_else(|_| "finish".into());
     match (method, path) {
+        ("GET", "/api/info") if mode == "info-404" => {
+            // No such route: an older service.
+            eprintln!("HTTP 404 Not Found");
+            exit(1);
+        }
+        ("GET", "/api/info") if mode == "info-1x" => {
+            print!("{{\"version\":\"1.19.5\"}}");
+        }
         ("GET", "/api/info") => {
             print!(
                 "{{\"version\":\"2.1.4\",\"pid\":{},\"urls\":[\"{endpoint}\"],\"paths\":{{\"tmp\":\"/tmp\"}},\"capabilities\":{{}}}}",
@@ -233,7 +266,33 @@ fn api(args: &[String], endpoint: &str) {
                 );
             }
             if mode == "prompt-400" {
-                fail(400, "Bad Request", "InvalidRequestError", "bad request");
+                fail(
+                    400,
+                    "Bad Request",
+                    "InvalidRequestError",
+                    "Skill not found: missing",
+                );
+            }
+            if mode == "prompt-409" {
+                let request: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+                let id = request["id"].as_str().unwrap_or_default();
+                fail(
+                    409,
+                    "Conflict",
+                    "ConflictError",
+                    &format!("Prompt message ID conflicts with an existing durable record: {id}"),
+                );
+            }
+            if mode == "prompt-503-failed" {
+                fail_with(
+                    503,
+                    "Service Unavailable",
+                    &serde_json::json!({
+                        "code": "service_failed",
+                        "message": "The background service could not start.",
+                        "action": "Run `opencode service restart` after checking the service logs.",
+                    }),
+                );
             }
             if mode == "prompt-401" {
                 fail(401, "Unauthorized", "UnauthorizedError", "Unauthorized");
@@ -259,18 +318,17 @@ fn api(args: &[String], endpoint: &str) {
                 eprintln!("HTTP 404 Not Found");
                 exit(1);
             }
-            // The first prompt fails once: a refusal, or an outcome that does
-            // not say whether the line was admitted.
-            if matches!(mode.as_str(), "prompt-409-once" | "prompt-502-once") {
+            // The first prompt fails once: the readiness gate turns it away,
+            // or an outcome does not say whether the line was admitted.
+            if matches!(mode.as_str(), "prompt-503-once" | "prompt-502-once") {
                 let marker = format!("{dir}/failed-once");
                 if !std::path::Path::new(&marker).exists() {
                     let _ = std::fs::write(&marker, "1");
-                    if mode == "prompt-409-once" {
-                        fail(
-                            409,
-                            "Conflict",
-                            "ConflictError",
-                            "Prompt message ID conflicts with an existing durable record",
+                    if mode == "prompt-503-once" {
+                        fail_with(
+                            503,
+                            "Service Unavailable",
+                            &serde_json::json!({"code": "service_starting"}),
                         );
                     }
                     fail(502, "Bad Gateway", "UnknownError", "bad gateway");
@@ -443,7 +501,16 @@ fn api(args: &[String], endpoint: &str) {
 /// Answer the way `opencode api` reports a non-2xx answer: the error's body on
 /// stdout, `HTTP <status> <text>` on stderr, exit status 1.
 fn fail(status: u16, text: &str, tag: &str, message: &str) -> ! {
-    print!("{}", serde_json::json!({ "_tag": tag, "message": message }));
+    fail_with(
+        status,
+        text,
+        &serde_json::json!({ "_tag": tag, "message": message }),
+    )
+}
+
+/// The same, with the body as the service writes it.
+fn fail_with(status: u16, text: &str, body: &serde_json::Value) -> ! {
+    print!("{body}");
     eprintln!("HTTP {status} {text}");
     exit(1)
 }
