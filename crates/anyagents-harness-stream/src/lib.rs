@@ -18,11 +18,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyagents_harness::{
-    DeliverOutcome, DeliveryMode, HarnessError, HarnessHealth, OutboundMessage, SteerSupport,
-    TurnState, TurnUsage, compose_message, message_id_in_text, spawn_command,
+    DeliverOutcome, DeliveryMode, FileStamp, HarnessError, HarnessHealth, OutboundMessage,
+    SteerSupport, TurnState, TurnUsage, compose_message, message_id_in_text, spawn_command,
 };
 use serde_json::{Value, json};
 
@@ -274,7 +274,13 @@ struct State {
     state_dir: Option<PathBuf>,
     unconfirmed: bool,
     alive: bool,
+    /// Bumped by every stdout line: what [`StreamHarness::quiet`] measures.
     epoch: u64,
+    /// Bumped only when something the host reads changes: what the activity
+    /// watcher waits on.
+    changes: u64,
+    /// When this child last printed a line.
+    last_line_at: Option<Instant>,
     generation: u64,
     input_blocked: bool,
     turn_user_inputs: usize,
@@ -558,7 +564,11 @@ impl StreamHarness {
                 .unwrap_or_else(|err| err.into_inner());
             if state.alive && state.epoch == epoch {
                 let mut state = state;
+                let before = state.observed();
                 finish_open_quiet(&mut state);
+                if state.observed() != before {
+                    state.changes = state.changes.wrapping_add(1);
+                }
                 self.wake.notify_all();
                 return true;
             }
@@ -676,80 +686,10 @@ impl StreamHarness {
         Ok(())
     }
 
+    /// A read of the child's state. It never does I/O: an Antigravity
+    /// cascade that stays open without a closing line is watched by its own
+    /// turn timer ([`watch_agy_cascade`]), not by how often the host asks.
     pub fn health(&self) -> HarnessHealth {
-        if let Some(ref rpc) = self.agy_rpc {
-            let poll_ctx = {
-                let mut state = lock(&self.shared);
-                if state.alive
-                    && !state.open.is_empty()
-                    && state.turn_user_inputs > 0
-                    && state
-                        .last_rpc_health_poll
-                        .is_none_or(|t| t.elapsed() >= Duration::from_secs(1))
-                {
-                    state.last_rpc_health_poll = Some(Instant::now());
-                    state.session_id.clone().map(|sid| {
-                        (
-                            state.generation,
-                            sid,
-                            state.child.as_ref().map(Child::id),
-                            state.http_port,
-                        )
-                    })
-                } else {
-                    None
-                }
-            };
-            if let Some((generation, session_id, child_pid, cached_port)) = poll_ctx
-                && let Some(port) = resolve_agy_http_port(rpc, cached_port, child_pid)
-            {
-                {
-                    let mut state = lock(&self.shared);
-                    if state.generation == generation && state.alive {
-                        state.http_port = Some(port);
-                    }
-                }
-                if let Ok((resolved_sid, running)) =
-                    agy_rpc_is_running(port, &rpc.csrf_token, &session_id)
-                {
-                    let mut state = lock(&self.shared);
-                    if state.generation == generation && state.alive && !state.open.is_empty() {
-                        if resolved_sid != session_id {
-                            state.session_id = Some(resolved_sid);
-                        }
-                        if running {
-                            state.idle_since = None;
-                        } else {
-                            let now = Instant::now();
-                            let first_idle = state.idle_since.is_none();
-                            let idle_since = *state.idle_since.get_or_insert(now);
-                            if now.duration_since(idle_since) >= AGY_TURN_CLOSE_GRACE {
-                                finish_open(&mut state, TurnUsage::default());
-                                state.turn_user_inputs = 1;
-                                state.epoch = state.epoch.wrapping_add(1);
-                                drop(state);
-                                self.wake.notify_all();
-                            } else if first_idle {
-                                let remain = AGY_TURN_CLOSE_GRACE
-                                    .saturating_sub(now.duration_since(idle_since));
-                                drop(state);
-                                let shared = Arc::clone(&self.shared);
-                                let wake = Arc::clone(&self.wake);
-                                let _ = thread::spawn(move || {
-                                    thread::sleep(remain);
-                                    let mut st = lock(&shared);
-                                    if st.generation == generation && st.alive {
-                                        st.epoch = st.epoch.wrapping_add(1);
-                                    }
-                                    drop(st);
-                                    wake.notify_all();
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-        }
         let mut state = lock(&self.shared);
         if !state.alive {
             state.reap_child();
@@ -823,15 +763,12 @@ impl StreamHarness {
                 if (!state.open.is_empty() || state.turn_user_inputs > 0)
                     && let Some(ref rpc) = self.agy_rpc
                 {
-                    if state
-                        .idle_since
-                        .is_some_and(|t| t.elapsed() < AGY_TURN_CLOSE_GRACE)
-                        || (state.turn_user_inputs == 0
-                            && (state.session_id.is_some()
-                                || state
-                                    .turn_started_at
-                                    .is_some_and(|t| t.elapsed() < Duration::from_millis(250))))
-                    {
+                    if let Some(reopens_in) = agy_input_gate(&state) {
+                        // A gate that opens with time, not with a line, wakes
+                        // the host when it does.
+                        if let Some(remain) = reopens_in {
+                            nudge_after(&self.shared, &self.wake, state.generation, remain);
+                        }
                         return Ok(DeliverOutcome::Deferred);
                     }
                     let session_id = state.session_id.clone().unwrap_or_default();
@@ -906,6 +843,8 @@ impl StreamHarness {
                         state.idle_since = Some(Instant::now());
                     }
                 }
+                drop(state);
+                nudge_after(&self.shared, &self.wake, generation, AGY_STEER_PROBE_GAP);
                 return Ok(DeliverOutcome::Deferred);
             };
             {
@@ -922,6 +861,8 @@ impl StreamHarness {
                 if state.generation == generation {
                     state.last_steer_probe = Some(Instant::now());
                 }
+                drop(state);
+                nudge_after(&self.shared, &self.wake, generation, AGY_STEER_PROBE_GAP);
                 return Ok(DeliverOutcome::Deferred);
             }
             if resolved_sid != session_id {
@@ -947,6 +888,8 @@ impl StreamHarness {
                 if state.turn_user_inputs == 0 {
                     state.idle_since = None;
                     state.last_steer_probe = Some(Instant::now());
+                    drop(state);
+                    nudge_after(&self.shared, &self.wake, generation, AGY_STEER_PROBE_GAP);
                     return Ok(DeliverOutcome::Deferred);
                 }
                 if !state.open.is_empty() {
@@ -958,17 +901,7 @@ impl StreamHarness {
                             AGY_TURN_CLOSE_GRACE.saturating_sub(now.duration_since(idle_since));
                         drop(state);
                         if first_idle {
-                            let shared = Arc::clone(&self.shared);
-                            let wake = Arc::clone(&self.wake);
-                            let _ = thread::spawn(move || {
-                                thread::sleep(remain);
-                                let mut st = lock(&shared);
-                                if st.generation == generation && st.alive {
-                                    st.epoch = st.epoch.wrapping_add(1);
-                                }
-                                drop(st);
-                                wake.notify_all();
-                            });
+                            nudge_after(&self.shared, &self.wake, generation, remain);
                         }
                         return Ok(DeliverOutcome::Deferred);
                     }
@@ -1091,17 +1024,22 @@ impl StreamHarness {
                     && (state.session_id.is_some()
                         || state
                             .turn_started_at
-                            .is_some_and(|t| t.elapsed() < Duration::from_millis(250))))
+                            .is_some_and(|t| t.elapsed() < AGY_FRESH_TURN)))
                 || (state.session_id.is_none()
                     && state
                         .last_steer_probe
-                        .is_some_and(|t| t.elapsed() < Duration::from_millis(400))))
+                        .is_some_and(|t| t.elapsed() < AGY_STEER_PROBE_GAP)))
         {
             return false;
         }
         true
     }
 
+    /// Call `notify` when something the host reads through this harness
+    /// changes (a turn opens or closes, input is acknowledged or unblocked, a
+    /// quota, fault or session id appears, the child exits), and once at
+    /// start. A streamed step or text delta changes none of it and wakes
+    /// nobody.
     pub fn watch_activity(&self, notify: Arc<dyn Fn() + Send + Sync>) {
         let shared = Arc::clone(&self.shared);
         let wake = Arc::clone(&self.wake);
@@ -1109,15 +1047,15 @@ impl StreamHarness {
             .name(format!("{}-watch", self.spec.name))
             .spawn(move || {
                 let mut state = lock(&shared);
-                let mut seen = 0u64;
+                let mut seen = None;
                 loop {
                     if !state.alive {
                         drop(state);
                         notify();
                         break;
                     }
-                    if state.epoch != seen {
-                        seen = state.epoch;
+                    if seen != Some(state.changes) {
+                        seen = Some(state.changes);
                         drop(state);
                         notify();
                         state = lock(&shared);
@@ -1201,6 +1139,7 @@ impl StreamHarness {
             state.planner_config = None;
             state.http_port = self.agy_rpc.as_ref().and_then(|r| r.port_override);
             state.text = None;
+            state.last_line_at = None;
             state.generation
         };
         self.pending = None;
@@ -1256,7 +1195,7 @@ impl StreamHarness {
                 if state.generation == generation {
                     state.stderr_done = true;
                     state.refresh_exit_fault();
-                    state.epoch = state.epoch.wrapping_add(1);
+                    state.touch();
                 }
                 wake.notify_all();
             }) {
@@ -1266,6 +1205,19 @@ impl StreamHarness {
                 return Err(HarnessError::Failed(err.to_string()));
             }
         };
+        if let Some(rpc) = self.agy_rpc.clone() {
+            let shared = Arc::clone(&self.shared);
+            let wake = Arc::clone(&self.wake);
+            // Detached: it may be inside a bounded request when the child
+            // stops, and it exits on the generation change once it returns.
+            if let Err(err) = thread::Builder::new()
+                .name(format!("{}-cascade", self.spec.name))
+                .spawn(move || watch_agy_cascade(shared, wake, rpc, generation))
+            {
+                self.stop_child();
+                return Err(HarnessError::Failed(err.to_string()));
+            }
+        }
         let shared = Arc::clone(&self.shared);
         let wake = Arc::clone(&self.wake);
         let spec = self.spec.clone();
@@ -1388,7 +1340,56 @@ impl BoundedStderr {
     }
 }
 
+/// Everything the host reads through the harness API: liveness, turn state,
+/// receipts that decide a deferred delivery, quota, faults, input readiness
+/// and the vendor session id. A line that leaves all of it unchanged is not a
+/// transition and wakes nobody.
+#[derive(PartialEq, Eq)]
+struct Observed {
+    alive: bool,
+    unconfirmed: bool,
+    input_blocked: bool,
+    awaiting_first_step: bool,
+    agy_idle: bool,
+    open: usize,
+    followups: usize,
+    seen: usize,
+    finished: usize,
+    acknowledged: usize,
+    rejected: usize,
+    reclaimed: usize,
+    quota_reset_at_ms: Option<i64>,
+    failure: Option<String>,
+    session_id: Option<String>,
+}
+
 impl State {
+    fn observed(&self) -> Observed {
+        Observed {
+            alive: self.alive,
+            unconfirmed: self.unconfirmed,
+            input_blocked: self.input_blocked,
+            awaiting_first_step: self.turn_user_inputs == 0,
+            agy_idle: self.idle_since.is_some(),
+            open: self.open.len(),
+            followups: self.followups.len(),
+            seen: self.seen.len(),
+            finished: self.finished.len(),
+            acknowledged: self.acknowledged.len(),
+            rejected: self.rejected.len(),
+            reclaimed: self.reclaimed_steers.len(),
+            quota_reset_at_ms: self.quota_reset_at_ms,
+            failure: self.failure(),
+            session_id: self.session_id.clone(),
+        }
+    }
+
+    /// Record a transition the host must see.
+    fn touch(&mut self) {
+        self.epoch = self.epoch.wrapping_add(1);
+        self.changes = self.changes.wrapping_add(1);
+    }
+
     // Both a fresh pipe write and an already-written retry consult the same
     // receipt state. Transport acknowledgement alone never commits a busy steer.
     fn written_outcome(
@@ -1497,6 +1498,8 @@ impl State {
             unconfirmed: false,
             alive: false,
             epoch: 0,
+            changes: 0,
+            last_line_at: None,
             generation: 0,
             input_blocked: false,
             seen: HashSet::new(),
@@ -1665,6 +1668,7 @@ fn read_stdout(
             if state.generation != generation {
                 return;
             }
+            let before = state.observed();
             state.idle_since = None;
             note_markers(&mut state, &value);
             if spec.protocol == LineProtocol::AcknowledgedResult
@@ -1818,7 +1822,14 @@ fn read_stdout(
             {
                 let _ = std::fs::remove_file(dir.join(".anyagents-last-error.json"));
             }
-            state.persist_failure();
+            let after = state.observed();
+            if after.failure != before.failure {
+                state.persist_failure();
+            }
+            if after != before {
+                state.changes = state.changes.wrapping_add(1);
+            }
+            state.last_line_at = Some(Instant::now());
             state.epoch = state.epoch.wrapping_add(1);
         }
         wake.notify_all();
@@ -1845,7 +1856,7 @@ fn read_stdout(
     }
     state.alive = false;
     state.refresh_exit_fault();
-    state.epoch = state.epoch.wrapping_add(1);
+    state.touch();
     wake.notify_all();
 }
 
@@ -2134,7 +2145,7 @@ fn watch_writable(
         if result < 0 || poll.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
             state.alive = false;
         }
-        state.epoch = state.epoch.wrapping_add(1);
+        state.touch();
         drop(state);
         wake.notify_all();
     }
@@ -2341,6 +2352,154 @@ fn agy_rpc_post(
 /// timer via `isRootIdleWithTasks`) never emit `result` while idle and instead
 /// accept a new invocation via `SendUserCascadeMessage` with `plannerConfig`.
 const AGY_TURN_CLOSE_GRACE: Duration = Duration::from_millis(200);
+
+/// A turn just written is not steered into for this long, before its first
+/// step names the cascade.
+const AGY_FRESH_TURN: Duration = Duration::from_millis(250);
+
+/// The pause after a steer probe found no cascade to steer into.
+const AGY_STEER_PROBE_GAP: Duration = Duration::from_millis(400);
+
+/// Whether a steer must wait, and for how long when only time opens the
+/// gate: `Some(None)` waits for the first step line, `Some(Some(d))` for `d`.
+fn agy_input_gate(state: &State) -> Option<Option<Duration>> {
+    if let Some(idle) = state.idle_since
+        && idle.elapsed() < AGY_TURN_CLOSE_GRACE
+    {
+        return Some(Some(AGY_TURN_CLOSE_GRACE - idle.elapsed()));
+    }
+    if state.turn_user_inputs != 0 {
+        return None;
+    }
+    if state.session_id.is_some() {
+        return Some(None);
+    }
+    let started = state.turn_started_at?;
+    (started.elapsed() < AGY_FRESH_TURN).then(|| Some(AGY_FRESH_TURN - started.elapsed()))
+}
+
+/// How long an open cascade's stdout stays quiet before its run status is
+/// asked, and the spacing between two asks.
+const AGY_CASCADE_POLL: Duration = Duration::from_secs(1);
+
+/// Longest wait between two attempts to find the language server's port.
+const AGY_PORT_RETRY_MAX: Duration = Duration::from_secs(60);
+
+/// The turn timer of one Antigravity child. A cascade held open by a
+/// background task never prints its closing `result`, so while a turn is open
+/// and stdout has been quiet for [`AGY_CASCADE_POLL`], ask the language server
+/// once per interval whether the cascade still runs; one that stays idle past
+/// [`AGY_TURN_CLOSE_GRACE`] closes the turn. Streaming lines prove the cascade
+/// runs, so an active turn costs no requests, and an idle child costs none.
+fn watch_agy_cascade(
+    shared: Arc<Mutex<State>>,
+    wake: Arc<Condvar>,
+    rpc: AgyRpcConfig,
+    generation: u64,
+) {
+    let mut port_retry = AGY_CASCADE_POLL;
+    let mut port_after: Option<Instant> = None;
+    loop {
+        let (session_id, child_pid, cached_port) = {
+            let mut state = lock(&shared);
+            loop {
+                if !state.alive || state.generation != generation {
+                    return;
+                }
+                if state.open.is_empty() || state.turn_user_inputs == 0 {
+                    state = wake.wait(state).unwrap_or_else(|err| err.into_inner());
+                    continue;
+                }
+                let now = Instant::now();
+                let due = [state.last_rpc_health_poll, state.last_line_at]
+                    .into_iter()
+                    .flatten()
+                    .max()
+                    .map_or(now, |last| last + AGY_CASCADE_POLL)
+                    .max(port_after.unwrap_or(now));
+                if now < due {
+                    state = wake
+                        .wait_timeout(state, due - now)
+                        .unwrap_or_else(|err| err.into_inner())
+                        .0;
+                    continue;
+                }
+                state.last_rpc_health_poll = Some(now);
+                if let Some(session_id) = state.session_id.clone() {
+                    break (
+                        session_id,
+                        state.child.as_ref().map(Child::id),
+                        state.http_port,
+                    );
+                }
+            }
+        };
+        let Some(port) = resolve_agy_http_port(&rpc, cached_port, child_pid) else {
+            port_after = Some(Instant::now() + port_retry);
+            port_retry = (port_retry * 2).min(AGY_PORT_RETRY_MAX);
+            continue;
+        };
+        port_after = None;
+        port_retry = AGY_CASCADE_POLL;
+        {
+            let mut state = lock(&shared);
+            if state.generation == generation && state.alive {
+                state.http_port = Some(port);
+            }
+        }
+        let Ok((resolved_sid, running)) = agy_rpc_is_running(port, &rpc.csrf_token, &session_id)
+        else {
+            continue;
+        };
+        let mut state = lock(&shared);
+        if state.generation != generation || !state.alive || state.open.is_empty() {
+            continue;
+        }
+        if resolved_sid != session_id {
+            state.session_id = Some(resolved_sid);
+            state.touch();
+        }
+        if running {
+            state.idle_since = None;
+            continue;
+        }
+        let now = Instant::now();
+        let first_idle = state.idle_since.is_none();
+        let idle_since = *state.idle_since.get_or_insert(now);
+        if now.duration_since(idle_since) >= AGY_TURN_CLOSE_GRACE {
+            finish_open(&mut state, TurnUsage::default());
+            state.turn_user_inputs = 1;
+            state.touch();
+            drop(state);
+            wake.notify_all();
+        } else if first_idle {
+            drop(state);
+            nudge_after(
+                &shared,
+                &wake,
+                generation,
+                AGY_TURN_CLOSE_GRACE.saturating_sub(now.duration_since(idle_since)),
+            );
+        }
+    }
+}
+
+/// Wake the host once `remain` has passed, when an input held back by a
+/// time gate (the cascade-close grace, a fresh turn, a recent steer probe)
+/// may be offered again.
+fn nudge_after(shared: &Arc<Mutex<State>>, wake: &Arc<Condvar>, generation: u64, remain: Duration) {
+    let shared = Arc::clone(shared);
+    let wake = Arc::clone(wake);
+    let _ = thread::spawn(move || {
+        thread::sleep(remain);
+        let mut state = lock(&shared);
+        if state.generation == generation && state.alive {
+            state.touch();
+        }
+        drop(state);
+        wake.notify_all();
+    });
+}
 
 fn agy_rpc_is_running(
     port: u16,
@@ -2640,6 +2799,145 @@ pub fn detect_agy_session_quota_and_error(
     config_dir: &Path,
     now_ms: i64,
 ) -> (Option<i64>, Option<String>) {
+    static CACHE: std::sync::LazyLock<Mutex<HashMap<PathBuf, AgyEvidence>>> =
+        std::sync::LazyLock::new(Mutex::default);
+    let logs = lock(&CACHE)
+        .get(config_dir)
+        .map(|entry| entry.inputs.log_paths());
+    if let Some(logs) = logs {
+        let inputs = AgyInputs::stamp(config_dir, logs);
+        if let Some(entry) = lock(&CACHE).get(config_dir)
+            && entry.inputs == inputs
+        {
+            return entry.finding.clone().at(now_ms);
+        }
+    }
+    let (inputs, finding) = AgyInputs::read(config_dir);
+    lock(&CACHE).insert(
+        config_dir.to_path_buf(),
+        AgyEvidence {
+            inputs,
+            finding: finding.clone(),
+        },
+    );
+    finding.at(now_ms)
+}
+
+/// What an Antigravity config directory says about its last turn before the
+/// current time is applied. It depends only on files, so it is kept until
+/// one of them changes: the scheduler asks every second, and the logs it
+/// reads can be large.
+#[derive(Clone)]
+enum AgyFinding {
+    Nothing,
+    Quota {
+        reset_at_ms: i64,
+        error: Option<String>,
+    },
+    Error(Option<String>),
+}
+
+impl AgyFinding {
+    fn at(self, now_ms: i64) -> (Option<i64>, Option<String>) {
+        match self {
+            Self::Nothing => (None, None),
+            Self::Quota { reset_at_ms, error } if reset_at_ms > now_ms => {
+                (Some(reset_at_ms), error)
+            }
+            Self::Quota { .. } => (None, None),
+            Self::Error(error) => (None, error),
+        }
+    }
+}
+
+struct AgyEvidence {
+    inputs: AgyInputs,
+    finding: AgyFinding,
+}
+
+/// Stamps of every file the finding reads: the operator markers, the
+/// persisted error, the log directory (a log created or removed) and its
+/// three newest logs, whatever their age, since a log older than a marker
+/// becomes relevant again when it is appended to.
+#[derive(PartialEq, Eq)]
+struct AgyInputs {
+    rotated: Option<FileStamp>,
+    cleared: Option<FileStamp>,
+    last_error: Option<FileStamp>,
+    log_dir: Option<FileStamp>,
+    newest_logs: Vec<(PathBuf, Option<FileStamp>)>,
+}
+
+impl AgyInputs {
+    fn markers(config_dir: &Path, newest_logs: Vec<(PathBuf, Option<FileStamp>)>) -> Self {
+        Self {
+            rotated: FileStamp::of(&config_dir.join(".anyagents-profile-rotated-ms")),
+            cleared: FileStamp::of(&config_dir.join(".anyagents-quota-cleared-ms")),
+            last_error: FileStamp::of(&config_dir.join(".anyagents-last-error.json")),
+            log_dir: FileStamp::of(&config_dir.join(".gemini/antigravity-cli/log")),
+            newest_logs,
+        }
+    }
+
+    fn log_paths(&self) -> Vec<PathBuf> {
+        self.newest_logs
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect()
+    }
+
+    /// The stamps a cached finding is checked against, for the logs the last
+    /// read found newest: a few `stat` calls, no listing and no file read.
+    fn stamp(config_dir: &Path, logs: Vec<PathBuf>) -> Self {
+        Self::markers(
+            config_dir,
+            logs.into_iter()
+                .map(|path| {
+                    let stamp = FileStamp::of(&path);
+                    (path, stamp)
+                })
+                .collect(),
+        )
+    }
+
+    /// Read every input and derive the finding, with the stamps taken
+    /// before the reads so a change during them is seen next time.
+    fn read(config_dir: &Path) -> (Self, AgyFinding) {
+        let log_dir = config_dir.join(".gemini/antigravity-cli/log");
+        let log_dir_stamp = FileStamp::of(&log_dir);
+        let mut logs: Vec<(SystemTime, PathBuf, FileStamp)> = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&log_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                if !name.starts_with("cli-") || !name.ends_with(".log") {
+                    continue;
+                }
+                if let Ok(meta) = entry.metadata()
+                    && let Ok(mtime) = meta.modified()
+                {
+                    logs.push((mtime, path, FileStamp::from_metadata(&meta)));
+                }
+            }
+        }
+        logs.sort_by_key(|(mtime, _, _)| std::cmp::Reverse(*mtime));
+        let mut inputs = Self::markers(
+            config_dir,
+            logs.iter()
+                .take(3)
+                .map(|(_, path, stamp)| (path.clone(), Some(*stamp)))
+                .collect(),
+        );
+        // The listing above is as new as this stamp, not as the later one.
+        inputs.log_dir = log_dir_stamp;
+        let finding = agy_finding(config_dir, &logs);
+        (inputs, finding)
+    }
+}
+
+fn agy_finding(config_dir: &Path, logs: &[(SystemTime, PathBuf, FileStamp)]) -> AgyFinding {
     let rotated_ms = std::fs::read_to_string(config_dir.join(".anyagents-profile-rotated-ms"))
         .ok()
         .and_then(|s| s.trim().parse::<i64>().ok())
@@ -2656,64 +2954,46 @@ pub fn detect_agy_session_quota_and_error(
         if ts > reset_floor_ms {
             let err = val.get("error").and_then(Value::as_str).map(str::to_string);
             if let Some(raw_reset) = val.get("quota_reset_at_ms").and_then(Value::as_i64) {
-                if raw_reset > now_ms {
-                    return (Some(raw_reset), err);
-                }
-                return (None, None);
+                return AgyFinding::Quota {
+                    reset_at_ms: raw_reset,
+                    error: err,
+                };
             }
             if err.is_some() {
-                return (None, err);
+                return AgyFinding::Error(err);
             }
         }
     }
-    let log_dir = config_dir.join(".gemini/antigravity-cli/log");
-    let Ok(entries) = std::fs::read_dir(&log_dir) else {
-        return (None, None);
-    };
-    let mut logs: Vec<(i64, PathBuf)> = Vec::new();
-    for entry in entries.flatten() {
-        let p = entry.path();
-        let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        if !name.starts_with("cli-") || !name.ends_with(".log") {
-            continue;
-        };
-        if let Ok(meta) = entry.metadata()
-            && let Ok(mtime) = meta.modified()
-            && let Ok(dur) = mtime.duration_since(std::time::UNIX_EPOCH)
-        {
-            let mtime_ms = dur.as_millis() as i64;
-            if mtime_ms > reset_floor_ms {
-                logs.push((mtime_ms, p));
-            }
-        }
-    }
-    logs.sort_by_key(|b| std::cmp::Reverse(b.0));
-    for (mtime_ms, path) in logs.into_iter().take(3) {
-        let Ok(text) = std::fs::read_to_string(&path) else {
+    let recent = logs.iter().filter_map(|(mtime, path, _)| {
+        let mtime_ms = mtime
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_millis() as i64;
+        (mtime_ms > reset_floor_ms).then_some((mtime_ms, path))
+    });
+    for (mtime_ms, path) in recent.take(3) {
+        let Ok(text) = std::fs::read_to_string(path) else {
             continue;
         };
         for line in text.lines().rev() {
             if let Some((_, after)) = line.split_once("run ended with error and no response: ") {
                 let err_str = after.trim().to_string();
                 if let Some(dur_ms) = parse_resets_in_ms(&err_str) {
-                    let raw_reset = mtime_ms.saturating_add(dur_ms);
-                    if raw_reset > now_ms {
-                        return (Some(raw_reset), Some(err_str));
-                    }
-                    return (None, None);
+                    return AgyFinding::Quota {
+                        reset_at_ms: mtime_ms.saturating_add(dur_ms),
+                        error: Some(err_str),
+                    };
                 }
-                return (None, Some(err_str));
+                return AgyFinding::Error(Some(err_str));
             }
             if line.contains("Sending user message to conversation")
                 && !text.contains("run ended with error and no response:")
             {
-                return (None, None);
+                return AgyFinding::Nothing;
             }
         }
     }
-    (None, None)
+    AgyFinding::Nothing
 }
 
 /// The line that puts one message into the child.

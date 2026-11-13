@@ -209,40 +209,76 @@ fn target_key(base: &str, owner: &str, repo: &str, reference: &str, pr: bool) ->
     )
 }
 
-pub(super) fn begin_cycle(schedules: &[anyagents_core::AgentSchedule], now: i64) {
+/// The probe target of a GitHub watch: a numeric check reference is its PR.
+fn target_of(base: &str, target: &super::WatchTarget) -> Option<String> {
+    let (owner, repo, reference, pr) = match target {
+        super::WatchTarget::GitHubPr {
+            owner,
+            repo,
+            number,
+        } => (owner, repo, number.to_string(), true),
+        super::WatchTarget::GitHubCheck {
+            owner,
+            repo,
+            reference,
+        } => {
+            let clean = reference.strip_prefix('#').unwrap_or(reference);
+            match clean.parse::<u64>() {
+                Ok(number) => (owner, repo, number.to_string(), true),
+                Err(_) => (owner, repo, clean.to_string(), false),
+            }
+        }
+        _ => return None,
+    };
+    Some(target_key(base, owner, repo, &reference, pr))
+}
+
+/// Register this cycle's watchers, `(schedule id, target)`, of each target.
+pub(super) fn begin_cycle<'a>(
+    watches: impl IntoIterator<Item = (&'a str, &'a super::WatchTarget)>,
+    now: i64,
+) {
     let base = std::env::var("ANYAGENTS_GITHUB_API_BASE").unwrap_or_default();
     let mut watchers: HashMap<String, HashSet<String>> = HashMap::new();
-    for schedule in schedules.iter().filter(|s| s.kind == "watch") {
-        let Ok(target) = super::parse_watch_spec(&schedule.spec) else {
-            continue;
-        };
-        let (owner, repo, reference, pr) = match target {
-            super::WatchTarget::GitHubPr {
-                owner,
-                repo,
-                number,
-            } => (owner, repo, number.to_string(), true),
-            super::WatchTarget::GitHubCheck {
-                owner,
-                repo,
-                reference,
-            } => {
-                let clean = reference.strip_prefix('#').unwrap_or(&reference);
-                match clean.parse::<u64>() {
-                    Ok(number) => (owner, repo, number.to_string(), true),
-                    Err(_) => (owner, repo, clean.to_string(), false),
-                }
-            }
-            _ => continue,
-        };
-        watchers
-            .entry(target_key(&base, &owner, &repo, &reference, pr))
-            .or_default()
-            .insert(schedule.id.to_string());
+    for (id, target) in watches {
+        if let Some(key) = target_of(&base, target) {
+            watchers.entry(key).or_default().insert(id.to_string());
+        }
     }
     if let Ok(mut probes) = PROBES.lock() {
         probes.register(watchers, now);
     }
+}
+
+/// The earliest time a probe of this watch's target can reach the network:
+/// before it, [`probe`] answers from its cache or its rate-limit hold. `None`
+/// for a target that is not GitHub, `Some(i64::MAX)` for a settled one.
+pub(super) fn next_probe_at(target: &super::WatchTarget) -> Option<i64> {
+    let base = std::env::var("ANYAGENTS_GITHUB_API_BASE").unwrap_or_default();
+    let key = target_of(&base, target)?;
+    let probes = PROBES.lock().ok()?;
+    let Some(state) = probes.targets.get(&key) else {
+        return Some(0);
+    };
+    if state.settled && state.successful.is_some() {
+        return Some(i64::MAX);
+    }
+    let owner = match target {
+        super::WatchTarget::GitHubPr { owner, .. }
+        | super::WatchTarget::GitHubCheck { owner, .. } => owner.to_ascii_lowercase(),
+        _ => return None,
+    };
+    let cached_until = if state.result.is_some() {
+        state.next_at
+    } else {
+        0
+    };
+    Some(
+        cached_until
+            .max(probes.limited_until)
+            .max(state.resume_at)
+            .max(probes.auth_until.get(&owner).copied().unwrap_or(0)),
+    )
 }
 
 impl Probes {

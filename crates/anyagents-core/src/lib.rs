@@ -39,7 +39,7 @@ pub use storage::{
     configured_scratch_dir, configured_state_dir, configured_workspaces_dir, storage_env_enabled,
 };
 pub use store::{
-    Ack, Agent, AgentLock, AgentQueryMetadata, AgentSchedule, BillingMode, Channel,
+    Ack, Agent, AgentLock, AgentQueryMetadata, AgentSchedule, AgentSummary, BillingMode, Channel,
     ConversationTurn, Group, GroupAction, GroupActor, HistorySearchQuery, HistorySort, Incoming,
     Lag, MAX_RECOVERY_ATTEMPTS, Message, NewAgent, NewChannel, NewSchedule, NewUsage, OpenTurn,
     Origin, OutboundEffect, ReceiveOutcome, Store, TurnOwnershipSnapshot, UsageAccessError,

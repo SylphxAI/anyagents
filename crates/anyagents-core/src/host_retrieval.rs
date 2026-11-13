@@ -1,15 +1,16 @@
 //! Host-only file retrieval. All paths are derived from authorized registry IDs;
 //! active native JSONL is read in place and never handed off or rewritten here.
 use crate::{
-    Agent, HistorySearchQuery, Store,
+    Agent, AgentId, HistorySearchQuery, Store,
     host_cursor::{FileStamp, SourceCursor},
     host_index::{HostIndex, IndexError, IndexHit, IndexMetadata, MemoryScope},
     host_native_metadata::{EventHeader, MetadataReader},
     learned_memory::sha256,
-    raw_segment::{RawCoordinate, open_readonly, read_raw},
+    raw_segment::{RawSource, open_readonly, read_raw},
 };
+use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs, io,
     path::{Path, PathBuf},
 };
@@ -24,10 +25,28 @@ pub struct HostRawRead<'a> {
     pub length: u64,
 }
 
+/// The registry facts history indexing reads from an agent row.
+struct Owner {
+    id: AgentId,
+    name: String,
+}
+impl From<&Agent> for Owner {
+    fn from(agent: &Agent) -> Self {
+        Self {
+            id: agent.id.clone(),
+            name: agent.name.clone(),
+        }
+    }
+}
+
+fn store_error(error: crate::Error) -> IndexError {
+    io::Error::other(error.to_string()).into()
+}
+
 impl Store {
     pub fn is_host_path_redacted(&self, owner: &str, path: &Path) -> Result<bool, IndexError> {
         let root = self.data_dir().join("agents").join(owner);
-        if !safe_components(self.data_dir(), &root)? {
+        if !safe_components(&mut Walk::new(&root), self.data_dir(), &root)? {
             return Ok(true);
         }
         Ok(self
@@ -37,22 +56,26 @@ impl Store {
     }
 
     fn unresolved_host_paths(&self, owner: &str) -> Result<Vec<PathBuf>, IndexError> {
-        let paths = self
-            .conn()
-            .prepare("SELECT receipt FROM conversation_redactions WHERE agent_id=?1")?
-            .query_map([owner], |r| r.get::<_, String>(0))?
-            .map(|raw| -> Result<_, IndexError> {
-                let receipt: crate::redaction::Receipt = serde_json::from_str(&raw?)?;
-                Ok(receipt
-                    .unscrubbed
-                    .into_iter()
-                    .map(|f| PathBuf::from(f.path))
-                    .collect::<Vec<_>>())
-            })
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
+        let mut paths = Vec::new();
+        for (_, receipt) in self.redaction_receipts(Some(owner)).map_err(store_error)? {
+            paths.extend(unscrubbed_paths(&receipt)?);
+        }
+        Ok(paths)
+    }
+
+    /// Pending redaction exclusions of the listed agents, read once per search.
+    fn unresolved_host_paths_of(
+        &self,
+        owners: &[Owner],
+    ) -> Result<HashMap<String, Vec<PathBuf>>, IndexError> {
+        let wanted: HashSet<&str> = owners.iter().map(|o| o.id.as_str()).collect();
+        let mut paths: HashMap<String, Vec<PathBuf>> = HashMap::new();
+        for (owner, receipt) in self.redaction_receipts(None).map_err(store_error)? {
+            if wanted.contains(owner.as_str()) {
+                let unscrubbed = unscrubbed_paths(&receipt)?;
+                paths.entry(owner).or_default().extend(unscrubbed);
+            }
+        }
         Ok(paths)
     }
 
@@ -64,33 +87,30 @@ impl Store {
         if !index_path.exists() {
             return Ok(false);
         }
-        let candidate = HostIndex::open(&index_path)?.verification_candidate(now_ms)?;
-        let Some((owner, path)) = candidate else {
+        let mut index = HostIndex::shared(&index_path)?;
+        let Some((owner, path)) = index.verification_candidate(now_ms)? else {
             return Ok(false);
         };
-        let agent = self
-            .list_agents()
-            .map_err(|e| io::Error::other(e.to_string()))?
-            .into_iter()
-            .find(|a| a.id.as_str() == owner);
-        let Some(agent) = agent else {
-            let index = HostIndex::open(&index_path)?;
+        let Some((id, name)) = self
+            .agent_names([owner.as_str()])
+            .map_err(store_error)?
+            .pop()
+        else {
             index.clear_source(&owner, &path)?;
             index.checkpoint()?;
             return Ok(true);
         };
-        let _guard = self
-            .lock_agent_lifecycle(&agent.id)
-            .map_err(|e| io::Error::other(e.to_string()))?;
-        let mut index = HostIndex::open(&index_path)?;
+        let agent = Owner { id, name };
+        let _guard = self.lock_agent_lifecycle(&agent.id).map_err(store_error)?;
         let Some(mut cursor) = index.source_cursor(&owner, &path)? else {
             return Ok(false);
         };
         cursor.verification_attempt_ms = now_ms;
         index.save_source(&owner, &path, &cursor)?;
         let root = self.data_dir().join("agents").join(agent.id.as_str());
-        if !safe_components(self.data_dir(), &root)?
-            || !native_transcripts(&root)?.contains(&path)
+        let mut walk = Walk::new(&root);
+        if !safe_components(&mut walk, self.data_dir(), &root)?
+            || !native_transcripts(&mut walk, &root)?.contains(&path)
             || self
                 .unresolved_host_paths(&owner)?
                 .iter()
@@ -119,7 +139,7 @@ impl Store {
             .filter(|s| *s != "*" && !s.eq_ignore_ascii_case("all"))
             .map(|s| self.agent_by_name(s).map(|a| a.id.to_string()))
             .transpose()
-            .map_err(|e| io::Error::other(e.to_string()))?;
+            .map_err(store_error)?;
         let visible: Vec<String> = authorized
             .iter()
             .filter(|id| selected.as_ref().is_none_or(|s| s == *id))
@@ -132,16 +152,15 @@ impl Store {
         if !index_path.exists() {
             return Ok(None);
         }
-        let Some(hit) = HostIndex::open(&index_path)?.document(&visible, scope, request.id)? else {
+        let index = HostIndex::shared(&index_path)?;
+        let Some(hit) = index.document(&visible, scope, request.id)? else {
             return Ok(None);
         };
         let agent = self
             .agent_by_name(&hit.metadata.agent_id)
-            .map_err(|e| io::Error::other(e.to_string()))?;
-        let _guard = self
-            .lock_agent_lifecycle(&agent.id)
-            .map_err(|e| io::Error::other(e.to_string()))?;
-        let Some(mut hit) = HostIndex::open(&index_path)?.document(
+            .map_err(store_error)?;
+        let _guard = self.lock_agent_lifecycle(&agent.id).map_err(store_error)?;
+        let Some(mut hit) = index.document(
             std::slice::from_ref(&agent.id.to_string()),
             scope,
             request.id,
@@ -157,7 +176,8 @@ impl Store {
             .into());
         }
         let root = self.data_dir().join("agents").join(agent.id.as_str());
-        if !safe_components(self.data_dir(), &root)?
+        let mut walk = Walk::new(&root);
+        if !safe_components(&mut walk, self.data_dir(), &root)?
             || self
                 .unresolved_host_paths(agent.id.as_str())?
                 .iter()
@@ -166,13 +186,13 @@ impl Store {
             return Ok(None);
         }
         let paths = match hit.metadata.source {
-            MemoryScope::Memory => regular_files(&root.join("memory"), true)?
+            MemoryScope::Memory => regular_files(&mut walk, &root.join("memory"), true)?
                 .into_iter()
                 .filter(|p| !is_hidden_memory_file(p))
                 .collect(),
             MemoryScope::Transcripts => {
-                let mut paths = native_transcripts(&root)?;
-                paths.extend(history_archives(&root)?);
+                let mut paths = native_transcripts(&mut walk, &root)?;
+                paths.extend(history_archives(&mut walk, &root)?);
                 paths
             }
             MemoryScope::All => return Ok(None),
@@ -190,38 +210,15 @@ impl Store {
     /// so newly upserted, read, or
     /// deleted topics are immediately readable via `raw_id` and `search_host_files`.
     pub fn sync_agent_memory_index(&self, agent: &Agent) -> Result<(), IndexError> {
-        let root = self.data_dir().join("agents").join(agent.id.as_str());
-        let mut index = HostIndex::open(&self.data_dir().join(INDEX_FILE))?;
-        if !safe_components(self.data_dir(), &root)? {
-            index.retain_agent_scope(agent.id.as_str(), MemoryScope::Memory, &HashSet::new())?;
-            return Ok(());
-        }
+        let mut index = HostIndex::shared(&self.data_dir().join(INDEX_FILE))?;
         let unresolved = self.unresolved_host_paths(agent.id.as_str())?;
-        let mut ids = HashSet::new();
-        for path in memory_indexable_files(&root.join("memory"))? {
-            if unresolved.iter().any(|blocked| path.starts_with(blocked)) {
-                continue;
-            }
-            let id = format!(
-                "memory:{}:{}",
-                agent.id,
-                sha256(path.as_os_str().as_encoded_bytes())
-            );
-            let metadata = IndexMetadata {
-                agent_id: agent.id.to_string(),
-                source: MemoryScope::Memory,
-                timestamp_ms: Some(modified_ms(&path)?),
-                direction: "in".into(),
-                sender: format!("agent:{}", agent.name),
-                destination: format!("agent:{}", agent.name),
-                tool_name: None,
-                tool_names: Vec::new(),
-                role: Some("memory".into()),
-            };
-            refresh_document(&mut index, &id, &metadata, &path)?;
-            ids.insert(id);
-        }
-        index.retain_agent_scope(agent.id.as_str(), MemoryScope::Memory, &ids)?;
+        self.refresh_class(
+            &mut index,
+            &Owner::from(agent),
+            MemoryScope::Memory,
+            &unresolved,
+            agents_identity(self.data_dir())?,
+        )?;
         Ok(())
     }
 
@@ -233,6 +230,16 @@ impl Store {
         scope: MemoryScope,
         query: &HistorySearchQuery,
     ) -> Result<Vec<(IndexHit, Vec<u8>)>, IndexError> {
+        self.search_host_files_at(authorized, scope, query, crate::now_ms())
+    }
+
+    fn search_host_files_at(
+        &self,
+        authorized: &[String],
+        scope: MemoryScope,
+        query: &HistorySearchQuery,
+        now_ms: i64,
+    ) -> Result<Vec<(IndexHit, Vec<u8>)>, IndexError> {
         let selected = query
             .agent
             .as_deref()
@@ -240,101 +247,40 @@ impl Store {
             .filter(|s| *s != "*" && !s.eq_ignore_ascii_case("all"))
             .map(|s| self.agent_by_name(s).map(|a| a.id))
             .transpose()
-            .map_err(|e| io::Error::other(e.to_string()))?;
-        let mut agents: Vec<Agent> = self
-            .list_agents()
-            .map_err(|e| io::Error::other(e.to_string()))?
+            .map_err(store_error)?;
+        let authorized: HashSet<&str> = authorized.iter().map(String::as_str).collect();
+        let mut owners: Vec<Owner> = self
+            .agent_names(
+                authorized
+                    .into_iter()
+                    .filter(|id| selected.as_ref().is_none_or(|s| s.as_str() == *id)),
+            )
+            .map_err(store_error)?
             .into_iter()
-            .filter(|a| authorized.contains(&a.id.to_string()))
-            .filter(|a| selected.as_ref().is_none_or(|id| id == &a.id))
+            .map(|(id, name)| Owner { id, name })
             .collect();
-        agents.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
-        let mut index = HostIndex::open(&self.data_dir().join(INDEX_FILE))?;
-        for agent in &agents {
-            let _guard = self
-                .lock_agent_lifecycle(&agent.id)
-                .map_err(|e| io::Error::other(e.to_string()))?;
-            let root = self.data_dir().join("agents").join(agent.id.as_str());
-            if !safe_components(self.data_dir(), &root)? {
-                index.retain_agent_scope(agent.id.as_str(), scope, &HashSet::new())?;
-                continue;
+        owners.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
+        let mut index = HostIndex::shared(&self.data_dir().join(INDEX_FILE))?;
+        let unresolved = self.unresolved_host_paths_of(&owners)?;
+        let agents = agents_identity(self.data_dir())?;
+        for owner in &owners {
+            let unresolved = unresolved
+                .get(owner.id.as_str())
+                .map_or(&[][..], Vec::as_slice);
+            for &class in classes(scope) {
+                self.refresh_class_if_changed(
+                    &mut index, owner, class, unresolved, agents, now_ms,
+                )?;
             }
-            let mut ids = HashSet::new();
-            // The durable redactor is the only text mutation authority. A
-            // pending/failed copy excludes precisely that path and descendants;
-            // an unrelated unsupported store does not hide scrubbed local data.
-            let unresolved = self.unresolved_host_paths(agent.id.as_str())?;
-            if scope != MemoryScope::Transcripts {
-                for path in memory_indexable_files(&root.join("memory"))? {
-                    if unresolved.iter().any(|blocked| path.starts_with(blocked)) {
-                        continue;
-                    }
-                    let id = format!(
-                        "memory:{}:{}",
-                        agent.id,
-                        sha256(path.as_os_str().as_encoded_bytes())
-                    );
-                    let metadata = IndexMetadata {
-                        agent_id: agent.id.to_string(),
-                        source: MemoryScope::Memory,
-                        timestamp_ms: Some(modified_ms(&path)?),
-                        direction: "in".into(),
-                        sender: format!("agent:{}", agent.name),
-                        destination: format!("agent:{}", agent.name),
-                        tool_name: None,
-                        tool_names: Vec::new(),
-                        role: Some("memory".into()),
-                    };
-                    refresh_document(&mut index, &id, &metadata, &path)?;
-                    ids.insert(id);
-                }
-            }
-            if scope != MemoryScope::Memory {
-                for path in native_transcripts(&root)? {
-                    if unresolved.iter().any(|blocked| path.starts_with(blocked)) {
-                        continue;
-                    }
-                    ids.extend(refresh_native(&mut index, agent, &path)?.documents);
-                }
-                // Reconciled archive pages are lossless historical documents,
-                // not necessarily JSONL. Their entire text remains searchable.
-                for path in history_archives(&root)? {
-                    if unresolved.iter().any(|blocked| path.starts_with(blocked)) {
-                        continue;
-                    }
-                    let id = format!(
-                        "history:{}:{}",
-                        agent.id,
-                        sha256(path.as_os_str().as_encoded_bytes())
-                    );
-                    let metadata = IndexMetadata {
-                        agent_id: agent.id.to_string(),
-                        source: MemoryScope::Transcripts,
-                        timestamp_ms: None,
-                        direction: "in".into(),
-                        sender: format!("agent:{}", agent.name),
-                        destination: format!("agent:{}", agent.name),
-                        tool_name: None,
-                        tool_names: Vec::new(),
-                        role: Some("history".into()),
-                    };
-                    refresh_document(&mut index, &id, &metadata, &path)?;
-                    ids.insert(id);
-                }
-            }
-            index.retain_agent_scope(agent.id.as_str(), scope, &ids)?;
         }
-        let visible: Vec<_> = agents.iter().map(|a| a.id.to_string()).collect();
+        let visible: Vec<_> = owners.iter().map(|a| a.id.to_string()).collect();
         let mut request = query.clone();
         request.agent = None;
         let hits = index.search(&visible, scope, &request)?;
         let mut out = Vec::with_capacity(hits.len());
         for hit in hits {
-            let owner_id = crate::AgentId::parse(&hit.metadata.agent_id)
-                .map_err(|e| io::Error::other(e.to_string()))?;
-            let _guard = self
-                .lock_agent_lifecycle(&owner_id)
-                .map_err(|e| io::Error::other(e.to_string()))?;
+            let owner_id = crate::AgentId::parse(&hit.metadata.agent_id).map_err(store_error)?;
+            let _guard = self.lock_agent_lifecycle(&owner_id).map_err(store_error)?;
             let Some(current) =
                 index.document(std::slice::from_ref(&hit.metadata.agent_id), scope, &hit.id)?
             else {
@@ -352,11 +298,286 @@ impl Store {
         }
         Ok(out)
     }
+
+    /// Skip a class whose recorded walk still matches the filesystem and the
+    /// policy: it has nothing new to index, so it costs a stat per recorded
+    /// entry, with no lock, no directory listing, no file open and no query
+    /// besides its own record. Otherwise refresh it under the lifecycle lock.
+    fn refresh_class_if_changed(
+        &self,
+        index: &mut HostIndex,
+        owner: &Owner,
+        class: MemoryScope,
+        unresolved: &[PathBuf],
+        agents: Option<(u64, u64)>,
+        now_ms: i64,
+    ) -> Result<(), IndexError> {
+        let class_name = class
+            .source()
+            .ok_or_else(|| io::Error::other("a history class is memory or transcripts"))?;
+        let root = self.data_dir().join("agents").join(owner.id.as_str());
+        if let Some((recorded, tree)) = index.agent_tree(owner.id.as_str(), class_name)?
+            && recorded == tree_policy(owner, unresolved)?
+            && serde_json::from_str::<Tree>(&tree).is_ok_and(|t| t.is_current(&root, agents))
+        {
+            return Ok(());
+        }
+        #[cfg(test)]
+        tests::CLASS_WALKS.with(|n| n.set(n.get() + 1));
+        let _guard = self.lock_agent_lifecycle(&owner.id).map_err(store_error)?;
+        // Exclusions are read again under the lock, as a refresh always has.
+        let unresolved = self.unresolved_host_paths(owner.id.as_str())?;
+        let policy = tree_policy(owner, &unresolved)?;
+        let walk = self.refresh_class(index, owner, class, &unresolved, agents)?;
+        let tree = Tree {
+            started_ms: now_ms,
+            agents,
+            entries: walk.entries,
+        };
+        // A path that cannot be recorded (not UTF-8) only costs a walk later.
+        if let Ok(tree) = serde_json::to_string(&tree) {
+            index.save_agent_tree(owner.id.as_str(), class_name, &policy, &tree)?;
+        }
+        Ok(())
+    }
+
+    /// Index what one class's walk finds and forget the class's sources it no
+    /// longer finds. The other class and its cursors are never touched.
+    fn refresh_class(
+        &self,
+        index: &mut HostIndex,
+        owner: &Owner,
+        class: MemoryScope,
+        unresolved: &[PathBuf],
+        agents: Option<(u64, u64)>,
+    ) -> Result<Walk, IndexError> {
+        let root = self.data_dir().join("agents").join(owner.id.as_str());
+        let mut walk = Walk::new(&root);
+        let mut keep = HashSet::new();
+        // The durable redactor is the only text mutation authority. A
+        // pending/failed copy excludes precisely that path and descendants;
+        // an unrelated unsupported store does not hide scrubbed local data.
+        let blocked = |path: &Path| unresolved.iter().any(|b| path.starts_with(b));
+        if agent_root_safe(&mut walk, agents)? {
+            match class {
+                MemoryScope::Memory => {
+                    for path in memory_indexable_files(&mut walk, &root.join("memory"))? {
+                        if blocked(&path) {
+                            continue;
+                        }
+                        let id = format!(
+                            "memory:{}:{}",
+                            owner.id,
+                            sha256(path.as_os_str().as_encoded_bytes())
+                        );
+                        let metadata = memory_metadata(owner, Some(modified_ms(&path)?));
+                        let stamp = refresh_document(index, &id, &metadata, &path)?;
+                        walk.note(&path, Some(stamp));
+                        keep.insert(path.to_string_lossy().into_owned());
+                    }
+                }
+                MemoryScope::Transcripts => {
+                    for path in native_transcripts(&mut walk, &root)? {
+                        if blocked(&path) {
+                            continue;
+                        }
+                        let stamp = refresh_native(index, owner, &path)?.stamp;
+                        walk.note(&path, Some(stamp));
+                        keep.insert(path.to_string_lossy().into_owned());
+                    }
+                    // Reconciled archive pages are lossless historical documents,
+                    // not necessarily JSONL. Their entire text remains searchable.
+                    for path in history_archives(&mut walk, &root)? {
+                        if blocked(&path) {
+                            continue;
+                        }
+                        let id = format!(
+                            "history:{}:{}",
+                            owner.id,
+                            sha256(path.as_os_str().as_encoded_bytes())
+                        );
+                        let stamp = refresh_document(index, &id, &history_metadata(owner), &path)?;
+                        walk.note(&path, Some(stamp));
+                        keep.insert(path.to_string_lossy().into_owned());
+                    }
+                }
+                MemoryScope::All => {
+                    return Err(io::Error::other("refresh one history class at a time").into());
+                }
+            }
+        }
+        let stale: Vec<String> = index
+            .agent_sources(owner.id.as_str())?
+            .into_iter()
+            .filter(|(segment, cursor)| {
+                !keep.contains(segment) && source_class(cursor).is_none_or(|c| c == class)
+            })
+            .map(|(segment, _)| segment)
+            .collect();
+        index.forget_sources(owner.id.as_str(), &stale)?;
+        Ok(walk)
+    }
 }
 
-#[derive(Default)]
+fn unscrubbed_paths(receipt: &str) -> Result<Vec<PathBuf>, IndexError> {
+    let receipt: crate::redaction::Receipt = serde_json::from_str(receipt)?;
+    Ok(receipt
+        .unscrubbed
+        .into_iter()
+        .map(|f| PathBuf::from(f.path))
+        .collect())
+}
+
+const CLASSES: [MemoryScope; 2] = [MemoryScope::Memory, MemoryScope::Transcripts];
+fn classes(scope: MemoryScope) -> &'static [MemoryScope] {
+    match scope {
+        MemoryScope::All => &CLASSES,
+        MemoryScope::Memory => &CLASSES[..1],
+        MemoryScope::Transcripts => &CLASSES[1..],
+    }
+}
+
+/// The class a source cursor was published for. Unknown cursors are treated
+/// as belonging to whichever class is being refreshed.
+fn source_class(cursor: &str) -> Option<MemoryScope> {
+    let cursor: SourceCursor = serde_json::from_str(cursor).ok()?;
+    if cursor.policy.starts_with("native-jsonl") {
+        return Some(MemoryScope::Transcripts);
+    }
+    serde_json::from_str::<IndexMetadata>(&cursor.policy)
+        .ok()
+        .map(|m| m.source)
+}
+
+fn native_policy(owner: &Owner) -> String {
+    format!("native-jsonl-v4:{}:{}", owner.id, owner.name)
+}
+fn memory_metadata(owner: &Owner, timestamp_ms: Option<i64>) -> IndexMetadata {
+    IndexMetadata {
+        agent_id: owner.id.to_string(),
+        source: MemoryScope::Memory,
+        timestamp_ms,
+        direction: "in".into(),
+        sender: format!("agent:{}", owner.name),
+        destination: format!("agent:{}", owner.name),
+        tool_name: None,
+        tool_names: Vec::new(),
+        role: Some("memory".into()),
+    }
+}
+fn history_metadata(owner: &Owner) -> IndexMetadata {
+    IndexMetadata {
+        agent_id: owner.id.to_string(),
+        source: MemoryScope::Transcripts,
+        timestamp_ms: None,
+        direction: "in".into(),
+        sender: format!("agent:{}", owner.name),
+        destination: format!("agent:{}", owner.name),
+        tool_name: None,
+        tool_names: Vec::new(),
+        role: Some("history".into()),
+    }
+}
+
+/// Everything besides file stamps that decides what a class indexes: every
+/// policy and metadata shape that names the agent, and its redaction
+/// exclusions. Bump the version when indexing changes in any other way.
+fn tree_policy(owner: &Owner, unresolved: &[PathBuf]) -> Result<String, IndexError> {
+    let mut unresolved: Vec<_> = unresolved.iter().map(|p| p.to_string_lossy()).collect();
+    unresolved.sort();
+    Ok(serde_json::to_string(&(
+        "host-tree-v1",
+        native_policy(owner),
+        memory_metadata(owner, None),
+        history_metadata(owner),
+        unresolved,
+    ))?)
+}
+
+/// What one refresh of a history class inspected: the agent root, every
+/// directory it listed and every file it indexed, each stamped before it was
+/// read. A change to any entry changes its stamp, and an added, removed or
+/// renamed entry changes its directory's stamp, so while all of them still
+/// match, the class has nothing new to index.
+#[derive(Serialize, Deserialize)]
+struct Tree {
+    started_ms: i64,
+    /// Identity of `agents/`; its own stamp changes with every new agent.
+    agents: Option<(u64, u64)>,
+    /// Paths relative to the agent root; the empty path is the root itself.
+    entries: Vec<(PathBuf, Option<FileStamp>)>,
+}
+impl Tree {
+    fn is_current(&self, root: &Path, agents: Option<(u64, u64)>) -> bool {
+        self.agents == agents
+            && self.entries.iter().all(|(relative, recorded)| {
+                let path = if relative.as_os_str().is_empty() {
+                    root.to_owned()
+                } else {
+                    root.join(relative)
+                };
+                // A stamp taken within the timestamp granularity of the walk
+                // could be reused by a later change; such a tree is not trusted.
+                recorded
+                    .as_ref()
+                    .is_none_or(|s| s.settled_before(self.started_ms))
+                    && FileStamp::of_path(&path).is_ok_and(|now| now == *recorded)
+            })
+    }
+}
+
+/// Records what a refresh inspects, relative to the agent root.
+struct Walk {
+    root: PathBuf,
+    entries: Vec<(PathBuf, Option<FileStamp>)>,
+}
+impl Walk {
+    fn new(root: &Path) -> Self {
+        Self {
+            root: root.to_owned(),
+            entries: Vec::new(),
+        }
+    }
+    /// The first observation of a path is kept: any later change differs from it.
+    fn note(&mut self, path: &Path, stamp: Option<FileStamp>) {
+        let relative = path.strip_prefix(&self.root).unwrap_or(path).to_owned();
+        if !self.entries.iter().any(|(seen, _)| *seen == relative) {
+            self.entries.push((relative, stamp));
+        }
+    }
+    fn note_dir(&mut self, path: &Path, metadata: &fs::Metadata) {
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            self.note(path, Some(FileStamp::from_metadata(metadata)));
+        }
+    }
+}
+
+/// `agents/` must be a directory reached without a symlink.
+fn agents_identity(data_dir: &Path) -> io::Result<Option<(u64, u64)>> {
+    use std::os::unix::fs::MetadataExt;
+    match fs::symlink_metadata(data_dir.join("agents")) {
+        Ok(m) if m.file_type().is_symlink() => Ok(None),
+        Ok(m) => Ok(Some((m.dev(), m.ino()))),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+/// The same check as `safe_components(data_dir, root)`, with `agents/`
+/// checked once per search. The root is recorded even when absent.
+fn agent_root_safe(walk: &mut Walk, agents: Option<(u64, u64)>) -> io::Result<bool> {
+    let root = walk.root.clone();
+    let metadata = match fs::symlink_metadata(&root) {
+        Ok(m) => Some(m),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e),
+    };
+    walk.note(&root, metadata.as_ref().map(FileStamp::from_metadata));
+    Ok(agents.is_some() && metadata.is_some_and(|m| !m.file_type().is_symlink()))
+}
+
 pub struct RefreshStats {
-    pub documents: Vec<String>,
+    /// The stamp of the file the published frontier describes.
+    stamp: FileStamp,
     pub prefix_verified_bytes: u64,
     pub boundary_capture_bytes: u64,
     pub suffix_scanned_bytes: u64,
@@ -367,7 +588,7 @@ fn refresh_document(
     id: &str,
     metadata: &IndexMetadata,
     path: &Path,
-) -> Result<(), IndexError> {
+) -> Result<FileStamp, IndexError> {
     refresh_document_before_publish(index, id, metadata, path, || Ok(()))
 }
 fn refresh_document_before_publish(
@@ -376,25 +597,27 @@ fn refresh_document_before_publish(
     metadata: &IndexMetadata,
     path: &Path,
     before_publish: impl FnOnce() -> io::Result<()>,
-) -> Result<(), IndexError> {
-    let stamp = FileStamp::read(&open_readonly(path)?)?;
+) -> Result<FileStamp, IndexError> {
+    // One path walk; the stamp, hash and projection share this descriptor.
+    let mut source = RawSource::open(path)?;
+    let stamp = source.stamp().clone();
     let policy = serde_json::to_string(metadata)?;
     if index
         .source_cursor(&metadata.agent_id, path)?
         .is_some_and(|old| old.stamp == stamp && old.policy == policy)
     {
-        return Ok(());
+        return Ok(stamp);
     }
-    let raw = document_coordinate(path)?;
+    let raw = source.whole()?;
     index.refresh_source(|index| {
-        index.index(id, metadata, &raw)?;
+        index.index_from(&mut source, id, metadata, &raw)?;
         before_publish()?;
         if FileStamp::read(&open_readonly(path)?)? == stamp {
             index.save_source(
                 &metadata.agent_id,
                 path,
                 &SourceCursor {
-                    stamp,
+                    stamp: stamp.clone(),
                     policy,
                     end: raw.length,
                     next_seq: 2,
@@ -410,48 +633,50 @@ fn refresh_document_before_publish(
             )
             .into());
         }
-        Ok(())
+        Ok(stamp)
     })
 }
 fn refresh_native(
     index: &mut HostIndex,
-    agent: &Agent,
+    owner: &Owner,
     path: &Path,
 ) -> Result<RefreshStats, IndexError> {
-    refresh_native_at(index, agent, path, false, crate::now_ms())
+    refresh_native_at(index, owner, path, false, crate::now_ms())
 }
 fn refresh_native_at(
     index: &mut HostIndex,
-    agent: &Agent,
+    owner: &Owner,
     path: &Path,
     force_full: bool,
     now_ms: i64,
 ) -> Result<RefreshStats, IndexError> {
-    let stamp = FileStamp::read(&open_readonly(path)?)?;
-    let policy = format!("native-jsonl-v4:{}:{}", agent.id, agent.name);
+    // One path walk; scan, metadata and projection share this descriptor.
+    let mut source = RawSource::open(path)?;
+    let stamp = source.stamp().clone();
+    let policy = native_policy(owner);
     let old = index
-        .source_cursor(agent.id.as_str(), path)?
+        .source_cursor(owner.id.as_str(), path)?
         .filter(|old| old.policy == policy);
     if !force_full && old.as_ref().is_some_and(|old| old.stamp == stamp) {
         return Ok(RefreshStats {
-            documents: index.source_documents(agent.id.as_str(), path)?,
-            ..Default::default()
+            stamp,
+            prefix_verified_bytes: 0,
+            boundary_capture_bytes: 0,
+            suffix_scanned_bytes: 0,
+            indexed_records: 0,
         });
     }
-    let scan = crate::host_cursor::scan_jsonl(path, &stamp, old.as_ref(), force_full)?;
+    let scan = crate::host_cursor::scan_jsonl(&mut source, old.as_ref(), force_full)?;
     index.refresh_source(|index| {
         if scan.replace {
-            index.clear_source(agent.id.as_str(), path)?;
+            index.clear_source(owner.id.as_str(), path)?;
         }
         // There cannot be committed documents beyond the atomically published
         // frontier. An interrupted outer transaction is rolled back by SQLite.
         for raw in &scan.records {
-            use std::io::{Read, Seek, SeekFrom};
-            let mut file = open_readonly(path)?;
-            file.seek(SeekFrom::Start(raw.offset))?;
             let header: EventHeader =
-                serde_json::from_reader(MetadataReader::new(file.take(raw.length)))?;
-            let mut metadata = event_metadata(agent, &header);
+                serde_json::from_reader(MetadataReader::new(source.range(raw.offset, raw.length)))?;
+            let mut metadata = event_metadata(owner, &header);
             let records = header.tool_records();
             let mut names = Vec::new();
             if let Some(name) = &metadata.tool_name {
@@ -470,7 +695,7 @@ fn refresh_native_at(
                 let name = match (name, call_id) {
                     (Some(name), _) => name,
                     (None, Some(id)) => index
-                        .call_tool(agent.id.as_str(), path, id)?
+                        .call_tool(owner.id.as_str(), path, id)?
                         .unwrap_or_else(|| "unknown".into()),
                     (None, None) => "unknown".into(),
                 };
@@ -482,14 +707,14 @@ fn refresh_native_at(
             metadata.tool_names = names;
             let id = format!(
                 "transcript:{}:{}:{}",
-                agent.id,
+                owner.id,
                 sha256(path.as_os_str().as_encoded_bytes()),
                 raw.seq
             );
-            index.index(&id, &metadata, raw)?;
+            index.index_from(&mut source, &id, &metadata, raw)?;
             for (call_id, name) in records {
                 if let (Some(call_id), Some(name)) = (call_id, name) {
-                    index.save_call(agent.id.as_str(), path, call_id, name, &id)?;
+                    index.save_call(owner.id.as_str(), path, call_id, name, &id)?;
                 }
             }
         }
@@ -497,10 +722,10 @@ fn refresh_native_at(
         // the frontier; the next refresh revalidates and retries that suffix.
         if FileStamp::read(&open_readonly(path)?)? == stamp {
             index.save_source(
-                agent.id.as_str(),
+                owner.id.as_str(),
                 path,
                 &SourceCursor {
-                    stamp,
+                    stamp: stamp.clone(),
                     policy,
                     end: scan.end,
                     next_seq: scan.next_seq,
@@ -527,7 +752,7 @@ fn refresh_native_at(
             .into());
         }
         Ok(RefreshStats {
-            documents: index.source_documents(agent.id.as_str(), path)?,
+            stamp,
             prefix_verified_bytes: scan.prefix_verified_bytes,
             boundary_capture_bytes: scan.boundary_capture_bytes,
             suffix_scanned_bytes: scan.suffix_scanned_bytes,
@@ -536,14 +761,16 @@ fn refresh_native_at(
     })
 }
 
-fn safe_components(root: &Path, target: &Path) -> io::Result<bool> {
+/// No component below `root` may be a symlink or missing. Directories on the
+/// way are recorded.
+fn safe_components(walk: &mut Walk, root: &Path, target: &Path) -> io::Result<bool> {
     let relative = target.strip_prefix(root).map_err(io::Error::other)?;
     let mut path = root.to_owned();
     for component in relative.components() {
         path.push(component);
         match fs::symlink_metadata(&path) {
             Ok(m) if m.file_type().is_symlink() => return Ok(false),
-            Ok(_) => (),
+            Ok(m) => walk.note_dir(&path, &m),
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
             Err(e) => return Err(e),
         }
@@ -558,35 +785,16 @@ fn modified_ms(path: &Path) -> io::Result<i64> {
         .as_millis()
         .min(i64::MAX as u128) as i64)
 }
-fn document_coordinate(path: &Path) -> io::Result<RawCoordinate> {
-    use sha2::{Digest, Sha256};
-    use std::io::Read;
-    let mut file = crate::raw_segment::open_readonly(path)?;
-    let mut hash = Sha256::new();
-    let mut buffer = [0; 65536];
-    let mut length = 0;
-    loop {
-        let n = file.read(&mut buffer)?;
-        if n == 0 {
-            break;
-        }
-        length += n as u64;
-        hash.update(&buffer[..n]);
-    }
-    Ok(RawCoordinate {
-        segment: path.into(),
-        offset: 0,
-        length,
-        sha256: format!("{:x}", hash.finalize()),
-        seq: 1,
-    })
-}
 /// Read both the generic archive and the historical directory spelling so an
 /// upgrade never makes already-migrated documents disappear. New migrations
 /// only write the generic location.
-fn history_archives(root: &Path) -> io::Result<Vec<PathBuf>> {
-    let mut paths = regular_files(&root.join("history/archive"), true)?;
-    paths.extend(regular_files(&root.join("history").join("owners"), true)?);
+fn history_archives(walk: &mut Walk, root: &Path) -> io::Result<Vec<PathBuf>> {
+    let history = root.join("history");
+    if let Ok(metadata) = fs::symlink_metadata(&history) {
+        walk.note_dir(&history, &metadata);
+    }
+    let mut paths = regular_files(walk, &history.join("archive"), true)?;
+    paths.extend(regular_files(walk, &history.join("owners"), true)?);
     Ok(paths)
 }
 fn is_hidden_memory_file(path: &Path) -> bool {
@@ -595,8 +803,8 @@ fn is_hidden_memory_file(path: &Path) -> bool {
         .is_some_and(|name| name.starts_with('.'))
 }
 
-fn memory_indexable_files(mem_dir: &Path) -> io::Result<Vec<PathBuf>> {
-    let files: Vec<PathBuf> = regular_files(mem_dir, true)?
+fn memory_indexable_files(walk: &mut Walk, mem_dir: &Path) -> io::Result<Vec<PathBuf>> {
+    let files: Vec<PathBuf> = regular_files(walk, mem_dir, true)?
         .into_iter()
         .filter(|p| !is_hidden_memory_file(p))
         .collect();
@@ -618,7 +826,8 @@ fn memory_indexable_files(mem_dir: &Path) -> io::Result<Vec<PathBuf>> {
         .collect())
 }
 
-fn regular_files(root: &Path, recursive: bool) -> io::Result<Vec<PathBuf>> {
+/// Regular files under `root`, recording each directory before listing it.
+fn regular_files(walk: &mut Walk, root: &Path, recursive: bool) -> io::Result<Vec<PathBuf>> {
     let meta = match fs::symlink_metadata(root) {
         Ok(m) => m,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(vec![]),
@@ -627,6 +836,7 @@ fn regular_files(root: &Path, recursive: bool) -> io::Result<Vec<PathBuf>> {
     if !meta.is_dir() || meta.file_type().is_symlink() {
         return Ok(vec![]);
     }
+    walk.note_dir(root, &meta);
     let mut result = Vec::new();
     for entry in fs::read_dir(root)? {
         let entry = entry?;
@@ -634,16 +844,16 @@ fn regular_files(root: &Path, recursive: bool) -> io::Result<Vec<PathBuf>> {
         if kind.is_file() {
             result.push(entry.path());
         } else if recursive && kind.is_dir() {
-            result.extend(regular_files(&entry.path(), true)?);
+            result.extend(regular_files(walk, &entry.path(), true)?);
         }
     }
     result.sort();
     Ok(result)
 }
-fn native_transcripts(root: &Path) -> io::Result<Vec<PathBuf>> {
-    let mut result = regular_files(&root.join("transcripts"), true)?;
+fn native_transcripts(walk: &mut Walk, root: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut result = regular_files(walk, &root.join("transcripts"), true)?;
     let config = root.join("config");
-    if !safe_components(root, &config)? {
+    if !safe_components(walk, root, &config)? {
         return Ok(result);
     }
     let sylphx = config.join("sylphx-transcript.jsonl");
@@ -652,7 +862,7 @@ fn native_transcripts(root: &Path) -> io::Result<Vec<PathBuf>> {
     }
     for projects in [config.join("projects"), config.join(".claude/projects")] {
         // No guessed personal home or Codex SQLite discovery.
-        if safe_components(root, &projects)?
+        if safe_components(walk, root, &projects)?
             && fs::symlink_metadata(&projects)
                 .is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
         {
@@ -660,7 +870,7 @@ fn native_transcripts(root: &Path) -> io::Result<Vec<PathBuf>> {
                 let entry = entry?;
                 if entry.file_type()?.is_dir() {
                     result.extend(
-                        regular_files(&entry.path(), false)?
+                        regular_files(walk, &entry.path(), false)?
                             .into_iter()
                             .filter(|p| p.extension().is_some_and(|e| e == "jsonl")),
                     );
@@ -672,7 +882,7 @@ fn native_transcripts(root: &Path) -> io::Result<Vec<PathBuf>> {
     result.dedup();
     Ok(result)
 }
-fn event_metadata(agent: &Agent, value: &EventHeader) -> IndexMetadata {
+fn event_metadata(owner: &Owner, value: &EventHeader) -> IndexMetadata {
     let role = value
         .role
         .as_deref()
@@ -690,7 +900,7 @@ fn event_metadata(agent: &Agent, value: &EventHeader) -> IndexMetadata {
         .as_deref()
         .unwrap_or(if role == "user" { "in" } else { "out" });
     IndexMetadata {
-        agent_id: agent.id.to_string(),
+        agent_id: owner.id.to_string(),
         source: MemoryScope::Transcripts,
         timestamp_ms: value.timestamp_ms.or_else(|| {
             value
@@ -704,7 +914,7 @@ fn event_metadata(agent: &Agent, value: &EventHeader) -> IndexMetadata {
         destination: value
             .destination
             .clone()
-            .unwrap_or_else(|| format!("agent:{}", agent.name)),
+            .unwrap_or_else(|| format!("agent:{}", owner.name)),
         tool_names: tool.iter().cloned().collect(),
         tool_name: tool,
         role: Some(role.into()),
@@ -715,6 +925,126 @@ fn event_metadata(agent: &Agent, value: &EventHeader) -> IndexMetadata {
 mod tests {
     use super::*;
     use crate::NewAgent;
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Class refreshes that took the lifecycle lock and walked the tree.
+        pub(super) static CLASS_WALKS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// A search touches an unchanged agent with a stat per recorded entry:
+    /// no lock, no directory listing, no file open. Any change it could miss
+    /// (a file, a directory entry, the name, the exclusions, the documents)
+    /// walks only the class that changed, and results stay the same.
+    #[test]
+    fn unchanged_agent_history_is_searched_without_rewalking() {
+        use std::io::Write;
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(NewAgent::new("settled-archive", "spiron"))
+            .unwrap();
+        let absent = store
+            .create_agent(NewAgent::new("never-ran", "spiron"))
+            .unwrap();
+        for id in [&agent.id, &absent.id] {
+            store.set_agent_state(id, "archived").unwrap();
+        }
+        let root = dir.path().join("agents").join(agent.id.as_str());
+        fs::create_dir_all(root.join("memory")).unwrap();
+        fs::create_dir_all(root.join("config/projects/p")).unwrap();
+        fs::write(root.join("memory/MEMORY.md"), "settledneedle memory").unwrap();
+        let native = root.join("config/projects/p/session.jsonl");
+        fs::write(
+            &native,
+            "{\"role\":\"user\",\"content\":\"settledneedle transcript\"}\n",
+        )
+        .unwrap();
+        let ids = [agent.id.to_string(), absent.id.to_string()];
+        let walks = || CLASS_WALKS.with(Cell::get);
+        // Searches run "later" so the stamps written here have settled.
+        let mut at = crate::now_ms() + 10_000;
+        let mut search = |term: &str| {
+            at += 1_000;
+            store
+                .search_host_files_at(
+                    &ids,
+                    MemoryScope::All,
+                    &HistorySearchQuery {
+                        query: Some(term.into()),
+                        sort: crate::HistorySort::Oldest,
+                        ..Default::default()
+                    },
+                    at,
+                )
+                .unwrap()
+                .into_iter()
+                .map(|(hit, bytes)| (hit.id, hit.metadata.sender, bytes))
+                .collect::<Vec<_>>()
+        };
+        let start = walks();
+        let first = search("settledneedle");
+        assert_eq!(first.len(), 2);
+        assert_eq!(walks() - start, 4, "two classes of two agents");
+        let start = walks();
+        assert_eq!(search("settledneedle"), first);
+        assert_eq!(walks(), start, "nothing changed, nothing walked");
+
+        // An append changes the transcript's stamp: only that class walks.
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&native)
+            .unwrap()
+            .write_all(b"{\"role\":\"user\",\"content\":\"appendedneedle\"}\n")
+            .unwrap();
+        assert_eq!(search("appendedneedle").len(), 1);
+        assert_eq!(walks() - start, 1);
+        // A new file in a nested directory changes that directory's stamp.
+        let start = walks();
+        fs::create_dir_all(root.join("memory/topics")).unwrap();
+        fs::write(root.join("memory/topics/first.md"), "nestedneedle one").unwrap();
+        assert_eq!(search("nestedneedle").len(), 1);
+        fs::write(root.join("memory/topics/second.md"), "nestedneedle two").unwrap();
+        assert_eq!(search("nestedneedle").len(), 2);
+        assert_eq!(walks() - start, 2);
+        assert_eq!(search("nestedneedle").len(), 2);
+        assert_eq!(walks() - start, 2);
+        // A rename changes every policy that names the agent.
+        let start = walks();
+        store.rename_agent(&agent.id, "renamed-archive").unwrap();
+        let renamed = search("appendedneedle");
+        assert_eq!(renamed[0].1, "user");
+        assert_eq!(search("nestedneedle")[0].1, "agent:renamed-archive");
+        assert_eq!(walks() - start, 2);
+        // Dropping the agent's documents (as a redaction does) forgets its walks.
+        let start = walks();
+        HostIndex::open(&dir.path().join(INDEX_FILE))
+            .unwrap()
+            .retain_agent_documents(agent.id.as_str(), &HashSet::new())
+            .unwrap();
+        assert_eq!(search("nestedneedle").len(), 2);
+        assert_eq!(walks() - start, 2);
+        // A walk right after a change cannot trust stamps the filesystem may
+        // still reuse, so the next search walks again until they settle.
+        let start = walks();
+        fs::write(root.join("memory/topics/third.md"), "nestedneedle three").unwrap();
+        let now = crate::now_ms();
+        for _ in 0..2 {
+            let hits = store
+                .search_host_files_at(
+                    &ids,
+                    MemoryScope::Memory,
+                    &HistorySearchQuery {
+                        query: Some("nestedneedle".into()),
+                        ..Default::default()
+                    },
+                    now,
+                )
+                .unwrap();
+            assert_eq!(hits.len(), 3);
+        }
+        assert_eq!(walks() - start, 2);
+    }
     #[test]
     fn native_tool_correlation_survives_reopen_and_is_scoped_atomic_and_rebuildable() {
         use std::io::Write;
@@ -848,7 +1178,7 @@ mod tests {
         // neither the new correlation nor an advanced source cursor.
         let excessive = serde_json::json!({"content": (0..1025).map(|_| serde_json::json!({"type":"tool_use","id":"too-many","name":"wrong"})).collect::<Vec<_>>()});
         fs::OpenOptions::new().append(true).open(&native).unwrap().write_all(format!("{{\"type\":\"function_call\",\"call_id\":\"partial\",\"name\":\"not-published\"}}\n{excessive}\n").as_bytes()).unwrap();
-        let failure = refresh_native(&mut index, &own, &native)
+        let failure = refresh_native(&mut index, &Owner::from(&own), &native)
             .err()
             .expect("metadata cap must refuse refresh");
         assert!(
@@ -868,7 +1198,7 @@ mod tests {
         );
         // Replacement must discard old call correlations, not attach stale names.
         fs::write(&native, &output).unwrap();
-        refresh_native(&mut index, &own, &native).unwrap();
+        refresh_native(&mut index, &Owner::from(&own), &native).unwrap();
         assert!(
             index
                 .call_tool(own.id.as_str(), &native, "same")
@@ -892,6 +1222,85 @@ mod tests {
                 .as_deref(),
             Some("foreign")
         );
+    }
+
+    /// A refresh walks the path once for all its reads (plus one replacement
+    /// check) and reads O(bytes / window), never once per record or per byte.
+    #[test]
+    fn refresh_reads_each_source_through_one_descriptor_and_buffer() {
+        use crate::raw_segment::counters::snapshot;
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(NewAgent::new("buffered-reader", "spiron"))
+            .unwrap();
+        let path = dir.path().join("native.jsonl");
+        let mut text = String::new();
+        for i in 0..4_000 {
+            text.push_str(&format!(
+                "{{\"role\":\"user\",\"content\":\"record{i} {}\"}}\n",
+                "word ".repeat(i % 50)
+            ));
+        }
+        text.push_str(&format!(
+            "{{\"role\":\"tool\",\"output\":{}}}\n",
+            serde_json::json!("large ".repeat(300_000))
+        ));
+        fs::write(&path, &text).unwrap();
+        let mut index = HostIndex::open(&dir.path().join("index.db")).unwrap();
+        let delta = |before: (usize, usize)| {
+            let after = snapshot();
+            (after.0 - before.0, after.1 - before.1)
+        };
+        let before = snapshot();
+        let stats = refresh_native(&mut index, &Owner::from(&agent), &path).unwrap();
+        let (opens, reads) = delta(before);
+        assert_eq!(stats.indexed_records, 4_001);
+        assert_eq!(opens, 2);
+        let windows = text.len() / 65_536 + 1;
+        assert!(
+            reads <= 4 * windows,
+            "{reads} reads for {} bytes in 4001 records",
+            text.len()
+        );
+        let hits = index
+            .search(
+                &[agent.id.to_string()],
+                MemoryScope::Transcripts,
+                &HistorySearchQuery {
+                    query: Some("record3999".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].raw.seq, 4_000);
+        // Unchanged: one walk to stamp the file, no reads.
+        let before = snapshot();
+        refresh_native(&mut index, &Owner::from(&agent), &path).unwrap();
+        assert_eq!(delta(before), (1, 0));
+        // A whole-file document hashes and projects from one descriptor too.
+        let memory = dir.path().join("MEMORY.md");
+        fs::write(&memory, "memoryneedle ".repeat(50_000)).unwrap();
+        let metadata = IndexMetadata {
+            agent_id: agent.id.to_string(),
+            source: MemoryScope::Memory,
+            timestamp_ms: Some(0),
+            direction: "in".into(),
+            sender: "owner".into(),
+            destination: "owner".into(),
+            tool_name: None,
+            tool_names: Vec::new(),
+            role: Some("memory".into()),
+        };
+        let before = snapshot();
+        refresh_document(&mut index, "memory:buffered", &metadata, &memory).unwrap();
+        let (opens, reads) = delta(before);
+        assert_eq!(opens, 2);
+        assert!(reads <= 4, "{reads}");
+        let before = snapshot();
+        refresh_document(&mut index, "memory:buffered", &metadata, &memory).unwrap();
+        assert_eq!(delta(before), (1, 0));
     }
 
     #[test]
@@ -1045,7 +1454,7 @@ mod tests {
         let index_path = dir.path().join(INDEX_FILE);
         let mut index = HostIndex::open(&index_path).unwrap();
         let t0 = crate::now_ms();
-        refresh_native_at(&mut index, &agent, &path, false, t0).unwrap();
+        refresh_native_at(&mut index, &Owner::from(&agent), &path, false, t0).unwrap();
         let suffix = b"{\"content\":\"suffixneedle\"}\n";
         fs::OpenOptions::new()
             .append(true)
@@ -1053,7 +1462,8 @@ mod tests {
             .unwrap()
             .write_all(suffix)
             .unwrap();
-        let append = refresh_native_at(&mut index, &agent, &path, false, t0 + 1).unwrap();
+        let append =
+            refresh_native_at(&mut index, &Owner::from(&agent), &path, false, t0 + 1).unwrap();
         assert_eq!(
             append.prefix_verified_bytes,
             crate::host_cursor::BOUNDARY_BYTES
@@ -1064,13 +1474,20 @@ mod tests {
         );
         assert_eq!(append.suffix_scanned_bytes, suffix.len() as u64);
         assert_eq!(append.indexed_records, 1);
-        assert_eq!(append.documents.len(), 2);
+        assert_eq!(
+            index
+                .source_documents(agent.id.as_str(), &path)
+                .unwrap()
+                .len(),
+            2
+        );
         // Same-size edit inside the last boundary must trigger full replacement.
         let mut file = fs::OpenOptions::new().write(true).open(&path).unwrap();
         file.seek(SeekFrom::Start(prefix.len() as u64 + 12))
             .unwrap();
         file.write_all(b"inside").unwrap();
-        let inside = refresh_native_at(&mut index, &agent, &path, false, t0 + 2).unwrap();
+        let inside =
+            refresh_native_at(&mut index, &Owner::from(&agent), &path, false, t0 + 2).unwrap();
         assert_eq!(inside.indexed_records, 2);
         assert_eq!(
             inside.suffix_scanned_bytes,
@@ -1083,7 +1500,8 @@ mod tests {
         file.write_all(b"newneedle").unwrap();
         let mut append_file = fs::OpenOptions::new().append(true).open(&path).unwrap();
         append_file.write_all(suffix).unwrap();
-        let outside = refresh_native_at(&mut index, &agent, &path, false, t0 + 3).unwrap();
+        let outside =
+            refresh_native_at(&mut index, &Owner::from(&agent), &path, false, t0 + 3).unwrap();
         assert_eq!(outside.indexed_records, 1);
         assert_eq!(
             outside.prefix_verified_bytes,
@@ -1132,7 +1550,14 @@ mod tests {
         );
         // Shrink and a new inode use the complete-source path, not suffix reuse.
         fs::write(&path, suffix).unwrap();
-        let shrink = refresh_native_at(&mut index, &agent, &path, false, t0 + 3_600_004).unwrap();
+        let shrink = refresh_native_at(
+            &mut index,
+            &Owner::from(&agent),
+            &path,
+            false,
+            t0 + 3_600_004,
+        )
+        .unwrap();
         assert_eq!(
             (
                 shrink.prefix_verified_bytes,
@@ -1144,7 +1569,14 @@ mod tests {
         let replacement = root.join("replacement");
         fs::write(&replacement, &prefix).unwrap();
         fs::rename(&replacement, &path).unwrap();
-        let replaced = refresh_native_at(&mut index, &agent, &path, false, t0 + 3_600_005).unwrap();
+        let replaced = refresh_native_at(
+            &mut index,
+            &Owner::from(&agent),
+            &path,
+            false,
+            t0 + 3_600_005,
+        )
+        .unwrap();
         assert_eq!(
             (
                 replaced.prefix_verified_bytes,
@@ -1174,8 +1606,8 @@ mod tests {
         fs::write(&good, "{\"content\":\"goodneedle\"}\n").unwrap();
         let mut index = HostIndex::open(&dir.path().join(INDEX_FILE)).unwrap();
         let t0 = crate::now_ms();
-        refresh_native_at(&mut index, &agent, &bad, false, t0).unwrap();
-        refresh_native_at(&mut index, &agent, &good, false, t0).unwrap();
+        refresh_native_at(&mut index, &Owner::from(&agent), &bad, false, t0).unwrap();
+        refresh_native_at(&mut index, &Owner::from(&agent), &good, false, t0).unwrap();
         let before = index
             .source_cursor(agent.id.as_str(), &bad)
             .unwrap()
@@ -1369,7 +1801,7 @@ mod tests {
         fs::write(&path, [prefix.as_slice(), tail.as_slice()].concat()).unwrap();
         let index_path = dir.path().join("index.db");
         let mut index = HostIndex::open(&index_path).unwrap();
-        let first = refresh_native(&mut index, &agent, &path).unwrap();
+        let first = refresh_native(&mut index, &Owner::from(&agent), &path).unwrap();
         assert_eq!(first.indexed_records, 2);
         assert_eq!(first.prefix_verified_bytes, 0);
         assert_eq!(
@@ -1386,7 +1818,7 @@ mod tests {
         );
         drop(index);
         let mut index = HostIndex::open(&index_path).unwrap();
-        let warm = refresh_native(&mut index, &agent, &path).unwrap();
+        let warm = refresh_native(&mut index, &Owner::from(&agent), &path).unwrap();
         assert_eq!(
             (
                 warm.prefix_verified_bytes,
@@ -1395,7 +1827,9 @@ mod tests {
             ),
             (0, 0, 0)
         );
-        assert_eq!(warm.documents.len(), 2);
+        let documents =
+            |index: &HostIndex| index.source_documents(agent.id.as_str(), &path).unwrap();
+        assert_eq!(documents(&index).len(), 2);
         let suffix = b"needle\"}\n{\"role\":\"user\",\"content\":\"newneedle\"}\n";
         fs::OpenOptions::new()
             .append(true)
@@ -1403,21 +1837,21 @@ mod tests {
             .unwrap()
             .write_all(suffix)
             .unwrap();
-        let appended = refresh_native(&mut index, &agent, &path).unwrap();
+        let appended = refresh_native(&mut index, &Owner::from(&agent), &path).unwrap();
         assert_eq!(appended.prefix_verified_bytes, prefix.len() as u64);
         assert_eq!(
             appended.suffix_scanned_bytes,
             (tail.len() + suffix.len()) as u64
         );
         assert_eq!(appended.indexed_records, 2);
-        assert_eq!(appended.documents.len(), 4);
+        assert_eq!(documents(&index).len(), 4);
         // A middle/prefix edit followed by append must not look append-only.
         let edited = String::from_utf8(fs::read(&path).unwrap())
             .unwrap()
             .replace("originalneedle", "rewrittenneedle")
             + "{\"content\":\"fifthneedle\"}\n";
         fs::write(&path, &edited).unwrap();
-        let changed = refresh_native(&mut index, &agent, &path).unwrap();
+        let changed = refresh_native(&mut index, &Owner::from(&agent), &path).unwrap();
         assert_eq!(changed.indexed_records, 5);
         assert_eq!(changed.suffix_scanned_bytes, edited.len() as u64);
         let search = |index: &HostIndex, term: &str| {
@@ -1437,10 +1871,10 @@ mod tests {
         let replacement = dir.path().join("replacement");
         fs::write(&replacement, b"{\"content\":\"replacementneedle\"}\n").unwrap();
         fs::rename(replacement, &path).unwrap();
-        let replaced = refresh_native(&mut index, &agent, &path).unwrap();
+        let replaced = refresh_native(&mut index, &Owner::from(&agent), &path).unwrap();
         assert_eq!(replaced.indexed_records, 1);
         assert_eq!(replaced.prefix_verified_bytes, 0);
-        assert_eq!(replaced.documents.len(), 1);
+        assert_eq!(documents(&index).len(), 1);
         assert!(search(&index, "rewrittenneedle").is_empty());
         assert_eq!(
             read_raw(&search(&index, "replacementneedle")[0].raw).unwrap(),
@@ -1453,10 +1887,10 @@ mod tests {
         let failure = index
             .refresh_source(|index| -> Result<(), IndexError> {
                 index.clear_source(agent.id.as_str(), &path)?;
-                let raw = document_coordinate(&path)?;
+                let raw = RawSource::open(&path)?.whole()?;
                 index.index(
                     "uncommitted-batch",
-                    &event_metadata(&agent, &EventHeader::default()),
+                    &event_metadata(&Owner::from(&agent), &EventHeader::default()),
                     &raw,
                 )?;
                 let mut advanced: SourceCursor =
@@ -1486,14 +1920,10 @@ mod tests {
                 .is_none()
         );
         assert!(search(&index, "replacementneedle").is_empty());
-        refresh_native(&mut index, &agent, &path).unwrap();
+        refresh_native(&mut index, &Owner::from(&agent), &path).unwrap();
         fs::write(&path, b"").unwrap();
-        assert!(
-            refresh_native(&mut index, &agent, &path)
-                .unwrap()
-                .documents
-                .is_empty()
-        );
+        refresh_native(&mut index, &Owner::from(&agent), &path).unwrap();
+        assert!(documents(&index).is_empty());
     }
 
     #[test]

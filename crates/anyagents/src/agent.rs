@@ -1214,7 +1214,7 @@ pub fn offline_roster(
     server::roster_views(
         &store,
         &anyagents_supervisor::HealthBoard::default(),
-        agents,
+        &agents.iter().collect::<Vec<_>>(),
         archived_count,
         query,
     )

@@ -365,14 +365,30 @@ fn session_running(resp: &Value, session: &str) -> Option<bool> {
         .as_bool()
 }
 
+/// How often an open turn's session state is asked for. dsh's HTTP gateway
+/// reports turn ends only on its WebSocket stream, so an open turn is polled;
+/// an idle harness is not.
+const TURN_POLL: Duration = Duration::from_millis(250);
+
 fn poll_dsh_turns(shared: Arc<Mutex<State>>, wake: Arc<Condvar>) {
     loop {
         let (port, cookie, session) = {
             let st = lock(&shared);
+            // Asleep while no turn is open: `deliver` notifies after it opens
+            // one (the port and cookie are known by then), and the reader and
+            // `Drop` notify when the process goes.
             let st = wake
-                .wait_timeout_while(st, Duration::from_millis(250), |s| {
+                .wait_while(st, |s| {
                     s.alive && (s.open.is_empty() || s.port.is_none() || s.cookie.is_none())
                 })
+                .unwrap_or_else(|e| e.into_inner());
+            if !st.alive {
+                return;
+            }
+            // Wait one poll interval, or less when the turn is cancelled or
+            // the process goes.
+            let st = wake
+                .wait_timeout_while(st, TURN_POLL, |s| s.alive && !s.open.is_empty())
                 .unwrap_or_else(|e| e.into_inner())
                 .0;
             if !st.alive {
@@ -386,7 +402,6 @@ fn poll_dsh_turns(shared: Arc<Mutex<State>>, wake: Arc<Condvar>) {
             };
             (port, cookie, st.session.clone())
         };
-        thread::sleep(Duration::from_millis(250));
         let Ok(resp) = dsh_rpc(port, &cookie, "session/list", "poll", &json!({})) else {
             continue;
         };
@@ -611,5 +626,131 @@ mod tests {
         ] {
             assert_eq!(session_running(&malformed, "selected"), None);
         }
+    }
+
+    /// A dsh gateway that answers every `session/list` with `running` for
+    /// session `s`, and counts the calls.
+    fn gateway(
+        running: Arc<std::sync::atomic::AtomicBool>,
+    ) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::Ordering;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&calls);
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0u8; length];
+                let _ = reader.read_exact(&mut body);
+                counted.fetch_add(1, Ordering::SeqCst);
+                let answer = json!({"ok": true, "payload": {"items": [
+                    {"sessionId": "s", "running": running.load(Ordering::SeqCst)}
+                ]}})
+                .to_string();
+                let _ = write!(
+                    stream,
+                    "HTTP/1.0 200 OK\r\nContent-Length: {}\r\n\r\n{answer}",
+                    answer.len()
+                );
+            }
+        });
+        (port, calls)
+    }
+
+    fn connected_state(port: u16) -> Arc<Mutex<State>> {
+        Arc::new(Mutex::new(State {
+            child: None,
+            alive: true,
+            epoch: 0,
+            port: Some(port),
+            launch_token: None,
+            cookie: Some("dsh-auth-test=1".into()),
+            session: "s".into(),
+            open: Vec::new(),
+            seen: HashSet::new(),
+            written: Vec::new(),
+            finished: HashSet::new(),
+            turns_started: 0,
+            usages: Vec::new(),
+            quota_reset_at_ms: None,
+        }))
+    }
+
+    fn open_turn(shared: &Mutex<State>, wake: &Condvar, id: &str) {
+        let mut st = lock(shared);
+        st.open.push(id.into());
+        st.epoch = st.epoch.wrapping_add(1);
+        drop(st);
+        wake.notify_all();
+    }
+
+    fn stop(shared: &Mutex<State>, wake: &Condvar) {
+        lock(shared).alive = false;
+        wake.notify_all();
+    }
+
+    #[test]
+    fn an_idle_harness_asks_dsh_nothing_and_an_open_turn_is_polled_to_its_end() {
+        use std::sync::atomic::Ordering;
+        let running = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (port, calls) = gateway(Arc::clone(&running));
+        let shared = connected_state(port);
+        let wake = Arc::new(Condvar::new());
+        let poller = {
+            let (shared, wake) = (Arc::clone(&shared), Arc::clone(&wake));
+            thread::spawn(move || poll_dsh_turns(shared, wake))
+        };
+        thread::sleep(Duration::from_millis(400));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        open_turn(&shared, &wake, "m1");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !lock(&shared).finished.contains("m1") {
+            assert!(
+                Instant::now() < deadline,
+                "the finished turn was never seen"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(lock(&shared).open.is_empty());
+        let after_turn = calls.load(Ordering::SeqCst);
+        thread::sleep(Duration::from_millis(600));
+        assert_eq!(calls.load(Ordering::SeqCst), after_turn);
+
+        let started = Instant::now();
+        stop(&shared, &wake);
+        poller.join().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn a_harness_stopped_mid_turn_stops_polling_at_once() {
+        let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (port, _calls) = gateway(running);
+        let shared = connected_state(port);
+        let wake = Arc::new(Condvar::new());
+        let poller = {
+            let (shared, wake) = (Arc::clone(&shared), Arc::clone(&wake));
+            thread::spawn(move || poll_dsh_turns(shared, wake))
+        };
+        open_turn(&shared, &wake, "m1");
+        thread::sleep(Duration::from_millis(100));
+        let started = Instant::now();
+        stop(&shared, &wake);
+        poller.join().unwrap();
+        assert!(started.elapsed() < TURN_POLL + Duration::from_millis(200));
+        assert!(!lock(&shared).finished.contains("m1"));
     }
 }

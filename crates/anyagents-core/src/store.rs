@@ -9,9 +9,9 @@ use std::io::{ErrorKind, Read};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use anyagents_harness::normalize_harness_name;
@@ -27,11 +27,15 @@ mod audit_tests;
 mod credentials;
 mod group_policy;
 mod harness_leases;
+mod history_ops;
 mod lifecycle;
+mod mcp_ops;
+mod registry;
 mod runtime;
 #[cfg(test)]
 #[path = "store/runtime_tests.rs"]
 mod runtime_tests;
+mod server_ops;
 pub use credentials::{
     CredentialBinding, CredentialBindingAudit, CredentialKind, CredentialObservation,
     CredentialSlot, CredentialTarget,
@@ -52,18 +56,73 @@ pub struct Origin {
     pub thread_id: Option<i64>,
     pub message_id: Option<i64>,
 }
-use crate::migrate::{self, now_ms as clock_now_ms};
+#[cfg(test)]
+use crate::migrate;
+use crate::migrate::now_ms as clock_now_ms;
 
 /// Milliseconds since the Unix epoch. A clock that is before the epoch reads as 0.
 pub fn now_ms() -> i64 {
     clock_now_ms()
 }
 
-const MESSAGE_COLS: &str = "id, agent_id, seq, source_time_ms, source_key, sender, body, \
-     reply_to, received_at_ms, delivered_at_ms, origin, context";
+// Column lists as macros, so hot statements are `concat!` literals that
+// `prepare_cached` reuses instead of a `format!` and a fresh prepare per call.
+macro_rules! message_cols {
+    () => {
+        "id, agent_id, seq, source_time_ms, source_key, sender, body, \
+         reply_to, received_at_ms, delivered_at_ms, origin, context"
+    };
+}
+macro_rules! agent_cols {
+    () => {
+        "id, name, harness, model, workdir, instructions, state, \
+         created_at_ms, launch_env, parent_id, is_admin, role, description"
+    };
+}
+macro_rules! schedule_cols {
+    () => {
+        "id, agent_id, kind, spec, prompt, interval_ms, next_fire_at_ms, \
+         last_fired_at_ms, watch_baseline, last_observed, state, created_at_ms"
+    };
+}
 
-const AGENT_COLS: &str = "id, name, harness, model, workdir, instructions, state, \
-     created_at_ms, launch_env, parent_id, is_admin, role, description";
+/// Rows of `agents` (bound as `?1`) that may scale to zero: running, no
+/// running child, the last turn completed past every mailbox line, and every
+/// line delivered. Shared by the read-only precheck and the guarded UPDATE.
+macro_rules! idle_release_predicate {
+    () => {
+        "id = ?1
+    AND state = 'running'
+    AND NOT EXISTS (
+        SELECT 1 FROM agents child
+        WHERE child.parent_id = ?1
+          AND child.state = 'running'
+    )
+    AND EXISTS (
+        SELECT 1 FROM turn_recovery tr
+        WHERE tr.agent_id = ?1
+          AND tr.completed_seq >= tr.opened_seq
+          AND tr.completed_seq > 0
+          AND tr.completed_seq >= COALESCE((
+              SELECT MAX(m.seq) FROM messages m WHERE m.agent_id = ?1
+          ), 0)
+    )
+    AND COALESCE((
+        SELECT mc.delivered_seq FROM mailbox_cursors mc WHERE mc.agent_id = ?1
+    ), 0) >= COALESCE((
+        SELECT MAX(m.seq) FROM messages m WHERE m.agent_id = ?1
+    ), 0)"
+    };
+}
+
+macro_rules! agent_summary_cols {
+    () => {
+        "id, name, harness, model, state, parent_id, role, is_admin, created_at_ms"
+    };
+}
+
+const MESSAGE_COLS: &str = message_cols!();
+const AGENT_COLS: &str = agent_cols!();
 
 fn is_scope_env_key(key: &str) -> bool {
     matches!(key, "ANYAGENTS_SCOPE" | "ANYAGENTS_PUBLIC")
@@ -280,6 +339,23 @@ impl Agent {
     pub fn is_task_subagent(&self) -> bool {
         self.parent_id.is_some() && self.lifecycle() == "task"
     }
+}
+
+/// An agent's identity, lifecycle state and place in the tree, without its
+/// instructions or launch environment: what rosters, trees and sweeps over
+/// many agents need per row. Policy derived from the launch environment
+/// (scope, lifecycle mode) needs the full [`Agent`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentSummary {
+    pub id: AgentId,
+    pub name: String,
+    pub harness: String,
+    pub model: Option<String>,
+    pub state: String,
+    pub parent_id: Option<AgentId>,
+    pub role: Option<String>,
+    pub is_admin: bool,
+    pub created_at_ms: i64,
 }
 
 /// Fields for `agents.create`. The harness value is a catalog key.
@@ -691,17 +767,16 @@ pub enum Wake {
     Agent { agent_id: AgentId },
 }
 
-/// Open database. Methods take a shared reference; writes serialize on the mutex.
+/// A handle on an open database. Every handle a process opens on one file
+/// shares that file's single read-write connection and read pool (see
+/// `registry`); writes serialize on the writer's mutex, reads never wait for
+/// it. Wake subscribers and the capability key belong to the handle.
 pub struct Store {
-    conn: Mutex<Connection>,
+    shared: Arc<registry::Shared>,
     db_path: PathBuf,
     data_dir: PathBuf,
     wakes: Mutex<Vec<Sender<Wake>>>,
     capabilities: Mutex<Option<String>>,
-    /// Total time a bounded write may keep retrying transient lock errors.
-    write_retry_budget_ms: AtomicU64,
-    /// The writer connection's configured busy timeout.
-    busy_timeout_ms: AtomicU64,
 }
 
 /// Default per-statement wait for the writer lock.
@@ -744,8 +819,49 @@ fn is_transient_sqlite_error(error: &rusqlite::Error) -> bool {
     )
 }
 
-enum ReadConn<'a> {
-    Owned(Connection),
+/// Idle read-only connections kept for reuse. Opening a connection per read
+/// discards SQLite's page cache and re-reads the schema every time; on a
+/// multi-GB store that turned every read into a burst of `pread` syscalls and
+/// pinned the daemon in the kernel. Readers beyond this many simply close.
+const MAX_IDLE_READERS: usize = 32;
+/// Upper bound for memory-mapped I/O (SQLite clamps it to its compile-time
+/// maximum). Mapped pages come straight from the shared OS page cache, so
+/// reads cost no syscalls and no per-connection copy.
+const MMAP_SIZE_BYTES: i64 = 64 * 1024 * 1024 * 1024;
+/// Per-connection page cache, in KiB (negative `cache_size` units).
+const CACHE_SIZE_KIB: i64 = 32 * 1024;
+/// Prepared statements kept per connection; read paths reuse a few dozen.
+const STATEMENT_CACHE: usize = 128;
+
+/// Apply the shared performance settings to any store connection. Failures
+/// are ignored: each setting is an optimisation, never a correctness need.
+fn tune_connection(conn: &Connection) {
+    let _ = conn.pragma_update(None, "mmap_size", MMAP_SIZE_BYTES);
+    let _ = conn.pragma_update(None, "cache_size", -CACHE_SIZE_KIB);
+    let _ = conn.pragma_update(None, "temp_store", "MEMORY");
+    conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE);
+}
+
+/// Open one read-only connection for the reader pool.
+fn open_reader(path: &Path) -> Option<Connection> {
+    let conn = Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    let _ = conn.busy_timeout(BUSY_TIMEOUT);
+    let _ = conn.pragma_update(None, "query_only", "ON");
+    tune_connection(&conn);
+    Some(conn)
+}
+
+/// A pooled read-only connection (or, when none can be opened, the writer).
+pub(crate) enum ReadConn<'a> {
+    /// A reader borrowed from the pool; returned on drop.
+    Pooled {
+        conn: Option<Connection>,
+        pool: &'a Mutex<Vec<Connection>>,
+    },
     Guard(MutexGuard<'a, Connection>),
 }
 
@@ -753,8 +869,18 @@ impl std::ops::Deref for ReadConn<'_> {
     type Target = Connection;
     fn deref(&self) -> &Connection {
         match self {
-            Self::Owned(c) => c,
+            Self::Pooled { conn, .. } => conn.as_ref().expect("pooled reader present until drop"),
             Self::Guard(g) => g,
+        }
+    }
+}
+
+impl Drop for ReadConn<'_> {
+    fn drop(&mut self) {
+        if let Self::Pooled { conn, pool } = self
+            && let Some(conn) = conn.take()
+        {
+            registry::Shared::recycle(pool, conn);
         }
     }
 }
@@ -811,230 +937,35 @@ fn preserve_legacy_scopes(conn: &mut Connection) -> Result<(), Error> {
 }
 
 impl Store {
-    /// Open or create the database, turn on WAL, and apply pending migrations.
+    /// A handle on the database at `path`. The first open of a file in this
+    /// process creates it if needed, turns on WAL, applies pending migrations
+    /// and repairs legacy rows; later opens, while any handle on the file is
+    /// alive, reuse that connection without touching the database.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
         let path = path.as_ref();
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent)?;
-        }
-        let conn = Connection::open(path)?;
-        // A 30s wait: ~78 agents finishing at once queue here instead of failing
-        // with `database is locked`. BEGIN IMMEDIATE (not the DEFERRED default)
-        // is what makes the wait apply to read-then-write paths.
-        conn.busy_timeout(BUSY_TIMEOUT)?;
-        conn.pragma_update(None, "foreign_keys", "ON")?;
-        // Without a limit the WAL file keeps its high-water size forever after
-        // one burst; with it, each checkpoint reset truncates the file back.
-        conn.pragma_update(None, "journal_size_limit", WAL_SIZE_LIMIT_BYTES)?;
-        let mut mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
-        if !mode.eq_ignore_ascii_case("wal") {
-            mode = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
-        }
-        if !mode.eq_ignore_ascii_case("wal") {
-            return Err(Error::Message(format!(
-                "sqlite journal mode is {mode}, not wal"
-            )));
-        }
-        let mut conn = conn;
-        let schema_version = migrate::current_version(&conn)?;
-        migrate::migrate(&mut conn)?;
-        // Tolerate busy on per-open DDL: a WAL-pinned DB must not make
-        // Store::open fail (sandbox skips SEAT_PEERS and denies peer-trees).
-        // Defer legacy work to the next open when the WAL frees.
-        if let Err(e) = preserve_legacy_scopes(&mut conn)
-            && !is_transient_lock_error(&e)
-        {
-            return Err(e);
-        }
-        if migrate::current_version(&conn)? < 1 {
-            return Err(Error::Message("migrations did not apply".into()));
-        }
-        // Read first so ordinary opens of current stores do not take the writer
-        // lock. The UPDATE is idempotent and changes only the harness selector.
-        // Tolerate busy here: defer to next open when WAL is pinned.
-        let has_legacy_harness: bool = match conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM agents WHERE harness IN ('sylphx', 'sylphx-agent', 'sylphx_agent', 'sylphx/default'))",
-            [],
-            |row| row.get(0),
-        ) {
-            Ok(v) => v,
-            Err(e) if is_transient_sqlite_error(&e) => false,
-            Err(e) => return Err(e.into()),
-        };
-        if has_legacy_harness
-            && let Err(e) = conn.execute(
-                "UPDATE agents SET harness = 'spiron' WHERE harness IN ('sylphx', 'sylphx-agent', 'sylphx_agent', 'sylphx/default')",
-                [],
-            )
-                && !is_transient_sqlite_error(&e) {
-                    return Err(e.into());
-                }
-        let has_legacy_state: bool = match conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM agents WHERE state NOT IN ('created', 'running', 'idle', 'paused', 'archived'))",
-            [],
-            |row| row.get(0),
-        ) {
-            Ok(v) => v,
-            Err(e) if is_transient_sqlite_error(&e) => false,
-            Err(e) => return Err(e.into()),
-        };
-        if has_legacy_state
-            && let Err(e) = conn.execute(
-                "UPDATE agents SET state = 'archived' WHERE state NOT IN ('created', 'running', 'idle', 'paused', 'archived')",
-                [],
-            )
-                && !is_transient_sqlite_error(&e) {
-                    return Err(e.into());
-                }
-        let has_aux_schema: bool = match conn.query_row(
-            "SELECT (SELECT count(*) FROM sqlite_master WHERE name IN ('message_versions', 'agent_topology_state', 'idx_rag_chunks_agent_id_time')) = 3",
-            [],
-            |row| row.get(0),
-        ) {
-            Ok(v) => v,
-            Err(e) if is_transient_sqlite_error(&e) => true,
-            Err(e) => return Err(e.into()),
-        };
-        if !has_aux_schema
-            && let Err(e) = conn.execute_batch(
-                "CREATE TABLE IF NOT EXISTS message_versions (
-                    agent_id TEXT NOT NULL,
-                    chat_id INTEGER NOT NULL,
-                    message_id INTEGER NOT NULL,
-                    body TEXT NOT NULL,
-                    updated_at_ms INTEGER NOT NULL,
-                    PRIMARY KEY (agent_id, chat_id, message_id)
-                );
-                CREATE TABLE IF NOT EXISTS agent_topology_state (
-                    agent_id TEXT PRIMARY KEY,
-                    state_json TEXT NOT NULL,
-                    updated_at_ms INTEGER NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS idx_rag_chunks_agent_id_time
-                    ON rag_chunks(agent_id, timestamp_ms DESC, chunk_id);",
-            )
-            && !is_transient_sqlite_error(&e)
-        {
-            return Err(e.into());
-        }
-        // UNIQUE(agent_id, seq) already supports reverse mailbox sequence scans.
-        // Avoid even idempotent DDL on ordinary opens: it needs the writer lock.
-        for (name, sql) in [
-            (
-                "idx_schedules_active_agent",
-                "CREATE INDEX IF NOT EXISTS idx_schedules_active_agent ON agent_schedules(agent_id, created_at_ms, id) WHERE state = 'active'",
-            ),
-            (
-                "idx_messages_agent_time",
-                "CREATE INDEX IF NOT EXISTS idx_messages_agent_time ON messages(agent_id, received_at_ms DESC, seq DESC)",
-            ),
-            (
-                "idx_agents_state",
-                "CREATE INDEX IF NOT EXISTS idx_agents_state ON agents(state)",
-            ),
-            (
-                "idx_agents_live_name",
-                "CREATE INDEX IF NOT EXISTS idx_agents_live_name ON agents(name) WHERE state != 'archived'",
-            ),
-            (
-                "idx_outbound_agent_time",
-                "CREATE INDEX IF NOT EXISTS idx_outbound_agent_time ON outbound_messages(agent_id, sent_at_ms DESC, id DESC)",
-            ),
-        ] {
-            let exists: bool = match conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1)",
-                [name],
-                |row| row.get(0),
-            ) {
-                Ok(v) => v,
-                Err(e) if is_transient_sqlite_error(&e) => true,
-                Err(e) => return Err(e.into()),
-            };
-            if !exists
-                && let Err(e) = conn.execute_batch(sql)
-                && !is_transient_sqlite_error(&e)
-            {
-                return Err(e.into());
-            }
-        }
-        // Older databases may already have this column from an earlier runtime.
-        // Presence, not an arbitrary failed ALTER, is the idempotency condition.
-        // Tolerate busy here as well.
-        let has_public: bool = match conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('groups') WHERE name = 'public')",
-            [],
-            |row| row.get(0),
-        ) {
-            Ok(v) => v,
-            Err(e) if is_transient_sqlite_error(&e) => true,
-            Err(e) => return Err(e.into()),
-        };
-        if !has_public
-            && let Err(e) = conn.execute(
-                "ALTER TABLE groups ADD COLUMN public INTEGER NOT NULL DEFAULT 0",
-                [],
-            )
-            && !is_transient_sqlite_error(&e)
-        {
-            return Err(e.into());
-        }
-        // Current schemas maintain FTS transactionally on every history write.
-        // Only legacy upgrades need the full derivative-index validation; doing
-        // it on every open scans history and competes with the server writer.
-        if schema_version < 23 {
-            ensure_lexical_fts_backfilled(&mut conn)?;
-        }
-        let store = Self {
-            conn: Mutex::new(conn),
+        Ok(Self {
+            shared: registry::shared(path)?,
             db_path: path.to_path_buf(),
             data_dir: data_dir_for(path),
             wakes: Mutex::new(Vec::new()),
             capabilities: Mutex::new(None),
-            write_retry_budget_ms: AtomicU64::new(WRITE_RETRY_BUDGET.as_millis() as u64),
-            busy_timeout_ms: AtomicU64::new(BUSY_TIMEOUT.as_millis() as u64),
-        };
-        store.backfill_runtime_on_open()?;
-        Ok(store)
-    }
-
-    /// Give every agent without one its runtime row and turns, derived from
-    /// legacy state. A read decides first, so opening a current store takes no
-    /// writer lock; a busy writer defers the backfill to the next open.
-    fn backfill_runtime_on_open(&self) -> Result<(), Error> {
-        let missing: bool = match self.conn().query_row(
-            "SELECT EXISTS(SELECT 1 FROM agents a
-                 WHERE NOT EXISTS (SELECT 1 FROM agent_runtime r WHERE r.agent_id = a.id))",
-            [],
-            |row| row.get(0),
-        ) {
-            Ok(missing) => missing,
-            Err(e) if is_transient_sqlite_error(&e) => false,
-            Err(e) => return Err(e.into()),
-        };
-        if !missing {
-            return Ok(());
-        }
-        let data_dir = self.data_dir.clone();
-        match self.backfill_runtime_state(|id| legacy_last_error(&data_dir, id)) {
-            Ok(_) => Ok(()),
-            Err(e) if is_transient_lock_error(&e) => Ok(()),
-            Err(e) => Err(e),
-        }
+        })
     }
 
     /// Set the writer's per-statement lock wait and the total budget that
-    /// retried writes may spend on transient lock errors.
+    /// retried writes may spend on transient lock errors. The writer is shared,
+    /// so this applies to every handle this process has on the database.
     pub fn set_lock_wait(
         &self,
         busy_timeout: Duration,
         retry_budget: Duration,
     ) -> Result<(), Error> {
         self.conn().busy_timeout(busy_timeout)?;
-        self.busy_timeout_ms
+        self.shared
+            .busy_timeout_ms
             .store(busy_timeout.as_millis() as u64, Ordering::Relaxed);
-        self.write_retry_budget_ms
+        self.shared
+            .write_retry_budget_ms
             .store(retry_budget.as_millis() as u64, Ordering::Relaxed);
         Ok(())
     }
@@ -1062,7 +993,7 @@ impl Store {
                 Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
             });
             let restored = conn.busy_timeout(Duration::from_millis(
-                self.busy_timeout_ms.load(Ordering::Relaxed),
+                self.shared.busy_timeout_ms.load(Ordering::Relaxed),
             ));
             match truncated.map_err(Error::from) {
                 Ok((0, 0)) => outcome.truncated = true,
@@ -1083,7 +1014,8 @@ impl Store {
         &self,
         mut op: impl FnMut(&mut Connection) -> Result<T, Error>,
     ) -> Result<T, Error> {
-        let budget = Duration::from_millis(self.write_retry_budget_ms.load(Ordering::Relaxed));
+        let budget =
+            Duration::from_millis(self.shared.write_retry_budget_ms.load(Ordering::Relaxed));
         let started = std::time::Instant::now();
         let mut backoff = Duration::from_millis(10);
         loop {
@@ -1146,7 +1078,7 @@ impl Store {
         let now = now_ms();
         {
             let mut conn = self.conn();
-            agent_by_id(&conn, agent_id)?;
+            agent_exists(&conn, agent_id)?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             // A new instance replaces the old one: the generation moves, and
             // every capability minted before it stops authenticating.
@@ -1198,7 +1130,7 @@ impl Store {
 
     /// A receipt one named send already produced, or `None`.
     pub fn send_receipt(&self, id: &str) -> Result<Option<String>, Error> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         Ok(conn
             .query_row("SELECT receipt FROM sends WHERE id = ?1", [id], |row| {
                 row.get(0)
@@ -1214,7 +1146,7 @@ impl Store {
         agent_id: &AgentId,
         key: &str,
     ) -> Result<Option<Message>, Error> {
-        message_by_source(&self.conn(), agent_id, key)
+        message_by_source(&self.read_conn(), agent_id, key)
     }
 
     /// Keep one named send's receipt after it was delivered.
@@ -1248,19 +1180,20 @@ impl Store {
     /// Whether a capability was ever minted on this deployment. Once one has
     /// been, the deployment has an identity boundary.
     pub fn ever_authenticated(&self) -> bool {
-        let conn = self.conn();
-        conn.query_row("SELECT COUNT(*) FROM agent_capabilities", [], |row| {
-            row.get::<_, i64>(0)
-        })
-        .map(|count| count > 0)
-        .unwrap_or(false)
+        self.read_conn()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM agent_capabilities)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(false)
     }
 
     /// Replace an agent's instance: its generation moves, so every capability
     /// minted for the last instance stops authenticating at once.
     pub fn retire_capabilities(&self, agent_id: &AgentId) -> Result<(), Error> {
         let conn = self.conn();
-        agent_by_id(&conn, agent_id)?;
+        agent_exists(&conn, agent_id)?;
         conn.execute(
             "UPDATE agent_capabilities SET revoked_at_ms = ?1
              WHERE agent_id = ?2 AND revoked_at_ms IS NULL",
@@ -1512,7 +1445,7 @@ impl Store {
         }
         let updated = {
             let conn = self.conn();
-            agent_by_id(&conn, agent_id)?;
+            agent_exists(&conn, agent_id)?;
             conn.execute(
                 "UPDATE agents SET harness = ?2 WHERE id = ?1",
                 params![agent_id.as_str(), clean],
@@ -1579,7 +1512,7 @@ impl Store {
     pub fn set_agent_role(&self, id: &AgentId, role: Option<&str>) -> Result<Agent, Error> {
         let clean = role.map(str::trim).filter(|s| !s.is_empty());
         let conn = self.conn();
-        agent_by_id(&conn, id)?;
+        agent_exists(&conn, id)?;
         conn.execute(
             "UPDATE agents SET role = ?1 WHERE id = ?2",
             params![clean, id.as_str()],
@@ -1664,7 +1597,7 @@ impl Store {
     ) -> Result<Agent, Error> {
         let clean = description.map(str::trim).filter(|s| !s.is_empty());
         let conn = self.conn();
-        agent_by_id(&conn, id)?;
+        agent_exists(&conn, id)?;
         conn.execute(
             "UPDATE agents SET description = ?1 WHERE id = ?2",
             params![clean, id.as_str()],
@@ -1700,11 +1633,12 @@ impl Store {
         let lookup = name.strip_prefix("agent:").unwrap_or(name);
         let conn = self.read_conn();
         let found = conn
-            .query_row(
-                &format!("SELECT {AGENT_COLS} FROM agents WHERE name = ?1 OR id = ?1"),
-                [lookup],
-                agent_from_row,
-            )
+            .prepare_cached(concat!(
+                "SELECT ",
+                agent_cols!(),
+                " FROM agents WHERE name = ?1 OR id = ?1"
+            ))?
+            .query_row([lookup], agent_from_row)
             .optional()?;
         if let Some(agent) = found {
             return Ok(agent);
@@ -1725,7 +1659,29 @@ impl Store {
 
     pub fn list_agents(&self) -> Result<Vec<Agent>, Error> {
         let conn = self.read_conn();
-        let mut stmt = conn.prepare(&format!("SELECT {AGENT_COLS} FROM agents ORDER BY name"))?;
+        let mut stmt = conn.prepare_cached(concat!(
+            "SELECT ",
+            agent_cols!(),
+            " FROM agents ORDER BY name"
+        ))?;
+        let mut rows = stmt.query([])?;
+        let mut agents = Vec::new();
+        while let Some(row) = rows.next()? {
+            agents.push(agent_from_row(row)?);
+        }
+        Ok(agents)
+    }
+
+    /// Every agent that is not archived, ordered by name. Hot paths use this
+    /// instead of [`Store::list_agents`] so their cost follows the live fleet,
+    /// not the ever-growing archive (served by `idx_agents_state`).
+    pub fn list_live_agents(&self) -> Result<Vec<Agent>, Error> {
+        let conn = self.read_conn();
+        let mut stmt = conn.prepare_cached(concat!(
+            "SELECT ",
+            agent_cols!(),
+            " FROM agents WHERE state IN ('created', 'running', 'idle', 'paused') ORDER BY name"
+        ))?;
         let mut rows = stmt.query([])?;
         let mut agents = Vec::new();
         while let Some(row) = rows.next()? {
@@ -1837,14 +1793,67 @@ impl Store {
 
     pub fn children_of(&self, parent_id: &AgentId) -> Result<Vec<Agent>, Error> {
         let conn = self.read_conn();
-        let mut stmt = conn.prepare(&format!(
-            "SELECT {AGENT_COLS} FROM agents WHERE parent_id = ?1 ORDER BY created_at_ms, name"
+        let mut stmt = conn.prepare_cached(concat!(
+            "SELECT ",
+            agent_cols!(),
+            " FROM agents WHERE parent_id = ?1 ORDER BY created_at_ms, name"
         ))?;
         let mut rows = stmt.query([parent_id.as_str()])?;
         let mut agents = Vec::new();
         while let Some(row) = rows.next()? {
             agents.push(agent_from_row(row)?);
         }
+        Ok(agents)
+    }
+
+    /// A parent's children that are not archived, oldest first. Served by a
+    /// partial index, so a parent's archived history is never read.
+    pub fn live_children_of(&self, parent_id: &AgentId) -> Result<Vec<Agent>, Error> {
+        let conn = self.read_conn();
+        let mut stmt = conn.prepare_cached(concat!(
+            "SELECT ",
+            agent_cols!(),
+            " FROM agents WHERE parent_id = ?1 AND state != 'archived'
+             ORDER BY created_at_ms, name"
+        ))?;
+        let agents = stmt
+            .query_map([parent_id.as_str()], agent_from_row)?
+            .collect::<Result<_, _>>()?;
+        Ok(agents)
+    }
+
+    /// Ids of the agents in one lifecycle state, by name, from the state index.
+    pub fn agent_ids_in_state(&self, state: &str) -> Result<Vec<AgentId>, Error> {
+        let conn = self.read_conn();
+        let mut stmt =
+            conn.prepare_cached("SELECT id FROM agents WHERE state = ?1 ORDER BY name")?;
+        let ids = stmt
+            .query_map([state], |row| row.get::<_, String>(0))?
+            .map(|id| AgentId::parse(&id?))
+            .collect::<Result<_, Error>>()?;
+        Ok(ids)
+    }
+
+    /// Every agent (or every non-archived one) by name, without reading
+    /// instructions or decoding launch environments.
+    pub fn agent_summaries(&self, include_archived: bool) -> Result<Vec<AgentSummary>, Error> {
+        let conn = self.read_conn();
+        let mut stmt = if include_archived {
+            conn.prepare_cached(concat!(
+                "SELECT ",
+                agent_summary_cols!(),
+                " FROM agents ORDER BY name"
+            ))?
+        } else {
+            conn.prepare_cached(concat!(
+                "SELECT ",
+                agent_summary_cols!(),
+                " FROM agents WHERE state != 'archived' ORDER BY name"
+            ))?
+        };
+        let agents = stmt
+            .query_map([], agent_summary_from_row)?
+            .collect::<Result<_, _>>()?;
         Ok(agents)
     }
 
@@ -1994,7 +2003,7 @@ impl Store {
             return Err(Error::Message(format!("invalid group name: {name}")));
         }
         let conn = self.conn();
-        agent_by_id(&conn, agent_id)?;
+        agent_exists(&conn, agent_id)?;
         conn.execute(
             "INSERT OR IGNORE INTO groups (name, created_at_ms) VALUES (?1, ?2)",
             params![name, now_ms()],
@@ -2043,7 +2052,7 @@ impl Store {
 
     /// Whether a named virtual group is `public` (`true`) or `private` (`false`, default).
     pub fn is_group_public(&self, name: &str) -> bool {
-        let conn = self.conn();
+        let conn = self.read_conn();
         conn.query_row("SELECT public FROM groups WHERE name = ?1", [name], |r| {
             Ok(r.get::<_, i64>(0)? != 0)
         })
@@ -2052,34 +2061,20 @@ impl Store {
 
     /// The agents in a named group, by name. An unknown group is empty.
     pub fn group_members(&self, name: &str) -> Result<Vec<String>, Error> {
-        let conn = self.conn();
-        let mut stmt = conn.prepare(
-            "SELECT a.name FROM group_agents AS g JOIN agents AS a ON a.id = g.agent_id
-             WHERE g.group_name = ?1 ORDER BY a.name",
-        )?;
-        let mut rows = stmt.query([name])?;
-        let mut members = Vec::new();
-        while let Some(row) = rows.next()? {
-            members.push(row.get(0)?);
-        }
-        Ok(members)
+        group_members_on(&self.read_conn(), name)
     }
 
     /// Every named group and its current members, ordered by group name.
     pub fn list_groups(&self) -> Result<Vec<(String, Vec<String>)>, Error> {
+        let conn = self.read_conn();
         let names: Vec<String> = {
-            let conn = self.conn();
             let mut stmt = conn.prepare("SELECT name FROM groups ORDER BY name")?;
-            let mut rows = stmt.query([])?;
-            let mut out = Vec::new();
-            while let Some(row) = rows.next()? {
-                out.push(row.get(0)?);
-            }
-            out
+            stmt.query_map([], |row| row.get(0))?
+                .collect::<Result<_, _>>()?
         };
         let mut groups = Vec::with_capacity(names.len());
         for name in names {
-            let members = self.group_members(&name)?;
+            let members = group_members_on(&conn, &name)?;
             groups.push((name, members));
         }
         Ok(groups)
@@ -2172,7 +2167,7 @@ impl Store {
     pub fn attach_channel(&self, channel_id: &ChannelId, agent_id: &AgentId) -> Result<(), Error> {
         let conn = self.conn();
         channel_with(&conn, channel_id)?;
-        agent_by_id(&conn, agent_id)?;
+        agent_exists(&conn, agent_id)?;
         conn.execute(
             "INSERT OR IGNORE INTO channel_agents (channel_id, agent_id) VALUES (?1, ?2)",
             params![channel_id.as_str(), agent_id.as_str()],
@@ -2273,12 +2268,12 @@ impl Store {
             .and_then(|sender| sender.strip_prefix("agent:"))
             .and_then(|reference| AgentId::parse(reference).ok())
         {
-            agent_by_id(&tx, &author)?;
+            agent_exists(&tx, &author)?;
         }
         if !admit(&tx)? {
             return Ok(None);
         }
-        agent_by_id(&tx, agent_id)?;
+        agent_exists(&tx, agent_id)?;
         // Erasure is authoritative over provider retries/edits, including basic
         // group relays and rows outside the normal bounded origin scan. Refuse
         // resurrection before source dedup, quote/mention enrichment, baseline
@@ -2773,11 +2768,14 @@ impl Store {
         // child, mail past its cursor, no completed turn) is reviewed on every
         // idle pass and must not take the writer lock each time. The UPDATE
         // below re-checks the same predicate under the lock.
-        let eligible: bool = self.read_conn().query_row(
-            &format!("SELECT EXISTS(SELECT 1 FROM agents WHERE {IDLE_RELEASE_PREDICATE})"),
-            [id.as_str()],
-            |row| row.get(0),
-        )?;
+        let eligible: bool = self
+            .read_conn()
+            .prepare_cached(concat!(
+                "SELECT EXISTS(SELECT 1 FROM agents WHERE ",
+                idle_release_predicate!(),
+                ")"
+            ))?
+            .query_row([id.as_str()], |row| row.get(0))?;
         if !eligible {
             return Ok(false);
         }
@@ -2828,7 +2826,10 @@ impl Store {
                 )
                 .optional()?;
             let updated = tx.execute(
-                &format!("UPDATE agents SET state = 'idle' WHERE {IDLE_RELEASE_PREDICATE}"),
+                concat!(
+                    "UPDATE agents SET state = 'idle' WHERE ",
+                    idle_release_predicate!()
+                ),
                 [id.as_str()],
             )?;
             tx.commit()?;
@@ -2888,7 +2889,7 @@ impl Store {
                 [id.as_str()],
             )?;
             if changed == 0 {
-                agent_by_id(&tx, id)?;
+                agent_exists(&tx, id)?;
                 return Err(Error::Message(format!(
                     "agent {id} was admitted; its name is not a failed reservation"
                 )));
@@ -2979,8 +2980,8 @@ impl Store {
 
     /// Messages with `seq > since`, in sequence order. `None` starts at the beginning.
     pub fn inbox(&self, agent_id: &AgentId, since: Option<i64>) -> Result<Vec<Message>, Error> {
-        let conn = self.conn();
-        agent_by_id(&conn, agent_id)?;
+        let conn = self.read_conn();
+        agent_exists(&conn, agent_id)?;
         let delivered = cursor(&conn, agent_id)?;
         let mut stmt = conn.prepare(&format!(
             "SELECT {MESSAGE_COLS}
@@ -3014,7 +3015,7 @@ impl Store {
         sender: Option<&str>,
     ) -> Result<Vec<Message>, Error> {
         let conn = self.read_conn();
-        agent_by_id(&conn, agent_id)?;
+        agent_exists(&conn, agent_id)?;
         let delivered = cursor(&conn, agent_id)?;
         let mut stmt = conn.prepare(&format!(
             "SELECT {MESSAGE_COLS} FROM messages
@@ -3181,22 +3182,21 @@ impl Store {
         &self,
         agent_id: &AgentId,
     ) -> Result<TurnOwnershipSnapshot, Error> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let last_in: Option<(i64, i64, Option<String>, Option<String>)> = conn
-            .query_row(
+            .prepare_cached(
                 "SELECT seq, delivered_at_ms, sender, source_key
                  FROM messages
                  WHERE agent_id = ?1 AND delivered_at_ms IS NOT NULL
                  ORDER BY seq DESC LIMIT 1",
-                [agent_id.as_str()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
+            )?
+            .query_row([agent_id.as_str()], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
             .optional()?;
-        let last_outbound_at_ms: Option<i64> = conn.query_row(
-            "SELECT MAX(sent_at_ms) FROM outbound_messages WHERE agent_id = ?1",
-            [agent_id.as_str()],
-            |row| row.get(0),
-        )?;
+        let last_outbound_at_ms: Option<i64> = conn
+            .prepare_cached("SELECT MAX(sent_at_ms) FROM outbound_messages WHERE agent_id = ?1")?
+            .query_row([agent_id.as_str()], |row| row.get(0))?;
         Ok(match last_in {
             Some((seq, delivered_at_ms, sender, source_key)) => TurnOwnershipSnapshot {
                 last_delivered_seq: Some(seq),
@@ -3220,12 +3220,12 @@ impl Store {
         agent_id: &AgentId,
         source_key: &str,
     ) -> Result<bool, Error> {
-        let conn = self.conn();
-        let exists: i64 = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM messages WHERE agent_id = ?1 AND source_key = ?2)",
-            params![agent_id.as_str(), source_key],
-            |row| row.get(0),
-        )?;
+        let conn = self.read_conn();
+        let exists: i64 = conn
+            .prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM messages WHERE agent_id = ?1 AND source_key = ?2)",
+            )?
+            .query_row(params![agent_id.as_str(), source_key], |row| row.get(0))?;
         Ok(exists != 0)
     }
 
@@ -4422,12 +4422,17 @@ impl Store {
     /// The next message the harness has not taken, or `None` when delivery has
     /// caught up.
     pub fn next_undelivered(&self, agent_id: &AgentId) -> Result<Option<Message>, Error> {
-        let delivered = self.delivered_cursor(agent_id)?;
+        let conn = self.read_conn();
+        // One snapshot: a line committed between reading the cursor and the
+        // last sequence must not look like a hole in the mailbox.
+        let snapshot = conn.unchecked_transaction()?;
+        agent_exists(&snapshot, agent_id)?;
+        let delivered = cursor(&snapshot, agent_id)?;
         let next = delivered + 1;
-        if let Some(message) = self.message_at(agent_id, next)? {
+        if let Some(message) = message_at_on(&snapshot, agent_id, next, delivered)? {
             return Ok(Some(message));
         }
-        let received = self.received_cursor(agent_id)?;
+        let received = last_seq(&snapshot, agent_id)?;
         if received > delivered {
             return Err(Error::Message(format!(
                 "mailbox sequence has a hole at {next}"
@@ -4440,40 +4445,35 @@ impl Store {
     /// agent (`event != "reaction_passive"`). Passive group reactions remain in
     /// the mailbox and are delivered on the agent's next active turn.
     pub fn has_actionable_undelivered(&self, agent_id: &AgentId) -> Result<bool, Error> {
-        let conn = self.conn();
-        agent_by_id(&conn, agent_id)?;
+        let conn = self.read_conn();
+        agent_exists(&conn, agent_id)?;
         let delivered = cursor(&conn, agent_id)?;
         // Server-side filter (same predicate as the roster query): the
         // per-row Rust JSON parse would scan and deserialize every
         // undelivered line on each idle poll, pinning one core per agent
         // (80 agents x 4 polls/s against a multi-GB mailbox).
-        let found: bool = conn.query_row(
-            "SELECT EXISTS(
-               SELECT 1 FROM messages
-               WHERE agent_id = ?1 AND seq > ?2
-                 AND (CASE WHEN json_valid(context) THEN json_extract(context, '$.event') END) IS NOT 'reaction_passive'
-             )",
-            params![agent_id.as_str(), delivered],
-            |row| row.get(0),
-        )?;
+        let found: bool = conn
+            .prepare_cached(
+                "SELECT EXISTS(
+                   SELECT 1 FROM messages
+                   WHERE agent_id = ?1 AND seq > ?2
+                     AND (CASE WHEN json_valid(context) THEN json_extract(context, '$.event') END) IS NOT 'reaction_passive'
+                 )",
+            )?
+            .query_row(params![agent_id.as_str(), delivered], |row| row.get(0))?;
         Ok(found)
     }
 
     pub fn received_cursor(&self, agent_id: &AgentId) -> Result<i64, Error> {
-        let conn = self.conn();
-        agent_by_id(&conn, agent_id)?;
-        let seq: i64 = conn.query_row(
-            "SELECT MAX(0, COALESCE(MAX(seq), 0)) FROM messages WHERE agent_id = ?1",
-            [agent_id.as_str()],
-            |row| row.get(0),
-        )?;
-        Ok(seq)
+        let conn = self.read_conn();
+        agent_exists(&conn, agent_id)?;
+        last_seq(&conn, agent_id)
     }
 
     /// The one delivery cursor: the last sequence the harness took.
     pub fn delivered_cursor(&self, agent_id: &AgentId) -> Result<i64, Error> {
         let conn = self.read_conn();
-        agent_by_id(&conn, agent_id)?;
+        agent_exists(&conn, agent_id)?;
         cursor(&conn, agent_id)
     }
 
@@ -4482,7 +4482,7 @@ impl Store {
     pub fn advance_delivered(&self, agent_id: &AgentId, seq: i64) -> Result<i64, Error> {
         self.write_with_retry(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            agent_by_id(&tx, agent_id)?;
+            agent_exists(&tx, agent_id)?;
             bump_delivered(&tx, agent_id, seq)?;
             tx.commit()?;
             Ok(seq)
@@ -4505,7 +4505,7 @@ impl Store {
     pub fn note_delivered(&self, agent_id: &AgentId, seq: i64) -> Result<(), Error> {
         self.write_with_retry(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            agent_by_id(&tx, agent_id)?;
+            agent_exists(&tx, agent_id)?;
             bump_delivered(&tx, agent_id, seq)?;
             let now = now_ms();
             let prev_seq = (seq - 1).max(0);
@@ -4557,7 +4557,7 @@ impl Store {
         }
         self.write_with_retry(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            agent_by_id(&tx, agent_id)?;
+            agent_exists(&tx, agent_id)?;
             let mut seqs = Vec::new();
             for msg_id in message_ids {
                 if let Some(seq) = tx
@@ -4615,7 +4615,7 @@ impl Store {
         }
         self.write_with_retry(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            agent_by_id(&tx, agent_id)?;
+            agent_exists(&tx, agent_id)?;
             let mut min_seq: Option<i64> = None;
             for msg_id in message_ids {
                 if let Some(seq) = tx
@@ -4780,7 +4780,7 @@ impl Store {
             // BEGIN IMMEDIATE: a SELECT-then-UPDATE under BEGIN DEFERRED raises
             // SQLITE_BUSY without honouring busy_timeout when a peer is writing.
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            agent_by_id(&tx, agent_id)?;
+            agent_exists(&tx, agent_id)?;
             tx.execute(
                 "UPDATE turn_recovery
                  SET completed_seq = opened_seq,
@@ -4797,7 +4797,7 @@ impl Store {
     pub fn note_turn_recovered(&self, agent_id: &AgentId, opened_seq: i64) -> Result<(), Error> {
         self.write_with_retry(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            agent_by_id(&tx, agent_id)?;
+            agent_exists(&tx, agent_id)?;
             tx.execute(
                 "UPDATE turn_recovery
                  SET recovery_count = recovery_count + 1
@@ -4813,11 +4813,10 @@ impl Store {
     pub fn has_open_turn(&self, agent_id: &AgentId) -> Result<bool, Error> {
         let conn = self.read_conn();
         let row: Option<(i64, i64)> = conn
-            .query_row(
+            .prepare_cached(
                 "SELECT opened_seq, completed_seq FROM turn_recovery WHERE agent_id = ?1",
-                [agent_id.as_str()],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
+            )?
+            .query_row([agent_id.as_str()], |r| Ok((r.get(0)?, r.get(1)?)))
             .optional()?;
         Ok(row.is_some_and(|(opened_seq, completed_seq)| opened_seq > completed_seq))
     }
@@ -4826,14 +4825,15 @@ impl Store {
     /// eligible for automatic mid-turn recovery.
     pub fn open_turn(&self, agent_id: &AgentId) -> Result<Option<OpenTurn>, Error> {
         let conn = self.read_conn();
-        agent_by_id(&conn, agent_id)?;
+        agent_exists(&conn, agent_id)?;
         let row: Option<(i64, i64, i64, i64)> = conn
-            .query_row(
+            .prepare_cached(
                 "SELECT opened_seq, completed_seq, recovery_count, opened_at_ms
                  FROM turn_recovery WHERE agent_id = ?1",
-                [agent_id.as_str()],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-            )
+            )?
+            .query_row([agent_id.as_str()], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })
             .optional()?;
         let Some((opened_seq, completed_seq, recovery_count, opened_at_ms)) = row else {
             return Ok(None);
@@ -4842,9 +4842,10 @@ impl Store {
             return Ok(None);
         }
         let delivered = cursor(&conn, agent_id)?;
-        let mut msg_stmt = conn.prepare(&format!(
-            "SELECT {MESSAGE_COLS}
-             FROM messages
+        let mut msg_stmt = conn.prepare_cached(concat!(
+            "SELECT ",
+            message_cols!(),
+            " FROM messages
              WHERE agent_id = ?1 AND seq > ?2 AND seq <= ?3
              ORDER BY seq ASC"
         ))?;
@@ -4856,7 +4857,7 @@ impl Store {
         if messages.is_empty() {
             return Ok(None);
         }
-        let mut out_stmt = conn.prepare(
+        let mut out_stmt = conn.prepare_cached(
             "SELECT id, destination, reply_to, body, sent_at_ms
              FROM outbound_messages
              WHERE agent_id = ?1 AND sent_at_ms >= ?2
@@ -4885,14 +4886,17 @@ impl Store {
     }
 
     pub fn message(&self, agent_id: &AgentId, id: &str) -> Result<Option<Message>, Error> {
-        let conn = self.conn();
-        agent_by_id(&conn, agent_id)?;
+        let conn = self.read_conn();
+        agent_exists(&conn, agent_id)?;
         let found = conn
-            .query_row(
-                &format!("SELECT {MESSAGE_COLS} FROM messages WHERE agent_id = ?1 AND id = ?2"),
-                params![agent_id.as_str(), id],
-                |row| Ok(message_from_row(&conn, row)),
-            )
+            .prepare_cached(concat!(
+                "SELECT ",
+                message_cols!(),
+                " FROM messages WHERE agent_id = ?1 AND id = ?2"
+            ))?
+            .query_row(params![agent_id.as_str(), id], |row| {
+                Ok(message_from_row(&conn, row))
+            })
             .optional()?;
         found.transpose()
     }
@@ -4927,7 +4931,7 @@ impl Store {
         // second row for the same usage.
         self.write_with_retry(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            agent_by_id(&tx, &record.agent_id)?;
+            agent_exists(&tx, &record.agent_id)?;
             tx.execute(
                 "INSERT INTO usage_records (
                     id, agent_id, harness, model, input_tokens, output_tokens,
@@ -4958,10 +4962,10 @@ impl Store {
     }
 
     pub fn list_usage(&self, agent_id: Option<&AgentId>) -> Result<Vec<UsageRecord>, Error> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let sql = match agent_id {
             Some(id) => {
-                agent_by_id(&conn, id)?;
+                agent_exists(&conn, id)?;
                 "SELECT id, agent_id, harness, model, input_tokens, output_tokens,
                         cache_read_tokens, cache_write_tokens, reported_cost_micros,
                         estimated_cost_micros, billing_mode, quota_state, day, recorded_at_ms
@@ -4986,54 +4990,35 @@ impl Store {
         Ok(records)
     }
 
-    fn message_at(&self, agent_id: &AgentId, seq: i64) -> Result<Option<Message>, Error> {
-        let conn = self.conn();
-        let found = conn
-            .query_row(
-                &format!("SELECT {MESSAGE_COLS} FROM messages WHERE agent_id = ?1 AND seq = ?2"),
-                params![agent_id.as_str(), seq],
-                |row| Ok(message_from_row(&conn, row)),
-            )
-            .optional()?;
-        found.transpose()
-    }
-
     fn age_at(&self, agent_id: &AgentId, seq: i64, now_ms: i64) -> Result<Option<i64>, Error> {
         let conn = self.read_conn();
         // Server-side filter: per-row JSON parse here pins a core per agent
         // on every health publish; see `has_actionable_undelivered`.
         let received_at: Option<i64> = conn
-            .query_row(
+            .prepare_cached(
                 "SELECT received_at_ms FROM messages
                  WHERE agent_id = ?1 AND seq >= ?2
                    AND (CASE WHEN json_valid(context) THEN json_extract(context, '$.event') END) IS NOT 'reaction_passive'
                  ORDER BY seq ASC LIMIT 1",
-                params![agent_id.as_str(), seq],
-                |row| row.get(0),
-            )
+            )?
+            .query_row(params![agent_id.as_str(), seq], |row| row.get(0))
             .optional()?;
         Ok(received_at.map(|at| (now_ms - at).max(0)))
     }
 
+    /// The process's one read-write connection to this database. Use it only
+    /// to write: reads go through [`Store::read_conn`] and never wait here.
     pub(crate) fn conn(&self) -> MutexGuard<'_, Connection> {
-        self.conn
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.shared.writer()
     }
 
-    fn read_conn(&self) -> ReadConn<'_> {
-        if !self.db_path.as_os_str().is_empty()
-            && let Ok(c) = Connection::open_with_flags(
-                &self.db_path,
-                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-            )
-        {
-            let _ = c.busy_timeout(Duration::from_secs(30));
-            let _ = c.pragma_update(None, "query_only", "ON");
-            return ReadConn::Owned(c);
-        }
-        ReadConn::Guard(self.conn())
+    /// A read-only connection from the shared pool. Each statement outside an
+    /// explicit transaction reads the latest commit, including this process's
+    /// own writes. Falls back to the writer only when no reader can be opened.
+    pub(crate) fn read_conn(&self) -> ReadConn<'_> {
+        self.shared
+            .reader()
+            .unwrap_or_else(|| ReadConn::Guard(self.conn()))
     }
 
     pub fn create_schedule(&self, input: NewSchedule) -> Result<AgentSchedule, Error> {
@@ -5044,7 +5029,7 @@ impl Store {
         }
         let id = format!("sch_{:012x}{}", now, hex(&rand_bytes));
         let conn = self.conn();
-        agent_by_id(&conn, &input.agent_id)?;
+        agent_exists(&conn, &input.agent_id)?;
         // Deduplicate identical active recurring/watch schedules for the same agent.
         if (input.kind == "every" || input.kind == "watch")
             && let Some(existing_id) = conn
@@ -5099,51 +5084,47 @@ impl Store {
         let mut out = Vec::new();
         match (agent_id, active_only) {
             (Some(aid), true) => {
-                let mut stmt = conn.prepare(
-                    "SELECT id, agent_id, kind, spec, prompt, interval_ms, next_fire_at_ms,
-                            last_fired_at_ms, watch_baseline, last_observed, state, created_at_ms
-                     FROM agent_schedules
-                     WHERE agent_id = ?1 AND state = 'active'
-                     ORDER BY created_at_ms ASC, id ASC",
-                )?;
+                let mut stmt = conn.prepare_cached(concat!(
+                    "SELECT ",
+                    schedule_cols!(),
+                    " FROM agent_schedules WHERE agent_id = ?1 AND state = 'active'
+                     ORDER BY created_at_ms ASC, id ASC"
+                ))?;
                 let rows = stmt.query_map([aid.as_str()], schedule_from_row)?;
                 for row in rows {
                     out.push(row?);
                 }
             }
             (Some(aid), false) => {
-                let mut stmt = conn.prepare(
-                    "SELECT id, agent_id, kind, spec, prompt, interval_ms, next_fire_at_ms,
-                            last_fired_at_ms, watch_baseline, last_observed, state, created_at_ms
-                     FROM agent_schedules
-                     WHERE agent_id = ?1
-                     ORDER BY created_at_ms ASC, id ASC",
-                )?;
+                let mut stmt = conn.prepare_cached(concat!(
+                    "SELECT ",
+                    schedule_cols!(),
+                    " FROM agent_schedules WHERE agent_id = ?1
+                     ORDER BY created_at_ms ASC, id ASC"
+                ))?;
                 let rows = stmt.query_map([aid.as_str()], schedule_from_row)?;
                 for row in rows {
                     out.push(row?);
                 }
             }
             (None, true) => {
-                let mut stmt = conn.prepare(
-                    "SELECT id, agent_id, kind, spec, prompt, interval_ms, next_fire_at_ms,
-                            last_fired_at_ms, watch_baseline, last_observed, state, created_at_ms
-                     FROM agent_schedules
-                     WHERE state = 'active'
-                     ORDER BY created_at_ms ASC, id ASC",
-                )?;
+                let mut stmt = conn.prepare_cached(concat!(
+                    "SELECT ",
+                    schedule_cols!(),
+                    " FROM agent_schedules WHERE state = 'active'
+                     ORDER BY created_at_ms ASC, id ASC"
+                ))?;
                 let rows = stmt.query_map([], schedule_from_row)?;
                 for row in rows {
                     out.push(row?);
                 }
             }
             (None, false) => {
-                let mut stmt = conn.prepare(
-                    "SELECT id, agent_id, kind, spec, prompt, interval_ms, next_fire_at_ms,
-                            last_fired_at_ms, watch_baseline, last_observed, state, created_at_ms
-                     FROM agent_schedules
-                     ORDER BY created_at_ms ASC, id ASC",
-                )?;
+                let mut stmt = conn.prepare_cached(concat!(
+                    "SELECT ",
+                    schedule_cols!(),
+                    " FROM agent_schedules ORDER BY created_at_ms ASC, id ASC"
+                ))?;
                 let rows = stmt.query_map([], schedule_from_row)?;
                 for row in rows {
                     out.push(row?);
@@ -5154,14 +5135,13 @@ impl Store {
     }
 
     pub fn get_schedule(&self, id: &str) -> Result<Option<AgentSchedule>, Error> {
-        let conn = self.conn();
-        conn.query_row(
-            "SELECT id, agent_id, kind, spec, prompt, interval_ms, next_fire_at_ms,
-                    last_fired_at_ms, watch_baseline, last_observed, state, created_at_ms
-             FROM agent_schedules WHERE id = ?1",
-            [id.trim()],
-            schedule_from_row,
-        )
+        let conn = self.read_conn();
+        conn.prepare_cached(concat!(
+            "SELECT ",
+            schedule_cols!(),
+            " FROM agent_schedules WHERE id = ?1"
+        ))?
+        .query_row([id.trim()], schedule_from_row)
         .optional()
         .map_err(Error::from)
     }
@@ -5326,11 +5306,11 @@ impl Store {
         watch_baseline: Option<&str>,
         last_observed: Option<&str>,
     ) -> Result<(), Error> {
-        // Coalesce unchanged observations: the 1s schedule tick would
-        // otherwise write a WAL frame per watch per second even when both
-        // fields already hold those values.
-        let conn = self.conn();
-        let cur: Option<(Option<String>, Option<String>)> = conn
+        // Coalesce unchanged observations: a schedule pass would otherwise
+        // write a WAL frame per watch even when both fields already hold
+        // those values. The reader decides; only a change takes the writer.
+        let cur: Option<(Option<String>, Option<String>)> = self
+            .read_conn()
             .query_row(
                 "SELECT watch_baseline, last_observed FROM agent_schedules WHERE id = ?1 AND state = 'active'",
                 [id],
@@ -5352,7 +5332,7 @@ impl Store {
         if new_baseline == cur_baseline && new_observed == cur_observed {
             return Ok(());
         }
-        conn.execute(
+        self.conn().execute(
             "UPDATE agent_schedules
              SET watch_baseline = COALESCE(?2, watch_baseline),
                  last_observed = COALESCE(?3, last_observed)
@@ -5364,13 +5344,12 @@ impl Store {
 }
 
 fn schedule_by_id(conn: &Connection, id: &str) -> Result<AgentSchedule, Error> {
-    conn.query_row(
-        "SELECT id, agent_id, kind, spec, prompt, interval_ms, next_fire_at_ms,
-                last_fired_at_ms, watch_baseline, last_observed, state, created_at_ms
-         FROM agent_schedules WHERE id = ?1",
-        [id],
-        schedule_from_row,
-    )
+    conn.prepare_cached(concat!(
+        "SELECT ",
+        schedule_cols!(),
+        " FROM agent_schedules WHERE id = ?1"
+    ))?
+    .query_row([id], schedule_from_row)
     .optional()?
     .ok_or_else(|| Error::Message(format!("schedule not found: {id}")))
 }
@@ -6029,11 +6008,22 @@ fn legacy_last_error(data_dir: &Path, id: &AgentId) -> Option<String> {
 
 fn agent_by_id(conn: &Connection, id: &AgentId) -> Result<Agent, Error> {
     let found = conn
-        .query_row(
-            &format!("SELECT {AGENT_COLS} FROM agents WHERE id = ?1"),
-            [id.as_str()],
-            agent_from_row,
-        )
+        .prepare_cached(concat!(
+            "SELECT ",
+            agent_cols!(),
+            " FROM agents WHERE id = ?1"
+        ))?
+        .query_row([id.as_str()], agent_from_row)
+        .optional()?;
+    found.ok_or_else(|| Error::AgentNotFound(id.to_string()))
+}
+
+/// `Ok` when the agent exists, else [`Error::AgentNotFound`]: the guard most
+/// mailbox and turn operations need, without reading or decoding the row.
+fn agent_exists(conn: &Connection, id: &AgentId) -> Result<(), Error> {
+    let found = conn
+        .prepare_cached("SELECT 1 FROM agents WHERE id = ?1")?
+        .query_row([id.as_str()], |_| Ok(()))
         .optional()?;
     found.ok_or_else(|| Error::AgentNotFound(id.to_string()))
 }
@@ -6192,6 +6182,32 @@ fn agent_from_row(row: &rusqlite::Row<'_>) -> Result<Agent, rusqlite::Error> {
             .map(|json| decode_env(&json))
             .unwrap_or_default(),
         parent_id,
+    })
+}
+
+fn agent_summary_from_row(row: &rusqlite::Row<'_>) -> Result<AgentSummary, rusqlite::Error> {
+    let parse = |index: usize, raw: &str| {
+        AgentId::parse(raw).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(
+                index,
+                rusqlite::types::Type::Text,
+                Box::new(err),
+            )
+        })
+    };
+    Ok(AgentSummary {
+        id: parse(0, &row.get::<_, String>(0)?)?,
+        name: row.get(1)?,
+        harness: row.get(2)?,
+        model: row.get(3)?,
+        state: row.get(4)?,
+        parent_id: match row.get::<_, Option<String>>(5)? {
+            Some(raw) if !raw.is_empty() => Some(parse(5, &raw)?),
+            _ => None,
+        },
+        role: row.get(6)?,
+        is_admin: row.get(7)?,
+        created_at_ms: row.get(8)?,
     })
 }
 
@@ -6669,14 +6685,14 @@ fn message_by_source(
     source_key: &str,
 ) -> Result<Option<Message>, Error> {
     let found = conn
-        .query_row(
-            &format!(
-                "SELECT {MESSAGE_COLS} FROM messages
-                 WHERE agent_id = ?1 AND source_key = ?2"
-            ),
-            params![agent_id.as_str(), source_key],
-            |row| Ok(message_from_row(conn, row)),
-        )
+        .prepare_cached(concat!(
+            "SELECT ",
+            message_cols!(),
+            " FROM messages WHERE agent_id = ?1 AND source_key = ?2"
+        ))?
+        .query_row(params![agent_id.as_str(), source_key], |row| {
+            Ok(message_from_row(conn, row))
+        })
         .optional()?;
     found.transpose()
 }
@@ -7970,21 +7986,56 @@ fn extract_at_handles(text: &str) -> Vec<String> {
 }
 
 fn next_seq(conn: &Connection, agent_id: &AgentId) -> Result<i64, Error> {
-    let seq = conn.query_row(
-        "SELECT MAX(0, COALESCE(MAX(seq), 0)) + 1 FROM messages WHERE agent_id = ?1",
-        [agent_id.as_str()],
-        |row| row.get(0),
-    )?;
+    let seq = conn
+        .prepare_cached(
+            "SELECT MAX(0, COALESCE(MAX(seq), 0)) + 1 FROM messages WHERE agent_id = ?1",
+        )?
+        .query_row([agent_id.as_str()], |row| row.get(0))?;
     Ok(seq)
+}
+
+/// The highest sequence in the agent's mailbox, or 0 when it is empty.
+fn last_seq(conn: &Connection, agent_id: &AgentId) -> Result<i64, Error> {
+    Ok(conn
+        .prepare_cached("SELECT MAX(0, COALESCE(MAX(seq), 0)) FROM messages WHERE agent_id = ?1")?
+        .query_row([agent_id.as_str()], |row| row.get(0))?)
+}
+
+/// The mailbox line at `seq`, acknowledged against the `delivered` cursor.
+fn message_at_on(
+    conn: &Connection,
+    agent_id: &AgentId,
+    seq: i64,
+    delivered: i64,
+) -> Result<Option<Message>, Error> {
+    let found = conn
+        .prepare_cached(concat!(
+            "SELECT ",
+            message_cols!(),
+            " FROM messages WHERE agent_id = ?1 AND seq = ?2"
+        ))?
+        .query_row(params![agent_id.as_str(), seq], |row| {
+            Ok(message_from_row_with_cursor(row, delivered))
+        })
+        .optional()?;
+    found.transpose()
+}
+
+fn group_members_on(conn: &Connection, name: &str) -> Result<Vec<String>, Error> {
+    let mut stmt = conn.prepare(
+        "SELECT a.name FROM group_agents AS g JOIN agents AS a ON a.id = g.agent_id
+         WHERE g.group_name = ?1 ORDER BY a.name",
+    )?;
+    let members = stmt
+        .query_map([name], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    Ok(members)
 }
 
 fn cursor(conn: &Connection, agent_id: &AgentId) -> Result<i64, Error> {
     let found = conn
-        .query_row(
-            "SELECT delivered_seq FROM mailbox_cursors WHERE agent_id = ?1",
-            [agent_id.as_str()],
-            |row| row.get(0),
-        )
+        .prepare_cached("SELECT delivered_seq FROM mailbox_cursors WHERE agent_id = ?1")?
+        .query_row([agent_id.as_str()], |row| row.get(0))
         .optional()?;
     found.ok_or_else(|| Error::Message(format!("mailbox cursor missing for {agent_id}")))
 }
@@ -8006,38 +8057,11 @@ fn bump_delivered(conn: &Connection, agent_id: &AgentId, seq: i64) -> Result<(),
 }
 
 fn message_exists(conn: &Connection, agent_id: &AgentId, seq: i64) -> Result<bool, Error> {
-    let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM messages WHERE agent_id = ?1 AND seq = ?2",
-        params![agent_id.as_str(), seq],
-        |row| row.get(0),
-    )?;
+    let count: i64 = conn
+        .prepare_cached("SELECT COUNT(*) FROM messages WHERE agent_id = ?1 AND seq = ?2")?
+        .query_row(params![agent_id.as_str(), seq], |row| row.get(0))?;
     Ok(count == 1)
 }
-
-/// Rows of `agents` (bound as `?1`) that may scale to zero: running, no
-/// running child, the last turn completed past every mailbox line, and every
-/// line delivered. Shared by the read-only precheck and the guarded UPDATE.
-const IDLE_RELEASE_PREDICATE: &str = "id = ?1
-    AND state = 'running'
-    AND NOT EXISTS (
-        SELECT 1 FROM agents child
-        WHERE child.parent_id = ?1
-          AND child.state = 'running'
-    )
-    AND EXISTS (
-        SELECT 1 FROM turn_recovery tr
-        WHERE tr.agent_id = ?1
-          AND tr.completed_seq >= tr.opened_seq
-          AND tr.completed_seq > 0
-          AND tr.completed_seq >= COALESCE((
-              SELECT MAX(m.seq) FROM messages m WHERE m.agent_id = ?1
-          ), 0)
-    )
-    AND COALESCE((
-        SELECT mc.delivered_seq FROM mailbox_cursors mc WHERE mc.agent_id = ?1
-    ), 0) >= COALESCE((
-        SELECT MAX(m.seq) FROM messages m WHERE m.agent_id = ?1
-    ), 0)";
 
 #[cfg(test)]
 mod tests {
@@ -9541,6 +9565,24 @@ mod tests {
                 [hidden.id.as_str()],
             )
             .unwrap();
+        let mut keyed = Incoming::new("keyed line");
+        keyed.source_key = Some("src:read".into());
+        let ReceiveOutcome::New(line) = store.receive(&own.id, keyed).unwrap() else {
+            panic!("a new line");
+        };
+        store.record_send_receipt("send-1", "receipt").unwrap();
+        store.join_group("readers", &own.id).unwrap();
+        let watch = store
+            .create_schedule(NewSchedule {
+                agent_id: own.id.clone(),
+                kind: "watch".into(),
+                spec: "file:/tmp/never".into(),
+                prompt: "check".into(),
+                interval_ms: None,
+                next_fire_at_ms: None,
+                watch_baseline: Some("base".into()),
+            })
+            .unwrap();
         std::thread::scope(|scope| {
             let mut writer = store.conn();
             let tx = writer
@@ -9574,6 +9616,29 @@ mod tests {
                     store.lag(id, now_ms())?;
                     store.has_open_turn(id)?;
                     store.open_turn(id)?;
+                    assert_eq!(store.send_receipt("send-1")?.as_deref(), Some("receipt"));
+                    assert!(store.message_by_source_key(id, "src:read")?.is_some());
+                    assert!(store.has_message_source_key(id, "src:read")?);
+                    assert!(store.ever_authenticated());
+                    assert!(!store.is_group_public("readers"));
+                    assert_eq!(store.group_members("readers")?, ["reader"]);
+                    assert_eq!(store.list_groups()?.len(), 1);
+                    store.group("readers")?;
+                    store.check_group_joins(&GroupActor::Agent(id.clone()), &["readers"])?;
+                    assert_eq!(store.inbox(id, None)?.len(), 1);
+                    store.turn_ownership_snapshot(id)?;
+                    assert!(store.has_actionable_undelivered(id)?);
+                    assert_eq!(store.received_cursor(id)?, 1);
+                    assert_eq!(store.delivered_cursor(id)?, 0);
+                    assert_eq!(
+                        store.next_undelivered(id)?.map(|m| m.id),
+                        Some(line.id.clone())
+                    );
+                    assert!(store.message(id, line.id.as_str())?.is_some());
+                    store.list_usage(Some(id))?;
+                    assert!(store.get_schedule(&watch.id)?.is_some());
+                    // An unchanged observation is decided without the writer.
+                    store.update_schedule_watch_observation(&watch.id, Some("base"), None)?;
                     // No legacy chunks at all, then only invisible legacy chunks:
                     // neither case may acquire the writer mutex or transaction.
                     store.backfill_full_mailbox_history(Some(&[]))?;
@@ -10136,6 +10201,8 @@ mod tests {
                 .unwrap();
             expected.push((store.agent(&agent.id).unwrap(), scope));
         }
+        // The upgrade runs when a new process first opens the database.
+        drop(store);
         for _ in 0..2 {
             let reopened = Store::open(dir.path().join("state.db")).unwrap();
             for schedule in &schedules {
@@ -10167,6 +10234,7 @@ mod tests {
                 );
             }
         }
+        let store = Store::open(dir.path().join("state.db")).unwrap();
         let new = store
             .create_agent(NewAgent {
                 name: "new-child".into(),
@@ -11356,6 +11424,102 @@ mod tests {
             "SELECT id FROM agents WHERE state != 'archived' AND (NULL IS NULL OR state = NULL)",
         );
         assert!(live.contains("idx_agents_live_name"), "{live}");
+    }
+
+    #[test]
+    fn hot_path_queries_use_their_indexes() {
+        let (_dir, store) = setup();
+        let conn = store.read_conn();
+        let plan = |sql: &str| -> String {
+            let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(3))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let active = plan(concat!(
+            "SELECT ",
+            schedule_cols!(),
+            " FROM agent_schedules WHERE state = 'active' ORDER BY created_at_ms ASC, id ASC"
+        ));
+        assert!(active.contains("idx_agent_schedules_active"), "{active}");
+        assert!(!active.contains("TEMP B-TREE"), "{active}");
+        let skipped = plan(
+            "SELECT id FROM agent_schedules WHERE kind = 'at' AND state = 'fired'
+               AND last_fired_at_ms IS NULL AND last_observed LIKE 'skipped:%'
+               AND next_fire_at_ms >= 1",
+        );
+        assert!(
+            skipped.contains("idx_agent_schedules_kind_state"),
+            "{skipped}"
+        );
+        let children = plan(concat!(
+            "SELECT ",
+            agent_cols!(),
+            " FROM agents WHERE parent_id = 'x' AND state != 'archived'
+             ORDER BY created_at_ms, name"
+        ));
+        assert!(children.contains("idx_agents_live_parent"), "{children}");
+        assert!(!children.contains("TEMP B-TREE"), "{children}");
+    }
+
+    #[test]
+    fn narrow_agent_reads_match_the_full_rows() {
+        let (_dir, store) = setup();
+        let root = agent(&store, "root");
+        let live = child(&store, "live", &root);
+        let gone = child(&store, "gone", &root);
+        let paused = child(&store, "paused", &root);
+        store.set_agent_state(&gone.id, "archived").unwrap();
+        store.set_agent_state(&paused.id, "paused").unwrap();
+        store.set_agent_running(&live.id, "/work").unwrap();
+
+        assert_eq!(
+            names(&store.live_children_of(&root.id).unwrap()),
+            ["live", "paused"]
+        );
+        let children = store.children_of(&root.id).unwrap();
+        let mut all_children = names(&children);
+        all_children.sort_unstable();
+        assert_eq!(all_children, ["gone", "live", "paused"]);
+        assert!(store.live_children_of(&live.id).unwrap().is_empty());
+
+        assert_eq!(
+            store.agent_ids_in_state("running").unwrap(),
+            std::slice::from_ref(&live.id)
+        );
+        assert_eq!(
+            store.agent_ids_in_state("archived").unwrap(),
+            std::slice::from_ref(&gone.id)
+        );
+
+        let full = store.list_agents().unwrap();
+        let all = store.agent_summaries(true).unwrap();
+        assert_eq!(all.len(), full.len());
+        for (summary, agent) in all.iter().zip(&full) {
+            assert_eq!(
+                summary,
+                &AgentSummary {
+                    id: agent.id.clone(),
+                    name: agent.name.clone(),
+                    harness: agent.harness.clone(),
+                    model: agent.model.clone(),
+                    state: agent.state.clone(),
+                    parent_id: agent.parent_id.clone(),
+                    role: agent.role.clone(),
+                    is_admin: agent.is_admin,
+                    created_at_ms: agent.created_at_ms,
+                }
+            );
+        }
+        let live_names: Vec<_> = store
+            .agent_summaries(false)
+            .unwrap()
+            .into_iter()
+            .map(|a| a.name)
+            .collect();
+        assert_eq!(live_names, ["live", "paused", "root"]);
     }
 
     #[test]

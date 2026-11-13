@@ -1254,42 +1254,66 @@ pub(crate) fn read_shared_agents_md(config: &Path) -> Option<String> {
         .filter(|text| !text.is_empty())
 }
 
+/// Fast-forward the checkout that holds the shared `skills` and `AGENTS.md`.
+/// One `ls-remote` names origin's `main`; while it is the commit this process
+/// last pulled, the checkout is neither scanned nor pulled.
 #[cfg(unix)]
 pub(crate) fn sync_canonical_skills(data_dir: &Path) {
-    for rel in ["skills", "AGENTS.md"] {
-        let target_path = data_dir.join(rel);
-        if let Ok(resolved) = std::fs::canonicalize(&target_path)
-            && let Some(repo_root) = resolved.parent()
-            && repo_root.join(".git").exists()
-        {
-            let is_clean = std::process::Command::new("git")
-                .args([
-                    "-c",
-                    "core.fsmonitor=false",
-                    "-c",
-                    "core.hooksPath=/dev/null",
-                ])
-                .arg("-C")
-                .arg(repo_root)
-                .args(["status", "--porcelain"])
-                .output()
-                .ok()
-                .is_some_and(|o| o.status.success() && o.stdout.is_empty());
-            if is_clean {
-                let _ = std::process::Command::new("git")
-                    .args([
-                        "-c",
-                        "core.fsmonitor=false",
-                        "-c",
-                        "core.hooksPath=/dev/null",
-                    ])
-                    .arg("-C")
-                    .arg(repo_root)
-                    .args(["pull", "--ff-only", "--quiet", "origin", "main"])
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status();
-            }
+    use std::collections::BTreeMap;
+    use std::sync::{Mutex, PoisonError};
+    static PULLED: Mutex<BTreeMap<PathBuf, String>> = Mutex::new(BTreeMap::new());
+    let git = |repo_root: &Path| {
+        let mut command = std::process::Command::new("git");
+        command
+            .args([
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+            ])
+            .arg("-C")
+            .arg(repo_root);
+        command
+    };
+    let repo_roots: std::collections::BTreeSet<PathBuf> = ["skills", "AGENTS.md"]
+        .into_iter()
+        .filter_map(|rel| std::fs::canonicalize(data_dir.join(rel)).ok())
+        .filter_map(|resolved| resolved.parent().map(Path::to_path_buf))
+        .filter(|repo_root| repo_root.join(".git").exists())
+        .collect();
+    for repo_root in repo_roots {
+        let remote_main = git(&repo_root)
+            .args(["ls-remote", "--quiet", "origin", "refs/heads/main"])
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .and_then(|out| {
+                String::from_utf8_lossy(&out.stdout)
+                    .split_whitespace()
+                    .next()
+                    .map(str::to_string)
+            });
+        let pulled = || PULLED.lock().unwrap_or_else(PoisonError::into_inner);
+        if remote_main.is_some() && pulled().get(&repo_root) == remote_main.as_ref() {
+            continue;
+        }
+        let is_clean = git(&repo_root)
+            .args(["status", "--porcelain"])
+            .output()
+            .ok()
+            .is_some_and(|o| o.status.success() && o.stdout.is_empty());
+        if !is_clean {
+            continue;
+        }
+        let fast_forwarded = git(&repo_root)
+            .args(["pull", "--ff-only", "--quiet", "origin", "main"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        if fast_forwarded && let Some(commit) = remote_main {
+            pulled().insert(repo_root, commit);
         }
     }
 }
@@ -3494,11 +3518,37 @@ fn write_profile_key_file(dir: &Path, filename: &str, key: &str) -> Result<(), E
     write_required_file(&key_path, format!("{key}\n").as_bytes(), 0o600)
 }
 
+/// How a credential write relates to the processes already running on it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CredentialChange {
+    /// New credentials: running processes move to them at their next boundary.
+    Replaced,
+    /// The same account renewed its token. The harness renews tokens by itself,
+    /// so this only refreshes files for future launches.
+    Renewed,
+}
+
 pub(crate) fn propagate_profile_files_to_bound_agents(
     data: &Path,
     provider: &str,
     profile: &str,
     rel_paths: &[&str],
+) -> Result<(), Error> {
+    propagate_credentials(
+        data,
+        provider,
+        profile,
+        rel_paths,
+        CredentialChange::Replaced,
+    )
+}
+
+fn propagate_credentials(
+    data: &Path,
+    provider: &str,
+    profile: &str,
+    rel_paths: &[&str],
+    change: CredentialChange,
 ) -> Result<(), Error> {
     let prof_dir = data.join("profiles").join(provider).join(profile);
     let target_tag = format!("{provider}/{profile}");
@@ -3579,28 +3629,29 @@ pub(crate) fn propagate_profile_files_to_bound_agents(
             ".anyagents-seeded-profile",
             &format!("{target_tag}\n"),
         )?;
-        let now_prop = anyagents_core::now_ms();
-        let _ = write_profile_marker(
-            &cfg,
-            ".anyagents-quota-cleared-ms",
-            &format!("{now_prop}\n"),
-        );
-        let has_open = store_opt
-            .as_ref()
-            .is_some_and(|s| s.has_open_turn(&agent_rec.id).unwrap_or(false));
-        if !has_open {
+        if change == CredentialChange::Replaced {
+            let now_prop = anyagents_core::now_ms();
+            let _ = write_profile_marker(
+                &cfg,
+                ".anyagents-quota-cleared-ms",
+                &format!("{now_prop}\n"),
+            );
+            // A profile change holds no mail and never preempts a live turn:
+            // the supervisor moves the process at its next idle or faulted point.
             write_profile_marker(
                 &cfg,
                 ".anyagents-profile-rotated-ms",
                 &format!("{now_prop}\n"),
             )?;
+            let _ = std::fs::remove_file(cfg.join(".anyagents-last-error.json"));
         }
-        let _ = std::fs::remove_file(cfg.join(".anyagents-last-error.json"));
         if let Some(s) = store_opt.as_ref() {
             if let Some((_, uid, gid, _)) = resolved_agent_seat_info(s, agent_rec) {
                 crate::sandbox::share_config_with_seat_uid(&cfg, uid, gid);
             }
-            poke_agent_wake_socket(data, &agent_rec.id);
+            if change == CredentialChange::Replaced {
+                poke_agent_wake_socket(data, &agent_rec.id);
+            }
         }
     }
     Ok(())
@@ -5148,17 +5199,82 @@ fn merge_preserved_oauth_metadata(src_bytes: &[u8], dst_bytes: &[u8]) -> Option<
     changed.then(|| serde_json::to_vec(&src_val).ok()).flatten()
 }
 
+/// A file's identity and content stamp: any rewrite, rename or chmod changes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileStamp {
+    dev: u64,
+    ino: u64,
+    len: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+impl FileStamp {
+    fn of(meta: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            len: meta.len(),
+            mtime: (meta.mtime(), meta.mtime_nsec()),
+            ctime: (meta.ctime(), meta.ctime_nsec()),
+        }
+    }
+}
+
+type CopyStamps = (FileStamp, FileStamp);
+
+/// `(source, destination)` pairs a copy last found nothing to do for, with the
+/// stamps both files had then. The decision depends only on the two files, so
+/// while neither changes it stands without reading them again.
+static SETTLED_COPIES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<(PathBuf, PathBuf), CopyStamps>>,
+> = std::sync::LazyLock::new(Default::default);
+
+fn settled_copies()
+-> std::sync::MutexGuard<'static, std::collections::HashMap<(PathBuf, PathBuf), CopyStamps>> {
+    SETTLED_COPIES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(test)]
+thread_local! {
+    static COPY_EVALUATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn copy_seat_file_if_newer(src: &Path, dst: &Path) -> bool {
+    let key = (src.to_path_buf(), dst.to_path_buf());
+    let stamps = std::fs::symlink_metadata(src)
+        .ok()
+        .zip(std::fs::metadata(dst).ok())
+        .map(|(src_meta, dst_meta)| (FileStamp::of(&src_meta), FileStamp::of(&dst_meta)));
+    if stamps.is_some() && settled_copies().get(&key) == stamps.as_ref() {
+        return false;
+    }
+    let copied = copy_seat_file_if_newer_uncached(src, dst);
+    // Stamps taken before the read: a change during it is seen next time.
+    match stamps.filter(|_| !copied) {
+        Some(stamps) => settled_copies().insert(key, stamps),
+        None => settled_copies().remove(&key),
+    };
+    copied
+}
+
+fn copy_seat_file_if_newer_uncached(src: &Path, dst: &Path) -> bool {
+    #[cfg(test)]
+    COPY_EVALUATIONS.with(|count| count.set(count.get() + 1));
     let Ok(src_meta) = std::fs::symlink_metadata(src) else {
         return false;
     };
     if src_meta.file_type().is_symlink() || !src_meta.file_type().is_file() || src_meta.len() == 0 {
         return false;
     }
-    if std::fs::read(src).is_err() {
+    let read = std::fs::read(src).or_else(|_| {
         chmod_seat_file_readable(src);
-    }
-    let Ok(mut src_bytes) = std::fs::read(src) else {
+        std::fs::read(src)
+    });
+    let Ok(mut src_bytes) = read else {
         return false;
     };
     if src_bytes.is_empty() {
@@ -5939,6 +6055,15 @@ fn overlay_active_quota_reset_on_cached_usage(
 }
 
 pub(crate) fn sync_fresher_bound_agent_credentials(data: &Path) {
+    if let Ok(store) = Store::open(data.join("state.db")) {
+        sync_fresher_bound_agent_credentials_in(&store, data);
+    }
+}
+
+/// Copy fresher credentials between live agents' seats and their bound
+/// profiles. Archived agents run no harness, so their seats never refresh a
+/// token; a pair of files unchanged since the last pass is not read again.
+pub(crate) fn sync_fresher_bound_agent_credentials_in(store: &Store, data: &Path) {
     let profiles_root = data.join("profiles");
     let now_ms = anyagents_core::now_ms();
     let sync_stamp = profiles_root.join(".last-agent-cred-sync-ms");
@@ -5959,20 +6084,9 @@ pub(crate) fn sync_fresher_bound_agent_credentials(data: &Path) {
             }
         }
     }
-    if let Ok(store) = Store::open(data.join("state.db"))
-        && let Ok(agents) = store.list_agents()
-    {
+    if let Ok(agents) = store.list_live_agents() {
         for agent in &agents {
-            if agent.state == "archived" {
-                continue;
-            }
             let cfg = agent_config_dir(data, &agent.id);
-            if agent.harness == "claude-code"
-                && let Some(reset_ms) =
-                    anyagents_harness_claude::detect_session_quota_reset_ms(&cfg, now_ms)
-            {
-                record_profile_quota_reset(data, agent, reset_ms);
-            }
             let bound = bound_profile_name(&cfg);
             let seeded = seeded_profile_name(&cfg);
             if seeded.is_some() && bound.is_some() && seeded != bound {
@@ -6005,11 +6119,16 @@ pub(crate) fn sync_fresher_bound_agent_credentials(data: &Path) {
                 }
             }
             if updated_any {
-                propagate_profile_files_to_bound_agents(data, &provider, &prof_name, rels)
+                let change = if provider == "google-antigravity" {
+                    CredentialChange::Renewed
+                } else {
+                    CredentialChange::Replaced
+                };
+                propagate_credentials(data, &provider, &prof_name, rels, change)
                     .unwrap_or_else(|err| eprintln!("runtime persistence failed: {err}"));
             } else if provider == "anthropic" {
                 sync_anthropic_agent_credentials_from_profile(
-                    Some(&store),
+                    Some(store),
                     data,
                     agent,
                     &cfg,
@@ -7220,11 +7339,12 @@ pub(crate) fn probe_one_profile_usage(
                                 eprintln!("credential refresh persistence failed: {err}")
                             })
                             .ok()?;
-                        propagate_profile_files_to_bound_agents(
+                        propagate_credentials(
                             data,
                             provider,
                             profile,
                             &[tok_rel],
+                            CredentialChange::Renewed,
                         )
                         .map_err(|err| eprintln!("runtime persistence failed: {err}"))
                         .ok()?;
@@ -8528,7 +8648,7 @@ pub(crate) fn try_rotate_exhausted_profile(
     if has_active_quota_hold && cur_pct.is_some_and(|pct| pct <= 0) {
         let bound_counts = count_bound_profile_agents(
             data,
-            &store.list_agents().unwrap_or_default(),
+            &store.list_live_agents().unwrap_or_default(),
             &provider,
             &agent.id,
         );
@@ -10174,7 +10294,7 @@ mod tests {
     }
 
     #[test]
-    fn propagate_profile_files_defers_rotated_marker_during_open_turn() {
+    fn propagate_profile_files_marks_working_seats_without_holding_their_turn() {
         let tmp = tempfile::tempdir().unwrap();
         let data = tmp.path();
         let store = Store::open(data.join("state.db")).unwrap();
@@ -10202,9 +10322,11 @@ mod tests {
             idle_cfg.join(".anyagents-profile-rotated-ms").exists(),
             "idle seat should receive rotated marker on credential refresh"
         );
+        // The supervisor applies a profile change at the next idle point, so
+        // the marker never preempts the open turn or holds its mail.
         assert!(
-            !working_cfg.join(".anyagents-profile-rotated-ms").exists(),
-            "working seat with open turn must not receive rotated marker mid-turn"
+            working_cfg.join(".anyagents-profile-rotated-ms").exists(),
+            "working seat should learn of the profile change"
         );
         assert!(
             working_cfg.join(".anyagents-quota-cleared-ms").exists(),
@@ -10845,35 +10967,25 @@ mod tests {
         .unwrap();
 
         let child_cfg = anyagents_core::agent_config_dir(data, &child.id);
-        let sess_dir = child_cfg.join("sessions/2026/10/29");
-        std::fs::create_dir_all(&sess_dir).unwrap();
-        let rollout_path = sess_dir.join("rollout-2026-10-29T18-51-32-test.jsonl");
-        let rollout_line = serde_json::json!({
-            "timestamp": "2026-10-29T18:51:40.000Z",
-            "ordinal": 4,
-            "type": "event_msg",
-            "payload": {
-                "type": "task_complete",
-                "root_turn_id": "t1",
-                "turn_id": "t1",
-                "last_agent_message": null,
-                "error": {
-                    "message": "workspace routing discovery unauthorized (401)"
-                }
-            }
-        });
-        std::fs::write(&rollout_path, format!("{rollout_line}\n")).unwrap();
-        let rotated_at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        // The Codex adapter persists a 401 turn fault as this record.
+        let persist_fault = |timestamp_ms: i64| {
+            std::fs::write(
+                child_cfg.join(".anyagents-last-error.json"),
+                serde_json::json!({
+                    "error": "workspace routing discovery unauthorized (401)",
+                    "quota_reset_at_ms": null,
+                    "timestamp_ms": timestamp_ms,
+                })
+                .to_string(),
+            )
+            .unwrap();
+        };
         std::fs::write(
             child_cfg.join(".anyagents-profile-rotated-ms"),
             "1700000000000\n",
         )
         .unwrap();
-        let rollout = std::fs::File::options()
-            .write(true)
-            .open(&rollout_path)
-            .unwrap();
-        rollout.set_modified(rotated_at).unwrap();
+        persist_fault(1_700_000_000_000);
 
         let health = anyagents_supervisor::HealthBoard::default();
         let (delivery_mode, steer_support) = anyagents_supervisor::declared(&child.harness);
@@ -10895,16 +11007,14 @@ mod tests {
         );
         let mut views;
 
-        // A rollout at the rotation boundary is stale, even if it contains an
-        // error. Do not let wall-clock or filesystem precision decide freshness.
+        // A fault recorded at the rotation boundary is stale. Do not let
+        // wall-clock precision decide freshness.
         views = vec![crate::server::agent_view(&store, &health, &child).unwrap()];
         assert_eq!(views[0].turn_state, "working");
         assert!(views[0].last_error.is_none());
         assert!(store.next_undelivered(&parent.id).unwrap().is_none());
 
-        rollout
-            .set_modified(rotated_at + std::time::Duration::from_secs(1))
-            .unwrap();
+        persist_fault(1_700_000_001_000);
         views = vec![crate::server::agent_view(&store, &health, &child).unwrap()];
         assert_eq!(views[0].turn_state, "errored");
         assert_eq!(
@@ -12533,6 +12643,117 @@ git -c safe.directory="$5" -C "$5" status --porcelain
     }
 
     #[test]
+    #[cfg(unix)]
+    fn canonical_skills_pull_only_when_origin_main_moves() {
+        use crate::worktree::tests::git;
+        let dir = tempfile::tempdir().unwrap();
+        let commit = |repo: &Path, file: &str| {
+            std::fs::create_dir_all(repo.join("skills")).unwrap();
+            std::fs::write(repo.join("skills").join(file), file).unwrap();
+            git(repo, &["add", "."]);
+            git(
+                repo,
+                &[
+                    "-c",
+                    "user.name=Example",
+                    "-c",
+                    "user.email=example@example.org",
+                    "commit",
+                    "-qm",
+                    file,
+                ],
+            );
+        };
+        let origin = dir.path().join("origin.git");
+        let author = dir.path().join("author");
+        let checkout = dir.path().join("checkout");
+        let data = dir.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        git(
+            dir.path(),
+            &[
+                "init",
+                "-q",
+                "--bare",
+                "-b",
+                "main",
+                origin.to_str().unwrap(),
+            ],
+        );
+        git(
+            dir.path(),
+            &[
+                "clone",
+                "-q",
+                origin.to_str().unwrap(),
+                author.to_str().unwrap(),
+            ],
+        );
+        git(&author, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        commit(&author, "one.md");
+        commit(&author, "two.md");
+        git(&author, &["push", "-q", "origin", "main"]);
+        git(
+            dir.path(),
+            &[
+                "clone",
+                "-q",
+                origin.to_str().unwrap(),
+                checkout.to_str().unwrap(),
+            ],
+        );
+        std::os::unix::fs::symlink(checkout.join("skills"), data.join("skills")).unwrap();
+
+        sync_canonical_skills(&data);
+        let synced = git(&checkout, &["rev-parse", "HEAD"]);
+        // Origin has not moved since the last pull: the checkout is left alone,
+        // even one a local reset put behind.
+        git(&checkout, &["reset", "-q", "--hard", "HEAD~1"]);
+        sync_canonical_skills(&data);
+        assert_ne!(git(&checkout, &["rev-parse", "HEAD"]), synced);
+
+        commit(&author, "three.md");
+        git(&author, &["push", "-q", "origin", "main"]);
+        sync_canonical_skills(&data);
+        assert_eq!(
+            git(&checkout, &["rev-parse", "HEAD"]),
+            git(&author, &["rev-parse", "HEAD"])
+        );
+        assert!(checkout.join("skills/three.md").is_file());
+    }
+
+    #[test]
+    fn unchanged_credential_pairs_are_not_read_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("seat/.credentials.json");
+        let dst = dir.path().join("profile/.credentials.json");
+        std::fs::create_dir_all(src.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
+        let cred = |token: &str, expires_at: i64| {
+            serde_json::json!({"claudeAiOauth": {
+                "accessToken": token,
+                "refreshToken": "refresh",
+                "expiresAt": expires_at,
+            }})
+            .to_string()
+        };
+        std::fs::write(&src, cred("same", 2_000_000_000_000)).unwrap();
+        std::fs::write(&dst, cred("same", 2_000_000_000_000)).unwrap();
+        let evaluations = || COPY_EVALUATIONS.with(std::cell::Cell::get);
+        let start = evaluations();
+        assert!(!copy_seat_file_if_newer(&src, &dst));
+        assert!(!copy_seat_file_if_newer(&src, &dst));
+        assert_eq!(evaluations() - start, 1, "an unchanged pair was read again");
+
+        std::fs::write(&src, cred("fresher", 2_000_000_100_000)).unwrap();
+        assert!(copy_seat_file_if_newer(&src, &dst));
+        assert!(std::fs::read_to_string(&dst).unwrap().contains("fresher"));
+        assert!(!copy_seat_file_if_newer(&src, &dst));
+        assert!(!copy_seat_file_if_newer(&src, &dst));
+        assert_eq!(evaluations() - start, 3);
+    }
+
+    #[test]
     fn copy_seat_file_if_newer_syncs_rotated_refresh_token_and_preserves_metadata() {
         let tmp = tempfile::tempdir().unwrap();
         let prof_cred = tmp.path().join("profile-credentials.json");
@@ -13329,6 +13550,43 @@ mod runtime_config_tests {
             .unwrap();
         assert_eq!(seeded_profile_name(&cfg).as_deref(), Some("openai/target"));
         assert!(prof.join("auth.json").is_file());
+    }
+
+    #[test]
+    fn a_renewed_token_refreshes_files_without_rotating_the_running_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        store
+            .hold_capability_key("0123456789abcdef0123456789abcdef")
+            .unwrap();
+        let agent = store
+            .create_agent(anyagents_core::NewAgent::new("sample", "agy"))
+            .unwrap();
+        let cfg = agent_config_dir(dir.path(), &agent.id);
+        let rel = ".gemini/antigravity-cli/antigravity-oauth-token";
+        std::fs::create_dir_all(cfg.join(".gemini/antigravity-cli")).unwrap();
+        write_profile_marker(&cfg, ".anyagents-profile", "google-antigravity/target\n").unwrap();
+        std::fs::write(cfg.join(".anyagents-last-error.json"), b"{}").unwrap();
+        let prof = dir.path().join("profiles/google-antigravity/target");
+        std::fs::create_dir_all(prof.join(".gemini/antigravity-cli")).unwrap();
+        std::fs::write(prof.join(rel), b"renewed-token").unwrap();
+
+        propagate_credentials(
+            dir.path(),
+            "google-antigravity",
+            "target",
+            &[rel],
+            CredentialChange::Renewed,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(cfg.join(rel)).unwrap(), b"renewed-token");
+        assert!(!cfg.join(".anyagents-profile-rotated-ms").exists());
+        assert!(cfg.join(".anyagents-last-error.json").exists());
+
+        propagate_profile_files_to_bound_agents(dir.path(), "google-antigravity", "target", &[rel])
+            .unwrap();
+        assert!(cfg.join(".anyagents-profile-rotated-ms").exists());
+        assert!(!cfg.join(".anyagents-last-error.json").exists());
     }
 
     #[test]
