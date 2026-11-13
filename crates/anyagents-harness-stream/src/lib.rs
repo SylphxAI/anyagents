@@ -287,7 +287,6 @@ struct State {
     last_turn_step_type: Option<String>,
     idle_since: Option<Instant>,
     last_rpc_health_poll: Option<Instant>,
-    turn_started_at: Option<Instant>,
     last_steer_probe: Option<Instant>,
     reclaimed_steers: Vec<String>,
     planner_config: Option<Value>,
@@ -309,6 +308,23 @@ struct State {
     text: Option<(String, Vec<String>)>,
     /// The last open turn ended on quiet rather than on a result line.
     finished_quiet: HashSet<String>,
+    /// What this process's `ready` frame announced: `None` until it is read,
+    /// then whether the peer proves consumption and deduplicates input.
+    ready: Option<bool>,
+    /// Inputs written whole into a peer that proves consumption, which it has
+    /// neither proved consumed nor refused yet.
+    in_flight: HashSet<String>,
+    /// Inputs that peer proved are in its session journal.
+    consumed: HashSet<String>,
+    /// Consumed inputs it answered as journaled by an earlier process.
+    duplicates: HashSet<String>,
+    /// The open turn refused a steer as closed: it takes no more, and the
+    /// next input waits for its result to start the next turn.
+    turn_closing: bool,
+    /// Turns in a row the peer could not start (`turn_not_started`), and
+    /// when the next one may be offered.
+    refused_turns: u32,
+    turn_retry_at: Option<Instant>,
 }
 
 impl StreamHarness {
@@ -696,7 +712,8 @@ impl StreamHarness {
         }
         HarnessHealth {
             process_alive: state.alive,
-            turn_state: if state.open.is_empty() && !state.unconfirmed {
+            turn_state: if state.open.is_empty() && !state.unconfirmed && state.in_flight.is_empty()
+            {
                 TurnState::Idle
             } else {
                 TurnState::InTurn
@@ -728,6 +745,18 @@ impl StreamHarness {
         message: &OutboundMessage,
         line: &Value,
     ) -> Result<DeliverOutcome, HarnessError> {
+        if self.spec.protocol == LineProtocol::AcknowledgedResult {
+            let state = lock(&self.shared);
+            // The peer says what it can do before it is given anything: its
+            // `ready` decides which custody rules every input follows.
+            if state.ready.is_none() && state.alive && !state.unconfirmed {
+                return Ok(DeliverOutcome::Deferred);
+            }
+            if state.ready == Some(true) {
+                drop(state);
+                return self.deliver_consumed(message, line);
+            }
+        }
         let bytes = self
             .pending
             .is_none()
@@ -813,7 +842,6 @@ impl StreamHarness {
                         state.turns_started += 1;
                         state.open.push(message.id.clone());
                         state.turn_user_inputs = 0;
-                        state.turn_started_at = Some(Instant::now());
                         state.idle_since = None;
                         state.sign_in_fault = None;
                     } else if self.mode == DeliveryMode::Steer {
@@ -1010,9 +1038,156 @@ impl StreamHarness {
         }
     }
 
+    /// Delivery to a peer that proves consumption (`steer_consumed`) and
+    /// deduplicates input by its request id (`idempotent_input`).
+    ///
+    /// Every input is written at once: a `prompt` when no turn is open, a
+    /// `steer` into the open one, so the peer takes all pending input
+    /// together, in order, at its next step. The answer is `InFlight` until
+    /// the peer proves the input is in its journal (the turn's `accepted`, a
+    /// `steer_consumed`), then `Accepted`, or `Duplicate` when an earlier
+    /// process had already journaled it. An input the peer refuses or ends
+    /// its turn without consuming returns to the mailbox and is written again;
+    /// it was certainly not journaled, and a second copy would be dropped by
+    /// its request id anyway. Nothing waits for a turn to end, and no hold
+    /// file is written.
+    fn deliver_consumed(
+        &mut self,
+        message: &OutboundMessage,
+        line: &Value,
+    ) -> Result<DeliverOutcome, HarnessError> {
+        let id = message.id.as_str();
+        {
+            let mut state = lock(&self.shared);
+            // A hold an older peer left is reconciled before anything else.
+            if state.unconfirmed {
+                return Ok(DeliverOutcome::Deferred);
+            }
+            if !state.alive {
+                return Err(HarnessError::Dead);
+            }
+            // The pipe finishes the line it started before any other input
+            // is judged: a half-written line blocks every line behind it.
+            if self.pending.is_none() {
+                if let Some(outcome) = state.consumption_outcome(id) {
+                    return outcome;
+                }
+                if let Some(reset_at_ms) = state.quota_reset_at_ms {
+                    return Ok(DeliverOutcome::Quota { reset_at_ms });
+                }
+                let starts_turn = state.open.is_empty();
+                // A turn starts only once every earlier input has its answer,
+                // so a line still on its way to a closed turn cannot land
+                // behind the next one.
+                if starts_turn && !state.in_flight.is_empty() {
+                    return Ok(DeliverOutcome::Deferred);
+                }
+                // A turn that refused a steer as closed takes no more; its
+                // result, already on its way, opens the way to the next turn.
+                if !starts_turn && state.turn_closing {
+                    return Ok(DeliverOutcome::Deferred);
+                }
+                // A peer that could not start the last turn is asked again
+                // when its backoff ends; the reader wakes the host then.
+                if starts_turn
+                    && state
+                        .turn_retry_at
+                        .is_some_and(|retry_at| Instant::now() < retry_at)
+                {
+                    return Ok(DeliverOutcome::Deferred);
+                }
+                let mut line = line.clone();
+                line["type"] = json!(if starts_turn { "prompt" } else { "steer" });
+                line["request_id"] = json!(id);
+                if starts_turn {
+                    state.turns_started += 1;
+                    state.turn_user_inputs = 0;
+                    state.idle_since = None;
+                    state.sign_in_fault = None;
+                    state.turn_closing = false;
+                }
+                // The owner before the first byte is visible: an immediate
+                // receipt finds it. This is not consumption.
+                state.open.push(id.to_string());
+                state.in_flight.insert(id.to_string());
+                self.pending = Some(PendingWrite {
+                    id: id.to_string(),
+                    bytes: format!("{line}\n").into_bytes(),
+                    offset: 0,
+                    generation: state.generation,
+                });
+            }
+        }
+        let pending = self.pending.as_mut().expect("reserved above");
+        let result = write_pending(&self.stdin, pending);
+        #[cfg(test)]
+        if let Some(after_write) = self.after_write.take() {
+            after_write();
+        }
+        let mut state = lock(&self.shared);
+        if state.generation != pending.generation || !state.alive {
+            return Err(HarnessError::Dead);
+        }
+        match result {
+            Ok(false) => {
+                state.input_blocked = true;
+                self.wake.notify_all();
+                Ok(DeliverOutcome::Deferred)
+            }
+            Ok(true) => {
+                state.input_blocked = false;
+                let written = self.pending.take().expect("completed write").id;
+                state.seen.insert(written.clone());
+                state.written.push(written.clone());
+                if written != id {
+                    // An earlier line finished; this one is judged afresh.
+                    drop(state);
+                    return self.deliver_consumed(message, line);
+                }
+                // Refused before this lock: it goes back to the mailbox.
+                state
+                    .consumption_outcome(id)
+                    .unwrap_or(Ok(DeliverOutcome::Deferred))
+            }
+            Err(_) => {
+                state.alive = false;
+                self.wake.notify_all();
+                Err(HarnessError::Dead)
+            }
+        }
+    }
+
+    /// Wait until the peer's `ready` frame is read or the process exits.
+    /// A peer that says nothing within `patience` is refused.
+    pub fn wait_ready(&self, patience: Duration) -> Result<(), HarnessError> {
+        if self.wait_pred(patience, |state| state.ready.is_some() || !state.alive) {
+            return Ok(());
+        }
+        Err(HarnessError::Failed(format!(
+            "{} sent no ready frame within {}s",
+            self.spec.name,
+            patience.as_secs()
+        )))
+    }
+
+    /// The peer proves consumption and deduplicates input, so every input is
+    /// steered at once and replayed freely.
+    pub fn proves_consumption(&self) -> bool {
+        lock(&self.shared).ready == Some(true)
+    }
+
     pub fn input_ready(&self) -> bool {
         let state = lock(&self.shared);
         if state.input_blocked || state.unconfirmed {
+            return false;
+        }
+        if self.spec.protocol == LineProtocol::AcknowledgedResult
+            && (state.ready.is_none()
+                || (state.open.is_empty()
+                    && state
+                        .turn_retry_at
+                        .is_some_and(|retry_at| Instant::now() < retry_at)))
+        {
             return false;
         }
         if self.agy_rpc.is_some()
@@ -1020,11 +1195,7 @@ impl StreamHarness {
             && (state
                 .idle_since
                 .is_some_and(|t| t.elapsed() < AGY_TURN_CLOSE_GRACE)
-                || (state.turn_user_inputs == 0
-                    && (state.session_id.is_some()
-                        || state
-                            .turn_started_at
-                            .is_some_and(|t| t.elapsed() < AGY_FRESH_TURN)))
+                || (state.turn_user_inputs == 0 && state.session_id.is_some())
                 || (state.session_id.is_none()
                     && state
                         .last_steer_probe
@@ -1114,6 +1285,14 @@ impl StreamHarness {
             state.finished.clear();
             state.finished_quiet.clear();
             state.usages.clear();
+            // What the last process announced and consumed is its own.
+            state.ready = None;
+            state.in_flight.clear();
+            state.consumed.clear();
+            state.duplicates.clear();
+            state.turn_closing = false;
+            state.refused_turns = 0;
+            state.turn_retry_at = None;
             state.quota_reset_at_ms = None;
             state.sign_in_fault = None;
             if let Some(dir) = &state.state_dir {
@@ -1134,7 +1313,6 @@ impl StreamHarness {
             state.last_turn_step_type = None;
             state.idle_since = None;
             state.last_rpc_health_poll = None;
-            state.turn_started_at = None;
             state.last_steer_probe = None;
             state.planner_config = None;
             state.http_port = self.agy_rpc.as_ref().and_then(|r| r.port_override);
@@ -1265,7 +1443,6 @@ impl StreamHarness {
         state.last_turn_step_type = None;
         state.idle_since = None;
         state.last_rpc_health_poll = None;
-        state.turn_started_at = None;
         state.last_steer_probe = None;
         state.planner_config = None;
         state.http_port = None;
@@ -1358,6 +1535,9 @@ struct Observed {
     acknowledged: usize,
     rejected: usize,
     reclaimed: usize,
+    ready: Option<bool>,
+    in_flight: usize,
+    consumed: usize,
     quota_reset_at_ms: Option<i64>,
     failure: Option<String>,
     session_id: Option<String>,
@@ -1378,6 +1558,9 @@ impl State {
             acknowledged: self.acknowledged.len(),
             rejected: self.rejected.len(),
             reclaimed: self.reclaimed_steers.len(),
+            ready: self.ready,
+            in_flight: self.in_flight.len(),
+            consumed: self.consumed.len(),
             quota_reset_at_ms: self.quota_reset_at_ms,
             failure: self.failure(),
             session_id: self.session_id.clone(),
@@ -1388,6 +1571,27 @@ impl State {
     fn touch(&mut self) {
         self.epoch = self.epoch.wrapping_add(1);
         self.changes = self.changes.wrapping_add(1);
+    }
+
+    /// What the mailbox may record for an input written to a peer that
+    /// proves consumption, or `None` when it is not in this process's hands
+    /// (never written, or returned for writing again).
+    fn consumption_outcome(&self, id: &str) -> Option<Result<DeliverOutcome, HarnessError>> {
+        if let Some(reason) = self.rejected.get(id) {
+            return Some(Err(HarnessError::Failed(reason.clone())));
+        }
+        if self.consumed.contains(id) {
+            return Some(Ok(if self.duplicates.contains(id) {
+                DeliverOutcome::Duplicate
+            } else {
+                DeliverOutcome::Accepted {
+                    turn_finished: self.finished.contains(id),
+                }
+            }));
+        }
+        self.in_flight
+            .contains(id)
+            .then_some(Ok(DeliverOutcome::InFlight))
     }
 
     // Both a fresh pipe write and an already-written retry consult the same
@@ -1513,7 +1717,6 @@ impl State {
             last_turn_step_type: None,
             idle_since: None,
             last_rpc_health_poll: None,
-            turn_started_at: None,
             last_steer_probe: None,
             reclaimed_steers: Vec::new(),
             planner_config: None,
@@ -1526,6 +1729,13 @@ impl State {
             usages: Vec::new(),
             text: None,
             finished_quiet: HashSet::new(),
+            ready: None,
+            in_flight: HashSet::new(),
+            consumed: HashSet::new(),
+            duplicates: HashSet::new(),
+            turn_closing: false,
+            refused_turns: 0,
+            turn_retry_at: None,
         }
     }
 }
@@ -1663,6 +1873,7 @@ fn read_stdout(
                 let _ = std::fs::remove_file(rpc.config_dir.join(".anyagents-last-error.json"));
             }
         }
+        let mut retry_after = None;
         {
             let mut state = lock(&shared);
             if state.generation != generation {
@@ -1672,6 +1883,18 @@ fn read_stdout(
             state.idle_since = None;
             note_markers(&mut state, &value);
             if spec.protocol == LineProtocol::AcknowledgedResult
+                && kind == Some("ready")
+                && state.ready.is_none()
+            {
+                state.ready = Some(announces_consumption(&value));
+            }
+            // A peer that proves consumption is read by its own rules; the
+            // receipts below are the older peer's.
+            let consumption =
+                spec.protocol == LineProtocol::AcknowledgedResult && state.ready == Some(true);
+            if consumption {
+                retry_after = note_consumption_receipt(&mut state, kind, &value);
+            } else if spec.protocol == LineProtocol::AcknowledgedResult
                 && let Some(id) = value.get("request_id").and_then(Value::as_str)
                 && state
                     .open
@@ -1720,9 +1943,13 @@ fn read_stdout(
             }
             if let Some(reset_at_ms) = effect.quota_reset_at_ms {
                 state.quota_reset_at_ms = Some(reset_at_ms);
-                let rejected_ids = std::mem::take(&mut state.open);
-                for id in rejected_ids {
-                    state.seen.remove(&id);
+                // Such a peer still closes its turn with a result that names
+                // what it consumed; nothing is dropped before that.
+                if !consumption {
+                    let rejected_ids = std::mem::take(&mut state.open);
+                    for id in rejected_ids {
+                        state.seen.remove(&id);
+                    }
                 }
             }
             if let Some(session_id) = effect.session_id
@@ -1742,8 +1969,18 @@ fn read_stdout(
                 || value
                     .get("request_id")
                     .and_then(Value::as_str)
-                    .is_some_and(|id| state.input_turns.values().any(|owner| owner == id));
-            if effect.finishes_turn && correlated {
+                    .is_some_and(|id| {
+                        state.input_turns.values().any(|owner| owner == id)
+                            || (consumption && state.in_flight.contains(id))
+                    });
+            // Its result closes the turn even when it reports a quota: what
+            // the turn did not consume goes back to the mailbox.
+            let finishes = if consumption {
+                kind == Some("result") && synthetic_401.is_none()
+            } else {
+                effect.finishes_turn
+            };
+            if finishes && correlated {
                 if spec.protocol == LineProtocol::AcknowledgedResult
                     && let Some((_, lines)) = &mut state.text
                 {
@@ -1763,16 +2000,24 @@ fn read_stdout(
                         })
                         .map(str::trim)
                         .filter(|error| !error.is_empty());
-                    if value.get("is_error").and_then(Value::as_bool) == Some(true)
-                        || value.get("status").and_then(Value::as_str) == Some("failed")
-                        || error.is_some()
+                    if effect.quota_reset_at_ms.is_none()
+                        && (value.get("is_error").and_then(Value::as_bool) == Some(true)
+                            || value.get("status").and_then(Value::as_str) == Some("failed")
+                            || error.is_some())
                     {
                         state.sign_in_fault =
                             Some(error.unwrap_or("harness turn failed").to_string());
                     }
                 }
-                let usage = effect.usage.unwrap_or_default();
-                if spec.protocol == LineProtocol::AcknowledgedResult {
+                let usage = effect.usage.unwrap_or_else(|| spec.usage_of(&value));
+                if consumption {
+                    finish_consumed(
+                        &mut state,
+                        value["request_id"].as_str().unwrap(),
+                        usage,
+                        &value,
+                    );
+                } else if spec.protocol == LineProtocol::AcknowledgedResult {
                     let unconfirmed = value.get("undelivered_steers").is_some_and(|items| {
                         items.as_array().is_none_or(|items| !items.is_empty())
                     });
@@ -1815,7 +2060,7 @@ fn read_stdout(
                 state.open.clear();
                 state.followups.clear();
             }
-            if effect.finishes_turn
+            if finishes
                 && correlated
                 && state.failure().is_none()
                 && let Some(dir) = &state.state_dir
@@ -1833,6 +2078,10 @@ fn read_stdout(
             state.epoch = state.epoch.wrapping_add(1);
         }
         wake.notify_all();
+        // A turn the peer could not start opens again with time alone.
+        if let Some(wait) = retry_after {
+            nudge_after(&shared, &wake, generation, wait);
+        }
         if poisoned_agy || synthetic_401.is_some() {
             break;
         }
@@ -2084,6 +2333,207 @@ fn finish_correlated(state: &mut State, turn: &str, usage: TurnUsage, unconfirme
         // when the turn failed right after this.
         let _ = std::fs::remove_file(dir.join(".anyagents-session-reset-recovery"));
         let _ = std::fs::remove_file(dir.join(".anyagents-last-error.json"));
+    }
+}
+
+/// The `ready` frame names both capabilities the pipelined path relies on:
+/// a per-input consumption signal and request-id deduplication.
+fn announces_consumption(value: &Value) -> bool {
+    let named = |capability: &str| {
+        value
+            .get("capabilities")
+            .and_then(Value::as_array)
+            .is_some_and(|items| items.iter().any(|item| item.as_str() == Some(capability)))
+    };
+    named("steer_consumed") && named("idempotent_input")
+}
+
+/// One receipt from a peer that proves consumption. Only an input this
+/// process wrote and has not settled is moved; a consumption proof is kept
+/// whatever else is known, since it states what the journal holds.
+///
+/// Returns how long to wait before the host is woken to offer a turn the
+/// peer could not start again.
+fn note_consumption_receipt(
+    state: &mut State,
+    kind: Option<&str>,
+    value: &Value,
+) -> Option<Duration> {
+    let request = value.get("request_id").and_then(Value::as_str);
+    match kind {
+        // The turn-starting prompt is consumed when its turn is accepted,
+        // which the peer says only after journaling it. A steer may be
+        // acknowledged before that; it is consumed after it, in order.
+        Some("accepted") => {
+            let id = request
+                .filter(|id| state.in_flight.contains(*id))?
+                .to_string();
+            if value.get("mode").and_then(Value::as_str) == Some("duplicate") {
+                state.duplicates.insert(id.clone());
+            }
+            settle_consumed(state, &id, &id);
+            state.refused_turns = 0;
+            state.turn_retry_at = None;
+        }
+        Some("steer_ack") if value.get("accepted").and_then(Value::as_bool) == Some(true) => {
+            if let (Some(id), Some(turn)) = (
+                request.filter(|id| state.in_flight.contains(*id)),
+                value.get("turn_id").and_then(Value::as_str),
+            ) {
+                state.acknowledged.insert(id.to_string());
+                state.input_turns.insert(id.to_string(), turn.to_string());
+            }
+        }
+        Some("steer_consumed") => {
+            let id = value.get("steer_request_id").and_then(Value::as_str)?;
+            // A steer an earlier process journaled is consumed all the same.
+            if value.get("duplicate").and_then(Value::as_bool) == Some(true) {
+                state.duplicates.insert(id.to_string());
+            }
+            let turn = value
+                .get("turn_id")
+                .and_then(Value::as_str)
+                .or_else(|| state.input_turns.get(id).map(String::as_str))
+                .unwrap_or(id)
+                .to_string();
+            let id = id.to_string();
+            settle_consumed(state, &id, &turn);
+        }
+        Some("rejected") => {
+            let id = request
+                .filter(|id| state.in_flight.contains(*id))?
+                .to_string();
+            match value.get("code").and_then(Value::as_str) {
+                // The turn could not start (its session still leased by a
+                // process that died, its journal unwritable): nothing given
+                // to it was journaled. Not a fault: the same input is offered
+                // again after a backoff, since the peer names no moment when
+                // a turn can start.
+                Some("turn_not_started") => {
+                    let opened = state.open.first().is_some_and(|owner| *owner == id);
+                    release_input(state, &id);
+                    state.turn_closing |= !state.open.is_empty();
+                    if opened {
+                        state.refused_turns = state.refused_turns.saturating_add(1);
+                        let wait = TURN_RETRY_FIRST
+                            .saturating_mul(1 << (state.refused_turns - 1).min(5))
+                            .min(TURN_RETRY_MAX);
+                        state.turn_retry_at = Some(Instant::now() + wait);
+                        return Some(wait);
+                    }
+                }
+                // The turn it was written to closed first: never journaled.
+                Some("turn_closed" | "no_active_turn") => {
+                    release_input(state, &id);
+                    state.turn_closing |= !state.open.is_empty();
+                }
+                code => {
+                    state.in_flight.remove(&id);
+                    state.open.retain(|open| open != &id);
+                    state.rejected.insert(
+                        id,
+                        format!("controller rejected input: {}", code.unwrap_or("unknown")),
+                    );
+                }
+            }
+        }
+        _ => {}
+    }
+    None
+}
+
+/// The first wait before a turn the peer could not start is offered again;
+/// each refusal in a row doubles it up to [`TURN_RETRY_MAX`].
+const TURN_RETRY_FIRST: Duration = Duration::from_secs(1);
+const TURN_RETRY_MAX: Duration = Duration::from_secs(30);
+
+fn settle_consumed(state: &mut State, id: &str, turn: &str) {
+    state.in_flight.remove(id);
+    state.consumed.insert(id.to_string());
+    state.acknowledged.insert(id.to_string());
+    state.input_turns.insert(id.to_string(), turn.to_string());
+}
+
+/// Give an input back to the mailbox: the peer refused it, or ended the turn
+/// it was steered into without consuming it, so it is not in the journal and
+/// the next pass writes it again, in order. A consumed input never goes back.
+fn release_input(state: &mut State, id: &str) {
+    if state.consumed.contains(id) {
+        return;
+    }
+    state.in_flight.remove(id);
+    state.open.retain(|open| open != id);
+    state.acknowledged.remove(id);
+    state.input_turns.remove(id);
+    state.seen.remove(id);
+}
+
+/// The result that closes `turn` for a peer that proves consumption. Its
+/// consumed inputs are finished, the turn's usage on its opener; inputs it
+/// acknowledged but never consumed, and every id it lists undelivered, go
+/// back to the mailbox. An input with no answer yet stays in flight until the
+/// peer refuses it. A duplicate turn ran nothing, so it finishes nothing.
+fn finish_consumed(state: &mut State, turn: &str, usage: TurnUsage, value: &Value) {
+    if value.get("duplicate").and_then(Value::as_bool) == Some(true)
+        && state.in_flight.contains(turn)
+    {
+        state.duplicates.insert(turn.to_string());
+        settle_consumed(state, turn, turn);
+    }
+    // A turn closed on an input it never accepted did not journal it.
+    release_input(state, turn);
+    let undelivered: Vec<String> = value
+        .get("undelivered_steer_ids")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    for id in &undelivered {
+        release_input(state, id);
+    }
+    let mut members: Vec<String> = state
+        .input_turns
+        .iter()
+        .filter(|(_, owner)| owner.as_str() == turn)
+        .map(|(id, _)| id.clone())
+        .collect();
+    // The opener first, so it carries the turn's usage.
+    members.sort_by_key(|id| id != turn);
+    for id in members {
+        if !state.consumed.contains(&id) {
+            release_input(state, &id);
+        } else if !state.duplicates.contains(&id) && state.finished.insert(id.clone()) {
+            let item_usage = if id == turn {
+                usage.clone()
+            } else {
+                TurnUsage::default()
+            };
+            state.usages.push((id, item_usage));
+        }
+    }
+    if state.open.first().is_some_and(|owner| owner == turn) {
+        state.open.clear();
+    } else {
+        state
+            .open
+            .retain(|id| id != turn && state.input_turns.get(id).is_none_or(|owner| owner != turn));
+    }
+    state.turn_closing &= !state.open.is_empty();
+    state.turn_user_inputs = 0;
+    state.last_turn_step_type = None;
+    state.idle_since = None;
+    if state.open.is_empty()
+        && !state.unconfirmed
+        && let Some(dir) = &state.state_dir
+    {
+        // As a confirmed legacy completion: a lingering reset marker would
+        // ask for a recovery the session no longer needs.
+        let _ = std::fs::remove_file(dir.join(".anyagents-session-reset-recovery"));
     }
 }
 
@@ -2353,29 +2803,32 @@ fn agy_rpc_post(
 /// accept a new invocation via `SendUserCascadeMessage` with `plannerConfig`.
 const AGY_TURN_CLOSE_GRACE: Duration = Duration::from_millis(200);
 
-/// A turn just written is not steered into for this long, before its first
-/// step names the cascade.
-const AGY_FRESH_TURN: Duration = Duration::from_millis(250);
-
 /// The pause after a steer probe found no cascade to steer into.
 const AGY_STEER_PROBE_GAP: Duration = Duration::from_millis(400);
 
-/// Whether a steer must wait, and for how long when only time opens the
-/// gate: `Some(None)` waits for the first step line, `Some(Some(d))` for `d`.
+/// Whether a steer must wait: `Some(None)` until the next stdout line,
+/// `Some(Some(d))` for `d`.
+///
+/// Two waits remain, and both come from the vendor. A steer goes through the
+/// language server, while the turn it joins was started on stdin, and nothing
+/// orders the two:
+/// - A known cascade that has not shown the turn's first step may still be
+///   idle; a steer sent now would start its own invocation ahead of the turn's
+///   own message. The first step line ends this wait.
+/// - A cascade that just went idle may be ending its turn, whose `result`
+///   names no invocation: a steer sent as a new invocation now would have that
+///   late `result` close it. [`AGY_TURN_CLOSE_GRACE`] is the vendor's
+///   `pollResponse` bound on that line.
+///
+/// A fresh session has no cascade to steer into until the language server
+/// shows one, and the steer path asks it at once rather than after a delay.
 fn agy_input_gate(state: &State) -> Option<Option<Duration>> {
     if let Some(idle) = state.idle_since
         && idle.elapsed() < AGY_TURN_CLOSE_GRACE
     {
         return Some(Some(AGY_TURN_CLOSE_GRACE - idle.elapsed()));
     }
-    if state.turn_user_inputs != 0 {
-        return None;
-    }
-    if state.session_id.is_some() {
-        return Some(None);
-    }
-    let started = state.turn_started_at?;
-    (started.elapsed() < AGY_FRESH_TURN).then(|| Some(AGY_FRESH_TURN - started.elapsed()))
+    (state.turn_user_inputs == 0 && state.session_id.is_some()).then_some(None)
 }
 
 /// How long an open cascade's stdout stays quiet before its run status is
@@ -2485,8 +2938,8 @@ fn watch_agy_cascade(
 }
 
 /// Wake the host once `remain` has passed, when an input held back by a
-/// time gate (the cascade-close grace, a fresh turn, a recent steer probe)
-/// may be offered again.
+/// time gate (the cascade-close grace, a recent steer probe, a turn the peer
+/// could not start) may be offered again.
 fn nudge_after(shared: &Arc<Mutex<State>>, wake: &Arc<Condvar>, generation: u64, remain: Duration) {
     let shared = Arc::clone(shared);
     let wake = Arc::clone(wake);
@@ -3022,6 +3475,8 @@ pub fn cancel_line(spec: &StreamSpec) -> Value {
     })
 }
 
+#[cfg(test)]
+mod consumption_tests;
 #[cfg(test)]
 mod tests;
 

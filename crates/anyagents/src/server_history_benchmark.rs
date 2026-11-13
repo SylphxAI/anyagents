@@ -29,6 +29,7 @@ fn state(store: Arc<Store>, data: &Path) -> AppState {
             data_dir: data.into(),
         },
         identity: Arc::new(ServingIdentity::capture()),
+        profiles: Default::default(),
     }
 }
 

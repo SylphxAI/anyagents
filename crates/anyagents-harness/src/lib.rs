@@ -632,6 +632,15 @@ pub enum DeliverOutcome {
     /// The harness has the message. `turn_finished` means the turn that
     /// contained it has already completed.
     Accepted { turn_finished: bool },
+    /// The whole message is in the vendor's native steering input, and the
+    /// vendor has not yet proved it consumed it. It stays in the mailbox, but
+    /// the next message may be written behind it at once: the vendor takes
+    /// every pending input together, in order, at its next step.
+    InFlight,
+    /// The vendor proved this session already consumed the message before
+    /// (idempotent input replayed to a new process). It is delivered and
+    /// started no new work.
+    Duplicate,
     /// Input cannot take the complete message yet; it stays in the mailbox.
     Deferred,
     /// The vendor asked us to wait. Not a failure and not a restart.

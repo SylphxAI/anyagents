@@ -1473,10 +1473,28 @@ pub fn flush(data: &Path, name: &str) -> Result<(), anyagents_core::Error> {
                 source_time_ms: message.source_time_ms,
                 context: message.context.clone(),
             };
+            // Only a message the harness provably took is delivered. A line
+            // still in flight, deferred or quota-held stays in the mailbox for
+            // the next delivery, which idempotent input makes safe to repeat.
             match anyagents_harness::Harness::deliver(&mut harness, &outbound) {
-                Ok(_) => {
+                Ok(
+                    anyagents_harness::DeliverOutcome::Accepted { .. }
+                    | anyagents_harness::DeliverOutcome::Duplicate,
+                ) => {
                     store.note_delivered(&agent.id, message.seq)?;
                     flushed += 1;
+                }
+                Ok(anyagents_harness::DeliverOutcome::InFlight) => {
+                    failure = Some("not yet consumed by the harness; left queued".into());
+                    break;
+                }
+                Ok(anyagents_harness::DeliverOutcome::Deferred) => {
+                    failure = Some("harness deferred the message; left queued".into());
+                    break;
+                }
+                Ok(anyagents_harness::DeliverOutcome::Quota { reset_at_ms }) => {
+                    failure = Some(format!("quota until {reset_at_ms}; left queued"));
+                    break;
                 }
                 Err(err) => {
                     failure = Some(err.to_string());
