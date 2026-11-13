@@ -143,6 +143,7 @@ async fn serve(
     identity: Arc<ServingIdentity>,
 ) -> Result<(), Error> {
     let _server_lock = acquire_server_lock(data)?;
+    anyagents_toolchain::init_server(data, crate::sandbox::host_home_dir());
     crate::worktree_access::recover_inspections(data)?;
     let store = Arc::new(Store::open(data.join("state.db"))?);
     // The server lock excludes concurrent creation: no unadmitted row is in

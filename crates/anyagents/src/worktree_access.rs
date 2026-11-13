@@ -14,9 +14,11 @@ fn git_dirs(path: &Path) -> Result<Vec<PathBuf>, Error> {
     if !path.join(".git").exists() {
         return Ok(Vec::new());
     }
+    let git = anyagents_toolchain::tool("git", "checkout").map_err(|e| refusal(path, e))?;
     let mut dirs = Vec::new();
     for flag in ["--git-dir", "--git-common-dir"] {
-        let out = std::process::Command::new("git")
+        let out = git
+            .command()
             .args([
                 "-c",
                 "core.fsmonitor=false",
@@ -51,7 +53,9 @@ pub(crate) fn set_worktree_identity(path: &Path) -> Result<(), Error> {
         return Err(refusal(path, "identity requires a linked worktree"));
     }
     validate_config_files(private, common)?;
-    let extension = std::process::Command::new("git")
+    let git = anyagents_toolchain::tool("git", "checkout").map_err(|e| refusal(path, e))?;
+    let extension = git
+        .command()
         .args(["config", "--no-includes", "--file"])
         .arg(common.join("config"))
         .args(["--bool", "--get", "extensions.worktreeConfig"])
@@ -80,7 +84,8 @@ pub(crate) fn set_worktree_identity(path: &Path) -> Result<(), Error> {
         if value.trim().is_empty() {
             return Err(refusal(path, "Git author identity cannot be empty"));
         }
-        let out = std::process::Command::new("git")
+        let out = git
+            .command()
             .args(["config", "--no-includes", "--file"])
             .arg(&config)
             .args([key, &value])
@@ -126,7 +131,9 @@ fn validate_config_files(private: &Path, common: &Path) -> Result<(), Error> {
         }
         // --file - and --no-includes inspect only the opened input. Never
         // follow the include or print config values in a diagnostic.
-        let out = std::process::Command::new("git")
+        let out = anyagents_toolchain::tool("git", "checkout")
+            .map_err(|e| refusal(&path, e))?
+            .command()
             .args([
                 "-c",
                 "core.hooksPath=/dev/null",
@@ -205,13 +212,8 @@ pub(crate) fn configure_seat_git(config: &Path, workdir: &Path) -> Result<(), Er
             break;
         }
     }
-    // Harness fixtures can deliberately omit system tools from PATH. Preserve
-    // their configured precedence, then include the OS Git used for parsing.
-    let mut paths: Vec<_> = std::env::var_os("PATH")
-        .map(|value| std::env::split_paths(&value).collect())
-        .unwrap_or_default();
-    paths.extend([PathBuf::from("/usr/bin"), PathBuf::from("/bin")]);
-    let path_env = std::env::join_paths(paths).map_err(|e| refusal(config, e))?;
+    let path_env = anyagents_toolchain::global().exec_path("worktree_access");
+    let git_tool = anyagents_toolchain::tool("git", "checkout").map_err(|e| refusal(config, e))?;
     let staging = data.join("worktree-grants");
     std::fs::create_dir_all(&staging)?;
     let staging = std::fs::canonicalize(staging)?;
@@ -219,7 +221,7 @@ pub(crate) fn configure_seat_git(config: &Path, workdir: &Path) -> Result<(), Er
     // daemon may not be able to read that checkout under its reduced identity;
     // an unrelated malformed config must not govern this file-only operation.
     let git = || {
-        let mut command = std::process::Command::new("git");
+        let mut command = git_tool.command();
         command.current_dir(&staging).env("PATH", &path_env);
         for key in [
             "GIT_DIR",
@@ -1064,10 +1066,11 @@ impl RecordedWorktree {
 
     pub(crate) fn command(&self) -> std::io::Result<std::process::Command> {
         self.validate()?;
+        let git = anyagents_toolchain::tool("git", "checkout").map_err(std::io::Error::other)?;
         let g = &self.grant;
         let mut cmd = if unsafe { libc::geteuid() } == g.uid && unsafe { libc::getegid() } == g.gid
         {
-            std::process::Command::new("git")
+            git.command()
         } else {
             // Attributes (including index attributes) can select any driver in
             // trusted config. Pinning metadata alone cannot make parent-UID Git
@@ -1082,15 +1085,15 @@ impl RecordedWorktree {
                 &g.gid.to_string(),
                 "--no-new-privs",
                 "--",
-                "git",
             ]);
+            cmd.arg(git.path());
             cmd
         };
         cmd.env_clear()
             .current_dir("/")
             .env(
                 "PATH",
-                std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into()),
+                anyagents_toolchain::global().exec_path("worktree_access"),
             )
             .env("HOME", "/nonexistent")
             .env("XDG_CONFIG_HOME", "/nonexistent")
@@ -2651,13 +2654,7 @@ if [ -e "$1/.git" ] || [ -L "$1/.git" ]; then
   git -c safe.directory="$1" -C "$1" status --porcelain >/dev/null
 fi
 "#;
-    // Vendor fixtures and deployments may intentionally narrow PATH. Keep their
-    // overrides first, then include the OS utilities used by this admission.
-    let mut paths: Vec<_> = std::env::var_os("PATH")
-        .map(|value| std::env::split_paths(&value).collect())
-        .unwrap_or_default();
-    paths.extend([PathBuf::from("/usr/bin"), PathBuf::from("/bin")]);
-    let path_env = std::env::join_paths(paths).map_err(|e| refusal(path, e))?;
+    let path_env = anyagents_toolchain::global().exec_path("worktree_access.admission");
     let out = command
         .env("PATH", path_env)
         .env("HOME", "/nonexistent")

@@ -3846,43 +3846,12 @@ impl Drop for CodeChildGuard {
     }
 }
 
-static CACHED_JS_RUNTIME: std::sync::OnceLock<Option<(PathBuf, bool)>> = std::sync::OnceLock::new();
-
-fn find_js_runtime() -> Option<(PathBuf, bool)> {
-    CACHED_JS_RUNTIME
-        .get_or_init(|| {
-            let mut dirs = Vec::new();
-            if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-                dirs.push(home.join(".local/opt/node/bin"));
-                dirs.push(home.join(".local/opt/bun/bin"));
-                if let Some(host_home) = crate::sandbox::host_home_dir() {
-                    dirs.push(host_home.join(".local/opt/node/bin"));
-                    dirs.push(host_home.join(".local/opt/bun/bin"));
-                }
-                dirs.push(home.join(".local/bin"));
-                dirs.push(home.join(".bun/bin"));
-            } else if let Some(host_home) = crate::sandbox::host_home_dir() {
-                dirs.push(host_home.join(".local/opt/node/bin"));
-                dirs.push(host_home.join(".local/opt/bun/bin"));
-            }
-            if let Some(path_os) = std::env::var_os("PATH") {
-                dirs.extend(std::env::split_paths(&path_os));
-            }
-            dirs.push(PathBuf::from("/usr/local/bin"));
-            dirs.push(PathBuf::from("/usr/bin"));
-            dirs.push(PathBuf::from("/bin"));
-
-            for (bin_name, is_node) in [("node", true), ("bun", false)] {
-                for dir in &dirs {
-                    let candidate = dir.join(bin_name);
-                    if candidate.is_file() {
-                        return Some((candidate, is_node));
-                    }
-                }
-            }
-            None
-        })
-        .clone()
+fn find_js_runtime() -> Result<(PathBuf, bool), String> {
+    let resolved = anyagents_toolchain::global()
+        .first_of(&["node", "bun"], "mcp.js")
+        .map_err(|err| err.to_string())?;
+    let is_node = resolved.name == "node";
+    Ok((resolved.path, is_node))
 }
 
 impl AgentMcp {
@@ -4897,9 +4866,7 @@ impl AgentMcp {
             .timeout_ms
             .unwrap_or(DEFAULT_CODE_TIMEOUT_MS)
             .clamp(100, MAX_CODE_TIMEOUT_MS);
-        let (runtime_bin, is_node) = find_js_runtime().ok_or_else(|| {
-            "neither `node` nor `bun` was found on this machine to execute `code` mode".to_string()
-        })?;
+        let (runtime_bin, is_node) = find_js_runtime()?;
 
         let started = Instant::now();
         let mut cmd = Command::new(&runtime_bin);
@@ -5389,7 +5356,9 @@ impl Drop for ScopedTempDir {
 fn transcode_image_to_png_bytes(path: &Path) -> Option<Vec<u8>> {
     let dir = ScopedTempDir::new().ok()?;
     let out_png = dir.path().join("converted.png");
-    let status = std::process::Command::new("convert")
+    let convert = anyagents_toolchain::tool("convert", "mcp.read").ok()?;
+    let status = convert
+        .command()
         .arg(format!("{}[0]", path.display()))
         .arg(&out_png)
         .stdout(std::process::Stdio::null())
@@ -5558,17 +5527,21 @@ fn read_multimedia_file(
             .max(start_page)
             .min(start_page + 9);
 
-        let extracted_text = std::process::Command::new("pdftotext")
-            .args([
-                "-f",
-                &start_page.to_string(),
-                "-l",
-                &end_page.to_string(),
-                &resolved.display().to_string(),
-                "-",
-            ])
-            .output()
+        let extracted_text = anyagents_toolchain::tool("pdftotext", "mcp.read")
             .ok()
+            .and_then(|tool| {
+                tool.command()
+                    .args([
+                        "-f",
+                        &start_page.to_string(),
+                        "-l",
+                        &end_page.to_string(),
+                        &resolved.display().to_string(),
+                        "-",
+                    ])
+                    .output()
+                    .ok()
+            })
             .filter(|out| out.status.success())
             .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
             .unwrap_or_default();
@@ -5576,21 +5549,23 @@ fn read_multimedia_file(
         let mut pages_rendered = 0usize;
         if let Ok(tmp_dir) = ScopedTempDir::new() {
             let prefix = tmp_dir.path().join("page");
-            if let Ok(status) = std::process::Command::new("pdftoppm")
-                .args([
-                    "-jpeg",
-                    "-r",
-                    "100",
-                    "-f",
-                    &start_page.to_string(),
-                    "-l",
-                    &end_page.to_string(),
-                    &resolved.display().to_string(),
-                    &prefix.display().to_string(),
-                ])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
+            if let Ok(pdftoppm) = anyagents_toolchain::tool("pdftoppm", "mcp.read")
+                && let Ok(status) = pdftoppm
+                    .command()
+                    .args([
+                        "-jpeg",
+                        "-r",
+                        "100",
+                        "-f",
+                        &start_page.to_string(),
+                        "-l",
+                        &end_page.to_string(),
+                        &resolved.display().to_string(),
+                        &prefix.display().to_string(),
+                    ])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
                 && status.success()
                 && let Ok(entries) = std::fs::read_dir(tmp_dir.path())
             {

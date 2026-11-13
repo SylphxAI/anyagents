@@ -886,7 +886,7 @@ fn request_with_token_dir(
         record_response(path, &response);
         return Ok(response);
     }
-    gh_command(path, etag, modified, agent_id)
+    gh_command(path, etag, modified, agent_id)?
         .output()
         .map_err(|_| Error::Transport)
         .and_then(|output| parse_response(&output.stdout))
@@ -953,27 +953,51 @@ fn gh_command(
     etag: Option<&str>,
     modified: Option<&str>,
     agent_id: &str,
-) -> std::process::Command {
-    let mut command = std::process::Command::new("timeout");
-    command.env("ANYAGENTS_AGENT_ID", agent_id).args([
-        "15s",
-        "gh",
-        "api",
-        "--include",
-        "--method",
-        "GET",
-        "-H",
-        "Accept: application/vnd.github+json",
-        "-H",
-        "X-GitHub-Api-Version: 2022-11-28",
-    ]);
+) -> Result<std::process::Command, Error> {
+    gh_command_with(
+        anyagents_toolchain::global(),
+        path,
+        etag,
+        modified,
+        agent_id,
+    )
+}
+
+fn gh_command_with(
+    toolchain: &anyagents_toolchain::Toolchain,
+    path: &str,
+    etag: Option<&str>,
+    modified: Option<&str>,
+    agent_id: &str,
+) -> Result<std::process::Command, Error> {
+    let timeout = toolchain
+        .tool("timeout", "github-watch")
+        .map_err(|_| Error::Transport)?;
+    let gh = toolchain
+        .tool("gh", "github-watch")
+        .map_err(|_| Error::Transport)?;
+    let mut command = timeout.command();
+    command
+        .env("ANYAGENTS_AGENT_ID", agent_id)
+        .arg("15s")
+        .arg(gh.path())
+        .args([
+            "api",
+            "--include",
+            "--method",
+            "GET",
+            "-H",
+            "Accept: application/vnd.github+json",
+            "-H",
+            "X-GitHub-Api-Version: 2022-11-28",
+        ]);
     if let Some(etag) = etag {
         command.args(["-H", &format!("If-None-Match: {etag}")]);
     } else if let Some(modified) = modified {
         command.args(["-H", &format!("If-Modified-Since: {modified}")]);
     }
     command.arg(path);
-    command
+    Ok(command)
 }
 
 fn parse_response(bytes: &[u8]) -> Result<Response, Error> {
@@ -2767,9 +2791,36 @@ mod tests {
 
     #[test]
     fn gh_adapter_owns_cold_and_warm_conditional_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        let make_tool = |name: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, "#!/bin/sh\necho 1.0\n").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let sha = anyagents_toolchain::sha256_file(&path).unwrap();
+            (std::fs::canonicalize(path).unwrap(), sha)
+        };
+        let (timeout_path, timeout_sha) = make_tool("timeout");
+        let (gh_path, gh_sha) = make_tool("gh");
+        let manifest = format!(
+            "schema = 1\nenforce_undeclared = true\n[tool.timeout]\npath = \"{}\"\nversion = \"1.0\"\nsha256 = \"{timeout_sha}\"\nenforce = true\n[tool.gh]\npath = \"{}\"\nversion = \"1.0\"\nsha256 = \"{gh_sha}\"\nenforce = true\n",
+            timeout_path.display(),
+            gh_path.display(),
+        );
+        let toolchain = anyagents_toolchain::Toolchain::from_manifest_text(
+            &manifest,
+            &dir.path().join("toolchain.toml"),
+        );
         for etag in [None, Some("W/\"v1\"")] {
-            let command = gh_command("repos/o/r/pulls/42", etag, None, "agent");
+            let command =
+                gh_command_with(&toolchain, "repos/o/r/pulls/42", etag, None, "agent").unwrap();
+            assert_eq!(command.get_program(), timeout_path.as_os_str());
             let args: Vec<_> = command.get_args().map(|v| v.to_str().unwrap()).collect();
+            assert_eq!(args.first(), Some(&"15s"));
+            assert_eq!(args.get(1).copied(), gh_path.to_str());
             assert!(!args.iter().any(|arg| arg.starts_with("Cache-Control:")));
             assert!(args.windows(2).any(|pair| pair == ["--method", "GET"]));
             assert!(args.contains(&"--include"));
