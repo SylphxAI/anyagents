@@ -58,9 +58,35 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             std::fs::write(sample.join("report.json"), &text)?;
             println!("{text}");
         }
+        Some("serve") => service::serve(config)?,
+        Some("search") => {
+            let client = anyagents_memory::protocol::Client::for_data_dir(
+                &data,
+                std::time::Duration::from_secs(30),
+            )
+            .ok_or("no service socket")?;
+            let owners: Vec<String> = args
+                .windows(2)
+                .filter(|w| w[0] == "--owner")
+                .map(|w| w[1].clone())
+                .collect();
+            let query = arg("--query").ok_or("--query")?;
+            let (hits, status) = client.search(&query, &owners, None, None, None, 5)?;
+            println!("{}", serde_json::to_string_pretty(&status)?);
+            let passages: Vec<String> = hits
+                .iter()
+                .map(|h| format!("{} {}..{}", h.document_id, h.offset, h.offset + h.length))
+                .collect();
+            for (hit, line) in hits.iter().zip(&passages) {
+                println!("{:.3} {line}", hit.score);
+            }
+            let scores = client.rerank(&query, &passages)?;
+            println!("rerank scores {scores:?}");
+        }
         _ => {
             return Err(
-                "usage: memory-eval <fetch|sample|eval> [--data DIR] [--models DIR] ...".into(),
+                "usage: memory-eval <fetch|sample|eval|serve|search> [--data DIR] [--models DIR] ..."
+                    .into(),
             );
         }
     }
