@@ -143,6 +143,8 @@ struct State {
     tail: TranscriptTail,
     /// `CLAUDE_CONFIG_DIR`, where the session transcripts live.
     config_dir: Option<PathBuf>,
+    /// When the child was seen to have exited while its stdout stayed open.
+    exited_at: Option<Instant>,
     /// The take is the proof: for a harness with no transcript to read (the
     /// cloud harness, which starts a turn with the line it echoes).
     commit_on_take: bool,
@@ -440,13 +442,14 @@ impl ClaudeHarness {
                 .rev()
                 .find(|(key, _)| key == "CLAUDE_CONFIG_DIR")
                 .map(|(_, value)| PathBuf::from(value));
-            let (applied, applied_uuids) = session_id
+            let scan = session_id
                 .map(|session| transcript_marks(&self.environment, session))
                 .unwrap_or_default();
             let mut state = lock(&self.shared);
             state.child = Some(child);
             state.stderr = diagnostics::Evidence::default();
             state.alive = true;
+            state.exited_at = None;
             state.sign_in_fault = None;
             state.open.clear();
             state.followups.clear();
@@ -457,12 +460,12 @@ impl ClaudeHarness {
             // transcript's to settle: found there, it is a duplicate.
             state.taken.clear();
             state.written_now.clear();
-            state.applied_before.extend(applied);
-            state.applied_uuids.extend(applied_uuids);
+            state.applied_before.extend(scan.ids);
+            state.applied_uuids.extend(scan.uuids);
             // Without a config directory there is no transcript to read.
             state.commit_on_take |= config_dir.is_none();
             state.config_dir = config_dir;
-            state.tail = TranscriptTail::default();
+            state.tail = scan.tail;
             state.peer = None;
             if initial_quota.is_some() {
                 state.quota_reset_at_ms = initial_quota;
@@ -547,13 +550,14 @@ impl Harness for ClaudeHarness {
         }
         {
             let mut state = lock(&self.shared);
+            if !state.alive {
+                return Err(HarnessError::Dead);
+            }
+            // The running process's verdict; a new process may take it.
             if let Some(reason) = state.rejected.get(id) {
                 return Ok(DeliverOutcome::Rejected {
                     reason: reason.clone(),
                 });
-            }
-            if !state.alive {
-                return Err(HarnessError::Dead);
             }
             if let Some(reset_at_ms) = state.quota_reset_at_ms
                 && !state.finished.contains(id)
@@ -598,10 +602,10 @@ impl Harness for ClaudeHarness {
     }
 
     fn proven(&self, message_id: &str) -> Option<Proof> {
-        let mut state = lock(&self.shared);
-        if state.taken.contains(message_id) {
-            read_transcript(&mut state);
+        if lock(&self.shared).taken.contains(message_id) {
+            refresh_transcript(&self.shared);
         }
+        let state = lock(&self.shared);
         if state.consumed.contains(message_id) {
             return Some(Proof::Taken {
                 turn_finished: state.finished.contains(message_id),
@@ -674,7 +678,12 @@ impl Harness for ClaudeHarness {
     }
 
     fn health(&self) -> HarnessHealth {
-        let state = lock(&self.shared);
+        let mut state = lock(&self.shared);
+        // The child exited, and a descendant keeps its stdout open: past the
+        // grace no proof can still arrive from it.
+        if state.alive && exited_past_grace(&mut state) {
+            state.alive = false;
+        }
         HarnessHealth {
             process_alive: state.alive,
             turn_state: if state.open.is_empty() && state.in_flight.is_empty() {
@@ -731,6 +740,25 @@ impl Harness for ClaudeHarness {
     fn watch_activity(&self, notify: Arc<dyn Fn() + Send + Sync>) {
         watch_child(Arc::clone(&self.shared), Arc::clone(&self.wake), notify);
     }
+}
+
+/// How long a child that exited may keep its stdout open (a descendant
+/// holding it) before it is declared dead anyway.
+const EXIT_GRACE: Duration = Duration::from_secs(5);
+
+/// Whether the child exited more than [`EXIT_GRACE`] ago while its stdout
+/// never ended. Dead is otherwise only declared at that end.
+fn exited_past_grace(state: &mut State) -> bool {
+    if state.exited_at.is_none()
+        && let Some(child) = state.child.as_mut()
+        && let Ok(Some(status)) = child.try_wait()
+    {
+        state.stderr.status = Some(status);
+        state.exited_at = Some(Instant::now());
+    }
+    state
+        .exited_at
+        .is_some_and(|exited| exited.elapsed() >= EXIT_GRACE)
 }
 
 /// Undo `accept_message` for a line whose write failed.
@@ -797,6 +825,12 @@ fn read_stdout(stdout: ChildStdout, shared: Arc<Mutex<State>>, wake: Arc<Condvar
         let Ok(value) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
+        // A line that ends a turn, hands lines back or cancels one is judged
+        // against what the transcript already stores: read it first, outside
+        // the lock.
+        if settles_lines(&value) {
+            refresh_transcript(&shared);
+        }
         {
             let mut state = lock(&shared);
             let before = state.observed();
@@ -839,6 +873,21 @@ fn read_stdout(stdout: ChildStdout, shared: Arc<Mutex<State>>, wake: Arc<Condvar
         state.epoch = state.epoch.wrapping_add(1);
     }
     wake.notify_all();
+}
+
+/// Whether `value` can end a turn, hand lines back or cancel one: a result,
+/// a quota or sign-in failure, or a command's `cancelled` or `discarded`.
+fn settles_lines(value: &Value) -> bool {
+    match value.get("type").and_then(Value::as_str) {
+        Some("result") => true,
+        Some("command_lifecycle") => matches!(
+            value.get("state").and_then(Value::as_str),
+            Some("cancelled" | "discarded")
+        ),
+        _ => {
+            quota_from_claude(value).is_some() || synthetic_auth_error_from_claude(value).is_some()
+        }
+    }
 }
 
 fn watch_child(shared: Arc<Mutex<State>>, wake: Arc<Condvar>, notify: Arc<dyn Fn() + Send + Sync>) {
@@ -1041,7 +1090,6 @@ fn u64_field(value: Option<&Value>, key: &str) -> u64 {
 /// the mailbox, to be written again for the turn that succeeds. A line the
 /// conversation already took stays taken.
 fn hand_back(state: &mut State, id: &str, reason: &str) {
-    read_transcript(state);
     state.failures.push((id.to_string(), reason.to_string()));
     if state.consumed.contains(id) {
         return;
@@ -1084,9 +1132,12 @@ fn note_proof(state: &mut State, value: &Value) {
             };
             match value.get("state").and_then(Value::as_str) {
                 Some("started") => take(state, &id),
-                // A batch that failed to set up is cancelled after `started`:
-                // it never entered the conversation, and goes back.
-                Some("cancelled") if !state.consumed.contains(&id) => {
+                // A batch that failed to set up is cancelled after `started`,
+                // and a command still queued when the session ended is
+                // discarded (Claude Code re-emits its uuid on the next
+                // worker): neither entered the conversation, so it goes back.
+                // The transcript was read first: a stored line stays taken.
+                Some("cancelled" | "discarded") if !state.consumed.contains(&id) => {
                     state.open.retain(|item| item != &id);
                     state.followups.retain(|item| item != &id);
                     state.in_flight.remove(&id);
@@ -1094,7 +1145,7 @@ fn note_proof(state: &mut State, value: &Value) {
                     state.seen.remove(&id);
                 }
                 // Claude Code's own verdict: it will never take this line.
-                Some(verdict @ ("refused" | "discarded")) if !state.consumed.contains(&id) => {
+                Some(verdict @ "refused") if !state.consumed.contains(&id) => {
                     state.open.retain(|item| item != &id);
                     state.followups.retain(|item| item != &id);
                     state.in_flight.remove(&id);
@@ -1130,7 +1181,6 @@ fn note_proof(state: &mut State, value: &Value) {
                 take(state, &id);
                 persist(state, &id);
             }
-            read_transcript(state);
         }
         _ => {}
     }
@@ -1165,79 +1215,84 @@ fn persist(state: &mut State, id: &str) {
 }
 
 /// The session transcript as it grows: where it is and how far it was read.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct TranscriptTail {
     path: Option<PathBuf>,
     offset: u64,
-    partial: String,
 }
 
 /// Read what the session transcript gained since the last read, and commit
 /// every taken line it now holds: a user row (its own uuid, or a merged
 /// row's `mergedSendUuids`) or a folded line's `queued_command` attachment
-/// (`source_uuid`), and the marker each carries.
-fn read_transcript(state: &mut State) {
-    use std::io::{Read, Seek, SeekFrom};
-    if state.taken.is_empty() {
-        return;
-    }
-    let (Some(config), Some(session)) = (state.config_dir.clone(), state.session_id.clone()) else {
-        return;
-    };
-    let name = format!("{session}.jsonl");
-    let current = state
-        .tail
-        .path
-        .as_ref()
-        .is_some_and(|path| path.file_name().is_some_and(|file| file == name.as_str()));
-    if !current {
-        let found = std::fs::read_dir(config.join("projects"))
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|project| project.path().join(&name))
-            .find(|path| path.is_file());
-        let Some(found) = found else {
+/// (`source_uuid`), and the marker each carries. The file is read outside
+/// the state lock (a live transcript reaches gigabytes), from where the
+/// last read, or the launch's scan, ended.
+fn refresh_transcript(shared: &Mutex<State>) {
+    use std::io::{Seek, SeekFrom};
+    let (config, session, tail) = {
+        let state = lock(shared);
+        if state.taken.is_empty() {
+            return;
+        }
+        let (Some(config), Some(session)) = (state.config_dir.clone(), state.session_id.clone())
+        else {
             return;
         };
-        state.tail = TranscriptTail {
-            path: Some(found),
-            ..TranscriptTail::default()
-        };
-    }
-    let Some(path) = state.tail.path.clone() else {
+        (config, session, state.tail.clone())
+    };
+    let name = format!("{session}.jsonl");
+    let tail = match tail.path {
+        Some(ref path) if path.file_name().is_some_and(|file| file == name.as_str()) => tail,
+        _ => {
+            let found = std::fs::read_dir(config.join("projects"))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|project| project.path().join(&name))
+                .find(|path| path.is_file());
+            let Some(found) = found else {
+                return;
+            };
+            TranscriptTail {
+                path: Some(found),
+                offset: 0,
+            }
+        }
+    };
+    let Some(path) = tail.path.clone() else {
         return;
     };
     let Ok(mut file) = std::fs::File::open(&path) else {
         return;
     };
-    if file.seek(SeekFrom::Start(state.tail.offset)).is_err() {
+    if file.seek(SeekFrom::Start(tail.offset)).is_err() {
         return;
     }
-    let mut grown = String::new();
-    let Ok(read) = file.read_to_string(&mut grown) else {
+    let mut ids = Vec::new();
+    let mut uuids = Vec::new();
+    let read = each_row(file, |row| {
+        let (row_ids, row_uuids) = row_marks(row);
+        ids.extend(row_ids);
+        uuids.extend(row_uuids);
+    });
+    let mut state = lock(shared);
+    // Another read covered these bytes first.
+    if state.tail.path.as_ref() == Some(&path) && state.tail.offset != tail.offset {
         return;
+    }
+    state.tail = TranscriptTail {
+        path: Some(path),
+        offset: tail.offset + read,
     };
-    state.tail.offset += read as u64;
-    let mut text = std::mem::take(&mut state.tail.partial);
-    text.push_str(&grown);
-    let complete = text.rfind('\n').map_or(0, |end| end + 1);
-    state.tail.partial = text[complete..].to_string();
-    for line in text[..complete].lines() {
-        let Ok(row) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        let (ids, uuids) = row_marks(&row);
-        let mut held: Vec<String> = uuids
-            .iter()
-            .filter_map(|uuid| state.uuid_ids.get(uuid).cloned())
-            .collect();
-        held.extend(ids);
-        for id in held {
-            if state.taken.contains(&id) || state.in_flight.contains(&id) {
-                take(state, &id);
-                persist(state, &id);
-            }
+    let mut held: Vec<String> = uuids
+        .iter()
+        .filter_map(|uuid| state.uuid_ids.get(uuid).cloned())
+        .collect();
+    held.extend(ids);
+    for id in held {
+        if state.taken.contains(&id) || state.in_flight.contains(&id) {
+            take(&mut state, &id);
+            persist(&mut state, &id);
         }
     }
 }
@@ -1287,38 +1342,68 @@ fn row_marks(row: &Value) -> (Vec<String>, Vec<String>) {
 /// entered its conversation: a user row, or a line folded in mid-turn (a
 /// `queued_command` attachment). Claude Code itself recognises a replayed
 /// uuid only for a user row; this covers the folded ones too.
-fn transcript_marks(
-    environment: &[(String, String)],
-    session: &str,
-) -> (HashSet<String>, HashSet<String>) {
-    let mut marks = HashSet::new();
-    let mut uuids = HashSet::new();
+fn transcript_marks(environment: &[(String, String)], session: &str) -> TranscriptScan {
+    let mut scan = TranscriptScan::default();
     let Some(config) = environment
         .iter()
         .rev()
         .find(|(key, _)| key == "CLAUDE_CONFIG_DIR")
         .map(|(_, value)| PathBuf::from(value))
     else {
-        return (marks, uuids);
+        return scan;
     };
     let name = format!("{session}.jsonl");
     let Ok(projects) = std::fs::read_dir(config.join("projects")) else {
-        return (marks, uuids);
+        return scan;
     };
     for project in projects.flatten() {
-        let Ok(file) = std::fs::File::open(project.path().join(&name)) else {
+        let path = project.path().join(&name);
+        let Ok(file) = std::fs::File::open(&path) else {
             continue;
         };
-        for line in BufReader::new(file).lines().map_while(Result::ok) {
-            let Ok(row) = serde_json::from_str::<Value>(&line) else {
-                continue;
-            };
-            let (ids, row_uuids) = row_marks(&row);
-            marks.extend(ids);
-            uuids.extend(row_uuids);
+        let read = each_row(file, |row| {
+            let (ids, uuids) = row_marks(row);
+            scan.ids.extend(ids);
+            scan.uuids.extend(uuids);
+        });
+        // The live read starts where this scan ended.
+        scan.tail = TranscriptTail {
+            path: Some(path),
+            offset: read,
+        };
+    }
+    scan
+}
+
+/// What a launch read from a resumed session's transcript.
+#[derive(Default)]
+struct TranscriptScan {
+    ids: HashSet<String>,
+    uuids: HashSet<String>,
+    tail: TranscriptTail,
+}
+
+/// Call `row` for each complete JSONL row of `reader`, decoding lossily so
+/// one invalid byte costs one row, never the rest. Returns the bytes read up
+/// to the end of the last complete row; a row still being written is left.
+fn each_row(reader: impl std::io::Read, mut row: impl FnMut(&Value)) -> u64 {
+    let mut reader = BufReader::new(reader);
+    let mut line = Vec::new();
+    let mut read = 0u64;
+    loop {
+        line.clear();
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) if line.last() != Some(&b'\n') => break,
+            Ok(n) => {
+                read += n as u64;
+                if let Ok(value) = serde_json::from_str::<Value>(&String::from_utf8_lossy(&line)) {
+                    row(&value);
+                }
+            }
         }
     }
-    (marks, uuids)
+    read
 }
 
 /// The text of a message content: the string itself, or each text block.
@@ -1703,9 +1788,23 @@ mod tests {
         let project = config.path().join("projects").join("work");
         std::fs::create_dir_all(&project).unwrap();
         let transcript = project.join("sess.jsonl");
+        // The launch scanned what an earlier process stored, an invalid byte
+        // included; the live read starts where that scan ended.
+        let mut text = String::from("{\"type\":\"user\",\"uuid\":\"earlier\"}\n");
+        let mut bytes = text.clone().into_bytes();
+        bytes.extend_from_slice(b"{\"type\":\"assistant\",\"x\":\"\xff\"}\n");
+        std::fs::write(&transcript, &bytes).unwrap();
+        let env = [(
+            "CLAUDE_CONFIG_DIR".to_string(),
+            config.path().display().to_string(),
+        )];
+        let scan = transcript_marks(&env, "sess");
+        assert!(scan.uuids.contains("earlier"));
+        assert_eq!(scan.tail.offset, bytes.len() as u64);
         let mut state = State {
             config_dir: Some(config.path().to_path_buf()),
             session_id: Some("sess".into()),
+            tail: scan.tail,
             ..State::default()
         };
         for id in ["m1", "m2", "m3"] {
@@ -1718,49 +1817,57 @@ mod tests {
                 &serde_json::json!({"type": "command_lifecycle", "command_uuid": uuid_for(id), "state": "started"}),
             );
         }
-        read_transcript(&mut state);
-        assert!(state.consumed.is_empty(), "nothing is on disk yet");
+        let shared = Mutex::new(state);
+        refresh_transcript(&shared);
+        assert!(lock(&shared).consumed.is_empty(), "nothing is on disk yet");
         // A merged user row names its other members in `mergedSendUuids`, a
         // folded line is an attachment with its `source_uuid`; the last row
         // is still being written.
-        let rows = [serde_json::json!({"type": "user", "uuid": uuid_for("m2"),
+        let merged = serde_json::json!({"type": "user", "uuid": uuid_for("m2"),
                 "mergedSendUuids": [uuid_for("m1")],
                 "message": {"content": [{"type": "text", "text": "anyagents-message:m1\na"},
-                                        {"type": "text", "text": "anyagents-message:m2\nb"}]}})];
-        let mut text: String = rows.iter().map(|row| format!("{row}\n")).collect();
+                                        {"type": "text", "text": "anyagents-message:m2\nb"}]}});
         let folded = serde_json::json!({"type": "attachment", "attachment": {
             "type": "queued_command", "source_uuid": uuid_for("m3"),
             "prompt": [{"type": "text", "text": "anyagents-message:m3\nc"}]}})
         .to_string();
-        text.push_str(&folded[..10]);
-        std::fs::write(&transcript, &text).unwrap();
-        read_transcript(&mut state);
-        assert!(state.consumed.contains("m1") && state.consumed.contains("m2"));
-        assert!(
-            !state.consumed.contains("m3"),
-            "a half-written row proves nothing"
-        );
-        text.push_str(&folded[10..]);
-        text.push('\n');
-        std::fs::write(&transcript, &text).unwrap();
-        read_transcript(&mut state);
+        text = format!("{merged}\n{}", &folded[..10]);
+        bytes.extend_from_slice(text.as_bytes());
+        std::fs::write(&transcript, &bytes).unwrap();
+        refresh_transcript(&shared);
+        {
+            let state = lock(&shared);
+            assert!(state.consumed.contains("m1") && state.consumed.contains("m2"));
+            assert!(
+                !state.consumed.contains("m3"),
+                "a half-written row proves nothing"
+            );
+        }
+        bytes.extend_from_slice(&folded.as_bytes()[10..]);
+        bytes.push(b'\n');
+        std::fs::write(&transcript, &bytes).unwrap();
+        refresh_transcript(&shared);
+        let state = lock(&shared);
         assert!(state.consumed.contains("m3"));
         assert!(state.taken.is_empty());
     }
 
     #[test]
-    fn a_line_claude_code_cancels_after_starting_it_goes_back() {
+    fn a_line_claude_code_cancels_or_discards_after_starting_it_goes_back() {
         let mut state = State::default();
         state.uuid_ids.insert(uuid_for("m1"), "m1".into());
-        state.in_flight.insert("m1".into());
-        for verdict in ["started", "cancelled"] {
-            note_proof(
-                &mut state,
-                &serde_json::json!({"type": "command_lifecycle", "command_uuid": uuid_for("m1"), "state": verdict}),
-            );
+        for ending in ["cancelled", "discarded"] {
+            state.in_flight.insert("m1".into());
+            for verdict in ["started", ending] {
+                note_proof(
+                    &mut state,
+                    &serde_json::json!({"type": "command_lifecycle", "command_uuid": uuid_for("m1"), "state": verdict}),
+                );
+            }
+            assert!(!state.consumed.contains("m1") && !state.taken.contains("m1"));
+            assert!(!state.seen.contains("m1"), "{ending}: it is written again");
+            assert!(!state.rejected.contains_key("m1"), "{ending}");
         }
-        assert!(!state.consumed.contains("m1") && !state.taken.contains("m1"));
-        assert!(!state.seen.contains("m1"), "it is written again");
         state.in_flight.insert("m1".into());
         note_proof(
             &mut state,
