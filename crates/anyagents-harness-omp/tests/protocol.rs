@@ -138,6 +138,15 @@ fn steer(harness: &mut OmpHarness, id: &str) {
     });
 }
 
+/// Offer `id` until it is written, and wait until OMP read it, so a `step`
+/// commanded next takes it.
+fn steer_read(harness: &mut OmpHarness, vendor: &Vendor, id: &str) {
+    steer(harness, id);
+    until(&format!("OMP read {id}"), || {
+        vendor.wire().iter().any(|seen| seen == id)
+    });
+}
+
 #[test]
 fn omp_runs_in_rpc_mode_and_names_its_protocol_and_session() {
     let vendor = Vendor::new();
@@ -207,8 +216,8 @@ fn a_crash_after_a_step_leaves_a_session_that_holds_what_it_took() {
     let vendor = Vendor::new();
     let mut first = vendor.start(None);
     deliver(&mut first, "m1");
-    steer(&mut first, "m2");
-    steer(&mut first, "m3");
+    steer_read(&mut first, &vendor, "m2");
+    steer_read(&mut first, &vendor, "m3");
     // The step after a tool batch takes m2 and dies before m3: the tool
     // call's reply put the session on disk.
     vendor.command("step-1");
@@ -271,7 +280,7 @@ fn a_resumed_session_recognises_what_an_earlier_process_put_into_it() {
     let vendor = Vendor::new();
     let mut first = vendor.start(None);
     deliver(&mut first, "m1");
-    steer(&mut first, "m2");
+    steer_read(&mut first, &vendor, "m2");
     vendor.command("step");
     deliver(&mut first, "m2");
     vendor.command("finish");
