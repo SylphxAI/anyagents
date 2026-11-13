@@ -198,7 +198,7 @@ pub struct Launch {
 pub const LINE_PER_TURN: Delivery = Delivery {
     level: DeliveryLevel::TurnEnd,
     idempotent: false,
-    proof: "one input line per turn",
+    proof: std::borrow::Cow::Borrowed("one input line per turn"),
     peer: None,
 };
 
@@ -207,7 +207,7 @@ pub const LINE_PER_TURN: Delivery = Delivery {
 pub const LINE_INTO_TURN: Delivery = Delivery {
     level: DeliveryLevel::MidTurn,
     idempotent: false,
-    proof: "input line written",
+    proof: std::borrow::Cow::Borrowed("input line written"),
     peer: None,
 };
 
@@ -218,7 +218,7 @@ pub const LINE_INTO_TURN: Delivery = Delivery {
 const OLDER_SPIRON: Delivery = Delivery {
     level: DeliveryLevel::TurnEnd,
     idempotent: false,
-    proof: "accepted (one input per turn)",
+    proof: std::borrow::Cow::Borrowed("accepted (one input per turn)"),
     peer: None,
 };
 
@@ -227,7 +227,7 @@ const OLDER_SPIRON: Delivery = Delivery {
 pub const SPIRON: Delivery = Delivery {
     level: DeliveryLevel::NextStep,
     idempotent: true,
-    proof: "accepted/steer_consumed receipts; request_id journal",
+    proof: std::borrow::Cow::Borrowed("accepted/steer_consumed receipts; request_id journal"),
     peer: None,
 };
 
@@ -634,6 +634,16 @@ impl StreamHarness {
     /// A read of the child's state. It never does I/O: an Antigravity
     /// cascade that stays open without a closing line is watched by its own
     /// turn timer ([`watch_agy_cascade`]), not by how often the host asks.
+    /// What this harness already proved about `id`, without writing
+    /// (`Harness::proven`). Each protocol fills it in its own change.
+    pub fn proven(&self, _id: &str) -> Option<anyagents_harness::Proof> {
+        None
+    }
+
+    /// Stop the child and read it to the end (`Harness::stop`). Each
+    /// protocol fills it in its own change.
+    pub fn stop(&mut self) {}
+
     pub fn health(&self) -> HarnessHealth {
         let mut state = lock(&self.shared);
         if !state.alive {

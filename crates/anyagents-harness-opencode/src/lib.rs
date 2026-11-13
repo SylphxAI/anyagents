@@ -69,7 +69,7 @@ const TURN_POLL: Duration = Duration::from_secs(1);
 pub const DELIVERY: Delivery = Delivery {
     level: DeliveryLevel::MidTurn,
     idempotent: true,
-    proof: "durable inbox admission, by id",
+    proof: std::borrow::Cow::Borrowed("durable inbox admission, by id"),
     peer: None,
 };
 

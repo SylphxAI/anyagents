@@ -1490,6 +1490,11 @@ pub fn flush(data: &Path, name: &str) -> Result<(), anyagents_core::Error> {
                     failure = Some(format!("quota until {reset_at_ms}; left queued"));
                     break;
                 }
+                // Refused for good: parked past the cursor, its sender told.
+                Ok(anyagents_harness::DeliverOutcome::Rejected { reason }) => {
+                    store.reject_message(&agent.id, message.seq, &reason)?;
+                    println!("{}\trejected\t{}\t{reason}", agent.name, message.id.as_str());
+                }
                 Err(err) => {
                     failure = Some(err.to_string());
                     break;

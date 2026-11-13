@@ -84,7 +84,7 @@ impl Harness for IdleHarness {
             delivery: Delivery {
                 level: DeliveryLevel::TurnEnd,
                 idempotent: false,
-                proof: "scripted double",
+                proof: std::borrow::Cow::Borrowed("scripted double"),
                 peer: None,
             },
             quota_reset_at_ms: None,

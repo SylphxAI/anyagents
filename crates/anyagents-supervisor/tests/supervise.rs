@@ -497,7 +497,8 @@ fn a_restart_mid_stream_loses_nothing_and_writes_nothing_twice() {
     // Do not kill the child until it has read the first accepted pipe write.
     assert!(wait_until(|| log_contains(&log, "user:1:")));
     // The process dies with the turn still open. The supervisor starts a new
-    // one after its backoff, and the next two lines go to it in order.
+    // one after its backoff: the interrupted turn's recovery note goes first,
+    // then the next two lines, in order.
     let pid = supervisor.live(&agent.id).unwrap().pid.unwrap();
     let killed = std::process::Command::new("kill")
         .args(["-KILL", &pid.to_string()])
@@ -526,9 +527,17 @@ fn a_restart_mid_stream_loses_nothing_and_writes_nothing_twice() {
         std::fs::read_to_string(&log).unwrap_or_default()
     );
     let text = std::fs::read_to_string(&log).unwrap_or_default();
+    // The recovery note names the interrupted message; it is no input of its
+    // own. Count the lines that carry each message as input.
+    let inputs: Vec<&str> = text
+        .lines()
+        .filter(|line| line.starts_with('{') && !line.contains("[Recovery]"))
+        .collect();
     for message in &inbox {
         assert_eq!(
-            text.matches(&format!("anyagents-message:{}", message.id))
+            inputs
+                .iter()
+                .filter(|line| line.contains(&format!("anyagents-message:{}", message.id)))
                 .count(),
             1,
             "{} was written once across the restart: {text}",
@@ -536,6 +545,16 @@ fn a_restart_mid_stream_loses_nothing_and_writes_nothing_twice() {
         );
         assert_eq!(message.ack, anyagents_core::Ack::Delivered);
     }
+    let note = text
+        .find("[Recovery]")
+        .expect("the interrupted turn's recovery note");
+    let two = text
+        .find(&format!("anyagents-message:{}", inbox[1].id))
+        .expect("the second line");
+    assert!(
+        note < two,
+        "the recovery note goes ahead of later mail: {text}"
+    );
     drop(supervisor);
 }
 
@@ -1322,7 +1341,7 @@ impl Default for SwitchProbe {
                 delivery: anyagents_harness::Delivery {
                     level: anyagents_harness::DeliveryLevel::MidTurn,
                     idempotent: false,
-                    proof: "scripted double",
+                    proof: std::borrow::Cow::Borrowed("scripted double"),
                     peer: None,
                 },
                 quota_reset_at_ms: None,
@@ -1660,7 +1679,7 @@ fn a_dead_process_switches_without_waiting_for_restart_backoff() {
 }
 
 #[test]
-fn deferred_pending_mail_precedes_interrupted_turn_recovery() {
+fn interrupted_turn_recovery_goes_ahead_of_pending_mail() {
     use std::sync::{Mutex, atomic::AtomicBool, mpsc};
 
     struct DispatchClock {
@@ -1704,8 +1723,8 @@ fn deferred_pending_mail_precedes_interrupted_turn_recovery() {
         .unwrap();
     let pending = store.next_undelivered(&agent.id).unwrap().unwrap();
 
-    // Real mail is deferred, but recovery would be accepted immediately. This
-    // makes an invalid recovery offer observable without racing an input gate.
+    // Real mail is deferred, but recovery is accepted immediately, so the
+    // order of the two offers is observable without racing an input gate.
     let probe = Arc::new(Mutex::new(SwitchProbe {
         accept_recovery: true,
         ..SwitchProbe::default()
@@ -1730,21 +1749,20 @@ fn deferred_pending_mail_precedes_interrupted_turn_recovery() {
         Vec::new(),
     )
     .unwrap();
+    // The interrupted turn's messages are older than the pending mail: its
+    // recovery note goes first, even while the vendor defers that mail.
     let deadline = Instant::now() + WAIT_CEILING;
-    loop {
-        let (offers, given) = rx
+    let recovery = loop {
+        let (_, given) = rx
             .recv_timeout(deadline.saturating_duration_since(Instant::now()))
             .expect("dispatch must park");
-        if offers > 0 {
-            assert!(
-                given.is_empty(),
-                "recovery must not overtake deferred mail: {given:?}"
-            );
-            break;
+        if !given.is_empty() {
+            assert_eq!(given.len(), 1, "only the recovery note is taken: {given:?}");
+            assert!(given[0].starts_with("recovery_"), "{given:?}");
+            break given[0].clone();
         }
-    }
+    };
     assert_eq!(store.delivered_cursor(&agent.id).unwrap(), interrupted.seq);
-    assert_eq!(store.open_turn(&agent.id).unwrap(), Some(open));
     assert_eq!(
         store.next_undelivered(&agent.id).unwrap().unwrap().id,
         pending.id
@@ -1759,14 +1777,15 @@ fn deferred_pending_mail_precedes_interrupted_turn_recovery() {
         let (_, given) = rx
             .recv_timeout(deadline.saturating_duration_since(Instant::now()))
             .expect("delivery must park");
-        if !given.is_empty() {
-            assert_eq!(given, vec![pending.id.to_string()]);
+        if given.len() > 1 {
+            assert_eq!(given, vec![recovery.clone(), pending.id.to_string()]);
             break;
         }
     }
     assert_eq!(store.delivered_cursor(&agent.id).unwrap(), pending.seq);
     assert!(store.next_undelivered(&agent.id).unwrap().is_none());
     assert!(store.open_turn(&agent.id).unwrap().is_none());
+    let _ = open;
     drop(supervisor);
 }
 
@@ -1783,6 +1802,12 @@ impl anyagents_harness::Harness for CountedClaude {
         message: &anyagents_harness::OutboundMessage,
     ) -> Result<anyagents_harness::DeliverOutcome, anyagents_harness::HarnessError> {
         self.inner.deliver(message)
+    }
+    fn proven(&self, message_id: &str) -> Option<anyagents_harness::Proof> {
+        self.inner.proven(message_id)
+    }
+    fn stop(&mut self) {
+        self.inner.stop();
     }
     fn background(&mut self) -> Result<(), anyagents_harness::HarnessError> {
         self.inner.background()

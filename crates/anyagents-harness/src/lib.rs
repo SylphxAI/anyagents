@@ -11,6 +11,7 @@ mod name;
 mod seat;
 mod stamp;
 
+use std::borrow::Cow;
 use std::time::Duration;
 
 use serde_json::Value;
@@ -620,8 +621,9 @@ pub struct Delivery {
     /// A message an earlier process of the same session already consumed is
     /// recognised when it is handed over again, and is not applied twice.
     pub idempotent: bool,
-    /// The vendor signal the level rests on, in a few words.
-    pub proof: &'static str,
+    /// The vendor signal the level rests on, in a few words. Borrowed for an
+    /// adapter's own constant; owned when it crosses a process boundary.
+    pub proof: Cow<'static, str>,
     /// What the running process said about itself in its handshake (vendor,
     /// version, protocol, capabilities). `None` before a process announced
     /// itself, and for a vendor whose handshake names nothing.
@@ -686,6 +688,23 @@ pub enum DeliverOutcome {
     Deferred,
     /// The vendor asked us to wait. Not a failure and not a restart.
     Quota { reset_at_ms: i64 },
+    /// The vendor refused the message for good, without applying it: no
+    /// retry and no new process can make it take this message (a malformed
+    /// request, an id another record holds, a code no retry clears). The
+    /// loop parks it as rejected, past the cursor, and tells its sender. An
+    /// adapter answers the same when the same id is offered again.
+    Rejected { reason: String },
+}
+
+/// What a harness already proved about one message, read without writing
+/// anything (`Harness::proven`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Proof {
+    /// The vendor took it with the proof the harness's level requires;
+    /// `turn_finished` means the turn that contained it already ended.
+    Taken { turn_finished: bool },
+    /// The session already held it from an earlier process.
+    Duplicate,
 }
 
 /// The harness process could not take the message.
@@ -701,6 +720,24 @@ pub enum HarnessError {
 /// scripted fake can stay a delivery double without a process.
 pub trait Harness: Send {
     fn deliver(&mut self, message: &OutboundMessage) -> Result<DeliverOutcome, HarnessError>;
+
+    /// What this harness already proved about `message_id`, without writing
+    /// anything and whether or not its process still runs. The host commits
+    /// these before it replaces the process or waits out a quota: a proof
+    /// outlives the process that gave it, but not the adapter that holds it.
+    /// `deliver` answers a proven message the same way, before it looks at
+    /// liveness or quota. `None` when nothing is proven yet.
+    fn proven(&self, _message_id: &str) -> Option<Proof> {
+        None
+    }
+
+    /// Stop the vendor process and read everything it already wrote, so
+    /// every proof it gave is known to `proven` before the host replaces it.
+    /// The adapter stays usable for `proven` afterwards. Called once, right
+    /// before the host swaps in a new process; dropping the adapter must
+    /// still stop the process when this was never called.
+    fn stop(&mut self) {}
+
     fn background(&mut self) -> Result<(), HarnessError>;
     fn resume(&mut self, session: &str) -> Result<(), HarnessError>;
     fn cancel(&mut self) -> Result<(), HarnessError>;

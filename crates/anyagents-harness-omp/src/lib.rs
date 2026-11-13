@@ -51,7 +51,7 @@ use serde_json::{Value, json};
 pub const DELIVERY: Delivery = Delivery {
     level: DeliveryLevel::NextStep,
     idempotent: true,
-    proof: "user message_end carrying the marker; session file read at start",
+    proof: std::borrow::Cow::Borrowed("user message_end carrying the marker; session file read at start"),
     peer: None,
 };
 

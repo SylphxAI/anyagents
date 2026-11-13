@@ -783,8 +783,11 @@ struct Session<H: Harness> {
     turns_recorded: u32,
     /// Set when a fresh harness process starts (`boot` or `replace_process`)
     /// so an open turn interrupted by the previous process's exit is resumed
-    /// with a `[Recovery]` prompt if no new mailbox message wakes it first.
+    /// with a `[Recovery]` note, ahead of any new mail.
     pending_recovery: bool,
+    /// The recovery note is not yet written to the vendor: new mail, which is
+    /// younger than the interrupted turn's, waits behind it.
+    recovery_blocks_mail: bool,
     /// Set once at least one turn has completed during this session, enabling
     /// automatic scale-to-zero (`idle`) for any agent after a completed turn.
     completed_turn_in_session: bool,
@@ -837,6 +840,7 @@ impl<H: Harness + 'static> Session<H> {
             written: 0,
             turns_recorded: 0,
             pending_recovery: false,
+            recovery_blocks_mail: false,
             completed_turn_in_session: false,
             quota_started_at: None,
             pending_switch_started_at: None,
@@ -876,6 +880,7 @@ impl<H: Harness + 'static> Session<H> {
                         self.restart_at = None;
                         // Unknown until recover_once reads durable state successfully.
                         self.pending_recovery = true;
+                        self.recovery_blocks_mail = false;
                         self.delivery = Some(*delivery);
                     }
                     Boot::Busy => {
@@ -1191,7 +1196,15 @@ impl<H: Harness + 'static> Session<H> {
                 // A quota wait belonged to the process that is gone.
                 harness.clear_quota();
                 if let Some(delivery) = self.delivery.as_mut() {
+                    // Stop the old process and read it to the end before the
+                    // new one takes any mail: what it proved in its last
+                    // moments is committed, never handed to its successor. A
+                    // launch that failed left the old process serving.
+                    if let Err(err) = delivery.retire_harness() {
+                        self.last_error = Some(format!("commit proven mail: {err}"));
+                    }
                     self.pending_recovery = true;
+                    self.recovery_blocks_mail = false;
                     delivery.replace_harness(harness);
                 }
                 self.exit_watch = None;
@@ -1234,27 +1247,35 @@ impl<H: Harness + 'static> Session<H> {
         true
     }
 
-    /// Commit what a dead or quota-held process proved it took, before the
-    /// quota wait or the process replacement that skips the delivery pass.
-    /// A proof outlives the process that gave it, but not the adapter that
-    /// holds it: once a new process takes over, an uncommitted message would
-    /// be handed over again. Every adapter answers a proven message before
-    /// its quota or its liveness, and an unwritten one with `Quota` or
-    /// `Dead`, so this pass writes nothing. A live process without a quota
-    /// would take new input, so it is left to the delivery pass.
+    /// Commit what the harness already proved it took, before anything that
+    /// skips the delivery pass: a quota wait, a switch drain, or replacing
+    /// the process, alive or dead. A proof outlives the process that gave it
+    /// but not the adapter that holds it, so an uncommitted one would hand
+    /// the message to the next process again. Nothing is written.
     fn commit_proven(&mut self) {
         let Some(delivery) = self.delivery.as_mut() else {
             return;
         };
-        let health = delivery.harness().health();
-        if health.process_alive && health.quota_reset_at_ms.is_none() {
-            return;
+        match delivery.commit_proven() {
+            Ok(committed) => {
+                self.written = self
+                    .written
+                    .saturating_add(committed.clamp(0, u64::from(u32::MAX)) as u32);
+            }
+            Err(err) => self.last_error = Some(format!("commit proven mail: {err}")),
         }
-        if let Ok(RunOutcome::Delivered { delivered }) = delivery.run_once() {
-            self.written = self
-                .written
-                .saturating_add(delivered.clamp(0, u64::from(u32::MAX)) as u32);
-        }
+    }
+
+    /// The last message the harness refused for good in this pass, as the
+    /// agent's error, so a parked message is seen.
+    fn take_rejection_note(&mut self) -> Option<String> {
+        let delivery = self.delivery.as_mut()?;
+        delivery.take_rejections().pop().map(|rejection| {
+            format!(
+                "message {} (seq {}) rejected by the harness: {}",
+                rejection.message_id, rejection.seq, rejection.reason
+            )
+        })
     }
 
     /// One pass over the mailbox. Every line is handed to the harness's own
@@ -1269,6 +1290,8 @@ impl<H: Harness + 'static> Session<H> {
             // replacement process instead of steering them into the old turn,
             // and cut over at the turn boundary (a harness transition wakes
             // this worker) or at the drain deadline.
+            // What the old process proves while it drains is committed now.
+            self.commit_proven();
             let deadline = switch_started_at.saturating_add(PENDING_SWITCH_DRAIN_MS);
             let now = self.inner.clock.now_ms();
             // Never busy-loop on a wait whose deadline is already past.
@@ -1280,22 +1303,40 @@ impl<H: Harness + 'static> Session<H> {
             self.sleep(Some(wait_until));
             return false;
         }
+        // An interrupted turn's messages are older than any mail behind
+        // them: its recovery note goes first, and new mail follows it only
+        // once it is written.
+        if self.pending_recovery {
+            if self.recover_once() {
+                return false;
+            }
+            if self.pending_recovery && self.recovery_blocks_mail {
+                if let Some(health) = self.harness_health() {
+                    self.idle_wait(&health);
+                }
+                return false;
+            }
+        }
         let outcome = {
             let Some(delivery) = self.delivery.as_mut() else {
                 return false;
             };
             delivery.run_once()
         };
+        let rejected = self.take_rejection_note();
         match outcome {
-            Ok(RunOutcome::Quota { .. }) => false,
+            Ok(RunOutcome::Quota { .. }) => {
+                if rejected.is_some() {
+                    self.last_error = rejected;
+                    self.publish();
+                }
+                false
+            }
             Ok(RunOutcome::Delivered { delivered }) => {
                 // The turn this opens may start new commands: the next idle
                 // point looks at the process tree again.
                 self.exit_watch = None;
-                // New mailbox messages just woke the session directly; any open
-                // turn from before a process restart is now superseded by them.
-                self.pending_recovery = false;
-                self.last_error = None;
+                self.last_error = rejected;
                 self.written = self
                     .written
                     .saturating_add(delivered.clamp(0, u64::from(u32::MAX)) as u32);
@@ -1308,6 +1349,10 @@ impl<H: Harness + 'static> Session<H> {
                 // No message was accepted on this pass (the mailbox may still
                 // contain deferred mail). Record whatever the vendor reported.
                 self.attempt = 0;
+                if rejected.is_some() {
+                    self.last_error = rejected;
+                    self.publish();
+                }
                 let Some(mut health) = self.harness_health() else {
                     return false;
                 };
@@ -1632,11 +1677,6 @@ impl<H: Harness + 'static> Session<H> {
                 self.pending_recovery = false;
                 return false;
             };
-            if !matches!(delivery.store().next_undelivered(&self.id), Ok(None)) {
-                // Idle also covers deferred or passive mail. Recovery must not
-                // overtake any queued message, and a failed read is not emptiness.
-                return false;
-            }
             let open = match delivery.store().open_turn(&self.id) {
                 Ok(open) => open,
                 Err(err) => {
@@ -1647,6 +1687,7 @@ impl<H: Harness + 'static> Session<H> {
             match open {
                 None => {
                     self.pending_recovery = false;
+                    self.recovery_blocks_mail = false;
                     if self
                         .last_error
                         .as_deref()
@@ -1660,19 +1701,30 @@ impl<H: Harness + 'static> Session<H> {
             }
         };
         match outcome {
-            Ok(DeliverOutcome::Accepted { .. }) => {
+            Ok(DeliverOutcome::Accepted { .. } | DeliverOutcome::Duplicate) => {
                 self.pending_recovery = false;
+                self.recovery_blocks_mail = false;
                 self.last_error = None;
                 self.written = self.written.saturating_add(1);
                 false
             }
-            // The delivery loop answers a recovery note only as taken or not.
-            Ok(
-                DeliverOutcome::Deferred
-                | DeliverOutcome::InFlight
-                | DeliverOutcome::Duplicate
-                | DeliverOutcome::Quota { .. },
-            ) => false,
+            Ok(DeliverOutcome::Rejected { reason }) => {
+                self.pending_recovery = false;
+                self.recovery_blocks_mail = false;
+                self.last_error = Some(format!("recovery note rejected by the harness: {reason}"));
+                self.publish();
+                false
+            }
+            // Written and not yet proved: mail may follow it.
+            Ok(DeliverOutcome::InFlight) => {
+                self.recovery_blocks_mail = false;
+                false
+            }
+            // Not written: mail waits behind it.
+            Ok(DeliverOutcome::Deferred | DeliverOutcome::Quota { .. }) => {
+                self.recovery_blocks_mail = true;
+                false
+            }
             Err(anyagents_agent::Error::HarnessDown) => {
                 if !self.wait_backoff() {
                     return true;

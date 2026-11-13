@@ -69,7 +69,7 @@ const INVALID_PARAMS: i64 = -32602;
 pub const DELIVERY: Delivery = Delivery {
     level: DeliveryLevel::NextStep,
     idempotent: true,
-    proof: "userMessage item per turn/start commandId",
+    proof: std::borrow::Cow::Borrowed("userMessage item per turn/start commandId"),
     peer: None,
 };
 

@@ -248,6 +248,14 @@ impl anyagents_harness::Harness for ContractHarness {
         self.inner.deliver(message, &line)
     }
 
+    fn proven(&self, message_id: &str) -> Option<anyagents_harness::Proof> {
+        self.inner.proven(message_id)
+    }
+
+    fn stop(&mut self) {
+        self.inner.stop();
+    }
+
     fn background(&mut self) -> Result<(), HarnessError> {
         self.inner.background()
     }
@@ -1821,6 +1829,36 @@ impl Harness for VendorHarness {
         };
         self.sync_session().map_err(HarnessError::Failed)?;
         out
+    }
+
+    fn proven(&self, message_id: &str) -> Option<anyagents_harness::Proof> {
+        match self {
+            Self::Claude(harness, _) => harness.proven(message_id),
+            Self::Codex(harness, _) => harness.proven(message_id),
+            Self::OpenCode(harness, _) => harness.proven(message_id),
+            Self::Agy(harness, _) => harness.proven(message_id),
+            Self::Muse(harness, _) => harness.proven(message_id),
+            Self::Omp(harness, _) => harness.proven(message_id),
+            Self::Dsh(harness, _) => harness.proven(message_id),
+            Self::Grok(harness, _) => harness.proven(message_id),
+            Self::Spiron(harness, _, _) => harness.proven(message_id),
+            Self::Contract(harness) => harness.proven(message_id),
+        }
+    }
+
+    fn stop(&mut self) {
+        match self {
+            Self::Claude(harness, _) => harness.stop(),
+            Self::Codex(harness, _) => harness.stop(),
+            Self::OpenCode(harness, _) => harness.stop(),
+            Self::Agy(harness, _) => harness.stop(),
+            Self::Muse(harness, _) => harness.stop(),
+            Self::Omp(harness, _) => harness.stop(),
+            Self::Dsh(harness, _) => harness.stop(),
+            Self::Grok(harness, _) => harness.stop(),
+            Self::Spiron(harness, _, _) => harness.stop(),
+            Self::Contract(harness) => harness.stop(),
+        }
     }
 
     fn background(&mut self) -> Result<(), HarnessError> {

@@ -46,7 +46,7 @@ use serde_json::{Value, json};
 pub const DELIVERY: Delivery = Delivery {
     level: DeliveryLevel::NextStep,
     idempotent: true,
-    proof: "command_lifecycle started / replay echo, by uuid",
+    proof: std::borrow::Cow::Borrowed("command_lifecycle started / replay echo, by uuid"),
     peer: None,
 };
 
@@ -55,7 +55,7 @@ pub const DELIVERY: Delivery = Delivery {
 pub const CLOUD_DELIVERY: Delivery = Delivery {
     level: DeliveryLevel::TurnEnd,
     idempotent: false,
-    proof: "replay echo when the line's turn starts",
+    proof: std::borrow::Cow::Borrowed("replay echo when the line's turn starts"),
     peer: None,
 };
 

@@ -47,7 +47,7 @@ use serde_json::{Value, json};
 pub const DELIVERY: Delivery = Delivery {
     level: DeliveryLevel::MidTurn,
     idempotent: true,
-    proof: "durable inbox admission, by request id",
+    proof: std::borrow::Cow::Borrowed("durable inbox admission, by request id"),
     peer: None,
 };
 

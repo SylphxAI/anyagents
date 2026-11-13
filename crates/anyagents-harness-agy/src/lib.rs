@@ -34,7 +34,7 @@ use anyagents_harness_stream::{
 pub const DELIVERY: Delivery = Delivery {
     level: DeliveryLevel::MidTurn,
     idempotent: false,
-    proof: "SendUserCascadeMessage queued it (its answer, or the cascade mailbox)",
+    proof: std::borrow::Cow::Borrowed("SendUserCascadeMessage queued it (its answer, or the cascade mailbox)"),
     peer: None,
 };
 

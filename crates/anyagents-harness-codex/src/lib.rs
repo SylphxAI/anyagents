@@ -77,7 +77,7 @@ const SETTLE_TURNS: usize = 2;
 pub const DELIVERY: Delivery = Delivery {
     level: DeliveryLevel::NextStep,
     idempotent: true,
-    proof: "userMessage item carrying our clientId; thread/items/list history",
+    proof: std::borrow::Cow::Borrowed("userMessage item carrying our clientId; thread/items/list history"),
     peer: None,
 };
 

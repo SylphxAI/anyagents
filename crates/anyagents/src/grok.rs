@@ -48,7 +48,7 @@ fn rpc_wait() -> Duration {
 pub const DELIVERY: Delivery = Delivery {
     level: DeliveryLevel::MidTurn,
     idempotent: false,
-    proof: "marker in x.ai/queue/changed or user_message_chunk; session/prompt answer",
+    proof: std::borrow::Cow::Borrowed("marker in x.ai/queue/changed or user_message_chunk; session/prompt answer"),
     peer: None,
 };
 

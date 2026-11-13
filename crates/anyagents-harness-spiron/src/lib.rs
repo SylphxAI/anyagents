@@ -115,6 +115,14 @@ impl Harness for SpironHarness {
         self.inner.deliver(message, &line)
     }
 
+    fn proven(&self, message_id: &str) -> Option<anyagents_harness::Proof> {
+        self.inner.proven(message_id)
+    }
+
+    fn stop(&mut self) {
+        self.inner.stop();
+    }
+
     fn background(&mut self) -> Result<(), HarnessError> {
         self.inner.background()
     }
