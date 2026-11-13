@@ -321,7 +321,11 @@ configuration resets legacy wildcard trust and lists only the seat's exact
 checkout and recorded common gitdir, preserving other settings. Cleanup loads
 its gitdir/worktree pair from the server journal, verifies the protected metadata
 ownership and effective ACLs, and passes both paths explicitly: a child-edited
-`.git` pointer never selects metadata. A missing, broken or changed pointer on a
+`.git` pointer never selects metadata. Shared metadata that a group can write is
+untrusted unless the deployment names that group in
+`ANYAGENTS_TRUSTED_METADATA_GIDS` (comma-separated gids or group names): a
+deployment whose seats share Git hubs by design declares those seats one trust
+domain for that metadata; world-writable metadata is never trusted. A missing, broken or changed pointer on a
 journaled checkout preserves its entire workdir (including build-named output)
 and emits a diagnostic; it cannot select non-Git directory deletion. Cleanup Git
 runs as the journaled seat UID/GID, with no inherited secret environment or socket
