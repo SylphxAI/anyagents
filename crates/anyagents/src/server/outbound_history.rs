@@ -13,10 +13,12 @@
 //!   `<key>.done`, are read there, and move into `receipts/` on the first scan.
 //!
 //! `<key>` is the hexadecimal effect key. Only this daemon opens obligations,
-//! so it knows each one: the first reconcile scans the directory for those a
-//! previous process left, and every obligation this process opens stays
-//! registered until it settles. Later reconciles visit registered obligations
-//! only and touch no file when none is open.
+//! so it knows each one: the first reconcile lists the directory once,
+//! registering the obligations a previous process left, and every obligation
+//! this process opens stays registered until it settles. What a previous
+//! process left to tidy (unheld lock files, staged writes, flat-layout
+//! receipts) is worked off a bounded batch per reconcile. Reconciles then
+//! visit registered obligations only and touch no file when none is open.
 
 use super::{ApiError, Delivery};
 use anyagents_core::{AgentId, Error, MessageId, Store};
@@ -94,11 +96,19 @@ fn is_encoded(name: &str) -> bool {
 /// Open obligations of each journal directory this process knows of.
 #[derive(Default)]
 struct Open {
-    /// The directory was scanned for obligations a previous process left.
+    /// The directory was listed for obligations a previous process left.
     scanned: bool,
     /// Encoded keys whose `.pending` file may exist.
     keys: BTreeSet<String>,
+    /// Files the listing found that a previous process left to tidy, worked
+    /// off at most [`TIDY_BATCH`] per reconcile.
+    leftovers: Vec<String>,
 }
+
+/// Leftover files one reconcile tidies. A flat-layout journal held 11k
+/// receipts and as many lock files; moving them all in one maintenance pass
+/// kept that pass (and the publication barrier) busy for the whole migration.
+const TIDY_BATCH: usize = 256;
 
 static OPEN: OnceLock<Mutex<HashMap<PathBuf, Open>>> = OnceLock::new();
 
@@ -424,25 +434,35 @@ where
 
 /// Only receipts of already acknowledged effects are replayed. Prepared or
 /// malformed obligations remain untouched and produce an explicit diagnostic.
-/// The cost is one visit per open obligation; with none open, no file is
-/// touched.
+/// The cost is one visit per open obligation plus at most [`TIDY_BATCH`]
+/// leftovers of a previous process; with neither, no file is touched.
 pub(super) fn reconcile(store: &Store) -> Result<(), Error> {
     let directory = directory(store);
-    if with_open(&directory, |open| open.scanned && open.keys.is_empty()) {
+    if with_open(&directory, |open| {
+        open.scanned && open.keys.is_empty() && open.leftovers.is_empty()
+    }) {
         return Ok(());
     }
     let _barrier = publication_barrier(store)?;
     let mut first_error = None;
     if !with_open(&directory, |open| open.scanned) {
-        match scan(&directory) {
-            Ok(tidy_error) => {
-                with_open(&directory, |open| open.scanned = true);
-                first_error = tidy_error;
-            }
+        match list(&directory) {
+            Ok((pending, leftovers)) => with_open(&directory, |open| {
+                open.keys.extend(pending);
+                open.leftovers = leftovers;
+                open.scanned = true;
+            }),
             Err(error) => {
                 first_error.get_or_insert(error);
             }
         }
+    }
+    let batch: Vec<String> = with_open(&directory, |open| {
+        let keep = open.leftovers.len().saturating_sub(TIDY_BATCH);
+        open.leftovers.split_off(keep)
+    });
+    if let Some(error) = tidy(&directory, &batch) {
+        first_error.get_or_insert(error);
     }
     let keys: Vec<String> = with_open(&directory, |open| open.keys.iter().cloned().collect());
     for name in keys {
@@ -471,25 +491,24 @@ pub(super) fn reconcile(store: &Store) -> Result<(), Error> {
     }
 }
 
-/// The one directory scan a process makes. It registers the obligations a
-/// previous process left open and tidies what it left behind: lock files no
-/// one holds, staged writes no one finishes, and receipts in the legacy flat
-/// layout, which move into `receipts/` unchanged. A key some delivery holds
-/// is left to that delivery; files this module did not write are untouched.
+/// The one directory listing a process makes. It returns the obligations a
+/// previous process left open, which are registered at once, and the files it
+/// left behind to tidy: lock files no one holds, staged writes no one
+/// finishes, and receipts in the legacy flat layout. Listing reads names
+/// only; [`tidy`] works the leftovers off in batches.
 ///
 /// `Err` means the directory could not be read in full, so an open obligation
-/// may be unregistered and the scan must run again. A file that could not be
-/// tidied stays as it is and is reported as `Ok(Some(error))`; the scan is
-/// complete and does not repeat.
-fn scan(directory: &Path) -> Result<Option<Error>, Error> {
+/// may be unregistered and the listing must run again.
+fn list(directory: &Path) -> Result<(Vec<String>, Vec<String>), Error> {
     let entries = match std::fs::read_dir(directory) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((Vec::new(), Vec::new()));
+        }
         Err(error) => return Err(error.into()),
     };
-    let receipts = create_receipts(directory)?;
-    let mut first_error = None;
-    let mut moved = false;
+    let mut pending = Vec::new();
+    let mut leftovers = Vec::new();
     for entry in entries {
         let entry = entry?;
         let file_name = entry.file_name();
@@ -499,11 +518,40 @@ fn scan(directory: &Path) -> Result<Option<Error>, Error> {
         if !entry.file_type()?.is_file() || file_name == ".publication.lock" {
             continue;
         }
+        let keyed = |suffix: &str| file_name.strip_suffix(suffix).filter(|n| is_encoded(n));
+        if let Some(name) = keyed(".pending") {
+            pending.push(name.to_owned());
+        } else if keyed(".lock").is_some()
+            || keyed(".pending.tmp").is_some()
+            || keyed(".done.tmp").is_some()
+            || keyed(".done").is_some()
+            || (file_name.starts_with('.') && file_name.ends_with(".tmp"))
+        {
+            leftovers.push(file_name.to_owned());
+        }
+    }
+    Ok((pending, leftovers))
+}
+
+/// Tidy one batch of leftover files: unlink lock files no one holds, recover
+/// staged writes, and move legacy receipts into `receipts/`. A key some
+/// delivery holds is left to that delivery; files this module did not write
+/// are untouched. A file that could not be tidied stays as it is and is
+/// reported; it is not retried.
+fn tidy(directory: &Path, batch: &[String]) -> Option<Error> {
+    if batch.is_empty() {
+        return None;
+    }
+    let receipts = match create_receipts(directory) {
+        Ok(receipts) => receipts,
+        Err(error) => return Some(error),
+    };
+    let mut first_error = None;
+    let mut moved = false;
+    for file_name in batch {
         let result = (|| -> Result<(), Error> {
             let keyed = |suffix: &str| file_name.strip_suffix(suffix).filter(|n| is_encoded(n));
-            if let Some(name) = keyed(".pending") {
-                with_open(directory, |open| open.keys.insert(name.to_owned()));
-            } else if let Some(name) = keyed(".lock") {
+            if let Some(name) = keyed(".lock") {
                 // Acquiring and releasing an unheld lock unlinks its file.
                 drop(KeyLock::acquire(&Files::new(directory, name).lock, false)?);
             } else if let Some(name) = keyed(".pending.tmp").or_else(|| keyed(".done.tmp")) {
@@ -515,7 +563,10 @@ fn scan(directory: &Path) -> Result<Option<Error>, Error> {
                     moved |= migrate_receipt(directory, name)?;
                 }
             } else if file_name.starts_with('.') && file_name.ends_with(".tmp") {
-                recover_legacy_staged(directory, &entry.path())?;
+                match recover_legacy_staged(directory, &directory.join(file_name)) {
+                    Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    other => other?,
+                }
             }
             Ok(())
         })();
@@ -527,7 +578,7 @@ fn scan(directory: &Path) -> Result<Option<Error>, Error> {
     {
         first_error.get_or_insert(error);
     }
-    Ok(first_error)
+    first_error
 }
 
 /// Move one flat-layout receipt into `receipts/`. A receipt already there for
@@ -908,6 +959,66 @@ mod tests {
                 "receipts"
             ]
         );
+    }
+
+    /// The listing registers every open obligation at once, but a reconcile
+    /// tidies at most `TIDY_BATCH` leftovers, so migrating a large flat
+    /// journal never holds one maintenance pass (and the publication barrier)
+    /// for the whole directory. A receipt still waiting in the flat layout is
+    /// read there, so a keyed retry reuses it mid-migration.
+    #[test]
+    fn the_first_scan_tidies_leftovers_in_bounded_batches() {
+        let (_dir, store, sender) = fixture();
+        let journal = directory(&store);
+        std::fs::create_dir_all(&journal).unwrap();
+        let total = 2 * TIDY_BATCH + 5;
+        let key = |n: usize| format!("send:old-{n}:0");
+        for n in 0..total {
+            let mut done = intent(&sender, &key(n), Some(delivery()));
+            done.body = None;
+            put(&journal.join(format!("{}.done", encode(&key(n)))), &done);
+        }
+        let acknowledged = encode("send:acked:0");
+        put(
+            &journal.join(format!("{acknowledged}.pending")),
+            &intent(&sender, "send:acked:0", Some(delivery())),
+        );
+        let flat = |journal: &Path| {
+            names(journal)
+                .into_iter()
+                .filter(|name| name.ends_with(".done"))
+                .count()
+        };
+        forget(&store);
+        reconcile(&store).unwrap();
+        assert_eq!(
+            outbound_rows(&store),
+            1,
+            "the open obligation settled at once"
+        );
+        assert_eq!(flat(&journal), total - TIDY_BATCH);
+        assert_eq!(names(&journal.join("receipts")).len(), TIDY_BATCH + 1);
+        let waiting = (0..total)
+            .find(|n| journal.join(format!("{}.done", encode(&key(*n)))).exists())
+            .unwrap();
+        let retry = deliver(
+            &store,
+            &sender,
+            "agent:recipient",
+            None,
+            "hello",
+            Some(&key(waiting)),
+            false,
+            || panic!("a settled keyed effect is never repeated"),
+        )
+        .unwrap_or_else(|error| panic!("{}", error.message));
+        assert!(retry[0].duplicate);
+        reconcile(&store).unwrap();
+        assert_eq!(flat(&journal), total - 2 * TIDY_BATCH);
+        reconcile(&store).unwrap();
+        assert_eq!(flat(&journal), 0);
+        assert_eq!(names(&journal.join("receipts")).len(), total + 1);
+        assert_eq!(names(&journal), [".publication.lock", "receipts"]);
     }
 
     /// A file the first scan cannot tidy stays in place and is reported once;
