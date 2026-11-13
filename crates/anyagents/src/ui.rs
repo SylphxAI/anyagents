@@ -615,14 +615,13 @@ fn is_healthy_active_turn(agent: &AgentView, on_quota: bool) -> bool {
 }
 
 /// Mail that waits for a healthy turn by design: a `turn-end` harness takes
-/// it when the turn ends, a `next-step` harness at the turn's next step (a
-/// long tool call holds it that long), and a pending switch holds it for the
-/// replacement. A `mid-turn` harness takes mail as it arrives, so its mail
-/// waiting is lag.
+/// it when the turn ends, and a pending switch holds it for the replacement.
+/// A `mid-turn` or `next-step` harness takes mail into the running turn, so
+/// its mail waiting is lag, shown as lag: a stuck mailbox must not read as a
+/// queue.
 fn is_expected_turn_queue(agent: &AgentView, on_quota: bool) -> bool {
     is_healthy_active_turn(agent, on_quota)
-        && (matches!(agent.delivery.level.as_str(), "turn-end" | "next-step")
-            || agent.pending_switch)
+        && (agent.delivery.level == "turn-end" || agent.pending_switch)
 }
 
 fn format_status_with_alerts(agent: &AgentView, now: i64) -> String {
@@ -1781,12 +1780,13 @@ mod tests {
         assert!(rendered_stuck.contains("! lag 3m"), "{rendered_stuck}");
         assert!(!rendered_stuck.contains("queued"));
 
-        // 5. A next-step agent's mail waits for the turn's next step, which a
-        //    long tool call holds: a queue, not lag.
+        // 5. A next-step agent's mail that still waits is lag too: its turn
+        //    takes mail at the next step, and a mailbox stuck behind a step
+        //    that never comes must not read as a queue.
         let next_step = sample_agent("working", "next-step", Some(20 * 60_000), Some(180_000));
         let rendered_next = format_status_with_alerts(&next_step, 10_000_000);
-        assert!(rendered_next.contains("queued 3m"), "{rendered_next}");
-        assert!(!rendered_next.contains("! lag"));
+        assert!(rendered_next.contains("! lag 3m"), "{rendered_next}");
+        assert!(!rendered_next.contains("queued"));
 
         let mut children: HashMap<&str, Vec<&AgentView>> = HashMap::new();
         children.insert(
@@ -1796,6 +1796,6 @@ mod tests {
         let mut memo = HashMap::new();
         let stats = compute_subtree_stats("agt_root", &children, 10_000_000, &mut memo);
         assert_eq!(stats.working, 4);
-        assert_eq!(stats.lagging, 2);
+        assert_eq!(stats.lagging, 3);
     }
 }
