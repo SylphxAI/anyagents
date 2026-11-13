@@ -839,6 +839,9 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/v1/operator/agents/{name}/inbox", get(operator_inbox))
         .route("/v1/whoami", get(whoami))
         .route("/v1/usage", get(usage_report))
+        .route("/v1/outcomes", get(outcome_report))
+        .route("/v1/agents/{name}/verdict", post(verdict_route))
+        .route("/v1/skills/reads", post(skill_read_route))
         .route("/v1/webhooks/healthz", get(webhook_healthz))
         .route("/v1/webhooks/telegram/{channel_id}", post(telegram_webhook))
         .route("/v1/webhooks/mcp", get(mcp_get_route).post(mcp_post_route))
@@ -1029,35 +1032,48 @@ struct UsageQuery {
 /// operator, a public-scope caller and a root caller may aggregate the whole
 /// workspace or any target, while every other caller is confined to itself
 /// and its causal descendants, and any wider request fails closed.
+/// Every agent, and the ones `principal` may read usage and outcomes for:
+/// the operator, a public-scope caller and a root caller may read the whole
+/// workspace or any target; every other caller only itself and its causal
+/// descendants, and any wider request fails closed.
+fn usage_scope(
+    store: &Store,
+    principal: &Principal,
+    target: Option<&str>,
+    include_descendants: Option<bool>,
+) -> Result<(Vec<Agent>, Vec<anyagents_core::AgentId>), ApiError> {
+    let caller = match principal {
+        Principal::Operator => None,
+        Principal::Agent { agent_id, .. } => Some(
+            store
+                .agent(agent_id)
+                .map_err(|_| ApiError::forbidden("authenticated agent no longer exists"))?,
+        ),
+    };
+    let agents = store.list_agents().map_err(ApiError::from_store)?;
+    let agent_ids =
+        anyagents_core::resolve_usage_agents(caller.as_ref(), &agents, target, include_descendants)
+            .map_err(|err| match err {
+                anyagents_core::UsageAccessError::Forbidden(why) => ApiError::forbidden(why),
+                anyagents_core::UsageAccessError::Invalid(why) => {
+                    ApiError::new(StatusCode::BAD_REQUEST, why)
+                }
+            })?;
+    Ok((agents, agent_ids))
+}
+
 async fn usage_report(
     principal: Principal,
     State(state): State<AppState>,
     Query(query): Query<UsageQuery>,
 ) -> Result<Json<anyagents_core::UsageReport>, ApiError> {
     spawn_store(move || {
-        let caller = match &principal {
-            Principal::Operator => None,
-            Principal::Agent { agent_id, .. } => Some(
-                state
-                    .store
-                    .agent(agent_id)
-                    .map_err(|_| ApiError::forbidden("authenticated agent no longer exists"))?,
-            ),
-        };
-        let agents = state.store.list_agents().map_err(ApiError::from_store)?;
-        let include_descendants = query.include_descendants.or(query.subtree);
-        let agent_ids = anyagents_core::resolve_usage_agents(
-            caller.as_ref(),
-            &agents,
+        let (agents, agent_ids) = usage_scope(
+            &state.store,
+            &principal,
             query.agent.as_deref(),
-            include_descendants,
-        )
-        .map_err(|err| match err {
-            anyagents_core::UsageAccessError::Forbidden(why) => ApiError::forbidden(why),
-            anyagents_core::UsageAccessError::Invalid(why) => {
-                ApiError::new(StatusCode::BAD_REQUEST, why)
-            }
-        })?;
+            query.include_descendants.or(query.subtree),
+        )?;
         let group_by = match query.group_by.as_deref() {
             None => anyagents_core::UsageGroupBy::Agent,
             Some(raw) => anyagents_core::UsageGroupBy::parse(raw)
@@ -1078,6 +1094,141 @@ async fn usage_report(
             anyagents_core::aggregate_usage(&records, &agent_ids, &names, filter, now_ms())
                 .map_err(|why| ApiError::new(StatusCode::BAD_REQUEST, why))?;
         Ok(Json(report))
+    })
+    .await
+}
+
+/// `GET /v1/outcomes`: outcomes, recovery and cost per successful outcome
+/// (ADR 0008), over the same caller boundary and query parameters as
+/// `GET /v1/usage`. `group_by` is `model` (harness and model, the default),
+/// `harness`, `role`, `profile`, `agent` or `skill`. The window bounds when
+/// outcomes were observed; their cost may predate it.
+async fn outcome_report(
+    principal: Principal,
+    State(state): State<AppState>,
+    Query(query): Query<UsageQuery>,
+) -> Result<Json<anyagents_core::OutcomeReport>, ApiError> {
+    spawn_store(move || {
+        let (_, agent_ids) = usage_scope(
+            &state.store,
+            &principal,
+            query.agent.as_deref(),
+            query.include_descendants.or(query.subtree),
+        )?;
+        let group_by =
+            anyagents_core::OutcomeGroupBy::parse(query.group_by.as_deref().unwrap_or(""))
+                .map_err(|why| ApiError::new(StatusCode::BAD_REQUEST, why))?;
+        let now = now_ms();
+        let (since, until) = anyagents_core::UsageFilter {
+            since_ms: query.since_ms,
+            until_ms: query.until_ms,
+            days: query.days,
+            group_by: anyagents_core::UsageGroupBy::Agent,
+        }
+        .window(now)
+        .map_err(|why| ApiError::new(StatusCode::BAD_REQUEST, why))?;
+        let report = state
+            .store
+            .outcome_report(&agent_ids, since, until.unwrap_or(now), group_by)
+            .map_err(ApiError::from_store)?;
+        Ok(Json(report))
+    })
+    .await
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VerdictRequest {
+    /// `accepted`, `rework`, `rejected` or `abandoned`.
+    verdict: String,
+    #[serde(default, alias = "note")]
+    reason: Option<String>,
+}
+
+/// `POST /v1/agents/{name}/verdict`: record a verdict on an agent's work
+/// (ADR 0008). Only a strict ancestor, a root admin or the operator may judge
+/// it; an agent never records an outcome of its own work.
+async fn verdict_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+    Json(body): Json<VerdictRequest>,
+) -> Result<Json<anyagents_core::Outcome>, ApiError> {
+    spawn_store(move || {
+        let kind = anyagents_core::OutcomeKind::parse_verdict(&body.verdict).ok_or_else(|| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "verdict must be accepted, rework, rejected or abandoned",
+            )
+        })?;
+        let target = state
+            .store
+            .agent_by_name(&name)
+            .map_err(ApiError::from_store)?;
+        let actor = match &principal {
+            Principal::Operator => "operator".to_string(),
+            Principal::Agent { agent_id, .. } if *agent_id == target.id => {
+                return Err(ApiError::forbidden(
+                    "an agent cannot record a verdict on its own work",
+                ));
+            }
+            Principal::Agent { agent_id, name } => {
+                if is_self_or_ancestor(&state.store, agent_id, &target) {
+                    format!("agent:{name}")
+                } else {
+                    require_admin_or_operator(
+                        &state.store,
+                        &principal,
+                        "agents.verdict",
+                        &target.name,
+                    )?
+                }
+            }
+        };
+        let config = anyagents_core::agent_config_dir(state.store.data_dir(), &target.id);
+        let (outcome, _) = state
+            .store
+            .record_outcome(anyagents_core::NewOutcome::verdict(
+                target.id.clone(),
+                kind,
+                actor,
+                body.reason,
+                now_ms(),
+                create::bound_profile_name(&config),
+            ))
+            .map_err(ApiError::from_store)?;
+        Ok(Json(outcome))
+    })
+    .await
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SkillReadRequest {
+    skill: String,
+    file: String,
+    sha256: String,
+}
+
+/// `POST /v1/skills/reads`: the calling agent read one skill file whose bytes
+/// had `sha256` (ADR 0008). Recorded for the authenticated agent only.
+async fn skill_read_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    Json(body): Json<SkillReadRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let Principal::Agent { agent_id, .. } = principal else {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "skill reads are recorded for the calling agent",
+        ));
+    };
+    spawn_store(move || {
+        state
+            .store
+            .record_skill_read(&agent_id, &body.skill, &body.file, &body.sha256)
+            .map_err(ApiError::from_store)?;
+        Ok(Json(serde_json::json!({ "recorded": true })))
     })
     .await
 }
@@ -11316,6 +11467,142 @@ exec '{}' "$@"
         usage_report(principal, State(state), Query(q))
             .await
             .map(|Json(r)| r)
+    }
+
+    #[tokio::test]
+    async fn verdicts_need_an_ancestor_and_outcomes_follow_the_usage_boundary() {
+        let (_dir, state, root, child, _grandchild, sibling, other_root) = usage_fixture();
+        let as_agent = |agent: &Agent| Principal::Agent {
+            agent_id: agent.id.clone(),
+            name: agent.name.clone(),
+        };
+        let judge = |principal: Principal, target: &str, verdict: &str| {
+            verdict_route(
+                principal,
+                State(state.clone()),
+                AxumPath(target.to_string()),
+                Json(VerdictRequest {
+                    verdict: verdict.to_string(),
+                    reason: Some("checked against the brief".to_string()),
+                }),
+            )
+        };
+        // An agent never judges its own work; peers and other roots cannot.
+        for (principal, target) in [
+            (as_agent(&child), "usage-child"),
+            (as_agent(&sibling), "usage-child"),
+            (as_agent(&other_root), "usage-child"),
+        ] {
+            let err = judge(principal, target, "accepted").await.unwrap_err();
+            assert_eq!(err.status, StatusCode::FORBIDDEN, "{}", err.message);
+        }
+        let err = judge(Principal::Operator, "usage-child", "pr_merged")
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        // Any strict ancestor may judge; the operator may judge anyone.
+        let Json(rework) = judge(as_agent(&root), "usage-grandchild", "rework")
+            .await
+            .unwrap();
+        assert_eq!(rework.kind, anyagents_core::OutcomeKind::Rework);
+        assert_eq!(rework.actor, "agent:usage-root");
+        assert_eq!(rework.note.as_deref(), Some("checked against the brief"));
+        let Json(accepted) = judge(as_agent(&child), "usage-grandchild", "Accepted")
+            .await
+            .unwrap();
+        assert_eq!(accepted.kind, anyagents_core::OutcomeKind::Accepted);
+        let Json(rejected) = judge(Principal::Operator, "usage-sibling", "rejected")
+            .await
+            .unwrap();
+        assert_eq!(rejected.actor, "operator");
+
+        let report = |principal: Principal, query: UsageQuery| {
+            outcome_report(principal, State(state.clone()), Query(query))
+        };
+        let by_agent = || UsageQuery {
+            group_by: Some("agent".to_string()),
+            ..UsageQuery::default()
+        };
+        let Json(all) = report(Principal::Operator, by_agent()).await.unwrap();
+        let rows: Vec<(&str, u64, u64, u64)> = all
+            .groups
+            .iter()
+            .map(|group| {
+                (
+                    group.agent_name.as_deref().unwrap(),
+                    group.succeeded,
+                    group.failed,
+                    group.recovered,
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![("usage-grandchild", 1, 0, 1), ("usage-sibling", 0, 1, 0)]
+        );
+        // Each judged agent's own usage is its cost; the rest is unattributed.
+        assert_eq!(
+            all.groups
+                .iter()
+                .map(|group| group.cost.reported_cost_micros)
+                .sum::<i64>(),
+            400 + 800
+        );
+        assert_eq!(all.unattributed.reported_cost_micros, 100 + 200 + 1600);
+        // A child sees only its subtree, and cannot widen it.
+        let Json(mine) = report(as_agent(&child), by_agent()).await.unwrap();
+        assert_eq!(mine.groups.len(), 1);
+        assert_eq!(
+            mine.groups[0].agent_name.as_deref(),
+            Some("usage-grandchild")
+        );
+        assert_eq!(mine.unattributed.reported_cost_micros, 200);
+        let err = report(
+            as_agent(&child),
+            UsageQuery {
+                agent: Some("usage-sibling".to_string()),
+                ..UsageQuery::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status, StatusCode::FORBIDDEN);
+        let err = report(
+            Principal::Operator,
+            UsageQuery {
+                group_by: Some("day".to_string()),
+                ..UsageQuery::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn skill_reads_are_recorded_only_for_the_calling_agent() {
+        let (_dir, state, root, ..) = usage_fixture();
+        let read = |principal: Principal, file: &str| {
+            skill_read_route(
+                principal,
+                State(state.clone()),
+                Json(SkillReadRequest {
+                    skill: "prove-it".to_string(),
+                    file: file.to_string(),
+                    sha256: "d".repeat(64),
+                }),
+            )
+        };
+        let as_root = || Principal::Agent {
+            agent_id: root.id.clone(),
+            name: root.name.clone(),
+        };
+        let Json(recorded) = read(as_root(), "SKILL.md").await.unwrap();
+        assert_eq!(recorded["recorded"], true);
+        let err = read(as_root(), "../escape").await.unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        let err = read(Principal::Operator, "SKILL.md").await.unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

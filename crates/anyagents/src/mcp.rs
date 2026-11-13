@@ -967,6 +967,11 @@ struct AgentsArgs {
     ///   `agent`/`day`/`model`/`harness`. Callers with `scope == "public"`, roots and
     ///   the local operator see the whole workspace; other callers see only self plus
     ///   causal descendants, and an explicit out-of-scope target is refused.)
+    /// - `"verdict"` (judge the work of `name`, a descendant: `verdict` is `accepted`,
+    ///   `rework`, `rejected` or `abandoned`, with an optional `reason`; never your own work)
+    /// - `"outcomes"` (successes, failures, recovery and cost per success, with the same
+    ///   target, window and visibility as `usage`; `group_by` is `model`, `harness`,
+    ///   `role`, `profile`, `agent` or `skill`)
     #[serde(default)]
     action: Option<String>,
     /// Target body id when action = "redact"; `transcript:<zero-based-line>` addresses
@@ -979,9 +984,13 @@ struct AgentsArgs {
     /// Optional end-exclusive decoded-text span. Omit to tombstone the whole body.
     #[serde(default)]
     span: Option<crate::api::RedactionSpan>,
-    /// Required audit reason for redact. Never repeat sensitive text in this field.
+    /// Required audit reason for redact (never repeat sensitive text here); the
+    /// optional reason for a verdict.
     #[serde(default)]
     reason: Option<String>,
+    /// For `verdict`: `"accepted"`, `"rework"`, `"rejected"` or `"abandoned"`.
+    #[serde(default)]
+    verdict: Option<String>,
     /// Optional state filter for `list`: `"running"`, `"working"`, `"errored"`, `"idle"`, `"paused"`, `"archived"`, or `"all"` (default `"all"`).
     #[serde(default)]
     state: Option<String>,
@@ -1091,7 +1100,8 @@ struct AgentsArgs {
     /// For `usage`: trailing window in days, intersected with `since_ms`/`until_ms`.
     #[serde(default)]
     days: Option<i64>,
-    /// For `usage`: grouping dimension (`agent`, `day`, `model`, `harness`).
+    /// For `usage`: grouping dimension (`agent`, `day`, `model`, `harness`); for
+    /// `outcomes`: `model`, `harness`, `role`, `profile`, `agent` or `skill`.
     #[serde(default)]
     group_by: Option<String>,
 }
@@ -1926,7 +1936,7 @@ impl AgentMcp {
     }
 
     #[tool(
-        description = "Unified agent & cross-harness sub-agent manager (`action`: `list` | `inspect` | `spawn` | `create` | `describe` | `redact` | `steer` | `wake` | `pause` | `archive` | `delete` | `rename` | `role` | `harness` | `models`, supporting multi-level sub-agent trees). Use `list` (default, with optional `parent`: `\"self\"` | `\"subagents\"` | `\"root\"` and `state`: `\"running\"` | `\"working\"` | `\"paused\"` | `\"archived\"` | `\"all\"`) to inspect agents and sub-agents; use `inspect` (`name`: `\"<agent-or-id>\"`, `limit`: `10`) to view live status, schedules, and recent turns; use `spawn` (`role`, `name`, `repo`: `\"<org>/<repo>\"` | `\"inherit\"`, `branch`, `base`, `workdir`: path | `\"worktree\"` | `\"private\"` | `\"inherit\"`, `description`, `prompt`, `harness`, `model`, `profile`) to launch a sub-agent with an isolated managed Git worktree; use `describe` (`name`: `\"self\"` | `\"all\"` | `\"<agent>\"`, `description`: `\"...\"`) to read role descriptions or update a target's `description`/`instructions`/`role` (updating `description`, `instructions`, `role`, or `rename` requires the target's Parent/Ancestor agent or an Admin); use `steer`, `wake`, `pause`, `archive` (auto-reaps clean/pushed managed worktrees while preserving dirty ones), or `delete` to control lifecycle; use `redact` (`name`, `message_id` or `seq`, optional `span`: {`unit`: `bytes` | `chars`, `start`, `end`}, `reason`) for audited erasure with permission `conversation.redact` (ancestors/admin only, quiescent target); or use `create`, `rename`, `role`, `harness`, `models`."
+        description = "Unified agent & cross-harness sub-agent manager (`action`: `list` | `inspect` | `spawn` | `create` | `describe` | `redact` | `steer` | `wake` | `pause` | `archive` | `delete` | `rename` | `role` | `harness` | `models`, supporting multi-level sub-agent trees). Use `list` (default, with optional `parent`: `\"self\"` | `\"subagents\"` | `\"root\"` and `state`: `\"running\"` | `\"working\"` | `\"paused\"` | `\"archived\"` | `\"all\"`) to inspect agents and sub-agents; use `inspect` (`name`: `\"<agent-or-id>\"`, `limit`: `10`) to view live status, schedules, and recent turns; use `spawn` (`role`, `name`, `repo`: `\"<org>/<repo>\"` | `\"inherit\"`, `branch`, `base`, `workdir`: path | `\"worktree\"` | `\"private\"` | `\"inherit\"`, `description`, `prompt`, `harness`, `model`, `profile`) to launch a sub-agent with an isolated managed Git worktree; use `describe` (`name`: `\"self\"` | `\"all\"` | `\"<agent>\"`, `description`: `\"...\"`) to read role descriptions or update a target's `description`/`instructions`/`role` (updating `description`, `instructions`, `role`, or `rename` requires the target's Parent/Ancestor agent or an Admin); use `steer`, `wake`, `pause`, `archive` (auto-reaps clean/pushed managed worktrees while preserving dirty ones), or `delete` to control lifecycle; use `redact` (`name`, `message_id` or `seq`, optional `span`: {`unit`: `bytes` | `chars`, `start`, `end`}, `reason`) for audited erasure with permission `conversation.redact` (ancestors/admin only, quiescent target); use `verdict` (`name`, `verdict`: `accepted` | `rework` | `rejected` | `abandoned`, `reason`) to judge a descendant's work, and `outcomes` (like `usage`) for successes and cost per success; or use `create`, `rename`, `role`, `harness`, `models`."
     )]
     async fn agents(
         &self,
@@ -1956,7 +1966,7 @@ impl AgentMcp {
                 }
             });
         match action.as_str() {
-            "usage" => {
+            "usage" | "outcomes" => {
                 let mut qs = String::new();
                 let mut push = |k: &str, v: String| {
                     if !qs.is_empty() {
@@ -1984,12 +1994,37 @@ impl AgentMcp {
                 if let Some(v) = args.group_by.as_deref().filter(|v| !v.trim().is_empty()) {
                     push("group_by", v.to_string());
                 }
+                let route = format!("/v1/{action}");
                 let path = if qs.is_empty() {
-                    "/v1/usage".to_string()
+                    route
                 } else {
-                    format!("/v1/usage?{qs}")
+                    format!("{route}?{qs}")
                 };
                 let response = self.client.get(&path, None).await?;
+                Ok(rmcp::handler::server::wrapper::Json(response))
+            }
+            "verdict" => {
+                let target = args
+                    .name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        "verdict requires the agent `name` whose work is judged".to_string()
+                    })?;
+                let verdict = args.verdict.as_deref().ok_or_else(|| {
+                    "verdict requires `verdict`: accepted, rework, rejected or abandoned"
+                        .to_string()
+                })?;
+                let body = serde_json::json!({ "verdict": verdict, "reason": args.reason });
+                let path = format!(
+                    "/v1/agents/{}/verdict",
+                    urlencoding_simple(target.strip_prefix("agent:").unwrap_or(target))
+                );
+                let response = self
+                    .client
+                    .get(&path, Some(body.to_string().into_bytes()))
+                    .await?;
                 Ok(rmcp::handler::server::wrapper::Json(response))
             }
             "redact" => {
@@ -3218,6 +3253,7 @@ impl AgentMcp {
         Parameters(args): Parameters<SkillsArgs>,
     ) -> Result<rmcp::handler::server::wrapper::Json<serde_json::Value>, String> {
         let val = self.execute_skills_tool(args)?;
+        self.record_skill_read(&val).await;
         Ok(rmcp::handler::server::wrapper::Json(val))
     }
 
@@ -4396,6 +4432,32 @@ impl AgentMcp {
             }
         }
         map
+    }
+
+    /// Tell the server which skill file this agent read and the digest of the
+    /// bytes it got (ADR 0008). Telemetry never fails the read itself.
+    async fn record_skill_read(&self, answer: &serde_json::Value) {
+        if answer.get("action").and_then(serde_json::Value::as_str) != Some("read") {
+            return;
+        }
+        let field = |key| answer.get(key).and_then(serde_json::Value::as_str);
+        let (Some(skill), Some(file), Some(content)) =
+            (field("name"), field("file"), field("content"))
+        else {
+            return;
+        };
+        let body = serde_json::json!({
+            "skill": skill,
+            "file": file,
+            "sha256": anyagents_core::learned_memory::sha256(content.as_bytes()),
+        });
+        if let Err(err) = self
+            .client
+            .get::<serde_json::Value>("/v1/skills/reads", Some(body.to_string().into_bytes()))
+            .await
+        {
+            eprintln!("skill read of `{skill}/{file}` not recorded: {err}");
+        }
     }
 
     fn execute_skills_tool(&self, args: SkillsArgs) -> Result<serde_json::Value, String> {
