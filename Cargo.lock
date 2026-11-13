@@ -309,6 +309,7 @@ dependencies = [
  "anyagents-harness-claude",
  "libc",
  "rusqlite",
+ "serde",
  "serde_json",
  "tempfile",
 ]

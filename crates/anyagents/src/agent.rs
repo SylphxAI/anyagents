@@ -1478,6 +1478,7 @@ pub fn flush(data: &Path, name: &str) -> Result<(), anyagents_core::Error> {
             config_dir,
             work_dir,
             extra_env: Vec::new(),
+            lock: None,
         };
         let mut harness = match crate::vendor::vendor_launch_with_store(request, &store) {
             Ok(harness) => harness,

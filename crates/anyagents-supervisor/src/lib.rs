@@ -15,7 +15,8 @@ use std::time::Duration;
 pub use anyagents_agent::recovery_outbound;
 use anyagents_agent::{DeliveryLoop, RunOutcome};
 use anyagents_core::{
-    Agent, AgentId, BillingMode, NewUsage, Store, Wake, agent_config_dir, agent_work_dir, utc_day,
+    Agent, AgentId, AgentLock, BillingMode, NewUsage, Store, Wake, agent_config_dir,
+    agent_work_dir, utc_day,
 };
 use anyagents_harness::{DeliverOutcome, Delivery, Harness, HarnessHealth, TurnState, TurnUsage};
 
@@ -242,9 +243,88 @@ pub struct LaunchRequest {
     pub config_dir: PathBuf,
     pub work_dir: PathBuf,
     pub extra_env: Vec<(String, String)>,
+    /// A copy of the agent's process lock for a process host that outlives
+    /// this kernel (a keeper) to hold for the life of the process. `None`
+    /// when processes are hosted in the kernel.
+    pub lock: Option<Arc<AgentLock>>,
 }
 
 pub type Launch<H> = Arc<dyn Fn(LaunchRequest) -> Result<H, String> + Send + Sync>;
+
+/// Who holds harness processes, and whether they outlive this kernel.
+///
+/// With keepers (`docs/adr/0007-process-architecture.md`) a harness process
+/// and the adapter that speaks to it live in their own process. A kernel that
+/// stops leaves them running ([`Supervisor::retain_processes`]); the next one
+/// takes each over ([`Custody::attach`]) and resumes delivery from the
+/// mailbox cursor, with the adapter's memory of what it was given intact.
+pub trait Custody<H>: Send + Sync {
+    /// Launched processes outlive this kernel: a launch hands the host a copy
+    /// of the agent's process lock, and a stop may leave them running.
+    fn outlives_kernel(&self) -> bool;
+    /// Agents whose processes a previous kernel left running.
+    fn retained(&self) -> Vec<AgentId>;
+    /// Take over the process a previous kernel left for `agent`.
+    fn attach(&self, agent: &AgentId) -> Result<Option<Attached<H>>, String>;
+    /// End the process a previous kernel left for `agent` without taking it
+    /// over: the agent is no longer running.
+    fn release(&self, agent: &AgentId);
+    /// Leave `harness` running for the next kernel.
+    fn retain(&self, harness: H);
+    /// Keep `note` with the process for the next kernel that attaches.
+    fn note(&self, harness: &H, note: &str);
+}
+
+/// A process a previous kernel left, taken over.
+pub struct Attached<H> {
+    pub harness: H,
+    /// The copy of the agent's process lock the host held.
+    pub lock: AgentLock,
+    /// What the process was launched for, which the agent's configuration
+    /// may no longer name: a difference is a switch, made at its boundary.
+    pub harness_name: String,
+    pub model: Option<String>,
+    pub started_at_ms: Option<i64>,
+    /// What the last kernel kept with the process ([`Custody::note`]).
+    pub note: Option<String>,
+}
+
+/// Harness processes hosted in the kernel: they end with it.
+pub struct InProcess;
+
+impl<H> Custody<H> for InProcess {
+    fn outlives_kernel(&self) -> bool {
+        false
+    }
+
+    fn retained(&self) -> Vec<AgentId> {
+        Vec::new()
+    }
+
+    fn attach(&self, _agent: &AgentId) -> Result<Option<Attached<H>>, String> {
+        Ok(None)
+    }
+
+    fn release(&self, _agent: &AgentId) {}
+
+    fn retain(&self, harness: H) {
+        drop(harness);
+    }
+
+    fn note(&self, _harness: &H, _note: &str) {}
+}
+
+/// What a kernel keeps with a process for the kernel that takes it over:
+/// the usage it already recorded from it, so none is recorded twice, and the
+/// operator profile marker it was launched under.
+#[derive(Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+struct ProcessNote {
+    served: Option<TurnUsage>,
+    turns_recorded: u32,
+    written: u32,
+    profile_rotated_ms: i64,
+    completed_turn: bool,
+}
 
 /// How soon a worker looks again after it handed lines over, or while a turn
 /// is open, after it last did work or was woken. One store read, so `flush`
@@ -340,9 +420,13 @@ struct Inner<H> {
     store: Arc<Store>,
     clock: Arc<dyn Clock>,
     launch: Launch<H>,
+    custody: Arc<dyn Custody<H>>,
     extra_env: Vec<(String, String)>,
     board: HealthBoard,
     stop: AtomicBool,
+    /// Set by [`Supervisor::retain_processes`]: stopping workers leave their
+    /// processes to the next kernel instead of ending them.
+    retain: AtomicBool,
     workers: Mutex<HashMap<AgentId, Slot>>,
     #[cfg(test)]
     idle_release_hook: Option<IdleReleaseHook>,
@@ -364,19 +448,35 @@ struct WakeListener {
 }
 
 impl<H: Harness + 'static> Supervisor<H> {
+    /// Start with harness processes hosted in this kernel.
     pub fn start(
         store: Arc<Store>,
         clock: Arc<dyn Clock>,
         launch: Launch<H>,
         extra_env: Vec<(String, String)>,
     ) -> Result<Self, String> {
+        Self::start_with_custody(store, clock, launch, extra_env, Arc::new(InProcess))
+    }
+
+    /// Start with `custody` holding harness processes. Processes a previous
+    /// kernel left are taken over by the workers of running agents and ended
+    /// for every other agent.
+    pub fn start_with_custody(
+        store: Arc<Store>,
+        clock: Arc<dyn Clock>,
+        launch: Launch<H>,
+        extra_env: Vec<(String, String)>,
+        custody: Arc<dyn Custody<H>>,
+    ) -> Result<Self, String> {
         let inner = Arc::new(Inner {
             store: Arc::clone(&store),
             clock,
             launch,
+            custody,
             extra_env,
             board: HealthBoard::default(),
             stop: AtomicBool::new(false),
+            retain: AtomicBool::new(false),
             workers: Mutex::new(HashMap::new()),
             #[cfg(test)]
             idle_release_hook: None,
@@ -402,6 +502,14 @@ impl<H: Harness + 'static> Supervisor<H> {
 
     pub fn board(&self) -> HealthBoard {
         self.inner.board.clone()
+    }
+
+    /// Stop, leaving every harness process to the next kernel when the
+    /// custody lets processes outlive this one. A worker in the middle of a
+    /// call finishes it first; nothing is ended.
+    pub fn retain_processes(self) {
+        self.inner.retain.store(true, Ordering::SeqCst);
+        drop(self);
     }
 }
 
@@ -512,14 +620,27 @@ fn listen_wake<H: Harness>(socket: UnixDatagram, inner: Arc<Inner<H>>) {
 }
 
 fn route<H: Harness + 'static>(inner: Arc<Inner<H>>, events: Receiver<Wake>) {
+    // A process a previous kernel left is taken over by its running agent's
+    // worker, which releases it to idle through the same checks as any live
+    // process (its turn, its commands still running). Every other one is
+    // ended: its agent no longer runs.
+    let retained: std::collections::HashSet<AgentId> =
+        inner.custody.retained().into_iter().collect();
     if let Ok(agents) = inner.store.list_live_agents() {
+        let mut running = std::collections::HashSet::new();
         for agent in agents {
             if agent.state == "running" {
-                if inner.store.complete_idle_agent(&agent.id).unwrap_or(false) {
+                running.insert(agent.id.clone());
+                if !retained.contains(&agent.id)
+                    && inner.store.complete_idle_agent(&agent.id).unwrap_or(false)
+                {
                     continue;
                 }
                 ensure(&inner, agent.id);
             }
+        }
+        for id in retained.difference(&running) {
+            inner.custody.release(id);
         }
     }
     while let Ok(wake) = events.recv() {
@@ -813,6 +934,12 @@ struct Session<H: Harness> {
     /// Those commands cannot be watched (no pidfd): review them on the
     /// backoff timer instead.
     review_children: bool,
+    /// A copy of the process lock for each process host this worker starts,
+    /// when hosts outlive the kernel.
+    host_lock: Option<Arc<AgentLock>>,
+    /// The process came from a previous kernel: it was not restarted, so no
+    /// turn of it was interrupted.
+    adopted: bool,
 }
 
 impl<H: Harness + 'static> Session<H> {
@@ -853,6 +980,8 @@ impl<H: Harness + 'static> Session<H> {
             process_scan_logged: false,
             exit_watch: None,
             review_children: false,
+            host_lock: None,
+            adopted: false,
         }
     }
 
@@ -868,7 +997,7 @@ impl<H: Harness + 'static> Session<H> {
         loop {
             if self.stop.load(Ordering::SeqCst) {
                 self.record_usage();
-                self.delivery = None;
+                self.end_delivery();
                 self.publish();
                 return false;
             }
@@ -878,10 +1007,14 @@ impl<H: Harness + 'static> Session<H> {
                         delivery.harness().watch_activity(Arc::clone(&self.notify));
                         self.exit_watch = None;
                         self.restart_at = None;
-                        // Unknown until recover_once reads durable state successfully.
-                        self.pending_recovery = true;
+                        // A fresh process may follow an interrupted turn:
+                        // unknown until recover_once reads durable state. A
+                        // process taken over from a previous kernel never
+                        // stopped, so its turn goes on.
+                        self.pending_recovery = !std::mem::take(&mut self.adopted);
                         self.recovery_blocks_mail = false;
                         self.delivery = Some(*delivery);
+                        self.save_note();
                     }
                     Boot::Busy => {
                         self.delivery = None;
@@ -921,7 +1054,7 @@ impl<H: Harness + 'static> Session<H> {
                 self.commit_proven();
                 self.record_usage_with(&health);
                 if !self.wait_backoff() {
-                    self.delivery = None;
+                    self.end_delivery();
                     self.restart_at = None;
                     self.publish();
                     return false;
@@ -930,11 +1063,115 @@ impl<H: Harness + 'static> Session<H> {
                 continue;
             }
             if self.deliver_once() {
-                self.delivery = None;
+                self.stop_delivery();
                 self.restart_at = None;
                 self.publish();
                 return true;
             }
+        }
+    }
+
+    /// The worker stops: its process ends with it, or, while the kernel
+    /// stops with [`Supervisor::retain_processes`], is left to the next one.
+    fn end_delivery(&mut self) {
+        if !self.inner.retain.load(Ordering::SeqCst) {
+            self.stop_delivery();
+            return;
+        }
+        let host_lock = self.host_lock.take();
+        if let Some(delivery) = self.delivery.take() {
+            // The host keeps holding the agent's lock after this process.
+            if let Some(lock) = &host_lock {
+                lock.retain();
+            }
+            self.inner.custody.retain(delivery.into_harness());
+        }
+    }
+
+    /// End the process and release the agent's lock.
+    fn stop_delivery(&mut self) {
+        self.delivery = None;
+        self.host_lock = None;
+    }
+
+    /// Keep this worker's accounting of the process with it, for a kernel
+    /// that takes the process over after this one.
+    fn save_note(&self) {
+        if !self.inner.custody.outlives_kernel() {
+            return;
+        }
+        let Some(delivery) = self.delivery.as_ref() else {
+            return;
+        };
+        let note = ProcessNote {
+            served: self.served.clone(),
+            turns_recorded: self.turns_recorded,
+            written: self.written,
+            profile_rotated_ms: self.process_profile_rotated_ms,
+            completed_turn: self.completed_turn_in_session,
+        };
+        if let Ok(text) = serde_json::to_string(&note) {
+            self.inner.custody.note(delivery.harness(), &text);
+        }
+    }
+
+    /// Take over a process a previous kernel left, under the agent lock copy
+    /// its host held, with that kernel's accounting of it.
+    fn adopt(&mut self, store: Store, attached: Attached<H>) -> Boot<H> {
+        let Attached {
+            harness,
+            lock,
+            harness_name,
+            model,
+            started_at_ms,
+            note,
+        } = attached;
+        let fresh = match store.agent(&self.id) {
+            Ok(fresh) if fresh.state == "running" => fresh,
+            Ok(_) | Err(anyagents_core::Error::AgentNotFound(_)) => return Boot::Stopped,
+            Err(_) => {
+                // Not this kernel's to end on a read failure: leave it.
+                lock.retain();
+                self.inner.custody.retain(harness);
+                return Boot::Retry;
+            }
+        };
+        let host_lock = match lock.share() {
+            Ok(copy) => Arc::new(copy),
+            Err(_) => {
+                lock.retain();
+                self.inner.custody.retain(harness);
+                return Boot::Retry;
+            }
+        };
+        self.paths = AgentPaths::from_store(&self.inner.store, &fresh);
+        self.configured = Some(fresh.clone());
+        // The process serves what it was launched for; a configuration
+        // changed while no kernel ran is a switch at its next boundary.
+        self.agent = Agent {
+            harness: harness_name,
+            model,
+            ..fresh
+        };
+        let note: ProcessNote = note
+            .as_deref()
+            .and_then(|text| serde_json::from_str(text).ok())
+            .unwrap_or_else(|| ProcessNote {
+                profile_rotated_ms: self.marker_ms(PROFILE_ROTATED).unwrap_or(0),
+                ..ProcessNote::default()
+            });
+        self.served = note.served;
+        self.turns_recorded = note.turns_recorded;
+        self.written = note.written;
+        self.process_profile_rotated_ms = note.profile_rotated_ms;
+        self.completed_turn_in_session = note.completed_turn;
+        self.process_started_at = Some(started_at_ms.unwrap_or_else(|| self.inner.clock.now_ms()));
+        self.host_lock = Some(host_lock);
+        self.adopted = true;
+        match DeliveryLoop::start_with_lock(store, lock, self.id.clone(), harness) {
+            Ok(delivery) => Boot::Ready(Box::new(delivery)),
+            Err(err) if err.agent_busy() => Boot::Busy,
+            Err(_) => Boot::Retry,
         }
     }
 
@@ -946,6 +1183,13 @@ impl<H: Harness + 'static> Session<H> {
             Ok(store) => store,
             Err(_) => return Boot::Retry,
         };
+        // A process a previous kernel left holds the agent's lock: take it
+        // over instead of starting another.
+        match self.inner.custody.attach(&self.id) {
+            Ok(Some(attached)) => return self.adopt(store, attached),
+            Ok(None) => {}
+            Err(_) => return Boot::Retry,
+        }
         // Acquire the per-agent process lock BEFORE launching the child or
         // creating workspace/scratch directories so concurrent archive/delete
         // reaping under this lock cannot race an in-flight spawn.
@@ -953,6 +1197,14 @@ impl<H: Harness + 'static> Session<H> {
             Ok(lock) => lock,
             Err(anyagents_core::Error::AgentBusy) => return Boot::Busy,
             Err(_) => return Boot::Retry,
+        };
+        self.host_lock = if self.inner.custody.outlives_kernel() {
+            match lock.share() {
+                Ok(copy) => Some(Arc::new(copy)),
+                Err(_) => return Boot::Retry,
+            }
+        } else {
+            None
         };
         match store.agent(&self.id) {
             Ok(fresh) if fresh.state != "running" => return Boot::Stopped,
@@ -1003,6 +1255,7 @@ impl<H: Harness + 'static> Session<H> {
             config_dir: self.paths.config_dir.clone(),
             work_dir: self.paths.work_dir.clone(),
             extra_env: self.inner.extra_env.clone(),
+            lock: self.host_lock.clone(),
         });
         match &res {
             Ok(_) => {
@@ -1225,6 +1478,7 @@ impl<H: Harness + 'static> Session<H> {
                 self.served = None;
                 self.turns_recorded = 0;
                 self.restart_at = None;
+                self.save_note();
                 true
             }
             Err(_) => {
@@ -1552,7 +1806,8 @@ impl<H: Harness + 'static> Session<H> {
             self.last_error = Some(format!("persist turn completion: {err}"));
             return false;
         }
-        if served != before {
+        let served_changed = served != before;
+        if served_changed {
             let turns = turns_served
                 .saturating_sub(self.turns_recorded)
                 .max(self.written.max(1));
@@ -1578,6 +1833,9 @@ impl<H: Harness + 'static> Session<H> {
             self.completed_turn_in_session = true;
             self.consecutive_turn_errors = 0;
             self.last_error = None;
+        }
+        if completed || served_changed {
+            self.save_note();
         }
         true
     }
@@ -1630,7 +1888,7 @@ impl<H: Harness + 'static> Session<H> {
             return false;
         }
         self.stop.store(true, Ordering::SeqCst);
-        self.delivery = None;
+        self.stop_delivery();
         self.restart_at = None;
         reap_ephemeral_dirs(&self.paths.config_dir, &self.paths.managed_work);
         self.publish();
@@ -2401,9 +2659,11 @@ mod tests {
                     DeliveryMode::Steer,
                 )))
             }),
+            custody: Arc::new(InProcess),
             extra_env: Vec::new(),
             board: HealthBoard::default(),
             stop: AtomicBool::new(false),
+            retain: AtomicBool::new(false),
             workers: Mutex::new(HashMap::new()),
             idle_release_hook: Some(Arc::new(move |_| {
                 at_idle_tx.send(()).unwrap();
@@ -2640,9 +2900,11 @@ mod tests {
             store: Arc::clone(&store),
             clock: Arc::clone(&clock) as Arc<dyn Clock>,
             launch: Arc::new(|_| Err("no launch".into())),
+            custody: Arc::new(InProcess),
             extra_env: Vec::new(),
             board: HealthBoard::default(),
             stop: AtomicBool::new(false),
+            retain: AtomicBool::new(false),
             workers: Mutex::new(HashMap::new()),
             idle_release_hook: None,
         });
@@ -2756,9 +3018,11 @@ mod persistence_tests {
             store: Arc::clone(&store),
             clock: Arc::new(SystemClock::new()),
             launch: Arc::new(move |_| Ok(make_harness())),
+            custody: Arc::new(InProcess),
             extra_env: Vec::new(),
             board: HealthBoard::default(),
             stop: AtomicBool::new(false),
+            retain: AtomicBool::new(false),
             workers: Mutex::new(HashMap::new()),
             idle_release_hook: None,
         });
@@ -3094,9 +3358,11 @@ mod persistence_tests {
                 launches_counter.fetch_add(1, Ordering::SeqCst);
                 Err("unexpected launch".into())
             }),
+            custody: Arc::new(InProcess),
             extra_env: Vec::new(),
             board: HealthBoard::default(),
             stop: AtomicBool::new(false),
+            retain: AtomicBool::new(false),
             workers: Mutex::new(HashMap::new()),
             idle_release_hook: None,
         });

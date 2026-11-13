@@ -3301,6 +3301,7 @@ mod tests {
                 config_dir: anyagents_core::agent_config_dir(dir.path(), &bad),
                 work_dir: checkout.clone(),
                 extra_env: Vec::new(),
+                lock: None,
             });
             let error = match launch {
                 Err(error) => error,

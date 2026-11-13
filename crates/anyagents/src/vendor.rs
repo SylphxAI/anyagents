@@ -2505,6 +2505,7 @@ cat >/dev/null
                     config_dir: config.clone(),
                     work_dir: root.join("work"),
                     extra_env: vec![],
+                    lock: None,
                 },
                 &store,
             )
@@ -2664,6 +2665,7 @@ cat >/dev/null
                 config_dir: config.clone(),
                 work_dir: root.join("work"),
                 extra_env: vec![],
+                lock: None,
             },
             &store,
         );
@@ -2711,6 +2713,7 @@ cat >/dev/null
                 config_dir: config.clone(),
                 work_dir: root.join("work"),
                 extra_env: vec![],
+                lock: None,
             },
             &store,
         )
@@ -2937,6 +2940,7 @@ done
                     config_dir: config.clone(),
                     work_dir: root.join("work"),
                     extra_env: vec![],
+                    lock: None,
                 },
                 &store,
             )
@@ -3099,6 +3103,7 @@ done
             config_dir: config.clone(),
             work_dir: root.join("work"),
             extra_env: vec![],
+            lock: None,
         };
         prepare_host_session(&request(agent.clone())).unwrap();
         let first = host_session::active(root).unwrap().unwrap();
@@ -3166,6 +3171,7 @@ done
                     config_dir: config.clone(),
                     work_dir: root.join("work"),
                     extra_env: vec![],
+                    lock: None,
                 };
                 prepare_host_session(&request()).unwrap();
                 let first = host_session::active(root).unwrap().unwrap();

@@ -177,6 +177,7 @@ for line in sys.stdin:
             config_dir: config.clone(),
             work_dir: work.clone(),
             extra_env: vec![],
+            lock: None,
         };
         let mut vendor = vendor_launch(request()).unwrap();
         assert!(matches!(vendor, VendorHarness::Spiron(..)));
