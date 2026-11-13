@@ -23,15 +23,35 @@ live session, and is marked where it is inferred:
   that turn ends (inferred; the binary does not establish when).
 - Input still pending when a turn ends is not dropped: it becomes the next
   turn ("Converted stranded interjection into a queued prompt turn").
-- A refusal is a JSON-RPC error answer to that `session/prompt` and the
-  prompt is not queued (inferred), with one of the binary's refusal texts.
+- Grok has no refusal that a later offer clears. With `follow_up_behavior
+  = "steer"` every prompt for the loaded session is appended to
+  `pending_inputs`; a prompt a `UserPromptSubmit` hook blocks "is held at
+  the front of the queue" until the user sends or removes it. The texts once
+  read as refusals are not protocol errors: "The session is not ready yet.
+  Send again in a moment." is the TUI's (`crates/codegen/xai-grok-pager`),
+  and "prompt blocked: ..." / "prompt refused: session folder removed" sit
+  among the prompt handler's tracing events. So the suite's `refuse` command
+  changes nothing here: the input is queued, as Grok queues it.
+- An error answer comes from the ACP layer (`agent-client-protocol` 0.10.4
+  in the binary): `{code, message, data?}`, message "Invalid params",
+  "Internal error", ... with the detail in `data` (inferred from the crate's
+  constructors). Two state files make the next `session/prompt` fail before
+  it is queued, once each:
+    invalid-params   -32602 "Invalid params": a request the server could
+                     not read; the handler never ran it
+    internal-error   -32603 "Internal error": the handler failed; whether
+                     it applied the prompt is unknown to the client
 - Nothing is deduplicated by an id the client sends.
 """
 from engine import Input, Protocol, marker_id
 
 VERSION = "1.0.67"
 INTERJECTION = "The user sent a message while you were working:\n<user_query>\n%s\n</user_query>"
-NOT_READY = "The session is not ready yet. Send again in a moment."
+# The next prompt fails before it is queued, once, while the file exists.
+ERRORS = {
+    "invalid-params": (-32602, "Invalid params", "missing field `prompt`"),
+    "internal-error": (-32603, "Internal error", "session store unavailable"),
+}
 
 
 def text_of(prompt):
@@ -52,8 +72,20 @@ class Grok(Protocol):
     def reply(self, rid, result):
         self.emit({"jsonrpc": "2.0", "id": rid, "result": result})
 
-    def error(self, rid, code, message):
-        self.emit({"jsonrpc": "2.0", "id": rid, "error": {"code": code, "message": message}})
+    def error(self, rid, code, message, data=None):
+        error = {"code": code, "message": message}
+        if data is not None:
+            error["data"] = data
+        self.emit({"jsonrpc": "2.0", "id": rid, "error": error})
+
+    def failure(self):
+        """The error the next prompt fails with, if a state file asks."""
+        for name, error in ERRORS.items():
+            path = self.engine.root / name
+            if path.exists():
+                path.unlink()
+                return error
+        return None
 
     def note(self, method, params):
         self.emit({"jsonrpc": "2.0", "method": method, "params": params})
@@ -101,12 +133,13 @@ class Grok(Protocol):
             inp = Input(marker_id(text), text, method,
                         {"rid": rid, "queue_id": "q-%d-%d" % (engine.launch, self.prompts)})
             engine.received(inp)
+            failure = self.failure()
+            if failure is not None:
+                self.later(lambda: self.error(rid, *failure))
+                return
             if engine.turn is None:
                 self.begin(inp)
                 self.later(self.queue_changed)
-                return
-            if self.take_refusal():
-                self.later(lambda: self.error(rid, -32603, NOT_READY))
                 return
             engine.queue(inp)
             self.later(self.queue_changed)

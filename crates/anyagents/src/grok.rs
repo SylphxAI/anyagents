@@ -13,12 +13,21 @@
 //! (the running prompt or a pending entry), in a `user_message_chunk` or an
 //! `x.ai/session/interjection`, or the answer to its request. Grok names none
 //! of these by an id AnyAgents sends, so the marker line is the link, and it
-//! deduplicates nothing. A JSON-RPC error answer, before Grok showed the
-//! prompt admitted, that carries one of Grok's refusal texts is a refusal:
-//! the message goes back to the mailbox. Any other error leaves it unknown
-//! whether Grok applied the prompt, so it counts as taken and is never
-//! written again. A message is written only once every earlier one is
-//! admitted, so a refused message is never overtaken by a later one.
+//! deduplicates nothing, so nothing is ever written to Grok twice.
+//!
+//! An error answer to a prompt Grok already showed admitted ends that turn:
+//! the message was taken. An error answer before Grok showed it admitted is
+//! parked as rejected and its sender told; it is never written again. For a
+//! request the JSON-RPC layer could not take (`-32700`, `-32600`, `-32601`,
+//! `-32602`) that is certain: Grok never ran it, and it would refuse the same
+//! request again. For any other error it is unknown whether Grok applied it,
+//! and since Grok deduplicates nothing a second write could apply it twice,
+//! while counting it as taken could lose it without a word. Grok 1.0.67 has
+//! no refusal a later offer clears: with `follow_up_behavior = "steer"` it
+//! appends every prompt for its session to `pending_inputs`, and a prompt a
+//! hook blocks is held at the front of that queue, not answered. A message
+//! is written only once every earlier one is admitted or answered, so mail
+//! keeps its order.
 //!
 //! These wire facts come from the 1.0.67 binary's strings, not from a live
 //! session; `tests/invariants/fakes/proto_grok.py` marks which are inferred.
@@ -30,7 +39,7 @@ use std::time::Duration;
 
 use anyagents_harness::{
     DeliverOutcome, Delivery, DeliveryLevel, Harness, HarnessError, HarnessHealth,
-    MESSAGE_MARKER_PREFIX, OutboundMessage, TurnState, compose_message, marked_message,
+    MESSAGE_MARKER_PREFIX, OutboundMessage, Proof, TurnState, compose_message, marked_message,
 };
 use anyagents_harness_stream::{NotificationEffect, RpcChild, RpcFail, RpcLaunch};
 use serde_json::{Value, json};
@@ -48,19 +57,16 @@ fn rpc_wait() -> Duration {
 pub const DELIVERY: Delivery = Delivery {
     level: DeliveryLevel::MidTurn,
     idempotent: false,
-    proof: std::borrow::Cow::Borrowed("marker in x.ai/queue/changed or user_message_chunk; session/prompt answer"),
+    proof: std::borrow::Cow::Borrowed(
+        "marker in x.ai/queue/changed or user_message_chunk; session/prompt answer",
+    ),
     peer: None,
 };
 
-/// What Grok answers a `session/prompt` it turns away before queueing it:
-/// "prompt blocked: ..." (no model; a `UserPromptSubmit` hook's "Prompt
-/// blocked by hook ..."), "prompt refused: session folder removed", "The
-/// session is not ready yet. Send again in a moment.".
-const REFUSALS: &[&str] = &[
-    "prompt blocked",
-    "prompt refused",
-    "session is not ready yet",
-];
+/// The JSON-RPC errors raised for a request the server could not read
+/// (parse error, invalid request, method not found, invalid params): the
+/// handler never ran, and the same request is refused again.
+const UNREAD_REQUEST: &[i64] = &[-32700, -32600, -32601, -32602];
 
 pub struct GrokHarness {
     rpc: RpcChild,
@@ -80,12 +86,15 @@ struct State {
     /// The mailbox id behind each `session/prompt` request.
     requests: HashMap<i64, String>,
     /// Answers that arrived before their request was recorded: the error
-    /// message, or `None` for a result.
-    early: HashMap<i64, Option<String>>,
+    /// object, or `None` for a result.
+    early: HashMap<i64, Option<Value>>,
     /// Written, and Grok has shown nothing about it yet.
     unconfirmed: HashSet<String>,
     /// Written and not yet answered.
     unanswered: usize,
+    /// Answered with an error before Grok showed it admitted, and why: never
+    /// written again, by this process or a later one of this adapter.
+    rejected: HashMap<String, String>,
     /// A prompt was taken since the session was last idle.
     serving: bool,
     turns_served: u32,
@@ -97,30 +106,24 @@ struct Prompt {
     request: Option<i64>,
     /// Grok showed it queued or in its turn.
     admitted: bool,
-    answer: Option<Answer>,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Answer {
-    /// Its turn ended, or an error left it unknown whether it was applied.
-    Taken,
-    /// Grok turned it away before queueing it.
-    Refused,
+    /// Grok answered its request after admitting it: the turn that took it
+    /// ended, with a result or an error.
+    answered: bool,
 }
 
 impl Prompt {
-    /// What the mailbox may record for it, or `None` while Grok has shown
-    /// nothing.
-    fn outcome(&self) -> Option<DeliverOutcome> {
-        match self.answer {
-            Some(Answer::Refused) => Some(DeliverOutcome::Deferred),
-            Some(Answer::Taken) => Some(DeliverOutcome::Accepted {
-                turn_finished: true,
-            }),
-            None => self.admitted.then_some(DeliverOutcome::Accepted {
-                turn_finished: false,
-            }),
-        }
+    /// What Grok proved about it, or `None` while Grok has shown nothing.
+    fn proof(&self) -> Option<Proof> {
+        (self.admitted || self.answered).then_some(Proof::Taken {
+            turn_finished: self.answered,
+        })
+    }
+}
+
+impl State {
+    /// What Grok proved about `id`. A proof outlives the process.
+    fn proven(&self, id: &str) -> Option<Proof> {
+        self.prompts.get(id)?.proof()
     }
 }
 
@@ -263,7 +266,7 @@ impl Harness for GrokHarness {
         let session = {
             let mut st = lock(&self.shared);
             // What Grok showed about a message outlives its process.
-            if let Some(known) = written_outcome(&mut st, id) {
+            if let Some(known) = known_outcome(&st, id) {
                 return Ok(known);
             }
             if !self.rpc.alive() {
@@ -272,8 +275,9 @@ impl Harness for GrokHarness {
             if st.prompts.contains_key(id) {
                 return Ok(DeliverOutcome::InFlight);
             }
-            // Behind a message Grok has not admitted yet nothing is written:
-            // if Grok turned that one away, a later one would overtake it.
+            // Behind a message Grok has neither admitted nor answered nothing
+            // is written, so mail reaches Grok in mailbox order. Its answer
+            // or admission wakes the host to offer the next one.
             if !st.unconfirmed.is_empty() {
                 return Ok(DeliverOutcome::Deferred);
             }
@@ -285,7 +289,7 @@ impl Harness for GrokHarness {
                 Prompt {
                     request: None,
                     admitted: false,
-                    answer: None,
+                    answered: false,
                 },
             );
             st.unconfirmed.insert(id.to_string());
@@ -309,15 +313,27 @@ impl Harness for GrokHarness {
                 if let Some(error) = st.early.remove(&request) {
                     answer(&mut st, id, request, error);
                 }
-                Ok(written_outcome(&mut st, id).unwrap_or(DeliverOutcome::InFlight))
+                Ok(known_outcome(&st, id).unwrap_or(DeliverOutcome::InFlight))
             }
-            Err(err) => {
+            // The line was not written: Grok has nothing to apply. The
+            // process is judged by its output, which ends at EOF.
+            Err(_) => {
                 st.prompts.remove(id);
                 st.unconfirmed.remove(id);
                 st.unanswered -= 1;
-                Err(fail(err))
+                Ok(DeliverOutcome::Deferred)
             }
         }
+    }
+
+    fn proven(&self, message_id: &str) -> Option<Proof> {
+        lock(&self.shared).proven(message_id)
+    }
+
+    /// Stop the child and read what it already printed, to its end: every
+    /// proof it gave is known to `proven` afterwards.
+    fn stop(&mut self) {
+        self.rpc.stop_child();
     }
 
     fn background(&mut self) -> Result<(), HarnessError> {
@@ -388,15 +404,19 @@ impl Harness for GrokHarness {
     }
 }
 
-/// What the mailbox may record for a message this process wrote, once Grok
-/// has shown something about it. A refusal forgets the write, so the next
-/// offer writes the message again.
-fn written_outcome(state: &mut State, id: &str) -> Option<DeliverOutcome> {
-    let outcome = state.prompts.get(id)?.outcome()?;
-    if outcome == DeliverOutcome::Deferred {
-        state.prompts.remove(id);
+/// What the mailbox may record for a message this adapter wrote, once Grok
+/// has shown something about it: a rejection, or a proof. Both stand after
+/// the process exits.
+fn known_outcome(state: &State, id: &str) -> Option<DeliverOutcome> {
+    if let Some(reason) = state.rejected.get(id) {
+        return Some(DeliverOutcome::Rejected {
+            reason: reason.clone(),
+        });
     }
-    Some(outcome)
+    match state.proven(id)? {
+        Proof::Taken { turn_finished } => Some(DeliverOutcome::Accepted { turn_finished }),
+        Proof::Duplicate => Some(DeliverOutcome::Duplicate),
+    }
 }
 
 /// `name version` from the `initialize` answer's `agentInfo`.
@@ -549,13 +569,7 @@ fn on_notification(state: &mut State, value: &Value) -> NotificationEffect {
                 let error = params
                     .get("error")
                     .filter(|error| !error.is_null())
-                    .map(|error| {
-                        error
-                            .get("message")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string()
-                    });
+                    .cloned();
                 match state.requests.get(&request).cloned() {
                     Some(id) => answer(state, &id, request, error),
                     None => {
@@ -584,35 +598,69 @@ fn on_notification(state: &mut State, value: &Value) -> NotificationEffect {
     NotificationEffect::default()
 }
 
-/// Grok answered `request`, which carried `id`: `error` is its error
-/// message, `None` for a result.
-fn answer(state: &mut State, id: &str, request: i64, error: Option<String>) {
+/// Grok answered `request`, which carried `id`: `error` is its error object,
+/// `None` for a result.
+fn answer(state: &mut State, id: &str, request: i64, error: Option<Value>) {
     // A request is answered once.
     state.requests.remove(&request);
     let Some(prompt) = state.prompts.get_mut(id) else {
         return;
     };
-    if prompt.request != Some(request) || prompt.answer.is_some() {
+    if prompt.request != Some(request) || prompt.answered {
         return;
     }
-    let refused = error.is_some_and(|message| !prompt.admitted && is_refusal(&message));
-    prompt.answer = Some(if refused {
-        Answer::Refused
-    } else {
-        Answer::Taken
-    });
+    let rejected = match error {
+        Some(error) if !prompt.admitted => Some(rejection(&error)),
+        // A result, or an error that ended a turn Grok had taken it into.
+        _ => None,
+    };
+    match rejected {
+        Some(reason) => {
+            state.prompts.remove(id);
+            state.rejected.insert(id.to_string(), reason);
+        }
+        None => {
+            prompt.answered = true;
+            state.serving = true;
+        }
+    }
     state.unconfirmed.remove(id);
     state.unanswered = state.unanswered.saturating_sub(1);
-    state.serving |= !refused;
     if state.serving && state.unanswered == 0 {
         state.serving = false;
         state.turns_served += 1;
     }
 }
 
-fn is_refusal(message: &str) -> bool {
-    let message = message.to_ascii_lowercase();
-    REFUSALS.iter().any(|refusal| message.contains(refusal))
+/// Why a prompt Grok answered with `error` before showing it admitted is
+/// parked. It is never written again: for a request the JSON-RPC layer
+/// could not read, Grok never ran it and would refuse it again; for any
+/// other error Grok may have applied it, and it deduplicates nothing.
+fn rejection(error: &Value) -> String {
+    let code = error.get("code").and_then(Value::as_i64);
+    let mut what = match code {
+        Some(code) => format!("{code} "),
+        None => String::new(),
+    };
+    what.push_str(
+        error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("error"),
+    );
+    match error.get("data") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(data)) => what.push_str(&format!(" ({data})")),
+        Some(data) => what.push_str(&format!(" ({data})")),
+    }
+    if code.is_some_and(|code| UNREAD_REQUEST.contains(&code)) {
+        format!("grok refused the prompt before running it: {what}")
+    } else {
+        format!(
+            "grok answered the prompt with {what} before showing it queued; it may or may \
+             not have applied it and deduplicates nothing, so it is not written again"
+        )
+    }
 }
 
 /// Grok showed a queue or a turn: every unconfirmed message whose marker line
@@ -749,7 +797,7 @@ mod tests {
             Prompt {
                 request: Some(request),
                 admitted: false,
-                answer: None,
+                answered: false,
             },
         );
         state.requests.insert(request, id.to_string());
@@ -757,11 +805,12 @@ mod tests {
         state.unanswered += 1;
     }
 
-    fn answered(request: i64, error: Option<&str>) -> Value {
+    /// The answer to `request`: a result, or the error `{code, message}`.
+    fn answered(request: i64, error: Option<(i64, &str)>) -> Value {
         json!({"method": "$rpc/response", "params": {
             "id": request,
             "result": if error.is_none() { json!({"stopReason": "end_turn"}) } else { Value::Null },
-            "error": error.map_or(Value::Null, |message| json!({"code": -32603, "message": message})),
+            "error": error.map_or(Value::Null, |(code, message)| json!({"code": code, "message": message})),
         }})
     }
 
@@ -786,29 +835,34 @@ mod tests {
             }}),
         );
         assert_eq!(
-            state.prompts["m1"].outcome(),
-            Some(DeliverOutcome::Accepted {
+            state.proven("m1"),
+            Some(Proof::Taken {
                 turn_finished: false
             })
         );
-        assert_eq!(state.prompts["m2"].outcome(), None);
+        assert_eq!(state.proven("m2"), None);
         assert_eq!(state.unconfirmed.len(), 1);
     }
 
     #[test]
-    fn a_refusal_before_admission_hands_the_message_back_and_any_other_error_keeps_it() {
+    fn an_error_before_admission_is_parked_and_one_after_it_ends_the_turn() {
         let mut state = State::default();
-        written(&mut state, "refused", 1);
+        written(&mut state, "unread", 1);
         written(&mut state, "unknown", 2);
         written(&mut state, "admitted", 3);
+        // The texts this adapter once took for refusals are Grok's log and
+        // TUI lines: an error carrying one is no different from any other.
+        on_notification(&mut state, &answered(1, Some((-32602, "Invalid params"))));
         on_notification(
             &mut state,
             &answered(
-                1,
-                Some("The session is not ready yet. Send again in a moment."),
+                2,
+                Some((
+                    -32603,
+                    "The session is not ready yet. Send again in a moment.",
+                )),
             ),
         );
-        on_notification(&mut state, &answered(2, Some("internal error")));
         on_notification(
             &mut state,
             &json!({"method": "session/update", "params": {"update": {
@@ -817,29 +871,41 @@ mod tests {
                     "The user sent a message while you were working:\n<user_query>\nanyagents-message:admitted\nhi\n</user_query>"}
             }}}),
         );
-        on_notification(
-            &mut state,
-            &answered(3, Some("prompt blocked: model unavailable")),
-        );
-        assert_eq!(
-            written_outcome(&mut state, "refused"),
-            Some(DeliverOutcome::Deferred)
-        );
-        assert!(
-            !state.prompts.contains_key("refused"),
-            "the next offer writes it again"
-        );
-        for taken in ["unknown", "admitted"] {
-            assert_eq!(
-                written_outcome(&mut state, taken),
-                Some(DeliverOutcome::Accepted {
-                    turn_finished: true
-                }),
-                "{taken}"
-            );
+        on_notification(&mut state, &answered(3, Some((-32603, "Internal error"))));
+        let reason = |id: &str| match known_outcome(&state, id) {
+            Some(DeliverOutcome::Rejected { reason }) => reason,
+            other => panic!("{id}: {other:?}"),
+        };
+        assert!(reason("unread").contains("before running it: -32602 Invalid params"));
+        assert!(reason("unknown").contains("may or may not have applied it"));
+        for parked in ["unread", "unknown"] {
+            // Not a proof, and nothing left to write.
+            assert_eq!(state.proven(parked), None, "{parked}");
+            assert!(!state.prompts.contains_key(parked), "{parked}");
         }
+        assert_eq!(
+            known_outcome(&state, "admitted"),
+            Some(DeliverOutcome::Accepted {
+                turn_finished: true
+            })
+        );
+        assert!(state.unconfirmed.is_empty());
         assert_eq!(state.unanswered, 0);
         assert_eq!(state.turns_served, 1);
+    }
+
+    #[test]
+    fn a_rejection_names_the_error_and_its_data() {
+        assert_eq!(
+            rejection(
+                &json!({"code": -32602, "message": "Invalid params", "data": "missing field `prompt`"})
+            ),
+            "grok refused the prompt before running it: -32602 Invalid params (missing field `prompt`)"
+        );
+        assert!(
+            rejection(&json!({"code": -32000, "message": "Authentication required"}))
+                .starts_with("grok answered the prompt with -32000 Authentication required before")
+        );
     }
 
     #[test]
@@ -852,7 +918,7 @@ mod tests {
         let error = state.early.remove(&7).unwrap();
         answer(&mut state, "m1", 7, error);
         assert_eq!(
-            written_outcome(&mut state, "m1"),
+            known_outcome(&state, "m1"),
             Some(DeliverOutcome::Accepted {
                 turn_finished: true
             })
@@ -905,4 +971,149 @@ mod conformance {
     }
 
     anyagents_invariants::conformance_suite!(Grok);
+}
+
+#[cfg(all(test, unix))]
+mod process {
+    //! The adapter over a real child: the scripted Grok of the conformance
+    //! suite (`fakes/proto_grok.py`), and a shell script where the order of
+    //! what the child prints must be exact.
+    use std::path::Path;
+    use std::time::{Duration, Instant};
+
+    use anyagents_harness::{
+        Context, DeliverOutcome, Harness, HarnessError, OutboundMessage, Proof,
+    };
+    use anyagents_invariants::conformance::{World, ids};
+
+    use super::GrokHarness;
+    use super::conformance::Grok;
+
+    fn outbound(id: &str, seq: i64) -> OutboundMessage {
+        OutboundMessage {
+            id: id.to_string(),
+            seq,
+            text: "hello".to_string(),
+            sender: None,
+            reply_to: None,
+            source_time_ms: None,
+            context: Context::default(),
+        }
+    }
+
+    /// The scripted Grok answers the next prompt with `error` (a file the
+    /// fake reads) while a turn runs: the message is parked, written once,
+    /// never offered to Grok again, and the process is not restarted.
+    fn a_prompt_answered_with(error: &str, expect: &str) {
+        let mut world = World::<Grok>::new();
+        let first = world.prompt();
+        std::fs::write(world.fixture.dir().join(error), "").unwrap();
+        let poison = world.receive(1).remove(0);
+        world.pump_until("the prompt is parked", |w| w.cursor() == poison.seq);
+        let rejections = world.delivery.take_rejections();
+        assert_eq!(rejections.len(), 1, "{rejections:?}");
+        assert_eq!(rejections[0].message_id, poison.id.as_str());
+        assert!(
+            rejections[0].reason.contains(expect),
+            "{}",
+            rejections[0].reason
+        );
+        // Offered again, it is answered the same, and nothing is written.
+        let again = outbound(poison.id.as_str(), poison.seq);
+        for _ in 0..3 {
+            assert!(matches!(
+                world.delivery.harness_mut().deliver(&again),
+                Ok(DeliverOutcome::Rejected { .. })
+            ));
+        }
+        world.pump_for(Duration::from_millis(200));
+        // Mail behind it still flows.
+        let next = world.receive(1).remove(0);
+        world.drain(next.seq);
+        let wire = world.fixture.wire();
+        assert_eq!(
+            wire.iter().filter(|id| **id == poison.id.as_str()).count(),
+            1,
+            "written again: {wire:?}"
+        );
+        let journal = ids(&world.fixture.journal());
+        assert!(!journal.contains(&poison.id.to_string()), "{journal:?}");
+        assert!(journal.contains(&first.id.to_string()), "{journal:?}");
+        assert_eq!(
+            journal.iter().filter(|id| **id == next.id.as_str()).count(),
+            1,
+            "{journal:?}"
+        );
+        assert!(world.delivery.take_rejections().is_empty());
+        assert_eq!(world.fixture.launches(), 1, "restarted");
+    }
+
+    #[test]
+    fn a_request_grok_cannot_read_is_parked_and_never_written_again() {
+        a_prompt_answered_with("invalid-params", "before running it: -32602 Invalid params");
+    }
+
+    #[test]
+    fn an_unclassified_error_before_admission_is_parked_not_resent_nor_restarted() {
+        a_prompt_answered_with("internal-error", "may or may not have applied it");
+    }
+
+    /// A Grok that admits `m1` and prints nothing more until it is stopped.
+    /// The script is the shell's input file, so nothing executes a file
+    /// written by this test.
+    const ADMITS_THEN_WAITS: &str = r#"IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentInfo":{"name":"grok-shell","version":"1.0.67"}}}'
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s1"}}'
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","method":"x.ai/queue/changed","params":{"sessionId":"s1","entries":[],"runningText":"anyagents-message:m1\nhello"}}'
+: > printed
+exec sleep 30
+"#;
+
+    #[test]
+    fn a_proof_printed_just_before_stop_is_proven_after_it() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("agent"), ADMITS_THEN_WAITS).unwrap();
+        // `sh agent --no-leader --always-approve stdio`, in the directory.
+        let mut harness = GrokHarness::start(
+            "/bin/sh",
+            None,
+            None,
+            &[],
+            dir.path(),
+            Path::new("/opt/bin/anyagents"),
+            &[],
+        )
+        .expect("the script starts");
+        let m1 = outbound("m1", 1);
+        assert!(matches!(
+            harness.deliver(&m1),
+            Ok(DeliverOutcome::InFlight | DeliverOutcome::Accepted { .. })
+        ));
+        // The proof is in the pipe; whether the reader took it yet is open.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !dir.path().join("printed").exists() {
+            assert!(Instant::now() < deadline, "the script never admitted m1");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        harness.stop();
+        // Stopped means read to the end of its output.
+        assert!(!harness.health().process_alive);
+        assert_eq!(
+            harness.proven("m1"),
+            Some(Proof::Taken {
+                turn_finished: false
+            })
+        );
+        // A proof is answered before liveness; anything new finds it gone.
+        assert_eq!(
+            harness.deliver(&m1),
+            Ok(DeliverOutcome::Accepted {
+                turn_finished: false
+            })
+        );
+        assert_eq!(harness.deliver(&outbound("m2", 2)), Err(HarnessError::Dead));
+        assert_eq!(harness.proven("m2"), None);
+    }
 }
