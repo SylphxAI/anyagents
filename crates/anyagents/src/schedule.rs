@@ -860,14 +860,16 @@ struct Step {
 /// Evaluate local timers and watches (and the turn-ownership rules) without
 /// issuing any external probe: one full census of the store, which is a fresh
 /// local timer's first step. [`start_loops`] keeps that timer and steps it again
-/// only when something is due.
-pub fn tick_local_schedules_once(store: &Store, health: &HealthBoard, now: i64) -> usize {
+/// only when something is due; tests drive single passes through this.
+#[cfg(test)]
+fn tick_local_schedules_once(store: &Store, health: &HealthBoard, now: i64) -> usize {
     Timer::local().step(store, health, 0, now).fired
 }
 
 /// Evaluate network-backed watches: one full census of the store. Slow external
 /// services cannot delay a later local tick or consume a timer's due transition.
-pub fn tick_external_watches_once(store: &Store, health: &HealthBoard, now: i64) -> usize {
+#[cfg(test)]
+fn tick_external_watches_once(store: &Store, health: &HealthBoard, now: i64) -> usize {
     Timer::external().step(store, health, 0, now).fired
 }
 
