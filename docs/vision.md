@@ -35,7 +35,8 @@ People and teams who already use one or more agent harnesses and want them runni
 ## Boundaries
 
 - Server first. `anyagents serve` is the product. The CLI, the MCP server, a future TUI or GUI, and every channel are clients of the same API.
-- One Rust binary is the server, the CLI and the MCP server. The npm package is a launcher for that binary.
+- One Rust binary is the server, the keeper that holds each harness process, the CLI and the MCP server. The npm package is a launcher for that binary.
+- The server is a small kernel: identity, mailboxes, supervision, schedules and authorization. Harness processes live in keepers, so restarting or upgrading the server stops no agent ([ADR 0007](adr/0007-process-architecture.md)); services and connectors move out of the kernel's process one at a time, as that ADR orders them.
 - Local by default: the API listens on a Unix socket owned by the user. Network access (`--listen` / `--webhook-listen`) is opt-in and authenticates every request via an operator token or per-agent `mcp-capability` (`POST /mcp` / `GET /mcp` for remote Cloud Agents).
 - Three MCP mounting profiles prevent tool collisions across execution boundaries: `full` over `stdio` for local third-party CLIs (`code` + coordination + memory/skills + web + browser/computer), `remote` over HTTPS `/mcp` for closed-box third-party Cloud Agents (omitting host-local `code` so the cloud container uses its own native sandbox file/bash tools while sharing coordination, memory/skills, web, and host browser/computer), and `coordination` for `spiron` (omitting duplicate `code`/web/memory/skills so `spiron` uses its native capability core).
 - Vendor sign-in credentials live in a config directory AnyAgents owns, written and read only by the vendor tool. AnyAgents never reads, sends or logs the token, and never routes a subscription through the gateway.
@@ -53,6 +54,7 @@ People and teams who already use one or more agent harnesses and want them runni
 ## Target metrics
 
 - No message lost or delivered twice across a server crash, measured by the crash-injection suite.
+- A server restart, crash or upgrade interrupts no running turn, measured by the keeper process tests and the server restart test.
 - Delivery lag (receive to harness accept) under one second for a harness that accepts input during a turn; the lag of every other harness is reported, never hidden.
 - Creating an agent on a harness that is not yet installed, through to its first answer, in one command and one sign-in.
 

@@ -57,14 +57,14 @@ AnyAgents is a **100% vendor-neutral multi-agent orchestrator**. It never implem
 
 ## How it works
 
-`anyagents serve` is one long-lived server. The CLI, an MCP server registered into each agent, and channels such as Telegram are its clients. Each agent is one vendor process in that vendor's programmatic mode, supervised by the server.
+`anyagents serve` is one long-lived server. The CLI, an MCP server registered into each agent, and channels such as Telegram are its clients. Each agent is one vendor process in that vendor's programmatic mode, supervised by the server and held by its own keeper process, so restarting or upgrading the server does not stop any agent.
 
 - [Vision](docs/vision.md): goal, first-version scope, boundaries.
 - [Architecture](docs/architecture.md): state, the three axes, harnesses, the mailbox and its guarantees, runtime boundaries, channels, the gateway, usage.
 - [Verification](docs/verification.md): reproducible scripted harness checks, coverage and live-acceptance boundaries.
 - [Serving identity](docs/serving-identity.md): read back the version, source, binary hash and PID on both server sockets.
 - [Desktop and mobile control](docs/computer-and-device.md): OS backends, Android/iOS setup, semantic snapshots and stale-ref handling.
-- [Decisions](docs/adr/): [0001](docs/adr/0001-server-first-one-binary.md) (server-first single binary) and [0002](docs/adr/0002-runtime-drivers-and-capability-identity.md) (capability identity and runtime boundaries).
+- [Decisions](docs/adr/): [0001](docs/adr/0001-server-first-one-binary.md) (server-first single binary), [0002](docs/adr/0002-runtime-drivers-and-capability-identity.md) (capability identity and runtime boundaries) and [0007](docs/adr/0007-process-architecture.md) (a small kernel, keepers that hold harness processes, services and connectors outside).
 
 ## Licence
 

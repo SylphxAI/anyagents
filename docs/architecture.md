@@ -1,6 +1,6 @@
 # AnyAgents architecture
 
-Status: design. Decisions behind it are in [adr/0001-server-first-one-binary.md](adr/0001-server-first-one-binary.md) and [adr/0002-runtime-drivers-and-capability-identity.md](adr/0002-runtime-drivers-and-capability-identity.md).
+Status: design. Decisions behind it are in [adr/0001-server-first-one-binary.md](adr/0001-server-first-one-binary.md), [adr/0002-runtime-drivers-and-capability-identity.md](adr/0002-runtime-drivers-and-capability-identity.md) and, for which process holds what, [adr/0007-process-architecture.md](adr/0007-process-architecture.md).
 
 ## The standard, and the shape
 
@@ -19,10 +19,12 @@ The established pattern for running vendor agents is a long-lived gateway that d
      |  sign-in    |  adapters   |  three acks |             |  aggregates |
      +-------------+-------------+-------------+-------------+-------------+
                                        |
+                       keepers: one `anyagents keeper` per harness
+                                       |
                     vendor processes: claude, codex, opencode, gemini, ...
 ```
 
-Everything runs in one process, `anyagents serve`, with one embedded database. Each module below is one crate with one public interface; the protocol gateway is a sixth module used only in API-key mode.
+`anyagents serve` is the kernel: the API, identity, the mailboxes, supervision, schedules and the one embedded database run in it. Each harness process is held by its own keeper, a small process (`anyagents keeper`, the same binary) that starts the harness, owns its pipes and hosts the vendor adapter, so the kernel can stop, crash or be replaced by a newer binary while every harness keeps running ([ADR 0007](adr/0007-process-architecture.md)). The protocol gateway, used only in API-key mode, runs inside the kernel.
 
 ## Three-axis vendor-neutral model (`Harness × Profile × Sandbox`)
 
@@ -61,7 +63,7 @@ Clients show only valid combinations, so an invalid one is never offered rather 
 
 ## Protocol gateway (API-key mode)
 
-A local HTTP server inside `anyagents serve`, bound to loopback, reachable only by the harness processes AnyAgents started (each gets a per-agent gateway token).
+A local HTTP server inside `anyagents serve`, bound to loopback, reachable only by the harness processes AnyAgents started (each gets a per-agent gateway token). Its port is kept in `<data>/gateway.port` and bound again at the next start, so a harness that outlived the last server in its keeper still reaches the gateway at the origin it was started with; only when that port is taken does the gateway take another and repoint every agent.
 
 - **Inbound protocols:** the Anthropic Messages API (`/v1/messages`, streaming), and the OpenAI Chat Completions and Responses APIs (`/v1/chat/completions`, `/v1/responses`, streaming), because those are what the supported harnesses speak.
 - **Outbound:** the provider's native API for the chosen model. When inbound and outbound are the same protocol the request passes through unchanged apart from the key and model; otherwise the gateway maps messages, system prompts, tool definitions, tool calls and results, streaming events, stop reasons and usage between them.
@@ -102,7 +104,8 @@ AnyAgents is a message switchboard plus a process supervisor. It never models a 
 
 Each agent is one long-lived vendor process in its programmatic mode, run under a supervisor:
 
-- A per-agent lock: a second process for the same agent is refused, never started beside the first.
+- Its own keeper. The vendor process and the adapter that speaks to it live in a keeper process, not in the server. A server that stops, crashes or is upgraded leaves every keeper running; the next server takes each running agent's keeper over, with the adapter's memory of the session intact, and resumes delivery from the mailbox cursor. A process taken over gets no `[Recovery]` note: its turn never stopped. A keeper whose agent no longer runs is stopped at startup. `anyagents keepers list` shows every keeper; `anyagents keepers stop` ends them.
+- A per-agent lock: a second process for the same agent is refused, never started beside the first. The keeper holds a copy of the lock for the life of its process, so the lock stays held while no server runs.
 - Restart with exponential backoff and jitter after a crash, resuming the same vendor session id. Starting a new session in place of a failed resume is reported as a failed resume, not hidden.
 - A quota or rate-limit answer from the vendor (for example an HTTP 429 with a reset time) is a health state with its reset time, not a crash and not a restart loop.
 - A process that has gone is replaced after its backoff, resuming the session, and the lines after the one cursor go to the new process. A line already taken is never written twice: each adapter remembers the ids its session holds.
@@ -364,7 +367,7 @@ Every input to an agent (a Telegram message, another agent's `send`, a CLI or TU
 - **Sequence.** On durable receive the server assigns the next per-agent sequence number. Delivery, acknowledgement and replay key on that sequence. A message's source time (the Telegram `date`, the sender's clock) is kept as metadata and shown, but never used to order: a late, older event gets the next sequence and is not inserted behind messages already delivered.
 - **One delivery cursor.** A row is `received` when its insert commits, and `delivered` when the harness has shown the evidence its delivery level requires ([delivery.md](delivery.md)): the vendor's acceptance, or its proof that the running turn consumed the row. Rows written ahead of that proof are in flight; the cursor moves only over a contiguous consumed prefix. There is no second cursor and no turn bookkeeping.
 - **Contiguous cursor.** It advances only over a contiguous prefix of the sequence, one row at a time, so one row the harness did not take is visible as the oldest undelivered one rather than skipped.
-- **Idempotent delivery.** After a crash, rows past the cursor are handed over again. An adapter never writes a row twice to one process, and an idempotent harness recognises a row an earlier process of the session consumed, by the vendor's own deduplication of an id AnyAgents sends or by reading the vendor's durable history first ([delivery.md](delivery.md)). Inbound channel events dedupe on their source key (for Telegram, the bot and its update id).
+- **Idempotent delivery.** After a crash, rows past the cursor are handed over again. An adapter never writes a row twice to one process, and an idempotent harness recognises a row an earlier process of the session consumed, by the vendor's own deduplication of an id AnyAgents sends or by reading the vendor's durable history first ([delivery.md](delivery.md)). The adapter lives in the harness's keeper, so a server crash or restart loses none of its memory of what it wrote, and a request the dying server was writing reaches the adapter whole or not at all. Inbound channel events dedupe on their source key (for Telegram, the bot and its update id).
 - **Egress is the agent's own `send`.** An agent replies by calling its MCP `send` tool, or a channel tool; the switchboard routes that immediately. A reply to a Telegram message carries that chat as its target, so the agent's `send` reaches the same chat. Nothing reads a vendor's transcript to find an answer.
 - **Retention.** Delivered messages are kept for a configurable period for `inbox` and audit, then compacted.
 
@@ -380,6 +383,7 @@ These are invariants with tests (`tests/invariants/`): crash injection against a
 6. A quota fault is a reported state with a reset time, and the server keeps the mailbox growing durably while it lasts.
 7. One vendor process per agent.
 8. A line is handed over once per burst: never twice across a restart, never lost across one.
+9. A server restart, crash or upgrade ends no harness process and interrupts no turn; the next server resumes delivery from the cursor (`anyagents-keeper` process tests and `server_harnesses::a_harness_outlives_a_server_crash_an_upgrade_and_a_clean_stop`).
 
 ## Channels
 
@@ -506,6 +510,7 @@ Each row keeps the harness, model, role and profile the agent ran with. `skill_r
 ## Security model
 
 - The API listens on a Unix socket readable only by the user. A TCP listener is opt-in and requires a bearer token.
+- Each keeper listens on `<data>/keepers/<instance>/s`, in a `0700` directory, and closes any connection whose peer runs as another uid; a harness, which runs as its seat, cannot reach it. A harness's launch, environment included, reaches its keeper through a pipe and is never written to disk.
 - Each agent's MCP capability is scoped to that agent, and minted fresh for each of its instances; the last one stops working at once.
 - The operator's authority is its own token, never an agent's.
 - Secrets (channel tokens, API keys, the capability itself) live in the OS keychain or a 0600 file, never in the database, logs, tool arguments or usage records.
