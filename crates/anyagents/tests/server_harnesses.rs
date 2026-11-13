@@ -736,6 +736,89 @@ fn keepers_across_protocol_versions_are_taken_over_or_replaced() {
     drop(server);
 }
 
+/// A harness kept across a restart sends its gateway token to the port the
+/// last server held. When something else listens there by the next start,
+/// the gateway moves: every agent's token is replaced, and an API-key agent's
+/// kept harness is replaced rather than taken over, so none keeps sending its
+/// token to the old port. The turn it held is recovered and answered once.
+#[test]
+fn a_moved_gateway_replaces_the_kept_harnesses_of_api_key_agents() {
+    let _env = support::lock();
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    support::operator_for_contract(&data);
+    create_asker(&data);
+    let name = "responder";
+    let agent_file = data.join("responder-name");
+    std::fs::write(&agent_file, name).unwrap();
+    let id = create(&data, name, "claude-code", &agent_file);
+    let key_file = dir.path().join("key");
+    std::fs::write(&key_file, "sk-provider-secret\n").unwrap();
+    let keyed = bin()
+        .arg("--data")
+        .arg(&data)
+        .args([
+            "model",
+            name,
+            "--base-url",
+            "http://127.0.0.1:9",
+            "--model",
+            "claude",
+        ])
+        .arg("--key-file")
+        .arg(&key_file)
+        .output()
+        .unwrap();
+    assert!(
+        keyed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&keyed.stderr)
+    );
+    let hold = data.join("hold-turn");
+    hold_turns(&data, &id, &hold);
+    std::fs::write(&hold, b"").unwrap();
+    let anyagents = Path::new(env!("CARGO_BIN_EXE_anyagents"));
+    let server = Server::start(&data, anyagents);
+    let sent = send(&data, name);
+    wait_logged(&data, &format!("holding {sent}"), "the turn did not start");
+    let harness = kept_harness(&data, &id);
+    let token_file = data.join("agents").join(&id).join("gateway-token.txt");
+    let token = std::fs::read_to_string(&token_file).unwrap();
+    let port: u16 = std::fs::read_to_string(data.join("gateway.port"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    server.crash();
+
+    // Something else takes the port while no server runs.
+    let squatter = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+    let server = Server::start(&data, anyagents);
+    support::wait_for(|| !alive(harness), "the kept harness was taken over");
+    let moved: u16 = std::fs::read_to_string(data.join("gateway.port"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_ne!(moved, port, "the gateway stayed on a port it does not hold");
+    assert_ne!(
+        std::fs::read_to_string(&token_file).unwrap(),
+        token,
+        "the token handed out before the move still works"
+    );
+    assert_ne!(kept_harness(&data, &id), harness);
+    std::fs::remove_file(&hold).unwrap();
+    ask(&data, name, "claude-code", &sent);
+    assert_eq!(
+        answers(&data, &sent),
+        1,
+        "{sent} was not answered exactly once"
+    );
+    drop(server);
+    drop(squatter);
+}
+
 /// Stopping keepers is the step before a rollback to a binary without them.
 /// It refuses while a server runs (that server would start them again),
 /// exits non-zero when it refuses, and once no server runs it ends every

@@ -258,7 +258,7 @@ async fn serve(
     // The gateway is up and every agent repointed before anything is bound or
     // started: a client that sees the socket must find a live origin, not the
     // port of the server that just stopped.
-    crate::gateway::start(data)?;
+    let gateway = crate::gateway::start(data)?;
     // The API is bound before any vendor starts: an agent that is slow, silent
     // or wedged must never stop the server from answering.
     prepare_socket(&path)?;
@@ -269,7 +269,14 @@ async fn serve(
         crate::sandbox::share_socket_with_seats(&path);
     }
     let launch_store = Arc::clone(&store);
-    let custody = crate::keeper::custody(data, &host, Vec::new());
+    // A harness kept from the last server on a gateway origin that moved
+    // would send its token wherever that port now leads: it is replaced.
+    let refused = if gateway.moved {
+        gateway.agents
+    } else {
+        Vec::new()
+    };
+    let custody = crate::keeper::custody(data, &host, refused);
     let supervisor = Retaining(Some(
         Supervisor::<VendorHarness>::start_with_custody(
             Arc::clone(&store),
