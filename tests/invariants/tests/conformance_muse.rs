@@ -46,5 +46,5 @@ fn muse_reports_next_step_idempotent_delivery_and_its_version() {
     let delivery = harness.health().delivery;
     assert_eq!(delivery.level, DeliveryLevel::NextStep);
     assert!(delivery.idempotent);
-    assert_eq!(delivery.peer.as_deref(), Some("muse 1.4.18-R8587.1"));
+    assert_eq!(delivery.peer.as_deref(), Some("muse 1.4.20-R8619.1"));
 }

@@ -1,21 +1,29 @@
-"""`muse serve` (Muse 1.4.18): JSON-RPC 2.0, one object per line.
+"""`muse serve` (Muse 1.4.20): JSON-RPC 2.0, one object per line.
 
 `turn/start {commandId, sessionId, input, ifBusy: "steer"}` opens a turn when
 none runs (the turn is named after its `commandId`) and otherwise writes the
 input durably into the running turn's inbox before it answers. The answer is
 an admission ack only: `{commandId, status, disposition, turnId,
-startedNewTurn, queuedAtUs}`. What proves the model saw an input is the
-`userMessage` item (`item/completed`, no `item/started`) the turn emits when
-the input enters the conversation: at the turn's start for its own prompt, at
-the next step boundary for steered input, every waiting steer together and
-oldest first. `turn/started` is emitted for a turn's own submit, never for a
-steer. `turn/completed` closes a turn with its usage.
+startedNewTurn}`, plus `queuedAtUs` on a fresh `queued` or `steered`
+admission, and only to a connection that opted into `experimentalApi`: never
+on `started`, and never on the replay of a command an earlier process
+admitted. What proves the model saw an input is the `userMessage` item
+(`item/completed`, no `item/started`) the turn emits when the input enters
+the conversation: at the turn's start for its own prompt, at the next step
+boundary for steered input, every waiting steer together and oldest first.
+`turn/started` is emitted for a turn's own submit, never for a steer.
+`turn/completed` closes a turn with its usage.
 
 A `commandId` is an idempotency key, durable within the session: replaying it
-with the same payload answers the same ack and applies nothing; reusing it
-with a different payload is refused (-32030). A refusal (-32030
-`commandRejected`, which the `refuse` command produces for the next steer) is
-recorded against its command the same way, and the input is not applied.
+with the same payload answers the recorded decision and applies nothing;
+reusing it with a different payload is refused -32030 `commandRejected`,
+reason `command_id_conflict`. A refusal before admission (-32031, the
+command-admission queue is full, which the `refuse` command produces for the
+next steer) records nothing, and the input is not applied.
+
+The session's record is what the model saw (the engine's journal): a resume
+without `excludeItems: true` serves it as `inline` history, one `userMessage`
+item per input, with the `commandId` that wrote it.
 
 A steer still waiting when its turn ends is not dropped: it starts a
 successor turn whose `turnId` is that steer's `commandId`, and every other
@@ -33,9 +41,10 @@ from engine import Input, Protocol, marker_id
 COMMANDS = "muse-commands.json"
 INBOX = "muse-inbox.json"
 SESSION = "muse-session"
-VERSION = "1.4.18-R8587.1"
+VERSION = "1.4.20-R8619.1"
 
 COMMAND_REJECTED = -32030
+QUEUE_FULL = -32031
 SESSION_NOT_FOUND = -32020
 METHOD_NOT_FOUND = -32601
 
@@ -51,11 +60,17 @@ class Muse(Protocol):
     # engine records every input it is handed, so a second application of one
     # mailbox message under another command shows in the journal.
     idempotent = False
+    # Muse records an input before it announces it: its view events, the
+    # `userMessage` item among them, fold from durable records.
+    stores_after_proof = False
 
     def __init__(self, engine, args):
         super().__init__(engine, args)
         self.cursor = 0
         self.queued_turns = []
+        self.experimental = False
+        # Commands an earlier process admitted: their replay drops `queuedAtUs`.
+        self.earlier = set(self.load(COMMANDS, {}))
         # Steers a dead process left waiting, run once the session resumes.
         self.leftover = self.load(INBOX, {"turn": None, "items": []})
         self.save_inbox()
@@ -76,10 +91,30 @@ class Muse(Protocol):
         items += self.leftover["items"]
         self.store(INBOX, {"turn": self.engine.turn or self.leftover["turn"], "items": items})
 
-    def record(self, command, fingerprint, answer):
+    def record(self, command, ident, fingerprint, answer):
         commands = self.load(COMMANDS, {})
-        commands[command] = dict(answer, fingerprint=fingerprint)
+        commands[command] = dict(answer, fingerprint=fingerprint, id=ident)
         self.store(COMMANDS, commands)
+
+    def history(self):
+        """The session's record: one `userMessage` item per input its model
+        saw, with the command that wrote it."""
+        command_of = {row["id"]: command for command, row in self.load(COMMANDS, {}).items()
+                      if "ack" in row}
+        path = self.engine.root / "journal.jsonl"
+        rows = [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+        items = []
+        for row in rows:
+            if row["kind"] == "lost":
+                continue
+            item = {"itemId": "item-%d" % len(items), "kind": "userMessage", "turnId": row["turn"],
+                    "revision": 1, "status": "completed", "text": row["text"]}
+            if row["id"] in command_of:
+                item["commandId"] = command_of[row["id"]]
+            if row["kind"] == "steer":
+                item["steered"] = True
+            items.append(item)
+        return items
 
     # The wire.
 
@@ -111,6 +146,7 @@ class Muse(Protocol):
         method, rid = msg.get("method"), msg.get("id")
         params = msg.get("params") or {}
         if method == "initialize":
+            self.experimental = (params.get("capabilities") or {}).get("experimentalApi") is True
             self.reply(rid, {"serverInfo": VERSION, "userAgent": "muse/%s (fake)" % VERSION,
                              "schema": {"version": 1, "fingerprint": "fake"}})
         elif method == "initialized":
@@ -130,7 +166,14 @@ class Muse(Protocol):
                                  "data": {"kind": "sessionNotFound", "retryable": False}})
                 return
             self.session = wanted
-            self.reply(rid, self.session_result(self.engine.turn))
+            result = self.session_result(self.engine.turn)
+            result["viewCursor"] = str(self.cursor)
+            if params.get("excludeItems") is True:
+                result["history"] = {"mode": "none", "items": None, "snapshot": None,
+                                     "noneReason": "excludeItems"}
+            else:
+                result["history"] = {"mode": "inline", "items": self.history(), "snapshot": None}
+            self.reply(rid, result)
             self.resume_leftover()
         elif method == "session/setApprovalMode":
             self.reply(rid, {"commandId": params.get("commandId"), "status": "accepted"})
@@ -155,25 +198,28 @@ class Muse(Protocol):
         known = self.load(COMMANDS, {}).get(command)
         if known is not None:
             if known["fingerprint"] != fingerprint:
-                error = {"code": COMMAND_REJECTED, "message": "commandId reused with another payload",
+                error = {"code": COMMAND_REJECTED,
+                         "message": "command id replayed with a different payload",
                          "data": {"kind": "commandRejected", "retryable": False,
-                                  "commandId": command, "reason": "fingerprintMismatch"}}
+                                  "commandId": command, "reason": "command_id_conflict"}}
                 self.later(lambda: self.error(rid, error))
             elif "error" in known:
                 self.later(lambda: self.error(rid, known["error"]))
             else:
-                self.later(lambda: self.reply(rid, known["ack"]))
+                ack = dict(known["ack"])
+                if command in self.earlier:
+                    ack.pop("queuedAtUs", None)
+                self.later(lambda: self.reply(rid, ack))
             return
         if engine.turn is not None and params.get("ifBusy") == "steer":
             if self.take_refusal():
-                error = {"code": COMMAND_REJECTED, "message": "the running turn refused the steer",
-                         "data": {"kind": "commandRejected", "retryable": True,
-                                  "commandId": command, "reason": "turnClosing"}}
-                self.record(command, fingerprint, {"error": error})
+                # Refused before admission: nothing is recorded.
+                error = {"code": QUEUE_FULL, "message": "the command-admission queue is full",
+                         "data": {"kind": "backpressured", "retryable": True}}
                 self.later(lambda: self.error(rid, error))
                 return
             ack = self.ack(command, "steered", engine.turn, False)
-            self.record(command, fingerprint, {"ack": ack})
+            self.record(command, inp.id, fingerprint, {"ack": ack})
             engine.queue(inp)
             self.save_inbox()
             self.later(lambda: self.reply(rid, ack))
@@ -181,12 +227,12 @@ class Muse(Protocol):
         if engine.turn is not None:
             # `ifBusy` absent or `queue`: a turn of its own, after this one.
             ack = self.ack(command, "queued", command, False)
-            self.record(command, fingerprint, {"ack": ack})
+            self.record(command, inp.id, fingerprint, {"ack": ack})
             self.queued_turns.append(inp)
             self.later(lambda: self.reply(rid, ack))
             return
         ack = self.ack(command, "started", command, True)
-        self.record(command, fingerprint, {"ack": ack})
+        self.record(command, inp.id, fingerprint, {"ack": ack})
         engine.open_turn(inp, command)
 
         def started():
@@ -196,8 +242,11 @@ class Muse(Protocol):
         self.later(started)
 
     def ack(self, command, disposition, turn, started):
-        return {"commandId": command, "status": "accepted", "disposition": disposition,
-                "turnId": turn, "startedNewTurn": started, "queuedAtUs": now_us()}
+        ack = {"commandId": command, "status": "accepted", "disposition": disposition,
+               "turnId": turn, "startedNewTurn": started}
+        if disposition != "started" and self.experimental:
+            ack["queuedAtUs"] = now_us()
+        return ack
 
     def consumed(self, taken):
         for inp, _ in taken:
@@ -217,7 +266,11 @@ class Muse(Protocol):
         self.consumed(self.engine.step())
 
     def resume_leftover(self):
-        items = self.leftover["items"]
+        # The inbox drains as the session records what its model took: an
+        # input the record holds is no longer waiting, even when the process
+        # died before it rewrote the inbox.
+        seen = self.engine.journal_ids(kept_only=True)
+        items = [row for row in self.leftover["items"] if row["id"] not in seen]
         self.leftover = {"turn": None, "items": []}
         if items and self.engine.turn is None:
             self.successor([Input(row["id"], row["text"], "turn/start",

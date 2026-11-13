@@ -14,28 +14,40 @@
 //!   into the running turn's inbox otherwise. The request is sent without
 //!   waiting; its answer arrives as `$rpc/response`. The mailbox id is the
 //!   first line of the text (`anyagents-message:<id>`).
-//! - The `commandId` is derived from the mailbox id (and how many times the
-//!   vendor rejected it), and the payload is the same on every write. The
-//!   vendor keeps every command's answer for the session, so writing a command
-//!   again replays its answer and applies nothing. An answer whose
-//!   `queuedAtUs` predates this process belongs to a command an earlier
-//!   process wrote: the vendor holds that input, so it is a duplicate.
-//! - The answer only says the input is queued. The proof that the model saw it
-//!   is the `userMessage` item (`item/completed`) carrying its `commandId` and
-//!   the turn it joined; until it arrives the message is in flight. That
-//!   turn's `turn/completed` finishes it. A steer the turn never consumed is
-//!   carried by the vendor into a successor turn named after its command, and
-//!   stays in flight until that turn's proof.
-//! - A rejection (-32030, which the vendor records against the command) or an
-//!   admission refusal (queue full, overloaded, draining, starting up) was not
-//!   applied: the message is deferred and written again once the vendor has
-//!   moved on (a turn boundary, or the next pass when no turn runs), after a
-//!   rejection under the next command id. An error that leaves the outcome
-//!   unknown is resolved the same way, by writing the same command again. A
-//!   session fault (not found, not loaded, held elsewhere, invalid params)
-//!   fails delivery, and the supervisor restarts the process.
+//! - The `commandId` is derived from the mailbox id alone, the same in every
+//!   process and for every payload. Muse keeps every command's decision for
+//!   the session and replays it for the same id, so writing a command again
+//!   applies nothing.
+//! - The answer only says the input is admitted, and it reads the same for a
+//!   fresh admission and for the replay of one an earlier process wrote (its
+//!   `queuedAtUs` is absent on `started`, on replays after a restart and on
+//!   connections without `experimentalApi`, so it proves nothing). The proof
+//!   that the model saw an input is the `userMessage` item carrying its
+//!   `commandId` and the turn it joined. Resuming a session reads the items
+//!   its record already holds (the resume's history, or `view/page` when the
+//!   history did not fit Muse's budget): a message found there is a duplicate
+//!   and is never written again, and every other admitted input is consumed
+//!   while this process watches, so its item reaches it. That item's turn's
+//!   `turn/completed` finishes it. A steer the turn never consumed is carried
+//!   by the vendor into a successor turn named after its command, and stays in
+//!   flight until that turn's proof.
+//! - `-32030` (`commandRejected`) is a decision Muse records against the
+//!   command id. With reason `command_id_conflict` the id is already held by
+//!   an earlier write of this message (another payload): it was admitted, and
+//!   waits for its proof like any other admitted input. With any other reason,
+//!   and for `-32002` (input too large) and `-32602` (invalid params), the
+//!   vendor refused the message for good: no write under its id can succeed,
+//!   so it is rejected. An admission refusal (queue full, overloaded,
+//!   draining, starting up) or an unknown outcome is deferred and written
+//!   again under the same id once the vendor has moved on (a turn boundary,
+//!   or the next pass when no turn runs); every answer wakes the host. A
+//!   session fault (not found, not loaded, held elsewhere) fails delivery,
+//!   and the supervisor restarts the process.
 //! - A message is not written while an earlier one's `turn/start` is
 //!   unanswered, so a refusal never lets a later message overtake it.
+//! - The process is dead only once its stdout reached end of file, so every
+//!   proof it printed is read first. A write that fails leaves the message
+//!   for the same command id later.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -44,7 +56,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyagents_harness::{
     DeliverOutcome, Delivery, DeliveryLevel, Harness, HarnessError, HarnessHealth, OutboundMessage,
-    TurnState, TurnUsage, message_id_in_text,
+    Proof, TurnState, TurnUsage, message_id_in_text,
 };
 use anyagents_harness_stream::{NotificationEffect, RpcChild, RpcFail, RpcLaunch};
 use serde_json::{Value, json};
@@ -55,14 +67,22 @@ const REQUEST_WAIT: Duration = Duration::from_secs(60);
 /// A cold resume can take much longer than a request.
 const RESUME_WAIT: Duration = Duration::from_secs(180);
 
-/// The command was rejected, and the rejection is recorded against its id:
-/// the input was not applied, and the same id is rejected again.
+/// `commandRejected`: a decision Muse records against the command id, with
+/// `data.reason`; the same id answers it again.
 const COMMAND_REJECTED: i64 = -32030;
+/// The `commandRejected` reason for an id an earlier write holds with
+/// another payload.
+const COMMAND_ID_CONFLICT: [&str; 2] = ["command_id_conflict", "commandIdConflict"];
+/// The frame or params are over the vendor's limit (`inputTooLarge`).
+const INPUT_TOO_LARGE: i64 = -32002;
+/// Malformed params (`invalidParams`).
+const INVALID_PARAMS: i64 = -32602;
 /// Session faults: no write into this process can succeed.
 const SESSION_NOT_FOUND: i64 = -32020;
 const SESSION_NOT_LOADED: i64 = -32024;
 const WRITER_LEASE_HELD: i64 = -32021;
-const INVALID_PARAMS: i64 = -32602;
+/// The most events one `view/page` serves.
+const PAGE_LIMIT: u64 = 1_000;
 
 /// What this adapter guarantees for mail that reaches a busy agent
 /// (`docs/delivery.md`).
@@ -98,14 +118,14 @@ enum Stage {
     /// Not applied, or not known to be: write it again once the vendor has
     /// passed `boundary`, or when no turn runs.
     Retry { boundary: u64 },
+    /// The vendor refused it for good: no write under its id can succeed.
+    Rejected(String),
     /// The session cannot take input in this process.
     Fault(String),
 }
 
 struct Input {
     seq: i64,
-    /// How many times the vendor rejected it; part of its command id.
-    attempt: u32,
     command: String,
     stage: Stage,
 }
@@ -120,9 +140,15 @@ struct State {
     work_dir: Option<PathBuf>,
     /// What the process said about itself in `initialize`.
     peer: Option<String>,
-    /// Wall clock, in microseconds, just before this process was spawned: a
-    /// command the vendor queued earlier was written by an earlier process.
-    launched_at_us: u64,
+    /// The inputs the session's record held when this process resumed it,
+    /// by mailbox id and by command id: written by an earlier process.
+    held: HashSet<String>,
+    held_commands: HashSet<String>,
+    /// The reader reached the end of the vendor's stdout: every line the
+    /// process printed has been read, and nothing more will come.
+    reader_done: bool,
+    /// Told when the reader is done.
+    watchers: Vec<Arc<dyn Fn() + Send + Sync>>,
     /// The turn that runs.
     running: Option<String>,
     /// Turns this process saw run, or that inputs joined.
@@ -153,18 +179,29 @@ struct State {
 
 impl State {
     /// The answer for a message the vendor has settled, whether or not the
-    /// process still runs.
+    /// process still runs: a proof, the session's record, or a refusal for
+    /// good.
     fn settled(&self, id: &str) -> Option<DeliverOutcome> {
-        match &self.inputs.get(id)?.stage {
-            Stage::Consumed { .. } => Some(DeliverOutcome::Accepted {
+        match self.inputs.get(id).map(|input| &input.stage) {
+            Some(Stage::Consumed { .. }) => Some(DeliverOutcome::Accepted {
                 turn_finished: false,
             }),
-            Stage::Finished => Some(DeliverOutcome::Accepted {
+            Some(Stage::Finished) => Some(DeliverOutcome::Accepted {
                 turn_finished: true,
             }),
-            Stage::Duplicate => Some(DeliverOutcome::Duplicate),
-            _ => None,
+            Some(Stage::Duplicate) => Some(DeliverOutcome::Duplicate),
+            Some(Stage::Rejected(reason)) => Some(DeliverOutcome::Rejected {
+                reason: reason.clone(),
+            }),
+            Some(_) => None,
+            None => self.holds(id).then_some(DeliverOutcome::Duplicate),
         }
+    }
+
+    /// Whether the session's record held this message when this process
+    /// resumed it.
+    fn holds(&self, id: &str) -> bool {
+        self.held.contains(id) || self.held_commands.contains(&command_id(id))
     }
 
     /// Whether the vendor has work of the host's in hand: a running turn, or
@@ -215,12 +252,16 @@ impl MuseHarness {
         let shared = Arc::new(Mutex::new(State {
             wanted_session: session_id.map(str::to_string),
             work_dir: work_dir.map(Path::to_path_buf),
-            launched_at_us: now_us(),
             ..State::default()
         }));
         let on_shared = Arc::clone(&shared);
         let lines = Arc::new((Mutex::new(0u64), Condvar::new()));
         let on_lines = Arc::clone(&lines);
+        // Dropped with the reader's line handler, once it read the last line.
+        let reader_end = ReaderEnd {
+            shared: Arc::clone(&shared),
+            lines: Arc::clone(&lines),
+        };
         let mut args = vec!["serve".to_string()];
         args.extend(extra_args.iter().cloned());
         let rpc = RpcChild::launch(
@@ -235,6 +276,7 @@ impl MuseHarness {
                 work_dir: work_dir.map(Path::to_path_buf),
             },
             Arc::new(move |line| {
+                let _reader = &reader_end;
                 let unobserved = {
                     let mut state = lock(&on_shared);
                     let before = state.version;
@@ -254,13 +296,10 @@ impl MuseHarness {
         let harness = Self { rpc, shared, lines };
         match harness.handshake() {
             Ok(()) => Ok(harness),
-            Err(err) => {
-                if harness.health().process_alive {
-                    Err(err)
-                } else {
-                    Ok(harness)
-                }
-            }
+            // A process that went away during the handshake is a dead
+            // harness, which its reader reports once it read every line.
+            Err(err) if harness.rpc.alive() => Err(err),
+            Err(_) => Ok(harness),
         }
     }
 
@@ -343,25 +382,30 @@ impl MuseHarness {
             }
             params
         };
-        let mut result = match &wanted {
+        let resumed = match &wanted {
             Some(session) => match self.resume_session(session, true) {
-                Ok(result) => result,
-                Err(err) if is_session_missing(&err) => {
-                    self.call("session/start", start_params(), RESUME_WAIT)?
-                }
+                Ok(result) => Some(result),
+                Err(err) if is_session_missing(&err) => None,
                 Err(err) => return Err(err),
             },
-            None => self.call("session/start", start_params(), RESUME_WAIT)?,
+            None => None,
         };
-        if wanted.is_some()
-            && work_dir.is_some()
-            && result
-                .pointer("/session/workspaceRoot")
-                .and_then(Value::as_str)
-                .is_none()
-        {
-            result = self.call("session/start", start_params(), RESUME_WAIT)?;
-        }
+        // A resumed session without a workspace root is started afresh in
+        // the working directory.
+        let resumed = resumed.filter(|result| {
+            work_dir.is_none()
+                || result
+                    .pointer("/session/workspaceRoot")
+                    .and_then(Value::as_str)
+                    .is_some()
+        });
+        let (result, resumed) = match resumed {
+            Some(result) => (result, true),
+            None => (
+                self.call("session/start", start_params(), RESUME_WAIT)?,
+                false,
+            ),
+        };
         let session = result
             .pointer("/session/sessionId")
             .and_then(Value::as_str)
@@ -369,9 +413,16 @@ impl MuseHarness {
             .map(str::to_string)
             .or(wanted)
             .ok_or_else(|| HarnessError::Failed("session id missing".into()))?;
+        let record = if resumed {
+            self.read_record(&session, &result)?
+        } else {
+            Record::default()
+        };
         {
             let mut state = lock(&self.shared);
             state.session = session.clone();
+            state.held = record.ids;
+            state.held_commands = record.commands;
             if let Some(turn) = active_turn(&result) {
                 state.known_turns.insert(turn.clone());
                 state.running = Some(turn);
@@ -390,6 +441,68 @@ impl MuseHarness {
         Ok(())
     }
 
+    /// The inputs `session`'s record holds, from the history its resume
+    /// served. When the history did not fit Muse's budget, the view is paged
+    /// forward from its latest compaction boundary (from its start when it
+    /// has none): an input an earlier process wrote and the host has not
+    /// committed is newer than that boundary, since the process consumed it
+    /// right before it went away. A view that cannot be read leaves what was
+    /// read.
+    fn read_record(&self, session: &str, resumed: &Value) -> Result<Record, HarnessError> {
+        let mut record = Record::default();
+        let history = resumed.get("history").unwrap_or(&Value::Null);
+        let served = history.get("items").and_then(Value::as_array).or_else(|| {
+            history
+                .pointer("/snapshot/state/items")
+                .and_then(Value::as_array)
+        });
+        if let Some(items) = served {
+            for item in items {
+                record.take(item);
+            }
+            return Ok(record);
+        }
+        let page = |cursor: Option<&str>, anchored: bool| {
+            let mut params = json!({
+                "sessionId": session,
+                "direction": "forward",
+                "limit": PAGE_LIMIT,
+            });
+            if let Some(cursor) = cursor {
+                params["cursor"] = json!(cursor);
+            } else if anchored {
+                params["anchor"] = json!("latestCompaction");
+            }
+            self.call("view/page", params, REQUEST_WAIT)
+        };
+        let mut result = match page(None, true) {
+            Err(HarnessError::Dead) => return Err(HarnessError::Dead),
+            Err(_) => page(None, false),
+            ok => ok,
+        };
+        loop {
+            let page_result = match result {
+                Ok(page_result) => page_result,
+                Err(HarnessError::Dead) => return Err(HarnessError::Dead),
+                Err(_) => return Ok(record),
+            };
+            for event in page_result
+                .get("events")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if let Some(item) = event.pointer("/params/item") {
+                    record.take(item);
+                }
+            }
+            match page_result.get("nextCursor").and_then(Value::as_str) {
+                Some(cursor) => result = page(Some(cursor), false),
+                None => return Ok(record),
+            }
+        }
+    }
+
     fn call(&self, method: &str, params: Value, wait: Duration) -> Result<Value, HarnessError> {
         self.rpc.request(method, params, wait).map_err(fail)
     }
@@ -406,10 +519,11 @@ impl MuseHarness {
             .map(Some)
             .chain(std::iter::once(None))
         {
+            // Without `excludeItems`, the result serves the history the
+            // record is read from.
             let mut params = json!({
                 "commandId": fresh_command_id(),
                 "sessionId": session,
-                "excludeItems": true
             });
             if include_permission_profile {
                 params["permissionProfile"] = json!(":unrestricted");
@@ -436,11 +550,11 @@ impl Harness for MuseHarness {
     fn deliver(&mut self, message: &OutboundMessage) -> Result<DeliverOutcome, HarnessError> {
         let params = {
             let mut state = lock(&self.shared);
-            // A proof stays valid after the process died.
+            // What the vendor settled stands after the process died.
             if let Some(answer) = state.settled(&message.id) {
                 return Ok(answer);
             }
-            if !self.rpc.alive() {
+            if state.reader_done {
                 return Err(HarnessError::Dead);
             }
             let stage = state.inputs.get(&message.id).map(|input| &input.stage);
@@ -471,20 +585,20 @@ impl Harness for MuseHarness {
             {
                 return Ok(DeliverOutcome::Deferred);
             }
+            // The process stopped taking input but has not printed its last
+            // line yet; its end of file reports it dead and wakes the host.
+            if !self.rpc.alive() {
+                return Ok(DeliverOutcome::Deferred);
+            }
             if state.session.is_empty() {
                 return Err(HarnessError::Failed("no session".into()));
             }
-            let attempt = state
-                .inputs
-                .get(&message.id)
-                .map_or(0, |input| input.attempt);
-            let command = command_id(&message.id, attempt);
+            let command = command_id(&message.id);
             state.commands.insert(command.clone(), message.id.clone());
             state.inputs.insert(
                 message.id.clone(),
                 Input {
                     seq: message.seq,
-                    attempt,
                     command: command.clone(),
                     stage: Stage::Sending,
                 },
@@ -516,42 +630,63 @@ impl Harness for MuseHarness {
                     .unwrap_or(DeliverOutcome::InFlight))
             }
             Err(_) => {
-                // Whether the line reached the vendor is unknown; the next
-                // process writes the same command, which the vendor replays.
+                // The line was not written, or only in part, which the vendor
+                // cannot parse. The message goes again under the same command,
+                // which the vendor replays if it took it.
                 let boundary = state.boundary;
                 if let Some(input) = state.inputs.get_mut(&message.id)
                     && input.stage == Stage::Sending
                 {
                     input.stage = Stage::Retry { boundary };
                 }
-                Err(HarnessError::Dead)
+                state.changed();
+                Ok(DeliverOutcome::Deferred)
             }
         }
     }
 
+    fn proven(&self, message_id: &str) -> Option<Proof> {
+        match lock(&self.shared).settled(message_id)? {
+            DeliverOutcome::Accepted { turn_finished } => Some(Proof::Taken { turn_finished }),
+            DeliverOutcome::Duplicate => Some(Proof::Duplicate),
+            _ => None,
+        }
+    }
+
+    /// Stop the child and read what it printed up to end of file; what it
+    /// proved stays answerable.
+    fn stop(&mut self) {
+        self.rpc.stop_child();
+    }
+
     fn background(&mut self) -> Result<(), HarnessError> {
-        if self.rpc.alive() {
-            Ok(())
-        } else {
+        if lock(&self.shared).reader_done {
             Err(HarnessError::Dead)
+        } else {
+            Ok(())
         }
     }
 
     fn resume(&mut self, session: &str) -> Result<(), HarnessError> {
-        if !self.rpc.alive() {
+        if lock(&self.shared).reader_done {
             return Err(HarnessError::Dead);
         }
         let result = self.resume_session(session, false)?;
-        let mut state = lock(&self.shared);
         let resumed = result
             .pointer("/session/sessionId")
             .and_then(Value::as_str)
             .unwrap_or(session)
             .to_string();
+        let record = self.read_record(&resumed, &result)?;
+        let mut state = lock(&self.shared);
         if resumed != state.session {
             // Writes into another session mean nothing to this one.
             state.inputs.retain(|_, input| state_settled(&input.stage));
+            state.held.clear();
+            state.held_commands.clear();
         }
+        state.held.extend(record.ids);
+        state.held_commands.extend(record.commands);
         state.session = resumed;
         state.running = active_turn(&result);
         if let Some(turn) = state.running.clone() {
@@ -588,7 +723,7 @@ impl Harness for MuseHarness {
     fn health(&self) -> HarnessHealth {
         let state = lock(&self.shared);
         HarnessHealth {
-            process_alive: self.rpc.alive(),
+            process_alive: !state.reader_done,
             turn_state: if state.busy() {
                 TurnState::InTurn
             } else {
@@ -631,25 +766,86 @@ impl Harness for MuseHarness {
         self.rpc.process_id()
     }
 
+    /// Lines the host reads wake `notify`, and so does the reader reaching
+    /// the end of the vendor's stdout, which is when the process is dead.
     fn watch_activity(&self, notify: Arc<dyn Fn() + Send + Sync>) {
+        lock(&self.shared).watchers.push(Arc::clone(&notify));
         self.rpc.watch_activity(notify)
     }
 }
 
+/// Owned by the reader's line handler, which the reader drops once it read
+/// the vendor's last line: then, and only then, the process is dead.
+struct ReaderEnd {
+    shared: Arc<Mutex<State>>,
+    lines: Arc<(Mutex<u64>, Condvar)>,
+}
+
+impl Drop for ReaderEnd {
+    fn drop(&mut self) {
+        let watchers = {
+            let mut state = lock(&self.shared);
+            state.reader_done = true;
+            state.changed();
+            std::mem::take(&mut state.watchers)
+        };
+        let (count, wake) = &*self.lines;
+        *lock(count) += 1;
+        wake.notify_all();
+        for notify in watchers {
+            notify();
+        }
+    }
+}
+
+/// The inputs a session's record holds: by mailbox id (the first line of
+/// their text) and by command id.
+#[derive(Default)]
+struct Record {
+    ids: HashSet<String>,
+    commands: HashSet<String>,
+}
+
+impl Record {
+    /// Note one served item, when it is an input that entered the
+    /// conversation.
+    fn take(&mut self, item: &Value) {
+        if item.get("kind").and_then(Value::as_str) != Some("userMessage")
+            || item.get("retracted").and_then(Value::as_bool) == Some(true)
+        {
+            return;
+        }
+        if let Some(command) = item.get("commandId").and_then(Value::as_str) {
+            self.commands.insert(command.to_string());
+        }
+        if let Some(id) = item
+            .get("text")
+            .and_then(Value::as_str)
+            .and_then(message_id_in_text)
+        {
+            self.ids.insert(id.to_string());
+        }
+    }
+}
+
+/// What stays answerable for a message after the session changes.
 fn state_settled(stage: &Stage) -> bool {
     matches!(
         stage,
-        Stage::Consumed { .. } | Stage::Finished | Stage::Duplicate
+        Stage::Consumed { .. } | Stage::Finished | Stage::Duplicate | Stage::Rejected(_)
     )
 }
 
-/// The command id of one mailbox message's `attempt`-th write: a UUIDv7, the
-/// shape Muse requires, the same in every process. Its time is the mailbox
-/// id's own (a TypeID carries a UUIDv7), and the rest is a hash of the id and
-/// the attempt.
-pub fn command_id(message_id: &str, attempt: u32) -> String {
+/// The command id of one mailbox message: a UUIDv7, the shape Muse requires,
+/// the same in every process and for every payload. Its time is the mailbox
+/// id's own (a TypeID carries a UUIDv7), and the rest is a hash of the id.
+pub fn command_id(message_id: &str) -> String {
+    // Earlier adapters hashed a write number into the key; every id is the
+    // one they gave a message's first write, so a message they wrote is
+    // replayed, not written anew.
+    const FIRST_WRITE: u32 = 0;
     let digest =
-        fnv1a_128(format!("anyagents/muse/turn-start\0{message_id}\0{attempt}").as_bytes());
+        fnv1a_128(format!("anyagents/muse/turn-start\0{message_id}\0{FIRST_WRITE}").as_bytes());
     let millis = typeid_millis(message_id).unwrap_or((digest >> 88) as u64 & 0xFF_FFFF_FFFF);
     let value = (u128::from(millis & 0xFFFF_FFFF_FFFF) << 80)
         | (0x7 << 76)
@@ -708,13 +904,6 @@ fn uuid_text(value: u128) -> String {
         &hex[16..20],
         &hex[20..32]
     )
-}
-
-fn now_us() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX))
-        .unwrap_or(0)
 }
 
 /// `muse <version>` from the `initialize` result.
@@ -814,14 +1003,15 @@ fn on_notification(state: &mut State, value: &Value) {
     }
 }
 
-/// The vendor answered the `turn/start` that wrote `id`.
+/// The vendor answered the `turn/start` that wrote `id`. Every answer wakes
+/// the host: an admitted input waits for its proof, a refusal for its next
+/// write.
 fn on_answer(state: &mut State, id: &str, result: &Value, error: &Value) {
+    let held = state.holds(id);
     let State {
         inputs,
-        commands,
         completed_turns,
         known_turns,
-        launched_at_us,
         boundary,
         quota_reset_at_ms,
         ..
@@ -834,59 +1024,63 @@ fn on_answer(state: &mut State, id: &str, result: &Value, error: &Value) {
         return;
     }
     if error.is_null() {
+        // A fresh admission and the replay of one an earlier process wrote
+        // answer alike. Either way the vendor holds the input unconsumed: one
+        // the session had consumed was in its record, and is never written.
+        // Its `userMessage` item proves it.
         let turn = result.get("turnId").and_then(Value::as_str);
-        // Admitted before this process started. Without an admission time, a
-        // steer into a turn this process never knew: a fresh one joins the
-        // running turn, which it knows from the resume or its `turn/started`.
-        let earlier = match result.get("queuedAtUs").and_then(Value::as_u64) {
-            Some(queued) => queued < *launched_at_us,
-            None => {
-                result.get("disposition").and_then(Value::as_str) == Some("steered")
-                    && turn.is_some_and(|turn| !known_turns.contains(turn))
-            }
-        };
-        input.stage = if earlier {
-            Stage::Duplicate
-        } else {
-            if let Some(turn) = turn {
-                known_turns.insert(turn.to_string());
-            }
-            Stage::Admitted {
-                turn: turn
-                    .filter(|turn| !completed_turns.contains(*turn))
-                    .map(str::to_string),
-            }
+        if let Some(turn) = turn {
+            known_turns.insert(turn.to_string());
+        }
+        input.stage = Stage::Admitted {
+            turn: turn
+                .filter(|turn| !completed_turns.contains(*turn))
+                .map(str::to_string),
         };
         state.changed();
         return;
     }
-    let retry = Stage::Retry {
-        boundary: *boundary,
-    };
-    if let Some(reset_at_ms) = quota_from_error(error) {
+    let reason = RpcFail::Failed(error.clone()).reason();
+    input.stage = if let Some(reset_at_ms) = quota_from_error(error) {
         *quota_reset_at_ms = Some(reset_at_ms);
-        input.stage = retry;
-        state.changed();
-        return;
-    }
-    match error.get("code").and_then(Value::as_i64) {
-        Some(COMMAND_REJECTED) => {
-            input.attempt += 1;
-            input.command = command_id(id, input.attempt);
-            commands.insert(input.command.clone(), id.to_string());
-            input.stage = retry;
+        Stage::Retry {
+            boundary: *boundary,
         }
-        Some(SESSION_NOT_FOUND | SESSION_NOT_LOADED | WRITER_LEASE_HELD | INVALID_PARAMS) => {
-            input.stage = Stage::Fault(RpcFail::Failed(error.clone()).reason());
-            state.changed();
+    } else {
+        match error.get("code").and_then(Value::as_i64) {
+            // An earlier write of this message holds the id: it was admitted.
+            Some(COMMAND_REJECTED) if is_id_conflict(error) => {
+                if held {
+                    Stage::Duplicate
+                } else {
+                    Stage::Admitted { turn: None }
+                }
+            }
+            // Recorded against the id, or the message itself is malformed or
+            // too large: no write of it can succeed.
+            Some(COMMAND_REJECTED | INPUT_TOO_LARGE | INVALID_PARAMS) => Stage::Rejected(reason),
+            Some(SESSION_NOT_FOUND | SESSION_NOT_LOADED | WRITER_LEASE_HELD) => {
+                Stage::Fault(reason)
+            }
+            // Refused at admission (queue full, overloaded, draining, starting
+            // up), or the outcome is unknown (interrupted, cancelled, a
+            // malformed answer): the same command again either applies it or
+            // replays what the vendor did with it, at the next boundary, or
+            // on the next pass when no turn runs.
+            _ => Stage::Retry {
+                boundary: *boundary,
+            },
         }
-        // Refused at admission (queue full, overloaded, draining, starting
-        // up), or the outcome is unknown (interrupted, cancelled, a malformed
-        // answer): the same command again either applies it or replays what
-        // the vendor did with it. Neither wakes the host: it retries at the
-        // next boundary, or on its next pass when no turn runs.
-        _ => input.stage = retry,
-    }
+    };
+    state.changed();
+}
+
+/// A `commandRejected` whose reason is that the id is already held.
+fn is_id_conflict(error: &Value) -> bool {
+    error
+        .pointer("/data/reason")
+        .and_then(Value::as_str)
+        .is_some_and(|reason| COMMAND_ID_CONFLICT.contains(&reason))
 }
 
 fn on_turn_started(state: &mut State, params: &Value) {
@@ -946,7 +1140,10 @@ fn on_item(state: &mut State, params: &Value) {
     state.known_turns.insert(turn.to_string());
     match state.inputs.get_mut(&id) {
         Some(input) => {
-            if !matches!(input.stage, Stage::Finished | Stage::Duplicate) {
+            if !matches!(
+                input.stage,
+                Stage::Finished | Stage::Duplicate | Stage::Rejected(_)
+            ) {
                 input.stage = stage;
             }
         }
@@ -956,7 +1153,6 @@ fn on_item(state: &mut State, params: &Value) {
                 id,
                 Input {
                     seq: 0,
-                    attempt: 0,
                     command: command.unwrap_or_default().to_string(),
                     stage,
                 },
@@ -1144,12 +1340,14 @@ mod tests {
     }
 
     #[test]
-    fn a_command_id_is_a_uuid7_fixed_by_the_message_and_its_attempt() {
+    fn a_command_id_is_a_uuid7_fixed_by_the_message_alone() {
         let id = "msg_01m78v9pswehq8ns457b0vdz42";
-        let first = command_id(id, 0);
-        assert_eq!(first, command_id(id, 0), "the same in every process");
-        assert_ne!(first, command_id(id, 1), "a rejection moves to a new id");
-        assert_ne!(first, command_id("msg_01m78vwxx4eh69a0g459dnsd32", 0));
+        let first = command_id(id);
+        assert_eq!(first, command_id(id), "the same in every process");
+        // The id an earlier adapter gave this message's first write, so a
+        // message it wrote is replayed rather than written anew.
+        assert_eq!(first, "01a1d1b4-db3c-7408-97fe-f55acf1aaa64");
+        assert_ne!(first, command_id("msg_01m78vwxx4eh69a0g459dnsd32"));
         let hex: String = first.chars().filter(|c| *c != '-').collect();
         assert_eq!(first.len(), 36);
         assert_eq!(&hex[12..13], "7", "version 7: {first}");
@@ -1162,7 +1360,7 @@ mod tests {
         assert_eq!(Some(millis), typeid_millis(id));
         assert!(millis > 1_790_000_000_000 && millis < 1_800_000_000_000);
         // A recovery note for that message shares its time, not its id.
-        let note = command_id(&format!("recovery_{id}_1"), 0);
+        let note = command_id(&format!("recovery_{id}_1"));
         assert_eq!(&note.replace('-', "")[0..12], &hex[0..12]);
         assert_ne!(note, first);
     }
@@ -1185,12 +1383,13 @@ mod tests {
     }
 
     fn sending(state: &mut State, id: &str, seq: i64) {
+        let command = command_id(id);
+        state.commands.insert(command.clone(), id.to_string());
         state.inputs.insert(
             id.to_string(),
             Input {
                 seq,
-                attempt: 0,
-                command: command_id(id, 0),
+                command,
                 stage: Stage::Sending,
             },
         );
@@ -1200,52 +1399,167 @@ mod tests {
         state.inputs[id].stage.clone()
     }
 
+    fn rejection(code: i64, reason: Option<&str>) -> Value {
+        let mut error = json!({"code": code, "message": "refused"});
+        if let Some(reason) = reason {
+            error["data"] = json!({"commandId": "c", "reason": reason});
+        }
+        error
+    }
+
+    fn user_message(id: &str, turn: &str) -> Value {
+        json!({"item": {"kind": "userMessage", "turnId": turn, "commandId": command_id(id),
+            "text": format!("anyagents-message:{id}\nhello")}})
+    }
+
     #[test]
-    fn an_answer_admitted_before_this_process_is_a_duplicate() {
+    fn a_replayed_ack_without_queued_at_waits_for_its_item_and_settles() {
+        // A second process resumed a session whose turn `t1` an earlier
+        // process ran: `steer` was admitted into it and never consumed.
         let mut state = State {
-            launched_at_us: 2_000,
             running: Some("t2".into()),
             known_turns: HashSet::from(["t2".to_string()]),
             ..State::default()
         };
-        for id in ["old", "fresh", "unknown-turn", "running-turn"] {
+        for id in ["started", "steer"] {
             sending(&mut state, id, 1);
         }
-        let ack = |turn: &str, queued: Option<u64>| {
-            let mut ack = json!({"status": "accepted", "disposition": "steered",
-                "turnId": turn, "startedNewTurn": false});
-            if let Some(queued) = queued {
-                ack["queuedAtUs"] = json!(queued);
+        // Replays after a restart carry no `queuedAtUs`, and `started` acks
+        // never do: neither tells a replay from a fresh admission.
+        let replay = |disposition: &str, turn: &str| {
+            json!({"commandId": "c", "status": "accepted", "disposition": disposition,
+                "turnId": turn, "startedNewTurn": disposition == "started"})
+        };
+        on_answer(&mut state, "steer", &replay("steered", "t1"), &Value::Null);
+        on_answer(&mut state, "started", &replay("started", "c"), &Value::Null);
+        assert_eq!(
+            stage(&state, "steer"),
+            Stage::Admitted {
+                turn: Some("t1".into())
             }
-            ack
+        );
+        assert_eq!(state.settled("steer"), None, "admitted is not proved");
+        // The vendor carries the steer into a successor named after its
+        // command, whose item settles it.
+        let successor = command_id("steer");
+        on_turn_started(&mut state, &json!({"turnId": successor}));
+        on_item(&mut state, &user_message("steer", &successor));
+        assert_eq!(
+            state.settled("steer"),
+            Some(DeliverOutcome::Accepted {
+                turn_finished: false
+            })
+        );
+        on_turn_completed(&mut state, &json!({"turnId": successor}));
+        assert_eq!(
+            state.settled("steer"),
+            Some(DeliverOutcome::Accepted {
+                turn_finished: true
+            })
+        );
+    }
+
+    #[test]
+    fn the_session_record_settles_what_an_earlier_process_wrote() {
+        let mut record = Record::default();
+        let note = |id: &str, kind: &str| {
+            json!({"kind": kind, "turnId": "t1", "commandId": command_id(id),
+                "text": format!("anyagents-message:{id}\nhello")})
         };
-        on_answer(&mut state, "old", &ack("t1", Some(1_000)), &Value::Null);
-        on_answer(&mut state, "fresh", &ack("t2", Some(3_000)), &Value::Null);
-        // Without an admission time, only the turns this process knows tell.
-        on_answer(&mut state, "unknown-turn", &ack("t1", None), &Value::Null);
-        on_answer(&mut state, "running-turn", &ack("t2", None), &Value::Null);
-        assert_eq!(stage(&state, "old"), Stage::Duplicate);
-        assert_eq!(stage(&state, "unknown-turn"), Stage::Duplicate);
-        let admitted = Stage::Admitted {
-            turn: Some("t2".into()),
+        record.take(&note("consumed", "userMessage"));
+        record.take(&note("answer", "agentMessage"));
+        record.take(&json!({"kind": "userMessage", "turnId": "t1",
+            "commandId": "01a1d1b4-0000-7000-8000-000000000000",
+            "text": "anyagents-message:other-command\nhello"}));
+        let mut retracted = note("retracted", "userMessage");
+        retracted["retracted"] = json!(true);
+        record.take(&retracted);
+        let state = State {
+            held: record.ids,
+            held_commands: record.commands,
+            ..State::default()
         };
-        assert_eq!(stage(&state, "fresh"), admitted);
-        assert_eq!(stage(&state, "running-turn"), admitted);
+        assert_eq!(state.settled("consumed"), Some(DeliverOutcome::Duplicate));
+        // Written under another command id, found by its first line.
+        assert_eq!(
+            state.settled("other-command"),
+            Some(DeliverOutcome::Duplicate)
+        );
+        assert_eq!(state.settled("answer"), None);
+        assert_eq!(state.settled("retracted"), None);
+        assert_eq!(state.settled("fresh"), None);
+    }
+
+    #[test]
+    fn each_refusal_is_settled_by_what_it_means() {
+        let mut state = State {
+            running: Some("t1".into()),
+            boundary: 7,
+            held: HashSet::from(["held-conflict".to_string()]),
+            ..State::default()
+        };
+        let cases = [
+            (
+                "conflict",
+                rejection(COMMAND_REJECTED, Some("command_id_conflict")),
+            ),
+            (
+                "held-conflict",
+                rejection(COMMAND_REJECTED, Some("command_id_conflict")),
+            ),
+            (
+                "recorded",
+                rejection(COMMAND_REJECTED, Some("runtime_busy")),
+            ),
+            ("bare", rejection(COMMAND_REJECTED, None)),
+            ("too-large", rejection(INPUT_TOO_LARGE, None)),
+            ("invalid", rejection(INVALID_PARAMS, None)),
+            ("queue-full", rejection(-32031, None)),
+            ("overloaded", rejection(-32001, None)),
+            ("interrupted", rejection(-32013, None)),
+            ("unloaded", rejection(SESSION_NOT_LOADED, None)),
+        ];
+        for (seq, (id, error)) in cases.iter().enumerate() {
+            sending(&mut state, id, seq as i64);
+            let before = state.version;
+            on_answer(&mut state, id, &Value::Null, error);
+            assert_ne!(state.version, before, "{id}: every answer wakes the host");
+        }
+        // The id is held by an earlier write of the message: admitted, and
+        // waiting for its proof, or the record already holds it.
+        assert_eq!(stage(&state, "conflict"), Stage::Admitted { turn: None });
+        assert_eq!(state.settled("conflict"), None);
+        assert_eq!(stage(&state, "held-conflict"), Stage::Duplicate);
+        for id in ["recorded", "bare", "too-large", "invalid"] {
+            assert!(
+                matches!(state.settled(id), Some(DeliverOutcome::Rejected { .. })),
+                "{id}: {:?}",
+                stage(&state, id)
+            );
+        }
+        assert_eq!(
+            state.settled("too-large"),
+            Some(DeliverOutcome::Rejected {
+                reason: "-32002 refused".into()
+            })
+        );
+        for id in ["queue-full", "overloaded", "interrupted"] {
+            assert_eq!(stage(&state, id), Stage::Retry { boundary: 7 }, "{id}");
+        }
+        assert!(matches!(stage(&state, "unloaded"), Stage::Fault(_)));
+        // A proof never overturns a refusal for good.
+        on_item(&mut state, &user_message("recorded", "t1"));
+        assert!(matches!(stage(&state, "recorded"), Stage::Rejected(_)));
     }
 
     #[test]
     fn a_turn_finishes_what_it_consumed_and_leaves_its_unconsumed_steer_in_flight() {
-        let mut state = State {
-            launched_at_us: 1,
-            ..State::default()
-        };
+        let mut state = State::default();
         for (id, seq) in [("prompt", 1), ("steer", 2), ("next", 3)] {
             sending(&mut state, id, seq);
-            let command = command_id(id, 0);
-            state.commands.insert(command.clone(), id.to_string());
         }
         let started = |command: &str| json!({"turnId": command, "commandId": command});
-        let prompt = command_id("prompt", 0);
+        let prompt = command_id("prompt");
         on_turn_started(&mut state, &started(&prompt));
         on_item(
             &mut state,
@@ -1254,7 +1568,7 @@ mod tests {
         on_answer(
             &mut state,
             "steer",
-            &json!({"disposition": "steered", "turnId": prompt, "queuedAtUs": 5}),
+            &json!({"disposition": "steered", "turnId": prompt}),
             &Value::Null,
         );
         on_turn_completed(
@@ -1267,7 +1581,7 @@ mod tests {
         assert!(state.busy(), "the carried steer is still the vendor's");
         assert_eq!(state.served.len(), 1);
         // The successor named after the steer's command proves it.
-        let successor = command_id("steer", 0);
+        let successor = command_id("steer");
         on_turn_started(&mut state, &started(&successor));
         on_item(
             &mut state,
@@ -1280,19 +1594,15 @@ mod tests {
                 turn: successor.clone()
             }
         );
-        // A refusal waits for the next boundary while a turn runs.
-        on_answer(
-            &mut state,
-            "next",
-            &Value::Null,
-            &json!({"code": COMMAND_REJECTED, "message": "rejected"}),
-        );
+        // A refusal at admission waits for the next boundary while a turn
+        // runs, under the same command id.
+        on_answer(&mut state, "next", &Value::Null, &rejection(-32031, None));
         assert_eq!(
             stage(&state, "next"),
             Stage::Retry {
                 boundary: state.boundary
             }
         );
-        assert_eq!(state.inputs["next"].command, command_id("next", 1));
+        assert_eq!(state.inputs["next"].command, command_id("next"));
     }
 }

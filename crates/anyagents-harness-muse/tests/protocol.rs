@@ -4,7 +4,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyagents_harness::{
-    Context, DeliverOutcome, DeliveryLevel, Harness, HarnessError, OutboundMessage, TurnState,
+    Context, DeliverOutcome, DeliveryLevel, Harness, HarnessError, OutboundMessage, Proof,
+    TurnState,
 };
 use anyagents_harness_muse::{MuseHarness, command_id};
 use tempfile::TempDir;
@@ -36,17 +37,24 @@ impl Vendor {
     }
 
     fn start(&self, mode: &str, session: Option<&str>) -> MuseHarness {
+        self.start_with(env!("CARGO_BIN_EXE_fake_muse"), mode, session, &[])
+    }
+
+    fn start_with(
+        &self,
+        program: &str,
+        mode: &str,
+        session: Option<&str>,
+        extra: &[(&str, &str)],
+    ) -> MuseHarness {
         let log = self.dir.path().join("log");
-        MuseHarness::start(
-            env!("CARGO_BIN_EXE_fake_muse"),
-            session,
-            &[
-                ("ANYAGENTS_FAKE_MODE", mode),
-                ("ANYAGENTS_FAKE_LOG", log.to_str().unwrap()),
-                ("ANYAGENTS_FAKE_MUSE_DIR", self.dir.path().to_str().unwrap()),
-            ],
-        )
-        .expect("start")
+        let mut environment = vec![
+            ("ANYAGENTS_FAKE_MODE", mode),
+            ("ANYAGENTS_FAKE_LOG", log.to_str().unwrap()),
+            ("ANYAGENTS_FAKE_MUSE_DIR", self.dir.path().to_str().unwrap()),
+        ];
+        environment.extend_from_slice(extra);
+        MuseHarness::start(program, session, &environment).expect("start")
     }
 
     /// Ask the vendor to act (`step`, `finish`) and wait until it has.
@@ -71,8 +79,28 @@ impl Vendor {
     fn writes_of(&self, command: &str) -> usize {
         self.log()
             .lines()
-            .filter(|line| line.contains("\"turn/start\"") && line.contains(command))
+            .filter(|line| {
+                line.starts_with("in:") && line.contains("\"turn/start\"") && line.contains(command)
+            })
             .count()
+    }
+
+    /// The answers the vendor printed that name `command`.
+    fn answers_of(&self, command: &str) -> Vec<String> {
+        self.log()
+            .lines()
+            .filter(|line| line.starts_with("out:") && line.contains(command))
+            .map(str::to_string)
+            .collect()
+    }
+}
+
+/// Wait until `done` holds.
+fn eventually(what: &str, mut done: impl FnMut() -> bool) {
+    let deadline = Instant::now() + PATIENCE;
+    while !done() {
+        assert!(Instant::now() < deadline, "never {what}");
+        thread::sleep(Duration::from_millis(5));
     }
 }
 
@@ -108,7 +136,7 @@ fn a_prompt_is_in_flight_until_its_turn_records_it_and_finished_with_the_turn() 
     let delivery = harness.health().delivery;
     assert_eq!(delivery.level, DeliveryLevel::NextStep);
     assert!(delivery.idempotent);
-    assert_eq!(delivery.peer.as_deref(), Some("muse 1.4.18-test"));
+    assert_eq!(delivery.peer.as_deref(), Some("muse 1.4.20-test"));
     let m1 = msg("m1", 1);
     assert!(matches!(
         harness.deliver(&m1).unwrap(),
@@ -133,11 +161,12 @@ fn a_prompt_is_in_flight_until_its_turn_records_it_and_finished_with_the_turn() 
     // Offered many times, written once, as one steer-or-start command whose
     // id is the message's own; the host held the tool approval.
     assert_eq!(harness.written_ids(), ["m1"]);
-    assert_eq!(vendor.writes_of(&command_id("m1", 0)), 1);
+    assert_eq!(vendor.writes_of(&command_id("m1")), 1);
     let log = vendor.log();
     assert_eq!(log.matches("\"ifBusy\":\"steer\"").count(), 1, "{log}");
     assert!(
-        log.contains("\"id\":900"),
+        log.lines()
+            .any(|line| line.starts_with("in:") && line.contains("\"id\":900")),
         "the approval was answered: {log}"
     );
 }
@@ -200,12 +229,12 @@ fn a_steer_its_turn_ended_on_finishes_in_the_successor_turn() {
     until(&mut harness, &m2, FINISHED);
     until(&mut harness, &m3, FINISHED);
     assert_eq!(harness.turns_served(), 2);
-    assert_eq!(vendor.writes_of(&command_id("m2", 0)), 1);
-    assert_eq!(vendor.writes_of(&command_id("m3", 0)), 1);
+    assert_eq!(vendor.writes_of(&command_id("m2")), 1);
+    assert_eq!(vendor.writes_of(&command_id("m3")), 1);
 }
 
 #[test]
-fn a_rejected_steer_waits_for_its_turn_and_goes_again_under_the_next_command_id() {
+fn a_refused_steer_waits_for_its_turn_and_goes_again_under_the_same_command_id() {
     let vendor = Vendor::new();
     let mut harness = vendor.start("refuse_steer", None);
     let (m1, m2) = (msg("m1", 1), msg("m2", 2));
@@ -220,10 +249,9 @@ fn a_rejected_steer_waits_for_its_turn_and_goes_again_under_the_next_command_id(
     vendor.command("finish");
     until(&mut harness, &m2, CONSUMED);
     assert_eq!(harness.written_ids(), ["m1", "m2", "m2"]);
-    // The rejection is the vendor's answer to that command for good, so the
-    // next write is a command of its own.
-    assert_eq!(vendor.writes_of(&command_id("m2", 0)), 1);
-    assert_eq!(vendor.writes_of(&command_id("m2", 1)), 1);
+    // The queue refused it before admission and recorded nothing, so the
+    // next write is the same command.
+    assert_eq!(vendor.writes_of(&command_id("m2")), 2);
     assert_eq!(harness.turns_started(), 2);
 }
 
@@ -234,12 +262,12 @@ fn an_unknown_outcome_is_written_again_under_the_same_command_id() {
     let m1 = msg("m1", 1);
     until(&mut harness, &m1, CONSUMED);
     assert_eq!(harness.written_ids(), ["m1", "m1"]);
-    assert_eq!(vendor.writes_of(&command_id("m1", 0)), 2);
+    assert_eq!(vendor.writes_of(&command_id("m1")), 2);
     assert_eq!(harness.turns_started(), 1);
 }
 
 #[test]
-fn a_command_an_earlier_process_wrote_is_a_duplicate() {
+fn a_message_the_session_record_holds_is_a_duplicate_and_never_written_again() {
     let vendor = Vendor::new();
     let m1 = msg("m1", 1);
     let session = {
@@ -248,12 +276,245 @@ fn a_command_an_earlier_process_wrote_is_a_duplicate() {
         first.session_id().unwrap()
     };
     let mut second = vendor.start("finish", Some(&session));
-    until(&mut second, &m1, DeliverOutcome::Duplicate);
-    // The vendor replayed the first process's answer and started nothing.
+    // Proved by the record the resume served, before anything is written.
+    assert_eq!(second.proven("m1"), Some(Proof::Duplicate));
+    assert_eq!(second.deliver(&m1).unwrap(), DeliverOutcome::Duplicate);
+    assert_eq!(vendor.writes_of(&command_id("m1")), 1);
+    assert!(second.written_ids().is_empty());
     assert_eq!(second.turns_started(), 0);
-    assert_eq!(second.turns_served(), 0);
-    assert_eq!(vendor.writes_of(&command_id("m1", 0)), 2);
     assert_eq!(second.health().turn_state, TurnState::Idle);
+    assert!(
+        !vendor.log().contains("excludeItems"),
+        "the resume asks for the history"
+    );
+}
+
+#[test]
+fn a_record_over_the_history_budget_is_paged() {
+    let vendor = Vendor::new();
+    let messages: Vec<_> = (1..=5).map(|n| msg(&format!("m{n}"), n)).collect();
+    let session = {
+        let mut first = vendor.start("finish", None);
+        for message in &messages {
+            until(&mut first, message, FINISHED);
+        }
+        first.session_id().unwrap()
+    };
+    let mut second = vendor.start_with(
+        env!("CARGO_BIN_EXE_fake_muse"),
+        "finish",
+        Some(&session),
+        &[("ANYAGENTS_FAKE_MUSE_HISTORY", "paged")],
+    );
+    for message in &messages {
+        assert_eq!(second.deliver(message).unwrap(), DeliverOutcome::Duplicate);
+        assert_eq!(vendor.writes_of(&command_id(&message.id)), 1);
+    }
+    let log = vendor.log();
+    assert!(log.contains("\"view/page\""), "{log}");
+}
+
+#[test]
+fn a_replayed_ack_without_queued_at_settles_by_its_item() {
+    let vendor = Vendor::new();
+    let (m1, m2) = (msg("m1", 1), msg("m2", 2));
+    let session = {
+        let mut first = vendor.start("hold", None);
+        until(&mut first, &m1, CONSUMED);
+        until(&mut first, &m2, DeliverOutcome::InFlight);
+        eventually("m2 is admitted", || {
+            vendor.answers_of(&command_id("m2")).len() == 1
+        });
+        let session = first.session_id().unwrap();
+        // The process goes away with m2 admitted into its turn, unconsumed.
+        first.stop();
+        session
+    };
+    let mut second = vendor.start("hold", Some(&session));
+    assert_eq!(second.deliver(&m1).unwrap(), DeliverOutcome::Duplicate);
+    // m2 is not in the record: written again under its own id, the vendor
+    // replays the first process's ack, without `queuedAtUs`.
+    until(&mut second, &m2, DeliverOutcome::InFlight);
+    eventually("the replayed ack is read", || {
+        vendor.answers_of(&command_id("m2")).len() == 2
+    });
+    let answers = vendor.answers_of(&command_id("m2"));
+    assert!(
+        answers.iter().all(|answer| !answer.contains("queuedAtUs")),
+        "{answers:?}"
+    );
+    for _ in 0..20 {
+        assert_eq!(second.deliver(&m2).unwrap(), DeliverOutcome::InFlight);
+    }
+    // The vendor carries the waiting steer into a successor turn: its item
+    // settles it.
+    vendor.command("carry");
+    until(&mut second, &m2, CONSUMED);
+    assert_eq!(vendor.writes_of(&command_id("m2")), 2);
+}
+
+#[test]
+fn a_conflicting_payload_under_the_same_id_waits_for_the_first_write() {
+    let vendor = Vendor::new();
+    let (m1, m2) = (msg("m1", 1), msg("m2", 2));
+    let session = {
+        let mut first = vendor.start("hold", None);
+        until(&mut first, &m1, CONSUMED);
+        until(&mut first, &m2, DeliverOutcome::InFlight);
+        eventually("m2 is admitted", || {
+            vendor.answers_of(&command_id("m2")).len() == 1
+        });
+        let session = first.session_id().unwrap();
+        first.stop();
+        session
+    };
+    // The same mailbox message, written by a host that composes it
+    // differently: Muse refuses the id as held by another payload.
+    let mut changed = m2.clone();
+    changed.text = "hello, composed anew".to_string();
+    let mut second = vendor.start("hold", Some(&session));
+    until(&mut second, &changed, DeliverOutcome::InFlight);
+    eventually("the conflict is read", || {
+        vendor
+            .answers_of(&command_id("m2"))
+            .iter()
+            .any(|answer| answer.contains("command_id_conflict"))
+    });
+    for _ in 0..20 {
+        assert_eq!(second.deliver(&changed).unwrap(), DeliverOutcome::InFlight);
+    }
+    // The first write is the one the vendor holds, and its item settles it.
+    vendor.command("carry");
+    until(&mut second, &changed, CONSUMED);
+    assert_eq!(second.written_ids(), ["m2"]);
+    assert_eq!(vendor.writes_of(&command_id("m2")), 2);
+}
+
+#[test]
+fn a_refusal_for_good_is_rejected_and_answered_again_without_a_write() {
+    for (mode, code) in [
+        ("too_large", "-32002"),
+        ("invalid_params", "-32602"),
+        ("rejected", "-32030"),
+    ] {
+        let vendor = Vendor::new();
+        let mut harness = vendor.start(mode, None);
+        let m1 = msg("m1", 1);
+        let deadline = Instant::now() + PATIENCE;
+        let reason = loop {
+            match harness.deliver(&m1).expect("no restart") {
+                DeliverOutcome::InFlight => {}
+                DeliverOutcome::Rejected { reason } => break reason,
+                other => panic!("{mode}: {other:?}"),
+            }
+            assert!(Instant::now() < deadline, "{mode}");
+            thread::sleep(Duration::from_millis(5));
+        };
+        assert!(reason.contains(code), "{mode}: {reason}");
+        for _ in 0..5 {
+            assert_eq!(
+                harness.deliver(&m1).unwrap(),
+                DeliverOutcome::Rejected {
+                    reason: reason.clone()
+                }
+            );
+        }
+        assert_eq!(
+            harness.proven("m1"),
+            None,
+            "{mode}: a refusal proves nothing"
+        );
+        assert_eq!(vendor.writes_of(&command_id("m1")), 1, "{mode}");
+        assert!(harness.health().process_alive, "{mode}");
+    }
+}
+
+#[test]
+fn a_proof_printed_just_before_a_stop_is_answered_after_it() {
+    let vendor = Vendor::new();
+    let mut harness = vendor.start("hold", None);
+    let (m1, m2) = (msg("m1", 1), msg("m2", 2));
+    until(&mut harness, &m1, CONSUMED);
+    until(&mut harness, &m2, DeliverOutcome::InFlight);
+    vendor.command("step");
+    harness.stop();
+    assert!(!harness.health().process_alive);
+    assert_eq!(
+        harness.proven("m2"),
+        Some(Proof::Taken {
+            turn_finished: false
+        })
+    );
+    // A proof is answered before liveness; anything else is dead.
+    assert_eq!(harness.deliver(&m2).unwrap(), CONSUMED);
+    assert_eq!(harness.deliver(&msg("m3", 3)), Err(HarnessError::Dead));
+}
+
+/// A wrapper around the fake that outlives it: once the fake exits it closes
+/// its stdin, so the host's next write fails, while it keeps stdout open
+/// until the test lets it print one more line.
+#[cfg(unix)]
+fn deaf_wrapper(dir: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    let path = dir.join("muse-wrapper.sh");
+    let script = format!(
+        "#!/bin/sh\n\
+         '{fake}' \"$@\"\n\
+         exec 0<&-\n\
+         : > '{dir}/deaf'\n\
+         while [ ! -e '{dir}/speak' ]; do sleep 0.01; done\n\
+         printf '%s\\n' \"$PROOF_LINE\"\n",
+        fake = env!("CARGO_BIN_EXE_fake_muse"),
+        dir = dir.display(),
+    );
+    std::fs::write(&path, script).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+#[cfg(unix)]
+#[test]
+fn a_process_is_dead_only_once_its_stdout_ended() {
+    let vendor = Vendor::new();
+    let wrapper_dir = TempDir::new().unwrap();
+    let wrapper = deaf_wrapper(wrapper_dir.path());
+    // The line the vendor prints after its stdin is gone: m2's proof.
+    let proof = serde_json::json!({"jsonrpc": "2.0", "method": "item/completed",
+        "params": {"sessionId": "sess-from-vendor", "item": {"kind": "userMessage",
+            "turnId": command_id("m1"), "commandId": command_id("m2"), "steered": true,
+            "text": "anyagents-message:m2\nhello"}}})
+    .to_string();
+    let mut harness = vendor.start_with(
+        wrapper.to_str().unwrap(),
+        "hold",
+        None,
+        &[("PROOF_LINE", proof.as_str())],
+    );
+    let (m1, m2, m3) = (msg("m1", 1), msg("m2", 2), msg("m3", 3));
+    until(&mut harness, &m1, CONSUMED);
+    until(&mut harness, &m2, DeliverOutcome::InFlight);
+    std::fs::write(vendor.dir.path().join("exit"), "").unwrap();
+    eventually("the vendor's stdin closes", || {
+        wrapper_dir.path().join("deaf").exists()
+    });
+    // The write fails, and the process is still not dead: its stdout is
+    // open, and a proof may still come.
+    assert_eq!(harness.deliver(&m3).unwrap(), DeliverOutcome::Deferred);
+    assert_eq!(harness.deliver(&m2).unwrap(), DeliverOutcome::InFlight);
+    assert!(harness.health().process_alive);
+    assert_eq!(harness.proven("m2"), None);
+    std::fs::write(wrapper_dir.path().join("speak"), "").unwrap();
+    eventually("the reader reaches the end", || {
+        !harness.health().process_alive
+    });
+    assert_eq!(
+        harness.proven("m2"),
+        Some(Proof::Taken {
+            turn_finished: false
+        })
+    );
+    assert_eq!(harness.deliver(&m2).unwrap(), CONSUMED);
+    assert_eq!(harness.deliver(&m3), Err(HarnessError::Dead));
 }
 
 #[test]
