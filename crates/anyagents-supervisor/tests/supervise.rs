@@ -1806,9 +1806,12 @@ done
     store
         .receive(&agent.id, Incoming::new("stream a long answer"))
         .unwrap();
+    // The turn closes before its usage row is written (two commits), so wait
+    // for both before counting.
     assert!(wait_until(|| {
         store.delivered_cursor(&agent.id).unwrap() == 1
             && store.open_turn(&agent.id).unwrap().is_none()
+            && !store.list_usage(Some(&agent.id)).unwrap().is_empty()
     }));
     let usage = store.list_usage(Some(&agent.id)).unwrap();
     assert_eq!(usage.len(), 1, "the streamed turn is recorded once");

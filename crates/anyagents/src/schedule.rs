@@ -3273,7 +3273,12 @@ Connection: close
         .unwrap();
 
         let now = anyagents_core::now_ms();
-        github::begin_cycle(&store.list_schedules(None, true).unwrap(), now);
+        let watched = store.list_schedules(None, true).unwrap();
+        let targets: Vec<_> = watched
+            .iter()
+            .map(|s| (s.id.as_str(), parse_watch_spec(&s.spec).unwrap()))
+            .collect();
+        github::begin_cycle(targets.iter().map(|(id, t)| (*id, t)), now);
         let tick = |store: &Store, health: &HealthBoard, at| {
             github::with_completion_clock(at, || tick_schedules_once(store, health, at))
         };
