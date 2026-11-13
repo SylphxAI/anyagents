@@ -583,8 +583,41 @@ pub fn kill_child(child: &mut std::process::Child, environment: &[(String, Strin
     let _ = wait_child_or_group_exit(child, pid, KILL_REAP_GRACE);
 }
 
+/// End a harness process group this process did not start: the group a keeper
+/// that died left behind. `TERM` to the group, a grace for it to empty, then
+/// `KILL`, inside the seat UID boundary when `environment` names one. The
+/// group's exit is not an event here (nothing reports it to a non-parent), so
+/// emptiness is probed on a short interval within the grace.
+pub fn terminate_group(pgid: u32, environment: &[(String, String)]) {
+    const TERM_GRACE: std::time::Duration = std::time::Duration::from_millis(800);
+    const KILL_GRACE: std::time::Duration = std::time::Duration::from_millis(100);
+    const GROUP_PROBE: std::time::Duration = std::time::Duration::from_millis(25);
+    let emptied = |grace: std::time::Duration| {
+        let deadline = std::time::Instant::now() + grace;
+        loop {
+            if !pgid_alive(pgid) {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(GROUP_PROBE);
+        }
+    };
+    if pgid <= 1 || !pgid_alive(pgid) {
+        return;
+    }
+    kill_process_group(pgid, "-TERM", environment);
+    if emptied(TERM_GRACE) {
+        return;
+    }
+    kill_process_group(pgid, "-KILL", environment);
+    let _ = emptied(KILL_GRACE);
+}
+
 /// How a harness takes input that arrives during a turn.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DeliveryMode {
     /// Input enters the active turn, including while a tool runs.
     Steer,
@@ -598,7 +631,10 @@ pub enum DeliveryMode {
 /// runs, as `docs/delivery.md` defines the levels. Each level keeps every
 /// guarantee of the one before it, and the conformance suite in
 /// `tests/invariants` holds every adapter to the level it reports.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "kebab-case")]
 pub enum DeliveryLevel {
     /// Mail for a busy agent is applied when the running turn ends: it starts
     /// the next turn.
@@ -623,7 +659,7 @@ impl DeliveryLevel {
 }
 
 /// The delivery one harness offers and what it rests on.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Delivery {
     pub level: DeliveryLevel,
     /// A message an earlier process of the same session already consumed is
@@ -647,14 +683,15 @@ impl Delivery {
 }
 
 /// Whether a turn is open.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TurnState {
     Idle,
     InTurn,
 }
 
 /// What `health` reports. Quota and sign-in trouble are states, not crashes.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct HarnessHealth {
     pub process_alive: bool,
     pub turn_state: TurnState,
@@ -664,7 +701,7 @@ pub struct HarnessHealth {
 }
 
 /// One mailbox message handed to a harness. The id is what a replay is deduped on.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct OutboundMessage {
     pub id: String,
     pub seq: i64,
@@ -678,7 +715,8 @@ pub struct OutboundMessage {
 }
 
 /// Result of one `deliver` call.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DeliverOutcome {
     /// The harness has the message. `turn_finished` means the turn that
     /// contained it has already completed.
@@ -744,7 +782,8 @@ pub fn names_message_size(reason: &str) -> bool {
 
 /// What a harness already proved about one message, read without writing
 /// anything (`Harness::proven`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Proof {
     /// The vendor took it with the proof the harness's level requires;
     /// `turn_finished` means the turn that contained it already ended.
@@ -754,7 +793,8 @@ pub enum Proof {
 }
 
 /// The harness process could not take the message.
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, thiserror::Error, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum HarnessError {
     #[error("harness process is not running")]
     Dead,
@@ -873,7 +913,7 @@ impl TurnUsage {
 ///
 /// Cost is in millionths of the vendor's currency unit when the vendor reports
 /// a cost. A vendor that reports only tokens leaves the cost empty.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TurnUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -962,5 +1002,29 @@ mod tests {
             matches!(unix_signal::signal_target(grandchild_pid, 0), Err(3)),
             "grandchild pid {grandchild_pid} still alive after kill_child"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminate_group_ends_a_group_this_process_does_not_wait_on() {
+        use std::io::{BufRead as _, BufReader};
+        use std::process::Stdio;
+        let mut cmd = spawn_command(std::path::Path::new("/bin/sh"), &[]).unwrap();
+        cmd.args(["-c", "trap '' TERM; sleep 30 & echo $!; wait"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut child = cmd.spawn().unwrap();
+        let leader = child.id();
+        let mut line = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let grandchild: i32 = line.trim().parse().expect("grandchild pid");
+        // The keeper that started this group is gone: something else reaps.
+        let reaper = std::thread::spawn(move || child.wait());
+        terminate_group(leader, &[]);
+        assert!(!pgid_alive(leader), "the group survived terminate_group");
+        assert!(matches!(unix_signal::signal_target(grandchild, 0), Err(3)));
+        reaper.join().unwrap().unwrap();
     }
 }
