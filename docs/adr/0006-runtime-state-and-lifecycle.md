@@ -117,6 +117,14 @@ This produces a recurring class of failures:
 
 **Steer custody (`steer_holds`, replaces the JSON hold file)**
 
+Superseded 2026-11-13: steer custody needs no state machine of its own. A
+harness that proves consumption commits each input on its own proof over the
+contiguous cursor, and a harness that cannot is held to a lower level
+([delivery.md](../delivery.md)). The JSON hold is retired, an agent directory's
+leftover hold is settled against the Spiron journal at launch, and migration
+030 drops the never-wired `steer_holds` table. The table below records the
+proposal.
+
 | From | Event | To | Mailbox effect |
 |---|---|---|---|
 | — | before any input bytes are written | Held | cursor unchanged |
