@@ -182,7 +182,7 @@ cursor. These fixtures are not captured vendor-runtime conformance evidence.
 
 `anyagents memory-service` is a separate process beside `anyagents serve`. It
 reads the server's host index and raw sources read-only, writes only its own
-dense index (`<data>/memory-service/dense-v1.db`, rebuildable, never
+dense index (`<data>/memory-service/dense-<space>.db`, rebuildable, never
 `state.db`), and answers on an owner-only socket
 (`<data>/memory-service.sock`, mode `0600`) with one newline-delimited JSON
 request and reply per connection:
@@ -191,7 +191,7 @@ request and reply per connection:
 | --- | --- |
 | `search {query, owners, source?, since_ms?, until_ms?, limit}` | dense candidates: document id, owner, cited raw range (absolute offset, length, SHA-256), score |
 | `rerank {query, passages}` | one cross-encoder score per passage |
-| `status` | model pair, embedded and pending documents, vectors |
+| `status` | model pair, embedded and pending documents, vectors, dense space, rebuild estimate and state, US$ spent |
 
 The server decides access. It sends only the owners the caller may read, and
 resolves each candidate the way it resolves a lexical hit: the document must
@@ -232,6 +232,57 @@ own threads at normal priority (`--query-threads`, default 2). An idle embedder 
 holds at the same digest, so removed, redacted or rewritten history leaves
 the dense index within that interval; until then the server's resolution
 step refuses such candidates.
+
+### Embedding and rerank providers
+
+Which embedder and reranker run is configuration:
+`<data>/memory-service/config.json` (or `--config <file>`). With nothing
+configured the service runs the pinned local pair below, offline: no network
+call and no spend, the safe default for an open-source install. A remote model
+is bound to one AnyAgents profile, `<provider>/<profile>` under
+`<data>/profiles`, whose API key the service reads where the profile pool keeps
+it, and to a model id:
+
+```json
+{
+  "embedder": {"provider": "openai", "profile": "openrouter/default",
+               "model": "qwen/qwen3-embedding-8b", "dimensions": 1024,
+               "usd_per_million_tokens": 0.01},
+  "reranker": {"provider": "rerank", "profile": "openrouter/default",
+               "model": "cohere/rerank-5-pro"},
+  "max_rebuild_usd": 10
+}
+```
+
+| Provider | Request |
+| --- | --- |
+| `local` (default) | a pinned ONNX model (`model` names a pin; default the pinned pair) |
+| `openai` | `POST {base_url}/embeddings` with OpenAI's body (`model`, `input`, `encoding_format`, optional `dimensions`) |
+| `rerank` | `POST {base_url}/rerank` with `model`, `query`, `documents`, `top_n`; scores from `results[]` or `data[]` (`index`, `relevance_score`): the Cohere, Voyage, Jina and OpenRouter shape |
+
+`base_url` defaults to the provider's documented root for `openrouter`,
+`google-gemini` (Google's OpenAI-compatible endpoint), `sylphx`, `openai`,
+`voyage`, `cohere` and `jina`. `query_prefix`, `passage_prefix`, `body`,
+`query_body` and `passage_body` add a model's instruction text or request
+fields (for example `input_type`, or OpenRouter's
+`provider.data_collection`). Remote calls retry throttling and upstream
+failures, and record the cost the provider reports (`usage.cost`) or, failing
+that, the configured price.
+
+Every dense index is stamped with its space: provider, model, dimension and
+preprocessing (projection, piece budget, token counter and passage prefix).
+Each space has its own file, so vectors of two models never mix. When the
+configured embedder names a new space, the service builds it in the
+background like any backlog (nice 19, resumable, a bounded batch at a time;
+remote requests are paced). Before it starts it estimates what the build
+reads, from a uniform sample of 256 documents cut exactly as the embedder will
+cut them, and what it costs at the model's price; the estimate is logged,
+written beside the index (`dense-<space>.estimate.json`) and reported in
+`status.rebuild`. A remote build starts only when its price is known and the
+estimate is within `max_rebuild_usd` (US$10 by default), and stops taking
+backlog when the spend providers report reaches it; new history keeps being
+embedded. Once the new space has no backlog, other spaces' files are deleted.
+Changing the reranker rebuilds nothing.
 
 Models and runtime are pinned in `crates/anyagents-memory/src/pins.rs` by
 Hugging Face commit and per-file SHA-256, and ONNX Runtime 1.31.0 by the
@@ -319,6 +370,57 @@ against 1.3 s for `hs-rerank-1`, inside the server's 8 s bound; `hs-rerank-1`
 on the first 100 queries lifted the hybrid list's MRR@10 by 0.034, less than
 the default's 0.054 over all 170. Every candidate in `pins.rs` can be selected with
 `--embedder` / `--reranker` and evaluated with the same command.
+
+### Providers compared (2026-11-13)
+
+Which remote models our profiles actually offer, read from the profile pool,
+the providers' model listings and their documentation:
+
+| Profile | Embeddings | Rerank |
+| --- | --- | --- |
+| `openrouter/default` | 39 models (`/api/v1/embeddings/models`), among them `google/gemini-embedding-2`, `qwen/qwen3-embedding-8b`, `mongodb/voyage-4-large`, `cohere/embed-5-pro`, `openai/text-embedding-3-large` | 13 models (`/api/v1/models?output_modalities=rerank`): Cohere rerank 5/4/3.5, Voyage rerank-3/2.5, Qwen3-Reranker 0.6B/8B, Nemotron |
+| `google-gemini/api` | `gemini-embedding-001`, `gemini-embedding-2`, `gemini-embedding-2-preview` (ListModels, `embedContent`) | none |
+| `sylphx/*` | none routable for our key (the authenticated catalog lists no embedding row; `/v1/embeddings` answers `model_not_available`) | `/v1/rerank` is retired |
+| coding plans (`qwen-token-plan`, `kimi-`, `glm-`, `minimax-code-plan`) | not usable: their keys are for interactive coding tools only | none |
+| subscriptions (`anthropic`, `openai`, `google-antigravity`, `xai`, `cursor`, `muse`) and `deepseek/api` | none | none |
+
+The OpenRouter account had US$0.01 of credit left (US$3,026.12 bought, all
+used), so its candidates could not be run: the first request past a pilot was
+refused with `402 in_flight_budget_exhausted`. The comparison below therefore
+covers the Gemini API profile's two embedders and the local pair.
+
+A second sample of the same two lead agents (2026-11-08 14:33 to 2026-11-13
+22:08 UTC: 7,538 messages, 188 queries) was built read-only into a private
+directory and deleted after the runs. Remote embedders ran at 1024 dimensions
+through Google's OpenAI-compatible endpoint; `gemini-embedding-2` takes its
+task in the text (queries `task: search result | query: `, documents
+`title: none | text: `), and without it scored far lower (dense MRR@10 0.080,
+reranked hybrid 0.192). The reranker is the local
+`multilingual-reranker-small` throughout.
+
+| Ranking | R@1 | R@10 | MRR@10 | nDCG@10 |
+| --- | --- | --- | --- | --- |
+| BM25 | 0.074 | 0.245 | 0.121 | 0.151 |
+| BM25 + rerank (no embeddings) | 0.117 | 0.293 | 0.170 | 0.200 |
+| Dense, local `granite-embedding-311m` | 0.064 | 0.245 | 0.115 | 0.146 |
+| Dense, `gemini-embedding-2` | 0.080 | 0.303 | 0.139 | 0.178 |
+| Dense, `gemini-embedding-001` | 0.080 | 0.330 | 0.148 | 0.191 |
+| Hybrid, local | 0.074 | 0.314 | 0.143 | 0.184 |
+| Hybrid + rerank, local | 0.133 | 0.362 | 0.192 | 0.232 |
+| Hybrid + rerank, `gemini-embedding-2` | 0.144 | 0.388 | 0.207 | 0.250 |
+| Hybrid + rerank, `gemini-embedding-001` | **0.160** | **0.420** | **0.219** | **0.265** |
+
+Reranking BM25 alone does not reach hybrid retrieval: it can only reorder the
+lexical top 20, which holds the answer for 34% of queries, against 44% to 50%
+for the fused lists, so embeddings stay. A cloud embedder adds about 0.06 to
+recall@10 and 0.03 to MRR@10 over the local one; with 188 queries the MRR
+difference is at the edge of noise, the recall difference is not. Embedding
+the sample took about 2 minutes per remote model against 8 minutes on eight
+local threads. Cost of the runs: about US$1.70 on the Gemini API profile at
+list price (US$0.20 per million tokens for `gemini-embedding-2`, US$0.15 for
+`gemini-embedding-001`, about 3.1 million tokens per build; the endpoint
+reports no usage, so this is the estimate the run recorded), and US$0.006 on
+OpenRouter, from its key usage before and after.
 
 ## Incremental indexing and migration
 

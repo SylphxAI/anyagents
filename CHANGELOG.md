@@ -21,6 +21,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   4 MiB of new history before it answers and reports the rest in
   `retrieval.pending`; a low-priority daemon thread indexes it, verifies
   sources hourly, and pre-warms every agent's history after a start.
+- Embeddings and rerank can come from a remote model bound to an AnyAgents
+  profile: an OpenAI-compatible `/embeddings` endpoint or a Cohere/Voyage/Jina
+  style `/rerank`, chosen in `<data>/memory-service/config.json`. With nothing
+  configured the pinned local models run offline. Each dense index is stamped
+  with its vector space; a new embedding model is rebuilt in the background
+  after its estimated tokens and cost are reported, within `max_rebuild_usd`.
 - Hybrid retrieval: BM25 fused with dense candidates from a local multilingual
   embedder and reranked by a local cross-encoder, run by the new
   `anyagents memory-service` process. Every result cites its raw bytes; without
