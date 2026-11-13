@@ -2454,16 +2454,6 @@ mod tests {
             .create_agent(NewAgent::new("topic-owner", "spiron"))
             .unwrap();
         let root = dir.path().join("agents").join(agent.id.as_str());
-        crate::learned_memory::write_sleep_state(
-            &root,
-            &crate::learned_memory::SleepState {
-                last_consolidated_ms: 123,
-                last_inbound_seq: 4,
-                last_outbound_ms: 5,
-                consolidated_topics: 1,
-            },
-        )
-        .unwrap();
         crate::learned_memory::upsert_memory_topic(
             &root,
             &agent.name,
@@ -2476,7 +2466,9 @@ mod tests {
         .unwrap();
         fs::write(root.join("memory/.hidden-note.md"), "hiddensecretneedle").unwrap();
         assert!(root.join("memory/MEMORY.md").is_file());
-        assert!(root.join("memory/.sleep-state.json").is_file());
+        // A dotfile left by an older binary (for example the retired
+        // `.sleep-state.json`) is never a learned fact.
+        fs::write(root.join("memory/.sleep-state.json"), "{\"hiddenstateneedle\":1}").unwrap();
         let ids = [agent.id.to_string()];
         let hits = store
             .search_host_files(
@@ -2506,6 +2498,7 @@ mod tests {
                 MemoryScope::Memory,
                 &HistorySearchQuery {
                     query: Some("hiddensecretneedle".into()),
+                    queries: vec!["hiddenstateneedle".into()],
                     ..Default::default()
                 },
             )
