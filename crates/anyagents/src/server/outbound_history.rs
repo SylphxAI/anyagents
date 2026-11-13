@@ -1,13 +1,32 @@
 //! Durable local settlement for effects whose external acknowledgement cannot
 //! participate in the store transaction. Recovery writes history, never sends.
+//!
+//! `<data>/outbound-history/` holds:
+//! - `<key>.pending`: an open obligation, written before its effect runs and
+//!   rewritten with the effect's receipt. Core redaction inspects these, and
+//!   every `*.tmp`, before an erasure.
+//! - `<key>.lock`: the key's flock. It exists only while held.
+//! - `<key>.pending.tmp`, `<key>.done.tmp`: a write in flight. A failed write
+//!   removes its own; one a dead process left is recovered under the key lock.
+//! - `receipts/<key>.done`: a settled receipt, without the body. A keyed retry
+//!   reuses it. Receipts settled before this layout stay at the top level as
+//!   `<key>.done`, are read there, and move into `receipts/` on the first scan.
+//!
+//! `<key>` is the hexadecimal effect key. Only this daemon opens obligations,
+//! so it knows each one: the first reconcile scans the directory for those a
+//! previous process left, and every obligation this process opens stays
+//! registered until it settles. Later reconciles visit registered obligations
+//! only and touch no file when none is open.
 
 use super::{ApiError, Delivery};
 use anyagents_core::{AgentId, Error, MessageId, Store};
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeSet, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock, PoisonError};
 
 #[derive(Serialize, Deserialize)]
 struct Intent {
@@ -19,8 +38,76 @@ struct Intent {
     receipt: Option<Vec<Delivery>>,
 }
 
+impl Intent {
+    fn same_obligation(&self, other: &Intent) -> bool {
+        self.effect_key == other.effect_key
+            && self.agent_id == other.agent_id
+            && self.destination == other.destination
+            && self.reply_to == other.reply_to
+            && self.body == other.body
+    }
+}
+
 fn directory(store: &Store) -> PathBuf {
     store.data_dir().join("outbound-history")
+}
+
+/// Every file of one effect key.
+struct Files {
+    pending: PathBuf,
+    lock: PathBuf,
+    staged_pending: PathBuf,
+    staged_done: PathBuf,
+    done: PathBuf,
+    legacy_done: PathBuf,
+}
+
+impl Files {
+    fn new(directory: &Path, name: &str) -> Self {
+        Files {
+            pending: directory.join(format!("{name}.pending")),
+            lock: directory.join(format!("{name}.lock")),
+            staged_pending: directory.join(format!("{name}.pending.tmp")),
+            staged_done: directory.join(format!("{name}.done.tmp")),
+            done: directory.join("receipts").join(format!("{name}.done")),
+            legacy_done: directory.join(format!("{name}.done")),
+        }
+    }
+}
+
+/// Internal keys are short; hexadecimal encoding is reversible and avoids
+/// introducing a second collision or pathname interpretation boundary.
+fn encode(key: &str) -> String {
+    key.as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Whether `name` is a key encoding this module wrote.
+fn is_encoded(name: &str) -> bool {
+    !name.is_empty()
+        && name.len().is_multiple_of(2)
+        && name.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Open obligations of each journal directory this process knows of.
+#[derive(Default)]
+struct Open {
+    /// The directory was scanned for obligations a previous process left.
+    scanned: bool,
+    /// Encoded keys whose `.pending` file may exist.
+    keys: BTreeSet<String>,
+}
+
+static OPEN: OnceLock<Mutex<HashMap<PathBuf, Open>>> = OnceLock::new();
+
+fn with_open<R>(directory: &Path, f: impl FnOnce(&mut Open) -> R) -> R {
+    let mut journals = OPEN
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    f(journals.entry(directory.to_path_buf()).or_default())
 }
 
 /// Releases the open-file-description flock on drop even when a concurrent
@@ -48,21 +135,106 @@ fn publication_barrier(store: &Store) -> Result<FileLock, Error> {
     Ok(FileLock(file))
 }
 
-fn write(path: &Path, intent: &Intent) -> Result<(), Error> {
+/// One key's exclusive flock, on a file that exists only while it is held.
+/// The holder unlinks the file before it unlocks, and an acquirer keeps its
+/// lock only while the path still names the inode it locked; a waiter that
+/// locked an unlinked inode retries on the current one. So two holders never
+/// coexist, and no lock file outlives its holder.
+struct KeyLock {
+    file: File,
+    path: PathBuf,
+}
+
+impl KeyLock {
+    /// `wait` blocks for a holder; otherwise a held key yields `None`.
+    fn acquire(path: &Path, wait: bool) -> Result<Option<KeyLock>, Error> {
+        loop {
+            let file = OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .mode(0o600)
+                .open(path)?;
+            if wait {
+                file.lock()?;
+            } else {
+                match file.try_lock() {
+                    Ok(()) => {}
+                    Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
+                    Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+                }
+            }
+            let held = file.metadata()?;
+            match std::fs::symlink_metadata(path) {
+                Ok(current) if current.dev() == held.dev() && current.ino() == held.ino() => {
+                    return Ok(Some(KeyLock {
+                        file,
+                        path: path.to_path_buf(),
+                    }));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+}
+
+impl Drop for KeyLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+        let _ = self.file.unlock();
+    }
+}
+
+fn sync_directory(path: &Path) -> Result<(), Error> {
+    File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+fn create_receipts(directory: &Path) -> Result<PathBuf, Error> {
+    let receipts = directory.join("receipts");
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&receipts)?;
+    Ok(receipts)
+}
+
+/// Atomically replace `target` with `intent`, staged at `staged`, a top-level
+/// `*.tmp` that the key's lock holder alone writes. A failed write removes the
+/// staged copy it made, so no failed write leaves a temporary file behind.
+fn write(staged: &Path, target: &Path, intent: &Intent) -> Result<(), Error> {
     let bytes = serde_json::to_vec(intent)
         .map_err(|error| Error::Message(format!("serialize outbound obligation: {error}")))?;
-    let parent = path.parent().expect("owned journal path");
-    let temporary = parent.join(format!(".{}.tmp", MessageId::generate()));
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(&temporary)?;
-    file.write_all(&bytes)?;
-    file.sync_all()?;
-    std::fs::rename(&temporary, path)?;
-    File::open(parent)?.sync_all()?;
-    Ok(())
+        .open(staged)?;
+    let result = (|| -> Result<(), Error> {
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        std::fs::rename(staged, target)?;
+        let target_dir = target.parent().expect("owned journal path");
+        sync_directory(target_dir)?;
+        let staged_dir = staged.parent().expect("owned journal path");
+        if staged_dir != target_dir {
+            sync_directory(staged_dir)?;
+        }
+        Ok(())
+    })();
+    if result.is_err()
+        && let Err(error) = std::fs::remove_file(staged)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!(
+            "outbound history: cannot remove failed write {}: {error}",
+            staged.display()
+        );
+    }
+    result
 }
 
 fn load(path: &Path) -> Result<Option<Intent>, Error> {
@@ -78,7 +250,44 @@ fn load(path: &Path) -> Result<Option<Intent>, Error> {
     }
 }
 
-fn settle(store: &Store, path: &Path, intent: &Intent) -> Result<(), Error> {
+fn remove_if_present(path: &Path) -> Result<(), Error> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Finish what a dead lock holder of this key staged; call with the key's lock
+/// held. A complete staged obligation that carries an acknowledged effect's
+/// receipt is the newer state of a committed obligation lacking one, so it is
+/// rolled forward. Every other staged copy is superseded by the committed
+/// files and removed.
+fn recover_staged(directory: &Path, name: &str) -> Result<(), Error> {
+    let files = Files::new(directory, name);
+    match std::fs::read(&files.staged_pending) {
+        Ok(bytes) => roll_forward_or_remove(&bytes, &files.staged_pending, &files.pending)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    remove_if_present(&files.staged_done)
+}
+
+fn roll_forward_or_remove(bytes: &[u8], staged: &Path, pending: &Path) -> Result<(), Error> {
+    if let Ok(staged_intent) = serde_json::from_slice::<Intent>(bytes)
+        && staged_intent.body.is_some()
+        && staged_intent.receipt.is_some()
+        && let Some(committed) = load(pending)?
+        && committed.receipt.is_none()
+        && committed.same_obligation(&staged_intent)
+    {
+        std::fs::rename(staged, pending)?;
+        return sync_directory(pending.parent().expect("owned journal path"));
+    }
+    remove_if_present(staged)
+}
+
+fn settle(store: &Store, directory: &Path, name: &str, intent: &Intent) -> Result<(), Error> {
     let receipt = intent.receipt.as_ref().ok_or_else(|| {
         Error::Message(
             "outbound effect has no terminal receipt; automatic resend is refused".into(),
@@ -106,9 +315,12 @@ fn settle(store: &Store, path: &Path, intent: &Intent) -> Result<(), Error> {
         body: None,
         receipt: intent.receipt.clone(),
     };
-    write(&path.with_extension("done"), &done)?;
-    std::fs::remove_file(path)?;
-    File::open(path.parent().expect("owned journal path"))?.sync_all()?;
+    let files = Files::new(directory, name);
+    create_receipts(directory)?;
+    write(&files.staged_done, &files.done, &done)?;
+    std::fs::remove_file(&files.pending)?;
+    sync_directory(directory)?;
+    with_open(directory, |open| open.keys.remove(name));
     Ok(())
 }
 
@@ -130,36 +342,24 @@ where
 {
     let _barrier = publication_barrier(store).map_err(ApiError::from_store)?;
     let directory = directory(store);
-    std::fs::create_dir_all(&directory)
-        .map_err(Error::from)
-        .map_err(ApiError::from_store)?;
     let effect_key = key
         .map(str::to_owned)
         .unwrap_or_else(|| MessageId::generate().to_string());
-    // Internal keys are short; hexadecimal encoding is reversible and avoids
-    // introducing a second collision or pathname interpretation boundary.
-    let filename: String = effect_key
-        .as_bytes()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
-    let path = directory.join(format!("{filename}.pending"));
-    let lock = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .mode(0o600)
-        .open(path.with_extension("lock"))
-        .map_err(Error::from)
-        .map_err(ApiError::from_store)?;
-    lock.lock()
-        .map_err(Error::from)
-        .map_err(ApiError::from_store)?;
-    let _lock = FileLock(lock);
-    let existing = load(&path.with_extension("done"))
+    let name = encode(&effect_key);
+    let files = Files::new(&directory, &name);
+    let _lock = KeyLock::acquire(&files.lock, true)
         .map_err(ApiError::from_store)?
-        .or(load(&path).map_err(ApiError::from_store)?);
+        .expect("a waiting acquire holds the lock");
+    recover_staged(&directory, &name).map_err(ApiError::from_store)?;
+    // A legacy receipt only ever moves into `receipts/`, so reading the
+    // legacy place first cannot miss one that moves between the two reads.
+    let existing = match load(&files.legacy_done).map_err(ApiError::from_store)? {
+        Some(intent) => Some(intent),
+        None => match load(&files.done).map_err(ApiError::from_store)? {
+            Some(intent) => Some(intent),
+            None => load(&files.pending).map_err(ApiError::from_store)?,
+        },
+    };
     let mut intent = if let Some(intent) = existing {
         if intent.effect_key != effect_key
             || &intent.agent_id != agent_id
@@ -175,11 +375,16 @@ where
             )));
         }
         if let Some(mut receipt) = intent.receipt.clone() {
-            if path.exists() {
-                let pending = load(&path).map_err(ApiError::from_store)?.ok_or_else(|| {
-                    ApiError::from_store(Error::Message("outbound obligation disappeared".into()))
-                })?;
-                settle(store, &path, &pending).map_err(ApiError::from_store)?;
+            if files.pending.exists() {
+                let pending = load(&files.pending)
+                    .map_err(ApiError::from_store)?
+                    .ok_or_else(|| {
+                        ApiError::from_store(Error::Message(
+                            "outbound obligation disappeared".into(),
+                        ))
+                    })?;
+                with_open(&directory, |open| open.keys.insert(name.clone()));
+                settle(store, &directory, &name, &pending).map_err(ApiError::from_store)?;
             } else if !receipt.is_empty() {
                 store
                     .record_outbound_once(&intent.effect_key, agent_id, destination, reply_to, body)
@@ -207,49 +412,110 @@ where
             receipt: None,
         }
     };
-    write(&path, &intent).map_err(ApiError::from_store)?;
+    // Registered before it can exist, so no outcome leaves it unreconciled.
+    with_open(&directory, |open| open.keys.insert(name.clone()));
+    write(&files.staged_pending, &files.pending, &intent).map_err(ApiError::from_store)?;
     let receipt = effect()?;
     intent.receipt = Some(receipt.clone());
-    write(&path, &intent).map_err(ApiError::from_store)?;
-    settle(store, &path, &intent).map_err(ApiError::from_store)?;
+    write(&files.staged_pending, &files.pending, &intent).map_err(ApiError::from_store)?;
+    settle(store, &directory, &name, &intent).map_err(ApiError::from_store)?;
     Ok(receipt)
 }
 
 /// Only receipts of already acknowledged effects are replayed. Prepared or
 /// malformed obligations remain untouched and produce an explicit diagnostic.
+/// The cost is one visit per open obligation; with none open, no file is
+/// touched.
 pub(super) fn reconcile(store: &Store) -> Result<(), Error> {
-    let _barrier = publication_barrier(store)?;
     let directory = directory(store);
-    let entries = match std::fs::read_dir(&directory) {
+    if with_open(&directory, |open| open.scanned && open.keys.is_empty()) {
+        return Ok(());
+    }
+    let _barrier = publication_barrier(store)?;
+    let mut first_error = None;
+    if !with_open(&directory, |open| open.scanned) {
+        match scan(&directory) {
+            Ok(tidy_error) => {
+                with_open(&directory, |open| open.scanned = true);
+                first_error = tidy_error;
+            }
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    let keys: Vec<String> = with_open(&directory, |open| open.keys.iter().cloned().collect());
+    for name in keys {
+        let result = (|| -> Result<(), Error> {
+            let files = Files::new(&directory, &name);
+            // A delivery holding the key settles it itself.
+            let Some(_lock) = KeyLock::acquire(&files.lock, false)? else {
+                return Ok(());
+            };
+            recover_staged(&directory, &name)?;
+            match load(&files.pending)? {
+                Some(intent) => settle(store, &directory, &name, &intent),
+                None => {
+                    with_open(&directory, |open| open.keys.remove(&name));
+                    Ok(())
+                }
+            }
+        })();
+        if let Err(error) = result {
+            first_error.get_or_insert(error);
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+/// The one directory scan a process makes. It registers the obligations a
+/// previous process left open and tidies what it left behind: lock files no
+/// one holds, staged writes no one finishes, and receipts in the legacy flat
+/// layout, which move into `receipts/` unchanged. A key some delivery holds
+/// is left to that delivery; files this module did not write are untouched.
+///
+/// `Err` means the directory could not be read in full, so an open obligation
+/// may be unregistered and the scan must run again. A file that could not be
+/// tidied stays as it is and is reported as `Ok(Some(error))`; the scan is
+/// complete and does not repeat.
+fn scan(directory: &Path) -> Result<Option<Error>, Error> {
+    let entries = match std::fs::read_dir(directory) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
+    let receipts = create_receipts(directory)?;
     let mut first_error = None;
+    let mut moved = false;
     for entry in entries {
+        let entry = entry?;
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        if !entry.file_type()?.is_file() || file_name == ".publication.lock" {
+            continue;
+        }
         let result = (|| -> Result<(), Error> {
-            let path = entry?.path();
-            if path
-                .extension()
-                .is_none_or(|extension| extension != "pending")
-            {
-                return Ok(());
-            }
-            let lock = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .mode(0o600)
-                .open(path.with_extension("lock"))?;
-            match lock.try_lock() {
-                Ok(()) => {}
-                Err(std::fs::TryLockError::WouldBlock) => return Ok(()),
-                Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
-            }
-            let _lock = FileLock(lock);
-            if let Some(intent) = load(&path)? {
-                settle(store, &path, &intent)?;
+            let keyed = |suffix: &str| file_name.strip_suffix(suffix).filter(|n| is_encoded(n));
+            if let Some(name) = keyed(".pending") {
+                with_open(directory, |open| open.keys.insert(name.to_owned()));
+            } else if let Some(name) = keyed(".lock") {
+                // Acquiring and releasing an unheld lock unlinks its file.
+                drop(KeyLock::acquire(&Files::new(directory, name).lock, false)?);
+            } else if let Some(name) = keyed(".pending.tmp").or_else(|| keyed(".done.tmp")) {
+                if let Some(_lock) = KeyLock::acquire(&Files::new(directory, name).lock, false)? {
+                    recover_staged(directory, name)?;
+                }
+            } else if let Some(name) = keyed(".done") {
+                if let Some(_lock) = KeyLock::acquire(&Files::new(directory, name).lock, false)? {
+                    moved |= migrate_receipt(directory, name)?;
+                }
+            } else if file_name.starts_with('.') && file_name.ends_with(".tmp") {
+                recover_legacy_staged(directory, &entry.path())?;
             }
             Ok(())
         })();
@@ -257,11 +523,59 @@ pub(super) fn reconcile(store: &Store) -> Result<(), Error> {
             first_error.get_or_insert(error);
         }
     }
-    if let Some(error) = first_error {
-        return Err(error);
+    if moved && let Err(error) = sync_directory(&receipts).and_then(|()| sync_directory(directory))
+    {
+        first_error.get_or_insert(error);
     }
+    Ok(first_error)
+}
 
-    Ok(())
+/// Move one flat-layout receipt into `receipts/`. A receipt already there for
+/// the same key that differs keeps both; the flat one is read first.
+fn migrate_receipt(directory: &Path, name: &str) -> Result<bool, Error> {
+    let files = Files::new(directory, name);
+    let read = |path: &Path| -> Result<Option<serde_json::Value>, Error> {
+        match std::fs::read(path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|error| {
+                Error::Message(format!(
+                    "invalid outbound receipt {}: {error}",
+                    path.display()
+                ))
+            }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    };
+    let Some(legacy) = read(&files.legacy_done)? else {
+        return Ok(false);
+    };
+    match read(&files.done)? {
+        None => std::fs::rename(&files.legacy_done, &files.done)?,
+        Some(current) if current == legacy => std::fs::remove_file(&files.legacy_done)?,
+        Some(_) => return Ok(false),
+    }
+    Ok(true)
+}
+
+/// A staged write of the flat layout's writer, named `.<random id>.tmp`. Only
+/// a previous process wrote these. A complete one names its key and is
+/// recovered under that key's lock; an empty or torn one was never committed.
+fn recover_legacy_staged(directory: &Path, path: &Path) -> Result<(), Error> {
+    let bytes = std::fs::read(path)?;
+    let Ok(intent) = serde_json::from_slice::<Intent>(&bytes) else {
+        return remove_if_present(path);
+    };
+    let name = encode(&intent.effect_key);
+    let files = Files::new(directory, &name);
+    match KeyLock::acquire(&files.lock, false)? {
+        Some(_lock) => roll_forward_or_remove(&bytes, path, &files.pending),
+        None => Ok(()),
+    }
+}
+
+#[cfg(test)]
+fn forget(store: &Store) {
+    with_open(&directory(store), |open| *open = Open::default());
 }
 
 #[cfg(test)]
@@ -276,6 +590,48 @@ mod tests {
             seq: 1,
             duplicate: false,
         }]
+    }
+
+    fn names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn fixture() -> (tempfile::TempDir, Store, AgentId) {
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let sender = store
+            .create_agent(anyagents_core::NewAgent::new("sender", "opencode"))
+            .unwrap();
+        (dir, store, sender.id)
+    }
+
+    fn intent(sender: &AgentId, key: &str, receipt: Option<Vec<Delivery>>) -> Intent {
+        Intent {
+            effect_key: key.into(),
+            agent_id: sender.clone(),
+            destination: "agent:recipient".into(),
+            reply_to: None,
+            body: Some("hello".into()),
+            receipt,
+        }
+    }
+
+    fn put(path: &Path, intent: &Intent) {
+        std::fs::write(path, serde_json::to_vec(intent).unwrap()).unwrap();
+    }
+
+    fn outbound_rows(store: &Store) -> i64 {
+        rusqlite::Connection::open(store.data_dir().join("state.db"))
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM outbound_messages", [], |row| {
+                row.get(0)
+            })
+            .unwrap()
     }
 
     #[test]
@@ -305,6 +661,7 @@ mod tests {
         assert_eq!(effects.get(), 1);
         db.execute_batch("DROP TRIGGER fail_history;").unwrap();
         // Restart-style recovery settles history from the durable receipt only.
+        forget(&store);
         reconcile(&store).unwrap();
         let retry = deliver(
             &store,
@@ -322,22 +679,15 @@ mod tests {
         .unwrap_or_else(|error| panic!("{}", error.message));
         assert!(retry[0].duplicate);
         assert_eq!(effects.get(), 1);
-        for entry in std::fs::read_dir(directory(&store))
-            .unwrap()
-            .filter_map(Result::ok)
-        {
-            if entry
-                .path()
-                .extension()
-                .is_some_and(|extension| extension == "done")
-            {
-                let retained: serde_json::Value =
-                    serde_json::from_slice(&std::fs::read(entry.path()).unwrap()).unwrap();
-                assert!(
-                    retained["body"].is_null(),
-                    "completed receipts retain no body copy"
-                );
-            }
+        let receipts = directory(&store).join("receipts");
+        assert_eq!(names(&receipts).len(), 1);
+        for entry in std::fs::read_dir(&receipts).unwrap().filter_map(Result::ok) {
+            let retained: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(entry.path()).unwrap()).unwrap();
+            assert!(
+                retained["body"].is_null(),
+                "completed receipts retain no body copy"
+            );
         }
         assert_eq!(
             db.query_row("SELECT COUNT(*) FROM outbound_messages", [], |row| row
@@ -409,6 +759,9 @@ mod tests {
                 .count(),
             1
         );
+        // The retained obligation stays open across a restart, too.
+        forget(&store);
+        assert!(reconcile(&store).is_err());
     }
 
     #[test]
@@ -436,5 +789,291 @@ mod tests {
             std::fs::read(directory(&store)).unwrap(),
             b"blocked directory sentinel"
         );
+    }
+
+    /// Settled obligations leave a receipt and nothing else: no lock file and
+    /// no temporary file. Once the startup scan ran and nothing is open, the
+    /// per-minute reconcile touches no file at all.
+    #[test]
+    fn settled_obligations_leave_only_receipts_and_idle_reconcile_touches_nothing() {
+        let (dir, store, sender) = fixture();
+        for key in [Some("keyed-call"), None] {
+            deliver(
+                &store,
+                &sender,
+                "agent:recipient",
+                None,
+                "hello",
+                key,
+                false,
+                || Ok(delivery()),
+            )
+            .unwrap_or_else(|error| panic!("{}", error.message));
+        }
+        let journal = directory(&store);
+        assert_eq!(names(&journal), [".publication.lock", "receipts"]);
+        assert_eq!(names(&journal.join("receipts")).len(), 2);
+        reconcile(&store).unwrap();
+        assert_eq!(names(&journal), [".publication.lock", "receipts"]);
+        // Any file access would now fail: the journal path is a regular file.
+        let parked = dir.path().join("parked");
+        std::fs::rename(&journal, &parked).unwrap();
+        std::fs::write(&journal, b"no directory here").unwrap();
+        reconcile(&store).unwrap();
+        std::fs::remove_file(&journal).unwrap();
+        std::fs::rename(&parked, &journal).unwrap();
+        // A keyed retry still reuses its receipt.
+        let retry = deliver(
+            &store,
+            &sender,
+            "agent:recipient",
+            None,
+            "hello",
+            Some("keyed-call"),
+            false,
+            || panic!("a settled keyed effect is never repeated"),
+        )
+        .unwrap_or_else(|error| panic!("{}", error.message));
+        assert!(retry[0].duplicate);
+        assert_eq!(outbound_rows(&store), 2);
+    }
+
+    /// The first reconcile after a restart moves the flat layout's receipts
+    /// into `receipts/`, unlinks lock files no one holds, removes staged writes
+    /// that were never committed, and settles acknowledged obligations. Every
+    /// receipt stays readable and keyed retries still reuse them.
+    #[test]
+    fn first_scan_migrates_the_flat_layout_without_losing_a_receipt() {
+        let (_dir, store, sender) = fixture();
+        let journal = directory(&store);
+        std::fs::create_dir_all(journal.join("abandoned-20261113")).unwrap();
+        std::fs::write(journal.join("abandoned-20261113/note.txt"), "kept").unwrap();
+        std::fs::write(journal.join("README"), "kept").unwrap();
+        std::fs::write(journal.join(".publication.lock"), b"").unwrap();
+        let settled = encode("send:old:0");
+        let mut done = intent(&sender, "send:old:0", Some(delivery()));
+        done.body = None;
+        put(&journal.join(format!("{settled}.done")), &done);
+        std::fs::write(journal.join(format!("{settled}.lock")), b"").unwrap();
+        let acknowledged = encode("send:acked:0");
+        put(
+            &journal.join(format!("{acknowledged}.pending")),
+            &intent(&sender, "send:acked:0", Some(delivery())),
+        );
+        std::fs::write(journal.join(format!("{acknowledged}.lock")), b"").unwrap();
+        for torn in [&b""[..], b"{\"effect_key\":\"send:"] {
+            std::fs::write(
+                journal.join(format!(".{}.tmp", MessageId::generate())),
+                torn,
+            )
+            .unwrap();
+        }
+        forget(&store);
+        reconcile(&store).unwrap();
+        assert_eq!(
+            names(&journal),
+            [
+                ".publication.lock",
+                "README",
+                "abandoned-20261113",
+                "receipts"
+            ]
+        );
+        assert_eq!(
+            names(&journal.join("receipts")),
+            [format!("{acknowledged}.done"), format!("{settled}.done")]
+        );
+        assert_eq!(names(&journal.join("abandoned-20261113")), ["note.txt"]);
+        assert_eq!(outbound_rows(&store), 1, "the acknowledged effect settled");
+        for key in ["send:old:0", "send:acked:0"] {
+            let retry = deliver(
+                &store,
+                &sender,
+                "agent:recipient",
+                None,
+                "hello",
+                Some(key),
+                false,
+                || panic!("a settled keyed effect is never repeated"),
+            )
+            .unwrap_or_else(|error| panic!("{}", error.message));
+            assert!(retry[0].duplicate);
+        }
+        assert_eq!(
+            names(&journal),
+            [
+                ".publication.lock",
+                "README",
+                "abandoned-20261113",
+                "receipts"
+            ]
+        );
+    }
+
+    /// A file the first scan cannot tidy stays in place and is reported once;
+    /// the scan is complete and later reconciles do not repeat it.
+    #[test]
+    fn a_file_the_scan_cannot_tidy_is_reported_once() {
+        let (dir, store, _sender) = fixture();
+        let journal = directory(&store);
+        std::fs::create_dir_all(&journal).unwrap();
+        let malformed = journal.join(format!("{}.done", encode("send:torn:0")));
+        std::fs::write(&malformed, b"{\"effect_key\"").unwrap();
+        forget(&store);
+        assert!(reconcile(&store).is_err());
+        assert_eq!(std::fs::read(&malformed).unwrap(), b"{\"effect_key\"");
+        let parked = dir.path().join("parked");
+        std::fs::rename(&journal, &parked).unwrap();
+        std::fs::write(&journal, b"no directory here").unwrap();
+        reconcile(&store).unwrap();
+    }
+
+    /// A process that died after staging an acknowledged receipt but before
+    /// committing it leaves the receipt in the staged copy: recovery rolls it
+    /// forward instead of leaving the outcome unknown, and never repeats the
+    /// effect. A staged copy without a receipt is simply removed.
+    #[test]
+    fn staged_receipt_of_a_dead_writer_is_rolled_forward() {
+        let (_dir, store, sender) = fixture();
+        let journal = directory(&store);
+        std::fs::create_dir_all(&journal).unwrap();
+        let acked = encode("send:acked:0");
+        put(
+            &journal.join(format!("{acked}.pending")),
+            &intent(&sender, "send:acked:0", None),
+        );
+        put(
+            &journal.join(format!("{acked}.pending.tmp")),
+            &intent(&sender, "send:acked:0", Some(delivery())),
+        );
+        let unknown = encode("send:unknown:0");
+        put(
+            &journal.join(format!("{unknown}.pending")),
+            &intent(&sender, "send:unknown:0", None),
+        );
+        put(
+            &journal.join(format!("{unknown}.pending.tmp")),
+            &intent(&sender, "send:unknown:0", None),
+        );
+        forget(&store);
+        let outcome = reconcile(&store);
+        assert!(
+            outcome.is_err_and(|error| error.to_string().contains("no terminal receipt")),
+            "the obligation without a receipt stays open"
+        );
+        assert_eq!(
+            names(&journal),
+            [
+                ".publication.lock".to_string(),
+                format!("{unknown}.pending"),
+                "receipts".to_string()
+            ]
+        );
+        assert_eq!(outbound_rows(&store), 1);
+        let retry = deliver(
+            &store,
+            &sender,
+            "agent:recipient",
+            None,
+            "hello",
+            Some("send:acked:0"),
+            false,
+            || panic!("an acknowledged effect is never repeated"),
+        )
+        .unwrap_or_else(|error| panic!("{}", error.message));
+        assert!(retry[0].duplicate);
+    }
+
+    /// A write that fails after staging removes its staged copy, and only its
+    /// own. When settlement fails after the effect, the receipt survives in
+    /// the obligation, nothing temporary is left, and reconcile settles it.
+    #[test]
+    fn a_failed_write_leaves_no_temporary_file() {
+        let (dir, store, sender) = fixture();
+        let staged = dir.path().join("key.pending.tmp");
+        let unreachable = dir.path().join("missing/key.done");
+        let record = intent(&sender, "key", Some(delivery()));
+        assert!(write(&staged, &unreachable, &record).is_err());
+        assert!(!staged.exists(), "the failed write removed its staged copy");
+        std::fs::write(&staged, b"not this write's").unwrap();
+        assert!(write(&staged, &dir.path().join("key.pending"), &record).is_err());
+        assert_eq!(std::fs::read(&staged).unwrap(), b"not this write's");
+
+        let journal = directory(&store);
+        std::fs::create_dir_all(&journal).unwrap();
+        // Settlement cannot make `receipts/` through a dangling link.
+        std::os::unix::fs::symlink(dir.path().join("nowhere"), journal.join("receipts")).unwrap();
+        let effects = Cell::new(0);
+        assert!(
+            deliver(
+                &store,
+                &sender,
+                "agent:recipient",
+                None,
+                "hello",
+                Some("blocked-call"),
+                false,
+                || {
+                    effects.set(effects.get() + 1);
+                    Ok(delivery())
+                },
+            )
+            .is_err()
+        );
+        let pending = encode("blocked-call");
+        assert_eq!(
+            names(&journal),
+            [
+                ".publication.lock".to_string(),
+                format!("{pending}.pending"),
+                "receipts".to_string()
+            ]
+        );
+        std::fs::remove_file(journal.join("receipts")).unwrap();
+        reconcile(&store).unwrap();
+        assert_eq!(names(&journal), [".publication.lock", "receipts"]);
+        assert_eq!(effects.get(), 1);
+        assert_eq!(outbound_rows(&store), 1);
+        let retry = deliver(
+            &store,
+            &sender,
+            "agent:recipient",
+            None,
+            "hello",
+            Some("blocked-call"),
+            false,
+            || panic!("an acknowledged effect is never repeated"),
+        )
+        .unwrap_or_else(|error| panic!("{}", error.message));
+        assert!(retry[0].duplicate);
+    }
+
+    /// A waiter that locked an inode its holder unlinked retries on the
+    /// current file, so it never holds the key beside a later acquirer.
+    #[test]
+    fn a_key_lock_is_exclusive_although_its_file_is_unlinked_on_release() {
+        let dir = crate::test_tempdir();
+        let path = dir.path().join("key.lock");
+        let holder = KeyLock::acquire(&path, true).unwrap().unwrap();
+        let (acquired, observed) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let waiter_path = path.clone();
+        let waiter = std::thread::spawn(move || {
+            let lock = KeyLock::acquire(&waiter_path, true).unwrap().unwrap();
+            acquired.send(()).unwrap();
+            released.recv().unwrap();
+            drop(lock);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        drop(holder);
+        observed.recv().unwrap();
+        assert!(
+            KeyLock::acquire(&path, false).unwrap().is_none(),
+            "the waiter holds the lock on the current file"
+        );
+        release.send(()).unwrap();
+        waiter.join().unwrap();
+        assert!(!path.exists(), "no lock file outlives its holder");
+        assert!(KeyLock::acquire(&path, false).unwrap().is_some());
     }
 }
