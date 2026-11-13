@@ -13,7 +13,9 @@ use sha2::{Digest, Sha256};
 use std::{
     fs,
     io::{self, Read},
-    path::Path,
+    ops::{Deref, DerefMut},
+    path::{Path, PathBuf},
+    sync::{Mutex, MutexGuard},
 };
 
 const WINDOW_BYTES: usize = 4096;
@@ -84,6 +86,106 @@ fn decode_tool_names(value: String) -> rusqlite::Result<Vec<String>> {
 pub struct HostIndex {
     conn: Connection,
 }
+
+/// Index connections kept open for reuse by this process: opening one maps
+/// the WAL and probes the schema, so callers borrow an idle connection and
+/// return it when done. At most `MAX_IDLE_PER_FILE` stay idle per index
+/// file, and a connection whose file was deleted or replaced is closed.
+static IDLE: Mutex<Vec<IdleIndex>> = Mutex::new(Vec::new());
+const MAX_IDLE_PER_FILE: usize = 4;
+struct IdleIndex {
+    path: PathBuf,
+    identity: (u64, u64),
+    index: HostIndex,
+}
+impl IdleIndex {
+    fn is_current(&self) -> bool {
+        file_identity(&self.path).is_ok_and(|now| now == Some(self.identity))
+    }
+}
+fn file_identity(path: &Path) -> io::Result<Option<(u64, u64)>> {
+    use std::os::unix::fs::MetadataExt;
+    match fs::metadata(path) {
+        Ok(m) => Ok(Some((m.dev(), m.ino()))),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+fn idle_pool() -> MutexGuard<'static, Vec<IdleIndex>> {
+    IDLE.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// A [`HostIndex`] borrowed from this process's pool; returned on drop.
+pub(crate) struct SharedHostIndex(Option<IdleIndex>);
+impl Deref for SharedHostIndex {
+    type Target = HostIndex;
+    fn deref(&self) -> &HostIndex {
+        &self.0.as_ref().expect("borrowed until drop").index
+    }
+}
+impl DerefMut for SharedHostIndex {
+    fn deref_mut(&mut self) -> &mut HostIndex {
+        &mut self.0.as_mut().expect("borrowed until drop").index
+    }
+}
+impl Drop for SharedHostIndex {
+    fn drop(&mut self) {
+        // A connection left inside a transaction is closed, never reused.
+        let Some(idle) = self.0.take().filter(|i| i.index.conn.is_autocommit()) else {
+            return;
+        };
+        let closed: Vec<IdleIndex> = {
+            let mut pool = idle_pool();
+            pool.push(idle);
+            let mut closed = Vec::new();
+            let mut kept: Vec<IdleIndex> = Vec::with_capacity(pool.len());
+            for entry in pool.drain(..).rev() {
+                let same_file = kept.iter().filter(|k| k.path == entry.path).count();
+                if same_file < MAX_IDLE_PER_FILE && entry.is_current() {
+                    kept.push(entry);
+                } else {
+                    closed.push(entry);
+                }
+            }
+            kept.reverse();
+            *pool = kept;
+            closed
+        };
+        // Closing a connection can checkpoint; never under the pool lock.
+        drop(closed);
+    }
+}
+
+impl HostIndex {
+    /// Borrow an idle connection to the index at `path`, opening (and
+    /// creating) one only when none is idle.
+    pub(crate) fn shared(path: &Path) -> Result<SharedHostIndex, IndexError> {
+        let reused = file_identity(path)?.and_then(|identity| {
+            let mut pool = idle_pool();
+            let at = pool
+                .iter()
+                .rposition(|i| i.path == path && i.identity == identity)?;
+            Some(pool.remove(at))
+        });
+        if let Some(idle) = reused {
+            return Ok(SharedHostIndex(Some(idle)));
+        }
+        let index = Self::open(path)?;
+        let identity = file_identity(path)?
+            .ok_or_else(|| io::Error::other("host index vanished while opening"))?;
+        Ok(SharedHostIndex(Some(IdleIndex {
+            path: path.to_owned(),
+            identity,
+            index,
+        })))
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Connections opened on this thread.
+    static OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 impl HostIndex {
     fn schema_state(conn: &Connection) -> Result<(bool, bool), rusqlite::Error> {
         let old_required_time = conn
@@ -114,6 +216,8 @@ impl HostIndex {
     }
 
     pub fn open(path: &Path) -> Result<Self, IndexError> {
+        #[cfg(test)]
+        OPENS.with(|n| n.set(n.get() + 1));
         match Self::open_inner(path) {
             Err(IndexError::Sql(error))
                 if error.to_string().contains("malformed")
@@ -1095,6 +1199,67 @@ mod tests {
             tool_names: Vec::new(),
             role: Some("user".into()),
         }
+    }
+    /// One connection serves every sequential borrower; concurrent borrowers
+    /// get their own; a replaced file or an open transaction is never reused.
+    #[test]
+    fn shared_index_reuses_connections_but_never_a_replaced_file() {
+        let dir = crate::test_tempdir();
+        let path = dir.path().join("index.db");
+        let opens = || OPENS.with(std::cell::Cell::get);
+        let start = opens();
+        drop(HostIndex::shared(&path).unwrap());
+        for _ in 0..5 {
+            drop(HostIndex::shared(&path).unwrap());
+        }
+        assert_eq!(opens() - start, 1);
+        let first = HostIndex::shared(&path).unwrap();
+        let second = HostIndex::shared(&path).unwrap();
+        assert_eq!(opens() - start, 2);
+        drop((first, second));
+        // Delete the file under two idle connections: neither may serve it.
+        let segment = RawSegment::open(&dir.path().join("events.raw")).unwrap();
+        let raw = segment.append(b"replacedneedle").unwrap();
+        HostIndex::shared(&path)
+            .unwrap()
+            .index("old", &metadata("a", MemoryScope::Memory, 1), &raw)
+            .unwrap();
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+        let start = opens();
+        let mut fresh = HostIndex::shared(&path).unwrap();
+        assert_eq!(opens() - start, 1);
+        let q = HistorySearchQuery {
+            query: Some("replacedneedle".into()),
+            ..Default::default()
+        };
+        assert!(
+            fresh
+                .search(&["a".into()], MemoryScope::All, &q)
+                .unwrap()
+                .is_empty()
+        );
+        fresh
+            .index("new", &metadata("a", MemoryScope::Memory, 2), &raw)
+            .unwrap();
+        drop(fresh);
+        let independent = HostIndex::open(&path).unwrap();
+        assert_eq!(
+            independent
+                .search(&["a".into()], MemoryScope::All, &q)
+                .unwrap()[0]
+                .id,
+            "new"
+        );
+        // A connection dropped inside a transaction is closed, not pooled.
+        let start = opens();
+        let borrowed = HostIndex::shared(&path).unwrap();
+        borrowed.conn.execute_batch("BEGIN").unwrap();
+        drop(borrowed);
+        let next = HostIndex::shared(&path).unwrap();
+        assert!(next.conn.is_autocommit());
+        assert_eq!(opens() - start, 1);
     }
     #[test]
     fn required_time_cache_is_invalidated_without_touching_raw_history() {

@@ -87,7 +87,7 @@ impl Store {
         if !index_path.exists() {
             return Ok(false);
         }
-        let mut index = HostIndex::open(&index_path)?;
+        let mut index = HostIndex::shared(&index_path)?;
         let Some((owner, path)) = index.verification_candidate(now_ms)? else {
             return Ok(false);
         };
@@ -152,7 +152,7 @@ impl Store {
         if !index_path.exists() {
             return Ok(None);
         }
-        let index = HostIndex::open(&index_path)?;
+        let index = HostIndex::shared(&index_path)?;
         let Some(hit) = index.document(&visible, scope, request.id)? else {
             return Ok(None);
         };
@@ -210,7 +210,7 @@ impl Store {
     /// so newly upserted, read, or
     /// deleted topics are immediately readable via `raw_id` and `search_host_files`.
     pub fn sync_agent_memory_index(&self, agent: &Agent) -> Result<(), IndexError> {
-        let mut index = HostIndex::open(&self.data_dir().join(INDEX_FILE))?;
+        let mut index = HostIndex::shared(&self.data_dir().join(INDEX_FILE))?;
         let unresolved = self.unresolved_host_paths(agent.id.as_str())?;
         self.refresh_class(
             &mut index,
@@ -260,7 +260,7 @@ impl Store {
             .map(|(id, name)| Owner { id, name })
             .collect();
         owners.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
-        let mut index = HostIndex::open(&self.data_dir().join(INDEX_FILE))?;
+        let mut index = HostIndex::shared(&self.data_dir().join(INDEX_FILE))?;
         let unresolved = self.unresolved_host_paths_of(&owners)?;
         let agents = agents_identity(self.data_dir())?;
         for owner in &owners {
