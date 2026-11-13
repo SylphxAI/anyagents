@@ -2503,15 +2503,95 @@ fn quota_of(value: &Value) -> Option<i64> {
         .pointer("/result/error")
         .or_else(|| value.get("error"))
         .and_then(Value::as_str)
-        && let Some(delay_ms) = parse_resets_in_ms(err_text)
     {
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
-        return Some(now_ms.saturating_add(delay_ms));
+        if let Some(reset_ms) = parse_resets_at_ms(err_text) {
+            return Some(reset_ms);
+        }
+        if let Some(delay_ms) = parse_resets_in_ms(err_text) {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            return Some(now_ms.saturating_add(delay_ms));
+        }
     }
     None
+}
+
+fn parse_resets_at_ms(text: &str) -> Option<i64> {
+    let lower = text.to_ascii_lowercase();
+    let idx = lower.find("resets at ")?;
+    let after = text[idx + "resets at ".len()..].trim_start();
+    let token = after
+        .split_whitespace()
+        .next()?
+        .trim_end_matches(['.', ',', ';', ')', ']', '"']);
+    parse_rfc3339_utc_ms(token)
+}
+
+fn parse_rfc3339_utc_ms(ts: &str) -> Option<i64> {
+    let (date_part, rest) = ts.split_once(['T', 't'])?;
+    let mut date_it = date_part.split('-');
+    let year: i64 = date_it.next()?.parse().ok()?;
+    let month: u32 = date_it.next()?.parse().ok()?;
+    let day: u32 = date_it.next()?.parse().ok()?;
+    if date_it.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+
+    let (time_core, offset_secs): (&str, i64) = if let Some(core) = rest.strip_suffix(['Z', 'z']) {
+        (core, 0)
+    } else {
+        let idx = rest.rfind(['+', '-'])?;
+        let (core, off) = rest.split_at(idx);
+        let sign = if off.starts_with('-') { -1 } else { 1 };
+        let mut off_it = off[1..].split(':');
+        let oh: i64 = off_it.next()?.parse().ok()?;
+        let om: i64 = off_it.next()?.parse().ok()?;
+        if off_it.next().is_some() || !(0..=23).contains(&oh) || !(0..=59).contains(&om) {
+            return None;
+        }
+        (core, sign * (oh * 3600 + om * 60))
+    };
+
+    let (hms, frac_ms) = match time_core.split_once('.') {
+        Some((hms, frac)) => {
+            if frac.is_empty() || !frac.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let padded = format!("{frac:0<3}");
+            let ms: i64 = padded[..3].parse().ok()?;
+            (hms, ms)
+        }
+        None => (time_core, 0),
+    };
+    let mut hms_it = hms.split(':');
+    let hour: i64 = hms_it.next()?.parse().ok()?;
+    let min: i64 = hms_it.next()?.parse().ok()?;
+    let sec: i64 = hms_it.next()?.parse().ok()?;
+    if hms_it.next().is_some()
+        || !(0..=23).contains(&hour)
+        || !(0..=59).contains(&min)
+        || !(0..=59).contains(&sec)
+    {
+        return None;
+    }
+
+    // Howard Hinnant days-from-civil (1970-01-01 = 0).
+    let y = year - if month <= 2 { 1 } else { 0 };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let m = i64::from(month);
+    let d = i64::from(day);
+    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+
+    let secs = days
+        .checked_mul(86_400)?
+        .checked_add(hour * 3600 + min * 60 + sec)?
+        .checked_sub(offset_secs)?;
+    secs.checked_mul(1_000)?.checked_add(frac_ms)
 }
 
 fn parse_resets_in_ms(text: &str) -> Option<i64> {

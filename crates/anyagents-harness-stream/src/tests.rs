@@ -1490,3 +1490,20 @@ fn confirmed_turn_completion_clears_marker_and_error_artifacts() {
     );
     assert!(!harness.has_unconfirmed_hold());
 }
+
+#[test]
+fn quota_of_parses_rfc3339_resets_at_timestamp() {
+    let ev = serde_json::json!({
+        "type": "result",
+        "is_error": true,
+        "error": "Sylphx AI failure Some(\"rate_limit_exceeded\"): Subscription quota exhausted. Your usage window resets at 2026-11-16T00:00:00Z."
+    });
+    assert_eq!(super::quota_of(&ev), Some(1_794_787_200_000));
+
+    let offset_ev = serde_json::json!({
+        "type": "result",
+        "is_error": true,
+        "error": "Quota exhausted; resets at 2026-11-15T19:00:00.250-05:00"
+    });
+    assert_eq!(super::quota_of(&offset_ev), Some(1_794_787_200_250));
+}
