@@ -36,7 +36,10 @@ use crate::identity::ServingIdentity;
 use crate::operator;
 use crate::vendor::{self, VendorHarness};
 
+mod memory_backlog;
 mod outbound_history;
+mod quota_rotation;
+mod reap_queue;
 
 const SOCKET_NAME: &str = "anyagents.sock";
 /// `sockaddr_un.sun_path` holds 108 bytes, including the trailing NUL.
@@ -240,6 +243,8 @@ async fn serve(
         .map_err(Error::Message)?;
     if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none() && !crate::sandbox::is_isolated_test_env()
     {
+        quota_rotation::start(Arc::clone(&store));
+        let memory_backlog = memory_backlog::start(&store);
         let reaper_root = data.to_path_buf();
         let reaper_store = Arc::clone(&store);
         let reaper_health = state.health.clone();
@@ -253,6 +258,7 @@ async fn serve(
                 let root = reaper_root.clone();
                 let store = Arc::clone(&reaper_store);
                 let health = reaper_health.clone();
+                let memory_backlog = Arc::clone(&memory_backlog);
                 let _ = tokio::task::spawn_blocking(move || {
                     // The daemon is the long-lived writer: keep the WAL bounded
                     // from here so it never grows while readers overlap.
@@ -271,7 +277,7 @@ async fn serve(
                         eprintln!("outbound history settlement remains pending: {error}");
                     }
                     reap_archived_agents(&store, &root, &health);
-                    consolidate_idle_agent_memory(&store, &root, &health);
+                    consolidate_idle_agent_memory(&store, &root, &health, &memory_backlog);
                     if run_verify
                         && let Err(error) =
                             store.verify_one_host_history_source(anyagents_core::now_ms())
@@ -279,7 +285,8 @@ async fn serve(
                         eprintln!("anyagents-host-history: deferred full verification: {error}");
                     }
                     crate::browser::reap_idle_browsers(&root);
-                    crate::create::sync_fresher_bound_agent_credentials(&root);
+                    record_live_quota_resets(&store, &root, &health);
+                    crate::create::sync_fresher_bound_agent_credentials_in(&store, &root);
                     #[cfg(unix)]
                     crate::create::sync_canonical_skills(&root);
                 })
@@ -383,28 +390,27 @@ pub(crate) fn mark_explicitly_archived_locked(
     crate::worktree_access::revoke_recorded(data_dir, &agent.id)?;
     let mut archived = vec![agent.id.clone()];
     mark_archive_generation_locked(store, data_dir, agent);
-    if let Ok(all_agents) = store.list_agents() {
-        let mut queue = std::collections::VecDeque::new();
-        queue.push_back(agent.id.clone());
-        let mut seen = std::collections::HashSet::new();
-        seen.insert(agent.id.clone());
-        while let Some(pid) = queue.pop_front() {
-            for child in all_agents
-                .iter()
-                .filter(|a| a.parent_id.as_ref() == Some(&pid))
-            {
-                if seen.insert(child.id.clone()) {
-                    queue.push_back(child.id.clone());
-                    let Ok(_child_lifecycle) = store.try_lock_agent_lifecycle(&child.id) else {
-                        continue;
-                    };
-                    let Ok(child) = store.set_agent_state(&child.id, "archived") else {
-                        continue;
-                    };
-                    crate::worktree_access::revoke_recorded(data_dir, &child.id)?;
-                    mark_archive_generation_locked(store, data_dir, &child);
-                    archived.push(child.id.clone());
-                }
+    let mut queue = std::collections::VecDeque::new();
+    queue.push_back(agent.id.clone());
+    let mut seen = std::collections::HashSet::new();
+    seen.insert(agent.id.clone());
+    while let Some(pid) = queue.pop_front() {
+        let Ok(mut children) = store.children_of(&pid) else {
+            continue;
+        };
+        children.sort_by(|a, b| a.name.cmp(&b.name));
+        for child in &children {
+            if seen.insert(child.id.clone()) {
+                queue.push_back(child.id.clone());
+                let Ok(_child_lifecycle) = store.try_lock_agent_lifecycle(&child.id) else {
+                    continue;
+                };
+                let Ok(child) = store.set_agent_state(&child.id, "archived") else {
+                    continue;
+                };
+                crate::worktree_access::revoke_recorded(data_dir, &child.id)?;
+                mark_archive_generation_locked(store, data_dir, &child);
+                archived.push(child.id.clone());
             }
         }
     }
@@ -425,6 +431,9 @@ fn mark_archive_generation_locked(store: &Store, data_dir: &Path, agent: &Agent)
     ) {
         eprintln!("cannot persist {}: {err}", archived_marker.display());
     }
+    if agent.parent_id.is_some() {
+        reap_queue::enqueue(data_dir, &agent.id);
+    }
     if let Ok(schedules) = store.list_schedules(Some(&agent.id), true) {
         for sched in schedules {
             let _ = store.cancel_schedule(Some(&agent.id), &sched.id);
@@ -440,11 +449,13 @@ pub(crate) fn reap_archived_agent_locked(
     data_dir: &Path,
     agent_id: &anyagents_core::AgentId,
 ) {
-    let Ok(agent) = store.agent(agent_id) else {
-        return;
+    let agent = match store.agent(agent_id) {
+        Ok(agent) => agent,
+        Err(Error::AgentNotFound(_)) => return reap_queue::dequeue(data_dir, agent_id),
+        Err(_) => return reap_queue::note_failure(data_dir, agent_id, now_ms()),
     };
     if agent.state != "archived" || agent.parent_id.is_none() {
-        return;
+        return reap_queue::dequeue(data_dir, agent_id);
     }
     let cfg = anyagents_core::agent_config_dir(data_dir, agent_id);
     let archived = cfg.join(".anyagents-archived");
@@ -455,66 +466,71 @@ pub(crate) fn reap_archived_agent_locked(
         // Upgrade legacy or interrupted empty archive markers under the wake lock.
         mark_archive_generation_locked(store, data_dir, &agent);
     }
-    let Ok(generation) = std::fs::read(&archived) else {
-        return;
-    };
+    let generation = std::fs::read(&archived).unwrap_or_default();
     if generation.is_empty() {
-        return;
+        return reap_queue::note_failure(data_dir, agent_id, now_ms());
     }
     let reaped = cfg.join(".anyagents-reaped");
     if std::fs::read(&reaped).is_ok_and(|done| done == generation) {
-        return;
+        return reap_queue::dequeue(data_dir, agent_id);
     }
-    if reap_subagent_ephemeral_dirs(data_dir, agent_id)
-        && let Err(err) = anyagents_harness::atomic_write_nonempty_file(&reaped, &generation, 0o644)
-    {
-        eprintln!("cannot persist {}: {err}", reaped.display());
+    if !reap_subagent_ephemeral_dirs_in(store, data_dir, agent_id) {
+        return reap_queue::note_failure(data_dir, agent_id, now_ms());
+    }
+    match anyagents_harness::atomic_write_nonempty_file(&reaped, &generation, 0o644) {
+        Ok(()) => reap_queue::dequeue(data_dir, agent_id),
+        Err(err) => {
+            eprintln!("cannot persist {}: {err}", reaped.display());
+            reap_queue::note_failure(data_dir, agent_id, now_ms());
+        }
     }
 }
 
 /// The maintenance worker runs this at startup and each minute without waiting
-/// for an agent lock.
+/// for an agent lock. It visits only archives whose cleanup is owed and due.
 fn reap_archived_agents(store: &Store, data_dir: &Path, health: &HealthBoard) {
-    let Ok(agents) = store.list_agents() else {
-        return;
-    };
-    let large_pop = agents.len() > 32 && std::env::var_os("ANYAGENTS_TESTS").is_none();
-    for agent in agents {
-        if agent.state != "archived" || agent.parent_id.is_none() {
-            continue;
-        }
-        if large_pop {
-            let cfg = anyagents_core::agent_config_dir(data_dir, &agent.id);
-            if cfg.join(".anyagents-reaped").is_file() {
-                continue;
-            }
-        }
-        let Ok(_lifecycle) = store.try_lock_agent_lifecycle(&agent.id) else {
+    reap_archived_agents_at(store, data_dir, health, now_ms());
+}
+
+fn reap_archived_agents_at(store: &Store, data_dir: &Path, health: &HealthBoard, now: i64) {
+    reap_queue::backfill(store, data_dir);
+    for agent_id in reap_queue::due(data_dir, now) {
+        let Ok(_lifecycle) = store.try_lock_agent_lifecycle(&agent_id) else {
             continue;
         };
-        // A wake followed by a new self-archive may have started a process since
-        // the population read. Check current health only after taking the lock.
-        if health.get(&agent.id).is_some_and(|live| live.process_alive) {
+        // A wake followed by a new self-archive may have started a process
+        // since the archive. Check current health only after taking the lock.
+        if health.get(&agent_id).is_some_and(|live| live.process_alive) {
             continue;
         }
-        // Re-read under the lock: this population may predate a direct wake.
-        reap_archived_agent_locked(store, data_dir, &agent.id);
+        // Re-read under the lock: the queue may predate a direct wake.
+        reap_archived_agent_locked(store, data_dir, &agent_id);
     }
 }
 
 /// Consolidate idle agents' topic files without changing the active session's
 /// immutable snapshot. Updated files are pinned only at the next explicit session.
-fn consolidate_idle_agent_memory(store: &Store, data_dir: &Path, health: &HealthBoard) {
-    let Ok(agents) = store.list_live_agents() else {
-        return;
-    };
+/// Only agents in the backlog are visited; one leaves once its consolidation
+/// has caught up with its mailbox.
+fn consolidate_idle_agent_memory(
+    store: &Store,
+    data_dir: &Path,
+    health: &HealthBoard,
+    backlog: &memory_backlog::MemoryBacklog,
+) {
     let mut llm_consolidated_count = 0usize;
-    for agent in agents {
-        if agent.state == "archived" {
-            continue;
-        }
+    for agent_id in backlog.pending() {
+        let agent = match store.agent(&agent_id) {
+            Ok(agent) if agent.state != "archived" => agent,
+            Err(err) if !matches!(err, Error::AgentNotFound(_)) => continue,
+            _ => {
+                backlog.settle(&agent_id);
+                continue;
+            }
+        };
         let agent_root = data_dir.join("agents").join(agent.id.as_str());
         if !agent_root.join("memory").is_dir() {
+            backlog.settle(&agent_id);
             continue;
         }
         let Ok(_lifecycle) = store.try_lock_agent_lifecycle(&agent.id) else {
@@ -527,10 +543,28 @@ fn consolidate_idle_agent_memory(store: &Store, data_dir: &Path, health: &Health
             continue;
         }
         let allow_llm = llm_consolidated_count < 1;
-        if let Ok((_, true)) =
-            store.consolidate_agent_sleep_memory_with_options(&agent.id, allow_llm)
-        {
+        let consolidated = store.consolidate_agent_sleep_memory_with_options(&agent.id, allow_llm);
+        if let Ok((_, true)) = consolidated {
             llm_consolidated_count += 1;
+        }
+        if consolidated.is_ok() && store.sleep_memory_caught_up(&agent.id).unwrap_or(false) {
+            backlog.settle(&agent_id);
+        }
+    }
+}
+
+/// Record the reset of each profile whose live agent the supervisor reports
+/// quota-held, so profile listings and rotation see it. The board is in memory:
+/// a fleet with no quota hold costs one indexed read.
+fn record_live_quota_resets(store: &Store, data_dir: &Path, health: &HealthBoard) {
+    let now = now_ms();
+    for agent in store.list_live_agents().unwrap_or_default() {
+        if let Some(reset_ms) = health
+            .get(&agent.id)
+            .and_then(|live| live.quota_reset_at_ms)
+            .filter(|&reset_ms| reset_ms > now)
+        {
+            create::record_profile_quota_reset(data_dir, &agent, reset_ms);
         }
     }
 }
@@ -539,6 +573,7 @@ pub(crate) fn clear_explicitly_archived(data_dir: &Path, agent_id: &anyagents_co
     let cfg = anyagents_core::agent_config_dir(data_dir, agent_id);
     let _ = std::fs::remove_file(cfg.join(".anyagents-reaped"));
     let _ = std::fs::remove_file(cfg.join(".anyagents-archived"));
+    reap_queue::dequeue(data_dir, agent_id);
 }
 
 /// Both intervals tick immediately at startup. Each loop owns its blocking
@@ -2354,6 +2389,16 @@ fn is_self_or_ancestor(
     false
 }
 
+/// An unrestricted reader's scope: every agent, archived ones included.
+fn every_agent_id(store: &Store) -> Result<Vec<String>, ApiError> {
+    Ok(store
+        .agent_ids()
+        .map_err(ApiError::from_store)?
+        .iter()
+        .map(ToString::to_string)
+        .collect())
+}
+
 /// Resolve the caller's conversation visibility once, before selecting a
 /// recent or Raw-RAG read path. Non-admin agents see only themselves and their
 /// descendants; `all` is an alias for exactly that set. Administrative reads
@@ -2390,27 +2435,15 @@ fn conversation_visibility(
                 return Ok((requested.to_string(), None));
             }
 
-            let agents = store.list_agents().map_err(ApiError::from_store)?;
-            let mut visible_ids = std::collections::HashSet::from([caller.id.clone()]);
-            let mut changed = true;
-            while changed {
-                changed = false;
-                for agent in &agents {
-                    if let Some(parent) = &agent.parent_id
-                        && visible_ids.contains(parent)
-                        && visible_ids.insert(agent.id.clone())
-                    {
-                        changed = true;
-                    }
-                }
-            }
-            let visible_agent_ids: Vec<String> =
-                visible_ids.iter().map(ToString::to_string).collect();
-
             if requested.eq_ignore_ascii_case("self") {
                 return Ok((caller.name, Some(vec![caller.id.to_string()])));
             }
+            let mut visible_ids = store
+                .descendant_ids(&caller.id)
+                .map_err(ApiError::from_store)?;
+            visible_ids.insert(caller.id.clone());
             if requested.eq_ignore_ascii_case("all") || requested == "*" {
+                let visible_agent_ids = visible_ids.iter().map(ToString::to_string).collect();
                 return Ok(("all".to_string(), Some(visible_agent_ids)));
             }
 
@@ -2763,6 +2796,16 @@ async fn list_agents(
 }
 
 fn compute_caller_relationship(store: &Store, caller: &Agent, target: &Agent) -> String {
+    relationship_with(caller, target, |ancestor, agent| {
+        is_self_or_ancestor(store, ancestor, agent)
+    })
+}
+
+fn relationship_with(
+    caller: &Agent,
+    target: &Agent,
+    is_self_or_ancestor: impl Fn(&anyagents_core::AgentId, &Agent) -> bool,
+) -> String {
     if caller.id == target.id {
         "self".to_string()
     } else if caller.parent_id.as_ref() == Some(&target.id) {
@@ -2771,14 +2814,87 @@ fn compute_caller_relationship(store: &Store, caller: &Agent, target: &Agent) ->
         "child".to_string()
     } else if caller.parent_id.is_some() && caller.parent_id == target.parent_id {
         "sibling".to_string()
-    } else if is_self_or_ancestor(store, &target.id, caller) {
+    } else if is_self_or_ancestor(&target.id, caller) {
         "ancestor".to_string()
-    } else if is_self_or_ancestor(store, &caller.id, target) {
+    } else if is_self_or_ancestor(&caller.id, target) {
         "descendant".to_string()
     } else if caller.parent_id.is_none() && target.parent_id.is_none() {
         "peer".to_string()
     } else {
         "other".to_string()
+    }
+}
+
+/// An agent caller's view of one roster, read once per request instead of
+/// once per listed agent. Every check is the predicate the single-agent routes
+/// use; only where the rows come from differs.
+struct RosterCaller<'a> {
+    store: &'a Store,
+    caller: &'a Agent,
+    /// The roster rows, so an ancestor walk reads the store only for a parent
+    /// outside the roster.
+    rows: HashMap<&'a str, &'a Agent>,
+    /// Agents that share a group or Telegram chat with the caller.
+    sharing: HashSet<anyagents_core::AgentId>,
+}
+
+impl<'a> RosterCaller<'a> {
+    fn new(store: &'a Store, caller: &'a Agent, roster: &'a [Agent]) -> Self {
+        Self {
+            store,
+            caller,
+            rows: roster.iter().map(|a| (a.id.as_str(), a)).collect(),
+            sharing: store.agents_sharing_group_or_chat(&caller.id),
+        }
+    }
+
+    /// [`is_self_or_ancestor`] over the roster rows.
+    fn is_self_or_ancestor(&self, ancestor: &anyagents_core::AgentId, target: &Agent) -> bool {
+        if ancestor == &target.id {
+            return true;
+        }
+        let mut cursor = target.parent_id.clone();
+        let mut depth = 0usize;
+        while let Some(pid) = cursor {
+            if &pid == ancestor {
+                return true;
+            }
+            cursor = match self.rows.get(pid.as_str()) {
+                Some(parent) => parent.parent_id.clone(),
+                None => self.store.agent(&pid).ok().and_then(|a| a.parent_id),
+            };
+            depth += 1;
+            if depth > 16 {
+                break;
+            }
+        }
+        false
+    }
+
+    /// The isolated-scope rule of [`get_agent`].
+    fn sees(&self, agent: &Agent) -> bool {
+        !(self.caller.is_isolated()
+            && !self.is_self_or_ancestor(&self.caller.id, agent)
+            && self.caller.parent_id.as_ref() != Some(&agent.id)
+            && !self.sharing.contains(&agent.id))
+    }
+
+    fn annotate(&self, view: &mut AgentView, agent: &Agent) {
+        view.relationship = Some(relationship_with(self.caller, agent, |ancestor, target| {
+            self.is_self_or_ancestor(ancestor, target)
+        }));
+        view.can_message = Some(
+            can_sender_message_agent_with(self.store, self.caller, agent, || {
+                self.sharing.contains(&agent.id)
+            })
+            .is_ok(),
+        );
+        // [`can_actor_read_agent_private`] for this caller.
+        let reads_private = self.is_self_or_ancestor(&self.caller.id, agent)
+            || (self.caller.is_admin && self.caller.parent_id.is_none());
+        if !reads_private {
+            view.instructions = None;
+        }
     }
 }
 
@@ -2798,43 +2914,26 @@ fn list_agents_sync_for_principal(
     };
     // Only the selected state and its ancestors are read; the archive is
     // counted by index instead of being deserialized row by row.
-    let (all_agents, archived_count) = state
+    let (roster, archived_count) = state
         .store
         .roster_agents(query.state.as_deref())
         .map_err(ApiError::from_store)?;
-    let all_agents: Vec<_> = all_agents
-        .into_iter()
-        .filter(|agent| {
-            !caller_agent.as_ref().is_some_and(|caller| {
-                caller.is_isolated()
-                    && !is_self_or_ancestor(&state.store, &caller.id, agent)
-                    && caller.parent_id.as_ref() != Some(&agent.id)
-                    && !state.store.share_any_group_or_chat(&caller.id, &agent.id)
-            })
-        })
+    let caller = caller_agent
+        .as_ref()
+        .map(|caller| RosterCaller::new(&state.store, caller, &roster));
+    let visible: Vec<&Agent> = roster
+        .iter()
+        .filter(|agent| caller.as_ref().is_none_or(|caller| caller.sees(agent)))
         .collect();
-    let mut listed = roster_views(
-        &state.store,
-        &state.health,
-        all_agents,
-        archived_count,
-        query,
-    )?;
-    for view in &mut listed.agents {
-        let Some(ref caller) = caller_agent else {
-            continue;
-        };
-        let agent = state
-            .store
-            .agent_by_name(&view.id)
-            .map_err(ApiError::from_store)?;
-        view.relationship = Some(compute_caller_relationship(&state.store, caller, &agent));
-        view.can_message = Some(
-            can_actor_message_agent(&state.store, &Actor::Agent(caller.name.clone()), &agent)
-                .is_ok(),
-        );
-        if !can_actor_read_agent_private(&state.store, principal, &agent) {
-            view.instructions = None;
+    let mut listed = roster_views(&state.store, &state.health, &visible, archived_count, query)?;
+    if let Some(caller) = &caller {
+        let by_id: HashMap<&str, &Agent> = visible.iter().map(|a| (a.id.as_str(), *a)).collect();
+        for view in &mut listed.agents {
+            let agent = by_id
+                .get(view.id.as_str())
+                .copied()
+                .expect("every view comes from a visible row");
+            caller.annotate(view, agent);
         }
     }
     Ok(Json(listed))
@@ -2844,7 +2943,7 @@ fn list_agents_sync_for_principal(
 pub(crate) fn roster_views(
     store: &Store,
     health: &HealthBoard,
-    all_agents: Vec<Agent>,
+    all_agents: &[&Agent],
     archived_count: usize,
     query: &ListAgentsQuery,
 ) -> Result<AgentsResponse, ApiError> {
@@ -2859,7 +2958,7 @@ pub(crate) fn roster_views(
             "invalid agent state",
         ));
     }
-    let by_id: HashMap<_, _> = all_agents.iter().map(|a| (a.id.as_str(), a)).collect();
+    let by_id: HashMap<_, _> = all_agents.iter().map(|a| (a.id.as_str(), *a)).collect();
     let selected_name = query
         .name
         .as_deref()
@@ -2874,7 +2973,7 @@ pub(crate) fn roster_views(
         .transpose()
         .map_err(ApiError::from_store)?;
     let mut selected = HashSet::new();
-    for agent in &all_agents {
+    for agent in all_agents {
         let state_matches = match query.state.as_deref() {
             Some("all") => true,
             Some(state) => agent.state == state,
@@ -2918,7 +3017,7 @@ pub(crate) fn roster_views(
     let mut metadata = store.agent_query_metadata().map_err(ApiError::from_store)?;
     let seats = crate::sandbox::roster_seats();
     let mut agents = Vec::with_capacity(selected.len());
-    for agent in &all_agents {
+    for agent in all_agents {
         if !selected.contains(agent.id.as_str()) {
             continue;
         }
@@ -2960,6 +3059,59 @@ pub(crate) fn compute_block_reason(
         return Some("delivery_error".to_string());
     }
     None
+}
+
+/// A millisecond timestamp an operator or rotation marker holds; 0 when absent.
+fn read_ms_marker(path: &Path) -> i64 {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .unwrap_or(0)
+}
+
+/// The quota reset and fault text an adapter or the launcher last persisted in
+/// `.anyagents-last-error.json`. A record from before the last profile rotation
+/// (for AGY, also before the last quota clear) is stale, and an expired reset
+/// clears its record. Claude Code persists no reset, so only its text counts.
+fn persisted_fault(
+    harness: &str,
+    cfg: &Path,
+    rotated_ms: i64,
+    now: i64,
+) -> (Option<i64>, Option<String>) {
+    let Some(record) = std::fs::read_to_string(cfg.join(".anyagents-last-error.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+    else {
+        return (None, None);
+    };
+    let floor = if harness == "agy" {
+        rotated_ms.max(read_ms_marker(&cfg.join(".anyagents-quota-cleared-ms")))
+    } else {
+        rotated_ms
+    };
+    let recorded_at = record
+        .get("timestamp_ms")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    if recorded_at <= floor {
+        return (None, None);
+    }
+    let error = record
+        .get("error")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    if harness == "claude-code" {
+        return (None, error);
+    }
+    match record
+        .get("quota_reset_at_ms")
+        .and_then(serde_json::Value::as_i64)
+    {
+        Some(reset_ms) if reset_ms > now => (Some(reset_ms), error),
+        Some(_) => (None, None),
+        None => (None, error),
+    }
 }
 
 fn archived_agent_view_fast(agent: &Agent) -> AgentView {
@@ -3051,41 +3203,22 @@ fn agent_view_preloaded(
             .map_err(ApiError::from_store)?
     };
     let cfg = anyagents_core::agent_config_dir(store.data_dir(), &agent.id);
-    let rotated_ms = std::fs::read_to_string(cfg.join(".anyagents-profile-rotated-ms"))
-        .ok()
-        .and_then(|s| s.trim().parse::<i64>().ok())
-        .unwrap_or(0);
-    let (session_quota, mut session_error) = if agent.state == "archived" {
-        (None, None)
-    } else if agent.harness == "claude-code" {
-        let persisted_err = crate::vendor::read_persisted_last_error(&cfg).and_then(|(e, _)| e);
-        (
-            anyagents_harness_claude::detect_session_quota_reset_ms(&cfg, now),
-            persisted_err,
-        )
-    } else if agent.harness == "agy" {
-        anyagents_harness_agy::detect_agy_session_quota_and_error(&cfg, now)
-    } else {
-        match crate::vendor::read_persisted_last_error(&cfg) {
-            Some((err, Some(reset_ms))) if reset_ms > now => (Some(reset_ms), err),
-            Some((err, None)) => (None, err),
-            _ => (None, None),
-        }
-    };
-    if agent.state != "archived" && session_error.is_none() && agent.harness == "codex" {
-        session_error = crate::vendor::detect_codex_session_turn_error(&cfg, rotated_ms);
-    }
+    let rotated_ms = read_ms_marker(&cfg.join(".anyagents-profile-rotated-ms"));
+    // The supervisor's board is the live state; a fault outlives its process
+    // only as the record an adapter persisted. A view never reads a vendor
+    // transcript, log or session store.
+    let (session_quota, session_error) = persisted_fault(&agent.harness, &cfg, rotated_ms, now);
     let (
         process,
         mut turn_state,
         mode,
         steer,
-        mut quota,
+        quota,
         live_harness,
         live_model,
         process_started_at_ms,
         pending_switch,
-        mut last_error,
+        last_error,
     ) = match health.get(&agent.id) {
         Some(live) if !crate::vendor::is_spiron_harness(&agent.harness) || live.process_alive => {
             let effective_quota = live.quota_reset_at_ms.or(session_quota);
@@ -3154,11 +3287,7 @@ fn agent_view_preloaded(
         }
     };
     if let Some(reset_ms) = quota.filter(|&ms| ms > now) {
-        create::record_profile_quota_reset(store.data_dir(), agent, reset_ms);
-        if create::try_rotate_exhausted_profile(store, store.data_dir(), agent, true).is_some() {
-            quota = None;
-            last_error = None;
-        }
+        quota_rotation::queue(&agent.id, reset_ms);
     }
     if (agent.state == "running" || agent.state == "idle") && quota.is_none_or(|ms| ms <= now) {
         if let Some(ref err_msg) = last_error {
@@ -3575,6 +3704,7 @@ async fn archive_agent_route(
     .await
 }
 
+#[cfg(test)]
 pub(crate) fn reap_subagent_ephemeral_dirs(
     data_dir: &Path,
     agent_id: &anyagents_core::AgentId,
@@ -3582,13 +3712,33 @@ pub(crate) fn reap_subagent_ephemeral_dirs(
     let Ok(store) = Store::open(data_dir.join("state.db")) else {
         return false;
     };
-    let Ok(agents) = store.list_agents() else {
-        return false;
-    };
+    reap_subagent_ephemeral_dirs_in(&store, data_dir, agent_id)
+}
+
+fn reap_subagent_ephemeral_dirs_in(
+    store: &Store,
+    data_dir: &Path,
+    agent_id: &anyagents_core::AgentId,
+) -> bool {
     // Delete calls this after removing the row; all surviving references still
     // protect their workdirs. A failed read must never mean no shared workdirs.
-    let agent = agents.iter().find(|agent| &agent.id == agent_id);
-    let parent_id = agent.and_then(|agent| agent.parent_id.as_ref());
+    let agent = match store.agent(agent_id) {
+        Ok(agent) => Some(agent),
+        Err(Error::AgentNotFound(_)) => None,
+        Err(_) => return false,
+    };
+    let parent = match agent.as_ref().and_then(|agent| agent.parent_id.as_ref()) {
+        Some(parent_id) => match store.agent(parent_id) {
+            Ok(parent) => Some(parent),
+            Err(Error::AgentNotFound(_)) => None,
+            Err(_) => return false,
+        },
+        None => None,
+    };
+    let Ok(unarchived) = store.unarchived_workdirs() else {
+        return false;
+    };
+    let agent = agent.as_ref();
     let mut complete = true;
     let agent_root = data_dir.join("agents").join(agent_id.as_str());
     let config_dir = agent_root.join("config");
@@ -3661,16 +3811,24 @@ pub(crate) fn reap_subagent_ephemeral_dirs(
     if let Some(agent) = agent {
         let _ = crate::browser::stop_profile(data_dir, &agent.name);
     }
-    for other in &agents {
-        let keep_protected =
-            &other.id != agent_id && (other.state != "archived" || parent_id == Some(&other.id));
-        if keep_protected && let Some(wd) = &other.workdir {
-            let wd_path = PathBuf::from(&wd);
-            if let Ok(abs) = std::path::absolute(&wd_path) {
-                shared_workdirs.insert(abs);
-            }
-            shared_workdirs.insert(wd_path);
+    // Every other agent that is not archived, and the parent even when it is,
+    // keeps its workdir.
+    let protected = unarchived
+        .iter()
+        .filter(|(id, _)| id != agent_id)
+        .map(|(_, workdir)| workdir.as_str())
+        .chain(
+            parent
+                .as_ref()
+                .filter(|parent| &parent.id != agent_id)
+                .and_then(|parent| parent.workdir.as_deref()),
+        );
+    for wd in protected {
+        let wd_path = PathBuf::from(wd);
+        if let Ok(abs) = std::path::absolute(&wd_path) {
+            shared_workdirs.insert(abs);
         }
+        shared_workdirs.insert(wd_path);
     }
     let marker_path = config_dir.join(".anyagents-managed-worktree.json");
     let marker_val = std::fs::read_to_string(&marker_path)
@@ -4118,7 +4276,7 @@ async fn delete_agent_route(
                 .join(&deleted.name),
             seat_ids,
         );
-        reap_subagent_ephemeral_dirs(state.store.data_dir(), &deleted.id);
+        reap_subagent_ephemeral_dirs_in(&state.store, state.store.data_dir(), &deleted.id);
         for private_tree in ["config", "memory", "skills"] {
             let tree_path = agent_dir.join(private_tree);
             remove_path_with_seat(&tree_path, seat_ids);
@@ -4209,6 +4367,12 @@ fn prepare_agent_wake(store: &Store, found: &Agent) -> Result<(), ApiError> {
     crate::worktree_access::restore_recorded(store.data_dir(), &found.id)
         .map_err(ApiError::from_store)?;
     clear_explicitly_archived(store.data_dir(), &found.id);
+    // The gateway starts with routes for the live fleet only.
+    if found.state == "archived"
+        && let Err(err) = crate::gateway::add_route(store.data_dir(), found)
+    {
+        eprintln!("agent {}: gateway route not restored: {err}", found.id);
+    }
     Ok(())
 }
 
@@ -4679,6 +4843,7 @@ async fn conversation_route(
                 .store
                 .lock_agent_lifecycle(&target.id)
                 .map_err(ApiError::from_store)?;
+            memory_backlog::mark(&target.id);
             let agent_root = state
                 .store
                 .data_dir()
@@ -4798,13 +4963,7 @@ async fn conversation_route(
             }
             let authorized = match visible_agent_ids.as_ref() {
                 Some(ids) => ids.clone(),
-                None => state
-                    .store
-                    .list_agents()
-                    .map_err(ApiError::from_store)?
-                    .into_iter()
-                    .map(|a| a.id.to_string())
-                    .collect(),
+                None => every_agent_id(&state.store)?,
             };
             let (hit, bytes) = state
                 .store
@@ -4939,13 +5098,7 @@ async fn conversation_route(
         };
         let authorized = match visible_agent_ids.as_ref() {
             Some(ids) => ids.clone(),
-            None => state
-                .store
-                .list_agents()
-                .map_err(ApiError::from_store)?
-                .into_iter()
-                .map(|a| a.id.to_string())
-                .collect(),
+            None => every_agent_id(&state.store)?,
         };
         let should_search_host_files = has_structured_search
             || query.scope != anyagents_core::host_index::MemoryScope::All
@@ -6021,6 +6174,19 @@ fn can_sender_message_agent(
     sender: &Agent,
     recipient: &Agent,
 ) -> Result<(), ApiError> {
+    can_sender_message_agent_with(store, sender, recipient, || {
+        store.share_any_group_or_chat(&sender.id, &recipient.id)
+    })
+}
+
+/// [`can_sender_message_agent`] with the group-or-chat share answered by the
+/// caller, so a roster can answer it once for every recipient.
+fn can_sender_message_agent_with(
+    store: &Store,
+    sender: &Agent,
+    recipient: &Agent,
+    share_group_or_chat: impl FnOnce() -> bool,
+) -> Result<(), ApiError> {
     if sender.id == recipient.id
         || recipient.parent_id.as_ref() == Some(&sender.id)
         || sender.parent_id.as_ref() == Some(&recipient.id)
@@ -6038,9 +6204,7 @@ fn can_sender_message_agent(
             sender.name, recipient.name
         )));
     }
-    if store.share_any_group_or_chat(&sender.id, &recipient.id)
-        || store.has_messaged(recipient, sender)
-    {
+    if share_group_or_chat() || store.has_messaged(recipient, sender) {
         return Ok(());
     }
     let same_parent_siblings = sender.parent_id.is_some()
@@ -6499,12 +6663,16 @@ fn room_skipped(store: &Store, body: &SendRequest, room: &str) -> Vec<crate::api
         Ok(Some(members)) => members,
         _ => return Vec::new(),
     };
-    store
-        .list_agents()
-        .unwrap_or_default()
-        .into_iter()
+    // One row per member name, in name order.
+    let members: std::collections::BTreeMap<_, _> = members
+        .iter()
+        .filter_map(|member| store.agent_by_name(member).ok())
+        .filter(|agent| members.contains(&agent.name))
+        .map(|agent| (agent.name.clone(), agent))
+        .collect();
+    members
+        .into_values()
         .filter(|agent| !body_author_is(body, agent))
-        .filter(|agent| members.iter().any(|m| m == &agent.name))
         .filter(|agent| agent.state != "running" && agent.state != "idle")
         .map(|agent| crate::api::SkippedDelivery {
             to: format!("agent:{}", agent.name),
@@ -6941,6 +7109,53 @@ pub fn owner_workdir() -> Option<std::path::PathBuf> {
 #[cfg(test)]
 pub(crate) mod tests {
     #[test]
+    fn memory_backlog_follows_wakes_and_idle_consolidation_visits_nothing() {
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(anyagents_core::NewAgent::new("sleeper", "codex"))
+            .unwrap();
+        let root = dir.path().join("agents").join(agent.id.as_str());
+        let sleep_state = root.join("memory/.sleep-state.json");
+        let write_topic = |topic: &str| {
+            anyagents_core::learned_memory::upsert_memory_topic(
+                &root,
+                "sleeper",
+                None,
+                topic,
+                Some("fact"),
+                "learned",
+                anyagents_core::now_ms(),
+            )
+            .unwrap();
+        };
+        write_topic("first");
+        let backlog = memory_backlog::start(&store);
+        assert_eq!(backlog.pending(), std::slice::from_ref(&agent.id));
+        consolidate_idle_agent_memory(&store, dir.path(), &HealthBoard::default(), &backlog);
+        assert!(sleep_state.exists());
+        assert!(backlog.pending().is_empty());
+
+        // Nothing woke the agent, so a pass does not look at it.
+        write_topic("second");
+        std::fs::remove_file(&sleep_state).unwrap();
+        consolidate_idle_agent_memory(&store, dir.path(), &HealthBoard::default(), &backlog);
+        assert!(!sleep_state.exists(), "idle agent was visited");
+
+        store
+            .receive(&agent.id, anyagents_core::Incoming::new("new work"))
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while backlog.pending().is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(backlog.pending(), std::slice::from_ref(&agent.id));
+        consolidate_idle_agent_memory(&store, dir.path(), &HealthBoard::default(), &backlog);
+        assert!(sleep_state.exists(), "woken agent was not consolidated");
+        assert!(backlog.pending().is_empty());
+    }
+
+    #[test]
     fn idle_memory_consolidation_preserves_selected_and_disabled_session_pins() {
         let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
@@ -6970,7 +7185,10 @@ pub(crate) mod tests {
             )
             .unwrap();
             std::fs::write(root.join("selected.md"), "changed selected").unwrap();
-            consolidate_idle_agent_memory(&store, dir.path(), &HealthBoard::default());
+            let backlog = memory_backlog::MemoryBacklog::default();
+            backlog.mark(&agent.id);
+            consolidate_idle_agent_memory(&store, dir.path(), &HealthBoard::default(), &backlog);
+            assert!(backlog.pending().is_empty(), "caught-up agent stays queued");
             assert_eq!(
                 anyagents_core::host_session::active(&root).unwrap(),
                 Some(pinned.clone())
@@ -7135,7 +7353,7 @@ pub(crate) mod tests {
             let views = roster_views(
                 &store,
                 &health,
-                agents,
+                &agents.iter().collect::<Vec<_>>(),
                 archived,
                 &ListAgentsQuery::default(),
             )
@@ -7171,7 +7389,149 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn agent_views_only_read_agy_logs_for_the_agy_harness() {
+    fn roster_authorization_matches_the_single_agent_checks() {
+        let dir = crate::test_tempdir();
+        let state = archetype_validation_state(dir.path());
+        let store = &state.store;
+        let make = |name: &str, parent: Option<&Agent>, scope: Option<&str>| {
+            let mut new = anyagents_core::NewAgent::new(name, "codex");
+            new.parent_id = parent.map(|p| p.id.clone());
+            new.instructions = Some(format!("{name} private instructions"));
+            let agent = store.create_agent(new).unwrap();
+            match scope {
+                Some(scope) => store.set_agent_scope(&agent.id, scope).unwrap(),
+                None => agent,
+            }
+        };
+        let root = make("root", None, None);
+        let admin = make("admin", None, None);
+        store.set_agent_admin(&admin.id, true).unwrap();
+        let peer = make("peer", None, None);
+        let lead = make("lead", Some(&root), Some("siblings"));
+        let sib = make("sib", Some(&root), Some("siblings"));
+        let worker = make("worker", Some(&lead), None);
+        let iso = make("iso", Some(&root), Some("isolated"));
+        let iso_child = make("iso-child", Some(&iso), None);
+        let public = make("public", Some(&peer), Some("public"));
+        let private = make("private", Some(&peer), None);
+        let gone = make("gone", Some(&lead), None);
+        store.set_agent_state(&gone.id, "archived").unwrap();
+        store.join_group("team", &iso.id).unwrap();
+        store.join_group("team", &private.id).unwrap();
+        store
+            .record_outbound(&private.id, "agent:worker", None, "hello")
+            .unwrap();
+        let callers = [
+            &root, &admin, &peer, &lead, &sib, &worker, &iso, &iso_child, &public, &private,
+        ];
+        for caller in callers {
+            let caller = store.agent(&caller.id).unwrap();
+            let principal = Principal::Agent {
+                agent_id: caller.id.clone(),
+                name: caller.name.clone(),
+            };
+            for filter in [None, Some("all"), Some("archived")] {
+                let query = ListAgentsQuery {
+                    state: filter.map(str::to_string),
+                    ..Default::default()
+                };
+                let Json(listed) =
+                    list_agents_sync_for_principal(&state, &principal, &query).unwrap();
+                // The isolated-scope rule, checked row by row against the store.
+                let (roster, archived) = store.roster_agents(filter).unwrap();
+                let visible: Vec<&Agent> = roster
+                    .iter()
+                    .filter(|agent| {
+                        !(caller.is_isolated()
+                            && !is_self_or_ancestor(store, &caller.id, agent)
+                            && caller.parent_id.as_ref() != Some(&agent.id)
+                            && !store.share_any_group_or_chat(&caller.id, &agent.id))
+                    })
+                    .collect();
+                let expected =
+                    roster_views(store, &state.health, &visible, archived, &query).unwrap();
+                let ids = |views: &[AgentView]| -> Vec<String> {
+                    views.iter().map(|view| view.id.clone()).collect()
+                };
+                assert_eq!(
+                    ids(&listed.agents),
+                    ids(&expected.agents),
+                    "{}",
+                    caller.name
+                );
+                for view in &listed.agents {
+                    let target = store.agent_by_name(&view.id).unwrap();
+                    let context = format!("{} -> {}", caller.name, target.name);
+                    assert_eq!(
+                        view.relationship,
+                        Some(compute_caller_relationship(store, &caller, &target)),
+                        "{context}"
+                    );
+                    assert_eq!(
+                        view.can_message,
+                        Some(
+                            can_actor_message_agent(
+                                store,
+                                &Actor::Agent(caller.name.clone()),
+                                &target
+                            )
+                            .is_ok()
+                        ),
+                        "{context}"
+                    );
+                    assert_eq!(
+                        view.instructions.is_some(),
+                        can_actor_read_agent_private(store, &principal, &target),
+                        "{context}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Vendor history each harness leaves behind that the view once scanned:
+    /// a Claude Code session ending in a rate-limit rejection, an AGY CLI log
+    /// ending in an error, and Codex rollouts ending in a 401 turn fault.
+    fn write_vendor_history(cfg: &Path) {
+        let reset_s = now_ms() / 1000 + 3600;
+        let projects = cfg.join("projects/-work");
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::write(
+            projects.join("session.jsonl"),
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "type": "assistant",
+                    "apiError": "usage_limit_reached",
+                    "quotaLimits": {"status": "rejected", "resetsAt": reset_s},
+                    "error": "rate_limit",
+                    "apiErrorStatus": 429
+                })
+            ),
+        )
+        .unwrap();
+        let logs = cfg.join(".gemini/antigravity-cli/log");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(
+            logs.join("cli-previous-session.log"),
+            "run ended with error and no response: previous agy session failed\n",
+        )
+        .unwrap();
+        let sessions = cfg.join("sessions/2026/11/13");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let fault = serde_json::json!({
+            "type": "event_msg",
+            "payload": {"type": "task_complete", "error": {"message": "unauthorized (401)"}}
+        });
+        std::fs::write(
+            sessions.join("rollout-2026-11-13T00-00-00-x.jsonl"),
+            format!("{fault}\n{fault}\n{fault}\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn agent_views_never_read_vendor_history() {
         let _env = env_lock();
         let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
@@ -7189,35 +7549,99 @@ pub(crate) mod tests {
                 .create_agent(anyagents_core::NewAgent::new(harness, harness))
                 .unwrap();
             let cfg = anyagents_core::agent_config_dir(dir.path(), &agent.id);
-            let logs = cfg.join(".gemini/antigravity-cli/log");
-            std::fs::create_dir_all(&logs).unwrap();
-            std::fs::write(
-                logs.join("cli-previous-session.log"),
-                "run ended with error and no response: previous agy session failed\n",
+            write_vendor_history(&cfg);
+            for view in [
+                agent_view(&store, &health, &agent).unwrap(),
+                crate::agent::view_named(dir.path(), &agent.name).unwrap(),
+            ] {
+                assert_eq!(view.last_error, None, "{harness}");
+                assert_eq!(view.quota_reset_at_ms, None, "{harness}");
+                assert_eq!(view.block_reason, None, "{harness}");
+            }
+            let (agents, archived) = store.roster_agents(None).unwrap();
+            let roster = roster_views(
+                &store,
+                &health,
+                &agents.iter().collect::<Vec<_>>(),
+                archived,
+                &ListAgentsQuery::default(),
             )
             .unwrap();
-            let mut view = agent_view(&store, &health, &agent).unwrap();
-            let expected = (harness == "agy").then_some("previous agy session failed");
-            assert_eq!(view.last_error.as_deref(), expected, "server: {harness}");
-            view.last_error = None;
-            view = crate::agent::view_named(dir.path(), &agent.name).unwrap();
-            assert_eq!(view.last_error.as_deref(), expected, "client: {harness}");
+            assert!(
+                roster
+                    .agents
+                    .iter()
+                    .all(|view| view.last_error.is_none() && view.quota_reset_at_ms.is_none()),
+                "{harness}"
+            );
 
+            // What the adapter persisted is what the view reports.
+            let reset_ms = now_ms() + 3_600_000;
             std::fs::write(
                 cfg.join(".anyagents-last-error.json"),
                 serde_json::json!({
-                    "timestamp_ms": anyagents_core::now_ms(),
+                    "timestamp_ms": now_ms(),
                     "error": "current harness failed",
+                    "quota_reset_at_ms": reset_ms,
                 })
                 .to_string(),
             )
             .unwrap();
-            view = agent_view(&store, &health, &agent).unwrap();
-            assert_eq!(view.last_error.as_deref(), Some("current harness failed"));
-            view.last_error = None;
-            view = crate::agent::view_named(dir.path(), &agent.name).unwrap();
-            assert_eq!(view.last_error.as_deref(), Some("current harness failed"));
+            let expected_quota = (harness != "claude-code").then_some(reset_ms);
+            for view in [
+                agent_view(&store, &health, &agent).unwrap(),
+                crate::agent::view_named(dir.path(), &agent.name).unwrap(),
+            ] {
+                assert_eq!(view.last_error.as_deref(), Some("current harness failed"));
+                assert_eq!(view.quota_reset_at_ms, expected_quota, "{harness}");
+            }
+            std::fs::remove_file(cfg.join(".anyagents-last-error.json")).unwrap();
         }
+    }
+
+    #[test]
+    fn agent_view_reports_the_live_board_over_persisted_faults() {
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let health = HealthBoard::default();
+        let agent = store
+            .create_agent(anyagents_core::NewAgent::new("claude", "claude-code"))
+            .unwrap();
+        store.set_agent_state(&agent.id, "running").unwrap();
+        let agent = store.agent(&agent.id).unwrap();
+        let cfg = anyagents_core::agent_config_dir(dir.path(), &agent.id);
+        write_vendor_history(&cfg);
+        let reset_ms = now_ms() + 3_600_000;
+        let live = |quota: Option<i64>, error: Option<&str>| anyagents_supervisor::LiveState {
+            process_alive: true,
+            turn_state: anyagents_harness::TurnState::Idle,
+            delivery_mode: anyagents_harness::DeliveryMode::Steer,
+            steer_support: anyagents_harness::SteerSupport::Yes,
+            quota_reset_at_ms: quota,
+            restart_at_ms: None,
+            pid: Some(42),
+            live_harness: Some("claude-code".into()),
+            live_model: None,
+            process_started_at_ms: Some(1),
+            last_error: error.map(str::to_string),
+        };
+        health.publish(&agent.id, live(Some(reset_ms), None));
+        let view = agent_view(&store, &health, &agent).unwrap();
+        assert_eq!(view.process, "alive");
+        assert_eq!(view.quota_reset_at_ms, Some(reset_ms));
+        assert_eq!(view.block_reason.as_deref(), Some("quota_exhausted"));
+        assert_eq!(view.turn_state, "idle");
+
+        health.publish(&agent.id, live(None, None));
+        let view = agent_view(&store, &health, &agent).unwrap();
+        assert_eq!(view.quota_reset_at_ms, None);
+        assert_eq!(view.block_reason, None);
+        assert_eq!(view.turn_state, "idle");
+
+        health.publish(&agent.id, live(None, Some("not logged in")));
+        let view = agent_view(&store, &health, &agent).unwrap();
+        assert_eq!(view.turn_state, "errored");
+        assert_eq!(view.block_reason.as_deref(), Some("sign_in_required"));
     }
 
     #[test]
@@ -8804,7 +9228,8 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&blocked).unwrap();
         std::fs::write(blocked.join("keep"), b"partial cleanup").unwrap();
         std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
-        reap_archived_agents(&store, dir.path(), &HealthBoard::default());
+        let failed_at = now_ms();
+        reap_archived_agents_at(&store, dir.path(), &HealthBoard::default(), failed_at);
         // Restore access before asserting so failed tests don't leak fixtures.
         std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(
@@ -8820,12 +9245,76 @@ pub(crate) mod tests {
             other_cfg.join(".anyagents-reaped").exists(),
             "failure starved an independent archive"
         );
-        reap_archived_agents(&store, dir.path(), &HealthBoard::default());
+        // A failed cleanup waits out its backoff instead of the next minute.
+        reap_archived_agents_at(
+            &store,
+            dir.path(),
+            &HealthBoard::default(),
+            failed_at + 30_000,
+        );
+        assert!(blocked.exists(), "retried before its backoff");
+        assert!(!cfg.join(".anyagents-reaped").exists());
+        reap_archived_agents_at(
+            &store,
+            dir.path(),
+            &HealthBoard::default(),
+            now_ms() + 60_000,
+        );
         assert!(!blocked.exists());
         assert_eq!(
             std::fs::read(cfg.join(".anyagents-reaped")).unwrap(),
             std::fs::read(cfg.join(".anyagents-archived")).unwrap()
         );
+    }
+
+    #[test]
+    fn reap_queue_backfills_once_and_idle_maintenance_visits_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let parent = store
+            .create_agent(anyagents_core::NewAgent::new("parent", "opencode"))
+            .unwrap();
+        // Finished under an earlier binary: its marker matches its archive.
+        let finished = archived_reap_fixture(&store, "finished", &parent);
+        let finished_cfg = anyagents_core::agent_config_dir(dir.path(), &finished.id);
+        std::fs::copy(
+            finished_cfg.join(".anyagents-archived"),
+            finished_cfg.join(".anyagents-reaped"),
+        )
+        .unwrap();
+        // Archived by an earlier binary that wrote no marker at all.
+        let mut new = anyagents_core::NewAgent::new("legacy", "opencode");
+        new.parent_id = Some(parent.id.clone());
+        let legacy = store.create_agent(new).unwrap();
+        store.set_agent_state(&legacy.id, "archived").unwrap();
+        let legacy_cfg = anyagents_core::agent_config_dir(dir.path(), &legacy.id);
+        // Forget what this binary queued, as if the archives predated the queue.
+        std::fs::remove_dir_all(dir.path().join("reap-pending")).unwrap();
+        for cfg in [&finished_cfg, &legacy_cfg] {
+            std::fs::create_dir_all(cfg.join(".claude")).unwrap();
+        }
+
+        reap_archived_agents(&store, dir.path(), &HealthBoard::default());
+        assert!(
+            finished_cfg.join(".claude").exists(),
+            "finished archive revisited"
+        );
+        assert!(
+            !legacy_cfg.join(".claude").exists(),
+            "legacy archive not backfilled"
+        );
+        assert_eq!(
+            std::fs::read(legacy_cfg.join(".anyagents-reaped")).unwrap(),
+            std::fs::read(legacy_cfg.join(".anyagents-archived")).unwrap()
+        );
+
+        // Nothing is owed now, so maintenance visits no agent at all.
+        std::fs::create_dir_all(legacy_cfg.join(".claude")).unwrap();
+        std::fs::remove_file(finished_cfg.join(".anyagents-reaped")).unwrap();
+        reap_archived_agents(&store, dir.path(), &HealthBoard::default());
+        assert!(legacy_cfg.join(".claude").exists());
+        assert!(finished_cfg.join(".claude").exists());
+        assert!(reap_queue::due(dir.path(), i64::MAX).is_empty());
     }
 
     #[test]
