@@ -80,6 +80,7 @@ fn state(dir: &Path) -> AppState {
             operator_digest: Some(auth::operator_digest(OPERATOR)),
         },
         identity: Arc::new(ServingIdentity::capture()),
+        profiles: Default::default(),
     }
 }
 

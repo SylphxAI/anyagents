@@ -41,8 +41,11 @@ mod file_cache;
 mod latency_tests;
 mod memory_backlog;
 mod outbound_history;
+mod profiles;
 mod quota_rotation;
 mod reap_queue;
+
+pub(crate) use profiles::ServedProfile;
 
 const SOCKET_NAME: &str = "anyagents.sock";
 /// `sockaddr_un.sun_path` holds 108 bytes, including the trailing NUL.
@@ -92,6 +95,8 @@ pub(crate) struct AppState {
     pub(crate) sign_in: Arc<Mutex<dyn CommandRunner + Send>>,
     pub(crate) auth: auth::Mode,
     pub(crate) identity: Arc<ServingIdentity>,
+    /// The last provider-profile listing, refreshed in the background.
+    pub(crate) profiles: Arc<profiles::ProfileSnapshots>,
 }
 
 /// This process's capability key. Tests name one so a server and the fixture
@@ -240,6 +245,7 @@ async fn serve(
         sign_in,
         auth,
         identity,
+        profiles: Default::default(),
     };
     let _ = boundary;
     let listener = api_listener;
@@ -1330,6 +1336,8 @@ async fn harness_route(
             body.profile.as_deref(),
         )
         .map_err(ApiError::from_store)?;
+        // The agent's profile binding may have moved.
+        state.profiles.invalidate(&state.store);
         Ok(Json(out))
     })
     .await
@@ -1773,6 +1781,8 @@ async fn model_route(
                 body.profile.as_deref(),
             )
             .map_err(ApiError::from_store)?;
+            // The agent's profile binding may have moved.
+            state.profiles.invalidate(&state.store);
             return Ok(Json(out));
         }
         let model_str = body
@@ -1953,18 +1963,31 @@ async fn profile_models_route(
     .await
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct ProfilesQuery {
+    /// Answer with a listing made after this call rather than the snapshot.
+    #[serde(default)]
+    fresh: Option<bool>,
+}
+
+/// `GET /v1/profiles`: the last listing at once, each entry marked with the
+/// age of its usage reading; see [`profiles`].
 async fn profiles_route(
     principal: Principal,
     State(state): State<AppState>,
-) -> Result<Json<Vec<create::ProviderProfileEntry>>, ApiError> {
+    Query(query): Query<ProfilesQuery>,
+) -> Result<Json<Vec<ServedProfile>>, ApiError> {
+    let store = Arc::clone(&state.store);
     spawn_store(move || {
-        require_admin_or_operator(&state.store, &principal, "profiles.list", "profiles")?;
-        Ok(Json(create::list_provider_profiles_fast(
-            &state.store,
-            state.store.data_dir(),
-        )))
+        require_admin_or_operator(&store, &principal, "profiles.list", "profiles").map(drop)
     })
-    .await
+    .await?;
+    state
+        .profiles
+        .list(&state.store, query.fresh.unwrap_or(false))
+        .await
+        .map(Json)
+        .map_err(|why| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, why))
 }
 
 #[derive(Deserialize)]
@@ -1984,6 +2007,7 @@ async fn set_profile_route(
         let (provider, profile) =
             create::set_provider_profile(state.store.data_dir(), &body.profile, &body.key)
                 .map_err(ApiError::from_store)?;
+        state.profiles.invalidate(&state.store);
         Ok(Json(serde_json::json!({
             "provider": provider,
             "profile": profile,
@@ -8312,6 +8336,7 @@ pub(crate) mod tests {
                 data_dir: dir.path().into(),
             },
             identity: Arc::new(ServingIdentity::capture()),
+            profiles: Default::default(),
         };
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let principal = |a: &Agent| Principal::Agent {
@@ -8426,6 +8451,7 @@ pub(crate) mod tests {
                 data_dir: dir.path().into(),
             },
             identity: Arc::new(ServingIdentity::capture()),
+            profiles: Default::default(),
         };
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let principal = || Principal::Agent { agent_id: parent.id.clone(), name: parent.name.clone() };
@@ -8511,6 +8537,7 @@ pub(crate) mod tests {
                 data_dir: dir.path().into(),
             },
             identity: Arc::new(ServingIdentity::capture()),
+            profiles: Default::default(),
         };
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
@@ -8624,6 +8651,7 @@ pub(crate) mod tests {
             health: HealthBoard::default(),
             sign_in: Arc::new(Mutex::new(ProcessRunner)),
             identity: Arc::new(ServingIdentity::capture()),
+            profiles: Default::default(),
             auth: auth::Mode::Trusted {
                 data_dir: dir.path().to_path_buf(),
             },
@@ -8726,6 +8754,7 @@ pub(crate) mod tests {
             health: HealthBoard::default(),
             sign_in: Arc::new(Mutex::new(ProcessRunner)),
             identity: Arc::new(ServingIdentity::capture()),
+            profiles: Default::default(),
             auth: auth::Mode::Trusted {
                 data_dir: dir.path().into(),
             },
@@ -9464,6 +9493,7 @@ pub(crate) mod tests {
             health: HealthBoard::default(),
             sign_in: Arc::new(Mutex::new(ProcessRunner)),
             identity: Arc::new(ServingIdentity::capture()),
+            profiles: Default::default(),
             auth: auth::Mode::Trusted {
                 data_dir: dir.path().into(),
             },
@@ -10288,6 +10318,7 @@ exec '{}' "$@"
             health: HealthBoard::default(),
             sign_in: Arc::new(Mutex::new(ProcessRunner)),
             identity: Arc::new(ServingIdentity::capture()),
+            profiles: Default::default(),
             auth: auth::Mode::Trusted {
                 data_dir: dir.path().into(),
             },
@@ -10429,6 +10460,7 @@ exec '{}' "$@"
             health: HealthBoard::default(),
             sign_in: Arc::new(Mutex::new(ProcessRunner)),
             identity: Arc::new(ServingIdentity::capture()),
+            profiles: Default::default(),
             auth: auth::Mode::Trusted {
                 data_dir: data.into(),
             },
