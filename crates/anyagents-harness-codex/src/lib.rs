@@ -1,24 +1,46 @@
-//! Codex adapter.
+//! Codex adapter: one `codex app-server` child, JSON-RPC 2.0, one object per
+//! line.
 //!
-//! One child runs `codex app-server`. Messages are one JSON object per line.
-//! Startup sends `initialize`, `initialized`, then `thread/start` (or
-//! `thread/resume` when a session id is already known).
+//! Startup sends `initialize` (whose `userAgent` names the peer's version),
+//! `initialized`, then `thread/start`, or `thread/resume` when a session id is
+//! already known. Before anything is written into a resumed thread, its
+//! newest turns are read (`thread/items/list`): a message an earlier process
+//! already applied is answered `Duplicate` and never written again. Only these
+//! handshake calls (and `cancel`) wait for an answer, and only for a bounded
+//! time; delivery never waits.
 //!
-//! The mailbox id is the first line of the user text (`anyagents-message:<id>`)
-//! and the `clientUserMessageId` field. An id already written, or echoed back,
-//! is not written again.
+//! Delivery is `next-step`. A message carries its mailbox id as
+//! `clientUserMessageId` and on the first line of its text
+//! (`anyagents-message:<id>`). `deliver` writes it as `turn/start` when no turn
+//! runs, or as `turn/steer` naming the running turn as `expectedTurnId`, and
+//! answers `InFlight`. The vendor proves consumption with the `userMessage`
+//! item (`item/started`, `item/completed`) that carries our id as `clientId`
+//! when the input enters the conversation; only then is the message
+//! `Accepted`. A message is written once per process:
+//! - a refusal (`-32600`: no active turn, another turn, a turn that cannot be
+//!   steered, a draining server) certainly did not apply it: it is forgotten
+//!   and offered again once the turn changes;
+//! - a quota error forgets it and reports the reset time;
+//! - `-32602` (input too long) refuses that message for good;
+//! - any other error leaves its fate unknown, and so does a turn that ends
+//!   without a proof for input written into it (a steer can race the turn's
+//!   last step into history without an item event; an interrupt drops pending
+//!   input). The thread's history settles it once no turn runs: found, it is
+//!   consumed; missing, it is forgotten and written again. Nothing new is
+//!   written while one is unsettled, so mail keeps its order.
 //!
-//! Declared delivery mode is steer. `deliver` sends `turn/start` when no turn
-//! is open and `turn/steer` during one. `cancel` sends `turn/interrupt`.
-//! `turn_finished` becomes true when `turn/completed` reports status `completed`.
-//! Token counts come from `thread/tokenUsage/updated`. This vendor reports no
-//! currency amount, so the cost stays empty.
+//! A new turn starts only once every earlier input is settled. A turn that
+//! completes finishes the messages it consumed. A failed turn surfaces its
+//! error as a fault at once and is never re-sent: the supervisor restarts the
+//! process and sends a recovery note. `cancel` sends `turn/interrupt`.
 //!
-//! A rate-limit notice is a wait only when it includes a reset time. Values of
+//! Token counts come from `thread/tokenUsage/updated`, one usage per completed
+//! turn. This vendor reports no currency amount, so the cost stays empty. A
+//! rate-limit notice is a wait only when it includes a reset time. Values of
 //! `resetsAt` at or above `10^12` are epoch milliseconds; smaller values are
 //! epoch seconds.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Stdio};
@@ -32,20 +54,30 @@ use anyagents_harness::{
 };
 use serde_json::{Value, json};
 
-fn rpc_wait() -> Duration {
-    if std::env::var_os("ANYAGENTS_FAKE_MODE").is_some() {
-        Duration::from_secs(3)
-    } else {
-        Duration::from_secs(60)
-    }
-}
+/// How long a handshake call (`initialize`, `thread/start`, `thread/resume`,
+/// `turn/interrupt`) may take. Delivery never waits for an answer.
+const CALL_WAIT: Duration = Duration::from_secs(60);
+
+/// Items asked for per `thread/items/list` page.
+const HISTORY_PAGE: u64 = 50;
+
+/// How many of a resumed thread's newest turns are read for messages an
+/// earlier process applied. Mail is written in mailbox order and a turn starts
+/// only once every earlier input is settled, so a message an earlier process
+/// applied but whose commit was lost is in the last turn or two it ran.
+const RESUME_TURNS: usize = 4;
+
+/// How many of the newest turns are read to settle a message whose fate is
+/// unknown. Nothing new is written while one is unsettled, so the turn it
+/// joined is the newest.
+const SETTLE_TURNS: usize = 2;
 
 /// What this adapter guarantees for mail that reaches a busy agent
 /// (`docs/delivery.md`).
 pub const DELIVERY: Delivery = Delivery {
-    level: DeliveryLevel::MidTurn,
-    idempotent: false,
-    proof: "turn/steer answered",
+    level: DeliveryLevel::NextStep,
+    idempotent: true,
+    proof: "userMessage item carrying our clientId; thread/items/list history",
     peer: None,
 };
 
@@ -65,72 +97,609 @@ struct State {
     /// Bumped when something the host reads changes: what the activity
     /// watcher waits on.
     epoch: u64,
-    seen: HashSet<String>,
-    written: Vec<String>,
-    open: Vec<String>,
-    finished: HashSet<String>,
-    turns_started: usize,
-    quota_reset_at_ms: Option<i64>,
+    /// `codex <version>`, from the `initialize` answer.
+    peer: Option<String>,
     thread_id: Option<String>,
     thread_invalidated: bool,
-    turn_id: Option<String>,
-    last_usage: Option<TurnUsage>,
-    usages: Vec<(String, TurnUsage)>,
-    next_rpc: i64,
-    pending: std::collections::HashMap<i64, Pending>,
     config_dir: Option<PathBuf>,
-    consecutive_turn_errors: u32,
+
+    /// The running turn, as far as the vendor has said.
+    turn: Option<String>,
+    /// How each turn this process saw end, ended.
+    ended: HashMap<String, TurnEnd>,
+    /// The running turn refused a steer it will refuse again (a review or
+    /// compact turn): nothing more is written into it.
+    unsteerable: Option<String>,
+    /// The vendor refused a `turn/start`: none is written until a turn event.
+    start_held: bool,
+    /// The server is shutting down and takes no more input.
+    draining: bool,
+
+    /// Messages written and not yet proved, refused or settled.
+    inflight: HashMap<String, Custody>,
+    /// Proved consumed by this process, with the turn that consumed each.
+    consumed: HashMap<String, Option<String>>,
+    /// Consumed into a turn that has not ended yet.
+    members: HashMap<String, Vec<String>>,
+    /// Consumed into a turn that completed.
+    finished: HashSet<String>,
+    /// Refused for good.
+    rejected: HashMap<String, String>,
+    /// Found in a resumed thread's history: an earlier process applied them.
+    applied_before: HashSet<String>,
+    /// Ids written to the vendor and not refused, in write order.
+    written: Vec<String>,
+    turns_started: usize,
+
+    /// False until a resumed thread's history has been read.
+    history_ready: bool,
+    history: Option<Scan>,
+    scans: u64,
+    /// The peer has no history API: nothing can be checked against it.
+    history_missing: bool,
+    /// The history could not be read: nothing can be written safely.
+    history_failure: Option<String>,
+
+    next_rpc: i64,
+    requests: HashMap<i64, Request>,
+
+    last_usage: Option<TurnUsage>,
+    /// One per completed turn: the turn and its usage.
+    usages: Vec<(String, TurnUsage)>,
+    quota_reset_at_ms: Option<i64>,
     pending_turn_error: Option<String>,
     fault_error: Option<String>,
-    last_turn_input: Option<(String, Value, String)>,
-    retry_turn_start: bool,
 }
 
-/// What the host reads through the harness API and the session pointer.
-#[derive(PartialEq, Eq)]
-struct Observed {
-    alive: bool,
-    open: usize,
-    seen: usize,
-    finished: usize,
-    usages: usize,
-    quota_reset_at_ms: Option<i64>,
-    fault_error: Option<String>,
-    thread_id: Option<String>,
-    thread_invalidated: bool,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TurnEnd {
+    Completed,
+    Interrupted,
+    Failed,
 }
 
-impl State {
-    fn observed(&self) -> Observed {
-        Observed {
-            alive: self.alive,
-            open: self.open.len(),
-            seen: self.seen.len(),
-            finished: self.finished.len(),
-            usages: self.usages.len(),
-            quota_reset_at_ms: self.quota_reset_at_ms,
-            fault_error: self.fault_error.clone(),
-            thread_id: self.thread_id.clone(),
-            thread_invalidated: self.thread_invalidated,
-        }
-    }
+/// One message this process wrote and has not settled.
+struct Custody {
+    stage: Stage,
+    /// The turn it joined, once known.
+    turn: Option<String>,
 }
 
-enum Pending {
-    Waiting,
-    Done(Value),
-    Err(Value),
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Stage {
+    /// The request carrying it is unanswered.
+    Sent { start: bool },
+    /// The vendor holds it as pending input of its turn.
+    Pending,
+    /// Its fate is unknown: the thread's history decides.
+    Doubtful,
+}
+
+enum Request {
+    /// A handshake call the caller waits for, and its answer once it came.
+    Call(Option<Result<Value, Value>>),
+    /// `turn/start` or `turn/steer` carrying message `id`.
+    Input { id: String, start: bool },
+    /// One page of history scan `scan`.
+    History { scan: u64 },
+}
+
+/// A read of the thread's newest turns, newest first, a page at a time.
+struct Scan {
+    serial: u64,
+    purpose: Purpose,
+    /// How many turns to read.
+    budget: usize,
+    /// The next page's cursor.
+    cursor: Option<String>,
+    /// A page request is on its way.
+    waiting: bool,
+    turns: Vec<String>,
+    /// Message id, and the turn its `userMessage` item is in.
+    found: HashMap<String, String>,
+}
+
+enum Purpose {
+    /// Every message the resumed thread already holds.
+    Resume,
+    /// Settle these doubtful messages.
+    Settle(Vec<String>),
+}
+
+/// How a message is written.
+enum Target {
+    Start,
+    Steer(String),
+}
+
+/// What an error answer to `turn/start` or `turn/steer` says about the input.
+#[derive(Debug, PartialEq, Eq)]
+enum Answer {
+    /// Certainly not applied; offered again once the turn changes.
+    Refused(Refusal),
+    /// Certainly not applied, and never will be.
+    Rejected(String),
+    Quota(i64),
+    /// It may or may not have been applied.
+    Unknown,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Refusal {
+    /// `no active turn to steer`.
+    NoTurn,
+    /// `expected active turn id X but found Y`, with Y when it parses.
+    OtherTurn(Option<String>),
+    /// `Server is draining`.
+    Draining,
+    /// The turn takes no steer (review, compact, another output schema), or
+    /// a refusal this adapter does not name.
+    Held,
 }
 
 enum CallFail {
     Dead,
-    Quota(i64),
     Failed(String),
 }
 
-enum Ready {
-    Done(Value),
-    Err(Value),
+impl State {
+    fn touch(&mut self) {
+        self.epoch = self.epoch.wrapping_add(1);
+    }
+
+    fn register(&mut self, request: Request) -> i64 {
+        self.next_rpc += 1;
+        self.requests.insert(self.next_rpc, request);
+        self.next_rpc
+    }
+
+    /// A consumption this process proved, or an earlier process's found in
+    /// history. Valid after the process exits.
+    fn proof(&self, id: &str) -> Option<DeliverOutcome> {
+        if self.consumed.contains_key(id) {
+            return Some(DeliverOutcome::Accepted {
+                turn_finished: self.finished.contains(id),
+            });
+        }
+        self.applied_before
+            .contains(id)
+            .then_some(DeliverOutcome::Duplicate)
+    }
+
+    /// The answer for a message this process already knows about, if any.
+    fn known(&self, id: &str) -> Option<Result<DeliverOutcome, HarnessError>> {
+        if let Some(proof) = self.proof(id) {
+            return Some(Ok(proof));
+        }
+        if !self.alive {
+            return Some(Err(HarnessError::Dead));
+        }
+        if let Some(reason) = self.rejected.get(id) {
+            return Some(Err(HarnessError::Failed(reason.clone())));
+        }
+        let custody = self.inflight.get(id)?;
+        // A message only history can settle, when history cannot be read: a
+        // new process reads it again when it resumes the thread.
+        if custody.stage == Stage::Doubtful
+            && let Some(reason) = &self.history_failure
+        {
+            return Some(Err(HarnessError::Failed(reason.clone())));
+        }
+        Some(Ok(DeliverOutcome::InFlight))
+    }
+
+    /// Where a new message may be written now, if anywhere.
+    fn write_target(&self) -> Option<Target> {
+        if !self.history_ready || self.draining {
+            return None;
+        }
+        // A message behind one whose fate is unknown could overtake it, and
+        // a steer before the turn it joins is known could miss it.
+        if self
+            .inflight
+            .values()
+            .any(|custody| matches!(custody.stage, Stage::Doubtful | Stage::Sent { start: true }))
+        {
+            return None;
+        }
+        match &self.turn {
+            Some(turn) => {
+                (self.unsteerable.as_ref() != Some(turn)).then(|| Target::Steer(turn.clone()))
+            }
+            None => (!self.start_held && self.inflight.is_empty()).then_some(Target::Start),
+        }
+    }
+
+    /// The vendor proved `id` consumed into `turn`.
+    fn consume(&mut self, id: &str, turn: Option<&str>) {
+        let Some(custody) = self.inflight.remove(id) else {
+            return;
+        };
+        let turn = turn.map(str::to_owned).or(custody.turn);
+        if let Some(turn) = &turn {
+            match self.ended.get(turn) {
+                Some(TurnEnd::Completed) => {
+                    self.finished.insert(id.to_owned());
+                }
+                Some(_) => {}
+                None => self
+                    .members
+                    .entry(turn.clone())
+                    .or_default()
+                    .push(id.to_owned()),
+            }
+        }
+        self.consumed.insert(id.to_owned(), turn);
+        self.touch();
+    }
+
+    /// Hand `id` back to the mailbox: the vendor does not have it.
+    fn forget(&mut self, id: &str) {
+        self.inflight.remove(id);
+        self.written.retain(|written| written != id);
+        self.touch();
+    }
+
+    fn turn_started(&mut self, turn: &str) {
+        if self.ended.contains_key(turn) || self.turn.as_deref() == Some(turn) {
+            return;
+        }
+        self.turn = Some(turn.to_owned());
+        self.start_held = false;
+        self.touch();
+    }
+
+    /// The vendor holds no running turn `turn` any more: input pending in it
+    /// is settled from history.
+    fn turn_gone(&mut self, turn: &str) {
+        if self.turn.as_deref() == Some(turn) {
+            self.turn = None;
+        }
+        if self.unsteerable.as_deref() == Some(turn) {
+            self.unsteerable = None;
+        }
+        self.start_held = false;
+        for custody in self.inflight.values_mut() {
+            if custody.stage == Stage::Pending && custody.turn.as_deref() == Some(turn) {
+                custody.stage = Stage::Doubtful;
+            }
+        }
+        self.touch();
+    }
+
+    fn on_input_answer(&mut self, id: String, start: bool, answer: Result<Value, Value>) {
+        match answer {
+            Ok(result) => {
+                let turn = if start {
+                    result.pointer("/turn/id")
+                } else {
+                    result.get("turnId")
+                }
+                .and_then(Value::as_str)
+                .filter(|turn| !turn.is_empty())
+                .map(str::to_owned);
+                if start && let Some(turn) = &turn {
+                    self.turn_started(turn);
+                }
+                let ended = turn
+                    .as_ref()
+                    .is_some_and(|turn| self.ended.contains_key(turn));
+                let Some(custody) = self.inflight.get_mut(&id) else {
+                    return;
+                };
+                if custody.turn.is_none() {
+                    custody.turn = turn;
+                }
+                if matches!(custody.stage, Stage::Sent { .. }) {
+                    // Pending in a turn that already ended, or in a turn the
+                    // answer does not name: history decides.
+                    custody.stage = if ended || custody.turn.is_none() {
+                        Stage::Doubtful
+                    } else {
+                        Stage::Pending
+                    };
+                    self.touch();
+                }
+            }
+            Err(error) => {
+                let Some(custody) = self.inflight.get_mut(&id) else {
+                    return;
+                };
+                let turn = custody.turn.clone();
+                match classify(&error) {
+                    Answer::Unknown => {
+                        custody.stage = Stage::Doubtful;
+                        self.touch();
+                    }
+                    Answer::Quota(reset_at_ms) => {
+                        self.forget(&id);
+                        self.quota_reset_at_ms = Some(reset_at_ms);
+                    }
+                    Answer::Rejected(reason) => {
+                        self.forget(&id);
+                        self.rejected.insert(id, reason);
+                    }
+                    Answer::Refused(refusal) => {
+                        self.forget(&id);
+                        match refusal {
+                            Refusal::NoTurn => {
+                                if let Some(turn) = turn {
+                                    self.turn_gone(&turn);
+                                }
+                            }
+                            Refusal::OtherTurn(Some(found)) => {
+                                if let Some(turn) = turn {
+                                    self.turn_gone(&turn);
+                                }
+                                self.turn_started(&found);
+                            }
+                            Refusal::Draining => self.draining = true,
+                            Refusal::OtherTurn(None) | Refusal::Held => {
+                                if start {
+                                    self.start_held = true;
+                                } else {
+                                    self.unsteerable = turn;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn on_notification(&mut self, method: &str, params: &Value) {
+        match method {
+            "item/started" | "item/completed" => {
+                let turn = params.get("turnId").and_then(Value::as_str);
+                if let Some(id) = params.get("item").and_then(user_message_id) {
+                    if let Some(turn) = turn
+                        && self.turn.is_none()
+                    {
+                        self.turn_started(turn);
+                    }
+                    let id = id.to_owned();
+                    self.consume(&id, turn);
+                }
+            }
+            "turn/started" => {
+                if let Some(turn) = turn_id(params) {
+                    self.turn_started(turn);
+                }
+            }
+            "turn/completed" => self.turn_completed(params),
+            "thread/tokenUsage/updated" => self.last_usage = Some(usage_from_codex(params)),
+            "error" => {
+                // An error the server retries is not the turn's outcome.
+                if params.get("willRetry").and_then(Value::as_bool) != Some(true)
+                    && let Some(message) = extract_turn_error(params)
+                {
+                    self.pending_turn_error = Some(message);
+                }
+                if is_unrecoverable_thread_error(params) {
+                    self.invalidate_thread();
+                }
+            }
+            "account/rateLimits/updated" => {
+                if let Some(reset_at_ms) = quota_from_limits(params) {
+                    self.quota_reset_at_ms = Some(reset_at_ms);
+                    self.touch();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn turn_completed(&mut self, params: &Value) {
+        let Some(turn) = turn_id(params).map(str::to_owned) else {
+            return;
+        };
+        let status = params
+            .pointer("/turn/status")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let error = extract_turn_error(params);
+        let end = match status {
+            "completed" if error.is_none() => TurnEnd::Completed,
+            "interrupted" if error.is_none() => TurnEnd::Interrupted,
+            _ => TurnEnd::Failed,
+        };
+        self.ended.insert(turn.clone(), end);
+        self.turn_gone(&turn);
+        let members = self.members.remove(&turn).unwrap_or_default();
+        match end {
+            TurnEnd::Completed => {
+                self.finished.extend(members);
+                let usage = self.last_usage.take().unwrap_or_default();
+                self.usages.push((turn, usage));
+                self.pending_turn_error = None;
+                self.fault_error = None;
+                persist_codex_fault_error(self.config_dir.as_deref(), None);
+            }
+            TurnEnd::Interrupted => self.pending_turn_error = None,
+            TurnEnd::Failed => {
+                let message = error
+                    .or_else(|| self.pending_turn_error.take())
+                    .unwrap_or_else(|| {
+                        format!("turn {}", if status.is_empty() { "failed" } else { status })
+                    });
+                if let Some(reset_at_ms) = quota_from_rpc_error(params) {
+                    self.quota_reset_at_ms = Some(reset_at_ms);
+                } else if self.quota_reset_at_ms.is_some() && strings_contain_limit(params) {
+                    // The quota notice already set the wait.
+                } else {
+                    self.fault_error = Some(message.clone());
+                    persist_codex_fault_error(self.config_dir.as_deref(), Some(&message));
+                    if is_unrecoverable_thread_error(params) {
+                        self.invalidate_thread();
+                    }
+                }
+            }
+        }
+    }
+
+    /// The thread can never be continued: the process is ended and the
+    /// session pointer retired, so the next process starts a fresh thread.
+    fn invalidate_thread(&mut self) {
+        self.thread_id = None;
+        self.turn = None;
+        self.thread_invalidated = true;
+        self.alive = false;
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+        }
+        self.touch();
+    }
+
+    fn on_history_page(&mut self, serial: u64, answer: Result<Value, Value>) {
+        let Some(mut scan) = self.history.take_if(|scan| scan.serial == serial) else {
+            return;
+        };
+        scan.waiting = false;
+        self.touch();
+        let result = match answer {
+            Ok(result) => result,
+            // A peer without the history API: nothing to check against.
+            Err(error) if error.get("code").and_then(Value::as_i64) == Some(-32601) => {
+                self.history_missing = true;
+                self.finish_scan(scan);
+                return;
+            }
+            Err(error) => {
+                self.history_failure = Some(format!(
+                    "cannot read the thread's history: {}",
+                    rpc_failure(&error)
+                ));
+                return;
+            }
+        };
+        let mut done = true;
+        if let Some(entries) = result.get("data").and_then(Value::as_array) {
+            done = entries.is_empty();
+            for entry in entries {
+                let turn = entry.get("turnId").and_then(Value::as_str).unwrap_or("");
+                if !scan.turns.iter().any(|seen| seen == turn) {
+                    if scan.turns.len() == scan.budget {
+                        done = true;
+                        break;
+                    }
+                    scan.turns.push(turn.to_owned());
+                }
+                if let Some(id) = entry.get("item").and_then(user_message_id) {
+                    scan.found.insert(id.to_owned(), turn.to_owned());
+                }
+            }
+        }
+        match result.get("nextCursor").and_then(Value::as_str) {
+            Some(cursor) if !done => {
+                scan.cursor = Some(cursor.to_owned());
+                self.history = Some(scan);
+            }
+            _ => self.finish_scan(scan),
+        }
+    }
+
+    fn finish_scan(&mut self, scan: Scan) {
+        match scan.purpose {
+            Purpose::Resume => {
+                self.applied_before.extend(scan.found.into_keys());
+                self.history_ready = true;
+            }
+            Purpose::Settle(ids) => {
+                for id in ids {
+                    if self
+                        .inflight
+                        .get(&id)
+                        .is_none_or(|custody| custody.stage != Stage::Doubtful)
+                    {
+                        continue;
+                    }
+                    match scan.found.get(&id) {
+                        Some(turn) => {
+                            let turn = turn.clone();
+                            self.consume(&id, Some(&turn));
+                        }
+                        None => self.forget(&id),
+                    }
+                }
+            }
+        }
+        self.touch();
+    }
+
+    /// Start a scan for a resumed thread; it gates every write until done.
+    fn begin_resume_scan(&mut self) {
+        self.history_ready = false;
+        self.scans += 1;
+        self.history = Some(Scan::new(self.scans, Purpose::Resume, RESUME_TURNS));
+    }
+
+    /// The next request the adapter itself owes the vendor: a history page.
+    fn next_request(&mut self) -> Option<Value> {
+        if !self.alive || self.history_failure.is_some() {
+            return None;
+        }
+        let thread_id = self.thread_id.clone()?;
+        if self.history.is_none() {
+            // Settle doubtful input once no turn runs and every input has its
+            // answer, when the history it joined is final.
+            let quiet = self.turn.is_none()
+                && !self
+                    .inflight
+                    .values()
+                    .any(|custody| matches!(custody.stage, Stage::Sent { .. }));
+            let doubtful: Vec<String> = self
+                .inflight
+                .iter()
+                .filter(|(_, custody)| custody.stage == Stage::Doubtful)
+                .map(|(id, _)| id.clone())
+                .collect();
+            if !quiet || doubtful.is_empty() {
+                return None;
+            }
+            self.scans += 1;
+            self.history = Some(Scan::new(
+                self.scans,
+                Purpose::Settle(doubtful),
+                SETTLE_TURNS,
+            ));
+        }
+        let scan = self.history.as_mut()?;
+        if scan.waiting {
+            return None;
+        }
+        scan.waiting = true;
+        let mut params = json!({
+            "threadId": thread_id,
+            "sortDirection": "desc",
+            "limit": HISTORY_PAGE,
+        });
+        if let Some(cursor) = &scan.cursor {
+            params["cursor"] = json!(cursor);
+        }
+        let serial = scan.serial;
+        let rpc = self.register(Request::History { scan: serial });
+        Some(json!({
+            "jsonrpc": "2.0",
+            "id": rpc,
+            "method": "thread/items/list",
+            "params": params,
+        }))
+    }
+}
+
+impl Scan {
+    fn new(serial: u64, purpose: Purpose, budget: usize) -> Self {
+        Self {
+            serial,
+            purpose,
+            budget,
+            cursor: None,
+            waiting: false,
+            turns: Vec::new(),
+            found: HashMap::new(),
+        }
+    }
 }
 
 impl CodexHarness {
@@ -171,7 +740,7 @@ impl CodexHarness {
         }
     }
 
-    /// Ids this process actually wrote, in write order.
+    /// Ids written to the vendor and not refused, in write order.
     pub fn written_ids(&self) -> Vec<String> {
         lock(&self.shared).written.clone()
     }
@@ -192,23 +761,23 @@ impl CodexHarness {
         lock(&self.shared).thread_invalidated
     }
 
-    /// Usage copied onto `id` when its turn completed.
+    /// Usage of the completed turn that consumed `id`.
     pub fn usage_for(&self, id: &str) -> Option<TurnUsage> {
         let state = lock(&self.shared);
+        let turn = state.consumed.get(id)?.as_ref()?;
         state
             .usages
             .iter()
-            .rev()
-            .find(|(item, _)| item == id)
+            .find(|(done, _)| done == turn)
             .map(|(_, usage)| usage.clone())
     }
 
-    /// Whether a completed turn finished `id`.
+    /// Whether a completed turn consumed `id`.
     pub fn is_finished(&self, id: &str) -> bool {
         lock(&self.shared).finished.contains(id)
     }
 
-    /// Wait until a completed turn finishes `id`, or the deadline passes.
+    /// Wait until a completed turn consumed `id`, or the deadline passes.
     pub fn wait_finished(&self, id: &str, timeout: Duration) -> bool {
         self.wait_pred(timeout, |state| state.finished.contains(id))
     }
@@ -223,7 +792,8 @@ impl CodexHarness {
         found
     }
 
-    /// Wait until a turn fault (`401` or 3 consecutive turn errors) has been recorded.
+    /// Wait until a turn fault (a failed turn, or a sign-in failure) has been
+    /// recorded.
     pub fn wait_error(&self, timeout: Duration) -> Option<String> {
         let mut found = None;
         self.wait_pred(timeout, |state| {
@@ -249,14 +819,11 @@ impl CodexHarness {
             if now >= deadline {
                 return false;
             }
-            let (guard, wait) = self
+            let (guard, _) = self
                 .wake
                 .wait_timeout(state, deadline - now)
                 .unwrap_or_else(|err| err.into_inner());
             state = guard;
-            if wait.timed_out() && !pred(&state) {
-                return false;
-            }
         }
     }
 
@@ -269,13 +836,6 @@ impl CodexHarness {
             .iter()
             .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
             .collect();
-        let harness = Self {
-            environment: env_pairs.clone(),
-            shared: Arc::new(Mutex::new(State::default())),
-            stdin: Arc::new(Mutex::new(None)),
-            wake: Arc::new(Condvar::new()),
-            reader: None,
-        };
         let mut cmd = anyagents_harness::spawn_command(&program, &env_pairs)?;
         cmd.arg("app-server")
             .stdin(Stdio::piped())
@@ -287,102 +847,101 @@ impl CodexHarness {
         let mut child = cmd
             .spawn()
             .map_err(|err| HarnessError::Failed(err.to_string()))?;
-        let Some(child_stdin) = child.stdin.take() else {
+        let (Some(child_stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
             anyagents_harness::kill_child(&mut child, &env_pairs);
             let _ = child.wait();
-            return Err(HarnessError::Failed("child stdin missing".into()));
+            return Err(HarnessError::Failed("child pipes missing".into()));
         };
-        let Some(stdout) = child.stdout.take() else {
-            anyagents_harness::kill_child(&mut child, &env_pairs);
-            let _ = child.wait();
-            return Err(HarnessError::Failed("child stdout missing".into()));
+        let config_dir = env_pairs
+            .iter()
+            .find(|(k, _)| k == "CODEX_HOME")
+            .or_else(|| env_pairs.iter().find(|(k, _)| k == "HOME"))
+            .map(|(_, v)| PathBuf::from(v));
+        let shared = Arc::new(Mutex::new(State {
+            child: Some(child),
+            alive: true,
+            config_dir,
+            history_ready: true,
+            ..State::default()
+        }));
+        let stdin = Arc::new(Mutex::new(Some(child_stdin)));
+        let wake = Arc::new(Condvar::new());
+        let mut harness = Self {
+            environment: env_pairs,
+            shared: Arc::clone(&shared),
+            stdin: Arc::clone(&stdin),
+            wake: Arc::clone(&wake),
+            reader: None,
         };
-        {
-            let mut state = lock(&harness.shared);
-            state.child = Some(child);
-            state.alive = true;
-            state.config_dir = env_pairs
-                .iter()
-                .find(|(k, _)| k == "CODEX_HOME")
-                .or_else(|| env_pairs.iter().find(|(k, _)| k == "HOME"))
-                .map(|(_, v)| PathBuf::from(v));
-        }
-        *lock(&harness.stdin) = Some(child_stdin);
-        let shared = Arc::clone(&harness.shared);
-        let wake = Arc::clone(&harness.wake);
-        let stdin = Arc::clone(&harness.stdin);
-        let handle = thread::Builder::new()
-            .name("anyagents-codex".into())
-            .spawn(move || read_stdout(stdout, shared, wake, stdin))
-            .map_err(|err| HarnessError::Failed(err.to_string()))?;
-        // The reader handle has to live on the struct. Rebuild is awkward because
-        // `harness` was not mut and spawn failure must still kill the child.
-        let harness = attach_reader(harness, handle);
+        // A reader that cannot start leaves the child to `Drop`.
+        harness.reader = Some(
+            thread::Builder::new()
+                .name("anyagents-codex".into())
+                .spawn(move || read_stdout(stdout, shared, wake, stdin))
+                .map_err(|err| HarnessError::Failed(err.to_string()))?,
+        );
         Ok(harness)
     }
 
     fn handshake(&self, session: Option<&str>) -> Result<(), HarnessError> {
-        self.rpc(
+        let hello = self.rpc(
             "initialize",
-            json!({"clientInfo": {"name": "anyagents", "version": "0.1.0"}}),
+            json!({"clientInfo": {"name": "anyagents", "version": env!("CARGO_PKG_VERSION")}}),
         )?;
+        lock(&self.shared).peer = hello
+            .get("userAgent")
+            .and_then(Value::as_str)
+            .and_then(peer_from_user_agent);
         self.notify("initialized", json!({}))?;
-        let fake = std::env::var_os("ANYAGENTS_FAKE_MODE").is_some();
-        let (cfg_provider, cfg_model) = if fake {
-            (None, None)
-        } else {
-            self.codex_config_overrides()
-        };
-        let build_start_params = || {
-            if fake {
-                json!({})
-            } else {
-                let mut obj = serde_json::Map::new();
-                obj.insert("approvalPolicy".into(), json!("never"));
-                obj.insert("sandbox".into(), json!("danger-full-access"));
-                if let Some(ref p) = cfg_provider {
-                    obj.insert("modelProvider".into(), json!(p));
+        let (result, resumed) = match session {
+            Some(session) => match self.rpc("thread/resume", self.thread_params(Some(session))) {
+                Ok(result) => (result, true),
+                Err(_) if !fake_mode() => {
+                    (self.rpc("thread/start", self.thread_params(None))?, false)
                 }
-                if let Some(ref m) = cfg_model {
-                    obj.insert("model".into(), json!(m));
-                }
-                Value::Object(obj)
-            }
-        };
-        let result = if let Some(session) = session {
-            let params = if fake {
-                json!({"threadId": session})
-            } else {
-                let mut obj = serde_json::Map::new();
-                obj.insert("threadId".into(), json!(session));
-                obj.insert("approvalPolicy".into(), json!("never"));
-                obj.insert("sandbox".into(), json!("danger-full-access"));
-                if let Some(ref p) = cfg_provider {
-                    obj.insert("modelProvider".into(), json!(p));
-                }
-                if let Some(ref m) = cfg_model {
-                    obj.insert("model".into(), json!(m));
-                }
-                Value::Object(obj)
-            };
-            match self.rpc("thread/resume", params) {
-                Ok(val) => val,
-                Err(_) if !fake => self.rpc("thread/start", build_start_params())?,
                 Err(err) => return Err(err),
-            }
-        } else {
-            self.rpc("thread/start", build_start_params())?
+            },
+            None => (self.rpc("thread/start", self.thread_params(None))?, false),
         };
-        let thread_id = result
+        let Some(thread_id) = result
             .pointer("/thread/id")
             .and_then(Value::as_str)
+            .or(session)
             .map(ToOwned::to_owned)
-            .or_else(|| session.map(ToOwned::to_owned));
-        let Some(thread_id) = thread_id else {
+        else {
             return Err(HarnessError::Failed("thread id missing".into()));
         };
-        lock(&self.shared).thread_id = Some(thread_id);
+        {
+            let mut state = lock(&self.shared);
+            state.thread_id = Some(thread_id);
+            if resumed {
+                state.begin_resume_scan();
+            }
+        }
+        self.pump();
         Ok(())
+    }
+
+    /// `thread/start` or `thread/resume` parameters: full access, no
+    /// approvals, and the provider and model the agent's `config.toml` names.
+    fn thread_params(&self, session: Option<&str>) -> Value {
+        let mut params = serde_json::Map::new();
+        if let Some(session) = session {
+            params.insert("threadId".into(), json!(session));
+        }
+        if fake_mode() {
+            return Value::Object(params);
+        }
+        params.insert("approvalPolicy".into(), json!("never"));
+        params.insert("sandbox".into(), json!("danger-full-access"));
+        let (provider, model) = self.codex_config_overrides();
+        if let Some(provider) = provider {
+            params.insert("modelProvider".into(), json!(provider));
+        }
+        if let Some(model) = model {
+            params.insert("model".into(), json!(model));
+        }
+        Value::Object(params)
     }
 
     fn codex_config_overrides(&self) -> (Option<String>, Option<String>) {
@@ -433,7 +992,6 @@ impl CodexHarness {
         match self.call(method, params) {
             Ok(value) => Ok(value),
             Err(CallFail::Dead) => Err(HarnessError::Dead),
-            Err(CallFail::Quota(_)) => Err(HarnessError::Failed("quota during startup".into())),
             Err(CallFail::Failed(reason)) => Err(HarnessError::Failed(reason)),
         }
     }
@@ -441,54 +999,54 @@ impl CodexHarness {
     fn notify(&self, method: &str, params: Value) -> Result<(), HarnessError> {
         let line = json!({"jsonrpc": "2.0", "method": method, "params": params});
         if write_stdin(&self.stdin, &line).is_err() {
-            self.mark_dead();
+            mark_dead(&self.shared, &self.wake);
             Err(HarnessError::Dead)
         } else {
             Ok(())
         }
     }
 
+    /// One handshake call: write it and wait, at most [`CALL_WAIT`], for its
+    /// answer.
     fn call(&self, method: &str, params: Value) -> Result<Value, CallFail> {
         let id = {
             let mut state = lock(&self.shared);
             if !state.alive {
                 return Err(CallFail::Dead);
             }
-            state.next_rpc += 1;
-            let id = state.next_rpc;
-            state.pending.insert(id, Pending::Waiting);
-            id
+            state.register(Request::Call(None))
         };
         let line = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
         if write_stdin(&self.stdin, &line).is_err() {
-            lock(&self.shared).pending.remove(&id);
-            self.mark_dead();
+            lock(&self.shared).requests.remove(&id);
+            mark_dead(&self.shared, &self.wake);
             return Err(CallFail::Dead);
         }
-        let deadline = Instant::now() + rpc_wait();
+        let deadline = Instant::now() + CALL_WAIT;
         let mut state = lock(&self.shared);
         loop {
-            if let Some(ready) = take_ready(&mut state, id) {
-                return match ready {
-                    Ready::Done(value) => Ok(value),
-                    Ready::Err(error) => {
-                        if let Some(reset_at_ms) = quota_from_rpc_error(&error) {
-                            state.quota_reset_at_ms = Some(reset_at_ms);
-                            Err(CallFail::Quota(reset_at_ms))
-                        } else {
-                            Err(CallFail::Failed(rpc_failure(&error)))
-                        }
+            if let Some(Request::Call(slot)) = state.requests.get_mut(&id)
+                && let Some(answer) = slot.take()
+            {
+                state.requests.remove(&id);
+                return answer.map_err(|error| {
+                    if let Some(reset_at_ms) = quota_from_rpc_error(&error) {
+                        state.quota_reset_at_ms = Some(reset_at_ms);
                     }
-                };
+                    CallFail::Failed(format!("{method}: {}", rpc_failure(&error)))
+                });
             }
             if !state.alive {
-                state.pending.remove(&id);
+                state.requests.remove(&id);
                 return Err(CallFail::Dead);
             }
             let now = Instant::now();
             if now >= deadline {
-                state.pending.remove(&id);
-                return Err(CallFail::Failed("timed out".into()));
+                state.requests.remove(&id);
+                return Err(CallFail::Failed(format!(
+                    "{method}: no answer within {}s",
+                    CALL_WAIT.as_secs()
+                )));
             }
             let (guard, _) = self
                 .wake
@@ -498,9 +1056,14 @@ impl CodexHarness {
         }
     }
 
-    fn mark_dead(&self) {
-        lock(&self.shared).alive = false;
-        self.wake.notify_all();
+    /// Send the request the adapter owes the vendor, if any.
+    fn pump(&self) {
+        let request = lock(&self.shared).next_request();
+        if let Some(request) = request
+            && write_stdin(&self.stdin, &request).is_err()
+        {
+            mark_dead(&self.shared, &self.wake);
+        }
     }
 
     fn stop_child(&mut self) {
@@ -518,16 +1081,7 @@ impl CodexHarness {
         if let Some(handle) = self.reader.take() {
             let _ = handle.join();
         }
-        let mut state = lock(&self.shared);
-        state.open.clear();
-        state.turn_id = None;
-        state.alive = false;
     }
-}
-
-fn attach_reader(mut harness: CodexHarness, handle: JoinHandle<()>) -> CodexHarness {
-    harness.reader = Some(handle);
-    harness
 }
 
 impl Drop for CodexHarness {
@@ -538,24 +1092,14 @@ impl Drop for CodexHarness {
 
 impl Harness for CodexHarness {
     fn deliver(&mut self, message: &OutboundMessage) -> Result<DeliverOutcome, HarnessError> {
-        let input = json!([{
-            "type": "text",
-            "text": compose_message(&message.id, &message.context, &message.text)
-        }]);
-        let (thread_id, steering) = {
+        let id = message.id.as_str();
+        let (rpc, line) = {
             let mut state = lock(&self.shared);
-            if !state.alive {
-                return Err(HarnessError::Dead);
+            if let Some(known) = state.known(id) {
+                return known;
             }
-            if let Some(reset_at_ms) = state.quota_reset_at_ms
-                && !state.finished.contains(&message.id)
-            {
-                return Ok(DeliverOutcome::Quota { reset_at_ms });
-            }
-            if state.seen.contains(&message.id) {
-                return Ok(DeliverOutcome::Accepted {
-                    turn_finished: state.finished.contains(&message.id),
-                });
+            if let Some(reason) = &state.history_failure {
+                return Err(HarnessError::Failed(reason.clone()));
             }
             if let Some(reset_at_ms) = state.quota_reset_at_ms {
                 return Ok(DeliverOutcome::Quota { reset_at_ms });
@@ -563,106 +1107,66 @@ impl Harness for CodexHarness {
             let Some(thread_id) = state.thread_id.clone() else {
                 return Err(HarnessError::Failed("no thread".into()));
             };
-            let steering = state.turn_id.clone();
-            state.fault_error = None;
-            state.consecutive_turn_errors = 0;
-            if steering.is_none() {
-                state.last_turn_input =
-                    Some((thread_id.clone(), input.clone(), message.id.clone()));
-            }
-            state.open.push(message.id.clone());
-            (thread_id, steering)
-        };
-        let (method, params) = if let Some(turn_id) = &steering {
-            (
-                "turn/steer",
-                json!({
-                    "threadId": thread_id,
-                    "expectedTurnId": turn_id,
-                    "input": input.clone(),
-                    "clientUserMessageId": message.id,
-                }),
-            )
-        } else {
-            (
-                "turn/start",
-                json!({
-                    "threadId": thread_id,
-                    "input": input.clone(),
-                    "clientUserMessageId": message.id,
-                }),
-            )
-        };
-        let mut effective_steering = steering;
-        let rpc = match self.call(method, params) {
-            Err(CallFail::Failed(_)) if effective_steering.is_some() => {
-                {
-                    let mut state = lock(&self.shared);
-                    if state.turn_id == effective_steering {
-                        state.turn_id = None;
-                    }
-                    state.last_turn_input =
-                        Some((thread_id.clone(), input.clone(), message.id.clone()));
-                }
-                effective_steering = None;
-                self.call(
+            let Some(target) = state.write_target() else {
+                return Ok(DeliverOutcome::Deferred);
+            };
+            let input = json!([{
+                "type": "text",
+                "text": compose_message(id, &message.context, &message.text)
+            }]);
+            let (method, params, start, turn) = match target {
+                Target::Start => (
                     "turn/start",
+                    json!({"threadId": thread_id, "input": input, "clientUserMessageId": id}),
+                    true,
+                    None,
+                ),
+                Target::Steer(turn) => (
+                    "turn/steer",
                     json!({
                         "threadId": thread_id,
-                        "input": input.clone(),
-                        "clientUserMessageId": message.id,
+                        "expectedTurnId": turn,
+                        "input": input,
+                        "clientUserMessageId": id,
                     }),
-                )
+                    false,
+                    Some(turn),
+                ),
+            };
+            let rpc = state.register(Request::Input {
+                id: id.to_owned(),
+                start,
+            });
+            state.inflight.insert(
+                id.to_owned(),
+                Custody {
+                    stage: Stage::Sent { start },
+                    turn,
+                },
+            );
+            state.written.push(id.to_owned());
+            state.fault_error = None;
+            if start {
+                state.turns_started += 1;
             }
-            other => other,
+            let line = json!({"jsonrpc": "2.0", "id": rpc, "method": method, "params": params});
+            (rpc, line)
         };
-        let effective_method = if effective_steering.is_some() {
-            "turn/steer"
-        } else {
-            "turn/start"
-        };
-        let mut state = lock(&self.shared);
-        match rpc {
-            Ok(result) => {
-                commit_delivery(
-                    &mut state,
-                    &message.id,
-                    effective_steering.is_none(),
-                    effective_method,
-                    &result,
-                );
-                Ok(DeliverOutcome::Accepted {
-                    turn_finished: state.finished.contains(&message.id),
-                })
+        if write_stdin(&self.stdin, &line).is_err() {
+            // A broken pipe took no whole line: nothing was applied.
+            {
+                let mut state = lock(&self.shared);
+                state.requests.remove(&rpc);
+                state.inflight.remove(id);
+                state.written.retain(|written| written != id);
             }
-            Err(CallFail::Dead) => {
-                if effective_steering.is_none() {
-                    state.last_turn_input = None;
-                }
-                unstage(&mut state, &message.id);
-                Err(HarnessError::Dead)
-            }
-            Err(CallFail::Quota(reset_at_ms)) => {
-                if effective_steering.is_none() {
-                    state.last_turn_input = None;
-                }
-                unstage(&mut state, &message.id);
-                state.quota_reset_at_ms = Some(reset_at_ms);
-                Ok(DeliverOutcome::Quota { reset_at_ms })
-            }
-            Err(CallFail::Failed(reason)) => {
-                if effective_steering.is_none() {
-                    state.last_turn_input = None;
-                }
-                unstage(&mut state, &message.id);
-                state.consecutive_turn_errors = state.consecutive_turn_errors.saturating_add(1);
-                if is_auth_or_provider_401(&reason) || state.consecutive_turn_errors >= 3 {
-                    state.fault_error = Some(reason.clone());
-                    persist_codex_fault_error(state.config_dir.as_deref(), Some(&reason));
-                }
-                Err(HarnessError::Failed(reason))
-            }
+            mark_dead(&self.shared, &self.wake);
+            return Err(HarnessError::Dead);
         }
+        // The answer may already be in: a refusal hands the message back.
+        lock(&self.shared)
+            .known(id)
+            .unwrap_or(Ok(DeliverOutcome::Deferred))
     }
 
     fn background(&mut self) -> Result<(), HarnessError> {
@@ -677,42 +1181,36 @@ impl Harness for CodexHarness {
         if !lock(&self.shared).alive {
             return Err(HarnessError::Dead);
         }
-        let params = if std::env::var_os("ANYAGENTS_FAKE_MODE").is_some() {
-            json!({"threadId": session})
-        } else {
-            let (cfg_provider, cfg_model) = self.codex_config_overrides();
-            let mut obj = serde_json::Map::new();
-            obj.insert("threadId".into(), json!(session));
-            obj.insert("approvalPolicy".into(), json!("never"));
-            obj.insert("sandbox".into(), json!("danger-full-access"));
-            if let Some(p) = cfg_provider {
-                obj.insert("modelProvider".into(), json!(p));
-            }
-            if let Some(m) = cfg_model {
-                obj.insert("model".into(), json!(m));
-            }
-            Value::Object(obj)
-        };
-        let result = self.rpc("thread/resume", params)?;
+        let result = self.rpc("thread/resume", self.thread_params(Some(session)))?;
         let thread_id = result
             .pointer("/thread/id")
             .and_then(Value::as_str)
             .unwrap_or(session)
             .to_string();
-        let mut state = lock(&self.shared);
-        state.thread_id = Some(thread_id);
-        state.turn_id = None;
-        state.open.clear();
+        {
+            let mut state = lock(&self.shared);
+            state.thread_id = Some(thread_id);
+            state.turn = None;
+            // Input written to the thread left behind is offered to this one.
+            let left: Vec<String> = state.inflight.keys().cloned().collect();
+            for id in left {
+                state.forget(&id);
+            }
+            state.begin_resume_scan();
+        }
+        self.pump();
         Ok(())
     }
 
+    /// Ask the running turn to stop. Its `turn/completed` settles the input
+    /// it held.
     fn cancel(&mut self) -> Result<(), HarnessError> {
         let (thread_id, turn_id) = {
             let state = lock(&self.shared);
             if !state.alive {
                 return Err(HarnessError::Dead);
             }
-            (state.thread_id.clone(), state.turn_id.clone())
+            (state.thread_id.clone(), state.turn.clone())
         };
         if let (Some(thread_id), Some(turn_id)) = (thread_id, turn_id) {
             self.rpc(
@@ -720,22 +1218,24 @@ impl Harness for CodexHarness {
                 json!({"threadId": thread_id, "turnId": turn_id}),
             )?;
         }
-        let mut state = lock(&self.shared);
-        state.open.clear();
-        state.turn_id = None;
         Ok(())
     }
 
     fn health(&self) -> HarnessHealth {
         let state = lock(&self.shared);
+        let busy = state.turn.is_some() || !state.inflight.is_empty();
         HarnessHealth {
             process_alive: state.alive,
-            turn_state: if state.open.is_empty() || state.fault_error.is_some() {
-                TurnState::Idle
-            } else {
+            turn_state: if busy && state.fault_error.is_none() {
                 TurnState::InTurn
+            } else {
+                TurnState::Idle
             },
-            delivery: DELIVERY,
+            delivery: Delivery {
+                idempotent: !state.history_missing,
+                ..DELIVERY
+            }
+            .with_peer(state.peer.clone()),
             quota_reset_at_ms: state.quota_reset_at_ms,
             sign_in_fault: state.fault_error.clone(),
         }
@@ -777,58 +1277,21 @@ impl Harness for CodexHarness {
     }
 }
 
-fn commit_delivery(state: &mut State, id: &str, started_turn: bool, method: &str, result: &Value) {
-    if !state.written.iter().any(|item| item == id) {
-        state.written.push(id.to_string());
-        state.seen.insert(id.to_string());
-        if started_turn {
-            state.turns_started += 1;
-        }
-    }
-    if state.finished.contains(id)
-        || state.consecutive_turn_errors > 0
-        || state.fault_error.is_some()
-    {
-        return;
-    }
-    let turn_id = if method == "turn/steer" {
-        result.get("turnId").and_then(Value::as_str)
-    } else {
-        result.pointer("/turn/id").and_then(Value::as_str)
-    };
-    if let Some(turn_id) = turn_id {
-        state.turn_id = Some(turn_id.to_string());
-    }
+fn fake_mode() -> bool {
+    std::env::var_os("ANYAGENTS_FAKE_MODE").is_some()
 }
 
-fn unstage(state: &mut State, id: &str) {
-    if state.finished.contains(id) {
-        return;
-    }
-    state.open.retain(|item| item != id);
+fn mark_dead(shared: &Mutex<State>, wake: &Condvar) {
+    let mut state = lock(shared);
+    state.alive = false;
+    state.touch();
+    drop(state);
+    wake.notify_all();
 }
 
-fn finish_open(state: &mut State) {
-    let usage = state.last_usage.clone().unwrap_or_default();
-    for id in state.open.drain(..) {
-        state.finished.insert(id.clone());
-        state.usages.push((id, usage.clone()));
-    }
-    state.turn_id = None;
-}
-
-fn take_ready(state: &mut State, id: i64) -> Option<Ready> {
-    match state.pending.remove(&id) {
-        Some(Pending::Done(value)) => Some(Ready::Done(value)),
-        Some(Pending::Err(value)) => Some(Ready::Err(value)),
-        Some(Pending::Waiting) => {
-            state.pending.insert(id, Pending::Waiting);
-            None
-        }
-        None => None,
-    }
-}
-
+/// Read the child's output until it closes. A write that fails marks the
+/// process dead, and reading goes on: a proof already on its way still
+/// counts.
 fn read_stdout(
     stdout: ChildStdout,
     shared: Arc<Mutex<State>>,
@@ -843,10 +1306,9 @@ fn read_stdout(
         let Ok(value) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
+        // A request from the server (an approval): approve it.
         if value.get("method").is_some()
             && let Some(id) = value.get("id")
-            && value.get("result").is_none()
-            && value.get("error").is_none()
         {
             let reply = json!({
                 "jsonrpc": "2.0",
@@ -854,44 +1316,19 @@ fn read_stdout(
                 "result": {"decision": "approved", "approved": true}
             });
             if write_stdin(&stdin, &reply).is_err() {
-                break;
+                mark_dead(&shared, &wake);
             }
+            continue;
         }
-        let retry_payload = {
+        let request = {
             let mut state = lock(&shared);
-            let before = state.observed();
             apply_line(&mut state, &value);
-            let retry = if state.retry_turn_start {
-                state.retry_turn_start = false;
-                state.last_turn_input.clone().map(|(tid, inp, mid)| {
-                    state.next_rpc += 1;
-                    let rpc_id = state.next_rpc;
-                    json!({
-                        "jsonrpc": "2.0",
-                        "id": rpc_id,
-                        "method": "turn/start",
-                        "params": {
-                            "threadId": tid,
-                            "input": inp,
-                            "clientUserMessageId": mid,
-                        }
-                    })
-                })
-            } else {
-                None
-            };
-            // An item delta or progress event changes nothing the host reads,
-            // and wakes nobody.
-            if state.observed() != before {
-                state.epoch = state.epoch.wrapping_add(1);
-            }
-            retry
+            state.next_request()
         };
-        if let Some(req) = retry_payload {
-            if write_stdin(&stdin, &req).is_err() {
-                break;
-            }
-            lock(&shared).turns_started += 1;
+        if let Some(request) = request
+            && write_stdin(&stdin, &request).is_err()
+        {
+            mark_dead(&shared, &wake);
         }
         wake.notify_all();
     }
@@ -901,7 +1338,7 @@ fn read_stdout(
         if let Some(child) = state.child.as_mut() {
             let _ = child.try_wait();
         }
-        state.epoch = state.epoch.wrapping_add(1);
+        state.touch();
     }
     wake.notify_all();
 }
@@ -930,29 +1367,101 @@ fn watch_child(shared: Arc<Mutex<State>>, wake: Arc<Condvar>, notify: Arc<dyn Fn
         });
 }
 
+/// One line from the server: a notification or the answer to a request.
 fn apply_line(state: &mut State, value: &Value) {
-    note_ids(state, value);
-    if value.get("method").is_some()
-        && value.get("result").is_none()
-        && value.get("error").is_none()
-    {
-        let method = value.get("method").and_then(Value::as_str).unwrap_or("");
+    if let Some(method) = value.get("method").and_then(Value::as_str) {
         let params = value.get("params").cloned().unwrap_or(Value::Null);
-        on_notification(state, method, &params);
+        state.on_notification(method, &params);
         return;
     }
     let Some(id) = value.get("id").and_then(Value::as_i64) else {
         return;
     };
-    if !matches!(state.pending.get(&id), Some(Pending::Waiting)) {
-        return;
+    let answer = match (value.get("result"), value.get("error")) {
+        (_, Some(error)) => Err(error.clone()),
+        (Some(result), None) => Ok(result.clone()),
+        (None, None) => return,
+    };
+    match state.requests.remove(&id) {
+        Some(Request::Call(_)) => {
+            state.requests.insert(id, Request::Call(Some(answer)));
+        }
+        Some(Request::Input { id, start }) => state.on_input_answer(id, start, answer),
+        Some(Request::History { scan }) => state.on_history_page(scan, answer),
+        None => {}
     }
-    if let Some(error) = value.get("error") {
-        state.pending.insert(id, Pending::Err(error.clone()));
-        return;
+}
+
+/// The mailbox id a `userMessage` item carries: its `clientId`, else the
+/// marker on the first line of its first text part.
+fn user_message_id(item: &Value) -> Option<&str> {
+    if item.get("type").and_then(Value::as_str) != Some("userMessage") {
+        return None;
     }
-    if let Some(result) = value.get("result") {
-        state.pending.insert(id, Pending::Done(result.clone()));
+    if let Some(id) = item
+        .get("clientId")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+    {
+        return Some(id);
+    }
+    item.get("content")?
+        .as_array()?
+        .iter()
+        .find(|part| part.get("type").and_then(Value::as_str) == Some("text"))?
+        .get("text")
+        .and_then(Value::as_str)
+        .and_then(message_id_in_text)
+}
+
+fn turn_id(params: &Value) -> Option<&str> {
+    params
+        .pointer("/turn/id")
+        .or_else(|| params.get("turnId"))
+        .and_then(Value::as_str)
+        .filter(|turn| !turn.is_empty())
+}
+
+/// `codex <version>` from an `initialize` `userAgent` such as
+/// `codex_cli_rs/0.169.0 (Linux; x86_64)`.
+fn peer_from_user_agent(agent: &str) -> Option<String> {
+    let (_, rest) = agent.split_once('/')?;
+    let version = rest.split_whitespace().next()?;
+    Some(format!("codex {version}"))
+}
+
+/// What an error answer to `turn/start` or `turn/steer` means for its input.
+fn classify(error: &Value) -> Answer {
+    if let Some(reset_at_ms) = quota_from_rpc_error(error) {
+        return Answer::Quota(reset_at_ms);
+    }
+    let message = error.get("message").and_then(Value::as_str).unwrap_or("");
+    match error.get("code").and_then(Value::as_i64) {
+        Some(-32600) => {
+            if message.starts_with("no active turn") {
+                Answer::Refused(Refusal::NoTurn)
+            } else if message.starts_with("expected active turn id") {
+                let found = message
+                    .split_once("but found `")
+                    .and_then(|(_, rest)| rest.split_once('`'))
+                    .map(|(turn, _)| turn.to_owned())
+                    .filter(|turn| !turn.is_empty());
+                Answer::Refused(Refusal::OtherTurn(found))
+            } else if error.pointer("/data/reason").and_then(Value::as_str)
+                == Some("serverShuttingDown")
+                || message.contains("draining")
+            {
+                Answer::Refused(Refusal::Draining)
+            } else if message.contains("must not be empty") {
+                Answer::Rejected(rpc_failure(error))
+            } else {
+                Answer::Refused(Refusal::Held)
+            }
+        }
+        // A method this peer lacks took nothing.
+        Some(-32601) => Answer::Refused(Refusal::Held),
+        Some(-32602) => Answer::Rejected(rpc_failure(error)),
+        _ => Answer::Unknown,
     }
 }
 
@@ -967,40 +1476,12 @@ fn is_unrecoverable_thread_error(params: &Value) -> bool {
         || raw.contains("\"http_status_code\":413")
 }
 
-fn invalidate_thread(state: &mut State) {
-    let rejected = std::mem::take(&mut state.open);
-    for id in rejected {
-        state.seen.remove(&id);
-        state.written.retain(|w| w != &id);
-    }
-    state.thread_id = None;
-    state.turn_id = None;
-    state.thread_invalidated = true;
-    state.alive = false;
-    if let Some(child) = state.child.as_mut() {
-        let _ = child.kill();
-    }
-}
-
-fn is_auth_or_provider_401(err: &str) -> bool {
-    let lower = err.to_ascii_lowercase();
-    lower.contains("401")
-        || lower.contains("unauthorized")
-        || lower.contains("invalid_api_key")
-        || lower.contains("authentication failed")
-        || lower.contains("not logged in")
-        || lower.contains("sign in required")
-}
-
 fn extract_turn_error(params: &Value) -> Option<String> {
     for ptr in [
         "/turn/error/message",
         "/error/message",
-        "/msg/error/message",
-        "/turn/lastError/message",
         "/turn/error",
         "/error",
-        "/msg/error",
         "/message",
     ] {
         if let Some(s) = params
@@ -1012,7 +1493,7 @@ fn extract_turn_error(params: &Value) -> Option<String> {
             return Some(s.to_string());
         }
     }
-    for ptr in ["/turn/error", "/error", "/msg/error"] {
+    for ptr in ["/turn/error", "/error"] {
         if let Some(obj) = params.pointer(ptr).filter(|v| v.is_object()) {
             let raw = obj.to_string();
             if raw != "{}" {
@@ -1053,90 +1534,6 @@ fn persist_codex_fault_error(config_dir: Option<&Path>, err: Option<&str>) {
     }
 }
 
-fn on_notification(state: &mut State, method: &str, params: &Value) {
-    match method {
-        "thread/tokenUsage/updated" => state.last_usage = Some(usage_from_codex(params)),
-        "turn/started" => {
-            if let Some(tid) = params
-                .pointer("/turn/id")
-                .or_else(|| params.get("turnId"))
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-            {
-                state.turn_id = Some(tid.to_string());
-            }
-        }
-        "error" | "codex/event/error" | "codex/event/stream_error" => {
-            if let Some(msg) = extract_turn_error(params) {
-                state.pending_turn_error = Some(msg);
-            }
-            if is_unrecoverable_thread_error(params) {
-                invalidate_thread(state);
-            }
-        }
-        "codex/event/task_complete" => {
-            if let Some(msg) = extract_turn_error(params) {
-                state.pending_turn_error = Some(msg);
-            }
-        }
-        "turn/completed" => {
-            let status = params
-                .pointer("/turn/status")
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            let turn_err = extract_turn_error(params).or_else(|| state.pending_turn_error.take());
-            if status == "completed" && turn_err.is_none() {
-                state.consecutive_turn_errors = 0;
-                state.fault_error = None;
-                state.last_turn_input = None;
-                state.retry_turn_start = false;
-                persist_codex_fault_error(state.config_dir.as_deref(), None);
-                finish_open(state);
-            } else if status == "interrupted" && turn_err.is_none() {
-                state.open.clear();
-                state.turn_id = None;
-                state.retry_turn_start = false;
-            } else if is_unrecoverable_thread_error(params) {
-                if let Some(msg) = turn_err {
-                    state.fault_error = Some(msg.clone());
-                    persist_codex_fault_error(state.config_dir.as_deref(), Some(&msg));
-                }
-                invalidate_thread(state);
-            } else {
-                state.consecutive_turn_errors = state.consecutive_turn_errors.saturating_add(1);
-                let msg = turn_err.unwrap_or_else(|| {
-                    format!("turn {}", if status.is_empty() { "failed" } else { status })
-                });
-                if is_auth_or_provider_401(&msg) || state.consecutive_turn_errors >= 3 {
-                    state.fault_error = Some(msg.clone());
-                    persist_codex_fault_error(state.config_dir.as_deref(), Some(&msg));
-                }
-                if state.consecutive_turn_errors < 3 && state.last_turn_input.is_some() {
-                    state.turn_id = None;
-                    state.retry_turn_start = true;
-                } else {
-                    state.open.clear();
-                    state.turn_id = None;
-                    state.retry_turn_start = false;
-                }
-            }
-        }
-        "account/rateLimits/updated" => {
-            if let Some(reset_at_ms) = quota_from_limits(params) {
-                state.quota_reset_at_ms = Some(reset_at_ms);
-                let rejected = std::mem::take(&mut state.open);
-                for id in rejected {
-                    state.seen.remove(&id);
-                    state.written.retain(|w| w != &id);
-                }
-                state.turn_id = None;
-                state.retry_turn_start = false;
-            }
-        }
-        _ => {}
-    }
-}
-
 fn usage_from_codex(params: &Value) -> TurnUsage {
     let last = params
         .pointer("/tokenUsage/last")
@@ -1155,33 +1552,6 @@ fn u64_field(value: Option<&Value>, key: &str) -> u64 {
         .and_then(|item| item.get(key))
         .and_then(Value::as_u64)
         .unwrap_or(0)
-}
-
-fn note_ids(state: &mut State, value: &Value) {
-    match value {
-        Value::Object(map) => {
-            for (key, item) in map {
-                if key == "clientUserMessageId"
-                    && let Some(id) = item.as_str()
-                    && !id.is_empty()
-                {
-                    state.seen.insert(id.to_string());
-                }
-                note_ids(state, item);
-            }
-        }
-        Value::Array(items) => {
-            for item in items {
-                note_ids(state, item);
-            }
-        }
-        Value::String(text) => {
-            if let Some(id) = message_id_in_text(text) {
-                state.seen.insert(id.to_string());
-            }
-        }
-        _ => {}
-    }
 }
 
 fn quota_from_limits(params: &Value) -> Option<i64> {
@@ -1282,13 +1652,96 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|err| err.into_inner())
 }
 
-#[cfg(all(test, unix))]
-mod protocol_write_tests {
+#[cfg(test)]
+mod tests {
     use super::*;
 
-    // Failed-write cases have no input pipe before the reader starts, rather
-    // than depending on the child shell closing it before a protocol write.
-    fn reader_fixture(script: &str, retry: bool, input: Stdio) -> CodexHarness {
+    fn user_message(client_id: Value, text: &str) -> Value {
+        json!({
+            "type": "userMessage",
+            "id": "item-1",
+            "clientId": client_id,
+            "content": [{"type": "text", "text": text, "text_elements": []}],
+        })
+    }
+
+    #[test]
+    fn a_user_message_names_its_message_by_client_id_then_by_marker() {
+        assert_eq!(
+            user_message_id(&user_message(json!("msg_1"), "anyagents-message:msg_2\nhi")),
+            Some("msg_1")
+        );
+        assert_eq!(
+            user_message_id(&user_message(Value::Null, "anyagents-message:msg_2\nhi")),
+            Some("msg_2")
+        );
+        assert_eq!(
+            user_message_id(&user_message(Value::Null, "hi\nanyagents-message:msg_2")),
+            None
+        );
+        let mut agent = user_message(json!("msg_1"), "anyagents-message:msg_1");
+        agent["type"] = json!("agentMessage");
+        assert_eq!(user_message_id(&agent), None);
+    }
+
+    #[test]
+    fn the_peer_is_the_version_the_user_agent_names() {
+        assert_eq!(
+            peer_from_user_agent("codex_cli_rs/0.169.0 (Linux 6.18; x86_64) xterm").as_deref(),
+            Some("codex 0.169.0")
+        );
+        assert_eq!(peer_from_user_agent("fake"), None);
+    }
+
+    #[test]
+    fn errors_say_whether_the_input_was_applied() {
+        let error = |code: i64, message: &str| json!({"code": code, "message": message});
+        assert_eq!(
+            classify(&error(-32600, "no active turn to steer")),
+            Answer::Refused(Refusal::NoTurn)
+        );
+        assert_eq!(
+            classify(&error(
+                -32600,
+                "expected active turn id `turn-1` but found `turn-2`"
+            )),
+            Answer::Refused(Refusal::OtherTurn(Some("turn-2".into())))
+        );
+        assert_eq!(
+            classify(&json!({
+                "code": -32600,
+                "message": "Server is draining; retry after reconnecting",
+                "data": {"reason": "serverShuttingDown"}
+            })),
+            Answer::Refused(Refusal::Draining)
+        );
+        assert_eq!(
+            classify(&error(-32600, "cannot steer a review turn")),
+            Answer::Refused(Refusal::Held)
+        );
+        assert!(matches!(
+            classify(&error(
+                -32602,
+                "Input exceeds the maximum length of 1048576 characters."
+            )),
+            Answer::Rejected(_)
+        ));
+        assert_eq!(
+            classify(&error(-32603, "failed to steer turn: channel closed")),
+            Answer::Unknown
+        );
+        assert_eq!(
+            classify(&json!({
+                "code": -32000,
+                "message": "usageLimitExceeded",
+                "data": {"resetsAt": 1_700_000_000}
+            })),
+            Answer::Quota(1_700_000_000_000)
+        );
+    }
+
+    #[cfg(unix)]
+    fn reader_fixture(script: &str, input: Stdio) -> CodexHarness {
         let mut child = std::process::Command::new("/bin/sh")
             .args(["-c", script])
             .stdin(input)
@@ -1300,9 +1753,7 @@ mod protocol_write_tests {
         let shared = Arc::new(Mutex::new(State {
             alive: true,
             child: Some(child),
-            open: vec!["m1".into()],
-            last_turn_input: retry.then(|| ("thread-1".into(), json!([]), "m1".into())),
-            retry_turn_start: retry,
+            history_ready: true,
             ..State::default()
         }));
         let wake = Arc::new(Condvar::new());
@@ -1317,54 +1768,29 @@ mod protocol_write_tests {
         }
     }
 
+    // A failed write has no input pipe before the reader starts, rather than
+    // depending on the child shell closing it before a protocol write.
+    #[cfg(unix)]
     #[test]
-    fn failed_required_approval_reply_marks_the_protocol_dead_without_finishing_work() {
+    fn failed_required_approval_reply_marks_the_protocol_dead() {
         let harness = reader_fixture(
             "printf '%s\n' '{\"id\":99,\"method\":\"approval/request\"}'; exec sleep 30",
-            false,
             Stdio::null(),
         );
         assert!(harness.wait_pred(Duration::from_secs(5), |state| !state.alive));
-        assert!(!harness.is_finished("m1"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn successful_required_approval_reply_preserves_protocol_progress() {
         let harness = reader_fixture(
             "printf '%s\n' '{\"id\":99,\"method\":\"approval/request\"}'; IFS= read -r reply; printf '%s\n' '{\"method\":\"turn/started\",\"params\":{\"turnId\":\"reply-received\"}}'; exec sleep 30",
-            false,
             Stdio::piped(),
         );
         assert!(
-            harness.wait_pred(Duration::from_secs(5), |state| state.turn_id.as_deref()
+            harness.wait_pred(Duration::from_secs(5), |state| state.turn.as_deref()
                 == Some("reply-received"))
         );
         assert!(harness.health().process_alive);
-    }
-
-    #[test]
-    fn failed_retry_write_does_not_count_a_turn_that_was_never_sent() {
-        let harness = reader_fixture(
-            "printf '%s\n' '{\"method\":\"ready\"}'; exec sleep 30",
-            true,
-            Stdio::null(),
-        );
-        assert!(harness.wait_pred(Duration::from_secs(5), |state| !state.alive));
-        assert_eq!(harness.turns_started(), 0);
-        assert!(!harness.is_finished("m1"));
-    }
-
-    #[test]
-    fn successful_retry_write_is_counted_and_reaches_the_vendor() {
-        let harness = reader_fixture(
-            "printf '%s\n' '{\"method\":\"ready\"}'; IFS= read -r retry; printf '%s\n' '{\"method\":\"turn/started\",\"params\":{\"turnId\":\"retry-received\"}}'; exec sleep 30",
-            true,
-            Stdio::piped(),
-        );
-        assert!(
-            harness.wait_pred(Duration::from_secs(5), |state| state.turn_id.as_deref()
-                == Some("retry-received"))
-        );
-        assert_eq!(harness.turns_started(), 1);
     }
 }
