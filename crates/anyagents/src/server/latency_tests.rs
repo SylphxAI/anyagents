@@ -172,6 +172,59 @@ fn a_handler_whose_read_waits_never_holds_the_async_worker() {
     drop(stop);
 }
 
+/// A delivery waits for its recipient's lifecycle lock (a blocking `flock`)
+/// on the blocking pool, never on an async worker: while the recipient is
+/// held, the health route still answers, and the send completes once the
+/// lock is released.
+#[test]
+fn a_send_waiting_for_its_recipients_lifecycle_never_holds_the_async_worker() {
+    let dir = crate::test_tempdir();
+    let state = state(dir.path());
+    let recipient = state
+        .store
+        .create_agent(anyagents_core::NewAgent::new("held-recipient", "opencode"))
+        .unwrap();
+    let held = state.store.lock_agent_lifecycle(&recipient.id).unwrap();
+    let store = Arc::clone(&state.store);
+    let api = dir.path().join("api.sock");
+    let stop = one_worker_server(state, api.clone());
+    let sending = {
+        let api = api.clone();
+        std::thread::spawn(move || {
+            let body = r#"{"sender":"operator","to":["agent:held-recipient"],"text":"hello"}"#;
+            let mut stream = UnixStream::connect(&api).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(20)))
+                .unwrap();
+            write!(
+                stream,
+                "POST /v1/send HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\
+                 x-anyagents-operator: {OPERATOR}\r\ncontent-type: application/json\r\n\
+                 content-length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+            let mut answer = String::new();
+            stream.read_to_string(&mut answer).map(|_| answer)
+        })
+    };
+    // While the delivery waits for the held lifecycle, the worker is free.
+    for _ in 0..10 {
+        healthz_answers(&api);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !sending.is_finished(),
+        "the send did not wait for the lifecycle"
+    );
+    assert!(store.inbox(&recipient.id, None).unwrap().is_empty());
+    drop(held);
+    let answer = sending.join().unwrap().unwrap();
+    assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+    assert_eq!(store.inbox(&recipient.id, None).unwrap().len(), 1);
+    drop(stop);
+}
+
 mod views {
     use anyagents_core::{Agent, NewAgent, Store, agent_config_dir, now_ms};
     use anyagents_supervisor::HealthBoard;
