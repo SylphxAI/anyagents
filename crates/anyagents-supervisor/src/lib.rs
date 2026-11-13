@@ -913,6 +913,7 @@ impl<H: Harness + 'static> Session<H> {
                 continue;
             }
             if !health.process_alive {
+                self.commit_proven();
                 self.record_usage_with(&health);
                 if !self.wait_backoff() {
                     self.delivery = None;
@@ -1179,6 +1180,7 @@ impl<H: Harness + 'static> Session<H> {
             self.restart_at = None;
             return false;
         }
+        self.commit_proven();
         // Flush any usage the exited process finished serving before swapping it.
         if !self.record_usage() {
             return false;
@@ -1227,8 +1229,32 @@ impl<H: Harness + 'static> Session<H> {
             // A new process makes this pass's snapshot stale: start over.
             return (rotated_after_start || config_switched) && self.replace_process();
         }
+        self.commit_proven();
         self.sleep(Some(reset_at));
         true
+    }
+
+    /// Commit what a dead or quota-held process proved it took, before the
+    /// quota wait or the process replacement that skips the delivery pass.
+    /// A proof outlives the process that gave it, but not the adapter that
+    /// holds it: once a new process takes over, an uncommitted message would
+    /// be handed over again. Every adapter answers a proven message before
+    /// its quota or its liveness, and an unwritten one with `Quota` or
+    /// `Dead`, so this pass writes nothing. A live process without a quota
+    /// would take new input, so it is left to the delivery pass.
+    fn commit_proven(&mut self) {
+        let Some(delivery) = self.delivery.as_mut() else {
+            return;
+        };
+        let health = delivery.harness().health();
+        if health.process_alive && health.quota_reset_at_ms.is_none() {
+            return;
+        }
+        if let Ok(RunOutcome::Delivered { delivered }) = delivery.run_once() {
+            self.written = self
+                .written
+                .saturating_add(delivered.clamp(0, u64::from(u32::MAX)) as u32);
+        }
     }
 
     /// One pass over the mailbox. Every line is handed to the harness's own

@@ -191,6 +191,62 @@ fn a_running_agent_receives_mail_without_a_manual_deliver() {
 }
 
 #[test]
+fn a_message_proved_before_the_process_died_is_committed_and_never_handed_over_again() {
+    let dir = short_dir();
+    let log = dir.path().join("vendor.log");
+    let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+    let agent = store
+        .create_agent(NewAgent::new("alpha", "claude-code"))
+        .unwrap();
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    store
+        .set_agent_running(&agent.id, &work.display().to_string())
+        .unwrap();
+    let start = 1_699_000_000_000;
+    let clock = ManualClock::new(start);
+    let supervisor = Supervisor::start(
+        Arc::clone(&store),
+        Arc::new(clock.clone()) as Arc<dyn Clock>,
+        scripted("prove_exit", log.clone()),
+        Vec::new(),
+    )
+    .unwrap();
+    assert!(wait_until(|| {
+        supervisor
+            .live(&agent.id)
+            .is_some_and(|live| live.process_alive)
+    }));
+    store
+        .receive(&agent.id, Incoming::new("proved-then-died"))
+        .unwrap();
+    // The vendor proves the line and exits at once. The proof is committed
+    // while the clock is still: before the restart backoff, and before a new
+    // process could be handed the line again.
+    assert!(wait_until(
+        || store.delivered_cursor(&agent.id).unwrap() == 1
+    ));
+    // The next process is handed the interrupted turn's recovery note, which
+    // is offered only once the mailbox holds nothing for it.
+    let mut ticks = 0;
+    assert!(wait_until(|| {
+        ticks += 1;
+        clock.set_ms(start + ticks * 1_000);
+        log_contains(&log, "[Recovery]")
+    }));
+    drop(supervisor);
+    let written = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        written
+            .lines()
+            .filter(|line| line.contains("proved-then-died") && !line.contains("[Recovery]"))
+            .count(),
+        1,
+        "{written}"
+    );
+}
+
+#[test]
 fn quota_pauses_until_the_reset_time() {
     let dir = short_dir();
     let log = dir.path().join("vendor.log");
@@ -828,8 +884,13 @@ fn assert_finished_agent_scales_to_zero(is_root: bool, role: Option<&str>) {
         clock.set_ms(due + i64::from(stepped) * 1_000);
         std::thread::sleep(Duration::from_millis(50));
     }
-    // Completing the turn automatically scales the sub-agent to `idle` and releases its process.
+    // Completing the turn automatically scales the sub-agent to `idle` and
+    // releases its process. The turn's proof can be its last event, so the
+    // idle review runs on the supervisor's timer: let time pass.
+    let mut ticks = 0;
     assert!(wait_until(|| {
+        ticks += 1;
+        clock.set_ms(due + 50_000 + ticks * 250);
         other.agent(&sub.id).unwrap().state == "idle"
             && supervisor
                 .live(&sub.id)
@@ -847,7 +908,10 @@ fn assert_finished_agent_scales_to_zero(is_root: bool, role: Option<&str>) {
         clock.set_ms(due + 100_000 + i64::from(stepped2) * 1_000);
         std::thread::sleep(Duration::from_millis(50));
     }
+    let mut ticks = 0;
     assert!(wait_until(|| {
+        ticks += 1;
+        clock.set_ms(due + 150_000 + ticks * 250);
         other.agent(&sub.id).unwrap().state == "idle"
     }));
     drop(supervisor);
@@ -1014,16 +1078,27 @@ fn profile_rotation_keeps_mail_flowing_and_preserves_an_in_turn_child() {
     let release = dir.path().join("finish-turn");
     let log = dir.path().join("vendor.log");
     let program = dir.path().join("controlled-claude");
-    // The real ClaudeHarness owns this process. Each turn consumes one release
-    // token before reporting completion, so the replacement's queued turn stays
-    // observable even when the runtime promptly releases completed idle agents.
+    // The real ClaudeHarness owns this process. Like Claude Code, it reads
+    // every line as it arrives and proves it entered the conversation with
+    // the replay echo: a line that arrives while a turn runs joins that
+    // turn. A turn reports completion only once it claims a release token,
+    // so the replacement's queued turn stays observable even when the
+    // runtime promptly releases completed idle agents.
     std::fs::write(&program, r#"#!/bin/sh
+turn="$RELEASE_TURN.$$.open"
 while IFS= read -r line; do
     printf '%s:%s\n' "$$" "$line" >> "$PROBE_LOG"
-    while [ ! -f "$RELEASE_TURN" ]; do sleep 0.01; done
-    rm "$RELEASE_TURN"
-    printf '%s\n' '{"type":"result","subtype":"success","session_id":"rotation-test","usage":{"input_tokens":1,"output_tokens":1}}'
+    printf '%s\n' "$line" | sed 's/^{/{"isReplay":true,/'
+    if [ ! -f "$turn" ]; then
+        : > "$turn"
+        (
+            while ! mv "$RELEASE_TURN" "$turn.released" 2>/dev/null; do sleep 0.01; done
+            rm -f "$turn"
+            printf '%s\n' '{"type":"result","subtype":"success","session_id":"rotation-test","usage":{"input_tokens":1,"output_tokens":1}}'
+        ) &
+    fi
 done
+wait
 "#).unwrap();
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
     let clock = ManualClock::new(1_700_000_000_000);
@@ -1108,12 +1183,7 @@ done
                 .success()
         );
     }
-    // The same child works through the steered mail before it is replaced.
-    std::fs::write(dir.path().join("finish-turn"), "done\n").unwrap();
-    assert!(wait_until(|| log_contains(
-        &log_path,
-        "steered-during-rotation"
-    )));
+    // The same child took the steered mail into its running turn.
     let log = std::fs::read_to_string(&log_path).unwrap();
     assert!(
         log.lines()
@@ -1121,8 +1191,8 @@ done
             .unwrap()
             .starts_with(&format!("{first_pid}:"))
     );
-    // When that work ends the child is idle and the rotation takes effect.
-    std::fs::write(dir.path().join("finish-turn"), "finish-steered-turn\n").unwrap();
+    // When that turn ends the child is idle and the rotation takes effect.
+    std::fs::write(dir.path().join("finish-turn"), "done\n").unwrap();
     assert!(wait_until(|| store.open_turn(&agent.id).unwrap().is_none()
         && supervisor
             .live(&agent.id)
@@ -1769,6 +1839,7 @@ fn a_streaming_turn_costs_a_bounded_number_of_supervisor_passes() {
         format!(
             r#"#!/bin/sh
 while IFS= read -r line; do
+    printf '%s\n' "$line" | sed 's/^{{/{{"isReplay":true,/'
     i=0
     while [ "$i" -lt {LINES} ]; do
         printf '%s\n' "{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"chunk $i\"}}]}}}}"

@@ -1,7 +1,8 @@
 //! Speaks just enough stream-json for the adapter tests.
 //!
 //! `ANYAGENTS_FAKE_MODE` selects the script: `hold`, `finish`, `batch`,
-//! `batch_late`, `quota`, `failed_turn`, `synthetic_401`, `steer` or `die`.
+//! `batch_late`, `quota`, `failed_turn`, `synthetic_401`, `steer`, `die` or
+//! `prove_exit` (proves its first line, then exits).
 //! `ANYAGENTS_FAKE_LOG` is a file that receives argv and stdin.
 //!
 //! Every line enters the conversation as soon as it is read: the child proves
@@ -89,6 +90,9 @@ fn main() {
             let _ = writeln!(stdout, "{QUOTA}");
         }
         let _ = stdout.flush();
+        if mode == "prove_exit" {
+            return;
+        }
     }
 }
 
