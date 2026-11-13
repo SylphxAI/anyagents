@@ -189,13 +189,13 @@ impl Mode {
     }
 }
 
-/// The agent one capability authenticates, read from the store.
+/// The agent one capability authenticates, read from the store on every call:
+/// one indexed lookup of the capability and its agent's name, so a rotated or
+/// revoked capability stops working on the next call, whichever process
+/// committed the change.
 pub fn agent_for_capability(store: &Store, token: &str) -> Result<Principal, AuthError> {
-    if let Ok(agent_id) = store.authenticate_capability(token) {
-        let name = store
-            .agent(&agent_id)
-            .map_err(|_| AuthError::Unauthenticated("the agent is gone".into()))?
-            .name;
+    if let Ok(Some((agent_id, name))) = store.capability_holder(token) {
+        let name = name.ok_or_else(|| AuthError::Unauthenticated("the agent is gone".into()))?;
         return Ok(Principal::Agent { agent_id, name });
     }
     #[cfg(unix)]
@@ -339,6 +339,41 @@ mod tests {
         assert!(
             matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
         );
+    }
+
+    #[test]
+    fn a_capability_rotated_by_another_process_stops_working_on_the_next_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let server = Store::open(&path).unwrap();
+        server.hold_capability_key(&"a".repeat(64)).unwrap();
+        let agent = server
+            .create_agent(anyagents_core::NewAgent::new("rotated", "test"))
+            .unwrap();
+        let first = server.issue_capability(&agent.id).unwrap();
+        assert_eq!(
+            agent_for_capability(&server, &first).unwrap(),
+            Principal::Agent {
+                agent_id: agent.id.clone(),
+                name: "rotated".into(),
+            }
+        );
+        // Another process holding the key mints a new capability and later
+        // retires every one; the server sees each change on its next call.
+        let other = Store::open(&path).unwrap();
+        other.hold_capability_key(&"a".repeat(64)).unwrap();
+        let second = other.issue_capability(&agent.id).unwrap();
+        assert!(agent_for_capability(&server, &first).is_err());
+        other.rename_agent(&agent.id, "renamed").unwrap();
+        assert_eq!(
+            agent_for_capability(&server, &second).unwrap(),
+            Principal::Agent {
+                agent_id: agent.id.clone(),
+                name: "renamed".into(),
+            }
+        );
+        other.retire_capabilities(&agent.id).unwrap();
+        assert!(agent_for_capability(&server, &second).is_err());
     }
 
     #[test]

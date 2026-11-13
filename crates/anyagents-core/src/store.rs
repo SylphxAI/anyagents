@@ -29,6 +29,7 @@ mod group_policy;
 mod harness_leases;
 mod history_ops;
 mod lifecycle;
+mod mcp_ops;
 mod registry;
 mod runtime;
 #[cfg(test)]
