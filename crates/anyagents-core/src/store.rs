@@ -27,6 +27,7 @@ mod audit_tests;
 mod credentials;
 mod group_policy;
 mod harness_leases;
+mod history_ops;
 mod lifecycle;
 mod registry;
 mod runtime;

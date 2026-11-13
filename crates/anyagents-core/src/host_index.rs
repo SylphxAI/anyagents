@@ -1,7 +1,10 @@
 //! Rebuildable host index: metadata and contentless FTS windows only.
 //! Raw bytes stay in their original filesystem segment. Every result requires
 //! an explicit host-authorized agent set, including learned-memory results.
-use crate::{HistorySearchQuery, HistorySort, raw_segment::RawCoordinate};
+use crate::{
+    HistorySearchQuery, HistorySort,
+    raw_segment::{RawCoordinate, RawSource},
+};
 use rusqlite::{
     Connection, OptionalExtension, TransactionBehavior, params, params_from_iter, types::Value,
 };
@@ -9,8 +12,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
-    io::{self, Read, Seek, SeekFrom},
-    path::Path,
+    io::{self, Read},
+    ops::{Deref, DerefMut},
+    path::{Path, PathBuf},
+    sync::{Mutex, MutexGuard},
 };
 
 const WINDOW_BYTES: usize = 4096;
@@ -35,7 +40,7 @@ pub enum MemoryScope {
     Transcripts,
 }
 impl MemoryScope {
-    fn source(self) -> Option<&'static str> {
+    pub(crate) fn source(self) -> Option<&'static str> {
         match self {
             Self::All => None,
             Self::Memory => Some("memory"),
@@ -81,6 +86,106 @@ fn decode_tool_names(value: String) -> rusqlite::Result<Vec<String>> {
 pub struct HostIndex {
     conn: Connection,
 }
+
+/// Index connections kept open for reuse by this process: opening one maps
+/// the WAL and probes the schema, so callers borrow an idle connection and
+/// return it when done. At most `MAX_IDLE_PER_FILE` stay idle per index
+/// file, and a connection whose file was deleted or replaced is closed.
+static IDLE: Mutex<Vec<IdleIndex>> = Mutex::new(Vec::new());
+const MAX_IDLE_PER_FILE: usize = 4;
+struct IdleIndex {
+    path: PathBuf,
+    identity: (u64, u64),
+    index: HostIndex,
+}
+impl IdleIndex {
+    fn is_current(&self) -> bool {
+        file_identity(&self.path).is_ok_and(|now| now == Some(self.identity))
+    }
+}
+fn file_identity(path: &Path) -> io::Result<Option<(u64, u64)>> {
+    use std::os::unix::fs::MetadataExt;
+    match fs::metadata(path) {
+        Ok(m) => Ok(Some((m.dev(), m.ino()))),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+fn idle_pool() -> MutexGuard<'static, Vec<IdleIndex>> {
+    IDLE.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// A [`HostIndex`] borrowed from this process's pool; returned on drop.
+pub(crate) struct SharedHostIndex(Option<IdleIndex>);
+impl Deref for SharedHostIndex {
+    type Target = HostIndex;
+    fn deref(&self) -> &HostIndex {
+        &self.0.as_ref().expect("borrowed until drop").index
+    }
+}
+impl DerefMut for SharedHostIndex {
+    fn deref_mut(&mut self) -> &mut HostIndex {
+        &mut self.0.as_mut().expect("borrowed until drop").index
+    }
+}
+impl Drop for SharedHostIndex {
+    fn drop(&mut self) {
+        // A connection left inside a transaction is closed, never reused.
+        let Some(idle) = self.0.take().filter(|i| i.index.conn.is_autocommit()) else {
+            return;
+        };
+        let closed: Vec<IdleIndex> = {
+            let mut pool = idle_pool();
+            pool.push(idle);
+            let mut closed = Vec::new();
+            let mut kept: Vec<IdleIndex> = Vec::with_capacity(pool.len());
+            for entry in pool.drain(..).rev() {
+                let same_file = kept.iter().filter(|k| k.path == entry.path).count();
+                if same_file < MAX_IDLE_PER_FILE && entry.is_current() {
+                    kept.push(entry);
+                } else {
+                    closed.push(entry);
+                }
+            }
+            kept.reverse();
+            *pool = kept;
+            closed
+        };
+        // Closing a connection can checkpoint; never under the pool lock.
+        drop(closed);
+    }
+}
+
+impl HostIndex {
+    /// Borrow an idle connection to the index at `path`, opening (and
+    /// creating) one only when none is idle.
+    pub(crate) fn shared(path: &Path) -> Result<SharedHostIndex, IndexError> {
+        let reused = file_identity(path)?.and_then(|identity| {
+            let mut pool = idle_pool();
+            let at = pool
+                .iter()
+                .rposition(|i| i.path == path && i.identity == identity)?;
+            Some(pool.remove(at))
+        });
+        if let Some(idle) = reused {
+            return Ok(SharedHostIndex(Some(idle)));
+        }
+        let index = Self::open(path)?;
+        let identity = file_identity(path)?
+            .ok_or_else(|| io::Error::other("host index vanished while opening"))?;
+        Ok(SharedHostIndex(Some(IdleIndex {
+            path: path.to_owned(),
+            identity,
+            index,
+        })))
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Connections opened on this thread.
+    static OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 impl HostIndex {
     fn schema_state(conn: &Connection) -> Result<(bool, bool), rusqlite::Error> {
         let old_required_time = conn
@@ -92,9 +197,9 @@ impl HostIndex {
         let already_initialized = !old_required_time
             && conn
                 .query_row(
-                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='host_fts'",
+                    "SELECT count(*)=2 FROM sqlite_master WHERE type='table' AND name IN ('host_fts','host_agent_trees')",
                     [],
-                    |_| Ok(true),
+                    |r| r.get(0),
                 )
                 .optional()?
                 .unwrap_or(false)
@@ -111,6 +216,8 @@ impl HostIndex {
     }
 
     pub fn open(path: &Path) -> Result<Self, IndexError> {
+        #[cfg(test)]
+        OPENS.with(|n| n.set(n.get() + 1));
         match Self::open_inner(path) {
             Err(IndexError::Sql(error))
                 if error.to_string().contains("malformed")
@@ -158,6 +265,7 @@ impl HostIndex {
                 DROP TABLE IF EXISTS host_document_tools;
                 DROP TABLE IF EXISTS host_documents;
                 DROP TABLE IF EXISTS host_sources;
+                DROP TABLE IF EXISTS host_agent_trees;
                 DROP TABLE IF EXISTS host_fts;",
                 )?;
             }
@@ -177,6 +285,9 @@ impl HostIndex {
             CREATE TABLE IF NOT EXISTS host_sources (
                 agent_id TEXT NOT NULL, segment TEXT NOT NULL, cursor TEXT NOT NULL,
                 PRIMARY KEY(agent_id,segment));
+            CREATE TABLE IF NOT EXISTS host_agent_trees (
+                agent_id TEXT NOT NULL, class TEXT NOT NULL, policy TEXT NOT NULL,
+                tree TEXT NOT NULL, PRIMARY KEY(agent_id,class));
             CREATE INDEX IF NOT EXISTS host_documents_owner ON host_documents(agent_id,source,timestamp_ms);
             CREATE TABLE IF NOT EXISTS host_windows (
                 id INTEGER PRIMARY KEY, document_id TEXT NOT NULL REFERENCES host_documents(id) ON DELETE CASCADE,
@@ -208,27 +319,17 @@ impl HostIndex {
     }
 
     /// Delete stale filesystem coordinates after a complete authorized scan.
+    /// Documents can vanish here while their files stay unchanged, so the
+    /// agent's recorded walks go too and its next search walks again.
     pub fn retain_agent_documents(
         &mut self,
         owner: &str,
         keep: &std::collections::HashSet<String>,
     ) -> Result<(), IndexError> {
-        self.retain_agent_scope(owner, MemoryScope::All, keep)
-    }
-
-    /// A scoped refresh must not prune the other source class or its cursors.
-    pub(crate) fn retain_agent_scope(
-        &mut self,
-        owner: &str,
-        scope: MemoryScope,
-        keep: &std::collections::HashSet<String>,
-    ) -> Result<(), IndexError> {
         let ids = self
             .conn
-            .prepare(
-                "SELECT id FROM host_documents WHERE agent_id=?1 AND (?2 IS NULL OR source=?2)",
-            )?
-            .query_map(params![owner, scope.source()], |r| r.get::<_, String>(0))?
+            .prepare("SELECT id FROM host_documents WHERE agent_id=?1")?
+            .query_map([owner], |r| r.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
         let stale: Vec<String> = ids.into_iter().filter(|id| !keep.contains(id)).collect();
         if stale.is_empty() {
@@ -252,7 +353,75 @@ impl HostIndex {
             (SELECT segment FROM host_documents WHERE agent_id=?1)",
             [owner],
         )?;
+        tx.execute("DELETE FROM host_agent_trees WHERE agent_id=?1", [owner])?;
         tx.commit()?;
+        Ok(())
+    }
+
+    /// Every published source of one agent with its cursor: one row per file,
+    /// never one per document.
+    pub(crate) fn agent_sources(&self, owner: &str) -> Result<Vec<(String, String)>, IndexError> {
+        Ok(self
+            .conn
+            .prepare_cached("SELECT segment, cursor FROM host_sources WHERE agent_id=?1")?
+            .query_map([owner], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<_, _>>()?)
+    }
+
+    /// Drop sources whose files a complete walk no longer finds, with all
+    /// their documents. Every document belongs to a published source.
+    pub(crate) fn forget_sources(
+        &mut self,
+        owner: &str,
+        segments: &[String],
+    ) -> Result<(), IndexError> {
+        if segments.is_empty() {
+            return Ok(());
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for segment in segments {
+            tx.execute(
+                "DELETE FROM host_documents WHERE agent_id=?1 AND segment=?2",
+                params![owner, segment],
+            )?;
+            tx.execute(
+                "DELETE FROM host_sources WHERE agent_id=?1 AND segment=?2",
+                params![owner, segment],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The walk last recorded for one class of an agent: `(policy, tree)`.
+    pub(crate) fn agent_tree(
+        &self,
+        owner: &str,
+        class: &str,
+    ) -> Result<Option<(String, String)>, IndexError> {
+        Ok(self
+            .conn
+            .prepare_cached(
+                "SELECT policy, tree FROM host_agent_trees WHERE agent_id=?1 AND class=?2",
+            )?
+            .query_row([owner, class], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?)
+    }
+    pub(crate) fn save_agent_tree(
+        &self,
+        owner: &str,
+        class: &str,
+        policy: &str,
+        tree: &str,
+    ) -> Result<(), IndexError> {
+        self.conn
+            .prepare_cached(
+                "INSERT INTO host_agent_trees VALUES(?1,?2,?3,?4)
+                ON CONFLICT(agent_id,class) DO UPDATE SET policy=excluded.policy, tree=excluded.tree",
+            )?
+            .execute([owner, class, policy, tree])?;
         Ok(())
     }
 
@@ -309,6 +478,7 @@ impl HostIndex {
         raw.map(|s| serde_json::from_str(&s).map_err(IndexError::from))
             .transpose()
     }
+    #[cfg(test)]
     pub(crate) fn source_documents(
         &self,
         owner: &str,
@@ -446,17 +616,38 @@ impl HostIndex {
         metadata: &IndexMetadata,
         raw: &RawCoordinate,
     ) -> Result<bool, IndexError> {
+        let mut source = RawSource::open(&raw.segment)?;
+        // Check actual bytes even on an otherwise eligible cache hit.
+        source.verify(raw)?;
+        self.index_from(&mut source, id, metadata, raw)
+    }
+
+    /// Index a coordinate that was just hashed from `source`'s descriptor, so
+    /// an unchanged document needs no reread. A changed one is projected from
+    /// the same descriptor and refused unless the projected bytes are exactly
+    /// the coordinate's bytes.
+    pub(crate) fn index_from(
+        &mut self,
+        source: &mut RawSource,
+        id: &str,
+        metadata: &IndexMetadata,
+        raw: &RawCoordinate,
+    ) -> Result<bool, IndexError> {
         self.in_write_scope("host_document_index", |this| {
-            this.index_in_write_scope(id, metadata, raw)
+            this.index_in_write_scope(source, id, metadata, raw)
         })
     }
 
     fn index_in_write_scope(
         &mut self,
+        file: &mut RawSource,
         id: &str,
         metadata: &IndexMetadata,
         raw: &RawCoordinate,
     ) -> Result<bool, IndexError> {
+        if raw.segment != file.path() {
+            return Err(io::Error::other("indexed coordinate names another source").into());
+        }
         let source = metadata
             .source
             .source()
@@ -475,8 +666,6 @@ impl HostIndex {
         {
             return Err(io::Error::other("indexed document owner cannot change").into());
         }
-        // Check actual bytes even on an otherwise eligible cache hit.
-        verify_coordinate(raw)?;
         let old: Option<(String, String)> = self.conn.query_row(
             "SELECT json_array(segment,offset,length,sha256,seq),json_array(agent_id,source,timestamp_ms,direction,sender,destination,tool_name,role) FROM host_documents WHERE id=?1",
             [id], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
@@ -532,14 +721,23 @@ impl HostIndex {
                 params![id, name],
             )?;
         }
-        let mut file = crate::raw_segment::open_readonly(&raw.segment)?;
+        // One sequential pass: each window keeps the previous window's last
+        // OVERLAP_BYTES and reads only its new bytes, which are also hashed.
+        let mut reader = file.range(raw.offset, raw.length);
+        let mut hash = Sha256::new();
+        let mut carried = 0;
         let mut relative = 0u64;
         let mut json_state = JsonProjection::default();
         let mut bytes = [0u8; WINDOW_BYTES];
         while relative < raw.length {
             let length = (raw.length - relative).min(WINDOW_BYTES as u64) as usize;
-            file.seek(SeekFrom::Start(raw.offset + relative))?;
-            file.read_exact(&mut bytes[..length])?;
+            reader
+                .read_exact(&mut bytes[carried..length])
+                .map_err(|e| match e.kind() {
+                    io::ErrorKind::UnexpectedEof => integrity_mismatch(),
+                    _ => e,
+                })?;
+            hash.update(&bytes[carried..length]);
             // Lossy projection is only for search over binary tool outputs.
             // The stored coordinate and the returned range remain exact bytes.
             let mut tokens =
@@ -575,10 +773,14 @@ impl HostIndex {
             if relative + length as u64 == raw.length {
                 break;
             }
+            bytes.copy_within(length - OVERLAP_BYTES..length, 0);
+            carried = OVERLAP_BYTES;
             relative += (length - OVERLAP_BYTES) as u64;
         }
-        // Catch mutation during the streaming projection before commit.
-        verify_coordinate(raw)?;
+        // Never publish a projection of bytes other than the coordinate's.
+        if format!("{:x}", hash.finalize()) != raw.sha256 {
+            return Err(integrity_mismatch().into());
+        }
         tx.commit()?;
         Ok(true)
     }
@@ -933,25 +1135,8 @@ impl JsonProjection {
     }
 }
 
-fn verify_coordinate(raw: &RawCoordinate) -> io::Result<()> {
-    let mut file = crate::raw_segment::open_readonly(&raw.segment)?;
-    file.seek(SeekFrom::Start(raw.offset))?;
-    let mut reader = file.take(raw.length);
-    let mut hash = Sha256::new();
-    let mut count = 0u64;
-    let mut buffer = [0u8; 65536];
-    loop {
-        let n = reader.read(&mut buffer)?;
-        if n == 0 {
-            break;
-        }
-        hash.update(&buffer[..n]);
-        count += n as u64;
-    }
-    if count != raw.length || format!("{:x}", hash.finalize()) != raw.sha256 {
-        return Err(io::Error::other("index coordinate integrity mismatch"));
-    }
-    Ok(())
+fn integrity_mismatch() -> io::Error {
+    io::Error::other("index coordinate integrity mismatch")
 }
 
 fn has_excluded_text(raw: &RawCoordinate, excludes: &[String]) -> io::Result<bool> {
@@ -967,9 +1152,8 @@ fn has_excluded_text(raw: &RawCoordinate, excludes: &[String]) -> io::Result<boo
         return Ok(false);
     }
     let overlap = terms.iter().map(String::len).max().unwrap_or_default() + 4;
-    let mut file = crate::raw_segment::open_readonly(&raw.segment)?;
-    file.seek(SeekFrom::Start(raw.offset))?;
-    let mut reader = file.take(raw.length);
+    let mut file = RawSource::open(&raw.segment)?;
+    let mut reader = file.range(raw.offset, raw.length);
     let mut buffer = [0u8; WINDOW_BYTES];
     let mut carry = Vec::new();
     let mut decoded_carry = Vec::new();
@@ -1015,6 +1199,67 @@ mod tests {
             tool_names: Vec::new(),
             role: Some("user".into()),
         }
+    }
+    /// One connection serves every sequential borrower; concurrent borrowers
+    /// get their own; a replaced file or an open transaction is never reused.
+    #[test]
+    fn shared_index_reuses_connections_but_never_a_replaced_file() {
+        let dir = crate::test_tempdir();
+        let path = dir.path().join("index.db");
+        let opens = || OPENS.with(std::cell::Cell::get);
+        let start = opens();
+        drop(HostIndex::shared(&path).unwrap());
+        for _ in 0..5 {
+            drop(HostIndex::shared(&path).unwrap());
+        }
+        assert_eq!(opens() - start, 1);
+        let first = HostIndex::shared(&path).unwrap();
+        let second = HostIndex::shared(&path).unwrap();
+        assert_eq!(opens() - start, 2);
+        drop((first, second));
+        // Delete the file under two idle connections: neither may serve it.
+        let segment = RawSegment::open(&dir.path().join("events.raw")).unwrap();
+        let raw = segment.append(b"replacedneedle").unwrap();
+        HostIndex::shared(&path)
+            .unwrap()
+            .index("old", &metadata("a", MemoryScope::Memory, 1), &raw)
+            .unwrap();
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+        let start = opens();
+        let mut fresh = HostIndex::shared(&path).unwrap();
+        assert_eq!(opens() - start, 1);
+        let q = HistorySearchQuery {
+            query: Some("replacedneedle".into()),
+            ..Default::default()
+        };
+        assert!(
+            fresh
+                .search(&["a".into()], MemoryScope::All, &q)
+                .unwrap()
+                .is_empty()
+        );
+        fresh
+            .index("new", &metadata("a", MemoryScope::Memory, 2), &raw)
+            .unwrap();
+        drop(fresh);
+        let independent = HostIndex::open(&path).unwrap();
+        assert_eq!(
+            independent
+                .search(&["a".into()], MemoryScope::All, &q)
+                .unwrap()[0]
+                .id,
+            "new"
+        );
+        // A connection dropped inside a transaction is closed, not pooled.
+        let start = opens();
+        let borrowed = HostIndex::shared(&path).unwrap();
+        borrowed.conn.execute_batch("BEGIN").unwrap();
+        drop(borrowed);
+        let next = HostIndex::shared(&path).unwrap();
+        assert!(next.conn.is_autocommit());
+        assert_eq!(opens() - start, 1);
     }
     #[test]
     fn required_time_cache_is_invalidated_without_touching_raw_history() {
