@@ -5210,7 +5210,9 @@ impl Store {
     }
 
     /// Atomically claim a timer/watch transition and retain its mailbox wake.
-    /// The caller holds the agent lifecycle lock and checks external retirement
+    /// The wake enters the mailbox like any other message; a busy, paused or
+    /// quota-blocked owner receives it through normal mailbox delivery. The
+    /// caller holds the agent lifecycle lock and checks external retirement
     /// markers. A failed index/mail insert rolls back the claim for retry.
     #[allow(clippy::too_many_arguments)]
     pub fn claim_schedule_tick_with_wake(
@@ -5228,7 +5230,7 @@ impl Store {
         let outcome = self.receive_with_admission(agent_id, incoming, true, |conn| {
             let eligible: bool = conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM agent_schedules s JOIN agents a ON a.id=s.agent_id
-                 WHERE s.id=?1 AND s.agent_id=?2 AND a.state NOT IN ('paused','archived'))",
+                 WHERE s.id=?1 AND s.agent_id=?2 AND a.state <> 'archived')",
                 params![id, agent_id.as_str()],
                 |r| r.get(0),
             )?;
@@ -5249,20 +5251,31 @@ impl Store {
         Ok(outcome.is_some())
     }
 
-    pub fn restore_skipped_at_schedules(&self, min_next_fire_at_ms: i64) -> Result<usize, Error> {
+    /// Whether the agent's mailbox still holds a message from `sender` that the
+    /// harness has not taken.
+    pub fn has_undelivered_message_from(
+        &self,
+        agent_id: &AgentId,
+        sender: &str,
+    ) -> Result<bool, Error> {
         let conn = self.conn();
-        let mut updated = conn.execute(
-            "UPDATE agent_schedules
-             SET state = 'active',
-                 last_observed = NULL
-             WHERE kind = 'at'
-               AND state = 'fired'
-               AND last_fired_at_ms IS NULL
-               AND last_observed LIKE 'skipped:%'
-               AND next_fire_at_ms >= ?1",
-            params![min_next_fire_at_ms],
+        let delivered = cursor(&conn, agent_id)?;
+        let found: bool = conn.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM messages
+               WHERE agent_id = ?1 AND seq > ?2 AND sender = ?3
+             )",
+            params![agent_id.as_str(), delivered, sender],
+            |row| row.get(0),
         )?;
-        updated += conn.execute(
+        Ok(found)
+    }
+
+    /// Reopen GitHub PR watches that an earlier release retired when checks
+    /// completed, so they keep watching until the PR is merged or closed.
+    pub fn restore_checks_completed_pr_watches(&self) -> Result<usize, Error> {
+        let conn = self.conn();
+        let updated = conn.execute(
             "UPDATE agent_schedules
              SET state = 'active',
                  watch_baseline = 'checks_completed'

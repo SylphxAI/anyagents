@@ -4,10 +4,21 @@
 //! wake (`every`), or event watch (`watch`: GitHub PR/check terminal state, Spiron
 //! promise state change pulled from the public API, or an AnyAgents agent going idle).
 //!
-//! Wakes fire only when the owning agent is idle and not quota-blocked.
-//! A missed wake never fires twice, and cancelling a schedule takes effect immediately.
+//! A due tick or a triggered watch is written to the owner's mailbox at once, like
+//! any other message. Mailbox delivery alone decides when the owner sees it: it is
+//! steered into a running turn, or held while the owner is paused or quota-blocked
+//! and delivered on resume. A schedule adds no new tick while its previous one is
+//! still undelivered, so missed recurring ticks coalesce into one. Cancelling a
+//! schedule takes effect immediately.
+//!
+//! The server's timers ([`start_loops`]) hold the active schedules in memory and
+//! sleep until the earliest due time, a watch's next probe, or a schedule change,
+//! reading nothing in between. Watches with no change event (a file, a process,
+//! an agent going idle, a remote state) are probed at their own interval.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use anyagents_core::{Agent, AgentId, AgentSchedule, Incoming, NewSchedule, Store};
@@ -506,6 +517,7 @@ pub fn create_agent_schedule(
     let created = store
         .create_schedule(input)
         .map_err(|err| err.to_string())?;
+    schedules_changed(store.data_dir());
     Ok(ScheduleView::from(created))
 }
 
@@ -525,9 +537,13 @@ pub fn cancel_agent_schedule(
     agent_id: &anyagents_core::AgentId,
     id: &str,
 ) -> Result<usize, String> {
-    store
+    let cancelled = store
         .cancel_schedule(Some(agent_id), id)
-        .map_err(|err| err.to_string())
+        .map_err(|err| err.to_string())?;
+    if cancelled > 0 {
+        schedules_changed(store.data_dir());
+    }
+    Ok(cancelled)
 }
 
 fn initial_watch_baseline(
@@ -566,53 +582,39 @@ fn initial_watch_baseline(
     }
 }
 
-/// Returns `Some(reason)` when the owning agent must NOT receive a scheduled wake
-/// right now (`"paused"`, `"quota_blocked"`, or `"busy"`), or `None` when idle and eligible.
-pub fn agent_wake_block_reason(
+/// Returns `Some(reason)` when the agent cannot act on a turn-ownership nudge right
+/// now (`"paused"`, `"archived"`, `"quota_blocked"` or `"busy"`), or `None` when idle
+/// and eligible. Schedule wakes never consult it: they always enter the mailbox.
+///
+/// `archived` is whether the agent carries an explicit archive marker
+/// ([`crate::server::is_explicitly_archived`]), read once by the caller.
+fn agent_wake_block_reason(
     store: &Store,
     health: &HealthBoard,
     agent: &Agent,
+    archived: bool,
     now: i64,
 ) -> Option<&'static str> {
     if agent.state == "paused" {
         return Some("paused");
     }
-    if agent.state == "archived" || crate::server::is_explicitly_archived(store.data_dir(), agent) {
+    if agent.state == "archived" || archived {
         return Some("archived");
     }
+    // The typed reset deadline is the only quota authority: an error text that
+    // mentions a quota or rate limit says nothing once its deadline has passed.
     let cfg = anyagents_core::agent_config_dir(store.data_dir(), &agent.id);
-    let (session_quota, session_error) = if agent.harness == "claude-code" {
-        let (_, persisted_err) =
-            anyagents_harness_agy::detect_agy_session_quota_and_error(&cfg, now);
-        (
-            anyagents_harness_claude::detect_session_quota_reset_ms(&cfg, now),
-            persisted_err,
-        )
+    let session_quota = if agent.harness == "claude-code" {
+        anyagents_harness_claude::detect_session_quota_reset_ms(&cfg, now)
     } else {
-        anyagents_harness_agy::detect_agy_session_quota_and_error(&cfg, now)
+        anyagents_harness_agy::detect_agy_session_quota_and_error(&cfg, now).0
     };
-    let live = health.get(&agent.id);
-    let effective_quota = live
-        .as_ref()
-        .and_then(|l| l.quota_reset_at_ms)
+    let effective_quota = health
+        .get(&agent.id)
+        .and_then(|live| live.quota_reset_at_ms)
         .or(session_quota);
-    let effective_err = live
-        .as_ref()
-        .and_then(|l| l.last_error.clone())
-        .or(session_error);
     if effective_quota.is_some_and(|ms| ms > now) {
         return Some("quota_blocked");
-    }
-    if let Some(ref err) = effective_err {
-        let lower = err.to_ascii_lowercase();
-        if lower.contains("quota")
-            || lower.contains("rate limit")
-            || lower.contains("429")
-            || lower.contains("credit balance is too low")
-            || lower.contains("usage limit")
-        {
-            return Some("quota_blocked");
-        }
     }
     if is_agent_busy(store, health, agent, now) {
         return Some("busy");
@@ -621,6 +623,10 @@ pub fn agent_wake_block_reason(
 }
 
 pub fn is_agent_busy(store: &Store, health: &HealthBoard, agent: &Agent, now: i64) -> bool {
+    // A published live turn proves busy without touching the store.
+    if in_live_turn(health, &agent.id) {
+        return true;
+    }
     // Check first-party turn ownership even before health has been published.
     if crate::vendor::is_spiron_harness(&agent.harness) && store.try_lock_agent(&agent.id).is_err()
     {
@@ -642,25 +648,562 @@ pub fn is_agent_busy(store: &Store, health: &HealthBoard, agent: &Agent, now: i6
             return true;
         }
     }
-    if let Some(live) = health.get(&agent.id)
-        && live.process_alive
-        && live.turn_state == anyagents_harness::TurnState::InTurn
-    {
-        return true;
-    }
     false
 }
 
-/// Evaluate local timers and watches without issuing any external probe.
-/// This is called on its own one-second loop, including the startup tick.
-pub fn tick_local_schedules_once(store: &Store, health: &HealthBoard, now: i64) -> usize {
-    if let Err(err) = store.restore_skipped_at_schedules(now.saturating_sub(3_600_000)) {
-        eprintln!("Schedule recovery unavailable: {err}");
-        return 0;
+/// Whether the supervisor has published a live process in a turn for this agent.
+fn in_live_turn(health: &HealthBoard, agent_id: &AgentId) -> bool {
+    health.get(agent_id).is_some_and(|live| {
+        live.process_alive && live.turn_state == anyagents_harness::TurnState::InTurn
+    })
+}
+
+/// Probe cadence of a local watch (file, process, agent idle): none has a change
+/// event this process can wait on.
+const LOCAL_WATCH_PROBE_MS: i64 = 1_000;
+/// Probe cadence of a Spiron watch, and recheck cadence of a triggered external
+/// watch held by its undelivered previous wake. GitHub probes follow their own
+/// adaptive per-target interval in [`github`].
+const EXTERNAL_RECHECK_MS: i64 = 3_000;
+/// Spacing before a due tick or triggered watch whose wake was not written (a
+/// held lifecycle lock, a store error) is tried again.
+const RETRY_MS: i64 = 1_000;
+/// Longest a timer trusts its cached schedules without re-reading them. It covers
+/// writes from another process and wall-clock steps; every change made through
+/// this module wakes the timers at once.
+const SAFETY_NET_MS: i64 = 60_000;
+/// A task child that ended a parent-initiated turn without reporting is nudged
+/// this long after the parent's message was delivered.
+const CHILD_NUDGE_AFTER_MS: i64 = 15_000;
+/// A parent is reminded of a reported, idle task child after this long.
+const PARENT_REMINDER_AFTER_MS: i64 = 900_000;
+/// How often the timer's turn-ownership guard re-reads the live fleet. It cannot
+/// observe deliveries and sends as they happen, so it re-reads them within the
+/// time a nudge takes to come due: it learns of a delivery before its nudge is due.
+const GUARD_REFRESH_MS: i64 = CHILD_NUDGE_AFTER_MS;
+/// How often a guard candidate held only by a block is compared, in memory,
+/// with the supervisor's published live state.
+const GUARD_WATCH_MS: i64 = 1_000;
+
+/// One change feed per data directory: a schedule written in this process wakes
+/// that directory's running timers at once.
+static FEEDS: LazyLock<Mutex<HashMap<PathBuf, Arc<tokio::sync::watch::Sender<u64>>>>> =
+    LazyLock::new(Mutex::default);
+
+#[allow(dead_code, reason = "server::start_schedule_loops starts these timers")]
+fn change_feed(data_dir: &Path) -> Arc<tokio::sync::watch::Sender<u64>> {
+    let mut feeds = FEEDS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    Arc::clone(
+        feeds
+            .entry(data_dir.to_path_buf())
+            .or_insert_with(|| Arc::new(tokio::sync::watch::channel(0).0)),
+    )
+}
+
+/// Wake this process's schedule timers for `data_dir`: an active schedule was
+/// created, changed or cancelled. [`create_agent_schedule`] and
+/// [`cancel_agent_schedule`] call it; any other in-process writer of schedules
+/// should too. A write from another process is read within [`SAFETY_NET_MS`].
+pub fn schedules_changed(data_dir: &Path) {
+    let feeds = FEEDS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(feed) = feeds.get(data_dir) {
+        feed.send_modify(|generation| *generation = generation.wrapping_add(1));
     }
-    let fired = tick_schedule_partition(store, health, now, false);
-    let _ = tick_task_subagent_turn_ownership(store, health, now);
-    fired
+}
+
+/// Start the server's schedule timers: one for local timers and watches (with
+/// the turn-ownership guard), one for network-backed watches, so an in-flight
+/// external request cannot delay a local tick. Both step at once at startup,
+/// then each sleeps until its earliest due time or a schedule change.
+#[allow(dead_code, reason = "server::start_schedule_loops starts these timers")]
+pub fn start_loops(
+    store: Arc<Store>,
+    health: HealthBoard,
+) -> (tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>) {
+    let feed = change_feed(store.data_dir());
+    let local = spawn_timer(
+        Arc::clone(&store),
+        health.clone(),
+        feed.subscribe(),
+        Timer::local(),
+    );
+    let external = spawn_timer(store, health, feed.subscribe(), Timer::external());
+    (local, external)
+}
+
+#[allow(dead_code, reason = "server::start_schedule_loops starts these timers")]
+fn spawn_timer(
+    store: Arc<Store>,
+    health: HealthBoard,
+    mut changes: tokio::sync::watch::Receiver<u64>,
+    timer: Timer,
+) -> tokio::task::JoinHandle<()> {
+    let timer = Arc::new(Mutex::new(timer));
+    tokio::spawn(async move {
+        loop {
+            let generation = *changes.borrow_and_update();
+            let (st, hb, tm) = (Arc::clone(&store), health.clone(), Arc::clone(&timer));
+            let step = tokio::task::spawn_blocking(move || {
+                let mut timer = tm.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                timer
+                    .step(&st, &hb, generation, anyagents_core::now_ms())
+                    .deadline
+            })
+            .await;
+            let deadline = step.unwrap_or_else(|err| {
+                eprintln!("Schedule pass failed: {err}");
+                anyagents_core::now_ms().saturating_add(RETRY_MS)
+            });
+            let wait = deadline
+                .saturating_sub(anyagents_core::now_ms())
+                .clamp(0, SAFETY_NET_MS);
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_millis(wait as u64)) => {}
+                Ok(()) = changes.changed() => {}
+            }
+        }
+    })
+}
+
+/// One of the server's schedule timers. A step does work only when an entry is
+/// due, the guard is due, or the schedules changed.
+struct Timer {
+    plan: Plan,
+    /// The local timer also runs the turn-ownership guard.
+    guard: Option<TurnGuard>,
+    restored: bool,
+    deadline: i64,
+}
+
+impl Timer {
+    fn local() -> Self {
+        Self {
+            plan: Plan::new(false),
+            guard: Some(TurnGuard::default()),
+            restored: false,
+            deadline: i64::MIN,
+        }
+    }
+
+    fn external() -> Self {
+        Self {
+            plan: Plan::new(true),
+            guard: None,
+            restored: true,
+            deadline: i64::MIN,
+        }
+    }
+
+    /// Run whatever is due at `now`.
+    fn step(&mut self, store: &Store, health: &HealthBoard, generation: u64, now: i64) -> Step {
+        let mut step = Step {
+            worked: false,
+            fired: 0,
+            deadline: self.deadline,
+        };
+        if now < self.deadline && generation == self.plan.generation {
+            return step;
+        }
+        if !self.restored {
+            step.worked = true;
+            self.restored = restore_legacy_pr_watches_once(store);
+            if !self.restored {
+                self.deadline = now.saturating_add(RETRY_MS);
+                step.deadline = self.deadline;
+                return step;
+            }
+        }
+        if self.plan.stale(generation, now) {
+            step.worked = true;
+            self.plan.reload(store, generation, now);
+        }
+        if self.plan.due(now) {
+            step.worked = true;
+            let pass = self.plan.pass(store, health, now);
+            step.fired = pass.fired;
+            if pass.wrote {
+                self.plan.reload(store, generation, now);
+            }
+        }
+        if let Some(guard) = &mut self.guard
+            && guard.due(health, now)
+        {
+            step.worked = true;
+            guard.run(store, health, now);
+        }
+        let mut deadline = self.plan.next_deadline();
+        if let Some(guard) = &self.guard {
+            deadline = deadline.min(guard.next_deadline(now));
+        }
+        // Anything still due after its own step waits out a retry, never a spin.
+        self.deadline = if deadline <= now {
+            now.saturating_add(RETRY_MS)
+        } else {
+            deadline
+        };
+        step.deadline = self.deadline;
+        step
+    }
+}
+
+/// What one timer step did.
+struct Step {
+    /// The step read or wrote the store.
+    worked: bool,
+    /// Wakes written.
+    fired: usize,
+    /// When the next step is due.
+    deadline: i64,
+}
+
+/// Evaluate local timers and watches (and the turn-ownership rules) without
+/// issuing any external probe: one full census of the store, which is a fresh
+/// local timer's first step. [`start_loops`] keeps that timer and steps it again
+/// only when something is due.
+pub fn tick_local_schedules_once(store: &Store, health: &HealthBoard, now: i64) -> usize {
+    Timer::local().step(store, health, 0, now).fired
+}
+
+/// Evaluate network-backed watches: one full census of the store. Slow external
+/// services cannot delay a later local tick or consume a timer's due transition.
+pub fn tick_external_watches_once(store: &Store, health: &HealthBoard, now: i64) -> usize {
+    Timer::external().step(store, health, 0, now).fired
+}
+
+// Retain the complete single-pass fixture for existing cross-class contracts;
+// production never serializes the two partitions through this helper.
+#[cfg(test)]
+fn tick_schedules_once(store: &Store, health: &HealthBoard, now: i64) -> usize {
+    tick_local_schedules_once(store, health, now) + tick_external_watches_once(store, health, now)
+}
+
+/// Reopen the PR watches an earlier release retired when checks completed, once
+/// per database in this process. No current path retires a PR watch that way, so
+/// the repair (a full scan of every schedule ever made) has nothing to do after
+/// its first run. Returns false while the store cannot run it.
+fn restore_legacy_pr_watches_once(store: &Store) -> bool {
+    static DONE: LazyLock<Mutex<HashSet<PathBuf>>> = LazyLock::new(Mutex::default);
+    let mut done = DONE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if done.contains(store.data_dir()) {
+        return true;
+    }
+    match store.restore_checks_completed_pr_watches() {
+        Ok(_) => {
+            done.insert(store.data_dir().to_path_buf());
+            true
+        }
+        Err(err) => {
+            eprintln!("Schedule recovery unavailable: {err}");
+            false
+        }
+    }
+}
+
+/// One full turn-ownership pass over the live fleet, as a census would run it.
+#[cfg(test)]
+fn tick_task_subagent_turn_ownership(store: &Store, health: &HealthBoard, now: i64) -> usize {
+    TurnGuard::default().run(store, health, now)
+}
+
+/// A parent and its live `lifecycle: task` children.
+struct Family {
+    parent: Agent,
+    children: Vec<Agent>,
+}
+
+/// A live task child the guard may act on: paused and archived ones never are.
+fn guard_candidate(agent: &Agent) -> bool {
+    agent.is_task_subagent() && !matches!(agent.state.as_str(), "paused" | "archived")
+}
+
+/// Group the live task children by parent. Archived children never act, so only
+/// the live fleet is read; an archived parent of a live child is read on its own.
+fn task_families(store: &Store, live: &[Agent]) -> Vec<Family> {
+    let by_id: HashMap<&AgentId, &Agent> = live.iter().map(|a| (&a.id, a)).collect();
+    let mut slots: HashMap<&AgentId, Option<usize>> = HashMap::new();
+    let mut families: Vec<Family> = Vec::new();
+    for child in live.iter().filter(|a| guard_candidate(a)) {
+        let Some(parent_id) = child.parent_id.as_ref() else {
+            continue;
+        };
+        let slot = *slots.entry(parent_id).or_insert_with(|| {
+            let parent = match by_id.get(parent_id) {
+                Some(parent) => (*parent).clone(),
+                None => store.agent(parent_id).ok()?,
+            };
+            families.push(Family {
+                parent,
+                children: Vec::new(),
+            });
+            Some(families.len() - 1)
+        });
+        if let Some(slot) = slot {
+            families[slot].children.push(child.clone());
+        }
+    }
+    families
+}
+
+/// What one family's pass did and what it waits on.
+#[derive(Default)]
+struct GuardOutcome {
+    actions: usize,
+    /// Earliest later time a rule can hold for the snapshots read.
+    next_at: Option<i64>,
+    /// Agents whose block alone keeps a due rule from acting.
+    blocked: Vec<AgentId>,
+}
+
+impl GuardOutcome {
+    fn wait_until(&mut self, at: i64) {
+        self.next_at = Some(self.next_at.map_or(at, |next| next.min(at)));
+    }
+}
+
+/// Facts read at most once per agent in a pass: the archive marker, the block
+/// reason, and a parent's ownership snapshot.
+struct GuardMemo<'a> {
+    store: &'a Store,
+    health: &'a HealthBoard,
+    now: i64,
+    archived: HashMap<AgentId, bool>,
+    blocked: HashMap<AgentId, bool>,
+    snapshots: HashMap<AgentId, Option<anyagents_core::TurnOwnershipSnapshot>>,
+}
+
+impl<'a> GuardMemo<'a> {
+    fn new(store: &'a Store, health: &'a HealthBoard, now: i64) -> Self {
+        Self {
+            store,
+            health,
+            now,
+            archived: HashMap::new(),
+            blocked: HashMap::new(),
+            snapshots: HashMap::new(),
+        }
+    }
+
+    fn archived(&mut self, agent: &Agent) -> bool {
+        let store = self.store;
+        *self
+            .archived
+            .entry(agent.id.clone())
+            .or_insert_with(|| crate::server::is_explicitly_archived(store.data_dir(), agent))
+    }
+
+    /// [`agent_wake_block_reason`] is `Some`. A published live turn answers first,
+    /// without the store or the session files.
+    fn blocked(&mut self, agent: &Agent) -> bool {
+        if let Some(&blocked) = self.blocked.get(&agent.id) {
+            return blocked;
+        }
+        let blocked = in_live_turn(self.health, &agent.id) || {
+            let archived = self.archived(agent);
+            agent_wake_block_reason(self.store, self.health, agent, archived, self.now).is_some()
+        };
+        self.blocked.insert(agent.id.clone(), blocked);
+        blocked
+    }
+
+    fn snapshot(&mut self, agent_id: &AgentId) -> Option<anyagents_core::TurnOwnershipSnapshot> {
+        let store = self.store;
+        self.snapshots
+            .entry(agent_id.clone())
+            .or_insert_with(|| store.turn_ownership_snapshot(agent_id).ok())
+            .clone()
+    }
+
+    /// Whether a child a rule points at may be acted on now. A child held only by
+    /// its block is recorded for watching.
+    fn child_may_act(&mut self, child: &Agent, out: &mut GuardOutcome) -> bool {
+        if self.archived(child)
+            || self
+                .store
+                .list_schedules(Some(&child.id), true)
+                .is_ok_and(|s| !s.is_empty())
+        {
+            return false;
+        }
+        if self.blocked(child) {
+            out.blocked.push(child.id.clone());
+            return false;
+        }
+        true
+    }
+
+    /// Whether a parent may be told about its child now. A parent held only by
+    /// its block is recorded for watching.
+    fn parent_may_act(&mut self, parent: &Agent, out: &mut GuardOutcome) -> bool {
+        if matches!(parent.state.as_str(), "paused" | "archived") || self.archived(parent) {
+            return false;
+        }
+        if self.blocked(parent) {
+            out.blocked.push(parent.id.clone());
+            return false;
+        }
+        true
+    }
+}
+
+/// Apply both turn-ownership rules to one family. The cheapest decisive fact is
+/// read first: a rule's time, then whether its action was already taken, and
+/// only then the archive marker, schedules and block reasons.
+fn guard_family(memo: &mut GuardMemo<'_>, family: &Family) -> GuardOutcome {
+    let (store, now) = (memo.store, memo.now);
+    let parent = &family.parent;
+    let parent_sender = format!("agent:{}", parent.name);
+    let mut out = GuardOutcome::default();
+    let mut waiting: Vec<(String, String, i64)> = Vec::new();
+    for child in &family.children {
+        let Ok(snap) = store.turn_ownership_snapshot(&child.id) else {
+            continue;
+        };
+        let last_in_ms = snap.last_delivered_at_ms.unwrap_or(0);
+        let last_out_ms = snap.last_outbound_at_ms.unwrap_or(0);
+        if last_in_ms > 0
+            && last_in_ms > last_out_ms
+            && snap
+                .last_delivered_sender
+                .as_deref()
+                .is_some_and(|s| s == "parent" || s == parent_sender || s == "system:turn-guard")
+        {
+            let due = last_in_ms.saturating_add(CHILD_NUDGE_AFTER_MS);
+            if now < due {
+                out.wait_until(due);
+                continue;
+            }
+            let seq = snap.last_delivered_seq.unwrap_or(0);
+            let already_nudged = snap
+                .last_delivered_source_key
+                .as_deref()
+                .is_some_and(|k| k.starts_with("turn-guard:child-nudge:"));
+            let (recipient, key) = if already_nudged {
+                (
+                    parent,
+                    format!("turn-guard:parent-alert:{}:{seq}", child.id),
+                )
+            } else {
+                (child, format!("turn-guard:child-nudge:{}:{seq}", child.id))
+            };
+            if !store
+                .has_message_source_key(&recipient.id, &key)
+                .is_ok_and(|exists| !exists)
+                || !memo.child_may_act(child, &mut out)
+                || (already_nudged && !memo.parent_may_act(parent, &mut out))
+            {
+                continue;
+            }
+            let body = if already_nudged {
+                format!(
+                    "[Sub-Agent Turn Ownership Guard] Task sub-agent `{}` (`role: {}`) exited its turn without calling `send` to report back and has no active schedules. Inspect it via `agents(action: \"inspect\", name: \"{}\")`, send it a follow-up instruction, or close it via `agents(action: \"archive\", name: \"{}\")`.",
+                    child.name,
+                    child.role.as_deref().unwrap_or("task"),
+                    child.name,
+                    child.name
+                )
+            } else {
+                format!(
+                    "[Turn Ownership Guard] You exited your turn as a `lifecycle: task` sub-agent without calling `send` to report to your parent (`agent:{}`) and without an active `schedule`. Complete any remaining work now or call `send` (`to: \"parent\"`) with your verified outcome or blocker.",
+                    parent.name
+                )
+            };
+            if send_guard_message(store, &recipient.id, body, key, now) {
+                out.actions += 1;
+            }
+        } else if last_out_ms > 0 && last_out_ms >= last_in_ms {
+            // The reminder counts from the later of the report and the parent's
+            // last delivery, so nothing is due before the report plus the wait.
+            let earliest = last_out_ms.saturating_add(PARENT_REMINDER_AFTER_MS);
+            if now < earliest {
+                out.wait_until(earliest);
+                continue;
+            }
+            if !memo.child_may_act(child, &mut out) || !memo.parent_may_act(parent, &mut out) {
+                continue;
+            }
+            let Some(parent_snap) = memo.snapshot(&parent.id) else {
+                continue;
+            };
+            let due = last_out_ms
+                .max(parent_snap.last_delivered_at_ms.unwrap_or(0))
+                .saturating_add(PARENT_REMINDER_AFTER_MS);
+            if now < due {
+                out.wait_until(due);
+                continue;
+            }
+            waiting.push((
+                child.name.clone(),
+                child.role.clone().unwrap_or_else(|| "task".to_string()),
+                last_out_ms,
+            ));
+        }
+    }
+
+    if !waiting.is_empty() {
+        waiting.sort_by(|a, b| a.0.cmp(&b.0));
+        let fingerprint_raw = waiting
+            .iter()
+            .map(|(name, _, ts)| format!("{name}:{ts}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let digest = anyagents_core::learned_memory::sha256(fingerprint_raw.as_bytes());
+        let hash16 = &digest[..16.min(digest.len())];
+        let reminder_key = format!("turn-guard:waiting-parent:{}:{hash16}", parent.id);
+        if store
+            .has_message_source_key(&parent.id, &reminder_key)
+            .is_ok_and(|exists| !exists)
+        {
+            let formatted = waiting
+                .iter()
+                .map(|(name, role, _)| format!("`{name}` (`{role}`)"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let body = format!(
+                "[Sub-Agent Turn Ownership Guard] The following `lifecycle: task` sub-agent(s) reported to you and are idle with no active schedules (`waiting_parent`): {formatted}. The ball is in your court: for each sub-agent, either send a follow-up instruction via `send` if work remains, or close it via `agents(action: \"archive\", name: \"<name>\")` if its deliverable is accepted."
+            );
+            if send_guard_message(store, &parent.id, body, reminder_key, now) {
+                out.actions += 1;
+            }
+        }
+    }
+    out
+}
+
+fn send_guard_message(
+    store: &Store,
+    to: &AgentId,
+    body: String,
+    source_key: String,
+    now: i64,
+) -> bool {
+    let mut msg = Incoming::new(body);
+    msg.sender = Some("system:turn-guard".to_string());
+    msg.source_key = Some(source_key);
+    msg.source_time_ms = Some(now);
+    if store.receive(to, msg).is_err() {
+        return false;
+    }
+    crate::create::poke_agent_wake_socket(store.data_dir(), to);
+    crate::create::poke_agent_wake_socket_mail(store.data_dir(), to);
+    true
+}
+
+/// The parts of an agent's published live state whose change can lift a block.
+type LiveMark = (bool, anyagents_harness::TurnState, bool, Option<i64>);
+
+fn live_mark(health: &HealthBoard, agent_id: &AgentId, now: i64) -> Option<LiveMark> {
+    health.get(agent_id).map(|live| {
+        (
+            live.process_alive,
+            live.turn_state,
+            live.quota_reset_at_ms.is_some_and(|at| at > now),
+            live.process_started_at_ms,
+        )
+    })
 }
 
 /// Enforce event-driven Ping-Pong turn ownership between parents and `lifecycle: task`
@@ -674,387 +1217,515 @@ pub fn tick_local_schedules_once(store: &Store, health: &HealthBoard, now: i64) 
 ///   for `>= 15m` after both the report and the parent's latest turn completed while the parent
 ///   is idle, deliver a single consolidated event notification to `parent` reminding it to either
 ///   send follow-up instructions or `archive` the completed task sub-agent(s).
-pub fn tick_task_subagent_turn_ownership(store: &Store, health: &HealthBoard, now: i64) -> usize {
-    // Archived children never act, so only the live fleet is read each tick;
-    // an archived parent of a live child is fetched on demand below.
-    let Ok(agents) = store.list_live_agents() else {
-        return 0;
-    };
-    let mut agents_by_id: HashMap<AgentId, Agent> =
-        agents.iter().cloned().map(|a| (a.id.clone(), a)).collect();
-    let mut actions = 0usize;
-    let mut waiting_by_parent: HashMap<AgentId, Vec<(String, String, i64)>> = HashMap::new();
+///
+/// The local timer runs a full pass over the live fleet every [`GUARD_REFRESH_MS`],
+/// and in between only the families whose rule comes due or whose blocking
+/// agent's published live state changes.
+#[derive(Default)]
+struct TurnGuard {
+    refresh_at: i64,
+    families: Vec<FamilyWatch>,
+}
 
-    for child in &agents {
-        let Some(parent_id) = child.parent_id.as_ref() else {
-            continue;
-        };
-        if !agents_by_id.contains_key(parent_id) {
-            let Ok(parent) = store.agent(parent_id) else {
-                continue;
-            };
-            agents_by_id.insert(parent_id.clone(), parent);
-        }
-        let Some(parent) = agents_by_id.get(parent_id) else {
-            continue;
-        };
-        if matches!(child.state.as_str(), "paused" | "archived")
-            || crate::server::is_explicitly_archived(store.data_dir(), child)
-        {
-            continue;
-        }
-        if !child.is_task_subagent() {
-            continue;
-        }
-        if agent_wake_block_reason(store, health, child, now).is_some() {
-            continue;
-        }
-        if store
-            .list_schedules(Some(&child.id), true)
-            .is_ok_and(|s| !s.is_empty())
-        {
-            continue;
-        }
-        let Ok(snap) = store.turn_ownership_snapshot(&child.id) else {
-            continue;
-        };
-        let last_in_ms = snap.last_delivered_at_ms.unwrap_or(0);
-        let last_out_ms = snap.last_outbound_at_ms.unwrap_or(0);
-        let parent_sender = format!("agent:{}", parent.name);
+struct FamilyWatch {
+    family: Family,
+    next_at: i64,
+    watched: Vec<(AgentId, Option<LiveMark>)>,
+}
 
-        if last_in_ms > 0
-            && last_in_ms > last_out_ms
-            && now.saturating_sub(last_in_ms) >= 15_000
-            && snap
-                .last_delivered_sender
-                .as_deref()
-                .is_some_and(|s| s == "parent" || s == parent_sender || s == "system:turn-guard")
-        {
-            let seq = snap.last_delivered_seq.unwrap_or(0);
-            let already_nudged = snap
-                .last_delivered_source_key
-                .as_deref()
-                .is_some_and(|k| k.starts_with("turn-guard:child-nudge:"));
-            if already_nudged {
-                if !matches!(parent.state.as_str(), "paused" | "archived")
-                    && !crate::server::is_explicitly_archived(store.data_dir(), parent)
-                    && agent_wake_block_reason(store, health, parent, now).is_none()
-                {
-                    let alert_key = format!("turn-guard:parent-alert:{}:{seq}", child.id);
-                    if store
-                        .has_message_source_key(&parent.id, &alert_key)
-                        .is_ok_and(|exists| !exists)
-                    {
-                        let body = format!(
-                            "[Sub-Agent Turn Ownership Guard] Task sub-agent `{}` (`role: {}`) exited its turn without calling `send` to report back and has no active schedules. Inspect it via `agents(action: \"inspect\", name: \"{}\")`, send it a follow-up instruction, or close it via `agents(action: \"archive\", name: \"{}\")`.",
-                            child.name,
-                            child.role.as_deref().unwrap_or("task"),
-                            child.name,
-                            child.name
-                        );
-                        let mut msg = Incoming::new(body);
-                        msg.sender = Some("system:turn-guard".to_string());
-                        msg.source_key = Some(alert_key);
-                        msg.source_time_ms = Some(now);
-                        if store.receive(&parent.id, msg).is_ok() {
-                            crate::create::poke_agent_wake_socket(store.data_dir(), &parent.id);
-                            crate::create::poke_agent_wake_socket_mail(
-                                store.data_dir(),
-                                &parent.id,
-                            );
-                            actions += 1;
-                        }
-                    }
-                }
-            } else {
-                let nudge_key = format!("turn-guard:child-nudge:{}:{seq}", child.id);
-                if store
-                    .has_message_source_key(&child.id, &nudge_key)
-                    .is_ok_and(|exists| !exists)
-                {
-                    let body = format!(
-                        "[Turn Ownership Guard] You exited your turn as a `lifecycle: task` sub-agent without calling `send` to report to your parent (`agent:{}`) and without an active `schedule`. Complete any remaining work now or call `send` (`to: \"parent\"`) with your verified outcome or blocker.",
-                        parent.name
-                    );
-                    let mut msg = Incoming::new(body);
-                    msg.sender = Some("system:turn-guard".to_string());
-                    msg.source_key = Some(nudge_key);
-                    msg.source_time_ms = Some(now);
-                    if store.receive(&child.id, msg).is_ok() {
-                        crate::create::poke_agent_wake_socket(store.data_dir(), &child.id);
-                        crate::create::poke_agent_wake_socket_mail(store.data_dir(), &child.id);
-                        actions += 1;
-                    }
-                }
+impl FamilyWatch {
+    fn new(family: Family, outcome: GuardOutcome, health: &HealthBoard, now: i64) -> Self {
+        let mut watched: Vec<(AgentId, Option<LiveMark>)> = Vec::new();
+        for id in outcome.blocked {
+            if !watched.iter().any(|(seen, _)| *seen == id) {
+                let mark = live_mark(health, &id, now);
+                watched.push((id, mark));
             }
-        } else if last_out_ms > 0
-            && last_out_ms >= last_in_ms
-            && !matches!(parent.state.as_str(), "paused" | "archived")
-            && !crate::server::is_explicitly_archived(store.data_dir(), parent)
-            && agent_wake_block_reason(store, health, parent, now).is_none()
-            && let Ok(parent_snap) = store.turn_ownership_snapshot(&parent.id)
-        {
-            let ref_ms = last_out_ms.max(parent_snap.last_delivered_at_ms.unwrap_or(0));
-            if now.saturating_sub(ref_ms) >= 900_000 {
-                waiting_by_parent
-                    .entry(parent.id.clone())
-                    .or_default()
-                    .push((
-                        child.name.clone(),
-                        child.role.clone().unwrap_or_else(|| "task".to_string()),
-                        last_out_ms,
-                    ));
-            }
+        }
+        Self {
+            family,
+            next_at: outcome.next_at.unwrap_or(i64::MAX),
+            watched,
         }
     }
 
-    for (parent_id, mut children) in waiting_by_parent {
-        children.sort_by(|a, b| a.0.cmp(&b.0));
-        let fingerprint_raw = children
-            .iter()
-            .map(|(name, _, ts)| format!("{name}:{ts}"))
-            .collect::<Vec<_>>()
-            .join(",");
-        let digest = anyagents_core::learned_memory::sha256(fingerprint_raw.as_bytes());
-        let hash16 = &digest[..16.min(digest.len())];
-        let reminder_key = format!("turn-guard:waiting-parent:{parent_id}:{hash16}");
-        if store
-            .has_message_source_key(&parent_id, &reminder_key)
-            .is_ok_and(|exists| !exists)
-        {
-            let formatted = children
+    fn due(&self, health: &HealthBoard, now: i64) -> bool {
+        now >= self.next_at
+            || self
+                .watched
                 .iter()
-                .map(|(name, role, _)| format!("`{name}` (`{role}`)"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let body = format!(
-                "[Sub-Agent Turn Ownership Guard] The following `lifecycle: task` sub-agent(s) reported to you and are idle with no active schedules (`waiting_parent`): {formatted}. The ball is in your court: for each sub-agent, either send a follow-up instruction via `send` if work remains, or close it via `agents(action: \"archive\", name: \"<name>\")` if its deliverable is accepted."
-            );
-            let mut msg = Incoming::new(body);
-            msg.sender = Some("system:turn-guard".to_string());
-            msg.source_key = Some(reminder_key);
-            msg.source_time_ms = Some(now);
-            if store.receive(&parent_id, msg).is_ok() {
-                crate::create::poke_agent_wake_socket(store.data_dir(), &parent_id);
-                crate::create::poke_agent_wake_socket_mail(store.data_dir(), &parent_id);
-                actions += 1;
-            }
-        }
+                .any(|(id, mark)| live_mark(health, id, now) != *mark)
+    }
+}
+
+impl TurnGuard {
+    fn due(&self, health: &HealthBoard, now: i64) -> bool {
+        now >= self.refresh_at || self.families.iter().any(|f| f.due(health, now))
     }
 
-    actions
-}
-
-/// Evaluate network-backed watches on a separate loop. Slow external services
-/// cannot delay a later local tick or consume a timer's due transition.
-pub fn tick_external_watches_once(store: &Store, health: &HealthBoard, now: i64) -> usize {
-    tick_schedule_partition(store, health, now, true)
-}
-
-fn is_external_watch(sched: &AgentSchedule) -> bool {
-    sched.kind == "watch"
-        && matches!(
-            parse_watch_spec(&sched.spec),
-            Ok(WatchTarget::GitHubPr { .. }
-                | WatchTarget::GitHubCheck { .. }
-                | WatchTarget::SpironPromise { .. })
-        )
-}
-
-// Retain the complete single-pass fixture for existing cross-class contracts;
-// production never serializes the two partitions through this helper.
-#[cfg(test)]
-fn tick_schedules_once(store: &Store, health: &HealthBoard, now: i64) -> usize {
-    tick_local_schedules_once(store, health, now) + tick_external_watches_once(store, health, now)
-}
-
-fn tick_schedule_partition(store: &Store, health: &HealthBoard, now: i64, external: bool) -> usize {
-    let schedules: Vec<_> = match store.list_schedules(None, true) {
-        Ok(schedules) => schedules
-            .into_iter()
-            .filter(|sched| is_external_watch(sched) == external)
-            .collect(),
-        Err(err) => {
-            eprintln!("Schedule census unavailable: {err}");
-            return 0;
+    fn run(&mut self, store: &Store, health: &HealthBoard, now: i64) -> usize {
+        let mut memo = GuardMemo::new(store, health, now);
+        let mut actions = 0;
+        if now >= self.refresh_at {
+            let Ok(live) = store.list_live_agents() else {
+                self.refresh_at = now.saturating_add(RETRY_MS);
+                return 0;
+            };
+            self.refresh_at = now.saturating_add(GUARD_REFRESH_MS);
+            self.families = task_families(store, &live)
+                .into_iter()
+                .map(|family| {
+                    let outcome = guard_family(&mut memo, &family);
+                    actions += outcome.actions;
+                    FamilyWatch::new(family, outcome, health, now)
+                })
+                .collect();
+            return actions;
         }
-    };
-    if external {
-        github::begin_cycle(&schedules, now);
-    }
-    let mut fired_count = 0;
-    let mut wake_blocks: HashMap<AgentId, Option<&'static str>> = HashMap::new();
-    for sched in schedules {
-        if (sched.kind == "at" || sched.kind == "every")
-            && sched.next_fire_at_ms.is_none_or(|due| now < due)
-        {
-            continue;
-        }
-        let agent = match store.agent(&sched.agent_id) {
-            Ok(agent) => agent,
-            Err(anyagents_core::Error::AgentNotFound(_)) => {
-                if let Err(err) = store.cancel_schedule(None, &sched.id) {
-                    eprintln!("Schedule cancellation failed: {err}");
-                }
+        for watch in &mut self.families {
+            if !watch.due(health, now) {
                 continue;
+            }
+            // Rows held since the last full pass may be stale; act on fresh ones.
+            let family = Family {
+                parent: store
+                    .agent(&watch.family.parent.id)
+                    .unwrap_or_else(|_| watch.family.parent.clone()),
+                children: watch
+                    .family
+                    .children
+                    .iter()
+                    .filter_map(|child| store.agent(&child.id).ok())
+                    .filter(guard_candidate)
+                    .collect(),
+            };
+            let outcome = guard_family(&mut memo, &family);
+            actions += outcome.actions;
+            *watch = FamilyWatch::new(family, outcome, health, now);
+        }
+        actions
+    }
+
+    fn next_deadline(&self, now: i64) -> i64 {
+        self.families.iter().fold(self.refresh_at, |at, family| {
+            let at = at.min(family.next_at);
+            if family.watched.is_empty() {
+                at
+            } else {
+                at.min(now.saturating_add(GUARD_WATCH_MS))
+            }
+        })
+    }
+}
+
+/// One active schedule as a timer holds it, with its watch spec parsed once.
+struct Entry {
+    sched: AgentSchedule,
+    /// The target of a watch whose spec parses.
+    watch: Option<WatchTarget>,
+    /// When the entry next needs a look: a timer's due time, a watch's next
+    /// probe, or a retry.
+    check_at: i64,
+    /// The watched agent of an `agent:idle` watch as last resolved, so its
+    /// published live turn answers without the store.
+    idle_target: Option<AgentId>,
+}
+
+impl Entry {
+    fn is_github(&self) -> bool {
+        matches!(
+            self.watch,
+            Some(WatchTarget::GitHubPr { .. } | WatchTarget::GitHubCheck { .. })
+        )
+    }
+}
+
+fn is_external_target(target: &WatchTarget) -> bool {
+    matches!(
+        target,
+        WatchTarget::GitHubPr { .. }
+            | WatchTarget::GitHubCheck { .. }
+            | WatchTarget::SpironPromise { .. }
+    )
+}
+
+/// The active schedules of one partition: local timers and watches, or
+/// network-backed watches.
+struct Plan {
+    external: bool,
+    entries: Vec<Entry>,
+    /// Change-feed generation the entries were read at.
+    generation: u64,
+    reload_at: i64,
+}
+
+#[derive(Default)]
+struct PassOutcome {
+    fired: usize,
+    /// A schedule row was (or may have been) written, so the plan is re-read.
+    wrote: bool,
+}
+
+#[derive(Default)]
+struct EntryOutcome {
+    fired: bool,
+    wrote: bool,
+}
+
+impl EntryOutcome {
+    const WROTE: Self = Self {
+        fired: false,
+        wrote: true,
+    };
+}
+
+impl Plan {
+    fn new(external: bool) -> Self {
+        Self {
+            external,
+            entries: Vec::new(),
+            generation: 0,
+            reload_at: i64::MIN,
+        }
+    }
+
+    fn stale(&self, generation: u64, now: i64) -> bool {
+        generation != self.generation || now >= self.reload_at
+    }
+
+    fn reload(&mut self, store: &Store, generation: u64, now: i64) {
+        match self.read(store) {
+            Ok(entries) => {
+                self.entries = entries;
+                self.generation = generation;
+                self.reload_at = now.saturating_add(SAFETY_NET_MS);
             }
             Err(err) => {
-                eprintln!("Schedule agent state unavailable: {err}");
-                continue;
+                eprintln!("Schedule census unavailable: {err}");
+                self.reload_at = now.saturating_add(RETRY_MS);
             }
-        };
-        if agent.state == "archived" {
-            if let Err(err) = store.cancel_schedule(None, &sched.id) {
-                eprintln!("Schedule cancellation failed: {err}");
-            }
-            continue;
-        }
-        // Wakes admitted in this pass must not make later schedules for the
-        // same initially idle agent appear busy because of our own mailbox writes.
-        let block = *wake_blocks
-            .entry(agent.id.clone())
-            .or_insert_with(|| agent_wake_block_reason(store, health, &agent, now));
-        match sched.kind.as_str() {
-            "at" => {
-                let Some(due) = sched.next_fire_at_ms else {
-                    continue;
-                };
-                if now < due {
-                    continue;
-                }
-                if let Some(reason) = block {
-                    // Preserve the due time and make the outstanding hold visible. A later
-                    // local tick delivers exactly once as soon as the owner is eligible.
-                    let observed = format!("deferred:{reason}");
-                    if sched.last_observed.as_deref() != Some(observed.as_str())
-                        && let Err(err) = store.update_schedule_watch_observation(
-                            &sched.id,
-                            sched.watch_baseline.as_deref(),
-                            Some(&observed),
-                        )
-                    {
-                        eprintln!("Schedule {} deferral write failed: {err}", sched.id);
-                    }
-                    continue;
-                }
-                if deliver_scheduled_wake(
-                    store,
-                    &agent,
-                    &sched,
-                    &format!("schedule:{}:{}", sched.id, due),
-                    now,
-                ) {
-                    fired_count += 1;
-                }
-            }
-            "every" => {
-                let Some(due) = sched.next_fire_at_ms else {
-                    continue;
-                };
-                if now < due {
-                    continue;
-                }
-                let interval = sched.interval_ms.unwrap_or(60_000).max(1_000);
-                let mut next_due = due.saturating_add(interval);
-                while next_due <= now {
-                    next_due = next_due.saturating_add(interval);
-                }
-                if let Some(reason) = block {
-                    // Advance next_fire_at_ms past `now` without firing so missed ticks never queue or double-fire.
-                    if let Err(err) = store.claim_schedule_tick(
-                        &sched.id,
-                        Some(due),
-                        "active",
-                        Some(next_due),
-                        None,
-                        None,
-                        Some(&format!("skipped:{reason}")),
-                    ) {
-                        eprintln!("Schedule {} skip write failed: {err}", sched.id);
-                    }
-                    continue;
-                }
-                if claim_and_deliver_scheduled_wake(
-                    store,
-                    &agent,
-                    &sched,
-                    Some(due),
-                    "active",
-                    Some(next_due),
-                    None,
-                    Some("fired"),
-                    &sched.prompt,
-                    &format!("schedule:{}:{}", sched.id, due),
-                    now,
-                ) {
-                    fired_count += 1;
-                }
-            }
-            "watch" => {
-                let eval = evaluate_watch(store, health, &sched, now);
-                if block.is_some() {
-                    // Record latest observation while the owning agent is busy/paused without
-                    // consuming a terminal transition or mutating the baseline.
-                    if eval.observed.is_some()
-                        && eval.observed != sched.last_observed
-                        && let Err(err) = store.update_schedule_watch_observation(
-                            &sched.id,
-                            sched.watch_baseline.as_deref(),
-                            eval.observed.as_deref(),
-                        )
-                    {
-                        eprintln!("Schedule {} observation write failed: {err}", sched.id);
-                    }
-                    continue;
-                }
-                if !eval.triggered {
-                    if (eval.baseline.is_some() || eval.observed.is_some())
-                        && (eval
-                            .baseline
-                            .as_ref()
-                            .is_some_and(|b| Some(b) != sched.watch_baseline.as_ref())
-                            || eval
-                                .observed
-                                .as_ref()
-                                .is_some_and(|o| Some(o) != sched.last_observed.as_ref()))
-                        && let Err(err) = store.update_schedule_watch_observation(
-                            &sched.id,
-                            eval.baseline.as_deref(),
-                            eval.observed.as_deref(),
-                        )
-                    {
-                        eprintln!("Schedule {} observation write failed: {err}", sched.id);
-                    }
-                    continue;
-                }
-                let (wake_prompt, source_key) = if let Some(ref tr) = eval.transition {
-                    (
-                        format!("[watch: {} transition={tr}]\n{}", sched.spec, sched.prompt),
-                        format!("schedule:{}:watch:{tr}:{now}", sched.id),
-                    )
-                } else {
-                    (sched.prompt.clone(), format!("schedule:{}:watch", sched.id))
-                };
-                if claim_and_deliver_scheduled_wake(
-                    store,
-                    &agent,
-                    &sched,
-                    None,
-                    eval.next_state,
-                    None,
-                    eval.baseline.as_deref(),
-                    eval.observed.as_deref(),
-                    &wake_prompt,
-                    &source_key,
-                    now,
-                ) {
-                    fired_count += 1;
-                }
-            }
-            _ => {}
         }
     }
-    fired_count
+
+    /// Read this partition's active schedules, keeping each watch's next probe
+    /// and each pending retry. A watch of an archived or deleted owner ends here,
+    /// as every census pass has ended it; a timer's owner is read when it is due.
+    fn read(&self, store: &Store) -> Result<Vec<Entry>, anyagents_core::Error> {
+        let schedules = store.list_schedules(None, true)?;
+        let previous: HashMap<&str, &Entry> = self
+            .entries
+            .iter()
+            .map(|entry| (entry.sched.id.as_str(), entry))
+            .collect();
+        let mut live: Option<HashSet<AgentId>> = None;
+        let mut entries = Vec::new();
+        for sched in schedules {
+            let watch = if sched.kind == "watch" {
+                parse_watch_spec(&sched.spec).ok()
+            } else {
+                None
+            };
+            if watch.as_ref().is_some_and(is_external_target) != self.external {
+                continue;
+            }
+            if sched.kind == "watch" {
+                if live.is_none() {
+                    live = Some(
+                        store
+                            .list_live_agents()?
+                            .into_iter()
+                            .map(|agent| agent.id)
+                            .collect(),
+                    );
+                }
+                if live
+                    .as_ref()
+                    .is_some_and(|live| !live.contains(&sched.agent_id))
+                {
+                    if let Err(err) = store.cancel_schedule(None, &sched.id) {
+                        eprintln!("Schedule cancellation failed: {err}");
+                    }
+                    continue;
+                }
+            }
+            let prior = previous.get(sched.id.as_str()).copied();
+            let check_at = if sched.kind == "watch" {
+                prior.map_or(i64::MIN, |p| p.check_at)
+            } else {
+                let due = sched.next_fire_at_ms.unwrap_or(i64::MAX);
+                // A retry outlives the reload only while the slot it retries stands.
+                prior
+                    .filter(|p| p.sched.next_fire_at_ms == sched.next_fire_at_ms)
+                    .map_or(due, |p| p.check_at.max(due))
+            };
+            let idle_target = prior.and_then(|p| p.idle_target.clone());
+            entries.push(Entry {
+                sched,
+                watch,
+                check_at,
+                idle_target,
+            });
+        }
+        Ok(entries)
+    }
+
+    fn due(&self, now: i64) -> bool {
+        self.entries.iter().any(|entry| entry.check_at <= now)
+    }
+
+    fn next_deadline(&self) -> i64 {
+        self.entries
+            .iter()
+            .map(|entry| entry.check_at)
+            .fold(self.reload_at, i64::min)
+    }
+
+    /// Evaluate every entry whose check time has come.
+    fn pass(&mut self, store: &Store, health: &HealthBoard, now: i64) -> PassOutcome {
+        if self.external {
+            github::begin_cycle(
+                self.entries
+                    .iter()
+                    .filter_map(|e| Some((e.sched.id.as_str(), e.watch.as_ref()?))),
+                now,
+            );
+        }
+        let (mut order, rest): (Vec<usize>, Vec<usize>) =
+            (0..self.entries.len()).partition(|&i| self.entries[i].check_at <= now);
+        // GitHub answers come from one cache per target. Once a due watch has
+        // probed its target, every other watch of it sees that answer now.
+        if order.iter().any(|&i| self.entries[i].is_github()) {
+            order.extend(rest.into_iter().filter(|&i| self.entries[i].is_github()));
+        }
+        let mut outcome = PassOutcome::default();
+        for i in order {
+            let step = evaluate_entry(store, health, &mut self.entries[i], now);
+            outcome.fired += usize::from(step.fired);
+            outcome.wrote |= step.wrote;
+        }
+        outcome
+    }
+}
+
+enum Owner {
+    Live(Box<Agent>),
+    /// Archived or deleted: its schedule is cancelled.
+    Gone,
+    /// Unreadable now: the entry waits for a later look.
+    Unknown,
+}
+
+fn schedule_owner(store: &Store, sched: &AgentSchedule) -> Owner {
+    match store.agent(&sched.agent_id) {
+        Ok(agent) if agent.state == "archived" => Owner::Gone,
+        Ok(agent) => Owner::Live(Box::new(agent)),
+        Err(anyagents_core::Error::AgentNotFound(_)) => Owner::Gone,
+        Err(err) => {
+            eprintln!("Schedule agent state unavailable: {err}");
+            Owner::Unknown
+        }
+    }
+}
+
+fn cancel_for_gone_owner(store: &Store, sched: &AgentSchedule) -> EntryOutcome {
+    if let Err(err) = store.cancel_schedule(None, &sched.id) {
+        eprintln!("Schedule cancellation failed: {err}");
+    }
+    EntryOutcome::WROTE
+}
+
+fn evaluate_entry(
+    store: &Store,
+    health: &HealthBoard,
+    entry: &mut Entry,
+    now: i64,
+) -> EntryOutcome {
+    match entry.sched.kind.as_str() {
+        "at" | "every" => evaluate_timer(store, entry, now),
+        "watch" => evaluate_watch_entry(store, health, entry, now),
+        _ => {
+            entry.check_at = i64::MAX;
+            EntryOutcome::default()
+        }
+    }
+}
+
+fn evaluate_timer(store: &Store, entry: &mut Entry, now: i64) -> EntryOutcome {
+    let sched = &entry.sched;
+    let Some(due) = sched.next_fire_at_ms else {
+        entry.check_at = i64::MAX;
+        return EntryOutcome::default();
+    };
+    if now < due {
+        entry.check_at = due;
+        return EntryOutcome::default();
+    }
+    // Until a re-read shows the slot claimed, this one waits out a retry.
+    entry.check_at = now.saturating_add(RETRY_MS);
+    let agent = match schedule_owner(store, sched) {
+        Owner::Live(agent) => agent,
+        Owner::Gone => return cancel_for_gone_owner(store, sched),
+        Owner::Unknown => return EntryOutcome::default(),
+    };
+    let source_key = format!("schedule:{}:{}", sched.id, due);
+    if sched.kind == "at" {
+        return EntryOutcome {
+            fired: deliver_scheduled_wake(store, &agent, sched, &source_key, now),
+            wrote: true,
+        };
+    }
+    let interval = sched.interval_ms.unwrap_or(60_000).max(1_000);
+    let mut next_due = due.saturating_add(interval);
+    while next_due <= now {
+        next_due = next_due.saturating_add(interval);
+    }
+    let Some(previous_pending) = previous_wake_pending(store, &agent, sched) else {
+        return EntryOutcome::default();
+    };
+    if previous_pending {
+        // The undelivered tick already stands for this one; the owner
+        // receives a single wake and the schedule moves to its next slot.
+        if let Err(err) = store.claim_schedule_tick(
+            &sched.id,
+            Some(due),
+            "active",
+            Some(next_due),
+            None,
+            None,
+            Some("coalesced"),
+        ) {
+            eprintln!("Schedule {} coalesce write failed: {err}", sched.id);
+        }
+        return EntryOutcome::WROTE;
+    }
+    EntryOutcome {
+        fired: claim_and_deliver_scheduled_wake(
+            store,
+            &agent,
+            sched,
+            Some(due),
+            "active",
+            Some(next_due),
+            None,
+            Some("fired"),
+            &sched.prompt,
+            &source_key,
+            now,
+        ),
+        wrote: true,
+    }
+}
+
+/// When a watch is probed next after a look at `now`.
+fn watch_probe_at(watch: Option<&WatchTarget>, now: i64) -> i64 {
+    match watch {
+        // A spec never changes, so an invalid one is looked at once.
+        None => i64::MAX,
+        Some(WatchTarget::SpironPromise { .. }) => now.saturating_add(EXTERNAL_RECHECK_MS),
+        Some(target @ (WatchTarget::GitHubPr { .. } | WatchTarget::GitHubCheck { .. })) => {
+            github::next_probe_at(target)
+                .unwrap_or(0)
+                .max(now.saturating_add(RETRY_MS))
+        }
+        Some(_) => now.saturating_add(LOCAL_WATCH_PROBE_MS),
+    }
+}
+
+fn evaluate_watch_entry(
+    store: &Store,
+    health: &HealthBoard,
+    entry: &mut Entry,
+    now: i64,
+) -> EntryOutcome {
+    let eval = evaluate_watch(
+        store,
+        health,
+        &entry.sched,
+        entry.watch.as_ref(),
+        &mut entry.idle_target,
+        now,
+    );
+    entry.check_at = watch_probe_at(entry.watch.as_ref(), now);
+    let recheck_at = now.saturating_add(if entry.watch.as_ref().is_some_and(is_external_target) {
+        EXTERNAL_RECHECK_MS
+    } else {
+        LOCAL_WATCH_PROBE_MS
+    });
+    let sched = &entry.sched;
+    let changed = eval
+        .baseline
+        .as_ref()
+        .is_some_and(|b| Some(b) != sched.watch_baseline.as_ref())
+        || eval
+            .observed
+            .as_ref()
+            .is_some_and(|o| Some(o) != sched.last_observed.as_ref());
+    if !eval.triggered && !changed {
+        return EntryOutcome::default();
+    }
+    let agent = match schedule_owner(store, sched) {
+        Owner::Live(agent) => agent,
+        Owner::Gone => return cancel_for_gone_owner(store, sched),
+        Owner::Unknown => {
+            entry.check_at = entry.check_at.min(recheck_at);
+            return EntryOutcome::default();
+        }
+    };
+    if !eval.triggered {
+        if let Err(err) = store.update_schedule_watch_observation(
+            &sched.id,
+            eval.baseline.as_deref(),
+            eval.observed.as_deref(),
+        ) {
+            eprintln!("Schedule {} observation write failed: {err}", sched.id);
+        }
+        return EntryOutcome::WROTE;
+    }
+    let Some(previous_pending) = previous_wake_pending(store, &agent, sched) else {
+        entry.check_at = entry.check_at.min(recheck_at);
+        return EntryOutcome::default();
+    };
+    if previous_pending {
+        // Record the latest observation without consuming the transition or
+        // moving the baseline; it is written once the pending wake is taken.
+        entry.check_at = entry.check_at.min(recheck_at);
+        if eval.observed.is_some() && eval.observed != sched.last_observed {
+            if let Err(err) = store.update_schedule_watch_observation(
+                &sched.id,
+                sched.watch_baseline.as_deref(),
+                eval.observed.as_deref(),
+            ) {
+                eprintln!("Schedule {} observation write failed: {err}", sched.id);
+            }
+            return EntryOutcome::WROTE;
+        }
+        return EntryOutcome::default();
+    }
+    let (wake_prompt, source_key) = if let Some(ref tr) = eval.transition {
+        (
+            format!("[watch: {} transition={tr}]\n{}", sched.spec, sched.prompt),
+            format!("schedule:{}:watch:{tr}:{now}", sched.id),
+        )
+    } else {
+        (sched.prompt.clone(), format!("schedule:{}:watch", sched.id))
+    };
+    let fired = claim_and_deliver_scheduled_wake(
+        store,
+        &agent,
+        sched,
+        None,
+        eval.next_state,
+        None,
+        eval.baseline.as_deref(),
+        eval.observed.as_deref(),
+        &wake_prompt,
+        &source_key,
+        now,
+    );
+    if !fired {
+        entry.check_at = entry.check_at.min(now.saturating_add(RETRY_MS));
+    }
+    EntryOutcome { fired, wrote: true }
 }
 
 fn deliver_scheduled_wake(
@@ -1099,8 +1770,7 @@ fn claim_and_deliver_scheduled_wake(
             return Ok(false);
         };
         let agent = store.agent(&agent.id)?;
-        if agent.state == "paused"
-            || agent.state == "archived"
+        if agent.state == "archived"
             || crate::server::is_explicitly_archived(store.data_dir(), &agent)
         {
             return Ok(false);
@@ -1116,7 +1786,7 @@ fn claim_and_deliver_scheduled_wake(
             &agent.id,
             Incoming {
                 text: prompt.into(),
-                sender: Some(format!("schedule:{}", sched.id)),
+                sender: Some(schedule_sender(&sched.id)),
                 source_time_ms: Some(now),
                 source_key: Some(source_key.into()),
                 reply_to: None,
@@ -1138,6 +1808,23 @@ fn claim_and_deliver_scheduled_wake(
             false
         }
     }
+}
+
+/// Whether the schedule's previous wake still waits in the owner's mailbox, or
+/// `None` when the mailbox cannot be read (the tick then waits for a later pass).
+fn previous_wake_pending(store: &Store, agent: &Agent, sched: &AgentSchedule) -> Option<bool> {
+    match store.has_undelivered_message_from(&agent.id, &schedule_sender(&sched.id)) {
+        Ok(pending) => Some(pending),
+        Err(err) => {
+            eprintln!("Schedule {} mailbox state unavailable: {err}", sched.id);
+            None
+        }
+    }
+}
+
+/// Mailbox sender of every wake a schedule writes.
+fn schedule_sender(schedule_id: &str) -> String {
+    format!("schedule:{schedule_id}")
 }
 
 struct WatchEval {
@@ -1174,9 +1861,11 @@ fn evaluate_watch(
     store: &Store,
     health: &HealthBoard,
     sched: &AgentSchedule,
+    target: Option<&WatchTarget>,
+    idle_target: &mut Option<AgentId>,
     now: i64,
 ) -> WatchEval {
-    let Ok(target) = parse_watch_spec(&sched.spec) else {
+    let Some(target) = target else {
         return WatchEval::pending(
             sched.watch_baseline.clone(),
             Some("invalid_spec".to_string()),
@@ -1184,12 +1873,23 @@ fn evaluate_watch(
     };
     match target {
         WatchTarget::AgentIdle { target } => {
-            let Ok(found) = store.agent_by_name(&target) else {
+            // The watched agent's published live turn answers without the store.
+            if idle_target
+                .as_ref()
+                .is_some_and(|id| in_live_turn(health, id))
+            {
+                return WatchEval::pending(
+                    Some("working".to_string()),
+                    Some("working".to_string()),
+                );
+            }
+            let Ok(found) = store.agent_by_name(target) else {
                 return WatchEval::pending(
                     sched.watch_baseline.clone(),
                     Some("not_found".to_string()),
                 );
             };
+            *idle_target = Some(found.id.clone());
             if is_agent_busy(store, health, &found, now) {
                 WatchEval::pending(Some("working".to_string()), Some("working".to_string()))
             } else {
@@ -1197,7 +1897,7 @@ fn evaluate_watch(
             }
         }
         WatchTarget::SpironPromise { id, kind } => {
-            let current = match probe_spiron_state(&id, &kind) {
+            let current = match probe_spiron_state(id, kind) {
                 Ok(current) => current,
                 Err(err) => {
                     return WatchEval::pending(
@@ -1214,7 +1914,7 @@ fn evaluate_watch(
             number,
         } => {
             let Some((_, state_desc)) =
-                probe_github_pr_terminal(&owner, &repo, number, sched.agent_id.as_str(), now)
+                probe_github_pr_terminal(owner, repo, *number, sched.agent_id.as_str(), now)
             else {
                 return WatchEval::pending(sched.watch_baseline.clone(), None);
             };
@@ -1225,13 +1925,9 @@ fn evaluate_watch(
             repo,
             reference,
         } => {
-            let Some((is_terminal, state_desc)) = probe_github_check_terminal(
-                &owner,
-                &repo,
-                &reference,
-                sched.agent_id.as_str(),
-                now,
-            ) else {
+            let Some((is_terminal, state_desc)) =
+                probe_github_check_terminal(owner, repo, reference, sched.agent_id.as_str(), now)
+            else {
                 return WatchEval::pending(sched.watch_baseline.clone(), None);
             };
             if is_terminal {
@@ -1241,14 +1937,14 @@ fn evaluate_watch(
             }
         }
         WatchTarget::ProcessExit { pid } => {
-            if probe_process_alive(pid) {
+            if probe_process_alive(*pid) {
                 WatchEval::pending(Some("running".to_string()), Some("running".to_string()))
             } else {
                 WatchEval::fired(sched.watch_baseline.clone(), Some("exited".to_string()))
             }
         }
         WatchTarget::PathChanged { path } => {
-            let current = probe_path_fingerprint(&path);
+            let current = probe_path_fingerprint(path);
             if current.starts_with("probe_error:") {
                 return WatchEval::pending(sched.watch_baseline.clone(), Some(current));
             }
@@ -1433,18 +2129,24 @@ pub fn probe_spiron_state(id: &str, kind: &str) -> Result<String, SpironProbeErr
     probe_spiron_at(&base, spiron_api_key().as_deref(), id, kind)
 }
 
+/// One client for every Spiron probe, so repeated probes reuse its pooled
+/// keep-alive connections instead of a new TLS handshake per watch per pass.
+static SPIRON_HTTP: LazyLock<ureq::Agent> = LazyLock::new(|| {
+    ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(5)))
+        .max_redirects(0)
+        .http_status_as_error(false)
+        .build()
+        .new_agent()
+});
+
 fn probe_spiron_at(
     base: &str,
     key: Option<&str>,
     id: &str,
     kind: &str,
 ) -> Result<String, SpironProbeError> {
-    let agent = ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(5)))
-        .max_redirects(0)
-        .http_status_as_error(false)
-        .build()
-        .new_agent();
+    let agent = &*SPIRON_HTTP;
     let kinds = if kind == "task" {
         ["tasks", "promises"]
     } else {
@@ -1528,6 +2230,30 @@ mod tests {
     use anyagents_core::NewAgent;
     use anyagents_harness::{DeliveryMode, SteerSupport, TurnState};
     use anyagents_supervisor::LiveState;
+
+    fn publish_turn(
+        health: &HealthBoard,
+        agent_id: &AgentId,
+        turn_state: TurnState,
+        quota_reset_at_ms: Option<i64>,
+    ) {
+        health.publish(
+            agent_id,
+            LiveState {
+                process_alive: true,
+                turn_state,
+                delivery_mode: DeliveryMode::Steer,
+                steer_support: SteerSupport::Yes,
+                quota_reset_at_ms,
+                restart_at_ms: None,
+                pid: None,
+                live_harness: None,
+                live_model: None,
+                process_started_at_ms: Some(1000),
+                last_error: quota_reset_at_ms.map(|_| "quota exceeded".to_string()),
+            },
+        );
+    }
 
     #[test]
     fn parses_durations_and_watch_specs() {
@@ -1680,8 +2406,8 @@ mod tests {
     }
 
     #[test]
-    fn same_agent_ready_local_watches_fire_together_unless_initially_blocked() {
-        for blocked in [false, true] {
+    fn same_agent_ready_local_watches_enter_mailbox_together_even_when_paused() {
+        for paused in [false, true] {
             let dir = tempfile::tempdir().unwrap();
             let store = Store::open(dir.path().join("state.db")).unwrap();
             let health = HealthBoard::default();
@@ -1714,20 +2440,16 @@ mod tests {
                     })
                     .unwrap();
             }
-            if blocked {
+            if paused {
                 store.set_agent_state(&owner.id, "paused").unwrap();
             }
             let fired = tick_local_schedules_once(&store, &health, anyagents_core::now_ms());
-            assert_eq!(fired, if blocked { 0 } else { 3 });
+            assert_eq!(fired, 3);
             let inbox = store.inbox(&owner.id, None).unwrap();
             assert_eq!(inbox.len(), fired);
             let schedules = store.list_schedules(Some(&owner.id), false).unwrap();
             assert_eq!(schedules.len(), 3);
-            assert!(
-                schedules
-                    .iter()
-                    .all(|s| s.state == if blocked { "active" } else { "fired" })
-            );
+            assert!(schedules.iter().all(|s| s.state == "fired"));
             assert_eq!(
                 tick_local_schedules_once(&store, &health, anyagents_core::now_ms()),
                 0
@@ -1775,13 +2497,13 @@ mod tests {
     }
 
     #[test]
-    fn overdue_at_records_busy_and_paused_deferrals_until_fired() {
+    fn overdue_at_enters_mailbox_while_owner_busy_or_paused() {
         for reason in ["busy", "paused"] {
             let dir = tempfile::tempdir().unwrap();
             let db = dir.path().join("state.db");
             let store = Store::open(&db).unwrap();
             let owner = store
-                .create_agent(NewAgent::new("deferred-owner", "codex"))
+                .create_agent(NewAgent::new("held-owner", "codex"))
                 .unwrap();
             let now = anyagents_core::now_ms();
             let due = now - 1000;
@@ -1790,7 +2512,7 @@ mod tests {
                     agent_id: owner.id.clone(),
                     kind: "at".into(),
                     spec: "past".into(),
-                    prompt: "deferred wake".into(),
+                    prompt: "held wake".into(),
                     interval_ms: None,
                     next_fire_at_ms: Some(due),
                     watch_baseline: None,
@@ -1800,54 +2522,34 @@ mod tests {
             if reason == "paused" {
                 store.set_agent_state(&owner.id, "paused").unwrap();
             } else {
-                health.publish(
-                    &owner.id,
-                    LiveState {
-                        process_alive: true,
-                        turn_state: TurnState::InTurn,
-                        delivery_mode: DeliveryMode::Steer,
-                        steer_support: SteerSupport::Yes,
-                        quota_reset_at_ms: None,
-                        restart_at_ms: None,
-                        pid: None,
-                        live_harness: Some("codex".into()),
-                        live_model: None,
-                        process_started_at_ms: Some(now),
-                        last_error: None,
-                    },
-                );
+                publish_turn(&health, &owner.id, TurnState::InTurn, None);
             }
-            for at in [now, now + 1000] {
-                assert_eq!(tick_local_schedules_once(&store, &health, at), 0);
-                let saved = store.list_schedules(Some(&owner.id), false).unwrap();
-                assert_eq!(saved[0].state, "active");
-                assert_eq!(saved[0].next_fire_at_ms, Some(due));
-                assert_eq!(saved[0].last_fired_at_ms, None);
-                assert_eq!(saved[0].last_observed, Some(format!("deferred:{reason}")));
-                assert!(store.inbox(&owner.id, None).unwrap().is_empty());
-            }
-            // The visible reason is durable; an independent store sees it too.
-            drop(store);
-            let store = Store::open(&db).unwrap();
             assert_eq!(
-                store.list_schedules(Some(&owner.id), false).unwrap()[0].last_observed,
-                Some(format!("deferred:{reason}"))
+                tick_local_schedules_once(&store, &health, now),
+                1,
+                "{reason}"
             );
-            store.set_agent_running(&owner.id, "/work").unwrap();
-            let idle = HealthBoard::default();
-            assert_eq!(tick_local_schedules_once(&store, &idle, now + 2000), 1);
             let saved = store.list_schedules(Some(&owner.id), false).unwrap();
             assert_eq!(saved[0].state, "fired");
             assert_eq!(saved[0].last_observed.as_deref(), Some("fired"));
-            assert_eq!(saved[0].last_fired_at_ms, Some(now + 2000));
-            assert_eq!(store.inbox(&owner.id, None).unwrap().len(), 1);
-            assert_eq!(tick_local_schedules_once(&store, &idle, now + 3000), 0);
+            assert_eq!(saved[0].last_fired_at_ms, Some(now));
+            let inbox = store.inbox(&owner.id, None).unwrap();
+            assert_eq!(inbox.len(), 1);
+            assert_eq!(inbox[0].text, "held wake");
+            // The mailbox, not the scheduler, holds it for a paused owner.
+            if reason == "paused" {
+                assert_eq!(store.agent(&owner.id).unwrap().state, "paused");
+            }
+            assert_eq!(tick_local_schedules_once(&store, &health, now + 1000), 0);
+            drop(store);
+            let store = Store::open(&db).unwrap();
+            assert_eq!(tick_local_schedules_once(&store, &health, now + 2000), 0);
             assert_eq!(store.inbox(&owner.id, None).unwrap().len(), 1);
         }
     }
 
     #[test]
-    fn local_schedule_watch_fires_with_idle_delivery_loop_lock() {
+    fn local_schedule_watch_fires_with_delivery_loop_lock_held() {
         for harness in ["agy", "claude-code", "codex", "opencode", "muse", "omp"] {
             let dir = tempfile::tempdir().unwrap();
             let store = Store::open(dir.path().join("state.db")).unwrap();
@@ -1886,17 +2588,11 @@ mod tests {
             .unwrap();
             assert_eq!(tick_schedules_once(&store, &health, now), 0);
             std::fs::write(&path, "after with different length").unwrap();
+            // A turn in progress does not hold the wake back: it enters the mailbox.
             live.turn_state = TurnState::InTurn;
-            health.publish(&owner.id, live.clone());
-            assert!(is_agent_busy(&store, &health, &owner, now));
-            assert_eq!(tick_schedules_once(&store, &health, now + 1000), 0);
-            assert_eq!(
-                store.list_schedules(Some(&owner.id), true).unwrap().len(),
-                1
-            );
-            live.turn_state = TurnState::Idle;
             health.publish(&owner.id, live);
-            assert_eq!(tick_schedules_once(&store, &health, now + 2000), 1);
+            assert!(is_agent_busy(&store, &health, &owner, now));
+            assert_eq!(tick_schedules_once(&store, &health, now + 1000), 1);
             let inbox = store.inbox(&owner.id, None).unwrap();
             assert_eq!(inbox.len(), 1);
             assert_eq!(inbox[0].text, "file changed");
@@ -1936,7 +2632,7 @@ mod tests {
     }
 
     #[test]
-    fn watch_schedule_defers_while_owner_busy_and_fires_when_idle() {
+    fn watch_schedule_enters_mailbox_while_owner_busy() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let health = HealthBoard::default();
@@ -1949,7 +2645,7 @@ mod tests {
             .unwrap();
         store.set_agent_running(&child.id, "/work").unwrap();
 
-        let _sched = create_agent_schedule(
+        create_agent_schedule(
             &store,
             &health,
             &owner,
@@ -1960,56 +2656,26 @@ mod tests {
         )
         .unwrap();
 
-        // While owner is busy (InTurn), even though worker-sub is idle, the one-shot watch
-        // is deferred rather than swallowed as `skipped:busy`.
-        health.publish(
-            &owner.id,
-            LiveState {
-                process_alive: true,
-                turn_state: TurnState::InTurn,
-                delivery_mode: DeliveryMode::Steer,
-                steer_support: SteerSupport::Yes,
-                quota_reset_at_ms: None,
-                restart_at_ms: None,
-                pid: None,
-                live_harness: Some("codex".to_string()),
-                live_model: None,
-                process_started_at_ms: Some(1000),
-                last_error: None,
-            },
-        );
+        // The owner is mid-turn; the triggered watch is written to its mailbox
+        // at once, where delivery steers it into the running turn.
+        publish_turn(&health, &owner.id, TurnState::InTurn, None);
         let now = anyagents_core::now_ms();
-        assert_eq!(tick_schedules_once(&store, &health, now), 0);
-        assert_eq!(store.inbox(&owner.id, None).unwrap().len(), 0);
-        let active = store.list_schedules(Some(&owner.id), true).unwrap();
-        assert_eq!(active.len(), 1);
-        assert_eq!(active[0].state, "active");
-
-        // Once owner finishes its turn and is Idle, the watch fires and wakes the owner.
-        health.publish(
-            &owner.id,
-            LiveState {
-                process_alive: true,
-                turn_state: TurnState::Idle,
-                delivery_mode: DeliveryMode::Steer,
-                steer_support: SteerSupport::Yes,
-                quota_reset_at_ms: None,
-                restart_at_ms: None,
-                pid: None,
-                live_harness: Some("codex".to_string()),
-                live_model: None,
-                process_started_at_ms: Some(1000),
-                last_error: None,
-            },
-        );
-        assert_eq!(tick_schedules_once(&store, &health, now + 5_000), 1);
+        assert_eq!(tick_schedules_once(&store, &health, now), 1);
         let inbox = store.inbox(&owner.id, None).unwrap();
         assert_eq!(inbox.len(), 1);
         assert_eq!(inbox[0].text, "subagent finished");
+        assert!(
+            store
+                .list_schedules(Some(&owner.id), true)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(tick_schedules_once(&store, &health, now + 5_000), 0);
+        assert_eq!(store.inbox(&owner.id, None).unwrap().len(), 1);
     }
 
     #[test]
-    fn positive_and_negative_schedule_wakes_respect_busy_quota_and_cancel() {
+    fn every_ticks_reach_idle_busy_and_quota_blocked_owners_until_cancel() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let health = HealthBoard::default();
@@ -2017,8 +2683,13 @@ mod tests {
             .create_agent(NewAgent::new("owner-opencode", "opencode"))
             .unwrap();
         store.set_agent_running(&owner.id, "/work").unwrap();
+        let next_due = |store: &Store| {
+            store.list_schedules(Some(&owner.id), true).unwrap()[0]
+                .next_fire_at_ms
+                .unwrap()
+        };
 
-        // 1. Positive test: idle OpenCode owner schedules a 1-minute wake and receives 1 prompt.
+        // Idle owner: a 1-minute schedule writes one wake when due.
         let sched = create_agent_schedule(
             &store,
             &health,
@@ -2032,108 +2703,153 @@ mod tests {
         let due = sched.next_fire_at_ms.unwrap();
         assert_eq!(tick_schedules_once(&store, &health, due - 1), 0);
         assert_eq!(store.inbox(&owner.id, None).unwrap().len(), 0);
-
         assert_eq!(tick_schedules_once(&store, &health, due), 1);
         let inbox = store.inbox(&owner.id, None).unwrap();
         assert_eq!(inbox.len(), 1);
         assert_eq!(inbox[0].text, "run outcome loop");
-
-        // Consume turn 1 so owner is idle again
+        assert_eq!(next_due(&store), due + 60_000);
         store.note_delivered(&owner.id, 1).unwrap();
         store.note_turn_completed(&owner.id).unwrap();
 
-        // 2. Negative test: busy owner gets NO wake, and missed wake never fires twice.
-        let next_due = store.list_schedules(Some(&owner.id), true).unwrap()[0]
-            .next_fire_at_ms
-            .unwrap();
-        health.publish(
-            &owner.id,
-            LiveState {
-                process_alive: true,
-                turn_state: TurnState::InTurn,
-                delivery_mode: DeliveryMode::Steer,
-                steer_support: SteerSupport::Yes,
-                quota_reset_at_ms: None,
-                restart_at_ms: None,
-                pid: None,
-                live_harness: Some("opencode".to_string()),
-                live_model: None,
-                process_started_at_ms: Some(1000),
-                last_error: None,
-            },
-        );
-        assert_eq!(tick_schedules_once(&store, &health, next_due), 0);
-        assert_eq!(store.inbox(&owner.id, None).unwrap().len(), 1);
+        // Busy owner: the tick is written to the mailbox for steering, exactly once.
+        publish_turn(&health, &owner.id, TurnState::InTurn, None);
+        let busy_due = next_due(&store);
+        assert_eq!(tick_schedules_once(&store, &health, busy_due), 1);
+        assert_eq!(tick_schedules_once(&store, &health, busy_due + 5_000), 0);
+        let inbox = store.inbox(&owner.id, None).unwrap();
+        assert_eq!(inbox.len(), 2);
+        assert_eq!(inbox[1].text, "run outcome loop");
+        let saved = &store.list_schedules(Some(&owner.id), true).unwrap()[0];
+        assert_eq!(saved.last_observed.as_deref(), Some("fired"));
+        assert_eq!(saved.next_fire_at_ms, Some(busy_due + 60_000));
+        store.note_delivered(&owner.id, 2).unwrap();
 
-        // Even when owner becomes idle 5s later, the missed wake does NOT fire late.
-        health.publish(
+        // Quota-blocked owner: the tick still enters the mailbox; delivery holds it.
+        let quota_due = next_due(&store);
+        publish_turn(
+            &health,
             &owner.id,
-            LiveState {
-                process_alive: true,
-                turn_state: TurnState::Idle,
-                delivery_mode: DeliveryMode::Steer,
-                steer_support: SteerSupport::Yes,
-                quota_reset_at_ms: None,
-                restart_at_ms: None,
-                pid: None,
-                live_harness: Some("opencode".to_string()),
-                live_model: None,
-                process_started_at_ms: Some(1000),
-                last_error: None,
-            },
+            TurnState::Idle,
+            Some(quota_due + 3_600_000),
         );
-        assert_eq!(tick_schedules_once(&store, &health, next_due + 5_000), 0);
-        assert_eq!(store.inbox(&owner.id, None).unwrap().len(), 1);
+        assert_eq!(tick_schedules_once(&store, &health, quota_due), 1);
+        assert_eq!(store.inbox(&owner.id, None).unwrap().len(), 3);
 
-        // 3. Negative test: quota-blocked owner gets NO wake.
-        let third_due = store.list_schedules(Some(&owner.id), true).unwrap()[0]
-            .next_fire_at_ms
-            .unwrap();
-        health.publish(
-            &owner.id,
-            LiveState {
-                process_alive: true,
-                turn_state: TurnState::Idle,
-                delivery_mode: DeliveryMode::Steer,
-                steer_support: SteerSupport::Yes,
-                quota_reset_at_ms: Some(third_due + 3_600_000),
-                restart_at_ms: None,
-                pid: None,
-                live_harness: Some("opencode".to_string()),
-                live_model: None,
-                process_started_at_ms: Some(1000),
-                last_error: Some("quota exceeded".to_string()),
-            },
-        );
-        assert_eq!(tick_schedules_once(&store, &health, third_due), 0);
-        assert_eq!(store.inbox(&owner.id, None).unwrap().len(), 1);
-
-        // 4. Negative test: none after cancel.
-        health.publish(
-            &owner.id,
-            LiveState {
-                process_alive: true,
-                turn_state: TurnState::Idle,
-                delivery_mode: DeliveryMode::Steer,
-                steer_support: SteerSupport::Yes,
-                quota_reset_at_ms: None,
-                restart_at_ms: None,
-                pid: None,
-                live_harness: Some("opencode".to_string()),
-                live_model: None,
-                process_started_at_ms: Some(1000),
-                last_error: None,
-            },
-        );
-        let fourth_due = store.list_schedules(Some(&owner.id), true).unwrap()[0]
-            .next_fire_at_ms
-            .unwrap();
+        // Cancelled: nothing more.
+        publish_turn(&health, &owner.id, TurnState::Idle, None);
+        store.note_delivered(&owner.id, 3).unwrap();
+        let cancelled_due = next_due(&store);
         assert_eq!(
             store.cancel_schedule(Some(&owner.id), &sched.id).unwrap(),
             1
         );
-        assert_eq!(tick_schedules_once(&store, &health, fourth_due + 1_000), 0);
-        assert_eq!(store.inbox(&owner.id, None).unwrap().len(), 1);
+        assert_eq!(
+            tick_schedules_once(&store, &health, cancelled_due + 1_000),
+            0
+        );
+        assert_eq!(store.inbox(&owner.id, None).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn expired_quota_deadline_with_stale_rate_limit_text_is_not_blocked() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let health = HealthBoard::default();
+        let owner = store
+            .create_agent(NewAgent::new("recovered-owner", "codex"))
+            .unwrap();
+        store.set_agent_running(&owner.id, "/work").unwrap();
+        let now = anyagents_core::now_ms();
+        let mut live = LiveState {
+            process_alive: true,
+            turn_state: TurnState::Idle,
+            delivery_mode: DeliveryMode::Steer,
+            steer_support: SteerSupport::Yes,
+            quota_reset_at_ms: Some(now - 1_000),
+            restart_at_ms: None,
+            pid: None,
+            live_harness: None,
+            live_model: None,
+            process_started_at_ms: Some(1000),
+            last_error: Some("HTTP 429: rate limit, quota exceeded".into()),
+        };
+        health.publish(&owner.id, live.clone());
+        let owner = store.agent(&owner.id).unwrap();
+        assert_eq!(
+            agent_wake_block_reason(&store, &health, &owner, false, now),
+            None
+        );
+        live.quota_reset_at_ms = Some(now + 60_000);
+        health.publish(&owner.id, live.clone());
+        assert_eq!(
+            agent_wake_block_reason(&store, &health, &owner, false, now),
+            Some("quota_blocked")
+        );
+        live.quota_reset_at_ms = Some(now - 1_000);
+        health.publish(&owner.id, live);
+
+        let sched = create_agent_schedule(
+            &store,
+            &health,
+            &owner,
+            None,
+            Some("1m"),
+            None,
+            "recovered check",
+        )
+        .unwrap();
+        let due = sched.next_fire_at_ms.unwrap();
+        assert_eq!(tick_schedules_once(&store, &health, due), 1);
+        let inbox = store.inbox(&owner.id, None).unwrap();
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].text, "recovered check");
+    }
+
+    #[test]
+    fn long_pause_leaves_one_pending_every_tick() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let health = HealthBoard::default();
+        let owner = store
+            .create_agent(NewAgent::new("paused-owner", "codex"))
+            .unwrap();
+        store.set_agent_running(&owner.id, "/work").unwrap();
+        let sched = create_agent_schedule(
+            &store,
+            &health,
+            &owner,
+            None,
+            Some("1m"),
+            None,
+            "hourly check",
+        )
+        .unwrap();
+        let due = sched.next_fire_at_ms.unwrap();
+        store.set_agent_state(&owner.id, "paused").unwrap();
+
+        // A thousand intervals pass while the owner is paused: one wake waits.
+        let mut fired = 0;
+        for step in 0..1_000 {
+            fired += tick_schedules_once(&store, &health, due + step * 60_000);
+        }
+        assert_eq!(fired, 1);
+        let inbox = store.inbox(&owner.id, None).unwrap();
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].text, "hourly check");
+        let saved = &store.list_schedules(Some(&owner.id), true).unwrap()[0];
+        assert_eq!(saved.last_observed.as_deref(), Some("coalesced"));
+        assert_eq!(saved.last_fired_at_ms, Some(due));
+        let resume_at = due + 999 * 60_000;
+        assert_eq!(saved.next_fire_at_ms, Some(resume_at + 60_000));
+
+        // Resume: the mailbox delivers the one pending tick, and the next slot
+        // after it writes exactly one new wake.
+        store.set_agent_running(&owner.id, "/work").unwrap();
+        store.note_delivered(&owner.id, 1).unwrap();
+        assert_eq!(tick_schedules_once(&store, &health, resume_at + 30_000), 0);
+        assert_eq!(tick_schedules_once(&store, &health, resume_at + 60_000), 1);
+        assert_eq!(tick_schedules_once(&store, &health, resume_at + 61_000), 0);
+        assert_eq!(store.inbox(&owner.id, None).unwrap().len(), 2);
     }
 
     #[test]
@@ -2241,7 +2957,12 @@ mod tests {
         )
         .unwrap();
         let now = anyagents_core::now_ms();
-        github::begin_cycle(&store.list_schedules(None, true).unwrap(), now);
+        let watched = store.list_schedules(None, true).unwrap();
+        let targets: Vec<_> = watched
+            .iter()
+            .map(|s| (s.id.as_str(), parse_watch_spec(&s.spec).unwrap()))
+            .collect();
+        github::begin_cycle(targets.iter().map(|(id, t)| (*id, t)), now);
         let barrier = Arc::new(std::sync::Barrier::new(101));
         let handles: Vec<_> = (0..100)
             .map(|i| {
@@ -2412,7 +3133,7 @@ mod tests {
             .unwrap();
         assert!(is_agent_busy(&store, &health, &agent, 1));
         assert_eq!(
-            agent_wake_block_reason(&store, &health, &agent, 1),
+            agent_wake_block_reason(&store, &health, &agent, false, 1),
             Some("busy")
         );
         conn.execute_batch("ALTER TABLE unavailable_turns RENAME TO turn_recovery")
@@ -2463,6 +3184,93 @@ mod tests {
             assert_eq!(probe_spiron_at(&base, None, "id", "promise"), expected);
             task.join().unwrap();
         }
+    }
+
+    #[test]
+    fn spiron_probes_share_one_keep_alive_connection() {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        // The peer accepts exactly one connection and answers two requests on
+        // it; a probe that dialed again would find no listener and fail.
+        let peer = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            drop(listener);
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(socket.try_clone().unwrap());
+            let mut writer = socket;
+            for state in ["pending", "complete"] {
+                let mut line = String::new();
+                while reader.read_line(&mut line).unwrap() > 0 && line != "\r\n" {
+                    line.clear();
+                }
+                let body = format!(r#"{{"state":"{state}"}}"#);
+                write!(
+                    writer,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+        assert_eq!(
+            probe_spiron_at(&base, None, "id", "promise"),
+            Ok("pending".into())
+        );
+        assert_eq!(
+            probe_spiron_at(&base, None, "id", "promise"),
+            Ok("complete".into())
+        );
+        peer.join().unwrap();
+    }
+
+    #[test]
+    fn legacy_pr_watch_repair_runs_once_per_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("state.db");
+        let store = Store::open(&db).unwrap();
+        let health = HealthBoard::default();
+        let owner = store
+            .create_agent(NewAgent::new("legacy-owner", "codex"))
+            .unwrap();
+        let watch = store
+            .create_schedule(NewSchedule {
+                agent_id: owner.id.clone(),
+                kind: "watch".into(),
+                spec: "github:pr:o/r#7".into(),
+                prompt: "verify".into(),
+                interval_ms: None,
+                next_fire_at_ms: None,
+                watch_baseline: Some("pending".into()),
+            })
+            .unwrap();
+        let retire = |conn: &rusqlite::Connection| {
+            conn.execute(
+                "UPDATE agent_schedules SET state='fired', last_observed='checks_completed' WHERE id=?1",
+                [watch.id.as_str()],
+            )
+            .unwrap();
+        };
+        let raw = rusqlite::Connection::open(&db).unwrap();
+        retire(&raw);
+        // The first local pass reopens what an earlier release retired.
+        assert!(restore_legacy_pr_watches_once(&store));
+        let reopened = store.get_schedule(&watch.id).unwrap().unwrap();
+        assert_eq!(reopened.state, "active");
+        assert_eq!(reopened.watch_baseline.as_deref(), Some("checks_completed"));
+        // Later passes, including from a reopened handle, never rescan.
+        retire(&raw);
+        drop(store);
+        let store = Store::open(&db).unwrap();
+        for at in 0..3 {
+            tick_local_schedules_once(&store, &health, anyagents_core::now_ms() + at);
+        }
+        assert_eq!(
+            store.get_schedule(&watch.id).unwrap().unwrap().state,
+            "fired"
+        );
     }
 
     #[test]
@@ -2701,5 +3509,455 @@ mod tests {
         assert_eq!(parent_inbox.len(), 1);
         assert!(parent_inbox[0].text.contains("waiting_parent"));
         assert!(parent_inbox[0].text.contains("`child-eng` (`engineer`)"));
+    }
+
+    fn timer_schedule(store: &Store, owner: &AgentId, kind: &str, spec: &str, due: Option<i64>) {
+        store
+            .create_schedule(NewSchedule {
+                agent_id: owner.clone(),
+                kind: kind.into(),
+                spec: spec.into(),
+                prompt: format!("{kind} {spec}"),
+                interval_ms: (kind == "every").then_some(3_600_000),
+                next_fire_at_ms: due,
+                watch_baseline: None,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn idle_timer_touches_the_store_only_at_its_deadlines() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let health = HealthBoard::default();
+        let owner = store
+            .create_agent(NewAgent::new("idle-owner", "codex"))
+            .unwrap();
+        let now = anyagents_core::now_ms();
+        timer_schedule(&store, &owner.id, "at", "later", Some(now + 3_600_000));
+        timer_schedule(&store, &owner.id, "every", "1h", Some(now + 3_600_000));
+        let mut timer = Timer::local();
+        let first = timer.step(&store, &health, 0, now);
+        assert!(first.worked);
+        let mut deadline = first.deadline;
+        // Ten idle minutes, stepped every second as the old census was: the store
+        // is read only when the guard re-reads the fleet (15 s) or the schedules
+        // are re-read as a safety net (60 s), never on the seconds between.
+        let mut worked_at = Vec::new();
+        for second in 1..=600 {
+            let at = now + second * 1_000;
+            let step = timer.step(&store, &health, 0, at);
+            if step.worked {
+                assert!(at >= deadline, "worked at {second}s before its deadline");
+                worked_at.push(second);
+            } else {
+                assert!(at < deadline);
+            }
+            deadline = step.deadline;
+        }
+        assert_eq!(worked_at, (1..=40).map(|n| n * 15).collect::<Vec<_>>());
+        assert!(store.inbox(&owner.id, None).unwrap().is_empty());
+        // Nothing was due, so nothing was written.
+        let saved = store.list_schedules(Some(&owner.id), true).unwrap();
+        assert!(saved.iter().all(|s| s.last_fired_at_ms.is_none()));
+    }
+
+    #[test]
+    fn timer_fires_each_kind_at_its_due_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let health = HealthBoard::default();
+        let now = anyagents_core::now_ms();
+        let at_owner = store
+            .create_agent(NewAgent::new("at-owner", "codex"))
+            .unwrap();
+        let every_owner = store
+            .create_agent(NewAgent::new("every-owner", "codex"))
+            .unwrap();
+        let watch_owner = store
+            .create_agent(NewAgent::new("watch-owner", "codex"))
+            .unwrap();
+        timer_schedule(&store, &at_owner.id, "at", "soon", Some(now + 2_500));
+        timer_schedule(&store, &every_owner.id, "every", "1h", Some(now + 4_000));
+        let path = dir.path().join("signal");
+        store
+            .create_schedule(NewSchedule {
+                agent_id: watch_owner.id.clone(),
+                kind: "watch".into(),
+                spec: format!("file:{}", path.display()),
+                prompt: "file appeared".into(),
+                interval_ms: None,
+                next_fire_at_ms: None,
+                watch_baseline: Some("missing".into()),
+            })
+            .unwrap();
+        let mut timer = Timer::local();
+        let inbox = |id: &AgentId| store.inbox(id, None).unwrap().len();
+        let deadline = timer.step(&store, &health, 0, now).deadline;
+        // A local watch is probed each second; nothing else is due yet.
+        assert_eq!(deadline, now + LOCAL_WATCH_PROBE_MS);
+        timer.step(&store, &health, 0, now + 1_000);
+        std::fs::write(&path, "ready").unwrap();
+        let deadline = timer.step(&store, &health, 0, now + 2_000).deadline;
+        assert_eq!(inbox(&watch_owner.id), 1);
+        // The watch fired and is gone, so the next step is the `at` due time.
+        assert_eq!(deadline, now + 2_500);
+        assert!(!timer.step(&store, &health, 0, now + 2_499).worked);
+        assert_eq!(inbox(&at_owner.id), 0);
+        let deadline = timer.step(&store, &health, 0, now + 2_500).deadline;
+        assert_eq!(inbox(&at_owner.id), 1);
+        assert_eq!(deadline, now + 4_000);
+        let deadline = timer.step(&store, &health, 0, now + 4_000).deadline;
+        assert_eq!(inbox(&every_owner.id), 1);
+        // The recurring schedule sleeps until its next slot or the guard's re-read.
+        assert_eq!(
+            deadline,
+            (now + GUARD_REFRESH_MS).min(now + 4_000 + 3_600_000)
+        );
+        for id in [&at_owner.id, &every_owner.id, &watch_owner.id] {
+            assert_eq!(inbox(id), 1);
+        }
+    }
+
+    #[test]
+    fn timer_coalesces_every_ticks_for_a_paused_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let health = HealthBoard::default();
+        let owner = store
+            .create_agent(NewAgent::new("paused-timer-owner", "codex"))
+            .unwrap();
+        let now = anyagents_core::now_ms();
+        store
+            .create_schedule(NewSchedule {
+                agent_id: owner.id.clone(),
+                kind: "every".into(),
+                spec: "1s".into(),
+                prompt: "tick".into(),
+                interval_ms: Some(1_000),
+                next_fire_at_ms: Some(now + 1_000),
+                watch_baseline: None,
+            })
+            .unwrap();
+        store.set_agent_state(&owner.id, "paused").unwrap();
+        let mut timer = Timer::local();
+        let mut at = now;
+        while at < now + 100_000 {
+            at = timer.step(&store, &health, 0, at).deadline;
+        }
+        let inbox = store.inbox(&owner.id, None).unwrap();
+        assert_eq!(inbox.len(), 1);
+        let saved = &store.list_schedules(Some(&owner.id), true).unwrap()[0];
+        assert_eq!(saved.last_observed.as_deref(), Some("coalesced"));
+        assert_eq!(saved.last_fired_at_ms, Some(now + 1_000));
+    }
+
+    #[test]
+    fn failed_delivery_retries_after_a_second_without_spinning() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let health = HealthBoard::default();
+        let owner = store
+            .create_agent(NewAgent::new("locked-owner", "codex"))
+            .unwrap();
+        let now = anyagents_core::now_ms();
+        timer_schedule(&store, &owner.id, "at", "now", Some(now));
+        let mut timer = Timer::local();
+        let held = store.lock_agent_lifecycle(&owner.id).unwrap();
+        let deadline = timer.step(&store, &health, 0, now).deadline;
+        assert!(store.inbox(&owner.id, None).unwrap().is_empty());
+        assert_eq!(deadline, now + RETRY_MS);
+        assert!(!timer.step(&store, &health, 0, now + 500).worked);
+        drop(held);
+        timer.step(&store, &health, 0, now + RETRY_MS);
+        assert_eq!(store.inbox(&owner.id, None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn schedule_change_wakes_the_running_timer_at_once() {
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        let health = HealthBoard::default();
+        let silent = store
+            .create_agent(NewAgent::new("silent-owner", "codex"))
+            .unwrap();
+        let notified = store
+            .create_agent(NewAgent::new("notified-owner", "codex"))
+            .unwrap();
+        let first = store
+            .create_agent(NewAgent::new("first-owner", "codex"))
+            .unwrap();
+        timer_schedule(
+            &store,
+            &first.id,
+            "at",
+            "now",
+            Some(anyagents_core::now_ms()),
+        );
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let (local, external) = start_loops(Arc::clone(&store), health.clone());
+            // The startup step fires what is already due.
+            let started = std::time::Instant::now();
+            while store.inbox(&first.id, None).unwrap().is_empty() {
+                assert!(
+                    started.elapsed() < Duration::from_secs(5),
+                    "no startup step"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            // A row written behind the module's back is not polled for: the timer
+            // sleeps until a deadline or a change.
+            timer_schedule(
+                &store,
+                &silent.id,
+                "at",
+                "now",
+                Some(anyagents_core::now_ms()),
+            );
+            tokio::time::sleep(Duration::from_millis(1_500)).await;
+            assert!(store.inbox(&silent.id, None).unwrap().is_empty());
+            // A schedule created through this module wakes the timer at once; its
+            // re-read also finds the earlier row.
+            let created_at = std::time::Instant::now();
+            create_agent_schedule(
+                &store,
+                &health,
+                &notified,
+                Some(&anyagents_core::now_ms().to_string()),
+                None,
+                None,
+                "wake now",
+            )
+            .unwrap();
+            while store.inbox(&notified.id, None).unwrap().is_empty()
+                || store.inbox(&silent.id, None).unwrap().is_empty()
+            {
+                assert!(
+                    created_at.elapsed() < Duration::from_secs(5),
+                    "the change did not wake the timer"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            local.abort();
+            external.abort();
+        });
+        runtime.shutdown_timeout(Duration::from_secs(5));
+    }
+
+    #[test]
+    fn external_timer_sleeps_until_the_github_target_can_be_probed() {
+        let _env = crate::server::tests::env_lock();
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = closed.local_addr().unwrap();
+        drop(closed);
+        let previous = std::env::var_os("ANYAGENTS_GITHUB_API_BASE");
+        // SAFETY: serialized with all other process-wide GitHub API overrides.
+        unsafe {
+            std::env::set_var("ANYAGENTS_GITHUB_API_BASE", format!("http://{address}"));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let health = HealthBoard::default();
+        let owner = store
+            .create_agent(NewAgent::new("pr-owner", "codex"))
+            .unwrap();
+        store
+            .create_schedule(NewSchedule {
+                agent_id: owner.id.clone(),
+                kind: "watch".into(),
+                spec: "github:pr:example-org/sleepy#9".into(),
+                prompt: "pr".into(),
+                interval_ms: None,
+                next_fire_at_ms: None,
+                watch_baseline: Some("pending".into()),
+            })
+            .unwrap();
+        let mut timer = Timer::external();
+        let now = anyagents_core::now_ms();
+        let step = github::with_completion_clock(now, || timer.step(&store, &health, 0, now));
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("ANYAGENTS_GITHUB_API_BASE", value),
+                None => std::env::remove_var("ANYAGENTS_GITHUB_API_BASE"),
+            }
+        }
+        assert!(step.worked);
+        // The unreachable API is an observation; its target is not probed again
+        // for a minute, and the external timer sleeps that long, not 3 s.
+        let saved = &store.list_schedules(Some(&owner.id), true).unwrap()[0];
+        assert_eq!(
+            saved.last_observed.as_deref(),
+            Some("probe_error:transport")
+        );
+        assert_eq!(step.deadline, now + 60_000);
+        assert!(!timer.step(&store, &health, 0, now + 3_000).worked);
+    }
+
+    #[test]
+    fn busy_idle_watch_target_answers_from_published_turn_without_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("state.db");
+        let store = Store::open(&db).unwrap();
+        let health = HealthBoard::default();
+        let owner = store
+            .create_agent(NewAgent::new("waiter", "codex"))
+            .unwrap();
+        let target = store
+            .create_agent(NewAgent::new("worker", "codex"))
+            .unwrap();
+        let sched = store
+            .create_schedule(NewSchedule {
+                agent_id: owner.id.clone(),
+                kind: "watch".into(),
+                spec: "agent:idle:worker".into(),
+                prompt: "worker idle".into(),
+                interval_ms: None,
+                next_fire_at_ms: None,
+                watch_baseline: None,
+            })
+            .unwrap();
+        let watch = parse_watch_spec(&sched.spec).ok();
+        let mut hint = None;
+        publish_turn(&health, &target.id, TurnState::InTurn, None);
+        let now = anyagents_core::now_ms();
+        let eval = evaluate_watch(&store, &health, &sched, watch.as_ref(), &mut hint, now);
+        assert_eq!(eval.observed.as_deref(), Some("working"));
+        assert_eq!(hint.as_ref(), Some(&target.id));
+        // With the agent table unreadable, the published turn still answers.
+        let raw = rusqlite::Connection::open(&db).unwrap();
+        raw.execute_batch("ALTER TABLE agents RENAME TO unavailable_agents")
+            .unwrap();
+        let eval = evaluate_watch(&store, &health, &sched, watch.as_ref(), &mut hint, now);
+        assert_eq!(eval.observed.as_deref(), Some("working"));
+        assert!(!eval.triggered);
+        raw.execute_batch("ALTER TABLE unavailable_agents RENAME TO agents")
+            .unwrap();
+        // Once the turn ends, the store decides, and the watch fires.
+        publish_turn(&health, &target.id, TurnState::Idle, None);
+        let eval = evaluate_watch(&store, &health, &sched, watch.as_ref(), &mut hint, now);
+        assert!(eval.triggered);
+        assert_eq!(eval.observed.as_deref(), Some("idle"));
+    }
+
+    #[test]
+    fn turn_guard_holds_for_schedules_busy_children_and_busy_parents() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let health = HealthBoard::default();
+        let parent = store
+            .create_agent(NewAgent::new("hold-parent", "codex"))
+            .unwrap();
+        let mut child_new = NewAgent::new("hold-child", "codex");
+        child_new.parent_id = Some(parent.id.clone());
+        let child = store.create_agent(child_new).unwrap();
+        let mut task = Incoming::new("Execute task");
+        task.sender = Some(format!("agent:{}", parent.name));
+        store.receive(&child.id, task).unwrap();
+        store.note_delivered(&child.id, 1).unwrap();
+        store.note_turn_completed(&child.id).unwrap();
+        let delivered_at = |store: &Store| {
+            store
+                .turn_ownership_snapshot(&child.id)
+                .unwrap()
+                .last_delivered_at_ms
+                .unwrap()
+        };
+        let due = delivered_at(&store) + 20_000;
+        // An active schedule means the child still owns its next step.
+        let sched = create_agent_schedule(&store, &health, &child, None, Some("1h"), None, "check")
+            .unwrap();
+        assert_eq!(tick_task_subagent_turn_ownership(&store, &health, due), 0);
+        cancel_agent_schedule(&store, &child.id, &sched.id).unwrap();
+        // A child mid-turn is not nudged; once idle, it is, once.
+        publish_turn(&health, &child.id, TurnState::InTurn, None);
+        assert_eq!(tick_task_subagent_turn_ownership(&store, &health, due), 0);
+        publish_turn(&health, &child.id, TurnState::Idle, None);
+        assert_eq!(tick_task_subagent_turn_ownership(&store, &health, due), 1);
+        assert_eq!(tick_task_subagent_turn_ownership(&store, &health, due), 0);
+        // The nudge is taken and the child ends again without reporting: the
+        // parent is alerted, but not while it is mid-turn itself.
+        store.note_delivered(&child.id, 2).unwrap();
+        store.note_turn_completed(&child.id).unwrap();
+        let alert_due = delivered_at(&store) + 20_000;
+        publish_turn(&health, &parent.id, TurnState::InTurn, None);
+        assert_eq!(
+            tick_task_subagent_turn_ownership(&store, &health, alert_due),
+            0
+        );
+        publish_turn(&health, &parent.id, TurnState::Idle, None);
+        assert_eq!(
+            tick_task_subagent_turn_ownership(&store, &health, alert_due),
+            1
+        );
+        let parent_inbox = store.inbox(&parent.id, None).unwrap();
+        assert!(
+            parent_inbox
+                .last()
+                .unwrap()
+                .text
+                .contains("exited its turn without calling `send`")
+        );
+    }
+
+    #[test]
+    fn turn_guard_acts_when_due_or_when_a_blocking_turn_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let health = HealthBoard::default();
+        let parent = store
+            .create_agent(NewAgent::new("guard-parent", "codex"))
+            .unwrap();
+        let mut child_new = NewAgent::new("guard-child", "codex");
+        child_new.parent_id = Some(parent.id.clone());
+        let child = store.create_agent(child_new).unwrap();
+        assert!(child.is_task_subagent());
+        let mut task = Incoming::new("Execute task");
+        task.sender = Some(format!("agent:{}", parent.name));
+        store.receive(&child.id, task).unwrap();
+        store.note_delivered(&child.id, 1).unwrap();
+        let delivered = store
+            .turn_ownership_snapshot(&child.id)
+            .unwrap()
+            .last_delivered_at_ms
+            .unwrap();
+        publish_turn(&health, &child.id, TurnState::InTurn, None);
+        let mut guard = TurnGuard::default();
+        // The first full pass learns the delivery and waits for its nudge time.
+        assert!(guard.due(&health, delivered + 5_000));
+        assert_eq!(guard.run(&store, &health, delivered + 5_000), 0);
+        let refresh = delivered + 5_000 + GUARD_REFRESH_MS;
+        assert_eq!(
+            guard.next_deadline(delivered + 5_000),
+            delivered + CHILD_NUDGE_AFTER_MS
+        );
+        assert!(!guard.due(&health, delivered + 8_000));
+        // Due, but the child is mid-turn: nothing is sent and its turn is watched.
+        let due = delivered + CHILD_NUDGE_AFTER_MS;
+        assert!(guard.due(&health, due));
+        assert_eq!(guard.run(&store, &health, due), 0);
+        assert!(!guard.due(&health, due + 200));
+        assert_eq!(guard.next_deadline(due + 200), due + 200 + GUARD_WATCH_MS);
+        // The turn ends: the watch, not the next full pass, sends the nudge.
+        publish_turn(&health, &child.id, TurnState::Idle, None);
+        store.note_turn_completed(&child.id).unwrap();
+        let ended = due + 400;
+        assert!(ended < refresh);
+        assert!(guard.due(&health, ended));
+        assert_eq!(guard.run(&store, &health, ended), 1);
+        let inbox = store.inbox(&child.id, None).unwrap();
+        assert!(
+            inbox
+                .last()
+                .unwrap()
+                .text
+                .contains("[Turn Ownership Guard]")
+        );
+        // Settled: no watch, no work until the next full pass.
+        assert!(!guard.due(&health, ended + 1_000));
+        assert_eq!(guard.run(&store, &health, refresh), 0);
+        assert_eq!(store.inbox(&child.id, None).unwrap().len(), inbox.len());
     }
 }
