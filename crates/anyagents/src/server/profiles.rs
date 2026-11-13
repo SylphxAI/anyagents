@@ -384,6 +384,46 @@ mod tests {
         assert_eq!(read.entry.usage.as_deref(), Some("5h: 80% left"));
     }
 
+    /// The listing the server refreshes in the background never writes into an
+    /// agent whose creation is in flight or failed: a rollback that removed
+    /// its tree stays removed, and the agent is still counted on its profile.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_listing_never_writes_into_an_agent_being_created() {
+        let (dir, store) = store();
+        let data = dir.path();
+        std::fs::create_dir_all(data.join("profiles/openai/default")).unwrap();
+        std::fs::write(
+            data.join("profiles/openai/default/profile.json"),
+            r#"{"provider":"openai","kind":"subscription","compatible_harnesses":["codex"]}"#,
+        )
+        .unwrap();
+        let spawning = store
+            .create_agent(anyagents_core::NewAgent::new("spawning", "codex"))
+            .unwrap();
+        assert_eq!(spawning.state, "created");
+        let running = store
+            .create_agent(anyagents_core::NewAgent::new("running", "codex"))
+            .unwrap();
+        store.set_agent_state(&running.id, "running").unwrap();
+        let running_cfg = anyagents_core::agent_config_dir(data, &running.id);
+        std::fs::create_dir_all(&running_cfg).unwrap();
+
+        let snapshots = Arc::new(ProfileSnapshots::default());
+        let listed = snapshots.list(&store, true).await.unwrap();
+        crate::create::sync_fresher_bound_agent_credentials_in(&store, data);
+
+        assert!(!data.join("agents").join(spawning.id.as_str()).exists());
+        assert_eq!(
+            std::fs::read_to_string(running_cfg.join(".anyagents-profile")).unwrap(),
+            "openai/default\n"
+        );
+        let pool = listed
+            .iter()
+            .find(|served| served.entry.provider == "openai" && served.entry.profile == "default")
+            .unwrap();
+        assert_eq!(pool.entry.assigned_agents, vec!["running", "spawning"]);
+    }
+
     /// A refresh that panics answers its waiting requests with an error and
     /// leaves the next request free to try again.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -5439,8 +5439,9 @@ fn sync_and_list_provider_profiles_inner(
 
         // Seed upstream provider profiles from existing seats on this server so pre-existing
         // logins (Subscriptions, Coding Plans, API Keys) are registered in the Master Pool.
+        // A seat still being created (or whose creation failed) is not one yet.
         for agent in &agents {
-            if agent.state == "archived" {
+            if matches!(agent.state.as_str(), "archived" | "created") {
                 continue;
             }
             let cfg = agent_config_dir(data, &agent.id);
@@ -5664,7 +5665,9 @@ fn sync_and_list_provider_profiles_inner(
             _ => (expected_provider.clone(), "default".to_string()),
         };
         let normalized = format!("{bound_prov}/{bound_prof}");
-        if bound.as_deref() != Some(normalized.as_str()) {
+        // A listing never writes into an agent whose creation is in flight or
+        // failed: its tree may be gone, and a write would bring it back.
+        if agent.state != "created" && bound.as_deref() != Some(normalized.as_str()) {
             write_profile_marker(&cfg, ".anyagents-profile", &format!("{normalized}\n"))
                 .unwrap_or_else(|err| eprintln!("runtime persistence failed: {err}"));
         }
@@ -5790,10 +5793,11 @@ fn rebalance_provider_profiles(
         // Working seats still contribute load, but automatic maintenance must
         // not rewrite their credentials or request a process rotation mid-turn.
         // Read the durable turn state afresh rather than trusting the census.
+        // An agent still being created is never moved: its tree may be gone.
         let can_move = |name: &str| {
-            store
-                .agent_by_name(name)
-                .is_ok_and(|agent| store.has_open_turn(&agent.id).is_ok_and(|open| !open))
+            store.agent_by_name(name).is_ok_and(|agent| {
+                agent.state != "created" && store.has_open_turn(&agent.id).is_ok_and(|open| !open)
+            })
         };
         // Step 1: evacuate exhausted profiles (0% left) onto any profile with remaining quota (> 0% left).
         let prof_keys: Vec<String> = bound.keys().cloned().collect();
@@ -6118,6 +6122,11 @@ pub(crate) fn sync_fresher_bound_agent_credentials_in(store: &Store, data: &Path
     }
     if let Ok(agents) = store.list_live_agents() {
         for agent in &agents {
+            // A seat still being created (or whose creation failed) has no
+            // credentials to sync, and a write could recreate a removed tree.
+            if agent.state == "created" {
+                continue;
+            }
             let cfg = agent_config_dir(data, &agent.id);
             let bound = bound_profile_name(&cfg);
             let seeded = seeded_profile_name(&cfg);
@@ -10129,10 +10138,13 @@ mod tests {
             .collect()
     }
 
+    /// A fully created agent on `openai/busy`; rebalancing never moves one
+    /// whose creation is still in flight.
     fn rebalance_test_agent(store: &Store, name: &str, parent: Option<&Agent>) -> Agent {
         let mut new = NewAgent::new(name, "codex");
         new.parent_id = parent.map(|a| a.id.clone());
         let agent = store.create_agent(new).unwrap();
+        let agent = store.set_agent_state(&agent.id, "idle").unwrap();
         let cfg = agent_config_dir(store.data_dir(), &agent.id);
         std::fs::create_dir_all(&cfg).unwrap();
         write_profile_marker(&cfg, ".anyagents-profile", "openai/busy\n").unwrap();
@@ -10388,6 +10400,31 @@ stderr: {}",
             assert_eq!(after.model, moved.model);
             assert_eq!(after.state, moved.state);
         }
+    }
+
+    /// An agent whose creation is in flight or failed is never moved, even off
+    /// an exhausted profile: its tree may be gone, and a move would write it.
+    #[test]
+    fn rebalance_provider_profiles_never_moves_an_agent_being_created() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path();
+        let store = Store::open(data.join("state.db")).unwrap();
+        store
+            .hold_capability_key("0123456789abcdef0123456789abcdef")
+            .unwrap();
+        let entries = rebalance_test_profiles(data, 0);
+        let spawning = store
+            .create_agent(NewAgent::new("spawning", "codex"))
+            .unwrap();
+        let cfg = agent_config_dir(data, &spawning.id);
+        std::fs::create_dir_all(&cfg).unwrap();
+        write_profile_marker(&cfg, ".anyagents-profile", "openai/busy\n").unwrap();
+        let before = std::fs::read_dir(&cfg).unwrap().count();
+
+        rebalance_provider_profiles(&store, data, &store.list_agents().unwrap(), &entries);
+
+        assert_eq!(bound_profile_name(&cfg).as_deref(), Some("openai/busy"));
+        assert_eq!(std::fs::read_dir(&cfg).unwrap().count(), before);
     }
 
     #[test]
@@ -14029,12 +14066,13 @@ mod runtime_config_tests {
             .unwrap();
         let agents: Vec<_> = (0..3)
             .map(|n| {
-                store
+                let agent = store
                     .create_agent(anyagents_core::NewAgent::new(
                         format!("sample-{n}"),
                         "codex",
                     ))
-                    .unwrap()
+                    .unwrap();
+                store.set_agent_state(&agent.id, "idle").unwrap()
             })
             .collect();
         for agent in &agents {
@@ -14329,6 +14367,8 @@ Connection: close
                 "claude-code",
             ))
             .unwrap();
+        // Mid-session: a running seat (a seat still being created is skipped).
+        store.set_agent_state(&agent.id, "running").unwrap();
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()

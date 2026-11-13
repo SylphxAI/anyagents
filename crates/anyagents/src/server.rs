@@ -3425,7 +3425,11 @@ fn agent_view_preloaded(
             )
         }
     };
-    if let Some(reset_ms) = quota.filter(|&ms| ms > now) {
+    // Rotation rewrites the agent's profile markers; an agent whose creation
+    // is in flight or failed is never written to from a view.
+    if agent.state != "created"
+        && let Some(reset_ms) = quota.filter(|&ms| ms > now)
+    {
         quota_rotation::queue(&agent.id, reset_ms);
     }
     if (agent.state == "running" || agent.state == "idle") && quota.is_none_or(|ms| ms <= now) {
