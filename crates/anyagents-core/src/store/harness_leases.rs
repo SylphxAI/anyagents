@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
 use super::runtime::ProcessIdentity;
-use super::{AgentId, Error, Store, agent_by_id, now_ms};
+use super::{AgentId, Error, Store, agent_exists, now_ms};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HarnessLease {
@@ -52,7 +52,7 @@ impl Store {
         }
         self.write_with_retry(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            agent_by_id(&tx, agent_id)?;
+            agent_exists(&tx, agent_id)?;
             tx.execute(
                 &format!(
                     "INSERT INTO harness_leases ({COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
@@ -121,6 +121,7 @@ impl Store {
     }
 
     /// Drop every lease whose holder `is_alive` reports gone. Returns the count.
+    /// `is_alive` runs while this process's writer is held: it must not use the store.
     pub fn reclaim_harness_leases(
         &self,
         is_alive: impl Fn(&ProcessIdentity) -> bool,

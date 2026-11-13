@@ -5,7 +5,7 @@ use std::collections::HashSet;
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
-use super::{Agent, AgentId, Error, Store, agent_by_id, now_ms};
+use super::{Agent, AgentId, Error, Store, agent_by_id, agent_exists, now_ms};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Group {
@@ -29,13 +29,13 @@ pub enum GroupAction {
 
 impl Store {
     pub fn group(&self, name: &str) -> Result<Option<Group>, Error> {
-        group(&self.conn(), name)
+        group(&self.read_conn(), name)
     }
 
     /// Preflight agent creation before creating its runtime. The actual join
     /// rechecks current authority in its write transaction.
     pub fn check_group_joins(&self, actor: &GroupActor, names: &[&str]) -> Result<(), Error> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let caller = caller(&conn, actor)?;
         for name in names {
             validate_name(name)?;
@@ -190,7 +190,7 @@ fn apply(
     }
     // Resolve and authorize the entire batch before its first mutation.
     for target in targets {
-        agent_by_id(conn, target)?;
+        agent_exists(conn, target)?;
         if action == GroupAction::Leave
             && let Some(caller) = caller
         {
