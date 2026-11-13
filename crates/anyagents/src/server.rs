@@ -2753,10 +2753,10 @@ async fn add_channel_route(
 
 /// A loopback port the operating system picked, held open until the caller
 /// serves on it, or why none could be bound.
-pub fn listen_on_loopback() -> Result<(u16, tokio::net::TcpListener), Error> {
+pub fn listen_on_loopback(port: u16) -> Result<(u16, tokio::net::TcpListener), Error> {
     // A non-blocking listener before it joins the runtime; the runtime makes it
     // blocking-polled itself.
-    let address = std::net::TcpListener::bind(("127.0.0.1", 0))?;
+    let address = std::net::TcpListener::bind(("127.0.0.1", port))?;
     address.set_nonblocking(true)?;
     let listener = tokio::net::TcpListener::from_std(address)?;
     let port = listener.local_addr()?.port();

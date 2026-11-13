@@ -9,7 +9,9 @@
 //!
 //! The route table is in memory. A restart rebuilds it from the stored images,
 //! before the supervisor starts any agent, and a token is kept on disk so an
-//! agent that resumes keeps the same one.
+//! agent that resumes keeps the same one. The port is kept on disk too: a
+//! harness process that outlived the last server in its keeper still has the
+//! origin it was started with, and a restarted server listens there again.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock, PoisonError};
@@ -39,7 +41,20 @@ pub fn start(data: &Path) -> Result<(), Error> {
     if GATEWAY.get().is_some() {
         return Ok(());
     }
-    let (port, listener) = crate::server::listen_on_loopback()?;
+    let port_file = data.join("gateway.port");
+    let previous = std::fs::read_to_string(&port_file)
+        .ok()
+        .and_then(|text| text.trim().parse::<u16>().ok());
+    // The last server's port, when it is free; else any, and every agent is
+    // repointed below (a harness still running on the old origin is then
+    // replaced at its next start).
+    let (port, listener) = match previous.map(crate::server::listen_on_loopback) {
+        Some(Ok(bound)) => bound,
+        _ => crate::server::listen_on_loopback(0)?,
+    };
+    if previous != Some(port) {
+        anyagents_harness::atomic_write_file(&port_file, format!("{port}\n").as_bytes(), 0o600)?;
+    }
     let routes = MemoryRoutes::new();
     let store = Store::open(data.join("state.db"))?;
     let mut provider_agents = Vec::new();
