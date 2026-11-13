@@ -112,6 +112,12 @@ macro_rules! idle_release_predicate {
     };
 }
 
+macro_rules! agent_summary_cols {
+    () => {
+        "id, name, harness, model, state, parent_id, role, is_admin, created_at_ms"
+    };
+}
+
 const MESSAGE_COLS: &str = message_cols!();
 const AGENT_COLS: &str = agent_cols!();
 
@@ -330,6 +336,23 @@ impl Agent {
     pub fn is_task_subagent(&self) -> bool {
         self.parent_id.is_some() && self.lifecycle() == "task"
     }
+}
+
+/// An agent's identity, lifecycle state and place in the tree, without its
+/// instructions or launch environment: what rosters, trees and sweeps over
+/// many agents need per row. Policy derived from the launch environment
+/// (scope, lifecycle mode) needs the full [`Agent`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentSummary {
+    pub id: AgentId,
+    pub name: String,
+    pub harness: String,
+    pub model: Option<String>,
+    pub state: String,
+    pub parent_id: Option<AgentId>,
+    pub role: Option<String>,
+    pub is_admin: bool,
+    pub created_at_ms: i64,
 }
 
 /// Fields for `agents.create`. The harness value is a catalog key.
@@ -1777,6 +1800,57 @@ impl Store {
         while let Some(row) = rows.next()? {
             agents.push(agent_from_row(row)?);
         }
+        Ok(agents)
+    }
+
+    /// A parent's children that are not archived, oldest first. Served by a
+    /// partial index, so a parent's archived history is never read.
+    pub fn live_children_of(&self, parent_id: &AgentId) -> Result<Vec<Agent>, Error> {
+        let conn = self.read_conn();
+        let mut stmt = conn.prepare_cached(concat!(
+            "SELECT ",
+            agent_cols!(),
+            " FROM agents WHERE parent_id = ?1 AND state != 'archived'
+             ORDER BY created_at_ms, name"
+        ))?;
+        let agents = stmt
+            .query_map([parent_id.as_str()], agent_from_row)?
+            .collect::<Result<_, _>>()?;
+        Ok(agents)
+    }
+
+    /// Ids of the agents in one lifecycle state, by name, from the state index.
+    pub fn agent_ids_in_state(&self, state: &str) -> Result<Vec<AgentId>, Error> {
+        let conn = self.read_conn();
+        let mut stmt =
+            conn.prepare_cached("SELECT id FROM agents WHERE state = ?1 ORDER BY name")?;
+        let ids = stmt
+            .query_map([state], |row| row.get::<_, String>(0))?
+            .map(|id| AgentId::parse(&id?))
+            .collect::<Result<_, Error>>()?;
+        Ok(ids)
+    }
+
+    /// Every agent (or every non-archived one) by name, without reading
+    /// instructions or decoding launch environments.
+    pub fn agent_summaries(&self, include_archived: bool) -> Result<Vec<AgentSummary>, Error> {
+        let conn = self.read_conn();
+        let mut stmt = if include_archived {
+            conn.prepare_cached(concat!(
+                "SELECT ",
+                agent_summary_cols!(),
+                " FROM agents ORDER BY name"
+            ))?
+        } else {
+            conn.prepare_cached(concat!(
+                "SELECT ",
+                agent_summary_cols!(),
+                " FROM agents WHERE state != 'archived' ORDER BY name"
+            ))?
+        };
+        let agents = stmt
+            .query_map([], agent_summary_from_row)?
+            .collect::<Result<_, _>>()?;
         Ok(agents)
     }
 
@@ -6092,6 +6166,32 @@ fn agent_from_row(row: &rusqlite::Row<'_>) -> Result<Agent, rusqlite::Error> {
             .map(|json| decode_env(&json))
             .unwrap_or_default(),
         parent_id,
+    })
+}
+
+fn agent_summary_from_row(row: &rusqlite::Row<'_>) -> Result<AgentSummary, rusqlite::Error> {
+    let parse = |index: usize, raw: &str| {
+        AgentId::parse(raw).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(
+                index,
+                rusqlite::types::Type::Text,
+                Box::new(err),
+            )
+        })
+    };
+    Ok(AgentSummary {
+        id: parse(0, &row.get::<_, String>(0)?)?,
+        name: row.get(1)?,
+        harness: row.get(2)?,
+        model: row.get(3)?,
+        state: row.get(4)?,
+        parent_id: match row.get::<_, Option<String>>(5)? {
+            Some(raw) if !raw.is_empty() => Some(parse(5, &raw)?),
+            _ => None,
+        },
+        role: row.get(6)?,
+        is_admin: row.get(7)?,
+        created_at_ms: row.get(8)?,
     })
 }
 
@@ -11308,6 +11408,102 @@ mod tests {
             "SELECT id FROM agents WHERE state != 'archived' AND (NULL IS NULL OR state = NULL)",
         );
         assert!(live.contains("idx_agents_live_name"), "{live}");
+    }
+
+    #[test]
+    fn hot_path_queries_use_their_indexes() {
+        let (_dir, store) = setup();
+        let conn = store.read_conn();
+        let plan = |sql: &str| -> String {
+            let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(3))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let active = plan(concat!(
+            "SELECT ",
+            schedule_cols!(),
+            " FROM agent_schedules WHERE state = 'active' ORDER BY created_at_ms ASC, id ASC"
+        ));
+        assert!(active.contains("idx_agent_schedules_active"), "{active}");
+        assert!(!active.contains("TEMP B-TREE"), "{active}");
+        let skipped = plan(
+            "SELECT id FROM agent_schedules WHERE kind = 'at' AND state = 'fired'
+               AND last_fired_at_ms IS NULL AND last_observed LIKE 'skipped:%'
+               AND next_fire_at_ms >= 1",
+        );
+        assert!(
+            skipped.contains("idx_agent_schedules_kind_state"),
+            "{skipped}"
+        );
+        let children = plan(concat!(
+            "SELECT ",
+            agent_cols!(),
+            " FROM agents WHERE parent_id = 'x' AND state != 'archived'
+             ORDER BY created_at_ms, name"
+        ));
+        assert!(children.contains("idx_agents_live_parent"), "{children}");
+        assert!(!children.contains("TEMP B-TREE"), "{children}");
+    }
+
+    #[test]
+    fn narrow_agent_reads_match_the_full_rows() {
+        let (_dir, store) = setup();
+        let root = agent(&store, "root");
+        let live = child(&store, "live", &root);
+        let gone = child(&store, "gone", &root);
+        let paused = child(&store, "paused", &root);
+        store.set_agent_state(&gone.id, "archived").unwrap();
+        store.set_agent_state(&paused.id, "paused").unwrap();
+        store.set_agent_running(&live.id, "/work").unwrap();
+
+        assert_eq!(
+            names(&store.live_children_of(&root.id).unwrap()),
+            ["live", "paused"]
+        );
+        let children = store.children_of(&root.id).unwrap();
+        let mut all_children = names(&children);
+        all_children.sort_unstable();
+        assert_eq!(all_children, ["gone", "live", "paused"]);
+        assert!(store.live_children_of(&live.id).unwrap().is_empty());
+
+        assert_eq!(
+            store.agent_ids_in_state("running").unwrap(),
+            std::slice::from_ref(&live.id)
+        );
+        assert_eq!(
+            store.agent_ids_in_state("archived").unwrap(),
+            std::slice::from_ref(&gone.id)
+        );
+
+        let full = store.list_agents().unwrap();
+        let all = store.agent_summaries(true).unwrap();
+        assert_eq!(all.len(), full.len());
+        for (summary, agent) in all.iter().zip(&full) {
+            assert_eq!(
+                summary,
+                &AgentSummary {
+                    id: agent.id.clone(),
+                    name: agent.name.clone(),
+                    harness: agent.harness.clone(),
+                    model: agent.model.clone(),
+                    state: agent.state.clone(),
+                    parent_id: agent.parent_id.clone(),
+                    role: agent.role.clone(),
+                    is_admin: agent.is_admin,
+                    created_at_ms: agent.created_at_ms,
+                }
+            );
+        }
+        let live_names: Vec<_> = store
+            .agent_summaries(false)
+            .unwrap()
+            .into_iter()
+            .map(|a| a.name)
+            .collect();
+        assert_eq!(live_names, ["live", "paused", "root"]);
     }
 
     #[test]
