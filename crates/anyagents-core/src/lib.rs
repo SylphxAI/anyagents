@@ -49,6 +49,14 @@ pub use store::{
     read_children_roster, read_root_roster, resolve_usage_agents, sum_usage,
     tokenize_hybrid_search_tokens, utc_day,
 };
+pub use store::{
+    AgentRuntime, BackfillReport, CredentialBinding, CredentialBindingAudit, CredentialKind,
+    CredentialObservation, CredentialSlot, CredentialTarget, Fault, FaultKind, HarnessLease,
+    LifecycleKind, LifecycleOp, LifecyclePhase, NewLifecycleOp, ProcessIdentity, QUOTA_ESTIMATE_MS,
+    QuotaBlock, QuotaReset, QuotaSource, RecoveryOffer, RuntimeChange, RuntimeState,
+    SchedulePending, SessionLease, SteerHold, SteerState, Turn, TurnOutcome, TurnState,
+    steer_allows,
+};
 
 /// The token a client presents as an agent, when it has one. A capability is
 /// written into the agent's own config directory; it is never an argument on a

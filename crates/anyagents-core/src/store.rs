@@ -24,8 +24,26 @@ use crate::quote::Quote;
 #[cfg(test)]
 #[path = "store/audit_tests.rs"]
 mod audit_tests;
+mod credentials;
 mod group_policy;
+mod harness_leases;
+mod lifecycle;
+mod runtime;
+#[cfg(test)]
+#[path = "store/runtime_tests.rs"]
+mod runtime_tests;
+pub use credentials::{
+    CredentialBinding, CredentialBindingAudit, CredentialKind, CredentialObservation,
+    CredentialSlot, CredentialTarget,
+};
 pub use group_policy::{Group, GroupAction, GroupActor};
+pub use harness_leases::HarnessLease;
+pub use lifecycle::{LifecycleKind, LifecycleOp, LifecyclePhase, NewLifecycleOp, SchedulePending};
+pub use runtime::{
+    AgentRuntime, BackfillReport, Fault, FaultKind, ProcessIdentity, QUOTA_ESTIMATE_MS, QuotaBlock,
+    QuotaReset, QuotaSource, RecoveryOffer, RuntimeChange, RuntimeState, SessionLease, SteerHold,
+    SteerState, Turn, TurnOutcome, TurnState, steer_allows,
+};
 
 /// A line's provider coordinates: the chat, the forum topic and the message id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -968,7 +986,7 @@ impl Store {
         if schema_version < 23 {
             ensure_lexical_fts_backfilled(&mut conn)?;
         }
-        Ok(Self {
+        let store = Self {
             conn: Mutex::new(conn),
             db_path: path.to_path_buf(),
             data_dir: data_dir_for(path),
@@ -976,7 +994,34 @@ impl Store {
             capabilities: Mutex::new(None),
             write_retry_budget_ms: AtomicU64::new(WRITE_RETRY_BUDGET.as_millis() as u64),
             busy_timeout_ms: AtomicU64::new(BUSY_TIMEOUT.as_millis() as u64),
-        })
+        };
+        store.backfill_runtime_on_open()?;
+        Ok(store)
+    }
+
+    /// Give every agent without one its runtime row and turns, derived from
+    /// legacy state. A read decides first, so opening a current store takes no
+    /// writer lock; a busy writer defers the backfill to the next open.
+    fn backfill_runtime_on_open(&self) -> Result<(), Error> {
+        let missing: bool = match self.conn().query_row(
+            "SELECT EXISTS(SELECT 1 FROM agents a
+                 WHERE NOT EXISTS (SELECT 1 FROM agent_runtime r WHERE r.agent_id = a.id))",
+            [],
+            |row| row.get(0),
+        ) {
+            Ok(missing) => missing,
+            Err(e) if is_transient_sqlite_error(&e) => false,
+            Err(e) => return Err(e.into()),
+        };
+        if !missing {
+            return Ok(());
+        }
+        let data_dir = self.data_dir.clone();
+        match self.backfill_runtime_state(|id| legacy_last_error(&data_dir, id)) {
+            Ok(_) => Ok(()),
+            Err(e) if is_transient_lock_error(&e) => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 
     /// Set the writer's per-statement lock wait and the total budget that
@@ -1397,6 +1442,9 @@ impl Store {
         if taken != 0 {
             return Err(Error::AgentExists(agent.name));
         }
+        if lifecycle::spawn_reservation(&tx, &agent.name)?.is_some() {
+            return Err(Error::NameReserved(agent.name));
+        }
         tx.execute(
             "INSERT INTO agents (
                 id, name, harness, model, workdir, instructions, state, created_at_ms, parent_id, role, description, launch_env
@@ -1419,6 +1467,7 @@ impl Store {
             "INSERT INTO mailbox_cursors (agent_id, delivered_seq) VALUES (?1, 0)",
             [agent.id.as_str()],
         )?;
+        runtime::seed_runtime(&tx, &agent.id)?;
         tx.commit()?;
         Ok(agent)
     }
@@ -2878,11 +2927,25 @@ impl Store {
     }
 
     pub fn delete_agent(&self, id: &AgentId) -> Result<Agent, Error> {
+        self.delete_agent_by(id, "unattributed")
+    }
+
+    /// Delete an agent and everything keyed by it in one commit. Its credential
+    /// bindings are removed with one audit row each, naming `actor`. The
+    /// lifecycle journal and binding audit are kept.
+    pub fn delete_agent_by(&self, id: &AgentId, actor: &str) -> Result<Agent, Error> {
         let deleted = {
             let mut conn = self.conn();
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let agent = agent_by_id(&tx, id)?;
+            credentials::delete_bindings_for_deleted_agent(&tx, id, actor)?;
             for table in [
+                "agent_runtime",
+                "turns",
+                "steer_holds",
+                "session_leases",
+                "quota_blocks",
+                "harness_leases",
                 "agent_aliases",
                 "agent_capabilities",
                 "usage_records",
@@ -5935,6 +5998,20 @@ fn channel_with(conn: &Connection, id: &ChannelId) -> Result<Channel, Error> {
         )
         .optional()?;
     found.ok_or_else(|| Error::ChannelNotFound(id.to_string()))
+}
+
+/// The fault text an older runtime persisted in the agent's config directory.
+fn legacy_last_error(data_dir: &Path, id: &AgentId) -> Option<String> {
+    let raw =
+        std::fs::read_to_string(agent_config_dir(data_dir, id).join(".anyagents-last-error.json"))
+            .ok()?;
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    value
+        .get("error")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
 }
 
 fn agent_by_id(conn: &Connection, id: &AgentId) -> Result<Agent, Error> {
