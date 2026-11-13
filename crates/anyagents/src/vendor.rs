@@ -1735,19 +1735,34 @@ const SPIRON_READY_WAIT: Duration = Duration::from_secs(60);
 /// could not yet prove reached the session journal.
 const LEGACY_SPIRON_HOLD: &str = "spiron-unconfirmed-steers.json";
 
+/// Where a settled hold is kept, with the ids the journal showed applied:
+/// `{"hold": <the hold>, "applied": [ids]}`. Every launch reads it again, so
+/// an applied id is answered as a duplicate until it is committed, even when
+/// a launch fails after the hold was settled.
+const LEGACY_SPIRON_RECONCILED: &str = "spiron-unconfirmed-steers.reconciled.json";
+
 /// Settle a hold an earlier AnyAgents left beside a Spiron agent's config. An
-/// id the agent's Spiron journal (`sessions.sqlite3`, any session) holds was
-/// applied: it is returned, to be committed without being written again. Any
-/// other id was never journaled and is delivered as new input. The hold is
-/// archived as `spiron-unconfirmed-steers.reconciled.json`.
+/// id that a user input in the agent's Spiron journal (`sessions.sqlite3`,
+/// any session) carries was applied: it is returned, to be committed without
+/// being written again. Any other id was never journaled and is delivered as
+/// new input. The applied ids are written to the reconciled record before
+/// the hold is removed, and are returned on every later launch too.
 ///
 /// Compatibility for agent directories written before the hold was retired;
-/// remove once no agent directory carries one.
+/// remove, with the reconciled records, once no agent directory carries a
+/// hold and every agent's cursor has passed the ids its record names.
 fn settle_legacy_spiron_hold(config_dir: &Path) -> Result<Vec<String>, String> {
+    let reconciled = config_dir.join(LEGACY_SPIRON_RECONCILED);
+    let mut applied: Vec<String> = std::fs::read(&reconciled)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|record| record.get("applied").cloned())
+        .and_then(|ids| serde_json::from_value(ids).ok())
+        .unwrap_or_default();
     let hold = config_dir.join(LEGACY_SPIRON_HOLD);
     let bytes = match std::fs::read(&hold) {
         Ok(bytes) => bytes,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(applied),
         Err(err) => return Err(format!("cannot read {}: {err}", hold.display())),
     };
     let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
@@ -1763,20 +1778,22 @@ fn settle_legacy_spiron_hold(config_dir: &Path) -> Result<Vec<String>, String> {
         .collect();
     ids.sort();
     ids.dedup();
-    let applied = spiron_journal_holds(config_dir, &ids);
-    crate::create::write_required_file(
-        &config_dir.join("spiron-unconfirmed-steers.reconciled.json"),
-        &bytes,
-        0o664,
-    )
-    .map_err(|err| err.to_string())?;
+    applied.extend(spiron_journal_holds(config_dir, &ids));
+    applied.sort();
+    applied.dedup();
+    let record = serde_json::json!({"hold": value, "applied": applied});
+    crate::create::write_required_file(&reconciled, record.to_string().as_bytes(), 0o664)
+        .map_err(|err| err.to_string())?;
     std::fs::remove_file(&hold)
         .map_err(|err| format!("cannot retire {}: {err}", hold.display()))?;
     Ok(applied)
 }
 
-/// The ids among `ids` that any session in the agent's Spiron journal names.
-/// An unreadable journal names none, so that input is delivered rather than
+/// The ids among `ids` that a user input in any session of the agent's
+/// Spiron journal carries: an event `{"type":"text","data":{"role":"user",
+/// "content":"anyagents-message:<id>\n..."}}`. A mention anywhere else (a
+/// tool result quoting the id, an assistant reply) is not one. An
+/// unreadable journal names none, so that input is delivered rather than
 /// lost.
 fn spiron_journal_holds(config_dir: &Path, ids: &[String]) -> Vec<String> {
     let db_path = config_dir.join("sessions.sqlite3");
@@ -1786,13 +1803,23 @@ fn spiron_journal_holds(config_dir: &Path, ids: &[String]) -> Vec<String> {
     let Some(conn) = crate::seat_tree::open_readonly_seat_sqlite(&db_path) else {
         return Vec::new();
     };
-    let Ok(mut stmt) =
-        conn.prepare("SELECT 1 FROM session_entries WHERE instr(event, ?1) > 0 LIMIT 1")
-    else {
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT 1 FROM session_entries
+         WHERE json_valid(event)
+           AND json_extract(event, '$.type') = 'text'
+           AND json_extract(event, '$.data.role') = 'user'
+           AND (json_extract(event, '$.data.content') = ?1
+                OR substr(json_extract(event, '$.data.content'), 1, length(?1) + 1)
+                   = ?1 || char(10))
+         LIMIT 1",
+    ) else {
         return Vec::new();
     };
     ids.iter()
-        .filter(|id| stmt.exists([id.as_str()]).unwrap_or(false))
+        .filter(|id| {
+            stmt.exists([format!("anyagents-message:{id}")])
+                .unwrap_or(false)
+        })
         .cloned()
         .collect()
 }

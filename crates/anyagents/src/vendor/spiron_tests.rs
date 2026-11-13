@@ -995,20 +995,25 @@ fn a_hold_an_older_anyagents_left_is_settled_against_the_spiron_journal_at_launc
         json!({"turn_id": applied.id, "request_ids": [applied.id, lost.id]}).to_string(),
     )
     .unwrap();
-    let journal = rusqlite::Connection::open(fake.config.join("sessions.sqlite3")).unwrap();
-    journal
-        .execute_batch("CREATE TABLE session_entries (session_id TEXT, idx INTEGER, event TEXT);")
-        .unwrap();
-    journal
-        .execute(
-            "INSERT INTO session_entries VALUES ('old-session', 1, ?1)",
-            [format!(
-                r#"{{"role":"user","text":"anyagents-message:{}\nbody"}}"#,
-                applied.id
-            )],
-        )
-        .unwrap();
-    drop(journal);
+    // As Spiron journals them: the applied input as a user text event; the
+    // other only quoted in a tool result, which is no input.
+    write_spiron_journal(
+        &fake.config,
+        &[
+            json!({"type": "text", "sessionKey": "cli:old", "data": {
+                "role": "user",
+                "content": format!("anyagents-message:{}\n<message>body</message>", applied.id),
+            }}),
+            json!({"type": "tool_result", "sessionKey": "cli:old", "data": {
+                "callId": "call_1", "toolName": "mcp__anyagents__inbox",
+                "result": {"content": [{"text": format!("\"content\":\"anyagents-message:{}", lost.id)}]},
+            }}),
+            json!({"type": "text", "sessionKey": "cli:old", "data": {
+                "role": "assistant",
+                "content": format!("anyagents-message:{}", lost.id),
+            }}),
+        ],
+    );
     let mut delivery = fake.delivery(store);
     assert!(!fake.config.join("spiron-unconfirmed-steers.json").exists());
     assert!(
@@ -1023,8 +1028,56 @@ fn a_hold_an_older_anyagents_left_is_settled_against_the_spiron_journal_at_launc
     assert_eq!(written, [lost.id.to_string()]);
 }
 
+/// A Spiron journal with these events in one session, as `sessions.sqlite3`
+/// stores them.
+fn write_spiron_journal(config: &Path, events: &[serde_json::Value]) {
+    let journal = rusqlite::Connection::open(config.join("sessions.sqlite3")).unwrap();
+    journal
+        .execute_batch(
+            "CREATE TABLE session_entries (
+                session_id TEXT NOT NULL, idx INTEGER NOT NULL,
+                event TEXT NOT NULL CHECK(json_valid(event)),
+                PRIMARY KEY(session_id, idx));",
+        )
+        .unwrap();
+    for (idx, event) in events.iter().enumerate() {
+        journal
+            .execute(
+                "INSERT INTO session_entries VALUES ('old-session', ?1, ?2)",
+                rusqlite::params![idx as i64, event.to_string()],
+            )
+            .unwrap();
+    }
+}
+
 #[test]
-fn spiron_supervisor_replays_a_line_journaled_before_a_crash_once_after_the_lease_and_sends_the_recovery_note()
+fn a_settled_hold_names_its_applied_ids_again_after_a_launch_that_failed() {
+    let temp = crate::test_tempdir();
+    let config = temp.path().join("config");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(
+        config.join(LEGACY_SPIRON_HOLD),
+        json!({"turn_id": "msg_a", "request_ids": ["msg_a", "msg_b"]}).to_string(),
+    )
+    .unwrap();
+    write_spiron_journal(
+        &config,
+        &[json!({"type": "text", "data": {"role": "user", "content": "anyagents-message:msg_a"}})],
+    );
+    assert_eq!(settle_legacy_spiron_hold(&config).unwrap(), ["msg_a"]);
+    assert!(!config.join(LEGACY_SPIRON_HOLD).exists());
+    // The launch after this one failed, so nothing was committed: the next
+    // launch still answers msg_a as applied, from the reconciled record.
+    assert_eq!(settle_legacy_spiron_hold(&config).unwrap(), ["msg_a"]);
+    let record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(config.join(LEGACY_SPIRON_RECONCILED)).unwrap())
+            .unwrap();
+    assert_eq!(record["applied"], json!(["msg_a"]));
+    assert_eq!(record["hold"]["request_ids"], json!(["msg_a", "msg_b"]));
+}
+
+#[test]
+fn spiron_supervisor_sends_the_recovery_note_first_after_the_lease_and_commits_a_journaled_line_once()
  {
     use anyagents_supervisor::{Supervisor, SystemClock};
     use std::sync::Arc;
@@ -1104,53 +1157,56 @@ fn spiron_supervisor_replays_a_line_journaled_before_a_crash_once_after_the_leas
     std::fs::write(config.join("lease"), "").unwrap();
     std::fs::write(config.join("journal-crash"), "").unwrap();
     eventually(|| !config.join("journal-crash").exists());
-    // The replacement cannot start a turn while the lease is held: each
-    // refusal hands the steer back, with no fault and no restart.
-    let replays = |wire: &[serde_json::Value]| {
-        wire.iter()
-            .filter(|line| line["launch"] == 2 && line["msg"]["request_id"] == steer.id.to_string())
-            .count()
+    // The replacement cannot start a turn while the lease is held. The
+    // interrupted turn's recovery note goes first and the steer follows it;
+    // each refusal hands both back, in that order, with no fault and no
+    // restart.
+    let second = || -> Vec<serde_json::Value> {
+        wire()
+            .into_iter()
+            .filter(|line| line["launch"] == 2)
+            .collect()
     };
-    eventually(|| replays(&wire()) >= 2);
+    let is_note = |line: &serde_json::Value| {
+        line["msg"]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("[Recovery]"))
+    };
+    eventually(|| second().iter().filter(|line| is_note(line)).count() >= 2);
+    assert!(is_note(&second()[0]), "{:?}", second());
     assert_eq!(
         std::fs::read_to_string(config.join("launches")).unwrap(),
         "2"
     );
     assert_eq!(store.delivered_cursor(&agent.id).unwrap(), first.seq);
     std::fs::remove_file(config.join("lease")).unwrap();
-    // Once a turn can start, the steer is journaled already, so it is
-    // committed as a replay, and the cut turn still gets its note.
+    // Once a turn can start, the note opens it and the steer follows into
+    // that turn; at the turn's next step Spiron finds the steer journaled
+    // already and answers it as a duplicate, which commits it.
     eventually(|| {
-        wire().iter().any(|line| {
-            line["launch"] == 2
-                && line["msg"]["text"]
-                    .as_str()
-                    .is_some_and(|text| text.contains("[Recovery]"))
-        })
+        let lines = second();
+        let steered = lines.iter().rposition(&is_note).is_some_and(|at| {
+            lines[at + 1..]
+                .iter()
+                .any(|line| line["msg"]["request_id"] == steer.id.to_string())
+        });
+        if steered && !config.join("step").exists() {
+            std::fs::write(config.join("step"), "").unwrap();
+        }
+        store.delivered_cursor(&agent.id).unwrap() == steer.seq
     });
-    assert_eq!(store.delivered_cursor(&agent.id).unwrap(), steer.seq);
-    let second: Vec<serde_json::Value> = wire()
-        .into_iter()
-        .filter(|line| line["launch"] == 2)
-        .collect();
-    let (note, replayed) = second.split_last().unwrap();
-    assert!(replayed.len() >= 2, "{second:?}");
-    for line in replayed {
-        assert_eq!(line["msg"]["type"], "prompt", "{second:?}");
-        assert_eq!(
-            line["msg"]["request_id"],
-            steer.id.to_string(),
-            "{second:?}"
-        );
-    }
-    assert_eq!(note["msg"]["type"], "prompt");
+    let second = second();
     assert_eq!(
         std::fs::read_to_string(config.join("launches")).unwrap(),
         "2"
     );
-    let note = note["msg"]["text"].as_str().unwrap();
+    let note = second
+        .iter()
+        .rev()
+        .find(|line| is_note(line))
+        .and_then(|line| line["msg"]["text"].as_str())
+        .unwrap();
     assert!(note.contains("the long task"), "{note}");
-    assert!(note.contains("a detail for the running turn"), "{note}");
     let journal: Vec<String> = std::fs::read_to_string(config.join("journal.jsonl"))
         .unwrap()
         .lines()
