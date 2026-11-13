@@ -783,7 +783,47 @@ fn writable_by_untrusted(path: &Path, owners: &[u32]) -> std::io::Result<bool> {
     writable_file_by_untrusted(&file, owners)
 }
 
+/// Groups a deployment declares as one trust domain with the server for
+/// shared Git metadata (`ANYAGENTS_TRUSTED_METADATA_GIDS`, comma-separated
+/// numeric gids or group names). Empty by default, so a group-writable store is
+/// untrusted unless the deployment says otherwise: on a desk where every seat
+/// shares one set of Git hubs by design, those seats already trust each other's
+/// writes to that metadata, and refusing it only blocks every checkout.
+fn trusted_metadata_gids() -> &'static [u32] {
+    static GIDS: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+    GIDS.get_or_init(|| {
+        std::env::var("ANYAGENTS_TRUSTED_METADATA_GIDS")
+            .ok()
+            .map(|raw| parse_trusted_gids(&raw))
+            .unwrap_or_default()
+    })
+}
+
+fn parse_trusted_gids(raw: &str) -> Vec<u32> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .filter_map(|item| {
+            item.parse::<u32>().ok().or_else(|| {
+                let name = std::ffi::CString::new(item).ok()?;
+                // SAFETY: getgrnam reads a NUL-terminated name and returns a
+                // pointer into static storage that is read before any other call.
+                let entry = unsafe { libc::getgrnam(name.as_ptr()) };
+                (!entry.is_null()).then(|| unsafe { (*entry).gr_gid })
+            })
+        })
+        .collect()
+}
+
 fn writable_file_by_untrusted(file: &std::fs::File, owners: &[u32]) -> std::io::Result<bool> {
+    writable_file_by_untrusted_with(file, owners, trusted_metadata_gids())
+}
+
+fn writable_file_by_untrusted_with(
+    file: &std::fs::File,
+    owners: &[u32],
+    trusted_gids: &[u32],
+) -> std::io::Result<bool> {
     use std::os::unix::fs::MetadataExt;
     #[cfg(not(target_os = "linux"))]
     let _ = owners; // Named-user POSIX ACL classification below is Linux-only.
@@ -813,9 +853,10 @@ fn writable_file_by_untrusted(file: &std::fs::File, owners: &[u32]) -> std::io::
                 })
                 .collect();
             let mask = entries.iter().find(|e| e.0 == 16).map_or(7, |e| e.1);
-            return Ok(entries.iter().any(|(tag, perm, uid)| match tag {
-                2 => perm & mask & 2 != 0 && !owners.contains(uid),
-                4 | 8 => perm & mask & 2 != 0,
+            return Ok(entries.iter().any(|(tag, perm, id)| match tag {
+                2 => perm & mask & 2 != 0 && !owners.contains(id),
+                4 => perm & mask & 2 != 0 && !trusted_gids.contains(&meta.gid()),
+                8 => perm & mask & 2 != 0 && !trusted_gids.contains(id),
                 32 => perm & 2 != 0,
                 _ => false,
             }));
@@ -825,7 +866,8 @@ fn writable_file_by_untrusted(file: &std::fs::File, owners: &[u32]) -> std::io::
             return Err(err);
         }
     }
-    Ok(meta.mode() & 0o022 != 0)
+    Ok(meta.mode() & 0o002 != 0
+        || (meta.mode() & 0o020 != 0 && !trusted_gids.contains(&meta.gid())))
 }
 
 /// Launch and admission share this exact predicate: the common store and its
@@ -4395,5 +4437,29 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A group a deployment declares trusted may write shared Git metadata;
+    /// any other group writer, and every world writer, stays untrusted.
+    #[cfg(unix)]
+    #[test]
+    fn group_writable_metadata_is_trusted_only_for_declared_groups() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = crate::test_tempdir();
+        let store = dir.path().join("store");
+        std::fs::create_dir(&store).unwrap();
+        std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o2775)).unwrap();
+        let gid = std::fs::metadata(&store).unwrap().gid();
+        let uid = std::fs::metadata(&store).unwrap().uid();
+        let open = || open_nofollow(&store).unwrap();
+        assert!(writable_file_by_untrusted_with(&open(), &[uid], &[]).unwrap());
+        assert!(!writable_file_by_untrusted_with(&open(), &[uid], &[gid]).unwrap());
+        assert!(writable_file_by_untrusted_with(&open(), &[uid], &[gid.wrapping_add(1)]).unwrap());
+        std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o2777)).unwrap();
+        assert!(writable_file_by_untrusted_with(&open(), &[uid], &[gid]).unwrap());
+        assert_eq!(
+            parse_trusted_gids(" 2100, ,abc-no-such-group-xyz ,7"),
+            vec![2100, 7]
+        );
     }
 }
