@@ -322,7 +322,7 @@ fn embed_sample(
     let mut documents = Vec::new();
     let mut cursor = 0;
     loop {
-        let batch = host.after(cursor, 4096)?;
+        let batch = host.after(cursor, 4096, crate::embed::Stripe::ALL)?;
         let Some(last) = batch.last() else { break };
         cursor = last.rowid;
         documents.extend(batch);

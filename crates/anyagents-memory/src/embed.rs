@@ -29,6 +29,19 @@ pub struct HostDocument {
     pub raw: RawCoordinate,
 }
 
+/// One worker's share of the catalog: the documents whose rowid is `index`
+/// modulo `of`. Each stripe keeps its own marks, so workers never wait on or
+/// skip past each other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stripe {
+    pub index: usize,
+    pub of: usize,
+}
+
+impl Stripe {
+    pub const ALL: Stripe = Stripe { index: 0, of: 1 };
+}
+
 /// A read-only view of the kernel's host index: the catalog of documents and
 /// their raw coordinates. The service never writes it.
 pub struct HostCatalog {
@@ -48,42 +61,61 @@ impl HostCatalog {
     const COLUMNS: &str =
         "rowid, id, agent_id, source, timestamp_ms, segment, offset, length, sha256, seq";
 
-    fn rows(&self, sql: &str, bound: i64, limit: usize) -> rusqlite::Result<Vec<HostDocument>> {
+    fn rows(
+        &self,
+        sql: &str,
+        bound: i64,
+        limit: usize,
+        stripe: Stripe,
+    ) -> rusqlite::Result<Vec<HostDocument>> {
         self.conn
             .prepare_cached(&format!(
-                "SELECT {} FROM host_documents {sql} LIMIT ?2",
+                "SELECT {} FROM host_documents WHERE rowid % ?3 = ?4 AND {sql} LIMIT ?2",
                 Self::COLUMNS
             ))?
-            .query_map(params![bound, limit as i64], |r| {
-                Ok(HostDocument {
-                    rowid: r.get(0)?,
-                    document: Document {
-                        id: r.get(1)?,
-                        agent_id: r.get(2)?,
-                        source: r.get(3)?,
-                        timestamp_ms: r.get(4)?,
-                        raw_sha256: r.get(8)?,
-                    },
-                    raw: RawCoordinate {
-                        segment: PathBuf::from(r.get::<_, String>(5)?),
-                        offset: r.get::<_, i64>(6)? as u64,
-                        length: r.get::<_, i64>(7)? as u64,
-                        sha256: r.get(8)?,
-                        seq: r.get::<_, i64>(9)? as u64,
-                    },
-                })
-            })?
+            .query_map(
+                params![bound, limit as i64, stripe.of as i64, stripe.index as i64],
+                |r| {
+                    Ok(HostDocument {
+                        rowid: r.get(0)?,
+                        document: Document {
+                            id: r.get(1)?,
+                            agent_id: r.get(2)?,
+                            source: r.get(3)?,
+                            timestamp_ms: r.get(4)?,
+                            raw_sha256: r.get(8)?,
+                        },
+                        raw: RawCoordinate {
+                            segment: PathBuf::from(r.get::<_, String>(5)?),
+                            offset: r.get::<_, i64>(6)? as u64,
+                            length: r.get::<_, i64>(7)? as u64,
+                            sha256: r.get(8)?,
+                            seq: r.get::<_, i64>(9)? as u64,
+                        },
+                    })
+                },
+            )?
             .collect()
     }
 
-    /// Documents published after `rowid`, oldest first.
-    pub fn after(&self, rowid: i64, limit: usize) -> rusqlite::Result<Vec<HostDocument>> {
-        self.rows("WHERE rowid>?1 ORDER BY rowid", rowid, limit)
+    /// Documents of `stripe` published after `rowid`, oldest first.
+    pub fn after(
+        &self,
+        rowid: i64,
+        limit: usize,
+        stripe: Stripe,
+    ) -> rusqlite::Result<Vec<HostDocument>> {
+        self.rows("rowid>?1 ORDER BY rowid", rowid, limit, stripe)
     }
 
-    /// Documents published before `rowid`, newest first.
-    pub fn before(&self, rowid: i64, limit: usize) -> rusqlite::Result<Vec<HostDocument>> {
-        self.rows("WHERE rowid<?1 ORDER BY rowid DESC", rowid, limit)
+    /// Documents of `stripe` published before `rowid`, newest first.
+    pub fn before(
+        &self,
+        rowid: i64,
+        limit: usize,
+        stripe: Stripe,
+    ) -> rusqlite::Result<Vec<HostDocument>> {
+        self.rows("rowid<?1 ORDER BY rowid DESC", rowid, limit, stripe)
     }
 
     pub fn max_rowid(&self) -> rusqlite::Result<i64> {
@@ -340,6 +372,66 @@ mod tests {
             end: start + text.len(),
             text: text.into(),
         }
+    }
+
+    #[test]
+    fn stripes_split_the_catalog_into_disjoint_shares_in_both_directions() {
+        use anyagents_core::{
+            host_index::{HostIndex, IndexMetadata, MemoryScope},
+            raw_segment::retained_jsonl_records,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("history.jsonl");
+        let lines: String = (0..7)
+            .map(|i| format!("{{\"content\":\"line {i}\"}}\n"))
+            .collect();
+        std::fs::write(&file, lines).unwrap();
+        let path = dir.path().join("host.db");
+        let mut index = HostIndex::open(&path).unwrap();
+        for (i, raw) in retained_jsonl_records(&file).unwrap().iter().enumerate() {
+            let metadata = IndexMetadata {
+                agent_id: "agt".into(),
+                source: MemoryScope::Transcripts,
+                timestamp_ms: Some(i as i64),
+                direction: "in".into(),
+                sender: "s".into(),
+                destination: "d".into(),
+                tool_name: None,
+                tool_names: Vec::new(),
+                role: None,
+            };
+            index.index(&format!("doc{i}"), &metadata, raw).unwrap();
+        }
+        drop(index);
+        let catalog = HostCatalog::open(&path).unwrap();
+        let all: Vec<i64> = catalog
+            .after(0, 100, Stripe::ALL)
+            .unwrap()
+            .iter()
+            .map(|d| d.rowid)
+            .collect();
+        assert_eq!(all.len(), 7);
+        let mut seen = Vec::new();
+        for index in 0..3 {
+            let stripe = Stripe { index, of: 3 };
+            let forward: Vec<i64> = catalog
+                .after(0, 100, stripe)
+                .unwrap()
+                .iter()
+                .map(|d| d.rowid)
+                .collect();
+            let backward: Vec<i64> = catalog
+                .before(i64::MAX, 100, stripe)
+                .unwrap()
+                .iter()
+                .map(|d| d.rowid)
+                .collect();
+            assert!(forward.iter().all(|r| *r as usize % 3 == index));
+            assert_eq!(backward, forward.iter().rev().copied().collect::<Vec<_>>());
+            seen.extend(forward);
+        }
+        seen.sort();
+        assert_eq!(seen, all);
     }
 
     #[test]

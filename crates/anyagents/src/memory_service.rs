@@ -15,7 +15,7 @@ pub struct MemoryServiceArgs {
     /// `<data>/memory-service/models`).
     #[arg(long, global = true)]
     models: Option<PathBuf>,
-    /// Cores the background embedder may use.
+    /// Background embedding workers, one core each, at the lowest priority.
     #[arg(long, global = true, default_value_t = 1)]
     index_threads: usize,
     /// Cores one query's embedding or rerank may use.

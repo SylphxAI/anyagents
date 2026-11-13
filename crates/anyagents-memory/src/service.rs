@@ -4,7 +4,7 @@
 //! writes only its own dense index.
 use crate::{
     dense::DenseIndex,
-    embed::{HostCatalog, embed_documents},
+    embed::{HostCatalog, Stripe, embed_documents},
     model::{self, ModelPin},
     protocol::{self, Reply, Request, Status},
     runtime::{self, Encoder, Error},
@@ -30,7 +30,7 @@ pub struct Config {
     /// Where pinned models and the runtime live; `<data>/memory-service/models`
     /// unless the operator chooses another directory.
     pub models: PathBuf,
-    /// Cores the background embedder may use. Query work is separate.
+    /// Background embedding workers, one core each. Query work is separate.
     pub index_threads: usize,
     /// Cores for one query's embedding or rerank.
     pub query_threads: usize,
@@ -225,15 +225,19 @@ pub fn serve(config: Config) -> Result<(), Error> {
         stop: AtomicBool::new(false),
     });
     if !config.no_index {
-        let indexer = Arc::clone(&shared);
-        std::thread::Builder::new()
-            .name("memory-indexer".into())
-            .spawn(move || {
-                nice_this_thread(indexer.config.nice);
-                if let Err(error) = index_loop(&indexer, environment) {
-                    eprintln!("memory-service: background embedding stopped: {error}");
-                }
-            })?;
+        let workers = config.index_threads.max(1);
+        for index in 0..workers {
+            let indexer = Arc::clone(&shared);
+            let stripe = Stripe { index, of: workers };
+            std::thread::Builder::new()
+                .name(format!("memory-indexer-{index}"))
+                .spawn(move || {
+                    nice_this_thread(indexer.config.nice);
+                    if let Err(error) = index_loop(&indexer, environment, stripe) {
+                        eprintln!("memory-service: background embedding stopped: {error}");
+                    }
+                })?;
+        }
     }
     eprintln!(
         "memory-service: {} + {} on {}",
@@ -258,15 +262,16 @@ const BATCH: usize = 64;
 
 /// Embed new documents first (above the tail mark, oldest first), then the
 /// backlog newest first (below the backfill mark). Both marks commit with
-/// each document, so a restart resumes where it stopped.
-fn index_loop(shared: &Shared, environment: &ort::environment::Environment) -> Result<(), Error> {
+/// each document, so a restart resumes where it stopped. Each worker owns one
+/// stripe of rowids and its own marks, on a single-threaded session: small
+/// encoders use cores best one batch per core. The first worker also sweeps.
+fn index_loop(
+    shared: &Shared,
+    environment: &ort::environment::Environment,
+    stripe: Stripe,
+) -> Result<(), Error> {
     let config = &shared.config;
-    let mut encoder = Encoder::load(
-        environment,
-        &config.models,
-        &config.embedder,
-        config.index_threads,
-    )?;
+    let mut encoder = Encoder::load(environment, &config.models, &config.embedder, 1)?;
     let mut dense = DenseIndex::open(
         &config.dense_path(),
         config.embedder.name,
@@ -280,8 +285,8 @@ fn index_loop(shared: &Shared, environment: &ort::environment::Environment) -> R
             continue;
         }
         let host = HostCatalog::open(&host_path)?;
-        let did = index_step(&host, &mut encoder, &mut dense)?;
-        if last_sweep.elapsed() >= SWEEP_EVERY {
+        let did = index_step(&host, &mut encoder, &mut dense, stripe)?;
+        if stripe.index == 0 && last_sweep.elapsed() >= SWEEP_EVERY {
             sweep(&host, &dense)?;
             last_sweep = Instant::now();
         }
@@ -292,32 +297,38 @@ fn index_loop(shared: &Shared, environment: &ort::environment::Environment) -> R
     Ok(())
 }
 
-/// One bounded step of background work; returns documents examined.
+/// One bounded step of background work for one stripe; returns documents
+/// examined. Marks are named by stripe (`tail/<i>/<n>`), so a restart with
+/// another worker count starts fresh marks and skips what is already
+/// embedded by its digest.
 pub fn index_step(
     host: &HostCatalog,
     encoder: &mut Encoder,
     dense: &mut DenseIndex,
+    stripe: Stripe,
 ) -> Result<usize, Error> {
-    let tail = match dense.progress("tail")? {
+    let tail_key = format!("tail/{}/{}", stripe.index, stripe.of);
+    let backfill_key = format!("backfill/{}/{}", stripe.index, stripe.of);
+    let tail = match dense.progress(&tail_key)? {
         Some(tail) => tail,
         None => {
             // First run: everything already published is backlog.
             let top = host.max_rowid()?;
-            dense.set_progress("tail", top)?;
-            dense.set_progress("backfill", top + 1)?;
+            dense.set_progress(&tail_key, top)?;
+            dense.set_progress(&backfill_key, top + 1)?;
             top
         }
     };
-    let fresh = host.after(tail, BATCH)?;
+    let fresh = host.after(tail, BATCH, stripe)?;
     if !fresh.is_empty() {
-        embed_documents(encoder, dense, &fresh, "tail")?;
+        embed_documents(encoder, dense, &fresh, &tail_key)?;
         return Ok(fresh.len());
     }
-    let backfill = dense.progress("backfill")?.unwrap_or(0);
-    let older = host.before(backfill, BATCH)?;
-    embed_documents(encoder, dense, &older, "backfill")?;
+    let backfill = dense.progress(&backfill_key)?.unwrap_or(0);
+    let older = host.before(backfill, BATCH, stripe)?;
+    embed_documents(encoder, dense, &older, &backfill_key)?;
     if older.is_empty() && backfill > 0 {
-        dense.set_progress("backfill", 0)?;
+        dense.set_progress(&backfill_key, 0)?;
     }
     Ok(older.len())
 }

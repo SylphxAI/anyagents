@@ -223,9 +223,11 @@ embedded once. Vectors are L2-normalised and stored as per-vector int8.
 
 The background embedder takes new documents first and then the backlog newest
 first; both marks commit with each document, so a restart resumes where it
-stopped. It runs on one thread at nice 19 by default (`--index-threads`,
-`--nice`); query embedding and reranking run on their own threads at normal
-priority (`--query-threads`). An idle embedder checks for new documents every
+stopped. It runs `--index-threads` workers (default 1) at nice 19 (`--nice`),
+each a single-threaded session over its own stripe of documents with its own
+marks, so the CPU it may take is exactly that many cores and only when no
+normal-priority work wants them. Query embedding and reranking run on their
+own threads at normal priority (`--query-threads`, default 2). An idle embedder checks for new documents every
 30 s. Every 10 minutes it drops vectors of documents the host index no longer
 holds at the same digest, so removed, redacted or rewritten history leaves
 the dense index within that interval; until then the server's resolution
