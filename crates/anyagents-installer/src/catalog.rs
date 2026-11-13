@@ -16,19 +16,6 @@ use crate::unpack::Format;
 /// The caller-owned override file, relative to the data directory.
 pub const OVERRIDES: &str = "harnesses.toml";
 
-/// How a legacy install was made. Removed once `install.rs` moves onto [`Source`].
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum InstallMethod {
-    /// `npm install` into a private prefix, never the user's global one.
-    Npm { package: String },
-    /// The vendor's own install script, given a private prefix.
-    VendorScript { url: String },
-    /// A release binary checked against a published checksum.
-    ReleaseBinary { url: String, sha256: String },
-    /// The vendor tool is already on the machine and AnyAgents only records it.
-    Vendored,
-}
-
 /// Which models a subscription on this harness may run, and where that was read.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubscriptionTerms {
@@ -52,8 +39,6 @@ pub struct DoctorSpec {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CatalogEntry {
     pub id: String,
-    /// Legacy install method, read only by the pre-registry `install.rs`.
-    pub install: InstallMethod,
     /// The vendor command that signs the user in: the program name, then its
     /// arguments. A managed sign-in runs the arguments with the managed launcher.
     pub sign_in_command: Vec<String>,
@@ -110,7 +95,6 @@ fn env(items: &[(&str, &str)]) -> BTreeMap<String, String> {
 
 struct Spec<'a> {
     id: &'a str,
-    install: InstallMethod,
     sign_in: &'a [&'a str],
     api_key: Option<&'a str>,
     models: &'a [&'a str],
@@ -124,7 +108,6 @@ struct Spec<'a> {
 fn harness(spec: Spec<'_>) -> CatalogEntry {
     CatalogEntry {
         id: spec.id.to_string(),
-        install: spec.install,
         sign_in_command: strings(spec.sign_in),
         api_key_variable: spec.api_key.map(str::to_string),
         subscription: SubscriptionTerms {
@@ -163,7 +146,6 @@ pub fn builtin_catalog() -> Vec<CatalogEntry> {
     let cloud = |id: &str, sign_in: &[&str], key: &str, models: &[&str], terms: &str| {
         harness(Spec {
             id,
-            install: InstallMethod::Vendored,
             sign_in,
             api_key: Some(key),
             models,
@@ -177,7 +159,6 @@ pub fn builtin_catalog() -> Vec<CatalogEntry> {
     vec![
         harness(Spec {
             id: "spiron",
-            install: InstallMethod::Vendored,
             sign_in: &["spiron", "login"],
             api_key: Some("SYLPHX_API_KEY"),
             models: &[],
@@ -189,9 +170,6 @@ pub fn builtin_catalog() -> Vec<CatalogEntry> {
         }),
         harness(Spec {
             id: "claude-code",
-            install: InstallMethod::Npm {
-                package: "@anthropic-ai/claude-code".to_string(),
-            },
             sign_in: &["claude", "auth", "login"],
             api_key: Some("ANTHROPIC_API_KEY"),
             models: &["claude-opus", "claude-sonnet"],
@@ -206,9 +184,6 @@ pub fn builtin_catalog() -> Vec<CatalogEntry> {
         }),
         harness(Spec {
             id: "codex",
-            install: InstallMethod::Npm {
-                package: "@openai/codex".to_string(),
-            },
             sign_in: &["codex", "login"],
             api_key: Some("OPENAI_API_KEY"),
             models: &["gpt"],
@@ -220,7 +195,6 @@ pub fn builtin_catalog() -> Vec<CatalogEntry> {
         }),
         harness(Spec {
             id: "opencode",
-            install: InstallMethod::Vendored,
             sign_in: &["opencode", "auth", "login"],
             api_key: Some("OPENAI_API_KEY"),
             models: &[],
@@ -235,7 +209,6 @@ pub fn builtin_catalog() -> Vec<CatalogEntry> {
         // that directory is the sign-in.
         harness(Spec {
             id: "agy",
-            install: InstallMethod::Vendored,
             sign_in: &["agy", "--print", "reply with the word signed-in"],
             api_key: Some("ANTIGRAVITY_API_KEY"),
             models: &["gemini"],
@@ -247,7 +220,6 @@ pub fn builtin_catalog() -> Vec<CatalogEntry> {
         }),
         harness(Spec {
             id: "muse",
-            install: InstallMethod::Vendored,
             sign_in: &["muse", "login"],
             api_key: Some("META_API_KEY"),
             models: &["muse-wonder-full-1.0"],
@@ -259,7 +231,6 @@ pub fn builtin_catalog() -> Vec<CatalogEntry> {
         }),
         harness(Spec {
             id: "omp",
-            install: InstallMethod::Vendored,
             sign_in: &["omp", "login"],
             api_key: Some("OPENAI_API_KEY"),
             models: &[],
@@ -271,7 +242,6 @@ pub fn builtin_catalog() -> Vec<CatalogEntry> {
         }),
         harness(Spec {
             id: "dsh",
-            install: InstallMethod::Vendored,
             sign_in: &["dsh", "--profile", "web"],
             api_key: Some("DEEPSEEK_API_KEY"),
             models: &["deepseek-v3.2-exp-think"],
@@ -283,7 +253,6 @@ pub fn builtin_catalog() -> Vec<CatalogEntry> {
         }),
         harness(Spec {
             id: "grok",
-            install: InstallMethod::Vendored,
             sign_in: &["grok", "login"],
             api_key: Some("XAI_API_KEY"),
             models: &["grok-4.20"],
@@ -327,7 +296,6 @@ pub fn builtin_catalog() -> Vec<CatalogEntry> {
 fn runtime(id: &str, source: Source, launcher: &str) -> CatalogEntry {
     CatalogEntry {
         id: id.to_string(),
-        install: InstallMethod::Vendored,
         sign_in_command: Vec::new(),
         api_key_variable: None,
         subscription: SubscriptionTerms {
@@ -566,11 +534,6 @@ mod tests {
             if let Some(runtime) = &entry.runtime {
                 assert!(catalog.runtimes().iter().any(|r| &r.id == runtime));
             }
-            assert!(
-                !matches!(entry.install, InstallMethod::VendorScript { .. }),
-                "{}",
-                entry.id
-            );
         }
     }
 

@@ -21,27 +21,7 @@ fn bin() -> Command {
     cmd
 }
 
-/// A `PATH` where creating an agent installs nothing: `npm` answers a version
-/// and a no-op install, and `claude` is this binary.
-fn machine_path(dir: &std::path::Path) -> std::ffi::OsString {
-    use std::os::unix::fs::PermissionsExt;
-    let bin = dir.join("bin");
-    std::fs::create_dir_all(&bin).unwrap();
-    let launcher = bin.join("claude");
-    if !launcher.exists() {
-        std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_anyagents"), &launcher).unwrap();
-    }
-    let npm = bin.join("npm");
-    if !npm.exists() {
-        std::fs::write(
-            &npm,
-            "#!/bin/sh\ncase \"$1\" in view) echo 0.0.0 ;; esac\nexit 0\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&npm, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-    std::env::join_paths([bin]).unwrap()
-}
+use support::machine_path;
 
 #[derive(Deserialize)]
 struct AgentsResponse {

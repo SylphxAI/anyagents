@@ -295,21 +295,50 @@ async fn serve(
             }
         });
         let updater_root = data.to_path_buf();
+        let updater_store = Arc::clone(&store);
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
             loop {
                 interval.tick().await;
                 let root = updater_root.clone();
+                let store_for_update = Arc::clone(&updater_store);
                 let _ = tokio::task::spawn_blocking(move || {
-                    for entry in anyagents_installer::builtin_catalog() {
-                        if let Ok((before, after, true)) =
-                            crate::install::update_harness(&root, &entry.id)
+                    let catalog = match anyagents_installer::Catalog::load(&root) {
+                        Ok(catalog) => catalog,
+                        Err(err) => {
+                            eprintln!("anyagents-updater: failed to load catalog overrides: {err}");
+                            return;
+                        }
+                    };
+                    for entry in catalog.harnesses().iter().chain(catalog.runtimes()) {
+                        if !entry.source.is_managed()
+                            || matches!(
+                                entry.source,
+                                anyagents_installer::source::Source::Unconfigured
+                            )
                         {
-                            eprintln!(
-                                "anyagents-updater: upgraded harness `{}` {} -> {}",
-                                entry.id, before, after
-                            );
+                            continue;
+                        }
+                        match crate::install::update_harness_with_store(
+                            &root,
+                            &entry.id,
+                            Arc::clone(&store_for_update)
+                                as Arc<dyn anyagents_installer::LeaseView>,
+                        ) {
+                            Ok((before, after, true)) => {
+                                eprintln!(
+                                    "anyagents-updater: upgraded harness `{}` {} -> {}",
+                                    entry.id, before, after
+                                );
+                            }
+                            Ok((_, _, false)) => {}
+                            Err(err) => {
+                                eprintln!(
+                                    "anyagents-updater: failed to update `{}`: {err}",
+                                    entry.id
+                                );
+                            }
                         }
                     }
                 })
@@ -3377,7 +3406,9 @@ fn install_state(store: &Store, agent: &Agent) -> String {
         Some(Ok(())) => "installed".to_string(),
         Some(Err(reason)) => reason,
         None => {
-            if crate::install::program(store.data_dir(), &agent.harness).is_file() {
+            if crate::install::is_healthy(store.data_dir(), &agent.harness)
+                || crate::install::program(store.data_dir(), &agent.harness).is_file()
+            {
                 "installed".to_string()
             } else {
                 "pending".to_string()
