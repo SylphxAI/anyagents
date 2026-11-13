@@ -580,12 +580,19 @@ fn route<H: Harness + 'static>(inner: Arc<Inner<H>>, events: Receiver<Wake>) {
                 }
             }
             Wake::Agent { agent_id } => {
-                if is_running(&inner.store, &agent_id) {
+                let row = inner.store.agent(&agent_id).ok();
+                // A parent is released only once its children are settled, so a
+                // child's row change is the event that can unblock that release.
+                let parent = row.as_ref().and_then(|agent| agent.parent_id.clone());
+                if row.is_some_and(|agent| agent.state == "running") {
                     if !wake_live_worker(&inner, &agent_id, true) {
                         ensure(&inner, agent_id);
                     }
                 } else {
                     stop_slot(&inner, &agent_id);
+                }
+                if let Some(parent) = parent {
+                    wake_live_worker(&inner, &parent, false);
                 }
             }
         }
