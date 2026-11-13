@@ -4,7 +4,8 @@ use crate::{
     Agent, AgentId, HistorySearchQuery, Store,
     host_cursor::{FileStamp, SourceCursor},
     host_index::{HostIndex, IndexError, IndexHit, IndexMetadata, MemoryScope},
-    host_native_metadata::{EventHeader, MetadataReader},
+    host_native_metadata::{Envelope, EventHeader, MetadataReader},
+    host_sqlite::{RowRef, StoreKind},
     learned_memory::sha256,
     raw_segment::{RawSource, open_readonly, read_raw},
 };
@@ -117,25 +118,24 @@ impl Store {
         index.save_source(&owner, &path, &cursor)?;
         let root = self.data_dir().join("agents").join(agent.id.as_str());
         let mut walk = Walk::new(&root);
-        if !safe_components(&mut walk, self.data_dir(), &root)?
-            || !native_transcripts(&mut walk, &root)?.contains(&path)
-            || self
-                .unresolved_host_paths(&owner)?
-                .iter()
-                .any(|p| path.starts_with(p))
-        {
+        let format = if safe_components(&mut walk, self.data_dir(), &root)? {
+            native_sources(&mut walk, &root)?
+                .into_iter()
+                .find(|s| s.path == path)
+                .map(|s| s.format)
+        } else {
+            None
+        };
+        let Some(format) = format.filter(|_| {
+            self.unresolved_host_paths(&owner)
+                .is_ok_and(|blocked| !blocked.iter().any(|p| path.starts_with(p)))
+        }) else {
             index.clear_source(&owner, &path)?;
             index.checkpoint()?;
             return Ok(true);
-        }
-        refresh_native_with_policy(
-            &mut index,
-            &agent,
-            &path,
-            true,
-            is_external_harness_transcript(&root, &path),
-            now_ms,
-        )?;
+        };
+        let tolerant = is_external_harness_transcript(&root, &path);
+        refresh_source_at(&mut index, &agent, &path, format, tolerant, true, now_ms)?;
         Ok(true)
     }
 
@@ -206,13 +206,17 @@ impl Store {
                 .filter(|p| !is_hidden_memory_file(p))
                 .collect(),
             MemoryScope::Transcripts => {
-                let mut paths = native_transcripts(&mut walk, &root)?;
+                let mut paths: Vec<PathBuf> = native_sources(&mut walk, &root)?
+                    .into_iter()
+                    .map(|s| s.path)
+                    .collect();
                 paths.extend(history_archives(&mut walk, &root)?);
                 paths
             }
             MemoryScope::All => return Ok(None),
         };
-        if !paths.contains(&hit.raw.segment) {
+        // A row is readable while its store is one the walk still finds.
+        if !paths.contains(&crate::host_sqlite::source_of(&hit.raw.segment)) {
             return Ok(None);
         }
         let (window, bytes) =
@@ -392,21 +396,31 @@ impl Store {
                     }
                 }
                 MemoryScope::Transcripts => {
-                    for path in native_transcripts(&mut walk, &root)? {
-                        if blocked(&path) {
+                    for source in native_sources(&mut walk, &root)? {
+                        if blocked(&source.path) {
                             continue;
                         }
-                        let stamp = refresh_native_with_policy(
+                        let path = source.path;
+                        if let NativeFormat::Store(_) = source.format {
+                            // New rows land in the write-ahead log before a
+                            // checkpoint touches the database file: both stamps,
+                            // taken before the read, describe the store.
+                            let wal = crate::host_sqlite::wal_path(&path);
+                            walk.note(&wal, FileStamp::of_path(&wal)?);
+                        }
+                        let stamp = refresh_source_at(
                             index,
                             owner,
                             &path,
-                            false,
+                            source.format,
                             is_external_harness_transcript(&root, &path),
+                            false,
                             crate::now_ms(),
-                        )?
-                        .stamp;
-                        walk.note(&path, Some(stamp));
-                        keep.insert(path.to_string_lossy().into_owned());
+                        )?;
+                        walk.note(&path, Some(stamp.stamp));
+                        if stamp.indexed {
+                            keep.insert(path.to_string_lossy().into_owned());
+                        }
                     }
                     // Reconciled archive pages are lossless historical documents,
                     // not necessarily JSONL. Their entire text remains searchable.
@@ -464,7 +478,7 @@ fn classes(scope: MemoryScope) -> &'static [MemoryScope] {
 /// as belonging to whichever class is being refreshed.
 fn source_class(cursor: &str) -> Option<MemoryScope> {
     let cursor: SourceCursor = serde_json::from_str(cursor).ok()?;
-    if cursor.policy.starts_with("native-jsonl") {
+    if cursor.policy.starts_with("native-") {
         return Some(MemoryScope::Transcripts);
     }
     serde_json::from_str::<IndexMetadata>(&cursor.policy)
@@ -473,7 +487,49 @@ fn source_class(cursor: &str) -> Option<MemoryScope> {
 }
 
 fn native_policy(owner: &Owner) -> String {
-    format!("native-jsonl-v4:{}:{}", owner.id, owner.name)
+    NativeFormat::Jsonl.policy(owner)
+}
+
+/// How one native history source is laid out, and so how its events are
+/// framed and which fields carry their metadata.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeFormat {
+    /// One event per JSONL line, metadata in top-level fields: AnyAgents
+    /// transcripts, legacy Spiron `sylphx-transcript.jsonl`, Claude Code
+    /// sessions and subagents, OMP, Grok and Muse.
+    Jsonl,
+    /// Codex rollouts: `{timestamp, type, payload}` per line.
+    CodexRollout,
+    /// AGY transcripts: `{created_at, type, source, content}` per line.
+    AgyTranscript,
+    /// A harness's own SQLite store, one event per row.
+    Store(StoreKind),
+}
+impl NativeFormat {
+    /// The parser policy a published cursor records. A changed policy
+    /// rebuilds the source.
+    fn policy(self, owner: &Owner) -> String {
+        let family = match self {
+            Self::Jsonl => "native-jsonl-v4",
+            Self::CodexRollout => "native-jsonl-v4+codex",
+            Self::AgyTranscript => "native-jsonl-v4+agy",
+            Self::Store(StoreKind::SpironSessions) => "native-sqlite-v1+spiron",
+            Self::Store(StoreKind::OpenCodeMessages) => "native-sqlite-v1+opencode",
+        };
+        format!("{family}:{}:{}", owner.id, owner.name)
+    }
+    fn envelope(self) -> Envelope {
+        match self {
+            Self::Jsonl | Self::AgyTranscript => Envelope::None,
+            Self::CodexRollout => Envelope::Codex,
+            Self::Store(StoreKind::SpironSessions) => Envelope::Spiron,
+            Self::Store(StoreKind::OpenCodeMessages) => Envelope::OpenCode,
+        }
+    }
+}
+struct NativeSource {
+    path: PathBuf,
+    format: NativeFormat,
 }
 fn memory_metadata(owner: &Owner, timestamp_ms: Option<i64>) -> IndexMetadata {
     IndexMetadata {
@@ -509,7 +565,8 @@ fn tree_policy(owner: &Owner, unresolved: &[PathBuf]) -> Result<String, IndexErr
     let mut unresolved: Vec<_> = unresolved.iter().map(|p| p.to_string_lossy()).collect();
     unresolved.sort();
     Ok(serde_json::to_string(&(
-        "host-tree-v1",
+        // v2: every harness's native history location is walked.
+        "host-tree-v2",
         native_policy(owner),
         memory_metadata(owner, None),
         history_metadata(owner),
@@ -659,10 +716,11 @@ fn refresh_document_before_publish(
         Ok(stamp)
     })
 }
+/// A history file a harness writes, not AnyAgents. Its writer may crash
+/// mid-line or concatenate records, so a malformed complete line is indexed
+/// as text with unknown metadata instead of failing the agent's search.
 fn is_external_harness_transcript(root: &Path, path: &Path) -> bool {
-    let config = root.join("config");
-    path.strip_prefix(&config)
-        .is_ok_and(|rel| rel.starts_with("projects") || rel.starts_with(".claude/projects"))
+    path.starts_with(root.join("config"))
 }
 #[cfg(test)]
 fn refresh_native(
@@ -670,30 +728,240 @@ fn refresh_native(
     owner: &Owner,
     path: &Path,
 ) -> Result<RefreshStats, IndexError> {
-    refresh_native_at(index, owner, path, false, crate::now_ms())
+    refresh_native_at(
+        index,
+        owner,
+        path,
+        NativeFormat::Jsonl,
+        false,
+        false,
+        crate::now_ms(),
+    )
 }
-#[cfg(test)]
+
+/// What a refresh published for one source: the stamp taken before it was
+/// read, and whether it is a source this reader indexes at all.
+struct Published {
+    stamp: FileStamp,
+    indexed: bool,
+}
+fn refresh_source_at(
+    index: &mut HostIndex,
+    owner: &Owner,
+    path: &Path,
+    format: NativeFormat,
+    tolerate_malformed: bool,
+    force_full: bool,
+    now_ms: i64,
+) -> Result<Published, IndexError> {
+    match format {
+        NativeFormat::Store(kind) => refresh_store_at(index, owner, path, kind, force_full, now_ms),
+        _ => Ok(Published {
+            stamp: refresh_native_at(
+                index,
+                owner,
+                path,
+                format,
+                tolerate_malformed,
+                force_full,
+                now_ms,
+            )?
+            .stamp,
+            indexed: true,
+        }),
+    }
+}
+
+/// Metadata of one native event and the tool calls it defines. Calls are
+/// correlated within one source: a file, or one native store.
+fn native_metadata(
+    index: &HostIndex,
+    owner: &Owner,
+    source: &Path,
+    header: &EventHeader,
+    format: NativeFormat,
+) -> Result<(IndexMetadata, Vec<(String, String)>), IndexError> {
+    let mut metadata = event_metadata(owner, header, format);
+    let records = header.tool_records(format.envelope());
+    let mut names = Vec::new();
+    if let Some(name) = &metadata.tool_name {
+        names.push(name.clone());
+    }
+    for (call_id, name) in &records {
+        let name = name.map(str::to_owned).or_else(|| {
+            call_id
+                .and_then(|id| {
+                    records
+                        .iter()
+                        .find_map(|(key, name)| (*key == Some(id)).then_some(*name).flatten())
+                })
+                .map(str::to_owned)
+        });
+        let name = match (name, call_id) {
+            (Some(name), _) => name,
+            (None, Some(id)) => index
+                .call_tool(owner.id.as_str(), source, id)?
+                .unwrap_or_else(|| "unknown".into()),
+            (None, None) => "unknown".into(),
+        };
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    metadata.tool_name = names.first().cloned();
+    metadata.tool_names = names;
+    let defined = records
+        .into_iter()
+        .filter_map(|(call, name)| Some((call?.to_owned(), name?.to_owned())))
+        .collect();
+    Ok((metadata, defined))
+}
+
+/// Index what is new in one native SQLite store: rows past the published
+/// rowid frontier and rows the store rewrote after the published change mark.
+/// The frontier and the rows are read in one snapshot of the store; rows,
+/// documents and the new frontier publish in one index transaction. A
+/// replaced database, a lower frontier or a changed frontier row rebuilds the
+/// store. Deleted rows stay published until full verification, and a stale
+/// row is refused at readback by its digest.
+fn refresh_store_at(
+    index: &mut HostIndex,
+    owner: &Owner,
+    db: &Path,
+    kind: StoreKind,
+    force_full: bool,
+    now_ms: i64,
+) -> Result<Published, IndexError> {
+    let stamp = FileStamp::read(&open_readonly(db)?)?;
+    let Some(store) = crate::host_sqlite::Store::open(db, kind)? else {
+        // Not this harness's layout: nothing in it is history this reader
+        // understands. Whatever an earlier layout published is forgotten by
+        // the caller's walk.
+        return Ok(Published {
+            stamp,
+            indexed: false,
+        });
+    };
+    let policy = NativeFormat::Store(kind).policy(owner);
+    let old = index
+        .source_cursor(owner.id.as_str(), db)?
+        .filter(|old| old.policy == policy);
+    store.snapshot()?;
+    let (top, changed) = store.frontier()?;
+    let row_digest = |rowid: u64| -> io::Result<String> {
+        Ok(match i64::try_from(rowid).ok().filter(|&r| r > 0) {
+            Some(rowid) => store.row(rowid)?.map(|b| sha256(&b)).unwrap_or_default(),
+            None => String::new(),
+        })
+    };
+    let after = match &old {
+        Some(old)
+            if !force_full
+                && old.stamp.same_file(&stamp)
+                && old.end <= top.max(0) as u64
+                && row_digest(old.end)? == old.boundary_sha256 =>
+        {
+            if old.end == top.max(0) as u64 && old.next_seq == changed.max(0) as u64 {
+                return Ok(Published {
+                    stamp,
+                    indexed: true,
+                });
+            }
+            Some((old.end as i64, old.next_seq as i64))
+        }
+        _ => None,
+    };
+    let boundary_sha256 = row_digest(top.max(0) as u64)?;
+    let envelope = NativeFormat::Store(kind);
+    index.refresh_source(|index| {
+        if after.is_none() {
+            index.clear_source(owner.id.as_str(), db)?;
+        }
+        let mut failure = None;
+        store
+            .rows(after, top, |row| {
+                let result = (|| -> Result<(), IndexError> {
+                    let reference = RowRef::new(db, kind, row.rowid);
+                    let raw = crate::raw_segment::RawCoordinate {
+                        segment: reference.segment(),
+                        offset: 0,
+                        length: row.bytes.len() as u64,
+                        sha256: sha256(&row.bytes),
+                        seq: row.rowid.max(0) as u64,
+                    };
+                    // A row the store accepted but this reader cannot frame
+                    // still indexes its text, with unknown metadata.
+                    let header: EventHeader =
+                        serde_json::from_reader(MetadataReader::new(&row.bytes[..]))
+                            .unwrap_or_default();
+                    let (mut metadata, calls) =
+                        native_metadata(index, owner, db, &header, envelope)?;
+                    if let Some(role) = row.role.as_deref().filter(|r| !r.is_empty()) {
+                        metadata.direction = if role == "user" { "in" } else { "out" }.into();
+                        metadata.role = Some(role.into());
+                    }
+                    if row.timestamp_ms.is_some() {
+                        metadata.timestamp_ms = row.timestamp_ms;
+                    }
+                    let id = format!(
+                        "transcript:{}:{}:{}",
+                        owner.id,
+                        sha256(db.as_os_str().as_encoded_bytes()),
+                        row.rowid
+                    );
+                    let mut source = RawSource::from_row(&reference, row.bytes)?;
+                    index.index_from(&mut source, &id, &metadata, &raw)?;
+                    for (call, name) in calls {
+                        index.save_call(owner.id.as_str(), db, &call, &name, &id)?;
+                    }
+                    Ok(())
+                })();
+                result.map_err(|error| {
+                    let message = error.to_string();
+                    failure = Some(error);
+                    io::Error::other(message)
+                })
+            })
+            .map_err(|error| failure.take().unwrap_or_else(|| error.into()))?;
+        index.save_source(
+            owner.id.as_str(),
+            db,
+            &SourceCursor {
+                stamp: stamp.clone(),
+                policy,
+                end: top.max(0) as u64,
+                next_seq: changed.max(0) as u64,
+                boundary_sha256,
+                full_verified_ms: match (&old, after) {
+                    (Some(old), Some(_)) => old.full_verified_ms,
+                    _ => now_ms,
+                },
+                verification_attempt_ms: match (&old, after) {
+                    (Some(old), Some(_)) => old.verification_attempt_ms,
+                    _ => now_ms,
+                },
+            },
+        )?;
+        Ok(Published {
+            stamp,
+            indexed: true,
+        })
+    })
+}
+
 fn refresh_native_at(
     index: &mut HostIndex,
     owner: &Owner,
     path: &Path,
-    force_full: bool,
-    now_ms: i64,
-) -> Result<RefreshStats, IndexError> {
-    refresh_native_with_policy(index, owner, path, force_full, false, now_ms)
-}
-fn refresh_native_with_policy(
-    index: &mut HostIndex,
-    owner: &Owner,
-    path: &Path,
-    force_full: bool,
+    format: NativeFormat,
     tolerate_malformed: bool,
+    force_full: bool,
     now_ms: i64,
 ) -> Result<RefreshStats, IndexError> {
     // One path walk; scan, metadata and projection share this descriptor.
     let mut source = RawSource::open(path)?;
     let stamp = source.stamp().clone();
-    let policy = native_policy(owner);
+    let policy = format.policy(owner);
     let old = index
         .source_cursor(owner.id.as_str(), path)?
         .filter(|old| old.policy == policy);
@@ -732,35 +1000,7 @@ fn refresh_native_with_policy(
                 }
                 Err(error) => return Err(error.into()),
             };
-            let mut metadata = event_metadata(owner, &header);
-            let records = header.tool_records();
-            let mut names = Vec::new();
-            if let Some(name) = &metadata.tool_name {
-                names.push(name.clone());
-            }
-            for (call_id, name) in &records {
-                let name = name.map(str::to_owned).or_else(|| {
-                    call_id
-                        .and_then(|id| {
-                            records.iter().find_map(|(key, name)| {
-                                (*key == Some(id)).then_some(*name).flatten()
-                            })
-                        })
-                        .map(str::to_owned)
-                });
-                let name = match (name, call_id) {
-                    (Some(name), _) => name,
-                    (None, Some(id)) => index
-                        .call_tool(owner.id.as_str(), path, id)?
-                        .unwrap_or_else(|| "unknown".into()),
-                    (None, None) => "unknown".into(),
-                };
-                if !names.contains(&name) {
-                    names.push(name);
-                }
-            }
-            metadata.tool_name = names.first().cloned();
-            metadata.tool_names = names;
+            let (metadata, calls) = native_metadata(index, owner, path, &header, format)?;
             let id = format!(
                 "transcript:{}:{}:{}",
                 owner.id,
@@ -768,10 +1008,8 @@ fn refresh_native_with_policy(
                 raw.seq
             );
             index.index_from(&mut source, &id, &metadata, raw)?;
-            for (call_id, name) in records {
-                if let (Some(call_id), Some(name)) = (call_id, name) {
-                    index.save_call(owner.id.as_str(), path, call_id, name, &id)?;
-                }
+            for (call, name) in calls {
+                index.save_call(owner.id.as_str(), path, &call, &name, &id)?;
             }
         }
         // A live append racing this snapshot is not corruption. Do not advance
@@ -906,48 +1144,182 @@ fn regular_files(walk: &mut Walk, root: &Path, recursive: bool) -> io::Result<Ve
     result.sort();
     Ok(result)
 }
-fn native_transcripts(walk: &mut Walk, root: &Path) -> io::Result<Vec<PathBuf>> {
-    let mut result = regular_files(walk, &root.join("transcripts"), true)?;
+/// Every native history source of one agent, found only below its own root
+/// and never through a symlink. Each harness keeps its history where
+/// AnyAgents points its configuration:
+///
+/// | Harness | Source |
+/// | --- | --- |
+/// | any | `transcripts/**` |
+/// | Spiron | `config/sessions.sqlite3` (`session_entries`); legacy `config/sylphx-transcript.jsonl` |
+/// | Claude Code | `config/{,.claude/}projects/*/*.jsonl` and `projects/*/*/subagents/*.jsonl` |
+/// | Codex | `config/sessions/**/*.jsonl` (`CODEX_HOME`) |
+/// | OpenCode | `config/data-home/opencode/opencode.db`, `config/.local/share/opencode/opencode.db` (`session_message`) |
+/// | AGY | `config/.gemini/antigravity-cli/brain/*/.system_generated/logs/transcript_full.jsonl` |
+/// | Muse | `config/data-home/muse/sessions/**/session.jsonl`, subagents included |
+/// | OMP | `config/.omp/agent/sessions/*/*.jsonl` (`PI_CODING_AGENT_DIR`) |
+/// | Grok | `config/.grok/sessions/*/*/chat_history.jsonl` |
+///
+/// dsh keeps zstd-compressed `session.jsonl.zstd`; it is not read until a
+/// raw coordinate can address bytes inside a compressed frame.
+fn native_sources(walk: &mut Walk, root: &Path) -> io::Result<Vec<NativeSource>> {
+    let jsonl = |path: PathBuf| NativeSource {
+        path,
+        format: NativeFormat::Jsonl,
+    };
+    let mut result: Vec<NativeSource> = regular_files(walk, &root.join("transcripts"), true)?
+        .into_iter()
+        .map(jsonl)
+        .collect();
     let config = root.join("config");
     if !safe_components(walk, root, &config)? {
         return Ok(result);
     }
+    let file = |walk: &mut Walk, path: &Path| -> io::Result<bool> {
+        Ok(safe_components(walk, root, path.parent().unwrap_or(root))?
+            && fs::symlink_metadata(path).is_ok_and(|m| m.is_file() && !m.file_type().is_symlink()))
+    };
     let sylphx = config.join("sylphx-transcript.jsonl");
-    if fs::symlink_metadata(&sylphx).is_ok_and(|m| m.is_file() && !m.file_type().is_symlink()) {
-        result.push(sylphx);
+    if file(walk, &sylphx)? {
+        result.push(jsonl(sylphx));
     }
+    for (db, kind) in [
+        (config.join("sessions.sqlite3"), StoreKind::SpironSessions),
+        (
+            config.join("data-home/opencode/opencode.db"),
+            StoreKind::OpenCodeMessages,
+        ),
+        (
+            config.join(".local/share/opencode/opencode.db"),
+            StoreKind::OpenCodeMessages,
+        ),
+    ] {
+        if file(walk, &db)? {
+            result.push(NativeSource {
+                path: db,
+                format: NativeFormat::Store(kind),
+            });
+        }
+    }
+    // Claude Code: one JSONL per session in each project directory, and each
+    // session's subagents below it. No guessed personal home is read.
     for projects in [config.join("projects"), config.join(".claude/projects")] {
-        // No guessed personal home or Codex SQLite discovery.
-        if safe_components(walk, root, &projects)?
-            && fs::symlink_metadata(&projects)
-                .is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
-        {
-            for entry in fs::read_dir(projects)? {
-                let entry = entry?;
-                if entry.file_type()?.is_dir() {
-                    result.extend(
-                        regular_files(walk, &entry.path(), false)?
-                            .into_iter()
-                            .filter(|p| p.extension().is_some_and(|e| e == "jsonl")),
-                    );
-                }
+        for project in subdirectories(walk, root, &projects)? {
+            result.extend(jsonl_files(walk, &project, false)?.into_iter().map(jsonl));
+            for session in subdirectories(walk, root, &project)? {
+                let subagents = session.join("subagents");
+                result.extend(jsonl_files(walk, &subagents, false)?.into_iter().map(jsonl));
             }
         }
     }
-    result.sort();
-    result.dedup();
+    if safe_components(walk, root, &config.join("sessions"))? {
+        result.extend(
+            jsonl_files(walk, &config.join("sessions"), true)?
+                .into_iter()
+                .map(|path| NativeSource {
+                    path,
+                    format: NativeFormat::CodexRollout,
+                }),
+        );
+    }
+    let brain = config.join(".gemini/antigravity-cli/brain");
+    for conversation in subdirectories(walk, root, &brain)? {
+        let transcript = conversation.join(".system_generated/logs/transcript_full.jsonl");
+        if file(walk, &transcript)? {
+            result.push(NativeSource {
+                path: transcript,
+                format: NativeFormat::AgyTranscript,
+            });
+        }
+    }
+    let muse = config.join("data-home/muse/sessions");
+    if safe_components(walk, root, &muse)? {
+        // Hidden directories hold Muse's view snapshots, not the session log.
+        result.extend(
+            regular_files(walk, &muse, true)?
+                .into_iter()
+                .filter(|p| {
+                    p.file_name().is_some_and(|n| n == "session.jsonl")
+                        && p.strip_prefix(&muse).is_ok_and(|rel| {
+                            !rel.components()
+                                .any(|c| c.as_os_str().to_string_lossy().starts_with('.'))
+                        })
+                })
+                .map(jsonl),
+        );
+    }
+    for cwd in subdirectories(walk, root, &config.join(".omp/agent/sessions"))? {
+        result.extend(jsonl_files(walk, &cwd, false)?.into_iter().map(jsonl));
+    }
+    for cwd in subdirectories(walk, root, &config.join(".grok/sessions"))? {
+        for session in subdirectories(walk, root, &cwd)? {
+            let history = session.join("chat_history.jsonl");
+            if file(walk, &history)? {
+                result.push(jsonl(history));
+            }
+        }
+    }
+    result.sort_by(|a, b| a.path.cmp(&b.path));
+    result.dedup_by(|a, b| a.path == b.path);
     Ok(result)
 }
-fn event_metadata(owner: &Owner, value: &EventHeader) -> IndexMetadata {
+
+/// Directories directly below `dir`, reached without a symlink. Hidden
+/// directories (a harness's own snapshots and caches) are not history.
+fn subdirectories(walk: &mut Walk, root: &Path, dir: &Path) -> io::Result<Vec<PathBuf>> {
+    if !safe_components(walk, root, dir)? {
+        return Ok(Vec::new());
+    }
+    let meta = fs::symlink_metadata(dir)?;
+    if !meta.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut result = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() && !entry.file_name().to_string_lossy().starts_with('.') {
+            let path = entry.path();
+            if let Ok(meta) = fs::symlink_metadata(&path) {
+                walk.note_dir(&path, &meta);
+            }
+            result.push(path);
+        }
+    }
+    result.sort();
+    Ok(result)
+}
+
+/// `*.jsonl` regular files in `dir`, optionally below it too.
+fn jsonl_files(walk: &mut Walk, dir: &Path, recursive: bool) -> io::Result<Vec<PathBuf>> {
+    Ok(regular_files(walk, dir, recursive)?
+        .into_iter()
+        .filter(|p| p.extension().is_some_and(|e| e == "jsonl"))
+        .collect())
+}
+
+fn event_metadata(owner: &Owner, value: &EventHeader, format: NativeFormat) -> IndexMetadata {
+    // Only an enveloped format's body is read; elsewhere `data` is payload.
+    let body =
+        matches!(format.envelope(), Envelope::Codex | Envelope::Spiron).then_some(&value.data);
     let role = value
         .role
         .as_deref()
         .or_else(|| value.message.as_ref().and_then(|m| m.role.as_deref()))
+        .or_else(|| body.and_then(|b| b.role.as_deref()))
+        .or(match (format, value.kind.as_deref()) {
+            (NativeFormat::Store(StoreKind::SpironSessions), Some("tool_call")) => {
+                Some("assistant")
+            }
+            (NativeFormat::Store(StoreKind::SpironSessions), Some("tool_result")) => Some("tool"),
+            (NativeFormat::AgyTranscript, Some("USER_INPUT")) => Some("user"),
+            _ => None,
+        })
         .unwrap_or("system");
     let tool = value
         .tool_name
         .clone()
         .or_else(|| value.tool.clone())
+        .or_else(|| body.and_then(|b| b.tool_name.clone()))
         .or_else(|| {
             (role == "tool").then(|| value.name.clone().unwrap_or_else(|| "unknown".into()))
         });
@@ -962,6 +1334,10 @@ fn event_metadata(owner: &Owner, value: &EventHeader) -> IndexMetadata {
             value
                 .timestamp
                 .as_deref()
+                .or(match format {
+                    NativeFormat::AgyTranscript => value.created_at.as_deref(),
+                    _ => None,
+                })
                 .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
                 .map(|time| time.timestamp_millis())
         }),
@@ -1510,7 +1886,16 @@ mod tests {
         let index_path = dir.path().join(INDEX_FILE);
         let mut index = HostIndex::open(&index_path).unwrap();
         let t0 = crate::now_ms();
-        refresh_native_at(&mut index, &Owner::from(&agent), &path, false, t0).unwrap();
+        refresh_native_at(
+            &mut index,
+            &Owner::from(&agent),
+            &path,
+            NativeFormat::Jsonl,
+            false,
+            false,
+            t0,
+        )
+        .unwrap();
         let suffix = b"{\"content\":\"suffixneedle\"}\n";
         fs::OpenOptions::new()
             .append(true)
@@ -1518,8 +1903,16 @@ mod tests {
             .unwrap()
             .write_all(suffix)
             .unwrap();
-        let append =
-            refresh_native_at(&mut index, &Owner::from(&agent), &path, false, t0 + 1).unwrap();
+        let append = refresh_native_at(
+            &mut index,
+            &Owner::from(&agent),
+            &path,
+            NativeFormat::Jsonl,
+            false,
+            false,
+            t0 + 1,
+        )
+        .unwrap();
         assert_eq!(
             append.prefix_verified_bytes,
             crate::host_cursor::BOUNDARY_BYTES
@@ -1542,8 +1935,16 @@ mod tests {
         file.seek(SeekFrom::Start(prefix.len() as u64 + 12))
             .unwrap();
         file.write_all(b"inside").unwrap();
-        let inside =
-            refresh_native_at(&mut index, &Owner::from(&agent), &path, false, t0 + 2).unwrap();
+        let inside = refresh_native_at(
+            &mut index,
+            &Owner::from(&agent),
+            &path,
+            NativeFormat::Jsonl,
+            false,
+            false,
+            t0 + 2,
+        )
+        .unwrap();
         assert_eq!(inside.indexed_records, 2);
         assert_eq!(
             inside.suffix_scanned_bytes,
@@ -1556,8 +1957,16 @@ mod tests {
         file.write_all(b"newneedle").unwrap();
         let mut append_file = fs::OpenOptions::new().append(true).open(&path).unwrap();
         append_file.write_all(suffix).unwrap();
-        let outside =
-            refresh_native_at(&mut index, &Owner::from(&agent), &path, false, t0 + 3).unwrap();
+        let outside = refresh_native_at(
+            &mut index,
+            &Owner::from(&agent),
+            &path,
+            NativeFormat::Jsonl,
+            false,
+            false,
+            t0 + 3,
+        )
+        .unwrap();
         assert_eq!(outside.indexed_records, 1);
         assert_eq!(
             outside.prefix_verified_bytes,
@@ -1610,6 +2019,8 @@ mod tests {
             &mut index,
             &Owner::from(&agent),
             &path,
+            NativeFormat::Jsonl,
+            false,
             false,
             t0 + 3_600_004,
         )
@@ -1629,6 +2040,8 @@ mod tests {
             &mut index,
             &Owner::from(&agent),
             &path,
+            NativeFormat::Jsonl,
+            false,
             false,
             t0 + 3_600_005,
         )
@@ -1666,7 +2079,16 @@ mod tests {
         let t0 = crate::now_ms();
         let before = {
             let mut index = HostIndex::open(&index_path).unwrap();
-            refresh_native_at(&mut index, &Owner::from(&agent), &path, false, t0).unwrap();
+            refresh_native_at(
+                &mut index,
+                &Owner::from(&agent),
+                &path,
+                NativeFormat::Jsonl,
+                false,
+                false,
+                t0,
+            )
+            .unwrap();
             index
                 .source_cursor(agent.id.as_str(), &path)
                 .unwrap()
@@ -1725,8 +2147,26 @@ mod tests {
         fs::write(&good, "{\"content\":\"goodneedle\"}\n").unwrap();
         let mut index = HostIndex::open(&dir.path().join(INDEX_FILE)).unwrap();
         let t0 = crate::now_ms();
-        refresh_native_at(&mut index, &Owner::from(&agent), &bad, false, t0).unwrap();
-        refresh_native_at(&mut index, &Owner::from(&agent), &good, false, t0).unwrap();
+        refresh_native_at(
+            &mut index,
+            &Owner::from(&agent),
+            &bad,
+            NativeFormat::Jsonl,
+            false,
+            false,
+            t0,
+        )
+        .unwrap();
+        refresh_native_at(
+            &mut index,
+            &Owner::from(&agent),
+            &good,
+            NativeFormat::Jsonl,
+            false,
+            false,
+            t0,
+        )
+        .unwrap();
         let before = index
             .source_cursor(agent.id.as_str(), &bad)
             .unwrap()
@@ -1855,9 +2295,11 @@ mod tests {
             .unwrap();
         let root = dir.path().join("agents").join(agent.id.as_str());
         fs::create_dir_all(root.join("memory")).unwrap();
-        fs::create_dir_all(root.join("config")).unwrap();
+        fs::create_dir_all(root.join("transcripts")).unwrap();
         let memory = root.join("memory/MEMORY.md");
-        let native = root.join("config/sylphx-transcript.jsonl");
+        // AnyAgents' own transcript is strict; a harness's file tolerates
+        // malformed lines (see `malformed_native_jsonl_falls_back...`).
+        let native = root.join("transcripts/history.jsonl");
         fs::write(&memory, "sharedneedle").unwrap();
         fs::write(&native, "{\"content\":\"sharedneedle\"}\n").unwrap();
         let ids = [agent.id.to_string()];
@@ -2067,7 +2509,11 @@ mod tests {
                 let raw = RawSource::open(&path)?.whole()?;
                 index.index(
                     "uncommitted-batch",
-                    &event_metadata(&Owner::from(&agent), &EventHeader::default()),
+                    &event_metadata(
+                        &Owner::from(&agent),
+                        &EventHeader::default(),
+                        NativeFormat::Jsonl,
+                    ),
                     &raw,
                 )?;
                 let mut advanced: SourceCursor =
@@ -2319,6 +2765,376 @@ mod tests {
         }
     }
 
+    /// One agent root holding every harness's native history where AnyAgents
+    /// points it, each event carrying its own needle.
+    fn every_harness_history(root: &Path) {
+        let line = |v: serde_json::Value| serde_json::to_string(&v).unwrap() + "\n";
+        let write = |rel: &str, text: String| {
+            let path = root.join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, text).unwrap();
+        };
+        crate::host_sqlite::tests::spiron_store(
+            &root.join("config/sessions.sqlite3"),
+            &[
+                r#"{"type":"text","timestamp":"2026-11-12T02:51:45Z","data":{"role":"user","content":"spironneedle 粵語問題"}}"#,
+                r#"{"type":"tool_call","timestamp":"2026-11-12T02:51:49Z","data":{"toolName":"mcp__anyagents__send","args":{"text":"spironcallneedle"},"callId":"c1"}}"#,
+                r#"{"type":"tool_result","timestamp":"2026-11-12T02:52:42Z","data":{"callId":"c1","toolName":"mcp__anyagents__send","result":"spironresultneedle"}}"#,
+            ],
+        );
+        let opencode = root.join("config/data-home/opencode/opencode.db");
+        fs::create_dir_all(opencode.parent().unwrap()).unwrap();
+        let conn = rusqlite::Connection::open(&opencode).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session_message(id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+                type TEXT NOT NULL, seq INTEGER NOT NULL, time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL, data TEXT NOT NULL);
+            INSERT INTO session_message VALUES('m1','s','user',1,1794162535171,1794162535171,
+                '{\"text\":\"opencodeneedle question\"}');
+            INSERT INTO session_message VALUES('m2','s','assistant',2,1794162535193,1794162538640,
+                '{\"content\":[{\"type\":\"tool\",\"id\":\"call_1\",\"name\":\"execute\",\"state\":{\"output\":\"opencodetoolneedle\"}}]}');",
+        )
+        .unwrap();
+        drop(conn);
+        let project = "config/projects/-work";
+        write(
+            &format!("{project}/s1.jsonl"),
+            line(
+                serde_json::json!({"type":"user","timestamp":"2026-11-01T00:00:00Z","message":{"role":"user","content":"claudeneedle"}}),
+            ),
+        );
+        write(
+            &format!("{project}/s1/subagents/agent-a1.jsonl"),
+            line(
+                serde_json::json!({"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"claudesubagentneedle"}}]}}),
+            ),
+        );
+        write(
+            "config/sessions/2026/11/03/rollout-2026-11-03T09-00-40-x.jsonl",
+            line(
+                serde_json::json!({"timestamp":"2026-11-03T09:00:41Z","type":"response_item","payload":{"type":"function_call","name":"exec","call_id":"k1","arguments":"codexneedle"}}),
+            ) + "{\"torn\":\"codextornneedle\"\n"
+                + &line(
+                    serde_json::json!({"timestamp":"2026-11-03T09:00:42Z","type":"response_item","payload":{"type":"function_call_output","call_id":"k1","output":"codexoutputneedle"}}),
+                ),
+        );
+        write(
+            "config/.gemini/antigravity-cli/brain/b1/.system_generated/logs/transcript_full.jsonl",
+            line(
+                serde_json::json!({"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","created_at":"2026-11-12T02:12:19Z","content":"agyneedle"}),
+            ),
+        );
+        // The non-full AGY transcript duplicates the full one and is not read.
+        write(
+            "config/.gemini/antigravity-cli/brain/b1/.system_generated/logs/transcript.jsonl",
+            line(serde_json::json!({"type":"USER_INPUT","content":"agyduplicateneedle"})),
+        );
+        write(
+            "config/data-home/muse/sessions/2026/11/12/m1/session.jsonl",
+            line(
+                serde_json::json!({"retained_frame":"session_permission_transaction","children":[{"record_json":"{\"payload\":\"museneedle\"}"}]}),
+            ),
+        );
+        write(
+            "config/data-home/muse/sessions/2026/11/12/m1/subagent/m2/session.jsonl",
+            line(
+                serde_json::json!({"retained_frame":"x","children":[{"record_json":"musesubagentneedle"}]}),
+            ),
+        );
+        write(
+            "config/data-home/muse/sessions/.msp-view-g1/m1/session.jsonl",
+            line(serde_json::json!({"snapshot":"musesnapshotneedle"})),
+        );
+        write(
+            "config/.omp/agent/sessions/--work--/2026-10-14T01-34-15-875Z_x.jsonl",
+            line(
+                serde_json::json!({"type":"message","timestamp":"2026-10-14T01:34:16.234Z","message":{"role":"user","content":[{"type":"text","text":"ompneedle"}]}}),
+            ),
+        );
+        write(
+            "config/.grok/sessions/%2Fwork/g1/chat_history.jsonl",
+            line(serde_json::json!({"role":"user","content":"grokneedle"})),
+        );
+    }
+
+    #[test]
+    fn every_harness_native_history_is_indexed_with_metadata_and_exact_readback() {
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(NewAgent::new("polyglot", "spiron"))
+            .unwrap();
+        let other = store
+            .create_agent(NewAgent::new("other", "spiron"))
+            .unwrap();
+        let root = dir.path().join("agents").join(agent.id.as_str());
+        every_harness_history(&root);
+        every_harness_history(&dir.path().join("agents").join(other.id.as_str()));
+        let ids = [agent.id.to_string()];
+        let find = |needle: &str| {
+            store
+                .search_host_files(
+                    &ids,
+                    MemoryScope::Transcripts,
+                    &HistorySearchQuery {
+                        query: Some(needle.into()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+        };
+        for needle in [
+            "spironneedle",
+            "spironcallneedle",
+            "spironresultneedle",
+            "opencodeneedle",
+            "opencodetoolneedle",
+            "claudeneedle",
+            "claudesubagentneedle",
+            "codexneedle",
+            "codextornneedle",
+            "codexoutputneedle",
+            "agyneedle",
+            "museneedle",
+            "musesubagentneedle",
+            "ompneedle",
+            "grokneedle",
+        ] {
+            let hits = find(needle);
+            assert_eq!(hits.len(), 1, "{needle}: {hits:?}");
+            let (hit, window) = &hits[0];
+            assert_eq!(hit.metadata.agent_id, agent.id.as_str(), "{needle}");
+            assert!(String::from_utf8_lossy(window).contains(needle), "{needle}");
+            // Every hit cites a raw coordinate that reads back exactly.
+            let (read, bytes) = store
+                .read_host_file_range(
+                    &ids,
+                    MemoryScope::Transcripts,
+                    None,
+                    HostRawRead {
+                        id: &hit.id,
+                        sha256: &hit.raw.sha256,
+                        offset: 0,
+                        length: 65536,
+                    },
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(read.raw, hit.raw, "{needle}");
+            assert_eq!(sha256(&bytes), hit.raw.sha256, "{needle}");
+        }
+        for skipped in ["agyduplicateneedle", "musesnapshotneedle"] {
+            assert!(find(skipped).is_empty(), "{skipped}");
+        }
+
+        // Metadata comes from each format's own fields.
+        let meta = |needle: &str| find(needle).remove(0).0;
+        let spiron = meta("spironneedle");
+        assert_eq!(spiron.metadata.role.as_deref(), Some("user"));
+        assert_eq!(spiron.metadata.direction, "in");
+        assert!(spiron.metadata.timestamp_ms.is_some());
+        assert!(
+            spiron
+                .raw
+                .segment
+                .ends_with("config/sessions.sqlite3/session_entries/1")
+        );
+        let result = meta("spironresultneedle");
+        assert_eq!(result.metadata.role.as_deref(), Some("tool"));
+        assert_eq!(
+            result.metadata.tool_name.as_deref(),
+            Some("mcp__anyagents__send")
+        );
+        let opencode = meta("opencodetoolneedle");
+        assert_eq!(opencode.metadata.role.as_deref(), Some("assistant"));
+        assert_eq!(opencode.metadata.timestamp_ms, Some(1794162535193));
+        assert_eq!(opencode.metadata.tool_names, vec!["execute".to_string()]);
+        let codex = meta("codexoutputneedle");
+        assert_eq!(codex.metadata.tool_name.as_deref(), Some("exec"));
+        assert!(codex.metadata.timestamp_ms.is_some());
+        assert_eq!(meta("agyneedle").metadata.role.as_deref(), Some("user"));
+        assert!(meta("agyneedle").metadata.timestamp_ms.is_some());
+        assert_eq!(
+            meta("claudesubagentneedle").metadata.tool_name.as_deref(),
+            Some("Bash")
+        );
+        // Tool filters reach store rows as they reach files.
+        let tools = store
+            .search_host_files(
+                &ids,
+                MemoryScope::Transcripts,
+                &HistorySearchQuery {
+                    query: Some("opencodetoolneedle".into()),
+                    tool_name: Some("execute".into()),
+                    only_tools: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(tools.len(), 1);
+    }
+
+    #[test]
+    fn store_rows_index_incrementally_follow_rewrites_and_rebuild_a_replaced_store() {
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store.create_agent(NewAgent::new("rows", "spiron")).unwrap();
+        let root = dir.path().join("agents").join(agent.id.as_str());
+        every_harness_history(&root);
+        let ids = [agent.id.to_string()];
+        let count = |needle: &str| {
+            store
+                .search_host_files(
+                    &ids,
+                    MemoryScope::Transcripts,
+                    &HistorySearchQuery {
+                        query: Some(needle.into()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+                .len()
+        };
+        assert_eq!(count("spironneedle"), 1);
+        let db = root.join("config/sessions.sqlite3");
+        let mut index = HostIndex::open(&dir.path().join(INDEX_FILE)).unwrap();
+        let owner = Owner::from(&agent);
+        let first = index
+            .source_cursor(agent.id.as_str(), &db)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.end, 3);
+        assert!(first.policy.starts_with("native-sqlite-v1+spiron:"));
+
+        // A live writer appends through its WAL; the next search sees it
+        // without the database file changing.
+        let writer = rusqlite::Connection::open(&db).unwrap();
+        writer
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+            .unwrap();
+        writer
+            .execute(
+                "INSERT INTO session_entries VALUES('s1',4,'{\"type\":\"text\",\"data\":{\"role\":\"assistant\",\"content\":\"appendedrowneedle\"}}')",
+                [],
+            )
+            .unwrap();
+        assert_eq!(count("appendedrowneedle"), 1);
+        let appended = index
+            .source_cursor(agent.id.as_str(), &db)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (appended.end, appended.full_verified_ms),
+            (4, first.full_verified_ms)
+        );
+
+        // OpenCode rewrites a streaming message in place: the new text is
+        // found and the old text is not.
+        let opencode = root.join("config/data-home/opencode/opencode.db");
+        let oc = rusqlite::Connection::open(&opencode).unwrap();
+        oc.execute(
+            "UPDATE session_message SET data='{\"text\":\"rewrittenneedle\"}', time_updated=1794162600000 WHERE id='m1'",
+            [],
+        )
+        .unwrap();
+        drop(oc);
+        assert_eq!(count("rewrittenneedle"), 1);
+        assert_eq!(count("opencodeneedle"), 0);
+
+        // A changed frontier row means the store was rebuilt beneath us.
+        writer
+            .execute(
+                "UPDATE session_entries SET event='{\"type\":\"done\"}' WHERE idx=4",
+                [],
+            )
+            .unwrap();
+        refresh_store_at(&mut index, &owner, &db, StoreKind::SpironSessions, false, 7).unwrap();
+        let rebuilt = index
+            .source_cursor(agent.id.as_str(), &db)
+            .unwrap()
+            .unwrap();
+        assert_eq!((rebuilt.end, rebuilt.full_verified_ms), (4, 7));
+        assert_eq!(count("appendedrowneedle"), 0);
+        assert_eq!(count("spironneedle"), 1);
+
+        // A deleted row is refused at readback by its digest.
+        let hit = store
+            .search_host_files(
+                &ids,
+                MemoryScope::Transcripts,
+                &HistorySearchQuery {
+                    query: Some("spironcallneedle".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .remove(0)
+            .0;
+        writer
+            .execute("DELETE FROM session_entries WHERE idx=2", [])
+            .unwrap();
+        assert!(crate::raw_segment::read_raw(&hit.raw).is_err());
+
+        // A store this reader does not know is not history: its earlier rows
+        // are forgotten with the walk that no longer finds it.
+        drop(writer);
+        fs::remove_file(&db).unwrap();
+        for suffix in ["-wal", "-shm"] {
+            let _ = fs::remove_file(crate::host_sqlite::tests::sibling_for_test(&db, suffix));
+        }
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute_batch("CREATE TABLE unrelated(x);")
+            .unwrap();
+        assert_eq!(count("spironneedle"), 0);
+        assert!(
+            index
+                .source_cursor(agent.id.as_str(), &db)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_redacted_or_linked_store_is_never_read() {
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(NewAgent::new("linked", "spiron"))
+            .unwrap();
+        let root = dir.path().join("agents").join(agent.id.as_str());
+        let elsewhere = dir.path().join("elsewhere");
+        every_harness_history(&elsewhere);
+        fs::create_dir_all(root.join("config/data-home/opencode")).unwrap();
+        std::os::unix::fs::symlink(
+            elsewhere.join("config/sessions.sqlite3"),
+            root.join("config/sessions.sqlite3"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            elsewhere.join("config/data-home/opencode"),
+            root.join("config/data-home/opencode/linked"),
+        )
+        .unwrap();
+        let ids = [agent.id.to_string()];
+        for needle in ["spironneedle", "opencodeneedle"] {
+            assert!(
+                store
+                    .search_host_files(
+                        &ids,
+                        MemoryScope::Transcripts,
+                        &HistorySearchQuery {
+                            query: Some(needle.into()),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap()
+                    .is_empty(),
+                "{needle}"
+            );
+        }
+    }
+
     #[test]
     fn authorized_full_text_native_in_place_and_memory_share_filters() {
         let dir = crate::test_tempdir();
@@ -2468,7 +3284,11 @@ mod tests {
         assert!(root.join("memory/MEMORY.md").is_file());
         // A dotfile left by an older binary (for example the retired
         // `.sleep-state.json`) is never a learned fact.
-        fs::write(root.join("memory/.sleep-state.json"), "{\"hiddenstateneedle\":1}").unwrap();
+        fs::write(
+            root.join("memory/.sleep-state.json"),
+            "{\"hiddenstateneedle\":1}",
+        )
+        .unwrap();
         let ids = [agent.id.to_string()];
         let hits = store
             .search_host_files(

@@ -20,6 +20,9 @@ use std::{
 
 const WINDOW_BYTES: usize = 4096;
 const OVERLAP_BYTES: usize = 256;
+/// The documents of one published source `?2`: the file itself, or each row
+/// of a native store, whose segments name rows below the store's path.
+const OF_SOURCE: &str = "(segment=?2 OR substr(segment,1,length(?2)+1)=?2||'/')";
 
 #[derive(Debug, thiserror::Error)]
 pub enum IndexError {
@@ -419,7 +422,7 @@ impl HostIndex {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         for segment in segments {
             tx.execute(
-                "DELETE FROM host_documents WHERE agent_id=?1 AND segment=?2",
+                &format!("DELETE FROM host_documents WHERE agent_id=?1 AND {OF_SOURCE}"),
                 params![owner, segment],
             )?;
             tx.execute(
@@ -485,7 +488,7 @@ impl HostIndex {
             })
             .collect::<Result<Vec<_>, _>>()?;
         due.retain(|(_, _, c)| {
-            c.policy.starts_with("native-jsonl-v4:")
+            (c.policy.starts_with("native-jsonl-v4") || c.policy.starts_with("native-sqlite-v1"))
                 && c.full_verified_ms <= now_ms.saturating_sub(3_600_000)
         });
         due.sort_by(|a, b| {
@@ -528,7 +531,7 @@ impl HostIndex {
     }
     pub(crate) fn clear_source(&self, owner: &str, path: &Path) -> Result<(), IndexError> {
         self.conn.execute(
-            "DELETE FROM host_documents WHERE agent_id=?1 AND segment=?2",
+            &format!("DELETE FROM host_documents WHERE agent_id=?1 AND {OF_SOURCE}"),
             params![owner, path.to_string_lossy()],
         )?;
         self.conn.execute(
@@ -914,6 +917,7 @@ impl HostIndex {
     ) -> Result<Vec<IndexHit>, IndexError> {
         self.search_in_segment(visible_agents, scope, query, None)
     }
+
     fn search_in_segment(
         &self,
         visible_agents: &[String],
@@ -934,14 +938,19 @@ impl HostIndex {
             .flat_map(|s| crate::tokenize_hybrid_search_tokens(s))
             .collect();
         let lexical = !terms.is_empty();
+        if let Some(segment) = segment {
+            // Sequence coordinates are local to one source: a file, or one
+            // native store whose rows each name their own segment.
+            let source = crate::host_sqlite::source_of(segment);
+            let source = source.to_string_lossy().to_string();
+            where_sql.push_str(" AND (d.segment=? OR substr(d.segment,1,length(?)+1)=?||'/')");
+            values.extend([source.clone().into(), source.clone().into(), source.into()]);
+        }
         let mut push = |clause: &str, value: Value| {
             where_sql.push_str(" AND ");
             where_sql.push_str(clause);
             values.push(value);
         };
-        if let Some(segment) = segment {
-            push("d.segment=?", segment.to_string_lossy().to_string().into());
-        }
         if let Some(agent) = query.agent.as_deref().filter(|a| *a != "all") {
             push("d.agent_id=?", agent.to_owned().into());
         }
@@ -1106,8 +1115,11 @@ impl HostIndex {
                     &neighbors,
                     Some(&hit.raw.segment),
                 )? {
-                    // Sequence coordinates are local to one segment.
-                    if neighbor.raw.segment == hit.raw.segment && ids.insert(neighbor.id.clone()) {
+                    // Sequence coordinates are local to one source.
+                    if crate::host_sqlite::source_of(&neighbor.raw.segment)
+                        == crate::host_sqlite::source_of(&hit.raw.segment)
+                        && ids.insert(neighbor.id.clone())
+                    {
                         expanded.push(neighbor);
                     }
                 }

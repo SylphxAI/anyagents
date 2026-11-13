@@ -14,6 +14,7 @@ mod host_native_metadata;
 pub mod host_retrieval;
 pub mod host_session;
 pub mod host_skills;
+mod host_sqlite;
 mod id;
 pub mod learned_memory;
 pub mod masking;
