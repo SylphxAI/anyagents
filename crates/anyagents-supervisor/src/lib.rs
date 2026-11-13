@@ -18,7 +18,7 @@ use anyagents_core::{
     Agent, AgentId, BillingMode, NewUsage, Store, Wake, agent_config_dir, agent_work_dir, utc_day,
 };
 use anyagents_harness::{
-    DeliverOutcome, DeliveryMode, Harness, SteerSupport, TurnState, TurnUsage,
+    DeliverOutcome, DeliveryMode, Harness, HarnessHealth, SteerSupport, TurnState, TurnUsage,
 };
 
 /// Maximum drain window (ms) to let an active turn finish naturally after a
@@ -35,6 +35,11 @@ const PENDING_SWITCH_DRAIN_MS: i64 = 15_000;
 /// this long before the next attempt.
 const SWITCH_RETRY_MS: i64 = 5_000;
 
+/// Operator markers in an agent's config directory: the time its provider
+/// profile was replaced, and the time its quota hold was cleared.
+const PROFILE_ROTATED: &str = ".anyagents-profile-rotated-ms";
+const QUOTA_CLEARED: &str = ".anyagents-quota-cleared-ms";
+
 /// Time source. Production uses the wall clock. Tests advance a manual clock.
 pub trait Clock: Send + Sync {
     fn now_ms(&self) -> i64;
@@ -46,13 +51,20 @@ pub trait Clock: Send + Sync {
     fn wait(&self, deadline: Option<i64>, woken: &Arc<AtomicBool>) -> bool;
     /// Wake every waiter whose flag is set. Set the flag first.
     fn poke(&self);
+    /// Set `woken` and wake the waiter that waits on it. The default sets the
+    /// flag and calls [`Clock::poke`].
+    fn wake(&self, woken: &Arc<AtomicBool>) {
+        woken.store(true, Ordering::SeqCst);
+        self.poke();
+    }
 }
 
-/// Wall clock. Each waiter parks its own thread, and [`Clock::poke`] unparks
-/// only the waiters whose flag is set: one agent's mail or vendor activity
-/// never wakes the rest of the fleet.
+/// Wall clock. Each waiter parks its own thread, and [`Clock::wake`] unparks
+/// only the waiter on that flag: one agent's mail or vendor activity never
+/// wakes, or even visits, the rest of the fleet.
 pub struct SystemClock {
-    waiters: Mutex<Vec<Waiter>>,
+    /// Parked threads by the address of the flag they wait on.
+    waiters: Mutex<HashMap<usize, Vec<Waiter>>>,
     next_waiter: AtomicU64,
 }
 
@@ -65,10 +77,14 @@ struct Waiter {
 impl SystemClock {
     pub fn new() -> Self {
         Self {
-            waiters: Mutex::new(Vec::new()),
+            waiters: Mutex::new(HashMap::new()),
             next_waiter: AtomicU64::new(0),
         }
     }
+}
+
+fn flag_key(woken: &Arc<AtomicBool>) -> usize {
+    Arc::as_ptr(woken) as usize
 }
 
 impl Default for SystemClock {
@@ -87,7 +103,8 @@ impl Clock for SystemClock {
             return true;
         }
         let id = self.next_waiter.fetch_add(1, Ordering::Relaxed);
-        lock(&self.waiters).push(Waiter {
+        let key = flag_key(woken);
+        lock(&self.waiters).entry(key).or_default().push(Waiter {
             id,
             woken: Arc::clone(woken),
             thread: thread::current(),
@@ -109,15 +126,29 @@ impl Clock for SystemClock {
             }
         };
         let mut waiters = lock(&self.waiters);
-        if let Some(at) = waiters.iter().position(|waiter| waiter.id == id) {
-            waiters.swap_remove(at);
+        if let Some(parked) = waiters.get_mut(&key) {
+            parked.retain(|waiter| waiter.id != id);
+            if parked.is_empty() {
+                waiters.remove(&key);
+            }
         }
         flagged
     }
 
     fn poke(&self) {
-        for waiter in lock(&self.waiters).iter() {
+        for waiter in lock(&self.waiters).values().flatten() {
             if waiter.woken.load(Ordering::SeqCst) {
+                waiter.thread.unpark();
+            }
+        }
+    }
+
+    fn wake(&self, woken: &Arc<AtomicBool>) {
+        woken.store(true, Ordering::SeqCst);
+        // A waiter registers before it reads the flag again, so a wake that
+        // finds nobody here is seen by the flag read.
+        if let Some(parked) = lock(&self.waiters).get(&flag_key(woken)) {
+            for waiter in parked {
                 waiter.thread.unpark();
             }
         }
@@ -217,16 +248,20 @@ pub struct LaunchRequest {
 
 pub type Launch<H> = Arc<dyn Fn(LaunchRequest) -> Result<H, String> + Send + Sync>;
 
-/// How soon a worker with an empty mailbox looks again after it last did
-/// work or was woken. One store read, so `flush` and a restarted process never
-/// leave a line waiting for an arrival.
+/// How soon a worker looks again after it handed lines over, or while a turn
+/// is open, after it last did work or was woken. One store read, so `flush`
+/// and a restarted process never leave a line waiting for an arrival.
 const IDLE_REVIEW_MS: i64 = 250;
-/// Ceiling of the idle review interval. Each review that finds nothing to do
-/// doubles the interval up to this bound; mail, vendor activity and agent
-/// wakes still end the wait at once and reset it. What only a review notices
-/// (a background command exiting before scale-to-zero, a profile rotation
-/// file) is picked up within this bound.
+/// Ceiling of the review interval while a turn is open. Each review that
+/// finds nothing to do doubles the interval up to this bound; mail, harness
+/// transitions and agent wakes end the wait at once and reset it. It covers
+/// an adapter whose turn end is only learned by asking (OpenCode's usage).
 const IDLE_REVIEW_MAX_MS: i64 = 15_000;
+/// How long a worker whose harness is idle sleeps without any event. Mail,
+/// harness transitions, agent changes and the exit of a command that held
+/// the agent awake are events; this only bounds what a lost wake hint from
+/// another process, or an operator marker written without a wake, can delay.
+const IDLE_SAFETY_NET_MS: i64 = 60_000;
 
 /// Supervisor view of one agent. Ages stay on the mailbox; this is the process.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -301,8 +336,40 @@ pub fn steer_name(steer: SteerSupport) -> &'static str {
 struct Slot {
     stop: Arc<AtomicBool>,
     woken: Arc<AtomicBool>,
-    done: Arc<AtomicBool>,
+    /// Set before `woken` when the agent row changed: the worker reads the
+    /// row again instead of on every pass.
+    agent_changed: Arc<AtomicBool>,
+    done: Arc<Finished>,
     thread: Option<JoinHandle<()>>,
+}
+
+/// Set once when a worker thread has returned; a stopper waits on it instead
+/// of spinning.
+#[derive(Default)]
+struct Finished {
+    flag: Mutex<bool>,
+    changed: Condvar,
+}
+
+impl Finished {
+    fn set(&self) {
+        *lock(&self.flag) = true;
+        self.changed.notify_all();
+    }
+
+    fn is_set(&self) -> bool {
+        *lock(&self.flag)
+    }
+
+    /// Wait up to `timeout` for the worker to return.
+    fn wait(&self, timeout: Duration) -> bool {
+        let guard = lock(&self.flag);
+        let (guard, _) = self
+            .changed
+            .wait_timeout_while(guard, timeout, |done| !*done)
+            .unwrap_or_else(|err| err.into_inner());
+        *guard
+    }
 }
 
 #[cfg(test)]
@@ -324,8 +391,15 @@ struct Inner<H> {
 pub struct Supervisor<H: Harness + 'static> {
     inner: Arc<Inner<H>>,
     wake_path: Option<PathBuf>,
-    listener: Option<JoinHandle<()>>,
+    listener: Option<WakeListener>,
     router: Option<JoinHandle<()>>,
+}
+
+/// The thread that turns other processes' wake datagrams into store wakes,
+/// and a handle on its socket so stopping it needs no receive timeout.
+struct WakeListener {
+    socket: UnixDatagram,
+    thread: JoinHandle<()>,
 }
 
 impl<H: Harness + 'static> Supervisor<H> {
@@ -386,11 +460,14 @@ impl<H: Harness + 'static> Drop for Supervisor<H> {
         };
         self.inner.clock.poke();
         self.inner.store.close_wakes();
-        if let Some(path) = &self.wake_path {
-            let _ = UnixDatagram::unbound().and_then(|sock| sock.send_to(b"x", path));
-        }
         if let Some(listener) = self.listener.take() {
-            let _ = listener.join();
+            // Either ends the blocking receive: the shutdown, or the byte if
+            // the socket still takes datagrams.
+            let _ = listener.socket.shutdown(std::net::Shutdown::Read);
+            if let Some(path) = &self.wake_path {
+                let _ = UnixDatagram::unbound().and_then(|sock| sock.send_to(b"x", path));
+            }
+            let _ = listener.thread.join();
         }
         if let Some(router) = self.router.take() {
             let _ = router.join();
@@ -401,7 +478,7 @@ impl<H: Harness + 'static> Drop for Supervisor<H> {
     }
 }
 
-fn bind_wake<H>(inner: &Arc<Inner<H>>) -> Result<(Option<PathBuf>, Option<JoinHandle<()>>), String>
+fn bind_wake<H>(inner: &Arc<Inner<H>>) -> Result<(Option<PathBuf>, Option<WakeListener>), String>
 where
     H: Harness + 'static,
 {
@@ -424,28 +501,29 @@ where
     }
     let socket = UnixDatagram::bind(&path).map_err(|err| err.to_string())?;
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).map_err(|err| err.to_string())?;
-    socket
-        .set_read_timeout(Some(Duration::from_millis(200)))
-        .map_err(|err| err.to_string())?;
+    let handle = socket.try_clone().map_err(|err| err.to_string())?;
     let listen_inner = Arc::clone(inner);
-    let listener = thread::Builder::new()
+    let thread = thread::Builder::new()
         .name("anyagents-wake".into())
         .spawn(move || listen_wake(socket, listen_inner))
         .map_err(|err| err.to_string())?;
-    Ok((Some(path), Some(listener)))
+    Ok((
+        Some(path),
+        Some(WakeListener {
+            socket: handle,
+            thread,
+        }),
+    ))
 }
 
+/// A blocking receive: the thread sleeps until a datagram arrives or the
+/// supervisor shuts the socket down.
 fn listen_wake<H: Harness>(socket: UnixDatagram, inner: Arc<Inner<H>>) {
     let mut buf = [0u8; 256];
     while !inner.stop.load(Ordering::SeqCst) {
         let count = match socket.recv(&mut buf) {
             Ok(count) => count,
-            Err(err)
-                if err.kind() == std::io::ErrorKind::TimedOut
-                    || err.kind() == std::io::ErrorKind::WouldBlock =>
-            {
-                continue;
-            }
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => break,
         };
         if count == 0 {
@@ -473,7 +551,7 @@ fn listen_wake<H: Harness>(socket: UnixDatagram, inner: Arc<Inner<H>>) {
 }
 
 fn route<H: Harness + 'static>(inner: Arc<Inner<H>>, events: Receiver<Wake>) {
-    if let Ok(agents) = inner.store.list_agents() {
+    if let Ok(agents) = inner.store.list_live_agents() {
         for agent in agents {
             if agent.state == "running" {
                 if inner.store.complete_idle_agent(&agent.id).unwrap_or(false) {
@@ -489,11 +567,13 @@ fn route<H: Harness + 'static>(inner: Arc<Inner<H>>, events: Receiver<Wake>) {
         }
         match wake {
             Wake::Mail { agent_id } => {
+                // Mail never changes the agent row: a live worker only needs
+                // waking, and reads its own mailbox. A row change that stops
+                // it arrives as `Wake::Agent`.
+                if wake_live_worker(&inner, &agent_id, false) {
+                    continue;
+                }
                 if is_running(&inner.store, &agent_id) {
-                    if let Some(slot) = lock(&inner.workers).get(&agent_id) {
-                        slot.woken.store(true, Ordering::SeqCst);
-                        inner.clock.poke();
-                    }
                     ensure(&inner, agent_id);
                 } else {
                     stop_slot(&inner, &agent_id);
@@ -501,13 +581,36 @@ fn route<H: Harness + 'static>(inner: Arc<Inner<H>>, events: Receiver<Wake>) {
             }
             Wake::Agent { agent_id } => {
                 if is_running(&inner.store, &agent_id) {
-                    ensure(&inner, agent_id);
+                    if !wake_live_worker(&inner, &agent_id, true) {
+                        ensure(&inner, agent_id);
+                    }
                 } else {
                     stop_slot(&inner, &agent_id);
                 }
             }
         }
     }
+}
+
+/// Wake the agent's worker when one is running and not stopping, marking the
+/// agent row changed when `agent_changed`. `false` when there is none.
+fn wake_live_worker<H: Harness + 'static>(
+    inner: &Arc<Inner<H>>,
+    id: &AgentId,
+    agent_changed: bool,
+) -> bool {
+    let workers = lock(&inner.workers);
+    let Some(slot) = workers
+        .get(id)
+        .filter(|slot| !slot.done.is_set() && !slot.stop.load(Ordering::SeqCst))
+    else {
+        return false;
+    };
+    if agent_changed {
+        slot.agent_changed.store(true, Ordering::SeqCst);
+    }
+    inner.clock.wake(&slot.woken);
+    true
 }
 
 fn is_running(store: &Store, id: &AgentId) -> bool {
@@ -519,13 +622,12 @@ fn stop_slot<H: Harness + 'static>(inner: &Arc<Inner<H>>, id: &AgentId) {
         let mut workers = lock(&inner.workers);
         if let Some(slot) = workers.get_mut(id) {
             slot.stop.store(true, Ordering::SeqCst);
-            slot.woken.store(true, Ordering::SeqCst);
+            inner.clock.wake(&slot.woken);
             Some(Arc::clone(&slot.done))
         } else {
             None
         }
     };
-    inner.clock.poke();
     if let Ok(agent) = inner.store.agent(id) {
         let (mode, steer) = declared(&agent.harness);
         inner.board.publish(
@@ -546,14 +648,11 @@ fn stop_slot<H: Harness + 'static>(inner: &Arc<Inner<H>>, id: &AgentId) {
         );
     }
     if let Some(done) = done {
-        let deadline = std::time::Instant::now() + Duration::from_millis(250);
-        while !done.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(5));
-        }
+        done.wait(Duration::from_millis(250));
         let finished_thread = {
             let mut workers = lock(&inner.workers);
             if let Some(slot) = workers.get_mut(id)
-                && slot.done.load(Ordering::SeqCst)
+                && slot.done.is_set()
             {
                 let thread = slot.thread.take();
                 workers.remove(id);
@@ -572,12 +671,10 @@ fn ensure<H: Harness + 'static>(inner: &Arc<Inner<H>>, id: AgentId) {
     let stopping_thread = {
         let mut workers = lock(&inner.workers);
         if let Some(slot) = workers.get_mut(&id) {
-            let finished = slot.done.load(Ordering::SeqCst);
+            let finished = slot.done.is_set();
             let stopping = slot.stop.load(Ordering::SeqCst);
             if !finished && !stopping {
-                slot.woken.store(true, Ordering::SeqCst);
-                drop(workers);
-                inner.clock.poke();
+                inner.clock.wake(&slot.woken);
                 return;
             }
             let thread = slot.thread.take();
@@ -604,17 +701,21 @@ fn ensure<H: Harness + 'static>(inner: &Arc<Inner<H>>, id: AgentId) {
     }
     let stop = Arc::new(AtomicBool::new(false));
     let woken = Arc::new(AtomicBool::new(false));
-    let done = Arc::new(AtomicBool::new(false));
+    let agent_changed = Arc::new(AtomicBool::new(true));
+    let done = Arc::new(Finished::default());
     let run_inner = Arc::clone(inner);
     let run_id = id.clone();
-    let run_stop = Arc::clone(&stop);
-    let run_woken = Arc::clone(&woken);
+    let signals = Signals {
+        stop: Arc::clone(&stop),
+        woken: Arc::clone(&woken),
+        agent_changed: Arc::clone(&agent_changed),
+    };
     let run_done = Arc::clone(&done);
     let thread = thread::Builder::new()
         .name("anyagents-agent".into())
         .spawn(move || {
-            let _ = run_agent(run_inner, run_id, run_stop, run_woken);
-            run_done.store(true, Ordering::SeqCst);
+            let _ = run_agent(run_inner, run_id, signals);
+            run_done.set();
         });
     let Ok(thread) = thread else {
         return;
@@ -624,6 +725,7 @@ fn ensure<H: Harness + 'static>(inner: &Arc<Inner<H>>, id: AgentId) {
         Slot {
             stop,
             woken,
+            agent_changed,
             done,
             thread: Some(thread),
         },
@@ -637,44 +739,30 @@ enum Boot<H: Harness> {
     Retry,
 }
 
-fn run_agent<H: Harness + 'static>(
-    inner: Arc<Inner<H>>,
-    id: AgentId,
+/// The flags a worker shares with the router.
+struct Signals {
     stop: Arc<AtomicBool>,
     woken: Arc<AtomicBool>,
-) -> bool {
+    agent_changed: Arc<AtomicBool>,
+}
+
+impl Signals {
+    #[cfg(test)]
+    fn detached() -> Self {
+        Self {
+            stop: Arc::new(AtomicBool::new(false)),
+            woken: Arc::new(AtomicBool::new(false)),
+            agent_changed: Arc::new(AtomicBool::new(true)),
+        }
+    }
+}
+
+fn run_agent<H: Harness + 'static>(inner: Arc<Inner<H>>, id: AgentId, signals: Signals) -> bool {
     let Ok(agent) = inner.store.agent(&id) else {
         return false;
     };
-    let paths = AgentPaths::from_store(&inner.store, &agent);
-    let notify = activity_notify(Arc::clone(&inner.clock), Arc::clone(&woken));
-    let mut session = Session {
-        inner,
-        id,
-        agent,
-        paths,
-        notify,
-        stop,
-        woken,
-        attempt: 0,
-        restart_at: None,
-        delivery: None,
-        served: None,
-        written: 0,
-        turns_recorded: 0,
-        pending_recovery: false,
-        completed_turn_in_session: false,
-        quota_started_at: None,
-        pending_switch_started_at: None,
-        switch_retry_at: 0,
-        process_started_at: None,
-        process_profile_rotated_ms: 0,
-        last_error: None,
-        consecutive_turn_errors: 0,
-        idle_review_ms: IDLE_REVIEW_MS,
-        process_scan_logged: false,
-    };
-    session.run()
+    let notify = activity_notify(Arc::clone(&inner.clock), Arc::clone(&signals.woken));
+    Session::new(inner, agent, notify, signals).run()
 }
 
 struct AgentPaths {
@@ -701,10 +789,7 @@ impl AgentPaths {
 }
 
 fn activity_notify(clock: Arc<dyn Clock>, woken: Arc<AtomicBool>) -> Arc<dyn Fn() + Send + Sync> {
-    Arc::new(move || {
-        woken.store(true, Ordering::SeqCst);
-        clock.poke();
-    })
+    Arc::new(move || clock.wake(&woken))
 }
 
 struct Session<H: Harness> {
@@ -715,6 +800,10 @@ struct Session<H: Harness> {
     notify: Arc<dyn Fn() + Send + Sync>,
     stop: Arc<AtomicBool>,
     woken: Arc<AtomicBool>,
+    /// Set by the router when the agent row changed.
+    agent_changed: Arc<AtomicBool>,
+    /// The agent row as last read: what the agent is configured to run.
+    configured: Option<Agent>,
     attempt: u32,
     restart_at: Option<i64>,
     delivery: Option<DeliveryLoop<H>>,
@@ -750,9 +839,61 @@ struct Session<H: Harness> {
     /// Whether the whole-process-table fallback of the in-flight check was
     /// already reported for this agent.
     process_scan_logged: bool,
+    /// Exit watch over the commands that kept an idle harness from release.
+    exit_watch: Option<ExitWatch>,
+    /// Those commands cannot be watched (no pidfd): review them on the
+    /// backoff timer instead.
+    review_children: bool,
 }
 
 impl<H: Harness + 'static> Session<H> {
+    fn new(
+        inner: Arc<Inner<H>>,
+        agent: Agent,
+        notify: Arc<dyn Fn() + Send + Sync>,
+        signals: Signals,
+    ) -> Self {
+        let paths = AgentPaths::from_store(&inner.store, &agent);
+        Self {
+            inner,
+            id: agent.id.clone(),
+            agent,
+            paths,
+            notify,
+            stop: signals.stop,
+            woken: signals.woken,
+            agent_changed: signals.agent_changed,
+            configured: None,
+            attempt: 0,
+            restart_at: None,
+            delivery: None,
+            served: None,
+            written: 0,
+            turns_recorded: 0,
+            pending_recovery: false,
+            completed_turn_in_session: false,
+            quota_started_at: None,
+            pending_switch_started_at: None,
+            switch_retry_at: 0,
+            process_started_at: None,
+            process_profile_rotated_ms: 0,
+            last_error: None,
+            consecutive_turn_errors: 0,
+            idle_review_ms: IDLE_REVIEW_MS,
+            process_scan_logged: false,
+            exit_watch: None,
+            review_children: false,
+        }
+    }
+
+    /// One read of the harness's state. A pass decides on one such snapshot,
+    /// and reads again only after it changed the harness.
+    fn harness_health(&self) -> Option<HarnessHealth> {
+        self.delivery
+            .as_ref()
+            .map(|delivery| delivery.harness().health())
+    }
+
     fn run(&mut self) -> bool {
         loop {
             if self.stop.load(Ordering::SeqCst) {
@@ -765,6 +906,7 @@ impl<H: Harness + 'static> Session<H> {
                 match self.boot() {
                     Boot::Ready(delivery) => {
                         delivery.harness().watch_activity(Arc::clone(&self.notify));
+                        self.exit_watch = None;
                         self.restart_at = None;
                         // Unknown until recover_once reads durable state successfully.
                         self.pending_recovery = true;
@@ -793,17 +935,19 @@ impl<H: Harness + 'static> Session<H> {
                 }
                 continue;
             }
-            self.publish();
+            let Some(health) = self.harness_health() else {
+                continue;
+            };
             // A changed configuration supersedes the old process's fault,
             // quota hold or restart delay before any further dispatch.
-            if self.try_apply_pending_switch() {
+            if self.try_apply_pending_switch(&health) {
                 continue;
             }
-            if self.quota_waiting() {
+            if self.quota_waiting(&health) {
                 continue;
             }
-            if !self.process_alive() {
-                self.record_usage();
+            if !health.process_alive {
+                self.record_usage_with(&health);
                 if !self.wait_backoff() {
                     self.delivery = None;
                     self.restart_at = None;
@@ -874,16 +1018,13 @@ impl<H: Harness + 'static> Session<H> {
                 return Err(format!("agent is {}", fresh.state));
             }
             self.paths = AgentPaths::from_store(&self.inner.store, &fresh);
+            self.configured = Some(fresh.clone());
             self.agent = fresh;
         }
         let _ = fs::create_dir_all(&self.paths.config_dir);
         let _ = fs::create_dir_all(&self.paths.managed_work);
         let _ = fs::create_dir_all(&self.paths.work_dir);
-        let rotated_ms =
-            fs::read_to_string(self.paths.config_dir.join(".anyagents-profile-rotated-ms"))
-                .ok()
-                .and_then(|s| s.trim().parse::<i64>().ok())
-                .unwrap_or(0);
+        let rotated_ms = self.marker_ms(PROFILE_ROTATED).unwrap_or(0);
         let res = (self.inner.launch)(LaunchRequest {
             agent: self.agent.clone(),
             data_dir: self.inner.store.data_dir().to_path_buf(),
@@ -913,9 +1054,36 @@ impl<H: Harness + 'static> Session<H> {
     }
 
     fn process_alive(&self) -> bool {
-        self.delivery
-            .as_ref()
-            .is_some_and(|delivery| delivery.harness().health().process_alive)
+        self.harness_health()
+            .is_some_and(|health| health.process_alive)
+    }
+
+    /// Publish the state this worker sleeps in, then wait for `deadline` or a
+    /// wake. `true` when a wake ended the wait.
+    fn sleep(&mut self, deadline: Option<i64>) -> bool {
+        self.publish();
+        self.inner.clock.wait(deadline, &self.woken)
+    }
+
+    /// The time an operator marker in the agent's config directory records.
+    fn marker_ms(&self, name: &str) -> Option<i64> {
+        fs::read_to_string(self.paths.config_dir.join(name))
+            .ok()
+            .and_then(|text| text.trim().parse::<i64>().ok())
+    }
+
+    /// The agent row: what the agent is configured to run. It is read again
+    /// only after the router marked it changed (`Wake::Agent`), at a process
+    /// launch, or when the idle safety net passed; `None` while it cannot be
+    /// read.
+    fn configured(&mut self) -> Option<&Agent> {
+        if self.agent_changed.swap(false, Ordering::SeqCst) || self.configured.is_none() {
+            self.configured = self.inner.store.agent(&self.id).ok();
+            if self.configured.is_none() {
+                self.agent_changed.store(true, Ordering::SeqCst);
+            }
+        }
+        self.configured.as_ref()
     }
 
     fn publish(&self) {
@@ -998,50 +1166,39 @@ impl<H: Harness + 'static> Session<H> {
             if self.stop.load(Ordering::SeqCst) {
                 return false;
             }
-            let rotated =
-                fs::read_to_string(self.paths.config_dir.join(".anyagents-profile-rotated-ms"))
-                    .ok()
-                    .and_then(|s| s.trim().parse::<i64>().ok())
-                    .is_some_and(|ms| ms >= started_at);
-            let cleared =
-                fs::read_to_string(self.paths.config_dir.join(".anyagents-quota-cleared-ms"))
-                    .ok()
-                    .and_then(|s| s.trim().parse::<i64>().ok())
-                    .is_some_and(|ms| ms >= started_at);
-            let config_switched = self.inner.store.agent(&self.id).is_ok_and(|fresh| {
-                fresh.harness != self.agent.harness || fresh.model != self.agent.model
-            });
-            if rotated || cleared || config_switched {
+            let rotated = self
+                .marker_ms(PROFILE_ROTATED)
+                .is_some_and(|ms| ms >= started_at);
+            let cleared = self
+                .marker_ms(QUOTA_CLEARED)
+                .is_some_and(|ms| ms >= started_at);
+            if rotated || cleared || self.runtime_switch_pending() == Some(true) {
                 self.attempt = 0;
                 break;
             }
-            self.inner.clock.wait(Some(deadline), &self.woken);
+            self.sleep(Some(deadline));
         }
         self.restart_at = None;
         !self.stop.load(Ordering::SeqCst)
     }
 
     fn profile_rotation_pending(&self) -> bool {
-        fs::read_to_string(self.paths.config_dir.join(".anyagents-profile-rotated-ms"))
-            .ok()
-            .and_then(|s| s.trim().parse::<i64>().ok())
+        self.marker_ms(PROFILE_ROTATED)
             .is_some_and(|ms| ms > self.process_profile_rotated_ms)
     }
 
-    fn profile_rotation_waits_for_turn(&self) -> bool {
-        self.profile_rotation_pending()
-            && self.delivery.as_ref().is_some_and(|delivery| {
-                let health = delivery.harness().health();
-                health.process_alive && health.turn_state == TurnState::InTurn
-            })
+    fn profile_rotation_waits_for_turn(&self, health: &HarnessHealth) -> bool {
+        health.process_alive
+            && health.turn_state == TurnState::InTurn
+            && self.profile_rotation_pending()
     }
 
     /// The harness or model this agent is configured for differs from the one
-    /// its process runs.
-    fn runtime_switch_pending(&self) -> bool {
-        self.inner.store.agent(&self.id).is_ok_and(|fresh| {
-            fresh.harness != self.agent.harness || fresh.model != self.agent.model
-        })
+    /// its process runs. `None` while the agent row cannot be read.
+    fn runtime_switch_pending(&mut self) -> Option<bool> {
+        let (harness, model) = (self.agent.harness.clone(), self.agent.model.clone());
+        let configured = self.configured()?;
+        Some(configured.harness != harness || configured.model != model)
     }
 
     /// Returns whether a new process took over.
@@ -1050,7 +1207,11 @@ impl<H: Harness + 'static> Session<H> {
         // active child when only a profile refresh is pending. A dead child can
         // still be recovered immediately, and an explicit harness or model
         // switch has already had its bounded drain.
-        if self.profile_rotation_waits_for_turn() && !self.runtime_switch_pending() {
+        if self
+            .harness_health()
+            .is_some_and(|health| self.profile_rotation_waits_for_turn(&health))
+            && self.runtime_switch_pending() != Some(true)
+        {
             return false;
         }
         if self.delivery.is_none() {
@@ -1070,6 +1231,7 @@ impl<H: Harness + 'static> Session<H> {
                     self.pending_recovery = true;
                     delivery.replace_harness(harness);
                 }
+                self.exit_watch = None;
                 self.served = None;
                 self.turns_recorded = 0;
                 self.restart_at = None;
@@ -1082,42 +1244,29 @@ impl<H: Harness + 'static> Session<H> {
         }
     }
 
-    fn quota_waiting(&mut self) -> bool {
-        let reset_at = self
-            .delivery
-            .as_ref()
-            .and_then(|delivery| delivery.harness().health().quota_reset_at_ms);
-        let Some(reset_at) = reset_at else {
+    fn quota_waiting(&mut self, health: &HarnessHealth) -> bool {
+        let Some(reset_at) = health.quota_reset_at_ms else {
             self.quota_started_at = None;
             return false;
         };
         let now = self.inner.clock.now_ms();
         let started_at = *self.quota_started_at.get_or_insert(now);
-        let rotated_after_start =
-            fs::read_to_string(self.paths.config_dir.join(".anyagents-profile-rotated-ms"))
-                .ok()
-                .and_then(|s| s.trim().parse::<i64>().ok())
-                .is_some_and(|ms| ms >= started_at);
-        let cleared_after_start =
-            fs::read_to_string(self.paths.config_dir.join(".anyagents-quota-cleared-ms"))
-                .ok()
-                .and_then(|s| s.trim().parse::<i64>().ok())
-                .is_some_and(|ms| ms >= started_at);
-        let config_switched = self.inner.store.agent(&self.id).is_ok_and(|fresh| {
-            fresh.harness != self.agent.harness || fresh.model != self.agent.model
-        });
+        let rotated_after_start = self
+            .marker_ms(PROFILE_ROTATED)
+            .is_some_and(|ms| ms >= started_at);
+        let cleared_after_start = self
+            .marker_ms(QUOTA_CLEARED)
+            .is_some_and(|ms| ms >= started_at);
+        let config_switched = self.runtime_switch_pending() == Some(true);
         if rotated_after_start || cleared_after_start || config_switched || now >= reset_at {
             self.quota_started_at = None;
             if let Some(delivery) = self.delivery.as_mut() {
                 delivery.clear_quota();
             }
-            if rotated_after_start || config_switched {
-                self.replace_process();
-            }
-            return false;
+            // A new process makes this pass's snapshot stale: start over.
+            return (rotated_after_start || config_switched) && self.replace_process();
         }
-        self.publish();
-        self.inner.clock.wait(Some(reset_at), &self.woken);
+        self.sleep(Some(reset_at));
         true
     }
 
@@ -1127,23 +1276,21 @@ impl<H: Harness + 'static> Session<H> {
     ///
     /// `true` when a second loop already holds the agent.
     fn deliver_once(&mut self) -> bool {
-        if self.try_apply_pending_switch() {
-            return false;
-        }
         if let Some(switch_started_at) = self.pending_switch_started_at {
             // An explicit harness or model switch is pending while the old
             // process is mid-turn: hold new mailbox messages in SQLite for the
             // replacement process instead of steering them into the old turn,
-            // and cut over at the turn boundary or at the drain deadline.
+            // and cut over at the turn boundary (a harness transition wakes
+            // this worker) or at the drain deadline.
             let deadline = switch_started_at.saturating_add(PENDING_SWITCH_DRAIN_MS);
             let now = self.inner.clock.now_ms();
             // Never busy-loop on a wait whose deadline is already past.
             let wait_until = if deadline > now {
-                deadline.min(now + 1_000)
+                deadline
             } else {
                 now + 1_000
             };
-            self.inner.clock.wait(Some(wait_until), &self.woken);
+            self.sleep(Some(wait_until));
             return false;
         }
         if self.pending_recovery
@@ -1169,6 +1316,9 @@ impl<H: Harness + 'static> Session<H> {
         match outcome {
             Ok(RunOutcome::Quota { .. }) => false,
             Ok(RunOutcome::Delivered { delivered }) => {
+                // The turn this opens may start new commands: the next idle
+                // point looks at the process tree again.
+                self.exit_watch = None;
                 // New mailbox messages just woke the session directly; any open
                 // turn from before a process restart is now superseded by them.
                 self.pending_recovery = false;
@@ -1185,32 +1335,40 @@ impl<H: Harness + 'static> Session<H> {
                 // No message was accepted on this pass (the mailbox may still
                 // contain deferred mail). Record whatever the vendor reported.
                 self.attempt = 0;
-                if !self.record_usage() {
-                    self.publish();
-                    self.inner.clock.wait(
-                        Some(self.inner.clock.now_ms() + IDLE_REVIEW_MS),
-                        &self.woken,
-                    );
+                let Some(mut health) = self.harness_health() else {
+                    return false;
+                };
+                if !self.record_usage_with(&health) {
+                    let retry_at = self.inner.clock.now_ms() + IDLE_REVIEW_MS;
+                    self.sleep(Some(retry_at));
                     return false;
                 }
-                if self.try_apply_pending_switch() {
+                if self.try_apply_pending_switch(&health) {
                     return false;
                 }
-                if self.delivery.as_ref().is_some_and(|d| {
-                    !d.harness().health().process_alive
-                        && (d.store().has_open_turn(&self.id).unwrap_or(false)
-                            || d.harness().has_unconfirmed_hold())
-                }) {
+                if !health.process_alive
+                    && self.delivery.as_ref().is_some_and(|d| {
+                        d.store().has_open_turn(&self.id).unwrap_or(false)
+                            || d.harness().has_unconfirmed_hold()
+                    })
+                {
                     if !self.wait_backoff() {
                         return false;
                     }
                     self.replace_process();
                     return false;
                 }
-                if self.pending_recovery && self.recover_once() {
-                    return false;
+                if self.pending_recovery {
+                    if self.recover_once() {
+                        return false;
+                    }
+                    // A recovery note may have opened a turn.
+                    let Some(fresh) = self.harness_health() else {
+                        return false;
+                    };
+                    health = fresh;
                 }
-                if let Some(err) = self.recoverable_mid_turn_fault() {
+                if let Some(err) = self.recoverable_mid_turn_fault(&health) {
                     self.last_error = Some(err);
                     if self.consecutive_turn_errors < 3 {
                         self.consecutive_turn_errors =
@@ -1224,10 +1382,10 @@ impl<H: Harness + 'static> Session<H> {
                     }
                     self.pending_recovery = false;
                 }
-                if self.try_release_idle_agent() {
+                if self.try_release_idle_agent(&health) {
                     return false;
                 }
-                self.idle_wait();
+                self.idle_wait(&health);
                 false
             }
             Err(anyagents_agent::Error::HarnessDown) => {
@@ -1287,19 +1445,16 @@ impl<H: Harness + 'static> Session<H> {
     /// A profile change holds no mail and never preempts a live `InTurn` child:
     /// the process keeps working and is replaced when it is next idle or faulted.
     /// A replacement that fails to launch leaves the old process serving mail.
-    fn try_apply_pending_switch(&mut self) -> bool {
-        let replaceable = {
-            let Some(delivery) = self.delivery.as_ref() else {
-                self.pending_switch_started_at = None;
-                return false;
-            };
-            let health = delivery.harness().health();
-            health.turn_state == TurnState::Idle
-                || !health.process_alive
-                || health.sign_in_fault.is_some()
-                || self.last_error.is_some()
-        };
-        let Ok(fresh) = self.inner.store.agent(&self.id) else {
+    fn try_apply_pending_switch(&mut self, health: &HarnessHealth) -> bool {
+        if self.delivery.is_none() {
+            self.pending_switch_started_at = None;
+            return false;
+        }
+        let replaceable = health.turn_state == TurnState::Idle
+            || !health.process_alive
+            || health.sign_in_fault.is_some()
+            || self.last_error.is_some();
+        let Some(runtime_changed) = self.runtime_switch_pending() else {
             return false;
         };
         let now = self.inner.clock.now_ms();
@@ -1307,13 +1462,11 @@ impl<H: Harness + 'static> Session<H> {
             self.pending_switch_started_at = None;
             return false;
         }
-        let runtime_changed =
-            fresh.harness != self.agent.harness || fresh.model != self.agent.model;
         if !runtime_changed {
             self.pending_switch_started_at = None;
             if !replaceable
                 || !self.profile_rotation_pending()
-                || self.profile_rotation_waits_for_turn()
+                || self.profile_rotation_waits_for_turn(health)
             {
                 return false;
             }
@@ -1340,13 +1493,20 @@ impl<H: Harness + 'static> Session<H> {
     /// the mailbox has drained, never holds a line back, and adds nothing while
     /// the harness has served nothing new.
     fn record_usage(&mut self) -> bool {
+        match self.harness_health() {
+            Some(health) => self.record_usage_with(&health),
+            None => true,
+        }
+    }
+
+    /// [`Session::record_usage`] against a snapshot this pass already read.
+    fn record_usage_with(&mut self, health: &HarnessHealth) -> bool {
         let Some(delivery) = self.delivery.as_ref() else {
             return true;
         };
         let served = delivery.harness().last_usage();
         let before = self.served.clone().unwrap_or_default();
         let turns_served = delivery.harness().turns_served();
-        let health = delivery.harness().health();
         let completed = (turns_served > self.turns_recorded || served != before)
             && health.turn_state == TurnState::Idle
             && health.sign_in_fault.is_none();
@@ -1395,37 +1555,24 @@ impl<H: Harness + 'static> Session<H> {
     /// child sub-agents, and its harness process has no in-flight background commands.
     /// Its config directory and session are preserved so sending any future message
     /// to the agent automatically wakes and resumes it.
-    fn try_release_idle_agent(&mut self) -> bool {
+    fn try_release_idle_agent(&mut self, health: &HarnessHealth) -> bool {
+        self.review_children = false;
         if self.last_error.is_some() {
             return false;
         }
-        let scaled = {
-            let Some(delivery) = self.delivery.as_ref() else {
-                return false;
-            };
-            let health = delivery.harness().health();
-            if health.turn_state != TurnState::Idle || health.sign_in_fault.is_some() {
-                return false;
-            }
-            let mut scanned = false;
-            let inflight =
-                harness_has_inflight_processes(delivery.harness().process_id(), &mut scanned);
-            if scanned && !self.process_scan_logged {
-                self.process_scan_logged = true;
-                eprintln!(
-                    "anyagents-supervisor: {}: /proc/<pid>/task/<tid>/children is unavailable; \
-                     idle release reads the whole process table on each review",
-                    self.id
-                );
-            }
-            if inflight {
-                return false;
-            }
+        if health.turn_state != TurnState::Idle || health.sign_in_fault.is_some() {
+            self.exit_watch = None;
+            return false;
+        }
+        if self.commands_in_flight() {
+            return false;
+        }
+        let scaled = self.delivery.as_ref().is_some_and(|delivery| {
             delivery
                 .store()
                 .complete_idle_agent(&self.id)
                 .unwrap_or(false)
-        };
+        });
         if !scaled {
             return false;
         }
@@ -1458,14 +1605,46 @@ impl<H: Harness + 'static> Session<H> {
         true
     }
 
+    /// Whether a command still runs under the idle harness. The process tree
+    /// is read once per idle point; while the commands found then still run,
+    /// it is not read again, and the exit of any of them wakes this worker.
+    fn commands_in_flight(&mut self) -> bool {
+        if self.exit_watch.as_ref().is_some_and(|watch| !watch.fired()) {
+            return true;
+        }
+        self.exit_watch = None;
+        let Some(delivery) = self.delivery.as_ref() else {
+            return false;
+        };
+        let mut scanned = false;
+        let running = harness_inflight_processes(delivery.harness().process_id(), &mut scanned);
+        if scanned && !self.process_scan_logged {
+            self.process_scan_logged = true;
+            eprintln!(
+                "anyagents-supervisor: {}: /proc/<pid>/task/<tid>/children is unavailable; \
+                 idle release reads the whole process table at each idle point",
+                self.id
+            );
+        }
+        if running.is_empty() {
+            return false;
+        }
+        match ExitWatch::start(&running, Arc::clone(&self.notify)) {
+            Ok(watch) => self.exit_watch = Some(watch),
+            // One already exited: look again on the next pass.
+            Err(WatchError::Gone) => self.woken.store(true, Ordering::SeqCst),
+            Err(WatchError::Unsupported) => self.review_children = true,
+        }
+        true
+    }
+
     /// Deliver one synthetic `[Recovery]` wake when a newly started harness
     /// process has an unfinished turn (`opened_seq > completed_seq`) and an
     /// empty mailbox. Returns `true` when the caller should re-enter the main
     /// loop immediately (e.g. after process replacement on failure).
-    fn recoverable_mid_turn_fault(&self) -> Option<String> {
+    fn recoverable_mid_turn_fault(&self, health: &HarnessHealth) -> Option<String> {
         let delivery = self.delivery.as_ref()?;
-        let health = delivery.harness().health();
-        let fault = health.sign_in_fault?;
+        let fault = health.sign_in_fault.clone()?;
         if delivery.harness().has_unconfirmed_idle_hold() {
             return Some(fault);
         }
@@ -1583,20 +1762,33 @@ impl<H: Harness + 'static> Session<H> {
         }
     }
 
-    /// Sleep through one idle review interval. A wake (mail, vendor activity,
-    /// agent change) ends it at once and resets the interval; a review that
-    /// ran out its interval with nothing to do doubles the next one, so an
-    /// idle agent's store reads and process checks fall to one per
-    /// `IDLE_REVIEW_MAX_MS` instead of four a second.
-    fn idle_wait(&mut self) {
-        let deadline = self.inner.clock.now_ms() + self.idle_review_ms;
-        self.idle_review_ms = if self.inner.clock.wait(Some(deadline), &self.woken) {
-            IDLE_REVIEW_MS
-        } else {
+    /// Sleep until something can change what this worker would do.
+    ///
+    /// An idle harness waits for an event: mail, a harness transition, an
+    /// agent change, or the exit of a command that kept it awake, bounded only
+    /// by `IDLE_SAFETY_NET_MS`. While a turn is open (or such commands cannot
+    /// be watched) it also reviews on a backoff from `IDLE_REVIEW_MS` doubling
+    /// to `IDLE_REVIEW_MAX_MS`, for an adapter that learns its turn end only by
+    /// asking; a wake resets the backoff.
+    fn idle_wait(&mut self, health: &HarnessHealth) {
+        let timed = health.turn_state == TurnState::InTurn || self.review_children;
+        let interval = if timed {
             self.idle_review_ms
-                .saturating_mul(2)
-                .min(IDLE_REVIEW_MAX_MS)
+        } else {
+            IDLE_SAFETY_NET_MS
         };
+        let deadline = self.inner.clock.now_ms() + interval;
+        if self.sleep(Some(deadline)) {
+            self.idle_review_ms = IDLE_REVIEW_MS;
+        } else if timed {
+            self.idle_review_ms = self
+                .idle_review_ms
+                .saturating_mul(2)
+                .min(IDLE_REVIEW_MAX_MS);
+        } else {
+            // A whole safety net without an event: read the agent row again.
+            self.agent_changed.store(true, Ordering::SeqCst);
+        }
     }
 
     /// Sleep until a new line arrives, unless one arrived while this pass ran:
@@ -1616,10 +1808,8 @@ impl<H: Harness + 'static> Session<H> {
         // With no line to hand over, a short timer is the backstop: a line read
         // by `flush` while this worker was restarting is picked up from the next
         // process without waiting for another arrival.
-        self.inner.clock.wait(
-            Some(self.inner.clock.now_ms() + IDLE_REVIEW_MS),
-            &self.woken,
-        );
+        let deadline = self.inner.clock.now_ms() + IDLE_REVIEW_MS;
+        self.sleep(Some(deadline));
     }
 }
 
@@ -1668,50 +1858,42 @@ fn is_transient_turn_fault(error: &str) -> bool {
     .any(|needle| lower.contains(needle))
 }
 
-/// Return `true` when `root_pid` has any non-zombie descendant process in `/proc`
-/// other than an idle persistent sidecar (`anyagents ... mcp`, `codex-code-mode-host`,
-/// or `language_server_linux`) that itself has no child processes.
-/// `true` when the harness process has a command running under it (any
-/// child other than an idle persistent sidecar). Sets `scanned` when the
-/// kernel offers no per-task `children` file and the whole process table had
-/// to be read instead.
-fn harness_has_inflight_processes(root_pid: Option<u32>, scanned: &mut bool) -> bool {
+/// The commands running under the harness process: every live child other
+/// than an idle persistent sidecar (`anyagents ... mcp`,
+/// `codex-code-mode-host`, `language_server_linux`), and every live child of
+/// a sidecar. Sets `scanned` when the kernel offers no per-task `children`
+/// file and the whole process table had to be read instead.
+fn harness_inflight_processes(root_pid: Option<u32>, scanned: &mut bool) -> Vec<u32> {
     let Some(root_pid) = root_pid.filter(|&p| p > 0) else {
-        return false;
+        return Vec::new();
     };
     #[cfg(unix)]
     {
-        // Read the harness's own subtree: a whole-/proc scan per idle review
-        // reads every process's status file on the host, per agent.
-        let children = match proc_children(root_pid) {
-            Some(children) => children,
-            None => {
-                *scanned = true;
-                return harness_has_inflight_processes_by_scan(root_pid);
-            }
+        // Read the harness's own subtree: a whole-/proc scan reads every
+        // process's status file on the host.
+        let Some(children) = proc_children(root_pid) else {
+            *scanned = true;
+            return harness_inflight_processes_by_scan(root_pid);
         };
-        for cpid in children {
-            if !proc_is_live(cpid) {
-                continue;
-            }
+        let mut running = Vec::new();
+        for cpid in children.into_iter().filter(|&pid| proc_is_live(pid)) {
             if is_persistent_sidecar(cpid) {
-                if proc_children(cpid)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .any(proc_is_live)
-                {
-                    return true;
-                }
+                running.extend(
+                    proc_children(cpid)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|&pid| proc_is_live(pid)),
+                );
             } else {
-                return true;
+                running.push(cpid);
             }
         }
-        false
+        running
     }
     #[cfg(not(unix))]
     {
         let _ = (root_pid, scanned);
-        false
+        Vec::new()
     }
 }
 
@@ -1768,9 +1950,9 @@ fn is_persistent_sidecar(pid: u32) -> bool {
 
 /// Fallback for kernels without `/proc/<pid>/task/<tid>/children`.
 #[cfg(unix)]
-fn harness_has_inflight_processes_by_scan(root_pid: u32) -> bool {
+fn harness_inflight_processes_by_scan(root_pid: u32) -> Vec<u32> {
     let Ok(entries) = fs::read_dir("/proc") else {
-        return false;
+        return Vec::new();
     };
     let mut children_of: HashMap<u32, Vec<u32>> = HashMap::new();
     for entry in entries.flatten() {
@@ -1797,22 +1979,113 @@ fn harness_has_inflight_processes_by_scan(root_pid: u32) -> bool {
             children_of.entry(ppid).or_default().push(pid);
         }
     }
-    let Some(direct_children) = children_of.get(&root_pid) else {
-        return false;
-    };
-    for &cpid in direct_children {
+    let mut running = Vec::new();
+    for &cpid in children_of.get(&root_pid).into_iter().flatten() {
         if is_persistent_sidecar(cpid) {
-            if children_of
-                .get(&cpid)
-                .is_some_and(|grandkids| !grandkids.is_empty())
-            {
-                return true;
-            }
+            running.extend(children_of.get(&cpid).into_iter().flatten().copied());
         } else {
-            return true;
+            running.push(cpid);
         }
     }
-    false
+    running
+}
+
+/// Why an exit watch was not armed.
+#[derive(Debug, PartialEq, Eq)]
+enum WatchError {
+    /// One of the processes had already exited.
+    Gone,
+    /// The kernel offers no pidfd for them.
+    Unsupported,
+}
+
+/// Waits on pidfds for any of a set of processes to exit, then calls
+/// `notify` once. Dropping the watch ends its thread without a call.
+struct ExitWatch {
+    fired: Arc<AtomicBool>,
+    /// Write end of the pipe the thread also polls: closing it on drop wakes
+    /// the thread with a hang-up.
+    _cancel: std::os::fd::OwnedFd,
+}
+
+impl ExitWatch {
+    #[cfg(target_os = "linux")]
+    fn start(pids: &[u32], notify: Arc<dyn Fn() + Send + Sync>) -> Result<Self, WatchError> {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        let mut pidfds = Vec::with_capacity(pids.len());
+        for &pid in pids {
+            let Ok(pid) = libc::pid_t::try_from(pid) else {
+                return Err(WatchError::Unsupported);
+            };
+            // SAFETY: pidfd_open takes a pid and flags and returns a new
+            // descriptor or -1.
+            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+            if fd < 0 {
+                return Err(match std::io::Error::last_os_error().raw_os_error() {
+                    Some(libc::ESRCH) => WatchError::Gone,
+                    _ => WatchError::Unsupported,
+                });
+            }
+            // SAFETY: the syscall returned a descriptor this process now owns.
+            pidfds.push(unsafe { OwnedFd::from_raw_fd(fd as i32) });
+        }
+        let mut ends = [0; 2];
+        // SAFETY: pipe2 fills both descriptors on success.
+        if unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+            return Err(WatchError::Unsupported);
+        }
+        // SAFETY: pipe2 returned two descriptors this process now owns.
+        let (cancel_rx, cancel_tx) =
+            unsafe { (OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])) };
+        let fired = Arc::new(AtomicBool::new(false));
+        let thread_fired = Arc::clone(&fired);
+        thread::Builder::new()
+            .name("anyagents-exits".into())
+            .spawn(move || {
+                let mut polled: Vec<libc::pollfd> = pidfds
+                    .iter()
+                    .chain(std::iter::once(&cancel_rx))
+                    .map(|fd| libc::pollfd {
+                        fd: fd.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    })
+                    .collect();
+                loop {
+                    // SAFETY: `polled` holds valid descriptors owned by this
+                    // thread for the whole call.
+                    let ready = unsafe {
+                        libc::poll(polled.as_mut_ptr(), polled.len() as libc::nfds_t, -1)
+                    };
+                    if ready < 0
+                        && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+                    {
+                        continue;
+                    }
+                    break;
+                }
+                let (cancel, exits) = polled.split_last().expect("cancel end polled");
+                if cancel.revents == 0 && exits.iter().any(|fd| fd.revents != 0) {
+                    thread_fired.store(true, Ordering::SeqCst);
+                    notify();
+                }
+            })
+            .map_err(|_| WatchError::Unsupported)?;
+        Ok(Self {
+            fired,
+            _cancel: cancel_tx,
+        })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn start(_pids: &[u32], _notify: Arc<dyn Fn() + Send + Sync>) -> Result<Self, WatchError> {
+        Err(WatchError::Unsupported)
+    }
+
+    /// One of the watched processes has exited.
+    fn fired(&self) -> bool {
+        self.fired.load(Ordering::SeqCst)
+    }
 }
 
 fn reap_ephemeral_dirs(config_dir: &std::path::Path, managed_work: &std::path::Path) {
@@ -2200,7 +2473,7 @@ mod tests {
         let workers = lock(&inner.workers);
         let slot = workers.get(&agent.id).unwrap();
         assert!(!slot.stop.load(Ordering::SeqCst));
-        assert!(!slot.done.load(Ordering::SeqCst));
+        assert!(!slot.done.is_set());
         drop(workers);
         drop(supervisor);
     }
@@ -2271,21 +2544,22 @@ mod tests {
             "this kernel exposes /proc/<pid>/task/<tid>/children"
         );
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while !harness_has_inflight_processes(Some(parent.id()), &mut false)
+        while harness_inflight_processes(Some(parent.id()), &mut false).is_empty()
             && std::time::Instant::now() < deadline
         {
             thread::sleep(Duration::from_millis(10));
         }
         let mut scanned = false;
-        assert!(
-            harness_has_inflight_processes(Some(parent.id()), &mut scanned),
+        assert_eq!(
+            harness_inflight_processes(Some(parent.id()), &mut scanned).len(),
+            1,
             "a running command under the harness is in flight"
         );
         assert!(
-            !harness_has_inflight_processes(Some(bare.id()), &mut scanned),
+            harness_inflight_processes(Some(bare.id()), &mut scanned).is_empty(),
             "a harness with no children has nothing in flight"
         );
-        assert!(!harness_has_inflight_processes(None, &mut scanned));
+        assert!(harness_inflight_processes(None, &mut scanned).is_empty());
         assert!(
             !scanned,
             "the subtree read must not fall back to a full scan"
@@ -2302,6 +2576,131 @@ mod tests {
         let _ = bare.kill();
         let _ = parent.wait();
         let _ = bare.wait();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_exit_watch_wakes_once_when_a_command_exits_and_never_after_drop() {
+        use std::process::Command;
+        use std::sync::mpsc;
+        let (tx, rx) = mpsc::channel();
+        let tx = Mutex::new(tx);
+        let notify: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            let _ = lock(&tx).send(());
+        });
+        let mut short = Command::new("sleep").arg("0.3").spawn().unwrap();
+        let mut long = Command::new("sleep").arg("30").spawn().unwrap();
+        let watch = match ExitWatch::start(&[short.id(), long.id()], Arc::clone(&notify)) {
+            Ok(watch) => watch,
+            // A kernel without pidfd falls back to the timed review.
+            Err(WatchError::Unsupported) => {
+                let _ = long.kill();
+                let _ = long.wait();
+                let _ = short.wait();
+                return;
+            }
+            Err(WatchError::Gone) => panic!("both commands still run"),
+        };
+        assert!(!watch.fired());
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("the exit of one watched command wakes the worker");
+        assert!(watch.fired());
+        assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
+        let _ = short.wait();
+
+        let cancelled = ExitWatch::start(&[long.id()], Arc::clone(&notify)).unwrap();
+        drop(cancelled);
+        let _ = long.kill();
+        let _ = long.wait();
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "a dropped watch never wakes the worker"
+        );
+        assert_eq!(
+            ExitWatch::start(&[long.id()], notify).err(),
+            Some(WatchError::Gone),
+            "a command that already exited is reported, not watched"
+        );
+    }
+
+    /// Records each wait's deadline and returns at once, as a deadline would.
+    struct RecordingClock {
+        now_ms: i64,
+        deadlines: Mutex<Vec<Option<i64>>>,
+    }
+
+    impl Clock for RecordingClock {
+        fn now_ms(&self) -> i64 {
+            self.now_ms
+        }
+        fn wait(&self, deadline: Option<i64>, woken: &Arc<AtomicBool>) -> bool {
+            lock(&self.deadlines).push(deadline);
+            woken.swap(false, Ordering::SeqCst)
+        }
+        fn poke(&self) {}
+    }
+
+    #[test]
+    fn an_idle_worker_waits_for_events_and_only_an_open_turn_reviews_on_a_timer() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        let agent = store
+            .create_agent(anyagents_core::NewAgent::new("worker", "contract"))
+            .unwrap();
+        let clock = Arc::new(RecordingClock {
+            now_ms: 1_700_000_000_000,
+            deadlines: Mutex::new(Vec::new()),
+        });
+        let inner = Arc::new(Inner::<anyagents_harness::FakeHarness> {
+            store: Arc::clone(&store),
+            clock: Arc::clone(&clock) as Arc<dyn Clock>,
+            launch: Arc::new(|_| Err("no launch".into())),
+            extra_env: Vec::new(),
+            board: HealthBoard::default(),
+            stop: AtomicBool::new(false),
+            workers: Mutex::new(HashMap::new()),
+            idle_release_hook: None,
+        });
+        let mut session = Session::new(inner, agent.clone(), Arc::new(|| {}), Signals::detached());
+        session.delivery = Some(
+            DeliveryLoop::start(
+                Store::open(dir.path().join("state.db")).unwrap(),
+                agent.id.clone(),
+                anyagents_harness::FakeHarness::new(DeliveryMode::Steer),
+            )
+            .unwrap(),
+        );
+        let last_deadline = || *lock(&clock.deadlines).last().unwrap();
+        let now = clock.now_ms;
+
+        // A faulted idle agent is not reviewed every few seconds forever.
+        session.last_error = Some("the last turn failed".into());
+        assert!(!session.deliver_once());
+        assert_eq!(last_deadline(), Some(now + IDLE_SAFETY_NET_MS));
+        session.last_error = None;
+
+        // Mail opens a turn; while it is open the worker reviews on a backoff.
+        store
+            .receive(&agent.id, anyagents_core::Incoming::new("work"))
+            .unwrap();
+        assert!(!session.deliver_once());
+        assert_eq!(last_deadline(), Some(now + IDLE_REVIEW_MS));
+        assert!(!session.deliver_once());
+        assert_eq!(last_deadline(), Some(now + IDLE_REVIEW_MS));
+        assert!(!session.deliver_once());
+        assert_eq!(last_deadline(), Some(now + 2 * IDLE_REVIEW_MS));
+
+        // The turn ends: an idle worker with nothing to release waits for an
+        // event again.
+        session
+            .delivery
+            .as_mut()
+            .unwrap()
+            .harness_mut()
+            .complete_turn()
+            .unwrap();
+        assert!(!session.deliver_once());
+        assert_eq!(last_deadline(), Some(now + IDLE_SAFETY_NET_MS));
     }
 
     #[test]
@@ -2363,7 +2762,6 @@ mod persistence_tests {
         let agent = store
             .create_agent(anyagents_core::NewAgent::new("worker", "contract"))
             .unwrap();
-        let paths = AgentPaths::from_store(&store, &agent);
         let make_harness = move || UsageHarness {
             inner: FakeHarness::new(DeliveryMode::Steer),
             usage: usage.clone(),
@@ -2385,32 +2783,9 @@ mod persistence_tests {
             harness,
         )
         .unwrap();
-        let mut session = Session {
-            inner,
-            id: agent.id.clone(),
-            agent,
-            paths,
-            notify: Arc::new(|| {}),
-            stop: Arc::new(AtomicBool::new(false)),
-            woken: Arc::new(AtomicBool::new(false)),
-            attempt: 0,
-            restart_at: None,
-            delivery: Some(delivery),
-            served: None,
-            written: 0,
-            turns_recorded: 0,
-            pending_recovery: true,
-            completed_turn_in_session: false,
-            quota_started_at: None,
-            pending_switch_started_at: None,
-            switch_retry_at: 0,
-            process_started_at: None,
-            process_profile_rotated_ms: 0,
-            last_error: None,
-            consecutive_turn_errors: 0,
-            idle_review_ms: IDLE_REVIEW_MS,
-            process_scan_logged: false,
-        };
+        let mut session = Session::new(inner, agent, Arc::new(|| {}), Signals::detached());
+        session.delivery = Some(delivery);
+        session.pending_recovery = true;
         store
             .receive(
                 &session.id,
@@ -2740,33 +3115,7 @@ mod persistence_tests {
             workers: Mutex::new(HashMap::new()),
             idle_release_hook: None,
         });
-        let paths = AgentPaths::from_store(&store, &agent);
-        let mut session = Session {
-            inner,
-            id: agent.id.clone(),
-            agent,
-            paths,
-            notify: Arc::new(|| {}),
-            stop: Arc::new(AtomicBool::new(false)),
-            woken: Arc::new(AtomicBool::new(false)),
-            attempt: 0,
-            restart_at: None,
-            delivery: None,
-            served: None,
-            written: 0,
-            turns_recorded: 0,
-            pending_recovery: false,
-            completed_turn_in_session: false,
-            quota_started_at: None,
-            pending_switch_started_at: None,
-            switch_retry_at: 0,
-            process_started_at: None,
-            process_profile_rotated_ms: 0,
-            last_error: None,
-            consecutive_turn_errors: 0,
-            idle_review_ms: IDLE_REVIEW_MS,
-            process_scan_logged: false,
-        };
+        let mut session = Session::new(inner, agent, Arc::new(|| {}), Signals::detached());
 
         let held = store.try_lock_agent(&session.id).unwrap();
         assert!(matches!(session.boot(), Boot::Busy));
