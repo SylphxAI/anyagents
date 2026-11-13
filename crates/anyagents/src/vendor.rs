@@ -566,12 +566,11 @@ fn read_opencode_exit_error(config_dir: &Path) -> Option<String> {
 }
 
 fn vendor_launch_inner(
-    request: LaunchRequest,
+    mut request: LaunchRequest,
     authority: Option<&anyagents_core::Store>,
 ) -> Result<VendorHarness, String> {
     // Strip any untrusted launch or authority variables from caller/stored env.
-    let mut env: Vec<(String, String)> = request
-        .extra_env
+    let mut env: Vec<(String, String)> = std::mem::take(&mut request.extra_env)
         .into_iter()
         .filter(|(k, _)| {
             !matches!(
