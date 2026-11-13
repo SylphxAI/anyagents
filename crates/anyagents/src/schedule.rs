@@ -690,7 +690,6 @@ const GUARD_WATCH_MS: i64 = 1_000;
 static FEEDS: LazyLock<Mutex<HashMap<PathBuf, Arc<tokio::sync::watch::Sender<u64>>>>> =
     LazyLock::new(Mutex::default);
 
-#[allow(dead_code, reason = "server::start_schedule_loops starts these timers")]
 fn change_feed(data_dir: &Path) -> Arc<tokio::sync::watch::Sender<u64>> {
     let mut feeds = FEEDS
         .lock()
@@ -719,7 +718,6 @@ pub fn schedules_changed(data_dir: &Path) {
 /// the turn-ownership guard), one for network-backed watches, so an in-flight
 /// external request cannot delay a local tick. Both step at once at startup,
 /// then each sleeps until its earliest due time or a schedule change.
-#[allow(dead_code, reason = "server::start_schedule_loops starts these timers")]
 pub fn start_loops(
     store: Arc<Store>,
     health: HealthBoard,
@@ -735,7 +733,6 @@ pub fn start_loops(
     (local, external)
 }
 
-#[allow(dead_code, reason = "server::start_schedule_loops starts these timers")]
 fn spawn_timer(
     store: Arc<Store>,
     health: HealthBoard,

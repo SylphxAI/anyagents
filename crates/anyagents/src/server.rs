@@ -435,8 +435,12 @@ fn mark_archive_generation_locked(store: &Store, data_dir: &Path, agent: &Agent)
         reap_queue::enqueue(data_dir, &agent.id);
     }
     if let Ok(schedules) = store.list_schedules(Some(&agent.id), true) {
+        let any = !schedules.is_empty();
         for sched in schedules {
             let _ = store.cancel_schedule(Some(&agent.id), &sched.id);
+        }
+        if any {
+            crate::schedule::schedules_changed(store.data_dir());
         }
     }
     crate::telegram::detach_archived_agent_from_telegram_groups(store, data_dir, agent, true);
@@ -576,45 +580,14 @@ pub(crate) fn clear_explicitly_archived(data_dir: &Path, agent_id: &anyagents_co
     reap_queue::dequeue(data_dir, agent_id);
 }
 
-/// Both intervals tick immediately at startup. Each loop owns its blocking
-/// pass, so an in-flight external request cannot hold the next local tick.
+/// Local timers and network watches run on separate timers, so an in-flight
+/// external request cannot hold a local tick. Each sleeps until its next due
+/// time or a schedule change.
 fn start_schedule_loops(
     store: Arc<Store>,
     health: HealthBoard,
 ) -> (tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>) {
-    let local = spawn_schedule_loop(
-        Arc::clone(&store),
-        health.clone(),
-        std::time::Duration::from_secs(1),
-        crate::schedule::tick_local_schedules_once,
-    );
-    let external = spawn_schedule_loop(
-        store,
-        health,
-        std::time::Duration::from_secs(3),
-        crate::schedule::tick_external_watches_once,
-    );
-    (local, external)
-}
-
-fn spawn_schedule_loop(
-    store: Arc<Store>,
-    health: HealthBoard,
-    period: std::time::Duration,
-    tick: fn(&Store, &HealthBoard, i64) -> usize,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(period);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            interval.tick().await;
-            let st = Arc::clone(&store);
-            let hb = health.clone();
-            if let Err(err) = tokio::task::spawn_blocking(move || tick(&st, &hb, now_ms())).await {
-                eprintln!("Schedule pass failed: {err}");
-            }
-        }
-    })
+    crate::schedule::start_loops(store, health)
 }
 
 /// How this server authenticates. A machine started without an operator token
@@ -1668,6 +1641,7 @@ async fn handle_schedule_action(
                     .store
                     .cancel_schedule(Some(&target.id), id_or_all)
                     .map_err(ApiError::from_store)?;
+                crate::schedule::schedules_changed(state.store.data_dir());
                 let schedules: Vec<crate::api::ScheduleView> = state
                     .store
                     .list_schedules(Some(&target.id), true)
@@ -8744,6 +8718,7 @@ pub(crate) mod tests {
                     watch_baseline: None,
                 })
                 .unwrap();
+            crate::schedule::schedules_changed(store.data_dir());
             loop {
                 if owners
                     .iter()
