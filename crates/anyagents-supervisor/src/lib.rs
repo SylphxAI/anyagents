@@ -294,20 +294,6 @@ impl HealthBoard {
     }
 }
 
-/// Catalog delivery when no process is up. It matches what each adapter reports
-/// while it runs.
-///
-/// Steer: Codex takes its `turn/start` while a turn is open and steers into it;
-/// Claude Code writes a new user message into the running stream-json child
-/// (acknowledged by its replay echo); OpenCode takes a prompt with `delivery: "steer"`,
-/// and its own session inbox decides whether that joins the running turn or
-/// starts the next one. Muse's app-server takes `ifBusy: "steer"` on
-/// `turn/start`.
-///
-/// Followup: the contract double (`ANYAGENTS_HARNESS_BIN`) reads one line per
-/// turn and answers with a `result`, so a line written mid-turn waits for that
-/// turn to end. AGY's stream input also starts a turn per line; its hook helpers
-/// have no wired, confirmed consumption acknowledgement.
 struct Slot {
     stop: Arc<AtomicBool>,
     woken: Arc<AtomicBool>,
