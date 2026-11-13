@@ -36,10 +36,16 @@ use crate::identity::ServingIdentity;
 use crate::operator;
 use crate::vendor::{self, VendorHarness};
 
+mod file_cache;
+#[cfg(test)]
+mod latency_tests;
 mod memory_backlog;
 mod outbound_history;
+mod profiles;
 mod quota_rotation;
 mod reap_queue;
+
+pub(crate) use profiles::ServedProfile;
 
 const SOCKET_NAME: &str = "anyagents.sock";
 /// `sockaddr_un.sun_path` holds 108 bytes, including the trailing NUL.
@@ -89,6 +95,8 @@ pub(crate) struct AppState {
     pub(crate) sign_in: Arc<Mutex<dyn CommandRunner + Send>>,
     pub(crate) auth: auth::Mode,
     pub(crate) identity: Arc<ServingIdentity>,
+    /// The last provider-profile listing, refreshed in the background.
+    pub(crate) profiles: Arc<profiles::ProfileSnapshots>,
 }
 
 /// This process's capability key. Tests name one so a server and the fixture
@@ -237,6 +245,7 @@ async fn serve(
         sign_in,
         auth,
         identity,
+        profiles: Default::default(),
     };
     let _ = boundary;
     let listener = api_listener;
@@ -675,15 +684,18 @@ async fn mint_capability(
     State(state): State<AppState>,
     AxumPath(name): AxumPath<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_admin_or_operator(&state.store, &principal, "agents.mint_capability", &name)?;
-    let agent = state
-        .store
-        .agent_by_name(&name)
-        .map_err(ApiError::from_store)?;
-    operator::mint(&state.store, &agent.id).map_err(ApiError::from_store)?;
-    Ok(Json(
-        serde_json::json!({ "agent": agent.name, "minted": true }),
-    ))
+    spawn_store(move || {
+        require_admin_or_operator(&state.store, &principal, "agents.mint_capability", &name)?;
+        let agent = state
+            .store
+            .agent_by_name(&name)
+            .map_err(ApiError::from_store)?;
+        operator::mint(&state.store, &agent.id).map_err(ApiError::from_store)?;
+        Ok(Json(
+            serde_json::json!({ "agent": agent.name, "minted": true }),
+        ))
+    })
+    .await
 }
 
 /// `GET /v1/webhooks/healthz`: unauthenticated readiness probe for the public
@@ -897,14 +909,19 @@ async fn mcp_get_route(
     headers: axum::http::HeaderMap,
     Query(query): Query<McpRouteQuery>,
 ) -> Result<axum::response::Response, ApiError> {
-    let (agent, _token) = authenticate_mcp_request(&state.store, &headers)?;
-    let config_dir = anyagents_core::agent_config_dir(state.store.data_dir(), &agent.id);
-    let profile = crate::mcp::McpProfile::resolve_http_with_config(
-        query.profile.as_deref(),
-        &agent.harness,
-        Some(&config_dir),
-    )
-    .map_err(|msg| ApiError::new(StatusCode::BAD_REQUEST, msg))?;
+    let presented = headers.clone();
+    let (agent, profile) = spawn_store(move || {
+        let (agent, _token) = authenticate_mcp_request(&state.store, &presented)?;
+        let config_dir = anyagents_core::agent_config_dir(state.store.data_dir(), &agent.id);
+        let profile = crate::mcp::McpProfile::resolve_http_with_config(
+            query.profile.as_deref(),
+            &agent.harness,
+            Some(&config_dir),
+        )
+        .map_err(|msg| ApiError::new(StatusCode::BAD_REQUEST, msg))?;
+        Ok((agent, profile))
+    })
+    .await?;
     let accept = headers
         .get(axum::http::header::ACCEPT)
         .and_then(|v| v.to_str().ok())
@@ -948,28 +965,39 @@ async fn mcp_post_route(
     Query(query): Query<McpRouteQuery>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<axum::response::Response, ApiError> {
-    let (agent, token) = authenticate_mcp_request(&state.store, &headers)?;
-    let config_dir = anyagents_core::agent_config_dir(state.store.data_dir(), &agent.id);
-    let profile = crate::mcp::McpProfile::resolve_http_with_config(
-        query.profile.as_deref(),
-        &agent.harness,
-        Some(&config_dir),
-    )
-    .map_err(|msg| ApiError::new(StatusCode::BAD_REQUEST, msg))?;
-    let sock = ensure_internal_socket_listener(&state);
-    let _ = std::fs::create_dir_all(&config_dir);
-    let mcp = crate::mcp::AgentMcp::new_for_http(
-        crate::mcp::AgentRef {
-            id: agent.id.clone(),
-            name: agent.name.clone(),
-            workdir: agent.workdir.as_deref().map(PathBuf::from),
-        },
-        sock,
-        config_dir,
-        token,
-        profile,
-    );
-    match mcp.handle_jsonrpc_request(payload).await {
+    let mcp = spawn_store(move || {
+        let (agent, token) = authenticate_mcp_request(&state.store, &headers)?;
+        let config_dir = anyagents_core::agent_config_dir(state.store.data_dir(), &agent.id);
+        let profile = crate::mcp::McpProfile::resolve_http_with_config(
+            query.profile.as_deref(),
+            &agent.harness,
+            Some(&config_dir),
+        )
+        .map_err(|msg| ApiError::new(StatusCode::BAD_REQUEST, msg))?;
+        let sock = ensure_internal_socket_listener(&state);
+        let _ = std::fs::create_dir_all(&config_dir);
+        Ok(crate::mcp::AgentMcp::new_for_http(
+            crate::mcp::AgentRef {
+                id: agent.id.clone(),
+                name: agent.name.clone(),
+                workdir: agent.workdir.as_deref().map(PathBuf::from),
+            },
+            sock,
+            config_dir,
+            token,
+            profile,
+        ))
+    })
+    .await?;
+    // A tool call mixes file, process and socket work into its async steps
+    // (`crate::mcp`), so the whole call is driven from a blocking-pool thread:
+    // whatever it waits on holds that thread, never an async worker.
+    let runtime = tokio::runtime::Handle::current();
+    let answered =
+        tokio::task::spawn_blocking(move || runtime.block_on(mcp.handle_jsonrpc_request(payload)))
+            .await
+            .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    match answered {
         Some(response_json) => Ok(axum::response::IntoResponse::into_response((
             StatusCode::OK,
             Json(response_json),
@@ -1063,15 +1091,18 @@ async fn whoami(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     match ctx.principal {
         Principal::Agent { agent_id, name } => {
-            let agent_record = state.store.agent(&agent_id).ok();
-            let workdir = agent_record.as_ref().and_then(|a| a.workdir.clone());
-            let harness = agent_record.as_ref().map(|a| a.harness.clone());
-            Ok(Json(serde_json::json!({
-                "agent_id": agent_id.as_str(),
-                "name": name,
-                "workdir": workdir,
-                "harness": harness,
-            })))
+            spawn_store(move || {
+                let agent_record = state.store.agent(&agent_id).ok();
+                let workdir = agent_record.as_ref().and_then(|a| a.workdir.clone());
+                let harness = agent_record.as_ref().map(|a| a.harness.clone());
+                Ok(Json(serde_json::json!({
+                    "agent_id": agent_id.as_str(),
+                    "name": name,
+                    "workdir": workdir,
+                    "harness": harness,
+                })))
+            })
+            .await
         }
         Principal::Operator => Err(ApiError::new(
             StatusCode::BAD_REQUEST,
@@ -1103,8 +1134,9 @@ impl axum::extract::FromRequestParts<AppState> for Whoami {
             // A machine without the boundary: the tool server says which agent
             // its own config directory belongs to, and the server checks that
             // the agent exists. Only here, and only for this read.
-            let principal =
-                auth::agent_by_name(&state.store, id.trim()).map_err(auth::AuthRejection)?;
+            let store = Arc::clone(&state.store);
+            let id = id.trim().to_string();
+            let principal = auth::off_worker(move || auth::agent_by_name(&store, &id)).await?;
             return Ok(Self { principal });
         }
         use axum::extract::FromRequestParts;
@@ -1123,12 +1155,12 @@ async fn operator_inbox(
     AxumPath(name): AxumPath<String>,
     Query(query): Query<Since>,
 ) -> Result<Json<InboxResponse>, ApiError> {
-    require_admin_or_operator(&state.store, &principal, "agents.operator_inbox", &name)?;
-    let agent = state
-        .store
-        .agent_by_name(&name)
-        .map_err(ApiError::from_store)?;
     spawn_store(move || {
+        require_admin_or_operator(&state.store, &principal, "agents.operator_inbox", &name)?;
+        let agent = state
+            .store
+            .agent_by_name(&name)
+            .map_err(ApiError::from_store)?;
         inbox_of(
             &state.store,
             &agent.id,
@@ -1188,29 +1220,32 @@ async fn set_admin_route(
     Json(body): Json<AdminRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_operator(&principal)?;
-    let agent = state
-        .store
-        .agent_by_name(&name)
-        .map_err(ApiError::from_store)?;
-    state
-        .store
-        .set_agent_admin(&agent.id, body.admin)
-        .map_err(ApiError::from_store)?;
-    state
-        .store
-        .record_admin_audit(
-            "operator",
-            if body.admin {
-                "agents.grant_admin"
-            } else {
-                "agents.revoke_admin"
-            },
-            &agent.name,
-        )
-        .map_err(ApiError::from_store)?;
-    Ok(Json(
-        serde_json::json!({"agent": agent.name, "admin": body.admin}),
-    ))
+    spawn_store(move || {
+        let agent = state
+            .store
+            .agent_by_name(&name)
+            .map_err(ApiError::from_store)?;
+        state
+            .store
+            .set_agent_admin(&agent.id, body.admin)
+            .map_err(ApiError::from_store)?;
+        state
+            .store
+            .record_admin_audit(
+                "operator",
+                if body.admin {
+                    "agents.grant_admin"
+                } else {
+                    "agents.revoke_admin"
+                },
+                &agent.name,
+            )
+            .map_err(ApiError::from_store)?;
+        Ok(Json(
+            serde_json::json!({"agent": agent.name, "admin": body.admin}),
+        ))
+    })
+    .await
 }
 
 // Socket requests carry secret values, never host filesystem paths.
@@ -1301,6 +1336,8 @@ async fn harness_route(
             body.profile.as_deref(),
         )
         .map_err(ApiError::from_store)?;
+        // The agent's profile binding may have moved.
+        state.profiles.invalidate(&state.store);
         Ok(Json(out))
     })
     .await
@@ -1703,37 +1740,37 @@ async fn model_route(
     AxumPath(name): AxumPath<String>,
     Json(body): Json<ModelRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let actor = require_admin_or_operator(&state.store, &principal, "agents.model", &name)?;
-    let agent = state
-        .store
-        .agent_by_name(&name)
-        .map_err(ApiError::from_store)?;
-    if body.profile.is_some() && (body.key.is_some() || body.base_url.is_some()) {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "profile cannot be combined with a key or base URL",
-        ));
-    }
-    if body.key.is_none() && body.base_url.is_none() {
-        let has_harness = body
-            .harness
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|s| !s.is_empty());
-        let has_model = body
-            .model
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|s| !s.is_empty());
-        let has_profile = body
-            .profile
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|s| !s.is_empty());
-        if !has_harness && !has_model && !has_profile {
-            return Err(ApiError::new(StatusCode::BAD_REQUEST, "model is required"));
+    spawn_store(move || {
+        let actor = require_admin_or_operator(&state.store, &principal, "agents.model", &name)?;
+        let agent = state
+            .store
+            .agent_by_name(&name)
+            .map_err(ApiError::from_store)?;
+        if body.profile.is_some() && (body.key.is_some() || body.base_url.is_some()) {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "profile cannot be combined with a key or base URL",
+            ));
         }
-        return spawn_store(move || {
+        if body.key.is_none() && body.base_url.is_none() {
+            let has_harness = body
+                .harness
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|s| !s.is_empty());
+            let has_model = body
+                .model
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|s| !s.is_empty());
+            let has_profile = body
+                .profile
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|s| !s.is_empty());
+            if !has_harness && !has_model && !has_profile {
+                return Err(ApiError::new(StatusCode::BAD_REQUEST, "model is required"));
+            }
             let out = create::configure_agent_runtime(
                 &state.store,
                 state.store.data_dir(),
@@ -1744,32 +1781,34 @@ async fn model_route(
                 body.profile.as_deref(),
             )
             .map_err(ApiError::from_store)?;
-            Ok(Json(out))
-        })
-        .await;
-    }
-    let model_str = body
-        .model
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "model is required"))?;
-    let key = body.key.as_deref().unwrap_or("").trim();
-    if key.is_empty() || key.contains(char::is_whitespace) {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "a nonempty single-line key is required",
-        ));
-    }
-    let base_url = body
-        .base_url
-        .as_deref()
-        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "base URL is required"))?;
-    crate::gateway::store_key(state.store.data_dir(), &agent, base_url, model_str, key)
-        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "could not bind provider key"))?;
-    Ok(Json(
-        serde_json::json!({"agent": agent.name, "model": model_str}),
-    ))
+            // The agent's profile binding may have moved.
+            state.profiles.invalidate(&state.store);
+            return Ok(Json(out));
+        }
+        let model_str = body
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "model is required"))?;
+        let key = body.key.as_deref().unwrap_or("").trim();
+        if key.is_empty() || key.contains(char::is_whitespace) {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "a nonempty single-line key is required",
+            ));
+        }
+        let base_url = body
+            .base_url
+            .as_deref()
+            .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "base URL is required"))?;
+        crate::gateway::store_key(state.store.data_dir(), &agent, base_url, model_str, key)
+            .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "could not bind provider key"))?;
+        Ok(Json(
+            serde_json::json!({"agent": agent.name, "model": model_str}),
+        ))
+    })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -1914,27 +1953,41 @@ async fn profile_models_route(
     State(state): State<AppState>,
     Query(query): Query<ProfileModelsQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_admin_or_operator(&state.store, &principal, "profiles.models", "profiles")?;
-    let data = state.store.data_dir().to_path_buf();
-    let prof = query.profile;
     spawn_store(move || {
+        require_admin_or_operator(&state.store, &principal, "profiles.models", "profiles")?;
         Ok(Json(create::probe_profile_models_catalog(
-            &data,
-            prof.as_deref(),
+            state.store.data_dir(),
+            query.profile.as_deref(),
         )))
     })
     .await
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct ProfilesQuery {
+    /// Answer with a listing made after this call rather than the snapshot.
+    #[serde(default)]
+    fresh: Option<bool>,
+}
+
+/// `GET /v1/profiles`: the last listing at once, each entry marked with the
+/// age of its usage reading; see [`profiles`].
 async fn profiles_route(
     principal: Principal,
     State(state): State<AppState>,
-) -> Result<Json<Vec<create::ProviderProfileEntry>>, ApiError> {
-    require_admin_or_operator(&state.store, &principal, "profiles.list", "profiles")?;
-    Ok(Json(create::list_provider_profiles_fast(
-        &state.store,
-        state.store.data_dir(),
-    )))
+    Query(query): Query<ProfilesQuery>,
+) -> Result<Json<Vec<ServedProfile>>, ApiError> {
+    let store = Arc::clone(&state.store);
+    spawn_store(move || {
+        require_admin_or_operator(&store, &principal, "profiles.list", "profiles").map(drop)
+    })
+    .await?;
+    state
+        .profiles
+        .list(&state.store, query.fresh.unwrap_or(false))
+        .await
+        .map(Json)
+        .map_err(|why| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, why))
 }
 
 #[derive(Deserialize)]
@@ -1949,21 +2002,25 @@ async fn set_profile_route(
     State(state): State<AppState>,
     Json(body): Json<SetProfileRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_admin_or_operator(&state.store, &principal, "profiles.set", &body.profile)?;
-    let (provider, profile) =
-        create::set_provider_profile(state.store.data_dir(), &body.profile, &body.key)
-            .map_err(ApiError::from_store)?;
-    Ok(Json(serde_json::json!({
-        "provider": provider,
-        "profile": profile,
-    })))
+    spawn_store(move || {
+        require_admin_or_operator(&state.store, &principal, "profiles.set", &body.profile)?;
+        let (provider, profile) =
+            create::set_provider_profile(state.store.data_dir(), &body.profile, &body.key)
+                .map_err(ApiError::from_store)?;
+        state.profiles.invalidate(&state.store);
+        Ok(Json(serde_json::json!({
+            "provider": provider,
+            "profile": profile,
+        })))
+    })
+    .await
 }
 
 async fn get_subagent_defaults_route(
     _principal: Principal,
     State(state): State<AppState>,
 ) -> Result<Json<create::SubagentDefaultsConfig>, ApiError> {
-    Ok(Json(create::load_subagent_defaults(state.store.data_dir())))
+    spawn_store(move || Ok(Json(create::load_subagent_defaults(state.store.data_dir())))).await
 }
 
 #[derive(Deserialize)]
@@ -1982,50 +2039,54 @@ async fn set_subagent_defaults_route(
     State(state): State<AppState>,
     Json(body): Json<SetSubagentDefaultsRequest>,
 ) -> Result<Json<create::SubagentDefaultsConfig>, ApiError> {
-    let target_label = body.agent.as_deref().unwrap_or("global");
-    require_admin_or_operator(
-        &state.store,
-        &principal,
-        "subagents.set_default",
-        target_label,
-    )?;
-    let mut cfg = create::load_subagent_defaults(state.store.data_dir());
-    if body.clear.unwrap_or(false) {
-        if let Some(ref ag) = body.agent {
-            cfg.agents.remove(ag.trim());
+    spawn_store(move || {
+        let target_label = body.agent.as_deref().unwrap_or("global");
+        require_admin_or_operator(
+            &state.store,
+            &principal,
+            "subagents.set_default",
+            target_label,
+        )?;
+        let mut cfg = create::load_subagent_defaults(state.store.data_dir());
+        if body.clear.unwrap_or(false) {
+            if let Some(ref ag) = body.agent {
+                cfg.agents.remove(ag.trim());
+            } else {
+                cfg.default = create::SubagentDefaultSpec {
+                    mode: "inherit".to_string(),
+                    harness: None,
+                    model: None,
+                    profile: None,
+                };
+            }
         } else {
-            cfg.default = create::SubagentDefaultSpec {
-                mode: "inherit".to_string(),
-                harness: None,
-                model: None,
-                profile: None,
+            let spec = create::SubagentDefaultSpec {
+                mode: body.mode,
+                harness: body
+                    .harness
+                    .as_deref()
+                    .map(anyagents_harness::normalize_harness_name)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string),
+                model: body.model.filter(|s| !s.trim().is_empty()),
+                profile: body.profile.filter(|s| !s.trim().is_empty()),
             };
-        }
-    } else {
-        let spec = create::SubagentDefaultSpec {
-            mode: body.mode,
-            harness: body
-                .harness
+            if let Some(ag) = body
+                .agent
                 .as_deref()
-                .map(anyagents_harness::normalize_harness_name)
+                .map(str::trim)
                 .filter(|s| !s.is_empty())
-                .map(str::to_string),
-            model: body.model.filter(|s| !s.trim().is_empty()),
-            profile: body.profile.filter(|s| !s.trim().is_empty()),
-        };
-        if let Some(ag) = body
-            .agent
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            cfg.agents.insert(ag.to_string(), spec);
-        } else {
-            cfg.default = spec;
+            {
+                cfg.agents.insert(ag.to_string(), spec);
+            } else {
+                cfg.default = spec;
+            }
         }
-    }
-    create::save_subagent_defaults(state.store.data_dir(), &cfg).map_err(ApiError::from_store)?;
-    Ok(Json(cfg))
+        create::save_subagent_defaults(state.store.data_dir(), &cfg)
+            .map_err(ApiError::from_store)?;
+        Ok(Json(cfg))
+    })
+    .await
 }
 
 #[derive(Deserialize, Default)]
@@ -2306,42 +2367,45 @@ async fn channels_route(
     principal: Principal,
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_admin_or_operator(&state.store, &principal, "channels.list", "channels")?;
-    let channels: Vec<_> = state
-        .store
-        .list_channels()
-        .map_err(ApiError::from_store)?
-        .into_iter()
-        .map(|c| {
-            let mem = anyagents_channel_telegram::Memory::try_from_state(&c.state)
-                .map_err(ApiError::from_store)?;
-            let bot_username = c
-                .identity
-                .clone()
-                .or_else(|| {
-                    mem.bot
-                        .as_deref()
-                        .and_then(|b| b.split_once(':').map(|(_, u)| u.to_string()))
-                })
-                .map(|u| {
-                    let clean = u.trim().trim_start_matches('@');
-                    format!("@{clean}")
-                });
-            let agents: Vec<String> = c
-                .agents
-                .iter()
-                .filter_map(|id| state.store.agent(id).ok().map(|a| a.name))
-                .collect();
-            Ok(serde_json::json!({
-                "id": c.id.to_string(),
-                "kind": c.kind,
-                "bot": bot_username,
-                "agents": agents,
-                "pending_managed_bots": mem.pending_managed_bots,
-            }))
-        })
-        .collect::<Result<Vec<_>, ApiError>>()?;
-    Ok(Json(serde_json::json!({"channels": channels})))
+    spawn_store(move || {
+        require_admin_or_operator(&state.store, &principal, "channels.list", "channels")?;
+        let channels: Vec<_> = state
+            .store
+            .list_channels()
+            .map_err(ApiError::from_store)?
+            .into_iter()
+            .map(|c| {
+                let mem = anyagents_channel_telegram::Memory::try_from_state(&c.state)
+                    .map_err(ApiError::from_store)?;
+                let bot_username = c
+                    .identity
+                    .clone()
+                    .or_else(|| {
+                        mem.bot
+                            .as_deref()
+                            .and_then(|b| b.split_once(':').map(|(_, u)| u.to_string()))
+                    })
+                    .map(|u| {
+                        let clean = u.trim().trim_start_matches('@');
+                        format!("@{clean}")
+                    });
+                let agents: Vec<String> = c
+                    .agents
+                    .iter()
+                    .filter_map(|id| state.store.agent(id).ok().map(|a| a.name))
+                    .collect();
+                Ok(serde_json::json!({
+                    "id": c.id.to_string(),
+                    "kind": c.kind,
+                    "bot": bot_username,
+                    "agents": agents,
+                    "pending_managed_bots": mem.pending_managed_bots,
+                }))
+            })
+            .collect::<Result<Vec<_>, ApiError>>()?;
+        Ok(Json(serde_json::json!({"channels": channels})))
+    })
+    .await
 }
 
 fn default_channel_kind() -> String {
@@ -3019,13 +3083,15 @@ pub(crate) fn roster_views(
         }
     }
     let mut metadata = store.agent_query_metadata().map_err(ApiError::from_store)?;
-    let seats = crate::sandbox::roster_seats();
+    let files = file_cache::cache();
+    files.catch_up();
+    let seats = view_seats(files);
     let mut agents = Vec::with_capacity(selected.len());
     for agent in all_agents {
         if !selected.contains(agent.id.as_str()) {
             continue;
         }
-        let view = agent_view_preloaded(store, health, agent, Some(&mut metadata), Some(&seats))?;
+        let view = agent_view_preloaded(store, health, agent, Some(&mut metadata), &seats)?;
         agents.push(view);
     }
     Ok(AgentsResponse {
@@ -3065,12 +3131,62 @@ pub(crate) fn compute_block_reason(
     None
 }
 
-/// A millisecond timestamp an operator or rotation marker holds; 0 when absent.
-fn read_ms_marker(path: &Path) -> i64 {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|s| s.trim().parse::<i64>().ok())
-        .unwrap_or(0)
+/// The marker files an agent view shows, all in the agent's config directory.
+const LAST_ERROR: &str = ".anyagents-last-error.json";
+const PROFILE_ROTATED: &str = ".anyagents-profile-rotated-ms";
+const QUOTA_CLEARED: &str = ".anyagents-quota-cleared-ms";
+const NOTIFIED_PARENT: &str = ".anyagents-notified-parent-error.json";
+const BOUND_PROFILE: &str = ".anyagents-profile";
+
+/// One agent's marker files, as the view cache holds them.
+struct Markers<'a> {
+    files: &'a file_cache::FileCache,
+    cfg: &'a Path,
+}
+
+impl Markers<'_> {
+    fn read(&self, name: &str) -> Option<std::sync::Arc<str>> {
+        self.files.file(&self.cfg.join(name))
+    }
+
+    /// A millisecond timestamp an operator or rotation marker holds; 0 when
+    /// absent.
+    fn ms(&self, name: &str) -> i64 {
+        self.read(name)
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .unwrap_or(0)
+    }
+
+    /// [`create::bound_profile_name`] from the cached marker.
+    fn bound_profile(&self) -> Option<String> {
+        self.read(BOUND_PROFILE)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Whether [`create::maybe_notify_parent_on_error`] would act for this
+    /// error: the same early returns and the same episode key it compares with
+    /// the notice marker. Only then does the view call it, and it re-checks
+    /// both files before it writes or sends anything.
+    fn parent_notice_due(&self, agent: &Agent, rotated_ms: i64, err_msg: &str) -> bool {
+        let trimmed = err_msg.trim();
+        if agent.parent_id.is_none()
+            || trimmed.is_empty()
+            || crate::host_memory::is_migration_wait(trimmed)
+        {
+            return false;
+        }
+        let source_key = format!(
+            "subagent-error:{}:{rotated_ms}:{trimmed}",
+            agent.id.as_str()
+        );
+        !self
+            .read(NOTIFIED_PARENT)
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+            .is_some_and(|val| {
+                val.get("source_key").and_then(|v| v.as_str()) == Some(source_key.as_str())
+            })
+    }
 }
 
 /// The quota reset and fault text an adapter or the launcher last persisted in
@@ -3079,18 +3195,18 @@ fn read_ms_marker(path: &Path) -> i64 {
 /// clears its record. Claude Code persists no reset, so only its text counts.
 fn persisted_fault(
     harness: &str,
-    cfg: &Path,
+    markers: &Markers<'_>,
     rotated_ms: i64,
     now: i64,
 ) -> (Option<i64>, Option<String>) {
-    let Some(record) = std::fs::read_to_string(cfg.join(".anyagents-last-error.json"))
-        .ok()
+    let Some(record) = markers
+        .read(LAST_ERROR)
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
     else {
         return (None, None);
     };
     let floor = if harness == "agy" {
-        rotated_ms.max(read_ms_marker(&cfg.join(".anyagents-quota-cleared-ms")))
+        rotated_ms.max(markers.ms(QUOTA_CLEARED))
     } else {
         rotated_ms
     };
@@ -3164,17 +3280,34 @@ pub(crate) fn agent_view(
     health: &HealthBoard,
     agent: &Agent,
 ) -> Result<AgentView, ApiError> {
-    agent_view_preloaded(store, health, agent, None, None)
+    let files = file_cache::cache();
+    files.catch_up();
+    agent_view_preloaded(store, health, agent, None, &view_seats(files))
 }
 
 type RosterSeats = HashMap<String, (String, u32, u32, u32)>;
+
+/// [`crate::sandbox::roster_seats`], kept by the view cache: the admitted
+/// principals come from the environment or from the registry file it names.
+fn view_seats(files: &file_cache::FileCache) -> std::sync::Arc<RosterSeats> {
+    let registry = std::env::var_os("ANYAGENTS_PRINCIPAL_REGISTRY").map(PathBuf::from);
+    match registry {
+        Some(registry) if std::env::var("ANYAGENTS_PRINCIPALS").is_err() => files.fact(
+            format!("seats:{}", registry.display()),
+            file_cache::Dep::File(registry),
+            || std::sync::Arc::new(crate::sandbox::roster_seats()),
+        ),
+        // Read from the environment, or nothing to read.
+        _ => std::sync::Arc::new(crate::sandbox::roster_seats()),
+    }
+}
 
 fn agent_view_preloaded(
     store: &Store,
     health: &HealthBoard,
     agent: &Agent,
     mut metadata: Option<&mut anyagents_core::AgentQueryMetadata>,
-    seats: Option<&RosterSeats>,
+    seats: &RosterSeats,
 ) -> Result<AgentView, ApiError> {
     if agent.state == "archived" {
         let mut view = archived_agent_view_fast(agent);
@@ -3207,11 +3340,13 @@ fn agent_view_preloaded(
             .map_err(ApiError::from_store)?
     };
     let cfg = anyagents_core::agent_config_dir(store.data_dir(), &agent.id);
-    let rotated_ms = read_ms_marker(&cfg.join(".anyagents-profile-rotated-ms"));
+    let files = file_cache::cache();
+    let markers = Markers { files, cfg: &cfg };
+    let rotated_ms = markers.ms(PROFILE_ROTATED);
     // The supervisor's board is the live state; a fault outlives its process
     // only as the record an adapter persisted. A view never reads a vendor
     // transcript, log or session store.
-    let (session_quota, session_error) = persisted_fault(&agent.harness, &cfg, rotated_ms, now);
+    let (session_quota, session_error) = persisted_fault(&agent.harness, &markers, rotated_ms, now);
     let (
         process,
         mut turn_state,
@@ -3290,7 +3425,11 @@ fn agent_view_preloaded(
             )
         }
     };
-    if let Some(reset_ms) = quota.filter(|&ms| ms > now) {
+    // Rotation rewrites the agent's profile markers; an agent whose creation
+    // is in flight or failed is never written to from a view.
+    if agent.state != "created"
+        && let Some(reset_ms) = quota.filter(|&ms| ms > now)
+    {
         quota_rotation::queue(&agent.id, reset_ms);
     }
     if (agent.state == "running" || agent.state == "idle") && quota.is_none_or(|ms| ms <= now) {
@@ -3300,9 +3439,11 @@ fn agent_view_preloaded(
             } else {
                 "errored"
             };
-            create::maybe_notify_parent_on_error(store, agent, &cfg, err_msg);
-        } else {
-            let _ = std::fs::remove_file(cfg.join(".anyagents-notified-parent-error.json"));
+            if markers.parent_notice_due(agent, rotated_ms, err_msg) {
+                create::maybe_notify_parent_on_error(store, agent, &cfg, err_msg);
+            }
+        } else if markers.read(NOTIFIED_PARENT).is_some() {
+            let _ = std::fs::remove_file(cfg.join(NOTIFIED_PARENT));
         }
     }
     let block_reason = compute_block_reason(quota, last_error.as_deref(), now);
@@ -3340,13 +3481,9 @@ fn agent_view_preloaded(
     } else {
         store.agent_aliases(&agent.id).unwrap_or_default()
     };
-    let seat_info = if let Some(seats) = seats {
-        seats
-            .get(agent.id.as_str())
-            .map(|(user, uid, gid, _)| (user.clone(), *uid, *gid, None))
-    } else {
-        create::resolved_agent_seat_info(store, agent)
-    };
+    let seat_info = seats
+        .get(agent.id.as_str())
+        .map(|(user, uid, gid, _)| (user.clone(), *uid, *gid));
     let schedules = if let Some(metadata) = metadata.as_mut() {
         metadata
             .schedules
@@ -3363,7 +3500,7 @@ fn agent_view_preloaded(
     Ok(AgentView {
         has_open_turn,
         open_turn_age_ms,
-        profile: create::bound_profile_name(&cfg),
+        profile: markers.bound_profile(),
         id: agent.id.to_string(),
         name: agent.name.clone(),
         role: agent.role.clone(),
@@ -3389,32 +3526,55 @@ fn agent_view_preloaded(
         block_reason,
         last_error,
         oldest_undelivered_age_ms,
-        install: install_state(store, agent),
+        install: install_state(store, files, agent),
         description: agent.public_description(),
         instructions: agent.instructions.clone(),
-        seat_user: seat_info.as_ref().map(|(u, _, _, _)| u.clone()),
-        seat_uid: seat_info.as_ref().map(|(_, uid, _, _)| *uid),
-        seat_gid: seat_info.as_ref().map(|(_, _, gid, _)| *gid),
+        seat_user: seat_info.as_ref().map(|(u, _, _)| u.clone()),
+        seat_uid: seat_info.as_ref().map(|(_, uid, _)| *uid),
+        seat_gid: seat_info.as_ref().map(|(_, _, gid)| *gid),
         schedules,
     })
 }
 
 /// `installed` once this harness is on the machine, `needed` when the reason it
 /// is not, `pending` when nothing has been recorded yet.
-fn install_state(store: &Store, agent: &Agent) -> String {
+fn install_state(store: &Store, files: &file_cache::FileCache, agent: &Agent) -> String {
     match crate::install::recorded(&agent.harness) {
         Some(Ok(())) => "installed".to_string(),
         Some(Err(reason)) => reason,
         None => {
-            if crate::install::is_healthy(store.data_dir(), &agent.harness)
-                || crate::install::program(store.data_dir(), &agent.harness).is_file()
-            {
+            if installed_on_disk(files, store.data_dir(), &agent.harness) {
                 "installed".to_string()
             } else {
                 "pending".to_string()
             }
         }
     }
+}
+
+/// Whether a harness this server has not recorded is on disk: its managed
+/// receipt or launcher, all under `<root>/harnesses/<id>/`. The deprecated
+/// `ANYAGENTS_<ID>_BIN` override names a program outside that tree, so it is
+/// checked directly.
+fn installed_on_disk(files: &file_cache::FileCache, root: &Path, harness: &str) -> bool {
+    let harness = anyagents_harness::normalize_harness_name(harness).to_string();
+    let check = {
+        let root = root.to_path_buf();
+        let harness = harness.clone();
+        move || {
+            crate::install::is_healthy(&root, &harness)
+                || crate::install::program(&root, &harness).is_file()
+        }
+    };
+    let override_var = format!("ANYAGENTS_{}_BIN", harness.to_uppercase().replace('-', "_"));
+    if std::env::var_os(override_var).is_some() {
+        return check();
+    }
+    files.fact(
+        format!("installed:{}:{harness}", root.display()),
+        file_cache::Dep::Dir(root.join("harnesses").join(&harness)),
+        check,
+    )
 }
 
 async fn create_agent_route(
@@ -4590,34 +4750,34 @@ async fn inbox(
     // An agent's `inbox` is strictly its own incoming queue. To inspect another
     // agent's full two-way communication (`in` + `out` with users, groups, and
     // peers), agents use `/v1/agents/{name}/conversation`.
-    let agent_id = match &principal {
-        Principal::Operator => {
-            state
-                .store
-                .agent_by_name(&name)
-                .map_err(ApiError::from_store)?
-                .id
-        }
-        Principal::Agent {
-            agent_id,
-            name: own_name,
-        } => {
-            let matches_self = name == "self"
-                || name == agent_id.as_str()
-                || name == own_name.as_str()
-                || state
+    spawn_store(move || {
+        let agent_id = match &principal {
+            Principal::Operator => {
+                state
                     .store
                     .agent_by_name(&name)
-                    .is_ok_and(|a| a.id == *agent_id);
-            if !matches_self {
-                return Err(ApiError::forbidden(
-                    "a session reads its own inbox, not another agent's; use conversation to read another agent's conversation",
-                ));
+                    .map_err(ApiError::from_store)?
+                    .id
             }
-            agent_id.clone()
-        }
-    };
-    spawn_store(move || {
+            Principal::Agent {
+                agent_id,
+                name: own_name,
+            } => {
+                let matches_self = name == "self"
+                    || name == agent_id.as_str()
+                    || name == own_name.as_str()
+                    || state
+                        .store
+                        .agent_by_name(&name)
+                        .is_ok_and(|a| a.id == *agent_id);
+                if !matches_self {
+                    return Err(ApiError::forbidden(
+                        "a session reads its own inbox, not another agent's; use conversation to read another agent's conversation",
+                    ));
+                }
+                agent_id.clone()
+            }
+        };
         inbox_of(
             &state.store,
             &agent_id,
@@ -5329,72 +5489,67 @@ async fn send(
     // On a machine without the boundary, its own agent route names the sender;
     // that is the one place a body chooses the author, and an inbox is still
     // only ever its own.
-    let route_named = match &principal {
-        Principal::Agent { name, .. } if state.auth.is_trusted() => body
-            .sender
-            .as_deref()
-            .and_then(|named| Actor::parse(named).ok())
-            .filter(|named| named.as_address() != Actor::Agent(name.clone()).as_address()),
-        _ => None,
-    };
-    let actor = match (&principal, route_named) {
-        (_, Some(named)) => named,
-        (Principal::Agent { agent_id, name }, None) => {
-            if let Some(named) = body.sender.as_deref() {
-                Actor::parse(named).and_then(|named| {
-                    let matches_self = named.as_address()
-                        == Actor::Agent(name.clone()).as_address()
-                        || match &named {
-                            Actor::Agent(n) => state
-                                .store
-                                .agent_by_name(n)
-                                .is_ok_and(|a| a.id == *agent_id),
-                            _ => false,
-                        };
-                    if matches_self {
-                        Ok(())
-                    } else {
-                        Err(ApiError::forbidden(
-                            "a session sends as itself, not as the sender it names",
-                        ))
-                    }
-                })?;
+    spawn_store(move || {
+        let route_named = match &principal {
+            Principal::Agent { name, .. } if state.auth.is_trusted() => body
+                .sender
+                .as_deref()
+                .and_then(|named| Actor::parse(named).ok())
+                .filter(|named| named.as_address() != Actor::Agent(name.clone()).as_address()),
+            _ => None,
+        };
+        let actor = match (&principal, route_named) {
+            (_, Some(named)) => named,
+            (Principal::Agent { agent_id, name }, None) => {
+                if let Some(named) = body.sender.as_deref() {
+                    Actor::parse(named).and_then(|named| {
+                        let matches_self = named.as_address()
+                            == Actor::Agent(name.clone()).as_address()
+                            || match &named {
+                                Actor::Agent(n) => state
+                                    .store
+                                    .agent_by_name(n)
+                                    .is_ok_and(|a| a.id == *agent_id),
+                                _ => false,
+                            };
+                        if matches_self {
+                            Ok(())
+                        } else {
+                            Err(ApiError::forbidden(
+                                "a session sends as itself, not as the sender it names",
+                            ))
+                        }
+                    })?;
+                }
+                Actor::Agent(name.clone())
             }
-            Actor::Agent(name.clone())
-        }
-        (Principal::Operator, _) => {
-            let sender = body.sender.as_deref().ok_or_else(|| {
-                ApiError::new(
-                    StatusCode::BAD_REQUEST,
-                    "an operator send needs an explicit sender",
-                )
-            })?;
-            Actor::parse(sender)?
-        }
-    };
-    let body = SendRequest {
-        sender: Some(actor.as_address()),
-        ..body
-    };
-    let store = Arc::clone(&state.store);
-    let principal_for_plan = principal.clone();
-    let actor_for_plan = actor.clone();
-    let body_for_plan = body.clone();
-    let plan = spawn_store(move || {
-        plan_send(&store, &principal_for_plan, &actor_for_plan, &body_for_plan)
+            (Principal::Operator, _) => {
+                let sender = body.sender.as_deref().ok_or_else(|| {
+                    ApiError::new(
+                        StatusCode::BAD_REQUEST,
+                        "an operator send needs an explicit sender",
+                    )
+                })?;
+                Actor::parse(sender)?
+            }
+        };
+        let body = SendRequest {
+            sender: Some(actor.as_address()),
+            ..body
+        };
+        let plan = plan_send(&state.store, &principal, &actor, &body)?;
+        let key_body = SendRequest {
+            sender: plan
+                .sender_id
+                .as_ref()
+                .map(|id| format!("agent:{id}"))
+                .or_else(|| body.sender.clone()),
+            ..body.clone()
+        };
+        let key = send_key(&key_body);
+        send_sync(&state.store, &actor, body, plan, key)
     })
-    .await?;
-    let key_body = SendRequest {
-        sender: plan
-            .sender_id
-            .as_ref()
-            .map(|id| format!("agent:{id}"))
-            .or_else(|| body.sender.clone()),
-        ..body.clone()
-    };
-    let key = send_key(&key_body);
-    let store = Arc::clone(&state.store);
-    spawn_store(move || send_sync(&store, &actor, body, plan, key)).await
+    .await
 }
 
 async fn interact_route(
@@ -8185,6 +8340,7 @@ pub(crate) mod tests {
                 data_dir: dir.path().into(),
             },
             identity: Arc::new(ServingIdentity::capture()),
+            profiles: Default::default(),
         };
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let principal = |a: &Agent| Principal::Agent {
@@ -8299,6 +8455,7 @@ pub(crate) mod tests {
                 data_dir: dir.path().into(),
             },
             identity: Arc::new(ServingIdentity::capture()),
+            profiles: Default::default(),
         };
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let principal = || Principal::Agent { agent_id: parent.id.clone(), name: parent.name.clone() };
@@ -8384,6 +8541,7 @@ pub(crate) mod tests {
                 data_dir: dir.path().into(),
             },
             identity: Arc::new(ServingIdentity::capture()),
+            profiles: Default::default(),
         };
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
@@ -8497,6 +8655,7 @@ pub(crate) mod tests {
             health: HealthBoard::default(),
             sign_in: Arc::new(Mutex::new(ProcessRunner)),
             identity: Arc::new(ServingIdentity::capture()),
+            profiles: Default::default(),
             auth: auth::Mode::Trusted {
                 data_dir: dir.path().to_path_buf(),
             },
@@ -8599,6 +8758,7 @@ pub(crate) mod tests {
             health: HealthBoard::default(),
             sign_in: Arc::new(Mutex::new(ProcessRunner)),
             identity: Arc::new(ServingIdentity::capture()),
+            profiles: Default::default(),
             auth: auth::Mode::Trusted {
                 data_dir: dir.path().into(),
             },
@@ -9337,6 +9497,7 @@ pub(crate) mod tests {
             health: HealthBoard::default(),
             sign_in: Arc::new(Mutex::new(ProcessRunner)),
             identity: Arc::new(ServingIdentity::capture()),
+            profiles: Default::default(),
             auth: auth::Mode::Trusted {
                 data_dir: dir.path().into(),
             },
@@ -10161,6 +10322,7 @@ exec '{}' "$@"
             health: HealthBoard::default(),
             sign_in: Arc::new(Mutex::new(ProcessRunner)),
             identity: Arc::new(ServingIdentity::capture()),
+            profiles: Default::default(),
             auth: auth::Mode::Trusted {
                 data_dir: dir.path().into(),
             },
@@ -10302,6 +10464,7 @@ exec '{}' "$@"
             health: HealthBoard::default(),
             sign_in: Arc::new(Mutex::new(ProcessRunner)),
             identity: Arc::new(ServingIdentity::capture()),
+            profiles: Default::default(),
             auth: auth::Mode::Trusted {
                 data_dir: data.into(),
             },

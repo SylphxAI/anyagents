@@ -1014,7 +1014,9 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
                 list_harnesses(&data);
                 Ok(())
             }
-            HarnessesCommand::Profiles { harness } => list_profiles_cmd(&data, harness.as_deref()),
+            HarnessesCommand::Profiles { harness } => {
+                list_profiles_cmd(&data, harness.as_deref(), false)
+            }
             HarnessesCommand::Update { harness } => update_harnesses_cmd(&data, harness.as_deref()),
         },
         Command::Profiles {
@@ -2087,10 +2089,13 @@ fn profiles_cmd(
         }
         Some("refresh") | Some("reset") => {
             create::force_refresh_provider_profiles(data, target)?;
-            if let Ok(store) = anyagents_core::Store::open(data.join("state.db")) {
+            // A server lists afresh itself; without one, sync here first.
+            if !client::can_call_server(data)
+                && let Ok(store) = anyagents_core::Store::open(data.join("state.db"))
+            {
                 let _ = create::sync_and_list_provider_profiles(&store, data);
             }
-            list_profiles_cmd(data, target)
+            list_profiles_cmd(data, target, true)
         }
         Some("models") | Some("catalog") => {
             let catalogs = if client::can_call_server(data) {
@@ -2125,8 +2130,8 @@ fn profiles_cmd(
                 .unwrap_or("claude-code");
             sign_in(data, prof_target, None)
         }
-        Some("list") => list_profiles_cmd(data, target),
-        other => list_profiles_cmd(data, other),
+        Some("list") => list_profiles_cmd(data, target, false),
+        other => list_profiles_cmd(data, other, false),
     }
 }
 
@@ -2437,7 +2442,14 @@ fn apply_local_subagent_default(
     }
 }
 
-fn list_profiles_cmd(data: &Path, filter: Option<&str>) -> Result<(), anyagents_core::Error> {
+/// `profiles`: the server's snapshot when a server answers, which costs no
+/// probe; otherwise a listing made here, probing every provider inline.
+/// `fresh` asks the server for a listing made after this call.
+fn list_profiles_cmd(
+    data: &Path,
+    filter: Option<&str>,
+    fresh: bool,
+) -> Result<(), anyagents_core::Error> {
     let filter = filter.filter(|f| {
         let t = f.trim();
         !t.is_empty()
@@ -2445,31 +2457,28 @@ fn list_profiles_cmd(data: &Path, filter: Option<&str>) -> Result<(), anyagents_
             && !t.eq_ignore_ascii_case("refresh")
             && !t.eq_ignore_ascii_case("reset")
     });
-    let mut entries = if let Ok(store) = anyagents_core::Store::open(data.join("state.db")) {
-        create::list_provider_profiles_fast(&store, data)
-    } else if client::can_call_server(data) {
-        match client::call::<Vec<create::ProviderProfileEntry>>(
-            data,
-            "GET",
-            "/v1/profiles",
-            None,
-            &client::authority(data),
-        ) {
-            Ok(Some(list)) => list,
-            Ok(None) => {
-                return Err(anyagents_core::Error::Message(
-                    "the server answered nothing".into(),
-                ));
-            }
-            Err(err) => return Err(anyagents_core::Error::Message(err)),
-        }
+    let path = if fresh {
+        "/v1/profiles?fresh=true"
     } else {
-        let store = anyagents_core::Store::open(data.join("state.db"))?;
-        create::list_provider_profiles_fast(&store, data)
+        "/v1/profiles"
     };
-    if entries.iter().any(|e| e.usage.is_none()) {
-        create::enrich_profiles_usage(data, &mut entries);
-    }
+    let (entries, usage_age_ms): (Vec<create::ProviderProfileEntry>, Option<i64>) =
+        match client::get::<Vec<server::ServedProfile>>(data, path)
+            .map_err(anyagents_core::Error::Message)?
+        {
+            Some(served) => {
+                let age = served.iter().filter_map(|s| s.usage_age_ms).max();
+                (served.into_iter().map(|s| s.entry).collect(), age)
+            }
+            None => {
+                let store = anyagents_core::Store::open(data.join("state.db"))?;
+                let mut entries = create::list_provider_profiles_fast(&store, data);
+                if entries.iter().any(|e| e.usage.is_none()) {
+                    create::enrich_profiles_usage(data, &mut entries);
+                }
+                (entries, None)
+            }
+        };
     let matches_filter = |e: &create::ProviderProfileEntry, f_trimmed: &str| -> bool {
         e.provider == f_trimmed
             || e.profile == f_trimmed
@@ -2483,6 +2492,12 @@ fn list_profiles_cmd(data: &Path, filter: Option<&str>) -> Result<(), anyagents_
         .into_iter()
         .filter(|e| filter.is_none_or(|f| matches_filter(e, f.trim())))
         .collect();
+    if let Some(age) = usage_age_ms {
+        eprintln!(
+            "usage as of {} ago; the server refreshes it in the background",
+            age_text(age)
+        );
+    }
     if ui::is_pretty() {
         ui::print_profiles_pretty(&filtered);
         return Ok(());
@@ -2505,6 +2520,16 @@ fn list_profiles_cmd(data: &Path, filter: Option<&str>) -> Result<(), anyagents_
         );
     }
     Ok(())
+}
+
+/// A short age: `42s`, `3m 05s`, `2h 10m`.
+fn age_text(ms: i64) -> String {
+    let secs = ms.max(0) / 1000;
+    match secs {
+        0..60 => format!("{secs}s"),
+        60..3600 => format!("{}m {:02}s", secs / 60, secs % 60),
+        _ => format!("{}h {:02}m", secs / 3600, secs % 3600 / 60),
+    }
 }
 
 fn interact_cmd(
