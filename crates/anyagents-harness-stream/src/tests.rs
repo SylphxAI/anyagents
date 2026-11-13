@@ -1491,6 +1491,7 @@ fn confirmed_turn_completion_clears_marker_and_error_artifacts() {
     assert!(!harness.has_unconfirmed_hold());
 }
 
+#[cfg(target_os = "linux")]
 fn plain_message(id: &str) -> anyagents_harness::OutboundMessage {
     anyagents_harness::OutboundMessage {
         id: id.into(),
@@ -1503,6 +1504,7 @@ fn plain_message(id: &str) -> anyagents_harness::OutboundMessage {
     }
 }
 
+#[cfg(target_os = "linux")]
 /// Counts the activity watcher's calls.
 fn counted_watch(harness: &super::StreamHarness) -> std::sync::mpsc::Receiver<()> {
     let (tx, rx) = std::sync::mpsc::channel();

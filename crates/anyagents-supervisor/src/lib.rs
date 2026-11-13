@@ -2000,7 +2000,8 @@ fn harness_inflight_processes_by_scan(root_pid: u32) -> Vec<u32> {
 /// Why an exit watch was not armed.
 #[derive(Debug, PartialEq, Eq)]
 enum WatchError {
-    /// One of the processes had already exited.
+    /// One of the processes had already exited. Only pidfds report it.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Gone,
     /// The kernel offers no pidfd for them.
     Unsupported,

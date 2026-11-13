@@ -7,8 +7,9 @@
 //! the maintenance worker visits only agents that did something, and an idle
 //! fleet costs it no per-agent work.
 
-use std::collections::HashSet;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use anyagents_core::{AgentId, Store, Wake};
 
@@ -17,7 +18,21 @@ pub(crate) struct MemoryBacklog {
     agents: Mutex<HashSet<AgentId>>,
 }
 
-static BACKLOG: OnceLock<Arc<MemoryBacklog>> = OnceLock::new();
+/// One backlog per data directory this process serves.
+static BACKLOGS: LazyLock<Mutex<HashMap<PathBuf, Arc<MemoryBacklog>>>> =
+    LazyLock::new(Mutex::default);
+
+fn backlog_for(data_dir: &Path, create: bool) -> Option<Arc<MemoryBacklog>> {
+    let mut backlogs = BACKLOGS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if create {
+        return Some(Arc::clone(
+            backlogs.entry(data_dir.to_path_buf()).or_default(),
+        ));
+    }
+    backlogs.get(data_dir).cloned()
+}
 
 impl MemoryBacklog {
     fn lock(&self) -> std::sync::MutexGuard<'_, HashSet<AgentId>> {
@@ -43,7 +58,7 @@ impl MemoryBacklog {
 
 /// The daemon's backlog: seeded with the live fleet and fed by store wakes.
 pub(crate) fn start(store: &Store) -> Arc<MemoryBacklog> {
-    let backlog = Arc::clone(BACKLOG.get_or_init(Arc::default));
+    let backlog = backlog_for(store.data_dir(), true).expect("created on demand");
     for agent in store.list_live_agents().unwrap_or_default() {
         backlog.mark(&agent.id);
     }
@@ -64,9 +79,10 @@ pub(crate) fn start(store: &Store) -> Arc<MemoryBacklog> {
     backlog
 }
 
-/// An API write changed this agent's memory. A no-op where no daemon runs.
-pub(crate) fn mark(agent_id: &AgentId) {
-    if let Some(backlog) = BACKLOG.get() {
+/// An API write changed this agent's memory. A no-op where no daemon serves
+/// `data_dir`.
+pub(crate) fn mark(data_dir: &Path, agent_id: &AgentId) {
+    if let Some(backlog) = backlog_for(data_dir, false) {
         backlog.mark(agent_id);
     }
 }

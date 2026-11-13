@@ -4817,7 +4817,7 @@ async fn conversation_route(
                 .store
                 .lock_agent_lifecycle(&target.id)
                 .map_err(ApiError::from_store)?;
-            memory_backlog::mark(&target.id);
+            memory_backlog::mark(state.store.data_dir(), &target.id);
             let agent_root = state
                 .store
                 .data_dir()
