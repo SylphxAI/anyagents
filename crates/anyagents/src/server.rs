@@ -2008,6 +2008,7 @@ async fn set_profile_route(
             create::set_provider_profile(state.store.data_dir(), &body.profile, &body.key)
                 .map_err(ApiError::from_store)?;
         state.profiles.invalidate(&state.store);
+        quota_rotation::profiles_changed(Some(provider.as_str()));
         Ok(Json(serde_json::json!({
             "provider": provider,
             "profile": profile,
