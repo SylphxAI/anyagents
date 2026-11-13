@@ -1194,9 +1194,12 @@ impl Harness for OpenCodeHarness {
             }
             Some(Prompt::Applied) => return Ok(DeliverOutcome::Duplicate),
             Some(Prompt::Rejected(reason)) => {
-                return Ok(DeliverOutcome::Rejected {
-                    reason: reason.clone(),
-                });
+                // A 409 names this line's id, held by another record; a size
+                // refusal is this line's own. A 400 may be every line's.
+                let message_specific = reason.contains("(HTTP 409)")
+                    || reason.contains("(HTTP 413)")
+                    || anyagents_harness::names_message_size(reason);
+                return Ok(DeliverOutcome::rejected(reason.clone(), message_specific));
             }
             _ => {}
         }

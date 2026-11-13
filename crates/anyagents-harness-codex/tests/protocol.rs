@@ -431,7 +431,7 @@ fn an_input_codex_refuses_for_good_is_parked_and_never_written_again() {
     let mut poison = msg("m1");
     poison.text = "x".repeat((1 << 20) + 1);
     let rejected = settle(&mut harness, &poison);
-    let DeliverOutcome::Rejected { reason } = &rejected else {
+    let DeliverOutcome::Rejected { reason, .. } = &rejected else {
         panic!("not parked: {rejected:?}");
     };
     assert!(reason.contains("-32602"), "{reason}");

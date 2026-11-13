@@ -554,10 +554,10 @@ impl Harness for ClaudeHarness {
                 return Err(HarnessError::Dead);
             }
             // The running process's verdict; a new process may take it.
+            // Claude Code does not say why it refused: a reason that may
+            // hold for every line.
             if let Some(reason) = state.rejected.get(id) {
-                return Ok(DeliverOutcome::Rejected {
-                    reason: reason.clone(),
-                });
+                return Ok(DeliverOutcome::rejected(reason.clone(), false));
             }
             if let Some(reset_at_ms) = state.quota_reset_at_ms
                 && !state.finished.contains(id)

@@ -738,9 +738,7 @@ impl StreamHarness {
             return Ok(proof_outcome(proof));
         }
         if let Some(reason) = lock(&self.shared).rejected.get(id) {
-            return Ok(DeliverOutcome::Rejected {
-                reason: reason.clone(),
-            });
+            return Ok(spiron_rejected(reason));
         }
         if self.spec.protocol == LineProtocol::AcknowledgedResult {
             let state = lock(&self.shared);
@@ -1522,9 +1520,7 @@ impl State {
     /// (never written, or returned for writing again).
     fn consumption_outcome(&self, id: &str) -> Option<Result<DeliverOutcome, HarnessError>> {
         if let Some(reason) = self.rejected.get(id) {
-            return Some(Ok(DeliverOutcome::Rejected {
-                reason: reason.clone(),
-            }));
+            return Some(Ok(spiron_rejected(reason)));
         }
         if self.consumed.contains(id) {
             return Some(Ok(if self.duplicates.contains(id) {
@@ -2412,6 +2408,12 @@ enum SpironRefusal {
     /// not start does, and a refusal that outlasts the lease fails the
     /// process with this reason, which the host shows.
     Unknown(String),
+}
+
+/// A Spiron refusal for good: `empty_prompt` is this input's own, the other
+/// codes may hold for every input.
+fn spiron_rejected(reason: &str) -> DeliverOutcome {
+    DeliverOutcome::rejected(reason, reason.ends_with("empty_prompt"))
 }
 
 fn spiron_refusal(value: &Value) -> SpironRefusal {

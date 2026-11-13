@@ -78,8 +78,9 @@ pub struct DeliveryLoop<H: Harness> {
     last_rejection: Option<String>,
 }
 
-/// More refusals than this in one pass are a vendor that refuses everything:
-/// the breaker stops parking and fails the harness instead.
+/// More refusals than this in one pass, of reasons that are not one
+/// message's own, are a vendor that refuses everything: the breaker stops
+/// parking and fails the harness instead.
 pub const MAX_REJECTIONS_PER_PASS: u32 = 2;
 
 impl<H: Harness> DeliveryLoop<H> {
@@ -180,7 +181,19 @@ impl<H: Harness> DeliveryLoop<H> {
                     | DeliverOutcome::InFlight
                     | DeliverOutcome::Rejected { .. },
                 ) if behind.is_some() => behind = Some(seq),
-                Ok(DeliverOutcome::Rejected { reason }) => {
+                // A reason of this message alone (its size, its content)
+                // is parked at once and never trips the breaker: two
+                // oversize messages are two parked messages.
+                Ok(DeliverOutcome::Rejected {
+                    reason,
+                    message_specific: true,
+                }) => {
+                    self.reject(&message, &reason)?;
+                }
+                Ok(DeliverOutcome::Rejected {
+                    reason,
+                    message_specific: false,
+                }) => {
                     // A breaker: a vendor that refuses message after message
                     // for one reason refuses everything. That is the
                     // harness's fault, not the mail's; nothing more is parked.
@@ -857,6 +870,64 @@ mod tests {
             RunOutcome::Delivered { delivered: 1 }
         );
         assert_eq!(loop_.delivered_cursor().unwrap(), seqs[2]);
+        assert_eq!(loop_.store().rejected_messages(&id).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn oversize_messages_are_each_parked_and_never_trip_the_breaker() {
+        let (_dir, mut loop_, id) = setup(DeliveryMode::Steer);
+        let seqs: Vec<i64> = ["huge one", "huge two", "huge three", "fine"]
+            .iter()
+            .map(|text| recv(loop_.store(), &id, text))
+            .collect();
+        let ids: Vec<String> = loop_
+            .store()
+            .inbox(&id, None)
+            .unwrap()
+            .into_iter()
+            .map(|message| message.id.as_str().to_string())
+            .collect();
+        for message in &ids[..3] {
+            loop_
+                .harness_mut()
+                .refuse_this_message(message, "-32002 inputTooLarge");
+        }
+        // Three refusals of the same reason in one pass, each the message's
+        // own: three parked messages, and the mail behind them flows.
+        assert_eq!(
+            loop_.run_once().unwrap(),
+            RunOutcome::Delivered { delivered: 1 }
+        );
+        assert_eq!(loop_.delivered_cursor().unwrap(), seqs[3]);
+        assert_eq!(loop_.store().rejected_messages(&id).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn a_systemic_refusal_still_trips_the_breaker_after_an_oversize_one() {
+        let (_dir, mut loop_, id) = setup(DeliveryMode::Steer);
+        let seqs: Vec<i64> = ["huge", "one", "two"]
+            .iter()
+            .map(|text| recv(loop_.store(), &id, text))
+            .collect();
+        let ids: Vec<String> = loop_
+            .store()
+            .inbox(&id, None)
+            .unwrap()
+            .into_iter()
+            .map(|message| message.id.as_str().to_string())
+            .collect();
+        loop_
+            .harness_mut()
+            .refuse_this_message(&ids[0], "-32002 inputTooLarge");
+        for message in &ids[1..] {
+            loop_
+                .harness_mut()
+                .refuse_forever(message, "-32602 invalid params");
+        }
+        // The oversize one is parked; the first systemic refusal is parked
+        // too, the second, for the same reason, trips the breaker.
+        assert!(matches!(loop_.run_once(), Err(Error::HarnessFailed(_))));
+        assert_eq!(loop_.delivered_cursor().unwrap(), seqs[1]);
         assert_eq!(loop_.store().rejected_messages(&id).unwrap().len(), 2);
     }
 

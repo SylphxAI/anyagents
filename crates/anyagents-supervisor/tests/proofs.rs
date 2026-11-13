@@ -95,9 +95,7 @@ impl Harness for Scripted {
             return Err(HarnessError::Dead);
         }
         if let Some(reason) = process.refused.get(&message.id) {
-            return Ok(DeliverOutcome::Rejected {
-                reason: reason.clone(),
-            });
+            return Ok(DeliverOutcome::rejected(reason.clone(), false));
         }
         if let Some(reset_at_ms) = process.quota_reset_at_ms {
             return Ok(DeliverOutcome::Quota { reset_at_ms });

@@ -31,8 +31,9 @@ pub struct FakeHarness {
     quota_reset_at_ms: Option<i64>,
     auto_finish: bool,
     resumed: Vec<String>,
-    /// Ids the vendor refuses for good, with its reason.
-    refused: HashMap<String, String>,
+    /// Ids the vendor refuses for good, with its reason and whether it
+    /// belongs to that message alone.
+    refused: HashMap<String, (String, bool)>,
 }
 
 impl FakeHarness {
@@ -56,9 +57,18 @@ impl FakeHarness {
         }
     }
 
-    /// The vendor refuses `id` for good whenever it is offered.
+    /// The vendor refuses `id` for good whenever it is offered, for a
+    /// reason that might hold for every message.
     pub fn refuse_forever(&mut self, id: &str, reason: &str) {
-        self.refused.insert(id.to_string(), reason.to_string());
+        self.refused
+            .insert(id.to_string(), (reason.to_string(), false));
+    }
+
+    /// The vendor refuses `id` for good for a reason of that message alone
+    /// (its size, its content).
+    pub fn refuse_this_message(&mut self, id: &str, reason: &str) {
+        self.refused
+            .insert(id.to_string(), (reason.to_string(), true));
     }
 
     /// Later `deliver` calls fail and write nothing.
@@ -170,10 +180,8 @@ impl Harness for FakeHarness {
         if !self.alive {
             return Err(HarnessError::Dead);
         }
-        if let Some(reason) = self.refused.get(&message.id) {
-            return Ok(DeliverOutcome::Rejected {
-                reason: reason.clone(),
-            });
+        if let Some((reason, message_specific)) = self.refused.get(&message.id) {
+            return Ok(DeliverOutcome::rejected(reason.clone(), *message_specific));
         }
         if let Some(reset_at_ms) = self.quota_reset_at_ms {
             return Ok(DeliverOutcome::Quota { reset_at_ms });

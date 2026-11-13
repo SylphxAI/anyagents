@@ -844,7 +844,8 @@ fn immediate_rejection_before_post_write_is_rejected_without_replay() {
         assert_eq!(
             harness.deliver(&message, &line).unwrap(),
             anyagents_harness::DeliverOutcome::Rejected {
-                reason: "spiron rejected the input: unknown_command".into()
+                reason: "spiron rejected the input: unknown_command".into(),
+                message_specific: false,
             }
         );
     }

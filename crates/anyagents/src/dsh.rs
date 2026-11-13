@@ -317,9 +317,13 @@ impl Harness for DshHarness {
                 });
             }
             Some(Prompt::Rejected(reason)) => {
-                return Ok(DeliverOutcome::Rejected {
-                    reason: reason.clone(),
-                });
+                // Its content or attachment, or a body too large: this
+                // line's own. A malformed call may be every line's.
+                let message_specific = reason.contains("gateway/input-invalid")
+                    || reason.contains("session/attachment-invalid")
+                    || reason.contains("HTTP 413")
+                    || anyagents_harness::names_message_size(reason);
+                return Ok(DeliverOutcome::rejected(reason.clone(), message_specific));
             }
             _ => {}
         }
@@ -1425,7 +1429,7 @@ mod tests {
         let (port, seen) = scripted(vec![refusal("gateway/input-invalid")]);
         let mut harness = harness_on(port);
         let line = message("msg_poison");
-        let Ok(DeliverOutcome::Rejected { reason }) = settle(&mut harness, &line) else {
+        let Ok(DeliverOutcome::Rejected { reason, .. }) = settle(&mut harness, &line) else {
             panic!("not rejected");
         };
         assert!(reason.contains("gateway/input-invalid"), "{reason}");
@@ -1433,7 +1437,8 @@ mod tests {
             assert_eq!(
                 harness.deliver(&line),
                 Ok(DeliverOutcome::Rejected {
-                    reason: reason.clone()
+                    reason: reason.clone(),
+                    message_specific: true,
                 })
             );
         }
@@ -1442,7 +1447,8 @@ mod tests {
         assert_eq!(
             harness.deliver(&line),
             Ok(DeliverOutcome::Rejected {
-                reason: reason.clone()
+                reason: reason.clone(),
+                message_specific: true,
             })
         );
         assert_eq!(harness.proven(&line.id), None);

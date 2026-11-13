@@ -209,9 +209,7 @@ impl State {
                 turn_finished: true,
             }),
             Some(Stage::Duplicate) => Some(DeliverOutcome::Duplicate),
-            Some(Stage::Rejected(reason)) => Some(DeliverOutcome::Rejected {
-                reason: reason.clone(),
-            }),
+            Some(Stage::Rejected(reason)) => Some(muse_rejected(reason)),
             Some(_) => None,
             None => self.holds(id).then_some(DeliverOutcome::Duplicate),
         }
@@ -864,6 +862,15 @@ fn state_settled(stage: &Stage) -> bool {
         stage,
         Stage::Consumed { .. } | Stage::Finished | Stage::Duplicate | Stage::Rejected(_)
     )
+}
+
+/// A Muse refusal for good. Over the limit (`-32002`) or too long or too
+/// large for Muse is this message's own; any other reason may hold for every
+/// message.
+fn muse_rejected(reason: &str) -> DeliverOutcome {
+    let message_specific =
+        reason.contains("-32002") || anyagents_harness::names_message_size(reason);
+    DeliverOutcome::rejected(reason, message_specific)
 }
 
 /// The command id of one mailbox message's `attempt`: a UUIDv7, the shape
@@ -1664,13 +1671,7 @@ mod tests {
                 "muse refused the message: -32010 capabilityRequired",
             ),
         ] {
-            assert_eq!(
-                state.settled(id),
-                Some(DeliverOutcome::Rejected {
-                    reason: reason.into()
-                }),
-                "{id}"
-            );
+            assert_eq!(state.settled(id), Some(muse_rejected(reason)), "{id}");
         }
         for id in ["queue-full", "overloaded", "interrupted"] {
             assert_eq!(stage(&state, id), Stage::Retry { boundary: 7 }, "{id}");

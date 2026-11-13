@@ -50,10 +50,14 @@ its output open (a descendant holding it) for five seconds.
 ### Rejected messages
 
 A message the vendor refused for good is parked in `rejected_messages` and
-never quoted in a recovery note. A breaker keeps a vendor that refuses
-everything from parking the whole mailbox: the same reason twice in a row,
-or more than two refusals in one pass, fails the harness instead, and the
-message stays in the mailbox. `anyagents requeue <agent>` lists an agent's
+never quoted in a recovery note. An adapter says whether the reason belongs
+to that message alone (`message_specific`: its size, an id another record
+holds, an empty or invalid body); such a message is parked at once and
+never counts toward the breaker, so two oversize messages are two parked
+messages, not a wedged mailbox. Any other reason might hold for every
+message, and a breaker keeps a vendor that refuses everything from parking
+the whole mailbox: the same such reason twice in a row, or more than two in
+one pass, fails the harness instead, and the message stays in the mailbox. `anyagents requeue <agent>` lists an agent's
 parked messages, and `anyagents requeue <agent> <msg_id>` puts one back at
 the end of its mailbox, from the same author. A sender notice a crash cut
 off is sent when the agent's delivery loop next starts.

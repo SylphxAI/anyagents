@@ -296,9 +296,14 @@ impl State {
             None => {}
         }
         if let Some(reason) = self.rejected.get(id) {
-            return Some(Ok(DeliverOutcome::Rejected {
-                reason: reason.clone(),
-            }));
+            // An input over Codex's length limit, or an empty one, is this
+            // message's own; any other invalid request may be every one's.
+            let message_specific = anyagents_harness::names_message_size(reason)
+                || reason.contains("must not be empty");
+            return Some(Ok(DeliverOutcome::rejected(
+                reason.clone(),
+                message_specific,
+            )));
         }
         if !self.alive {
             return Some(Err(HarnessError::Dead));

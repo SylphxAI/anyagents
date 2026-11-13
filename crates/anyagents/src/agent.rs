@@ -1530,8 +1530,11 @@ pub fn flush(data: &Path, name: &str) -> Result<(), anyagents_core::Error> {
                     break;
                 }
                 // Refused for good: parked past the cursor, its sender told.
-                Ok(anyagents_harness::DeliverOutcome::Rejected { reason }) => {
-                    if last_rejection.as_deref() == Some(reason.as_str()) {
+                Ok(anyagents_harness::DeliverOutcome::Rejected {
+                    reason,
+                    message_specific,
+                }) => {
+                    if !message_specific && last_rejection.as_deref() == Some(reason.as_str()) {
                         failure = Some(format!(
                             "the harness refuses message after message ({reason}); left queued"
                         ));
@@ -1543,7 +1546,9 @@ pub fn flush(data: &Path, name: &str) -> Result<(), anyagents_core::Error> {
                         agent.name,
                         message.id.as_str()
                     );
-                    last_rejection = Some(reason);
+                    if !message_specific {
+                        last_rejection = Some(reason);
+                    }
                 }
                 Err(err) => {
                     failure = Some(err.to_string());

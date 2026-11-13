@@ -409,9 +409,9 @@ impl Harness for GrokHarness {
 /// the process exits.
 fn known_outcome(state: &State, id: &str) -> Option<DeliverOutcome> {
     if let Some(reason) = state.rejected.get(id) {
-        return Some(DeliverOutcome::Rejected {
-            reason: reason.clone(),
-        });
+        // Grok's errors before admission are protocol errors, which may hold
+        // for every message.
+        return Some(DeliverOutcome::rejected(reason.clone(), false));
     }
     match state.proven(id)? {
         Proof::Taken { turn_finished } => Some(DeliverOutcome::Accepted { turn_finished }),
@@ -873,7 +873,7 @@ mod tests {
         );
         on_notification(&mut state, &answered(3, Some((-32603, "Internal error"))));
         let reason = |id: &str| match known_outcome(&state, id) {
-            Some(DeliverOutcome::Rejected { reason }) => reason,
+            Some(DeliverOutcome::Rejected { reason, .. }) => reason,
             other => panic!("{id}: {other:?}"),
         };
         assert!(reason("unread").contains("before running it: -32602 Invalid params"));

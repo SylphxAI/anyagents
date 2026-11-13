@@ -701,7 +701,45 @@ pub enum DeliverOutcome {
     /// request, an id another record holds, a code no retry clears). The
     /// loop parks it as rejected, past the cursor, and tells its sender. An
     /// adapter answers the same when the same id is offered again.
-    Rejected { reason: String },
+    ///
+    /// `message_specific` says the reason belongs to this message alone (its
+    /// size, its content): it is parked at once and never counts toward the
+    /// loop's breaker. Any other reason might hold for every message, so the
+    /// same one twice, or too many in one pass, fails the harness instead.
+    Rejected {
+        reason: String,
+        message_specific: bool,
+    },
+}
+
+impl DeliverOutcome {
+    /// A refusal for good; see [`DeliverOutcome::Rejected`].
+    pub fn rejected(reason: impl Into<String>, message_specific: bool) -> Self {
+        Self::Rejected {
+            reason: reason.into(),
+            message_specific,
+        }
+    }
+}
+
+/// Whether a vendor's refusal names the size or length of the message itself
+/// ("too large", "exceeds the maximum length", `inputTooLarge`): a reason that
+/// belongs to that one message.
+pub fn names_message_size(reason: &str) -> bool {
+    let reason = reason.to_ascii_lowercase();
+    [
+        "too large",
+        "too long",
+        "toolarge",
+        "toolong",
+        "too_large",
+        "too_long",
+        "exceeds the maximum",
+        "maximum length",
+        "payload too large",
+    ]
+    .iter()
+    .any(|phrase| reason.contains(phrase))
 }
 
 /// What a harness already proved about one message, read without writing
@@ -871,6 +909,23 @@ pub fn mentions_marker(value: &Value, id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_size_refusal_is_one_messages_own_and_a_malformed_one_is_not() {
+        for reason in [
+            "muse refused the message: -32002 inputTooLarge",
+            "Input exceeds the maximum length of 1048576 characters.",
+            "dsh session/prompt: HTTP 413: payload too large",
+        ] {
+            assert!(names_message_size(reason), "{reason}");
+        }
+        for reason in [
+            "muse refused the message: -32602",
+            "spiron rejected the input: wrong_session",
+        ] {
+            assert!(!names_message_size(reason), "{reason}");
+        }
+    }
 
     #[test]
     fn marker_is_only_the_first_line() {

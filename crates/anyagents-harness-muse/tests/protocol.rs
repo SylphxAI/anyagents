@@ -437,7 +437,7 @@ fn a_refusal_for_good_is_rejected_and_answered_again_without_a_write() {
         let reason = loop {
             match harness.deliver(&m1).expect("no restart") {
                 DeliverOutcome::InFlight => {}
-                DeliverOutcome::Rejected { reason } => break reason,
+                DeliverOutcome::Rejected { reason, .. } => break reason,
                 other => panic!("{mode}: {other:?}"),
             }
             assert!(Instant::now() < deadline, "{mode}");
@@ -452,7 +452,8 @@ fn a_refusal_for_good_is_rejected_and_answered_again_without_a_write() {
             assert_eq!(
                 harness.deliver(&m1).unwrap(),
                 DeliverOutcome::Rejected {
-                    reason: reason.clone()
+                    message_specific: reason.contains("-32002"),
+                    reason: reason.clone(),
                 }
             );
         }

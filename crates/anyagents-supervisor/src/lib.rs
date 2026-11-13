@@ -1722,7 +1722,7 @@ impl<H: Harness + 'static> Session<H> {
                 self.written = self.written.saturating_add(1);
                 false
             }
-            Ok(DeliverOutcome::Rejected { reason }) => {
+            Ok(DeliverOutcome::Rejected { reason, .. }) => {
                 self.pending_recovery = false;
                 self.recovery_blocks_mail = false;
                 self.last_error = Some(format!("recovery note rejected by the harness: {reason}"));

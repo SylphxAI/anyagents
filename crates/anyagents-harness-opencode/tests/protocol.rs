@@ -822,7 +822,7 @@ fn non_404_prompt_errors_and_repeated_404_fail_closed_without_minting_duplicate_
             // Nothing was admitted, and nothing ever will be: the line is
             // rejected, and the process is not at fault.
             assert!(
-                matches!(&outcome, Ok(DeliverOutcome::Rejected { reason }) if reason.contains("HTTP 4")),
+                matches!(&outcome, Ok(DeliverOutcome::Rejected { reason, .. }) if reason.contains("HTTP 4")),
                 "{mode}: {outcome:?}"
             );
             assert!(harness.health().process_alive, "{mode}");
@@ -1033,7 +1033,7 @@ fn a_poison_line_is_rejected_once_and_never_written_again() {
         let dir = TempDir::new().unwrap();
         let mut harness = start(&dir, mode);
         let rejected = match settle(&mut harness, &msg("m1")) {
-            Ok(DeliverOutcome::Rejected { reason }) => reason,
+            Ok(DeliverOutcome::Rejected { reason, .. }) => reason,
             other => panic!("{mode}: {other:?}"),
         };
         assert!(rejected.contains(status), "{mode}: {rejected}");
@@ -1041,7 +1041,8 @@ fn a_poison_line_is_rejected_once_and_never_written_again() {
             assert_eq!(
                 harness.deliver(&msg("m1")),
                 Ok(DeliverOutcome::Rejected {
-                    reason: rejected.clone()
+                    reason: rejected.clone(),
+                    message_specific: rejected.contains("(HTTP 409)"),
                 }),
                 "{mode}"
             );
@@ -1066,7 +1067,10 @@ fn a_poison_line_is_rejected_once_and_never_written_again() {
         harness.stop();
         assert_eq!(
             harness.deliver(&msg("m1")),
-            Ok(DeliverOutcome::Rejected { reason: rejected }),
+            Ok(DeliverOutcome::Rejected {
+                message_specific: rejected.contains("(HTTP 409)"),
+                reason: rejected,
+            }),
             "{mode}: a rejection stands after the process"
         );
         let log = log_of(&dir);
