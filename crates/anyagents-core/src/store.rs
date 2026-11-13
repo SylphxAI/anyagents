@@ -61,6 +61,33 @@ pub struct Origin {
     pub thread_id: Option<i64>,
     pub message_id: Option<i64>,
 }
+
+/// History an incoming line refers to, read before the ingress transaction
+/// (see [`Store::ingress_history`]).
+#[derive(Default)]
+struct IngressHistory {
+    /// Author and excerpt of the message a reaction reacts to.
+    reacted_to: Option<(String, String)>,
+    /// The original text of an edited message that has no recorded version.
+    edited_from: Option<String>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Runs where ingress reads stored history; a test writes from another
+    /// thread here to prove the writer is free.
+    static HISTORY_READ_PROBE: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn history_read_probe() {
+    #[cfg(test)]
+    HISTORY_READ_PROBE.with(|probe| {
+        if let Some(probe) = probe.borrow().as_ref() {
+            probe();
+        }
+    });
+}
 #[cfg(test)]
 use crate::migrate;
 use crate::migrate::now_ms as clock_now_ms;
@@ -2287,6 +2314,52 @@ impl Store {
             .map(|outcome| outcome.expect("unconditional message admission"))
     }
 
+    /// What ingress reads from the stored conversation history, read on a
+    /// snapshot before the writer is taken. These lookups match a channel's
+    /// message by text patterns, not by key, so they can visit every stored
+    /// message: inside the ingress transaction one Telegram reply held the
+    /// writer, and so every write of the daemon, for as long as that scan
+    /// took. They only enrich the delivered text; a duplicate found later
+    /// under the writer simply discards them.
+    fn ingress_history(
+        &self,
+        incoming: &mut Incoming,
+        source_key: Option<&str>,
+        agent_id: &AgentId,
+    ) -> IngressHistory {
+        let origin = incoming.origin;
+        let reacted = incoming.text.starts_with("[Reaction ");
+        let edited = parse_edited_message_text(&incoming.text).map(|(id, _)| id);
+        if incoming.quote.is_none() && !reacted && edited.is_none() {
+            return IngressHistory::default();
+        }
+        let reader = self.read_conn();
+        if let Some(quote) = incoming.quote.as_mut() {
+            enrich_quote_from_store(&reader, quote, origin);
+        }
+        let reacted_to = origin
+            .filter(|_| reacted)
+            .and_then(|o| o.chat_id.zip(o.message_id))
+            .and_then(|(chat_id, message_id)| {
+                resolve_origin_message_author_and_excerpt(&reader, chat_id, message_id)
+            });
+        // The recorded version is re-read under the writer; only its absence
+        // sends ingress to the history, as before.
+        let edited_from = edited.and_then(|edited_id| {
+            let chat_id = origin.and_then(|o| o.chat_id)?;
+            let message_id = origin.and_then(|o| o.message_id).unwrap_or(edited_id);
+            if stored_message_version(&reader, agent_id, chat_id, message_id, source_key).is_some()
+            {
+                return None;
+            }
+            original_message_text(&reader, agent_id, chat_id, message_id, source_key)
+        });
+        IngressHistory {
+            reacted_to,
+            edited_from,
+        }
+    }
+
     fn receive_with_admission(
         &self,
         agent_id: &AgentId,
@@ -2297,6 +2370,7 @@ impl Store {
         let mut incoming = incoming;
         let source_key = incoming.source_key.take().filter(|key| !key.is_empty());
         let received_at_ms = incoming.received_at_ms.unwrap_or_else(now_ms);
+        let history = self.ingress_history(&mut incoming, source_key.as_deref(), agent_id);
         enum ReceiveTx {
             Early(Option<ReceiveOutcome>),
             Inserted {
@@ -2347,19 +2421,14 @@ impl Store {
             retain_message_aliases(tx, &existing, ingress_origin, Some(key))?;
             return Ok(ReceiveTx::Early(Some(ReceiveOutcome::Duplicate(existing))));
         }
-        if let Some(ref mut quote) = incoming.quote {
-            enrich_quote_from_store(tx, quote, incoming.origin);
-        }
         let mut body = incoming.body();
         let mut reply_to_author = incoming
             .quote
             .as_ref()
             .and_then(|quote| resolve_quote_author(tx, quote));
-        if incoming.text.starts_with("[Reaction ")
-            && let Some(origin) = incoming.origin
+        if let Some(origin) = incoming.origin
             && let (Some(chat_id), Some(message_id)) = (origin.chat_id, origin.message_id)
-            && let Some((orig_sender, orig_text)) =
-                resolve_origin_message_author_and_excerpt(tx, chat_id, message_id)
+            && let Some((orig_sender, orig_text)) = history.reacted_to
         {
             if reply_to_author.is_none() {
                 reply_to_author = Some(orig_sender.clone());
@@ -2404,13 +2473,9 @@ impl Store {
                 .and_then(|o| o.message_id)
                 .unwrap_or(edited_msg_id);
             if let Some(chat_id) = incoming.origin.and_then(|o| o.chat_id) {
-                let prev_text = resolve_previous_message_version(
-                    tx,
-                    agent_id,
-                    chat_id,
-                    msg_id,
-                    source_key.as_deref(),
-                );
+                let prev_text =
+                    stored_message_version(tx, agent_id, chat_id, msg_id, source_key.as_deref())
+                        .or(history.edited_from);
                 let _ = tx.execute(
                     "INSERT INTO message_versions (agent_id, chat_id, message_id, body, updated_at_ms, origin_namespace)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6)
@@ -7165,6 +7230,7 @@ fn resolve_origin_message_author_and_excerpt(
     chat_id: i64,
     message_id: i64,
 ) -> Option<(String, String)> {
+    history_read_probe();
     let pattern = format!("%\"message_id\":{message_id}%");
     let mut stmt = conn
         .prepare(
@@ -7203,29 +7269,42 @@ fn parse_edited_message_text(text: &str) -> Option<(i64, &str)> {
     Some((msg_id, raw))
 }
 
-fn resolve_previous_message_version(
+/// The last version of an edited message this agent recorded: one indexed
+/// lookup, made inside the ingress transaction.
+fn stored_message_version(
     conn: &Connection,
     agent_id: &AgentId,
     chat_id: i64,
     message_id: i64,
     source_key: Option<&str>,
 ) -> Option<String> {
-    if let Ok(Some(version)) = conn
-        .query_row(
-            "SELECT body FROM message_versions
-             WHERE agent_id = ?1 AND chat_id = ?2 AND message_id = ?3 AND origin_namespace = ?4",
-            params![
-                agent_id.as_str(),
-                chat_id,
-                message_id,
-                origin_namespace(chat_id, source_key)
-            ],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()
-    {
-        return Some(version);
-    }
+    conn.query_row(
+        "SELECT body FROM message_versions
+         WHERE agent_id = ?1 AND chat_id = ?2 AND message_id = ?3 AND origin_namespace = ?4",
+        params![
+            agent_id.as_str(),
+            chat_id,
+            message_id,
+            origin_namespace(chat_id, source_key)
+        ],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .ok()
+    .flatten()
+}
+
+/// The text of an edited message's original delivery, found in the stored
+/// history when no version was recorded. This reads across the whole mailbox
+/// history, so ingress runs it on a read snapshot before taking the writer.
+fn original_message_text(
+    conn: &Connection,
+    agent_id: &AgentId,
+    chat_id: i64,
+    message_id: i64,
+    source_key: Option<&str>,
+) -> Option<String> {
+    history_read_probe();
     let pattern = format!("%\"message_id\":{message_id}%");
     let mut stmt = conn
         .prepare(&format!(
@@ -10478,6 +10557,94 @@ mod tests {
             )
             .unwrap();
         assert!(store.has_actionable_undelivered(&worker.id).unwrap());
+    }
+
+    /// A Telegram reply, reaction or edit makes ingress look the referenced
+    /// message up in the stored history by text pattern, which can read every
+    /// stored message. That read ran inside the ingress transaction, so the
+    /// daemon's single writer, and every other write, waited for it (a reply
+    /// to apollo on 2026-11-13 held it for 100 s). Here another thread writes
+    /// while each lookup runs; it must finish while the lookup is still going.
+    #[test]
+    fn ingress_reads_reply_reaction_and_edit_history_without_holding_the_writer() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (dir, store) = setup();
+        let reader_agent = agent(&store, "history_reader");
+        let other_agent = agent(&store, "history_other");
+        let bystander = agent(&store, "history_bystander");
+        let chat = Some(-100_555);
+        let original = |message_id: i64, text: &str| {
+            let mut line = Incoming::new(text);
+            line.sender = Some("telegram:user:7:alex".into());
+            line.origin = Some(Origin {
+                chat_id: chat,
+                thread_id: None,
+                message_id: Some(message_id),
+            });
+            line
+        };
+        store
+            .receive(&reader_agent.id, original(7, "the referenced line"))
+            .unwrap();
+        // Recorded for another agent only, so the edit below finds no version
+        // of its own and falls back to the history.
+        store
+            .receive(&other_agent.id, original(8, "first wording"))
+            .unwrap();
+
+        let lookups = std::sync::Arc::new(AtomicUsize::new(0));
+        let concurrent = std::sync::Arc::new(AtomicUsize::new(0));
+        let db = dir.path().join("state.db");
+        let bystander_id = bystander.id.clone();
+        let (seen, done) = (
+            std::sync::Arc::clone(&lookups),
+            std::sync::Arc::clone(&concurrent),
+        );
+        HISTORY_READ_PROBE.with(|probe| {
+            *probe.borrow_mut() = Some(Box::new(move || {
+                seen.fetch_add(1, Ordering::SeqCst);
+                let (db, id) = (db.clone(), bystander_id.clone());
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let store = Store::open(db).unwrap();
+                    let _ = tx.send(store.receive(&id, Incoming::new("meanwhile")).is_ok());
+                });
+                if rx.recv_timeout(Duration::from_secs(10)) == Ok(true) {
+                    done.fetch_add(1, Ordering::SeqCst);
+                }
+            }));
+        });
+
+        let mut reply = original(9, "answering it");
+        reply.quote = Some(Quote {
+            reference: Some(crate::quote::QuoteRef {
+                chat_id: -100_555,
+                message_id: 7,
+            }),
+            author: "Alex".into(),
+            ..Default::default()
+        });
+        store.receive(&reader_agent.id, reply).unwrap();
+        let reaction = original(7, "[Reaction 👍 on message #7]");
+        let ReceiveOutcome::New(reacted) = store.receive(&reader_agent.id, reaction).unwrap()
+        else {
+            panic!("a reaction is a new line");
+        };
+        let edit = original(8, "[Edited message #8]: second wording");
+        let ReceiveOutcome::New(edited) = store.receive(&reader_agent.id, edit).unwrap() else {
+            panic!("an edit is a new line");
+        };
+        HISTORY_READ_PROBE.with(|probe| probe.borrow_mut().take());
+
+        assert_eq!(lookups.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            concurrent.load(Ordering::SeqCst),
+            3,
+            "a write waited for an ingress history lookup"
+        );
+        // The lookups still shape what is delivered.
+        assert!(reacted.text.contains("the referenced line"));
+        assert!(edited.text.starts_with("[Edited message #8]"));
     }
 
     #[test]
