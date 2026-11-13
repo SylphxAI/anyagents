@@ -27,9 +27,20 @@
 //!   racing the dispatch): it goes back to the mailbox.
 //! - At start the adapter asks `get_state` for the session file and reads the
 //!   markers its user messages carry: a message an earlier process put into
-//!   the session is answered `Duplicate` and never written again.
+//!   the session is answered `Duplicate` and never written again. OMP writes
+//!   a new session's file only once it holds an assistant message, so a file
+//!   that does not exist yet holds nothing: the run that took a message never
+//!   finished a model reply, never ran a tool, and left nothing to resume. A
+//!   file that exists and cannot be read stops delivery: what it holds is
+//!   unknown. For the same reason the session is named to the host
+//!   (`session_id`) only once its file exists: OMP refuses to resume a
+//!   session it never wrote ("Session not found") and exits.
 //! - A message is written only once every earlier one is admitted, so a
 //!   refused message is never overtaken by a later one.
+//! - The process counts as gone only once its output ended, so every proof it
+//!   printed is read first: a write that fails forgets that write, and
+//!   stopping the process kills it and reads the rest of its output. What it
+//!   proved stays answerable (`proven`) after it is gone.
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -40,7 +51,7 @@ use std::thread::{self, JoinHandle};
 
 use anyagents_harness::{
     DeliverOutcome, Delivery, DeliveryLevel, Harness, HarnessError, HarnessHealth,
-    MESSAGE_MARKER_PREFIX, OutboundMessage, TurnState, TurnUsage, compose_message,
+    MESSAGE_MARKER_PREFIX, OutboundMessage, Proof, TurnState, TurnUsage, compose_message,
     message_id_in_text,
 };
 use anyagents_harness_stream::StreamSpec;
@@ -51,7 +62,9 @@ use serde_json::{Value, json};
 pub const DELIVERY: Delivery = Delivery {
     level: DeliveryLevel::NextStep,
     idempotent: true,
-    proof: std::borrow::Cow::Borrowed("user message_end carrying the marker; session file read at start"),
+    proof: std::borrow::Cow::Borrowed(
+        "user message_end carrying the marker; session file read at start",
+    ),
     peer: None,
 };
 
@@ -87,9 +100,18 @@ struct State {
     exit: Option<ExitStatus>,
     /// What the child's `ready` named.
     peer: Option<String>,
+    /// The session this child runs: the one it resumed, then the one
+    /// `get_state` named.
     session_id: Option<String>,
+    /// The session this child was started on, which OMP had on disk.
+    resumed: Option<String>,
+    /// The file `get_state` named for `session_id`, until it is seen on disk.
+    pending_file: Option<PathBuf>,
     /// `get_state` answered and the session file read: messages may go.
     known: bool,
+    /// The session's record could not be read: nothing may go, since what it
+    /// already holds is unknown.
+    unreadable: Option<String>,
     /// Markers the session file held at start: an earlier process put
     /// these messages into the session.
     applied_before: HashSet<String>,
@@ -127,6 +149,28 @@ struct Prompt {
 }
 
 impl State {
+    /// What this adapter proved about `id`, whatever became of the process.
+    fn proof(&self, id: &str) -> Option<Proof> {
+        if self.consumed.contains(id) {
+            return Some(Proof::Taken {
+                turn_finished: self.finished.contains(id),
+            });
+        }
+        self.applied_before.contains(id).then_some(Proof::Duplicate)
+    }
+
+    /// A session the next process can resume: the one this child was
+    /// started on, or the one it runs once OMP wrote its file.
+    fn resumable_session(&mut self) -> Option<String> {
+        if let Some(file) = &self.pending_file {
+            if !file.exists() {
+                return self.resumed.clone();
+            }
+            self.pending_file = None;
+        }
+        self.session_id.clone()
+    }
+
     fn busy(&self) -> bool {
         self.alive && (self.open > 0 || self.unsettled)
     }
@@ -206,10 +250,11 @@ impl OmpHarness {
         Ok(harness)
     }
 
-    /// The session this child runs: the one it resumed, then the one
-    /// `get_state` named.
+    /// The session the next process should resume: the one this child
+    /// resumed, then the one `get_state` named once OMP wrote its file. A
+    /// session OMP never wrote cannot be resumed, so it is not named.
     pub fn session_id(&self) -> Option<String> {
-        lock(&self.shared).session_id.clone()
+        lock(&self.shared).resumable_session()
     }
 
     fn launch(&mut self, session_id: Option<&str>) -> Result<(), HarnessError> {
@@ -245,6 +290,9 @@ impl OmpHarness {
             state.exit = None;
             state.peer = None;
             state.known = false;
+            state.unreadable = None;
+            state.pending_file = None;
+            state.resumed = session_id.map(str::to_string);
             state.applied_before.clear();
             state.prompts.clear();
             state.requests.clear();
@@ -294,14 +342,12 @@ impl OmpHarness {
         Ok(())
     }
 
+    /// Stop the child and read its output to the end, so every proof it
+    /// printed is known. The reader marks it gone at that end; what it
+    /// proved stays.
     fn stop_child(&mut self) {
         *lock(&self.stdin) = None;
-        let mut child = {
-            let mut state = lock(&self.shared);
-            state.alive = false;
-            state.child.take()
-        };
-        self.wake.notify_all();
+        let mut child = lock(&self.shared).child.take();
         if let Some(child) = child.as_mut() {
             anyagents_harness::kill_child(child, &self.environment);
         }
@@ -316,6 +362,14 @@ impl OmpHarness {
         if let Some(handle) = self.stderr_reader.take() {
             let _ = handle.join();
         }
+        // Without a reader (it never started), nothing else says it is gone.
+        let mut state = lock(&self.shared);
+        if state.alive {
+            state.alive = false;
+            state.changes += 1;
+        }
+        drop(state);
+        self.wake.notify_all();
     }
 }
 
@@ -326,6 +380,16 @@ impl Drop for OmpHarness {
 }
 
 impl Harness for OmpHarness {
+    fn proven(&self, message_id: &str) -> Option<Proof> {
+        lock(&self.shared).proof(message_id)
+    }
+
+    /// Kill the child and read its output to the end: a proof it printed
+    /// before it went is known to `proven` afterwards.
+    fn stop(&mut self) {
+        self.stop_child();
+    }
+
     fn deliver(&mut self, message: &OutboundMessage) -> Result<DeliverOutcome, HarnessError> {
         let id = message.id.as_str();
         let line = {
@@ -341,6 +405,9 @@ impl Harness for OmpHarness {
             }
             if state.prompts.contains_key(id) {
                 return Ok(DeliverOutcome::InFlight);
+            }
+            if let Some(reason) = &state.unreadable {
+                return Err(HarnessError::Failed(reason.clone()));
             }
             // Nothing goes before the session file is read, nor behind a
             // message OMP has not admitted yet.
@@ -372,12 +439,11 @@ impl Harness for OmpHarness {
         let written = write_line(&self.stdin, &line);
         let mut state = lock(&self.shared);
         if written.is_err() {
-            // The next process reads the session file before it writes.
-            state.alive = false;
+            // A broken pipe took no whole line: nothing was admitted. The
+            // process counts as gone once its output ends, after every proof
+            // it printed is read; that end wakes the host.
             state.forget(id);
-            state.changes += 1;
-            self.wake.notify_all();
-            return Err(HarnessError::Dead);
+            return Ok(DeliverOutcome::Deferred);
         }
         Ok(written_outcome(&mut state, id).unwrap_or(DeliverOutcome::InFlight))
     }
@@ -594,7 +660,9 @@ fn on_response(state: &mut State, frame: &Value) {
             if success {
                 read_state(state, frame.get("data").unwrap_or(&Value::Null));
             } else {
-                state.fault = Some(format!("omp refused get_state: {}", error()));
+                // Without the session file, a message an earlier process
+                // put into the session cannot be recognised.
+                state.unreadable = Some(format!("omp refused get_state: {}", error()));
             }
             state.known = true;
         }
@@ -622,31 +690,52 @@ fn on_response(state: &mut State, frame: &Value) {
 /// `get_state`: the session, the steering mode the session took, and the
 /// session file's record of what earlier processes put into it.
 fn read_state(state: &mut State, data: &Value) {
-    if let Some(session) = data.get("sessionId").and_then(Value::as_str) {
+    let session = data.get("sessionId").and_then(Value::as_str);
+    if let Some(session) = session {
         state.session_id = Some(session.to_string());
     }
     if data.get("steeringMode").and_then(Value::as_str) != Some("all") {
         state.fault = Some("omp did not take steering mode all".to_string());
     }
-    if let Some(file) = data.get("sessionFile").and_then(Value::as_str) {
-        state.applied_before = session_markers(Path::new(file));
+    let file = data
+        .get("sessionFile")
+        .and_then(Value::as_str)
+        .map(PathBuf::from);
+    if session.is_some() && session != state.resumed.as_deref() {
+        // Named to the host once OMP has written it.
+        state.pending_file = Some(file.clone().unwrap_or_default());
+    }
+    if let Some(file) = file {
+        match session_markers(&file) {
+            Ok(markers) => state.applied_before = markers,
+            Err(err) => {
+                state.unreadable = Some(format!(
+                    "cannot read the omp session file {}: {err}",
+                    file.display()
+                ));
+            }
+        }
     }
 }
 
 /// The mailbox id on the first line of every user message in the session
-/// file at `path`.
-fn session_markers(path: &Path) -> HashSet<String> {
-    let Ok(file) = std::fs::File::open(path) else {
-        return HashSet::new();
+/// file at `path`. A file OMP has not written yet holds none: it writes a
+/// new session's file with its first assistant message, and before that no
+/// run finished a reply or ran a tool.
+fn session_markers(path: &Path) -> std::io::Result<HashSet<String>> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(HashSet::new()),
+        Err(err) => return Err(err),
     };
-    BufReader::new(file)
-        .lines()
-        .map_while(Result::ok)
+    Ok(bytes
+        .split(|byte| *byte == b'\n')
+        .map(String::from_utf8_lossy)
         .filter(|line| line.contains(MESSAGE_MARKER_PREFIX))
         .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
         .filter(|entry| entry.get("type").and_then(Value::as_str) == Some("message"))
         .filter_map(|entry| user_marker(entry.get("message")?).map(str::to_string))
-        .collect()
+        .collect())
 }
 
 /// The mailbox id a user message's text starts with.
@@ -921,5 +1010,180 @@ mod tests {
             state.fault.as_deref(),
             Some("omp did not take steering mode all")
         );
+    }
+
+    fn get_state(file: &Path) -> Value {
+        json!({"id": STATE_REQUEST, "type": "response", "command": "get_state",
+            "success": true, "data": {"sessionId": "s1", "steeringMode": "all",
+            "sessionFile": file.display().to_string()}})
+    }
+
+    #[test]
+    fn a_session_file_omp_has_not_written_holds_nothing_and_names_no_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let mut state = State::default();
+        on_frame(&mut state, &get_state(&path));
+        // Nothing to recognise, and nothing to stop delivery.
+        assert!(state.known);
+        assert!(state.applied_before.is_empty());
+        assert_eq!(state.unreadable, None);
+        // OMP exits on `--session` for a session it never wrote.
+        assert_eq!(state.resumable_session(), None);
+        std::fs::write(&path, "{\"type\":\"session\",\"id\":\"s1\"}\n").unwrap();
+        assert_eq!(state.resumable_session().as_deref(), Some("s1"));
+
+        // A child started on a session OMP had names it from the start.
+        let mut state = State {
+            resumed: Some("s0".into()),
+            session_id: Some("s0".into()),
+            ..State::default()
+        };
+        assert_eq!(state.resumable_session().as_deref(), Some("s0"));
+        // A session it moved on to stays unnamed until it is on disk.
+        on_frame(&mut state, &get_state(&dir.path().join("fork.jsonl")));
+        assert_eq!(state.resumable_session().as_deref(), Some("s0"));
+    }
+
+    #[test]
+    fn a_session_record_that_cannot_be_read_stops_delivery() {
+        let dir = tempfile::tempdir().unwrap();
+        // A file that exists and cannot be read as one.
+        let mut state = State::default();
+        on_frame(&mut state, &get_state(dir.path()));
+        assert!(state.known);
+        assert!(
+            state
+                .unreadable
+                .as_deref()
+                .is_some_and(|reason| reason.contains("cannot read the omp session file")),
+            "{:?}",
+            state.unreadable
+        );
+        // So is a session whose record OMP would not name.
+        let mut state = State::default();
+        on_frame(
+            &mut state,
+            &json!({"id": STATE_REQUEST, "type": "response", "command": "get_state",
+                "success": false, "error": "boom"}),
+        );
+        assert!(state.known);
+        assert_eq!(
+            state.unreadable.as_deref(),
+            Some("omp refused get_state: boom")
+        );
+    }
+
+    /// An adapter over `/bin/sh -c script`: the script plays OMP.
+    #[cfg(unix)]
+    fn scripted(script: &str) -> OmpHarness {
+        let spec = StreamSpec {
+            args: vec!["-c".into(), script.into(), "--mode".into()],
+            ..StreamSpec::for_program("omp")
+        };
+        OmpHarness::start_with_spec(spec, "/bin/sh", None, &[], None).unwrap()
+    }
+
+    /// The two answers OMP gives before any message, for a session whose
+    /// file is `file`.
+    #[cfg(unix)]
+    fn handshake(file: &Path) -> String {
+        let steering = json!({"id": STEERING_REQUEST, "type": "response",
+            "command": "set_steering_mode", "success": true});
+        format!(
+            "read -r a; read -r b; printf '%s\\n' '{steering}' '{}';",
+            get_state(file)
+        )
+    }
+
+    #[cfg(unix)]
+    fn message(id: &str) -> OutboundMessage {
+        OutboundMessage {
+            id: id.into(),
+            seq: 1,
+            text: "hello".into(),
+            sender: None,
+            reply_to: None,
+            source_time_ms: None,
+            context: anyagents_harness::Context::default(),
+        }
+    }
+
+    #[cfg(unix)]
+    fn until(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !done() {
+            assert!(std::time::Instant::now() < deadline, "never: {what}");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    /// A write the child cannot take forgets that write; the process counts
+    /// as gone only once its output ends.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_write_hands_the_message_back_and_dead_waits_for_the_end_of_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let (closed, go) = (dir.path().join("closed"), dir.path().join("go"));
+        let script = format!(
+            "{} exec 0<&-; : > '{}'; while [ ! -e '{}' ]; do sleep 0.01; done",
+            handshake(&dir.path().join("session.jsonl")),
+            closed.display(),
+            go.display()
+        );
+        let mut harness = scripted(&script);
+        until("the child closed its input", || {
+            closed.exists() && lock(&harness.shared).known
+        });
+        assert_eq!(
+            harness.deliver(&message("m1")),
+            Ok(DeliverOutcome::Deferred)
+        );
+        assert!(!lock(&harness.shared).prompts.contains_key("m1"));
+        assert!(
+            harness.health().process_alive,
+            "dead before its output ended"
+        );
+        std::fs::write(&go, "").unwrap();
+        until("the child is gone", || !harness.health().process_alive);
+    }
+
+    /// A proof the child printed before the host stopped it is read, and
+    /// answered by `proven` once the process is gone.
+    #[cfg(unix)]
+    #[test]
+    fn a_proof_printed_before_stop_is_proven_after_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let printed = dir.path().join("printed");
+        let proof = json!({"type": "message_end", "messageId": "msg-1", "message": {
+            "role": "user", "content": [{"type": "text",
+            "text": format!("{MESSAGE_MARKER_PREFIX}m1\nhello")}]}});
+        let script = format!(
+            "{} read -r prompt; printf '%s\\n' '{proof}'; : > '{}'; exec sleep 30",
+            handshake(&dir.path().join("session.jsonl")),
+            printed.display()
+        );
+        let mut harness = scripted(&script);
+        until("the session file is read", || lock(&harness.shared).known);
+        assert_eq!(
+            harness.deliver(&message("m1")),
+            Ok(DeliverOutcome::InFlight)
+        );
+        until("the child printed its proof", || printed.exists());
+        harness.stop();
+        assert!(!harness.health().process_alive);
+        assert_eq!(
+            harness.proven("m1"),
+            Some(Proof::Taken {
+                turn_finished: false
+            })
+        );
+        assert_eq!(
+            harness.deliver(&message("m1")),
+            Ok(DeliverOutcome::Accepted {
+                turn_finished: false
+            })
+        );
+        assert_eq!(harness.proven("m2"), None);
     }
 }

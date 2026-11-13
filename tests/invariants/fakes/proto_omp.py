@@ -18,8 +18,10 @@ Read from the package's own source (`src/modes/rpc/rpc-mode.ts`,
   every queued one after `set_steering_mode` `all`, and emits
   `message_start`/`message_end` {message: {role: "user", content,
   steering: true}, messageId: "msg-N"} for each; the opening prompt is
-  emitted the same way, without `steering`, when its run starts. The session
-  file records each user message at its `message_end`.
+  emitted the same way, without `steering`, when its run starts.
+- A step boundary comes after a tool batch: the assistant message that asked
+  for the tools ends (and is recorded) before steering is taken, so by the
+  time a run takes a steer its session is on disk.
 - A run polls steering again at its stop boundary, so it never ends with
   steering queued. When it yields: `agent_end`, one `prompt_result` {id,
   agentInvoked, status, sessionSettled} per prompt it took (the steered ones,
@@ -27,6 +29,15 @@ Read from the package's own source (`src/modes/rpc/rpc-mode.ts`,
 - Nothing is deduplicated by `id`.
 - The session file (`get_state` names it `sessionFile`): a `session` header,
   then `{type: "message", id, parentId, timestamp, message}` per message.
+  Checked against 18.20.0 (`src/session/session-manager.ts`
+  `#appendToSessionFile`, `#shouldHaveSessionFile`): a new session's file is
+  not written until the session holds an assistant message; that first one
+  writes the whole file, header and earlier user messages included, and
+  every later entry is appended as it is recorded. A run that dies before
+  its first reply leaves no file.
+- `--session <id>` for a session that has no file exits 1 before `ready`,
+  printing `Error: Session "<id>" not found.` and a hint on stderr
+  (`src/main.ts` `exitForSessionResolutionError`).
 """
 import datetime
 import json
@@ -66,25 +77,55 @@ class Omp(Protocol):
         self.tickets = []
         # Steering past the one a one-at-a-time boundary takes.
         self.held = []
-        if "--session" in args:
-            self.session = args[args.index("--session") + 1]
-        else:
-            self.session = "omp-session-%d" % self.engine.launch
+        resumed = args[args.index("--session") + 1] if "--session" in args else None
+        self.session = resumed or "omp-session-%d" % self.engine.launch
         sessions = self.engine.root / "omp-sessions"
         sessions.mkdir(exist_ok=True)
         self.file = sessions / ("2026-11-13T00-00-00-000Z_%s.jsonl" % self.session)
         self.parent = None
-        if self.file.exists():
-            lines = self.file.read_text().splitlines()
-            self.parent = json.loads(lines[-1]).get("id") if lines else None
+        # What the session holds; on disk once `on_disk`.
+        self.entries = []
+        self.on_disk = self.file.exists()
+        if resumed and not self.on_disk:
+            sys.stderr.write('Error: Session "%s" not found.\n' % resumed)
+            sys.stderr.write("Run `omp --resume` without an argument to pick from recent "
+                             "sessions, or `omp` to start a new one.\n")
+            sys.stderr.flush()
+            os._exit(1)
+        if self.on_disk:
+            self.entries = [json.loads(line) for line in self.file.read_text().splitlines()]
+            self.parent = self.entries[-1].get("id") if self.entries else None
         else:
-            self.persist({"type": "session", "version": 3, "id": self.session,
-                          "timestamp": now(), "cwd": os.getcwd()})
+            self.entries = [{"type": "session", "version": 3, "id": self.session,
+                             "timestamp": now(), "cwd": os.getcwd()}]
+        # The step whose tool batch the session holds.
+        self.batch_step = None
+        # The session records an input when the model takes it, whether or
+        # not the process lives to print its frames: OMP queues a message's
+        # persistence before it emits its `message_end`
+        # (`agent-session.ts` `#queueMessageEndPersistence`, then
+        # `#emitSessionEvent`), so it stores before it proves.
+        journal = self.engine.journal
+
+        def journaled(inp, kind):
+            if kind == "steer":
+                self.tool_batch()
+            if kind != "lost":
+                self.persist_user(inp, steering=kind == "steer")
+            return journal(inp, kind)
+        self.engine.journal = journaled
         self.emit(READY)
 
     def persist(self, entry):
-        with self.file.open("a") as out:
-            out.write(json.dumps(entry) + "\n")
+        """Record `entry`. A new session reaches the disk with its first
+        assistant message, all at once; after that, entry by entry."""
+        self.entries.append(entry)
+        if self.on_disk:
+            with self.file.open("a") as out:
+                out.write(json.dumps(entry) + "\n")
+        elif entry.get("type") == "message" and entry["message"].get("role") == "assistant":
+            self.file.write_text("".join(json.dumps(e) + "\n" for e in self.entries))
+            self.on_disk = True
 
     def respond(self, rid, command, data=None, error=None):
         frame = {"id": rid, "type": "response", "command": command, "success": error is None}
@@ -94,16 +135,27 @@ class Omp(Protocol):
             frame["data"] = data
         self.emit(frame)
 
-    def user_message(self, inp, steering):
-        """The run took `inp`: its frames, and its line in the session file."""
+    @staticmethod
+    def user(inp, steering):
         message = {"role": "user", "content": [{"type": "text", "text": inp.text}],
                    "attribution": "user", "timestamp": 0}
         if steering:
             message["steering"] = True
-        entry = "%08x" % (len(self.file.read_text().splitlines()) + 1)
+        return message
+
+    def persist_message(self, message):
+        entry = "%08x" % (len(self.entries) + 1)
         self.persist({"type": "message", "id": entry, "parentId": self.parent,
                       "timestamp": now(), "message": message})
         self.parent = entry
+
+    def persist_user(self, inp, steering):
+        """The run took `inp`: its line in the session."""
+        self.persist_message(self.user(inp, steering))
+
+    def user_message(self, inp, steering):
+        """The frames that say the run took `inp`."""
+        message = self.user(inp, steering)
         self.messages += 1
         frame_id = "msg-%d" % self.messages
         return [{"type": "message_start", "message": message, "messageId": frame_id},
@@ -169,7 +221,40 @@ class Omp(Protocol):
         else:
             self.respond(rid, kind or "unknown", error="Unknown command: %s" % kind)
 
+    def frames(self, message):
+        """The frames of a message the run produced."""
+        self.messages += 1
+        frame_id = "msg-%d" % self.messages
+        self.emit({"type": "message_start", "message": message, "messageId": frame_id})
+        self.emit({"type": "message_end", "message": message, "messageId": frame_id})
+
+    def batch(self):
+        """The tool batch before the running step: the assistant message that
+        asked for a tool, and the tool's result."""
+        call = "call-%s-%d" % (self.engine.turn, self.engine.step_no)
+        return [{"role": "assistant", "stopReason": "toolUse",
+                 "content": [{"type": "toolCall", "id": call, "name": "bash",
+                              "arguments": {"command": "true"}}],
+                 "usage": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0,
+                           "totalTokens": 0, "cost": {"total": 0}}},
+                {"role": "toolResult", "toolCallId": call, "toolName": "bash",
+                 "content": [{"type": "text", "text": ""}], "isError": False}]
+
+    def tool_batch(self):
+        """Record the running step's tool batch in the session, once."""
+        step = (self.engine.turn, self.engine.step_no)
+        if self.batch_step == step:
+            return
+        self.batch_step = step
+        for message in self.batch():
+            self.persist_message(message)
+
     def consumed(self, taken):
+        # A step boundary follows a tool batch: the assistant message that
+        # asked for the tool, then its result. Steering is taken after them.
+        self.tool_batch()
+        for message in self.batch():
+            self.frames(message)
         for inp, _ in taken:
             for frame in self.user_message(inp, steering=True):
                 self.emit(frame)
@@ -191,10 +276,8 @@ class Omp(Protocol):
                                "totalTokens": 6,
                                "cost": {"input": 0.000003, "output": 0.000002, "cacheRead": 0,
                                         "cacheWrite": 0, "total": 0.000005}}}
-        self.messages += 1
-        frame_id = "msg-%d" % self.messages
-        self.emit({"type": "message_start", "message": assistant, "messageId": frame_id})
-        self.emit({"type": "message_end", "message": assistant, "messageId": frame_id})
+        self.persist_message(assistant)
+        self.frames(assistant)
         self.emit({"type": "agent_end", "messages": [assistant]})
         for rid in tickets[1:] + tickets[:1]:
             self.emit({"type": "prompt_result", "id": rid, "agentInvoked": True,

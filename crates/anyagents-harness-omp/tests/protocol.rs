@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use anyagents_harness::{Context, DeliverOutcome, Harness, OutboundMessage, TurnUsage};
+use anyagents_harness::{Context, DeliverOutcome, Harness, OutboundMessage, Proof, TurnUsage};
 use anyagents_harness_omp::OmpHarness;
 use anyagents_harness_stream::StreamSpec;
 use tempfile::TempDir;
@@ -141,13 +141,98 @@ fn steer(harness: &mut OmpHarness, id: &str) {
 #[test]
 fn omp_runs_in_rpc_mode_and_names_its_protocol_and_session() {
     let vendor = Vendor::new();
-    let harness = vendor.start(None);
-    until("the session is known", || harness.session_id().is_some());
+    let mut harness = vendor.start(None);
+    until("the peer is known", || {
+        harness.health().delivery.peer.is_some()
+    });
     let health = harness.health();
     assert!(health.process_alive, "a launch without --mode rpc exits");
     assert_eq!(health.delivery.peer.as_deref(), Some("omp rpc/1"));
     assert_eq!(health.sign_in_fault, None, "steering mode all was taken");
+    // OMP writes a new session only with its first reply, and refuses to
+    // resume one it never wrote: it is named once it is on disk.
+    deliver(&mut harness, "m1");
+    assert_eq!(harness.session_id(), None);
+    vendor.command("finish");
+    until("the session is on disk", || harness.session_id().is_some());
     assert_eq!(harness.session_id().as_deref(), Some("omp-session-1"));
+}
+
+#[test]
+fn a_run_that_died_before_its_first_reply_leaves_nothing_to_resume_or_recognise() {
+    let vendor = Vendor::new();
+    let mut first = vendor.start(None);
+    assert_eq!(
+        deliver(&mut first, "m1"),
+        DeliverOutcome::Accepted {
+            turn_finished: false
+        }
+    );
+    vendor.command("crash");
+    until("the child is gone", || !first.health().process_alive);
+    // Proved, so the host commits it; but no session reached the disk.
+    assert_eq!(
+        first.proven("m1"),
+        Some(Proof::Taken {
+            turn_finished: false
+        })
+    );
+    assert_eq!(first.session_id(), None, "OMP would refuse to resume it");
+    // A host that lost the commit hands m1 to a fresh session: the vendor's
+    // own record shows it never arrived, and nothing it began was kept.
+    let mut second = vendor.start(first.session_id().as_deref());
+    assert_eq!(
+        deliver(&mut second, "m1"),
+        DeliverOutcome::Accepted {
+            turn_finished: false
+        }
+    );
+    assert_eq!(vendor.wire(), ["m1", "m1"]);
+}
+
+#[test]
+fn a_session_omp_never_wrote_cannot_be_resumed() {
+    let vendor = Vendor::new();
+    let harness = vendor.start(Some("omp-session-9"));
+    until("the child is gone", || !harness.health().process_alive);
+    let exit = harness.exit_diagnostic().expect("an exit diagnostic");
+    assert!(
+        exit.contains("Session \"omp-session-9\" not found"),
+        "{exit}"
+    );
+}
+
+#[test]
+fn a_crash_after_a_step_leaves_a_session_that_holds_what_it_took() {
+    let vendor = Vendor::new();
+    let mut first = vendor.start(None);
+    deliver(&mut first, "m1");
+    steer(&mut first, "m2");
+    steer(&mut first, "m3");
+    // The step after a tool batch takes m2 and dies before m3: the tool
+    // call's reply put the session on disk.
+    vendor.command("step-1");
+    until("the child is gone", || !first.health().process_alive);
+    first.stop();
+    assert_eq!(
+        first.proven("m2"),
+        Some(Proof::Taken {
+            turn_finished: false
+        })
+    );
+    assert_eq!(first.proven("m3"), None);
+    let session = first.session_id().expect("the session is on disk");
+    let mut second = vendor.start(Some(&session));
+    for id in ["m1", "m2"] {
+        assert_eq!(deliver(&mut second, id), DeliverOutcome::Duplicate, "{id}");
+    }
+    assert_eq!(
+        deliver(&mut second, "m3"),
+        DeliverOutcome::Accepted {
+            turn_finished: false
+        }
+    );
+    assert_eq!(vendor.journal(), ["m1", "m2", "m3"]);
 }
 
 #[test]
