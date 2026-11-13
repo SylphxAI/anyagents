@@ -442,14 +442,8 @@ fn hash_all(mut reader: impl BufRead) -> io::Result<(u64, String)> {
 /// One JSONL line read from a buffered stream.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum JsonlLine {
-    /// A newline-terminated line holding exactly one JSON value.
+    /// A newline-terminated line holding an indexed raw coordinate.
     Complete { length: u64, sha256: String },
-    /// A newline-terminated line whose bytes are intact/hashed but not a single valid JSON value.
-    Malformed {
-        length: u64,
-        sha256: String,
-        error: String,
-    },
     /// Final bytes with no newline yet: never validated or committed.
     Partial { length: u64 },
 }
@@ -458,6 +452,13 @@ pub(crate) enum JsonlLine {
 /// through `IgnoredAny`, so neither a huge tool output nor the line itself is
 /// ever resident, and no byte is read twice. `None` means end of input.
 pub(crate) fn read_jsonl_line(reader: &mut impl BufRead) -> io::Result<Option<JsonlLine>> {
+    read_jsonl_line_with_policy(reader, false)
+}
+
+pub(crate) fn read_jsonl_line_with_policy(
+    reader: &mut impl BufRead,
+    tolerate_malformed: bool,
+) -> io::Result<Option<JsonlLine>> {
     let mut line = LineState {
         hash: Sha256::new(),
         length: 0,
@@ -487,22 +488,21 @@ pub(crate) fn read_jsonl_line(reader: &mut impl BufRead) -> io::Result<Option<Js
             length: line.length,
         }));
     }
-    let sha256 = format!("{:x}", line.hash.finalize());
-    match parsed {
-        Ok(_) => Ok(Some(JsonlLine::Complete {
-            length: line.length,
-            sha256,
-        })),
-        Err(e) if e.classify() == serde_json::error::Category::Io => Err(io::Error::new(
-            e.io_error_kind().unwrap_or(io::ErrorKind::Other),
-            e,
-        )),
-        Err(e) => Ok(Some(JsonlLine::Malformed {
-            length: line.length,
-            sha256,
-            error: e.to_string(),
-        })),
+    if let Err(e) = parsed {
+        if e.classify() == serde_json::error::Category::Io {
+            return Err(io::Error::new(
+                e.io_error_kind().unwrap_or(io::ErrorKind::Other),
+                e,
+            ));
+        }
+        if !tolerate_malformed {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, e));
+        }
     }
+    Ok(Some(JsonlLine::Complete {
+        length: line.length,
+        sha256: format!("{:x}", line.hash.finalize()),
+    }))
 }
 struct LineState {
     hash: Sha256,
@@ -847,9 +847,6 @@ fn scan_jsonl(
                     seq: records.len() as u64 + 1,
                 });
                 at += length;
-            }
-            JsonlLine::Malformed { error, .. } => {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, error));
             }
             // Read-only indexing leaves an active writer's tail untouched.
             JsonlLine::Partial { .. } if allow_partial_tail => break,
