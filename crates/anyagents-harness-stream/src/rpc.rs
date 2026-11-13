@@ -10,6 +10,11 @@
 //! line with a `method` is a notification. A line with both is a request from
 //! the vendor: the adapter's `on_request` returns the result, or `None` to
 //! answer nothing.
+//!
+//! The child is gone only once its stdout reached its end: a line the host
+//! could not write (its pipe broke) was not written, and is answered
+//! [`RpcFail::Dead`] to its caller, but every line the child printed before it
+//! went is still read, so no answer or proof it gave is lost.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -184,7 +189,6 @@ impl RpcChild {
         let line = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
         if write_stdin(&self.stdin, &line).is_err() {
             lock(&self.shared).pending.remove(&id);
-            self.mark_dead();
             return Err(RpcFail::Dead);
         }
         self.await_answer(id, wait)
@@ -206,7 +210,6 @@ impl RpcChild {
         let line = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
         if write_stdin(&self.stdin, &line).is_err() {
             lock(&self.shared).pending.remove(&id);
-            self.mark_dead();
             return Err(RpcFail::Dead);
         }
         Ok(id)
@@ -216,7 +219,6 @@ impl RpcChild {
     pub fn notify(&self, method: &str, params: Value) -> Result<(), RpcFail> {
         let line = json!({"jsonrpc": "2.0", "method": method, "params": params});
         if write_stdin(&self.stdin, &line).is_err() {
-            self.mark_dead();
             Err(RpcFail::Dead)
         } else {
             Ok(())
@@ -227,7 +229,6 @@ impl RpcChild {
     pub fn answer(&self, id: &Value, result: Value) -> Result<(), RpcFail> {
         let line = json!({"jsonrpc": "2.0", "id": id, "result": result});
         if write_stdin(&self.stdin, &line).is_err() {
-            self.mark_dead();
             Err(RpcFail::Dead)
         } else {
             Ok(())
@@ -334,19 +335,11 @@ impl RpcChild {
             });
     }
 
-    pub fn mark_dead(&self) {
-        lock(&self.shared).alive = false;
-        self.wake.notify_all();
-    }
-
+    /// Stop the child and read what it printed to the end: the reader has
+    /// handed every line to the adapter before this returns.
     pub fn stop_child(&mut self) {
         *lock(&self.stdin) = None;
-        let mut child = {
-            let mut state = lock(&self.shared);
-            state.alive = false;
-            state.child.take()
-        };
-        self.wake.notify_all();
+        let mut child = lock(&self.shared).child.take();
         if let Some(child) = child.as_mut() {
             anyagents_harness::kill_child(child, &self.environment);
         }
@@ -356,8 +349,8 @@ impl RpcChild {
         if let Some(mut child) = child {
             let _ = child.wait();
         }
-        let mut state = lock(&self.shared);
-        state.alive = false;
+        lock(&self.shared).alive = false;
+        self.wake.notify_all();
     }
 
     fn spawn(&mut self) -> Result<(), HarnessError> {
@@ -432,9 +425,10 @@ fn read_stdout(
             (Some(method), Some(id)) => {
                 if let Some(result) = on_request(method, &value) {
                     let answer = json!({"jsonrpc": "2.0", "id": id, "result": result});
-                    if write_stdin(&stdin, &answer).is_err() {
-                        break;
-                    }
+                    // An answer that cannot be written leaves the request
+                    // unanswered; what the child prints after it is still
+                    // read, and its stdout's end reports it gone.
+                    let _ = write_stdin(&stdin, &answer);
                 }
             }
             (Some(method), None) => {
@@ -628,13 +622,18 @@ mod tests {
         assert_eq!(event["params"]["error"]["code"], -32600);
     }
 
+    /// The host cannot write its answer to the vendor's request: the child
+    /// is not reported gone, and what it prints after it is still read (here
+    /// the answer to the host's own request), until its stdout ends.
     #[test]
-    fn required_reply_write_failure_marks_child_dead_and_wakes_pending_request() {
+    fn a_reply_that_cannot_be_written_keeps_the_child_read_to_its_end() {
         let (stdin_tx, stdin_rx) =
             std::sync::mpsc::sync_channel::<Arc<Mutex<Option<ChildStdin>>>>(1);
         let stdin_rx = Mutex::new(stdin_rx);
+        let (closed_tx, closed_rx) = std::sync::mpsc::channel::<()>();
+        let closed_tx = Mutex::new(closed_tx);
         let child = launch_with_request_handler(
-            "IFS= read -r request; printf '%s\n' '{\"id\":99,\"method\":\"approval/request\"}'; exec sleep 30".into(),
+            "IFS= read -r request; printf '%s\n' '{\"id\":99,\"method\":\"approval/request\"}'; sleep 0.3; printf '%s\n' '{\"id\":1,\"result\":\"proved\"}'; sleep 0.3".into(),
             Arc::new(|_| NotificationEffect::default()),
             Arc::new(move |_, _| {
                 // Close the host writer while handling the vendor's request.
@@ -642,15 +641,58 @@ mod tests {
                 // process still holds an inherited copy of the pipe's read end.
                 let stdin = lock(&stdin_rx).recv_timeout(Duration::from_secs(5)).unwrap();
                 *lock(&stdin) = None;
+                let _ = lock(&closed_tx).send(());
                 Some(json!({"approved": true}))
             }),
         );
         stdin_tx.send(Arc::clone(&child.stdin)).unwrap();
+        assert_eq!(
+            child
+                .request("turn", json!({}), Duration::from_secs(5))
+                .unwrap(),
+            json!("proved")
+        );
+        closed_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        // The host cannot write any more: the call says so, the child is
+        // still reported running until its stdout ends.
+        assert!(matches!(
+            child.notify("cancel", json!({})),
+            Err(RpcFail::Dead)
+        ));
+        assert!(child.alive());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while child.alive() {
+            assert!(Instant::now() < deadline, "the child's end was never read");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// A request the host cannot write was not written: its caller hears
+    /// `Dead`, but the child is reported gone only once its stdout ends,
+    /// after every line it printed is read.
+    #[test]
+    fn a_request_that_cannot_be_written_does_not_end_the_child() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let child = launch(
+            "sleep 0.3; printf '%s\n' '{\"method\":\"proof\",\"params\":{\"id\":\"m1\"}}'; sleep 0.2".into(),
+            Arc::new(move |line| {
+                tx.send(line.clone()).unwrap();
+                NotificationEffect::default()
+            }),
+        );
+        *lock(&child.stdin) = None;
         assert!(matches!(
             child.request("turn", json!({}), Duration::from_secs(5)),
             Err(RpcFail::Dead)
         ));
-        assert!(!child.alive());
+        assert!(child.alive());
+        let line = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(line["params"]["id"], "m1");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while child.alive() {
+            assert!(Instant::now() < deadline, "the child's end was never read");
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]

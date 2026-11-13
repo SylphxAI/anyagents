@@ -6,17 +6,30 @@
 //! line and usage come from `StreamSpec::for_program("agy")`.
 //!
 //! Delivery (`docs/delivery.md`): an idle agent's message is a stdin line that
-//! opens a turn. With the agent's config directory and a work directory, mail
-//! for a busy agent goes into the running cascade through the language
-//! server's `SendUserCascadeMessage` (`NEXT_INVOCATION`), which queues it in
-//! the cascade's durable mailbox and answers `{}`; the cascade takes it at its
-//! next step boundary, which nothing reports per message, so the level is
-//! `mid-turn`. The request runs off the delivery path and waits for its answer
-//! without a timeout. A refusal is not a fault: the message goes back to the
-//! mailbox. An answer that never came is settled from the cascade's mailbox
-//! and transcript, never by sending again blindly. Nothing deduplicates a
-//! message handed to a later process, so it is not idempotent. Without the
-//! language server a line written mid-turn waits for the turn to end.
+//! opens a turn, taken once the cascade shows the turn's first step. With the
+//! agent's config directory and a work directory, mail for a busy agent goes
+//! into the running cascade through the language server's
+//! `SendUserCascadeMessage` (`NEXT_INVOCATION`), which writes it to the
+//! cascade's durable mailbox and answers `{}`. That answer proves nothing: a
+//! cascade whose run fails never takes what waits in its mailbox. A message
+//! is committed only once the cascade's own record shows it took it: a
+//! `USER_INPUT` row of `transcript_full.jsonl` that opens with its marker, or
+//! its mailbox file marked in `messages/read.json`. Until then it is in
+//! flight; the cascade takes it at a later step or invocation, a process
+//! resuming the cascade finds it still held there and does not write it
+//! again, and a process on a new cascade (the old one retired) is offered it
+//! afresh. While the mailbox holds mail, new mail joins it rather than
+//! opening a turn on stdin that could run first.
+//!
+//! The level is `turn-end`: that the running turn takes its mailbox at its
+//! next step is inferred from the vendor, not yet proven against it. A
+//! resumed cascade's transcript is read before its process starts, so a
+//! message an earlier process applied is answered as a duplicate
+//! (idempotent). A refusal is not a fault: the message goes back to the
+//! mailbox. The request runs off the delivery path and waits for its answer
+//! without a timeout; an answer that never came is settled from the
+//! cascade's mailbox and transcript, never by sending again blindly. Without
+//! the language server a line written mid-turn waits for the turn to end.
 
 use std::path::{Path, PathBuf};
 
@@ -32,9 +45,11 @@ use anyagents_harness_stream::{
 /// What this adapter guarantees for mail that reaches a busy agent
 /// (`docs/delivery.md`).
 pub const DELIVERY: Delivery = Delivery {
-    level: DeliveryLevel::MidTurn,
-    idempotent: false,
-    proof: std::borrow::Cow::Borrowed("SendUserCascadeMessage queued it (its answer, or the cascade mailbox)"),
+    level: DeliveryLevel::TurnEnd,
+    idempotent: true,
+    proof: std::borrow::Cow::Borrowed(
+        "the cascade took it: a USER_INPUT transcript row or messages/read.json",
+    ),
     peer: None,
 };
 
@@ -172,6 +187,14 @@ impl Harness for AgyHarness {
     ) -> Result<DeliverOutcome, HarnessError> {
         self.inner
             .deliver(message, &message_line(&self.spec, message))
+    }
+
+    fn proven(&self, message_id: &str) -> Option<anyagents_harness::Proof> {
+        self.inner.proven(message_id)
+    }
+
+    fn stop(&mut self) {
+        self.inner.stop();
     }
 
     fn background(&mut self) -> Result<(), HarnessError> {

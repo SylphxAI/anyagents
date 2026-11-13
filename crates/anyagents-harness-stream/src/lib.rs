@@ -22,7 +22,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyagents_harness::{
     DeliverOutcome, Delivery, DeliveryLevel, DeliveryMode, FileStamp, HarnessError, HarnessHealth,
-    OutboundMessage, TurnState, TurnUsage, compose_message, message_id_in_text, spawn_command,
+    OutboundMessage, Proof, TurnState, TurnUsage, compose_message, message_id_in_text,
+    spawn_command,
 };
 use serde_json::{Value, json};
 
@@ -301,6 +302,23 @@ struct State {
     /// The Antigravity turn (its `turns_started`) whose cascade refused a
     /// steer: it is given no more, and the next input waits for its end.
     agy_refused_turn: Option<usize>,
+    /// Messages a cascade's durable mailbox holds that the cascade has not
+    /// shown taking: the language server queued them for this process, or a
+    /// resumed cascade still held them from an earlier one. Its answer to
+    /// `SendUserCascadeMessage` is no proof: a cascade whose run fails never
+    /// takes what waits in its mailbox.
+    agy_queued: Vec<AgyQueued>,
+    /// Messages a cascade took: a `USER_INPUT` row of its transcript, or its
+    /// mailbox's `read.json`, names them, or a turn this process wrote on
+    /// stdin showed its first step or closed. A proof about the session, so
+    /// a new process keeps it.
+    agy_taken: HashSet<String>,
+    /// The session's cascade was retired (its record is poisoned): no later
+    /// line names it again.
+    session_retired: bool,
+    /// stdin broke: the process takes no more lines, and its stdout's end,
+    /// read to the last proof, reports it gone.
+    stdin_broken: bool,
     seen: HashSet<String>,
     acknowledged: HashSet<String>,
     input_turns: HashMap<String, String>,
@@ -340,6 +358,10 @@ struct State {
     /// when the next one may be offered.
     refused_turns: u32,
     turn_retry_at: Option<Instant>,
+    /// When the first of those refusals came, and the reason the last one
+    /// gave.
+    turn_refused_since: Option<Instant>,
+    turn_refusal: Option<String>,
 }
 
 impl StreamHarness {
@@ -617,7 +639,10 @@ impl StreamHarness {
             if err.kind() == std::io::ErrorKind::WouldBlock {
                 return Err(HarnessError::Failed("stdin backpressure".into()));
             }
-            state.alive = false;
+            // The child closed its input: it is going, and its stdout's end,
+            // read to the last line, reports it gone.
+            state.stdin_broken = true;
+            state.touch();
             self.wake.notify_all();
             return Err(HarnessError::Dead);
         }
@@ -631,19 +656,18 @@ impl StreamHarness {
         Ok(())
     }
 
+    /// What this harness already proved about `id`, whether or not its
+    /// process still runs, without writing anything (`Harness::proven`). A
+    /// read of the state the stdout reader and the cascade watcher keep: it
+    /// does no I/O.
+    pub fn proven(&self, id: &str) -> Option<Proof> {
+        let state = lock(&self.shared);
+        state.proof_of(self.spec.protocol, self.agy_rpc.is_some(), id)
+    }
+
     /// A read of the child's state. It never does I/O: an Antigravity
     /// cascade that stays open without a closing line is watched by its own
     /// turn timer ([`watch_agy_cascade`]), not by how often the host asks.
-    /// What this harness already proved about `id`, without writing
-    /// (`Harness::proven`). Each protocol fills it in its own change.
-    pub fn proven(&self, _id: &str) -> Option<anyagents_harness::Proof> {
-        None
-    }
-
-    /// Stop the child and read it to the end (`Harness::stop`). Each
-    /// protocol fills it in its own change.
-    pub fn stop(&mut self) {}
-
     pub fn health(&self) -> HarnessHealth {
         let mut state = lock(&self.shared);
         if !state.alive {
@@ -690,13 +714,23 @@ impl StreamHarness {
     }
 
     /// Write one line into the child and record it as taken.
+    ///
+    /// What the vendor already proved about the message answers first,
+    /// before liveness or a quota: a proof outlives the process that gave
+    /// it. A refusal for good is answered again for the same id.
     pub fn deliver(
         &mut self,
         message: &OutboundMessage,
         line: &Value,
     ) -> Result<DeliverOutcome, HarnessError> {
-        if lock(&self.shared).applied_before.contains(&message.id) {
-            return Ok(DeliverOutcome::Duplicate);
+        let id = message.id.as_str();
+        if let Some(proof) = self.proven(id) {
+            return Ok(proof_outcome(proof));
+        }
+        if let Some(reason) = lock(&self.shared).rejected.get(id) {
+            return Ok(DeliverOutcome::Rejected {
+                reason: reason.clone(),
+            });
         }
         if self.spec.protocol == LineProtocol::AcknowledgedResult {
             let state = lock(&self.shared);
@@ -711,20 +745,34 @@ impl StreamHarness {
             }
             // An older peer proves nothing about input it takes mid-turn: it
             // is given the next input only once the running turn has ended.
-            let unwritten = self.pending.as_ref().is_none_or(|p| p.id != message.id);
-            if unwritten && !state.seen.contains(&message.id) && !state.open.is_empty() {
+            let unwritten = self.pending.as_ref().is_none_or(|p| p.id != id);
+            if unwritten && !state.seen.contains(id) && !state.open.is_empty() {
                 return Ok(DeliverOutcome::Deferred);
             }
         }
-        // A steer this process sent for the message answers first, before
-        // liveness: what the language server queued stays queued after the
-        // process exits.
-        let steered = self
-            .agy_rpc
-            .as_ref()
-            .and_then(|_| agy_steer_answer(&mut lock(&self.shared), &message.id));
-        if let Some(answer) = steered {
-            return answer;
+        if self.agy_rpc.is_some() {
+            let mut state = lock(&self.shared);
+            // A settled steer is judged by what the cascade holds or took
+            // (queued), or afresh (returned).
+            if state
+                .agy_steer
+                .as_ref()
+                .is_some_and(|steer| steer.outcome.is_some())
+            {
+                state.agy_steer = None;
+            }
+            // A steer under way is in flight until the language server
+            // settles it; one its cascade holds, until the cascade takes it.
+            if state.agy_steer.as_ref().is_some_and(|steer| steer.id == id) {
+                return Ok(DeliverOutcome::InFlight);
+            }
+            if state.agy_queued.iter().any(|queued| queued.id == id) {
+                return if state.alive {
+                    Ok(DeliverOutcome::InFlight)
+                } else {
+                    Err(HarnessError::Dead)
+                };
+            }
         }
         let bytes = self
             .pending
@@ -737,26 +785,28 @@ impl StreamHarness {
                 return Err(HarnessError::Dead);
             }
             if let Some(pending) = &self.pending {
-                if pending.id != message.id {
+                if pending.id != id {
                     return Ok(DeliverOutcome::Deferred);
                 }
             } else {
-                if let Some(reset_at_ms) = state.quota_reset_at_ms
-                    && !state.finished.contains(&message.id)
-                {
-                    return Ok(DeliverOutcome::Quota { reset_at_ms });
-                }
-                if let Some(reason) = state.rejected.get(&message.id) {
-                    return Err(HarnessError::Failed(reason.clone()));
-                }
-                if state.seen.contains(&message.id) {
-                    if self.agy_rpc.is_some() && agy_prompt_untaken(&state, &message.id) {
-                        return Ok(DeliverOutcome::InFlight);
-                    }
-                    return state.written_outcome(self.spec.protocol, &message.id);
+                if state.stdin_broken {
+                    return Ok(DeliverOutcome::Deferred);
                 }
                 if let Some(reset_at_ms) = state.quota_reset_at_ms {
                     return Ok(DeliverOutcome::Quota { reset_at_ms });
+                }
+                // Written and not proven yet: an Antigravity prompt until its
+                // cascade shows the turn, an older Spiron's until `accepted`.
+                if state.seen.contains(id) {
+                    return Ok(if self.agy_rpc.is_some() {
+                        DeliverOutcome::InFlight
+                    } else if self.spec.protocol == LineProtocol::AcknowledgedResult {
+                        DeliverOutcome::Deferred
+                    } else {
+                        DeliverOutcome::Accepted {
+                            turn_finished: state.finished.contains(id),
+                        }
+                    });
                 }
                 // One Antigravity steer at a time, and nothing written past
                 // it until it is settled: mail reaches the cascade in order.
@@ -775,13 +825,14 @@ impl StreamHarness {
                         return Ok(DeliverOutcome::Deferred);
                     }
                     state.agy_steer = Some(AgySteer {
-                        id: message.id.clone(),
+                        id: id.to_string(),
                         outcome: None,
+                        sent: None,
                     });
                     agy_steer = Some(AgySteerJob {
                         rpc: rpc.clone(),
-                        id: message.id.clone(),
-                        text: compose_message(&message.id, &message.context, &message.text),
+                        id: id.to_string(),
+                        text: compose_message(id, &message.context, &message.text),
                         session_id: state.session_id.clone().unwrap_or_default(),
                         child_pid: state.child.as_ref().map(Child::id),
                         cached_port: state.http_port,
@@ -793,19 +844,19 @@ impl StreamHarness {
                     // first byte is visible to the child. This is not acceptance.
                     if state.open.is_empty() {
                         state.turns_started += 1;
-                        state.open.push(message.id.clone());
+                        state.open.push(id.to_string());
                         state.turn_user_inputs = 0;
                         state.idle_since = None;
                         state.sign_in_fault = None;
                     } else if self.mode == DeliveryMode::Steer {
-                        if !state.open.contains(&message.id) {
-                            state.open.push(message.id.clone());
+                        if !state.open.iter().any(|open| open == id) {
+                            state.open.push(id.to_string());
                         }
                     } else {
-                        state.followups.push(message.id.clone());
+                        state.followups.push(id.to_string());
                     }
                     self.pending = Some(PendingWrite {
-                        id: message.id.clone(),
+                        id: id.to_string(),
                         bytes: bytes.expect("new write"),
                         offset: 0,
                         generation: state.generation,
@@ -846,15 +897,20 @@ impl StreamHarness {
                 let pending = self.pending.take().expect("completed write");
                 state.seen.insert(pending.id.clone());
                 state.written.push(pending.id);
-                if self.agy_rpc.is_some() && agy_prompt_untaken(&state, &message.id) {
-                    return Ok(DeliverOutcome::InFlight);
-                }
-                state.written_outcome(self.spec.protocol, &message.id)
+                drop(state);
+                self.deliver(message, line)
             }
+            // The line never reached the child whole, so it was not written:
+            // it stays in the mailbox. The child is going; its stdout's end
+            // says so once every line it wrote before is read.
             Err(_) => {
-                state.alive = false;
+                let pending = self.pending.take().expect("failed write");
+                state.open.retain(|open| *open != pending.id);
+                state.followups.retain(|open| *open != pending.id);
+                state.stdin_broken = true;
+                state.touch();
                 self.wake.notify_all();
-                Err(HarnessError::Dead)
+                Ok(DeliverOutcome::Deferred)
             }
         }
     }
@@ -879,12 +935,15 @@ impl StreamHarness {
         let id = message.id.as_str();
         {
             let mut state = lock(&self.shared);
-            // A consumption the peer proved stays proved after it exits.
+            // A consumption the peer proved stays proved after it exits, and
+            // a refusal for good stays one.
             if let Some(Ok(
-                proved @ (DeliverOutcome::Accepted { .. } | DeliverOutcome::Duplicate),
+                settled @ (DeliverOutcome::Accepted { .. }
+                | DeliverOutcome::Duplicate
+                | DeliverOutcome::Rejected { .. }),
             )) = state.consumption_outcome(id)
             {
-                return Ok(proved);
+                return Ok(settled);
             }
             if !state.alive {
                 return Err(HarnessError::Dead);
@@ -917,6 +976,22 @@ impl StreamHarness {
                         .turn_retry_at
                         .is_some_and(|retry_at| Instant::now() < retry_at)
                 {
+                    return Ok(DeliverOutcome::Deferred);
+                }
+                // A session lease a dead process left lapses within
+                // `SPIRON_LEASE`; turns that still cannot start after it are
+                // a fault of this process, not a wait.
+                if starts_turn
+                    && let Some(since) = state.turn_refused_since
+                    && since.elapsed() >= SPIRON_LEASE
+                {
+                    return Err(HarnessError::Failed(format!(
+                        "spiron could not start a turn for {}s: {}",
+                        since.elapsed().as_secs(),
+                        state.turn_refusal.as_deref().unwrap_or("turn_not_started")
+                    )));
+                }
+                if state.stdin_broken {
                     return Ok(DeliverOutcome::Deferred);
                 }
                 let mut line = line.clone();
@@ -972,10 +1047,16 @@ impl StreamHarness {
                     .consumption_outcome(id)
                     .unwrap_or(Ok(DeliverOutcome::Deferred))
             }
+            // The line never reached the peer whole, so it was not written:
+            // it goes back to the mailbox. The peer is going; its stdout's
+            // end says so once every receipt it wrote before is read.
             Err(_) => {
-                state.alive = false;
+                let failed = self.pending.take().expect("failed write").id;
+                release_input(&mut state, &failed);
+                state.stdin_broken = true;
+                state.touch();
                 self.wake.notify_all();
-                Err(HarnessError::Dead)
+                Ok(DeliverOutcome::Deferred)
             }
         }
     }
@@ -1001,7 +1082,7 @@ impl StreamHarness {
 
     pub fn input_ready(&self) -> bool {
         let state = lock(&self.shared);
-        if state.input_blocked {
+        if state.input_blocked || state.stdin_broken {
             return false;
         }
         if self.spec.protocol == LineProtocol::AcknowledgedResult
@@ -1062,6 +1143,13 @@ impl StreamHarness {
     }
 
     fn spawn(&mut self) -> Result<(), HarnessError> {
+        // A resumed cascade's own record, read before its process starts:
+        // what it took is not written again, and what its mailbox still
+        // holds is its to take, so it is not written again either.
+        let resumed = self.agy_rpc.as_ref().and_then(|rpc| {
+            let cascade = lock(&self.shared).session_id.clone()?;
+            Some(agy_scan(rpc, &cascade))
+        });
         // The seat the server configured for this agent: the child starts as
         // the agent's own uid, and no server-only key reaches it.
         let mut command = spawn_command(&self.program, &self.environment)?;
@@ -1104,7 +1192,7 @@ impl StreamHarness {
             state.seen.clear();
             state.acknowledged.clear();
             state.input_turns.clear();
-            state.rejected.clear();
+            // A refusal for good stays one: `rejected` outlives the process.
             state.written.clear();
             state.finished.clear();
             state.finished_quiet.clear();
@@ -1118,6 +1206,15 @@ impl StreamHarness {
             state.turn_closing = false;
             state.refused_turns = 0;
             state.turn_retry_at = None;
+            state.turn_refused_since = None;
+            state.turn_refusal = None;
+            state.stdin_broken = false;
+            state.session_retired = false;
+            state.agy_queued.clear();
+            if let Some((taken, held)) = resumed {
+                state.applied_before.extend(taken);
+                state.agy_queued = held;
+            }
             state.quota_reset_at_ms = None;
             state.sign_in_fault = None;
             state.stderr = BoundedStderr::default();
@@ -1234,22 +1331,27 @@ impl StreamHarness {
         Ok(())
     }
 
+    /// Stop the child and read what it wrote to the end: the stdout reader
+    /// reaches its end before this returns, so every proof the child gave is
+    /// known (`proven`) and kept until the next process starts.
+    pub fn stop(&mut self) {
+        self.stop_child();
+    }
+
     fn stop_child(&mut self) {
         self.pending = None;
         *lock(&self.stdin) = None;
-        let child = {
-            let mut state = lock(&self.shared);
-            state.alive = false;
-            state.child.take()
-        };
-        self.wake.notify_all();
+        let child = lock(&self.shared).child.take();
         if let Some(mut child) = child {
             anyagents_harness::kill_child(&mut child, &self.environment);
             let _ = child.wait();
         }
+        // The reader marks the child gone once it read the last line.
         if let Some(handle) = self.reader.take() {
             let _ = handle.join();
         }
+        lock(&self.shared).alive = false;
+        self.wake.notify_all();
         if let Some(handle) = self.stderr_reader.take() {
             let _ = handle.join();
         }
@@ -1268,7 +1370,6 @@ impl StreamHarness {
         state.planner_config = None;
         state.http_port = None;
         state.text = None;
-        state.alive = false;
     }
 
     fn wait_pred(&self, timeout: Duration, mut pred: impl FnMut(&State) -> bool) -> bool {
@@ -1394,7 +1495,9 @@ impl State {
     /// (never written, or returned for writing again).
     fn consumption_outcome(&self, id: &str) -> Option<Result<DeliverOutcome, HarnessError>> {
         if let Some(reason) = self.rejected.get(id) {
-            return Some(Err(HarnessError::Failed(reason.clone())));
+            return Some(Ok(DeliverOutcome::Rejected {
+                reason: reason.clone(),
+            }));
         }
         if self.consumed.contains(id) {
             return Some(Ok(if self.duplicates.contains(id) {
@@ -1410,29 +1513,36 @@ impl State {
             .then_some(Ok(DeliverOutcome::InFlight))
     }
 
-    // Both a fresh pipe write and an already-written retry consult the same
-    // receipt state. An older Spiron's input is taken once its turn is
-    // `accepted`.
-    fn written_outcome(
-        &self,
-        protocol: LineProtocol,
-        id: &str,
-    ) -> Result<DeliverOutcome, HarnessError> {
-        if let Some(reset_at_ms) = self.quota_reset_at_ms
-            && !self.finished.contains(id)
-        {
-            return Ok(DeliverOutcome::Quota { reset_at_ms });
+    /// What the vendor proved about `id`: the evidence each protocol's
+    /// level rests on, kept after the process exits.
+    ///
+    /// - Every protocol: the session's own record shows an earlier process
+    ///   applied it (`applied_before`).
+    /// - Spiron that proves consumption: `accepted` or `steer_consumed`.
+    /// - An older Spiron: `accepted`.
+    /// - Antigravity with its language server: the cascade took it (its
+    ///   transcript or mailbox says so, or its turn showed a step or closed).
+    /// - A line-per-turn child: the whole line was written.
+    fn proof_of(&self, protocol: LineProtocol, agy: bool, id: &str) -> Option<Proof> {
+        if self.applied_before.contains(id) {
+            return Some(Proof::Duplicate);
         }
-        if let Some(reason) = self.rejected.get(id) {
-            return Err(HarnessError::Failed(reason.clone()));
+        let taken = || Proof::Taken {
+            turn_finished: self.finished.contains(id),
+        };
+        match protocol {
+            LineProtocol::AcknowledgedResult => match self.ready {
+                Some(true) if self.consumed.contains(id) => Some(if self.duplicates.contains(id) {
+                    Proof::Duplicate
+                } else {
+                    taken()
+                }),
+                Some(false) if self.acknowledged.contains(id) => Some(taken()),
+                _ => None,
+            },
+            _ if agy => self.agy_taken.contains(id).then(taken),
+            _ => self.seen.contains(id).then(taken),
         }
-        let finished = self.finished.contains(id);
-        if protocol == LineProtocol::AcknowledgedResult && !self.acknowledged.contains(id) {
-            return Ok(DeliverOutcome::Deferred);
-        }
-        Ok(DeliverOutcome::Accepted {
-            turn_finished: finished,
-        })
     }
 
     fn failure(&self) -> Option<String> {
@@ -1521,6 +1631,10 @@ impl State {
             http_port: None,
             agy_steer: None,
             agy_refused_turn: None,
+            agy_queued: Vec::new(),
+            agy_taken: HashSet::new(),
+            session_retired: false,
+            stdin_broken: false,
             finished: HashSet::new(),
             turns_started: 0,
             quota_reset_at_ms: None,
@@ -1538,6 +1652,8 @@ impl State {
             turn_closing: false,
             refused_turns: 0,
             turn_retry_at: None,
+            turn_refused_since: None,
+            turn_refusal: None,
         }
     }
 }
@@ -1709,18 +1825,22 @@ fn read_stdout(
                         state.acknowledged.insert(id.to_string());
                         state.input_turns.insert(id.to_string(), id.to_string());
                     }
-                    Some("rejected") => {
-                        state.rejected.insert(
-                            id.to_string(),
-                            format!(
-                                "controller rejected input: {}",
-                                value
-                                    .get("code")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("unknown")
-                            ),
-                        );
-                    }
+                    Some("rejected") => match spiron_refusal(&value) {
+                        // Never taken: it is offered again once the turn
+                        // that refused it is gone.
+                        SpironRefusal::NotStarted | SpironRefusal::TurnClosed => {
+                            let id = id.to_string();
+                            state.open.retain(|open| *open != id);
+                            state.followups.retain(|open| *open != id);
+                            state.seen.remove(&id);
+                        }
+                        SpironRefusal::ForGood(reason) => {
+                            let id = id.to_string();
+                            state.open.retain(|open| *open != id);
+                            state.followups.retain(|open| *open != id);
+                            state.rejected.insert(id, reason);
+                        }
+                    },
                     _ => {}
                 }
             }
@@ -1732,6 +1852,7 @@ fn read_stdout(
                 if step_type == "user_input" || state.turn_user_inputs == 0 {
                     state.turn_user_inputs = state.turn_user_inputs.saturating_add(1);
                 }
+                agy_note_opener_taken(&mut state);
             }
             if let Some(reset_at_ms) = effect.quota_reset_at_ms {
                 state.quota_reset_at_ms = Some(reset_at_ms);
@@ -1746,6 +1867,7 @@ fn read_stdout(
             }
             if let Some(session_id) = effect.session_id
                 && !session_id.is_empty()
+                && !state.session_retired
             {
                 state.session_id = Some(session_id);
             }
@@ -1823,10 +1945,11 @@ fn read_stdout(
                     state.finished.remove(&id);
                 }
                 state.sign_in_fault = Some(synth_err.clone());
+                // The child is stopped; what it wrote before is still read,
+                // and its stdout's end reports it gone.
                 if let Some(child) = state.child.as_mut() {
                     let _ = child.kill();
                 }
-                state.alive = false;
             } else if correlated
                 && (poisoned_agy || effect.quota_reset_at_ms.is_none())
                 && matches!(kind, Some("done") | Some("result"))
@@ -1838,7 +1961,12 @@ fn read_stdout(
                     }
                     // Do not let sync_session recreate the retired pointer.
                     state.session_id = None;
-                    state.alive = false;
+                    state.session_retired = true;
+                    // The cascade takes nothing more: the child is stopped,
+                    // and its stdout's end reports it gone.
+                    if let Some(child) = state.child.as_mut() {
+                        let _ = child.kill();
+                    }
                 }
                 state.sign_in_fault = Some(err_str.to_string());
                 state.open.clear();
@@ -1866,9 +1994,18 @@ fn read_stdout(
         if let Some(wait) = retry_after {
             nudge_after(&shared, &wake, generation, wait);
         }
-        if poisoned_agy || synthetic_401.is_some() {
-            break;
+        // A step or a turn's end is when a cascade takes what its mailbox
+        // holds: its record says which.
+        if let Some(rpc) = &agy_rpc
+            && (value.get("step_update").is_some() || kind == Some("result"))
+        {
+            agy_settle(&shared, &wake, rpc, generation);
         }
+    }
+    // Every line is read: what the cascade took before the child went is in
+    // its record, and is looked at once more before the child counts as gone.
+    if let Some(rpc) = &agy_rpc {
+        agy_settle(&shared, &wake, rpc, generation);
     }
     // EOF can race waitpid and the independent stderr drainer. Collect both
     // before publishing a normal exit, with the old bounded reap grace period.
@@ -1998,6 +2135,9 @@ fn id_for_quiet(state: &mut State, id: &str) {
     state.text = text;
 }
 
+/// The turn ended: its inputs are finished, the first carrying its usage. An
+/// Antigravity turn that closed took the line that opened it; a message its
+/// cascade's mailbox still holds was not taken by it and finishes nothing.
 fn finish_open(state: &mut State, usage: TurnUsage) {
     state.turn_user_inputs = 0;
     state.last_turn_step_type = None;
@@ -2005,13 +2145,16 @@ fn finish_open(state: &mut State, usage: TurnUsage) {
     if state.open.is_empty() {
         return;
     }
-    for (idx, id) in state.open.drain(..).enumerate() {
+    let mut usage = Some(usage);
+    for id in std::mem::take(&mut state.open) {
+        if state.agy_queued.iter().any(|queued| queued.id == id) {
+            continue;
+        }
+        if state.seen.contains(&id) {
+            state.agy_taken.insert(id.clone());
+        }
         state.finished.insert(id.clone());
-        let item_usage = if idx == 0 {
-            usage.clone()
-        } else {
-            TurnUsage::default()
-        };
+        let item_usage = usage.take().unwrap_or_default();
         state.usages.push((id, item_usage));
     }
     if !state.followups.is_empty() {
@@ -2089,6 +2232,8 @@ fn note_consumption_receipt(
             settle_consumed(state, &id, &id);
             state.refused_turns = 0;
             state.turn_retry_at = None;
+            state.turn_refused_since = None;
+            state.turn_refusal = None;
         }
         Some("steer_ack") if value.get("accepted").and_then(Value::as_bool) == Some(true) => {
             if let (Some(id), Some(turn)) = (
@@ -2118,18 +2263,24 @@ fn note_consumption_receipt(
             let id = request
                 .filter(|id| state.in_flight.contains(*id))?
                 .to_string();
-            match value.get("code").and_then(Value::as_str) {
-                // The turn could not start (its session still leased by a
-                // process that died, its journal unwritable): nothing given
-                // to it was journaled. Not a fault: the same input is offered
-                // again after a backoff, since the peer names no moment when
-                // a turn can start.
-                Some("turn_not_started") => {
+            match spiron_refusal(value) {
+                // The turn could not start: nothing given to it was
+                // journaled. Spiron starts a turn only once it holds the
+                // session's lease, which a process that died keeps for up to
+                // `SPIRON_LEASE`, so the same input is offered again after a
+                // backoff; the reader wakes the host then. Refusals past
+                // that lease are a fault (`deliver_consumed`).
+                SpironRefusal::NotStarted => {
                     let opened = state.open.first().is_some_and(|owner| *owner == id);
                     release_input(state, &id);
                     state.turn_closing |= !state.open.is_empty();
                     if opened {
                         state.refused_turns = state.refused_turns.saturating_add(1);
+                        state.turn_refused_since.get_or_insert_with(Instant::now);
+                        state.turn_refusal = value
+                            .get("error")
+                            .and_then(Value::as_str)
+                            .map(str::to_string);
                         let wait = TURN_RETRY_FIRST
                             .saturating_mul(1 << (state.refused_turns - 1).min(5))
                             .min(TURN_RETRY_MAX);
@@ -2138,17 +2289,16 @@ fn note_consumption_receipt(
                     }
                 }
                 // The turn it was written to closed first: never journaled.
-                Some("turn_closed" | "no_active_turn") => {
+                // The next turn takes it; that turn's `result` (already on
+                // its way) or this refusal wakes the host.
+                SpironRefusal::TurnClosed => {
                     release_input(state, &id);
                     state.turn_closing |= !state.open.is_empty();
                 }
-                code => {
+                SpironRefusal::ForGood(reason) => {
                     state.in_flight.remove(&id);
                     state.open.retain(|open| open != &id);
-                    state.rejected.insert(
-                        id,
-                        format!("controller rejected input: {}", code.unwrap_or("unknown")),
-                    );
+                    state.rejected.insert(id, reason);
                 }
             }
         }
@@ -2161,6 +2311,38 @@ fn note_consumption_receipt(
 /// each refusal in a row doubles it up to [`TURN_RETRY_MAX`].
 const TURN_RETRY_FIRST: Duration = Duration::from_secs(1);
 const TURN_RETRY_MAX: Duration = Duration::from_secs(30);
+
+/// How long Spiron's session lease outlives the process that last renewed
+/// it (`LEASE_MS` in `spiron-agent`'s `local_admission.rs`): no turn can
+/// start until a dead holder's lease lapses.
+const SPIRON_LEASE: Duration = Duration::from_secs(180);
+
+/// What a Spiron `rejected` frame means for the input it names, by its code
+/// (`spiron-cli`'s `headless.rs`).
+#[derive(Debug, PartialEq, Eq)]
+enum SpironRefusal {
+    /// `turn_not_started`: the turn could not take its lease or journal its
+    /// input. A later turn can.
+    NotStarted,
+    /// `turn_closed` (the turn sealed before the steer reached it) or
+    /// `no_active_turn` (a steer with no turn): the next turn takes it.
+    TurnClosed,
+    /// Every other code, and a code this adapter does not know: no offer
+    /// makes Spiron take this input as it is written (`empty_prompt`,
+    /// `wrong_session`, `unknown_command`, `upgrade_retired`).
+    ForGood(String),
+}
+
+fn spiron_refusal(value: &Value) -> SpironRefusal {
+    match value.get("code").and_then(Value::as_str) {
+        Some("turn_not_started") => SpironRefusal::NotStarted,
+        Some("turn_closed" | "no_active_turn") => SpironRefusal::TurnClosed,
+        code => SpironRefusal::ForGood(format!(
+            "spiron rejected the input: {}",
+            code.unwrap_or("no code")
+        )),
+    }
+}
 
 fn settle_consumed(state: &mut State, id: &str, turn: &str) {
     state.in_flight.remove(id);
@@ -2299,12 +2481,17 @@ fn watch_writable(
             return;
         }
         state.input_blocked = false;
-        if result < 0 || poll.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
-            state.alive = false;
-        }
+        // A pipe the child closed takes no more lines. The child is going,
+        // and the stdout reader reports it gone once it read the last line.
+        let broken =
+            result < 0 || poll.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0;
+        state.stdin_broken |= broken;
         state.touch();
         drop(state);
         wake.notify_all();
+        if broken {
+            return;
+        }
     }
 }
 
@@ -2581,6 +2768,9 @@ const AGY_STEER_PROBE_GAP: Duration = Duration::from_millis(400);
 ///
 /// A fresh session has no cascade to steer into until the language server
 /// shows one, and the steer path asks it at once rather than after a delay.
+/// A cascade whose mailbox holds mail and that runs no turn of this process
+/// is steered at once: the message joins the mail and starts the invocation
+/// that takes all of it, in order.
 fn agy_input_gate(state: &State) -> Option<Option<Duration>> {
     if agy_steer_running(state) || (agy_held(state) && !state.open.is_empty()) {
         return Some(None);
@@ -2595,26 +2785,46 @@ fn agy_input_gate(state: &State) -> Option<Option<Duration>> {
     {
         return Some(Some(AGY_STEER_PROBE_GAP - probe.elapsed()));
     }
-    (state.turn_user_inputs == 0 && state.session_id.is_some()).then_some(None)
+    (state.turn_user_inputs == 0 && state.session_id.is_some() && !state.open.is_empty())
+        .then_some(None)
 }
 
 /// Whether the next input goes into the cascade through the language server
-/// rather than to stdin as a turn of its own: a turn is open, or the cascade
-/// is held open past its turn. A cascade held open that refused a steer gets
-/// the next input on stdin.
+/// rather than to stdin as a turn of its own: a turn is open, the cascade is
+/// held open past its turn, or its mailbox holds mail it has not taken. A
+/// cascade held open that refused a steer gets the next input on stdin, but
+/// never while its mailbox holds mail: a turn opened on stdin may run before
+/// the cascade takes what waits, so the next input joins the mailbox behind
+/// it instead.
 fn agy_steers(state: &State) -> bool {
-    !state.open.is_empty() || (state.turn_user_inputs > 0 && !agy_held(state))
+    !state.open.is_empty()
+        || (state.turn_user_inputs > 0 && !agy_held(state))
+        || !state.agy_queued.is_empty()
 }
 
 /// `id` opened the running turn on stdin and its cascade has not shown taking
-/// it: no step of the turn yet, and the language server has not reported the
-/// cascade running. Until it does, the prompt is in flight, not committed: a
-/// line the process never read is offered again as input of its own.
+/// it: no step of the turn yet, the language server has not reported the
+/// cascade running, and the turn has not closed. Until then the prompt is in
+/// flight, not committed: a line the process never read is offered again as
+/// input of its own.
 fn agy_prompt_untaken(state: &State, id: &str) -> bool {
-    state.turn_user_inputs == 0
-        && state.seen.contains(id)
+    state.seen.contains(id)
         && state.open.first().is_some_and(|opener| opener == id)
-        && !state.finished.contains(id)
+        && !state.agy_taken.contains(id)
+}
+
+/// The cascade showed the turn opened on stdin running (its first step, or
+/// the language server's run status): it took its opening line.
+fn agy_note_opener_taken(state: &mut State) {
+    if state.turn_user_inputs > 0
+        && let Some(opener) = state.open.first()
+        && state.seen.contains(opener)
+        && !state.agy_queued.iter().any(|queued| queued.id == *opener)
+        && !state.agy_taken.contains(opener)
+    {
+        let opener = opener.clone();
+        state.agy_taken.insert(opener);
+    }
 }
 
 /// The running turn's cascade refused a steer.
@@ -2634,6 +2844,9 @@ struct AgySteer {
     id: String,
     /// `None` while the request runs.
     outcome: Option<AgySteered>,
+    /// Where to look for it in the cascade's record once it is sent: a
+    /// cascade can take it before the language server answers.
+    sent: Option<AgyQueued>,
 }
 
 /// How a steer settled.
@@ -2641,11 +2854,27 @@ struct AgySteer {
 enum AgySteered {
     /// The language server queued the message in the cascade's durable
     /// mailbox: it answered `{}`, or, after an answer that never came, the
-    /// mailbox or the transcript holds the message. The cascade takes it at
-    /// its next step boundary; nothing proves which.
-    Queued { turn_finished: bool },
+    /// mailbox or the transcript holds the message. That is no proof the
+    /// cascade takes it: it waits in [`State::agy_queued`] until the
+    /// cascade's record shows it did.
+    Queued,
     /// Not sent, or certainly not queued: it goes back to the mailbox.
     Returned,
+}
+
+/// A message a cascade's durable mailbox holds, and how to find whether the
+/// cascade took it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AgyQueued {
+    id: String,
+    /// The cascade whose mailbox holds it.
+    cascade: String,
+    /// Its mailbox file (`messages/<mail>.json`), once found.
+    mail: Option<String>,
+    /// When its send began: an older mailbox file is not its.
+    since: SystemTime,
+    /// How much of the cascade's transcript is known not to name it.
+    transcript_from: u64,
 }
 
 /// What one steer needs, taken from the state when it starts.
@@ -2658,24 +2887,6 @@ struct AgySteerJob {
     cached_port: Option<u16>,
     planner_config: Option<Value>,
     generation: u64,
-}
-
-/// What this process's steer of `id` answers: `InFlight` while its request
-/// runs, `Accepted` once queued (even if the process has exited since), and
-/// `None` once returned, for the message to be judged afresh.
-fn agy_steer_answer(state: &mut State, id: &str) -> Option<Result<DeliverOutcome, HarnessError>> {
-    let steer = state.agy_steer.as_ref().filter(|steer| steer.id == id)?;
-    match steer.outcome {
-        None => Some(Ok(DeliverOutcome::InFlight)),
-        Some(AgySteered::Queued { turn_finished }) => {
-            state.agy_steer = None;
-            Some(Ok(DeliverOutcome::Accepted { turn_finished }))
-        }
-        Some(AgySteered::Returned) => {
-            state.agy_steer = None;
-            None
-        }
-    }
 }
 
 /// Run `job` off the delivery path; its message is in flight until the steer
@@ -2743,6 +2954,8 @@ const AGY_REFUSALS: [&str; 3] = [
 /// mailbox and answers `{}`. The answer is waited for without a timeout. A
 /// probe that fails, or a refusal, returns the message; an answer that
 /// never came is settled from the mailbox, never by sending again blindly.
+/// A queued message is held ([`State::agy_queued`]) until the cascade's
+/// record shows it took it, which may come before the answer does.
 fn agy_steer_attempt(
     shared: &Arc<Mutex<State>>,
     wake: &Arc<Condvar>,
@@ -2781,8 +2994,11 @@ fn agy_steer_attempt(
             state.idle_since = None;
             state.last_steer_probe = None;
             state.turn_user_inputs = state.turn_user_inputs.max(1);
+            agy_note_opener_taken(&mut state);
         } else {
-            if state.turn_user_inputs == 0 {
+            // A cascade that ran nothing yet is steered only to start the
+            // invocation that takes the mail its mailbox holds.
+            if state.turn_user_inputs == 0 && state.agy_queued.is_empty() {
                 state.idle_since = None;
                 drop(state);
                 return agy_back_off(shared, wake, generation);
@@ -2811,14 +3027,14 @@ fn agy_steer_attempt(
             state.planner_config = planner_config.clone();
         }
     }
-    let had_open = {
+    {
         let mut state = lock(shared);
         if state.generation != generation || !state.alive {
             return AgySteered::Returned;
         }
         // The turn ended while it was asked: the message opens the next one
-        // on stdin.
-        if state.open.is_empty() && state.turn_user_inputs == 0 {
+        // on stdin, unless the mailbox holds mail it must follow.
+        if state.open.is_empty() && state.turn_user_inputs == 0 && state.agy_queued.is_empty() {
             return AgySteered::Returned;
         }
         let had_open = !state.open.is_empty();
@@ -2835,13 +3051,27 @@ fn agy_steer_attempt(
         if !state.open.contains(&id) {
             state.open.push(id.clone());
         }
-        had_open
-    };
+    }
     // What the server writes for this message is written after this.
     let since = SystemTime::now();
     let transcript_from = agy_conversation_dir(&rpc, &session_id)
         .and_then(|dir| std::fs::metadata(dir.join("logs/transcript_full.jsonl")).ok())
         .map_or(0, |meta| meta.len());
+    let sending = AgyQueued {
+        id: id.clone(),
+        cascade: session_id.clone(),
+        mail: None,
+        since,
+        transcript_from,
+    };
+    {
+        let mut state = lock(shared);
+        if state.generation == generation
+            && let Some(steer) = state.agy_steer.as_mut().filter(|steer| steer.id == id)
+        {
+            steer.sent = Some(sending.clone());
+        }
+    }
     let sent = agy_rpc_send_steer(
         port,
         &rpc.csrf_token,
@@ -2861,18 +3091,26 @@ fn agy_steer_attempt(
         // own record does.
         Err(_) => agy_took(&rpc, &session_id, &id, since, transcript_from),
     };
+    // Queued is not taken: the cascade's record decides, now and later.
+    let held = queued.then(|| {
+        let mut held = sending;
+        let taken = agy_check(&rpc, &mut held);
+        (held, taken)
+    });
     let mut state = lock(shared);
     if state.generation != generation {
         return AgySteered::Returned;
     }
-    if queued {
+    if let Some((held, taken)) = held {
         state.idle_since = None;
         state.turn_user_inputs = state.turn_user_inputs.saturating_add(1);
-        state.seen.insert(id.clone());
         state.written.push(id.clone());
-        return AgySteered::Queued {
-            turn_finished: (!running && had_open) || state.finished.contains(&id),
-        };
+        if taken {
+            state.agy_taken.insert(id);
+        } else if !state.agy_taken.contains(&id) {
+            state.agy_queued.push(held);
+        }
+        return AgySteered::Queued;
     }
     state.open.retain(|open| open != &id);
     match sent {
@@ -2891,6 +3129,13 @@ fn agy_steer_attempt(
             nudge_after(shared, wake, generation, AGY_TURN_CLOSE_GRACE);
             AgySteered::Returned
         }
+        // The cascade refused it while no turn of this process runs and its
+        // mailbox holds mail: no turn's end will reopen the way, so it is
+        // asked again after a pause.
+        Err(AgyRpcError::Refused(_)) if state.open.is_empty() && !state.agy_queued.is_empty() => {
+            drop(state);
+            agy_back_off(shared, wake, generation)
+        }
         // The cascade refused it: the turn takes no more steers, and the
         // message waits for its end.
         Err(AgyRpcError::Refused(_)) => {
@@ -2906,6 +3151,56 @@ fn agy_steer_attempt(
             drop(state);
             agy_back_off(shared, wake, generation)
         }
+    }
+}
+
+/// Look at the cascade's record for every message its mailbox holds, and
+/// move each it took to [`State::agy_taken`], waking the host. Reads files
+/// only, never under the state lock; a process replaced since settles
+/// nothing.
+fn agy_settle(shared: &Arc<Mutex<State>>, wake: &Condvar, rpc: &AgyRpcConfig, generation: u64) {
+    let mut held = {
+        let state = lock(shared);
+        if state.generation != generation {
+            return;
+        }
+        let mut held = state.agy_queued.clone();
+        // A steer whose answer has not come yet is looked for too.
+        held.extend(
+            state
+                .agy_steer
+                .as_ref()
+                .filter(|steer| steer.outcome.is_none())
+                .and_then(|steer| steer.sent.clone()),
+        );
+        held
+    };
+    if held.is_empty() {
+        return;
+    }
+    let taken: Vec<bool> = held.iter_mut().map(|held| agy_check(rpc, held)).collect();
+    let mut state = lock(shared);
+    if state.generation != generation {
+        return;
+    }
+    let mut moved = false;
+    for (looked, taken) in held.into_iter().zip(taken) {
+        let at = state.agy_queued.iter().position(|q| q.id == looked.id);
+        if taken {
+            if let Some(at) = at {
+                state.agy_queued.remove(at);
+            }
+            moved |= state.agy_taken.insert(looked.id);
+        } else if let Some(at) = at {
+            state.agy_queued[at] = looked;
+        } else if let Some(steer) = state.agy_steer.as_mut().filter(|s| s.id == looked.id) {
+            steer.sent = Some(looked);
+        }
+    }
+    if moved {
+        state.touch();
+        drop(state);
+        wake.notify_all();
     }
 }
 
@@ -2987,14 +3282,12 @@ fn agy_conversation_dir(rpc: &AgyRpcConfig, cascade: &str) -> Option<PathBuf> {
     })
 }
 
-/// Allowance for file times against the clock read before a send.
-const AGY_MAILBOX_SLACK: Duration = Duration::from_secs(2);
-
 /// Whether `cascade` holds the message `id` that a send which began at
 /// `since` may have queued: a mailbox file written since then carries its
-/// marker line (in its base64 `CortexStep`), or the transcript does past
-/// `transcript_from`, where the cascade records a message it already took.
-/// Each mailbox file outlives its delivery (`read.json` marks it read).
+/// marker line (in its base64 `CortexStep`), or a `USER_INPUT` row of the
+/// transcript past `transcript_from` does, where the cascade records a
+/// message it already took. Each mailbox file outlives its delivery
+/// (`read.json` marks it read).
 fn agy_took(
     rpc: &AgyRpcConfig,
     cascade: &str,
@@ -3002,18 +3295,116 @@ fn agy_took(
     since: SystemTime,
     transcript_from: u64,
 ) -> bool {
-    use std::io::{Seek as _, SeekFrom};
     let Some(dir) = agy_conversation_dir(rpc, cascade) else {
         return false;
     };
-    let earliest = since
-        .checked_sub(AGY_MAILBOX_SLACK)
-        .unwrap_or(std::time::UNIX_EPOCH);
-    for entry in std::fs::read_dir(dir.join("messages"))
+    agy_find_mail(&dir.join("messages"), id, since).is_some()
+        || agy_transcript_takes(&dir.join("logs/transcript_full.jsonl"), transcript_from, id).0
+}
+
+/// Whether the cascade took the message `queued` holds: its mailbox file is
+/// marked read, or a `USER_INPUT` row of the transcript names it. Finds the
+/// mailbox file on the way, and moves past the transcript it read, so the
+/// next look reads only what the cascade wrote since.
+fn agy_check(rpc: &AgyRpcConfig, queued: &mut AgyQueued) -> bool {
+    let Some(dir) = agy_conversation_dir(rpc, &queued.cascade) else {
+        return false;
+    };
+    let messages = dir.join("messages");
+    if queued.mail.is_none() {
+        queued.mail = agy_find_mail(&messages, &queued.id, queued.since);
+    }
+    if queued
+        .mail
+        .as_ref()
+        .is_some_and(|mail| agy_read_set(&messages).contains(mail))
+    {
+        return true;
+    }
+    let (taken, read_to) = agy_transcript_takes(
+        &dir.join("logs/transcript_full.jsonl"),
+        queued.transcript_from,
+        &queued.id,
+    );
+    queued.transcript_from = read_to;
+    taken
+}
+
+/// What a cascade's own record says about the messages it was given, read
+/// before a process resumes it: every message a `USER_INPUT` row of its
+/// transcript names was taken (an earlier process applied it), and every
+/// message whose mailbox file is still marked undelivered
+/// (`messages/undelivered/<mail>`) is the cascade's to take at its next
+/// invocation, so it is held, in send order, rather than written again.
+fn agy_scan(rpc: &AgyRpcConfig, cascade: &str) -> (HashSet<String>, Vec<AgyQueued>) {
+    let mut taken = HashSet::new();
+    let Some(dir) = agy_conversation_dir(rpc, cascade) else {
+        return (taken, Vec::new());
+    };
+    let transcript_from = agy_transcript_rows(&dir.join("logs/transcript_full.jsonl"), 0, |id| {
+        taken.insert(id);
+    });
+    let messages = dir.join("messages");
+    let read = agy_read_set(&messages);
+    let mut waiting = Vec::new();
+    for entry in std::fs::read_dir(messages.join("undelivered"))
         .into_iter()
         .flatten()
         .flatten()
     {
+        let Some(mail) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if read.contains(&mail) {
+            continue;
+        }
+        let Ok(raw) = std::fs::read(messages.join(format!("{mail}.json"))) else {
+            continue;
+        };
+        let Ok(record) = serde_json::from_slice::<Value>(&raw) else {
+            continue;
+        };
+        let Some(id) = record
+            .get("stepPayload")
+            .and_then(Value::as_str)
+            .and_then(agy_base64)
+            .and_then(|step| agy_marker_id(&step))
+        else {
+            continue;
+        };
+        if taken.contains(&id) {
+            continue;
+        }
+        let sent = record
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        waiting.push((
+            sent,
+            AgyQueued {
+                id,
+                cascade: cascade.to_string(),
+                mail: Some(mail),
+                since: std::time::UNIX_EPOCH,
+                transcript_from,
+            },
+        ));
+    }
+    waiting.sort_by(|a, b| a.0.cmp(&b.0));
+    (taken, waiting.into_iter().map(|(_, held)| held).collect())
+}
+
+/// Allowance for file times against the clock read before a send.
+const AGY_MAILBOX_SLACK: Duration = Duration::from_secs(2);
+
+/// The mailbox file (`messages/<mail>.json`) written since `since` that
+/// carries the marker line of `id`, raw or inside its base64 `CortexStep`.
+fn agy_find_mail(messages: &Path, id: &str, since: SystemTime) -> Option<String> {
+    let earliest = since
+        .checked_sub(AGY_MAILBOX_SLACK)
+        .unwrap_or(std::time::UNIX_EPOCH);
+    for entry in std::fs::read_dir(messages).into_iter().flatten().flatten() {
         let path = entry.path();
         if path.extension().is_none_or(|ext| ext != "json")
             || path.file_name().is_some_and(|name| name == "read.json")
@@ -3031,16 +3422,103 @@ fn agy_took(
             .ok()
             .and_then(|mail| mail.get("stepPayload")?.as_str().and_then(agy_base64));
         if agy_holds_marker(&raw, id) || payload.is_some_and(|step| agy_holds_marker(&step, id)) {
-            return true;
+            return path.file_stem()?.to_str().map(str::to_string);
         }
     }
-    let Ok(mut transcript) = std::fs::File::open(dir.join("logs/transcript_full.jsonl")) else {
-        return false;
+    None
+}
+
+/// The mailbox ids `messages/read.json` marks read.
+fn agy_read_set(messages: &Path) -> HashSet<String> {
+    std::fs::read(messages.join("read.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok())
+        .and_then(|read| {
+            read.as_object().map(|marks| {
+                marks
+                    .iter()
+                    .filter(|(_, mark)| mark.as_bool() == Some(true))
+                    .map(|(mail, _)| mail.clone())
+                    .collect()
+            })
+        })
+        .unwrap_or_default()
+}
+
+/// Whether a `USER_INPUT` row of `transcript` past `from` names `id`, and
+/// where the last whole row read ends.
+fn agy_transcript_takes(transcript: &Path, from: u64, id: &str) -> (bool, u64) {
+    let mut taken = false;
+    let read_to = agy_transcript_rows(transcript, from, |row| taken |= row == id);
+    (taken, read_to)
+}
+
+/// Call `row` with the message of every `USER_INPUT` row of `transcript`
+/// past `from`, and answer where the last whole row ends: a row still being
+/// written is read again next time.
+fn agy_transcript_rows(transcript: &Path, from: u64, mut row: impl FnMut(String)) -> u64 {
+    use std::io::{Seek as _, SeekFrom};
+    let Ok(mut file) = std::fs::File::open(transcript) else {
+        return from;
     };
-    let mut tail = Vec::new();
-    transcript.seek(SeekFrom::Start(transcript_from)).is_ok()
-        && transcript.read_to_end(&mut tail).is_ok()
-        && agy_holds_marker(&tail, id)
+    if file.seek(SeekFrom::Start(from)).is_err() {
+        return from;
+    }
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    let mut read_to = from;
+    loop {
+        line.clear();
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) if line.last() != Some(&b'\n') => break,
+            Ok(count) => {
+                read_to += count as u64;
+                if let Some(id) = agy_row_marker(&line) {
+                    row(id);
+                }
+            }
+        }
+    }
+    read_to
+}
+
+/// The message a transcript row shows the cascade took: a `USER_INPUT` row
+/// whose user request opens with the marker line (`<USER_REQUEST>`, a
+/// newline, `anyagents-message:<id>`, a newline, JSON-escaped). A marker
+/// quoted further in, as a recovery note quotes the turn it recovers, is
+/// not one.
+fn agy_row_marker(line: &[u8]) -> Option<String> {
+    const ROW: &str = "\"type\":\"USER_INPUT\"";
+    const REQUEST: &str = "<USER_REQUEST>\\nanyagents-message:";
+    let line = String::from_utf8_lossy(line);
+    if !line.contains(ROW) {
+        return None;
+    }
+    let rest = &line[line.find(REQUEST)? + REQUEST.len()..];
+    agy_plain_id(&rest[..rest.find("\\n")?])
+}
+
+/// The message whose marker line opens the user input of a mailbox
+/// `CortexStep`.
+fn agy_marker_id(step: &[u8]) -> Option<String> {
+    let marker = anyagents_harness::MESSAGE_MARKER_PREFIX.as_bytes();
+    let at = step
+        .windows(marker.len())
+        .position(|window| window == marker)?
+        + marker.len();
+    let rest = &step[at..];
+    let end = rest.iter().position(|byte| *byte == b'\n')?;
+    agy_plain_id(std::str::from_utf8(&rest[..end]).ok()?)
+}
+
+/// `id` when it is a mailbox id: letters, digits, `_` and `-`.
+fn agy_plain_id(id: &str) -> Option<String> {
+    (!id.is_empty()
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-'))
+    .then(|| id.to_string())
 }
 
 /// Whether `bytes` carry the marker line of `id`: the marker, then the end of
@@ -3092,6 +3570,11 @@ const AGY_PORT_RETRY_MAX: Duration = Duration::from_secs(60);
 /// once per interval whether the cascade still runs; one that stays idle past
 /// [`AGY_TURN_CLOSE_GRACE`] closes the turn. Streaming lines prove the cascade
 /// runs, so an active turn costs no requests, and an idle child costs none.
+///
+/// While the cascade's mailbox holds mail it has not taken, its record is
+/// read once per [`AGY_CASCADE_POLL`] as well: a cascade can take it without
+/// a line on stdout (an invocation it resumed on its own), and stdout's steps
+/// only make the look come sooner.
 fn watch_agy_cascade(
     shared: Arc<Mutex<State>>,
     wake: Arc<Condvar>,
@@ -3100,6 +3583,7 @@ fn watch_agy_cascade(
 ) {
     let mut port_retry = AGY_CASCADE_POLL;
     let mut port_after: Option<Instant> = None;
+    let mut last_settle: Option<Instant> = None;
     loop {
         let (session_id, child_pid, cached_port) = {
             let mut state = lock(&shared);
@@ -3107,22 +3591,38 @@ fn watch_agy_cascade(
                 if !state.alive || state.generation != generation {
                     return;
                 }
-                if state.open.is_empty() || state.turn_user_inputs == 0 {
+                let now = Instant::now();
+                let settle_due = (!state.agy_queued.is_empty()
+                    || state
+                        .agy_steer
+                        .as_ref()
+                        .is_some_and(|steer| steer.outcome.is_none() && steer.sent.is_some()))
+                .then(|| last_settle.map_or(now, |last| last + AGY_CASCADE_POLL));
+                let status_due =
+                    (!state.open.is_empty() && state.turn_user_inputs > 0).then(|| {
+                        [state.last_rpc_health_poll, state.last_line_at]
+                            .into_iter()
+                            .flatten()
+                            .max()
+                            .map_or(now, |last| last + AGY_CASCADE_POLL)
+                            .max(port_after.unwrap_or(now))
+                    });
+                let Some(due) = settle_due.into_iter().chain(status_due).min() else {
                     state = wake.wait(state).unwrap_or_else(|err| err.into_inner());
                     continue;
-                }
-                let now = Instant::now();
-                let due = [state.last_rpc_health_poll, state.last_line_at]
-                    .into_iter()
-                    .flatten()
-                    .max()
-                    .map_or(now, |last| last + AGY_CASCADE_POLL)
-                    .max(port_after.unwrap_or(now));
+                };
                 if now < due {
                     state = wake
                         .wait_timeout(state, due - now)
                         .unwrap_or_else(|err| err.into_inner())
                         .0;
+                    continue;
+                }
+                if settle_due.is_some_and(|due| due <= now) {
+                    last_settle = Some(now);
+                    drop(state);
+                    agy_settle(&shared, &wake, &rpc, generation);
+                    state = lock(&shared);
                     continue;
                 }
                 state.last_rpc_health_poll = Some(now);
@@ -3344,6 +3844,14 @@ fn agy_rpc_cancel(port: u16, csrf_token: &str, session_id: &str) -> Result<(), S
         "cascadeId": session_id
     });
     agy_rpc_post(port, csrf_token, "CancelCascadeInvocation", &payload).map(|_| ())
+}
+
+/// The delivery answer for what a harness already proved.
+fn proof_outcome(proof: Proof) -> DeliverOutcome {
+    match proof {
+        Proof::Taken { turn_finished } => DeliverOutcome::Accepted { turn_finished },
+        Proof::Duplicate => DeliverOutcome::Duplicate,
+    }
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {

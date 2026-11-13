@@ -2,13 +2,14 @@
 and its language server 1.5.8, as AnyAgents drives them.
 
 What the real pair does, from static analysis of the installed binary and
-live journals (marked "inferred" where neither shows it):
+live records (marked "inferred" where neither shows it):
 
 - The CLI reads one `{"type": "user", ...}` line per turn from stdin; a line
   that arrives while a turn runs waits for that turn to end and starts the
   next one (inferred). It prints `init` (no version), one `step_update` per
   step (`step_type` `user_input` for each input the cascade took) and
-  `result` when the turn ends.
+  `result` when the turn ends, `status` `ERROR` with an `error` when its run
+  failed.
 - The language server runs in the same process. `cli.log` (a link to this
   launch's `log/cli-*.log` under `$AGY_CONFIG_DIR/.gemini/antigravity-cli`)
   names its pid, its version and its random HTTP port. It serves Connect
@@ -19,22 +20,38 @@ live journals (marked "inferred" where neither shows it):
     GetCascadeTrajectoryGeneratorMetadata  the planner config a new
                 invocation needs
     SendUserCascadeMessage  with `MESSAGE_DELIVERY_STRATEGY_NEXT_INVOCATION`
-                writes the message to the cascade's durable mailbox,
-                `brain/<cid>/.system_generated/messages/<uuid>.json` (its
-                text verbatim inside a base64 `CortexStep`), and answers
-                `{}`. The running turn takes every waiting message, in send
-                order, as `USER_INPUT` steps at its next step boundary, marks
-                each in `messages/read.json` and records it in
-                `logs/transcript_full.jsonl`. On an idle cascade it starts an
-                invocation, which needs a planner config. A refusal ("plan
-                model not specified; ...", "cascade not found: ...",
-                "cannot send message: there is an ongoing battle") is a
-                Connect error and queues nothing. Nothing is deduplicated.
+                writes the message to the cascade's durable mailbox
+                (`messages.(*FileStore).Save`):
+                `brain/<cid>/.system_generated/messages/<uuid>.json`, its
+                text verbatim inside a base64 `CortexStep`, and an empty
+                `messages/undelivered/<uuid>` marker; then answers `{}`.
+                That answer says the message is queued, never that the
+                cascade took it: a run that fails never takes what waits
+                (live: two messages a cascade's failing run left in
+                `undelivered/`, unread, in no transcript). The cascade takes
+                every waiting message, in send order, as `USER_INPUT` steps
+                at a step boundary of its run (inferred), and at the end of a
+                run that finds mail waiting it runs on (`MessageContinueCheck:
+                undelivered messages found, continuing execution`). Each one
+                it takes loses its undelivered marker (`MarkDelivered`), is
+                marked in `messages/read.json` (`MarkRead`) and gets a
+                `USER_INPUT` row in `logs/transcript_full.jsonl`. On an idle
+                cascade it starts an invocation, which needs a planner config
+                and takes every waiting message. A refusal ("plan model not
+                specified; ...", "cascade not found: ...", "cannot send
+                message: there is an ongoing battle") is a Connect error and
+                queues nothing. Nothing is deduplicated.
     CancelCascadeInvocation  stops the running turn.
-- A turn that ends with messages still waiting takes them at one more step
-  first (inferred: the cascade reads its mailbox at every step boundary).
-- A new process on the same conversation does not take what the last one
-  left waiting (inferred).
+- A process started on a conversation whose mailbox still holds mail takes
+  it at once, in one invocation of the resumed cascade (inferred from the
+  changelog: 1.1.28 fixed a bug that "left queued when-idle messages
+  undelivered until restart", 1.2.4 made "conversations with active turns
+  ... auto-resume after a restart").
+- A turn opened by a stdin line while mail waits takes the line first and the
+  mail at its next step boundary (inferred; AnyAgents never opens one then).
+- Records are written as the vendor writes them: compact transcript rows
+  (`{"step_index":..,"source":..,"type":..,"status":..,"created_at":..}`),
+  mailbox files with `", "` between fields, `read.json` compact.
 
 Besides the engine's commands, this vendor acts once on each of these files:
   drop-request  the next SendUserCascadeMessage is read and dropped: the
@@ -42,6 +59,9 @@ Besides the engine's commands, this vendor acts once on each of these files:
   drop-answer   the next SendUserCascadeMessage is queued, then the
                 connection closes with no answer
   fail-probe    the next GetAllCascadeTrajectories answers `unavailable`
+  fail          the running turn's run fails: an `ERROR_MESSAGE` step, then
+                `result` `ERROR`; the mail waiting for it stays in the
+                mailbox, undelivered
 and records every SendUserCascadeMessage as it arrives, before anything else
 happens to it, in `rpc.jsonl` (`{"id", "launch"}`).
 """
@@ -83,6 +103,26 @@ def cortex_step(text):
     return b"\x08\x0e\x9a\x01" + varint(len(user_input)) + user_input
 
 
+def read_varint(data, at):
+    value, shift = 0, 0
+    while True:
+        byte = data[at]
+        at += 1
+        value |= (byte & 0x7F) << shift
+        shift += 7
+        if not byte & 0x80:
+            return value, at
+
+
+def step_text(step):
+    """The user input text of a `cortex_step`."""
+    at = step.index(b"\x9a\x01") + 2
+    _, at = read_varint(step, at)
+    assert step[at] == 0x12
+    length, at = read_varint(step, at + 1)
+    return step[at:at + length].decode()
+
+
 def now():
     return datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -90,6 +130,13 @@ def now():
 def connect_error(message, code="unknown"):
     """A Connect error: what a handler that returned a Go error answers."""
     return STATUS[code], {"code": code, "message": message}
+
+
+def compact(value):
+    return json.dumps(value, separators=(",", ":"), ensure_ascii=False)
+
+
+ERROR = "API error (attempt 3): request failed: stream idle timeout (5m0s): context deadline exceeded"
 
 
 def write_atomically(path, text):
@@ -148,15 +195,45 @@ class Agy(Protocol):
         self.generated = self.home / "brain" / self.session / ".system_generated"
         (self.generated / "messages").mkdir(parents=True, exist_ok=True)
         (self.generated / "logs").mkdir(parents=True, exist_ok=True)
+        (self.generated / "messages" / "undelivered").mkdir(exist_ok=True)
         transcript = self.transcript()
         self.steps = len(transcript.read_text().splitlines()) if transcript.exists() else 0
         self.backlog = []
+        # Mail the cascade's mailbox holds that no running turn will take.
+        self.waiting = []
         self.announced = False
         server = ThreadingHTTPServer(("127.0.0.1", 0), Rpc)
         server.daemon_threads = True
         server.agy = self
         threading.Thread(target=server.serve_forever, daemon=True).start()
         self.write_log(server.server_address[1])
+        threading.Thread(target=self.watch, daemon=True).start()
+        with self.engine.lock:
+            held = self.held_mail()
+            if held:
+                self.later(lambda: self.invoke(held))
+
+    def held_mail(self):
+        """What the mailbox still holds, in send order."""
+        messages = self.generated / "messages"
+        held = []
+        for marker in (messages / "undelivered").iterdir():
+            mail = json.loads((messages / (marker.name + ".json")).read_text())
+            text = step_text(base64.b64decode(mail["stepPayload"]))
+            held.append((mail["timestamp"], Input(marker_id(text), text, "mailbox",
+                                                  {"mail": marker.name})))
+        return [inp for _, inp in sorted(held, key=lambda pair: pair[0])]
+
+    def watch(self):
+        """Act on `fail`."""
+        path = self.engine.root / "fail"
+        while True:
+            with self.engine.lock:
+                if path.exists():
+                    if self.engine.turn is not None:
+                        self.fail()
+                    path.unlink()
+            time.sleep(0.005)
 
     def write_log(self, port):
         logs = self.home / "log"
@@ -191,51 +268,80 @@ class Agy(Protocol):
 
     # The conversation's durable records.
 
-    def record(self, row):
-        row.update({"step_index": self.steps, "created_at": now(), "status": "DONE"})
+    def record(self, source, kind, **fields):
+        row = {"step_index": self.steps, "source": source, "type": kind, "status": "DONE",
+               "created_at": now()}
+        row.update(fields)
         with self.transcript().open("a") as out:
-            out.write(json.dumps(row) + "\n")
+            out.write(compact(row) + "\n")
         self.emit({"event": "step_update", "step_update": {
             "conversation_id": self.session, "step_index": self.steps, "state": "DONE",
-            "step_type": row["type"].lower()}})
+            "step_type": kind.lower()}})
         self.steps += 1
 
     def post(self, inp):
         """Queue `inp` in the cascade's mailbox."""
         mail = str(uuid.uuid4())
-        write_atomically(self.generated / "messages" / (mail + ".json"), json.dumps({
+        messages = self.generated / "messages"
+        write_atomically(messages / (mail + ".json"), json.dumps({
             "id": mail, "recipient": self.session, "sender": "user",
             "priority": "MESSAGE_PRIORITY_HIGH", "timestamp": now(),
             "stepPayload": base64.b64encode(cortex_step(inp.text)).decode(),
-            "deliveryStrategy": "MESSAGE_DELIVERY_STRATEGY_NEXT_INVOCATION"}))
+            "deliveryStrategy": "MESSAGE_DELIVERY_STRATEGY_NEXT_INVOCATION"},
+            separators=(", ", ":")))
+        (messages / "undelivered" / mail).write_text("")
         inp.meta["mail"] = mail
 
     def took(self, inp):
         """`inp` became a `USER_INPUT` step of the conversation."""
         mail = inp.meta.get("mail")
         if mail:
-            path = self.generated / "messages" / "read.json"
+            messages = self.generated / "messages"
+            (messages / "undelivered" / mail).unlink(missing_ok=True)
+            path = messages / "read.json"
             read = json.loads(path.read_text()) if path.exists() else {}
             read[mail] = True
-            write_atomically(path, json.dumps(read))
-        self.record({"type": "USER_INPUT", "source": "USER_EXPLICIT",
-                     "content": "<USER_REQUEST>\n%s\n</USER_REQUEST>" % inp.text})
+            write_atomically(path, compact(read))
+        self.record("USER_EXPLICIT", "USER_INPUT", content=(
+            "<USER_REQUEST>\n%s\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\n"
+            "The current local time is: %s.\n</ADDITIONAL_METADATA>" % (inp.text, now())))
 
     def thought(self):
         """The model call that follows the step's inputs."""
-        self.record({"type": "PLANNER_RESPONSE", "source": "MODEL"})
+        self.record("MODEL", "PLANNER_RESPONSE")
 
     # The CLI.
 
-    def begin(self, inp):
-        """A turn (an invocation of the cascade) that opens with `inp`."""
-        self.exists = True
-        self.engine.open_turn(inp)
+    def announce(self):
         if not self.announced:
             self.announced = True
             self.emit({"event": "init", "session_id": self.session})
+
+    def begin(self, inp):
+        """A turn (an invocation of the cascade) that opens with `inp`; mail
+        the mailbox holds waits for its next step boundary."""
+        self.exists = True
+        self.engine.open_turn(inp)
+        self.announce()
         self.took(inp)
         self.thought()
+        for waiting in self.waiting:
+            self.engine.queue(waiting)
+        self.waiting = []
+
+    def invoke(self, mail):
+        """An invocation of the idle cascade for the mail its mailbox holds:
+        its first step takes all of it, in send order."""
+        self.exists = True
+        self.waiting = []
+        self.engine.open_turn(mail[0])
+        self.announce()
+        self.took(mail[0])
+        for inp in mail[1:]:
+            self.engine.queue(inp)
+        self.consumed(self.engine.step())
+        if len(mail) == 1:
+            self.thought()
 
     def on_line(self, msg):
         if (msg.get("type") or msg.get("event")) != "user":
@@ -254,13 +360,21 @@ class Agy(Protocol):
         if taken:
             self.thought()
 
-    def end(self, status):
-        self.engine.end_turn()
-        self.emit({"event": "result", "result": {
-            "conversation_id": self.session, "status": status,
-            "usage": {"input_tokens": 1, "output_tokens": 1}}})
+    def end(self, status, error=None):
+        # What the turn never took stays in the mailbox.
+        self.waiting.extend(self.engine.end_turn())
+        result = {"conversation_id": self.session, "status": status,
+                  "usage": {"input_tokens": 1, "output_tokens": 1}}
+        if error:
+            result["error"] = error
+        self.emit({"event": "result", "result": result})
         if self.backlog:
             self.begin(self.backlog.pop(0))
+
+    def fail(self):
+        """The run fails: what waits for it is not taken."""
+        self.record("SYSTEM", "ERROR_MESSAGE", error=ERROR)
+        self.end("ERROR", ERROR)
 
     def finish(self):
         if self.engine.pending:
@@ -315,7 +429,7 @@ class Agy(Protocol):
             return self.refuse("cannot send message: there is an ongoing battle")
         self.post(inp)
         if engine.turn is None:
-            self.begin(inp)
+            self.invoke(self.waiting + [inp])
         else:
             engine.queue(inp)
         if self.once("drop-answer"):
