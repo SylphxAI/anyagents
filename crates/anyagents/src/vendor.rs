@@ -182,9 +182,8 @@ pub(crate) fn declared_delivery(harness: &str) -> anyagents_harness::Delivery {
         "dsh" => crate::dsh::DELIVERY,
         "grok" => crate::grok::DELIVERY,
         "spiron" => anyagents_harness_stream::SPIRON,
-        name if name == "claude-code" || is_cloud_harness(name) => {
-            anyagents_harness_claude::DELIVERY
-        }
+        "claude-code" => anyagents_harness_claude::DELIVERY,
+        name if is_cloud_harness(name) => anyagents_harness_claude::CLOUD_DELIVERY,
         _ => anyagents_harness_stream::LINE_PER_TURN,
     }
 }
@@ -1207,7 +1206,8 @@ fn vendor_launch_inner(
             session.as_deref(),
             &env,
             &request.work_dir,
-        )?;
+        )?
+        .with_delivery(anyagents_harness_claude::CLOUD_DELIVERY);
         let vh = VendorHarness::Claude(
             Box::new(harness),
             request.config_dir.join(&session_file).into(),

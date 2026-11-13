@@ -437,7 +437,8 @@ async fn mcp_tools_use_the_server_socket() {
     assert_eq!(alpha_row.harness, "claude-code");
     assert_eq!(alpha_row.state, "running");
     // The level the Claude Code adapter holds before a process announced itself.
-    assert_eq!(alpha_row.delivery["level"], "mid-turn");
+    assert_eq!(alpha_row.delivery["level"], "next-step");
+    assert_eq!(alpha_row.delivery["idempotent"], true);
     assert!(
         alpha_row.delivery["proof"]
             .as_str()

@@ -1,8 +1,8 @@
 //! Claude Code adapter.
 //!
 //! One child runs `claude -p` with stream-json on stdin and stdout. The mailbox
-//! id is the first line of the user text (`anyagents-message:<id>`). An id already
-//! written, or echoed back on stdout, is not written again.
+//! id is the first line of the user text (`anyagents-message:<id>`). An id this
+//! process already wrote is not written again.
 //!
 //! Declared delivery mode is steer. A stream-json child reads a `user` message
 //! at any point, mid-turn included, so every mailbox line is written the moment
@@ -10,11 +10,17 @@
 //! true when a `result` event closes the open turn. Token counts and
 //! `total_cost_usd` from that event are kept on the finished ids.
 //!
-//! Mid-turn delivery: with `--replay-user-messages` the child echoes back every
-//! line written to its stdin as a `user` event, which is the harness's own
-//! acknowledgement that the line entered the running conversation. A line
-//! written during a turn reaches the agent before its next model step; the
-//! echo is what marks it taken, and an id already echoed is never written twice.
+//! Mid-turn delivery: every line carries a `uuid` derived from its mailbox id.
+//! Claude Code queues a line that arrives during a turn and folds every queued
+//! line, in order, into the conversation at the turn's next step (after the
+//! running tools, before the next model request); a line still queued when
+//! the turn ends starts the next one. It proves each line entered the
+//! conversation, keyed by that uuid: `command_lifecycle` `started`, the
+//! `--replay-user-messages` echo (`isReplay`), and the result's
+//! `user_message_uuids`. A line is `InFlight` until one of them arrives, then
+//! `Accepted`. Claude Code drops a second line with a uuid its transcript
+//! already holds; a resumed session's transcript is also read at launch, so
+//! a line an earlier process folded in mid-turn is answered `Duplicate`.
 //!
 //! Resume starts the child again with `--resume` when the session id changed or the
 //! process has exited. Cancel sends a `control_request` whose subtype is `interrupt`.
@@ -38,11 +44,44 @@ use serde_json::{Value, json};
 /// What this adapter guarantees for mail that reaches a busy agent
 /// (`docs/delivery.md`).
 pub const DELIVERY: Delivery = Delivery {
-    level: DeliveryLevel::MidTurn,
-    idempotent: false,
-    proof: "stream-json line written",
+    level: DeliveryLevel::NextStep,
+    idempotent: true,
+    proof: "command_lifecycle started / replay echo, by uuid",
     peer: None,
 };
+
+/// `anyagents cloud-harness`, which speaks this protocol for a cloud agent:
+/// it runs one turn per line and echoes a line when its turn starts.
+pub const CLOUD_DELIVERY: Delivery = Delivery {
+    level: DeliveryLevel::TurnEnd,
+    idempotent: false,
+    proof: "replay echo when the line's turn starts",
+    peer: None,
+};
+
+/// The uuid a mailbox line carries, derived from its id so that a line
+/// handed to a resumed session again carries the same one.
+pub fn uuid_for(id: &str) -> String {
+    let fnv = |basis: u64| {
+        id.bytes().fold(basis, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
+    };
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&fnv(0xcbf2_9ce4_8422_2325).to_be_bytes());
+    bytes[8..].copy_from_slice(&fnv(0x6c62_272e_07bb_0142).to_be_bytes());
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..]
+    )
+}
 
 /// One long-lived Claude Code child.
 pub struct ClaudeHarness {
@@ -55,6 +94,7 @@ pub struct ClaudeHarness {
     wake: Arc<Condvar>,
     reader: Option<JoinHandle<()>>,
     stderr_reader: Option<JoinHandle<()>>,
+    delivery: Delivery,
 }
 
 #[derive(Default)]
@@ -78,8 +118,16 @@ struct State {
     failures: Vec<(String, String)>,
     turns: std::collections::BTreeMap<String, u64>,
     request_seq: u64,
-    /// Ids an echoed `user` event proved the child took.
-    echoed: HashSet<String>,
+    /// The mailbox id behind each uuid this process wrote.
+    uuid_ids: HashMap<String, String>,
+    /// Written, and not yet proved to have entered the conversation.
+    in_flight: HashSet<String>,
+    /// Proved to have entered the conversation.
+    consumed: HashSet<String>,
+    /// Ids the resumed session's transcript shows an earlier process applied.
+    applied_before: HashSet<String>,
+    /// What the child's `system` `init` named: version and capabilities.
+    peer: Option<String>,
     /// For each written id, whether no turn was open when it was written.
     phases: std::collections::HashMap<String, &'static str>,
 }
@@ -91,6 +139,8 @@ struct Observed {
     open: usize,
     followups: usize,
     seen: usize,
+    in_flight: usize,
+    consumed: usize,
     finished: usize,
     failures: usize,
     usages: usize,
@@ -106,6 +156,8 @@ impl State {
             open: self.open.len(),
             followups: self.followups.len(),
             seen: self.seen.len(),
+            in_flight: self.in_flight.len(),
+            consumed: self.consumed.len(),
             finished: self.finished.len(),
             failures: self.failures.len(),
             usages: self.usages.len(),
@@ -161,16 +213,25 @@ impl ClaudeHarness {
             wake: Arc::new(Condvar::new()),
             reader: None,
             stderr_reader: None,
+            delivery: DELIVERY,
         };
         harness.launch(session_id)?;
         Ok(harness)
     }
 
-    /// The create input line Claude Code reads: one `user` event whose text is
-    /// the marked message. Its echo is the acknowledgement.
+    /// The delivery this child's protocol peer offers, when it is not Claude
+    /// Code itself (`anyagents cloud-harness`).
+    pub fn with_delivery(mut self, delivery: Delivery) -> Self {
+        self.delivery = delivery;
+        self
+    }
+
+    /// The input line Claude Code reads: one `user` event whose text is the
+    /// marked message, carrying the uuid every proof of it is keyed by.
     pub fn steer_input_line(message: &OutboundMessage) -> Value {
         json!({
             "type": "user",
+            "uuid": uuid_for(&message.id),
             "message": {
                 "role": "user",
                 "content": [{
@@ -193,14 +254,14 @@ impl ClaudeHarness {
         lock(&self.shared).phases.get(id).copied()
     }
 
-    /// Whether the child echoed `id` back as a `user` event.
-    pub fn echoed(&self, id: &str) -> bool {
-        lock(&self.shared).echoed.contains(id)
+    /// Whether the child proved `id` entered the conversation.
+    pub fn consumed(&self, id: &str) -> bool {
+        lock(&self.shared).consumed.contains(id)
     }
 
-    /// Wait until the child echoes `id`.
-    pub fn wait_echoed(&self, id: &str, timeout: Duration) -> bool {
-        self.wait_pred(timeout, |state| state.echoed.contains(id))
+    /// Wait until the child proves `id` entered the conversation.
+    pub fn wait_consumed(&self, id: &str, timeout: Duration) -> bool {
+        self.wait_pred(timeout, |state| state.consumed.contains(id))
     }
 
     /// Ids this process actually wrote, in write order.
@@ -245,7 +306,7 @@ impl ClaudeHarness {
         lock(&self.shared).finished.contains(id)
     }
 
-    /// Whether `id` was written or echoed.
+    /// Whether `id` was written, or proved taken.
     pub fn seen(&self, id: &str) -> bool {
         lock(&self.shared).seen.contains(id)
     }
@@ -255,7 +316,7 @@ impl ClaudeHarness {
         self.wait_pred(timeout, |state| state.finished.contains(id))
     }
 
-    /// Wait until `id` is written or echoed.
+    /// Wait until `id` is written, or proved taken.
     pub fn wait_seen(&self, id: &str, timeout: Duration) -> bool {
         self.wait_pred(timeout, |state| state.seen.contains(id))
     }
@@ -345,6 +406,9 @@ impl ClaudeHarness {
                         .unwrap_or(0);
                     detect_session_quota_reset_ms(cfg_dir, now_ms)
                 });
+            let applied = session_id
+                .map(|session| transcript_marks(&self.environment, session))
+                .unwrap_or_default();
             let mut state = lock(&self.shared);
             state.child = Some(child);
             state.stderr = diagnostics::Evidence::default();
@@ -352,6 +416,11 @@ impl ClaudeHarness {
             state.sign_in_fault = None;
             state.open.clear();
             state.followups.clear();
+            // What the last process wrote and the session holds is the
+            // session's: a line it never proved goes to this process again.
+            state.in_flight.clear();
+            state.applied_before.extend(applied);
+            state.peer = None;
             if initial_quota.is_some() {
                 state.quota_reset_at_ms = initial_quota;
             }
@@ -424,39 +493,41 @@ impl Drop for ClaudeHarness {
 
 impl Harness for ClaudeHarness {
     fn deliver(&mut self, message: &OutboundMessage) -> Result<DeliverOutcome, HarnessError> {
+        let id = &message.id;
         {
             let mut state = lock(&self.shared);
+            // A proof outlives the process that gave it.
+            if state.consumed.contains(id) {
+                return Ok(DeliverOutcome::Accepted {
+                    turn_finished: state.finished.contains(id),
+                });
+            }
+            if state.applied_before.contains(id) && !state.written.contains(id) {
+                return Ok(DeliverOutcome::Duplicate);
+            }
             if !state.alive {
                 return Err(HarnessError::Dead);
             }
-            // A message whose last turn failed is not a duplicate: the turn that
-            // succeeds has to carry it. The adapter remembers it failed, so the
-            // host handing it over again always means a new attempt.
-            let failed_before = state.failures.iter().any(|(item, _)| item == &message.id);
             if let Some(reset_at_ms) = state.quota_reset_at_ms
-                && !state.finished.contains(&message.id)
+                && !state.finished.contains(id)
             {
                 return Ok(DeliverOutcome::Quota { reset_at_ms });
             }
-            if !failed_before
-                && (state.seen.contains(&message.id)
-                    || state.open.contains(&message.id)
-                    || state.followups.contains(&message.id))
-            {
-                return Ok(DeliverOutcome::Accepted {
-                    turn_finished: state.finished.contains(&message.id),
-                });
-            }
-            if let Some(reset_at_ms) = state.quota_reset_at_ms {
-                return Ok(DeliverOutcome::Quota { reset_at_ms });
+            // A line a failed turn handed back is not in flight: it is
+            // written again for the turn that succeeds.
+            if state.in_flight.contains(id) {
+                return Ok(DeliverOutcome::InFlight);
             }
             let phase = if state.open.is_empty() {
                 "idle"
             } else {
                 "turn"
             };
-            state.phases.insert(message.id.clone(), phase);
-            accept_message(&mut state, &message.id);
+            state.phases.insert(id.clone(), phase);
+            accept_message(&mut state, id);
+            state.in_flight.insert(id.clone());
+            state.consumed.remove(id);
+            state.uuid_ids.insert(uuid_for(id), id.clone());
         }
         let line = Self::create_input(message);
         let write_res = write_stdin(&self.stdin, &line);
@@ -465,13 +536,18 @@ impl Harness for ClaudeHarness {
             state.alive = false;
             state.open.clear();
             state.followups.clear();
-            state.seen.remove(&message.id);
+            state.in_flight.remove(id);
+            state.seen.remove(id);
             self.wake.notify_all();
             return Err(HarnessError::Dead);
         }
-        Ok(DeliverOutcome::Accepted {
-            turn_finished: state.finished.contains(&message.id)
-                && !state.failures.iter().any(|(item, _)| item == &message.id),
+        // A proof can beat this lock.
+        Ok(if state.consumed.contains(id) {
+            DeliverOutcome::Accepted {
+                turn_finished: state.finished.contains(id),
+            }
+        } else {
+            DeliverOutcome::InFlight
         })
     }
 
@@ -535,12 +611,12 @@ impl Harness for ClaudeHarness {
         let state = lock(&self.shared);
         HarnessHealth {
             process_alive: state.alive,
-            turn_state: if state.open.is_empty() {
+            turn_state: if state.open.is_empty() && state.in_flight.is_empty() {
                 TurnState::Idle
             } else {
                 TurnState::InTurn
             },
-            delivery: DELIVERY,
+            delivery: self.delivery.clone().with_peer(state.peer.clone()),
             quota_reset_at_ms: state.quota_reset_at_ms,
             sign_in_fault: state.sign_in_fault.clone(),
         }
@@ -640,18 +716,14 @@ fn read_stdout(stdout: ChildStdout, shared: Arc<Mutex<State>>, wake: Arc<Condvar
         {
             let mut state = lock(&shared);
             let before = state.observed();
-            // An id the vendor wrote or echoed starts no second turn. An id that
-            // only appears inside an error or a system notice is not proof it
-            // wrote the message: the turn that failed must be able to try again.
-            note_markers(&mut state, &value);
-            note_echo(&mut state, &value);
+            // Only Claude Code's own proof that a line entered the
+            // conversation takes it; a mention in text or an error is none.
+            note_proof(&mut state, &value);
             if let Some(reset_at_ms) = quota_from_claude(&value) {
                 state.quota_reset_at_ms = Some(reset_at_ms);
                 let rejected_ids = std::mem::take(&mut state.open);
                 for id in rejected_ids {
-                    state.seen.remove(&id);
-                    state.echoed.remove(&id);
-                    state.failures.push((id, "rate_limit".to_string()));
+                    hand_back(&mut state, &id, "rate_limit");
                 }
             }
             if let Some(reason) = synthetic_auth_error_from_claude(&value) {
@@ -792,10 +864,8 @@ fn fail_oauth_turn(state: &mut State, reason: String) {
     let mut ids = std::mem::take(&mut state.open);
     ids.append(&mut state.followups);
     for id in ids {
-        state.seen.remove(&id);
-        state.echoed.remove(&id);
         state.finished.remove(&id);
-        state.failures.push((id, reason.clone()));
+        hand_back(state, &id, &reason);
     }
     state.sign_in_fault = Some(reason);
     if let Some(child) = state.child.as_mut() {
@@ -883,49 +953,165 @@ fn u64_field(value: Option<&Value>, key: &str) -> u64 {
         .unwrap_or(0)
 }
 
-fn note_markers(state: &mut State, value: &Value) {
-    if !mentions_user_text(value) {
+/// A line whose turn failed before it entered the conversation goes back to
+/// the mailbox, to be written again for the turn that succeeds. A line the
+/// conversation already took stays taken.
+fn hand_back(state: &mut State, id: &str, reason: &str) {
+    state.failures.push((id.to_string(), reason.to_string()));
+    if state.consumed.contains(id) {
         return;
     }
-    collect_markers(state, value);
+    state.in_flight.remove(id);
+    state.seen.remove(id);
 }
 
-/// Whether a line carries user or assistant content, the only place the vendor
-/// writes a mailbox id back.
-fn mentions_user_text(value: &Value) -> bool {
-    match value {
-        Value::String(_) => false,
-        Value::Array(items) => items.iter().any(mentions_user_text),
-        Value::Object(map) => {
-            if map.get("type").and_then(Value::as_str).is_some_and(|kind| {
-                matches!(
-                    kind,
-                    "user" | "assistant" | "message" | "text" | "content_block"
-                )
-            }) {
-                return true;
+/// What the child proves about the lines this process gave it, keyed by
+/// their uuid: `command_lifecycle` `started` (its turn started with it, or a
+/// step folded it in), the replay echo of an input line, and the
+/// `user_message_uuids` a result lists. `cancelled` hands a line back to the
+/// mailbox; `refused` and `discarded` are Claude Code's own verdict on it, so
+/// it is taken and not offered again.
+fn note_proof(state: &mut State, value: &Value) {
+    let by_uuid = |state: &State, uuid: Option<&Value>| {
+        uuid.and_then(Value::as_str)
+            .and_then(|uuid| state.uuid_ids.get(uuid))
+            .cloned()
+    };
+    match value.get("type").and_then(Value::as_str) {
+        Some("system") if value.get("subtype").and_then(Value::as_str) == Some("init") => {
+            let version = value
+                .get("claude_code_version")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown version");
+            state.peer = Some(format!("claude-code {version}"));
+            if let Some(session) = value
+                .get("session_id")
+                .and_then(Value::as_str)
+                .filter(|session| !session.is_empty())
+            {
+                state.session_id = Some(session.to_string());
             }
-            map.values().any(mentions_user_text)
         }
-        _ => false,
+        Some("command_lifecycle") => {
+            let Some(id) = by_uuid(state, value.get("command_uuid").or(value.get("uuid"))) else {
+                return;
+            };
+            match value.get("state").and_then(Value::as_str) {
+                Some("started") => consume(state, &id),
+                Some("cancelled") => {
+                    state.open.retain(|item| item != &id);
+                    state.followups.retain(|item| item != &id);
+                    state.in_flight.remove(&id);
+                    state.seen.remove(&id);
+                }
+                Some(verdict @ ("refused" | "discarded")) => {
+                    consume(state, &id);
+                    state
+                        .failures
+                        .push((id, format!("claude code {verdict} the input")));
+                }
+                _ => {}
+            }
+        }
+        Some("user") if value.get("isReplay").and_then(Value::as_bool) == Some(true) => {
+            let id = by_uuid(state, value.get("uuid")).or_else(|| {
+                let mut ids = Vec::new();
+                collect_ids(value.get("message").unwrap_or(&Value::Null), &mut ids);
+                ids.into_iter().find(|id| state.in_flight.contains(id))
+            });
+            if let Some(id) = id {
+                consume(state, &id);
+            }
+        }
+        Some("result") => {
+            let ids: Vec<String> = value
+                .get("user_message_uuids")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|uuid| by_uuid(state, Some(uuid)))
+                .collect();
+            for id in ids {
+                consume(state, &id);
+            }
+        }
+        _ => {}
     }
 }
 
-/// A `user` event the child sends back is proof it took the line: the replay
-/// echo of a written line, or a message it reports itself. An error or a notice
-/// is not an echo. An echoed id is taken, and a turn that failed before it
-/// arrived no longer counts against it.
-fn note_echo(state: &mut State, value: &Value) {
-    if value.get("type").and_then(Value::as_str) != Some("user") {
+/// `id` entered the conversation. A line folded into the running turn
+/// belongs to that turn, not the next.
+fn consume(state: &mut State, id: &str) {
+    state.in_flight.remove(id);
+    if !state.consumed.insert(id.to_string()) {
         return;
     }
-    let mut ids = Vec::new();
-    collect_ids(value, &mut ids);
-    for id in ids {
-        state.echoed.insert(id.clone());
-        state.seen.insert(id.clone());
-        state.finished.remove(&id);
-        state.failures.retain(|(item, _)| item != &id);
+    state.seen.insert(id.to_string());
+    state.failures.retain(|(item, _)| item != id);
+    if !state.open.is_empty()
+        && let Some(at) = state.followups.iter().position(|item| item == id)
+    {
+        let id = state.followups.remove(at);
+        state.open.push(id);
+    }
+}
+
+/// The mailbox ids a resumed session's transcript shows entered its
+/// conversation: a user row's text, or a line folded in mid-turn (a
+/// `queued_command` attachment). Claude Code itself recognises a replayed
+/// uuid only for a user row; this covers the folded ones too.
+fn transcript_marks(environment: &[(String, String)], session: &str) -> HashSet<String> {
+    let mut marks = HashSet::new();
+    let Some(config) = environment
+        .iter()
+        .rev()
+        .find(|(key, _)| key == "CLAUDE_CONFIG_DIR")
+        .map(|(_, value)| PathBuf::from(value))
+    else {
+        return marks;
+    };
+    let name = format!("{session}.jsonl");
+    let Ok(projects) = std::fs::read_dir(config.join("projects")) else {
+        return marks;
+    };
+    for project in projects.flatten() {
+        let Ok(file) = std::fs::File::open(project.path().join(&name)) else {
+            continue;
+        };
+        for line in BufReader::new(file).lines().map_while(Result::ok) {
+            let Ok(row) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            let content = match row.get("type").and_then(Value::as_str) {
+                Some("user") => row.pointer("/message/content"),
+                Some("attachment")
+                    if row.pointer("/attachment/type").and_then(Value::as_str)
+                        == Some("queued_command") =>
+                {
+                    row.pointer("/attachment/prompt")
+                }
+                _ => None,
+            };
+            for text in content.into_iter().flat_map(text_blocks) {
+                if let Some(id) = message_id_in_text(text) {
+                    marks.insert(id.to_string());
+                }
+            }
+        }
+    }
+    marks
+}
+
+/// The text of a message content: the string itself, or each text block.
+fn text_blocks(content: &Value) -> Vec<&str> {
+    match content {
+        Value::String(text) => vec![text.as_str()],
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -944,27 +1130,6 @@ fn collect_ids(value: &Value, out: &mut Vec<String>) {
         Value::Object(map) => {
             for item in map.values() {
                 collect_ids(item, out);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn collect_markers(state: &mut State, value: &Value) {
-    match value {
-        Value::String(text) => {
-            if let Some(id) = message_id_in_text(text) {
-                state.seen.insert(id.to_string());
-            }
-        }
-        Value::Array(items) => {
-            for item in items {
-                collect_markers(state, item);
-            }
-        }
-        Value::Object(map) => {
-            for item in map.values() {
-                collect_markers(state, item);
             }
         }
         _ => {}
