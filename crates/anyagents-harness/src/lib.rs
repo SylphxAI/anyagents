@@ -7,6 +7,7 @@
 mod atomic_fs;
 mod fake;
 pub mod masking;
+pub mod media;
 mod name;
 mod seat;
 mod stamp;
