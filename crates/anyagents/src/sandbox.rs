@@ -429,9 +429,57 @@ pub fn share_capability_with_seat(path: &Path, gid: u32) -> std::io::Result<()> 
     Ok(())
 }
 
+/// Restore execute/traverse bits on `config_dir.parent()` (`<data>/agents/<id>`)
+/// if owned by the server user and blocking seat traversal (e.g. `0o700`/`0o2700`),
+/// preserving any existing setgid bit.
+#[cfg(unix)]
+fn ensure_agent_root_traversable(config_dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+    let Some(root) = config_dir.parent() else {
+        return Ok(());
+    };
+    let meta = match std::fs::symlink_metadata(root) {
+        Ok(m) => m,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    if !meta.is_dir() || meta.file_type().is_symlink() || meta.uid() != server_uid() {
+        return Ok(());
+    }
+    if (meta.mode() & 0o011) != 0 {
+        return Ok(());
+    }
+    let dir = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+        .open(root)?;
+    let opened_meta = dir.metadata()?;
+    if opened_meta.uid() != server_uid() {
+        return Ok(());
+    }
+    let opened_mode = opened_meta.mode() & 0o7777;
+    if (opened_mode & 0o011) == 0 {
+        dir.set_permissions(std::fs::Permissions::from_mode(
+            (opened_mode | 0o755) & 0o7777,
+        ))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_agent_root_traversable(_config_dir: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
 /// Give one agent's config directory to its explicitly admitted principal.
 /// Workdirs have separate fail-closed sharing before admission.
 pub fn share_config_with_seat_uid(config_dir: &Path, uid: u32, gid: u32) {
+    if let Err(err) = ensure_agent_root_traversable(config_dir) {
+        eprintln!(
+            "seat: cannot restore traverse permissions on parent of {}: {err}",
+            config_dir.display()
+        );
+    }
     let (eff_uid, eff_gid) = match existing_config_seat(config_dir) {
         Some((_, existing_uid, existing_gid, _)) => (existing_uid, existing_gid),
         None => (uid, gid),
@@ -544,6 +592,10 @@ pub(crate) fn ensure_seat_dir_as_owner(
 }
 
 pub(crate) fn prepare_config_with_seat_uid(config: &Path, uid: u32, gid: u32) -> Result<(), Error> {
+    ensure_agent_root_traversable(config).map_err(|error| Error::WorkdirPermission {
+        path: config.parent().unwrap_or(config).display().to_string(),
+        message: format!("cannot restore traverse permissions on agent root: {error}"),
+    })?;
     crate::seat_tree::share_config(config, uid, gid).map_err(|error| Error::WorkdirPermission {
         path: config.display().to_string(),
         message: format!("cannot prepare shared harness configuration: {error}"),
@@ -713,6 +765,15 @@ pub fn hydrate_operator_groups_if_needed() {
 
 fn is_peer_boundary_shared(config: &Path, gid: u32) -> bool {
     use std::os::unix::fs::MetadataExt as _;
+    if let Some(root) = config.parent()
+        && let Ok(m) = std::fs::symlink_metadata(root)
+        && m.is_dir()
+        && !m.file_type().is_symlink()
+        && m.uid() == server_uid()
+        && (m.mode() & 0o011) == 0
+    {
+        return false;
+    }
     let check_dir = |p: &Path| -> bool {
         std::fs::symlink_metadata(p).is_ok_and(|m| {
             m.is_dir() && !m.file_type().is_symlink() && m.gid() == gid && (m.mode() & 0o007) == 0
@@ -947,6 +1008,82 @@ mod tests {
             std::fs::metadata(&transcripts).unwrap().mode() & 0o7777,
             0o700,
             "transcripts stay host-private"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn prepare_and_share_config_restore_agent_root_traversal_preserving_setgid() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let (uid, gid) = (server_uid(), server_gid());
+
+        for initial_root_mode in [0o700u32, 0o2700u32] {
+            let root = dir.path().join(format!("agent-{initial_root_mode:o}"));
+            let config = root.join("config");
+            let memory = root.join("memory");
+            let skills = root.join("skills");
+            let transcripts = root.join("transcripts");
+            for sub in [&config, &memory, &skills, &transcripts] {
+                std::fs::create_dir_all(sub).unwrap();
+            }
+            for shared in [&memory, &skills] {
+                std::fs::set_permissions(shared, std::fs::Permissions::from_mode(0o2770)).unwrap();
+            }
+            std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::set_permissions(&transcripts, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(initial_root_mode))
+                .unwrap();
+
+            prepare_config_with_seat_uid(&config, uid, gid).unwrap();
+            let expected_root = (initial_root_mode | 0o755) & 0o7777;
+            assert_eq!(
+                std::fs::metadata(&root).unwrap().mode() & 0o7777,
+                expected_root,
+                "prepare_config_with_seat_uid must restore traverse bits from {initial_root_mode:o}"
+            );
+            assert_eq!(std::fs::metadata(&config).unwrap().mode() & 0o7777, 0o2770);
+            assert_eq!(std::fs::metadata(&config).unwrap().gid(), gid);
+
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(initial_root_mode))
+                .unwrap();
+            assert!(!is_peer_boundary_shared(&config, gid));
+            share_config_with_seat_uid(&config, uid, gid);
+            assert_eq!(
+                std::fs::metadata(&root).unwrap().mode() & 0o7777,
+                expected_root,
+                "share_config_with_seat_uid must restore traverse bits from {initial_root_mode:o}"
+            );
+            assert!(is_peer_boundary_shared(&config, gid));
+            assert_eq!(std::fs::metadata(&config).unwrap().mode() & 0o7777, 0o2770);
+            assert_eq!(
+                std::fs::metadata(&transcripts).unwrap().mode() & 0o7777,
+                0o700
+            );
+        }
+
+        // Already-traversable agent roots (e.g. 0o711) and symlinks must not be widened.
+        let traversable = dir.path().join("agent-711");
+        let trav_cfg = traversable.join("config");
+        std::fs::create_dir_all(&trav_cfg).unwrap();
+        std::fs::set_permissions(&traversable, std::fs::Permissions::from_mode(0o711)).unwrap();
+        prepare_config_with_seat_uid(&trav_cfg, uid, gid).unwrap();
+        assert_eq!(
+            std::fs::metadata(&traversable).unwrap().mode() & 0o7777,
+            0o711
+        );
+
+        let real_target = dir.path().join("real-private");
+        std::fs::create_dir_all(real_target.join("config")).unwrap();
+        std::fs::set_permissions(&real_target, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let symlink_root = dir.path().join("symlink-root");
+        std::os::unix::fs::symlink(&real_target, &symlink_root).unwrap();
+        assert!(prepare_config_with_seat_uid(&symlink_root.join("config"), uid, gid).is_err());
+        share_config_with_seat_uid(&symlink_root.join("config"), uid, gid);
+        assert_eq!(
+            std::fs::metadata(&real_target).unwrap().mode() & 0o7777,
+            0o700,
+            "symlinked parent must not have its target widened"
         );
     }
 

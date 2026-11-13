@@ -274,6 +274,7 @@ impl Drop for Server {
 }
 
 fn create(dir: &Path, name: &str) -> String {
+    support::managed_harnesses(dir);
     let created = Command::new(env!("CARGO_BIN_EXE_anyagents"))
         .env(
             "ANYAGENTS_OPERATOR_TOKEN_FILE",

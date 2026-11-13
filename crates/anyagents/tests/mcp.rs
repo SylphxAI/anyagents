@@ -21,27 +21,7 @@ fn bin() -> Command {
     cmd
 }
 
-/// A `PATH` where creating an agent installs nothing: `npm` answers a version
-/// and a no-op install, and `claude` is this binary.
-fn machine_path(dir: &std::path::Path) -> std::ffi::OsString {
-    use std::os::unix::fs::PermissionsExt;
-    let bin = dir.join("bin");
-    std::fs::create_dir_all(&bin).unwrap();
-    let launcher = bin.join("claude");
-    if !launcher.exists() {
-        std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_anyagents"), &launcher).unwrap();
-    }
-    let npm = bin.join("npm");
-    if !npm.exists() {
-        std::fs::write(
-            &npm,
-            "#!/bin/sh\ncase \"$1\" in view) echo 0.0.0 ;; esac\nexit 0\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&npm, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-    std::env::join_paths([bin]).unwrap()
-}
+use support::machine_path;
 
 #[derive(Deserialize)]
 struct AgentsResponse {
@@ -1734,4 +1714,104 @@ async fn code_mode_supports_memory_sdk_workspace_patch_list_exec_and_computer_sn
 
     client.cancel().await.unwrap();
     drop(server);
+}
+
+#[tokio::test]
+async fn skill_reads_verdicts_and_outcomes_share_the_authenticated_api() {
+    use anyagents_core::{NewAgent, Store, agent_config_dir};
+    let dir = support::physical_tempdir();
+    let store = Store::open(dir.path().join("state.db")).unwrap();
+    let lead = store
+        .create_agent(NewAgent::new("quality-lead", "spiron"))
+        .unwrap();
+    let mut input = NewAgent::new("quality-worker", "claude-code");
+    input.parent_id = Some(lead.id.clone());
+    let worker = store.create_agent(input).unwrap();
+    for agent in [&lead, &worker] {
+        store.set_agent_state(&agent.id, "paused").unwrap();
+    }
+    let skill = dir.path().join("skills").join("prove-it");
+    std::fs::create_dir_all(&skill).unwrap();
+    std::fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: prove-it\ndescription: verify before claiming\n---\nCheck the live state.\n",
+    )
+    .unwrap();
+    let _server = start_server(dir.path());
+    let worker_mcp = connect(dir.path(), &worker.name).await;
+    let lead_mcp = connect(dir.path(), &lead.name).await;
+
+    let read: serde_json::Value = ok_json(
+        call(
+            &worker_mcp,
+            "skills",
+            serde_json::json!({"name": "prove-it"}),
+        )
+        .await,
+    );
+    assert!(
+        read["content"]
+            .as_str()
+            .unwrap()
+            .contains("Check the live state.")
+    );
+    let own = call(
+        &worker_mcp,
+        "agents",
+        serde_json::json!({"action": "verdict", "name": worker.name, "verdict": "accepted"}),
+    )
+    .await;
+    assert!(error_text(&own).contains("its own work"), "{own:?}");
+    let verdict: serde_json::Value = ok_json(
+        call(
+            &lead_mcp,
+            "agents",
+            serde_json::json!({
+                "action": "verdict",
+                "name": worker.name,
+                "verdict": "accepted",
+                "reason": "tests pass",
+            }),
+        )
+        .await,
+    );
+    assert_eq!(verdict["kind"], "accepted");
+    assert_eq!(verdict["actor"], "agent:quality-lead");
+
+    let report: serde_json::Value = ok_json(
+        call(
+            &lead_mcp,
+            "agents",
+            serde_json::json!({"action": "outcomes", "group_by": "skill"}),
+        )
+        .await,
+    );
+    let groups = report["groups"].as_array().unwrap();
+    assert_eq!(groups.len(), 1, "{report}");
+    assert_eq!(groups[0]["skill"], "prove-it");
+    assert_eq!(groups[0]["succeeded"], 1);
+    assert_eq!(groups[0]["events"]["accepted"], 1);
+    // No usage was recorded: the ratio is unknown, never zero.
+    assert!(groups[0]["cost_per_success_micros"].is_null());
+
+    let cli = bin()
+        .env("ANYAGENTS_AGENT_ID", lead.id.as_str())
+        .env(
+            "ANYAGENTS_AGENT_CONFIG",
+            agent_config_dir(dir.path(), &lead.id),
+        )
+        .arg("--data")
+        .arg(dir.path())
+        .args(["outcomes", "--group-by", "skill"])
+        .output()
+        .unwrap();
+    assert!(
+        cli.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cli.stderr)
+    );
+    let text = String::from_utf8(cli.stdout).unwrap();
+    assert!(text.starts_with("prove-it\t1\t1\t0\t0\t0\t0\t"), "{text}");
+    worker_mcp.cancel().await.unwrap();
+    lead_mcp.cancel().await.unwrap();
 }

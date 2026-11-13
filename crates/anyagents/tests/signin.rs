@@ -1,6 +1,8 @@
 //! The CLI sign-in against a fake vendor: the agent's own config directory is
 //! the one the vendor command is given, and no credential is printed.
 
+mod support;
+
 use std::path::Path;
 use std::process::Command;
 
@@ -16,23 +18,7 @@ fn recorded_cwd(recorded: &str) -> String {
         .to_string()
 }
 
-/// A `PATH` where creating an agent installs nothing: `npm` answers a version
-/// and a no-op install.
-fn machine_path(dir: &Path) -> std::ffi::OsString {
-    use std::os::unix::fs::PermissionsExt;
-    let bin = dir.join("bin");
-    std::fs::create_dir_all(&bin).unwrap();
-    let npm = bin.join("npm");
-    if !npm.exists() {
-        std::fs::write(
-            &npm,
-            "#!/bin/sh\ncase \"$1\" in view) echo 0.0.0 ;; esac\nexit 0\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&npm, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-    std::env::join_paths([bin]).unwrap()
-}
+use support::machine_path;
 
 fn create(data: &Path, name: &str, harness: &str) {
     let out = bin()

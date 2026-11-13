@@ -614,9 +614,13 @@ fn is_healthy_active_turn(agent: &AgentView, on_quota: bool) -> bool {
             .is_none_or(|e| e.trim().is_empty())
 }
 
+/// Mail that waits for a healthy turn by design: a followup harness takes it
+/// when the turn ends, and a pending switch holds it for the replacement. A
+/// steering harness has no expected queue, whatever its name: its mail waiting
+/// is lag.
 fn is_expected_turn_queue(agent: &AgentView, on_quota: bool) -> bool {
     is_healthy_active_turn(agent, on_quota)
-        && (agent.delivery_mode == "followup" || agent.pending_switch || agent.harness == "spiron")
+        && (agent.delivery_mode == "followup" || agent.pending_switch)
 }
 
 fn format_status_with_alerts(agent: &AgentView, now: i64) -> String {
@@ -1759,11 +1763,21 @@ mod tests {
         let rendered_stalled = format_status_with_alerts(&stalled, 10_000_000);
         assert!(rendered_stalled.contains("! lag 3m"));
 
+        // 4. A steering agent mid-turn whose mail still waits is lag, not a
+        //    queue, whatever the harness is called.
+        let stuck_steer = sample_agent("working", "steer", Some(20 * 60_000), Some(180_000));
+        let rendered_stuck = format_status_with_alerts(&stuck_steer, 10_000_000);
+        assert!(rendered_stuck.contains("! lag 3m"), "{rendered_stuck}");
+        assert!(!rendered_stuck.contains("queued"));
+
         let mut children: HashMap<&str, Vec<&AgentView>> = HashMap::new();
-        children.insert("agt_root", vec![&steered, &followup, &stalled]);
+        children.insert(
+            "agt_root",
+            vec![&steered, &followup, &stalled, &stuck_steer],
+        );
         let mut memo = HashMap::new();
         let stats = compute_subtree_stats("agt_root", &children, 10_000_000, &mut memo);
-        assert_eq!(stats.working, 2);
-        assert_eq!(stats.lagging, 1);
+        assert_eq!(stats.working, 3);
+        assert_eq!(stats.lagging, 2);
     }
 }

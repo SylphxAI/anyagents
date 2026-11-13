@@ -1,7 +1,7 @@
 //! Rebuildable source cursors. Native append reuse checks a bounded boundary,
 //! while host maintenance periodically rebuilds the entire source. Returned
 //! coordinates always retain independent raw/window SHA verification.
-use crate::raw_segment::{JsonlLine, RawCoordinate, RawSource, read_jsonl_line};
+use crate::raw_segment::{JsonlLine, RawCoordinate, RawSource, read_jsonl_line_with_policy};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -86,6 +86,7 @@ pub(crate) fn scan_jsonl(
     source: &mut RawSource,
     previous: Option<&SourceCursor>,
     force_full: bool,
+    tolerate_malformed: bool,
 ) -> io::Result<JsonlRefresh> {
     let stamp = source.stamp().clone();
     let mut start = 0;
@@ -111,7 +112,7 @@ pub(crate) fn scan_jsonl(
     let mut records = Vec::new();
     let mut at = start;
     let mut scanned = 0;
-    while let Some(line) = read_jsonl_line(&mut reader)? {
+    while let Some(line) = read_jsonl_line_with_policy(&mut reader, tolerate_malformed)? {
         match line {
             JsonlLine::Complete { length, sha256 } => {
                 records.push(RawCoordinate {

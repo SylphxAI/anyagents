@@ -25,6 +25,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   runs one runtime thread over a kept-alive connection. No history is deleted.
 - A credential renewal never holds an agent's mail: a profile change takes
   effect at the agent's next idle point while mail keeps flowing.
+- Record outcomes beside usage (ADR 0008). A PR watch's merge, close or review
+  failure, and a verdict an ancestor or the operator records (`agents` `verdict`,
+  `anyagents verdict`), become `outcomes` rows; reads through the `skills` tool
+  become `skill_reads` with the digest of the bytes read. `GET /v1/outcomes`,
+  `agents` `outcomes` and `anyagents outcomes` report successes, recovery after
+  rework and cost per successful outcome by harness and model, role, profile,
+  agent or skill. The parent reminder for idle task sub-agents now asks for a
+  verdict. Usage docs no longer claim a price table or OpenTelemetry export.
 
 ## 0.1.3
 

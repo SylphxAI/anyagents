@@ -122,6 +122,7 @@ fn single_uid_local_mode_starts_and_routes_without_setpriv_or_seat_uids() {
     std::fs::write(&cap_path, format!("{}\n", support::CAPABILITY_KEY)).unwrap();
 
     let bin = env!("CARGO_BIN_EXE_anyagents");
+    support::managed_harnesses(&data);
     let create_agent = |name: &str| -> String {
         let out = Command::new(bin)
             .env("ANYAGENTS_OPERATOR_TOKEN_FILE", &token_path)

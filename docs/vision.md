@@ -2,7 +2,7 @@
 
 ## Goal
 
-Run any coding agent harness as a long-lived agent on your own machine or server, and let those agents talk to people and to each other. One server installs, signs in and supervises Claude Code, Codex, OpenCode, Gemini CLI and the next harness, gives each agent its own channels, and shows what every agent costs.
+Run any coding agent harness as a long-lived agent on your own machine or server, and let those agents talk to people and to each other. One server installs, signs in and supervises Claude Code, Codex, OpenCode, Gemini CLI and the next harness, gives each agent its own channels, and shows what every agent costs and what its work achieved. Those outcomes are the evidence from which skills, memory and the choice of harness and model are to improve ([ADR 0008](adr/0008-quality-loop.md)).
 
 AnyAgents drives each vendor's own tool. It never re-implements a vendor client and never lifts a subscription credential out of it, because the model works best in the harness it was trained in and the subscription is for that tool.
 
@@ -30,6 +30,7 @@ People and teams who already use one or more agent harnesses and want them runni
 4. **Channels.** Each agent can be attached to channels, or to none. The first version ships Telegram, behind a channel adapter interface that later channels implement.
 5. **Agents see each other.** Every agent on a server can list the others and message them through one `send` tool, with no external channel needed. Every session is authenticated as exactly one agent, and an answer names the message it answers, so a group conversation stays in its group and its topic.
 6. **Cost and usage.** Tokens, reported cost and quota state per agent, harness, model and day.
+7. **Outcomes.** Merged, closed and review-failed pull requests from an agent's watches, and verdicts from its ancestors or the operator, recorded beside usage. Successes, recovery after rework and cost per successful outcome are reported per harness and model, role, profile, agent or skill.
 
 ## Boundaries
 

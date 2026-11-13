@@ -48,6 +48,8 @@ pub enum AuthError {
     Unauthenticated(String),
     /// Authenticated, and not allowed to do this.
     Forbidden(String),
+    /// The decision itself failed; nothing was decided about the caller.
+    Internal(String),
 }
 
 impl AuthError {
@@ -55,6 +57,7 @@ impl AuthError {
         match self {
             Self::Unauthenticated(text) => text,
             Self::Forbidden(text) => text,
+            Self::Internal(text) => text,
         }
     }
 
@@ -62,6 +65,7 @@ impl AuthError {
         match self {
             Self::Unauthenticated(_) => axum::http::StatusCode::UNAUTHORIZED,
             Self::Forbidden(_) => axum::http::StatusCode::FORBIDDEN,
+            Self::Internal(_) => axum::http::StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 }
@@ -129,54 +133,33 @@ impl Mode {
         matches!(self, Self::Trusted { .. })
     }
 
-    /// Decide who is calling, before any route runs.
-    pub fn principal(&self, store: &Store, parts: &Parts) -> Result<Principal, AuthError> {
-        let agent_token = header(parts, operator::AGENT_HEADER);
-        let operator_token = header(parts, operator::HEADER);
-        // One request carries one authority, never two.
-        if agent_token.is_some() && operator_token.is_some() {
-            return Err(AuthError::Unauthenticated(
-                "one authority per call".to_string(),
-            ));
+    /// Decide who is calling, before any route runs, from what the request
+    /// presented. A capability or a route name is resolved in the store, so the
+    /// extractor runs this on the blocking pool; only the operator token, a pure
+    /// digest comparison, is decided in place.
+    pub fn principal(&self, store: &Store, presented: &Presented) -> Result<Principal, AuthError> {
+        if let Some(decided) = self.principal_without_store(presented) {
+            return decided;
         }
-        if let Some(token) = operator_token {
-            let expected = match self {
-                Self::Confined {
-                    operator_digest: Some(expected),
-                } => expected,
-                _ => {
-                    return Err(AuthError::Unauthenticated(
-                        "this server has no operator".to_string(),
-                    ));
-                }
-            };
-            if digest("anyagents-operator", &token) != *expected {
-                return Err(AuthError::Unauthenticated(
-                    "the operator token is not valid".to_string(),
-                ));
-            }
-            return Ok(Principal::Operator);
-        }
-        if let Some(token) = agent_token {
+        if let Some(token) = presented.agent_token.as_deref() {
             // A machine without the boundary knows no capabilities: its route
             // is the agent the tool server reads from its own config directory,
             // which the server resolves to an existing agent and nothing else.
             if self.is_trusted()
-                && let Some(id) = header(parts, AGENT_ID_HEADER)
+                && let Some(id) = presented.agent_id.as_deref()
             {
-                return agent_named(store, &id);
+                return agent_named(store, id);
             }
-            return agent_for_capability(store, &token);
+            return agent_for_capability(store, token);
         }
         match self {
             Self::Trusted { data_dir } if same_dir(data_dir, store.data_dir()) => {
-                let named = parts
-                    .extensions
-                    .get::<RouteAgent>()
-                    .map(|route| route.0.clone())
-                    .or_else(|| header(parts, AGENT_ID_HEADER));
-                match named {
-                    Some(route) => agent_named(store, &route),
+                match presented
+                    .route_agent
+                    .as_deref()
+                    .or(presented.agent_id.as_deref())
+                {
+                    Some(route) => agent_named(store, route),
                     None => Err(AuthError::Unauthenticated(
                         "this call names no agent".to_string(),
                     )),
@@ -186,6 +169,74 @@ impl Mode {
                 "the session is not authenticated".to_string(),
             )),
         }
+    }
+
+    /// The answer when it needs no store and no file: two authorities, or the
+    /// operator token checked against its digest. `None` when the store decides.
+    fn principal_without_store(
+        &self,
+        presented: &Presented,
+    ) -> Option<Result<Principal, AuthError>> {
+        // One request carries one authority, never two.
+        if presented.agent_token.is_some() && presented.operator_token.is_some() {
+            return Some(Err(AuthError::Unauthenticated(
+                "one authority per call".to_string(),
+            )));
+        }
+        let token = presented.operator_token.as_deref()?;
+        let expected = match self {
+            Self::Confined {
+                operator_digest: Some(expected),
+            } => expected,
+            _ => {
+                return Some(Err(AuthError::Unauthenticated(
+                    "this server has no operator".to_string(),
+                )));
+            }
+        };
+        if digest("anyagents-operator", token) != *expected {
+            return Some(Err(AuthError::Unauthenticated(
+                "the operator token is not valid".to_string(),
+            )));
+        }
+        Some(Ok(Principal::Operator))
+    }
+}
+
+/// What one request presented, copied out of its head so the decision can run
+/// on the blocking pool while the request's async worker serves other calls.
+#[derive(Clone, Debug, Default)]
+pub struct Presented {
+    agent_token: Option<String>,
+    operator_token: Option<String>,
+    agent_id: Option<String>,
+    route_agent: Option<String>,
+}
+
+impl Presented {
+    pub fn of(parts: &Parts) -> Self {
+        Self {
+            agent_token: header(parts, operator::AGENT_HEADER),
+            operator_token: header(parts, operator::HEADER),
+            agent_id: header(parts, AGENT_ID_HEADER),
+            route_agent: parts
+                .extensions
+                .get::<RouteAgent>()
+                .map(|route| route.0.clone()),
+        }
+    }
+}
+
+/// Run one authentication step that reads the store or a file on the blocking
+/// pool, so a slow disk holds this request and never an async worker.
+pub async fn off_worker<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, AuthError> + Send + 'static,
+) -> Result<T, AuthRejection> {
+    match tokio::task::spawn_blocking(work).await {
+        Ok(result) => result.map_err(AuthRejection),
+        Err(err) => Err(AuthRejection(AuthError::Internal(format!(
+            "the caller could not be resolved: {err}"
+        )))),
     }
 }
 
@@ -292,10 +343,13 @@ impl FromRequestParts<AppState> for Principal {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        state
-            .auth
-            .principal(&state.store, parts)
-            .map_err(AuthRejection)
+        let presented = Presented::of(parts);
+        if let Some(decided) = state.auth.principal_without_store(&presented) {
+            return decided.map_err(AuthRejection);
+        }
+        let auth = state.auth.clone();
+        let store = std::sync::Arc::clone(&state.store);
+        off_worker(move || auth.principal(&store, &presented)).await
     }
 }
 

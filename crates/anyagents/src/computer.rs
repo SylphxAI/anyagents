@@ -1303,13 +1303,21 @@ pub fn parse_png_dimensions(png: &[u8]) -> Option<(u32, u32)> {
     Some((width, height))
 }
 
+/// The declared path of a desktop or device tool (`xdotool`, `adb`, `idb`, ...).
+/// A tool the toolchain refuses is a typed error naming it, before any spawn.
+fn computer_tool(program: &str) -> Result<std::path::PathBuf, String> {
+    anyagents_toolchain::tool(program, "computer")
+        .map(|tool| tool.path)
+        .map_err(|err| err.to_string())
+}
+
 async fn run_cmd(
     program: &str,
     args: &[&str],
     envs: &[(&str, &str)],
     timeout_ms: u64,
 ) -> Result<std::process::Output, String> {
-    let mut cmd = tokio::process::Command::new(program);
+    let mut cmd = tokio::process::Command::new(computer_tool(program)?);
     cmd.args(args)
         .kill_on_drop(true)
         .stdin(std::process::Stdio::null())
@@ -1333,7 +1341,7 @@ async fn run_cmd_with_stdin(
     timeout_ms: u64,
 ) -> Result<std::process::Output, String> {
     use tokio::io::AsyncWriteExt as _;
-    let mut cmd = tokio::process::Command::new(program);
+    let mut cmd = tokio::process::Command::new(computer_tool(program)?);
     cmd.args(args)
         .kill_on_drop(true)
         .stdin(std::process::Stdio::piped())

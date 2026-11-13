@@ -198,7 +198,7 @@ size limit. HTTP refusals retain their status and response body.
 
 | Harness | Mode | How a line reaches it |
 | --- | --- | --- |
-| `spiron` (legacy `sylphx` alias) | `steer` | External `spiron --headless --json` process. Correlated `user` JSONL receives `accepted` (new turn) or `steer_ack` (active turn) before mailbox acceptance. Only the matching terminal `result` closes a turn; `cancel_ack` alone does not. |
+| `spiron` (legacy `sylphx` alias) | `steer` | External `spiron --headless --json` process. When `ready` advertises `steer_consumed` and `idempotent_input`, the whole inbox is written at once: the first line as `prompt` if no turn is open, every other as `steer`. Spiron journals all pending input together, in order, at its next step and proves each with `accepted` or `steer_consumed`; only then does the cursor move, over the consumed prefix. Refused (`turn_closed`, `no_active_turn`, `turn_not_started`) and `undelivered_steer_ids` lines are delivered again, and Spiron deduplicates by `request_id`. An older Spiron gets one steer per turn and the unconfirmed-steer hold. Only the matching terminal `result` closes a turn; `cancel_ack` alone does not. |
 | `opencode` | `steer` | `POST /api/session/{id}/prompt` with `delivery: "steer"`; the session's own inbox decides whether it joins the running turn or starts the next one. Accepted when the prompt API answers with `data`. |
 | `codex` | `steer` | `turn/start`, with `ifBusy: "steer"` while a turn is open. |
 | `claude-code` | `steer` | Idle: a stream-json `user` message. Active turn: an SDK `PreToolUse` callback returns pending lines as `additionalContext` in the current transcript before the tool proceeds; stdin replay alone is not evidence of mid-turn delivery. |
@@ -370,7 +370,7 @@ needs no Git consumer. Cloud-sandbox workspace preparation is unchanged.
 Every input to an agent (a Telegram message, another agent's `send`, a CLI or TUI message) is appended to that agent's mailbox. The mailbox is the only path into a harness.
 
 - **Sequence.** On durable receive the server assigns the next per-agent sequence number. Delivery, acknowledgement and replay key on that sequence. A message's source time (the Telegram `date`, the sender's clock) is kept as metadata and shown, but never used to order: a late, older event gets the next sequence and is not inserted behind messages already delivered.
-- **One delivery cursor.** A row is `received` when its insert commits, and `delivered` when the harness's own input or steer API has taken it. There is no second cursor and no turn bookkeeping: a row is done the moment the vendor has it.
+- **One delivery cursor.** A row is `received` when its insert commits, and `delivered` when the harness's own input or steer API has taken it, or, for a harness that proves consumption (Spiron), when the vendor proves it journaled the row. Rows written ahead of that proof are in flight; the cursor moves only over a contiguous consumed prefix. There is no second cursor and no turn bookkeeping.
 - **Contiguous cursor.** It advances only over a contiguous prefix of the sequence, one row at a time, so one row the harness did not take is visible as the oldest undelivered one rather than skipped.
 - **Idempotent delivery.** After a crash, rows past the cursor are handed over again. Each adapter remembers the ids its session holds and drops one it has already written, so a replay never reaches the agent twice. Claude Code and Codex also carry the id in the line itself, and Codex sends it as `clientUserMessageId`. Inbound channel events dedupe on their source key (for Telegram, the bot and its update id).
 - **Egress is the agent's own `send`.** An agent replies by calling its MCP `send` tool, or a channel tool; the switchboard routes that immediately. A reply to a Telegram message carries that chat as its target, so the agent's `send` reaches the same chat. Nothing reads a vendor's transcript to find an answer.
@@ -496,9 +496,20 @@ require an authenticated server rather than an offline database fallback.
 
 ## Usage and cost
 
-After each turn the adapter reads the usage the vendor tool reports and the server writes one usage record: agent, harness, model, input, output, cache-read and cache-write tokens, the cost the vendor reported (if it reports one), an estimated list-price cost from a versioned price table, the billing mode (subscription or API key), and any quota state the vendor reported. The `usage` API aggregates by agent, harness, model and day. Records are also exported as OpenTelemetry metrics using the [GenAI semantic conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/) when an endpoint is configured.
+After each turn the adapter reads the usage the vendor tool reports and the server writes one usage record: agent, harness, model, input, output, cache-read and cache-write tokens, the cost the vendor reported (if it reports one), the billing mode (subscription or API key), and any quota state the vendor reported. The record also has an estimated list-price cost field, which stays empty: there is no price table. The `usage` API aggregates by agent, harness, model and day.
 
-A subscription harness often reports tokens but no price; its record says `subscription` and shows the list-price estimate separately, never as money spent.
+Claude Code and Muse report a cost with each turn; Spiron and AGY report tokens only. A cost on a `subscription` record is the vendor's figure for the turn, never money spent.
+
+## Outcomes
+
+[ADR 0008](adr/0008-quality-loop.md) records what work achieved beside what it cost. An `outcomes` row is a fact from a source the measured agent does not control:
+
+- a PR watch's `merged`, `closed` or `review_failed` transition, stored for the watch's owner before the wake that reports it (and on first sight while an earlier wake is unread);
+- a verdict (`accepted`, `rework`, `rejected` or `abandoned`) that an ancestor, a root admin or the operator records through `agents` `verdict`, `POST /v1/agents/{name}/verdict` or `anyagents verdict`. An agent never records one on its own work.
+
+Each row keeps the harness, model, role and profile the agent ran with. `skill_reads` records every file an agent reads through the `skills` tool, with the SHA-256 of its bytes.
+
+`GET /v1/outcomes` (also `agents` `outcomes` and `anyagents outcomes`) groups outcomes by harness and model, harness, role, profile, agent or skill, within the usage caller boundary. A shared pull request counts once, for the agent that watched it first. A terminal verdict supersedes pull request evidence. The cost of an outcome is the agent's usage since its previous one. Cost per success is shown only when every attributed turn reported a cost, and usage no outcome covers is reported as `unattributed`.
 
 ## Security model
 

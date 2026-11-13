@@ -75,7 +75,7 @@ pub struct AgentView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seat_gid: Option<u32>,
     /// Active self-scheduled wakes (`at`, `every`) and event watches (`watch`) owned by this agent.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub schedules: Vec<ScheduleView>,
 }
 

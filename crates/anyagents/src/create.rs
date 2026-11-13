@@ -34,16 +34,146 @@ pub fn format_agent_display(name: &str, role: Option<&str>) -> String {
 }
 
 /// New config roots are private before credentials or a seat grant exist.
-/// DirBuilder leaves an existing root's admitted group/mode unchanged.
+/// Parent directories are created first with umask-governed traversable
+/// permissions; only the target directory itself is restricted to `0o700`,
+/// leaving an existing root's admitted group/mode unchanged.
 fn create_private_config_dir(config: &Path) -> std::io::Result<()> {
+    if let Some(parent) = config.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
     let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
         builder.mode(0o700);
     }
-    builder.create(config)
+    match builder.create(config) {
+        Ok(()) => Ok(()),
+        Err(err)
+            if err.kind() == std::io::ErrorKind::AlreadyExists
+                && std::fs::symlink_metadata(config).is_ok_and(|m| m.is_dir()) =>
+        {
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// What one creation attempt made on disk, so that a failed attempt removes
+/// exactly that and nothing that existed before it.
+#[derive(Default)]
+struct MadeDirs {
+    /// `<data>/agents/<id>`, which only this attempt's row names, and whether
+    /// this attempt created it.
+    root: Option<(PathBuf, bool)>,
+    /// Work directories and their parents this attempt created, oldest
+    /// first. Rollback removes each only while it is empty.
+    dirs: Vec<PathBuf>,
+}
+
+/// Unix permission bits of `path` itself, never of a symlink target.
+#[cfg(unix)]
+fn own_mode(path: &Path) -> std::io::Result<Option<u32>> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let meta = std::fs::symlink_metadata(path)?;
+    Ok((meta.is_dir() && !meta.file_type().is_symlink())
+        .then(|| meta.permissions().mode() & 0o7777))
+}
+
+#[cfg(unix)]
+fn set_own_mode(path: &Path, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+}
+
+/// An agent tree is private from its first byte: the root is made `0o700`
+/// before anything is written into it, and opened for traversal only by
+/// [`open_agent_root`] once its config is private. A root that already exists
+/// can only have been made for this new id by a writer racing the creation; it
+/// is closed the same way and kept by rollback.
+fn create_private_agent_root(root: &Path, config: &Path) -> std::io::Result<bool> {
+    if let Some(parent) = root.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        // `<data>/agents` is the shared inventory every seat enumerates.
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    match builder.create(root) {
+        Ok(()) => Ok(true),
+        Err(err)
+            if err.kind() == std::io::ErrorKind::AlreadyExists
+                && std::fs::symlink_metadata(root)
+                    .is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink()) =>
+        {
+            #[cfg(unix)]
+            {
+                for dir in [root, config] {
+                    match own_mode(dir) {
+                        Ok(Some(mode)) if mode & 0o077 != 0 => set_own_mode(dir, mode & 0o7700)?,
+                        Ok(_) => {}
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(err) => return Err(err),
+                    }
+                }
+            }
+            #[cfg(not(unix))]
+            let _ = config;
+            Ok(false)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// The seat reaches its config and a legacy managed workdir through the agent
+/// root. Open the root for traversal only after its config is private, with
+/// the same bits a umask-created root had.
+fn open_agent_root(root: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    if let Some(mode) = own_mode(root)?
+        && mode & 0o011 == 0
+    {
+        set_own_mode(root, (mode | 0o755) & 0o7777)?;
+    }
+    #[cfg(not(unix))]
+    let _ = root;
+    Ok(())
+}
+
+/// `create_dir_all` that records every level it made, so a failed creation
+/// can remove those levels and no directory that existed before it.
+fn create_dir_all_recorded(
+    path: &Path,
+    made: &std::cell::RefCell<MadeDirs>,
+) -> std::io::Result<()> {
+    let mut missing = Vec::new();
+    let mut cursor = Some(path);
+    while let Some(dir) = cursor.filter(|dir| !dir.as_os_str().is_empty()) {
+        match std::fs::symlink_metadata(dir) {
+            Ok(_) => break,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(dir.to_path_buf());
+                cursor = dir.parent();
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    for dir in missing.into_iter().rev() {
+        match std::fs::create_dir(&dir) {
+            Ok(()) => made.borrow_mut().dirs.push(dir),
+            // Another writer made it first; it is not this attempt's.
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists && dir.is_dir() => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
 }
 
 pub fn create(store: &Store, data: &Path, request: CreateRequest) -> Result<Agent, Error> {
@@ -104,6 +234,8 @@ fn create_with_seat(
     let data = std::path::absolute(data)?;
     // A checkout the consumer produced for this creation; rollback removes it.
     let provisioned: std::cell::RefCell<Option<PathBuf>> = std::cell::RefCell::new(None);
+    // Every directory this call made; rollback removes exactly these.
+    let made: std::cell::RefCell<MadeDirs> = std::cell::RefCell::new(MadeDirs::default());
     let finish = (|| -> Result<Agent, Error> {
         crate::sandbox::bind_principal(store, &agent)?;
         // Nothing is installed until an agent needs it: this is that moment. A
@@ -125,8 +257,13 @@ fn create_with_seat(
         }
         store.set_agent_launch_env(&agent.id, &pairs)?;
         let managed = agent_work_dir(&data, &agent.id);
-        std::fs::create_dir_all(&managed)?;
         let config = agent_config_dir(&data, &agent.id);
+        let root = config
+            .parent()
+            .ok_or_else(|| Error::Message("agent config has no root".into()))?
+            .to_path_buf();
+        let made_root = create_private_agent_root(&root, &config)?;
+        made.borrow_mut().root = Some((root.clone(), made_root));
         create_private_config_dir(&config)?;
         let _ = std::fs::create_dir_all(config.join("tmp"));
         if let Some(prof) = request
@@ -254,6 +391,7 @@ fn create_with_seat(
                     &target_wt,
                     parent_name.as_deref(),
                     &provisioned,
+                    &made,
                 )?;
                 target_wt
             }
@@ -285,9 +423,11 @@ fn create_with_seat(
         } else {
             match &explicit_workdir {
                 Some(path) => {
-                    std::fs::create_dir_all(path).map_err(|error| Error::WorkdirPermission {
-                        path: path.display().to_string(),
-                        message: error.to_string(),
+                    create_dir_all_recorded(path, &made).map_err(|error| {
+                        Error::WorkdirPermission {
+                            path: path.display().to_string(),
+                            message: error.to_string(),
+                        }
                     })?;
                     let abs = std::path::absolute(path)?;
                     if agent.parent_id.is_some()
@@ -319,7 +459,7 @@ fn create_with_seat(
                     } else {
                         match &request.workdir_default {
                             Some(shared) => {
-                                std::fs::create_dir_all(shared)?;
+                                create_dir_all_recorded(shared, &made)?;
                                 std::path::absolute(shared)?
                             }
                             None => managed_abs.clone(),
@@ -328,6 +468,11 @@ fn create_with_seat(
                 }
             }
         };
+        if cwd == managed_abs && !managed_abs.exists() {
+            create_dir_all_recorded(&managed_abs, &made)?;
+        }
+        // The config is private; the seat may now traverse to its own tree.
+        open_agent_root(&root)?;
         if let Some((_, uid, gid, launch)) = seat_override
             .clone()
             .or_else(|| resolved_agent_seat_info(store, &agent))
@@ -382,6 +527,7 @@ fn create_with_seat(
             &data,
             &agent,
             provisioned.into_inner().as_deref(),
+            &made.into_inner(),
             error,
         ));
     }
@@ -392,15 +538,29 @@ fn create_with_seat(
 /// always be retryable. If revocation of a partial worktree grant fails, the
 /// row, journal and checkout are kept (maintenance needs them to finish the
 /// revocation) but the row releases its name. Otherwise the row and the
-/// agent's directory are removed; a row that cannot be deleted releases its
-/// name the same way.
+/// directories this attempt made are removed; a row that cannot be deleted
+/// releases its name the same way. Whatever stays behind is closed to seats
+/// first, so a kept tree never fails another seat's peer-boundary check.
 fn roll_back_failed_creation(
     store: &Store,
     data: &Path,
     agent: &Agent,
     provisioned: Option<&Path>,
+    made: &MadeDirs,
     error: Error,
 ) -> Error {
+    #[cfg(unix)]
+    if let Some((root, _)) = &made.root
+        && let Ok(Some(mode)) = own_mode(root)
+        && mode & 0o077 != 0
+        && let Err(close) = set_own_mode(root, mode & 0o7700)
+    {
+        eprintln!(
+            "warning: cannot close partial directory {} of failed creation {}: {close}",
+            root.display(),
+            agent.id
+        );
+    }
     if let Err(revocation) = crate::worktree_access::revoke_recorded(data, &agent.id) {
         if let Err(release) = store.release_unadmitted_agent(&agent.id) {
             eprintln!(
@@ -414,6 +574,7 @@ fn roll_back_failed_creation(
         );
         return error;
     }
+    let mut kept_checkout = None;
     if let Some(checkout) = provisioned
         && let Err(cleanup) = remove_provisioned_checkout(checkout)
     {
@@ -422,6 +583,7 @@ fn roll_back_failed_creation(
             checkout.display(),
             agent.id
         );
+        kept_checkout = Some(checkout);
     }
     if let Err(delete) = store.delete_agent(&agent.id) {
         eprintln!(
@@ -436,15 +598,40 @@ fn roll_back_failed_creation(
         }
         return error;
     }
-    if let Err(remove) = std::fs::remove_dir_all(data.join("agents").join(agent.id.as_str()))
+    remove_made_dirs(made, kept_checkout, &agent.id);
+    error
+}
+
+/// Remove, newest first, exactly the directories one failed creation made.
+/// Work directories go only while empty, so no content this attempt did not
+/// write is ever removed. The agent root this attempt made holds only what it
+/// wrote, unless a checkout it could not remove lives inside; then it stays.
+fn remove_made_dirs(made: &MadeDirs, kept_checkout: Option<&Path>, id: &AgentId) {
+    for dir in made.dirs.iter().rev() {
+        match std::fs::remove_dir(dir) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => eprintln!(
+                "warning: keeping directory {} of failed creation {id}: {err}",
+                dir.display()
+            ),
+        }
+    }
+    let Some((root, true)) = &made.root else {
+        return;
+    };
+    if kept_checkout.is_some_and(|checkout| checkout.starts_with(root)) {
+        eprintln!(
+            "warning: keeping directory {} of failed creation {id}: it holds a checkout",
+            root.display()
+        );
+        return;
+    }
+    if let Err(remove) = std::fs::remove_dir_all(root)
         && remove.kind() != std::io::ErrorKind::NotFound
     {
-        eprintln!(
-            "warning: cannot remove partial directory of failed creation {}: {remove}",
-            agent.id
-        );
+        eprintln!("warning: cannot remove partial directory of failed creation {id}: {remove}");
     }
-    error
 }
 
 /// Undo a checkout made for a failed creation so the same name (and so the
@@ -543,6 +730,7 @@ fn provision_managed_worktree(
     target_wt: &Path,
     _parent_name: Option<&str>,
     provisioned: &std::cell::RefCell<Option<PathBuf>>,
+    made: &std::cell::RefCell<MadeDirs>,
 ) -> Result<(), Error> {
     if target_wt.exists() {
         let is_empty = std::fs::read_dir(target_wt)
@@ -558,7 +746,7 @@ fn provision_managed_worktree(
         }
     }
     if let Some(parent_dir) = target_wt.parent() {
-        std::fs::create_dir_all(parent_dir)?;
+        create_dir_all_recorded(parent_dir, made)?;
     }
     let branch = branch_opt
         .map(str::trim)
@@ -910,7 +1098,7 @@ pub(crate) fn write_agent_instructions_with_continuity(
         doc.push_str("- **Parent**: none (root)\n");
     }
 
-    doc.push_str("- **Lifecycle**: Role templates may declare `lifecycle: standing | task`. Sub-agents never archive themselves; the spawning parent closes/archives a task sub-agent (`action: \"archive\"`) once its deliverable is accepted. Idle processes release after mailbox/child/background work drains; identity and session persist.\n");
+    doc.push_str("- **Lifecycle**: Role templates may declare `lifecycle: standing | task`. Sub-agents never archive themselves; the spawning parent records its verdict on the deliverable (`action: \"verdict\"`) and closes/archives a task sub-agent (`action: \"archive\"`) once it is accepted. Idle processes release after mailbox/child/background work drains; identity and session persist.\n");
 
     if let Some(custom) = agent
         .instructions
@@ -1622,12 +1810,36 @@ pub(crate) fn write_seat_shared_file(dst: &Path, bytes: &[u8], mode: u32) -> boo
     }
 }
 
+/// Markers live in an agent tree that creation made private. Writing one never
+/// makes that tree: a writer holding a row read before its creation made the
+/// tree, or after a failed creation removed it, would otherwise leave an
+/// orphan `<data>/agents/<id>` with umask permissions, which every seat's
+/// peer-boundary check refuses. Only a config directory missing inside an
+/// existing agent root is made, and privately.
 pub(crate) fn write_profile_marker(
     config_dir: &Path,
     marker_file: &str,
     content: &str,
 ) -> Result<(), Error> {
-    write_required_file(&config_dir.join(marker_file), content.as_bytes(), 0o664)
+    if !config_dir.is_dir() {
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        match builder.create(config_dir) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists && config_dir.is_dir() => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
+    anyagents_harness::atomic_write_in_existing_dir(
+        &config_dir.join(marker_file),
+        content.as_bytes(),
+        0o664,
+    )
+    .map_err(Error::from)
 }
 
 pub(crate) fn seeded_profile_name(config_dir: &Path) -> Option<String> {
@@ -5407,8 +5619,9 @@ fn sync_and_list_provider_profiles_inner(
 
         // Seed upstream provider profiles from existing seats on this server so pre-existing
         // logins (Subscriptions, Coding Plans, API Keys) are registered in the Master Pool.
+        // A seat still being created (or whose creation failed) is not one yet.
         for agent in &agents {
-            if agent.state == "archived" {
+            if matches!(agent.state.as_str(), "archived" | "created") {
                 continue;
             }
             let cfg = agent_config_dir(data, &agent.id);
@@ -5632,7 +5845,9 @@ fn sync_and_list_provider_profiles_inner(
             _ => (expected_provider.clone(), "default".to_string()),
         };
         let normalized = format!("{bound_prov}/{bound_prof}");
-        if bound.as_deref() != Some(normalized.as_str()) {
+        // A listing never writes into an agent whose creation is in flight or
+        // failed: its tree may be gone, and a write would bring it back.
+        if agent.state != "created" && bound.as_deref() != Some(normalized.as_str()) {
             write_profile_marker(&cfg, ".anyagents-profile", &format!("{normalized}\n"))
                 .unwrap_or_else(|err| eprintln!("runtime persistence failed: {err}"));
         }
@@ -5758,10 +5973,11 @@ fn rebalance_provider_profiles(
         // Working seats still contribute load, but automatic maintenance must
         // not rewrite their credentials or request a process rotation mid-turn.
         // Read the durable turn state afresh rather than trusting the census.
+        // An agent still being created is never moved: its tree may be gone.
         let can_move = |name: &str| {
-            store
-                .agent_by_name(name)
-                .is_ok_and(|agent| store.has_open_turn(&agent.id).is_ok_and(|open| !open))
+            store.agent_by_name(name).is_ok_and(|agent| {
+                agent.state != "created" && store.has_open_turn(&agent.id).is_ok_and(|open| !open)
+            })
         };
         // Step 1: evacuate exhausted profiles (0% left) onto any profile with remaining quota (> 0% left).
         let prof_keys: Vec<String> = bound.keys().cloned().collect();
@@ -6086,6 +6302,11 @@ pub(crate) fn sync_fresher_bound_agent_credentials_in(store: &Store, data: &Path
     }
     if let Ok(agents) = store.list_live_agents() {
         for agent in &agents {
+            // A seat still being created (or whose creation failed) has no
+            // credentials to sync, and a write could recreate a removed tree.
+            if agent.state == "created" {
+                continue;
+            }
             let cfg = agent_config_dir(data, &agent.id);
             let bound = bound_profile_name(&cfg);
             let seeded = seeded_profile_name(&cfg);
@@ -10097,14 +10318,122 @@ mod tests {
             .collect()
     }
 
+    /// A fully created agent on `openai/busy`; rebalancing never moves one
+    /// whose creation is still in flight.
     fn rebalance_test_agent(store: &Store, name: &str, parent: Option<&Agent>) -> Agent {
         let mut new = NewAgent::new(name, "codex");
         new.parent_id = parent.map(|a| a.id.clone());
         let agent = store.create_agent(new).unwrap();
+        let agent = store.set_agent_state(&agent.id, "idle").unwrap();
         let cfg = agent_config_dir(store.data_dir(), &agent.id);
         std::fs::create_dir_all(&cfg).unwrap();
         write_profile_marker(&cfg, ".anyagents-profile", "openai/busy\n").unwrap();
         agent
+    }
+
+    /// A marker writer holding a row whose tree does not exist (read before a
+    /// creation made it, or after a failed creation removed it) cannot make an
+    /// orphan tree; an existing root only gains a private config directory.
+    #[cfg(unix)]
+    #[test]
+    fn markers_never_make_an_agent_tree() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(NewAgent::new("racing", "codex"))
+            .unwrap();
+        let cfg = agent_config_dir(dir.path(), &agent.id);
+        assert!(write_profile_marker(&cfg, ".anyagents-profile", "openai/default\n").is_err());
+        assert!(!dir.path().join("agents").join(agent.id.as_str()).exists());
+        std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+        write_profile_marker(&cfg, ".anyagents-profile", "openai/default\n").unwrap();
+        assert_eq!(
+            std::fs::metadata(&cfg).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(bound_profile_name(&cfg).as_deref(), Some("openai/default"));
+    }
+
+    /// The agent root is private before anything is written into it and opens
+    /// for traversal only through [`open_agent_root`]. A root a racing writer
+    /// made with umask permissions is closed, root and config alike, and is
+    /// not this attempt's to remove.
+    #[cfg(unix)]
+    #[test]
+    fn agent_roots_are_private_from_the_first_byte() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let dir = crate::test_tempdir();
+        let root = dir.path().join("agents/fresh");
+        let config = root.join("config");
+        assert!(create_private_agent_root(&root, &config).unwrap());
+        assert_eq!(mode(&root), 0o700);
+        create_private_config_dir(&config).unwrap();
+        assert_eq!(mode(&config), 0o700);
+        open_agent_root(&root).unwrap();
+        assert_eq!(mode(&root), 0o755);
+        assert_eq!(
+            mode(&config),
+            0o700,
+            "opening the root leaves config private"
+        );
+
+        let raced = dir.path().join("agents/raced");
+        std::fs::create_dir_all(raced.join("config")).unwrap();
+        for path in [&raced, &raced.join("config")] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::write(raced.join("config/.anyagents-profile"), "openai/default\n").unwrap();
+        assert!(!create_private_agent_root(&raced, &raced.join("config")).unwrap());
+        assert_eq!(mode(&raced), 0o700);
+        assert_eq!(mode(&raced.join("config")), 0o700);
+        assert!(raced.join("config/.anyagents-profile").is_file());
+    }
+
+    /// A failed creation removes exactly the directories it made: its private
+    /// agent tree and the levels of an explicit workdir it created, never a
+    /// directory that existed before it or anything inside one.
+    #[cfg(unix)]
+    #[test]
+    fn failed_creation_removes_exactly_the_directories_it_made() {
+        let dir = crate::test_tempdir();
+        let data = dir.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        let f = crate::worktree::tests::Fixture::new(&data);
+        // No capability key: the creation fails after admitting its workdir.
+        let store = Store::open(data.join("state.db")).unwrap();
+        let existing = dir.path().join("existing");
+        std::fs::create_dir(&existing).unwrap();
+        std::fs::write(existing.join("user-work.txt"), "kept").unwrap();
+        let mut request = worktree_request("failing", None);
+        request.workdir = Some(existing.join("new/deeper"));
+        let err = create_with_consumer(&store, &data, request, &f.consumer).unwrap_err();
+        assert!(err.to_string().contains("capability key"), "{err}");
+        assert!(matches!(
+            store.agent_by_name("failing"),
+            Err(Error::AgentNotFound(_))
+        ));
+        assert_eq!(std::fs::read_dir(data.join("agents")).unwrap().count(), 0);
+        assert!(!existing.join("new").exists(), "made levels are removed");
+        assert_eq!(
+            std::fs::read_to_string(existing.join("user-work.txt")).unwrap(),
+            "kept"
+        );
+
+        let mut request = worktree_request("failing", None);
+        request.workdir = Some(existing.clone());
+        assert!(create_with_consumer(&store, &data, request, &f.consumer).is_err());
+        assert!(existing.is_dir(), "a pre-existing workdir is never removed");
+        assert_eq!(std::fs::read_dir(data.join("agents")).unwrap().count(), 0);
+
+        // A made workdir that gained content it did not get from this attempt stays.
+        let made = std::cell::RefCell::new(MadeDirs::default());
+        let target = dir.path().join("made-then-used");
+        create_dir_all_recorded(&target, &made).unwrap();
+        std::fs::write(target.join("late.txt"), "kept").unwrap();
+        remove_made_dirs(&made.into_inner(), None, &AgentId::generate());
+        assert!(target.join("late.txt").is_file());
     }
 
     #[cfg(unix)]
@@ -10115,6 +10444,11 @@ mod tests {
         let config = dir.path().join("created/config");
         create_private_config_dir(&config).unwrap();
         assert_eq!(std::fs::metadata(&config).unwrap().mode() & 0o777, 0o700);
+        assert_ne!(
+            std::fs::metadata(config.parent().unwrap()).unwrap().mode() & 0o011,
+            0,
+            "agent root parent must remain traversable when config is created"
+        );
         std::fs::write(config.join("credential"), "retained credential").unwrap();
         std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o2770)).unwrap();
         create_private_config_dir(&config).unwrap();
@@ -10127,6 +10461,191 @@ mod tests {
         std::fs::write(&blocked, "preserved").unwrap();
         assert!(create_private_config_dir(&blocked).is_err());
         assert_eq!(std::fs::read_to_string(blocked).unwrap(), "preserved");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspaces_dir_keeps_agent_root_traversable_and_avoids_unused_managed_dirs() {
+        use std::os::unix::fs::MetadataExt;
+        const PROBE: &str = "ANYAGENTS_WORKSPACES_CREATE_PROBE";
+        if std::env::var_os(PROBE).is_none() {
+            let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+            for key in [
+                "ANYAGENTS_PRINCIPAL_REGISTRY",
+                "ANYAGENTS_PRINCIPALS",
+                "ANYAGENTS_AGENTS",
+                "ANYAGENTS_AGENT_UID",
+                "ANYAGENTS_AGENT_GID",
+                "ANYAGENTS_SOCKET_GID",
+                "ANYAGENTS_LAUNCHER",
+                "ANYAGENTS_SETPRIV",
+                "ANYAGENTS_DATA",
+                "ANYAGENTS_STATE_DIR",
+                "ANYAGENTS_WORKSPACES_DIR",
+                "ANYAGENTS_SCRATCH_DIR",
+                "ANYAGENTS_GIT_POOL_DIR",
+                "ANYAGENTS_PROTECTED_ROOTS",
+            ] {
+                cmd.env_remove(key);
+            }
+            let output = cmd
+                .env(PROBE, "1")
+                .env("ANYAGENTS_TEST_STORAGE_TIERS", "1")
+                .args([
+                    "--exact",
+                    "create::tests::workspaces_dir_keeps_agent_root_traversable_and_avoids_unused_managed_dirs",
+                    "--nocapture",
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "probe failed:
+stdout: {}
+stderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        unsafe {
+            libc::umask(0o022);
+        }
+        let tmp = crate::test_tempdir();
+        let data = tmp.path().join("data");
+        let workspaces = tmp.path().join("workspaces");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&workspaces).unwrap();
+        unsafe {
+            std::env::set_var("ANYAGENTS_WORKSPACES_DIR", &workspaces);
+        }
+        let store = Store::open(data.join("state.db")).unwrap();
+        store
+            .hold_capability_key("0123456789abcdef0123456789abcdef")
+            .unwrap();
+
+        let managed_agent = create(
+            &store,
+            &data,
+            CreateRequest {
+                name: "managed-worker".to_string(),
+                role: None,
+                harness: "codex".to_string(),
+                model: Some("test-model".to_string()),
+                profile: None,
+                repo: None,
+                branch: None,
+                base: None,
+                workdir: None,
+                workdir_default: None,
+                description: None,
+                instructions: None,
+                parent_id: None,
+            },
+        )
+        .unwrap();
+        let expected_managed = workspaces.join(managed_agent.id.as_str());
+        assert_eq!(
+            managed_agent.workdir.as_deref(),
+            Some(expected_managed.to_str().unwrap())
+        );
+        assert!(expected_managed.is_dir());
+
+        let managed_config = agent_config_dir(&data, &managed_agent.id);
+        let managed_root = managed_config.parent().unwrap();
+        assert_ne!(
+            std::fs::metadata(managed_root).unwrap().mode() & 0o011,
+            0,
+            "<data>/agents/<id> must be traversable with ANYAGENTS_WORKSPACES_DIR set"
+        );
+        // Simulate a fresh unshared private config before seat sharing.
+        let unshared_root = data.join("agents/unshared-probe");
+        let unshared_config = unshared_root.join("config");
+        create_private_config_dir(&unshared_config).unwrap();
+        assert_eq!(
+            std::fs::metadata(&unshared_root).unwrap().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(
+            std::fs::metadata(&unshared_config).unwrap().mode() & 0o777,
+            0o700
+        );
+        let (uid, gid) = (crate::sandbox::server_uid(), crate::sandbox::server_gid());
+        crate::sandbox::prepare_config_with_seat_uid(&unshared_config, uid, gid).unwrap();
+        assert_ne!(std::fs::metadata(&unshared_root).unwrap().mode() & 0o011, 0);
+        assert_eq!(
+            std::fs::metadata(&unshared_config).unwrap().mode() & 0o7777,
+            0o2770
+        );
+
+        let explicit_dir = tmp.path().join("explicit-work");
+        let explicit_agent = create(
+            &store,
+            &data,
+            CreateRequest {
+                name: "explicit-worker".to_string(),
+                role: None,
+                harness: "codex".to_string(),
+                model: Some("test-model".to_string()),
+                profile: None,
+                repo: None,
+                branch: None,
+                base: None,
+                workdir: Some(explicit_dir.clone()),
+                workdir_default: None,
+                description: None,
+                instructions: None,
+                parent_id: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            explicit_agent.workdir.as_deref(),
+            Some(explicit_dir.to_str().unwrap())
+        );
+        assert!(
+            !workspaces.join(explicit_agent.id.as_str()).exists(),
+            "explicit workdir must not eagerly create unused dir in ANYAGENTS_WORKSPACES_DIR"
+        );
+        let explicit_root = agent_config_dir(&data, &explicit_agent.id)
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        assert_ne!(std::fs::metadata(&explicit_root).unwrap().mode() & 0o011, 0);
+
+        // If creation fails after creating managed workspace in ANYAGENTS_WORKSPACES_DIR,
+        // rollback must remove both <data>/agents/<id> and <workspaces>/<id>.
+        unsafe {
+            std::env::set_var("ANYAGENTS_PROTECTED_ROOTS", &workspaces);
+        }
+        let failed = create(
+            &store,
+            &data,
+            CreateRequest {
+                name: "rollback-worker".to_string(),
+                role: None,
+                harness: "codex".to_string(),
+                model: Some("test-model".to_string()),
+                profile: None,
+                repo: None,
+                branch: None,
+                base: None,
+                workdir: None,
+                workdir_default: None,
+                description: None,
+                instructions: None,
+                parent_id: None,
+            },
+        );
+        assert!(failed.is_err());
+        let workspace_entries: Vec<_> = std::fs::read_dir(&workspaces)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            workspace_entries,
+            vec![expected_managed.file_name().unwrap().to_os_string()]
+        );
     }
 
     #[test]
@@ -10166,6 +10685,31 @@ mod tests {
             assert_eq!(after.model, moved.model);
             assert_eq!(after.state, moved.state);
         }
+    }
+
+    /// An agent whose creation is in flight or failed is never moved, even off
+    /// an exhausted profile: its tree may be gone, and a move would write it.
+    #[test]
+    fn rebalance_provider_profiles_never_moves_an_agent_being_created() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path();
+        let store = Store::open(data.join("state.db")).unwrap();
+        store
+            .hold_capability_key("0123456789abcdef0123456789abcdef")
+            .unwrap();
+        let entries = rebalance_test_profiles(data, 0);
+        let spawning = store
+            .create_agent(NewAgent::new("spawning", "codex"))
+            .unwrap();
+        let cfg = agent_config_dir(data, &spawning.id);
+        std::fs::create_dir_all(&cfg).unwrap();
+        write_profile_marker(&cfg, ".anyagents-profile", "openai/busy\n").unwrap();
+        let before = std::fs::read_dir(&cfg).unwrap().count();
+
+        rebalance_provider_profiles(&store, data, &store.list_agents().unwrap(), &entries);
+
+        assert_eq!(bound_profile_name(&cfg).as_deref(), Some("openai/busy"));
+        assert_eq!(std::fs::read_dir(&cfg).unwrap().count(), before);
     }
 
     #[test]
@@ -12132,7 +12676,8 @@ git -c safe.directory="$5" -C "$5" status --porcelain
         std::fs::create_dir_all(journal.parent().unwrap()).unwrap();
         std::fs::write(&journal, b"not a journal").unwrap();
         let original = Error::Message("injected admission failure".into());
-        let returned = roll_back_failed_creation(&store, data, &agent, None, original);
+        let returned =
+            roll_back_failed_creation(&store, data, &agent, None, &MadeDirs::default(), original);
         assert_eq!(returned.to_string(), "injected admission failure");
         let kept = store.agent(&agent.id).unwrap();
         assert_eq!(kept.state, "archived");
@@ -13807,16 +14352,18 @@ mod runtime_config_tests {
             .unwrap();
         let agents: Vec<_> = (0..3)
             .map(|n| {
-                store
+                let agent = store
                     .create_agent(anyagents_core::NewAgent::new(
                         format!("sample-{n}"),
                         "codex",
                     ))
-                    .unwrap()
+                    .unwrap();
+                store.set_agent_state(&agent.id, "idle").unwrap()
             })
             .collect();
         for agent in &agents {
             let cfg = agent_config_dir(dir.path(), &agent.id);
+            std::fs::create_dir_all(&cfg).unwrap();
             write_profile_marker(&cfg, ".anyagents-profile", "openai/unknown\n").unwrap();
         }
         let entry = |profile: &str, usage: Option<&str>| ProviderProfileEntry {
@@ -14107,6 +14654,8 @@ Connection: close
                 "claude-code",
             ))
             .unwrap();
+        // Mid-session: a running seat (a seat still being created is skipped).
+        store.set_agent_state(&agent.id, "running").unwrap();
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()

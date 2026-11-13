@@ -30,12 +30,14 @@ mod harness_leases;
 mod history_ops;
 mod lifecycle;
 mod mcp_ops;
+mod outcomes;
 mod registry;
 mod runtime;
 #[cfg(test)]
 #[path = "store/runtime_tests.rs"]
 mod runtime_tests;
 mod server_ops;
+mod steer_ops;
 pub use credentials::{
     CredentialBinding, CredentialBindingAudit, CredentialKind, CredentialObservation,
     CredentialSlot, CredentialTarget,
@@ -43,6 +45,9 @@ pub use credentials::{
 pub use group_policy::{Group, GroupAction, GroupActor};
 pub use harness_leases::HarnessLease;
 pub use lifecycle::{LifecycleKind, LifecycleOp, LifecyclePhase, NewLifecycleOp, SchedulePending};
+pub use outcomes::{
+    NewOutcome, Outcome, OutcomeCost, OutcomeGroup, OutcomeGroupBy, OutcomeKind, OutcomeReport,
+};
 pub use runtime::{
     AgentRuntime, BackfillReport, Fault, FaultKind, ProcessIdentity, QUOTA_ESTIMATE_MS, QuotaBlock,
     QuotaReset, QuotaSource, RecoveryOffer, RuntimeChange, RuntimeState, SessionLease, SteerHold,
@@ -2988,6 +2993,8 @@ impl Store {
                 "agent_aliases",
                 "agent_capabilities",
                 "usage_records",
+                "outcomes",
+                "skill_reads",
                 "mailbox_cursors",
                 "turn_recovery",
                 "messages",

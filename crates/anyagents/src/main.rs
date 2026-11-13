@@ -401,6 +401,37 @@ enum Command {
         #[arg(long)]
         days: Option<i64>,
     },
+    /// Outcomes, recovery and cost per successful outcome (ADR 0008).
+    /// Queried through the daemon socket when it is running; the operator
+    /// falls back to a read of the store otherwise.
+    Outcomes {
+        #[arg(long)]
+        agent: Option<String>,
+        /// `model` (harness and model, the default), `harness`, `role`,
+        /// `profile`, `agent` or `skill`.
+        #[arg(long = "group-by")]
+        group_by: Option<String>,
+        /// Include causal descendants of `--agent`.
+        #[arg(long)]
+        include_descendants: bool,
+        /// Outcomes observed from, inclusive (unix ms).
+        #[arg(long = "since-ms")]
+        since_ms: Option<i64>,
+        /// Outcomes observed until, inclusive (unix ms).
+        #[arg(long = "until-ms")]
+        until_ms: Option<i64>,
+        /// Trailing window in days.
+        #[arg(long)]
+        days: Option<i64>,
+    },
+    /// Record a verdict on an agent's work: `accepted`, `rework`, `rejected`
+    /// or `abandoned`. Only its ancestor, a root admin or the operator may.
+    Verdict {
+        agent: String,
+        verdict: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
     /// Speak MCP for one agent. Its capability comes from its config
     /// directory, never from a name.
     Mcp {
@@ -1014,7 +1045,9 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
                 list_harnesses(&data);
                 Ok(())
             }
-            HarnessesCommand::Profiles { harness } => list_profiles_cmd(&data, harness.as_deref()),
+            HarnessesCommand::Profiles { harness } => {
+                list_profiles_cmd(&data, harness.as_deref(), false)
+            }
             HarnessesCommand::Update { harness } => update_harnesses_cmd(&data, harness.as_deref()),
         },
         Command::Profiles {
@@ -1384,6 +1417,33 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
             agent::UsageError::Store(err) => err,
             agent::UsageError::Refused(text) => anyagents_core::Error::Message(text),
         }),
+        Command::Outcomes {
+            agent,
+            group_by,
+            include_descendants,
+            since_ms,
+            until_ms,
+            days,
+        } => agent::outcomes(
+            &data,
+            &agent::UsageParams {
+                agent,
+                group_by,
+                since_ms,
+                until_ms,
+                days,
+                include_descendants: include_descendants.then_some(true),
+            },
+        )
+        .map_err(|err| match err {
+            agent::UsageError::Store(err) => err,
+            agent::UsageError::Refused(text) => anyagents_core::Error::Message(text),
+        }),
+        Command::Verdict {
+            agent,
+            verdict,
+            reason,
+        } => agent::verdict_cmd(&data, &agent, &verdict, reason.as_deref()),
         Command::Channels { action } => channel::channels(&data, action),
         Command::Groups { action } => groups(&data, action),
         Command::Describe {
@@ -1797,15 +1857,17 @@ fn print_boundary(data: &Path) -> Result<(), anyagents_core::Error> {
 /// Print the catalog: id, the variable that points the vendor at its private
 /// config directory, and the command that installs it. Never a credential.
 fn list_harnesses(data: &Path) {
+    let catalog = anyagents_installer::Catalog::load(data)
+        .unwrap_or_else(|_| anyagents_installer::Catalog::builtin());
     if ui::is_pretty() {
         println!("\n  {}\n", ui::bold_cyan("Supported Harnesses"));
         let mut table = ui::Table::new(&[
             ("HARNESS", false),
             ("VERSION", false),
             ("CONFIG ENV", false),
-            ("INSTALL COMMAND", false),
+            ("INSTALL SOURCE", false),
         ]);
-        for entry in anyagents_installer::builtin_catalog() {
+        for entry in catalog.harnesses() {
             let ver = install::detect_version(data, &entry.id);
             let ver_cell = if ver == "-" {
                 ui::dim("-")
@@ -1816,35 +1878,49 @@ fn list_harnesses(data: &Path) {
                 ui::bold(&ui::cyan(&entry.id)),
                 ver_cell,
                 ui::dim(signin::config_variable(&entry.id).unwrap_or("-")),
-                signin::install_hint(&entry.id).unwrap_or_else(|| "-".to_string()),
+                entry.source.label(),
             ]);
         }
         table.print();
         println!();
         return;
     }
-    for entry in anyagents_installer::builtin_catalog() {
+    for entry in catalog.harnesses() {
         println!(
             "{}\t{}\t{}",
             entry.id,
             signin::config_variable(&entry.id).unwrap_or("-"),
-            signin::install_hint(&entry.id).unwrap_or_else(|| "-".to_string())
+            entry.source.label()
         );
     }
 }
 
 fn update_harnesses_cmd(data: &Path, target: Option<&str>) -> Result<(), anyagents_core::Error> {
-    let catalog = anyagents_installer::builtin_catalog();
+    let catalog = anyagents_installer::Catalog::load(data)
+        .map_err(|err| anyagents_core::Error::Message(err.to_string()))?;
     let targets: Vec<String> = match target.map(str::trim).filter(|s| !s.is_empty()) {
         Some(t) => {
-            if !catalog.iter().any(|c| c.id == t) {
+            let normalized = anyagents_harness::normalize_harness_name(t);
+            if catalog.get(normalized).is_none() {
                 return Err(anyagents_core::Error::Message(format!(
                     "unknown harness `{t}`"
                 )));
             }
-            vec![t.to_string()]
+            vec![normalized.to_string()]
         }
-        None => catalog.into_iter().map(|c| c.id).collect(),
+        None => catalog
+            .harnesses()
+            .iter()
+            .chain(catalog.runtimes())
+            .filter(|entry| {
+                entry.source.is_managed()
+                    && !matches!(
+                        entry.source,
+                        anyagents_installer::source::Source::Unconfigured
+                    )
+            })
+            .map(|entry| entry.id.clone())
+            .collect(),
     };
 
     let mut rows = Vec::new();
@@ -2071,10 +2147,13 @@ fn profiles_cmd(
         }
         Some("refresh") | Some("reset") => {
             create::force_refresh_provider_profiles(data, target)?;
-            if let Ok(store) = anyagents_core::Store::open(data.join("state.db")) {
+            // A server lists afresh itself; without one, sync here first.
+            if !client::can_call_server(data)
+                && let Ok(store) = anyagents_core::Store::open(data.join("state.db"))
+            {
                 let _ = create::sync_and_list_provider_profiles(&store, data);
             }
-            list_profiles_cmd(data, target)
+            list_profiles_cmd(data, target, true)
         }
         Some("models") | Some("catalog") => {
             let catalogs = if client::can_call_server(data) {
@@ -2109,8 +2188,8 @@ fn profiles_cmd(
                 .unwrap_or("claude-code");
             sign_in(data, prof_target, None)
         }
-        Some("list") => list_profiles_cmd(data, target),
-        other => list_profiles_cmd(data, other),
+        Some("list") => list_profiles_cmd(data, target, false),
+        other => list_profiles_cmd(data, other, false),
     }
 }
 
@@ -2421,7 +2500,14 @@ fn apply_local_subagent_default(
     }
 }
 
-fn list_profiles_cmd(data: &Path, filter: Option<&str>) -> Result<(), anyagents_core::Error> {
+/// `profiles`: the server's snapshot when a server answers, which costs no
+/// probe; otherwise a listing made here, probing every provider inline.
+/// `fresh` asks the server for a listing made after this call.
+fn list_profiles_cmd(
+    data: &Path,
+    filter: Option<&str>,
+    fresh: bool,
+) -> Result<(), anyagents_core::Error> {
     let filter = filter.filter(|f| {
         let t = f.trim();
         !t.is_empty()
@@ -2429,31 +2515,28 @@ fn list_profiles_cmd(data: &Path, filter: Option<&str>) -> Result<(), anyagents_
             && !t.eq_ignore_ascii_case("refresh")
             && !t.eq_ignore_ascii_case("reset")
     });
-    let mut entries = if let Ok(store) = anyagents_core::Store::open(data.join("state.db")) {
-        create::list_provider_profiles_fast(&store, data)
-    } else if client::can_call_server(data) {
-        match client::call::<Vec<create::ProviderProfileEntry>>(
-            data,
-            "GET",
-            "/v1/profiles",
-            None,
-            &client::authority(data),
-        ) {
-            Ok(Some(list)) => list,
-            Ok(None) => {
-                return Err(anyagents_core::Error::Message(
-                    "the server answered nothing".into(),
-                ));
-            }
-            Err(err) => return Err(anyagents_core::Error::Message(err)),
-        }
+    let path = if fresh {
+        "/v1/profiles?fresh=true"
     } else {
-        let store = anyagents_core::Store::open(data.join("state.db"))?;
-        create::list_provider_profiles_fast(&store, data)
+        "/v1/profiles"
     };
-    if entries.iter().any(|e| e.usage.is_none()) {
-        create::enrich_profiles_usage(data, &mut entries);
-    }
+    let (entries, usage_age_ms): (Vec<create::ProviderProfileEntry>, Option<i64>) =
+        match client::get::<Vec<server::ServedProfile>>(data, path)
+            .map_err(anyagents_core::Error::Message)?
+        {
+            Some(served) => {
+                let age = served.iter().filter_map(|s| s.usage_age_ms).max();
+                (served.into_iter().map(|s| s.entry).collect(), age)
+            }
+            None => {
+                let store = anyagents_core::Store::open(data.join("state.db"))?;
+                let mut entries = create::list_provider_profiles_fast(&store, data);
+                if entries.iter().any(|e| e.usage.is_none()) {
+                    create::enrich_profiles_usage(data, &mut entries);
+                }
+                (entries, None)
+            }
+        };
     let matches_filter = |e: &create::ProviderProfileEntry, f_trimmed: &str| -> bool {
         e.provider == f_trimmed
             || e.profile == f_trimmed
@@ -2467,6 +2550,12 @@ fn list_profiles_cmd(data: &Path, filter: Option<&str>) -> Result<(), anyagents_
         .into_iter()
         .filter(|e| filter.is_none_or(|f| matches_filter(e, f.trim())))
         .collect();
+    if let Some(age) = usage_age_ms {
+        eprintln!(
+            "usage as of {} ago; the server refreshes it in the background",
+            age_text(age)
+        );
+    }
     if ui::is_pretty() {
         ui::print_profiles_pretty(&filtered);
         return Ok(());
@@ -2489,6 +2578,16 @@ fn list_profiles_cmd(data: &Path, filter: Option<&str>) -> Result<(), anyagents_
         );
     }
     Ok(())
+}
+
+/// A short age: `42s`, `3m 05s`, `2h 10m`.
+fn age_text(ms: i64) -> String {
+    let secs = ms.max(0) / 1000;
+    match secs {
+        0..60 => format!("{secs}s"),
+        60..3600 => format!("{}m {:02}s", secs / 60, secs % 60),
+        _ => format!("{}h {:02}m", secs / 3600, secs % 3600 / 60),
+    }
 }
 
 fn interact_cmd(
@@ -2549,10 +2648,12 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
         .map(|s| create::sync_and_list_provider_profiles_with_options(&s, data, false))
         .unwrap_or_default();
 
+    let catalog = anyagents_installer::Catalog::load(data)
+        .unwrap_or_else(|_| anyagents_installer::Catalog::builtin());
     let mut harness_rows = Vec::new();
-    for entry in anyagents_installer::builtin_catalog() {
+    for entry in catalog.harnesses() {
         let bin_path = install::program(data, &entry.id);
-        let present = bin_path.is_file() || anyagents_installer::machine_has(&entry.id);
+        let present = install::is_healthy(data, &entry.id) || bin_path.is_file();
         let version = install::recorded_version(data, &entry.id);
         let (mode, steer) = anyagents_supervisor::declared(&entry.id);
         let profiles: Vec<String> = provider_profiles

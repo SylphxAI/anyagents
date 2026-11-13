@@ -85,6 +85,7 @@ dependencies = [
  "anyagents-harness-stream",
  "anyagents-installer",
  "anyagents-supervisor",
+ "anyagents-toolchain",
  "anyagents-tools",
  "axum",
  "bytes",
@@ -223,7 +224,6 @@ name = "anyagents-harness-opencode"
 version = "0.1.8"
 dependencies = [
  "anyagents-harness",
- "anyagents-harness-stream",
  "serde_json",
  "tempfile",
 ]
@@ -283,9 +283,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "anyagents-toolchain"
+version = "0.1.8"
+dependencies = [
+ "serde",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "toml",
+]
+
+[[package]]
 name = "anyagents-tools"
 version = "0.1.8"
 dependencies = [
+ "anyagents-toolchain",
  "base64 0.23.1",
  "serde",
  "serde_json",
