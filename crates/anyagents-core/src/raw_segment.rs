@@ -442,7 +442,7 @@ fn hash_all(mut reader: impl BufRead) -> io::Result<(u64, String)> {
 /// One JSONL line read from a buffered stream.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum JsonlLine {
-    /// A newline-terminated line holding exactly one JSON value.
+    /// A newline-terminated line holding an indexed raw coordinate.
     Complete { length: u64, sha256: String },
     /// Final bytes with no newline yet: never validated or committed.
     Partial { length: u64 },
@@ -452,6 +452,13 @@ pub(crate) enum JsonlLine {
 /// through `IgnoredAny`, so neither a huge tool output nor the line itself is
 /// ever resident, and no byte is read twice. `None` means end of input.
 pub(crate) fn read_jsonl_line(reader: &mut impl BufRead) -> io::Result<Option<JsonlLine>> {
+    read_jsonl_line_with_policy(reader, false)
+}
+
+pub(crate) fn read_jsonl_line_with_policy(
+    reader: &mut impl BufRead,
+    tolerate_malformed: bool,
+) -> io::Result<Option<JsonlLine>> {
     let mut line = LineState {
         hash: Sha256::new(),
         length: 0,
@@ -481,7 +488,17 @@ pub(crate) fn read_jsonl_line(reader: &mut impl BufRead) -> io::Result<Option<Js
             length: line.length,
         }));
     }
-    parsed.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    if let Err(e) = parsed {
+        if e.classify() == serde_json::error::Category::Io {
+            return Err(io::Error::new(
+                e.io_error_kind().unwrap_or(io::ErrorKind::Other),
+                e,
+            ));
+        }
+        if !tolerate_malformed {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, e));
+        }
+    }
     Ok(Some(JsonlLine::Complete {
         length: line.length,
         sha256: format!("{:x}", line.hash.finalize()),
