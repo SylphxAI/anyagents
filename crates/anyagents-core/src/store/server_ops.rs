@@ -4,7 +4,7 @@
 
 use std::collections::HashSet;
 
-use super::{AgentId, Store, telegram_chat_links};
+use super::{AgentId, Error, Store, telegram_chat_links};
 
 impl Store {
     /// Every agent that shares an internal group or a Telegram chat with
@@ -48,6 +48,40 @@ impl Store {
             }
         }
         shared
+    }
+
+    /// Every agent below `root` in the parent tree, in any state, through the
+    /// parent index. `root` itself is included only when a parent cycle leads
+    /// back to it.
+    pub fn descendant_ids(&self, root: &AgentId) -> Result<HashSet<AgentId>, Error> {
+        let conn = self.read_conn();
+        // UNION (not UNION ALL) deduplicates, so a parent cycle ends.
+        let mut stmt = conn.prepare_cached(
+            "WITH RECURSIVE below(id) AS (
+                 SELECT id FROM agents WHERE parent_id = ?1
+                 UNION
+                 SELECT a.id FROM agents a JOIN below b ON a.parent_id = b.id
+             )
+             SELECT id FROM below",
+        )?;
+        let rows = stmt.query_map([root.as_str()], |r| r.get::<_, String>(0))?;
+        let mut ids = HashSet::new();
+        for id in rows {
+            ids.insert(AgentId::parse(&id?)?);
+        }
+        Ok(ids)
+    }
+
+    /// The id of every agent, archived ones included, without decoding rows.
+    pub fn agent_ids(&self) -> Result<Vec<AgentId>, Error> {
+        let conn = self.read_conn();
+        let mut stmt = conn.prepare_cached("SELECT id FROM agents ORDER BY name")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut ids = Vec::new();
+        for id in rows {
+            ids.push(AgentId::parse(&id?)?);
+        }
+        Ok(ids)
     }
 }
 
@@ -136,5 +170,50 @@ mod tests {
         let shared = store.agents_sharing_group_or_chat(&caller.id);
         assert!(shared.contains(&peer.id) && shared.contains(&chatmate.id));
         assert!(!shared.contains(&stranger.id) && !shared.contains(&other_chat.id));
+    }
+
+    #[test]
+    fn descendants_follow_the_parent_index_across_states() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let child_of = |name: &str, parent: Option<&AgentId>| {
+            let mut new = NewAgent::new(name, "codex");
+            new.parent_id = parent.cloned();
+            store.create_agent(new).unwrap()
+        };
+        let root = child_of("root", None);
+        let a = child_of("a", Some(&root.id));
+        let b = child_of("b", Some(&a.id));
+        let c = child_of("c", Some(&root.id));
+        let other = child_of("other", None);
+        let stranger = child_of("stranger", Some(&other.id));
+        store.set_agent_state(&b.id, "archived").unwrap();
+
+        let below = store.descendant_ids(&root.id).unwrap();
+        assert_eq!(
+            below,
+            HashSet::from([a.id.clone(), b.id.clone(), c.id.clone()])
+        );
+        assert_eq!(
+            store.descendant_ids(&a.id).unwrap(),
+            HashSet::from([b.id.clone()])
+        );
+        assert!(store.descendant_ids(&b.id).unwrap().is_empty());
+        assert!(!store.descendant_ids(&other.id).unwrap().contains(&a.id));
+        assert!(
+            store
+                .descendant_ids(&other.id)
+                .unwrap()
+                .contains(&stranger.id)
+        );
+
+        let listed: Vec<_> = store
+            .list_agents()
+            .unwrap()
+            .into_iter()
+            .map(|a| a.id)
+            .collect();
+        assert_eq!(listed.len(), 6);
+        assert_eq!(store.agent_ids().unwrap(), listed);
     }
 }

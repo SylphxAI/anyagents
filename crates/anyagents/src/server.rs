@@ -385,28 +385,27 @@ pub(crate) fn mark_explicitly_archived_locked(
     crate::worktree_access::revoke_recorded(data_dir, &agent.id)?;
     let mut archived = vec![agent.id.clone()];
     mark_archive_generation_locked(store, data_dir, agent);
-    if let Ok(all_agents) = store.list_agents() {
-        let mut queue = std::collections::VecDeque::new();
-        queue.push_back(agent.id.clone());
-        let mut seen = std::collections::HashSet::new();
-        seen.insert(agent.id.clone());
-        while let Some(pid) = queue.pop_front() {
-            for child in all_agents
-                .iter()
-                .filter(|a| a.parent_id.as_ref() == Some(&pid))
-            {
-                if seen.insert(child.id.clone()) {
-                    queue.push_back(child.id.clone());
-                    let Ok(_child_lifecycle) = store.try_lock_agent_lifecycle(&child.id) else {
-                        continue;
-                    };
-                    let Ok(child) = store.set_agent_state(&child.id, "archived") else {
-                        continue;
-                    };
-                    crate::worktree_access::revoke_recorded(data_dir, &child.id)?;
-                    mark_archive_generation_locked(store, data_dir, &child);
-                    archived.push(child.id.clone());
-                }
+    let mut queue = std::collections::VecDeque::new();
+    queue.push_back(agent.id.clone());
+    let mut seen = std::collections::HashSet::new();
+    seen.insert(agent.id.clone());
+    while let Some(pid) = queue.pop_front() {
+        let Ok(mut children) = store.children_of(&pid) else {
+            continue;
+        };
+        children.sort_by(|a, b| a.name.cmp(&b.name));
+        for child in &children {
+            if seen.insert(child.id.clone()) {
+                queue.push_back(child.id.clone());
+                let Ok(_child_lifecycle) = store.try_lock_agent_lifecycle(&child.id) else {
+                    continue;
+                };
+                let Ok(child) = store.set_agent_state(&child.id, "archived") else {
+                    continue;
+                };
+                crate::worktree_access::revoke_recorded(data_dir, &child.id)?;
+                mark_archive_generation_locked(store, data_dir, &child);
+                archived.push(child.id.clone());
             }
         }
     }
@@ -2356,6 +2355,16 @@ fn is_self_or_ancestor(
     false
 }
 
+/// An unrestricted reader's scope: every agent, archived ones included.
+fn every_agent_id(store: &Store) -> Result<Vec<String>, ApiError> {
+    Ok(store
+        .agent_ids()
+        .map_err(ApiError::from_store)?
+        .iter()
+        .map(ToString::to_string)
+        .collect())
+}
+
 /// Resolve the caller's conversation visibility once, before selecting a
 /// recent or Raw-RAG read path. Non-admin agents see only themselves and their
 /// descendants; `all` is an alias for exactly that set. Administrative reads
@@ -2392,27 +2401,15 @@ fn conversation_visibility(
                 return Ok((requested.to_string(), None));
             }
 
-            let agents = store.list_agents().map_err(ApiError::from_store)?;
-            let mut visible_ids = std::collections::HashSet::from([caller.id.clone()]);
-            let mut changed = true;
-            while changed {
-                changed = false;
-                for agent in &agents {
-                    if let Some(parent) = &agent.parent_id
-                        && visible_ids.contains(parent)
-                        && visible_ids.insert(agent.id.clone())
-                    {
-                        changed = true;
-                    }
-                }
-            }
-            let visible_agent_ids: Vec<String> =
-                visible_ids.iter().map(ToString::to_string).collect();
-
             if requested.eq_ignore_ascii_case("self") {
                 return Ok((caller.name, Some(vec![caller.id.to_string()])));
             }
+            let mut visible_ids = store
+                .descendant_ids(&caller.id)
+                .map_err(ApiError::from_store)?;
+            visible_ids.insert(caller.id.clone());
             if requested.eq_ignore_ascii_case("all") || requested == "*" {
+                let visible_agent_ids = visible_ids.iter().map(ToString::to_string).collect();
                 return Ok(("all".to_string(), Some(visible_agent_ids)));
             }
 
@@ -4896,13 +4893,7 @@ async fn conversation_route(
             }
             let authorized = match visible_agent_ids.as_ref() {
                 Some(ids) => ids.clone(),
-                None => state
-                    .store
-                    .list_agents()
-                    .map_err(ApiError::from_store)?
-                    .into_iter()
-                    .map(|a| a.id.to_string())
-                    .collect(),
+                None => every_agent_id(&state.store)?,
             };
             let (hit, bytes) = state
                 .store
@@ -5037,13 +5028,7 @@ async fn conversation_route(
         };
         let authorized = match visible_agent_ids.as_ref() {
             Some(ids) => ids.clone(),
-            None => state
-                .store
-                .list_agents()
-                .map_err(ApiError::from_store)?
-                .into_iter()
-                .map(|a| a.id.to_string())
-                .collect(),
+            None => every_agent_id(&state.store)?,
         };
         let should_search_host_files = has_structured_search
             || query.scope != anyagents_core::host_index::MemoryScope::All
@@ -6608,12 +6593,16 @@ fn room_skipped(store: &Store, body: &SendRequest, room: &str) -> Vec<crate::api
         Ok(Some(members)) => members,
         _ => return Vec::new(),
     };
-    store
-        .list_agents()
-        .unwrap_or_default()
-        .into_iter()
+    // One row per member name, in name order.
+    let members: std::collections::BTreeMap<_, _> = members
+        .iter()
+        .filter_map(|member| store.agent_by_name(member).ok())
+        .filter(|agent| members.contains(&agent.name))
+        .map(|agent| (agent.name.clone(), agent))
+        .collect();
+    members
+        .into_values()
         .filter(|agent| !body_author_is(body, agent))
-        .filter(|agent| members.iter().any(|m| m == &agent.name))
         .filter(|agent| agent.state != "running" && agent.state != "idle")
         .map(|agent| crate::api::SkippedDelivery {
             to: format!("agent:{}", agent.name),
