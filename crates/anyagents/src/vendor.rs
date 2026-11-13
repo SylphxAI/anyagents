@@ -390,7 +390,6 @@ fn vendor_launch_authorized(
             _ => format!("host migration failed: {error}"),
         }
     })?;
-    prepare_host_session(&request)?;
     let config_dir = request.config_dir.clone();
     let res = vendor_launch_inner(request, store);
     if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none() {
@@ -752,6 +751,9 @@ fn vendor_launch_inner(
         crate::sandbox::prepare_config_with_seat_uid(&request.config_dir, *uid, *gid)
             .map_err(|error| error.to_string())?;
     }
+    // Admission and seat config grants precede instruction rendering: a refused
+    // seat must not mutate its host session or fail on an unrelated inode grant.
+    prepare_host_session(&request)?;
     if request.agent.harness == "agy" {
         ensure_agy_steering_settings(&request.config_dir, &request.work_dir)
             .map_err(|err| err.to_string())?;
