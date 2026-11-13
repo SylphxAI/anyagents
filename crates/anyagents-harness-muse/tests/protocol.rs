@@ -161,7 +161,7 @@ fn a_prompt_is_in_flight_until_its_turn_records_it_and_finished_with_the_turn() 
     // Offered many times, written once, as one steer-or-start command whose
     // id is the message's own; the host held the tool approval.
     assert_eq!(harness.written_ids(), ["m1"]);
-    assert_eq!(vendor.writes_of(&command_id("m1")), 1);
+    assert_eq!(vendor.writes_of(&command_id("m1", 0)), 1);
     let log = vendor.log();
     assert_eq!(log.matches("\"ifBusy\":\"steer\"").count(), 1, "{log}");
     assert!(
@@ -229,8 +229,8 @@ fn a_steer_its_turn_ended_on_finishes_in_the_successor_turn() {
     until(&mut harness, &m2, FINISHED);
     until(&mut harness, &m3, FINISHED);
     assert_eq!(harness.turns_served(), 2);
-    assert_eq!(vendor.writes_of(&command_id("m2")), 1);
-    assert_eq!(vendor.writes_of(&command_id("m3")), 1);
+    assert_eq!(vendor.writes_of(&command_id("m2", 0)), 1);
+    assert_eq!(vendor.writes_of(&command_id("m3", 0)), 1);
 }
 
 #[test]
@@ -251,8 +251,41 @@ fn a_refused_steer_waits_for_its_turn_and_goes_again_under_the_same_command_id()
     assert_eq!(harness.written_ids(), ["m1", "m2", "m2"]);
     // The queue refused it before admission and recorded nothing, so the
     // next write is the same command.
-    assert_eq!(vendor.writes_of(&command_id("m2")), 2);
+    assert_eq!(vendor.writes_of(&command_id("m2", 0)), 2);
     assert_eq!(harness.turns_started(), 2);
+}
+
+#[test]
+fn a_busy_refusal_goes_again_under_the_next_id_and_every_process_walks_the_same_chain() {
+    let vendor = Vendor::new();
+    let (m1, m2) = (msg("m1", 1), msg("m2", 2));
+    let session = {
+        let mut first = vendor.start("busy_steer", None);
+        until(&mut first, &m1, CONSUMED);
+        // Refused at its deadline: recorded against its first id.
+        until(&mut first, &m2, DeliverOutcome::Deferred);
+        for _ in 0..20 {
+            assert_eq!(first.deliver(&m2).unwrap(), DeliverOutcome::Deferred);
+        }
+        assert_eq!(vendor.writes_of(&command_id("m2", 0)), 1);
+        let session = first.session_id().unwrap();
+        first.stop();
+        session
+    };
+    // A new process starts the chain at attempt 0 again: Muse replays the
+    // recorded refusal, and the message goes on under attempt 1, which Muse
+    // never saw. Nothing is admitted twice.
+    let mut second = vendor.start("hold", Some(&session));
+    until(&mut second, &m2, CONSUMED);
+    assert_eq!(vendor.writes_of(&command_id("m2", 0)), 2);
+    assert_eq!(vendor.writes_of(&command_id("m2", 1)), 1);
+    assert_eq!(second.written_ids(), ["m2", "m2"]);
+    let session = second.session_id().unwrap();
+    second.stop();
+    // The record holds it now, under its second id: never written again.
+    let mut third = vendor.start("hold", Some(&session));
+    assert_eq!(third.deliver(&m2).unwrap(), DeliverOutcome::Duplicate);
+    assert!(third.written_ids().is_empty());
 }
 
 #[test]
@@ -262,7 +295,7 @@ fn an_unknown_outcome_is_written_again_under_the_same_command_id() {
     let m1 = msg("m1", 1);
     until(&mut harness, &m1, CONSUMED);
     assert_eq!(harness.written_ids(), ["m1", "m1"]);
-    assert_eq!(vendor.writes_of(&command_id("m1")), 2);
+    assert_eq!(vendor.writes_of(&command_id("m1", 0)), 2);
     assert_eq!(harness.turns_started(), 1);
 }
 
@@ -279,7 +312,7 @@ fn a_message_the_session_record_holds_is_a_duplicate_and_never_written_again() {
     // Proved by the record the resume served, before anything is written.
     assert_eq!(second.proven("m1"), Some(Proof::Duplicate));
     assert_eq!(second.deliver(&m1).unwrap(), DeliverOutcome::Duplicate);
-    assert_eq!(vendor.writes_of(&command_id("m1")), 1);
+    assert_eq!(vendor.writes_of(&command_id("m1", 0)), 1);
     assert!(second.written_ids().is_empty());
     assert_eq!(second.turns_started(), 0);
     assert_eq!(second.health().turn_state, TurnState::Idle);
@@ -308,7 +341,7 @@ fn a_record_over_the_history_budget_is_paged() {
     );
     for message in &messages {
         assert_eq!(second.deliver(message).unwrap(), DeliverOutcome::Duplicate);
-        assert_eq!(vendor.writes_of(&command_id(&message.id)), 1);
+        assert_eq!(vendor.writes_of(&command_id(&message.id, 0)), 1);
     }
     let log = vendor.log();
     assert!(log.contains("\"view/page\""), "{log}");
@@ -323,7 +356,7 @@ fn a_replayed_ack_without_queued_at_settles_by_its_item() {
         until(&mut first, &m1, CONSUMED);
         until(&mut first, &m2, DeliverOutcome::InFlight);
         eventually("m2 is admitted", || {
-            vendor.answers_of(&command_id("m2")).len() == 1
+            vendor.answers_of(&command_id("m2", 0)).len() == 1
         });
         let session = first.session_id().unwrap();
         // The process goes away with m2 admitted into its turn, unconsumed.
@@ -336,9 +369,9 @@ fn a_replayed_ack_without_queued_at_settles_by_its_item() {
     // replays the first process's ack, without `queuedAtUs`.
     until(&mut second, &m2, DeliverOutcome::InFlight);
     eventually("the replayed ack is read", || {
-        vendor.answers_of(&command_id("m2")).len() == 2
+        vendor.answers_of(&command_id("m2", 0)).len() == 2
     });
-    let answers = vendor.answers_of(&command_id("m2"));
+    let answers = vendor.answers_of(&command_id("m2", 0));
     assert!(
         answers.iter().all(|answer| !answer.contains("queuedAtUs")),
         "{answers:?}"
@@ -350,7 +383,7 @@ fn a_replayed_ack_without_queued_at_settles_by_its_item() {
     // settles it.
     vendor.command("carry");
     until(&mut second, &m2, CONSUMED);
-    assert_eq!(vendor.writes_of(&command_id("m2")), 2);
+    assert_eq!(vendor.writes_of(&command_id("m2", 0)), 2);
 }
 
 #[test]
@@ -362,7 +395,7 @@ fn a_conflicting_payload_under_the_same_id_waits_for_the_first_write() {
         until(&mut first, &m1, CONSUMED);
         until(&mut first, &m2, DeliverOutcome::InFlight);
         eventually("m2 is admitted", || {
-            vendor.answers_of(&command_id("m2")).len() == 1
+            vendor.answers_of(&command_id("m2", 0)).len() == 1
         });
         let session = first.session_id().unwrap();
         first.stop();
@@ -376,7 +409,7 @@ fn a_conflicting_payload_under_the_same_id_waits_for_the_first_write() {
     until(&mut second, &changed, DeliverOutcome::InFlight);
     eventually("the conflict is read", || {
         vendor
-            .answers_of(&command_id("m2"))
+            .answers_of(&command_id("m2", 0))
             .iter()
             .any(|answer| answer.contains("command_id_conflict"))
     });
@@ -387,7 +420,7 @@ fn a_conflicting_payload_under_the_same_id_waits_for_the_first_write() {
     vendor.command("carry");
     until(&mut second, &changed, CONSUMED);
     assert_eq!(second.written_ids(), ["m2"]);
-    assert_eq!(vendor.writes_of(&command_id("m2")), 2);
+    assert_eq!(vendor.writes_of(&command_id("m2", 0)), 2);
 }
 
 #[test]
@@ -411,6 +444,10 @@ fn a_refusal_for_good_is_rejected_and_answered_again_without_a_write() {
             thread::sleep(Duration::from_millis(5));
         };
         assert!(reason.contains(code), "{mode}: {reason}");
+        assert!(
+            !reason.contains("m1") && !reason.contains("1024"),
+            "{mode}: the reason names nothing of the message: {reason}"
+        );
         for _ in 0..5 {
             assert_eq!(
                 harness.deliver(&m1).unwrap(),
@@ -424,7 +461,7 @@ fn a_refusal_for_good_is_rejected_and_answered_again_without_a_write() {
             None,
             "{mode}: a refusal proves nothing"
         );
-        assert_eq!(vendor.writes_of(&command_id("m1")), 1, "{mode}");
+        assert_eq!(vendor.writes_of(&command_id("m1", 0)), 1, "{mode}");
         assert!(harness.health().process_alive, "{mode}");
     }
 }
@@ -481,7 +518,7 @@ fn a_process_is_dead_only_once_its_stdout_ended() {
     // The line the vendor prints after its stdin is gone: m2's proof.
     let proof = serde_json::json!({"jsonrpc": "2.0", "method": "item/completed",
         "params": {"sessionId": "sess-from-vendor", "item": {"kind": "userMessage",
-            "turnId": command_id("m1"), "commandId": command_id("m2"), "steered": true,
+            "turnId": command_id("m1", 0), "commandId": command_id("m2", 0), "steered": true,
             "text": "anyagents-message:m2\nhello"}}})
     .to_string();
     let mut harness = vendor.start_with(

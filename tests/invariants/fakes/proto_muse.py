@@ -17,9 +17,11 @@ boundary for steered input, every waiting steer together and oldest first.
 A `commandId` is an idempotency key, durable within the session: replaying it
 with the same payload answers the recorded decision and applies nothing;
 reusing it with a different payload is refused -32030 `commandRejected`,
-reason `command_id_conflict`. A refusal before admission (-32031, the
-command-admission queue is full, which the `refuse` command produces for the
-next steer) records nothing, and the input is not applied.
+reason `command_id_conflict`. Any other -32030 is a decision recorded against
+the id, which the same id answers again; its `data.retryable` says whether a
+retry under another id can succeed. The `refuse` command makes the next steer
+meet one: `runtime_busy`, a turn command refused at its deadline, retryable.
+The input is not applied.
 
 The session's record is what the model saw (the engine's journal): a resume
 without `excludeItems: true` serves it as `inline` history, one `userMessage`
@@ -44,7 +46,6 @@ SESSION = "muse-session"
 VERSION = "1.4.20-R8619.1"
 
 COMMAND_REJECTED = -32030
-QUEUE_FULL = -32031
 SESSION_NOT_FOUND = -32020
 METHOD_NOT_FOUND = -32601
 
@@ -213,9 +214,12 @@ class Muse(Protocol):
             return
         if engine.turn is not None and params.get("ifBusy") == "steer":
             if self.take_refusal():
-                # Refused before admission: nothing is recorded.
-                error = {"code": QUEUE_FULL, "message": "the command-admission queue is full",
-                         "data": {"kind": "backpressured", "retryable": True}}
+                # Refused at the turn command's deadline: recorded against
+                # the id, and a retry under another id can succeed.
+                error = {"code": COMMAND_REJECTED, "message": "the runtime is busy",
+                         "data": {"kind": "commandRejected", "commandId": command,
+                                  "reason": "runtime_busy", "retryable": True}}
+                self.record(command, inp.id, fingerprint, {"error": error})
                 self.later(lambda: self.error(rid, error))
                 return
             ack = self.ack(command, "steered", engine.turn, False)

@@ -14,10 +14,10 @@
 //!   into the running turn's inbox otherwise. The request is sent without
 //!   waiting; its answer arrives as `$rpc/response`. The mailbox id is the
 //!   first line of the text (`anyagents-message:<id>`).
-//! - The `commandId` is derived from the mailbox id alone, the same in every
-//!   process and for every payload. Muse keeps every command's decision for
-//!   the session and replays it for the same id, so writing a command again
-//!   applies nothing.
+//! - The `commandId` is derived from the mailbox id and an attempt number,
+//!   the same in every process and for every payload. Muse keeps every
+//!   command's decision for the session and replays it for the same id, so
+//!   writing a command again applies nothing.
 //! - The answer only says the input is admitted, and it reads the same for a
 //!   fresh admission and for the replay of one an earlier process wrote (its
 //!   `queuedAtUs` is absent on `started`, on replays after a restart and on
@@ -32,17 +32,30 @@
 //!   by the vendor into a successor turn named after its command, and stays in
 //!   flight until that turn's proof.
 //! - `-32030` (`commandRejected`) is a decision Muse records against the
-//!   command id. With reason `command_id_conflict` the id is already held by
-//!   an earlier write of this message (another payload): it was admitted, and
-//!   waits for its proof like any other admitted input. With any other reason,
-//!   and for `-32002` (input too large) and `-32602` (invalid params), the
-//!   vendor refused the message for good: no write under its id can succeed,
-//!   so it is rejected. An admission refusal (queue full, overloaded,
-//!   draining, starting up) or an unknown outcome is deferred and written
-//!   again under the same id once the vendor has moved on (a turn boundary,
-//!   or the next pass when no turn runs); every answer wakes the host. A
-//!   session fault (not found, not loaded, held elsewhere) fails delivery,
-//!   and the supervisor restarts the process.
+//!   command id, with a `reason`. With reason `command_id_conflict` the id is
+//!   already held by an earlier write of this message (another payload): it
+//!   was admitted, and waits for its proof like any other admitted input.
+//!   Otherwise the error's `retryable` (which overrides the code's default)
+//!   decides:
+//!   - Retryable (`runtime_busy`, a turn command refused at its deadline):
+//!     the same id would replay the refusal, so the message goes again under
+//!     its next attempt's id. Every process walks a message's ids from
+//!     attempt 0, and each id answers with the decision Muse recorded for it:
+//!     a recorded refusal moves to the next id, an id admitted earlier replays
+//!     its ack and waits for its proof, and the first id Muse never saw is the
+//!     one fresh write. Walking the chain again after a restart re-reads the
+//!     same decisions, so nothing is admitted twice.
+//!   - Not retryable, and `-32002` (input too large) or `-32602` (invalid
+//!     params) unless marked retryable: the vendor refused the message for
+//!     good, so it is rejected, with a reason that names only the code, its
+//!     kind and the refusal's reason, the same for every message it hits.
+//!
+//!   An admission refusal (queue full, overloaded, draining, starting up) or
+//!   an unknown outcome (interrupted, cancelled) is deferred and written again
+//!   under the same id once the vendor has moved on (a turn boundary, or the
+//!   next pass when no turn runs); every answer wakes the host. A session
+//!   fault (not found, not loaded, held elsewhere) fails delivery, and the
+//!   supervisor restarts the process.
 //! - A message is not written while an earlier one's `turn/start` is
 //!   unanswered, so a refusal never lets a later message overtake it.
 //! - The process is dead only once its stdout reached end of file, so every
@@ -77,6 +90,9 @@ const COMMAND_ID_CONFLICT: [&str; 2] = ["command_id_conflict", "commandIdConflic
 const INPUT_TOO_LARGE: i64 = -32002;
 /// Malformed params (`invalidParams`).
 const INVALID_PARAMS: i64 = -32602;
+/// The request was pre-empted, and its outcome is on the view: unknown.
+const INTERRUPTED: i64 = -32013;
+const CANCELLED: i64 = -32014;
 /// Session faults: no write into this process can succeed.
 const SESSION_NOT_FOUND: i64 = -32020;
 const SESSION_NOT_LOADED: i64 = -32024;
@@ -126,6 +142,9 @@ enum Stage {
 
 struct Input {
     seq: i64,
+    /// Which of the message's command ids this process writes: the first
+    /// whose recorded decision is not a retryable refusal.
+    attempt: u32,
     command: String,
     stage: Stage,
 }
@@ -201,7 +220,7 @@ impl State {
     /// Whether the session's record held this message when this process
     /// resumed it.
     fn holds(&self, id: &str) -> bool {
-        self.held.contains(id) || self.held_commands.contains(&command_id(id))
+        self.held.contains(id) || self.held_commands.contains(&command_id(id, 0))
     }
 
     /// Whether the vendor has work of the host's in hand: a running turn, or
@@ -446,8 +465,8 @@ impl MuseHarness {
     /// forward from its latest compaction boundary (from its start when it
     /// has none): an input an earlier process wrote and the host has not
     /// committed is newer than that boundary, since the process consumed it
-    /// right before it went away. A view that cannot be read leaves what was
-    /// read.
+    /// right before it went away. A view that cannot be read fails the
+    /// start.
     fn read_record(&self, session: &str, resumed: &Value) -> Result<Record, HarnessError> {
         let mut record = Record::default();
         let history = resumed.get("history").unwrap_or(&Value::Null);
@@ -484,7 +503,13 @@ impl MuseHarness {
             let page_result = match result {
                 Ok(page_result) => page_result,
                 Err(HarnessError::Dead) => return Err(HarnessError::Dead),
-                Err(_) => return Ok(record),
+                // Without the record a replayed command could wait for a
+                // proof an earlier process already took: no start.
+                Err(err) => {
+                    return Err(HarnessError::Failed(format!(
+                        "the session's record could not be read: {err}"
+                    )));
+                }
             };
             for event in page_result
                 .get("events")
@@ -593,12 +618,17 @@ impl Harness for MuseHarness {
             if state.session.is_empty() {
                 return Err(HarnessError::Failed("no session".into()));
             }
-            let command = command_id(&message.id);
+            let attempt = state
+                .inputs
+                .get(&message.id)
+                .map_or(0, |input| input.attempt);
+            let command = command_id(&message.id, attempt);
             state.commands.insert(command.clone(), message.id.clone());
             state.inputs.insert(
                 message.id.clone(),
                 Input {
                     seq: message.seq,
+                    attempt,
                     command: command.clone(),
                     stage: Stage::Sending,
                 },
@@ -836,16 +866,13 @@ fn state_settled(stage: &Stage) -> bool {
     )
 }
 
-/// The command id of one mailbox message: a UUIDv7, the shape Muse requires,
-/// the same in every process and for every payload. Its time is the mailbox
-/// id's own (a TypeID carries a UUIDv7), and the rest is a hash of the id.
-pub fn command_id(message_id: &str) -> String {
-    // Earlier adapters hashed a write number into the key; every id is the
-    // one they gave a message's first write, so a message they wrote is
-    // replayed, not written anew.
-    const FIRST_WRITE: u32 = 0;
+/// The command id of one mailbox message's `attempt`: a UUIDv7, the shape
+/// Muse requires, the same in every process and for every payload. Its time
+/// is the mailbox id's own (a TypeID carries a UUIDv7), and the rest is a
+/// hash of the id and the attempt.
+pub fn command_id(message_id: &str, attempt: u32) -> String {
     let digest =
-        fnv1a_128(format!("anyagents/muse/turn-start\0{message_id}\0{FIRST_WRITE}").as_bytes());
+        fnv1a_128(format!("anyagents/muse/turn-start\0{message_id}\0{attempt}").as_bytes());
     let millis = typeid_millis(message_id).unwrap_or((digest >> 88) as u64 & 0xFF_FFFF_FFFF);
     let value = (u128::from(millis & 0xFFFF_FFFF_FFFF) << 80)
         | (0x7 << 76)
@@ -1010,6 +1037,7 @@ fn on_answer(state: &mut State, id: &str, result: &Value, error: &Value) {
     let held = state.holds(id);
     let State {
         inputs,
+        commands,
         completed_turns,
         known_turns,
         boundary,
@@ -1040,14 +1068,22 @@ fn on_answer(state: &mut State, id: &str, result: &Value, error: &Value) {
         state.changed();
         return;
     }
-    let reason = RpcFail::Failed(error.clone()).reason();
+    let retry = Stage::Retry {
+        boundary: *boundary,
+    };
+    let code = error.get("code").and_then(Value::as_i64);
+    let retryable = error.pointer("/data/retryable").and_then(Value::as_bool);
     input.stage = if let Some(reset_at_ms) = quota_from_error(error) {
         *quota_reset_at_ms = Some(reset_at_ms);
-        Stage::Retry {
-            boundary: *boundary,
-        }
+        retry
     } else {
-        match error.get("code").and_then(Value::as_i64) {
+        match code {
+            Some(SESSION_NOT_FOUND | SESSION_NOT_LOADED | WRITER_LEASE_HELD) => {
+                Stage::Fault(RpcFail::Failed(error.clone()).reason())
+            }
+            // The outcome is on the view: the same command again applies it
+            // or replays what the vendor did with it.
+            Some(INTERRUPTED | CANCELLED) => retry,
             // An earlier write of this message holds the id: it was admitted.
             Some(COMMAND_REJECTED) if is_id_conflict(error) => {
                 if held {
@@ -1056,23 +1092,51 @@ fn on_answer(state: &mut State, id: &str, result: &Value, error: &Value) {
                     Stage::Admitted { turn: None }
                 }
             }
-            // Recorded against the id, or the message itself is malformed or
-            // too large: no write of it can succeed.
-            Some(COMMAND_REJECTED | INPUT_TOO_LARGE | INVALID_PARAMS) => Stage::Rejected(reason),
-            Some(SESSION_NOT_FOUND | SESSION_NOT_LOADED | WRITER_LEASE_HELD) => {
-                Stage::Fault(reason)
+            // Recorded against this id, but retrying can succeed: the next
+            // attempt's id, once the vendor has moved on. Every process walks
+            // the ids from attempt 0 and meets the same recorded decisions,
+            // so an id admitted earlier replays its ack instead of being
+            // admitted again.
+            Some(COMMAND_REJECTED) if retryable == Some(true) => {
+                input.attempt += 1;
+                input.command = command_id(id, input.attempt);
+                commands.insert(input.command.clone(), id.to_string());
+                retry
             }
-            // Refused at admission (queue full, overloaded, draining, starting
-            // up), or the outcome is unknown (interrupted, cancelled, a
-            // malformed answer): the same command again either applies it or
-            // replays what the vendor did with it, at the next boundary, or
-            // on the next pass when no turn runs.
-            _ => Stage::Retry {
-                boundary: *boundary,
-            },
+            // Refused for good: recorded against the id, or the message
+            // itself is malformed or too large, unless the vendor says a
+            // retry can succeed; or any refusal the vendor marks final.
+            Some(COMMAND_REJECTED) => Stage::Rejected(refusal(error)),
+            Some(INPUT_TOO_LARGE | INVALID_PARAMS) if retryable != Some(true) => {
+                Stage::Rejected(refusal(error))
+            }
+            _ if retryable == Some(false) => Stage::Rejected(refusal(error)),
+            // Refused at admission (queue full, overloaded, draining,
+            // starting up), or a malformed answer: the same command again,
+            // at the next boundary, or on the next pass when no turn runs.
+            _ => retry,
         }
     };
     state.changed();
+}
+
+/// Why the vendor refused a message, the same for every message the refusal
+/// hits: its code, its kind and its reason, never its text.
+fn refusal(error: &Value) -> String {
+    let mut text = format!(
+        "muse refused the message: {}",
+        error
+            .get("code")
+            .and_then(Value::as_i64)
+            .unwrap_or_default()
+    );
+    for key in ["/data/kind", "/data/reason"] {
+        if let Some(word) = error.pointer(key).and_then(Value::as_str) {
+            text.push(' ');
+            text.push_str(word);
+        }
+    }
+    text
 }
 
 /// A `commandRejected` whose reason is that the id is already held.
@@ -1153,6 +1217,7 @@ fn on_item(state: &mut State, params: &Value) {
                 id,
                 Input {
                     seq: 0,
+                    attempt: 0,
                     command: command.unwrap_or_default().to_string(),
                     stage,
                 },
@@ -1340,14 +1405,16 @@ mod tests {
     }
 
     #[test]
-    fn a_command_id_is_a_uuid7_fixed_by_the_message_alone() {
+    fn a_command_id_is_a_uuid7_fixed_by_the_message_and_its_attempt() {
         let id = "msg_01m78v9pswehq8ns457b0vdz42";
-        let first = command_id(id);
-        assert_eq!(first, command_id(id), "the same in every process");
-        // The id an earlier adapter gave this message's first write, so a
-        // message it wrote is replayed rather than written anew.
+        let first = command_id(id, 0);
+        assert_eq!(first, command_id(id, 0), "the same in every process");
+        // The id earlier adapters gave this message's first write, so a
+        // message they wrote is replayed rather than written anew.
         assert_eq!(first, "01a1d1b4-db3c-7408-97fe-f55acf1aaa64");
-        assert_ne!(first, command_id("msg_01m78vwxx4eh69a0g459dnsd32"));
+        assert_ne!(first, command_id(id, 1), "a retry is a command of its own");
+        assert_eq!(command_id(id, 1), command_id(id, 1));
+        assert_ne!(first, command_id("msg_01m78vwxx4eh69a0g459dnsd32", 0));
         let hex: String = first.chars().filter(|c| *c != '-').collect();
         assert_eq!(first.len(), 36);
         assert_eq!(&hex[12..13], "7", "version 7: {first}");
@@ -1360,7 +1427,7 @@ mod tests {
         assert_eq!(Some(millis), typeid_millis(id));
         assert!(millis > 1_790_000_000_000 && millis < 1_800_000_000_000);
         // A recovery note for that message shares its time, not its id.
-        let note = command_id(&format!("recovery_{id}_1"));
+        let note = command_id(&format!("recovery_{id}_1"), 0);
         assert_eq!(&note.replace('-', "")[0..12], &hex[0..12]);
         assert_ne!(note, first);
     }
@@ -1383,12 +1450,13 @@ mod tests {
     }
 
     fn sending(state: &mut State, id: &str, seq: i64) {
-        let command = command_id(id);
+        let command = command_id(id, 0);
         state.commands.insert(command.clone(), id.to_string());
         state.inputs.insert(
             id.to_string(),
             Input {
                 seq,
+                attempt: 0,
                 command,
                 stage: Stage::Sending,
             },
@@ -1400,15 +1468,21 @@ mod tests {
     }
 
     fn rejection(code: i64, reason: Option<&str>) -> Value {
-        let mut error = json!({"code": code, "message": "refused"});
+        let mut error = json!({"code": code, "message": "refused message m1 of 9000 bytes"});
         if let Some(reason) = reason {
             error["data"] = json!({"commandId": "c", "reason": reason});
         }
         error
     }
 
+    fn marked(mut error: Value, kind: &str, retryable: bool) -> Value {
+        error["data"]["kind"] = json!(kind);
+        error["data"]["retryable"] = json!(retryable);
+        error
+    }
+
     fn user_message(id: &str, turn: &str) -> Value {
-        json!({"item": {"kind": "userMessage", "turnId": turn, "commandId": command_id(id),
+        json!({"item": {"kind": "userMessage", "turnId": turn, "commandId": command_id(id, 0),
             "text": format!("anyagents-message:{id}\nhello")}})
     }
 
@@ -1441,7 +1515,7 @@ mod tests {
         assert_eq!(state.settled("steer"), None, "admitted is not proved");
         // The vendor carries the steer into a successor named after its
         // command, whose item settles it.
-        let successor = command_id("steer");
+        let successor = command_id("steer", 0);
         on_turn_started(&mut state, &json!({"turnId": successor}));
         on_item(&mut state, &user_message("steer", &successor));
         assert_eq!(
@@ -1463,7 +1537,7 @@ mod tests {
     fn the_session_record_settles_what_an_earlier_process_wrote() {
         let mut record = Record::default();
         let note = |id: &str, kind: &str| {
-            json!({"kind": kind, "turnId": "t1", "commandId": command_id(id),
+            json!({"kind": kind, "turnId": "t1", "commandId": command_id(id, 0),
                 "text": format!("anyagents-message:{id}\nhello")})
         };
         record.take(&note("consumed", "userMessage"));
@@ -1498,6 +1572,11 @@ mod tests {
             held: HashSet::from(["held-conflict".to_string()]),
             ..State::default()
         };
+        let busy = marked(
+            rejection(COMMAND_REJECTED, Some("runtime_busy")),
+            "commandRejected",
+            true,
+        );
         let cases = [
             (
                 "conflict",
@@ -1507,16 +1586,35 @@ mod tests {
                 "held-conflict",
                 rejection(COMMAND_REJECTED, Some("command_id_conflict")),
             ),
+            ("busy", busy.clone()),
             (
-                "recorded",
-                rejection(COMMAND_REJECTED, Some("runtime_busy")),
+                "policy",
+                marked(
+                    rejection(COMMAND_REJECTED, Some("policy_rejected")),
+                    "commandRejected",
+                    false,
+                ),
             ),
             ("bare", rejection(COMMAND_REJECTED, None)),
-            ("too-large", rejection(INPUT_TOO_LARGE, None)),
+            (
+                "too-large",
+                marked(rejection(INPUT_TOO_LARGE, None), "inputTooLarge", false),
+            ),
             ("invalid", rejection(INVALID_PARAMS, None)),
+            (
+                "invalid-retryable",
+                marked(rejection(INVALID_PARAMS, None), "invalidParams", true),
+            ),
+            (
+                "final",
+                marked(rejection(-32010, None), "capabilityRequired", false),
+            ),
             ("queue-full", rejection(-32031, None)),
             ("overloaded", rejection(-32001, None)),
-            ("interrupted", rejection(-32013, None)),
+            (
+                "interrupted",
+                marked(rejection(INTERRUPTED, None), "interrupted", false),
+            ),
             ("unloaded", rejection(SESSION_NOT_LOADED, None)),
         ];
         for (seq, (id, error)) in cases.iter().enumerate() {
@@ -1530,26 +1628,58 @@ mod tests {
         assert_eq!(stage(&state, "conflict"), Stage::Admitted { turn: None });
         assert_eq!(state.settled("conflict"), None);
         assert_eq!(stage(&state, "held-conflict"), Stage::Duplicate);
-        for id in ["recorded", "bare", "too-large", "invalid"] {
-            assert!(
-                matches!(state.settled(id), Some(DeliverOutcome::Rejected { .. })),
-                "{id}: {:?}",
-                stage(&state, id)
+        // A retryable refusal is recorded against its id: the next write is
+        // the next attempt's id, at the next boundary.
+        assert_eq!(stage(&state, "busy"), Stage::Retry { boundary: 7 });
+        assert_eq!(state.inputs["busy"].attempt, 1);
+        assert_eq!(state.inputs["busy"].command, command_id("busy", 1));
+        assert_eq!(state.commands[&command_id("busy", 1)], "busy");
+        // A second refusal of that id moves on again.
+        state.inputs.get_mut("busy").unwrap().stage = Stage::Sending;
+        on_answer(&mut state, "busy", &Value::Null, &busy);
+        assert_eq!(state.inputs["busy"].command, command_id("busy", 2));
+        // A retryable refusal before admission goes again under its own id.
+        assert_eq!(
+            stage(&state, "invalid-retryable"),
+            Stage::Retry { boundary: 7 }
+        );
+        assert_eq!(
+            state.inputs["invalid-retryable"].command,
+            command_id("invalid-retryable", 0)
+        );
+        // Refused for good, with a reason free of the message's own detail.
+        for (id, reason) in [
+            (
+                "policy",
+                "muse refused the message: -32030 commandRejected policy_rejected",
+            ),
+            ("bare", "muse refused the message: -32030"),
+            (
+                "too-large",
+                "muse refused the message: -32002 inputTooLarge",
+            ),
+            ("invalid", "muse refused the message: -32602"),
+            (
+                "final",
+                "muse refused the message: -32010 capabilityRequired",
+            ),
+        ] {
+            assert_eq!(
+                state.settled(id),
+                Some(DeliverOutcome::Rejected {
+                    reason: reason.into()
+                }),
+                "{id}"
             );
         }
-        assert_eq!(
-            state.settled("too-large"),
-            Some(DeliverOutcome::Rejected {
-                reason: "-32002 refused".into()
-            })
-        );
         for id in ["queue-full", "overloaded", "interrupted"] {
             assert_eq!(stage(&state, id), Stage::Retry { boundary: 7 }, "{id}");
+            assert_eq!(state.inputs[id].attempt, 0, "{id}");
         }
         assert!(matches!(stage(&state, "unloaded"), Stage::Fault(_)));
         // A proof never overturns a refusal for good.
-        on_item(&mut state, &user_message("recorded", "t1"));
-        assert!(matches!(stage(&state, "recorded"), Stage::Rejected(_)));
+        on_item(&mut state, &user_message("policy", "t1"));
+        assert!(matches!(stage(&state, "policy"), Stage::Rejected(_)));
     }
 
     #[test]
@@ -1559,7 +1689,7 @@ mod tests {
             sending(&mut state, id, seq);
         }
         let started = |command: &str| json!({"turnId": command, "commandId": command});
-        let prompt = command_id("prompt");
+        let prompt = command_id("prompt", 0);
         on_turn_started(&mut state, &started(&prompt));
         on_item(
             &mut state,
@@ -1581,7 +1711,7 @@ mod tests {
         assert!(state.busy(), "the carried steer is still the vendor's");
         assert_eq!(state.served.len(), 1);
         // The successor named after the steer's command proves it.
-        let successor = command_id("steer");
+        let successor = command_id("steer", 0);
         on_turn_started(&mut state, &started(&successor));
         on_item(
             &mut state,
@@ -1603,6 +1733,6 @@ mod tests {
                 boundary: state.boundary
             }
         );
-        assert_eq!(state.inputs["next"].command, command_id("next"));
+        assert_eq!(state.inputs["next"].command, command_id("next", 0));
     }
 }

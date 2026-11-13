@@ -12,7 +12,9 @@
 //!   process admitted.
 //! - A command id reused with another payload is refused `-32030` with
 //!   reason `command_id_conflict`; any other `-32030` is recorded against
-//!   the id, and the same id answers it again.
+//!   the id, and the same id answers it again. Its `data.retryable` says
+//!   whether a retry (under another id) can succeed: `runtime_busy`, a turn
+//!   command refused at its deadline, can.
 //! - `-32031` (the command-admission queue is full) is refused before
 //!   admission and records nothing.
 //! - A resume without `excludeItems: true` serves the session's items as its
@@ -24,10 +26,13 @@
 //!   as soon as it starts), `early_complete` (as `finish`, with
 //!   `turn/completed` before `turn/started` and the answer), `quota` (every
 //!   `turn/start` is answered 429), `refuse_steer` (the first steer into a
-//!   running turn is refused, -32031), `interrupt_once` (the first
+//!   running turn is refused, -32031), `busy_steer` (the first steer into a
+//!   running turn is refused -32030 `runtime_busy`, retryable, recorded),
+//!   `interrupt_once` (the first
 //!   `turn/start` is answered -32013 and not applied), `unloaded` (every
 //!   `turn/start` is answered -32024), `too_large` (-32002), `invalid_params`
-//!   (-32602), `rejected` (-32030 `runtime_busy`, recorded).
+//!   (-32602), `rejected` (-32030 `policy_rejected`, not retryable,
+//!   recorded).
 //! - `ANYAGENTS_FAKE_MUSE_HISTORY=paged`: a resume serves no history, as when
 //!   it is over the budget; `view/page` serves it.
 //! - `ANYAGENTS_FAKE_MUSE_DIR` holds the session's durable state (command
@@ -303,7 +308,7 @@ impl Fake {
         if self.mode == "rejected" {
             let error = json!({"code": -32030, "message": "command rejected",
                 "data": {"kind": "commandRejected", "commandId": command,
-                    "reason": "runtime_busy"}});
+                    "reason": "policy_rejected", "retryable": false}});
             self.record(&command, &fingerprint, json!({"error": error}));
             self.emit(&json!({"jsonrpc": "2.0", "id": id, "error": error}));
             return;
@@ -311,6 +316,17 @@ impl Fake {
         if let Some(turn) = self.running.clone()
             && params["ifBusy"] == "steer"
         {
+            if self.mode == "busy_steer" && !self.refused {
+                // Refused at the turn command's deadline: recorded against
+                // the id, and a retry under another id can succeed.
+                self.refused = true;
+                let error = json!({"code": -32030, "message": "the runtime is busy",
+                    "data": {"kind": "commandRejected", "commandId": command,
+                        "reason": "runtime_busy", "retryable": true}});
+                self.record(&command, &fingerprint, json!({"error": error}));
+                self.emit(&json!({"jsonrpc": "2.0", "id": id, "error": error}));
+                return;
+            }
             if self.mode == "refuse_steer" && !self.refused {
                 // Refused before admission: nothing is recorded.
                 self.refused = true;
