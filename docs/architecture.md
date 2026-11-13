@@ -496,9 +496,20 @@ require an authenticated server rather than an offline database fallback.
 
 ## Usage and cost
 
-After each turn the adapter reads the usage the vendor tool reports and the server writes one usage record: agent, harness, model, input, output, cache-read and cache-write tokens, the cost the vendor reported (if it reports one), an estimated list-price cost from a versioned price table, the billing mode (subscription or API key), and any quota state the vendor reported. The `usage` API aggregates by agent, harness, model and day. Records are also exported as OpenTelemetry metrics using the [GenAI semantic conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/) when an endpoint is configured.
+After each turn the adapter reads the usage the vendor tool reports and the server writes one usage record: agent, harness, model, input, output, cache-read and cache-write tokens, the cost the vendor reported (if it reports one), the billing mode (subscription or API key), and any quota state the vendor reported. The record also has an estimated list-price cost field, which stays empty: there is no price table. The `usage` API aggregates by agent, harness, model and day.
 
-A subscription harness often reports tokens but no price; its record says `subscription` and shows the list-price estimate separately, never as money spent.
+Claude Code and Muse report a cost with each turn; Spiron and AGY report tokens only. A cost on a `subscription` record is the vendor's figure for the turn, never money spent.
+
+## Outcomes
+
+[ADR 0008](adr/0008-quality-loop.md) records what work achieved beside what it cost. An `outcomes` row is a fact from a source the measured agent does not control:
+
+- a PR watch's `merged`, `closed` or `review_failed` transition, stored for the watch's owner before the wake that reports it (and on first sight while an earlier wake is unread);
+- a verdict (`accepted`, `rework`, `rejected` or `abandoned`) that an ancestor, a root admin or the operator records through `agents` `verdict`, `POST /v1/agents/{name}/verdict` or `anyagents verdict`. An agent never records one on its own work.
+
+Each row keeps the harness, model, role and profile the agent ran with. `skill_reads` records every file an agent reads through the `skills` tool, with the SHA-256 of its bytes.
+
+`GET /v1/outcomes` (also `agents` `outcomes` and `anyagents outcomes`) groups outcomes by harness and model, harness, role, profile, agent or skill, within the usage caller boundary. A shared pull request counts once, for the agent that watched it first. A terminal verdict supersedes pull request evidence. The cost of an outcome is the agent's usage since its previous one. Cost per success is shown only when every attributed turn reported a cost, and usage no outcome covers is reported as `unattributed`.
 
 ## Security model
 
