@@ -10,12 +10,13 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::Sender;
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, Weak};
 
 use rusqlite::{Connection, TransactionBehavior};
 
 use super::{
-    BUSY_TIMEOUT, MAX_IDLE_READERS, ReadConn, WAL_SIZE_LIMIT_BYTES, WRITE_RETRY_BUDGET,
+    BUSY_TIMEOUT, MAX_IDLE_READERS, ReadConn, WAL_SIZE_LIMIT_BYTES, WRITE_RETRY_BUDGET, Wake,
     data_dir_for, ensure_lexical_fts_backfilled, is_transient_lock_error,
     is_transient_sqlite_error, legacy_last_error, open_reader, preserve_legacy_scopes, runtime,
     tune_connection,
@@ -29,7 +30,9 @@ pub(super) struct Shared {
     /// database, which no second connection can reach.
     path: PathBuf,
     writer: Mutex<Connection>,
-    readers: Mutex<Vec<Connection>>,
+    readers: Arc<Mutex<Vec<Connection>>>,
+    /// In-process wake subscribers shared across every handle on this file.
+    wakes: Mutex<Vec<Sender<Wake>>>,
     /// Total time a bounded write may keep retrying transient lock errors.
     pub(super) write_retry_budget_ms: AtomicU64,
     /// The writer connection's configured busy timeout.
@@ -37,6 +40,21 @@ pub(super) struct Shared {
     /// A legacy repair was deferred because another process held the write
     /// lock; the next open on this path retries it.
     repairs_pending: AtomicBool,
+}
+
+/// Borrow a pooled reader for `path` only if this process already holds the
+/// store open; never opens a writer, runs migrations, or creates a file.
+pub(super) fn reader_if_open(path: &Path) -> Option<ReadConn<'static>> {
+    if path.as_os_str().is_empty() {
+        return None;
+    }
+    let key = canonical(path).ok()?;
+    let slot = {
+        let open = lock(&OPEN);
+        open.get(&key).cloned()
+    }?;
+    let shared = { lock(&slot).upgrade() }?;
+    shared.reader()
 }
 
 /// The shared state for `path`, opened (and migrated) on first use in this
@@ -132,7 +150,8 @@ impl Shared {
         Ok(Self {
             path: path.to_path_buf(),
             writer: Mutex::new(conn),
-            readers: Mutex::new(Vec::new()),
+            readers: Arc::new(Mutex::new(Vec::new())),
+            wakes: Mutex::new(Vec::new()),
             write_retry_budget_ms: AtomicU64::new(WRITE_RETRY_BUDGET.as_millis() as u64),
             busy_timeout_ms: AtomicU64::new(BUSY_TIMEOUT.as_millis() as u64),
             repairs_pending: AtomicBool::new(!complete),
@@ -156,12 +175,16 @@ impl Shared {
         Ok(())
     }
 
+    pub(super) fn wakes(&self) -> &Mutex<Vec<Sender<Wake>>> {
+        &self.wakes
+    }
+
     pub(super) fn writer(&self) -> MutexGuard<'_, Connection> {
         lock(&self.writer)
     }
 
     /// A pooled read-only connection, or `None` when none can be opened.
-    pub(super) fn reader(&self) -> Option<ReadConn<'_>> {
+    pub(super) fn reader(&self) -> Option<ReadConn<'static>> {
         if self.path.as_os_str().is_empty() {
             return None;
         }
@@ -169,7 +192,7 @@ impl Shared {
         let conn = idle.or_else(|| open_reader(&self.path))?;
         Some(ReadConn::Pooled {
             conn: Some(conn),
-            pool: &self.readers,
+            pool: Arc::clone(&self.readers),
         })
     }
 
@@ -554,6 +577,32 @@ mod tests {
         assert_eq!(store.agent(&agent.id).unwrap().harness, "spiron");
         let _settled = Store::open(&db).unwrap();
         assert_eq!(passes(), before + 1);
+    }
+
+    #[test]
+    fn reader_open_failure_preserves_authoritative_state() {
+        let dir = crate::test_tempdir();
+        let path = dir.path().join("state.db");
+        let store = Store::open(&path).unwrap();
+        let agent = store
+            .create_agent(NewAgent::new("reader-fallback", "test"))
+            .unwrap();
+        lock(&store.shared.readers).clear();
+        let moved = dir.path().join("moved.db");
+        std::fs::rename(&path, &moved).unwrap();
+        assert!(store.shared.reader().is_none());
+        let reader = store.read_conn();
+        assert!(matches!(&reader, ReadConn::Guard(_)));
+        let name: String = reader
+            .query_row(
+                "SELECT name FROM agents WHERE id = ?1",
+                [agent.id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(name, "reader-fallback");
+        drop(reader);
+        std::fs::rename(&moved, &path).unwrap();
     }
 
     #[test]

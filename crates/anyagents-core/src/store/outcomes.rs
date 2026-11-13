@@ -8,7 +8,7 @@
 //! policy can change without rewriting history.
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
 
 use super::{Store, agent_by_id, agent_exists};
@@ -281,9 +281,8 @@ impl Store {
             .map(str::trim)
             .filter(|profile| !profile.is_empty());
         let id = format!("out_{}", uuid::Uuid::now_v7().simple());
-        self.write_with_retry(|conn| {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let agent = agent_by_id(&tx, &new.agent_id)?;
+        self.write_tx(|tx| {
+            let agent = agent_by_id(tx, &new.agent_id)?;
             let inserted = tx.execute(
                 "INSERT INTO outcomes (id, agent_id, kind, source, subject, dedupe_key, actor,
                                        harness, model, role, profile, note, claimed_at_ms,
@@ -318,7 +317,6 @@ impl Store {
                 }
             }
             .ok_or_else(|| Error::Message("a newer binary recorded this outcome".to_string()))?;
-            tx.commit()?;
             Ok((stored, inserted))
         })
     }
@@ -352,15 +350,13 @@ impl Store {
             ));
         }
         let at = now_ms();
-        self.write_with_retry(|conn| {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            agent_exists(&tx, agent_id)?;
+        self.write_tx(|tx| {
+            agent_exists(tx, agent_id)?;
             tx.execute(
                 "INSERT INTO skill_reads (agent_id, skill, file, sha256, read_at_ms)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![agent_id.as_str(), skill, file, sha256, at],
             )?;
-            tx.commit()?;
             Ok(())
         })
     }
@@ -1010,6 +1006,78 @@ mod tests {
                 .record_skill_read(&unknown, "prove-it", "SKILL.md", &sha)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn failed_outcome_write_rolls_back_and_leaves_the_writer_usable() {
+        let (_dir, store) = open();
+        let worker = agent(&store, "worker", "test-harness", "test-model");
+        let t = worker.created_at_ms;
+        let fact = pull(&worker, 7, OutcomeKind::PrMerged, t, t + 1);
+        let mut unknown = fact.clone();
+        unknown.agent_id = AgentId::generate();
+        assert!(store.record_outcome(unknown).is_err());
+        store
+            .conn()
+            .execute_batch(
+                "CREATE TRIGGER fail_outcome AFTER INSERT ON outcomes
+             BEGIN SELECT RAISE(FAIL, 'injected outcome failure'); END;",
+            )
+            .unwrap();
+        // FAIL retains the statement's earlier insert unless write_tx rolls
+        // back the enclosing transaction after the body returns an error.
+        let error = store.record_outcome(fact.clone()).unwrap_err();
+        assert!(error.to_string().contains("injected outcome failure"));
+        let count: i64 = store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM outcomes", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+        store
+            .conn()
+            .execute_batch("DROP TRIGGER fail_outcome")
+            .unwrap();
+        let (stored, inserted) = store.record_outcome(fact.clone()).unwrap();
+        assert!(inserted);
+        assert_eq!(store.record_outcome(fact).unwrap(), (stored, false));
+    }
+
+    #[test]
+    fn failed_skill_read_rolls_back_and_leaves_the_writer_usable() {
+        let (_dir, store) = open();
+        let worker = agent(&store, "worker", "test-harness", "test-model");
+        let sha = "a".repeat(64);
+        store
+            .record_skill_read(&worker.id, "test-skill", "SKILL.md", &sha)
+            .unwrap();
+        store
+            .conn()
+            .execute_batch(
+                "CREATE TRIGGER fail_skill_read AFTER INSERT ON skill_reads
+             BEGIN SELECT RAISE(FAIL, 'injected skill read failure'); END;",
+            )
+            .unwrap();
+        let error = store
+            .record_skill_read(&worker.id, "test-skill", "references/a.md", &sha)
+            .unwrap_err();
+        assert!(error.to_string().contains("injected skill read failure"));
+        let count: i64 = store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM skill_reads", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+        store
+            .conn()
+            .execute_batch("DROP TRIGGER fail_skill_read")
+            .unwrap();
+        store
+            .record_skill_read(&worker.id, "test-skill", "references/a.md", &sha)
+            .unwrap();
+        let count: i64 = store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM skill_reads", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
     }
 
     #[test]

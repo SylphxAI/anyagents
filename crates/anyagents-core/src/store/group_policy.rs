@@ -3,7 +3,7 @@
 
 use std::collections::HashSet;
 
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use super::{Agent, AgentId, Error, Store, agent_by_id, agent_exists, now_ms};
 
@@ -51,14 +51,13 @@ impl Store {
         names: &[&str],
         targets: &[AgentId],
     ) -> Result<(), Error> {
-        let mut conn = self.conn();
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let caller = caller(&tx, actor)?;
-        for name in names {
-            apply(&tx, caller.as_ref(), name, GroupAction::Join, targets, None)?;
-        }
-        tx.commit()?;
-        Ok(())
+        self.write_tx(|tx| {
+            let caller = caller(tx, actor)?;
+            for name in names {
+                apply(tx, caller.as_ref(), name, GroupAction::Join, targets, None)?;
+            }
+            Ok(())
+        })
     }
 
     pub fn group_action_as(
@@ -69,12 +68,10 @@ impl Store {
         targets: &[AgentId],
         public: Option<bool>,
     ) -> Result<(), Error> {
-        let mut conn = self.conn();
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let caller = caller(&tx, actor)?;
-        apply(&tx, caller.as_ref(), name, action, targets, public)?;
-        tx.commit()?;
-        Ok(())
+        self.write_tx(|tx| {
+            let caller = caller(tx, actor)?;
+            apply(tx, caller.as_ref(), name, action, targets, public)
+        })
     }
 }
 

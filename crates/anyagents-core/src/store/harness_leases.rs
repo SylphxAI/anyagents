@@ -4,7 +4,7 @@
 
 use std::collections::BTreeSet;
 
-use rusqlite::{OptionalExtension, TransactionBehavior, params};
+use rusqlite::{OptionalExtension, params};
 
 use super::runtime::ProcessIdentity;
 use super::{AgentId, Error, Store, agent_exists, now_ms};
@@ -50,9 +50,8 @@ impl Store {
                 "a harness lease needs a harness and a version".into(),
             ));
         }
-        self.write_with_retry(|conn| {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            agent_exists(&tx, agent_id)?;
+        self.write_tx(|tx| {
+            agent_exists(tx, agent_id)?;
             tx.execute(
                 &format!(
                     "INSERT INTO harness_leases ({COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
@@ -78,7 +77,6 @@ impl Store {
                 )
                 .optional()?
                 .ok_or_else(|| Error::Message("harness lease vanished".into()))?;
-            tx.commit()?;
             Ok(lease)
         })
     }
@@ -91,8 +89,8 @@ impl Store {
         harness: &str,
         holder: &ProcessIdentity,
     ) -> Result<bool, Error> {
-        self.write_with_retry(|conn| {
-            Ok(conn.execute(
+        self.write_tx(|tx| {
+            Ok(tx.execute(
                 "DELETE FROM harness_leases WHERE agent_id = ?1 AND harness = ?2
                  AND holder_pid = ?3 AND holder_start_time = ?4",
                 params![agent_id.as_str(), harness, holder.pid, holder.start_time],
@@ -126,8 +124,7 @@ impl Store {
         &self,
         is_alive: impl Fn(&ProcessIdentity) -> bool,
     ) -> Result<usize, Error> {
-        self.write_with_retry(|conn| {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        self.write_tx(|tx| {
             let leases: Vec<HarnessLease> = {
                 let mut stmt = tx.prepare(&format!("SELECT {COLS} FROM harness_leases"))?;
                 let rows = stmt.query_map([], lease_from_row)?;
@@ -146,7 +143,6 @@ impl Store {
                     ],
                 )?;
             }
-            tx.commit()?;
             Ok(dropped)
         })
     }

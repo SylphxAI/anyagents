@@ -1226,3 +1226,105 @@ fn migration_from_the_previous_schema_keeps_every_row() {
         1
     );
 }
+
+#[test]
+fn end_turn_outlasts_transient_lock_and_surfaces_on_budget_exhaustion() {
+    let (dir, store, agent) = setup();
+    let db = dir.path().join("state.db");
+    let generation = go_live(&store, &agent);
+    let first = receive(&store, &agent, "turn-1");
+    store.note_delivered(&agent.id, first.seq).unwrap();
+    let turn1 = store.begin_turn(&agent.id, generation, first.seq).unwrap();
+
+    store
+        .set_lock_wait(Duration::from_millis(20), Duration::from_secs(10))
+        .unwrap();
+    let hold = |duration| {
+        let lock_conn = rusqlite::Connection::open(&db).unwrap();
+        lock_conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        std::thread::spawn(move || {
+            std::thread::sleep(duration);
+            lock_conn.execute_batch("COMMIT").unwrap();
+        })
+    };
+
+    let peer = hold(Duration::from_millis(250));
+    let closed = store
+        .end_turn(&agent.id, &turn1.turn_id, TurnOutcome::Completed)
+        .expect("end_turn should outlast transient lock within retry budget");
+    peer.join().unwrap();
+    assert_eq!(
+        (closed.state, closed.outcome),
+        (TurnState::Closed, Some(TurnOutcome::Completed))
+    );
+    assert_eq!(
+        store.agent_runtime(&agent.id).unwrap().unwrap().state,
+        RuntimeState::Live
+    );
+
+    let second = receive(&store, &agent, "turn-2");
+    store.note_delivered(&agent.id, second.seq).unwrap();
+    let turn2 = store.begin_turn(&agent.id, generation, second.seq).unwrap();
+    store
+        .set_lock_wait(Duration::from_millis(10), Duration::from_millis(120))
+        .unwrap();
+
+    let started = std::time::Instant::now();
+    let peer = hold(Duration::from_secs(2));
+    let err = store
+        .end_turn(&agent.id, &turn2.turn_id, TurnOutcome::Completed)
+        .expect_err("exhausted retry budget must surface lock error");
+    let elapsed = started.elapsed();
+    peer.join().unwrap();
+
+    assert!(err.is_transient_lock_error(), "unexpected error: {err}");
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "budget bounded the wait: {elapsed:?}"
+    );
+    assert_eq!(
+        store.agent_runtime(&agent.id).unwrap().unwrap().state,
+        RuntimeState::Live
+    );
+    assert_eq!(
+        store
+            .unfinished_turn(&agent.id)
+            .unwrap()
+            .map(|t| (t.turn_id, t.state)),
+        Some((turn2.turn_id, TurnState::Open))
+    );
+}
+
+#[test]
+fn write_transaction_rolls_back_without_replaying_failed_body() {
+    let (_dir, store, agent) = setup();
+    let calls = std::cell::Cell::new(0);
+    let result: Result<(), Error> = store.write_tx(|tx| {
+        calls.set(calls.get() + 1);
+        tx.execute(
+            "UPDATE agents SET description = 'rolled back' WHERE id = ?1",
+            [agent.id.as_str()],
+        )?;
+        Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            None,
+        )
+        .into())
+    });
+    assert!(result.unwrap_err().is_transient_lock_error());
+    assert_eq!(calls.get(), 1);
+    assert_eq!(store.agent(&agent.id).unwrap().description, None);
+    store
+        .write_tx(|tx| {
+            tx.execute(
+                "UPDATE agents SET description = 'committed' WHERE id = ?1",
+                [agent.id.as_str()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        store.agent(&agent.id).unwrap().description.as_deref(),
+        Some("committed")
+    );
+}
