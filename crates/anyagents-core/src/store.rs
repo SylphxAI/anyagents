@@ -782,7 +782,8 @@ fn open_reader(path: &Path) -> Option<Connection> {
     Some(conn)
 }
 
-enum ReadConn<'a> {
+/// A pooled read-only connection (or, when none can be opened, the writer).
+pub(crate) enum ReadConn<'a> {
     /// A reader borrowed from the pool; returned on drop.
     Pooled {
         conn: Option<Connection>,
@@ -1056,7 +1057,7 @@ impl Store {
 
     /// A receipt one named send already produced, or `None`.
     pub fn send_receipt(&self, id: &str) -> Result<Option<String>, Error> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         Ok(conn
             .query_row("SELECT receipt FROM sends WHERE id = ?1", [id], |row| {
                 row.get(0)
@@ -1072,7 +1073,7 @@ impl Store {
         agent_id: &AgentId,
         key: &str,
     ) -> Result<Option<Message>, Error> {
-        message_by_source(&self.conn(), agent_id, key)
+        message_by_source(&self.read_conn(), agent_id, key)
     }
 
     /// Keep one named send's receipt after it was delivered.
@@ -1106,12 +1107,13 @@ impl Store {
     /// Whether a capability was ever minted on this deployment. Once one has
     /// been, the deployment has an identity boundary.
     pub fn ever_authenticated(&self) -> bool {
-        let conn = self.conn();
-        conn.query_row("SELECT COUNT(*) FROM agent_capabilities", [], |row| {
-            row.get::<_, i64>(0)
-        })
-        .map(|count| count > 0)
-        .unwrap_or(false)
+        self.read_conn()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM agent_capabilities)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(false)
     }
 
     /// Replace an agent's instance: its generation moves, so every capability
@@ -1918,7 +1920,7 @@ impl Store {
 
     /// Whether a named virtual group is `public` (`true`) or `private` (`false`, default).
     pub fn is_group_public(&self, name: &str) -> bool {
-        let conn = self.conn();
+        let conn = self.read_conn();
         conn.query_row("SELECT public FROM groups WHERE name = ?1", [name], |r| {
             Ok(r.get::<_, i64>(0)? != 0)
         })
@@ -1927,34 +1929,20 @@ impl Store {
 
     /// The agents in a named group, by name. An unknown group is empty.
     pub fn group_members(&self, name: &str) -> Result<Vec<String>, Error> {
-        let conn = self.conn();
-        let mut stmt = conn.prepare(
-            "SELECT a.name FROM group_agents AS g JOIN agents AS a ON a.id = g.agent_id
-             WHERE g.group_name = ?1 ORDER BY a.name",
-        )?;
-        let mut rows = stmt.query([name])?;
-        let mut members = Vec::new();
-        while let Some(row) = rows.next()? {
-            members.push(row.get(0)?);
-        }
-        Ok(members)
+        group_members_on(&self.read_conn(), name)
     }
 
     /// Every named group and its current members, ordered by group name.
     pub fn list_groups(&self) -> Result<Vec<(String, Vec<String>)>, Error> {
+        let conn = self.read_conn();
         let names: Vec<String> = {
-            let conn = self.conn();
             let mut stmt = conn.prepare("SELECT name FROM groups ORDER BY name")?;
-            let mut rows = stmt.query([])?;
-            let mut out = Vec::new();
-            while let Some(row) = rows.next()? {
-                out.push(row.get(0)?);
-            }
-            out
+            stmt.query_map([], |row| row.get(0))?
+                .collect::<Result<_, _>>()?
         };
         let mut groups = Vec::with_capacity(names.len());
         for name in names {
-            let members = self.group_members(&name)?;
+            let members = group_members_on(&conn, &name)?;
             groups.push((name, members));
         }
         Ok(groups)
@@ -2854,7 +2842,7 @@ impl Store {
 
     /// Messages with `seq > since`, in sequence order. `None` starts at the beginning.
     pub fn inbox(&self, agent_id: &AgentId, since: Option<i64>) -> Result<Vec<Message>, Error> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         agent_by_id(&conn, agent_id)?;
         let delivered = cursor(&conn, agent_id)?;
         let mut stmt = conn.prepare(&format!(
@@ -3056,7 +3044,7 @@ impl Store {
         &self,
         agent_id: &AgentId,
     ) -> Result<TurnOwnershipSnapshot, Error> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let last_in: Option<(i64, i64, Option<String>, Option<String>)> = conn
             .query_row(
                 "SELECT seq, delivered_at_ms, sender, source_key
@@ -3095,7 +3083,7 @@ impl Store {
         agent_id: &AgentId,
         source_key: &str,
     ) -> Result<bool, Error> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let exists: i64 = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM messages WHERE agent_id = ?1 AND source_key = ?2)",
             params![agent_id.as_str(), source_key],
@@ -4297,12 +4285,17 @@ impl Store {
     /// The next message the harness has not taken, or `None` when delivery has
     /// caught up.
     pub fn next_undelivered(&self, agent_id: &AgentId) -> Result<Option<Message>, Error> {
-        let delivered = self.delivered_cursor(agent_id)?;
+        let conn = self.read_conn();
+        // One snapshot: a line committed between reading the cursor and the
+        // last sequence must not look like a hole in the mailbox.
+        let snapshot = conn.unchecked_transaction()?;
+        agent_by_id(&snapshot, agent_id)?;
+        let delivered = cursor(&snapshot, agent_id)?;
         let next = delivered + 1;
-        if let Some(message) = self.message_at(agent_id, next)? {
+        if let Some(message) = message_at_on(&snapshot, agent_id, next, delivered)? {
             return Ok(Some(message));
         }
-        let received = self.received_cursor(agent_id)?;
+        let received = last_seq(&snapshot, agent_id)?;
         if received > delivered {
             return Err(Error::Message(format!(
                 "mailbox sequence has a hole at {next}"
@@ -4315,7 +4308,7 @@ impl Store {
     /// agent (`event != "reaction_passive"`). Passive group reactions remain in
     /// the mailbox and are delivered on the agent's next active turn.
     pub fn has_actionable_undelivered(&self, agent_id: &AgentId) -> Result<bool, Error> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         agent_by_id(&conn, agent_id)?;
         let delivered = cursor(&conn, agent_id)?;
         // Server-side filter (same predicate as the roster query): the
@@ -4335,14 +4328,9 @@ impl Store {
     }
 
     pub fn received_cursor(&self, agent_id: &AgentId) -> Result<i64, Error> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         agent_by_id(&conn, agent_id)?;
-        let seq: i64 = conn.query_row(
-            "SELECT MAX(0, COALESCE(MAX(seq), 0)) FROM messages WHERE agent_id = ?1",
-            [agent_id.as_str()],
-            |row| row.get(0),
-        )?;
-        Ok(seq)
+        last_seq(&conn, agent_id)
     }
 
     /// The one delivery cursor: the last sequence the harness took.
@@ -4760,7 +4748,7 @@ impl Store {
     }
 
     pub fn message(&self, agent_id: &AgentId, id: &str) -> Result<Option<Message>, Error> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         agent_by_id(&conn, agent_id)?;
         let found = conn
             .query_row(
@@ -4833,7 +4821,7 @@ impl Store {
     }
 
     pub fn list_usage(&self, agent_id: Option<&AgentId>) -> Result<Vec<UsageRecord>, Error> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let sql = match agent_id {
             Some(id) => {
                 agent_by_id(&conn, id)?;
@@ -4859,18 +4847,6 @@ impl Store {
             records.push(usage_from_row(row)?);
         }
         Ok(records)
-    }
-
-    fn message_at(&self, agent_id: &AgentId, seq: i64) -> Result<Option<Message>, Error> {
-        let conn = self.conn();
-        let found = conn
-            .query_row(
-                &format!("SELECT {MESSAGE_COLS} FROM messages WHERE agent_id = ?1 AND seq = ?2"),
-                params![agent_id.as_str(), seq],
-                |row| Ok(message_from_row(&conn, row)),
-            )
-            .optional()?;
-        found.transpose()
     }
 
     fn age_at(&self, agent_id: &AgentId, seq: i64, now_ms: i64) -> Result<Option<i64>, Error> {
@@ -4899,7 +4875,7 @@ impl Store {
     /// A read-only connection from the shared pool. Each statement outside an
     /// explicit transaction reads the latest commit, including this process's
     /// own writes. Falls back to the writer only when no reader can be opened.
-    fn read_conn(&self) -> ReadConn<'_> {
+    pub(crate) fn read_conn(&self) -> ReadConn<'_> {
         self.shared
             .reader()
             .unwrap_or_else(|| ReadConn::Guard(self.conn()))
@@ -5023,7 +4999,7 @@ impl Store {
     }
 
     pub fn get_schedule(&self, id: &str) -> Result<Option<AgentSchedule>, Error> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         conn.query_row(
             "SELECT id, agent_id, kind, spec, prompt, interval_ms, next_fire_at_ms,
                     last_fired_at_ms, watch_baseline, last_observed, state, created_at_ms
@@ -5182,11 +5158,11 @@ impl Store {
         watch_baseline: Option<&str>,
         last_observed: Option<&str>,
     ) -> Result<(), Error> {
-        // Coalesce unchanged observations: the 1s schedule tick would
-        // otherwise write a WAL frame per watch per second even when both
-        // fields already hold those values.
-        let conn = self.conn();
-        let cur: Option<(Option<String>, Option<String>)> = conn
+        // Coalesce unchanged observations: a schedule pass would otherwise
+        // write a WAL frame per watch even when both fields already hold
+        // those values. The reader decides; only a change takes the writer.
+        let cur: Option<(Option<String>, Option<String>)> = self
+            .read_conn()
             .query_row(
                 "SELECT watch_baseline, last_observed FROM agent_schedules WHERE id = ?1 AND state = 'active'",
                 [id],
@@ -5208,7 +5184,7 @@ impl Store {
         if new_baseline == cur_baseline && new_observed == cur_observed {
             return Ok(());
         }
-        conn.execute(
+        self.conn().execute(
             "UPDATE agent_schedules
              SET watch_baseline = COALESCE(?2, watch_baseline),
                  last_observed = COALESCE(?3, last_observed)
@@ -7834,6 +7810,43 @@ fn next_seq(conn: &Connection, agent_id: &AgentId) -> Result<i64, Error> {
     Ok(seq)
 }
 
+/// The highest sequence in the agent's mailbox, or 0 when it is empty.
+fn last_seq(conn: &Connection, agent_id: &AgentId) -> Result<i64, Error> {
+    Ok(conn.query_row(
+        "SELECT MAX(0, COALESCE(MAX(seq), 0)) FROM messages WHERE agent_id = ?1",
+        [agent_id.as_str()],
+        |row| row.get(0),
+    )?)
+}
+
+/// The mailbox line at `seq`, acknowledged against the `delivered` cursor.
+fn message_at_on(
+    conn: &Connection,
+    agent_id: &AgentId,
+    seq: i64,
+    delivered: i64,
+) -> Result<Option<Message>, Error> {
+    let found = conn
+        .query_row(
+            &format!("SELECT {MESSAGE_COLS} FROM messages WHERE agent_id = ?1 AND seq = ?2"),
+            params![agent_id.as_str(), seq],
+            |row| Ok(message_from_row_with_cursor(row, delivered)),
+        )
+        .optional()?;
+    found.transpose()
+}
+
+fn group_members_on(conn: &Connection, name: &str) -> Result<Vec<String>, Error> {
+    let mut stmt = conn.prepare(
+        "SELECT a.name FROM group_agents AS g JOIN agents AS a ON a.id = g.agent_id
+         WHERE g.group_name = ?1 ORDER BY a.name",
+    )?;
+    let members = stmt
+        .query_map([name], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    Ok(members)
+}
+
 fn cursor(conn: &Connection, agent_id: &AgentId) -> Result<i64, Error> {
     let found = conn
         .query_row(
@@ -9397,6 +9410,24 @@ mod tests {
                 [hidden.id.as_str()],
             )
             .unwrap();
+        let mut keyed = Incoming::new("keyed line");
+        keyed.source_key = Some("src:read".into());
+        let ReceiveOutcome::New(line) = store.receive(&own.id, keyed).unwrap() else {
+            panic!("a new line");
+        };
+        store.record_send_receipt("send-1", "receipt").unwrap();
+        store.join_group("readers", &own.id).unwrap();
+        let watch = store
+            .create_schedule(NewSchedule {
+                agent_id: own.id.clone(),
+                kind: "watch".into(),
+                spec: "file:/tmp/never".into(),
+                prompt: "check".into(),
+                interval_ms: None,
+                next_fire_at_ms: None,
+                watch_baseline: Some("base".into()),
+            })
+            .unwrap();
         std::thread::scope(|scope| {
             let mut writer = store.conn();
             let tx = writer
@@ -9430,6 +9461,29 @@ mod tests {
                     store.lag(id, now_ms())?;
                     store.has_open_turn(id)?;
                     store.open_turn(id)?;
+                    assert_eq!(store.send_receipt("send-1")?.as_deref(), Some("receipt"));
+                    assert!(store.message_by_source_key(id, "src:read")?.is_some());
+                    assert!(store.has_message_source_key(id, "src:read")?);
+                    assert!(store.ever_authenticated());
+                    assert!(!store.is_group_public("readers"));
+                    assert_eq!(store.group_members("readers")?, ["reader"]);
+                    assert_eq!(store.list_groups()?.len(), 1);
+                    store.group("readers")?;
+                    store.check_group_joins(&GroupActor::Agent(id.clone()), &["readers"])?;
+                    assert_eq!(store.inbox(id, None)?.len(), 1);
+                    store.turn_ownership_snapshot(id)?;
+                    assert!(store.has_actionable_undelivered(id)?);
+                    assert_eq!(store.received_cursor(id)?, 1);
+                    assert_eq!(store.delivered_cursor(id)?, 0);
+                    assert_eq!(
+                        store.next_undelivered(id)?.map(|m| m.id),
+                        Some(line.id.clone())
+                    );
+                    assert!(store.message(id, line.id.as_str())?.is_some());
+                    store.list_usage(Some(id))?;
+                    assert!(store.get_schedule(&watch.id)?.is_some());
+                    // An unchanged observation is decided without the writer.
+                    store.update_schedule_watch_observation(&watch.id, Some("base"), None)?;
                     // No legacy chunks at all, then only invisible legacy chunks:
                     // neither case may acquire the writer mutex or transaction.
                     store.backfill_full_mailbox_history(Some(&[]))?;

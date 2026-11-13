@@ -29,13 +29,13 @@ pub enum GroupAction {
 
 impl Store {
     pub fn group(&self, name: &str) -> Result<Option<Group>, Error> {
-        group(&self.conn(), name)
+        group(&self.read_conn(), name)
     }
 
     /// Preflight agent creation before creating its runtime. The actual join
     /// rechecks current authority in its write transaction.
     pub fn check_group_joins(&self, actor: &GroupActor, names: &[&str]) -> Result<(), Error> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let caller = caller(&conn, actor)?;
         for name in names {
             validate_name(name)?;
