@@ -578,13 +578,15 @@ always verify their own SHA; explicit whole-event readback verifies the event SH
 
 This is deliberately not an append-only proof: a same-size edit **outside** the
 boundary may remain missing/stale in the index until full verification. The daemon
-maintenance loop fully rebuilds at most **one due source per 60-second tick**, with
-sources due **one hour after their last full verification**. Backlog, a continuously
+maintenance loop fully rebuilds at most **one due source every 15 minutes** (every
+15th 60-second tick), with sources due **one hour after their last full verification**. Backlog, a continuously
 changing source or failures can extend that detection delay; no fixed one-hour
 upper bound is promised. Failed sources rotate behind other due sources without
 publishing a new frontier. A stale returned window is refused immediately by its
-SHA check. Full verification uses the same lifecycle locks and pending-redaction
-path exclusions as query refresh; it never edits the source. This maintenance is
+SHA check. Full verification uses the same pending-redaction path exclusions as
+query refresh and takes the owner's lifecycle lock only when it is free: a busy
+owner is skipped, keeps its place in the rotation, and the maintenance worker never
+waits for it. It never edits the source. This maintenance is
 host-driven, not an LLM schedule. Native transcript writers remain active in PR1;
 the host raw append port is not activated by this index.
 

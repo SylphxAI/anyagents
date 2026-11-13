@@ -215,6 +215,38 @@ impl HostIndex {
         Ok((old_required_time, already_initialized))
     }
 
+    /// `host_calls.document_id` references `host_documents(id) ON DELETE
+    /// CASCADE`. Without an index on the child column, SQLite enforces the
+    /// cascade by scanning the whole `host_calls` table once per deleted
+    /// document: tens of megabytes per document on a large index, gigabytes
+    /// for one cleared source, all under the index's write lock and the
+    /// owner's lifecycle lock. Files created before this index get it on
+    /// their next open; a peer holding the write lock defers it to a later one.
+    fn ensure_call_document_index(conn: &Connection) -> Result<(), IndexError> {
+        let present: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='host_calls_document')",
+            [],
+            |r| r.get(0),
+        )?;
+        if present {
+            return Ok(());
+        }
+        match conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS host_calls_document ON host_calls(document_id);",
+        ) {
+            Ok(()) => Ok(()),
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if matches!(
+                    error.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                ) =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
     pub fn open(path: &Path) -> Result<Self, IndexError> {
         #[cfg(test)]
         OPENS.with(|n| n.set(n.get() + 1));
@@ -246,6 +278,7 @@ impl HostIndex {
         // those projections rather than presenting guessed historical times.
         let (_, already_initialized) = Self::schema_state(&conn)?;
         if already_initialized {
+            Self::ensure_call_document_index(&conn)?;
             return Ok(Self { conn });
         }
         // Serialize first-time schema creation and disposable-schema upgrades so
@@ -282,6 +315,7 @@ impl HostIndex {
                 agent_id TEXT NOT NULL, segment TEXT NOT NULL, call_id TEXT NOT NULL,
                 tool_name TEXT NOT NULL, document_id TEXT NOT NULL REFERENCES host_documents(id) ON DELETE CASCADE,
                 PRIMARY KEY(agent_id,segment,call_id));
+            CREATE INDEX IF NOT EXISTS host_calls_document ON host_calls(document_id);
             CREATE TABLE IF NOT EXISTS host_sources (
                 agent_id TEXT NOT NULL, segment TEXT NOT NULL, cursor TEXT NOT NULL,
                 PRIMARY KEY(agent_id,segment));
@@ -1282,6 +1316,52 @@ mod tests {
             std::fs::read(&raw).unwrap(),
             b"{\"content\":\"authoritative history\"}\n"
         );
+    }
+
+    /// Deleting a document cascades into `host_calls`; that lookup must use an
+    /// index, also on an index built before the index existed, or every
+    /// deleted document scans the whole table.
+    #[test]
+    fn deleting_a_document_finds_its_calls_by_index_on_old_and_new_files() {
+        let dir = crate::test_tempdir();
+        let path = dir.path().join("index.db");
+        let plan = |conn: &Connection| -> String {
+            conn.query_row(
+                "EXPLAIN QUERY PLAN SELECT 1 FROM host_calls WHERE document_id = 'x'",
+                [],
+                |r| r.get::<_, String>(3),
+            )
+            .unwrap()
+        };
+        let fresh = HostIndex::open(&path).unwrap();
+        assert!(plan(&fresh.conn).contains("host_calls_document"));
+        fresh
+            .conn
+            .execute_batch("DROP INDEX host_calls_document")
+            .unwrap();
+        assert!(plan(&fresh.conn).starts_with("SCAN host_calls"));
+        drop(fresh);
+        let upgraded = HostIndex::open(&path).unwrap();
+        assert!(plan(&upgraded.conn).contains("host_calls_document"));
+        // The cascade still removes a deleted document's calls.
+        let segment = RawSegment::open(&dir.path().join("events.raw")).unwrap();
+        let raw = segment.append(b"callneedle").unwrap();
+        let mut upgraded = upgraded;
+        upgraded
+            .index("doc", &metadata("a", MemoryScope::Transcripts, 1), &raw)
+            .unwrap();
+        upgraded
+            .save_call("a", &raw.segment, "call-1", "shell", "doc")
+            .unwrap();
+        upgraded
+            .conn
+            .execute("DELETE FROM host_documents WHERE id = 'doc'", [])
+            .unwrap();
+        let calls: i64 = upgraded
+            .conn
+            .query_row("SELECT COUNT(*) FROM host_calls", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(calls, 0);
     }
 
     #[test]
