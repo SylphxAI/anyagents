@@ -4,9 +4,7 @@ use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyagents_harness::{
-    Context, DeliverOutcome, DeliveryMode, Harness, OutboundMessage, SteerSupport,
-};
+use anyagents_harness::{Context, DeliverOutcome, DeliveryLevel, Harness, OutboundMessage};
 use anyagents_harness_agy::AgyHarness;
 use tempfile::TempDir;
 
@@ -61,8 +59,7 @@ fn a_result_records_usage_and_a_second_deliver_is_not_written() {
     assert_eq!(usage.output_tokens, 7);
     assert_eq!(usage.reported_cost_micros, None);
     assert_eq!(harness.session_id().as_deref(), Some("sess-from-vendor"));
-    assert_eq!(harness.health().delivery_mode, DeliveryMode::Followup);
-    assert_eq!(harness.health().steer_support, SteerSupport::Unproven);
+    assert_eq!(harness.health().delivery.level, DeliveryLevel::TurnEnd);
     harness.deliver(&msg("m1")).unwrap();
     assert_eq!(harness.written_ids(), vec!["m1".to_string()]);
 }

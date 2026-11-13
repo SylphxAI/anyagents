@@ -4,8 +4,8 @@
 use std::collections::HashSet;
 
 use crate::{
-    DeliverOutcome, DeliveryMode, Harness, HarnessError, HarnessHealth, OutboundMessage,
-    SteerSupport, TurnState,
+    DeliverOutcome, Delivery, DeliveryLevel, DeliveryMode, Harness, HarnessError, HarnessHealth,
+    OutboundMessage, TurnState,
 };
 
 #[derive(Clone, Debug)]
@@ -207,10 +207,14 @@ impl Harness for FakeHarness {
             } else {
                 TurnState::InTurn
             },
-            delivery_mode: self.mode,
-            steer_support: match self.mode {
-                DeliveryMode::Steer => SteerSupport::Yes,
-                DeliveryMode::Followup | DeliveryMode::Queue => SteerSupport::No,
+            delivery: Delivery {
+                level: match self.mode {
+                    DeliveryMode::Steer => DeliveryLevel::MidTurn,
+                    DeliveryMode::Followup | DeliveryMode::Queue => DeliveryLevel::TurnEnd,
+                },
+                idempotent: false,
+                proof: "scripted double",
+                peer: None,
             },
             quota_reset_at_ms: self.quota_reset_at_ms,
             sign_in_fault: None,

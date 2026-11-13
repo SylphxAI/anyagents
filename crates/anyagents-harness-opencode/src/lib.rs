@@ -27,8 +27,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use anyagents_harness::{
-    DeliverOutcome, DeliveryMode, Harness, HarnessError, HarnessHealth, OutboundMessage,
-    SteerSupport, TurnState, TurnUsage, compose_message,
+    DeliverOutcome, Delivery, DeliveryLevel, Harness, HarnessError, HarnessHealth, OutboundMessage,
+    TurnState, TurnUsage, compose_message,
 };
 use serde_json::{Value, json};
 
@@ -43,6 +43,15 @@ const START_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long the adapter waits for the started service's API to answer.
 const READY_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// What this adapter guarantees for mail that reaches a busy agent
+/// (`docs/delivery.md`).
+pub const DELIVERY: Delivery = Delivery {
+    level: DeliveryLevel::MidTurn,
+    idempotent: false,
+    proof: "prompt API answered",
+    peer: None,
+};
 
 /// One long-lived OpenCode service and the session it serves.
 pub struct OpenCodeHarness {
@@ -908,8 +917,7 @@ impl Harness for OpenCodeHarness {
             } else {
                 TurnState::Idle
             },
-            delivery_mode: DeliveryMode::Steer,
-            steer_support: SteerSupport::Yes,
+            delivery: DELIVERY,
             quota_reset_at_ms: state.quota_reset_at_ms,
             sign_in_fault: None,
         }

@@ -17,9 +17,7 @@ use anyagents_agent::{DeliveryLoop, RunOutcome};
 use anyagents_core::{
     Agent, AgentId, BillingMode, NewUsage, Store, Wake, agent_config_dir, agent_work_dir, utc_day,
 };
-use anyagents_harness::{
-    DeliverOutcome, DeliveryMode, Harness, HarnessHealth, SteerSupport, TurnState, TurnUsage,
-};
+use anyagents_harness::{DeliverOutcome, Delivery, Harness, HarnessHealth, TurnState, TurnUsage};
 
 /// Maximum drain window (ms) to let an active turn finish naturally after a
 /// harness or model switch is requested. While draining, new mailbox
@@ -268,8 +266,9 @@ const IDLE_SAFETY_NET_MS: i64 = 60_000;
 pub struct LiveState {
     pub process_alive: bool,
     pub turn_state: TurnState,
-    pub delivery_mode: DeliveryMode,
-    pub steer_support: SteerSupport,
+    /// What the agent's harness process guarantees for mail, as it announced
+    /// itself. `None` while no process has been started.
+    pub delivery: Option<Delivery>,
     pub quota_reset_at_ms: Option<i64>,
     pub restart_at_ms: Option<i64>,
     pub pid: Option<u32>,
@@ -309,30 +308,6 @@ impl HealthBoard {
 /// turn and answers with a `result`, so a line written mid-turn waits for that
 /// turn to end. AGY's stream input also starts a turn per line; its hook helpers
 /// have no wired, confirmed consumption acknowledgement.
-pub fn declared(harness: &str) -> (DeliveryMode, SteerSupport) {
-    match anyagents_harness::normalize_harness_name(harness) {
-        "codex" | "claude-code" | "opencode" | "muse" | "agy" | "omp" | "dsh" | "grok"
-        | "spiron" => (DeliveryMode::Steer, SteerSupport::Yes),
-        _ => (DeliveryMode::Followup, SteerSupport::Unproven),
-    }
-}
-
-pub fn mode_name(mode: DeliveryMode) -> &'static str {
-    match mode {
-        DeliveryMode::Steer => "steer",
-        DeliveryMode::Followup => "followup",
-        DeliveryMode::Queue => "queue",
-    }
-}
-
-pub fn steer_name(steer: SteerSupport) -> &'static str {
-    match steer {
-        SteerSupport::Yes => "yes",
-        SteerSupport::No => "no",
-        SteerSupport::Unproven => "unproven",
-    }
-}
-
 struct Slot {
     stop: Arc<AtomicBool>,
     woken: Arc<AtomicBool>,
@@ -635,15 +610,13 @@ fn stop_slot<H: Harness + 'static>(inner: &Arc<Inner<H>>, id: &AgentId) {
             None
         }
     };
-    if let Ok(agent) = inner.store.agent(id) {
-        let (mode, steer) = declared(&agent.harness);
+    if inner.store.agent(id).is_ok() {
         inner.board.publish(
             id,
             LiveState {
                 process_alive: false,
                 turn_state: TurnState::Idle,
-                delivery_mode: mode,
-                steer_support: steer,
+                delivery: None,
                 quota_reset_at_ms: None,
                 restart_at_ms: None,
                 pid: None,
@@ -1108,8 +1081,7 @@ impl<H: Harness + 'static> Session<H> {
                     } else {
                         TurnState::Idle
                     },
-                    delivery_mode: health.delivery_mode,
-                    steer_support: health.steer_support,
+                    delivery: Some(health.delivery),
                     quota_reset_at_ms: health.quota_reset_at_ms,
                     restart_at_ms: if health.process_alive {
                         None
@@ -1138,22 +1110,18 @@ impl<H: Harness + 'static> Session<H> {
                         .or_else(|| self.last_error.clone()),
                 }
             }
-            None => {
-                let (mode, steer) = declared(&self.agent.harness);
-                LiveState {
-                    process_alive: false,
-                    turn_state: TurnState::Idle,
-                    delivery_mode: mode,
-                    steer_support: steer,
-                    quota_reset_at_ms: None,
-                    restart_at_ms: self.restart_at,
-                    pid: None,
-                    live_harness: None,
-                    live_model: None,
-                    process_started_at_ms: None,
-                    last_error: self.last_error.clone(),
-                }
-            }
+            None => LiveState {
+                process_alive: false,
+                turn_state: TurnState::Idle,
+                delivery: None,
+                quota_reset_at_ms: None,
+                restart_at_ms: self.restart_at,
+                pid: None,
+                live_harness: None,
+                live_model: None,
+                process_started_at_ms: None,
+                last_error: self.last_error.clone(),
+            },
         };
         self.inner.board.publish(&self.id, state);
     }
@@ -2276,36 +2244,8 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn declared_catalog_matches_native_steer_adapters() {
-        for harness in [
-            "codex",
-            "claude-code",
-            "opencode",
-            "muse",
-            "agy",
-            "omp",
-            "dsh",
-            "grok",
-            "spiron",
-            "sylphx",
-            "sylphx-agent",
-            "sylphx_agent",
-            "sylphx/default",
-        ] {
-            assert_eq!(
-                super::declared(harness),
-                (super::DeliveryMode::Steer, super::SteerSupport::Yes),
-                "{harness}"
-            );
-        }
-        assert_eq!(
-            super::declared("contract"),
-            (super::DeliveryMode::Followup, super::SteerSupport::Unproven)
-        );
-    }
-
     use super::*;
+    use anyagents_harness::DeliveryMode;
 
     #[test]
     fn legacy_admin_files_do_not_disable_spiron_supervision() {
@@ -2734,7 +2674,7 @@ mod tests {
 #[cfg(test)]
 mod persistence_tests {
     use super::*;
-    use anyagents_harness::{FakeHarness, HarnessError, OutboundMessage};
+    use anyagents_harness::{DeliveryMode, FakeHarness, HarnessError, OutboundMessage};
     use rusqlite::Connection;
 
     struct UsageHarness {

@@ -3,9 +3,7 @@
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyagents_harness::{
-    Context, DeliverOutcome, DeliveryMode, Harness, OutboundMessage, SteerSupport,
-};
+use anyagents_harness::{Context, DeliverOutcome, DeliveryLevel, Harness, OutboundMessage};
 use anyagents_harness_muse::MuseHarness;
 use tempfile::TempDir;
 
@@ -40,8 +38,7 @@ fn a_completed_turn_records_usage_and_dedupes() {
     let dir = TempDir::new().unwrap();
     let mut harness = start(&dir, "finish", None);
     assert_eq!(harness.session_id().as_deref(), Some("sess-from-vendor"));
-    assert_eq!(harness.health().delivery_mode, DeliveryMode::Steer);
-    assert_eq!(harness.health().steer_support, SteerSupport::Yes);
+    assert_eq!(harness.health().delivery.level, DeliveryLevel::MidTurn);
     harness.deliver(&msg("m1")).unwrap();
     assert!(harness.wait_finished("m1", Duration::from_secs(5)));
     // The vendor's own turn reports its tokens, and the harness offers the last

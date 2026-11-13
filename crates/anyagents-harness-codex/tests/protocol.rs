@@ -4,8 +4,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyagents_harness::{
-    Context, DeliverOutcome, DeliveryMode, Harness, HarnessError, OutboundMessage, SteerSupport,
-    TurnState,
+    Context, DeliverOutcome, DeliveryLevel, Harness, HarnessError, OutboundMessage, TurnState,
 };
 use anyagents_harness_codex::CodexHarness;
 use tempfile::TempDir;
@@ -55,8 +54,7 @@ fn finish_records_usage_and_dedupes() {
     assert_eq!(usage.reported_cost_micros, None);
     assert_eq!(harness.session_id().as_deref(), Some("thread-1"));
     let health = harness.health();
-    assert_eq!(health.delivery_mode, DeliveryMode::Steer);
-    assert_eq!(health.steer_support, SteerSupport::Yes);
+    assert_eq!(health.delivery.level, DeliveryLevel::MidTurn);
     let log = read_log(&log_path(&dir));
     assert_eq!(log.matches("\"method\":\"turn/start\"").count(), 1);
     assert!(log.contains("\"clientUserMessageId\":\"m1\""));

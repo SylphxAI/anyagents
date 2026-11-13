@@ -37,8 +37,7 @@ struct AgentView {
     harness: String,
     state: String,
     process: String,
-    delivery_mode: String,
-    steer_support: String,
+    delivery: serde_json::Value,
 }
 
 #[derive(Deserialize)]
@@ -437,9 +436,13 @@ async fn mcp_tools_use_the_server_socket() {
         .expect("alpha");
     assert_eq!(alpha_row.harness, "claude-code");
     assert_eq!(alpha_row.state, "running");
-    // Claude Code takes a user line mid-turn, so the catalog steers.
-    assert_eq!(alpha_row.delivery_mode, "steer");
-    assert_eq!(alpha_row.steer_support, "yes");
+    // The level the Claude Code adapter holds before a process announced itself.
+    assert_eq!(alpha_row.delivery["level"], "mid-turn");
+    assert!(
+        alpha_row.delivery["proof"]
+            .as_str()
+            .is_some_and(|p| !p.is_empty())
+    );
     assert!(alpha_row.process == "alive" || alpha_row.process == "down");
 
     let listed_cli = bin()

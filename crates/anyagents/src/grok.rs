@@ -12,8 +12,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use anyagents_harness::{
-    DeliverOutcome, DeliveryMode, Harness, HarnessError, HarnessHealth, OutboundMessage,
-    SteerSupport, TurnState, TurnUsage, compose_message, marked_message, message_id_in_text,
+    DeliverOutcome, Delivery, DeliveryLevel, Harness, HarnessError, HarnessHealth, OutboundMessage,
+    TurnState, TurnUsage, compose_message, marked_message, message_id_in_text,
 };
 use anyagents_harness_stream::{NotificationEffect, RpcChild, RpcFail, RpcLaunch};
 use serde_json::{Value, json};
@@ -25,6 +25,15 @@ fn rpc_wait() -> Duration {
         Duration::from_secs(60)
     }
 }
+
+/// What this adapter guarantees for mail that reaches a busy agent
+/// (`docs/delivery.md`).
+pub const DELIVERY: Delivery = Delivery {
+    level: DeliveryLevel::MidTurn,
+    idempotent: false,
+    proof: "session/prompt line written",
+    peer: None,
+};
 
 pub struct GrokHarness {
     rpc: RpcChild,
@@ -287,8 +296,7 @@ impl Harness for GrokHarness {
             } else {
                 TurnState::InTurn
             },
-            delivery_mode: DeliveryMode::Steer,
-            steer_support: SteerSupport::Yes,
+            delivery: DELIVERY,
             quota_reset_at_ms: st.quota_reset_at_ms,
             sign_in_fault: None,
         }

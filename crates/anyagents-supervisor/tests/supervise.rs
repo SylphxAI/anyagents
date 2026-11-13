@@ -1249,8 +1249,12 @@ impl Default for SwitchProbe {
             health: anyagents_harness::HarnessHealth {
                 process_alive: true,
                 turn_state: anyagents_harness::TurnState::Idle,
-                delivery_mode: DeliveryMode::Steer,
-                steer_support: anyagents_harness::SteerSupport::Yes,
+                delivery: anyagents_harness::Delivery {
+                    level: anyagents_harness::DeliveryLevel::MidTurn,
+                    idempotent: false,
+                    proof: "scripted double",
+                    peer: None,
+                },
                 quota_reset_at_ms: None,
                 sign_in_fault: None,
             },

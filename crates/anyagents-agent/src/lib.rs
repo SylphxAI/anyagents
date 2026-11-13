@@ -6,7 +6,7 @@
 use anyagents_core::{AgentId, Message, Store};
 use anyagents_harness::{DeliverOutcome, Harness, HarnessError, OutboundMessage};
 
-pub use anyagents_harness::{DeliveryMode, SteerSupport, TurnState};
+pub use anyagents_harness::{Delivery, DeliveryLevel, DeliveryMode, TurnState};
 
 /// Why one step of the loop stopped.
 #[derive(Debug, thiserror::Error)]
@@ -45,8 +45,7 @@ pub enum RunOutcome {
 pub struct AgentHealth {
     pub process_alive: bool,
     pub turn_state: TurnState,
-    pub delivery_mode: DeliveryMode,
-    pub steer_support: SteerSupport,
+    pub delivery: Delivery,
     pub quota_reset_at_ms: Option<i64>,
     pub sign_in_fault: Option<String>,
     pub oldest_undelivered_age_ms: Option<i64>,
@@ -213,8 +212,7 @@ impl<H: Harness> DeliveryLoop<H> {
         Ok(AgentHealth {
             process_alive: harness.process_alive,
             turn_state: harness.turn_state,
-            delivery_mode: harness.delivery_mode,
-            steer_support: harness.steer_support,
+            delivery: harness.delivery,
             quota_reset_at_ms: harness.quota_reset_at_ms.or(self.quota_reset_at_ms),
             sign_in_fault: harness.sign_in_fault,
             oldest_undelivered_age_ms: lag.oldest_undelivered_age_ms,
@@ -566,8 +564,12 @@ mod tests {
             anyagents_harness::HarnessHealth {
                 process_alive: true,
                 turn_state: TurnState::InTurn,
-                delivery_mode: DeliveryMode::Steer,
-                steer_support: SteerSupport::Yes,
+                delivery: Delivery {
+                    level: DeliveryLevel::NextStep,
+                    idempotent: true,
+                    proof: "scripted proof",
+                    peer: None,
+                },
                 quota_reset_at_ms: None,
                 sign_in_fault: None,
             }

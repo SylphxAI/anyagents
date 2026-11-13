@@ -16,8 +16,8 @@ use std::time::{Duration, Instant};
 
 use anyagents_core::{AgentId, Incoming, NewAgent, Store};
 use anyagents_harness::{
-    DeliverOutcome, DeliveryMode, Harness, HarnessError, HarnessHealth, OutboundMessage,
-    SteerSupport, TurnState,
+    DeliverOutcome, Delivery, DeliveryLevel, Harness, HarnessError, HarnessHealth, OutboundMessage,
+    TurnState,
 };
 use anyagents_supervisor::{Clock, LaunchRequest, Supervisor, SystemClock};
 
@@ -81,8 +81,12 @@ impl Harness for IdleHarness {
         HarnessHealth {
             process_alive: true,
             turn_state: TurnState::Idle,
-            delivery_mode: DeliveryMode::Followup,
-            steer_support: SteerSupport::No,
+            delivery: Delivery {
+                level: DeliveryLevel::TurnEnd,
+                idempotent: false,
+                proof: "scripted double",
+                peer: None,
+            },
             quota_reset_at_ms: None,
             sign_in_fault: None,
         }

@@ -168,6 +168,26 @@ impl VendorHarness {
     }
 }
 
+/// What the adapter for `harness` guarantees for mail that reaches a busy
+/// agent, before a process has announced itself (`docs/delivery.md`). A live
+/// process reports its own, from its handshake.
+pub(crate) fn declared_delivery(harness: &str) -> anyagents_harness::Delivery {
+    match anyagents_harness::normalize_harness_name(harness) {
+        "codex" => anyagents_harness_codex::DELIVERY,
+        "opencode" => anyagents_harness_opencode::DELIVERY,
+        "agy" => anyagents_harness_agy::DELIVERY,
+        "muse" => anyagents_harness_muse::DELIVERY,
+        "omp" => anyagents_harness_omp::DELIVERY,
+        "dsh" => crate::dsh::DELIVERY,
+        "grok" => crate::grok::DELIVERY,
+        "spiron" => anyagents_harness_stream::SPIRON,
+        name if name == "claude-code" || is_cloud_harness(name) => {
+            anyagents_harness_claude::DELIVERY
+        }
+        _ => anyagents_harness_stream::LINE_PER_TURN,
+    }
+}
+
 /// A harness driven by a program named in the agent's config, which must obey
 /// the adapter contract in `docs/architecture.md`: one JSON line on stdin per
 /// message, and a `result` line on stdout when its turn ends. An agent's own
@@ -210,7 +230,7 @@ impl ContractHarness {
                 work_dir: work_dir.map(Path::to_path_buf),
                 session_id: None,
                 mode: anyagents_harness::DeliveryMode::Followup,
-                steer: anyagents_harness::SteerSupport::Unproven,
+                delivery: anyagents_harness_stream::LINE_PER_TURN,
             })?,
         })
     }
@@ -1725,7 +1745,7 @@ fn start_spiron(
         work_dir: Some(work_dir.to_path_buf()),
         session_id: session.map(str::to_string),
         mode: anyagents_harness::DeliveryMode::Steer,
-        steer: anyagents_harness::SteerSupport::Yes,
+        delivery: anyagents_harness_stream::SPIRON,
     })
     .map_err(|err| err.to_string())?;
     harness.set_state_dir(config_dir);
@@ -3034,7 +3054,7 @@ done
             work_dir: None,
             session_id: Some("vendor-1".into()),
             mode: anyagents_harness::DeliveryMode::Steer,
-            steer: anyagents_harness::SteerSupport::Yes,
+            delivery: anyagents_harness_stream::LINE_INTO_TURN,
         })
         .unwrap();
         let pointer = config.join("spiron-session-id");

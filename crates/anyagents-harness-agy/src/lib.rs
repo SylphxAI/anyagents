@@ -8,11 +8,21 @@
 use std::path::{Path, PathBuf};
 
 use anyagents_harness::{
-    DeliverOutcome, DeliveryMode, Harness, HarnessError, HarnessHealth, SteerSupport, TurnUsage,
+    DeliverOutcome, Delivery, DeliveryLevel, DeliveryMode, Harness, HarnessError, HarnessHealth,
+    TurnUsage,
 };
 pub use anyagents_harness_stream::detect_agy_session_quota_and_error;
 use anyagents_harness_stream::{
     AgyRpcConfig, Launch, StreamHarness, StreamSpec, cancel_line, message_line,
+};
+
+/// What this adapter guarantees for mail that reaches a busy agent
+/// (`docs/delivery.md`).
+pub const DELIVERY: Delivery = Delivery {
+    level: DeliveryLevel::MidTurn,
+    idempotent: false,
+    proof: "SendUserCascadeMessage answered",
+    peer: None,
 };
 
 /// One long-lived Antigravity child.
@@ -52,10 +62,13 @@ impl AgyHarness {
             args.push(spec.resume_flag.to_string());
             args.push(id.to_string());
         }
-        let (mode, steer) = if work_dir.is_some() {
-            (DeliveryMode::Steer, SteerSupport::Yes)
+        let (mode, delivery) = if work_dir.is_some() {
+            (DeliveryMode::Steer, DELIVERY)
         } else {
-            (DeliveryMode::Followup, SteerSupport::Unproven)
+            (
+                DeliveryMode::Followup,
+                anyagents_harness_stream::LINE_PER_TURN,
+            )
         };
         let fake_mode = std::env::var_os("ANYAGENTS_FAKE_MODE").is_some()
             || environment.iter().any(|(k, _)| k == "ANYAGENTS_FAKE_MODE");
@@ -101,7 +114,7 @@ impl AgyHarness {
                 work_dir: work_dir.map(Path::to_path_buf),
                 session_id: session_id.map(str::to_string),
                 mode,
-                steer,
+                delivery,
             },
             agy_rpc,
         )?;

@@ -5,7 +5,6 @@
 use std::path::Path;
 
 use anyagents_core::{Agent, AgentId, Error, Store};
-use anyagents_supervisor::{declared, mode_name, steer_name};
 
 use crate::api::{AgentView, AgentsResponse, GroupActionRequest, GroupView, GroupsResponse};
 use crate::client;
@@ -810,12 +809,12 @@ fn set_state(data: &Path, name: &str, state: &str) -> Result<AgentView, Error> {
         }
     }
     let lag = store.lag(&agent.id, anyagents_core::now_ms())?;
-    let (mode, steer) = declared(&agent.harness);
     let aliases = store.agent_aliases(&agent.id).unwrap_or_default();
     let seat_info = crate::create::resolved_agent_seat_info(&store, &agent);
     let public_desc = agent.public_description();
     let scope_val = agent.scope().to_string();
     let lifecycle_val = agent.lifecycle().to_string();
+    let delivery = (&crate::vendor::declared_delivery(&agent.harness)).into();
     Ok(AgentView {
         has_open_turn: false,
         open_turn_age_ms: None,
@@ -839,8 +838,7 @@ fn set_state(data: &Path, name: &str, state: &str) -> Result<AgentView, Error> {
         state: agent.state,
         process: "-".to_string(),
         turn_state: "idle".to_string(),
-        delivery_mode: mode_name(mode).to_string(),
-        steer_support: steer_name(steer).to_string(),
+        delivery,
         quota_reset_at_ms: None,
         block_reason: None,
         last_error: None,
@@ -960,12 +958,12 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
     let lag = store
         .lag(&agent.id, anyagents_core::now_ms())
         .map_err(|err| err.to_string())?;
-    let (mode, steer) = declared(&agent.harness);
     let aliases = store.agent_aliases(&agent.id).unwrap_or_default();
     let seat_info = crate::create::resolved_agent_seat_info(&store, &agent);
     let public_desc = agent.public_description();
     let scope_val = agent.scope().to_string();
     let lifecycle_val = agent.lifecycle().to_string();
+    let delivery = (&crate::vendor::declared_delivery(&agent.harness)).into();
     Ok(AgentView {
         has_open_turn: false,
         open_turn_age_ms: None,
@@ -989,8 +987,7 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
         state: agent.state,
         process: "-".to_string(),
         turn_state: "idle".to_string(),
-        delivery_mode: mode_name(mode).to_string(),
-        steer_support: steer_name(steer).to_string(),
+        delivery,
         quota_reset_at_ms: None,
         block_reason: None,
         last_error: None,
@@ -1189,8 +1186,7 @@ fn list_filtered(
                     harness: &agent.harness,
                     state: &agent.state,
                     process: &agent.process,
-                    mode: &agent.delivery_mode,
-                    steer: &agent.steer_support,
+                    delivery: agent.delivery.label(),
                     undelivered: agent.oldest_undelivered_age_ms,
                     quota: agent.quota_reset_at_ms,
                 });
@@ -1396,22 +1392,20 @@ struct AgentLine<'a> {
     harness: &'a str,
     state: &'a str,
     process: &'a str,
-    mode: &'a str,
-    steer: &'a str,
+    delivery: String,
     undelivered: Option<i64>,
     quota: Option<i64>,
 }
 
 fn print_agent(agent: AgentLine<'_>) {
     println!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         agent.id,
         agent.name,
         agent.harness,
         agent.state,
         agent.process,
-        agent.mode,
-        agent.steer,
+        agent.delivery,
         show_optional(agent.undelivered),
         show_optional(agent.quota),
     );

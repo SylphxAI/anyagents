@@ -100,7 +100,7 @@ fn pipe_harness(script: &str) -> super::StreamHarness {
         work_dir: None,
         session_id: None,
         mode: anyagents_harness::DeliveryMode::Followup,
-        steer: anyagents_harness::SteerSupport::Unproven,
+        delivery: crate::LINE_PER_TURN,
     })
     .unwrap()
 }
@@ -439,7 +439,7 @@ line3 = sys.stdin.readline()
             work_dir: Some(dir.clone()),
             session_id: None,
             mode: anyagents_harness::DeliveryMode::Steer,
-            steer: anyagents_harness::SteerSupport::Yes,
+            delivery: crate::LINE_INTO_TURN,
         },
         Some(super::AgyRpcConfig {
             config_dir: dir,
@@ -727,7 +727,7 @@ fn immediate_receipt_fixture(
         work_dir: None,
         session_id: None,
         mode: anyagents_harness::DeliveryMode::Steer,
-        steer: anyagents_harness::SteerSupport::Yes,
+        delivery: crate::LINE_INTO_TURN,
     })
     .map_err(|error| error.to_string())?;
     // Cold interpreter/module setup is not the receipt-ordering contract. Wait
@@ -1089,7 +1089,7 @@ fn poisoned_agy_result_retires_the_session_without_acknowledging_the_turn() {
                 work_dir: None,
                 session_id: Some("selected".into()),
                 mode: anyagents_harness::DeliveryMode::Followup,
-                steer: anyagents_harness::SteerSupport::Unproven,
+                delivery: crate::LINE_PER_TURN,
             },
             Some(super::AgyRpcConfig {
                 config_dir: dir.path().into(),
@@ -1183,7 +1183,7 @@ fn synthetic_401_claude_turn_fails_and_stops_stream_without_completing_turn() {
         work_dir: None,
         session_id: Some("sess-1".into()),
         mode: anyagents_harness::DeliveryMode::Steer,
-        steer: anyagents_harness::SteerSupport::Yes,
+        delivery: crate::LINE_INTO_TURN,
     })
     .unwrap();
     let message = anyagents_harness::OutboundMessage {
@@ -1299,7 +1299,7 @@ fn agy_rpc_discovers_running_turn_one_trajectory_and_accepts_steer_before_stdout
             work_dir: Some(dir.path().to_path_buf()),
             session_id: None,
             mode: anyagents_harness::DeliveryMode::Steer,
-            steer: anyagents_harness::SteerSupport::Yes,
+            delivery: crate::LINE_INTO_TURN,
         },
         Some(super::AgyRpcConfig {
             config_dir: dir.path().to_path_buf(),
@@ -1539,7 +1539,7 @@ exec sleep 30"#
         work_dir: None,
         session_id: None,
         mode: anyagents_harness::DeliveryMode::Followup,
-        steer: anyagents_harness::SteerSupport::Unproven,
+        delivery: crate::LINE_PER_TURN,
     })
     .unwrap();
     let wakes = counted_watch(&harness);
@@ -1650,7 +1650,7 @@ exec sleep 30"#
             work_dir: Some(dir.path().to_path_buf()),
             session_id: None,
             mode: anyagents_harness::DeliveryMode::Steer,
-            steer: anyagents_harness::SteerSupport::Yes,
+            delivery: crate::LINE_INTO_TURN,
         },
         Some(super::AgyRpcConfig {
             config_dir: dir.path().to_path_buf(),

@@ -22,8 +22,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use anyagents_harness::{
-    DeliverOutcome, DeliveryMode, Harness, HarnessError, HarnessHealth, OutboundMessage,
-    SteerSupport, TurnState, TurnUsage, message_id_in_text,
+    DeliverOutcome, Delivery, DeliveryLevel, Harness, HarnessError, HarnessHealth, OutboundMessage,
+    TurnState, TurnUsage, message_id_in_text,
 };
 use anyagents_harness_stream::{NotificationEffect, RpcChild, RpcFail, RpcLaunch};
 use serde_json::{Value, json};
@@ -38,6 +38,15 @@ fn rpc_wait() -> Duration {
 }
 /// A cold resume can take much longer than a request.
 const RESUME_WAIT: Duration = Duration::from_secs(180);
+
+/// What this adapter guarantees for mail that reaches a busy agent
+/// (`docs/delivery.md`).
+pub const DELIVERY: Delivery = Delivery {
+    level: DeliveryLevel::MidTurn,
+    idempotent: false,
+    proof: "turn/start ifBusy=steer answered",
+    peer: None,
+};
 
 /// One long-lived Muse `serve` child.
 pub struct MuseHarness {
@@ -493,8 +502,7 @@ impl Harness for MuseHarness {
             } else {
                 TurnState::InTurn
             },
-            delivery_mode: DeliveryMode::Steer,
-            steer_support: SteerSupport::Yes,
+            delivery: DELIVERY,
             quota_reset_at_ms: state.quota_reset_at_ms,
             sign_in_fault: None,
         }

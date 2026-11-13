@@ -21,8 +21,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyagents_harness::{
-    DeliverOutcome, DeliveryMode, FileStamp, HarnessError, HarnessHealth, OutboundMessage,
-    SteerSupport, TurnState, TurnUsage, compose_message, message_id_in_text, spawn_command,
+    DeliverOutcome, Delivery, DeliveryLevel, DeliveryMode, FileStamp, HarnessError, HarnessHealth,
+    OutboundMessage, TurnState, TurnUsage, compose_message, message_id_in_text, spawn_command,
 };
 use serde_json::{Value, json};
 
@@ -222,8 +222,45 @@ pub struct Launch {
     pub work_dir: Option<PathBuf>,
     pub session_id: Option<String>,
     pub mode: DeliveryMode,
-    pub steer: SteerSupport,
+    /// What this child guarantees once it announced itself.
+    pub delivery: Delivery,
 }
+
+/// A child that reads one line per turn: mail for a busy agent waits for the
+/// turn to end.
+pub const LINE_PER_TURN: Delivery = Delivery {
+    level: DeliveryLevel::TurnEnd,
+    idempotent: false,
+    proof: "one input line per turn",
+    peer: None,
+};
+
+/// A child that takes every line into the running turn; the written line is
+/// the only proof.
+pub const LINE_INTO_TURN: Delivery = Delivery {
+    level: DeliveryLevel::MidTurn,
+    idempotent: false,
+    proof: "input line written",
+    peer: None,
+};
+
+/// An older Spiron peer: one steer per turn, held in
+/// `spiron-unconfirmed-steers.json` until its turn's result confirms it.
+const OLDER_SPIRON: Delivery = Delivery {
+    level: DeliveryLevel::MidTurn,
+    idempotent: false,
+    proof: "steer_ack; unconfirmed-steer hold",
+    peer: None,
+};
+
+/// Spiron's headless peer when its `ready` frame names `steer_consumed` and
+/// `idempotent_input`.
+pub const SPIRON: Delivery = Delivery {
+    level: DeliveryLevel::NextStep,
+    idempotent: true,
+    proof: "accepted/steer_consumed receipts; request_id journal",
+    peer: None,
+};
 
 /// Native `LanguageServerService` ConnectRPC configuration for Antigravity (`agy`).
 #[derive(Clone, Debug)]
@@ -242,7 +279,7 @@ pub struct StreamHarness {
     work_dir: Option<PathBuf>,
     agy_rpc: Option<AgyRpcConfig>,
     mode: DeliveryMode,
-    steer: SteerSupport,
+    delivery: Delivery,
     shared: Arc<Mutex<State>>,
     stdin: Arc<Mutex<Option<ChildStdin>>>,
     wake: Arc<Condvar>,
@@ -311,6 +348,8 @@ struct State {
     /// What this process's `ready` frame announced: `None` until it is read,
     /// then whether the peer proves consumption and deduplicates input.
     ready: Option<bool>,
+    /// The protocol and capabilities that frame named.
+    peer: Option<String>,
     /// Inputs written whole into a peer that proves consumption, which it has
     /// neither proved consumed nor refused yet.
     in_flight: HashSet<String>,
@@ -348,7 +387,7 @@ impl StreamHarness {
             work_dir: launch.work_dir,
             agy_rpc,
             mode: launch.mode,
-            steer: launch.steer,
+            delivery: launch.delivery,
             shared: Arc::new(Mutex::new(State::new(launch.session_id.as_deref()))),
             stdin: Arc::new(Mutex::new(None)),
             wake: Arc::new(Condvar::new()),
@@ -381,7 +420,7 @@ impl StreamHarness {
             work_dir: None,
             session_id: session_id.map(str::to_string),
             mode: DeliveryMode::Followup,
-            steer: SteerSupport::Unproven,
+            delivery: LINE_PER_TURN,
         })
     }
 
@@ -718,11 +757,23 @@ impl StreamHarness {
             } else {
                 TurnState::InTurn
             },
-            delivery_mode: self.mode,
-            steer_support: self.steer,
+            delivery: self.delivery_now(&state),
             quota_reset_at_ms: state.quota_reset_at_ms,
             sign_in_fault: state.failure(),
         }
+    }
+
+    /// What this child guarantees as it announced itself. A Spiron peer whose
+    /// `ready` names no consumption proof keeps the older custody rules.
+    fn delivery_now(&self, state: &State) -> Delivery {
+        let delivery = if self.spec.protocol == LineProtocol::AcknowledgedResult
+            && state.ready == Some(false)
+        {
+            OLDER_SPIRON
+        } else {
+            self.delivery.clone()
+        };
+        delivery.with_peer(state.peer.clone())
     }
 
     pub fn clear_quota(&self) {
@@ -1287,6 +1338,7 @@ impl StreamHarness {
             state.usages.clear();
             // What the last process announced and consumed is its own.
             state.ready = None;
+            state.peer = None;
             state.in_flight.clear();
             state.consumed.clear();
             state.duplicates.clear();
@@ -1730,6 +1782,7 @@ impl State {
             text: None,
             finished_quiet: HashSet::new(),
             ready: None,
+            peer: None,
             in_flight: HashSet::new(),
             consumed: HashSet::new(),
             duplicates: HashSet::new(),
@@ -1887,6 +1940,7 @@ fn read_stdout(
                 && state.ready.is_none()
             {
                 state.ready = Some(announces_consumption(&value));
+                state.peer = Some(announced_peer(&value));
             }
             // A peer that proves consumption is read by its own rules; the
             // receipts below are the older peer's.
@@ -2346,6 +2400,24 @@ fn announces_consumption(value: &Value) -> bool {
             .is_some_and(|items| items.iter().any(|item| item.as_str() == Some(capability)))
     };
     named("steer_consumed") && named("idempotent_input")
+}
+
+/// What a `ready` frame says about the peer: its protocol and capabilities.
+fn announced_peer(value: &Value) -> String {
+    let protocol = value
+        .get("protocol")
+        .and_then(Value::as_str)
+        .unwrap_or("unnamed protocol");
+    let capabilities: Vec<&str> = value
+        .get("capabilities")
+        .and_then(Value::as_array)
+        .map(|items| items.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    if capabilities.is_empty() {
+        protocol.to_string()
+    } else {
+        format!("{protocol} [{}]", capabilities.join(", "))
+    }
 }
 
 /// One receipt from a peer that proves consumption. Only an input this

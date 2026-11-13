@@ -15,10 +15,19 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyagents_harness::{
-    DeliverOutcome, DeliveryMode, Harness, HarnessError, HarnessHealth, OutboundMessage,
-    SteerSupport, TurnState, TurnUsage, compose_message, marked_message, spawn_command,
+    DeliverOutcome, Delivery, DeliveryLevel, Harness, HarnessError, HarnessHealth, OutboundMessage,
+    TurnState, TurnUsage, compose_message, marked_message, spawn_command,
 };
 use serde_json::{Value, json};
+
+/// What this adapter guarantees for mail that reaches a busy agent
+/// (`docs/delivery.md`).
+pub const DELIVERY: Delivery = Delivery {
+    level: DeliveryLevel::MidTurn,
+    idempotent: false,
+    proof: "session/prompt answered",
+    peer: None,
+};
 
 pub struct DshHarness {
     environment: Vec<(String, String)>,
@@ -289,8 +298,7 @@ impl Harness for DshHarness {
             } else {
                 TurnState::InTurn
             },
-            delivery_mode: DeliveryMode::Steer,
-            steer_support: SteerSupport::Yes,
+            delivery: DELIVERY,
             quota_reset_at_ms: st.quota_reset_at_ms,
             sign_in_fault: None,
         }

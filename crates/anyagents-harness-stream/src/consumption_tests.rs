@@ -37,7 +37,7 @@ fn fake_spiron(dir: &Path, capable: bool) -> StreamHarness {
         work_dir: None,
         session_id: None,
         mode: anyagents_harness::DeliveryMode::Steer,
-        steer: anyagents_harness::SteerSupport::Yes,
+        delivery: super::SPIRON,
     })
     .unwrap();
     harness.wait_ready(Duration::from_secs(15)).unwrap();
@@ -138,7 +138,7 @@ fn nothing_is_written_before_the_peer_says_what_it_can_do() {
         work_dir: None,
         session_id: None,
         mode: anyagents_harness::DeliveryMode::Steer,
-        steer: anyagents_harness::SteerSupport::Yes,
+        delivery: super::SPIRON,
     })
     .unwrap();
     assert_eq!(deliver(&mut harness, "m1"), Deferred);

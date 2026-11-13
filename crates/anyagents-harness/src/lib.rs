@@ -585,12 +585,55 @@ pub enum DeliveryMode {
     Queue,
 }
 
-/// Whether this harness has shown it can steer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SteerSupport {
-    Yes,
-    No,
-    Unproven,
+/// What a harness guarantees for mail that reaches an agent while its turn
+/// runs, as `docs/delivery.md` defines the levels. Each level keeps every
+/// guarantee of the one before it, and the conformance suite in
+/// `tests/invariants` holds every adapter to the level it reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DeliveryLevel {
+    /// Mail for a busy agent is applied when the running turn ends: it starts
+    /// the next turn.
+    TurnEnd,
+    /// The vendor takes mail into the running turn as it arrives. Its
+    /// acceptance (a written line, an answered request) is the only proof;
+    /// nothing says at which step the turn read it.
+    MidTurn,
+    /// The vendor proves, message by message, that the running turn consumed
+    /// it at its next step, every pending message together in mailbox order.
+    NextStep,
+}
+
+impl DeliveryLevel {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::TurnEnd => "turn-end",
+            Self::MidTurn => "mid-turn",
+            Self::NextStep => "next-step",
+        }
+    }
+}
+
+/// The delivery one harness offers and what it rests on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Delivery {
+    pub level: DeliveryLevel,
+    /// A message an earlier process of the same session already consumed is
+    /// recognised when it is handed over again, and is not applied twice.
+    pub idempotent: bool,
+    /// The vendor signal the level rests on, in a few words.
+    pub proof: &'static str,
+    /// What the running process said about itself in its handshake (vendor,
+    /// version, protocol, capabilities). `None` before a process announced
+    /// itself, and for a vendor whose handshake names nothing.
+    pub peer: Option<String>,
+}
+
+impl Delivery {
+    /// The same delivery, as the running process announced itself.
+    pub fn with_peer(mut self, peer: Option<String>) -> Self {
+        self.peer = peer;
+        self
+    }
 }
 
 /// Whether a turn is open.
@@ -605,8 +648,7 @@ pub enum TurnState {
 pub struct HarnessHealth {
     pub process_alive: bool,
     pub turn_state: TurnState,
-    pub delivery_mode: DeliveryMode,
-    pub steer_support: SteerSupport,
+    pub delivery: Delivery,
     pub quota_reset_at_ms: Option<i64>,
     pub sign_in_fault: Option<String>,
 }

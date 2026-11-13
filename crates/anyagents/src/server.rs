@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use anyagents_core::{Address, Agent, Error, Incoming, ReceiveOutcome, Store, now_ms};
 use anyagents_gateway::MemoryRoutes;
 use anyagents_installer::{CommandRunner, InstallError, LineSink, builtin_catalog, sign_in};
-use anyagents_supervisor::{HealthBoard, Supervisor, SystemClock, declared, mode_name, steer_name};
+use anyagents_supervisor::{HealthBoard, Supervisor, SystemClock};
 use axum::body::Body;
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
@@ -3387,7 +3387,6 @@ fn persisted_fault(
 }
 
 fn archived_agent_view_fast(agent: &Agent) -> AgentView {
-    let (mode, steer) = declared(&agent.harness);
     AgentView {
         has_open_turn: false,
         open_turn_age_ms: None,
@@ -3411,8 +3410,7 @@ fn archived_agent_view_fast(agent: &Agent) -> AgentView {
         state: agent.state.clone(),
         process: "down".to_string(),
         turn_state: "idle".to_string(),
-        delivery_mode: mode_name(mode).to_string(),
-        steer_support: steer_name(steer).to_string(),
+        delivery: (&crate::vendor::declared_delivery(&agent.harness)).into(),
         quota_reset_at_ms: None,
         block_reason: None,
         last_error: None,
@@ -3502,8 +3500,7 @@ fn agent_view_preloaded(
     let (
         process,
         mut turn_state,
-        mode,
-        steer,
+        delivery,
         quota,
         live_harness,
         live_model,
@@ -3528,8 +3525,9 @@ fn agent_view_preloaded(
             (
                 if live.process_alive { "alive" } else { "down" },
                 if working { "working" } else { "idle" },
-                mode_name(live.delivery_mode),
-                steer_name(live.steer_support),
+                live.delivery
+                    .clone()
+                    .unwrap_or_else(|| crate::vendor::declared_delivery(&agent.harness)),
                 effective_quota,
                 if live.process_alive {
                     live.live_harness.clone()
@@ -3547,7 +3545,6 @@ fn agent_view_preloaded(
             )
         }
         _ => {
-            let (mode, steer) = declared(&agent.harness);
             let lock_busy = crate::vendor::is_spiron_harness(&agent.harness)
                 && matches!(
                     store.try_lock_agent(&agent.id),
@@ -3558,8 +3555,7 @@ fn agent_view_preloaded(
             (
                 proc_str,
                 turn_str,
-                mode_name(mode),
-                steer_name(steer),
+                crate::vendor::declared_delivery(&agent.harness),
                 session_quota,
                 if proc_str == "alive" {
                     Some(agent.harness.clone())
@@ -3672,8 +3668,7 @@ fn agent_view_preloaded(
         state: agent.state.clone(),
         process: process.to_string(),
         turn_state: turn_state.to_string(),
-        delivery_mode: mode.to_string(),
-        steer_support: steer.to_string(),
+        delivery: (&delivery).into(),
         quota_reset_at_ms: quota,
         block_reason,
         last_error,
@@ -7928,8 +7923,7 @@ pub(crate) mod tests {
         let live = |quota: Option<i64>, error: Option<&str>| anyagents_supervisor::LiveState {
             process_alive: true,
             turn_state: anyagents_harness::TurnState::Idle,
-            delivery_mode: anyagents_harness::DeliveryMode::Steer,
-            steer_support: anyagents_harness::SteerSupport::Yes,
+            delivery: Some(crate::vendor::declared_delivery("claude-code")),
             quota_reset_at_ms: quota,
             restart_at_ms: None,
             pid: Some(42),
@@ -7984,8 +7978,7 @@ pub(crate) mod tests {
                 anyagents_supervisor::LiveState {
                     process_alive: false,
                     turn_state: anyagents_harness::TurnState::Idle,
-                    delivery_mode: anyagents_harness::DeliveryMode::Steer,
-                    steer_support: anyagents_harness::SteerSupport::Yes,
+                    delivery: Some(crate::vendor::declared_delivery("spiron")),
                     quota_reset_at_ms: None,
                     restart_at_ms: None,
                     pid: None,
@@ -8057,12 +8050,10 @@ pub(crate) mod tests {
         let config = anyagents_core::agent_config_dir(dir.path(), &agent.id);
         std::fs::create_dir_all(&config).unwrap();
         std::fs::write(config.join("preserve"), "retained state").unwrap();
-        let (delivery_mode, steer_support) = declared(&agent.harness);
         let mut live = anyagents_supervisor::LiveState {
             process_alive: true,
             turn_state: anyagents_harness::TurnState::Idle,
-            delivery_mode,
-            steer_support,
+            delivery: Some(crate::vendor::declared_delivery(&agent.harness)),
             quota_reset_at_ms: None,
             restart_at_ms: None,
             pid: None,
@@ -9711,12 +9702,10 @@ pub(crate) mod tests {
         let cfg = anyagents_core::agent_config_dir(dir.path(), &child.id);
         std::fs::create_dir_all(cfg.join(".claude")).unwrap();
         let health = HealthBoard::default();
-        let (delivery_mode, steer_support) = declared(&child.harness);
         let mut live = anyagents_supervisor::LiveState {
             process_alive: true,
             turn_state: anyagents_harness::TurnState::Idle,
-            delivery_mode,
-            steer_support,
+            delivery: Some(crate::vendor::declared_delivery(&child.harness)),
             quota_reset_at_ms: None,
             restart_at_ms: None,
             pid: None,

@@ -27,8 +27,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyagents_harness::{
-    DeliverOutcome, DeliveryMode, Harness, HarnessError, HarnessHealth, OutboundMessage,
-    SteerSupport, TurnState, TurnUsage, compose_message, message_id_in_text,
+    DeliverOutcome, Delivery, DeliveryLevel, Harness, HarnessError, HarnessHealth, OutboundMessage,
+    TurnState, TurnUsage, compose_message, message_id_in_text,
 };
 use serde_json::{Value, json};
 
@@ -39,6 +39,15 @@ fn rpc_wait() -> Duration {
         Duration::from_secs(60)
     }
 }
+
+/// What this adapter guarantees for mail that reaches a busy agent
+/// (`docs/delivery.md`).
+pub const DELIVERY: Delivery = Delivery {
+    level: DeliveryLevel::MidTurn,
+    idempotent: false,
+    proof: "turn/steer answered",
+    peer: None,
+};
 
 /// One long-lived Codex app-server child.
 pub struct CodexHarness {
@@ -726,8 +735,7 @@ impl Harness for CodexHarness {
             } else {
                 TurnState::InTurn
             },
-            delivery_mode: DeliveryMode::Steer,
-            steer_support: SteerSupport::Yes,
+            delivery: DELIVERY,
             quota_reset_at_ms: state.quota_reset_at_ms,
             sign_in_fault: state.fault_error.clone(),
         }

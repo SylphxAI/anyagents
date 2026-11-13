@@ -8,7 +8,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyagents_harness::{
-    Context, DeliverOutcome, DeliveryMode, Harness, OutboundMessage, SteerSupport, TurnState,
+    Context, DeliverOutcome, DeliveryLevel, Harness, OutboundMessage, TurnState,
 };
 use anyagents_harness_opencode::OpenCodeHarness;
 use tempfile::TempDir;
@@ -111,8 +111,7 @@ fn an_open_turn_never_blocks_the_next_line() {
     assert_eq!(harness.deliver(&msg("m1")).unwrap(), accepted());
     assert_eq!(harness.deliver(&msg("m2")).unwrap(), accepted());
     assert_eq!(harness.health().turn_state, TurnState::InTurn);
-    assert_eq!(harness.health().delivery_mode, DeliveryMode::Steer);
-    assert_eq!(harness.health().steer_support, SteerSupport::Yes);
+    assert_eq!(harness.health().delivery.level, DeliveryLevel::MidTurn);
     assert_eq!(
         harness.written_ids(),
         vec!["m1".to_string(), "m2".to_string()]

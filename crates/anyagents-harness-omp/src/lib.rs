@@ -15,10 +15,19 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyagents_harness::{
-    DeliverOutcome, DeliveryMode, Harness, HarnessError, HarnessHealth, OutboundMessage,
-    SteerSupport, TurnUsage, compose_message,
+    DeliverOutcome, Delivery, DeliveryLevel, DeliveryMode, Harness, HarnessError, HarnessHealth,
+    OutboundMessage, TurnUsage, compose_message,
 };
 use anyagents_harness_stream::{Launch, StreamHarness, StreamSpec, cancel_line, message_line};
+
+/// What this adapter guarantees for mail that reaches a busy agent
+/// (`docs/delivery.md`).
+pub const DELIVERY: Delivery = Delivery {
+    level: DeliveryLevel::MidTurn,
+    idempotent: false,
+    proof: "prompt line written (streamingBehavior=steer)",
+    peer: None,
+};
 
 /// One long-lived OMP child.
 pub struct OmpHarness {
@@ -61,10 +70,13 @@ impl OmpHarness {
         let fake_mode = std::env::var_os("ANYAGENTS_FAKE_MODE").is_some()
             || environment.iter().any(|(k, _)| k == "ANYAGENTS_FAKE_MODE");
         let rpc_mode = work_dir.is_some() && !fake_mode;
-        let (mode, steer) = if rpc_mode {
-            (DeliveryMode::Steer, SteerSupport::Yes)
+        let (mode, delivery) = if rpc_mode {
+            (DeliveryMode::Steer, DELIVERY)
         } else {
-            (DeliveryMode::Followup, SteerSupport::Unproven)
+            (
+                DeliveryMode::Followup,
+                anyagents_harness_stream::LINE_PER_TURN,
+            )
         };
         let inner = StreamHarness::launch(Launch {
             spec: spec.clone(),
@@ -74,7 +86,7 @@ impl OmpHarness {
             work_dir: work_dir.map(Path::to_path_buf),
             session_id: session_id.map(str::to_string),
             mode,
-            steer,
+            delivery,
         })?;
         Ok(Self {
             inner,

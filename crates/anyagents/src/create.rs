@@ -11532,14 +11532,12 @@ stderr: {}",
         persist_fault(1_700_000_000_000);
 
         let health = anyagents_supervisor::HealthBoard::default();
-        let (delivery_mode, steer_support) = anyagents_supervisor::declared(&child.harness);
         health.publish(
             &child.id,
             anyagents_supervisor::LiveState {
                 process_alive: true,
                 turn_state: anyagents_harness::TurnState::InTurn,
-                delivery_mode,
-                steer_support,
+                delivery: Some(crate::vendor::declared_delivery(&child.harness)),
                 quota_reset_at_ms: None,
                 restart_at_ms: None,
                 pid: None,

@@ -1713,6 +1713,15 @@ fn inspect_cmd(data: &Path, agent: Option<String>, limit: usize, json: bool) -> 
             view.has_open_turn,
             view.profile.as_deref().unwrap_or("default")
         );
+        println!(
+            "Delivery: {} ({}){}",
+            view.delivery.label(),
+            view.delivery.proof,
+            view.delivery
+                .peer
+                .as_deref()
+                .map_or_else(String::new, |peer| format!("   Peer: {peer}"))
+        );
         for schedule in &view.schedules {
             println!("  {} {}: {}", schedule.kind, schedule.spec, schedule.prompt);
         }
@@ -2672,7 +2681,7 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
         let bin_path = install::program(data, &entry.id);
         let present = install::is_healthy(data, &entry.id) || bin_path.is_file();
         let version = install::recorded_version(data, &entry.id);
-        let (mode, steer) = anyagents_supervisor::declared(&entry.id);
+        let delivery = api::DeliveryView::from(&vendor::declared_delivery(&entry.id));
         let profiles: Vec<String> = provider_profiles
             .iter()
             .filter(|p| p.compatible_harnesses.iter().any(|h| h == &entry.id))
@@ -2683,8 +2692,7 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
             "installed": present,
             "version": version,
             "binary": bin_path.display().to_string(),
-            "delivery_mode": anyagents_supervisor::mode_name(mode),
-            "steer_support": anyagents_supervisor::steer_name(steer),
+            "delivery": delivery,
             "profiles": profiles,
         }));
     }
@@ -2744,7 +2752,6 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
             ("STATUS", false),
             ("VERSION", false),
             ("DELIVERY", false),
-            ("STEER", false),
             ("PROFILES", false),
         ]);
         for h in &harness_rows {
@@ -2760,8 +2767,7 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
             } else {
                 ver.to_string()
             };
-            let mode = h["delivery_mode"].as_str().unwrap_or("-");
-            let steer = h["steer_support"].as_str().unwrap_or("-");
+            let delivery = delivery_label(&h["delivery"]);
             let profs = h["profiles"]
                 .as_array()
                 .map(|arr| {
@@ -2777,8 +2783,7 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
                 ui::bold(&ui::cyan(id)),
                 inst,
                 ver_cell,
-                mode.to_string(),
-                steer.to_string(),
+                delivery,
                 profs,
             ]);
         }
@@ -2815,8 +2820,7 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
         } else {
             "on-demand"
         };
-        let mode = h["delivery_mode"].as_str().unwrap_or("-");
-        let steer = h["steer_support"].as_str().unwrap_or("-");
+        let delivery = delivery_label(&h["delivery"]);
         let profs = h["profiles"]
             .as_array()
             .map(|arr| {
@@ -2828,7 +2832,7 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
                 }
             })
             .unwrap_or_else(|| "auto".to_string());
-        println!("  {id}\t{inst}\tdelivery={mode}\tsteer={steer}\tprofiles={profs}");
+        println!("  {id}\t{inst}\tdelivery={delivery}\tprofiles={profs}");
     }
     let running_count = agents_list.iter().filter(|a| a.state == "running").count();
     let archived_count = agents_list.iter().filter(|a| a.state == "archived").count();
@@ -2843,11 +2847,24 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
             .and_then(|id| create::bound_profile_name(&anyagents_core::agent_config_dir(data, id)))
             .unwrap_or_else(|| "default".to_string());
         println!(
-            "  {}\t{}\tharness={}\tprofile={prof}\tstate={}\tprocess={}\tmode={}",
-            a.name, a.id, a.harness, a.state, a.process, a.delivery_mode
+            "  {}\t{}\tharness={}\tprofile={prof}\tstate={}\tprocess={}\tdelivery={}",
+            a.name,
+            a.id,
+            a.harness,
+            a.state,
+            a.process,
+            a.delivery.label()
         );
     }
     Ok(())
+}
+
+/// The delivery column of one harness row: its level, `+idempotent` when a
+/// replay is recognised.
+fn delivery_label(value: &serde_json::Value) -> String {
+    serde_json::from_value::<api::DeliveryView>(value.clone())
+        .map(|delivery| delivery.label())
+        .unwrap_or_else(|_| "-".to_string())
 }
 
 fn groups(data: &Path, action: GroupsCommand) -> Result<(), anyagents_core::Error> {

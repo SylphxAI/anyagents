@@ -5,7 +5,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyagents_harness::{
-    Context, DeliverOutcome, DeliveryMode, Harness, OutboundMessage, SteerSupport, TurnState,
+    Context, DeliverOutcome, DeliveryLevel, Harness, OutboundMessage, TurnState,
 };
 use anyagents_harness_claude::ClaudeHarness;
 use tempfile::TempDir;
@@ -74,8 +74,7 @@ fn finish_records_usage_and_dedupes() {
     let health = harness.health();
     // Claude Code reads a stream-json `user` line mid-turn, so the catalog
     // steers rather than following up.
-    assert_eq!(health.delivery_mode, DeliveryMode::Steer);
-    assert_eq!(health.steer_support, SteerSupport::Yes);
+    assert_eq!(health.delivery.level, DeliveryLevel::MidTurn);
     let again = harness.deliver(&msg("m1")).unwrap();
     assert!(matches!(
         again,
@@ -266,8 +265,7 @@ fn three_lines_written_while_a_turn_is_open_are_all_taken_by_the_running_stream(
     // took it. None is written twice, and no line waits for the turn to end.
     let dir = TempDir::new().unwrap();
     let mut harness = start(&dir, "steer", Some("sess-1"));
-    assert_eq!(harness.health().delivery_mode, DeliveryMode::Steer);
-    assert_eq!(harness.health().steer_support, SteerSupport::Yes);
+    assert_eq!(harness.health().delivery.level, DeliveryLevel::MidTurn);
     for id in ["m1", "m2", "m3"] {
         assert_eq!(
             harness.deliver(&msg(id)).unwrap(),
