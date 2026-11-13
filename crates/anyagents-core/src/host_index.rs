@@ -1,7 +1,10 @@
 //! Rebuildable host index: metadata and contentless FTS windows only.
 //! Raw bytes stay in their original filesystem segment. Every result requires
 //! an explicit host-authorized agent set, including learned-memory results.
-use crate::{HistorySearchQuery, HistorySort, raw_segment::RawCoordinate};
+use crate::{
+    HistorySearchQuery, HistorySort,
+    raw_segment::{RawCoordinate, RawSource},
+};
 use rusqlite::{
     Connection, OptionalExtension, TransactionBehavior, params, params_from_iter, types::Value,
 };
@@ -9,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
-    io::{self, Read, Seek, SeekFrom},
+    io::{self, Read},
     path::Path,
 };
 
@@ -446,17 +449,38 @@ impl HostIndex {
         metadata: &IndexMetadata,
         raw: &RawCoordinate,
     ) -> Result<bool, IndexError> {
+        let mut source = RawSource::open(&raw.segment)?;
+        // Check actual bytes even on an otherwise eligible cache hit.
+        source.verify(raw)?;
+        self.index_from(&mut source, id, metadata, raw)
+    }
+
+    /// Index a coordinate that was just hashed from `source`'s descriptor, so
+    /// an unchanged document needs no reread. A changed one is projected from
+    /// the same descriptor and refused unless the projected bytes are exactly
+    /// the coordinate's bytes.
+    pub(crate) fn index_from(
+        &mut self,
+        source: &mut RawSource,
+        id: &str,
+        metadata: &IndexMetadata,
+        raw: &RawCoordinate,
+    ) -> Result<bool, IndexError> {
         self.in_write_scope("host_document_index", |this| {
-            this.index_in_write_scope(id, metadata, raw)
+            this.index_in_write_scope(source, id, metadata, raw)
         })
     }
 
     fn index_in_write_scope(
         &mut self,
+        file: &mut RawSource,
         id: &str,
         metadata: &IndexMetadata,
         raw: &RawCoordinate,
     ) -> Result<bool, IndexError> {
+        if raw.segment != file.path() {
+            return Err(io::Error::other("indexed coordinate names another source").into());
+        }
         let source = metadata
             .source
             .source()
@@ -475,8 +499,6 @@ impl HostIndex {
         {
             return Err(io::Error::other("indexed document owner cannot change").into());
         }
-        // Check actual bytes even on an otherwise eligible cache hit.
-        verify_coordinate(raw)?;
         let old: Option<(String, String)> = self.conn.query_row(
             "SELECT json_array(segment,offset,length,sha256,seq),json_array(agent_id,source,timestamp_ms,direction,sender,destination,tool_name,role) FROM host_documents WHERE id=?1",
             [id], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
@@ -532,14 +554,23 @@ impl HostIndex {
                 params![id, name],
             )?;
         }
-        let mut file = crate::raw_segment::open_readonly(&raw.segment)?;
+        // One sequential pass: each window keeps the previous window's last
+        // OVERLAP_BYTES and reads only its new bytes, which are also hashed.
+        let mut reader = file.range(raw.offset, raw.length);
+        let mut hash = Sha256::new();
+        let mut carried = 0;
         let mut relative = 0u64;
         let mut json_state = JsonProjection::default();
         let mut bytes = [0u8; WINDOW_BYTES];
         while relative < raw.length {
             let length = (raw.length - relative).min(WINDOW_BYTES as u64) as usize;
-            file.seek(SeekFrom::Start(raw.offset + relative))?;
-            file.read_exact(&mut bytes[..length])?;
+            reader
+                .read_exact(&mut bytes[carried..length])
+                .map_err(|e| match e.kind() {
+                    io::ErrorKind::UnexpectedEof => integrity_mismatch(),
+                    _ => e,
+                })?;
+            hash.update(&bytes[carried..length]);
             // Lossy projection is only for search over binary tool outputs.
             // The stored coordinate and the returned range remain exact bytes.
             let mut tokens =
@@ -575,10 +606,14 @@ impl HostIndex {
             if relative + length as u64 == raw.length {
                 break;
             }
+            bytes.copy_within(length - OVERLAP_BYTES..length, 0);
+            carried = OVERLAP_BYTES;
             relative += (length - OVERLAP_BYTES) as u64;
         }
-        // Catch mutation during the streaming projection before commit.
-        verify_coordinate(raw)?;
+        // Never publish a projection of bytes other than the coordinate's.
+        if format!("{:x}", hash.finalize()) != raw.sha256 {
+            return Err(integrity_mismatch().into());
+        }
         tx.commit()?;
         Ok(true)
     }
@@ -933,25 +968,8 @@ impl JsonProjection {
     }
 }
 
-fn verify_coordinate(raw: &RawCoordinate) -> io::Result<()> {
-    let mut file = crate::raw_segment::open_readonly(&raw.segment)?;
-    file.seek(SeekFrom::Start(raw.offset))?;
-    let mut reader = file.take(raw.length);
-    let mut hash = Sha256::new();
-    let mut count = 0u64;
-    let mut buffer = [0u8; 65536];
-    loop {
-        let n = reader.read(&mut buffer)?;
-        if n == 0 {
-            break;
-        }
-        hash.update(&buffer[..n]);
-        count += n as u64;
-    }
-    if count != raw.length || format!("{:x}", hash.finalize()) != raw.sha256 {
-        return Err(io::Error::other("index coordinate integrity mismatch"));
-    }
-    Ok(())
+fn integrity_mismatch() -> io::Error {
+    io::Error::other("index coordinate integrity mismatch")
 }
 
 fn has_excluded_text(raw: &RawCoordinate, excludes: &[String]) -> io::Result<bool> {
@@ -967,9 +985,8 @@ fn has_excluded_text(raw: &RawCoordinate, excludes: &[String]) -> io::Result<boo
         return Ok(false);
     }
     let overlap = terms.iter().map(String::len).max().unwrap_or_default() + 4;
-    let mut file = crate::raw_segment::open_readonly(&raw.segment)?;
-    file.seek(SeekFrom::Start(raw.offset))?;
-    let mut reader = file.take(raw.length);
+    let mut file = RawSource::open(&raw.segment)?;
+    let mut reader = file.range(raw.offset, raw.length);
     let mut buffer = [0u8; WINDOW_BYTES];
     let mut carry = Vec::new();
     let mut decoded_carry = Vec::new();

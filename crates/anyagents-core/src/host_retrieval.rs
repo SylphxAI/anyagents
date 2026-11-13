@@ -6,7 +6,7 @@ use crate::{
     host_index::{HostIndex, IndexError, IndexHit, IndexMetadata, MemoryScope},
     host_native_metadata::{EventHeader, MetadataReader},
     learned_memory::sha256,
-    raw_segment::{RawCoordinate, open_readonly, read_raw},
+    raw_segment::{RawSource, open_readonly, read_raw},
 };
 use std::{
     collections::HashSet,
@@ -377,7 +377,9 @@ fn refresh_document_before_publish(
     path: &Path,
     before_publish: impl FnOnce() -> io::Result<()>,
 ) -> Result<(), IndexError> {
-    let stamp = FileStamp::read(&open_readonly(path)?)?;
+    // One path walk; the stamp, hash and projection share this descriptor.
+    let mut source = RawSource::open(path)?;
+    let stamp = source.stamp().clone();
     let policy = serde_json::to_string(metadata)?;
     if index
         .source_cursor(&metadata.agent_id, path)?
@@ -385,9 +387,9 @@ fn refresh_document_before_publish(
     {
         return Ok(());
     }
-    let raw = document_coordinate(path)?;
+    let raw = source.whole()?;
     index.refresh_source(|index| {
-        index.index(id, metadata, &raw)?;
+        index.index_from(&mut source, id, metadata, &raw)?;
         before_publish()?;
         if FileStamp::read(&open_readonly(path)?)? == stamp {
             index.save_source(
@@ -427,7 +429,9 @@ fn refresh_native_at(
     force_full: bool,
     now_ms: i64,
 ) -> Result<RefreshStats, IndexError> {
-    let stamp = FileStamp::read(&open_readonly(path)?)?;
+    // One path walk; scan, metadata and projection share this descriptor.
+    let mut source = RawSource::open(path)?;
+    let stamp = source.stamp().clone();
     let policy = format!("native-jsonl-v4:{}:{}", agent.id, agent.name);
     let old = index
         .source_cursor(agent.id.as_str(), path)?
@@ -438,7 +442,7 @@ fn refresh_native_at(
             ..Default::default()
         });
     }
-    let scan = crate::host_cursor::scan_jsonl(path, &stamp, old.as_ref(), force_full)?;
+    let scan = crate::host_cursor::scan_jsonl(&mut source, old.as_ref(), force_full)?;
     index.refresh_source(|index| {
         if scan.replace {
             index.clear_source(agent.id.as_str(), path)?;
@@ -446,11 +450,8 @@ fn refresh_native_at(
         // There cannot be committed documents beyond the atomically published
         // frontier. An interrupted outer transaction is rolled back by SQLite.
         for raw in &scan.records {
-            use std::io::{Read, Seek, SeekFrom};
-            let mut file = open_readonly(path)?;
-            file.seek(SeekFrom::Start(raw.offset))?;
             let header: EventHeader =
-                serde_json::from_reader(MetadataReader::new(file.take(raw.length)))?;
+                serde_json::from_reader(MetadataReader::new(source.range(raw.offset, raw.length)))?;
             let mut metadata = event_metadata(agent, &header);
             let records = header.tool_records();
             let mut names = Vec::new();
@@ -486,7 +487,7 @@ fn refresh_native_at(
                 sha256(path.as_os_str().as_encoded_bytes()),
                 raw.seq
             );
-            index.index(&id, &metadata, raw)?;
+            index.index_from(&mut source, &id, &metadata, raw)?;
             for (call_id, name) in records {
                 if let (Some(call_id), Some(name)) = (call_id, name) {
                     index.save_call(agent.id.as_str(), path, call_id, name, &id)?;
@@ -557,29 +558,6 @@ fn modified_ms(path: &Path) -> io::Result<i64> {
         .map_err(io::Error::other)?
         .as_millis()
         .min(i64::MAX as u128) as i64)
-}
-fn document_coordinate(path: &Path) -> io::Result<RawCoordinate> {
-    use sha2::{Digest, Sha256};
-    use std::io::Read;
-    let mut file = crate::raw_segment::open_readonly(path)?;
-    let mut hash = Sha256::new();
-    let mut buffer = [0; 65536];
-    let mut length = 0;
-    loop {
-        let n = file.read(&mut buffer)?;
-        if n == 0 {
-            break;
-        }
-        length += n as u64;
-        hash.update(&buffer[..n]);
-    }
-    Ok(RawCoordinate {
-        segment: path.into(),
-        offset: 0,
-        length,
-        sha256: format!("{:x}", hash.finalize()),
-        seq: 1,
-    })
 }
 /// Read both the generic archive and the historical directory spelling so an
 /// upgrade never makes already-migrated documents disappear. New migrations
@@ -892,6 +870,85 @@ mod tests {
                 .as_deref(),
             Some("foreign")
         );
+    }
+
+    /// A refresh walks the path once for all its reads (plus one replacement
+    /// check) and reads O(bytes / window), never once per record or per byte.
+    #[test]
+    fn refresh_reads_each_source_through_one_descriptor_and_buffer() {
+        use crate::raw_segment::counters::snapshot;
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(NewAgent::new("buffered-reader", "spiron"))
+            .unwrap();
+        let path = dir.path().join("native.jsonl");
+        let mut text = String::new();
+        for i in 0..4_000 {
+            text.push_str(&format!(
+                "{{\"role\":\"user\",\"content\":\"record{i} {}\"}}\n",
+                "word ".repeat(i % 50)
+            ));
+        }
+        text.push_str(&format!(
+            "{{\"role\":\"tool\",\"output\":{}}}\n",
+            serde_json::json!("large ".repeat(300_000))
+        ));
+        fs::write(&path, &text).unwrap();
+        let mut index = HostIndex::open(&dir.path().join("index.db")).unwrap();
+        let delta = |before: (usize, usize)| {
+            let after = snapshot();
+            (after.0 - before.0, after.1 - before.1)
+        };
+        let before = snapshot();
+        let stats = refresh_native(&mut index, &agent, &path).unwrap();
+        let (opens, reads) = delta(before);
+        assert_eq!(stats.indexed_records, 4_001);
+        assert_eq!(opens, 2);
+        let windows = text.len() / 65_536 + 1;
+        assert!(
+            reads <= 4 * windows,
+            "{reads} reads for {} bytes in 4001 records",
+            text.len()
+        );
+        let hits = index
+            .search(
+                &[agent.id.to_string()],
+                MemoryScope::Transcripts,
+                &HistorySearchQuery {
+                    query: Some("record3999".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].raw.seq, 4_000);
+        // Unchanged: one walk to stamp the file, no reads.
+        let before = snapshot();
+        refresh_native(&mut index, &agent, &path).unwrap();
+        assert_eq!(delta(before), (1, 0));
+        // A whole-file document hashes and projects from one descriptor too.
+        let memory = dir.path().join("MEMORY.md");
+        fs::write(&memory, "memoryneedle ".repeat(50_000)).unwrap();
+        let metadata = IndexMetadata {
+            agent_id: agent.id.to_string(),
+            source: MemoryScope::Memory,
+            timestamp_ms: Some(0),
+            direction: "in".into(),
+            sender: "owner".into(),
+            destination: "owner".into(),
+            tool_name: None,
+            tool_names: Vec::new(),
+            role: Some("memory".into()),
+        };
+        let before = snapshot();
+        refresh_document(&mut index, "memory:buffered", &metadata, &memory).unwrap();
+        let (opens, reads) = delta(before);
+        assert_eq!(opens, 2);
+        assert!(reads <= 4, "{reads}");
+        let before = snapshot();
+        refresh_document(&mut index, "memory:buffered", &metadata, &memory).unwrap();
+        assert_eq!(delta(before), (1, 0));
     }
 
     #[test]
@@ -1453,7 +1510,7 @@ mod tests {
         let failure = index
             .refresh_source(|index| -> Result<(), IndexError> {
                 index.clear_source(agent.id.as_str(), &path)?;
-                let raw = document_coordinate(&path)?;
+                let raw = RawSource::open(&path)?.whole()?;
                 index.index(
                     "uncommitted-batch",
                     &event_metadata(&agent, &EventHeader::default()),
