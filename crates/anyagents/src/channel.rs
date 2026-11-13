@@ -672,17 +672,6 @@ pub fn channels(data: &Path, action: crate::ChannelsCommand) -> Result<(), Error
     }
 }
 
-/// Record a channel and copy its secret into the credential store.
-#[allow(dead_code)]
-pub fn add_channel(
-    data: &Path,
-    kind: &str,
-    agent_name: &str,
-    token_file: &Path,
-) -> Result<(), Error> {
-    add_channel_with_options(data, kind, agent_name, Some(token_file), None, None, None)
-}
-
 pub fn add_channel_with_options(
     data: &Path,
     kind: &str,
