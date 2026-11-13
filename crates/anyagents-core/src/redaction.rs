@@ -6,7 +6,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
-use rusqlite::{OptionalExtension, TransactionBehavior, params};
+use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -560,9 +560,18 @@ impl Store {
         }
         let (_history_publication, history_dir) = lock_history_publication(self.data_dir())?;
         let _lifecycle = self.lock_agent_lifecycle(target)?;
-        let mut conn = self.conn();
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let actor = authorize(&tx, &actor, target)?;
+        enum RedactPhase1 {
+            Done(Receipt),
+            Prepared {
+                receipt: Receipt,
+                prepared: Vec<SessionFile>,
+                id: String,
+                whole_body: bool,
+                _process: crate::AgentLock,
+            },
+        }
+        let phase1 = self.write_tx(|tx| -> Result<RedactPhase1, Error> {
+        let actor = authorize(tx, &actor, target)?;
         if unresolved_history(self.data_dir(), &history_dir, target)? {
             return Err(invalid(
                 "outbound history has unresolved or unreadable obligations; reconcile before redaction",
@@ -674,23 +683,25 @@ impl Store {
                 ));
             }
             if original == TOMBSTONE
-                && !unverified_full_versions(&tx, self.database_path(), target, &id)?.is_empty()
+                && !unverified_full_versions(tx, self.database_path(), target, &id)?.is_empty()
             {
                 return Err(invalid(
                     "redaction edit baseline changed or its account is unknown; existing receipt does not verify bound versions",
                 ));
             }
-            return Ok(receipt);
+            return Ok(RedactPhase1::Done(receipt));
         }
         let (span, start, end) = bounds(&original, request.span.as_ref())?;
         if original[start..end] == *TOMBSTONE
             && let Some(raw) = tx.query_row(
                 "SELECT receipt FROM conversation_redactions WHERE agent_id = ?1 AND target_id = ?2 AND (SELECT count(*) FROM conversation_redactions WHERE agent_id = ?1 AND target_id = ?2) = 1 LIMIT 1",
                 params![target.as_str(), id], |r| r.get::<_, String>(0)).optional()? {
-            if original == TOMBSTONE && !unverified_full_versions(&tx, self.database_path(), target, &id)?.is_empty() {
+            if original == TOMBSTONE && !unverified_full_versions(tx, self.database_path(), target, &id)?.is_empty() {
                 return Err(invalid("redaction edit baseline changed or its account is unknown; existing receipt does not verify bound versions"));
             }
-            return serde_json::from_str(&raw).map_err(|_| invalid("unreadable redaction receipt"));
+            return serde_json::from_str(&raw)
+                .map(RedactPhase1::Done)
+                .map_err(|_| invalid("unreadable redaction receipt"));
         }
         if request.reason.contains(&original[start..end])
             || request.reason.contains(&rag_content_hash(&original))
@@ -821,7 +832,7 @@ impl Store {
             )?;
             // Telegram's edit baseline is a second body copy for this same
             // provider message, not a separate mailbox entry. Preserve its keys/time.
-            let versions = bound_versions(&tx, target, &id)?;
+            let versions = bound_versions(tx, target, &id)?;
             for Baseline {
                 chat,
                 message,
@@ -857,7 +868,7 @@ impl Store {
                 }
             }
             if whole_body {
-                for unresolved in unverified_full_versions(&tx, self.database_path(), target, &id)?
+                for unresolved in unverified_full_versions(tx, self.database_path(), target, &id)?
                 {
                     if !receipt.unscrubbed.contains(&unresolved) {
                         receipt.unscrubbed.push(unresolved);
@@ -892,7 +903,24 @@ impl Store {
                 (SELECT json_extract(origin, '$.chat_id') FROM messages WHERE agent_id = ?2 AND id = ?3),
                 (SELECT json_extract(origin, '$.message_id') FROM messages WHERE agent_id = ?2 AND id = ?3))",
             params![receipt.audit_id, target.as_str(), id, key, receipt.actor, PERMISSION, receipt.reason, timestamp_ms, if receipt.span.unit == SpanUnit::Bytes { "bytes" } else { "chars" }, receipt.span.start as i64, receipt.span.end as i64, receipt.removed_bytes as i64, receipt.removed_chars as i64, serde_json::to_string(&receipt).map_err(|_| invalid("receipt serialization failed"))?])?;
-        tx.commit()?;
+            Ok(RedactPhase1::Prepared {
+                receipt,
+                prepared,
+                id,
+                whole_body,
+                _process,
+            })
+        })?;
+        let (mut receipt, prepared, id, whole_body, _process) = match phase1 {
+            RedactPhase1::Done(receipt) => return Ok(receipt),
+            RedactPhase1::Prepared {
+                receipt,
+                prepared,
+                id,
+                whole_body,
+                _process,
+            } => (receipt, prepared, id, whole_body, _process),
+        };
         for mut session in prepared {
             receipt.unscrubbed.retain(|f| {
                 f.path != session.path.display().to_string()
@@ -954,19 +982,26 @@ impl Store {
             }
         }
         if whole_body {
+            let conn = self.read_conn();
             for unresolved in unverified_full_versions(&conn, self.database_path(), target, &id)? {
                 if !receipt.unscrubbed.contains(&unresolved) {
                     receipt.unscrubbed.push(unresolved);
                 }
             }
         }
-        let checkpoint = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, i64>(1)?,
-                r.get::<_, i64>(2)?,
-            ))
-        });
+        let checkpoint = {
+            let conn = self.conn();
+            let _ = conn.busy_timeout(std::time::Duration::ZERO);
+            let res = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            });
+            let _ = conn.busy_timeout(self.busy_timeout());
+            res
+        };
         match checkpoint {
             Ok((0, 0, 0)) => {}
             Ok(_) => receipt.unscrubbed.push(failure(
@@ -977,14 +1012,15 @@ impl Store {
                 "SQLite WAL truncation failed; residual bytes are unverified")),
         }
         receipt.full_scrub = receipt.unscrubbed.is_empty();
-        conn.execute(
-            "UPDATE conversation_redactions SET receipt = ?2 WHERE id = ?1",
-            params![
-                receipt.audit_id,
-                serde_json::to_string(&receipt)
-                    .map_err(|_| invalid("receipt serialization failed"))?
-            ],
-        )?;
+        let receipt_json =
+            serde_json::to_string(&receipt).map_err(|_| invalid("receipt serialization failed"))?;
+        self.write_tx(|tx| {
+            tx.execute(
+                "UPDATE conversation_redactions SET receipt = ?2 WHERE id = ?1",
+                params![receipt.audit_id, receipt_json],
+            )?;
+            Ok(())
+        })?;
         Ok(receipt)
     }
 }

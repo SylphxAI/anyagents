@@ -10,7 +10,7 @@
 use std::fmt;
 use std::str::FromStr;
 
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use super::{AgentId, Error, Store, agent_exists, cursor, now_ms};
 
@@ -545,14 +545,9 @@ fn quota_of(conn: &Connection, agent_id: &AgentId) -> Result<Option<QuotaBlock>,
 impl Store {
     fn runtime_write<T>(
         &self,
-        mut op: impl FnMut(&Transaction<'_>) -> Result<T, Error>,
+        op: impl FnOnce(&Transaction<'_>) -> Result<T, Error>,
     ) -> Result<T, Error> {
-        self.write_with_retry(|conn| {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let out = op(&tx)?;
-            tx.commit()?;
-            Ok(out)
-        })
+        self.write_tx(op)
     }
 
     /// The agent's runtime row. Every agent has one after the runtime backfill.

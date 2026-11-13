@@ -73,3 +73,18 @@ pub enum Error {
     #[error("{0}")]
     Message(String),
 }
+
+impl Error {
+    /// Returns true if this error is a transient SQLite lock contention error
+    /// (`SQLITE_BUSY` or `SQLITE_LOCKED`) that callers can safely retry after backoff.
+    pub fn is_transient_lock_error(&self) -> bool {
+        matches!(
+            self,
+            Self::Db(rusqlite::Error::SqliteFailure(err, _))
+                if matches!(
+                    err.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                )
+        )
+    }
+}

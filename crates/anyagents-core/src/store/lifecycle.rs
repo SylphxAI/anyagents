@@ -8,7 +8,7 @@
 use std::fmt;
 use std::str::FromStr;
 
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use super::{AgentId, Error, Store, agent_exists, now_ms};
 
@@ -191,14 +191,9 @@ fn evidence_entry(
 impl Store {
     fn lifecycle_write<T>(
         &self,
-        mut op: impl FnMut(&Transaction<'_>) -> Result<T, Error>,
+        op: impl FnOnce(&Transaction<'_>) -> Result<T, Error>,
     ) -> Result<T, Error> {
-        self.write_with_retry(|conn| {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let out = op(&tx)?;
-            tx.commit()?;
-            Ok(out)
-        })
+        self.write_tx(op)
     }
 
     /// Record a lifecycle command's intent. A spawn reserves `agent_name`: it is

@@ -307,7 +307,9 @@ impl HostIndex {
             Ok(upgraded) => {
                 conn.execute_batch("COMMIT;")?;
                 if upgraded {
+                    let _ = conn.busy_timeout(std::time::Duration::ZERO);
                     let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+                    conn.busy_timeout(std::time::Duration::from_secs(30))?;
                 }
                 Ok(Self { conn })
             }
@@ -596,15 +598,36 @@ impl HostIndex {
     }
 
     pub fn checkpoint(&self) -> Result<(), IndexError> {
-        let result: (i64, i64, i64) =
+        self.conn.busy_timeout(std::time::Duration::ZERO)?;
+        let result: Result<(i64, i64, i64), _> =
             self.conn
                 .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
                     Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-                })?;
-        if result.0 != 0 {
-            return Err(io::Error::other("host index reader prevented secure checkpoint").into());
+                });
+        let restored = self.conn.busy_timeout(std::time::Duration::from_secs(30));
+        match result {
+            Ok((0, _, _)) => {
+                restored?;
+                Ok(())
+            }
+            Ok(_) => {
+                let _ = restored;
+                Err(io::Error::other("host index reader prevented secure checkpoint").into())
+            }
+            Err(rusqlite::Error::SqliteFailure(err, _))
+                if matches!(
+                    err.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                ) =>
+            {
+                let _ = restored;
+                Err(io::Error::other("host index reader prevented secure checkpoint").into())
+            }
+            Err(error) => {
+                let _ = restored;
+                Err(error.into())
+            }
         }
-        Ok(())
     }
 
     /// Idempotently index a trusted coordinate. Invalid/changed bytes never
@@ -1644,5 +1667,43 @@ mod tests {
             .unwrap()
             .remove(0);
         assert!(read_raw(&hit.window).is_err());
+    }
+
+    #[test]
+    fn checkpoint_returns_immediately_when_snapshot_reader_blocks_wal_truncate() {
+        let dir = crate::test_tempdir();
+        let path = dir.path().join("index.db");
+        let segment = RawSegment::open(&dir.path().join("events.raw")).unwrap();
+        let raw = segment.append(b"wal frame held by reader").unwrap();
+        let mut index = HostIndex::open(&path).unwrap();
+        index
+            .index("doc-1", &metadata("agent-a", MemoryScope::Memory, 1), &raw)
+            .unwrap();
+
+        let reader = Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .unwrap();
+        reader
+            .execute_batch("BEGIN; SELECT count(*) FROM host_documents;")
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let err = index
+            .checkpoint()
+            .expect_err("snapshot reader must prevent WAL truncation");
+        let elapsed = started.elapsed();
+        drop(reader);
+
+        assert!(
+            err.to_string()
+                .contains("reader prevented secure checkpoint"),
+            "unexpected checkpoint error: {err}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "checkpoint waited too long despite Duration::ZERO: {elapsed:?}"
+        );
     }
 }
