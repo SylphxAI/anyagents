@@ -134,13 +134,14 @@ impl FileCache {
                 .cloned()
                 .expect("one cache key holds one type");
         }
-        let _ = dep;
+        // Without a watcher (or off Linux) every call reads through.
+        let _ = (key, dep);
         compute()
     }
 
     /// How many loads this process performed for keys that mention `prefix`:
     /// every disk read a cache in this process made for that tree.
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn loads_under(prefix: &Path) -> usize {
         let prefix = prefix.display().to_string();
         loads().iter().filter(|key| key.contains(&prefix)).count()
