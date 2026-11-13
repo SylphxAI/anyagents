@@ -62,11 +62,58 @@ pub fn now_ms() -> i64 {
     clock_now_ms()
 }
 
-const MESSAGE_COLS: &str = "id, agent_id, seq, source_time_ms, source_key, sender, body, \
-     reply_to, received_at_ms, delivered_at_ms, origin, context";
+// Column lists as macros, so hot statements are `concat!` literals that
+// `prepare_cached` reuses instead of a `format!` and a fresh prepare per call.
+macro_rules! message_cols {
+    () => {
+        "id, agent_id, seq, source_time_ms, source_key, sender, body, \
+         reply_to, received_at_ms, delivered_at_ms, origin, context"
+    };
+}
+macro_rules! agent_cols {
+    () => {
+        "id, name, harness, model, workdir, instructions, state, \
+         created_at_ms, launch_env, parent_id, is_admin, role, description"
+    };
+}
+macro_rules! schedule_cols {
+    () => {
+        "id, agent_id, kind, spec, prompt, interval_ms, next_fire_at_ms, \
+         last_fired_at_ms, watch_baseline, last_observed, state, created_at_ms"
+    };
+}
 
-const AGENT_COLS: &str = "id, name, harness, model, workdir, instructions, state, \
-     created_at_ms, launch_env, parent_id, is_admin, role, description";
+/// Rows of `agents` (bound as `?1`) that may scale to zero: running, no
+/// running child, the last turn completed past every mailbox line, and every
+/// line delivered. Shared by the read-only precheck and the guarded UPDATE.
+macro_rules! idle_release_predicate {
+    () => {
+        "id = ?1
+    AND state = 'running'
+    AND NOT EXISTS (
+        SELECT 1 FROM agents child
+        WHERE child.parent_id = ?1
+          AND child.state = 'running'
+    )
+    AND EXISTS (
+        SELECT 1 FROM turn_recovery tr
+        WHERE tr.agent_id = ?1
+          AND tr.completed_seq >= tr.opened_seq
+          AND tr.completed_seq > 0
+          AND tr.completed_seq >= COALESCE((
+              SELECT MAX(m.seq) FROM messages m WHERE m.agent_id = ?1
+          ), 0)
+    )
+    AND COALESCE((
+        SELECT mc.delivered_seq FROM mailbox_cursors mc WHERE mc.agent_id = ?1
+    ), 0) >= COALESCE((
+        SELECT MAX(m.seq) FROM messages m WHERE m.agent_id = ?1
+    ), 0)"
+    };
+}
+
+const MESSAGE_COLS: &str = message_cols!();
+const AGENT_COLS: &str = agent_cols!();
 
 fn is_scope_env_key(key: &str) -> bool {
     matches!(key, "ANYAGENTS_SCOPE" | "ANYAGENTS_PUBLIC")
@@ -1005,7 +1052,7 @@ impl Store {
         let now = now_ms();
         {
             let mut conn = self.conn();
-            agent_by_id(&conn, agent_id)?;
+            agent_exists(&conn, agent_id)?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             // A new instance replaces the old one: the generation moves, and
             // every capability minted before it stops authenticating.
@@ -1120,7 +1167,7 @@ impl Store {
     /// minted for the last instance stops authenticating at once.
     pub fn retire_capabilities(&self, agent_id: &AgentId) -> Result<(), Error> {
         let conn = self.conn();
-        agent_by_id(&conn, agent_id)?;
+        agent_exists(&conn, agent_id)?;
         conn.execute(
             "UPDATE agent_capabilities SET revoked_at_ms = ?1
              WHERE agent_id = ?2 AND revoked_at_ms IS NULL",
@@ -1372,7 +1419,7 @@ impl Store {
         }
         let updated = {
             let conn = self.conn();
-            agent_by_id(&conn, agent_id)?;
+            agent_exists(&conn, agent_id)?;
             conn.execute(
                 "UPDATE agents SET harness = ?2 WHERE id = ?1",
                 params![agent_id.as_str(), clean],
@@ -1439,7 +1486,7 @@ impl Store {
     pub fn set_agent_role(&self, id: &AgentId, role: Option<&str>) -> Result<Agent, Error> {
         let clean = role.map(str::trim).filter(|s| !s.is_empty());
         let conn = self.conn();
-        agent_by_id(&conn, id)?;
+        agent_exists(&conn, id)?;
         conn.execute(
             "UPDATE agents SET role = ?1 WHERE id = ?2",
             params![clean, id.as_str()],
@@ -1524,7 +1571,7 @@ impl Store {
     ) -> Result<Agent, Error> {
         let clean = description.map(str::trim).filter(|s| !s.is_empty());
         let conn = self.conn();
-        agent_by_id(&conn, id)?;
+        agent_exists(&conn, id)?;
         conn.execute(
             "UPDATE agents SET description = ?1 WHERE id = ?2",
             params![clean, id.as_str()],
@@ -1560,11 +1607,12 @@ impl Store {
         let lookup = name.strip_prefix("agent:").unwrap_or(name);
         let conn = self.read_conn();
         let found = conn
-            .query_row(
-                &format!("SELECT {AGENT_COLS} FROM agents WHERE name = ?1 OR id = ?1"),
-                [lookup],
-                agent_from_row,
-            )
+            .prepare_cached(concat!(
+                "SELECT ",
+                agent_cols!(),
+                " FROM agents WHERE name = ?1 OR id = ?1"
+            ))?
+            .query_row([lookup], agent_from_row)
             .optional()?;
         if let Some(agent) = found {
             return Ok(agent);
@@ -1585,7 +1633,11 @@ impl Store {
 
     pub fn list_agents(&self) -> Result<Vec<Agent>, Error> {
         let conn = self.read_conn();
-        let mut stmt = conn.prepare(&format!("SELECT {AGENT_COLS} FROM agents ORDER BY name"))?;
+        let mut stmt = conn.prepare_cached(concat!(
+            "SELECT ",
+            agent_cols!(),
+            " FROM agents ORDER BY name"
+        ))?;
         let mut rows = stmt.query([])?;
         let mut agents = Vec::new();
         while let Some(row) = rows.next()? {
@@ -1599,9 +1651,10 @@ impl Store {
     /// not the ever-growing archive (served by `idx_agents_state`).
     pub fn list_live_agents(&self) -> Result<Vec<Agent>, Error> {
         let conn = self.read_conn();
-        let mut stmt = conn.prepare_cached(&format!(
-            "SELECT {AGENT_COLS} FROM agents \
-             WHERE state IN ('created', 'running', 'idle', 'paused') ORDER BY name"
+        let mut stmt = conn.prepare_cached(concat!(
+            "SELECT ",
+            agent_cols!(),
+            " FROM agents WHERE state IN ('created', 'running', 'idle', 'paused') ORDER BY name"
         ))?;
         let mut rows = stmt.query([])?;
         let mut agents = Vec::new();
@@ -1714,8 +1767,10 @@ impl Store {
 
     pub fn children_of(&self, parent_id: &AgentId) -> Result<Vec<Agent>, Error> {
         let conn = self.read_conn();
-        let mut stmt = conn.prepare(&format!(
-            "SELECT {AGENT_COLS} FROM agents WHERE parent_id = ?1 ORDER BY created_at_ms, name"
+        let mut stmt = conn.prepare_cached(concat!(
+            "SELECT ",
+            agent_cols!(),
+            " FROM agents WHERE parent_id = ?1 ORDER BY created_at_ms, name"
         ))?;
         let mut rows = stmt.query([parent_id.as_str()])?;
         let mut agents = Vec::new();
@@ -1871,7 +1926,7 @@ impl Store {
             return Err(Error::Message(format!("invalid group name: {name}")));
         }
         let conn = self.conn();
-        agent_by_id(&conn, agent_id)?;
+        agent_exists(&conn, agent_id)?;
         conn.execute(
             "INSERT OR IGNORE INTO groups (name, created_at_ms) VALUES (?1, ?2)",
             params![name, now_ms()],
@@ -2035,7 +2090,7 @@ impl Store {
     pub fn attach_channel(&self, channel_id: &ChannelId, agent_id: &AgentId) -> Result<(), Error> {
         let conn = self.conn();
         channel_with(&conn, channel_id)?;
-        agent_by_id(&conn, agent_id)?;
+        agent_exists(&conn, agent_id)?;
         conn.execute(
             "INSERT OR IGNORE INTO channel_agents (channel_id, agent_id) VALUES (?1, ?2)",
             params![channel_id.as_str(), agent_id.as_str()],
@@ -2136,12 +2191,12 @@ impl Store {
             .and_then(|sender| sender.strip_prefix("agent:"))
             .and_then(|reference| AgentId::parse(reference).ok())
         {
-            agent_by_id(&tx, &author)?;
+            agent_exists(&tx, &author)?;
         }
         if !admit(&tx)? {
             return Ok(None);
         }
-        agent_by_id(&tx, agent_id)?;
+        agent_exists(&tx, agent_id)?;
         // Erasure is authoritative over provider retries/edits, including basic
         // group relays and rows outside the normal bounded origin scan. Refuse
         // resurrection before source dedup, quote/mention enrichment, baseline
@@ -2636,11 +2691,14 @@ impl Store {
         // child, mail past its cursor, no completed turn) is reviewed on every
         // idle pass and must not take the writer lock each time. The UPDATE
         // below re-checks the same predicate under the lock.
-        let eligible: bool = self.read_conn().query_row(
-            &format!("SELECT EXISTS(SELECT 1 FROM agents WHERE {IDLE_RELEASE_PREDICATE})"),
-            [id.as_str()],
-            |row| row.get(0),
-        )?;
+        let eligible: bool = self
+            .read_conn()
+            .prepare_cached(concat!(
+                "SELECT EXISTS(SELECT 1 FROM agents WHERE ",
+                idle_release_predicate!(),
+                ")"
+            ))?
+            .query_row([id.as_str()], |row| row.get(0))?;
         if !eligible {
             return Ok(false);
         }
@@ -2691,7 +2749,10 @@ impl Store {
                 )
                 .optional()?;
             let updated = tx.execute(
-                &format!("UPDATE agents SET state = 'idle' WHERE {IDLE_RELEASE_PREDICATE}"),
+                concat!(
+                    "UPDATE agents SET state = 'idle' WHERE ",
+                    idle_release_predicate!()
+                ),
                 [id.as_str()],
             )?;
             tx.commit()?;
@@ -2751,7 +2812,7 @@ impl Store {
                 [id.as_str()],
             )?;
             if changed == 0 {
-                agent_by_id(&tx, id)?;
+                agent_exists(&tx, id)?;
                 return Err(Error::Message(format!(
                     "agent {id} was admitted; its name is not a failed reservation"
                 )));
@@ -2843,7 +2904,7 @@ impl Store {
     /// Messages with `seq > since`, in sequence order. `None` starts at the beginning.
     pub fn inbox(&self, agent_id: &AgentId, since: Option<i64>) -> Result<Vec<Message>, Error> {
         let conn = self.read_conn();
-        agent_by_id(&conn, agent_id)?;
+        agent_exists(&conn, agent_id)?;
         let delivered = cursor(&conn, agent_id)?;
         let mut stmt = conn.prepare(&format!(
             "SELECT {MESSAGE_COLS}
@@ -2877,7 +2938,7 @@ impl Store {
         sender: Option<&str>,
     ) -> Result<Vec<Message>, Error> {
         let conn = self.read_conn();
-        agent_by_id(&conn, agent_id)?;
+        agent_exists(&conn, agent_id)?;
         let delivered = cursor(&conn, agent_id)?;
         let mut stmt = conn.prepare(&format!(
             "SELECT {MESSAGE_COLS} FROM messages
@@ -3046,20 +3107,19 @@ impl Store {
     ) -> Result<TurnOwnershipSnapshot, Error> {
         let conn = self.read_conn();
         let last_in: Option<(i64, i64, Option<String>, Option<String>)> = conn
-            .query_row(
+            .prepare_cached(
                 "SELECT seq, delivered_at_ms, sender, source_key
                  FROM messages
                  WHERE agent_id = ?1 AND delivered_at_ms IS NOT NULL
                  ORDER BY seq DESC LIMIT 1",
-                [agent_id.as_str()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
+            )?
+            .query_row([agent_id.as_str()], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
             .optional()?;
-        let last_outbound_at_ms: Option<i64> = conn.query_row(
-            "SELECT MAX(sent_at_ms) FROM outbound_messages WHERE agent_id = ?1",
-            [agent_id.as_str()],
-            |row| row.get(0),
-        )?;
+        let last_outbound_at_ms: Option<i64> = conn
+            .prepare_cached("SELECT MAX(sent_at_ms) FROM outbound_messages WHERE agent_id = ?1")?
+            .query_row([agent_id.as_str()], |row| row.get(0))?;
         Ok(match last_in {
             Some((seq, delivered_at_ms, sender, source_key)) => TurnOwnershipSnapshot {
                 last_delivered_seq: Some(seq),
@@ -3084,11 +3144,11 @@ impl Store {
         source_key: &str,
     ) -> Result<bool, Error> {
         let conn = self.read_conn();
-        let exists: i64 = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM messages WHERE agent_id = ?1 AND source_key = ?2)",
-            params![agent_id.as_str(), source_key],
-            |row| row.get(0),
-        )?;
+        let exists: i64 = conn
+            .prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM messages WHERE agent_id = ?1 AND source_key = ?2)",
+            )?
+            .query_row(params![agent_id.as_str(), source_key], |row| row.get(0))?;
         Ok(exists != 0)
     }
 
@@ -4289,7 +4349,7 @@ impl Store {
         // One snapshot: a line committed between reading the cursor and the
         // last sequence must not look like a hole in the mailbox.
         let snapshot = conn.unchecked_transaction()?;
-        agent_by_id(&snapshot, agent_id)?;
+        agent_exists(&snapshot, agent_id)?;
         let delivered = cursor(&snapshot, agent_id)?;
         let next = delivered + 1;
         if let Some(message) = message_at_on(&snapshot, agent_id, next, delivered)? {
@@ -4309,34 +4369,34 @@ impl Store {
     /// the mailbox and are delivered on the agent's next active turn.
     pub fn has_actionable_undelivered(&self, agent_id: &AgentId) -> Result<bool, Error> {
         let conn = self.read_conn();
-        agent_by_id(&conn, agent_id)?;
+        agent_exists(&conn, agent_id)?;
         let delivered = cursor(&conn, agent_id)?;
         // Server-side filter (same predicate as the roster query): the
         // per-row Rust JSON parse would scan and deserialize every
         // undelivered line on each idle poll, pinning one core per agent
         // (80 agents x 4 polls/s against a multi-GB mailbox).
-        let found: bool = conn.query_row(
-            "SELECT EXISTS(
-               SELECT 1 FROM messages
-               WHERE agent_id = ?1 AND seq > ?2
-                 AND (CASE WHEN json_valid(context) THEN json_extract(context, '$.event') END) IS NOT 'reaction_passive'
-             )",
-            params![agent_id.as_str(), delivered],
-            |row| row.get(0),
-        )?;
+        let found: bool = conn
+            .prepare_cached(
+                "SELECT EXISTS(
+                   SELECT 1 FROM messages
+                   WHERE agent_id = ?1 AND seq > ?2
+                     AND (CASE WHEN json_valid(context) THEN json_extract(context, '$.event') END) IS NOT 'reaction_passive'
+                 )",
+            )?
+            .query_row(params![agent_id.as_str(), delivered], |row| row.get(0))?;
         Ok(found)
     }
 
     pub fn received_cursor(&self, agent_id: &AgentId) -> Result<i64, Error> {
         let conn = self.read_conn();
-        agent_by_id(&conn, agent_id)?;
+        agent_exists(&conn, agent_id)?;
         last_seq(&conn, agent_id)
     }
 
     /// The one delivery cursor: the last sequence the harness took.
     pub fn delivered_cursor(&self, agent_id: &AgentId) -> Result<i64, Error> {
         let conn = self.read_conn();
-        agent_by_id(&conn, agent_id)?;
+        agent_exists(&conn, agent_id)?;
         cursor(&conn, agent_id)
     }
 
@@ -4345,7 +4405,7 @@ impl Store {
     pub fn advance_delivered(&self, agent_id: &AgentId, seq: i64) -> Result<i64, Error> {
         self.write_with_retry(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            agent_by_id(&tx, agent_id)?;
+            agent_exists(&tx, agent_id)?;
             bump_delivered(&tx, agent_id, seq)?;
             tx.commit()?;
             Ok(seq)
@@ -4368,7 +4428,7 @@ impl Store {
     pub fn note_delivered(&self, agent_id: &AgentId, seq: i64) -> Result<(), Error> {
         self.write_with_retry(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            agent_by_id(&tx, agent_id)?;
+            agent_exists(&tx, agent_id)?;
             bump_delivered(&tx, agent_id, seq)?;
             let now = now_ms();
             let prev_seq = (seq - 1).max(0);
@@ -4420,7 +4480,7 @@ impl Store {
         }
         self.write_with_retry(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            agent_by_id(&tx, agent_id)?;
+            agent_exists(&tx, agent_id)?;
             let mut seqs = Vec::new();
             for msg_id in message_ids {
                 if let Some(seq) = tx
@@ -4478,7 +4538,7 @@ impl Store {
         }
         self.write_with_retry(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            agent_by_id(&tx, agent_id)?;
+            agent_exists(&tx, agent_id)?;
             let mut min_seq: Option<i64> = None;
             for msg_id in message_ids {
                 if let Some(seq) = tx
@@ -4643,7 +4703,7 @@ impl Store {
             // BEGIN IMMEDIATE: a SELECT-then-UPDATE under BEGIN DEFERRED raises
             // SQLITE_BUSY without honouring busy_timeout when a peer is writing.
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            agent_by_id(&tx, agent_id)?;
+            agent_exists(&tx, agent_id)?;
             tx.execute(
                 "UPDATE turn_recovery
                  SET completed_seq = opened_seq,
@@ -4660,7 +4720,7 @@ impl Store {
     pub fn note_turn_recovered(&self, agent_id: &AgentId, opened_seq: i64) -> Result<(), Error> {
         self.write_with_retry(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            agent_by_id(&tx, agent_id)?;
+            agent_exists(&tx, agent_id)?;
             tx.execute(
                 "UPDATE turn_recovery
                  SET recovery_count = recovery_count + 1
@@ -4676,11 +4736,10 @@ impl Store {
     pub fn has_open_turn(&self, agent_id: &AgentId) -> Result<bool, Error> {
         let conn = self.read_conn();
         let row: Option<(i64, i64)> = conn
-            .query_row(
+            .prepare_cached(
                 "SELECT opened_seq, completed_seq FROM turn_recovery WHERE agent_id = ?1",
-                [agent_id.as_str()],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
+            )?
+            .query_row([agent_id.as_str()], |r| Ok((r.get(0)?, r.get(1)?)))
             .optional()?;
         Ok(row.is_some_and(|(opened_seq, completed_seq)| opened_seq > completed_seq))
     }
@@ -4689,14 +4748,15 @@ impl Store {
     /// eligible for automatic mid-turn recovery.
     pub fn open_turn(&self, agent_id: &AgentId) -> Result<Option<OpenTurn>, Error> {
         let conn = self.read_conn();
-        agent_by_id(&conn, agent_id)?;
+        agent_exists(&conn, agent_id)?;
         let row: Option<(i64, i64, i64, i64)> = conn
-            .query_row(
+            .prepare_cached(
                 "SELECT opened_seq, completed_seq, recovery_count, opened_at_ms
                  FROM turn_recovery WHERE agent_id = ?1",
-                [agent_id.as_str()],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-            )
+            )?
+            .query_row([agent_id.as_str()], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })
             .optional()?;
         let Some((opened_seq, completed_seq, recovery_count, opened_at_ms)) = row else {
             return Ok(None);
@@ -4705,9 +4765,10 @@ impl Store {
             return Ok(None);
         }
         let delivered = cursor(&conn, agent_id)?;
-        let mut msg_stmt = conn.prepare(&format!(
-            "SELECT {MESSAGE_COLS}
-             FROM messages
+        let mut msg_stmt = conn.prepare_cached(concat!(
+            "SELECT ",
+            message_cols!(),
+            " FROM messages
              WHERE agent_id = ?1 AND seq > ?2 AND seq <= ?3
              ORDER BY seq ASC"
         ))?;
@@ -4719,7 +4780,7 @@ impl Store {
         if messages.is_empty() {
             return Ok(None);
         }
-        let mut out_stmt = conn.prepare(
+        let mut out_stmt = conn.prepare_cached(
             "SELECT id, destination, reply_to, body, sent_at_ms
              FROM outbound_messages
              WHERE agent_id = ?1 AND sent_at_ms >= ?2
@@ -4749,13 +4810,16 @@ impl Store {
 
     pub fn message(&self, agent_id: &AgentId, id: &str) -> Result<Option<Message>, Error> {
         let conn = self.read_conn();
-        agent_by_id(&conn, agent_id)?;
+        agent_exists(&conn, agent_id)?;
         let found = conn
-            .query_row(
-                &format!("SELECT {MESSAGE_COLS} FROM messages WHERE agent_id = ?1 AND id = ?2"),
-                params![agent_id.as_str(), id],
-                |row| Ok(message_from_row(&conn, row)),
-            )
+            .prepare_cached(concat!(
+                "SELECT ",
+                message_cols!(),
+                " FROM messages WHERE agent_id = ?1 AND id = ?2"
+            ))?
+            .query_row(params![agent_id.as_str(), id], |row| {
+                Ok(message_from_row(&conn, row))
+            })
             .optional()?;
         found.transpose()
     }
@@ -4790,7 +4854,7 @@ impl Store {
         // second row for the same usage.
         self.write_with_retry(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            agent_by_id(&tx, &record.agent_id)?;
+            agent_exists(&tx, &record.agent_id)?;
             tx.execute(
                 "INSERT INTO usage_records (
                     id, agent_id, harness, model, input_tokens, output_tokens,
@@ -4824,7 +4888,7 @@ impl Store {
         let conn = self.read_conn();
         let sql = match agent_id {
             Some(id) => {
-                agent_by_id(&conn, id)?;
+                agent_exists(&conn, id)?;
                 "SELECT id, agent_id, harness, model, input_tokens, output_tokens,
                         cache_read_tokens, cache_write_tokens, reported_cost_micros,
                         estimated_cost_micros, billing_mode, quota_state, day, recorded_at_ms
@@ -4854,14 +4918,13 @@ impl Store {
         // Server-side filter: per-row JSON parse here pins a core per agent
         // on every health publish; see `has_actionable_undelivered`.
         let received_at: Option<i64> = conn
-            .query_row(
+            .prepare_cached(
                 "SELECT received_at_ms FROM messages
                  WHERE agent_id = ?1 AND seq >= ?2
                    AND (CASE WHEN json_valid(context) THEN json_extract(context, '$.event') END) IS NOT 'reaction_passive'
                  ORDER BY seq ASC LIMIT 1",
-                params![agent_id.as_str(), seq],
-                |row| row.get(0),
-            )
+            )?
+            .query_row(params![agent_id.as_str(), seq], |row| row.get(0))
             .optional()?;
         Ok(received_at.map(|at| (now_ms - at).max(0)))
     }
@@ -4889,7 +4952,7 @@ impl Store {
         }
         let id = format!("sch_{:012x}{}", now, hex(&rand_bytes));
         let conn = self.conn();
-        agent_by_id(&conn, &input.agent_id)?;
+        agent_exists(&conn, &input.agent_id)?;
         // Deduplicate identical active recurring/watch schedules for the same agent.
         if (input.kind == "every" || input.kind == "watch")
             && let Some(existing_id) = conn
@@ -4944,51 +5007,47 @@ impl Store {
         let mut out = Vec::new();
         match (agent_id, active_only) {
             (Some(aid), true) => {
-                let mut stmt = conn.prepare(
-                    "SELECT id, agent_id, kind, spec, prompt, interval_ms, next_fire_at_ms,
-                            last_fired_at_ms, watch_baseline, last_observed, state, created_at_ms
-                     FROM agent_schedules
-                     WHERE agent_id = ?1 AND state = 'active'
-                     ORDER BY created_at_ms ASC, id ASC",
-                )?;
+                let mut stmt = conn.prepare_cached(concat!(
+                    "SELECT ",
+                    schedule_cols!(),
+                    " FROM agent_schedules WHERE agent_id = ?1 AND state = 'active'
+                     ORDER BY created_at_ms ASC, id ASC"
+                ))?;
                 let rows = stmt.query_map([aid.as_str()], schedule_from_row)?;
                 for row in rows {
                     out.push(row?);
                 }
             }
             (Some(aid), false) => {
-                let mut stmt = conn.prepare(
-                    "SELECT id, agent_id, kind, spec, prompt, interval_ms, next_fire_at_ms,
-                            last_fired_at_ms, watch_baseline, last_observed, state, created_at_ms
-                     FROM agent_schedules
-                     WHERE agent_id = ?1
-                     ORDER BY created_at_ms ASC, id ASC",
-                )?;
+                let mut stmt = conn.prepare_cached(concat!(
+                    "SELECT ",
+                    schedule_cols!(),
+                    " FROM agent_schedules WHERE agent_id = ?1
+                     ORDER BY created_at_ms ASC, id ASC"
+                ))?;
                 let rows = stmt.query_map([aid.as_str()], schedule_from_row)?;
                 for row in rows {
                     out.push(row?);
                 }
             }
             (None, true) => {
-                let mut stmt = conn.prepare(
-                    "SELECT id, agent_id, kind, spec, prompt, interval_ms, next_fire_at_ms,
-                            last_fired_at_ms, watch_baseline, last_observed, state, created_at_ms
-                     FROM agent_schedules
-                     WHERE state = 'active'
-                     ORDER BY created_at_ms ASC, id ASC",
-                )?;
+                let mut stmt = conn.prepare_cached(concat!(
+                    "SELECT ",
+                    schedule_cols!(),
+                    " FROM agent_schedules WHERE state = 'active'
+                     ORDER BY created_at_ms ASC, id ASC"
+                ))?;
                 let rows = stmt.query_map([], schedule_from_row)?;
                 for row in rows {
                     out.push(row?);
                 }
             }
             (None, false) => {
-                let mut stmt = conn.prepare(
-                    "SELECT id, agent_id, kind, spec, prompt, interval_ms, next_fire_at_ms,
-                            last_fired_at_ms, watch_baseline, last_observed, state, created_at_ms
-                     FROM agent_schedules
-                     ORDER BY created_at_ms ASC, id ASC",
-                )?;
+                let mut stmt = conn.prepare_cached(concat!(
+                    "SELECT ",
+                    schedule_cols!(),
+                    " FROM agent_schedules ORDER BY created_at_ms ASC, id ASC"
+                ))?;
                 let rows = stmt.query_map([], schedule_from_row)?;
                 for row in rows {
                     out.push(row?);
@@ -5000,13 +5059,12 @@ impl Store {
 
     pub fn get_schedule(&self, id: &str) -> Result<Option<AgentSchedule>, Error> {
         let conn = self.read_conn();
-        conn.query_row(
-            "SELECT id, agent_id, kind, spec, prompt, interval_ms, next_fire_at_ms,
-                    last_fired_at_ms, watch_baseline, last_observed, state, created_at_ms
-             FROM agent_schedules WHERE id = ?1",
-            [id.trim()],
-            schedule_from_row,
-        )
+        conn.prepare_cached(concat!(
+            "SELECT ",
+            schedule_cols!(),
+            " FROM agent_schedules WHERE id = ?1"
+        ))?
+        .query_row([id.trim()], schedule_from_row)
         .optional()
         .map_err(Error::from)
     }
@@ -5196,13 +5254,12 @@ impl Store {
 }
 
 fn schedule_by_id(conn: &Connection, id: &str) -> Result<AgentSchedule, Error> {
-    conn.query_row(
-        "SELECT id, agent_id, kind, spec, prompt, interval_ms, next_fire_at_ms,
-                last_fired_at_ms, watch_baseline, last_observed, state, created_at_ms
-         FROM agent_schedules WHERE id = ?1",
-        [id],
-        schedule_from_row,
-    )
+    conn.prepare_cached(concat!(
+        "SELECT ",
+        schedule_cols!(),
+        " FROM agent_schedules WHERE id = ?1"
+    ))?
+    .query_row([id], schedule_from_row)
     .optional()?
     .ok_or_else(|| Error::Message(format!("schedule not found: {id}")))
 }
@@ -5861,11 +5918,22 @@ fn legacy_last_error(data_dir: &Path, id: &AgentId) -> Option<String> {
 
 fn agent_by_id(conn: &Connection, id: &AgentId) -> Result<Agent, Error> {
     let found = conn
-        .query_row(
-            &format!("SELECT {AGENT_COLS} FROM agents WHERE id = ?1"),
-            [id.as_str()],
-            agent_from_row,
-        )
+        .prepare_cached(concat!(
+            "SELECT ",
+            agent_cols!(),
+            " FROM agents WHERE id = ?1"
+        ))?
+        .query_row([id.as_str()], agent_from_row)
+        .optional()?;
+    found.ok_or_else(|| Error::AgentNotFound(id.to_string()))
+}
+
+/// `Ok` when the agent exists, else [`Error::AgentNotFound`]: the guard most
+/// mailbox and turn operations need, without reading or decoding the row.
+fn agent_exists(conn: &Connection, id: &AgentId) -> Result<(), Error> {
+    let found = conn
+        .prepare_cached("SELECT 1 FROM agents WHERE id = ?1")?
+        .query_row([id.as_str()], |_| Ok(()))
         .optional()?;
     found.ok_or_else(|| Error::AgentNotFound(id.to_string()))
 }
@@ -6501,14 +6569,14 @@ fn message_by_source(
     source_key: &str,
 ) -> Result<Option<Message>, Error> {
     let found = conn
-        .query_row(
-            &format!(
-                "SELECT {MESSAGE_COLS} FROM messages
-                 WHERE agent_id = ?1 AND source_key = ?2"
-            ),
-            params![agent_id.as_str(), source_key],
-            |row| Ok(message_from_row(conn, row)),
-        )
+        .prepare_cached(concat!(
+            "SELECT ",
+            message_cols!(),
+            " FROM messages WHERE agent_id = ?1 AND source_key = ?2"
+        ))?
+        .query_row(params![agent_id.as_str(), source_key], |row| {
+            Ok(message_from_row(conn, row))
+        })
         .optional()?;
     found.transpose()
 }
@@ -7802,21 +7870,19 @@ fn extract_at_handles(text: &str) -> Vec<String> {
 }
 
 fn next_seq(conn: &Connection, agent_id: &AgentId) -> Result<i64, Error> {
-    let seq = conn.query_row(
-        "SELECT MAX(0, COALESCE(MAX(seq), 0)) + 1 FROM messages WHERE agent_id = ?1",
-        [agent_id.as_str()],
-        |row| row.get(0),
-    )?;
+    let seq = conn
+        .prepare_cached(
+            "SELECT MAX(0, COALESCE(MAX(seq), 0)) + 1 FROM messages WHERE agent_id = ?1",
+        )?
+        .query_row([agent_id.as_str()], |row| row.get(0))?;
     Ok(seq)
 }
 
 /// The highest sequence in the agent's mailbox, or 0 when it is empty.
 fn last_seq(conn: &Connection, agent_id: &AgentId) -> Result<i64, Error> {
-    Ok(conn.query_row(
-        "SELECT MAX(0, COALESCE(MAX(seq), 0)) FROM messages WHERE agent_id = ?1",
-        [agent_id.as_str()],
-        |row| row.get(0),
-    )?)
+    Ok(conn
+        .prepare_cached("SELECT MAX(0, COALESCE(MAX(seq), 0)) FROM messages WHERE agent_id = ?1")?
+        .query_row([agent_id.as_str()], |row| row.get(0))?)
 }
 
 /// The mailbox line at `seq`, acknowledged against the `delivered` cursor.
@@ -7827,11 +7893,14 @@ fn message_at_on(
     delivered: i64,
 ) -> Result<Option<Message>, Error> {
     let found = conn
-        .query_row(
-            &format!("SELECT {MESSAGE_COLS} FROM messages WHERE agent_id = ?1 AND seq = ?2"),
-            params![agent_id.as_str(), seq],
-            |row| Ok(message_from_row_with_cursor(row, delivered)),
-        )
+        .prepare_cached(concat!(
+            "SELECT ",
+            message_cols!(),
+            " FROM messages WHERE agent_id = ?1 AND seq = ?2"
+        ))?
+        .query_row(params![agent_id.as_str(), seq], |row| {
+            Ok(message_from_row_with_cursor(row, delivered))
+        })
         .optional()?;
     found.transpose()
 }
@@ -7849,11 +7918,8 @@ fn group_members_on(conn: &Connection, name: &str) -> Result<Vec<String>, Error>
 
 fn cursor(conn: &Connection, agent_id: &AgentId) -> Result<i64, Error> {
     let found = conn
-        .query_row(
-            "SELECT delivered_seq FROM mailbox_cursors WHERE agent_id = ?1",
-            [agent_id.as_str()],
-            |row| row.get(0),
-        )
+        .prepare_cached("SELECT delivered_seq FROM mailbox_cursors WHERE agent_id = ?1")?
+        .query_row([agent_id.as_str()], |row| row.get(0))
         .optional()?;
     found.ok_or_else(|| Error::Message(format!("mailbox cursor missing for {agent_id}")))
 }
@@ -7875,38 +7941,11 @@ fn bump_delivered(conn: &Connection, agent_id: &AgentId, seq: i64) -> Result<(),
 }
 
 fn message_exists(conn: &Connection, agent_id: &AgentId, seq: i64) -> Result<bool, Error> {
-    let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM messages WHERE agent_id = ?1 AND seq = ?2",
-        params![agent_id.as_str(), seq],
-        |row| row.get(0),
-    )?;
+    let count: i64 = conn
+        .prepare_cached("SELECT COUNT(*) FROM messages WHERE agent_id = ?1 AND seq = ?2")?
+        .query_row(params![agent_id.as_str(), seq], |row| row.get(0))?;
     Ok(count == 1)
 }
-
-/// Rows of `agents` (bound as `?1`) that may scale to zero: running, no
-/// running child, the last turn completed past every mailbox line, and every
-/// line delivered. Shared by the read-only precheck and the guarded UPDATE.
-const IDLE_RELEASE_PREDICATE: &str = "id = ?1
-    AND state = 'running'
-    AND NOT EXISTS (
-        SELECT 1 FROM agents child
-        WHERE child.parent_id = ?1
-          AND child.state = 'running'
-    )
-    AND EXISTS (
-        SELECT 1 FROM turn_recovery tr
-        WHERE tr.agent_id = ?1
-          AND tr.completed_seq >= tr.opened_seq
-          AND tr.completed_seq > 0
-          AND tr.completed_seq >= COALESCE((
-              SELECT MAX(m.seq) FROM messages m WHERE m.agent_id = ?1
-          ), 0)
-    )
-    AND COALESCE((
-        SELECT mc.delivered_seq FROM mailbox_cursors mc WHERE mc.agent_id = ?1
-    ), 0) >= COALESCE((
-        SELECT MAX(m.seq) FROM messages m WHERE m.agent_id = ?1
-    ), 0)";
 
 #[cfg(test)]
 mod tests {

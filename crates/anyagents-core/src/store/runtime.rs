@@ -12,7 +12,7 @@ use std::str::FromStr;
 
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
-use super::{AgentId, Error, Store, agent_by_id, cursor, now_ms};
+use super::{AgentId, Error, Store, agent_exists, cursor, now_ms};
 
 /// A process, identified so that a reused pid never inherits a lease: the pid
 /// plus the kernel's start time for that pid.
@@ -763,7 +763,7 @@ impl Store {
         turn_id: Option<&str>,
     ) -> Result<SteerHold, Error> {
         self.runtime_write(|tx| {
-            agent_by_id(tx, agent_id)?;
+            agent_exists(tx, agent_id)?;
             match steer_of(tx, agent_id, message_id)? {
                 None => {
                     tx.execute(
@@ -861,7 +861,7 @@ impl Store {
         pgid: i64,
     ) -> Result<SessionLease, Error> {
         self.runtime_write(|tx| {
-            agent_by_id(tx, agent_id)?;
+            agent_exists(tx, agent_id)?;
             if let Some(held) = session_lease_of(tx, agent_id)? {
                 return Err(Error::LeaseHeld {
                     lease: "session",
@@ -944,7 +944,7 @@ impl Store {
         now: i64,
     ) -> Result<QuotaBlock, Error> {
         self.runtime_write(|tx| {
-            agent_by_id(tx, agent_id)?;
+            agent_exists(tx, agent_id)?;
             let previous = quota_of(tx, agent_id)?;
             let (until_ms, source, attempt) = match reset {
                 QuotaReset::Known { until_ms } => (until_ms, QuotaSource::Known, 0),

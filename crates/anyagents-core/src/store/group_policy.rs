@@ -5,7 +5,7 @@ use std::collections::HashSet;
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
-use super::{Agent, AgentId, Error, Store, agent_by_id, now_ms};
+use super::{Agent, AgentId, Error, Store, agent_by_id, agent_exists, now_ms};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Group {
@@ -190,7 +190,7 @@ fn apply(
     }
     // Resolve and authorize the entire batch before its first mutation.
     for target in targets {
-        agent_by_id(conn, target)?;
+        agent_exists(conn, target)?;
         if action == GroupAction::Leave
             && let Some(caller) = caller
         {

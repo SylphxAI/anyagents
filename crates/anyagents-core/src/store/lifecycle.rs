@@ -10,7 +10,7 @@ use std::str::FromStr;
 
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
-use super::{AgentId, Error, Store, agent_by_id, now_ms};
+use super::{AgentId, Error, Store, agent_exists, now_ms};
 
 macro_rules! ordered_enum {
     ($(#[$meta:meta])* $name:ident, $what:literal { $($variant:ident => $text:literal),+ $(,)? }) => {
@@ -227,7 +227,7 @@ impl Store {
                     return Err(Error::NameReserved(new.agent_name.clone()));
                 }
             } else {
-                agent_by_id(tx, &new.agent_id)?;
+                agent_exists(tx, &new.agent_id)?;
             }
             if let Some(active) = active_op_for(tx, &new.agent_id)? {
                 return Err(Error::LifecycleOpActive {
