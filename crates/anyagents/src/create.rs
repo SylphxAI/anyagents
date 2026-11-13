@@ -2082,6 +2082,10 @@ pub(crate) fn seed_harness_credentials(
             ".grok/settings_cache.json",
         ],
         "spiron" | "spiron-cloud" => &[
+            "spiron-agent.json",
+            "sylphx-agent.json",
+            "opencode.json",
+            "opencode/opencode.json",
             "auth.json",
             "credentials.json",
             "config.toml",
@@ -2223,10 +2227,12 @@ pub(crate) fn seed_harness_credentials(
                     | ".omp/agent/agent.db"
                     | "agent.db"
             );
+        let is_seat_selector = matches!(rel.as_str(), "spiron-agent.json" | "sylphx-agent.json");
         let dst_non_empty = dst.metadata().is_ok_and(|m| m.len() > 0);
-        if dst_non_empty && !is_auth_cred {
+        if !profile_changed && !is_seat_selector && dst_non_empty && !is_auth_cred {
             continue;
         }
+        let mut found_in_profile = false;
         for profile_root in &profile_roots {
             let mut src = profile_root.join(rel);
             if !src.is_file() {
@@ -2259,12 +2265,22 @@ pub(crate) fn seed_harness_credentials(
                 } else {
                     raw_src_bytes
                 };
+                if src_bytes.is_empty() && !is_auth_cred {
+                    let already_empty = dst.is_file() && dst.metadata().is_ok_and(|m| m.len() == 0);
+                    if !already_empty {
+                        anyagents_harness::atomic_write_file(&dst, &src_bytes, 0o660)
+                            .map_err(Error::from)?;
+                    }
+                    found_in_profile = true;
+                    break;
+                }
                 if dst_non_empty {
                     if std::fs::read(&dst).is_err() {
                         chmod_seat_file_readable(&dst);
                     }
                     if let Ok(dst_bytes) = std::fs::read(&dst) {
                         if src_bytes == dst_bytes {
+                            found_in_profile = true;
                             break;
                         }
                         if !profile_changed && !is_anthropic_cred {
@@ -2285,16 +2301,43 @@ pub(crate) fn seed_harness_credentials(
                                 || (src_exp.is_some_and(|s_exp| s_exp > now_ms)
                                     && dst_exp.is_none());
                             if !newer_oauth {
+                                found_in_profile = true;
                                 break;
                             }
                         }
                     } else if !profile_changed && !is_anthropic_cred {
+                        found_in_profile = true;
                         break;
                     }
                 }
-                write_required_file(&dst, &src_bytes, 0o660)?;
+                if !(dst_non_empty
+                    && !is_auth_cred
+                    && std::fs::read(&dst).is_ok_and(|cur| cur == src_bytes))
+                {
+                    write_required_file(&dst, &src_bytes, 0o660)?;
+                }
+                found_in_profile = true;
                 break;
             }
+        }
+        if !found_in_profile
+            && !profile_roots.is_empty()
+            && dst.exists()
+            && (is_seat_selector
+                || (profile_changed
+                    && (is_auth_cred
+                        || matches!(
+                            rel.as_str(),
+                            "config.toml"
+                                | "opencode.json"
+                                | "opencode/opencode.json"
+                                | ".config/opencode/opencode.json"
+                                | "settings.json"
+                                | "models_cache.json"
+                                | "model-catalog-direct.json"
+                        ))))
+        {
+            let _ = std::fs::remove_file(&dst);
         }
     }
     if crate::vendor::is_spiron_harness(&agent.harness) {
@@ -7082,18 +7125,25 @@ pub(crate) fn probe_one_profile_usage(
                         .and_then(|s| s.trim().parse::<i64>().ok())
                         .unwrap_or(0);
                     if now_ms.saturating_sub(last_attempt_ms) < 300_000 {
+                        let cached_expired = std::fs::read_to_string(&last_usage_path)
+                            .ok()
+                            .is_some_and(|s| s.trim().starts_with("oauth expired"));
+                        if cached_expired {
+                            return Some("oauth expired".to_string());
+                        }
                         write_seat_shared_file(&last_usage_path, b"__NONE__\n", 0o600);
                         return None;
                     }
                     let rtok = tok_val
                         .pointer("/token/refresh_token")
                         .or_else(|| tok_val.get("refresh_token"))
-                        .and_then(serde_json::Value::as_str)?
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
                         .trim()
                         .to_string();
                     if rtok.is_empty() {
-                        write_seat_shared_file(&last_usage_path, b"__NONE__\n", 0o600);
-                        return None;
+                        write_seat_shared_file(&last_usage_path, b"oauth expired\n", 0o600);
+                        return Some("oauth expired".to_string());
                     }
                     let reservation = match OAuthRefreshDiskReservation::acquire(
                         &prof_dir,
@@ -7138,8 +7188,8 @@ pub(crate) fn probe_one_profile_usage(
                         }
                     }
                     let Some((new_acc, new_ref)) = refreshed_tokens else {
-                        write_seat_shared_file(&last_usage_path, b"__NONE__\n", 0o600);
-                        return None;
+                        write_seat_shared_file(&last_usage_path, b"oauth expired\n", 0o600);
+                        return Some("oauth expired".to_string());
                     };
                     if let Some(tok_obj) = tok_val
                         .get_mut("token")
@@ -8628,10 +8678,35 @@ const PROFILE_HEALTHY_OAUTH_ATTEMPT_FRESHNESS_MS: i64 = 300_000;
 /// most recent refresh attempt also happened recently (so the token cannot silently
 /// recover on its own). Never probes the network and never treats a missing or stale
 /// signal as unhealthy evidence.
+fn google_oauth_expiry_ms(val: &serde_json::Value) -> Option<i64> {
+    for ptr in ["/token/expiry", "/expiry"] {
+        if let Some(raw) = val.pointer(ptr).and_then(serde_json::Value::as_str)
+            && let Ok(dt) = chrono::DateTime::parse_from_rfc3339(raw.trim())
+        {
+            return Some(dt.timestamp_millis());
+        }
+    }
+    for ptr in [
+        "/token/expires_at",
+        "/expires_at",
+        "/token/expiry_date",
+        "/expiry_date",
+    ] {
+        if let Some(n) = val.pointer(ptr).and_then(serde_json::Value::as_i64) {
+            return Some(if n > 0 && n < 10_000_000_000 {
+                n.saturating_mul(1_000)
+            } else {
+                n
+            });
+        }
+    }
+    None
+}
+
 fn profile_has_unhealthy_evidence(dir: &Path) -> bool {
     let now_ms = anyagents_core::now_ms();
     let usage_path = dir.join(".anyagents-last-usage.txt");
-    if let Ok(usage) = std::fs::read_to_string(&usage_path) {
+    let usage_text_and_age = std::fs::read_to_string(&usage_path).ok().map(|usage| {
         let age_ms = std::fs::metadata(&usage_path)
             .and_then(|meta| meta.modified())
             .map(|mtime| {
@@ -8641,32 +8716,63 @@ fn profile_has_unhealthy_evidence(dir: &Path) -> bool {
                     .unwrap_or(0)
             })
             .unwrap_or(i64::MAX);
-        if parse_remaining_pct_from_usage(&usage, None) == Some(0)
+        (usage, age_ms)
+    });
+    if let Some((ref usage, age_ms)) = usage_text_and_age {
+        let trimmed = usage.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.starts_with("oauth expired") && age_ms < PROFILE_HEALTHY_OAUTH_ATTEMPT_FRESHNESS_MS
+        {
+            return true;
+        }
+        if parse_remaining_pct_from_usage(trimmed, None) == Some(0)
             && age_ms < PROFILE_HEALTHY_USAGE_FRESHNESS_MS
         {
             return true;
         }
     }
-    let cred_text = std::fs::read_to_string(dir.join(".credentials.json"))
-        .or_else(|_| std::fs::read_to_string(dir.join(".claude/.credentials.json")));
-    let Ok(cred_text) = cred_text else {
-        return false;
-    };
-    let Ok(cred) = serde_json::from_str::<serde_json::Value>(&cred_text) else {
-        return false;
-    };
-    let expires_at = cred
-        .pointer("/claudeAiOauth/expiresAt")
-        .and_then(serde_json::Value::as_i64)
-        .unwrap_or(i64::MAX);
-    if expires_at > now_ms {
-        return false;
-    }
     let last_attempt_ms = std::fs::read_to_string(dir.join(OAUTH_REFRESH_ATTEMPT_FILE))
         .ok()
         .and_then(|s| s.trim().parse::<i64>().ok())
         .unwrap_or(0);
-    now_ms.saturating_sub(last_attempt_ms) < PROFILE_HEALTHY_OAUTH_ATTEMPT_FRESHNESS_MS
+    let recent_refresh_attempt = last_attempt_ms > 0
+        && now_ms.saturating_sub(last_attempt_ms) < PROFILE_HEALTHY_OAUTH_ATTEMPT_FRESHNESS_MS;
+
+    if let Ok(cred_text) = std::fs::read_to_string(dir.join(".credentials.json"))
+        .or_else(|_| std::fs::read_to_string(dir.join(".claude/.credentials.json")))
+        && let Ok(cred) = serde_json::from_str::<serde_json::Value>(&cred_text)
+    {
+        let expires_at = cred
+            .pointer("/claudeAiOauth/expiresAt")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(i64::MAX);
+        if expires_at <= now_ms && recent_refresh_attempt {
+            return true;
+        }
+    }
+
+    if let Ok(tok_text) =
+        std::fs::read_to_string(dir.join(".gemini/antigravity-cli/antigravity-oauth-token"))
+            .or_else(|_| std::fs::read_to_string(dir.join(".gemini/oauth_creds.json")))
+        && let Ok(tok) = serde_json::from_str::<serde_json::Value>(&tok_text)
+    {
+        let expires_at = google_oauth_expiry_ms(&tok).unwrap_or(i64::MAX);
+        let has_refresh_token = tok
+            .pointer("/token/refresh_token")
+            .or_else(|| tok.get("refresh_token"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty());
+        let usage_failed = usage_text_and_age.as_ref().is_none_or(|(u, _)| {
+            u.trim() == "__NONE__" || u.trim().to_ascii_lowercase().starts_with("oauth expired")
+        });
+        if (expires_at <= now_ms && (!has_refresh_token || recent_refresh_attempt))
+            || (recent_refresh_attempt && usage_failed)
+        {
+            return true;
+        }
+    }
+
+    false
 }
 
 /// Selects (or reuses the already-bound) Upstream Provider Profile for `agent`
@@ -14918,5 +15024,147 @@ Connection: close
         .unwrap();
         let child_git_wd = PathBuf::from(child_under_git.workdir.as_deref().unwrap());
         fixture.assert_checkout(&child_git_wd);
+    }
+
+    #[test]
+    fn spiron_profile_switch_removes_stale_seat_selector_and_refreshes_gateway_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path();
+        let store = Store::open(data.join("state.db")).unwrap();
+        let mut new_agent = NewAgent::new("spiron-switch", "spiron");
+        new_agent.model = Some("openrouter/model-a".to_string());
+        let agent = store.create_agent(new_agent).unwrap();
+        let cfg = agent_config_dir(data, &agent.id);
+        std::fs::create_dir_all(&cfg).unwrap();
+
+        let alt = data.join("profiles/gw/alt");
+        std::fs::create_dir_all(&alt).unwrap();
+        std::fs::write(
+            alt.join("sylphx-agent.json"),
+            br#"{"gateway_base_url":"https://alt.example/v1"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            alt.join("config.toml"),
+            b"sylphx_ai_url = \"https://alt.example/v1\"\nalways_approve = true\n",
+        )
+        .unwrap();
+        std::fs::write(alt.join("auth.json"), br#"{"access_token":"tok-a"}"#).unwrap();
+
+        let primary = data.join("profiles/gw/default");
+        std::fs::create_dir_all(primary.join(".config/opencode")).unwrap();
+        std::fs::write(
+            primary.join(".config/opencode/opencode.json"),
+            br#"{"provider":{"openrouter":{"options":{"baseURL":"https://gw.example/v1"}}}}"#,
+        )
+        .unwrap();
+        std::fs::write(primary.join("auth.json"), br#"{"access_token":"tok-b"}"#).unwrap();
+
+        write_profile_marker(&cfg, ".anyagents-profile", "gw/alt\n").unwrap();
+        seed_harness_credentials(&store, data, &agent, &cfg).unwrap();
+        assert!(cfg.join("sylphx-agent.json").exists());
+
+        write_profile_marker(&cfg, ".anyagents-profile", "gw/default\n").unwrap();
+        seed_harness_credentials(&store, data, &agent, &cfg).unwrap();
+        crate::spiron::write_spiron_config(
+            &cfg,
+            agent.model.as_deref(),
+            std::path::Path::new("/usr/bin/anyagents"),
+            &["mcp".to_string()],
+        )
+        .unwrap();
+
+        assert!(!cfg.join("sylphx-agent.json").exists());
+        let toml = std::fs::read_to_string(cfg.join("config.toml")).unwrap();
+        assert!(toml.contains("https://gw.example/v1"), "{toml}");
+        assert!(!toml.contains("https://alt.example/v1"), "{toml}");
+    }
+
+    #[test]
+    fn seed_harness_credentials_writes_empty_gemini_migrated_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path();
+        let store = Store::open(data.join("state.db")).unwrap();
+        let agent = store
+            .create_agent(NewAgent::new("agy-migrated", "agy"))
+            .unwrap();
+        let cfg = agent_config_dir(data, &agent.id);
+        std::fs::create_dir_all(&cfg).unwrap();
+
+        let prof = data.join("profiles/google-antigravity/default");
+        std::fs::create_dir_all(prof.join(".gemini/antigravity-cli")).unwrap();
+        std::fs::create_dir_all(prof.join(".gemini/config")).unwrap();
+        std::fs::write(
+            prof.join(".gemini/antigravity-cli/antigravity-oauth-token"),
+            br#"{"email":"a@example.com","token":{"access_token":"ya29.ok","refresh_token":"1//r"}}"#,
+        )
+        .unwrap();
+        std::fs::write(prof.join(".gemini/config/.migrated"), b"").unwrap();
+
+        seed_harness_credentials(&store, data, &agent, &cfg).unwrap();
+        assert!(
+            cfg.join(".gemini/antigravity-cli/antigravity-oauth-token")
+                .is_file()
+        );
+        let migrated = cfg.join(".gemini/config/.migrated");
+        assert!(migrated.is_file());
+        assert_eq!(std::fs::metadata(&migrated).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn initial_bind_skips_google_default_with_expired_oauth_and_refresh_failure() {
+        let (dir, store) = bind_test_store();
+        let data = dir.path();
+        let default = data.join("profiles/google-antigravity/default");
+        let healthy = data.join("profiles/google-antigravity/team-alpha");
+        std::fs::create_dir_all(default.join(".gemini/antigravity-cli")).unwrap();
+        std::fs::create_dir_all(healthy.join(".gemini/antigravity-cli")).unwrap();
+
+        let past_expiry = (chrono::Utc::now() - chrono::Duration::hours(2))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        std::fs::write(
+            default.join(".gemini/antigravity-cli/antigravity-oauth-token"),
+            serde_json::json!({
+                "email": "expired@example.com",
+                "token": {
+                    "access_token": "ya29.expired",
+                    "expiry": past_expiry,
+                    "refresh_token": "1//revoked"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            default.join(OAUTH_REFRESH_ATTEMPT_FILE),
+            anyagents_core::now_ms().to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            default.join(".anyagents-last-usage.txt"),
+            b"__NONE__
+",
+        )
+        .unwrap();
+
+        std::fs::write(
+            healthy.join(".gemini/antigravity-cli/antigravity-oauth-token"),
+            br#"{"email":"healthy@example.com","token":{"access_token":"ya29.ok","refresh_token":"1//ok"}}"#,
+        )
+        .unwrap();
+
+        let mut new_agent = NewAgent::new("agy-expired-default", "agy");
+        new_agent.model = Some("google-antigravity/gemini-3-flash".to_string());
+        let agent = store.create_agent(new_agent).unwrap();
+        let cfg = agent_config_dir(data, &agent.id);
+        std::fs::create_dir_all(&cfg).unwrap();
+
+        let picked = select_or_bind_profile(data, &[], &agent, &cfg);
+        assert_eq!(picked, vec![healthy]);
+        assert_eq!(
+            bound_profile_name(&cfg).as_deref(),
+            Some("google-antigravity/team-alpha")
+        );
     }
 }
