@@ -1254,42 +1254,66 @@ pub(crate) fn read_shared_agents_md(config: &Path) -> Option<String> {
         .filter(|text| !text.is_empty())
 }
 
+/// Fast-forward the checkout that holds the shared `skills` and `AGENTS.md`.
+/// One `ls-remote` names origin's `main`; while it is the commit this process
+/// last pulled, the checkout is neither scanned nor pulled.
 #[cfg(unix)]
 pub(crate) fn sync_canonical_skills(data_dir: &Path) {
-    for rel in ["skills", "AGENTS.md"] {
-        let target_path = data_dir.join(rel);
-        if let Ok(resolved) = std::fs::canonicalize(&target_path)
-            && let Some(repo_root) = resolved.parent()
-            && repo_root.join(".git").exists()
-        {
-            let is_clean = std::process::Command::new("git")
-                .args([
-                    "-c",
-                    "core.fsmonitor=false",
-                    "-c",
-                    "core.hooksPath=/dev/null",
-                ])
-                .arg("-C")
-                .arg(repo_root)
-                .args(["status", "--porcelain"])
-                .output()
-                .ok()
-                .is_some_and(|o| o.status.success() && o.stdout.is_empty());
-            if is_clean {
-                let _ = std::process::Command::new("git")
-                    .args([
-                        "-c",
-                        "core.fsmonitor=false",
-                        "-c",
-                        "core.hooksPath=/dev/null",
-                    ])
-                    .arg("-C")
-                    .arg(repo_root)
-                    .args(["pull", "--ff-only", "--quiet", "origin", "main"])
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status();
-            }
+    use std::collections::BTreeMap;
+    use std::sync::{Mutex, PoisonError};
+    static PULLED: Mutex<BTreeMap<PathBuf, String>> = Mutex::new(BTreeMap::new());
+    let git = |repo_root: &Path| {
+        let mut command = std::process::Command::new("git");
+        command
+            .args([
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+            ])
+            .arg("-C")
+            .arg(repo_root);
+        command
+    };
+    let repo_roots: std::collections::BTreeSet<PathBuf> = ["skills", "AGENTS.md"]
+        .into_iter()
+        .filter_map(|rel| std::fs::canonicalize(data_dir.join(rel)).ok())
+        .filter_map(|resolved| resolved.parent().map(Path::to_path_buf))
+        .filter(|repo_root| repo_root.join(".git").exists())
+        .collect();
+    for repo_root in repo_roots {
+        let remote_main = git(&repo_root)
+            .args(["ls-remote", "--quiet", "origin", "refs/heads/main"])
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .and_then(|out| {
+                String::from_utf8_lossy(&out.stdout)
+                    .split_whitespace()
+                    .next()
+                    .map(str::to_string)
+            });
+        let pulled = || PULLED.lock().unwrap_or_else(PoisonError::into_inner);
+        if remote_main.is_some() && pulled().get(&repo_root) == remote_main.as_ref() {
+            continue;
+        }
+        let is_clean = git(&repo_root)
+            .args(["status", "--porcelain"])
+            .output()
+            .ok()
+            .is_some_and(|o| o.status.success() && o.stdout.is_empty());
+        if !is_clean {
+            continue;
+        }
+        let fast_forwarded = git(&repo_root)
+            .args(["pull", "--ff-only", "--quiet", "origin", "main"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        if fast_forwarded && let Some(commit) = remote_main {
+            pulled().insert(repo_root, commit);
         }
     }
 }
@@ -12485,6 +12509,86 @@ git -c safe.directory="$5" -C "$5" status --porcelain
             "expected 7d tail preserved, got: {overlaid}"
         );
         assert_eq!(parse_remaining_pct_from_usage(&overlaid, None), Some(0));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn canonical_skills_pull_only_when_origin_main_moves() {
+        use crate::worktree::tests::git;
+        let dir = tempfile::tempdir().unwrap();
+        let commit = |repo: &Path, file: &str| {
+            std::fs::create_dir_all(repo.join("skills")).unwrap();
+            std::fs::write(repo.join("skills").join(file), file).unwrap();
+            git(repo, &["add", "."]);
+            git(
+                repo,
+                &[
+                    "-c",
+                    "user.name=Example",
+                    "-c",
+                    "user.email=example@example.org",
+                    "commit",
+                    "-qm",
+                    file,
+                ],
+            );
+        };
+        let origin = dir.path().join("origin.git");
+        let author = dir.path().join("author");
+        let checkout = dir.path().join("checkout");
+        let data = dir.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        git(
+            dir.path(),
+            &[
+                "init",
+                "-q",
+                "--bare",
+                "-b",
+                "main",
+                origin.to_str().unwrap(),
+            ],
+        );
+        git(
+            dir.path(),
+            &[
+                "clone",
+                "-q",
+                origin.to_str().unwrap(),
+                author.to_str().unwrap(),
+            ],
+        );
+        git(&author, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        commit(&author, "one.md");
+        commit(&author, "two.md");
+        git(&author, &["push", "-q", "origin", "main"]);
+        git(
+            dir.path(),
+            &[
+                "clone",
+                "-q",
+                origin.to_str().unwrap(),
+                checkout.to_str().unwrap(),
+            ],
+        );
+        std::os::unix::fs::symlink(checkout.join("skills"), data.join("skills")).unwrap();
+
+        sync_canonical_skills(&data);
+        let synced = git(&checkout, &["rev-parse", "HEAD"]);
+        // Origin has not moved since the last pull: the checkout is left alone,
+        // even one a local reset put behind.
+        git(&checkout, &["reset", "-q", "--hard", "HEAD~1"]);
+        sync_canonical_skills(&data);
+        assert_ne!(git(&checkout, &["rev-parse", "HEAD"]), synced);
+
+        commit(&author, "three.md");
+        git(&author, &["push", "-q", "origin", "main"]);
+        sync_canonical_skills(&data);
+        assert_eq!(
+            git(&checkout, &["rev-parse", "HEAD"]),
+            git(&author, &["rev-parse", "HEAD"])
+        );
+        assert!(checkout.join("skills/three.md").is_file());
     }
 
     #[test]
