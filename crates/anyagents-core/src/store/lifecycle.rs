@@ -117,7 +117,10 @@ pub struct SchedulePending {
 const OP_COLS: &str = "op_id, agent_id, agent_name, kind, phase, actor, reason, evidence, error, \
      started_at_ms, updated_at_ms, finished_at_ms";
 
-fn conversion(index: usize, err: impl std::error::Error + Send + Sync + 'static) -> rusqlite::Error {
+fn conversion(
+    index: usize,
+    err: impl std::error::Error + Send + Sync + 'static,
+) -> rusqlite::Error {
     rusqlite::Error::FromSqlConversionFailure(index, rusqlite::types::Type::Text, Box::new(err))
 }
 
@@ -177,7 +180,11 @@ pub(super) fn spawn_reservation(conn: &Connection, name: &str) -> Result<Option<
         .optional()?)
 }
 
-fn evidence_entry(phase: LifecyclePhase, at_ms: i64, evidence: serde_json::Value) -> serde_json::Value {
+fn evidence_entry(
+    phase: LifecyclePhase,
+    at_ms: i64,
+    evidence: serde_json::Value,
+) -> serde_json::Value {
     serde_json::json!({ "phase": phase.as_str(), "at_ms": at_ms, "evidence": evidence })
 }
 
@@ -198,8 +205,13 @@ impl Store {
     /// refused when an agent or another unfinished spawn already has it. Any
     /// other kind needs the agent to exist. One unfinished op per agent.
     pub fn begin_lifecycle_op(&self, new: &NewLifecycleOp) -> Result<LifecycleOp, Error> {
-        if new.actor.trim().is_empty() || new.reason.trim().is_empty() || new.agent_name.trim().is_empty() {
-            return Err(Error::Message("a lifecycle op needs an agent name, an actor and a reason".into()));
+        if new.actor.trim().is_empty()
+            || new.reason.trim().is_empty()
+            || new.agent_name.trim().is_empty()
+        {
+            return Err(Error::Message(
+                "a lifecycle op needs an agent name, an actor and a reason".into(),
+            ));
         }
         self.lifecycle_write(|tx| {
             if new.kind == LifecycleKind::Spawn {
@@ -278,7 +290,12 @@ impl Store {
                 "UPDATE lifecycle_ops SET phase = ?2, evidence = ?3, updated_at_ms = ?4,
                      finished_at_ms = CASE WHEN ?2 IN ('done', 'rolled_back') THEN ?4 ELSE NULL END
                  WHERE op_id = ?1",
-                params![op_id, to.as_str(), serde_json::Value::Array(entries).to_string(), now],
+                params![
+                    op_id,
+                    to.as_str(),
+                    serde_json::Value::Array(entries).to_string(),
+                    now
+                ],
             )?;
             op_by_id(tx, op_id)
         })
@@ -319,7 +336,11 @@ impl Store {
     }
 
     /// An agent's ops, newest first.
-    pub fn lifecycle_ops_for(&self, agent_id: &AgentId, limit: usize) -> Result<Vec<LifecycleOp>, Error> {
+    pub fn lifecycle_ops_for(
+        &self,
+        agent_id: &AgentId,
+        limit: usize,
+    ) -> Result<Vec<LifecycleOp>, Error> {
         let conn = self.read_conn();
         let mut stmt = conn.prepare(&format!(
             "SELECT {OP_COLS} FROM lifecycle_ops WHERE agent_id = ?1
@@ -379,7 +400,10 @@ impl Store {
 
     /// Take and clear the coalesced ticks of `schedule_id` (one delivery covers
     /// them all). `None` when nothing is pending.
-    pub fn take_schedule_pending(&self, schedule_id: &str) -> Result<Option<SchedulePending>, Error> {
+    pub fn take_schedule_pending(
+        &self,
+        schedule_id: &str,
+    ) -> Result<Option<SchedulePending>, Error> {
         self.lifecycle_write(|tx| {
             let pending = pending_of(tx, schedule_id)?;
             if pending.is_some() {

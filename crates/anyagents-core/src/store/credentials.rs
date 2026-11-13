@@ -21,7 +21,8 @@ fn valid_segment(text: &str) -> bool {
     chars
         .next()
         .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
-        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-'))
+        && chars
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-'))
 }
 
 /// A channel id segment as minted by the store (letters, digits and `_`).
@@ -165,7 +166,9 @@ impl FromStr for CredentialTarget {
                 Err(invalid("target", text))
             };
         }
-        let record = text.strip_prefix("record:").ok_or_else(|| invalid("target", text))?;
+        let record = text
+            .strip_prefix("record:")
+            .ok_or_else(|| invalid("target", text))?;
         let mut parts = record.split('/');
         match (parts.next(), parts.next(), parts.next(), parts.next()) {
             (Some(kind), Some(provider), Some(name), None)
@@ -229,7 +232,11 @@ fn optional_column<T: FromStr<Err = Error>>(
     let text: Option<String> = row.get(index)?;
     text.map(|text| {
         text.parse().map_err(|err: Error| {
-            rusqlite::Error::FromSqlConversionFailure(index, rusqlite::types::Type::Text, Box::new(err))
+            rusqlite::Error::FromSqlConversionFailure(
+                index,
+                rusqlite::types::Type::Text,
+                Box::new(err),
+            )
         })
     })
     .transpose()
@@ -262,7 +269,9 @@ fn binding_of(
 ) -> Result<Option<CredentialBinding>, Error> {
     Ok(conn
         .query_row(
-            &format!("SELECT {BINDING_COLS} FROM credential_bindings WHERE agent_id = ?1 AND slot = ?2"),
+            &format!(
+                "SELECT {BINDING_COLS} FROM credential_bindings WHERE agent_id = ?1 AND slot = ?2"
+            ),
             params![agent_id.as_str(), slot.to_string()],
             binding_from_row,
         )
@@ -303,16 +312,31 @@ pub(super) fn delete_bindings_for_deleted_agent(
     actor: &str,
 ) -> Result<(), Error> {
     let rows: Vec<(String, String)> = {
-        let mut stmt =
-            tx.prepare("SELECT slot, target FROM credential_bindings WHERE agent_id = ?1 ORDER BY slot")?;
+        let mut stmt = tx.prepare(
+            "SELECT slot, target FROM credential_bindings WHERE agent_id = ?1 ORDER BY slot",
+        )?;
         let rows = stmt.query_map([agent_id.as_str()], |row| Ok((row.get(0)?, row.get(1)?)))?;
         rows.collect::<Result<_, _>>()?
     };
     for (slot, target) in rows {
-        audit(tx, agent_id, &slot, Some(&target), None, actor, "agent deleted")?;
+        audit(
+            tx,
+            agent_id,
+            &slot,
+            Some(&target),
+            None,
+            actor,
+            "agent deleted",
+        )?;
     }
-    tx.execute("DELETE FROM credential_bindings WHERE agent_id = ?1", [agent_id.as_str()])?;
-    tx.execute("DELETE FROM credential_observations WHERE agent_id = ?1", [agent_id.as_str()])?;
+    tx.execute(
+        "DELETE FROM credential_bindings WHERE agent_id = ?1",
+        [agent_id.as_str()],
+    )?;
+    tx.execute(
+        "DELETE FROM credential_observations WHERE agent_id = ?1",
+        [agent_id.as_str()],
+    )?;
     Ok(())
 }
 
@@ -380,7 +404,15 @@ impl Store {
                 "DELETE FROM credential_bindings WHERE agent_id = ?1 AND slot = ?2",
                 params![agent_id.as_str(), slot_text],
             )?;
-            audit(tx, agent_id, &slot_text, Some(&before.target.to_string()), None, actor, reason)?;
+            audit(
+                tx,
+                agent_id,
+                &slot_text,
+                Some(&before.target.to_string()),
+                None,
+                actor,
+                reason,
+            )?;
             Ok(Some(before))
         })
     }
@@ -394,7 +426,10 @@ impl Store {
     }
 
     /// The agent's bindings, ordered by slot.
-    pub fn credential_bindings_of(&self, agent_id: &AgentId) -> Result<Vec<CredentialBinding>, Error> {
+    pub fn credential_bindings_of(
+        &self,
+        agent_id: &AgentId,
+    ) -> Result<Vec<CredentialBinding>, Error> {
         let conn = self.read_conn();
         let mut stmt = conn.prepare(&format!(
             "SELECT {BINDING_COLS} FROM credential_bindings WHERE agent_id = ?1 ORDER BY slot"
@@ -414,7 +449,10 @@ impl Store {
     }
 
     /// The agent's binding audit trail, oldest first.
-    pub fn credential_binding_audit(&self, agent_id: &AgentId) -> Result<Vec<CredentialBindingAudit>, Error> {
+    pub fn credential_binding_audit(
+        &self,
+        agent_id: &AgentId,
+    ) -> Result<Vec<CredentialBindingAudit>, Error> {
         let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT id, agent_id, slot, before_target, after_target, actor, reason, at_ms

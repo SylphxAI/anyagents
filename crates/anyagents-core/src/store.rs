@@ -29,6 +29,9 @@ mod group_policy;
 mod harness_leases;
 mod lifecycle;
 mod runtime;
+#[cfg(test)]
+#[path = "store/runtime_tests.rs"]
+mod runtime_tests;
 pub use credentials::{
     CredentialBinding, CredentialBindingAudit, CredentialKind, CredentialObservation,
     CredentialSlot, CredentialTarget,
@@ -37,9 +40,9 @@ pub use group_policy::{Group, GroupAction, GroupActor};
 pub use harness_leases::HarnessLease;
 pub use lifecycle::{LifecycleKind, LifecycleOp, LifecyclePhase, NewLifecycleOp, SchedulePending};
 pub use runtime::{
-    AgentRuntime, BackfillReport, Fault, FaultKind, ProcessIdentity, QUOTA_ESTIMATE_MS,
-    QuotaBlock, QuotaReset, QuotaSource, RecoveryOffer, RuntimeChange, RuntimeState,
-    SessionLease, SteerHold, SteerState, Turn, TurnOutcome, TurnState, steer_allows,
+    AgentRuntime, BackfillReport, Fault, FaultKind, ProcessIdentity, QUOTA_ESTIMATE_MS, QuotaBlock,
+    QuotaReset, QuotaSource, RecoveryOffer, RuntimeChange, RuntimeState, SessionLease, SteerHold,
+    SteerState, Turn, TurnOutcome, TurnState, steer_allows,
 };
 
 /// A line's provider coordinates: the chat, the forum topic and the message id.

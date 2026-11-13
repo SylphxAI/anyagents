@@ -280,7 +280,11 @@ pub struct QuotaBlock {
     pub observed_at_ms: i64,
 }
 
-fn conflict(machine: &'static str, expected: impl fmt::Display, actual: impl fmt::Display) -> Error {
+fn conflict(
+    machine: &'static str,
+    expected: impl fmt::Display,
+    actual: impl fmt::Display,
+) -> Error {
     Error::StateConflict {
         machine,
         expected: expected.to_string(),
@@ -309,8 +313,7 @@ fn agent_id_at(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<AgentI
     })
 }
 
-const RUNTIME_COLS: &str =
-    "agent_id, state, generation, attempt, until_ms, fault_kind, fault_detail, vendor_session_id, updated_at_ms";
+const RUNTIME_COLS: &str = "agent_id, state, generation, attempt, until_ms, fault_kind, fault_detail, vendor_session_id, updated_at_ms";
 
 fn runtime_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRuntime> {
     let fault_kind: Option<String> = row.get(5)?;
@@ -478,12 +481,19 @@ fn steer_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SteerHold> {
     })
 }
 
-const STEER_COLS: &str = "agent_id, message_id, generation, turn_id, state, redelivered, updated_at_ms";
+const STEER_COLS: &str =
+    "agent_id, message_id, generation, turn_id, state, redelivered, updated_at_ms";
 
-fn steer_of(conn: &Connection, agent_id: &AgentId, message_id: &str) -> Result<Option<SteerHold>, Error> {
+fn steer_of(
+    conn: &Connection,
+    agent_id: &AgentId,
+    message_id: &str,
+) -> Result<Option<SteerHold>, Error> {
     Ok(conn
         .query_row(
-            &format!("SELECT {STEER_COLS} FROM steer_holds WHERE agent_id = ?1 AND message_id = ?2"),
+            &format!(
+                "SELECT {STEER_COLS} FROM steer_holds WHERE agent_id = ?1 AND message_id = ?2"
+            ),
             params![agent_id.as_str(), message_id],
             steer_from_row,
         )
@@ -582,7 +592,12 @@ impl Store {
 
     /// Open a turn at `first_seq` for the live generation. Refused while another
     /// turn is unfinished or the runtime is not live in that generation.
-    pub fn begin_turn(&self, agent_id: &AgentId, generation: i64, first_seq: i64) -> Result<Turn, Error> {
+    pub fn begin_turn(
+        &self,
+        agent_id: &AgentId,
+        generation: i64,
+        first_seq: i64,
+    ) -> Result<Turn, Error> {
         self.runtime_write(|tx| {
             require_live(tx, agent_id, generation)?;
             if let Some(turn) = unfinished_turn(tx, agent_id)? {
@@ -622,7 +637,12 @@ impl Store {
     }
 
     /// Close the open turn on the harness's explicit terminal event.
-    pub fn end_turn(&self, agent_id: &AgentId, turn_id: &str, outcome: TurnOutcome) -> Result<Turn, Error> {
+    pub fn end_turn(
+        &self,
+        agent_id: &AgentId,
+        turn_id: &str,
+        outcome: TurnOutcome,
+    ) -> Result<Turn, Error> {
         if outcome == TurnOutcome::Recovered {
             return Err(refused("turn", TurnState::Open, "closed(recovered)"));
         }
@@ -651,7 +671,12 @@ impl Store {
     }
 
     /// Offer one `[Recovery]` for an interrupted turn, up to `limit` offers.
-    pub fn offer_turn_recovery(&self, agent_id: &AgentId, turn_id: &str, limit: i64) -> Result<RecoveryOffer, Error> {
+    pub fn offer_turn_recovery(
+        &self,
+        agent_id: &AgentId,
+        turn_id: &str,
+        limit: i64,
+    ) -> Result<RecoveryOffer, Error> {
         self.runtime_write(|tx| {
             let turn = turn_by_id(tx, agent_id, turn_id)?;
             if turn.state != TurnState::Interrupted {
@@ -664,11 +689,20 @@ impl Store {
                     let change = RuntimeChange {
                         fault: Some(Fault {
                             kind: FaultKind::RecoveryExhausted,
-                            detail: format!("turn {turn_id} recovered {} times", turn.recovery_count),
+                            detail: format!(
+                                "turn {turn_id} recovered {} times",
+                                turn.recovery_count
+                            ),
                         }),
                         ..RuntimeChange::default()
                     };
-                    transition_runtime_tx(tx, agent_id, runtime.state, RuntimeState::Faulted, &change)?;
+                    transition_runtime_tx(
+                        tx,
+                        agent_id,
+                        runtime.state,
+                        RuntimeState::Faulted,
+                        &change,
+                    )?;
                 }
                 return Ok(RecoveryOffer::Exhausted(turn));
             }
@@ -835,7 +869,9 @@ impl Store {
                 });
             }
             tx.execute(
-                &format!("INSERT INTO session_leases ({LEASE_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"),
+                &format!(
+                    "INSERT INTO session_leases ({LEASE_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
+                ),
                 params![
                     agent_id.as_str(),
                     vendor_session_id,
@@ -901,7 +937,12 @@ impl Store {
 
     /// Record a quota answer. A known reset is used as given; an unknown one is
     /// estimated from [`QUOTA_ESTIMATE_MS`] by consecutive unknown attempts.
-    pub fn block_quota(&self, agent_id: &AgentId, reset: QuotaReset, now: i64) -> Result<QuotaBlock, Error> {
+    pub fn block_quota(
+        &self,
+        agent_id: &AgentId,
+        reset: QuotaReset,
+        now: i64,
+    ) -> Result<QuotaBlock, Error> {
         self.runtime_write(|tx| {
             agent_by_id(tx, agent_id)?;
             let previous = quota_of(tx, agent_id)?;
@@ -935,7 +976,10 @@ impl Store {
     /// Clear the quota block (deadline passed, or an operator cleared it).
     pub fn clear_quota_block(&self, agent_id: &AgentId) -> Result<bool, Error> {
         self.runtime_write(|tx| {
-            Ok(tx.execute("DELETE FROM quota_blocks WHERE agent_id = ?1", [agent_id.as_str()])? > 0)
+            Ok(tx.execute(
+                "DELETE FROM quota_blocks WHERE agent_id = ?1",
+                [agent_id.as_str()],
+            )? > 0)
         })
     }
 
@@ -1047,7 +1091,8 @@ fn session_lease_of(conn: &Connection, agent_id: &AgentId) -> Result<Option<Sess
 }
 
 fn require_live(tx: &Transaction<'_>, agent_id: &AgentId, generation: i64) -> Result<(), Error> {
-    let runtime = runtime_of(tx, agent_id)?.ok_or_else(|| Error::AgentNotFound(agent_id.to_string()))?;
+    let runtime =
+        runtime_of(tx, agent_id)?.ok_or_else(|| Error::AgentNotFound(agent_id.to_string()))?;
     if runtime.state != RuntimeState::Live || runtime.generation != generation {
         return Err(conflict(
             "runtime",
@@ -1058,7 +1103,12 @@ fn require_live(tx: &Transaction<'_>, agent_id: &AgentId, generation: i64) -> Re
     Ok(())
 }
 
-fn set_turn_state(tx: &Transaction<'_>, agent_id: &AgentId, turn_id: &str, state: TurnState) -> Result<(), Error> {
+fn set_turn_state(
+    tx: &Transaction<'_>,
+    agent_id: &AgentId,
+    turn_id: &str,
+    state: TurnState,
+) -> Result<(), Error> {
     tx.execute(
         "UPDATE turns SET state = ?3 WHERE agent_id = ?1 AND turn_id = ?2",
         params![agent_id.as_str(), turn_id, state.as_str()],
@@ -1066,7 +1116,12 @@ fn set_turn_state(tx: &Transaction<'_>, agent_id: &AgentId, turn_id: &str, state
     Ok(())
 }
 
-fn close_turn(tx: &Transaction<'_>, agent_id: &AgentId, turn_id: &str, outcome: TurnOutcome) -> Result<(), Error> {
+fn close_turn(
+    tx: &Transaction<'_>,
+    agent_id: &AgentId,
+    turn_id: &str,
+    outcome: TurnOutcome,
+) -> Result<(), Error> {
     tx.execute(
         "UPDATE turns SET state = 'closed', outcome = ?3, closed_at_ms = ?4 WHERE agent_id = ?1 AND turn_id = ?2",
         params![agent_id.as_str(), turn_id, outcome.as_str(), now_ms()],
@@ -1082,7 +1137,9 @@ fn rewind_before(tx: &Transaction<'_>, agent_id: &AgentId, message_id: &str) -> 
             |row| row.get(0),
         )
         .optional()?
-        .ok_or_else(|| Error::Message(format!("steer message {message_id} is not in the mailbox")))?;
+        .ok_or_else(|| {
+            Error::Message(format!("steer message {message_id} is not in the mailbox"))
+        })?;
     tx.execute(
         "UPDATE mailbox_cursors SET delivered_seq = MIN(delivered_seq, ?2) WHERE agent_id = ?1",
         params![agent_id.as_str(), seq - 1],
@@ -1101,7 +1158,8 @@ fn transition_runtime_tx(
     to: RuntimeState,
     change: &RuntimeChange,
 ) -> Result<AgentRuntime, Error> {
-    let current = runtime_of(tx, agent_id)?.ok_or_else(|| Error::AgentNotFound(agent_id.to_string()))?;
+    let current =
+        runtime_of(tx, agent_id)?.ok_or_else(|| Error::AgentNotFound(agent_id.to_string()))?;
     if current.state != from {
         return Err(conflict("runtime", from, current.state));
     }

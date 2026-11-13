@@ -46,7 +46,9 @@ impl Store {
         holder: ProcessIdentity,
     ) -> Result<HarnessLease, Error> {
         if harness.trim().is_empty() || version.trim().is_empty() {
-            return Err(Error::Message("a harness lease needs a harness and a version".into()));
+            return Err(Error::Message(
+                "a harness lease needs a harness and a version".into(),
+            ));
         }
         self.write_with_retry(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -57,11 +59,20 @@ impl Store {
                      ON CONFLICT(agent_id, harness) DO UPDATE SET version = ?3, holder_pid = ?4,
                          holder_start_time = ?5, acquired_at_ms = ?6"
                 ),
-                params![agent_id.as_str(), harness, version, holder.pid, holder.start_time, now_ms()],
+                params![
+                    agent_id.as_str(),
+                    harness,
+                    version,
+                    holder.pid,
+                    holder.start_time,
+                    now_ms()
+                ],
             )?;
             let lease = tx
                 .query_row(
-                    &format!("SELECT {COLS} FROM harness_leases WHERE agent_id = ?1 AND harness = ?2"),
+                    &format!(
+                        "SELECT {COLS} FROM harness_leases WHERE agent_id = ?1 AND harness = ?2"
+                    ),
                     params![agent_id.as_str(), harness],
                     lease_from_row,
                 )
@@ -103,13 +114,17 @@ impl Store {
     /// as an error, never as an empty set.
     pub fn leased_versions(&self, harness: &str) -> Result<BTreeSet<String>, Error> {
         let conn = self.read_conn();
-        let mut stmt = conn.prepare("SELECT DISTINCT version FROM harness_leases WHERE harness = ?1")?;
+        let mut stmt =
+            conn.prepare("SELECT DISTINCT version FROM harness_leases WHERE harness = ?1")?;
         let rows = stmt.query_map([harness], |row| row.get::<_, String>(0))?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
     /// Drop every lease whose holder `is_alive` reports gone. Returns the count.
-    pub fn reclaim_harness_leases(&self, is_alive: impl Fn(&ProcessIdentity) -> bool) -> Result<usize, Error> {
+    pub fn reclaim_harness_leases(
+        &self,
+        is_alive: impl Fn(&ProcessIdentity) -> bool,
+    ) -> Result<usize, Error> {
         self.write_with_retry(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let leases: Vec<HarnessLease> = {
@@ -122,7 +137,12 @@ impl Store {
                 dropped += tx.execute(
                     "DELETE FROM harness_leases WHERE agent_id = ?1 AND harness = ?2
                      AND holder_pid = ?3 AND holder_start_time = ?4",
-                    params![lease.agent_id.as_str(), lease.harness, lease.holder.pid, lease.holder.start_time],
+                    params![
+                        lease.agent_id.as_str(),
+                        lease.harness,
+                        lease.holder.pid,
+                        lease.holder.start_time
+                    ],
                 )?;
             }
             tx.commit()?;
