@@ -2759,6 +2759,7 @@ mod persistence_tests {
             completed_turn_in_session: false,
             quota_started_at: None,
             pending_switch_started_at: None,
+            switch_retry_at: 0,
             process_started_at: None,
             process_profile_rotated_ms: 0,
             last_error: None,
