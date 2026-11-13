@@ -1466,6 +1466,16 @@ pub fn flush(data: &Path, name: &str) -> Result<(), anyagents_core::Error> {
         if agent.state != "running" {
             continue;
         }
+        // One vendor process per agent: a harness a server or a keeper holds
+        // takes its own mail; this one-shot process would be a second.
+        let _process = match store.try_lock_agent(&agent.id) {
+            Ok(lock) => lock,
+            Err(anyagents_core::Error::AgentBusy) => {
+                println!("{}	skipped	its harness process is live", agent.name);
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         let config_dir = anyagents_core::agent_config_dir(data, &agent.id);
         let work_dir = agent
             .workdir
