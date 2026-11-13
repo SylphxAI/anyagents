@@ -285,7 +285,8 @@ async fn serve(
                         eprintln!("anyagents-host-history: deferred full verification: {error}");
                     }
                     crate::browser::reap_idle_browsers(&root);
-                    crate::create::sync_fresher_bound_agent_credentials(&root);
+                    record_live_quota_resets(&store, &root, &health);
+                    crate::create::sync_fresher_bound_agent_credentials_in(&store, &root);
                     #[cfg(unix)]
                     crate::create::sync_canonical_skills(&root);
                 })
@@ -548,6 +549,22 @@ fn consolidate_idle_agent_memory(
         }
         if consolidated.is_ok() && store.sleep_memory_caught_up(&agent.id).unwrap_or(false) {
             backlog.settle(&agent_id);
+        }
+    }
+}
+
+/// Record the reset of each profile whose live agent the supervisor reports
+/// quota-held, so profile listings and rotation see it. The board is in memory:
+/// a fleet with no quota hold costs one indexed read.
+fn record_live_quota_resets(store: &Store, data_dir: &Path, health: &HealthBoard) {
+    let now = now_ms();
+    for agent in store.list_live_agents().unwrap_or_default() {
+        if let Some(reset_ms) = health
+            .get(&agent.id)
+            .and_then(|live| live.quota_reset_at_ms)
+            .filter(|&reset_ms| reset_ms > now)
+        {
+            create::record_profile_quota_reset(data_dir, &agent, reset_ms);
         }
     }
 }

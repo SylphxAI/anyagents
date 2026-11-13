@@ -5132,17 +5132,82 @@ fn merge_preserved_oauth_metadata(src_bytes: &[u8], dst_bytes: &[u8]) -> Option<
     changed.then(|| serde_json::to_vec(&src_val).ok()).flatten()
 }
 
+/// A file's identity and content stamp: any rewrite, rename or chmod changes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileStamp {
+    dev: u64,
+    ino: u64,
+    len: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+impl FileStamp {
+    fn of(meta: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            len: meta.len(),
+            mtime: (meta.mtime(), meta.mtime_nsec()),
+            ctime: (meta.ctime(), meta.ctime_nsec()),
+        }
+    }
+}
+
+type CopyStamps = (FileStamp, FileStamp);
+
+/// `(source, destination)` pairs a copy last found nothing to do for, with the
+/// stamps both files had then. The decision depends only on the two files, so
+/// while neither changes it stands without reading them again.
+static SETTLED_COPIES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<(PathBuf, PathBuf), CopyStamps>>,
+> = std::sync::LazyLock::new(Default::default);
+
+fn settled_copies()
+-> std::sync::MutexGuard<'static, std::collections::HashMap<(PathBuf, PathBuf), CopyStamps>> {
+    SETTLED_COPIES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(test)]
+thread_local! {
+    static COPY_EVALUATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn copy_seat_file_if_newer(src: &Path, dst: &Path) -> bool {
+    let key = (src.to_path_buf(), dst.to_path_buf());
+    let stamps = std::fs::symlink_metadata(src)
+        .ok()
+        .zip(std::fs::metadata(dst).ok())
+        .map(|(src_meta, dst_meta)| (FileStamp::of(&src_meta), FileStamp::of(&dst_meta)));
+    if stamps.is_some() && settled_copies().get(&key) == stamps.as_ref() {
+        return false;
+    }
+    let copied = copy_seat_file_if_newer_uncached(src, dst);
+    // Stamps taken before the read: a change during it is seen next time.
+    match stamps.filter(|_| !copied) {
+        Some(stamps) => settled_copies().insert(key, stamps),
+        None => settled_copies().remove(&key),
+    };
+    copied
+}
+
+fn copy_seat_file_if_newer_uncached(src: &Path, dst: &Path) -> bool {
+    #[cfg(test)]
+    COPY_EVALUATIONS.with(|count| count.set(count.get() + 1));
     let Ok(src_meta) = std::fs::symlink_metadata(src) else {
         return false;
     };
     if src_meta.file_type().is_symlink() || !src_meta.file_type().is_file() || src_meta.len() == 0 {
         return false;
     }
-    if std::fs::read(src).is_err() {
+    let read = std::fs::read(src).or_else(|_| {
         chmod_seat_file_readable(src);
-    }
-    let Ok(mut src_bytes) = std::fs::read(src) else {
+        std::fs::read(src)
+    });
+    let Ok(mut src_bytes) = read else {
         return false;
     };
     if src_bytes.is_empty() {
@@ -5923,6 +5988,15 @@ fn overlay_active_quota_reset_on_cached_usage(
 }
 
 pub(crate) fn sync_fresher_bound_agent_credentials(data: &Path) {
+    if let Ok(store) = Store::open(data.join("state.db")) {
+        sync_fresher_bound_agent_credentials_in(&store, data);
+    }
+}
+
+/// Copy fresher credentials between live agents' seats and their bound
+/// profiles. Archived agents run no harness, so their seats never refresh a
+/// token; a pair of files unchanged since the last pass is not read again.
+pub(crate) fn sync_fresher_bound_agent_credentials_in(store: &Store, data: &Path) {
     let profiles_root = data.join("profiles");
     let now_ms = anyagents_core::now_ms();
     let sync_stamp = profiles_root.join(".last-agent-cred-sync-ms");
@@ -5943,20 +6017,9 @@ pub(crate) fn sync_fresher_bound_agent_credentials(data: &Path) {
             }
         }
     }
-    if let Ok(store) = Store::open(data.join("state.db"))
-        && let Ok(agents) = store.list_agents()
-    {
+    if let Ok(agents) = store.list_live_agents() {
         for agent in &agents {
-            if agent.state == "archived" {
-                continue;
-            }
             let cfg = agent_config_dir(data, &agent.id);
-            if agent.harness == "claude-code"
-                && let Some(reset_ms) =
-                    anyagents_harness_claude::detect_session_quota_reset_ms(&cfg, now_ms)
-            {
-                record_profile_quota_reset(data, agent, reset_ms);
-            }
             let bound = bound_profile_name(&cfg);
             let seeded = seeded_profile_name(&cfg);
             if seeded.is_some() && bound.is_some() && seeded != bound {
@@ -5998,7 +6061,7 @@ pub(crate) fn sync_fresher_bound_agent_credentials(data: &Path) {
                     .unwrap_or_else(|err| eprintln!("runtime persistence failed: {err}"));
             } else if provider == "anthropic" {
                 sync_anthropic_agent_credentials_from_profile(
-                    Some(&store),
+                    Some(store),
                     data,
                     agent,
                     &cfg,
@@ -12422,6 +12485,37 @@ git -c safe.directory="$5" -C "$5" status --porcelain
             "expected 7d tail preserved, got: {overlaid}"
         );
         assert_eq!(parse_remaining_pct_from_usage(&overlaid, None), Some(0));
+    }
+
+    #[test]
+    fn unchanged_credential_pairs_are_not_read_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("seat/.credentials.json");
+        let dst = dir.path().join("profile/.credentials.json");
+        std::fs::create_dir_all(src.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
+        let cred = |token: &str, expires_at: i64| {
+            serde_json::json!({"claudeAiOauth": {
+                "accessToken": token,
+                "refreshToken": "refresh",
+                "expiresAt": expires_at,
+            }})
+            .to_string()
+        };
+        std::fs::write(&src, cred("same", 2_000_000_000_000)).unwrap();
+        std::fs::write(&dst, cred("same", 2_000_000_000_000)).unwrap();
+        let evaluations = || COPY_EVALUATIONS.with(std::cell::Cell::get);
+        let start = evaluations();
+        assert!(!copy_seat_file_if_newer(&src, &dst));
+        assert!(!copy_seat_file_if_newer(&src, &dst));
+        assert_eq!(evaluations() - start, 1, "an unchanged pair was read again");
+
+        std::fs::write(&src, cred("fresher", 2_000_000_100_000)).unwrap();
+        assert!(copy_seat_file_if_newer(&src, &dst));
+        assert!(std::fs::read_to_string(&dst).unwrap().contains("fresher"));
+        assert!(!copy_seat_file_if_newer(&src, &dst));
+        assert!(!copy_seat_file_if_newer(&src, &dst));
+        assert_eq!(evaluations() - start, 3);
     }
 
     #[test]
