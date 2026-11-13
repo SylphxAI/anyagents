@@ -32,6 +32,28 @@ impl From<&anyagents_harness::Delivery> for DeliveryView {
 }
 
 impl DeliveryView {
+    /// `AgentView::delivery_mode` for a client from before `delivery`:
+    /// `steer` when mail reaches a running turn, `followup` when it waits.
+    pub fn legacy_mode(&self) -> String {
+        match self.level.as_str() {
+            "next-step" | "mid-turn" => "steer",
+            _ => "followup",
+        }
+        .to_string()
+    }
+
+    /// `AgentView::steer_support` for a client from before `delivery`: `yes`
+    /// when the vendor proves consumption, `unproven` when only acceptance
+    /// is proven, `no` when mail waits for the turn to end.
+    pub fn legacy_steer(&self) -> String {
+        match self.level.as_str() {
+            "next-step" => "yes",
+            "mid-turn" => "unproven",
+            _ => "no",
+        }
+        .to_string()
+    }
+
     /// The level, with `+idempotent` when redelivery is safe: what a table
     /// column shows.
     pub fn label(&self) -> String {
@@ -92,6 +114,14 @@ pub struct AgentView {
     /// turn runs (`docs/delivery.md`).
     #[serde(default)]
     pub delivery: DeliveryView,
+    /// Deprecated: `delivery.legacy_mode()`, kept for one release so a CLI or
+    /// MCP client built before `delivery` still parses this view (it requires
+    /// the field). Remove it, with `steer_support`, in the release after.
+    #[serde(default)]
+    pub delivery_mode: String,
+    /// Deprecated with `delivery_mode`: `delivery.legacy_steer()`.
+    #[serde(default)]
+    pub steer_support: String,
     pub quota_reset_at_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub block_reason: Option<String>,

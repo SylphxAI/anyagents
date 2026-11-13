@@ -814,7 +814,8 @@ fn set_state(data: &Path, name: &str, state: &str) -> Result<AgentView, Error> {
     let public_desc = agent.public_description();
     let scope_val = agent.scope().to_string();
     let lifecycle_val = agent.lifecycle().to_string();
-    let delivery = (&crate::vendor::declared_delivery(&agent.harness)).into();
+    let delivery: crate::api::DeliveryView =
+        (&crate::vendor::declared_delivery(&agent.harness)).into();
     Ok(AgentView {
         has_open_turn: false,
         open_turn_age_ms: None,
@@ -838,6 +839,8 @@ fn set_state(data: &Path, name: &str, state: &str) -> Result<AgentView, Error> {
         state: agent.state,
         process: "-".to_string(),
         turn_state: "idle".to_string(),
+        delivery_mode: delivery.legacy_mode(),
+        steer_support: delivery.legacy_steer(),
         delivery,
         quota_reset_at_ms: None,
         block_reason: None,
@@ -963,7 +966,8 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
     let public_desc = agent.public_description();
     let scope_val = agent.scope().to_string();
     let lifecycle_val = agent.lifecycle().to_string();
-    let delivery = (&crate::vendor::declared_delivery(&agent.harness)).into();
+    let delivery: crate::api::DeliveryView =
+        (&crate::vendor::declared_delivery(&agent.harness)).into();
     Ok(AgentView {
         has_open_turn: false,
         open_turn_age_ms: None,
@@ -987,6 +991,8 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
         state: agent.state,
         process: "-".to_string(),
         turn_state: "idle".to_string(),
+        delivery_mode: delivery.legacy_mode(),
+        steer_support: delivery.legacy_steer(),
         delivery,
         quota_reset_at_ms: None,
         block_reason: None,
@@ -1493,7 +1499,11 @@ pub fn flush(data: &Path, name: &str) -> Result<(), anyagents_core::Error> {
                 // Refused for good: parked past the cursor, its sender told.
                 Ok(anyagents_harness::DeliverOutcome::Rejected { reason }) => {
                     store.reject_message(&agent.id, message.seq, &reason)?;
-                    println!("{}\trejected\t{}\t{reason}", agent.name, message.id.as_str());
+                    println!(
+                        "{}\trejected\t{}\t{reason}",
+                        agent.name,
+                        message.id.as_str()
+                    );
                 }
                 Err(err) => {
                     failure = Some(err.to_string());

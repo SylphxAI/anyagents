@@ -3387,6 +3387,8 @@ fn persisted_fault(
 }
 
 fn archived_agent_view_fast(agent: &Agent) -> AgentView {
+    let delivery: crate::api::DeliveryView =
+        (&crate::vendor::declared_delivery(&agent.harness)).into();
     AgentView {
         has_open_turn: false,
         open_turn_age_ms: None,
@@ -3410,7 +3412,9 @@ fn archived_agent_view_fast(agent: &Agent) -> AgentView {
         state: agent.state.clone(),
         process: "down".to_string(),
         turn_state: "idle".to_string(),
-        delivery: (&crate::vendor::declared_delivery(&agent.harness)).into(),
+        delivery_mode: delivery.legacy_mode(),
+        steer_support: delivery.legacy_steer(),
+        delivery,
         quota_reset_at_ms: None,
         block_reason: None,
         last_error: None,
@@ -3668,6 +3672,8 @@ fn agent_view_preloaded(
         state: agent.state.clone(),
         process: process.to_string(),
         turn_state: turn_state.to_string(),
+        delivery_mode: crate::api::DeliveryView::from(&delivery).legacy_mode(),
+        steer_support: crate::api::DeliveryView::from(&delivery).legacy_steer(),
         delivery: (&delivery).into(),
         quota_reset_at_ms: quota,
         block_reason,
@@ -7513,6 +7519,37 @@ pub(crate) mod tests {
         }
     }
     use super::*;
+
+    #[test]
+    fn an_agent_view_keeps_the_fields_a_client_from_before_delivery_requires() {
+        // A CLI or MCP client from the release before `delivery` requires both.
+        #[derive(serde::Deserialize)]
+        struct OlderClientView {
+            delivery_mode: String,
+            steer_support: String,
+        }
+        let temp = crate::test_tempdir();
+        let store = Store::open(temp.path().join("state.db")).unwrap();
+        for (harness, mode, steer) in [
+            ("spiron", "steer", "yes"),
+            ("grok", "steer", "unproven"),
+            ("spiron-cloud", "followup", "no"),
+        ] {
+            let agent = store
+                .create_agent(anyagents_core::NewAgent::new(
+                    format!("view-{harness}"),
+                    harness,
+                ))
+                .unwrap();
+            let json = serde_json::to_string(&archived_agent_view_fast(&agent)).unwrap();
+            let older: OlderClientView = serde_json::from_str(&json).unwrap();
+            assert_eq!(
+                (older.delivery_mode.as_str(), older.steer_support.as_str()),
+                (mode, steer),
+                "{harness}"
+            );
+        }
+    }
     use std::io::{Read, Write};
     use std::sync::MutexGuard;
 

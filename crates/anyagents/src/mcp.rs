@@ -8684,6 +8684,8 @@ mod spawn_args_tests {
             process: "none".to_string(),
             turn_state: turn_state.to_string(),
             delivery: Default::default(),
+            delivery_mode: String::new(),
+            steer_support: String::new(),
             quota_reset_at_ms: None,
             block_reason: None,
             last_error: None,
