@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use anyagents_core::{AgentId, AgentLock, Incoming, NewAgent, Store};
 use anyagents_harness::{
     DeliverOutcome, DeliveryMode, FakeHarness, Harness, HarnessError, HarnessHealth,
-    OutboundMessage,
+    OutboundMessage, TurnUsage,
 };
 use anyagents_supervisor::{Attached, Clock, Custody, LaunchRequest, ManualClock, Supervisor};
 
@@ -22,6 +22,10 @@ use anyagents_supervisor::{Attached, Clock, Custody, LaunchRequest, ManualClock,
 struct Kept {
     fake: Arc<Mutex<FakeHarness>>,
     ended: Arc<AtomicBool>,
+    /// What the vendor reports it served, and in how many turns.
+    usage: Arc<Mutex<(TurnUsage, u32)>>,
+    /// Another kernel took the process over.
+    superseded: Arc<AtomicBool>,
 }
 
 impl Kept {
@@ -29,6 +33,8 @@ impl Kept {
         Self {
             fake: Arc::new(Mutex::new(FakeHarness::new(DeliveryMode::Steer))),
             ended: Arc::new(AtomicBool::new(false)),
+            usage: Arc::new(Mutex::new((TurnUsage::default(), 0))),
+            superseded: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -77,6 +83,14 @@ impl Harness for Handle {
 
     fn process_id(&self) -> Option<u32> {
         Some(4242)
+    }
+
+    fn served_usage(&self) -> TurnUsage {
+        self.kept().usage.lock().unwrap().0.clone()
+    }
+
+    fn turns_served(&self) -> u32 {
+        self.kept().usage.lock().unwrap().1
     }
 }
 
@@ -145,6 +159,10 @@ impl Custody<Handle> for FakeCustody {
 
     fn note(&self, _harness: &Handle, note: &str) {
         self.0.notes.lock().unwrap().push(note.to_string());
+    }
+
+    fn superseded(&self, harness: &Handle) -> bool {
+        harness.kept().superseded.load(Ordering::SeqCst)
     }
 }
 
@@ -400,5 +418,112 @@ fn the_note_a_kernel_kept_restores_its_usage_accounting() {
     assert_eq!(saved["turns_recorded"], 2);
     assert_eq!(saved["served"]["input_tokens"], 5);
     assert_eq!(saved["completed_turn"], true);
+    drop(supervisor);
+}
+
+/// A usage row the last kernel recorded for a process is not recorded again
+/// by the kernel that takes the process over: the note it kept carries the
+/// accounting.
+#[test]
+fn usage_a_previous_kernel_recorded_is_not_recorded_again() {
+    let fx = Fixture::new();
+    let agent = fx.running("alpha", "claude-code");
+    let kept = Kept::new();
+    *kept.usage.lock().unwrap() = (
+        TurnUsage {
+            input_tokens: 5,
+            output_tokens: 3,
+            ..TurnUsage::default()
+        },
+        1,
+    );
+    fx.leave(&agent, &kept, "claude-code", None);
+    let first = fx.start();
+    assert!(wait_until(|| fx.store.list_usage(None).unwrap().len() == 1));
+    first.retain_processes();
+    let note = fx.left.notes.lock().unwrap().last().cloned();
+    let (kept_again, keeper_lock) = fx.left.retained.lock().unwrap().pop().unwrap();
+    // The next kernel finds the same process, with the note the last one kept.
+    fx.left.processes.lock().unwrap().insert(
+        agent.clone(),
+        (kept_again, keeper_lock.unwrap(), "claude-code".into(), note),
+    );
+    let second = fx.start();
+    assert!(wait_until(|| fx.left.processes.lock().unwrap().is_empty()));
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        fx.store.list_usage(None).unwrap().len(),
+        1,
+        "the usage was recorded twice"
+    );
+    drop(second);
+}
+
+/// A recovery note the last kernel still owed (it died before sending it) is
+/// sent by the kernel that takes the process over; so is one for a turn the
+/// store holds open while the process sits idle.
+#[test]
+fn an_owed_recovery_survives_the_kernel_that_owed_it() {
+    for owed_in_note in [true, false] {
+        let fx = Fixture::new();
+        let agent = fx.running("alpha", "claude-code");
+        fx.store.receive(&agent, Incoming::new("working")).unwrap();
+        let first = fx.store.next_undelivered(&agent).unwrap().unwrap();
+        fx.store.note_delivered(&agent, first.seq).unwrap();
+        assert!(fx.store.has_open_turn(&agent).unwrap());
+        // The process holds no open turn: it was lost while no kernel ran.
+        let kept = Kept::new();
+        let note = owed_in_note.then(|| {
+            r#"{"served":null,"turns_recorded":0,"written":1,"profile_rotated_ms":0,"completed_turn":false,"pending_recovery":true}"#.to_string()
+        });
+        fx.leave(&agent, &kept, "claude-code", note.as_deref());
+        let supervisor = fx.start();
+        assert!(
+            wait_until(|| kept.given().iter().any(|id| id.starts_with("recovery_"))),
+            "the owed recovery note was not sent (owed in the note: {owed_in_note})"
+        );
+        assert_eq!(fx.launches.load(Ordering::SeqCst), 0);
+        drop(supervisor);
+    }
+}
+
+/// A kernel whose process another kernel took over stands down: it neither
+/// ends the process nor starts a second one, and the lock stays held.
+#[test]
+fn a_superseded_kernel_stands_down() {
+    let fx = Fixture::new();
+    let agent = fx.running("alpha", "claude-code");
+    let kept = Kept::new();
+    fx.leave(&agent, &kept, "claude-code", None);
+    let supervisor = fx.start();
+    assert!(wait_until(|| {
+        supervisor
+            .live(&agent)
+            .is_some_and(|live| live.process_alive)
+    }));
+    kept.superseded.store(true, Ordering::SeqCst);
+    // Mail wakes the worker, which finds itself superseded.
+    fx.store
+        .receive(&agent, Incoming::new("for the other kernel"))
+        .unwrap();
+    assert!(wait_until(|| fx.left.retained.lock().unwrap().len() == 1));
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        fx.launches.load(Ordering::SeqCst),
+        0,
+        "a second process started"
+    );
+    assert!(
+        !kept.ended.load(Ordering::SeqCst),
+        "the other kernel's process was ended"
+    );
+    assert!(
+        kept.written().is_empty(),
+        "mail went to a process it no longer owns"
+    );
+    assert!(matches!(
+        fx.store.try_lock_agent(&agent),
+        Err(anyagents_core::Error::AgentBusy)
+    ));
     drop(supervisor);
 }

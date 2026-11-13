@@ -273,6 +273,11 @@ pub trait Custody<H>: Send + Sync {
     fn retain(&self, harness: H);
     /// Keep `note` with the process for the next kernel that attaches.
     fn note(&self, harness: &H, note: &str);
+    /// Another kernel took the process over: this one must stand down for
+    /// the agent, neither ending the process nor starting another.
+    fn superseded(&self, _harness: &H) -> bool {
+        false
+    }
 }
 
 /// A process a previous kernel left, taken over.
@@ -315,15 +320,18 @@ impl<H> Custody<H> for InProcess {
 }
 
 /// What a kernel keeps with a process for the kernel that takes it over:
-/// the usage it already recorded from it, so none is recorded twice, and the
-/// operator profile marker it was launched under.
-#[derive(Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+/// the usage it already recorded from it, so none is recorded twice, the
+/// operator profile marker it was launched under, and a `[Recovery]` note it
+/// still owes the process's agent.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 struct ProcessNote {
     served: Option<TurnUsage>,
     turns_recorded: u32,
     written: u32,
     profile_rotated_ms: i64,
     completed_turn: bool,
+    #[serde(default)]
+    pending_recovery: bool,
 }
 
 /// How soon a worker looks again after it handed lines over, or while a turn
@@ -937,9 +945,12 @@ struct Session<H: Harness> {
     /// A copy of the process lock for each process host this worker starts,
     /// when hosts outlive the kernel.
     host_lock: Option<Arc<AgentLock>>,
-    /// The process came from a previous kernel: it was not restarted, so no
-    /// turn of it was interrupted.
-    adopted: bool,
+    /// The process came from a previous kernel, with whether a `[Recovery]`
+    /// note is owed: one that kernel owed, or a turn left open in the store
+    /// while the process sits idle.
+    adopted: Option<bool>,
+    /// The note last kept with the process.
+    kept_note: Option<ProcessNote>,
 }
 
 impl<H: Harness + 'static> Session<H> {
@@ -981,7 +992,8 @@ impl<H: Harness + 'static> Session<H> {
             exit_watch: None,
             review_children: false,
             host_lock: None,
-            adopted: false,
+            adopted: None,
+            kept_note: None,
         }
     }
 
@@ -1010,11 +1022,13 @@ impl<H: Harness + 'static> Session<H> {
                         // A fresh process may follow an interrupted turn:
                         // unknown until recover_once reads durable state. A
                         // process taken over from a previous kernel never
-                        // stopped, so its turn goes on.
-                        self.pending_recovery = !std::mem::take(&mut self.adopted);
+                        // stopped: its turn goes on, and it is owed a
+                        // recovery note only as decided when it was adopted.
+                        self.pending_recovery = self.adopted.take().unwrap_or(true);
                         self.recovery_blocks_mail = false;
+                        self.kept_note = None;
                         self.delivery = Some(*delivery);
-                        self.save_note();
+                        self.sync_note();
                     }
                     Boot::Busy => {
                         self.delivery = None;
@@ -1042,6 +1056,15 @@ impl<H: Harness + 'static> Session<H> {
             let Some(health) = self.harness_health() else {
                 continue;
             };
+            if self
+                .delivery
+                .as_ref()
+                .is_some_and(|delivery| self.inner.custody.superseded(delivery.harness()))
+            {
+                self.stand_down();
+                return false;
+            }
+            self.sync_note();
             // A changed configuration supersedes the old process's fault,
             // quota hold or restart delay before any further dispatch.
             if self.try_apply_pending_switch(&health) {
@@ -1094,9 +1117,25 @@ impl<H: Harness + 'static> Session<H> {
         self.host_lock = None;
     }
 
+    /// Another kernel took the process over. Let go of it without ending it,
+    /// and without releasing the lock it and that kernel hold, and stop: no
+    /// second process is started beside it.
+    fn stand_down(&mut self) {
+        let host_lock = self.host_lock.take();
+        if let Some(delivery) = self.delivery.take() {
+            if let Some(lock) = &host_lock {
+                lock.retain();
+            }
+            self.inner.custody.retain(delivery.into_harness());
+        }
+        self.restart_at = None;
+        self.last_error = Some("another server took this agent's harness over".into());
+        self.publish();
+    }
+
     /// Keep this worker's accounting of the process with it, for a kernel
-    /// that takes the process over after this one.
-    fn save_note(&self) {
+    /// that takes the process over after this one, whenever it changed.
+    fn sync_note(&mut self) {
         if !self.inner.custody.outlives_kernel() {
             return;
         }
@@ -1109,9 +1148,14 @@ impl<H: Harness + 'static> Session<H> {
             written: self.written,
             profile_rotated_ms: self.process_profile_rotated_ms,
             completed_turn: self.completed_turn_in_session,
+            pending_recovery: self.pending_recovery,
         };
+        if self.kept_note.as_ref() == Some(&note) {
+            return;
+        }
         if let Ok(text) = serde_json::to_string(&note) {
             self.inner.custody.note(delivery.harness(), &text);
+            self.kept_note = Some(note);
         }
     }
 
@@ -1128,7 +1172,13 @@ impl<H: Harness + 'static> Session<H> {
         } = attached;
         let fresh = match store.agent(&self.id) {
             Ok(fresh) if fresh.state == "running" => fresh,
-            Ok(_) | Err(anyagents_core::Error::AgentNotFound(_)) => return Boot::Stopped,
+            Ok(_) | Err(anyagents_core::Error::AgentNotFound(_)) => {
+                // The process ends before its lock is released: never the
+                // other way round, which would leave it running unlocked.
+                drop(harness);
+                drop(lock);
+                return Boot::Stopped;
+            }
             Err(_) => {
                 // Not this kernel's to end on a read failure: leave it.
                 lock.retain();
@@ -1160,6 +1210,12 @@ impl<H: Harness + 'static> Session<H> {
                 profile_rotated_ms: self.marker_ms(PROFILE_ROTATED).unwrap_or(0),
                 ..ProcessNote::default()
             });
+        // A recovery the last kernel owed, or a turn the store holds open
+        // while the process sits idle (it ended, or was lost, with no kernel
+        // to see it), is owed still.
+        let health = harness.health();
+        let idle_with_open_turn =
+            health.turn_state == TurnState::Idle && store.has_open_turn(&self.id).unwrap_or(false);
         self.served = note.served;
         self.turns_recorded = note.turns_recorded;
         self.written = note.written;
@@ -1167,12 +1223,13 @@ impl<H: Harness + 'static> Session<H> {
         self.completed_turn_in_session = note.completed_turn;
         self.process_started_at = Some(started_at_ms.unwrap_or_else(|| self.inner.clock.now_ms()));
         self.host_lock = Some(host_lock);
-        self.adopted = true;
-        match DeliveryLoop::start_with_lock(store, lock, self.id.clone(), harness) {
-            Ok(delivery) => Boot::Ready(Box::new(delivery)),
-            Err(err) if err.agent_busy() => Boot::Busy,
-            Err(_) => Boot::Retry,
-        }
+        self.adopted = Some(note.pending_recovery || idle_with_open_turn);
+        Boot::Ready(Box::new(DeliveryLoop::adopted(
+            store,
+            lock,
+            self.id.clone(),
+            harness,
+        )))
     }
 
     fn boot(&mut self) -> Boot<H> {
@@ -1286,6 +1343,7 @@ impl<H: Harness + 'static> Session<H> {
     /// Publish the state this worker sleeps in, then wait for `deadline` or a
     /// wake. `true` when a wake ended the wait.
     fn sleep(&mut self, deadline: Option<i64>) -> bool {
+        self.sync_note();
         self.publish();
         self.inner.clock.wait(deadline, &self.woken)
     }
@@ -1478,7 +1536,7 @@ impl<H: Harness + 'static> Session<H> {
                 self.served = None;
                 self.turns_recorded = 0;
                 self.restart_at = None;
-                self.save_note();
+                self.sync_note();
                 true
             }
             Err(_) => {
@@ -1835,7 +1893,7 @@ impl<H: Harness + 'static> Session<H> {
             self.last_error = None;
         }
         if completed || served_changed {
-            self.save_note();
+            self.sync_note();
         }
         true
     }
@@ -3378,5 +3436,130 @@ mod persistence_tests {
         assert!(matches!(session.boot(), Boot::Stopped));
         assert_eq!(launches.load(Ordering::SeqCst), 0);
         assert!(!session.paths.work_dir.exists());
+    }
+}
+
+#[cfg(test)]
+mod custody_tests {
+    use super::*;
+    use anyagents_core::NewAgent;
+    use anyagents_harness::{HarnessError, OutboundMessage};
+
+    /// A process whose end looks at the agent lock: whether it was still held
+    /// when the process ended.
+    struct Probe {
+        lock_path: PathBuf,
+        held_when_ended: Arc<Mutex<Option<bool>>>,
+    }
+
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            use std::os::fd::AsRawFd as _;
+            let file = fs::File::open(&self.lock_path).unwrap();
+            // SAFETY: flock on a descriptor this probe owns; dropping it
+            // releases what it took.
+            let free = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 };
+            *lock(&self.held_when_ended) = Some(!free);
+        }
+    }
+
+    impl Harness for Probe {
+        fn deliver(&mut self, _message: &OutboundMessage) -> Result<DeliverOutcome, HarnessError> {
+            Ok(DeliverOutcome::Deferred)
+        }
+        fn background(&mut self) -> Result<(), HarnessError> {
+            Ok(())
+        }
+        fn resume(&mut self, _session: &str) -> Result<(), HarnessError> {
+            Ok(())
+        }
+        fn cancel(&mut self) -> Result<(), HarnessError> {
+            Ok(())
+        }
+        fn health(&self) -> HarnessHealth {
+            HarnessHealth {
+                process_alive: true,
+                turn_state: TurnState::Idle,
+                delivery_mode: DeliveryMode::Steer,
+                steer_support: SteerSupport::Yes,
+                quota_reset_at_ms: None,
+                sign_in_fault: None,
+            }
+        }
+    }
+
+    struct OneLeft(Mutex<Option<Attached<Probe>>>);
+
+    impl Custody<Probe> for OneLeft {
+        fn outlives_kernel(&self) -> bool {
+            true
+        }
+        fn retained(&self) -> Vec<AgentId> {
+            Vec::new()
+        }
+        fn attach(&self, _agent: &AgentId) -> Result<Option<Attached<Probe>>, String> {
+            Ok(lock(&self.0).take())
+        }
+        fn release(&self, _agent: &AgentId) {}
+        fn retain(&self, harness: Probe) {
+            std::mem::forget(harness);
+        }
+        fn note(&self, _harness: &Probe, _note: &str) {}
+    }
+
+    /// A process left for an agent that stopped running meanwhile is ended
+    /// before the agent lock it was taken over with is released: never left
+    /// running without its lock, even for a moment.
+    #[test]
+    fn a_process_taken_over_for_a_stopped_agent_ends_before_its_lock_is_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        let agent = store
+            .create_agent(NewAgent::new("alpha", "claude-code"))
+            .unwrap();
+        store.set_agent_state(&agent.id, "paused").unwrap();
+        let taken = store.try_lock_agent(&agent.id).unwrap();
+        let keeper_copy = taken.share().unwrap();
+        taken.retain();
+        drop(taken);
+        let adopted = AgentLock::adopt(
+            std::os::fd::AsFd::as_fd(&keeper_copy)
+                .try_clone_to_owned()
+                .unwrap(),
+        );
+        // The keeper is gone: only the adopted copy holds the lock now.
+        drop(keeper_copy);
+        let held_when_ended = Arc::new(Mutex::new(None));
+        let probe = Probe {
+            lock_path: anyagents_core::agent_lock_path(store.data_dir(), &agent.id),
+            held_when_ended: Arc::clone(&held_when_ended),
+        };
+        let inner = Arc::new(Inner::<Probe> {
+            store: Arc::clone(&store),
+            clock: Arc::new(SystemClock::new()),
+            launch: Arc::new(|_| Err("no launch".into())),
+            custody: Arc::new(OneLeft(Mutex::new(Some(Attached {
+                harness: probe,
+                lock: adopted,
+                harness_name: "claude-code".into(),
+                model: None,
+                started_at_ms: None,
+                note: None,
+            })))),
+            extra_env: Vec::new(),
+            board: HealthBoard::default(),
+            stop: AtomicBool::new(false),
+            retain: AtomicBool::new(false),
+            workers: Mutex::new(HashMap::new()),
+            idle_release_hook: None,
+        });
+        let mut session = Session::new(inner, agent.clone(), Arc::new(|| {}), Signals::detached());
+        assert!(matches!(session.boot(), Boot::Stopped));
+        assert_eq!(
+            *lock(&held_when_ended),
+            Some(true),
+            "the lock was released before the process ended"
+        );
+        store.try_lock_agent(&agent.id).unwrap();
     }
 }

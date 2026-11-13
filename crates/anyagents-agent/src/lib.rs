@@ -91,6 +91,25 @@ impl<H: Harness> DeliveryLoop<H> {
         Self::start_with_lock(store, lock, agent_id, harness)
     }
 
+    /// A delivery loop for a harness taken over from a previous kernel,
+    /// under the process lock its keeper handed back. The caller has read the
+    /// agent already; nothing here can fail, so a transient store error never
+    /// costs the running harness.
+    pub fn adopted(
+        store: Store,
+        lock: anyagents_core::AgentLock,
+        agent_id: AgentId,
+        harness: H,
+    ) -> Self {
+        Self {
+            store,
+            agent_id,
+            harness,
+            _lock: lock,
+            quota_reset_at_ms: None,
+        }
+    }
+
     /// Construct a delivery loop from an already-acquired per-agent process lock.
     pub fn start_with_lock(
         store: Store,

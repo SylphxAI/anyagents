@@ -1377,9 +1377,10 @@ impl Store {
 
     /// Exclusive lock for this agent's vendor process. A second caller gets [`Error::AgentBusy`].
     pub fn try_lock_agent(&self, agent_id: &AgentId) -> Result<AgentLock, Error> {
-        let dir = self.data_dir.join("locks");
-        std::fs::create_dir_all(&dir)?;
-        let path = dir.join(format!("{}.lock", agent_id.as_str()));
+        let path = agent_lock_path(&self.data_dir, agent_id);
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
         let file = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -5653,6 +5654,12 @@ pub fn legacy_agent_work_dir(data_dir: &Path, id: &AgentId) -> PathBuf {
 /// `{data}/agents/{id}/config`.
 pub fn agent_config_dir(data_dir: &Path, id: &AgentId) -> PathBuf {
     data_dir.join("agents").join(id.as_str()).join("config")
+}
+
+/// `{data}/locks/{id}.lock`: the agent's process lock, held by whatever holds
+/// its vendor process (a delivery loop, a keeper).
+pub fn agent_lock_path(data_dir: &Path, id: &AgentId) -> PathBuf {
+    data_dir.join("locks").join(format!("{}.lock", id.as_str()))
 }
 
 fn open_roster_conn(data_dir: &Path) -> Option<ReadConn<'static>> {
