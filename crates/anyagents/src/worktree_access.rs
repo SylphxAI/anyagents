@@ -58,7 +58,7 @@ pub(crate) fn set_worktree_identity(path: &Path) -> Result<(), Error> {
         validate_config_files(private, common)?;
         let config = common.join("config");
         let extension = anyagents_toolchain::tool("git", "checkout")
-            .map_err(|e| refusal(&path, e))?
+            .map_err(|e| refusal(path, e))?
             .command()
             .args(["config", "--no-includes", "--file"])
             .arg(&config)
@@ -70,7 +70,7 @@ pub(crate) fn set_worktree_identity(path: &Path) -> Result<(), Error> {
     } else {
         validate_config_files(private, common)?;
         let extension = anyagents_toolchain::tool("git", "checkout")
-            .map_err(|e| refusal(&path, e))?
+            .map_err(|e| refusal(path, e))?
             .command()
             .args(["config", "--no-includes", "--file"])
             .arg(common.join("config"))
