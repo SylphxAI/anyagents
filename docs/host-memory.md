@@ -55,10 +55,10 @@ writer is read through its WAL. A row's coordinate is
 `<database>/<table>/<rowid>` with offset 0, the row's length and SHA-256: a
 database is a regular file, so no real path collides with it. A refresh reads
 rows past the published rowid frontier, plus, for OpenCode, rows rewritten
-after the published `time_updated` mark, in one snapshot of the store. A
-replaced database, a lower frontier or a changed frontier row rebuilds the
-store; deleted rows remain published until hourly full verification and are
-refused at readback by their digest. A store with an unknown layout is not
+after the published `time_updated` mark, a bounded batch at a time, each from
+one snapshot of the store. A replaced database, a lower frontier or a changed
+frontier row rebuilds the store; deleted rows remain published until hourly
+full verification and are refused at readback by their digest. A store with an unknown layout is not
 read. The walk stamps the store and its `-wal`, so new rows in the log are
 seen before a checkpoint touches the database file.
 
@@ -324,11 +324,38 @@ the default's 0.054 over all 170. Every candidate in `pins.rs` can be selected w
 
 An unchanged inode/device, nonshrinking source and matching **64 KiB** frontier
 window allow suffix-only indexing. Replacement, shrink or boundary mismatch
-rebuilds the source. A host-driven low-priority verifier revisits older prefixes
-(periodic eligibility after one hour, bounded work per pass). A same-size rewrite
-outside the frontier window can remain stale until that verifier reaches it;
-there is no immediate full-history integrity guarantee on the fast path. Source
-cursor, document membership and call correlation publish atomically.
+rebuilds the source; the rebuild's first batch drops its old documents. A
+same-size rewrite outside the frontier window can remain stale until full
+verification reaches it; there is no immediate full-history integrity guarantee
+on the fast path.
+
+Indexing never holds a lock across a long read. A source is read in batches of
+about **2 MiB** (or 512 store rows): each batch is scanned, hashed and
+projected to search tokens with no lifecycle lock and no index transaction
+held. Only publishing a batch takes the owner's lifecycle lock and one short
+index write, and it publishes only if the source still holds what was read
+(the same file, unchanged or grown by appends with the batch's 64 KiB boundary
+unchanged; for a store, the same database with the batch's last row unchanged)
+and no redaction of the owner happened since the read. A batch that fails a
+check is dropped and read again later. Each batch's documents, call
+correlations and cursor publish atomically; a cursor records whether its
+source is complete.
+
+A search indexes at most **4 MiB** of new history before it answers. A class
+with more is queued for the background indexer, and the response carries
+`retrieval.pending` (sources and bytes) and a `partial:` line in
+`retrieval.degraded`: hits from that history may be missing until it is
+indexed. The background indexer is one daemon thread at nice 19 and idle I/O
+priority. It works through its queue in order: classes searches left
+incomplete (at most **64 MiB** per class per step, then queued again behind
+the rest) and sources due for full verification. With the queue empty it runs,
+once per daemon start, a pre-warm pass over every agent (live agents first), so
+history a new release covers is indexed gradually without waiting for a search. The maintenance
+tick's verifier (hourly per source) never reads a source or waits for a lock:
+it records the attempt and queues the source. Verification reads the whole
+source in batches, republishes only documents whose bytes changed, and moves
+the frontier and verification time only once it has read everything; a source
+that fails to read keeps both.
 
 Only daemon authority migrates data. Stable registry ownership and aliases map
 known per-agent Claude memory and caller-selected progress pages. The resumable manifest

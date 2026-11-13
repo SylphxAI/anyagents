@@ -323,9 +323,21 @@ pub struct RetrievalView {
     /// `lexical` (BM25), then `dense` and `rerank` when the memory service
     /// answered.
     pub stages: Vec<String>,
-    /// Why a stage that applies did not run.
+    /// Why a stage that applies did not run, or ran on partial history.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub degraded: Vec<String>,
+    /// History the search could not index before answering. It is being
+    /// indexed in the background, and hits from it may be missing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending: Option<PendingHistoryView>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct PendingHistoryView {
+    /// Sources (files or stores) not yet fully indexed.
+    pub sources: usize,
+    /// Approximate bytes of history still to index.
+    pub bytes: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]

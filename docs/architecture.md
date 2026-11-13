@@ -592,10 +592,17 @@ read-only connection that never creates a file beside the store. A store row is
 addressed as `<database>/<table>/<rowid>`; its bytes are the row's event text.
 The rebuildable contentless FTS
 index stores metadata, bounded search windows and SHA-256 raw coordinates, not a
-second raw transcript. Each source frontier and its documents/windows commit
-atomically. A source changing during publication defers that snapshot without
-advancing its frontier. `memory` and `transcripts` queries refresh/prune only their
-requested source class; `all` refreshes both.
+second raw transcript. A source is read, hashed and projected in bounded
+batches (about 2 MiB or 512 store rows) with no lifecycle lock and no index
+transaction held; each batch then publishes its documents, windows, call
+correlations and frontier atomically under the owner's lifecycle lock, only if
+the source still holds what was read and no redaction intervened. A batch that
+fails those checks is dropped without advancing the frontier. `memory` and
+`transcripts` queries refresh/prune only their requested source class; `all`
+refreshes both. A query indexes at most 4 MiB of new history before answering;
+the rest is queued for a daemon thread at nice 19 and idle I/O priority, and the
+response reports it in `retrieval.pending`. That thread also pre-warms every
+agent's history once per daemon start.
 
 An unchanged native JSONL source reuses its persisted cursor. For the same device
 and inode with no size decrease, a changed source checks the last **64 KiB before
@@ -607,15 +614,17 @@ always verify their own SHA; explicit whole-event readback verifies the event SH
 
 This is deliberately not an append-only proof: a same-size edit **outside** the
 boundary may remain missing/stale in the index until full verification. The daemon
-maintenance loop fully rebuilds at most **one due source every 15 minutes** (every
-15th 60-second tick), with sources due **one hour after their last full verification**. Backlog, a continuously
-changing source or failures can extend that detection delay; no fixed one-hour
-upper bound is promised. Failed sources rotate behind other due sources without
+maintenance loop schedules at most **one due source every 15 minutes** (every
+15th 60-second tick), with sources due **one hour after their last full verification**.
+The maintenance worker only records the attempt and queues the source; it never
+reads it or waits for a lock. The background indexer reads it in batches,
+republishes documents whose bytes changed, and records the verification and
+frontier once it has read the whole source. Backlog, a continuously changing
+source or failures can extend that detection delay; no fixed one-hour upper
+bound is promised. Failed sources rotate behind other due sources without
 publishing a new frontier. A stale returned window is refused immediately by its
 SHA check. Full verification uses the same pending-redaction path exclusions as
-query refresh and takes the owner's lifecycle lock only when it is free: a busy
-owner is skipped, keeps its place in the rotation, and the maintenance worker never
-waits for it. It never edits the source. This maintenance is
+query refresh. It never edits the source. This maintenance is
 host-driven, not an LLM schedule. Native transcript writers remain active in PR1;
 the host raw append port is not activated by this index.
 

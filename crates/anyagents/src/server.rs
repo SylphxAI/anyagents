@@ -113,6 +113,43 @@ fn capability_key() -> Result<String, Error> {
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
+/// Index host history in the background: what searches left for later,
+/// sources due for full verification, and a pre-warm pass over every agent
+/// after the daemon starts. It runs on its own thread at the lowest CPU and
+/// I/O priority, so it reads only when nothing else wants the machine.
+fn start_host_history_indexer(store: Arc<Store>) {
+    let spawned = std::thread::Builder::new()
+        .name("host-history".into())
+        .spawn(move || {
+            lower_this_thread_priority();
+            // Let the daemon finish starting before the pre-warm pass reads.
+            std::thread::sleep(std::time::Duration::from_secs(60));
+            store.run_host_history_indexer();
+        });
+    if let Err(error) = spawned {
+        eprintln!("anyagents-host-history: background indexer not started: {error}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn lower_this_thread_priority() {
+    const IOPRIO_WHO_PROCESS: libc::c_long = 1;
+    const IOPRIO_CLASS_IDLE: libc::c_long = 3;
+    // SAFETY: plain syscalls that lower only the calling thread's priority.
+    unsafe {
+        let tid = libc::syscall(libc::SYS_gettid);
+        libc::setpriority(libc::PRIO_PROCESS, tid as libc::id_t, 19);
+        libc::syscall(
+            libc::SYS_ioprio_set,
+            IOPRIO_WHO_PROCESS,
+            tid,
+            IOPRIO_CLASS_IDLE << 13,
+        );
+    }
+}
+#[cfg(not(target_os = "linux"))]
+fn lower_this_thread_priority() {}
+
 fn acquire_server_lock(data: &Path) -> Result<std::fs::File, Error> {
     std::fs::create_dir_all(data)?;
     let lock_path = data.join("server.lock");
@@ -254,6 +291,7 @@ async fn serve(
     if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none() && !crate::sandbox::is_isolated_test_env()
     {
         quota_rotation::start(Arc::clone(&store));
+        start_host_history_indexer(Arc::clone(&store));
         let reaper_root = data.to_path_buf();
         let reaper_store = Arc::clone(&store);
         let reaper_health = state.health.clone();
@@ -5375,13 +5413,16 @@ async fn conversation_route(
         let should_search_host_files = has_structured_search
             || query.scope != anyagents_core::host_index::MemoryScope::All
             || std::env::var_os("ANYAGENTS_TESTS").is_some();
-        let file_hits = if should_search_host_files {
+        // A search indexes only a bounded amount of new history before it
+        // answers; the background indexer takes the rest, and the response
+        // says the history it searched was partial.
+        let (file_hits, pending) = if should_search_host_files {
             state
                 .store
-                .search_host_files(&authorized, query.scope, &file_request)
+                .search_host_files_reporting(&authorized, query.scope, &file_request)
                 .map_err(|e| ApiError::from_store(Error::Message(e.to_string())))?
         } else {
-            Vec::new()
+            (Vec::new(), Default::default())
         };
         // A relevance search for text also ranks by meaning: dense candidates
         // from the memory service join the lexical ones, and the fused list
@@ -5423,6 +5464,21 @@ async fn conversation_route(
             }
             None => file_hits,
         };
+        if pending.sources > 0 {
+            let view = retrieval.get_or_insert_with(|| crate::api::RetrievalView {
+                stages: vec!["lexical".into()],
+                ..crate::api::RetrievalView::default()
+            });
+            view.degraded.push(format!(
+                "partial: {} history source(s), about {} KiB, are still being indexed in the background; hits from them may be missing",
+                pending.sources,
+                pending.bytes.div_ceil(1024)
+            ));
+            view.pending = Some(crate::api::PendingHistoryView {
+                sources: pending.sources,
+                bytes: pending.bytes,
+            });
+        }
 
         let (agent_name, agent_id_str, raw_turns) =
             if query.scope == anyagents_core::host_index::MemoryScope::Memory {
@@ -8519,6 +8575,92 @@ pub(crate) mod tests {
                 old
             );
         });
+    }
+
+    /// A search over more new history than one request may index answers
+    /// at once from what it indexed, says the rest is pending, and queues it;
+    /// after the background indexer runs, the same history is found.
+    #[test]
+    fn a_search_past_its_index_budget_answers_partial_and_the_background_completes_it() {
+        let dir = crate::test_tempdir();
+        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        let agent = store
+            .create_agent(anyagents_core::NewAgent::new("large-history", "spiron"))
+            .unwrap();
+        let path = dir
+            .path()
+            .join("agents")
+            .join(agent.id.as_str())
+            .join("transcripts/history.jsonl");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut text = String::from("{\"role\":\"user\",\"content\":\"earlyneedle\"}\n");
+        let filler = format!(
+            "{{\"role\":\"assistant\",\"content\":\"{}\"}}\n",
+            "filler ".repeat(36)
+        );
+        while (text.len() as u64) < anyagents_core::host_retrieval::REQUEST_INDEX_BYTES * 3 / 2 {
+            text.push_str(&filler);
+        }
+        text.push_str("{\"role\":\"user\",\"content\":\"lateneedle\"}\n");
+        std::fs::write(&path, &text).unwrap();
+        let state = AppState {
+            store: Arc::clone(&store),
+            health: HealthBoard::default(),
+            sign_in: Arc::new(Mutex::new(ProcessRunner)),
+            auth: auth::Mode::Trusted {
+                data_dir: dir.path().into(),
+            },
+            identity: Arc::new(ServingIdentity::capture()),
+            profiles: Default::default(),
+        };
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let search = |term: &str| {
+            runtime.block_on(async {
+                let principal = Principal::Agent {
+                    agent_id: agent.id.clone(),
+                    name: agent.name.clone(),
+                };
+                let Json(response) = conversation_route(
+                    principal,
+                    State(state.clone()),
+                    AxumPath(agent.name.clone()),
+                    Query(
+                        serde_json::from_value(
+                            serde_json::json!({"scope":"transcripts","query":term}),
+                        )
+                        .unwrap(),
+                    ),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{}", e.message));
+                response
+            })
+        };
+        // The first answer comes from the first 4 MiB: the late record is not
+        // indexed yet, and the response says so.
+        let first = search("lateneedle");
+        assert!(first.turns.iter().all(|t| !t.text.contains("lateneedle")));
+        let retrieval = first.retrieval.clone().unwrap();
+        let pending = retrieval.pending.clone().expect("a partial search says so");
+        assert_eq!(pending.sources, 1);
+        assert!(pending.bytes > 0);
+        assert!(
+            retrieval.degraded.iter().any(|d| d.starts_with("partial:")),
+            "{retrieval:?}"
+        );
+        assert_eq!(store.host_history_backlog(), 1);
+        while store.host_history_backlog() > 0 {
+            store.index_host_history_step(u64::MAX).unwrap();
+        }
+        let done = search("lateneedle");
+        assert!(done.turns.iter().any(|t| t.text.contains("lateneedle")));
+        assert!(done.retrieval.and_then(|r| r.pending).is_none());
+        assert!(
+            search("earlyneedle")
+                .turns
+                .iter()
+                .any(|t| t.text.contains("earlyneedle"))
+        );
     }
 
     #[test]

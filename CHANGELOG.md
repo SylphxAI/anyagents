@@ -15,6 +15,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `sessions.sqlite3`, OpenCode's `opencode.db` (tool parts included), Claude
   Code subagents, Codex rollouts, AGY, Muse, OMP and Grok sessions, read
   without ever creating a file beside a harness's store.
+- History indexing never holds an agent's lifecycle lock or the index's write
+  lock across a long read: sources are read and projected unlocked and publish
+  in short batches that check the source is unchanged. A search indexes at most
+  4 MiB of new history before it answers and reports the rest in
+  `retrieval.pending`; a low-priority daemon thread indexes it, verifies
+  sources hourly, and pre-warms every agent's history after a start.
 - Hybrid retrieval: BM25 fused with dense candidates from a local multilingual
   embedder and reranked by a local cross-encoder, run by the new
   `anyagents memory-service` process. Every result cites its raw bytes; without

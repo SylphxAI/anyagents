@@ -48,7 +48,7 @@ pub(crate) fn search(
 ) -> Hybrid {
     let mut retrieval = RetrievalView {
         stages: vec!["lexical".into()],
-        degraded: Vec::new(),
+        ..RetrievalView::default()
     };
     let Some(client) = Client::for_data_dir(store.data_dir(), SEARCH_DEADLINE) else {
         retrieval
