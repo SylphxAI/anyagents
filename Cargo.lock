@@ -224,7 +224,6 @@ name = "anyagents-harness-opencode"
 version = "0.1.8"
 dependencies = [
  "anyagents-harness",
- "anyagents-harness-stream",
  "serde_json",
  "tempfile",
 ]

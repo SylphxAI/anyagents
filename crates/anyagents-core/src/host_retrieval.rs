@@ -656,6 +656,7 @@ fn is_external_harness_transcript(root: &Path, path: &Path) -> bool {
     path.strip_prefix(&config)
         .is_ok_and(|rel| rel.starts_with("projects") || rel.starts_with(".claude/projects"))
 }
+#[cfg(test)]
 fn refresh_native(
     index: &mut HostIndex,
     owner: &Owner,
@@ -663,6 +664,7 @@ fn refresh_native(
 ) -> Result<RefreshStats, IndexError> {
     refresh_native_at(index, owner, path, false, crate::now_ms())
 }
+#[cfg(test)]
 fn refresh_native_at(
     index: &mut HostIndex,
     owner: &Owner,
