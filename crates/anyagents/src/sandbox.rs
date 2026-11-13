@@ -542,7 +542,26 @@ pub(crate) fn ensure_seat_dir_as_owner(
     gid: u32,
     mode: u32,
 ) -> std::io::Result<()> {
-    if std::fs::create_dir_all(path).is_ok() {
+    use std::os::unix::fs::DirBuilderExt;
+    // Materialise with the final mode in one step. A bare `create_dir_all`
+    // under a setgid parent yields umask defaults (2755 seen live), never
+    // the caller's mode; a returned success must not depend on a later
+    // repair pass.
+    let mut builder = std::fs::DirBuilder::new();
+    builder.mode(mode).recursive(true);
+    match builder.create(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() != std::io::ErrorKind::PermissionDenied => {
+            return Err(error);
+        }
+        Err(_) => {}
+    }
+    if let Ok(meta) = std::fs::symlink_metadata(path)
+        && meta.is_dir()
+        && !meta.file_type().is_symlink()
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
         return Ok(());
     }
     #[cfg(unix)]
@@ -794,7 +813,7 @@ fn is_peer_boundary_shared(config: &Path, gid: u32) -> bool {
     true
 }
 
-type CachedPeers = (std::time::Instant, PathBuf, usize, String);
+type CachedPeers = (std::time::Instant, PathBuf, u64, String);
 
 fn peers_cache() -> &'static std::sync::Mutex<Option<CachedPeers>> {
     static PEERS_CACHE: std::sync::OnceLock<std::sync::Mutex<Option<CachedPeers>>> =
@@ -808,16 +827,37 @@ pub(super) fn invalidate_peers_cache() {
     }
 }
 
+fn seat_assignment_digest(store: &anyagents_core::Store, agents: &[anyagents_core::Agent]) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut seats: Vec<(String, u32, u32)> = agents
+        .iter()
+        .filter_map(|agent| {
+            crate::create::resolved_agent_seat_info(store, agent)
+                .map(|(_, uid, gid, _)| (agent.id.as_str().to_string(), uid, gid))
+        })
+        .collect();
+    seats.sort();
+    let mut hasher = DefaultHasher::new();
+    for (id, uid, gid) in seats {
+        id.hash(&mut hasher);
+        uid.hash(&mut hasher);
+        gid.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 /// Registered root-to-principal resolution is the same authority used by vendor
 /// launch. Unregistered directories remain foreign in the shared inventory.
 pub(crate) fn peer_principals(store: &anyagents_core::Store) -> Result<String, Error> {
     let agents = store.list_agents()?;
     let cacheable = !is_isolated_test_env() && std::env::var_os("ANYAGENTS_PRINCIPALS").is_none();
+    let digest = cacheable.then(|| seat_assignment_digest(store, &agents));
     if cacheable
         && let Ok(guard) = peers_cache().lock()
-        && let Some((at, ref dir, count, ref json)) = *guard
+        && let Some((at, ref dir, cached, ref json)) = *guard
         && dir == store.data_dir()
-        && count == agents.len()
+        && Some(cached) == digest
         && at.elapsed() < std::time::Duration::from_secs(15)
     {
         return Ok(json.clone());
@@ -843,11 +883,13 @@ pub(crate) fn peer_principals(store: &anyagents_core::Store) -> Result<String, E
         }
     }
     let json = serde_json::to_string(&peers).map_err(|e| Error::Message(e.to_string()))?;
-    if cacheable && let Ok(mut guard) = peers_cache().lock() {
+    if let Some(digest) = digest
+        && let Ok(mut guard) = peers_cache().lock()
+    {
         *guard = Some((
             std::time::Instant::now(),
             store.data_dir().to_path_buf(),
-            agents.len(),
+            digest,
             json.clone(),
         ));
     }
@@ -932,11 +974,23 @@ pub fn run(data: &Path, config: Option<&Path>, command: &[String]) -> Result<(),
             config.display().to_string(),
         ));
     }
-    if let Ok(store) = anyagents_core::Store::open(data.join("state.db")) {
-        environment.push((
-            anyagents_harness::SEAT_PEERS_ENV.to_owned(),
-            peer_principals(&store)?,
-        ));
+    // A seat launch without the peer projection is refused, never
+    // downgraded: with seats configured, an unopenable store is a
+    // named failure. Single-UID deployments stay on the quiet path.
+    match anyagents_core::Store::open(data.join("state.db")) {
+        Ok(store) => {
+            environment.push((
+                anyagents_harness::SEAT_PEERS_ENV.to_owned(),
+                peer_principals(&store)?,
+            ));
+        }
+        Err(error) if seats_configured() => {
+            return Err(Error::Message(format!(
+                "cannot open state.db {}: {error}",
+                data.join("state.db").display()
+            )));
+        }
+        Err(_) => {}
     }
     let status = anyagents_harness::spawn_command(Path::new(&command[0]), &environment)
         .map_err(|e| Error::Message(e.to_string()))?
@@ -1261,6 +1315,54 @@ mod tests {
             match previous {
                 Some(value) => std::env::set_var("ANYAGENTS_PRINCIPALS", value),
                 None => std::env::remove_var("ANYAGENTS_PRINCIPALS"),
+            }
+        }
+    }
+
+    #[test]
+    fn unopenable_store_refuses_seat_launch_naming_state_db() {
+        let dir = tempfile::tempdir().unwrap();
+        boundary::write(dir.path()).unwrap();
+        // A directory where the store file belongs: `Store::open` fails at
+        // any uid (root or not), independent of DAC overrides.
+        std::fs::create_dir(dir.path().join("state.db")).unwrap();
+        let config = dir.path().join("config");
+        std::fs::create_dir(&config).unwrap();
+        std::fs::write(config.join(crate::operator::CAPABILITY_FILE), "cap\n").unwrap();
+        let launcher = dir.path().join("launcher");
+        std::fs::write(&launcher, "").unwrap();
+        let uid = if current_uid() == 42001 { 42002 } else { 42001 };
+        let _env = crate::server::tests::env_lock();
+        let keys = [
+            "ANYAGENTS_AGENT_UID",
+            "ANYAGENTS_AGENT_GID",
+            "ANYAGENTS_SOCKET_GID",
+            "ANYAGENTS_LAUNCHER",
+            "ANYAGENTS_PRINCIPALS",
+        ];
+        let old: Vec<_> = keys.iter().map(std::env::var_os).collect();
+        unsafe {
+            std::env::set_var("ANYAGENTS_AGENT_UID", uid.to_string());
+            std::env::set_var("ANYAGENTS_AGENT_GID", "42003");
+            std::env::set_var("ANYAGENTS_SOCKET_GID", "42004");
+            std::env::set_var("ANYAGENTS_LAUNCHER", &launcher);
+            std::env::set_var("ANYAGENTS_PRINCIPALS", "{}");
+        }
+        let message = run(
+            dir.path(),
+            Some(&config),
+            &["/bin/echo".to_string(), "launched".to_string()],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(message.contains("state.db"), "{message}");
+        assert!(!message.contains("the agent command exited"), "{message}");
+        unsafe {
+            for (key, value) in keys.into_iter().zip(old) {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
             }
         }
     }

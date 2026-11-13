@@ -95,7 +95,14 @@ def main():
             view = config / harness / 'skills'
             (view / 'local').symlink_to(overlay / 'local')
             (view / 'global').symlink_to(data / 'skills/global')
-        for name in ['state.db', 'secrets', 'anyagents.sock', 'operator-token']:
+        clean_env = {k: v for k, v in os.environ.items() if not k.startswith('ANYAGENTS_')}
+        # Seat-mode `agent-run` requires an openable store to project peers, so
+        # materialize a real host-owned 0600 SQLite store before hashing bytes.
+        subprocess.run([str(binary), '--data', str(data), 'peers'],
+                       env=clean_env, check=True, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.PIPE, text=True, timeout=30)
+        (data / 'state.db').chmod(0o600)
+        for name in ['secrets', 'anyagents.sock', 'operator-token']:
             put(f'data/{name}', 'synthetic-private-only\n')
         directory('data/agents/synthetic-peer')
         for name in ['config', 'memory', 'skills', 'sessions', 'transcripts']:
@@ -157,7 +164,7 @@ for file in "$root/skills/global/SKILL.md" \
 done
 echo PRIVATE_AND_GLOBAL_DENIED
 ''', 0o555)
-        env = {k: v for k, v in os.environ.items() if not k.startswith('ANYAGENTS_')}
+        env = dict(clean_env)
         env.update(ANYAGENTS_AGENT_UID=str(args.uid),
                    ANYAGENTS_AGENT_GID=str(args.gid), ANYAGENTS_SOCKET_GID=str(args.socket_gid),
                    ANYAGENTS_LAUNCHER=str(launcher))

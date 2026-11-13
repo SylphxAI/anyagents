@@ -12154,6 +12154,144 @@ git -c safe.directory="$5" -C "$5" status --porcelain
         );
     }
 
+    /// The full seat receipt as a separate seat uid: push -u,
+    /// --set-upstream-to, config --worktree, fetch --prune of a packed ref,
+    /// branch -D of a packed branch, and gc. Each exits zero through the
+    /// recorded launch command, and none adds objects to the pool.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn privileged_per_seat_receipt_as_separate_uid() {
+        let caps = std::fs::read_to_string("/proc/self/status").unwrap();
+        let effective = caps
+            .lines()
+            .find_map(|l| l.strip_prefix("CapEff:\t"))
+            .and_then(|n| u64::from_str_radix(n, 16).ok())
+            .unwrap_or(0);
+        let required = (1 << 0) | (1 << 6) | (1 << 7); // CHOWN, SETGID, SETUID
+        if effective & required != required || crate::sandbox::server_uid() != 0 {
+            assert!(
+                std::env::var_os("ANYAGENTS_REQUIRE_PRIVILEGED_WORKTREE_TEST").is_none(),
+                "requires privilege: CAP_CHOWN, CAP_SETGID and CAP_SETUID"
+            );
+            eprintln!(
+                "requires privilege: CAP_CHOWN, CAP_SETGID and CAP_SETUID; per-seat receipt acceptance not executed"
+            );
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+        unsafe { std::env::set_var("ANYAGENTS_LAUNCHER", "/usr/local/bin/anyagents-setpriv") };
+        struct Users(Vec<String>);
+        impl Drop for Users {
+            fn drop(&mut self) {
+                for user in &self.0 {
+                    let _ = Command::new("userdel").arg(user).status();
+                }
+            }
+        }
+        let mut users = Users(Vec::new());
+        let mut ids = Vec::new();
+        for suffix in ["a", "b"] {
+            let name = format!("aa-seat-{}-{suffix}", std::process::id());
+            assert!(
+                Command::new("useradd")
+                    .args(["--no-create-home", "--user-group", &name])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            users.0.push(name);
+            let name = &users.0[users.0.len() - 1];
+            let id = |flag: &str| {
+                String::from_utf8(
+                    Command::new("id")
+                        .args([flag, name])
+                        .output()
+                        .unwrap()
+                        .stdout,
+                )
+                .unwrap()
+                .trim()
+                .parse::<u32>()
+                .unwrap()
+            };
+            ids.push((id("-u"), id("-g")));
+        }
+        let (b_uid, b_gid) = ids[1];
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let data = dir.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let remote = crate::worktree::tests::seed_bare_remote(&data);
+        let consumer = crate::worktree::tests::pool_consumer(&data.join("pool"));
+        let target = dir.path().join("seat");
+        consumer
+            .remote(
+                &format!("file://{}", remote.display()),
+                &target,
+                "agent/seat",
+                Some("main"),
+            )
+            .unwrap();
+        let pool_repo = data.join("pool/ExampleOrg/demo.git");
+        let before = crate::worktree::tests::pool_object_count(&pool_repo);
+        let agent = anyagents_core::Store::open(data.join("state.db"))
+            .unwrap()
+            .create_agent(anyagents_core::NewAgent::new("seat-owner", "codex"))
+            .unwrap();
+        crate::sandbox::share_worktree_with_seat(
+            &target,
+            b_uid,
+            b_gid,
+            &crate::worktree_access::grant_path(&data, &agent.id),
+        )
+        .unwrap();
+        crate::worktree_access::verify(&target, b_uid, b_gid, None).unwrap();
+        let record =
+            crate::worktree_access::RecordedWorktree::load(&data, &agent.id, &target).unwrap();
+        record.validate().unwrap();
+        let run = |args: &[&str]| -> std::process::Output {
+            record.command().unwrap().args(args).output().unwrap()
+        };
+        let assert_ok = |args: &[&str]| {
+            let out = run(args);
+            assert!(
+                out.status.success(),
+                "{args:?} as seat uid {b_uid}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        assert_ok(&[
+            "-c",
+            "user.name=Seat Author",
+            "-c",
+            "user.email=seat@example.test",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "Seat work",
+        ]);
+        assert_ok(&["push", "-q", "-u", "origin", "HEAD:refs/heads/agent/seat"]);
+        assert_ok(&["branch", "--set-upstream-to=origin/main"]);
+        assert_ok(&["config", "--worktree", "seat.k", "v"]);
+        assert_ok(&["branch", "packed-local", "origin/packed-local"]);
+        assert_ok(&["pack-refs", "--all"]);
+        assert_ok(&["fetch", "-q", "--prune", "origin"]);
+        assert_ok(&["branch", "-D", "packed-local"]);
+        assert_ok(&["gc"]);
+        assert_ok(&["status", "--porcelain"]);
+        assert_eq!(
+            crate::worktree::tests::pool_object_count(&pool_repo),
+            before,
+            "receipt must not add objects to the pool"
+        );
+        crate::worktree_access::revoke_recorded(&data, &agent.id).unwrap();
+        eprintln!(
+            "per-seat receipt EXECUTED as seat uid {b_uid}: push -u, set-upstream, config --worktree, fetch --prune, branch -D packed, gc; pool unchanged"
+        );
+    }
+
     #[test]
     fn consumer_refusal_rolls_back_spawn_and_private_never_calls_consumer() {
         let dir = tempfile::tempdir().unwrap();

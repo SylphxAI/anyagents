@@ -798,6 +798,23 @@ fn share_open(
                 Err(e) => return Err(e),
             }
         } else {
+            // Runtime caches (`cache-home`, `tmp`) are append-only and
+            // legitimately hardlinked inside the same tree (uv's archive
+            // layout hardlinks wheels across archive dirs). Refusing every
+            // hardlink breaks any seat whose tooling populated its cache;
+            // the seat already owns these addresses. Only the grant is
+            // skipped, and only for hardlinked cache files: single-link
+            // cache files still get read/write treatment for their mode.
+            let needs_migration = !text.starts_with(".seat-")
+                && (text.starts_with("opencode.db")
+                    || text == "serve-exit.jsonl"
+                    || text.contains(".sqlite"));
+            if access.runtime_tree
+                && !needs_migration
+                && child.metadata().is_ok_and(|meta| meta.nlink() > 1)
+            {
+                continue;
+            }
             grant(
                 &child,
                 uid,
@@ -805,12 +822,7 @@ fn share_open(
                 text == "mcp-capability",
                 access.daemon_access,
             )?;
-            if !text.starts_with(".seat-")
-                && (text.starts_with("opencode.db")
-                    || text == "serve-exit.jsonl"
-                    || text.contains(".sqlite"))
-                && child.metadata()?.uid() != uid
-            {
+            if needs_migration && child.metadata()?.uid() != uid {
                 match migrate_open_file(&directory, &name, &child, uid, gid) {
                     Ok(()) => (),
                     Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
@@ -930,6 +942,28 @@ pub(crate) fn open_readonly_seat_sqlite(db_path: &Path) -> Option<ReadOnlySeatDb
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn runtime_cache_hardlinks_are_tolerated_but_top_level_links_are_refused() {
+        let temp = crate::test_tempdir();
+        let own = temp.path().join("config");
+        let me = super::super::sandbox::server_uid();
+        let seat_uid = if me == 42001 { 42002 } else { 42001 };
+        let gid = super::super::sandbox::server_gid();
+        // uv-style archive layout: one inode, two names, inside the cache.
+        let cached = own.join("cache-home/uvcache/archive-v0/pkg/file.py");
+        std::fs::create_dir_all(cached.parent().unwrap()).unwrap();
+        std::fs::write(&cached, "cached").unwrap();
+        std::fs::create_dir_all(own.join("cache-home/uvcache/pkg")).unwrap();
+        std::fs::hard_link(&cached, own.join("cache-home/uvcache/pkg/link.py")).unwrap();
+        share(&own, seat_uid, gid).unwrap();
+        // A hardlinked file outside the runtime tree stays refused.
+        let top = own.join("top.py");
+        std::fs::write(&top, "top").unwrap();
+        std::fs::hard_link(&top, own.join("again.py")).unwrap();
+        let err = share(&own, seat_uid, gid).unwrap_err();
+        assert!(err.to_string().contains("single-link"), "{err}");
+    }
+
     #[test]
     fn capability_group_write_is_normalized_for_current_and_distinct_seat_owners() {
         use std::os::unix::fs::PermissionsExt;

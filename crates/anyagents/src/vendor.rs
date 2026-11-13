@@ -390,7 +390,6 @@ fn vendor_launch_authorized(
             _ => format!("host migration failed: {error}"),
         }
     })?;
-    prepare_host_session(&request)?;
     let config_dir = request.config_dir.clone();
     let res = vendor_launch_inner(request, store);
     if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none() {
@@ -567,14 +566,11 @@ fn read_opencode_exit_error(config_dir: &Path) -> Option<String> {
 }
 
 fn vendor_launch_inner(
-    request: LaunchRequest,
+    mut request: LaunchRequest,
     authority: Option<&anyagents_core::Store>,
 ) -> Result<VendorHarness, String> {
-    crate::worktree_access::ensure_launchable(&request.data_dir, &request.agent.id)
-        .map_err(|error| error.to_string())?;
     // Strip any untrusted launch or authority variables from caller/stored env.
-    let mut env: Vec<(String, String)> = request
-        .extra_env
+    let mut env: Vec<(String, String)> = std::mem::take(&mut request.extra_env)
         .into_iter()
         .filter(|(k, _)| {
             !matches!(
@@ -697,10 +693,17 @@ fn vendor_launch_inner(
         request.config_dir.display().to_string(),
     ));
     let reopened;
+    let mut store_reopen_error: Option<anyagents_core::Error> = None;
     let store_opt = if let Some(store) = authority {
         Some(store)
     } else {
-        reopened = anyagents_core::Store::open(request.data_dir.join("state.db")).ok();
+        reopened = match anyagents_core::Store::open(request.data_dir.join("state.db")) {
+            Ok(store) => Some(store),
+            Err(error) => {
+                store_reopen_error = Some(error);
+                None
+            }
+        };
         reopened.as_ref()
     };
     let seat_hint = store_opt
@@ -728,10 +731,28 @@ fn vendor_launch_inner(
             request.agent.id
         ));
     }
+    // A seat launch whose state.db could not be reopened would silently
+    // lose the peer projection and every store-backed decision. Fail
+    // closed, naming the reopen error, rather than launching a seat
+    // without it. Single-UID launches keep the previous fallback.
+    if seat_spec.is_some()
+        && let Some(error) = store_reopen_error
+    {
+        return Err(format!(
+            "no seat launch without peers: cannot open state.db {}: {error}",
+            request.data_dir.join("state.db").display()
+        ));
+    }
+    // Reject missing store authority before preparing shared seat directories.
+    crate::worktree_access::ensure_launchable(&request.data_dir, &request.agent.id)
+        .map_err(|error| error.to_string())?;
     if let Some((_, uid, gid, _)) = resolved_seat.as_ref() {
         crate::sandbox::prepare_config_with_seat_uid(&request.config_dir, *uid, *gid)
             .map_err(|error| error.to_string())?;
     }
+    // Admission and seat config grants precede instruction rendering: a refused
+    // seat must not mutate its host session or fail on an unrelated inode grant.
+    prepare_host_session(&request)?;
     if request.agent.harness == "agy" {
         ensure_agy_steering_settings(&request.config_dir, &request.work_dir)
             .map_err(|err| err.to_string())?;
@@ -3509,6 +3530,80 @@ done
         env.push(("ANYAGENTS_NATIVE_MEMORY_DISABLED".into(), "1".into()));
         enforce_host_memory_env("claude-code", &mut env);
         assert!(env.contains(&("CLAUDE_CODE_DISABLE_AUTO_MEMORY".into(), "1".into())));
+    }
+
+    #[test]
+    fn unopenable_store_refuses_seat_launch() {
+        let _env = crate::server::tests::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let store = anyagents_core::Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(anyagents_core::NewAgent::new("seat-owner", "codex"))
+            .unwrap();
+        // Replace the store file with a directory: the reopen fails at any
+        // uid (root or not), deterministically, instead of downgrading.
+        std::fs::remove_file(dir.path().join("state.db")).unwrap();
+        std::fs::create_dir(dir.path().join("state.db")).unwrap();
+        let config = dir.path().join("config");
+        std::fs::create_dir(&config).unwrap();
+        let keys = [
+            "ANYAGENTS_FAKE_MODE",
+            "ANYAGENTS_AGENT_UID",
+            "ANYAGENTS_AGENT_GID",
+            "ANYAGENTS_SOCKET_GID",
+            "ANYAGENTS_LAUNCHER",
+            "ANYAGENTS_PRINCIPAL_REGISTRY",
+        ];
+        let old: Vec<_> = keys.iter().map(std::env::var_os).collect();
+        // The file-registry form: production deployments resolve seats
+        // from execution-principals.json, not an inline env map.
+        let registry = dir.path().join("execution-principals.json");
+        std::fs::write(
+            &registry,
+            serde_json::json!({
+                agent.id.as_str(): {"user":"synthetic-worker", "uid":42001, "gid":42002, "socket_gid":42003}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&registry, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        unsafe {
+            std::env::set_var("ANYAGENTS_FAKE_MODE", "1");
+            std::env::set_var("ANYAGENTS_AGENT_UID", "42001");
+            std::env::set_var("ANYAGENTS_AGENT_GID", "42002");
+            std::env::set_var("ANYAGENTS_SOCKET_GID", "42003");
+            std::env::set_var("ANYAGENTS_LAUNCHER", "/bin/true");
+            std::env::set_var("ANYAGENTS_PRINCIPAL_REGISTRY", &registry);
+        }
+        let error = match vendor_launch(LaunchRequest {
+            agent: agent.clone(),
+            data_dir: dir.path().to_path_buf(),
+            config_dir: config,
+            work_dir: dir.path().join("work"),
+            extra_env: Vec::new(),
+        }) {
+            Ok(_) => panic!("seat launch without a store should be refused"),
+            Err(error) => error,
+        };
+        // Either refusal proves the downgrade is gone; naming state.db
+        // holds across the store-backed paths, and the admission refusal
+        // covers resolutions that never reached the store.
+        assert!(
+            error.contains("state.db") || error.contains("admitted execution principal"),
+            "{error}"
+        );
+        assert!(!error.contains("unexpected launch"), "{error}");
+        unsafe {
+            for (key, value) in keys.into_iter().zip(old) {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
     }
 
     #[test]
