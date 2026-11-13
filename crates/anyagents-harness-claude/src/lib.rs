@@ -1431,3 +1431,48 @@ fn write_stdin(slot: &Mutex<Option<ChildStdin>>, value: &Value) -> std::io::Resu
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|err| err.into_inner())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_line_uuid_is_stable_per_message_and_well_formed() {
+        let uuid = uuid_for("msg_01m7ar22a9e2e929v2kn4afrgg");
+        assert_eq!(uuid, uuid_for("msg_01m7ar22a9e2e929v2kn4afrgg"));
+        assert_ne!(uuid, uuid_for("msg_01m7ar22a9e2e929v2kn4afrgh"));
+        let groups: Vec<&str> = uuid.split('-').collect();
+        assert_eq!(
+            groups.iter().map(|g| g.len()).collect::<Vec<_>>(),
+            [8, 4, 4, 4, 12]
+        );
+        assert!(groups[2].starts_with('4'), "version 4: {uuid}");
+        assert!(matches!(&groups[3][..1], "8" | "9" | "a" | "b"), "{uuid}");
+    }
+
+    #[test]
+    fn only_a_proof_for_a_line_this_process_wrote_takes_it() {
+        let mut state = State::default();
+        state.uuid_ids.insert(uuid_for("m1"), "m1".into());
+        state.in_flight.insert("m1".into());
+        // A user event that only mentions the marker, without isReplay, proves nothing.
+        note_proof(
+            &mut state,
+            &serde_json::json!({"type": "user", "message": {"content": [
+                {"type": "text", "text": "anyagents-message:m1\nquoted"}]}}),
+        );
+        assert!(!state.consumed.contains("m1"));
+        // An unknown uuid proves nothing either.
+        note_proof(
+            &mut state,
+            &serde_json::json!({"type": "command_lifecycle", "command_uuid": "other", "state": "started"}),
+        );
+        assert!(!state.consumed.contains("m1"));
+        note_proof(
+            &mut state,
+            &serde_json::json!({"type": "command_lifecycle", "command_uuid": uuid_for("m1"), "state": "started"}),
+        );
+        assert!(state.consumed.contains("m1"));
+        assert!(!state.in_flight.contains("m1"));
+    }
+}

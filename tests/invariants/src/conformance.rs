@@ -46,25 +46,54 @@ pub struct Seen {
     pub text: String,
 }
 
-impl Fixture {
-    /// A fresh vendor state for `protocol`.
-    pub fn new(protocol: &str) -> Self {
-        let dir = tempfile::tempdir().expect("fixture directory");
-        let program = dir.path().join("vendor");
+/// The one wrapper every fixture's vendor program links to, written once per
+/// test process. A fixture's program is a symlink to it named
+/// `vendor-<protocol>` inside the fixture directory, which tells the wrapper
+/// both. Writing a script per fixture raced with other test threads: a child
+/// forked while the script was still open for writing makes its exec fail
+/// (`ETXTBSY`); a symlink is never open for writing.
+fn wrapper() -> &'static Path {
+    static WRAPPER: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    WRAPPER.get_or_init(|| {
+        let dir = tempfile::Builder::new()
+            .prefix("anyagents-conformance-")
+            .tempdir()
+            .expect("wrapper directory")
+            .keep();
+        let path = dir.join("vendor.sh");
         std::fs::write(
-            &program,
+            &path,
             format!(
-                "#!/bin/sh\nexec /usr/bin/python3 -B -u '{VENDOR}' --fixture '{}' --protocol {protocol} \"$@\"\n",
-                dir.path().display()
+                "#!/bin/sh\nexec /usr/bin/python3 -B -u '{VENDOR}' --fixture \"$(dirname \"$0\")\" --protocol \"$(basename \"$0\" | sed 's/^vendor-//')\" \"$@\"\n"
             ),
         )
         .expect("vendor wrapper");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700))
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
                 .expect("vendor wrapper mode");
         }
+        path
+    })
+}
+
+#[cfg(unix)]
+fn link(target: &Path, at: &Path) {
+    std::os::unix::fs::symlink(target, at).expect("vendor program link");
+}
+
+#[cfg(not(unix))]
+fn link(target: &Path, at: &Path) {
+    std::fs::copy(target, at).expect("vendor program copy");
+}
+
+impl Fixture {
+    /// A fresh vendor state for `protocol`.
+    pub fn new(protocol: &str) -> Self {
+        let dir = tempfile::tempdir().expect("fixture directory");
+        let program = dir.path().join(format!("vendor-{protocol}"));
+        link(wrapper(), &program);
         Self { dir, program }
     }
 
