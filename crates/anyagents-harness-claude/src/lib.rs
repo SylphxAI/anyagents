@@ -25,7 +25,7 @@
 
 mod diagnostics;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Stdio};
@@ -1054,6 +1054,150 @@ pub fn quota_from_claude(value: &Value) -> Option<i64> {
 /// latest assistant/result turn ended with a rate-limit rejection whose reset
 /// time is still in the future (`> now_ms`).
 pub fn detect_session_quota_reset_ms(config_dir: &Path, now_ms: i64) -> Option<i64> {
+    static CACHE: std::sync::LazyLock<Mutex<HashMap<PathBuf, SessionEvidence>>> =
+        std::sync::LazyLock::new(Mutex::default);
+    let newest = lock(&CACHE)
+        .get(config_dir)
+        .map(|entry| entry.inputs.session_paths());
+    if let Some(newest) = newest {
+        let inputs = SessionInputs::stamp(config_dir, newest);
+        if let Some(entry) = lock(&CACHE).get(config_dir)
+            && entry.inputs == inputs
+        {
+            return entry.reset_at_ms.filter(|reset| *reset > now_ms);
+        }
+    }
+    let (inputs, reset_at_ms) = SessionInputs::read(config_dir);
+    lock(&CACHE).insert(
+        config_dir.to_path_buf(),
+        SessionEvidence {
+            inputs,
+            reset_at_ms,
+        },
+    );
+    reset_at_ms.filter(|reset| *reset > now_ms)
+}
+
+/// The reset time the newest session transcript ends on, kept until one of
+/// the files it was read from changes: the scheduler asks every second.
+struct SessionEvidence {
+    inputs: SessionInputs,
+    reset_at_ms: Option<i64>,
+}
+
+/// Stamps of what the reset time is read from: the operator markers, the
+/// session pointer, the project directories (a transcript created or
+/// removed) and the three newest transcripts.
+#[derive(PartialEq, Eq)]
+struct SessionInputs {
+    rotated: Option<anyagents_harness::FileStamp>,
+    cleared: Option<anyagents_harness::FileStamp>,
+    pointer: Option<anyagents_harness::FileStamp>,
+    projects: Vec<(PathBuf, Option<anyagents_harness::FileStamp>)>,
+    newest: Vec<(PathBuf, Option<anyagents_harness::FileStamp>)>,
+}
+
+impl SessionInputs {
+    fn session_paths(&self) -> Vec<PathBuf> {
+        self.newest.iter().map(|(path, _)| path.clone()).collect()
+    }
+
+    fn markers(
+        config_dir: &Path,
+        projects: Vec<(PathBuf, Option<anyagents_harness::FileStamp>)>,
+        newest: Vec<(PathBuf, Option<anyagents_harness::FileStamp>)>,
+    ) -> Self {
+        use anyagents_harness::FileStamp;
+        Self {
+            rotated: FileStamp::of(&config_dir.join(".anyagents-profile-rotated-ms")),
+            cleared: FileStamp::of(&config_dir.join(".anyagents-quota-cleared-ms")),
+            pointer: FileStamp::of(&config_dir.join("claude-session-id")),
+            projects,
+            newest,
+        }
+    }
+
+    /// The projects directory and each project directory, stamped.
+    fn project_dirs(config_dir: &Path) -> Vec<(PathBuf, Option<anyagents_harness::FileStamp>)> {
+        let projects_dir = config_dir.join("projects");
+        let mut dirs = vec![(
+            projects_dir.clone(),
+            anyagents_harness::FileStamp::of(&projects_dir),
+        )];
+        if let Ok(entries) = std::fs::read_dir(&projects_dir) {
+            let mut found: Vec<_> = entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.is_dir())
+                .map(|path| {
+                    let stamp = anyagents_harness::FileStamp::of(&path);
+                    (path, stamp)
+                })
+                .collect();
+            found.sort_by(|a, b| a.0.cmp(&b.0));
+            dirs.extend(found);
+        }
+        dirs
+    }
+
+    /// The stamps a cached reset is checked against: the project directories
+    /// and the transcripts the last read found newest, without opening any.
+    fn stamp(config_dir: &Path, newest: Vec<PathBuf>) -> Self {
+        let newest = newest
+            .into_iter()
+            .map(|path| {
+                let stamp = anyagents_harness::FileStamp::of(&path);
+                (path, stamp)
+            })
+            .collect();
+        Self::markers(config_dir, Self::project_dirs(config_dir), newest)
+    }
+
+    /// Stamp every input, then read the reset time, so a change during the
+    /// read is seen on the next call.
+    fn read(config_dir: &Path) -> (Self, Option<i64>) {
+        let projects = Self::project_dirs(config_dir);
+        let mut transcripts: Vec<(SystemTime, PathBuf, anyagents_harness::FileStamp)> = Vec::new();
+        for (dir, _) in projects.iter().skip(1) {
+            let Ok(files) = std::fs::read_dir(dir) else {
+                continue;
+            };
+            for file_entry in files.flatten() {
+                let p = file_entry.path();
+                if p.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                    continue;
+                }
+                if let Ok(meta) = file_entry.metadata()
+                    && let Ok(mtime) = meta.modified()
+                {
+                    transcripts.push((
+                        mtime,
+                        p,
+                        anyagents_harness::FileStamp::from_metadata(&meta),
+                    ));
+                }
+            }
+        }
+        transcripts.sort_by_key(|(mtime, _, _)| std::cmp::Reverse(*mtime));
+        let inputs = Self::markers(
+            config_dir,
+            projects,
+            transcripts
+                .iter()
+                .take(3)
+                .map(|(_, path, stamp)| (path.clone(), Some(*stamp)))
+                .collect(),
+        );
+        let reset_at_ms = transcripts
+            .first()
+            .and_then(|(_, newest, _)| session_reset_ms(config_dir, newest));
+        (inputs, reset_at_ms)
+    }
+}
+
+/// The reset time a rate-limit rejection at the end of the transcript names,
+/// unless the transcript has not changed since the quota was last cleared.
+fn session_reset_ms(config_dir: &Path, transcript: &Path) -> Option<i64> {
     use std::io::{Read, Seek, SeekFrom};
     let rotated_ms = std::fs::read_to_string(config_dir.join(".anyagents-profile-rotated-ms"))
         .ok()
@@ -1064,48 +1208,7 @@ pub fn detect_session_quota_reset_ms(config_dir: &Path, now_ms: i64) -> Option<i
         .and_then(|s| s.trim().parse::<i64>().ok())
         .unwrap_or(0)
         .max(rotated_ms);
-    let projects_dir = config_dir.join("projects");
-    let Ok(project_entries) = std::fs::read_dir(&projects_dir) else {
-        return None;
-    };
-    let preferred_session = std::fs::read_to_string(config_dir.join("claude-session-id"))
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-    let mut best_path: Option<(std::time::SystemTime, PathBuf)> = None;
-    let mut preferred_path: Option<PathBuf> = None;
-    for proj in project_entries.flatten() {
-        let proj_path = proj.path();
-        if !proj_path.is_dir() {
-            continue;
-        }
-        let Ok(files) = std::fs::read_dir(&proj_path) else {
-            continue;
-        };
-        for file_entry in files.flatten() {
-            let p = file_entry.path();
-            if p.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                continue;
-            }
-            if let Some(ref sid) = preferred_session
-                && p.file_stem().and_then(|s| s.to_str()) == Some(sid.as_str())
-            {
-                preferred_path = Some(p.clone());
-            }
-            if let Ok(meta) = file_entry.metadata()
-                && let Ok(mtime) = meta.modified()
-                && best_path.as_ref().is_none_or(|(prev_t, _)| mtime > *prev_t)
-            {
-                best_path = Some((mtime, p));
-            }
-        }
-    }
-    let target_jsonl = match (preferred_path, best_path) {
-        (_, Some((_, newest))) => newest,
-        (Some(pref), None) => pref,
-        (None, None) => return None,
-    };
-    let mut file = std::fs::File::open(target_jsonl).ok()?;
+    let mut file = std::fs::File::open(transcript).ok()?;
     let meta = file.metadata().ok()?;
     if cleared_ms > 0
         && let Ok(mtime) = meta.modified()
@@ -1131,7 +1234,7 @@ pub fn detect_session_quota_reset_ms(config_dir: &Path, now_ms: i64) -> Option<i
             continue;
         };
         if let Some(reset_at_ms) = quota_from_claude(&val) {
-            return (reset_at_ms > now_ms).then_some(reset_at_ms);
+            return Some(reset_at_ms);
         }
         if matches!(
             val.get("type").and_then(Value::as_str),

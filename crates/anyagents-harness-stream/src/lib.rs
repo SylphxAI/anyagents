@@ -18,11 +18,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyagents_harness::{
-    DeliverOutcome, DeliveryMode, HarnessError, HarnessHealth, OutboundMessage, SteerSupport,
-    TurnState, TurnUsage, compose_message, message_id_in_text, spawn_command,
+    DeliverOutcome, DeliveryMode, FileStamp, HarnessError, HarnessHealth, OutboundMessage,
+    SteerSupport, TurnState, TurnUsage, compose_message, message_id_in_text, spawn_command,
 };
 use serde_json::{Value, json};
 
@@ -2719,6 +2719,145 @@ pub fn detect_agy_session_quota_and_error(
     config_dir: &Path,
     now_ms: i64,
 ) -> (Option<i64>, Option<String>) {
+    static CACHE: std::sync::LazyLock<Mutex<HashMap<PathBuf, AgyEvidence>>> =
+        std::sync::LazyLock::new(Mutex::default);
+    let logs = lock(&CACHE)
+        .get(config_dir)
+        .map(|entry| entry.inputs.log_paths());
+    if let Some(logs) = logs {
+        let inputs = AgyInputs::stamp(config_dir, logs);
+        if let Some(entry) = lock(&CACHE).get(config_dir)
+            && entry.inputs == inputs
+        {
+            return entry.finding.clone().at(now_ms);
+        }
+    }
+    let (inputs, finding) = AgyInputs::read(config_dir);
+    lock(&CACHE).insert(
+        config_dir.to_path_buf(),
+        AgyEvidence {
+            inputs,
+            finding: finding.clone(),
+        },
+    );
+    finding.at(now_ms)
+}
+
+/// What an Antigravity config directory says about its last turn before the
+/// current time is applied. It depends only on files, so it is kept until
+/// one of them changes: the scheduler asks every second, and the logs it
+/// reads can be large.
+#[derive(Clone)]
+enum AgyFinding {
+    Nothing,
+    Quota {
+        reset_at_ms: i64,
+        error: Option<String>,
+    },
+    Error(Option<String>),
+}
+
+impl AgyFinding {
+    fn at(self, now_ms: i64) -> (Option<i64>, Option<String>) {
+        match self {
+            Self::Nothing => (None, None),
+            Self::Quota { reset_at_ms, error } if reset_at_ms > now_ms => {
+                (Some(reset_at_ms), error)
+            }
+            Self::Quota { .. } => (None, None),
+            Self::Error(error) => (None, error),
+        }
+    }
+}
+
+struct AgyEvidence {
+    inputs: AgyInputs,
+    finding: AgyFinding,
+}
+
+/// Stamps of every file the finding reads: the operator markers, the
+/// persisted error, the log directory (a log created or removed) and its
+/// three newest logs, whatever their age, since a log older than a marker
+/// becomes relevant again when it is appended to.
+#[derive(PartialEq, Eq)]
+struct AgyInputs {
+    rotated: Option<FileStamp>,
+    cleared: Option<FileStamp>,
+    last_error: Option<FileStamp>,
+    log_dir: Option<FileStamp>,
+    newest_logs: Vec<(PathBuf, Option<FileStamp>)>,
+}
+
+impl AgyInputs {
+    fn markers(config_dir: &Path, newest_logs: Vec<(PathBuf, Option<FileStamp>)>) -> Self {
+        Self {
+            rotated: FileStamp::of(&config_dir.join(".anyagents-profile-rotated-ms")),
+            cleared: FileStamp::of(&config_dir.join(".anyagents-quota-cleared-ms")),
+            last_error: FileStamp::of(&config_dir.join(".anyagents-last-error.json")),
+            log_dir: FileStamp::of(&config_dir.join(".gemini/antigravity-cli/log")),
+            newest_logs,
+        }
+    }
+
+    fn log_paths(&self) -> Vec<PathBuf> {
+        self.newest_logs
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect()
+    }
+
+    /// The stamps a cached finding is checked against, for the logs the last
+    /// read found newest: a few `stat` calls, no listing and no file read.
+    fn stamp(config_dir: &Path, logs: Vec<PathBuf>) -> Self {
+        Self::markers(
+            config_dir,
+            logs.into_iter()
+                .map(|path| {
+                    let stamp = FileStamp::of(&path);
+                    (path, stamp)
+                })
+                .collect(),
+        )
+    }
+
+    /// Read every input and derive the finding, with the stamps taken
+    /// before the reads so a change during them is seen next time.
+    fn read(config_dir: &Path) -> (Self, AgyFinding) {
+        let log_dir = config_dir.join(".gemini/antigravity-cli/log");
+        let log_dir_stamp = FileStamp::of(&log_dir);
+        let mut logs: Vec<(SystemTime, PathBuf, FileStamp)> = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&log_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                if !name.starts_with("cli-") || !name.ends_with(".log") {
+                    continue;
+                }
+                if let Ok(meta) = entry.metadata()
+                    && let Ok(mtime) = meta.modified()
+                {
+                    logs.push((mtime, path, FileStamp::from_metadata(&meta)));
+                }
+            }
+        }
+        logs.sort_by_key(|(mtime, _, _)| std::cmp::Reverse(*mtime));
+        let mut inputs = Self::markers(
+            config_dir,
+            logs.iter()
+                .take(3)
+                .map(|(_, path, stamp)| (path.clone(), Some(*stamp)))
+                .collect(),
+        );
+        // The listing above is as new as this stamp, not as the later one.
+        inputs.log_dir = log_dir_stamp;
+        let finding = agy_finding(config_dir, &logs);
+        (inputs, finding)
+    }
+}
+
+fn agy_finding(config_dir: &Path, logs: &[(SystemTime, PathBuf, FileStamp)]) -> AgyFinding {
     let rotated_ms = std::fs::read_to_string(config_dir.join(".anyagents-profile-rotated-ms"))
         .ok()
         .and_then(|s| s.trim().parse::<i64>().ok())
@@ -2735,64 +2874,46 @@ pub fn detect_agy_session_quota_and_error(
         if ts > reset_floor_ms {
             let err = val.get("error").and_then(Value::as_str).map(str::to_string);
             if let Some(raw_reset) = val.get("quota_reset_at_ms").and_then(Value::as_i64) {
-                if raw_reset > now_ms {
-                    return (Some(raw_reset), err);
-                }
-                return (None, None);
+                return AgyFinding::Quota {
+                    reset_at_ms: raw_reset,
+                    error: err,
+                };
             }
             if err.is_some() {
-                return (None, err);
+                return AgyFinding::Error(err);
             }
         }
     }
-    let log_dir = config_dir.join(".gemini/antigravity-cli/log");
-    let Ok(entries) = std::fs::read_dir(&log_dir) else {
-        return (None, None);
-    };
-    let mut logs: Vec<(i64, PathBuf)> = Vec::new();
-    for entry in entries.flatten() {
-        let p = entry.path();
-        let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        if !name.starts_with("cli-") || !name.ends_with(".log") {
-            continue;
-        };
-        if let Ok(meta) = entry.metadata()
-            && let Ok(mtime) = meta.modified()
-            && let Ok(dur) = mtime.duration_since(std::time::UNIX_EPOCH)
-        {
-            let mtime_ms = dur.as_millis() as i64;
-            if mtime_ms > reset_floor_ms {
-                logs.push((mtime_ms, p));
-            }
-        }
-    }
-    logs.sort_by_key(|b| std::cmp::Reverse(b.0));
-    for (mtime_ms, path) in logs.into_iter().take(3) {
-        let Ok(text) = std::fs::read_to_string(&path) else {
+    let recent = logs.iter().filter_map(|(mtime, path, _)| {
+        let mtime_ms = mtime
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_millis() as i64;
+        (mtime_ms > reset_floor_ms).then_some((mtime_ms, path))
+    });
+    for (mtime_ms, path) in recent.take(3) {
+        let Ok(text) = std::fs::read_to_string(path) else {
             continue;
         };
         for line in text.lines().rev() {
             if let Some((_, after)) = line.split_once("run ended with error and no response: ") {
                 let err_str = after.trim().to_string();
                 if let Some(dur_ms) = parse_resets_in_ms(&err_str) {
-                    let raw_reset = mtime_ms.saturating_add(dur_ms);
-                    if raw_reset > now_ms {
-                        return (Some(raw_reset), Some(err_str));
-                    }
-                    return (None, None);
+                    return AgyFinding::Quota {
+                        reset_at_ms: mtime_ms.saturating_add(dur_ms),
+                        error: Some(err_str),
+                    };
                 }
-                return (None, Some(err_str));
+                return AgyFinding::Error(Some(err_str));
             }
             if line.contains("Sending user message to conversation")
                 && !text.contains("run ended with error and no response:")
             {
-                return (None, None);
+                return AgyFinding::Nothing;
             }
         }
     }
-    (None, None)
+    AgyFinding::Nothing
 }
 
 /// The line that puts one message into the child.

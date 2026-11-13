@@ -1698,3 +1698,73 @@ exec sleep 30"#
         anyagents_harness::TurnState::Idle
     );
 }
+
+#[test]
+fn the_agy_quota_finding_is_kept_until_a_file_it_reads_changes() {
+    use std::io::Write as _;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    let dir = tempfile::tempdir().unwrap();
+    let logs = dir.path().join(".gemini/antigravity-cli/log");
+    std::fs::create_dir_all(&logs).unwrap();
+    let log = logs.join("cli-1.log");
+    std::fs::write(
+        &log,
+        "Sending user message to conversation c1\n\
+         run ended with error and no response: RESOURCE_EXHAUSTED: quota resets in 2h\n",
+    )
+    .unwrap();
+    let mtime_ms = |path: &std::path::Path| {
+        std::fs::metadata(path)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let (reset, error) = super::detect_agy_session_quota_and_error(dir.path(), now);
+    let reset = reset.expect("a quota reset in the newest log");
+    assert_eq!(reset, mtime_ms(&log) + 7_200_000);
+    assert!(error.unwrap().contains("RESOURCE_EXHAUSTED"));
+    // The kept finding still applies the current time.
+    assert_eq!(
+        super::detect_agy_session_quota_and_error(dir.path(), reset + 1),
+        (None, None)
+    );
+    // A clearing newer than the log hides it.
+    std::fs::write(
+        dir.path().join(".anyagents-quota-cleared-ms"),
+        format!("{}\n", mtime_ms(&log) + 1),
+    )
+    .unwrap();
+    assert_eq!(
+        super::detect_agy_session_quota_and_error(dir.path(), now),
+        (None, None)
+    );
+    // The same log, appended to after the clearing, counts again.
+    std::thread::sleep(Duration::from_millis(20));
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&log)
+        .unwrap()
+        .write_all(b"run ended with error and no response: overloaded\n")
+        .unwrap();
+    assert_eq!(
+        super::detect_agy_session_quota_and_error(dir.path(), now),
+        (None, Some("overloaded".to_string()))
+    );
+    // A persisted error newer than the clearing takes precedence.
+    std::fs::write(
+        dir.path().join(".anyagents-last-error.json"),
+        json!({"error": "persisted", "timestamp_ms": i64::MAX - 1}).to_string(),
+    )
+    .unwrap();
+    assert_eq!(
+        super::detect_agy_session_quota_and_error(dir.path(), now),
+        (None, Some("persisted".to_string()))
+    );
+}

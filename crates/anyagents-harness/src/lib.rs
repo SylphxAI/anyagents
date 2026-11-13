@@ -9,6 +9,7 @@ mod fake;
 pub mod masking;
 mod name;
 mod seat;
+mod stamp;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -20,6 +21,7 @@ pub use atomic_fs::{
 };
 pub use fake::FakeHarness;
 pub use name::normalize_harness_name;
+pub use stamp::FileStamp;
 
 /// Internal environment key the server sets when an agent has an OS seat. It
 /// carries `<launcher>\t<uid>\t<gid>\t<groups>` and is removed from the child's
