@@ -144,9 +144,40 @@ pub(super) fn probe(
     ))
 }
 
+pub(super) fn probe_pr(
+    owner: &str,
+    repo: &str,
+    reference: &str,
+    agent_id: &str,
+    now: i64,
+) -> Option<(bool, String, Option<String>)> {
+    let base = std::env::var("ANYAGENTS_GITHUB_API_BASE").unwrap_or_default();
+    let key = target_key(&base, owner, repo, reference, true);
+    let mut probes = PROBES.lock().ok()?;
+    let (terminal, state_desc) = probes.probe_with_clock(
+        &key,
+        owner,
+        repo,
+        reference,
+        true,
+        now,
+        |path, etag, modified| request(&base, path, etag, modified, agent_id, owner),
+        completed_now,
+    );
+    let head = probes.targets.get(&key).and_then(|t| t.head.clone());
+    Some((terminal, state_desc, head))
+}
+
 #[cfg(test)]
 std::thread_local! {
     static COMPLETION_CLOCK: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) fn reset_probes_for_test() {
+    if let Ok(mut probes) = PROBES.lock() {
+        *probes = Probes::default();
+    }
 }
 
 #[cfg(test)]
