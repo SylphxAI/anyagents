@@ -27,6 +27,10 @@ use serde_json::{Value, json};
 pub struct NotificationEffect {
     /// A rate limit with a reset time, in epoch milliseconds.
     pub quota_reset_at_ms: Option<i64>,
+    /// The line changed nothing the host reads through the adapter (a
+    /// streamed delta or a progress note), so the activity watcher stays
+    /// asleep. The default wakes it.
+    pub unobserved: bool,
 }
 
 /// How to start one vendor child.
@@ -55,7 +59,11 @@ pub struct RpcChild {
 struct State {
     child: Option<Child>,
     alive: bool,
+    /// Bumped by every line the child prints.
     epoch: u64,
+    /// Bumped only by lines the adapter says the host may read, by a quota
+    /// and by exit: what the activity watcher waits on.
+    changes: u64,
     next_id: i64,
     pending: HashMap<i64, Answer>,
     quota_reset_at_ms: Option<i64>,
@@ -294,7 +302,9 @@ impl RpcChild {
         lock(&self.shared).quota_reset_at_ms = reset_at_ms;
     }
 
-    /// Call `notify` after the vendor prints a line and once when it exits.
+    /// Call `notify` once at start, after the vendor prints a line the
+    /// adapter did not mark [`NotificationEffect::unobserved`], and once when
+    /// it exits.
     ///
     /// The callback runs on a background thread. It must not call back into
     /// this child.
@@ -305,15 +315,15 @@ impl RpcChild {
             .name("anyagents-rpc-watch".to_string())
             .spawn(move || {
                 let mut state = lock(&shared);
-                let mut seen = 0u64;
+                let mut seen = None;
                 loop {
                     if !state.alive {
                         drop(state);
                         notify();
                         break;
                     }
-                    if state.epoch != seen {
-                        seen = state.epoch;
+                    if seen != Some(state.changes) {
+                        seen = Some(state.changes);
                         drop(state);
                         notify();
                         state = lock(&shared);
@@ -417,6 +427,7 @@ fn read_stdout(
         };
         let method = value.get("method").and_then(Value::as_str);
         let id = value.get("id");
+        let mut observed = false;
         match (method, id) {
             (Some(method), Some(id)) => {
                 if let Some(result) = on_request(method, &value) {
@@ -429,6 +440,7 @@ fn read_stdout(
             (Some(method), None) => {
                 let params = value.get("params").cloned().unwrap_or(Value::Null);
                 let effect = on_line(&json!({"method": method, "params": params}));
+                observed = !effect.unobserved || effect.quota_reset_at_ms.is_some();
                 if let Some(reset_at_ms) = effect.quota_reset_at_ms {
                     lock(&shared).quota_reset_at_ms = Some(reset_at_ms);
                 }
@@ -465,6 +477,7 @@ fn read_stdout(
                         "method": "$rpc/response",
                         "params": { "id": id, "result": result, "error": error }
                     }));
+                    observed = !effect.unobserved || effect.quota_reset_at_ms.is_some();
                     if let Some(reset_at_ms) = effect.quota_reset_at_ms {
                         lock(&shared).quota_reset_at_ms = Some(reset_at_ms);
                     }
@@ -475,6 +488,9 @@ fn read_stdout(
         {
             let mut state = lock(&shared);
             state.epoch = state.epoch.wrapping_add(1);
+            if observed {
+                state.changes = state.changes.wrapping_add(1);
+            }
         }
         wake.notify_all();
     }
@@ -485,6 +501,7 @@ fn read_stdout(
             let _ = child.try_wait();
         }
         state.epoch = state.epoch.wrapping_add(1);
+        state.changes = state.changes.wrapping_add(1);
     }
     wake.notify_all();
 }

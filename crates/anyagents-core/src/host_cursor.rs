@@ -1,12 +1,12 @@
 //! Rebuildable source cursors. Native append reuse checks a bounded boundary,
 //! while host maintenance periodically rebuilds the entire source. Returned
 //! coordinates always retain independent raw/window SHA verification.
-use crate::raw_segment::{RawCoordinate, open_readonly};
+use crate::raw_segment::{JsonlLine, RawCoordinate, RawSource, read_jsonl_line};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    fs::File,
-    io::{self, BufRead, BufReader, Read, Seek, SeekFrom},
+    fs::{self, File},
+    io::{self, BufRead},
     path::Path,
 };
 
@@ -20,18 +20,39 @@ pub(crate) struct FileStamp {
 }
 impl FileStamp {
     pub fn read(file: &File) -> io::Result<Self> {
+        Ok(Self::from_metadata(&file.metadata()?))
+    }
+    pub fn from_metadata(m: &fs::Metadata) -> Self {
         use std::os::unix::fs::MetadataExt;
-        let m = file.metadata()?;
-        Ok(Self {
+        Self {
             len: m.len(),
             device: m.dev(),
             inode: m.ino(),
             modified: (m.mtime(), m.mtime_nsec()),
             changed: (m.ctime(), m.ctime_nsec()),
-        })
+        }
+    }
+    /// The entry itself, never a symlink target. `None` when it is absent.
+    pub fn of_path(path: &Path) -> io::Result<Option<Self>> {
+        match fs::symlink_metadata(path) {
+            Ok(m) => Ok(Some(Self::from_metadata(&m))),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
     }
     pub fn same_file(&self, other: &Self) -> bool {
         self.device == other.device && self.inode == other.inode
+    }
+    /// The last change predates `ms` by more than any filesystem timestamp
+    /// granularity, so a later change cannot reuse this exact stamp.
+    pub fn settled_before(&self, ms: i64) -> bool {
+        const GRANULARITY_MS: i64 = 2_000;
+        let changed_ms = self
+            .changed
+            .0
+            .saturating_mul(1_000)
+            .saturating_add(self.changed.1 / 1_000_000);
+        changed_ms < ms.saturating_sub(GRANULARITY_MS)
     }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -60,24 +81,24 @@ pub(crate) struct JsonlRefresh {
 /// Read one stable-length snapshot. Incomplete tail bytes never enter the
 /// committed frontier. Replacement, shrink or a changed 64KiB boundary forces
 /// a full rebuild; older edits are found by periodic full verification.
+/// Every record is hashed and validated from the one buffered pass over it.
 pub(crate) fn scan_jsonl(
-    path: &Path,
-    stamp: &FileStamp,
+    source: &mut RawSource,
     previous: Option<&SourceCursor>,
     force_full: bool,
 ) -> io::Result<JsonlRefresh> {
-    let mut file = open_readonly(path)?;
+    let stamp = source.stamp().clone();
     let mut start = 0;
     let mut seq = 1;
     let mut verified = 0;
     let mut replace = true;
     if !force_full
         && let Some(old) = previous
-        && old.stamp.same_file(stamp)
+        && old.stamp.same_file(&stamp)
         && stamp.len >= old.stamp.len
         && old.end <= stamp.len
     {
-        let (boundary, length) = boundary_hash(&mut file, old.end)?;
+        let (boundary, length) = boundary_hash(source, old.end)?;
         verified = length;
         if boundary == old.boundary_sha256 {
             start = old.end;
@@ -85,44 +106,29 @@ pub(crate) fn scan_jsonl(
             replace = false;
         }
     }
-    file.seek(SeekFrom::Start(start))?;
-    let mut reader = BufReader::with_capacity(65536, file.take(stamp.len - start));
+    let segment = source.path().to_owned();
+    let mut reader = source.range(start, stamp.len - start);
     let mut records = Vec::new();
     let mut at = start;
-    let mut length = 0;
-    let mut record_hash = Sha256::new();
     let mut scanned = 0;
-    loop {
-        let bytes = reader.fill_buf()?;
-        if bytes.is_empty() {
-            break;
+    while let Some(line) = read_jsonl_line(&mut reader)? {
+        match line {
+            JsonlLine::Complete { length, sha256 } => {
+                records.push(RawCoordinate {
+                    segment: segment.clone(),
+                    offset: at,
+                    length,
+                    sha256,
+                    seq,
+                });
+                at += length;
+                scanned += length;
+                seq += 1;
+            }
+            JsonlLine::Partial { length } => scanned += length,
         }
-        let newline = bytes.iter().position(|b| *b == b'\n');
-        let consumed = newline.map_or(bytes.len(), |n| n + 1);
-        record_hash.update(&bytes[..consumed]);
-        length += consumed as u64;
-        scanned += consumed as u64;
-        reader.consume(consumed);
-        if newline.is_none() {
-            continue;
-        }
-        let mut validation = open_readonly(path)?;
-        validation.seek(SeekFrom::Start(at))?;
-        serde_json::from_reader::<_, serde::de::IgnoredAny>(validation.take(length))
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        records.push(RawCoordinate {
-            segment: path.into(),
-            offset: at,
-            length,
-            sha256: format!("{:x}", record_hash.finalize_reset()),
-            seq,
-        });
-        at += length;
-        length = 0;
-        seq += 1;
     }
-    let mut file = open_readonly(path)?;
-    let (boundary_sha256, boundary_capture_bytes) = boundary_hash(&mut file, at)?;
+    let (boundary_sha256, boundary_capture_bytes) = boundary_hash(source, at)?;
     Ok(JsonlRefresh {
         records,
         end: at,
@@ -138,10 +144,20 @@ pub(crate) fn scan_jsonl(
 /// Two boundary reads per incremental refresh (old and new frontier), never
 /// proportional to prior history. A tail fragment remains outside the frontier.
 pub(crate) const BOUNDARY_BYTES: u64 = 64 * 1024;
-fn boundary_hash(file: &mut File, end: u64) -> io::Result<(String, u64)> {
+fn boundary_hash(source: &mut RawSource, end: u64) -> io::Result<(String, u64)> {
     let length = end.min(BOUNDARY_BYTES);
-    file.seek(SeekFrom::Start(end - length))?;
-    let mut bytes = vec![0; length as usize];
-    file.read_exact(&mut bytes)?;
-    Ok((format!("{:x}", Sha256::digest(&bytes)), length))
+    let mut reader = source.range(end - length, length);
+    let mut hash = Sha256::new();
+    let mut read = 0;
+    while read < length {
+        let bytes = reader.fill_buf()?;
+        if bytes.is_empty() {
+            return Err(io::ErrorKind::UnexpectedEof.into());
+        }
+        hash.update(bytes);
+        read += bytes.len() as u64;
+        let n = bytes.len();
+        reader.consume(n);
+    }
+    Ok((format!("{:x}", hash.finalize()), length))
 }

@@ -1,6 +1,7 @@
-//! An idle fleet costs almost nothing: on a store with a large delivered
-//! history, idle agents run a bounded number of review passes and sleep, even
-//! while a neighbour agent is busy receiving mail.
+//! An idle fleet costs nothing (ADR 0006 invariant I1): on a store with a
+//! large delivered history, idle agents run no supervisor pass at all, and so
+//! no store read and no `/proc` read, even while a neighbour agent is busy
+//! receiving mail.
 //!
 //! CPU time is read per agent thread (`/proc/self/task/<tid>/stat`): the
 //! launch callback runs on the agent's own supervisor thread and records its
@@ -49,8 +50,14 @@ impl Clock for CountingClock {
 /// A live, idle vendor process: it accepts every line and finishes the turn at
 /// once. It reports the test process as its pid so the idle-release check
 /// inspects a real process tree, as it does for a live vendor.
+///
+/// `reads` counts every `health` and `process_id` call: each supervisor pass
+/// reads the harness's health, and every `/proc` read of the in-flight check
+/// starts from `process_id`, so a pass, a store read or a `/proc` read for
+/// this agent cannot happen without moving it.
 struct IdleHarness {
     served: u32,
+    reads: Arc<AtomicU64>,
 }
 
 impl Harness for IdleHarness {
@@ -70,6 +77,7 @@ impl Harness for IdleHarness {
         Ok(())
     }
     fn health(&self) -> HarnessHealth {
+        self.reads.fetch_add(1, Ordering::SeqCst);
         HarnessHealth {
             process_alive: true,
             turn_state: TurnState::Idle,
@@ -83,6 +91,7 @@ impl Harness for IdleHarness {
         self.served
     }
     fn process_id(&self) -> Option<u32> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
         Some(std::process::id())
     }
 }
@@ -208,6 +217,8 @@ fn an_idle_fleet_on_a_large_store_sleeps_while_a_neighbour_is_busy() {
     });
     let threads: Arc<Mutex<HashMap<String, u32>>> = Arc::default();
     let launched = Arc::clone(&threads);
+    let reads: Arc<Mutex<HashMap<String, Arc<AtomicU64>>>> = Arc::default();
+    let counted = Arc::clone(&reads);
     let supervisor = Supervisor::<IdleHarness>::start(
         Arc::clone(&store),
         Arc::clone(&clock) as Arc<dyn Clock>,
@@ -216,7 +227,15 @@ fn an_idle_fleet_on_a_large_store_sleeps_while_a_neighbour_is_busy() {
                 .lock()
                 .unwrap()
                 .insert(request.agent.name.clone(), current_tid());
-            Ok(IdleHarness { served: 0 })
+            let harness_reads = Arc::new(AtomicU64::new(0));
+            counted
+                .lock()
+                .unwrap()
+                .insert(request.agent.name.clone(), Arc::clone(&harness_reads));
+            Ok(IdleHarness {
+                served: 0,
+                reads: harness_reads,
+            })
         }),
         Vec::new(),
     )
@@ -255,6 +274,13 @@ fn an_idle_fleet_on_a_large_store_sleeps_while_a_neighbour_is_busy() {
             sent
         })
     };
+    let idle_reads = |reads: &Mutex<HashMap<String, Arc<AtomicU64>>>| -> u64 {
+        let reads = reads.lock().unwrap();
+        idle.iter()
+            .map(|a| reads[&a.name].load(Ordering::SeqCst))
+            .sum()
+    };
+    let reads_before = idle_reads(&reads);
     let cpu_before = process_cpu_seconds();
     let idle_cpu_before = threads_cpu_seconds(&idle_tids);
     let waits_before = clock.waits.load(Ordering::SeqCst);
@@ -264,6 +290,7 @@ fn an_idle_fleet_on_a_large_store_sleeps_while_a_neighbour_is_busy() {
     let waits = clock.waits.load(Ordering::SeqCst) - waits_before;
     let cpu = process_cpu_seconds() - cpu_before;
     let idle_cpu = threads_cpu_seconds(&idle_tids) - idle_cpu_before;
+    let harness_reads = idle_reads(&reads) - reads_before;
     stop_mail.store(true, Ordering::SeqCst);
     let sent = mailer.join().unwrap();
 
@@ -272,18 +299,25 @@ fn an_idle_fleet_on_a_large_store_sleeps_while_a_neighbour_is_busy() {
     eprintln!(
         "idle_cost: agents={IDLE_AGENTS} history_rows={} window_s={elapsed:.2} \
          total_waits={waits} neighbour_lines={sent} idle_passes~={idle_passes} \
-         passes_per_idle_agent_per_s={:.3} idle_threads_cpu_s={idle_cpu:.3} \
-         idle_threads_pct_one_core={:.2} process_cpu_s={cpu:.3}",
+         passes_per_idle_agent_per_s={:.3} idle_harness_reads={harness_reads} \
+         idle_threads_cpu_s={idle_cpu:.3} idle_threads_pct_one_core={:.2} \
+         process_cpu_s={cpu:.3}",
         IDLE_AGENTS as i64 * HISTORY_PER_AGENT,
         idle_passes as f64 / IDLE_AGENTS as f64 / elapsed,
         idle_cpu / elapsed * 100.0,
     );
 
     // A fixed 250 ms review would be 4 passes per agent per second (576 in
-    // this window). Backed-off idle agents take at most a few.
+    // this window), and a backed-off review a few. An idle agent waits for an
+    // event, and none arrives for it: no pass reads its harness, so none
+    // reads the store or `/proc` for it either.
+    assert_eq!(
+        harness_reads, 0,
+        "idle agents must not run supervisor passes without an event"
+    );
     assert!(
         idle_passes <= (IDLE_AGENTS as u64) * 3,
-        "idle agents must back off between reviews: {idle_passes} passes for \
+        "idle agents must not review on a timer: {idle_passes} passes for \
          {IDLE_AGENTS} agents in {elapsed:.1}s"
     );
     // The idle agents' own threads, together, stay near zero while the

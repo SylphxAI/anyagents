@@ -39,7 +39,7 @@ pub use storage::{
     configured_scratch_dir, configured_state_dir, configured_workspaces_dir, storage_env_enabled,
 };
 pub use store::{
-    Ack, Agent, AgentLock, AgentQueryMetadata, AgentSchedule, BillingMode, Channel,
+    Ack, Agent, AgentLock, AgentQueryMetadata, AgentSchedule, AgentSummary, BillingMode, Channel,
     ConversationTurn, Group, GroupAction, GroupActor, HistorySearchQuery, HistorySort, Incoming,
     Lag, MAX_RECOVERY_ATTEMPTS, Message, NewAgent, NewChannel, NewSchedule, NewUsage, OpenTurn,
     Origin, OutboundEffect, ReceiveOutcome, Store, TurnOwnershipSnapshot, UsageAccessError,
@@ -48,6 +48,14 @@ pub use store::{
     legacy_agent_work_dir, now_ms, parse_agent_lifecycle, parse_agent_scope, rag_content_hash,
     read_children_roster, read_root_roster, resolve_usage_agents, sum_usage,
     tokenize_hybrid_search_tokens, utc_day,
+};
+pub use store::{
+    AgentRuntime, BackfillReport, CredentialBinding, CredentialBindingAudit, CredentialKind,
+    CredentialObservation, CredentialSlot, CredentialTarget, Fault, FaultKind, HarnessLease,
+    LifecycleKind, LifecycleOp, LifecyclePhase, NewLifecycleOp, ProcessIdentity, QUOTA_ESTIMATE_MS,
+    QuotaBlock, QuotaReset, QuotaSource, RecoveryOffer, RuntimeChange, RuntimeState,
+    SchedulePending, SessionLease, SteerHold, SteerState, Turn, TurnOutcome, TurnState,
+    steer_allows,
 };
 
 /// The token a client presents as an agent, when it has one. A capability is

@@ -36,7 +36,8 @@ fn bin() -> Command {
         .env_remove("ANYAGENTS_AGENT_ID")
         .env_remove("ANYAGENTS_AGENT_CONFIG")
         .env_remove("ANYAGENTS_DATA")
-        .env_remove("ANYAGENTS_PARENT_NAME");
+        .env_remove("ANYAGENTS_PARENT_NAME")
+        .env_remove("ANYAGENTS_OWNER_WORKDIR");
     command
 }
 
@@ -50,6 +51,124 @@ fn bin_in(dir: &std::path::Path) -> Command {
         .arg("--data")
         .arg(dir);
     command
+}
+
+#[test]
+fn configured_owner_catalog_is_authoritative_for_create_discovery_and_updates() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let owner = dir.path().join("owner");
+    let workspace = dir.path().join("workspace");
+    let home = dir.path().join("home");
+    for base in [&data, &workspace, &home] {
+        std::fs::create_dir_all(base.join(".agents/agents")).unwrap();
+        std::fs::write(base.join(".agents/agents/retired.md"), "Stale template.").unwrap();
+        std::fs::write(base.join(".agents/agents/worker.md"), "Wrong template.").unwrap();
+    }
+    for root in ["agents-templates", "archetypes"] {
+        std::fs::create_dir_all(data.join(root)).unwrap();
+        std::fs::write(data.join(root).join("retired.md"), "Stale template.").unwrap();
+    }
+    let run = |args: &[&str]| {
+        bin_in(&data)
+            .env("ANYAGENTS_OWNER_WORKDIR", &owner)
+            .env("HOME", &home)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let workspace = workspace.to_str().unwrap();
+    // A no-role agent remains possible, even before the catalog exists.
+    let created = run(&["agents", "create", "plain", "--workdir", workspace]);
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    for state in ["missing", "empty", "populated"] {
+        if state == "empty" {
+            std::fs::create_dir_all(owner.join(".agents/agents")).unwrap();
+        } else if state == "populated" {
+            std::fs::write(
+                owner.join(".agents/agents/worker.md"),
+                "---\nname: worker\ndescription: Current worker\n---\nAuthoritative template.",
+            )
+            .unwrap();
+        }
+        for role in ["retired", "unknown"] {
+            let rejected = run(&[
+                "agents",
+                "create",
+                "rejected",
+                "--workdir",
+                workspace,
+                "--role",
+                role,
+            ]);
+            assert!(!rejected.status.success(), "{state}: accepted {role}");
+            assert!(
+                String::from_utf8_lossy(&rejected.stderr).contains("unknown archetype template"),
+                "{}",
+                String::from_utf8_lossy(&rejected.stderr)
+            );
+            let update = run(&["role", "plain", role]);
+            assert!(
+                !update.status.success(),
+                "{state}: accepted role update {role}"
+            );
+        }
+    }
+    let created = run(&[
+        "agents",
+        "create",
+        "current",
+        "--workdir",
+        workspace,
+        "--role",
+        "worker",
+    ]);
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let update = run(&["role", "plain", "worker"]);
+    assert!(
+        update.status.success(),
+        "{}",
+        String::from_utf8_lossy(&update.stderr)
+    );
+    let store = Store::open(data.join("state.db")).unwrap();
+    assert!(store.agent_by_name("rejected").is_err());
+    let agent = store.agent_by_name("current").unwrap();
+    assert_eq!(agent.role.as_deref(), Some("worker"));
+    assert!(
+        agent
+            .instructions
+            .as_deref()
+            .unwrap()
+            .contains("Authoritative template.")
+    );
+    let prompt = std::fs::read_to_string(
+        data.join("agents")
+            .join(agent.id.as_str())
+            .join("config/AGENTS.md"),
+    )
+    .unwrap();
+    let catalog = prompt
+        .lines()
+        .find(|line| line.contains("Available sub-agent roles"))
+        .unwrap();
+    assert!(catalog.contains("worker"), "{catalog}");
+    assert!(!catalog.contains("retired"), "{catalog}");
+
+    // Removing the last owner role must not resurrect an identically named fallback.
+    std::fs::remove_file(owner.join(".agents/agents/worker.md")).unwrap();
+    let rejected = run(&["agents", "create", "removed", "--role", "worker"]);
+    assert!(!rejected.status.success());
+    let update = run(&["role", "plain", "worker"]);
+    assert!(!update.status.success());
+    assert!(store.agent_by_name("removed").is_err());
 }
 
 #[test]
