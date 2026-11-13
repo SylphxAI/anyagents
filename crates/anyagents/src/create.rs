@@ -10076,7 +10076,7 @@ mod tests {
     }
 
     #[test]
-    fn propagate_profile_files_defers_rotated_marker_during_open_turn() {
+    fn propagate_profile_files_marks_working_seats_without_holding_their_turn() {
         let tmp = tempfile::tempdir().unwrap();
         let data = tmp.path();
         let store = Store::open(data.join("state.db")).unwrap();
@@ -10104,9 +10104,11 @@ mod tests {
             idle_cfg.join(".anyagents-profile-rotated-ms").exists(),
             "idle seat should receive rotated marker on credential refresh"
         );
+        // The supervisor applies a profile change at the next idle point, so
+        // the marker never preempts the open turn or holds its mail.
         assert!(
-            !working_cfg.join(".anyagents-profile-rotated-ms").exists(),
-            "working seat with open turn must not receive rotated marker mid-turn"
+            working_cfg.join(".anyagents-profile-rotated-ms").exists(),
+            "working seat should learn of the profile change"
         );
         assert!(
             working_cfg.join(".anyagents-quota-cleared-ms").exists(),
