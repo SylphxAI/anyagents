@@ -9,9 +9,9 @@ use std::io::{ErrorKind, Read};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use anyagents_harness::normalize_harness_name;
@@ -28,6 +28,7 @@ mod credentials;
 mod group_policy;
 mod harness_leases;
 mod lifecycle;
+mod registry;
 mod runtime;
 #[cfg(test)]
 #[path = "store/runtime_tests.rs"]
@@ -52,7 +53,9 @@ pub struct Origin {
     pub thread_id: Option<i64>,
     pub message_id: Option<i64>,
 }
-use crate::migrate::{self, now_ms as clock_now_ms};
+#[cfg(test)]
+use crate::migrate;
+use crate::migrate::now_ms as clock_now_ms;
 
 /// Milliseconds since the Unix epoch. A clock that is before the epoch reads as 0.
 pub fn now_ms() -> i64 {
@@ -691,19 +694,16 @@ pub enum Wake {
     Agent { agent_id: AgentId },
 }
 
-/// Open database. Methods take a shared reference; writes serialize on the mutex.
+/// A handle on an open database. Every handle a process opens on one file
+/// shares that file's single read-write connection and read pool (see
+/// `registry`); writes serialize on the writer's mutex, reads never wait for
+/// it. Wake subscribers and the capability key belong to the handle.
 pub struct Store {
-    conn: Mutex<Connection>,
-    /// Idle read-only connections; see [`MAX_IDLE_READERS`].
-    readers: Mutex<Vec<Connection>>,
+    shared: Arc<registry::Shared>,
     db_path: PathBuf,
     data_dir: PathBuf,
     wakes: Mutex<Vec<Sender<Wake>>>,
     capabilities: Mutex<Option<String>>,
-    /// Total time a bounded write may keep retrying transient lock errors.
-    write_retry_budget_ms: AtomicU64,
-    /// The writer connection's configured busy timeout.
-    busy_timeout_ms: AtomicU64,
 }
 
 /// Default per-statement wait for the writer lock.
@@ -805,14 +805,8 @@ impl Drop for ReadConn<'_> {
     fn drop(&mut self) {
         if let Self::Pooled { conn, pool } = self
             && let Some(conn) = conn.take()
-            // Never pool a connection left inside a transaction: its stale
-            // snapshot would hide later commits from the next borrower.
-            && conn.is_autocommit()
         {
-            let mut idle = pool.lock().unwrap_or_else(|p| p.into_inner());
-            if idle.len() < MAX_IDLE_READERS {
-                idle.push(conn);
-            }
+            registry::Shared::recycle(pool, conn);
         }
     }
 }
@@ -869,232 +863,35 @@ fn preserve_legacy_scopes(conn: &mut Connection) -> Result<(), Error> {
 }
 
 impl Store {
-    /// Open or create the database, turn on WAL, and apply pending migrations.
+    /// A handle on the database at `path`. The first open of a file in this
+    /// process creates it if needed, turns on WAL, applies pending migrations
+    /// and repairs legacy rows; later opens, while any handle on the file is
+    /// alive, reuse that connection without touching the database.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
         let path = path.as_ref();
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent)?;
-        }
-        let conn = Connection::open(path)?;
-        // A 30s wait: ~78 agents finishing at once queue here instead of failing
-        // with `database is locked`. BEGIN IMMEDIATE (not the DEFERRED default)
-        // is what makes the wait apply to read-then-write paths.
-        conn.busy_timeout(BUSY_TIMEOUT)?;
-        conn.pragma_update(None, "foreign_keys", "ON")?;
-        // Without a limit the WAL file keeps its high-water size forever after
-        // one burst; with it, each checkpoint reset truncates the file back.
-        conn.pragma_update(None, "journal_size_limit", WAL_SIZE_LIMIT_BYTES)?;
-        let mut mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
-        if !mode.eq_ignore_ascii_case("wal") {
-            mode = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
-        }
-        if !mode.eq_ignore_ascii_case("wal") {
-            return Err(Error::Message(format!(
-                "sqlite journal mode is {mode}, not wal"
-            )));
-        }
-        let mut conn = conn;
-        tune_connection(&conn);
-        let schema_version = migrate::current_version(&conn)?;
-        migrate::migrate(&mut conn)?;
-        // Tolerate busy on per-open DDL: a WAL-pinned DB must not make
-        // Store::open fail (sandbox skips SEAT_PEERS and denies peer-trees).
-        // Defer legacy work to the next open when the WAL frees.
-        if let Err(e) = preserve_legacy_scopes(&mut conn)
-            && !is_transient_lock_error(&e)
-        {
-            return Err(e);
-        }
-        if migrate::current_version(&conn)? < 1 {
-            return Err(Error::Message("migrations did not apply".into()));
-        }
-        // Read first so ordinary opens of current stores do not take the writer
-        // lock. The UPDATE is idempotent and changes only the harness selector.
-        // Tolerate busy here: defer to next open when WAL is pinned.
-        let has_legacy_harness: bool = match conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM agents WHERE harness IN ('sylphx', 'sylphx-agent', 'sylphx_agent', 'sylphx/default'))",
-            [],
-            |row| row.get(0),
-        ) {
-            Ok(v) => v,
-            Err(e) if is_transient_sqlite_error(&e) => false,
-            Err(e) => return Err(e.into()),
-        };
-        if has_legacy_harness
-            && let Err(e) = conn.execute(
-                "UPDATE agents SET harness = 'spiron' WHERE harness IN ('sylphx', 'sylphx-agent', 'sylphx_agent', 'sylphx/default')",
-                [],
-            )
-                && !is_transient_sqlite_error(&e) {
-                    return Err(e.into());
-                }
-        let has_legacy_state: bool = match conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM agents WHERE state NOT IN ('created', 'running', 'idle', 'paused', 'archived'))",
-            [],
-            |row| row.get(0),
-        ) {
-            Ok(v) => v,
-            Err(e) if is_transient_sqlite_error(&e) => false,
-            Err(e) => return Err(e.into()),
-        };
-        if has_legacy_state
-            && let Err(e) = conn.execute(
-                "UPDATE agents SET state = 'archived' WHERE state NOT IN ('created', 'running', 'idle', 'paused', 'archived')",
-                [],
-            )
-                && !is_transient_sqlite_error(&e) {
-                    return Err(e.into());
-                }
-        let has_aux_schema: bool = match conn.query_row(
-            "SELECT (SELECT count(*) FROM sqlite_master WHERE name IN ('message_versions', 'agent_topology_state', 'idx_rag_chunks_agent_id_time')) = 3",
-            [],
-            |row| row.get(0),
-        ) {
-            Ok(v) => v,
-            Err(e) if is_transient_sqlite_error(&e) => true,
-            Err(e) => return Err(e.into()),
-        };
-        if !has_aux_schema
-            && let Err(e) = conn.execute_batch(
-                "CREATE TABLE IF NOT EXISTS message_versions (
-                    agent_id TEXT NOT NULL,
-                    chat_id INTEGER NOT NULL,
-                    message_id INTEGER NOT NULL,
-                    body TEXT NOT NULL,
-                    updated_at_ms INTEGER NOT NULL,
-                    PRIMARY KEY (agent_id, chat_id, message_id)
-                );
-                CREATE TABLE IF NOT EXISTS agent_topology_state (
-                    agent_id TEXT PRIMARY KEY,
-                    state_json TEXT NOT NULL,
-                    updated_at_ms INTEGER NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS idx_rag_chunks_agent_id_time
-                    ON rag_chunks(agent_id, timestamp_ms DESC, chunk_id);",
-            )
-            && !is_transient_sqlite_error(&e)
-        {
-            return Err(e.into());
-        }
-        // UNIQUE(agent_id, seq) already supports reverse mailbox sequence scans.
-        // Avoid even idempotent DDL on ordinary opens: it needs the writer lock.
-        for (name, sql) in [
-            (
-                "idx_schedules_active_agent",
-                "CREATE INDEX IF NOT EXISTS idx_schedules_active_agent ON agent_schedules(agent_id, created_at_ms, id) WHERE state = 'active'",
-            ),
-            (
-                "idx_messages_agent_time",
-                "CREATE INDEX IF NOT EXISTS idx_messages_agent_time ON messages(agent_id, received_at_ms DESC, seq DESC)",
-            ),
-            (
-                "idx_agents_state",
-                "CREATE INDEX IF NOT EXISTS idx_agents_state ON agents(state)",
-            ),
-            (
-                "idx_agents_live_name",
-                "CREATE INDEX IF NOT EXISTS idx_agents_live_name ON agents(name) WHERE state != 'archived'",
-            ),
-            (
-                "idx_outbound_agent_time",
-                "CREATE INDEX IF NOT EXISTS idx_outbound_agent_time ON outbound_messages(agent_id, sent_at_ms DESC, id DESC)",
-            ),
-        ] {
-            let exists: bool = match conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1)",
-                [name],
-                |row| row.get(0),
-            ) {
-                Ok(v) => v,
-                Err(e) if is_transient_sqlite_error(&e) => true,
-                Err(e) => return Err(e.into()),
-            };
-            if !exists
-                && let Err(e) = conn.execute_batch(sql)
-                && !is_transient_sqlite_error(&e)
-            {
-                return Err(e.into());
-            }
-        }
-        // Older databases may already have this column from an earlier runtime.
-        // Presence, not an arbitrary failed ALTER, is the idempotency condition.
-        // Tolerate busy here as well.
-        let has_public: bool = match conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('groups') WHERE name = 'public')",
-            [],
-            |row| row.get(0),
-        ) {
-            Ok(v) => v,
-            Err(e) if is_transient_sqlite_error(&e) => true,
-            Err(e) => return Err(e.into()),
-        };
-        if !has_public
-            && let Err(e) = conn.execute(
-                "ALTER TABLE groups ADD COLUMN public INTEGER NOT NULL DEFAULT 0",
-                [],
-            )
-            && !is_transient_sqlite_error(&e)
-        {
-            return Err(e.into());
-        }
-        // Current schemas maintain FTS transactionally on every history write.
-        // Only legacy upgrades need the full derivative-index validation; doing
-        // it on every open scans history and competes with the server writer.
-        if schema_version < 23 {
-            ensure_lexical_fts_backfilled(&mut conn)?;
-        }
-        let store = Self {
-            conn: Mutex::new(conn),
-            readers: Mutex::new(Vec::new()),
+        Ok(Self {
+            shared: registry::shared(path)?,
             db_path: path.to_path_buf(),
             data_dir: data_dir_for(path),
             wakes: Mutex::new(Vec::new()),
             capabilities: Mutex::new(None),
-            write_retry_budget_ms: AtomicU64::new(WRITE_RETRY_BUDGET.as_millis() as u64),
-            busy_timeout_ms: AtomicU64::new(BUSY_TIMEOUT.as_millis() as u64),
-        };
-        store.backfill_runtime_on_open()?;
-        Ok(store)
-    }
-
-    /// Give every agent without one its runtime row and turns, derived from
-    /// legacy state. A read decides first, so opening a current store takes no
-    /// writer lock; a busy writer defers the backfill to the next open.
-    fn backfill_runtime_on_open(&self) -> Result<(), Error> {
-        let missing: bool = match self.conn().query_row(
-            "SELECT EXISTS(SELECT 1 FROM agents a
-                 WHERE NOT EXISTS (SELECT 1 FROM agent_runtime r WHERE r.agent_id = a.id))",
-            [],
-            |row| row.get(0),
-        ) {
-            Ok(missing) => missing,
-            Err(e) if is_transient_sqlite_error(&e) => false,
-            Err(e) => return Err(e.into()),
-        };
-        if !missing {
-            return Ok(());
-        }
-        let data_dir = self.data_dir.clone();
-        match self.backfill_runtime_state(|id| legacy_last_error(&data_dir, id)) {
-            Ok(_) => Ok(()),
-            Err(e) if is_transient_lock_error(&e) => Ok(()),
-            Err(e) => Err(e),
-        }
+        })
     }
 
     /// Set the writer's per-statement lock wait and the total budget that
-    /// retried writes may spend on transient lock errors.
+    /// retried writes may spend on transient lock errors. The writer is shared,
+    /// so this applies to every handle this process has on the database.
     pub fn set_lock_wait(
         &self,
         busy_timeout: Duration,
         retry_budget: Duration,
     ) -> Result<(), Error> {
         self.conn().busy_timeout(busy_timeout)?;
-        self.busy_timeout_ms
+        self.shared
+            .busy_timeout_ms
             .store(busy_timeout.as_millis() as u64, Ordering::Relaxed);
-        self.write_retry_budget_ms
+        self.shared
+            .write_retry_budget_ms
             .store(retry_budget.as_millis() as u64, Ordering::Relaxed);
         Ok(())
     }
@@ -1122,7 +919,7 @@ impl Store {
                 Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
             });
             let restored = conn.busy_timeout(Duration::from_millis(
-                self.busy_timeout_ms.load(Ordering::Relaxed),
+                self.shared.busy_timeout_ms.load(Ordering::Relaxed),
             ));
             match truncated.map_err(Error::from) {
                 Ok((0, 0)) => outcome.truncated = true,
@@ -1143,7 +940,8 @@ impl Store {
         &self,
         mut op: impl FnMut(&mut Connection) -> Result<T, Error>,
     ) -> Result<T, Error> {
-        let budget = Duration::from_millis(self.write_retry_budget_ms.load(Ordering::Relaxed));
+        let budget =
+            Duration::from_millis(self.shared.write_retry_budget_ms.load(Ordering::Relaxed));
         let started = std::time::Instant::now();
         let mut backoff = Duration::from_millis(10);
         loop {
@@ -5092,27 +4890,19 @@ impl Store {
         Ok(received_at.map(|at| (now_ms - at).max(0)))
     }
 
+    /// The process's one read-write connection to this database. Use it only
+    /// to write: reads go through [`Store::read_conn`] and never wait here.
     pub(crate) fn conn(&self) -> MutexGuard<'_, Connection> {
-        self.conn
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.shared.writer()
     }
 
+    /// A read-only connection from the shared pool. Each statement outside an
+    /// explicit transaction reads the latest commit, including this process's
+    /// own writes. Falls back to the writer only when no reader can be opened.
     fn read_conn(&self) -> ReadConn<'_> {
-        if !self.db_path.as_os_str().is_empty() {
-            let idle = self
-                .readers
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .pop();
-            if let Some(conn) = idle.or_else(|| open_reader(&self.db_path)) {
-                return ReadConn::Pooled {
-                    conn: Some(conn),
-                    pool: &self.readers,
-                };
-            }
-        }
-        ReadConn::Guard(self.conn())
+        self.shared
+            .reader()
+            .unwrap_or_else(|| ReadConn::Guard(self.conn()))
     }
 
     pub fn create_schedule(&self, input: NewSchedule) -> Result<AgentSchedule, Error> {
@@ -10202,6 +9992,8 @@ mod tests {
                 .unwrap();
             expected.push((store.agent(&agent.id).unwrap(), scope));
         }
+        // The upgrade runs when a new process first opens the database.
+        drop(store);
         for _ in 0..2 {
             let reopened = Store::open(dir.path().join("state.db")).unwrap();
             for schedule in &schedules {
@@ -10233,6 +10025,7 @@ mod tests {
                 );
             }
         }
+        let store = Store::open(dir.path().join("state.db")).unwrap();
         let new = store
             .create_agent(NewAgent {
                 name: "new-child".into(),

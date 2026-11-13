@@ -1003,7 +1003,7 @@ pub struct BackfillReport {
     pub closed_turns: usize,
 }
 
-fn backfill_tx(
+pub(super) fn backfill_tx(
     tx: &Transaction<'_>,
     last_error: &dyn Fn(&AgentId) -> Option<String>,
 ) -> Result<BackfillReport, Error> {
