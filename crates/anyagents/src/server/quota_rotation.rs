@@ -69,9 +69,9 @@ fn due(
     reset_ms: i64,
     now: Instant,
 ) -> bool {
-    handled.get(agent_id).is_none_or(|&(seen, at)| {
-        seen != reset_ms || now.saturating_duration_since(at) >= RECHECK
-    })
+    handled
+        .get(agent_id)
+        .is_none_or(|&(seen, at)| seen != reset_ms || now.saturating_duration_since(at) >= RECHECK)
 }
 
 fn take() -> HashMap<AgentId, i64> {
@@ -112,8 +112,17 @@ mod tests {
         assert!(due(&handled, &id, 1_000, start), "a new hold is handled");
         handled.insert(id.clone(), (1_000, start));
         assert!(!due(&handled, &id, 1_000, start + Duration::from_secs(119)));
-        assert!(due(&handled, &id, 2_000, start + Duration::from_secs(1)), "a moved reset");
-        assert!(due(&handled, &id, 1_000, start + RECHECK), "the cooldown passed");
-        assert!(due(&handled, &AgentId::generate(), 1_000, start), "another agent");
+        assert!(
+            due(&handled, &id, 2_000, start + Duration::from_secs(1)),
+            "a moved reset"
+        );
+        assert!(
+            due(&handled, &id, 1_000, start + RECHECK),
+            "the cooldown passed"
+        );
+        assert!(
+            due(&handled, &AgentId::generate(), 1_000, start),
+            "another agent"
+        );
     }
 }

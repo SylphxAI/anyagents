@@ -1767,6 +1767,7 @@ fn the_agy_quota_finding_is_kept_until_a_file_it_reads_changes() {
         super::detect_agy_session_quota_and_error(dir.path(), now),
         (None, Some("persisted".to_string()))
     );
+}
 
 #[test]
 fn quota_of_parses_rfc3339_resets_at_timestamp() {
