@@ -22,18 +22,66 @@ use crate::dsh::DshHarness;
 use crate::grok::GrokHarness;
 
 pub enum VendorHarness {
-    Claude(Box<ClaudeHarness>, PathBuf),
-    Codex(Box<CodexHarness>, PathBuf),
-    OpenCode(Box<OpenCodeHarness>, PathBuf),
-    Agy(Box<AgyHarness>, PathBuf),
-    Muse(Box<MuseHarness>, PathBuf),
-    Omp(Box<OmpHarness>, PathBuf),
-    Dsh(Box<DshHarness>, PathBuf),
-    Grok(Box<GrokHarness>, PathBuf),
-    /// The external Spiron CLI.  The `PathBuf` is the canonical session file;
+    Claude(Box<ClaudeHarness>, SessionPointer),
+    Codex(Box<CodexHarness>, SessionPointer),
+    OpenCode(Box<OpenCodeHarness>, SessionPointer),
+    Agy(Box<AgyHarness>, SessionPointer),
+    Muse(Box<MuseHarness>, SessionPointer),
+    Omp(Box<OmpHarness>, SessionPointer),
+    Dsh(Box<DshHarness>, SessionPointer),
+    Grok(Box<GrokHarness>, SessionPointer),
+    /// The external Spiron CLI.  The pointer is the canonical session file;
     /// legacy `sylphx-session-id` is read once when this adapter starts.
-    Spiron(Box<StreamHarness>, PathBuf, String),
+    Spiron(Box<StreamHarness>, SessionPointer, String),
     Contract(Box<ContractHarness>),
+}
+
+/// The native resume pointer beside an agent's config, and the vendor session
+/// this process last recorded in it and in the host session registry.
+///
+/// The record is written once per vendor session id, not once per health
+/// read: binding the alias takes the registry lock, parses the registry and
+/// verifies the memory pin, and the id only changes when the vendor starts or
+/// resumes a session.
+pub struct SessionPointer {
+    path: PathBuf,
+    recorded: std::sync::Mutex<Recorded>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum Recorded {
+    Nothing,
+    Session(String),
+    Retired,
+}
+
+impl From<PathBuf> for SessionPointer {
+    fn from(path: PathBuf) -> Self {
+        Self {
+            path,
+            recorded: std::sync::Mutex::new(Recorded::Nothing),
+        }
+    }
+}
+
+impl std::ops::Deref for SessionPointer {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl AsRef<Path> for SessionPointer {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl SessionPointer {
+    fn recorded(&self) -> std::sync::MutexGuard<'_, Recorded> {
+        self.recorded.lock().unwrap_or_else(|err| err.into_inner())
+    }
 }
 
 impl VendorHarness {
@@ -41,7 +89,12 @@ impl VendorHarness {
         if let Self::Codex(harness, path) = self
             && harness.thread_invalidated()
         {
-            return retire_session_pointer(path);
+            let mut recorded = path.recorded();
+            if *recorded != Recorded::Retired {
+                retire_session_pointer(path)?;
+                *recorded = Recorded::Retired;
+            }
+            return Ok(());
         }
         let (session, path) = match self {
             Self::Claude(harness, path) => (harness.session_id(), Some(path)),
@@ -57,6 +110,10 @@ impl VendorHarness {
         };
         if let (Some(id), Some(path)) = (session, path) {
             let trimmed = id.trim();
+            let mut recorded = path.recorded();
+            if matches!(&*recorded, Recorded::Session(done) if done == trimmed) {
+                return Ok(());
+            }
             if !trimmed.is_empty() {
                 let existing = match std::fs::read_to_string(path) {
                     Ok(text) => Some(text),
@@ -104,6 +161,7 @@ impl VendorHarness {
                     )
                     .map_err(|err| err.to_string())?;
                 }
+                *recorded = Recorded::Session(trimmed.to_string());
             }
         }
         Ok(())
@@ -276,140 +334,6 @@ fn has_persisted_turn_error(config_dir: &Path) -> bool {
         .and_then(|v| v.as_u64())
         .unwrap_or(0)
         > 0
-}
-
-pub fn detect_codex_session_turn_error(config_dir: &Path, min_ts_ms: i64) -> Option<String> {
-    if let Some((Some(err), None)) = read_persisted_last_error(config_dir)
-        && !err.trim().is_empty()
-    {
-        return Some(err);
-    }
-    let sessions_dir = config_dir.join("sessions");
-    if !sessions_dir.is_dir() {
-        return None;
-    }
-    let mut latest_file: Option<(std::time::SystemTime, PathBuf)> = None;
-    if let Ok(years) = std::fs::read_dir(&sessions_dir) {
-        for y in years.flatten() {
-            let Ok(months) = std::fs::read_dir(y.path()) else {
-                continue;
-            };
-            for m in months.flatten() {
-                let Ok(days) = std::fs::read_dir(m.path()) else {
-                    continue;
-                };
-                for d in days.flatten() {
-                    let Ok(files) = std::fs::read_dir(d.path()) else {
-                        continue;
-                    };
-                    for f in files.flatten() {
-                        let path = f.path();
-                        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
-                            continue;
-                        };
-                        if !name.starts_with("rollout-") || !name.ends_with(".jsonl") {
-                            continue;
-                        }
-                        let Ok(meta) = f.metadata() else {
-                            continue;
-                        };
-                        let Ok(mtime) = meta.modified() else {
-                            continue;
-                        };
-                        if latest_file
-                            .as_ref()
-                            .is_none_or(|(prev_m, _)| mtime > *prev_m)
-                        {
-                            latest_file = Some((mtime, path));
-                        }
-                    }
-                }
-            }
-        }
-    }
-    let (mtime, path) = latest_file?;
-    let mtime_ms = mtime
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
-    if mtime_ms <= min_ts_ms {
-        return None;
-    }
-    use std::io::{Read, Seek, SeekFrom};
-    let mut file = std::fs::File::open(&path).ok()?;
-    let len = file.metadata().ok()?.len();
-    let tail_offset = len.saturating_sub(65_536);
-    if tail_offset > 0 {
-        let _ = file.seek(SeekFrom::Start(tail_offset));
-    }
-    let mut buf = String::new();
-    file.read_to_string(&mut buf).ok()?;
-    let lines_iter: Box<dyn Iterator<Item = &str>> = if tail_offset > 0 {
-        Box::new(buf.lines().skip(1))
-    } else {
-        Box::new(buf.lines())
-    };
-    let mut consec_err = 0u32;
-    let mut last_err: Option<String> = None;
-    for line in lines_iter {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) else {
-            continue;
-        };
-        let t = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        let payload = val.get("payload");
-        let pt = payload
-            .and_then(|p| p.get("type"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let role = payload
-            .and_then(|p| p.get("role"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        if t == "token_usage_record"
-            || (t == "response_item"
-                && (role == "assistant"
-                    || matches!(pt, "function_call" | "custom_tool_call" | "reasoning")))
-        {
-            consec_err = 0;
-            last_err = None;
-        } else if t == "event_msg" && pt == "task_complete" {
-            let err_opt = payload
-                .and_then(|p| p.get("error"))
-                .and_then(|e| {
-                    e.get("message")
-                        .and_then(|m| m.as_str())
-                        .or_else(|| e.as_str())
-                })
-                .map(str::trim)
-                .filter(|s| !s.is_empty());
-            if let Some(msg) = err_opt {
-                consec_err = consec_err.saturating_add(1);
-                last_err = Some(msg.to_string());
-            } else {
-                consec_err = 0;
-                last_err = None;
-            }
-        }
-    }
-    let err = last_err?;
-    let lower = err.to_ascii_lowercase();
-    let is_auth_401 = lower.contains("(401)")
-        || lower.contains(" 401 ")
-        || lower.contains("status 401")
-        || lower.contains("http 401")
-        || lower.contains("unauthorized")
-        || lower.contains("invalid_api_key")
-        || lower.contains("authentication failed");
-    if is_auth_401 || consec_err >= 3 {
-        Some(err)
-    } else {
-        None
-    }
 }
 
 pub fn persist_last_error(config_dir: &Path, error: Option<&str>, quota_reset_at_ms: Option<i64>) {
@@ -1050,7 +974,10 @@ fn vendor_launch_inner(
             &env,
             &request.work_dir,
         )?;
-        let vh = VendorHarness::Claude(Box::new(harness), request.config_dir.join(&session_file));
+        let vh = VendorHarness::Claude(
+            Box::new(harness),
+            request.config_dir.join(&session_file).into(),
+        );
         vh.sync_session()?;
         return Ok(vh);
     }
@@ -1091,7 +1018,10 @@ fn vendor_launch_inner(
             )
             .map_err(|err| err.to_string())?
         };
-        let vh = VendorHarness::Agy(Box::new(harness), request.config_dir.join("agy-session-id"));
+        let vh = VendorHarness::Agy(
+            Box::new(harness),
+            request.config_dir.join("agy-session-id").into(),
+        );
         vh.sync_session()?;
         Ok(vh)
     } else if request.agent.harness == "muse" {
@@ -1156,7 +1086,7 @@ fn vendor_launch_inner(
         }
         let vh = VendorHarness::Muse(
             Box::new(harness),
-            request.config_dir.join("muse-session-id"),
+            request.config_dir.join("muse-session-id").into(),
         );
         vh.sync_session()?;
         Ok(vh)
@@ -1209,7 +1139,10 @@ fn vendor_launch_inner(
             )
             .map_err(|err| err.to_string())?
         };
-        let vh = VendorHarness::Omp(Box::new(harness), request.config_dir.join("omp-session-id"));
+        let vh = VendorHarness::Omp(
+            Box::new(harness),
+            request.config_dir.join("omp-session-id").into(),
+        );
         vh.sync_session()?;
         Ok(vh)
     } else if request.agent.harness == "dsh" {
@@ -1225,7 +1158,10 @@ fn vendor_launch_inner(
             &request.work_dir,
         )
         .map_err(|err| err.to_string())?;
-        let vh = VendorHarness::Dsh(Box::new(harness), request.config_dir.join("dsh-session-id"));
+        let vh = VendorHarness::Dsh(
+            Box::new(harness),
+            request.config_dir.join("dsh-session-id").into(),
+        );
         vh.sync_session()?;
         Ok(vh)
     } else if request.agent.harness == "grok" {
@@ -1251,7 +1187,7 @@ fn vendor_launch_inner(
         .map_err(|err| err.to_string())?;
         let vh = VendorHarness::Grok(
             Box::new(harness),
-            request.config_dir.join("grok-session-id"),
+            request.config_dir.join("grok-session-id").into(),
         );
         vh.sync_session()?;
         Ok(vh)
@@ -1284,7 +1220,10 @@ fn vendor_launch_inner(
             &env,
             &request.work_dir,
         )?;
-        let vh = VendorHarness::Claude(Box::new(harness), request.config_dir.join(&session_file));
+        let vh = VendorHarness::Claude(
+            Box::new(harness),
+            request.config_dir.join(&session_file).into(),
+        );
         vh.sync_session()?;
         Ok(vh)
     } else if is_spiron_harness(&request.agent.harness) {
@@ -1302,7 +1241,7 @@ fn vendor_launch_inner(
         )?;
         let vh = VendorHarness::Spiron(
             Box::new(harness),
-            request.config_dir.join("spiron-session-id"),
+            request.config_dir.join("spiron-session-id").into(),
             request.agent.harness.clone(),
         );
         vh.sync_session()?;
@@ -1340,7 +1279,7 @@ fn vendor_launch_inner(
         })?;
         let vh = VendorHarness::OpenCode(
             Box::new(harness),
-            request.config_dir.join("opencode-session-id"),
+            request.config_dir.join("opencode-session-id").into(),
         );
         vh.sync_session()?;
         Ok(vh)
@@ -1359,7 +1298,7 @@ fn vendor_launch_inner(
         )?;
         let vh = VendorHarness::Codex(
             Box::new(harness),
-            request.config_dir.join("codex-session-id"),
+            request.config_dir.join("codex-session-id").into(),
         );
         vh.sync_session()?;
         Ok(vh)
@@ -1439,7 +1378,7 @@ fn vendor_launch_inner(
         )?;
         let vh = VendorHarness::Claude(
             Box::new(harness),
-            request.config_dir.join("claude-session-id"),
+            request.config_dir.join("claude-session-id").into(),
         );
         vh.sync_session()?;
         Ok(vh)
@@ -3069,6 +3008,48 @@ done
         std::fs::remove_dir_all(&fixture).unwrap();
         assert!(!fixture.exists());
         println!("NATIVE_VENDOR_FIXTURE_REMOVED");
+    }
+
+    #[test]
+    fn a_vendor_session_is_recorded_once_not_on_every_health_read() {
+        use anyagents_core::host_session;
+        let dir = crate::test_tempdir();
+        let root = dir.path().join("agent");
+        let config = root.join("config");
+        std::fs::create_dir_all(&config).unwrap();
+        let first = host_session::new_session(&root, "spiron").unwrap();
+        let harness = StreamHarness::launch(anyagents_harness_stream::Launch {
+            spec: StreamSpec::for_program("spiron"),
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), "exec sleep 30".into()],
+            environment: vec![],
+            work_dir: None,
+            session_id: Some("vendor-1".into()),
+            mode: anyagents_harness::DeliveryMode::Steer,
+            steer: anyagents_harness::SteerSupport::Yes,
+        })
+        .unwrap();
+        let pointer = config.join("spiron-session-id");
+        let vendor =
+            VendorHarness::Spiron(Box::new(harness), pointer.clone().into(), "spiron".into());
+        vendor.sync_session().unwrap();
+        assert_eq!(std::fs::read_to_string(&pointer).unwrap(), "vendor-1\n");
+        assert_eq!(
+            host_session::bound_vendor(&root, "spiron", "vendor-1").unwrap(),
+            Some(first)
+        );
+        // Neither the registry nor the pointer is read again for the same
+        // session: a registry that can no longer be parsed is not noticed.
+        let registry = root.join("sessions/registry.json");
+        let saved = std::fs::read(&registry).unwrap();
+        std::fs::write(&registry, b"not json").unwrap();
+        for _ in 0..3 {
+            vendor.sync_session().unwrap();
+            let _ = vendor.health();
+        }
+        assert_eq!(std::fs::read(&registry).unwrap(), b"not json");
+        std::fs::write(&registry, saved).unwrap();
+        assert_eq!(std::fs::read_to_string(&pointer).unwrap(), "vendor-1\n");
     }
 
     #[test]

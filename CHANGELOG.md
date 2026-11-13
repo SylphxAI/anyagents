@@ -11,6 +11,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and release idle processes under the same rules. Preserve legacy effective scopes
   on upgrade, default all new children to private, and retain browser profiles until
   deletion. Discovery and generated lifecycle instructions no longer depend on roles.
+- Schedule wakes share the one mailbox: a due `at` or `every` tick, or a triggered
+  watch, is written at once like any other message and reaches a busy owner by
+  steering, or a paused or quota-blocked owner on resume. Recurring ticks are no
+  longer dropped as `skipped:busy`; a schedule keeps at most one undelivered wake.
+- The daemon's own cost now follows events, not fleet, archive or history size.
+  Every `Store` handle in a process shares one writer and one read pool, and
+  migrations run once per process. Idle agents run no supervisor passes, and a
+  streaming turn wakes the supervisor only on transitions. Schedules sleep until
+  their next due time. Roster views read no vendor history. Archived agents are
+  reaped once, with backoff on failure. History search re-walks only what changed
+  and reads each file through one buffered descriptor. Each `anyagents mcp` child
+  runs one runtime thread over a kept-alive connection. No history is deleted.
+- A credential renewal never holds an agent's mail: a profile change takes
+  effect at the agent's next idle point while mail keeps flowing.
 
 ## 0.1.3
 

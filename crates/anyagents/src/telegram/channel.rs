@@ -21,6 +21,101 @@ use anyagents_channel_telegram::{
 };
 use anyagents_core::{Channel, CredentialStore, FileCredentialStore, Store};
 
+/// Something the Telegram poller acts on may have changed: a binding written
+/// here, a local receipt left pending, a bound agent's lifecycle (the poller
+/// forwards the store's agent wakes) or a stop. Every waiting poller thread in
+/// this process wakes, looks, and waits again. It lives beside the writes that
+/// raise it.
+pub(super) struct Signal {
+    generation: std::sync::Mutex<u64>,
+    raised: std::sync::Condvar,
+}
+
+pub(super) static CHANGES: Signal = Signal::new();
+
+impl Signal {
+    pub(super) const fn new() -> Self {
+        Self {
+            generation: std::sync::Mutex::new(0),
+            raised: std::sync::Condvar::new(),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, u64> {
+        self.generation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub(super) fn generation(&self) -> u64 {
+        *self.lock()
+    }
+
+    pub(super) fn raise(&self) {
+        *self.lock() += 1;
+        self.raised.notify_all();
+    }
+
+    /// Wait until the signal is raised after `seen`, a stop flag is set, or
+    /// `timeout` passes. A stop flag is set before the signal is raised, so a
+    /// waiter never misses a stop.
+    pub(super) fn wait(
+        &self,
+        seen: u64,
+        timeout: Duration,
+        stops: &[&std::sync::atomic::AtomicBool],
+    ) {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut generation = self.lock();
+        while *generation == seen && !stopped(stops) {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return;
+            }
+            generation = self
+                .raised
+                .wait_timeout(generation, left)
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
+        }
+    }
+
+    /// Wait out `timeout` unless a stop flag is set first; other changes do
+    /// not cut the wait short.
+    pub(super) fn pause(&self, timeout: Duration, stops: &[&std::sync::atomic::AtomicBool]) {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() || stopped(stops) {
+                return;
+            }
+            self.wait(self.generation(), left, stops);
+        }
+    }
+}
+
+fn stopped(stops: &[&std::sync::atomic::AtomicBool]) -> bool {
+    stops
+        .iter()
+        .any(|stop| stop.load(std::sync::atomic::Ordering::SeqCst))
+}
+
+/// A Telegram binding, a bound agent's lifecycle or a pending receipt may
+/// have changed: every poller in this process looks again now.
+pub(super) fn changed() {
+    CHANGES.raise();
+}
+
+/// Raises [`changed`] when dropped, so a binding that stops half way through
+/// its writes is looked at too.
+struct ChangedOnDrop;
+
+impl Drop for ChangedOnDrop {
+    fn drop(&mut self) {
+        changed();
+    }
+}
+
 /// Seconds one `getUpdates` may hold the connection open.
 pub const LONG_POLL_S: u64 = 30;
 /// A call that answers at once gets this long; a long poll gets its own plus ten.
@@ -1425,9 +1520,6 @@ fn translate_agent_mentions_for_telegram(store: &Store, text: &str) -> String {
     let Ok(channels) = store.list_channels() else {
         return text.to_string();
     };
-    let Ok(agents) = store.list_agents() else {
-        return text.to_string();
-    };
     let mut agent_to_bot: Vec<(String, String)> = Vec::new();
     for channel in channels {
         if channel.kind != "telegram" {
@@ -1450,10 +1542,7 @@ fn translate_agent_mentions_for_telegram(store: &Store, text: &str) -> String {
             continue;
         };
         for aid in &channel.agents {
-            if let Some(agent) = agents
-                .iter()
-                .find(|a| &a.id == aid || a.name.eq_ignore_ascii_case(aid.as_str()))
-            {
+            if let Ok(agent) = store.agent(aid) {
                 let name_lower = agent.name.to_ascii_lowercase();
                 if !name_lower.eq_ignore_ascii_case(bot_username)
                     && !agent_to_bot.iter().any(|(n, _)| n == &name_lower)
@@ -1720,6 +1809,9 @@ pub fn bind_agent_telegram_token(
         }
     }
 
+    // Every poller looks at the bindings again once these writes are done,
+    // whether or not all of them succeed.
+    let _changed = ChangedOnDrop;
     let channel_id = if let Some(ch) = reusable_channel {
         for other in &existing_channels {
             if other.id != ch.id && other.agents.contains(&target_agent.id) {
@@ -1928,6 +2020,7 @@ fn handle_managed_bot_event(
         }
     }
     let ch = existing;
+    let _changed = ChangedOnDrop;
     let ch = match ch {
         Some(ch) => ch,
         None => store.create_channel(anyagents_core::NewChannel {
@@ -3250,9 +3343,13 @@ fn deliver_locally_with_metadata(
                 eprintln!("Telegram message {message_id} local receipt cleanup pending: {err}");
             }
         }
-        Err(err) => eprintln!(
-            "Telegram message {message_id} local relay pending (durable receipt retained): {err}"
-        ),
+        Err(err) => {
+            eprintln!(
+                "Telegram message {message_id} local relay pending (durable receipt retained): {err}"
+            );
+            // The poller retries a pending receipt until it is projected.
+            changed();
+        }
     }
     Ok(())
 }

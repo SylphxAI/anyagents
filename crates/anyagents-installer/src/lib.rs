@@ -5,198 +5,28 @@
 //! is the only way a command leaves the process, and tests supply one that
 //! records what it was asked and answers without touching the network.
 
+pub mod catalog;
+pub mod exec;
+pub mod fetch;
+pub mod lifecycle;
+pub mod platform;
+pub mod receipt;
+pub mod source;
+pub mod unpack;
+pub mod verify;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyagents_harness::normalize_harness_name;
-use serde::{Deserialize, Serialize};
 
-/// How a harness is installed on one platform.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum InstallMethod {
-    /// `npm install` into a private prefix, never the user's global one.
-    Npm { package: String },
-    /// The vendor's own install script, given a private prefix.
-    VendorScript { url: String },
-    /// A release binary checked against a published checksum.
-    ReleaseBinary { url: String, sha256: String },
-    /// The vendor tool is already on the machine and AnyAgents only records it.
-    Vendored,
-}
+pub use catalog::{
+    Catalog, CatalogEntry, DoctorSpec, EntryOverride, InstallMethod, OVERRIDES, SubscriptionTerms,
+    builtin_catalog, builtin_runtimes, config_dir_variable,
+};
+pub use lifecycle::{HarnessStatus, Installed, Invocation, LeaseView, Lifecycle, NoLeases, Tick};
 
-/// Which models a subscription on this harness may run, and where that was read.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SubscriptionTerms {
-    /// The models the vendor's own terms allow under a subscription.
-    pub models: Vec<String>,
-    /// Where the terms were read. Empty means unread: offer an API key only.
-    pub source: String,
-}
-
-/// One vendor tool, as shipped with the binary.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CatalogEntry {
-    pub id: String,
-    pub install: InstallMethod,
-    /// The vendor command that signs the user in.
-    pub sign_in_command: Vec<String>,
-    /// The variable an API key is passed through, when the vendor documents one.
-    pub api_key_variable: Option<String>,
-    pub subscription: SubscriptionTerms,
-}
-
-/// The catalog shipped with the binary. A user override replaces an entry by id.
-pub fn builtin_catalog() -> Vec<CatalogEntry> {
-    vec![
-        entry(
-            "spiron",
-            InstallMethod::Vendored,
-            vec!["spiron".to_string(), "login".to_string()],
-            Some("SYLPHX_API_KEY".to_string()),
-            vec![],
-            "",
-        ),
-        entry(
-            "claude-code",
-            InstallMethod::Npm {
-                package: "@anthropic-ai/claude-code".to_string(),
-            },
-            vec![
-                "claude".to_string(),
-                "auth".to_string(),
-                "login".to_string(),
-            ],
-            Some("ANTHROPIC_API_KEY".to_string()),
-            vec!["claude-opus".to_string(), "claude-sonnet".to_string()],
-            "",
-        ),
-        entry(
-            "codex",
-            InstallMethod::Npm {
-                package: "@openai/codex".to_string(),
-            },
-            vec!["codex".to_string(), "login".to_string()],
-            Some("OPENAI_API_KEY".to_string()),
-            vec!["gpt".to_string()],
-            "",
-        ),
-        entry(
-            "opencode",
-            InstallMethod::Vendored,
-            vec![
-                "opencode".to_string(),
-                "auth".to_string(),
-                "login".to_string(),
-            ],
-            Some("OPENAI_API_KEY".to_string()),
-            vec![],
-            "",
-        ),
-        // The Antigravity CLI signs in the first time it runs and keeps the
-        // token in its own store under `AGY_CONFIG_DIR`, so running it with
-        // that directory is the sign-in.
-        // The Antigravity CLI is on the machine already and signed in; the
-        // adapter runs that copy, as the OpenCode adapter does.
-        entry(
-            "agy",
-            InstallMethod::Vendored,
-            vec![
-                "agy".to_string(),
-                "--print".to_string(),
-                "reply with the word signed-in".to_string(),
-            ],
-            Some("ANTIGRAVITY_API_KEY".to_string()),
-            vec!["gemini".to_string()],
-            "",
-        ),
-        // Muse is on the machine already and signed in, as Antigravity is.
-        entry(
-            "muse",
-            InstallMethod::Vendored,
-            vec!["muse".to_string(), "login".to_string()],
-            Some("META_API_KEY".to_string()),
-            vec!["muse-wonder-full-1.0".to_string()],
-            "",
-        ),
-        entry(
-            "omp",
-            InstallMethod::Vendored,
-            vec!["omp".to_string(), "login".to_string()],
-            Some("OPENAI_API_KEY".to_string()),
-            vec![],
-            "",
-        ),
-        entry(
-            "dsh",
-            InstallMethod::Vendored,
-            vec![
-                "dsh".to_string(),
-                "--profile".to_string(),
-                "web".to_string(),
-            ],
-            Some("DEEPSEEK_API_KEY".to_string()),
-            vec!["deepseek-v3.2-exp-think".to_string()],
-            "",
-        ),
-        entry(
-            "grok",
-            InstallMethod::Vendored,
-            vec!["grok".to_string(), "login".to_string()],
-            Some("XAI_API_KEY".to_string()),
-            vec!["grok-4.20".to_string()],
-            "",
-        ),
-        entry(
-            "spiron-cloud",
-            InstallMethod::Vendored,
-            vec!["spiron".to_string(), "login".to_string()],
-            Some("SYLPHX_API_KEY".to_string()),
-            vec![
-                "claude-opus-4.6".to_string(),
-                "claude-sonnet-4.6".to_string(),
-                "gpt-5.4".to_string(),
-            ],
-            "https://sylphx.com/terms",
-        ),
-        entry(
-            "claude-cloud",
-            InstallMethod::Vendored,
-            vec![
-                "claude".to_string(),
-                "auth".to_string(),
-                "login".to_string(),
-            ],
-            Some("ANTHROPIC_API_KEY".to_string()),
-            vec![
-                "claude-opus-4-6".to_string(),
-                "claude-sonnet-4-6".to_string(),
-                "claude-haiku-4-5".to_string(),
-            ],
-            "https://www.anthropic.com/legal/consumer-terms",
-        ),
-        entry(
-            "openai-cloud",
-            InstallMethod::Vendored,
-            vec!["codex".to_string(), "login".to_string()],
-            Some("OPENAI_API_KEY".to_string()),
-            vec![
-                "gpt-5.4".to_string(),
-                "gpt-5.4-mini".to_string(),
-                "gpt-5.3-codex".to_string(),
-            ],
-            "https://openai.com/policies/row-terms-of-use/",
-        ),
-        entry(
-            "cursor-cloud",
-            InstallMethod::Vendored,
-            vec!["cursor".to_string(), "login".to_string()],
-            Some("CURSOR_API_KEY".to_string()),
-            vec!["claude-4.6-opus".to_string(), "gpt-5.4".to_string()],
-            "https://www.cursor.com/terms-of-service",
-        ),
-    ]
-}
-
+#[cfg(test)]
 fn entry(
     id: &str,
     install: InstallMethod,
@@ -214,6 +44,12 @@ fn entry(
             models,
             source: source.to_string(),
         },
+        source: source::Source::Unconfigured,
+        launcher: id.to_string(),
+        runtime: None,
+        doctor: DoctorSpec::default(),
+        config_var: config_dir_variable(id).map(str::to_string),
+        self_update_off: BTreeMap::new(),
     }
 }
 
@@ -272,6 +108,34 @@ pub enum InstallError {
     UnknownHarness(String),
     #[error("install failed: {0}")]
     Failed(String),
+    #[error("unverifiable source for {harness}: {reason}")]
+    UnverifiableSource { harness: String, reason: String },
+    #[error("fetch {url}: {reason}")]
+    Fetch { url: String, reason: String },
+    #[error("checksum mismatch for {url}: expected {expected}, got {actual}")]
+    ChecksumMismatch {
+        url: String,
+        expected: String,
+        actual: String,
+    },
+    #[error("unpack failed: {0}")]
+    Unpack(String),
+    #[error("i/o error: {0}")]
+    Io(String),
+    #[error("corrupt install record: {0}")]
+    Corrupt(String),
+    #[error("invalid configuration: {0}")]
+    Config(String),
+    #[error("unsupported platform: {0}")]
+    UnsupportedPlatform(String),
+    #[error("no healthy version for {0}")]
+    NoHealthyVersion(String),
+    #[error("doctor failed: {0}")]
+    Doctor(String),
+    #[error("lease read failed: {0}")]
+    Leases(String),
+    #[error("harness {0} is not managed on disk")]
+    NotManaged(String),
 }
 
 /// Where one harness version lives: `<root>/harnesses/<id>/<version>/`.
@@ -451,19 +315,6 @@ pub fn config_dir(root: &Path, harness: &str, profile: &str) -> PathBuf {
     root.join("config")
         .join(normalize_harness_name(harness))
         .join(profile)
-}
-
-/// The variable that points this harness at its private config directory.
-pub fn config_dir_variable(harness: &str) -> Option<&'static str> {
-    match normalize_harness_name(harness) {
-        "claude-code" => Some("CLAUDE_CONFIG_DIR"),
-        "codex" => Some("CODEX_HOME"),
-        "agy" => Some("AGY_CONFIG_DIR"),
-        "muse" => Some("MUSE_CONFIG_HOME"),
-        "omp" => Some("PI_CODING_AGENT_DIR"),
-        "dsh" | "grok" | "spiron" => Some("HOME"),
-        _ => None,
-    }
 }
 
 struct CollectingSink<'a> {

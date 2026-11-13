@@ -43,7 +43,8 @@ pub fn start(data: &Path) -> Result<(), Error> {
     let routes = MemoryRoutes::new();
     let store = Store::open(data.join("state.db"))?;
     let mut provider_agents = Vec::new();
-    for agent in store.list_agents()? {
+    // An archived agent runs nothing; a wake gives it its route back.
+    for agent in store.list_live_agents()? {
         if let Some(image) = ProviderImage::load(data, &agent.id)? {
             routes.insert(token(data, &agent.id)?, image.route(&agent.name));
             provider_agents.push(agent.id);

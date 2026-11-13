@@ -42,6 +42,34 @@ pub enum Error {
     },
     #[error("workdir `{path}` is not writable by its seat: {message}")]
     WorkdirPermission { path: String, message: String },
+    #[error("{machine} transition from {from} to {to} is not allowed")]
+    InvalidTransition {
+        machine: &'static str,
+        from: String,
+        to: String,
+    },
+    #[error("{machine} state is {actual}, expected {expected}")]
+    StateConflict {
+        machine: &'static str,
+        expected: String,
+        actual: String,
+    },
+    #[error("{machine} precondition failed: {reason}")]
+    Precondition {
+        machine: &'static str,
+        reason: String,
+    },
+    #[error("{lease} lease is held by pid {holder_pid}")]
+    LeaseHeld {
+        lease: &'static str,
+        holder_pid: i64,
+    },
+    #[error("agent {agent} already has an unfinished lifecycle op {op_id}")]
+    LifecycleOpActive { agent: String, op_id: String },
+    #[error("agent name is reserved by an unfinished spawn: {0}")]
+    NameReserved(String),
+    #[error("{0}")]
+    InvalidCredential(String),
     #[error("{0}")]
     Message(String),
 }

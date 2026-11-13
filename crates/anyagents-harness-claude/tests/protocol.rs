@@ -538,3 +538,68 @@ fn synthetic_401_auth_error_fails_turn_and_stops_process_without_recording_usage
         "{failure}"
     );
 }
+
+#[test]
+fn the_session_quota_reset_is_kept_until_a_transcript_or_marker_changes() {
+    use anyagents_harness_claude::detect_session_quota_reset_ms;
+    use serde_json::json;
+
+    let rejected = |resets_at: i64| {
+        json!({
+            "type": "assistant",
+            "message": {"model": "<synthetic>", "role": "assistant", "content": []},
+            "apiError": "usage_limit_reached",
+            "quotaLimits": {"status": "rejected", "resetsAt": resets_at},
+            "error": "rate_limit",
+            "apiErrorStatus": 429
+        })
+    };
+    let dir = TempDir::new().unwrap();
+    let project = dir.path().join("projects").join("-work");
+    std::fs::create_dir_all(&project).unwrap();
+    let first = project.join("first.jsonl");
+    std::fs::write(&first, format!("{}\n", rejected(1_792_984_200))).unwrap();
+    assert_eq!(
+        detect_session_quota_reset_ms(dir.path(), 1_792_970_000_000),
+        Some(1_792_984_200_000)
+    );
+    // Unchanged files: the same answer, with the current time applied.
+    assert_eq!(
+        detect_session_quota_reset_ms(dir.path(), 1_792_990_000_000),
+        None
+    );
+    // An append to the transcript is read.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    use std::io::Write as _;
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&first)
+        .unwrap()
+        .write_all(format!("{}\n", json!({"type": "user", "message": {}})).as_bytes())
+        .unwrap();
+    assert_eq!(
+        detect_session_quota_reset_ms(dir.path(), 1_792_970_000_000),
+        None
+    );
+    // A newer transcript is found.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::fs::write(
+        project.join("second.jsonl"),
+        format!("{}\n", rejected(1_792_999_000)),
+    )
+    .unwrap();
+    assert_eq!(
+        detect_session_quota_reset_ms(dir.path(), 1_792_970_000_000),
+        Some(1_792_999_000_000)
+    );
+    // A clearing marker newer than the transcript hides it.
+    std::fs::write(
+        dir.path().join(".anyagents-quota-cleared-ms"),
+        format!("{}\n", i64::MAX - 1),
+    )
+    .unwrap();
+    assert_eq!(
+        detect_session_quota_reset_ms(dir.path(), 1_792_970_000_000),
+        None
+    );
+}

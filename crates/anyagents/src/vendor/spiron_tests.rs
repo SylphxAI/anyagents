@@ -440,7 +440,7 @@ for line in sys.stdin:
         agent.id.clone(),
         VendorHarness::Spiron(
             Box::new(harness),
-            temp.path().join("config/spiron-session-id"),
+            temp.path().join("config/spiron-session-id").into(),
             "spiron".into(),
         ),
     )
@@ -551,7 +551,7 @@ for line in sys.stdin:
         agent.id.clone(),
         VendorHarness::Spiron(
             Box::new(harness),
-            temp.path().join("config/spiron-session-id"),
+            temp.path().join("config/spiron-session-id").into(),
             "spiron".into(),
         ),
     )
@@ -613,7 +613,7 @@ for line in sys.stdin:
         agent.id.clone(),
         VendorHarness::Spiron(
             Box::new(restarted),
-            config.join("spiron-session-id"),
+            config.join("spiron-session-id").into(),
             "spiron".into(),
         ),
     )
@@ -916,7 +916,7 @@ for raw in sys.stdin:
             )?;
             let vh = VendorHarness::Spiron(
                 Box::new(h),
-                req.config_dir.join("spiron-session-id"),
+                req.config_dir.join("spiron-session-id").into(),
                 "spiron".into(),
             );
             vh.sync_session()?;
@@ -1065,7 +1065,7 @@ for raw in sys.stdin:
             )?;
             let vh = VendorHarness::Spiron(
                 Box::new(h),
-                req.config_dir.join("spiron-session-id"),
+                req.config_dir.join("spiron-session-id").into(),
                 "spiron".into(),
             );
             vh.sync_session()?;
@@ -1215,7 +1215,7 @@ for raw in sys.stdin:
             )?;
             let vh = VendorHarness::Spiron(
                 Box::new(h),
-                req.config_dir.join("spiron-session-id"),
+                req.config_dir.join("spiron-session-id").into(),
                 "spiron".into(),
             );
             vh.sync_session()?;

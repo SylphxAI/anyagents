@@ -69,6 +69,35 @@ struct State {
     last_usage: Option<TurnUsage>,
 }
 
+/// What the host reads through this adapter. A notification that changes
+/// none of it (a streamed delta, a progress note) wakes nobody.
+#[derive(PartialEq, Eq)]
+struct Observed {
+    turn: Option<String>,
+    taken: usize,
+    open: usize,
+    seen: usize,
+    finished: usize,
+    usages: usize,
+    quota_reset_at_ms: Option<i64>,
+    session: String,
+}
+
+impl State {
+    fn observed(&self) -> Observed {
+        Observed {
+            turn: self.turn.clone(),
+            taken: self.taken.len(),
+            open: self.open.len(),
+            seen: self.seen.len(),
+            finished: self.finished.len(),
+            usages: self.usages.len(),
+            quota_reset_at_ms: self.quota_reset_at_ms,
+            session: self.session.clone(),
+        }
+    }
+}
+
 impl MuseHarness {
     /// Start one child and complete the handshake.
     ///
@@ -115,7 +144,13 @@ impl MuseHarness {
                     .collect(),
                 work_dir: work_dir.map(Path::to_path_buf),
             },
-            Arc::new(move |line| on_notification(&mut lock(&on_shared), line)),
+            Arc::new(move |line| {
+                let mut state = lock(&on_shared);
+                let before = state.observed();
+                let mut effect = on_notification(&mut state, line);
+                effect.unobserved = state.observed() == before;
+                effect
+            }),
             Arc::new(on_request),
         )?;
         {
