@@ -287,7 +287,6 @@ struct State {
     last_turn_step_type: Option<String>,
     idle_since: Option<Instant>,
     last_rpc_health_poll: Option<Instant>,
-    turn_started_at: Option<Instant>,
     last_steer_probe: Option<Instant>,
     reclaimed_steers: Vec<String>,
     planner_config: Option<Value>,
@@ -813,7 +812,6 @@ impl StreamHarness {
                         state.turns_started += 1;
                         state.open.push(message.id.clone());
                         state.turn_user_inputs = 0;
-                        state.turn_started_at = Some(Instant::now());
                         state.idle_since = None;
                         state.sign_in_fault = None;
                     } else if self.mode == DeliveryMode::Steer {
@@ -1020,11 +1018,7 @@ impl StreamHarness {
             && (state
                 .idle_since
                 .is_some_and(|t| t.elapsed() < AGY_TURN_CLOSE_GRACE)
-                || (state.turn_user_inputs == 0
-                    && (state.session_id.is_some()
-                        || state
-                            .turn_started_at
-                            .is_some_and(|t| t.elapsed() < AGY_FRESH_TURN)))
+                || (state.turn_user_inputs == 0 && state.session_id.is_some())
                 || (state.session_id.is_none()
                     && state
                         .last_steer_probe
@@ -1134,7 +1128,6 @@ impl StreamHarness {
             state.last_turn_step_type = None;
             state.idle_since = None;
             state.last_rpc_health_poll = None;
-            state.turn_started_at = None;
             state.last_steer_probe = None;
             state.planner_config = None;
             state.http_port = self.agy_rpc.as_ref().and_then(|r| r.port_override);
@@ -1265,7 +1258,6 @@ impl StreamHarness {
         state.last_turn_step_type = None;
         state.idle_since = None;
         state.last_rpc_health_poll = None;
-        state.turn_started_at = None;
         state.last_steer_probe = None;
         state.planner_config = None;
         state.http_port = None;
@@ -1513,7 +1505,6 @@ impl State {
             last_turn_step_type: None,
             idle_since: None,
             last_rpc_health_poll: None,
-            turn_started_at: None,
             last_steer_probe: None,
             reclaimed_steers: Vec::new(),
             planner_config: None,
@@ -2353,29 +2344,32 @@ fn agy_rpc_post(
 /// accept a new invocation via `SendUserCascadeMessage` with `plannerConfig`.
 const AGY_TURN_CLOSE_GRACE: Duration = Duration::from_millis(200);
 
-/// A turn just written is not steered into for this long, before its first
-/// step names the cascade.
-const AGY_FRESH_TURN: Duration = Duration::from_millis(250);
-
 /// The pause after a steer probe found no cascade to steer into.
 const AGY_STEER_PROBE_GAP: Duration = Duration::from_millis(400);
 
-/// Whether a steer must wait, and for how long when only time opens the
-/// gate: `Some(None)` waits for the first step line, `Some(Some(d))` for `d`.
+/// Whether a steer must wait: `Some(None)` until the next stdout line,
+/// `Some(Some(d))` for `d`.
+///
+/// Two waits remain, and both come from the vendor. A steer goes through the
+/// language server, while the turn it joins was started on stdin, and nothing
+/// orders the two:
+/// - A known cascade that has not shown the turn's first step may still be
+///   idle; a steer sent now would start its own invocation ahead of the turn's
+///   own message. The first step line ends this wait.
+/// - A cascade that just went idle may be ending its turn, whose `result`
+///   names no invocation: a steer sent as a new invocation now would have that
+///   late `result` close it. [`AGY_TURN_CLOSE_GRACE`] is the vendor's
+///   `pollResponse` bound on that line.
+///
+/// A fresh session has no cascade to steer into until the language server
+/// shows one, and the steer path asks it at once rather than after a delay.
 fn agy_input_gate(state: &State) -> Option<Option<Duration>> {
     if let Some(idle) = state.idle_since
         && idle.elapsed() < AGY_TURN_CLOSE_GRACE
     {
         return Some(Some(AGY_TURN_CLOSE_GRACE - idle.elapsed()));
     }
-    if state.turn_user_inputs != 0 {
-        return None;
-    }
-    if state.session_id.is_some() {
-        return Some(None);
-    }
-    let started = state.turn_started_at?;
-    (started.elapsed() < AGY_FRESH_TURN).then(|| Some(AGY_FRESH_TURN - started.elapsed()))
+    (state.turn_user_inputs == 0 && state.session_id.is_some()).then_some(None)
 }
 
 /// How long an open cascade's stdout stays quiet before its run status is
