@@ -83,6 +83,10 @@ const RESUME_TURNS: usize = 4;
 /// joined is the newest.
 const SETTLE_TURNS: usize = 2;
 
+/// How long a child that exited may keep its stdout open (a descendant
+/// holding it) before it is declared dead anyway.
+const EXIT_GRACE: Duration = Duration::from_secs(5);
+
 /// What this adapter guarantees for mail that reaches a busy agent
 /// (`docs/delivery.md`).
 pub const DELIVERY: Delivery = Delivery {
@@ -107,6 +111,9 @@ pub struct CodexHarness {
 struct State {
     child: Option<Child>,
     alive: bool,
+    /// When the child was seen to have exited while its stdout stayed open
+    /// (a descendant holds it).
+    exited_at: Option<Instant>,
     /// Bumped when something the host reads changes: what the activity
     /// watcher waits on.
     epoch: u64,
@@ -1261,7 +1268,23 @@ impl Harness for CodexHarness {
     }
 
     fn health(&self) -> HarnessHealth {
-        let state = lock(&self.shared);
+        let mut state = lock(&self.shared);
+        // The child exited, and a descendant keeps its stdout open: past the
+        // grace no proof can still arrive from it.
+        if state.alive {
+            if state.exited_at.is_none()
+                && let Some(child) = state.child.as_mut()
+                && let Ok(Some(_)) = child.try_wait()
+            {
+                state.exited_at = Some(Instant::now());
+            }
+            if state
+                .exited_at
+                .is_some_and(|exited| exited.elapsed() >= EXIT_GRACE)
+            {
+                state.alive = false;
+            }
+        }
         let busy = state.turn.is_some() || !state.inflight.is_empty();
         HarnessHealth {
             process_alive: state.alive,

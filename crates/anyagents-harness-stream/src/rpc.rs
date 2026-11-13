@@ -64,6 +64,9 @@ pub struct RpcChild {
 struct State {
     child: Option<Child>,
     alive: bool,
+    /// When the child was seen to have exited while its stdout stayed open
+    /// (a descendant holds it).
+    exited_at: Option<Instant>,
     /// Bumped by every line the child prints.
     epoch: u64,
     /// Bumped only by lines the adapter says the host may read, by a quota
@@ -162,8 +165,30 @@ impl RpcChild {
         &self.environment
     }
 
+    /// Alive until the reader reached stdout's end, or until a child that
+    /// exited has kept its stdout open (a descendant holding it) for
+    /// [`crate::EXIT_GRACE`]: past that no answer can still arrive from it.
     pub fn alive(&self) -> bool {
-        lock(&self.shared).alive
+        let mut state = lock(&self.shared);
+        if state.alive {
+            if state.exited_at.is_none()
+                && let Some(child) = state.child.as_mut()
+                && let Ok(Some(_)) = child.try_wait()
+            {
+                state.exited_at = Some(Instant::now());
+            }
+            if state
+                .exited_at
+                .is_some_and(|exited| exited.elapsed() >= crate::EXIT_GRACE)
+            {
+                state.alive = false;
+                state.changes = state.changes.wrapping_add(1);
+                drop(state);
+                self.wake.notify_all();
+                return false;
+            }
+        }
+        state.alive
     }
 
     pub fn epoch(&self) -> u64 {
@@ -382,6 +407,7 @@ impl RpcChild {
             state.child = Some(child);
             state.stdout = Some(stdout);
             state.alive = true;
+            state.exited_at = None;
         }
         *lock(&self.stdin) = Some(child_stdin);
         Ok(())

@@ -2377,7 +2377,7 @@ fn note_consumption_receipt(
 
 /// How long a child that exited may keep its stdout open (a descendant
 /// holding it) before it is declared dead anyway.
-const EXIT_GRACE: Duration = Duration::from_secs(5);
+pub(crate) const EXIT_GRACE: Duration = Duration::from_secs(5);
 
 /// The first wait before a turn the peer could not start is offered again;
 /// each refusal in a row doubles it up to [`TURN_RETRY_MAX`].
