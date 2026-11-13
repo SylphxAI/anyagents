@@ -3488,7 +3488,7 @@ mod tests {
             let workdir = root.join("synthetic-work");
             crate::create::ensure_seat_environment(&config, &workdir).unwrap();
             let output = anyagents_toolchain::tool("git", "checkout")
-                .map_err(|e| refusal(&path, e))?
+                .unwrap()
                 .command()
                 .current_dir(&config)
                 .env("GIT_DIR", "/dev/null")
@@ -3524,7 +3524,7 @@ mod tests {
             .tempdir()
             .unwrap();
         let initialized = anyagents_toolchain::tool("git", "checkout")
-            .map_err(|e| refusal(&path, e))?
+            .unwrap()
             .command()
             .args(["init", "-q"])
             .arg(dir.path())
@@ -3603,7 +3603,7 @@ mod tests {
             configure_seat_git(&config, root).unwrap();
             let read = |key| {
                 let out = anyagents_toolchain::tool("git", "checkout")
-                    .map_err(|e| refusal(&path, e))?
+                    .unwrap()
                     .command()
                     .args(["config", "--includes", "--file"])
                     .arg(config.join(".gitconfig"))
