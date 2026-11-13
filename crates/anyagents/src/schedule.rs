@@ -1198,12 +1198,12 @@ fn evaluate_watch(
             repo,
             number,
         } => {
-            let Some((_, state_desc)) =
-                probe_github_pr_terminal(&owner, &repo, number, sched.agent_id.as_str(), now)
+            let Some((_, state_desc, head_sha)) =
+                probe_github_pr_state(&owner, &repo, number, sched.agent_id.as_str(), now)
             else {
                 return WatchEval::pending(sched.watch_baseline.clone(), None);
             };
-            evaluate_pr_observation(sched, state_desc)
+            evaluate_pr_observation(sched, state_desc, head_sha)
         }
         WatchTarget::GitHubCheck {
             owner,
@@ -1257,11 +1257,31 @@ fn evaluate_watch(
     }
 }
 
-fn evaluate_pr_observation(sched: &AgentSchedule, state_desc: String) -> WatchEval {
+fn parse_pr_baseline(baseline: Option<&str>) -> (&str, Option<&str>) {
+    match baseline {
+        None => ("pending", None),
+        Some(raw) => match raw.split_once('@') {
+            Some((state, head)) if !head.is_empty() => (state, Some(head)),
+            _ => (raw, None),
+        },
+    }
+}
+
+fn format_pr_baseline(state: &str, head_sha: Option<&str>) -> String {
+    match head_sha {
+        Some(head) if !head.is_empty() => format!("{state}@{head}"),
+        _ => state.to_string(),
+    }
+}
+
+fn evaluate_pr_observation(
+    sched: &AgentSchedule,
+    state_desc: String,
+    head_sha: Option<String>,
+) -> WatchEval {
     if state_desc.starts_with("probe_error:") {
         return WatchEval::pending(sched.watch_baseline.clone(), Some(state_desc));
     }
-    let prev = sched.watch_baseline.as_deref().unwrap_or("pending");
     if state_desc == "merged" || state_desc == "closed" {
         return WatchEval {
             triggered: true,
@@ -1271,22 +1291,32 @@ fn evaluate_pr_observation(sched: &AgentSchedule, state_desc: String) -> WatchEv
             baseline: Some(state_desc),
         };
     }
-    if prev.starts_with("merge_queue:") && !state_desc.starts_with("merge_queue:") {
+    let (raw_prev, prev_head) = parse_pr_baseline(sched.watch_baseline.as_deref());
+    let head_changed = match (prev_head, head_sha.as_deref()) {
+        (Some(prev), Some(curr)) => prev != curr,
+        _ => false,
+    };
+    let effective_head = head_sha.as_deref().filter(|h| !h.is_empty()).or(prev_head);
+    let next_baseline = format_pr_baseline(&state_desc, effective_head);
+    if raw_prev.starts_with("merge_queue:") && !state_desc.starts_with("merge_queue:") {
         return WatchEval {
             triggered: true,
             next_state: "active",
             transition: Some("evicted".to_string()),
             observed: Some(format!("evicted:{state_desc}")),
-            baseline: Some(state_desc),
+            baseline: Some(next_baseline),
         };
     }
+    // A new head commit invalidates any prior check/review baseline for the
+    // previous SHA so checks_completed -> checks_completed still wakes.
+    let prev = if head_changed { "pending" } else { raw_prev };
     if state_desc == "review_failed" && prev != "review_failed" {
         return WatchEval {
             triggered: true,
             next_state: "active",
             transition: Some("review_failed".to_string()),
             observed: Some("review_failed".to_string()),
-            baseline: Some("review_failed".to_string()),
+            baseline: Some(next_baseline),
         };
     }
     if state_desc == "checks_completed" && prev != "checks_completed" {
@@ -1295,10 +1325,10 @@ fn evaluate_pr_observation(sched: &AgentSchedule, state_desc: String) -> WatchEv
             next_state: "active",
             transition: Some("checks_completed".to_string()),
             observed: Some("checks_completed".to_string()),
-            baseline: Some("checks_completed".to_string()),
+            baseline: Some(next_baseline),
         };
     }
-    WatchEval::pending(Some(state_desc.clone()), Some(state_desc))
+    WatchEval::pending(Some(next_baseline), Some(state_desc))
 }
 
 fn probe_process_alive(pid: u32) -> bool {
@@ -1467,6 +1497,16 @@ fn probe_spiron_at(
 }
 
 mod github;
+
+fn probe_github_pr_state(
+    owner: &str,
+    repo: &str,
+    number: u64,
+    agent_id: &str,
+    now_ms: i64,
+) -> Option<(bool, String, Option<String>)> {
+    github::probe_pr(owner, repo, &number.to_string(), agent_id, now_ms)
+}
 
 fn probe_github_pr_terminal(
     owner: &str,
@@ -2150,15 +2190,117 @@ mod tests {
                 watch_baseline: Some("merge_queue:queued".to_string()),
             })
             .unwrap();
-        let error = evaluate_pr_observation(&sched, "probe_error:rate_limited".to_string());
+        let error = evaluate_pr_observation(&sched, "probe_error:rate_limited".to_string(), None);
         assert!(!error.triggered);
         assert_eq!(error.baseline, sched.watch_baseline);
-        let evicted = evaluate_pr_observation(&sched, "checks_completed".to_string());
+        let evicted = evaluate_pr_observation(&sched, "checks_completed".to_string(), None);
         assert!(evicted.triggered);
         assert_eq!(evicted.transition.as_deref(), Some("evicted"));
         assert_eq!(evicted.next_state, "active");
         sched.watch_baseline = evicted.baseline;
-        assert!(!evaluate_pr_observation(&sched, "checks_completed".to_string()).triggered);
+        assert!(!evaluate_pr_observation(&sched, "checks_completed".to_string(), None).triggered);
+    }
+
+    #[test]
+    fn pr_watch_head_sha_transition_rules_and_legacy_baselines() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let owner = store
+            .create_agent(NewAgent::new("pr-head-sha-watch", "codex"))
+            .unwrap();
+        let mut sched = store
+            .create_schedule(NewSchedule {
+                agent_id: owner.id,
+                kind: "watch".to_string(),
+                spec: "github:pr:o/r#42".to_string(),
+                prompt: "verify".to_string(),
+                interval_ms: None,
+                next_fire_at_ms: None,
+                watch_baseline: Some("pending".to_string()),
+            })
+            .unwrap();
+
+        // Initial completion on sha1 triggers and encodes sha1 in baseline.
+        let first = evaluate_pr_observation(
+            &sched,
+            "checks_completed".to_string(),
+            Some("sha1".to_string()),
+        );
+        assert!(first.triggered);
+        assert_eq!(first.transition.as_deref(), Some("checks_completed"));
+        assert_eq!(first.observed.as_deref(), Some("checks_completed"));
+        assert_eq!(first.baseline.as_deref(), Some("checks_completed@sha1"));
+        sched.watch_baseline = first.baseline;
+
+        // Same head_sha staying checks_completed does NOT re-trigger.
+        let same_head = evaluate_pr_observation(
+            &sched,
+            "checks_completed".to_string(),
+            Some("sha1".to_string()),
+        );
+        assert!(!same_head.triggered);
+        assert_eq!(same_head.baseline.as_deref(), Some("checks_completed@sha1"));
+
+        // New head_sha reaching checks_completed after an earlier checks_completed DOES trigger.
+        let new_head = evaluate_pr_observation(
+            &sched,
+            "checks_completed".to_string(),
+            Some("sha2".to_string()),
+        );
+        assert!(new_head.triggered);
+        assert_eq!(new_head.transition.as_deref(), Some("checks_completed"));
+        assert_eq!(new_head.observed.as_deref(), Some("checks_completed"));
+        assert_eq!(new_head.baseline.as_deref(), Some("checks_completed@sha2"));
+        sched.watch_baseline = new_head.baseline;
+
+        // New head_sha still in progress resets baseline to checks_in_progress@sha3 without waking,
+        // then triggers when sha3 reaches checks_completed.
+        let new_head_pending = evaluate_pr_observation(
+            &sched,
+            "checks_in_progress".to_string(),
+            Some("sha3".to_string()),
+        );
+        assert!(!new_head_pending.triggered);
+        assert_eq!(
+            new_head_pending.baseline.as_deref(),
+            Some("checks_in_progress@sha3")
+        );
+        sched.watch_baseline = new_head_pending.baseline;
+        let new_head_done = evaluate_pr_observation(
+            &sched,
+            "checks_completed".to_string(),
+            Some("sha3".to_string()),
+        );
+        assert!(new_head_done.triggered);
+        assert_eq!(
+            new_head_done.baseline.as_deref(),
+            Some("checks_completed@sha3")
+        );
+
+        // Legacy baseline without head_sha (e.g. "checks_completed") adopts the observed head_sha
+        // without spurious re-triggering, then triggers when a newer head_sha completes.
+        sched.watch_baseline = Some("checks_completed".to_string());
+        let legacy_same = evaluate_pr_observation(
+            &sched,
+            "checks_completed".to_string(),
+            Some("sha4".to_string()),
+        );
+        assert!(!legacy_same.triggered);
+        assert_eq!(
+            legacy_same.baseline.as_deref(),
+            Some("checks_completed@sha4")
+        );
+        sched.watch_baseline = legacy_same.baseline;
+        let legacy_next = evaluate_pr_observation(
+            &sched,
+            "checks_completed".to_string(),
+            Some("sha5".to_string()),
+        );
+        assert!(legacy_next.triggered);
+        assert_eq!(
+            legacy_next.baseline.as_deref(),
+            Some("checks_completed@sha5")
+        );
     }
 
     #[test]
@@ -2215,6 +2357,7 @@ mod tests {
                 write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
             }
         });
+        github::reset_probes_for_test();
         // This is the only test using this process-wide override.
         unsafe {
             std::env::set_var("ANYAGENTS_GITHUB_API_BASE", format!("http://{addr}"));
@@ -2292,7 +2435,7 @@ mod tests {
         let active = store.list_schedules(Some(&owner.id), true).unwrap();
         assert_eq!(
             active[0].watch_baseline.as_deref(),
-            Some("checks_completed")
+            Some("checks_completed@abc")
         );
         assert_eq!(
             active[0].last_observed.as_deref(),
@@ -2322,9 +2465,135 @@ mod tests {
         *stage.lock().unwrap() = 99;
         let _ = std::net::TcpStream::connect(addr);
         server.join().unwrap();
+        github::reset_probes_for_test();
         unsafe {
             std::env::remove_var("ANYAGENTS_GITHUB_API_BASE");
         }
+    }
+
+    #[test]
+    fn github_pr_watch_wakes_on_new_head_sha_checks_completed() {
+        let _env = crate::server::tests::env_lock();
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::{Arc, Mutex};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stage = Arc::new(Mutex::new(0));
+        let server_stage = Arc::clone(&stage);
+        let server = std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let mut buf = [0u8; 2048];
+                let len = stream.read(&mut buf).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..len]);
+                let stage = *server_stage.lock().unwrap();
+                if stage == 99 {
+                    break;
+                }
+                let sha = if stage == 0 { "sha111" } else { "sha222" };
+                let body = if request.contains("/pulls/") {
+                    format!(r#"{{"state":"open","merged":false,"head":{{"sha":"{sha}"}}}}"#)
+                } else if request.contains("/check-runs") {
+                    r#"{"total_count":1,"check_runs":[{"id":1,"name":"ci","status":"completed","conclusion":"success"}]}"#.to_string()
+                } else if request.contains("/status?") {
+                    r#"{"statuses":[]}"#.to_string()
+                } else {
+                    panic!("unexpected REST request: {request}");
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK
+Content-Type: application/json
+Content-Length: {}
+Connection: close
+
+{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            }
+        });
+        struct EnvGuard;
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                github::reset_probes_for_test();
+                unsafe {
+                    std::env::remove_var("ANYAGENTS_GITHUB_API_BASE");
+                }
+            }
+        }
+        github::reset_probes_for_test();
+        unsafe {
+            std::env::set_var("ANYAGENTS_GITHUB_API_BASE", format!("http://{addr}"));
+        }
+        let _guard = EnvGuard;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let health = HealthBoard::default();
+        let owner = store
+            .create_agent(NewAgent::new("owner-head-sha-pr", "codex"))
+            .unwrap();
+        store.set_agent_running(&owner.id, "/work").unwrap();
+        create_agent_schedule(
+            &store,
+            &health,
+            &owner,
+            None,
+            None,
+            Some("github:pr:ExampleOrg/project#453"),
+            "verify PR 453",
+        )
+        .unwrap();
+
+        let now = anyagents_core::now_ms();
+        github::begin_cycle(&store.list_schedules(None, true).unwrap(), now);
+        let tick = |store: &Store, health: &HealthBoard, at| {
+            github::with_completion_clock(at, || tick_schedules_once(store, health, at))
+        };
+
+        // Initial checks_completed on sha111 wakes the agent.
+        assert_eq!(tick(&store, &health, now), 1);
+        let inbox = store.inbox(&owner.id, None).unwrap();
+        let first = inbox.last().unwrap();
+        assert!(first.text.contains("transition=checks_completed]"));
+        assert_eq!(
+            store.list_schedules(Some(&owner.id), true).unwrap()[0]
+                .watch_baseline
+                .as_deref(),
+            Some("checks_completed@sha111")
+        );
+        store.note_delivered(&owner.id, first.seq).unwrap();
+        store.note_turn_completed(&owner.id).unwrap();
+
+        // Same head_sha staying checks_completed does not re-trigger.
+        assert_eq!(tick(&store, &health, now + 60_000), 0);
+        assert_eq!(store.inbox(&owner.id, None).unwrap().len(), 1);
+
+        // New head_sha (sha222) also finishing as checks_completed triggers a new wake.
+        *stage.lock().unwrap() = 1;
+        assert_eq!(tick(&store, &health, now + 180_000), 1);
+        let inbox = store.inbox(&owner.id, None).unwrap();
+        assert_eq!(inbox.len(), 2);
+        assert!(
+            inbox
+                .last()
+                .unwrap()
+                .text
+                .contains("transition=checks_completed]")
+        );
+        assert_eq!(
+            store.list_schedules(Some(&owner.id), true).unwrap()[0]
+                .watch_baseline
+                .as_deref(),
+            Some("checks_completed@sha222")
+        );
+
+        *stage.lock().unwrap() = 99;
+        let _ = std::net::TcpStream::connect(addr);
+        server.join().unwrap();
     }
 
     #[test]
