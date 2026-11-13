@@ -10214,7 +10214,7 @@ stderr: {}",
         unsafe {
             libc::umask(0o022);
         }
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_tempdir();
         let data = tmp.path().join("data");
         let workspaces = tmp.path().join("workspaces");
         std::fs::create_dir_all(&data).unwrap();
