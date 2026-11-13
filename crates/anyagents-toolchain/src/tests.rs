@@ -36,7 +36,10 @@ fn a_declared_tool_resolves_to_its_verified_canonical_path() {
     let dir = tempfile::tempdir().unwrap();
     let tool = fake_tool(dir.path(), "faketool", "1.2.3");
     let sha = sha256_file(&tool).unwrap();
-    let tc = toolchain(&manifest(&[("faketool", &tool, "1.2.3", sha, "enforce = true")], ""));
+    let tc = toolchain(&manifest(
+        &[("faketool", &tool, "1.2.3", sha, "enforce = true")],
+        "",
+    ));
     let resolved = tc.tool("faketool", "test").unwrap();
     assert_eq!(resolved.provenance, Provenance::Declared);
     assert_eq!(resolved.path, std::fs::canonicalize(&tool).unwrap());
@@ -52,7 +55,10 @@ fn a_wrong_digest_is_a_checksum_mismatch_naming_the_tool() {
         "",
     ));
     let err = tc.tool("faketool", "test").unwrap_err();
-    assert!(matches!(err, ToolchainError::ChecksumMismatch { ref tool, .. } if tool == "faketool"), "{err}");
+    assert!(
+        matches!(err, ToolchainError::ChecksumMismatch { ref tool, .. } if tool == "faketool"),
+        "{err}"
+    );
 }
 
 #[test]
@@ -60,22 +66,31 @@ fn a_wrong_version_is_a_version_mismatch() {
     let dir = tempfile::tempdir().unwrap();
     let tool = fake_tool(dir.path(), "faketool", "1.2.3");
     let sha = sha256_file(&tool).unwrap();
-    let tc = toolchain(&manifest(&[("faketool", &tool, "9.9.9", sha, "enforce = true")], ""));
+    let tc = toolchain(&manifest(
+        &[("faketool", &tool, "9.9.9", sha, "enforce = true")],
+        "",
+    ));
     let err = tc.tool("faketool", "test").unwrap_err();
-    assert!(matches!(err, ToolchainError::VersionMismatch { ref actual, .. } if actual.contains("1.2.3")), "{err}");
+    assert!(
+        matches!(err, ToolchainError::VersionMismatch { ref actual, .. } if actual.contains("1.2.3")),
+        "{err}"
+    );
 }
 
 #[test]
 fn a_missing_declared_tool_is_missing_at_its_path() {
     let tc = toolchain(&manifest(
-        &[("adb", Path::new("/example.invalid/adb"), "35", "0".repeat(64), "enforce = true")],
+        &[(
+            "adb",
+            Path::new("/example.invalid/adb"),
+            "35",
+            "0".repeat(64),
+            "enforce = true",
+        )],
         "",
     ));
     let err = tc.tool("adb", "computer.mobile").unwrap_err();
-    assert_eq!(
-        err.to_string(),
-        "adb: missing at /example.invalid/adb",
-    );
+    assert_eq!(err.to_string(), "adb: missing at /example.invalid/adb",);
 }
 
 #[test]
@@ -83,11 +98,18 @@ fn a_binary_swapped_after_start_is_caught_on_the_next_use() {
     let dir = tempfile::tempdir().unwrap();
     let tool = fake_tool(dir.path(), "faketool", "1.2.3");
     let sha = sha256_file(&tool).unwrap();
-    let tc = toolchain(&manifest(&[("faketool", &tool, "1.2.3", sha, "enforce = true")], ""));
+    let tc = toolchain(&manifest(
+        &[("faketool", &tool, "1.2.3", sha, "enforce = true")],
+        "",
+    ));
     tc.tool("faketool", "test").unwrap();
     // Replace the file (new inode, new size): the fingerprint changes.
     let replacement = dir.path().join("replacement");
-    std::fs::write(&replacement, "#!/bin/sh\necho \"faketool 1.2.3 tampered\"\n").unwrap();
+    std::fs::write(
+        &replacement,
+        "#!/bin/sh\necho \"faketool 1.2.3 tampered\"\n",
+    )
+    .unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -95,19 +117,31 @@ fn a_binary_swapped_after_start_is_caught_on_the_next_use() {
     }
     std::fs::rename(&replacement, &tool).unwrap();
     let err = tc.tool("faketool", "test").unwrap_err();
-    assert!(matches!(err, ToolchainError::ChecksumMismatch { .. }), "{err}");
+    assert!(
+        matches!(err, ToolchainError::ChecksumMismatch { .. }),
+        "{err}"
+    );
 }
 
 #[test]
 fn report_mode_uses_the_declared_path_and_reports_the_failure() {
     let dir = tempfile::tempdir().unwrap();
     let tool = fake_tool(dir.path(), "faketool", "1.2.3");
-    let tc = toolchain(&manifest(&[("faketool", &tool, "1.2.3", "b".repeat(64), "")], ""));
+    let tc = toolchain(&manifest(
+        &[("faketool", &tool, "1.2.3", "b".repeat(64), "")],
+        "",
+    ));
     let resolved = tc.tool("faketool", "test").unwrap();
     assert_eq!(resolved.path, tool);
-    assert!(matches!(resolved.provenance, Provenance::DeclaredUnverified { .. }));
+    assert!(matches!(
+        resolved.provenance,
+        Provenance::DeclaredUnverified { .. }
+    ));
     let report = tc.report();
-    assert!(matches!(report.tools[0].verified, Some(Err(ToolchainError::ChecksumMismatch { .. }))));
+    assert!(matches!(
+        report.tools[0].verified,
+        Some(Err(ToolchainError::ChecksumMismatch { .. }))
+    ));
 }
 
 #[test]
@@ -128,7 +162,10 @@ fn an_undeclared_tool_is_refused_when_undeclared_tools_are_enforced() {
 fn an_unreadable_manifest_fails_closed_and_names_the_manifest() {
     let tc = toolchain("schema = 1\n[tool.git]\npath = \"git\"\n");
     let err = tc.tool("git", "checkout").unwrap_err();
-    assert!(matches!(err, ToolchainError::ManifestUnreadable { ref path, .. } if path.ends_with("toolchain.toml")), "{err}");
+    assert!(
+        matches!(err, ToolchainError::ManifestUnreadable { ref path, .. } if path.ends_with("toolchain.toml")),
+        "{err}"
+    );
     assert!(tc.report().manifest_error.is_some());
     assert!(tc.child_path().is_none());
 }
@@ -142,7 +179,10 @@ fn a_missing_manifest_file_is_legacy_and_reported() {
     assert!(report.manifest.is_none());
     assert!(!report.child_path_constructed);
     assert_eq!(report.legacy.len(), 1);
-    assert_eq!(report.legacy[0].tool, "anyagents-toolchain-test-no-such-tool");
+    assert_eq!(
+        report.legacy[0].tool,
+        "anyagents-toolchain-test-no-such-tool"
+    );
     assert!(report.legacy[0].needed_by.contains("test"));
 }
 
@@ -164,7 +204,10 @@ fn the_required_set_returns_every_failure() {
         .unwrap_err();
     let named: Vec<_> = errs.iter().map(ToString::to_string).collect();
     assert_eq!(named.len(), 2);
-    assert!(named[0].starts_with("adb:") && named[1].starts_with("gh:"), "{named:?}");
+    assert!(
+        named[0].starts_with("adb:") && named[1].starts_with("gh:"),
+        "{named:?}"
+    );
 }
 
 #[test]

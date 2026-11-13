@@ -898,7 +898,11 @@ mod exec_env_tests {
             ("EXAMPLE_ONLY".into(), "materialized".into()),
         ]));
         let out = ws
-            .exec("printf '%s|%s' \"$EXAMPLE_ONLY\" \"${HOME-unset}\"", None, None)
+            .exec(
+                "printf '%s|%s' \"$EXAMPLE_ONLY\" \"${HOME-unset}\"",
+                None,
+                None,
+            )
             .unwrap();
         assert_eq!(out.stdout, "materialized|unset");
     }

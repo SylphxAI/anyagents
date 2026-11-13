@@ -134,14 +134,19 @@ mod tests {
             "schema = 1\n[tool.git]\npath = \"git\"\nversion = \"1\"\nsha256 = \"{SHA}\"\n"
         ))
         .unwrap_err();
-        assert!(matches!(err, ToolchainError::ManifestUnreadable { .. }), "{err}");
+        assert!(
+            matches!(err, ToolchainError::ManifestUnreadable { .. }),
+            "{err}"
+        );
         assert!(err.to_string().contains("not absolute"), "{err}");
     }
 
     #[test]
     fn a_short_digest_is_unreadable() {
-        let err = parse("schema = 1\n[tool.git]\npath = \"/usr/bin/git\"\nversion = \"1\"\nsha256 = \"abc\"\n")
-            .unwrap_err();
+        let err = parse(
+            "schema = 1\n[tool.git]\npath = \"/usr/bin/git\"\nversion = \"1\"\nsha256 = \"abc\"\n",
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("sha256"), "{err}");
     }
 

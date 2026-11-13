@@ -125,7 +125,10 @@ pub struct ToolchainReport {
 enum Source {
     /// No manifest file: every tool is legacy.
     Absent,
-    Loaded { path: PathBuf, manifest: Manifest },
+    Loaded {
+        path: PathBuf,
+        manifest: Manifest,
+    },
     Unreadable(ToolchainError),
 }
 
@@ -296,7 +299,10 @@ impl Toolchain {
     }
 
     fn record_legacy(&self, name: &str, needed_by: &str, found: Option<&Path>) {
-        let mut uses = self.legacy_uses.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut uses = self
+            .legacy_uses
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let entry = uses.entry(name.to_string()).or_insert_with(|| {
             eprintln!(
                 "anyagents-toolchain: `{name}` is not declared; legacy lookup for {needed_by} resolved {}. Declare it in {}.",
@@ -371,8 +377,13 @@ impl Toolchain {
         let Source::Loaded { manifest, .. } = &self.source else {
             return None;
         };
-        std::env::join_paths(self.bin_dir.iter().cloned().chain(manifest.child_path_tail.iter().cloned()))
-            .ok()
+        std::env::join_paths(
+            self.bin_dir
+                .iter()
+                .cloned()
+                .chain(manifest.child_path_tail.iter().cloned()),
+        )
+        .ok()
     }
 
     /// The `PATH` for a helper process AnyAgents runs itself (a Git or shell
@@ -398,7 +409,12 @@ impl Toolchain {
         std::fs::create_dir_all(bin_dir)?;
         let mut refused = Vec::new();
         let mut wanted = BTreeSet::new();
-        for name in manifest.tool.iter().filter(|(_, s)| s.expose).map(|(n, _)| n) {
+        for name in manifest
+            .tool
+            .iter()
+            .filter(|(_, s)| s.expose)
+            .map(|(n, _)| n)
+        {
             let target = match self.tool(name, "child PATH") {
                 Ok(tool) => tool.path,
                 Err(err) => {
@@ -425,14 +441,19 @@ impl Toolchain {
         }
         Ok(refused)
     }
+
+    #[cfg(not(unix))]
+    pub fn sync_exposed(&self) -> std::io::Result<Vec<ToolchainError>> {
+        Ok(Vec::new())
+    }
 }
 
 static GLOBAL: OnceLock<Toolchain> = OnceLock::new();
 
 /// Install the server's toolchain once, at start. Later calls are ignored and
 /// return the toolchain they could not install.
-pub fn install_global(toolchain: Toolchain) -> Result<(), Toolchain> {
-    GLOBAL.set(toolchain)
+pub fn install_global(toolchain: Toolchain) -> Result<(), Box<Toolchain>> {
+    GLOBAL.set(toolchain).map_err(Box::new)
 }
 
 /// The server's toolchain; an empty (all-legacy) one when none was installed,
@@ -444,6 +465,27 @@ pub fn global() -> &'static Toolchain {
 /// Resolve through [`global`].
 pub fn tool(name: &str, needed_by: &str) -> Result<ResolvedTool, ToolchainError> {
     global().tool(name, needed_by)
+}
+
+/// Install the server's toolchain once at startup, verify every declared tool,
+/// and publish exposed links for children.
+pub fn init_server(data_dir: &Path, host_home: Option<PathBuf>) -> &'static Toolchain {
+    let toolchain = Toolchain::load(data_dir).with_legacy_context(LegacyContext { host_home });
+    let _ = install_global(toolchain);
+    let installed = global();
+    let report = installed.verify_all();
+    if let Some(err) = &report.manifest_error {
+        eprintln!("anyagents-toolchain: {err}");
+    }
+    for status in &report.tools {
+        if let Some(Err(err)) = &status.verified {
+            eprintln!("anyagents-toolchain: {err}");
+        }
+    }
+    if let Err(err) = installed.sync_exposed() {
+        eprintln!("anyagents-toolchain: failed to sync exposed tools: {err}");
+    }
+    installed
 }
 
 #[cfg(test)]

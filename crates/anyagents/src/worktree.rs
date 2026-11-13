@@ -14,8 +14,8 @@ pub(crate) struct Consumer {
 impl Consumer {
     pub(crate) fn configured() -> Self {
         Self {
-            executable: std::env::var_os("ANYAGENTS_CHECKOUT_PROVIDER_BIN")
-                .map(PathBuf::from)
+            executable: anyagents_toolchain::tool("checkout-provider", "checkout")
+                .map(|tool| tool.path)
                 .unwrap_or_default(),
             git_pool_dir: anyagents_core::configured_git_pool_dir(),
         }
@@ -136,8 +136,11 @@ impl Consumer {
             source_repo: source.display().to_string(),
             message,
         };
+        let git_tool =
+            anyagents_toolchain::tool("git", "checkout").map_err(|e| refuse(e.to_string()))?;
         let git = |args: &[&str]| -> Result<String, Error> {
-            let out = Command::new("git")
+            let out = git_tool
+                .command()
                 .args([
                     "-c",
                     "core.fsmonitor=false",
@@ -182,7 +185,8 @@ impl Consumer {
                         return None;
                     }
                     let reachable = tip == commit
-                        || Command::new("git")
+                        || git_tool
+                            .command()
                             .args([
                                 "-c",
                                 "core.fsmonitor=false",
@@ -307,7 +311,12 @@ fn run_git_pool(
     dir: Option<&Path>,
     args: &[&std::ffi::OsStr],
 ) -> Result<String, Error> {
-    let mut cmd = Command::new("git");
+    let mut cmd = anyagents_toolchain::tool("git", "checkout")
+        .map_err(|e| Error::WorktreeProvisioning {
+            repo: repo.into(),
+            message: e.to_string(),
+        })?
+        .command();
     cmd.args([
         "-c",
         "core.fsmonitor=false",

@@ -271,8 +271,9 @@ pub fn profile_dir(data: &Path, profile: &str) -> PathBuf {
 }
 
 fn detect_chromium_version() -> (String, String) {
-    let bin = chromium_binary();
-    if let Ok(out) = Command::new(&bin).arg("--version").output() {
+    if let Ok(bin) = chromium_binary()
+        && let Ok(out) = Command::new(&bin).arg("--version").output()
+    {
         let text = String::from_utf8_lossy(&out.stdout);
         for token in text.split_whitespace() {
             if token.chars().next().is_some_and(|c| c.is_ascii_digit()) && token.contains('.') {
@@ -284,35 +285,10 @@ fn detect_chromium_version() -> (String, String) {
     ("136".to_string(), "136.0.7103.92".to_string())
 }
 
-fn chromium_binary() -> String {
-    if let Ok(custom) = std::env::var("ANYAGENTS_CHROMIUM_BIN")
-        && !custom.trim().is_empty()
-    {
-        return custom.trim().to_string();
-    }
-    static RESOLVED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    RESOLVED
-        .get_or_init(|| {
-            for candidate in [
-                "/usr/bin/google-chrome-stable",
-                "/usr/bin/google-chrome",
-                "/usr/bin/chromium",
-                "/usr/bin/chromium-browser",
-            ] {
-                if Path::new(candidate).is_file()
-                    && Command::new(candidate)
-                        .arg("--version")
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::null())
-                        .status()
-                        .is_ok_and(|s| s.success())
-                {
-                    return candidate.to_string();
-                }
-            }
-            "chromium".to_string()
-        })
-        .clone()
+fn chromium_binary() -> Result<PathBuf, Error> {
+    anyagents_toolchain::tool("chromium", "browser")
+        .map(|tool| tool.path)
+        .map_err(|err| Error::Message(err.to_string()))
 }
 
 fn read_profile_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>, Error> {
@@ -628,7 +604,7 @@ fn ensure_browser_running(
     let want_headless = headless_override.unwrap_or(false);
     let has_xvfb = Path::new("/usr/bin/xvfb-run").is_file();
     let has_display = std::env::var_os("DISPLAY").is_some_and(|v| !v.is_empty());
-    let bin = chromium_binary();
+    let bin = chromium_binary()?;
 
     let mut chrome_args = vec![
         format!("--user-data-dir={}", user_data_dir.display()),
@@ -2242,34 +2218,11 @@ fn spawn_cloudflared_quick_tunnel(local_port: u16, token: &str) -> (Option<Strin
             return (Some(format!("{trimmed}/takeover/{token}")), None);
         }
     }
-    let mut candidates = Vec::new();
-    if let Ok(home) = std::env::var("HOME") {
-        candidates.push(format!(
-            "{}/.local/bin/cloudflared",
-            home.trim_end_matches('/')
-        ));
-    }
-    candidates.extend([
-        "/usr/local/bin/cloudflared".to_string(),
-        "/usr/bin/cloudflared".to_string(),
-        "cloudflared".to_string(),
-    ]);
-    let Some(bin) = candidates.into_iter().find(|p| {
-        if p.starts_with('/') {
-            Path::new(p).is_file()
-        } else {
-            Command::new("which")
-                .arg(p)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .is_ok_and(|s| s.success())
-        }
-    }) else {
+    let Ok(bin) = anyagents_toolchain::tool("cloudflared", "browser.takeover") else {
         return (None, None);
     };
 
-    let mut cmd = Command::new(bin);
+    let mut cmd = bin.command();
     cmd.args([
         "tunnel",
         "--no-autoupdate",
@@ -3781,14 +3734,23 @@ fn resolve_fill_value(
     raw_text: Option<&str>,
     secret_ref: Option<&str>,
 ) -> Result<(String, Option<String>), Error> {
-    resolve_fill_value_with_op(data, raw_text, secret_ref, std::ffi::OsStr::new("op"))
+    resolve_fill_value_with_op(data, raw_text, secret_ref, None)
+}
+
+fn resolve_op_program(op_program: Option<&std::ffi::OsStr>) -> Result<std::ffi::OsString, Error> {
+    match op_program {
+        Some(bin) => Ok(bin.to_os_string()),
+        None => anyagents_toolchain::tool("op", "browser.secret_ref")
+            .map(|tool| tool.path.into_os_string())
+            .map_err(|err| Error::Message(err.to_string())),
+    }
 }
 
 fn resolve_fill_value_with_op(
     data: &Path,
     raw_text: Option<&str>,
     secret_ref: Option<&str>,
-    op_program: &std::ffi::OsStr,
+    op_program: Option<&std::ffi::OsStr>,
 ) -> Result<(String, Option<String>), Error> {
     let candidate = secret_ref
         .map(str::trim)
@@ -3808,7 +3770,8 @@ fn resolve_fill_value_with_op(
                     .into(),
             ));
         }
-        let mut cmd = build_op_secret_command(op_program, &["read", "--no-newline", candidate]);
+        let op_bin = resolve_op_program(op_program)?;
+        let mut cmd = build_op_secret_command(&op_bin, &["read", "--no-newline", candidate]);
         let out = cmd
             .output()
             .map_err(|_| Error::Message("failed to invoke `op` CLI for secret reference".into()))?;
@@ -3843,12 +3806,11 @@ fn resolve_fill_value_with_op(
                         .into(),
                 ));
             }
-            build_op_secret_command(
-                op_program,
-                &["item", "get", item, "--vault", vault, "--otp"],
-            )
+            let op_bin = resolve_op_program(op_program)?;
+            build_op_secret_command(&op_bin, &["item", "get", item, "--vault", vault, "--otp"])
         } else {
-            build_op_secret_command(op_program, &["item", "get", trimmed, "--otp"])
+            let op_bin = resolve_op_program(op_program)?;
+            build_op_secret_command(&op_bin, &["item", "get", trimmed, "--otp"])
         };
         let out = cmd
             .output()
@@ -6231,7 +6193,7 @@ mod tests {
     #[ignore = "launches real Chromium; CDP I/O fails intermittently with EINTR in CI; deleted with browser.rs, tracking: https://github.com/SylphxAI/anyagents/issues/200"]
     fn chromium_stealth_override_exception_is_observable() {
         let _browser = browser_fixture_guard();
-        if !Path::new(&chromium_binary()).exists() {
+        if !has_chromium() {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
@@ -6257,7 +6219,7 @@ mod tests {
     #[ignore = "launches real Chromium; CDP I/O fails intermittently with EINTR in CI; deleted with browser.rs, tracking: https://github.com/SylphxAI/anyagents/issues/200"]
     fn chromium_fill_requires_the_requested_value_or_option() {
         let _browser = browser_fixture_guard();
-        if !Path::new(&chromium_binary()).exists() {
+        if !has_chromium() {
             return;
         }
         let data = tempfile::tempdir().unwrap();
@@ -6315,15 +6277,11 @@ mod tests {
         let _browser = browser_fixture_guard();
         // The default suite permits hosts without Chromium. An explicitly
         // configured browser remains required, including a broken path.
-        if std::env::var_os("ANYAGENTS_CHROMIUM_BIN").is_none()
-            && !Path::new(&chromium_binary()).exists()
-        {
-            return;
+        match chromium_binary() {
+            Ok(bin) if bin.exists() => {}
+            Ok(_) => panic!("Chromium is required for split OTP input verification"),
+            Err(_) => return,
         }
-        assert!(
-            Path::new(&chromium_binary()).exists(),
-            "Chromium is required for split OTP input verification"
-        );
         let data = tempfile::tempdir().unwrap();
         let (mut runtime, _) =
             ensure_browser_running(data.path(), "split-code", Some(true), None).unwrap();
@@ -7010,7 +6968,7 @@ esac
             dir.path(),
             None,
             Some("op://vault-alpha/item-beta/password"),
-            shim.as_os_str(),
+            Some(shim.as_os_str()),
         )
         .unwrap();
         assert_eq!(secret, "in-memory-secret-value");
@@ -7020,7 +6978,7 @@ esac
             dir.path(),
             Some("op://vault-alpha/item-beta/otp?attribute=otp"),
             None,
-            shim.as_os_str(),
+            Some(shim.as_os_str()),
         )
         .unwrap();
         assert_eq!(attr_otp, "987654");
@@ -7033,7 +6991,7 @@ esac
             dir.path(),
             None,
             Some("op-otp://vault-alpha/item-beta"),
-            shim.as_os_str(),
+            Some(shim.as_os_str()),
         )
         .unwrap();
         assert_eq!(otp, "654321");
@@ -7043,7 +7001,7 @@ esac
             dir.path(),
             None,
             Some("op-otp://standalone-item"),
-            shim.as_os_str(),
+            Some(shim.as_os_str()),
         )
         .unwrap();
         assert_eq!(single_otp, "112233");
@@ -7054,9 +7012,13 @@ esac
             "op://vault-alpha/partial-leak/password",
             "op-otp://vault-alpha/partial-leak",
         ] {
-            let err =
-                resolve_fill_value_with_op(dir.path(), None, Some(failing_ref), shim.as_os_str())
-                    .unwrap_err();
+            let err = resolve_fill_value_with_op(
+                dir.path(),
+                None,
+                Some(failing_ref),
+                Some(shim.as_os_str()),
+            )
+            .unwrap_err();
             let msg = err.to_string();
             assert!(msg.contains("exit code 2"), "{msg}");
             for forbidden in [
@@ -7094,10 +7056,14 @@ esac
             "op://vault-alpha/empty-item/password",
             "op-otp://vault-alpha/empty-item",
         ] {
-            let msg =
-                resolve_fill_value_with_op(dir.path(), None, Some(empty_ref), shim.as_os_str())
-                    .unwrap_err()
-                    .to_string();
+            let msg = resolve_fill_value_with_op(
+                dir.path(),
+                None,
+                Some(empty_ref),
+                Some(shim.as_os_str()),
+            )
+            .unwrap_err()
+            .to_string();
             assert!(msg.contains("empty value"), "{msg}");
             assert!(!msg.contains("vault-alpha"), "{msg}");
             assert!(!msg.contains("empty-item"), "{msg}");
@@ -7112,7 +7078,7 @@ esac
                 dir.path(),
                 None,
                 Some(valid_ref),
-                missing_bin.as_os_str(),
+                Some(missing_bin.as_os_str()),
             )
             .unwrap_err()
             .to_string();
@@ -7127,10 +7093,14 @@ esac
             "op-otp://vault-alpha/   ",
             "unsupported://vault-alpha/item-beta",
         ] {
-            let msg =
-                resolve_fill_value_with_op(dir.path(), None, Some(malformed_ref), shim.as_os_str())
-                    .unwrap_err()
-                    .to_string();
+            let msg = resolve_fill_value_with_op(
+                dir.path(),
+                None,
+                Some(malformed_ref),
+                Some(shim.as_os_str()),
+            )
+            .unwrap_err()
+            .to_string();
             assert!(!msg.contains("vault-alpha"), "{msg}");
             assert!(!msg.contains("item-beta"), "{msg}");
             assert!(!msg.contains("only-two"), "{msg}");
@@ -7140,6 +7110,10 @@ esac
     // Each real-browser scenario owns its Chromium processes until teardown.
     // Starting every fixture together can starve CDP startup on a small runner;
     // keep the production 12s readiness ceiling and all interaction assertions.
+    fn has_chromium() -> bool {
+        chromium_binary().is_ok_and(|path| path.exists())
+    }
+
     static BROWSER_FIXTURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn browser_fixture_guard() -> std::sync::MutexGuard<'static, ()> {
@@ -7431,7 +7405,7 @@ esac
     #[ignore = "launches real Chromium; CDP I/O fails intermittently with EINTR in CI; deleted with browser.rs, tracking: https://github.com/SylphxAI/anyagents/issues/200"]
     fn takeover_prearmed_guard_survives_navigation_before_native_press() {
         let _browser = browser_fixture_guard();
-        if !Path::new(&chromium_binary()).exists() {
+        if !has_chromium() {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
@@ -7671,7 +7645,7 @@ esac
     #[ignore = "browser open intermittently fails with EINTR in CI; deleted with browser.rs, tracking: https://github.com/SylphxAI/anyagents/issues/200"]
     fn cross_origin_iframe_snapshot_fill_and_click_with_secret_ref() {
         let _browser = browser_fixture_guard();
-        if !Path::new(&chromium_binary()).exists() {
+        if !has_chromium() {
             return;
         }
         let iframe_html = r#"<!doctype html>
@@ -7828,7 +7802,7 @@ esac
     #[ignore = "launches real Chromium; CDP I/O fails intermittently with EINTR in CI; deleted with browser.rs, tracking: https://github.com/SylphxAI/anyagents/issues/200"]
     fn held_key_moves_raf_fixture_stops_on_release_and_isolates_profiles() {
         let _browser = browser_fixture_guard();
-        if !Path::new(&chromium_binary()).exists() {
+        if !has_chromium() {
             return;
         }
         let fixture_html = r#"<!doctype html>
@@ -8086,7 +8060,7 @@ esac
     #[ignore = "launches real Chromium; CDP I/O fails intermittently with EINTR in CI; deleted with browser.rs, tracking: https://github.com/SylphxAI/anyagents/issues/200"]
     fn human_takeover_captcha_detection_fencing_and_remote_solve() {
         let _browser = browser_fixture_guard();
-        if !Path::new(&chromium_binary()).exists() {
+        if !has_chromium() {
             return;
         }
         let html = r#"<!doctype html>
@@ -8312,7 +8286,7 @@ esac
     #[test]
     #[ignore = "Chromium CDP startup exceeds 12s under CI load; tracking: https://github.com/SylphxAI/anyagents/pull/115"]
     fn takeover_clipboard_ui_acceptance() {
-        if !Path::new(&chromium_binary()).exists() {
+        if !has_chromium() {
             return;
         }
         run_takeover_ui_acceptance(true);
@@ -8356,10 +8330,7 @@ esac
 
     fn assert_takeover_termination_releases(path: &str) {
         let _browser = browser_fixture_guard();
-        assert!(
-            Path::new(&chromium_binary()).exists(),
-            "Chromium is required"
-        );
+        assert!(has_chromium(), "Chromium is required");
         let dir = tempfile::tempdir().unwrap();
         let profile = "terminal-owner";
         let html = "<button style='position:absolute;left:20px;top:20px;width:150px;height:100px'>Hold</button><script>window.downs=0;window.ups=0;window.clicks=0;document.addEventListener('mousedown',()=>downs++);document.addEventListener('mouseup',()=>ups++);document.addEventListener('click',()=>clicks++);</script>".to_string();
@@ -8478,10 +8449,7 @@ esac
     #[ignore = "requires real Chromium; takeover native cancellation"]
     fn takeover_cancel_survives_earlier_stopped_pointerdown() {
         let _browser = browser_fixture_guard();
-        assert!(
-            Path::new(&chromium_binary()).exists(),
-            "Chromium is required"
-        );
+        assert!(has_chromium(), "Chromium is required");
         let dir = tempfile::tempdir().unwrap();
         let profile = "cancel-earlier-listener";
         let html = r#"<button id="target" style="position:fixed;left:50px;top:50px;width:200px;height:100px">Action</button><script>
@@ -8543,10 +8511,7 @@ esac
 
     fn run_takeover_ui_acceptance(clipboard_only: bool) {
         let _browser = browser_fixture_guard();
-        assert!(
-            Path::new(&chromium_binary()).exists(),
-            "Chromium is required"
-        );
+        assert!(has_chromium(), "Chromium is required");
         let html = r#"<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1">
         <title>Remote browser input test</title>
         <style>body{margin:0;background:#edf3fb;font:20px system-ui;color:#172a43}header{padding:28px;background:#fff;border-bottom:1px solid #ccd9e8}input{display:block;font:20px system-ui;width:280px;height:48px;margin-top:12px}#target{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);background:#086bce;color:white;border:0;border-radius:16px;padding:24px;font:20px system-ui}p{margin:28px;max-width:460px;line-height:1.6}</style>
@@ -8595,7 +8560,7 @@ esac
                 "/../../tests/browser-takeover.mjs"
             ))
             .args([&st.local_url, &ws, &output])
-            .env("ANYAGENTS_CHROMIUM", chromium_binary())
+            .env("ANYAGENTS_CHROMIUM", chromium_binary().unwrap())
             .status();
         let _ = execute(
             dir.path(),
@@ -8793,7 +8758,7 @@ esac
     #[ignore = "launches real Chromium; CDP I/O fails intermittently with EINTR in CI; deleted with browser.rs, tracking: https://github.com/SylphxAI/anyagents/issues/200"]
     fn takeover_viewport_preserves_identity_and_restores_every_exit() {
         let _browser = browser_fixture_guard();
-        if !Path::new(&chromium_binary()).exists() {
+        if !has_chromium() {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
@@ -8947,7 +8912,7 @@ esac
     #[ignore = "Chromium startup and OOPIF click/focus races; see docs/verification.md"]
     fn takeover_focus_finds_cross_origin_input() {
         let _browser = browser_fixture_guard();
-        if !Path::new(&chromium_binary()).exists() {
+        if !has_chromium() {
             return;
         }
         let child = spawn_html_server(
