@@ -120,7 +120,14 @@ impl Store {
             index.checkpoint()?;
             return Ok(true);
         }
-        refresh_native_at(&mut index, &agent, &path, true, now_ms)?;
+        refresh_native_with_policy(
+            &mut index,
+            &agent,
+            &path,
+            true,
+            is_external_harness_transcript(&root, &path),
+            now_ms,
+        )?;
         Ok(true)
     }
 
@@ -381,7 +388,15 @@ impl Store {
                         if blocked(&path) {
                             continue;
                         }
-                        let stamp = refresh_native(index, owner, &path)?.stamp;
+                        let stamp = refresh_native_with_policy(
+                            index,
+                            owner,
+                            &path,
+                            false,
+                            is_external_harness_transcript(&root, &path),
+                            crate::now_ms(),
+                        )?
+                        .stamp;
                         walk.note(&path, Some(stamp));
                         keep.insert(path.to_string_lossy().into_owned());
                     }
@@ -636,6 +651,11 @@ fn refresh_document_before_publish(
         Ok(stamp)
     })
 }
+fn is_external_harness_transcript(root: &Path, path: &Path) -> bool {
+    let config = root.join("config");
+    path.strip_prefix(&config)
+        .is_ok_and(|rel| rel.starts_with("projects") || rel.starts_with(".claude/projects"))
+}
 fn refresh_native(
     index: &mut HostIndex,
     owner: &Owner,
@@ -648,6 +668,16 @@ fn refresh_native_at(
     owner: &Owner,
     path: &Path,
     force_full: bool,
+    now_ms: i64,
+) -> Result<RefreshStats, IndexError> {
+    refresh_native_with_policy(index, owner, path, force_full, false, now_ms)
+}
+fn refresh_native_with_policy(
+    index: &mut HostIndex,
+    owner: &Owner,
+    path: &Path,
+    force_full: bool,
+    tolerate_malformed: bool,
     now_ms: i64,
 ) -> Result<RefreshStats, IndexError> {
     // One path walk; scan, metadata and projection share this descriptor.
@@ -666,7 +696,8 @@ fn refresh_native_at(
             indexed_records: 0,
         });
     }
-    let scan = crate::host_cursor::scan_jsonl(&mut source, old.as_ref(), force_full)?;
+    let scan =
+        crate::host_cursor::scan_jsonl(&mut source, old.as_ref(), force_full, tolerate_malformed)?;
     index.refresh_source(|index| {
         if scan.replace {
             index.clear_source(owner.id.as_str(), path)?;
@@ -674,8 +705,23 @@ fn refresh_native_at(
         // There cannot be committed documents beyond the atomically published
         // frontier. An interrupted outer transaction is rolled back by SQLite.
         for raw in &scan.records {
-            let header: EventHeader =
-                serde_json::from_reader(MetadataReader::new(source.range(raw.offset, raw.length)))?;
+            // EventHeader is derivative metadata; malformed/torn external JSONL
+            // records must not break lexical indexing or fail whole-agent search.
+            let header: EventHeader = match serde_json::from_reader(MetadataReader::new(
+                source.range(raw.offset, raw.length),
+            )) {
+                Ok(header) => header,
+                Err(error)
+                    if tolerate_malformed
+                        && matches!(
+                            error.classify(),
+                            serde_json::error::Category::Syntax | serde_json::error::Category::Eof
+                        ) =>
+                {
+                    EventHeader::default()
+                }
+                Err(error) => return Err(error.into()),
+            };
             let mut metadata = event_metadata(owner, &header);
             let records = header.tool_records();
             let mut names = Vec::new();
@@ -1785,6 +1831,64 @@ mod tests {
         );
         assert_eq!(cursor(&memory), memory_before);
         assert!(store.search_host_files(&ids, MemoryScope::All, &q).is_err());
+    }
+
+    #[test]
+    fn malformed_native_jsonl_falls_back_to_default_metadata_and_stays_searchable() {
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(NewAgent::new("torn-json-owner", "spiron"))
+            .unwrap();
+        let project_dir = dir
+            .path()
+            .join("agents")
+            .join(agent.id.as_str())
+            .join("config/projects/work");
+        fs::create_dir_all(&project_dir).unwrap();
+        let session = project_dir.join("session.jsonl");
+        let torn = concat!(
+            "{\"type\":\"api-request\",\"output_config\":{\"effort\":\"medium\"}",
+            "{\"parentUuid\":\"382fafc4\",\"message\":{\"content\":\"tornalpha99\"}}\n",
+            "invalid complete JSON record\n",
+            "{\"role\":\"assistant\",\"content\":\"validbeta88\"}\n",
+        );
+        fs::write(&session, torn).unwrap();
+        let ids = [agent.id.to_string()];
+        for needle in ["tornalpha99", "validbeta88"] {
+            let q = HistorySearchQuery {
+                query: Some(needle.into()),
+                ..Default::default()
+            };
+            let hits = store
+                .search_host_files(&ids, MemoryScope::Transcripts, &q)
+                .unwrap();
+            assert_eq!(hits.len(), 1, "expected hit for {needle}");
+            let q_all = HistorySearchQuery {
+                query: Some(needle.into()),
+                ..Default::default()
+            };
+            assert_eq!(
+                store
+                    .search_host_files(&ids, MemoryScope::All, &q_all)
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+        let index = HostIndex::open(&dir.path().join(INDEX_FILE)).unwrap();
+        assert!(
+            index
+                .source_cursor(agent.id.as_str(), &session)
+                .unwrap()
+                .is_some()
+        );
+        drop(index);
+        assert!(
+            store
+                .verify_one_host_history_source(crate::now_ms() + 3_600_001)
+                .unwrap()
+        );
     }
 
     #[test]

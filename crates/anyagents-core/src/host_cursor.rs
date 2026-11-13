@@ -86,6 +86,7 @@ pub(crate) fn scan_jsonl(
     source: &mut RawSource,
     previous: Option<&SourceCursor>,
     force_full: bool,
+    tolerate_malformed: bool,
 ) -> io::Result<JsonlRefresh> {
     let stamp = source.stamp().clone();
     let mut start = 0;
@@ -114,6 +115,25 @@ pub(crate) fn scan_jsonl(
     while let Some(line) = read_jsonl_line(&mut reader)? {
         match line {
             JsonlLine::Complete { length, sha256 } => {
+                records.push(RawCoordinate {
+                    segment: segment.clone(),
+                    offset: at,
+                    length,
+                    sha256,
+                    seq,
+                });
+                at += length;
+                scanned += length;
+                seq += 1;
+            }
+            JsonlLine::Malformed {
+                length,
+                sha256,
+                error,
+            } => {
+                if !tolerate_malformed {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, error));
+                }
                 records.push(RawCoordinate {
                     segment: segment.clone(),
                     offset: at,
