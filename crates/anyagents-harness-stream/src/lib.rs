@@ -48,9 +48,6 @@ pub enum LineProtocol {
     Result,
     /// `done` closes the turn and reports usage but no cost.
     Done,
-    /// `result` closes the turn with usage and an optional `cost_micros`; a
-    /// `text` line is answer text.
-    ResultWithCost,
     /// A persistent controller acknowledges each correlated input before the
     /// mailbox releases custody. `result` is the only terminal frame.
     AcknowledgedResult,
@@ -83,14 +80,6 @@ impl StreamSpec {
                 start_line: "user",
                 cancel: "interrupt",
                 protocol: LineProtocol::Result,
-            },
-            "opencode" => Self {
-                name: "anyagents-opencode".to_string(),
-                args: vec!["serve".to_string()],
-                resume_flag: "--session",
-                start_line: "prompt",
-                cancel: "cancel",
-                protocol: LineProtocol::ResultWithCost,
             },
             _ => Self {
                 name: format!("anyagents-{program}"),
@@ -138,17 +127,10 @@ impl StreamSpec {
         let finishes = quota_reset_at_ms.is_none()
             && match self.protocol {
                 LineProtocol::AcknowledgedResult => kind == Some("result"),
-                LineProtocol::Result | LineProtocol::ResultWithCost => {
+                LineProtocol::Result => {
                     kind == Some("result") && (!is_error || self.name == "anyagents-agy")
                 }
-                LineProtocol::Done => {
-                    !is_error
-                        && (kind == Some("done")
-                            || kind == Some("session_settled")
-                            || (kind == Some("prompt_result")
-                                && value.get("sessionSettled").and_then(Value::as_bool)
-                                    != Some(false)))
-                }
+                LineProtocol::Done => !is_error && kind == Some("done"),
             };
         LineEffect {
             finishes_turn: finishes,
@@ -163,7 +145,7 @@ impl StreamSpec {
                 .map(str::to_string),
             usage: finishes.then(|| self.usage_of(value)),
             quota_reset_at_ms,
-            text: self.text_of(value, finishes),
+            text: self.text_of(value),
         }
     }
 
@@ -181,34 +163,19 @@ impl StreamSpec {
             cache_write_tokens: number(usage, "cache_write_tokens")
                 .max(number(usage, "cacheWrite"))
                 .max(number(usage, "cache_creation_input_tokens")),
-            reported_cost_micros: match self.protocol {
-                LineProtocol::ResultWithCost => value.get("cost_micros").and_then(Value::as_i64),
-                _ => None,
-            },
+            reported_cost_micros: None,
         }
     }
 
-    /// Only a vendor that streams an answer without a closing result line has
-    /// answer text: a `text` line, or the text on the closing line itself.
-    fn text_of(&self, value: &Value, finishes: bool) -> Option<String> {
-        let kind = value.get("type").and_then(Value::as_str);
-        if self.protocol == LineProtocol::AcknowledgedResult {
-            return (kind == Some("text_delta"))
-                .then(|| value.get("text").or_else(|| value.get("delta")))
-                .flatten()
-                .and_then(Value::as_str)
-                .map(str::to_string);
-        }
-        if self.protocol != LineProtocol::ResultWithCost {
+    /// Answer text: only Spiron streams it, as `text_delta` lines.
+    fn text_of(&self, value: &Value) -> Option<String> {
+        if self.protocol != LineProtocol::AcknowledgedResult {
             return None;
         }
-        if !(finishes || kind == Some("text")) {
-            return None;
-        }
-        value
-            .get("text")
+        (value.get("type").and_then(Value::as_str) == Some("text_delta"))
+            .then(|| value.get("text").or_else(|| value.get("delta")))
+            .flatten()
             .and_then(Value::as_str)
-            .filter(|text| !text.is_empty())
             .map(str::to_string)
     }
 }
@@ -1581,9 +1548,8 @@ fn read_stdout(
         let Ok(mut value) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
-        let raw_text = (spec.protocol == LineProtocol::AcknowledgedResult)
-            .then(|| spec.text_of(&value, false))
-            .flatten();
+        // Answer text is read before masking.
+        let raw_text = spec.text_of(&value);
         anyagents_harness::masking::mask_json_strings(&mut value);
         let mut effect = spec.effect(&value);
         if raw_text.is_some() {

@@ -14,12 +14,6 @@ fn each_catalog_entry_starts_and_resumes_with_its_own_arguments() {
     );
     assert_eq!(agy.resume_args(None), ["--output-format", "stream-json"]);
 
-    let opencode = StreamSpec::for_program("opencode");
-    assert_eq!(
-        opencode.resume_args(Some("s1")),
-        ["serve", "--session", "s1"]
-    );
-
     let omp = StreamSpec::for_program("omp");
     assert_eq!(omp.name, "anyagents-omp");
     assert_eq!(omp.protocol, LineProtocol::Done);
@@ -52,35 +46,31 @@ fn the_closing_line_decides_the_turn_and_carries_its_usage() {
 }
 
 #[test]
-fn a_cost_is_kept_only_where_the_vendor_reports_one() {
+fn no_line_protocol_reports_a_cost_or_answer_text() {
     let result = json!({
         "type": "result",
         "cost_micros": 250_000,
+        "text": "pong",
         "usage": {"input_tokens": 1, "output_tokens": 2, "cache_read_tokens": 3, "cache_write_tokens": 4}
     });
-    let with_cost = StreamSpec::for_program("opencode").effect(&result);
-    let usage = with_cost.usage.expect("usage");
-    assert_eq!(usage.reported_cost_micros, Some(250_000));
-    let without = StreamSpec::for_program("agy").effect(&result);
-    assert_eq!(without.usage.expect("usage").reported_cost_micros, None);
-}
-
-#[test]
-fn answer_text_is_read_only_from_a_streaming_vendor() {
+    let effect = StreamSpec::for_program("agy").effect(&result);
+    assert!(effect.finishes_turn);
+    assert_eq!(effect.usage.expect("usage").reported_cost_micros, None);
+    assert_eq!(effect.text, None);
     let text = json!({"type": "text", "text": "pong"});
-    let opencode = StreamSpec::for_program("opencode").effect(&text);
-    assert!(!opencode.finishes_turn);
-    assert_eq!(opencode.text.as_deref(), Some("pong"));
-    // An empty or absent text is no answer.
-    let empty = StreamSpec::for_program("opencode").effect(&json!({"type": "text", "text": ""}));
-    assert_eq!(empty.text, None);
-    // The result-only harness never takes text.
-    assert_eq!(StreamSpec::for_program("agy").effect(&text).text, None);
+    assert_eq!(StreamSpec::for_program("omp").effect(&text).text, None);
+    // Retired OMP line frames no longer close a turn.
+    for frame in [
+        json!({"type": "session_settled"}),
+        json!({"type": "prompt_result"}),
+    ] {
+        assert!(!StreamSpec::for_program("omp").effect(&frame).finishes_turn);
+    }
 }
 
 #[test]
 fn a_rate_limit_anywhere_is_a_wait_with_its_reset_time() {
-    for program in ["agy", "omp", "opencode"] {
+    for program in ["agy", "omp"] {
         let effect = StreamSpec::for_program(program)
             .effect(&json!({"type": "rate_limit", "resets_at_ms": 1_700_000_000_000i64}));
         assert_eq!(effect.quota_reset_at_ms, Some(1_700_000_000_000));
