@@ -4,7 +4,7 @@
 
 Run any coding agent harness as a long-lived agent on your own machine or server, and let those agents talk to people and to each other. One server installs, signs in and supervises Claude Code, Codex, OpenCode, Gemini CLI and the next harness, gives each agent its own channels, and shows what every agent costs and what its work achieved. Those outcomes are the evidence from which skills, memory and the choice of harness and model are to improve ([ADR 0008](adr/0008-quality-loop.md)).
 
-AnyAgents drives each vendor's own tool. It never re-implements a vendor client and never lifts a subscription credential out of it, because the model works best in the harness it was trained in and the subscription is for that tool.
+AnyAgents is the master: the control plane for every harness, wherever each one runs, whether on this machine, a server, or a remote sandbox per agent. It owns profiles, identity, mailboxes, topology, schedules and the tool layer. Code Mode supplies every tool, including the file system and shell, and AnyAgents adds coordination, memory, skills and web. A vendor harness is the compliant channel to its model: AnyAgents always drives the vendor's own binary, because a subscription is for that tool. It disables the harness's built-in tools in favour of its own, and it never impersonates the vendor's client. See [ADR 0009](adr/0009-product-boundary.md) for where the core ends, which integrations are optional, and what belongs to a deployment.
 
 ## Name and position
 
