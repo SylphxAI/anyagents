@@ -21,10 +21,15 @@ pub struct MemoryServiceArgs {
     /// Cores one query's embedding or rerank may use.
     #[arg(long, global = true, default_value_t = 2)]
     query_threads: usize,
-    /// A pinned embedder other than the default (see `pins.rs`).
+    /// Which embedder and reranker run: a JSON file naming a local pinned
+    /// model or a remote one bound to a profile (default
+    /// `<data>/memory-service/config.json`; without it, the pinned local pair).
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
+    /// A pinned local embedder, overriding the configuration (see `pins.rs`).
     #[arg(long, global = true)]
     embedder: Option<String>,
-    /// A pinned reranker other than the default.
+    /// A pinned local reranker, overriding the configuration.
     #[arg(long, global = true)]
     reranker: Option<String>,
 }
@@ -62,11 +67,21 @@ enum MemoryServiceCommand {
         #[arg(long)]
         out: PathBuf,
     },
-    /// Score BM25, dense, their fusion and the reranked fusion on a sample.
+    /// Score BM25, BM25 reranked, and per embedder dense, fusion and the
+    /// reranked fusion on a sample. Remote candidates use this data
+    /// directory's profiles; the run refuses to start above the plan's budget
+    /// and stops when reported spend reaches it.
     Eval {
         /// A directory written by `eval-sample`.
         #[arg(long)]
         sample: PathBuf,
+        /// A JSON plan: `embedders`, `rerankers`, `max_usd` (default: the
+        /// configured pair, US$5).
+        #[arg(long)]
+        plan: Option<PathBuf>,
+        /// Count what each embedder would read and stop: no model is called.
+        #[arg(long)]
+        estimate: bool,
         /// Evaluate at most this many queries.
         #[arg(long)]
         max_queries: Option<usize>,
@@ -74,22 +89,32 @@ enum MemoryServiceCommand {
 }
 
 fn config(data: &Path, args: &MemoryServiceArgs) -> Result<Config, anyagents_core::Error> {
+    use anyagents_memory::providers::{EmbedderConfig, ProviderConfig, RerankerConfig};
+    let fail =
+        |e: Box<dyn std::error::Error + Send + Sync>| anyagents_core::Error::Message(e.to_string());
     let mut config = Config::new(data);
     if let Some(models) = &args.models {
         config.models = models.clone();
     }
     config.index_threads = args.index_threads.max(1);
     config.query_threads = args.query_threads.max(1);
-    for (name, slot) in [
-        (&args.embedder, &mut config.embedder),
-        (&args.reranker, &mut config.reranker),
-    ] {
-        if let Some(name) = name {
-            *slot = anyagents_memory::pins::by_name(name).ok_or_else(|| {
-                anyagents_core::Error::Message(format!("no pinned model named {name}"))
-            })?;
-        }
+    let path = args
+        .config
+        .clone()
+        .unwrap_or_else(|| ProviderConfig::path(data));
+    config.providers = ProviderConfig::load(&path).map_err(fail)?;
+    if let Some(name) = &args.embedder {
+        config.providers.embedder = EmbedderConfig::Local {
+            model: Some(name.clone()),
+        };
     }
+    if let Some(name) = &args.reranker {
+        config.providers.reranker = RerankerConfig::Local {
+            model: Some(name.clone()),
+        };
+    }
+    // Refuse a pin name that does not exist before any work starts.
+    config.local_pins().map_err(fail)?;
     Ok(config)
 }
 
@@ -99,11 +124,12 @@ pub fn run(data: &Path, args: MemoryServiceArgs) -> Result<(), anyagents_core::E
     let mut config = config(data, &args)?;
     match args.command {
         MemoryServiceCommand::Fetch => {
-            let fetched = anyagents_memory::model::fetch(&config.models, &config.pins())?;
+            let pins = config.local_pins().map_err(fail)?;
+            let fetched = anyagents_memory::model::fetch(&config.models, &pins)?;
             for url in &fetched {
                 println!("fetched {url}");
             }
-            anyagents_memory::model::check(&config.models, &config.pins())?;
+            anyagents_memory::model::check(&config.models, &pins)?;
             println!("verified under {}", config.models.display());
             Ok(())
         }
@@ -155,10 +181,30 @@ pub fn run(data: &Path, args: MemoryServiceArgs) -> Result<(), anyagents_core::E
         }
         MemoryServiceCommand::Eval {
             sample,
+            plan,
+            estimate,
             max_queries,
         } => {
+            let plan: anyagents_memory::eval::Plan = match plan {
+                Some(path) => serde_json::from_slice(&std::fs::read(&path)?).map_err(|e| {
+                    anyagents_core::Error::Message(format!("{}: {e}", path.display()))
+                })?,
+                None => anyagents_memory::eval::Plan {
+                    embedders: vec![config.providers.embedder.clone()],
+                    rerankers: vec![config.providers.reranker.clone()],
+                    ..anyagents_memory::eval::Plan::default()
+                },
+            };
+            if estimate {
+                for (model, tokens) in
+                    anyagents_memory::eval::estimate(&sample, &config, &plan).map_err(fail)?
+                {
+                    println!("{model}\t{tokens} tokens");
+                }
+                return Ok(());
+            }
             let report =
-                anyagents_memory::eval::run(&sample, &config, max_queries).map_err(fail)?;
+                anyagents_memory::eval::run(&sample, &config, &plan, max_queries).map_err(fail)?;
             let text = serde_json::to_string_pretty(&report)
                 .map_err(|e| anyagents_core::Error::Message(e.to_string()))?;
             std::fs::write(sample.join("report.json"), &text)?;

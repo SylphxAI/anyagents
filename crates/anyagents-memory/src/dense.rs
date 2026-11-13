@@ -59,42 +59,60 @@ fn dot(query: &[f32], scale: f32, bytes: &[u8]) -> f32 {
 }
 
 impl DenseIndex {
-    /// Open or create the index for one embedding model. A file built by
-    /// another model, or another dimension, is emptied: its vectors live in
-    /// another space.
-    pub fn open(path: &Path, model: &str, dims: usize) -> rusqlite::Result<Self> {
+    /// Open or create the index of one vector space, named by `space` (a
+    /// `providers::Stamp` key: provider, model, dimension, preprocessing).
+    /// A file built in another space is emptied: its vectors are not
+    /// comparable.
+    pub fn open(path: &Path, space: &str, dims: usize) -> rusqlite::Result<Self> {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
         let conn = Connection::open(path)?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.busy_timeout(std::time::Duration::from_secs(30))?;
         conn.execute_batch(
-            "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA synchronous=NORMAL;
-            CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS documents(
-                document_id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, source TEXT NOT NULL,
-                timestamp_ms INTEGER, raw_sha256 TEXT NOT NULL);
-            CREATE INDEX IF NOT EXISTS documents_owner ON documents(agent_id, source, timestamp_ms);
-            CREATE TABLE IF NOT EXISTS vectors(
-                document_id TEXT NOT NULL REFERENCES documents(document_id) ON DELETE CASCADE,
-                piece INTEGER NOT NULL, offset INTEGER NOT NULL, length INTEGER NOT NULL,
-                sha256 TEXT NOT NULL, text_sha256 TEXT NOT NULL, scale REAL NOT NULL,
-                vec BLOB NOT NULL, PRIMARY KEY(document_id, piece));
-            CREATE INDEX IF NOT EXISTS vectors_content ON vectors(text_sha256);
-            CREATE TABLE IF NOT EXISTS progress(k TEXT PRIMARY KEY, v INTEGER NOT NULL);",
+            "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA synchronous=NORMAL;",
         )?;
-        let identity = format!("{model}:{dims}");
-        let current: Option<String> = conn
-            .query_row("SELECT v FROM meta WHERE k='model'", [], |r| r.get(0))
-            .optional()?;
-        if current.as_deref() != Some(identity.as_str()) {
+        // Workers open the same file at once: creating the schema and
+        // checking the space happen in one write transaction each, taken in
+        // turn, never as a read upgraded to a write (which SQLite refuses
+        // without waiting).
+        conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let prepared = (|| -> rusqlite::Result<()> {
             conn.execute_batch(
-                "DELETE FROM vectors; DELETE FROM documents; DELETE FROM progress;",
+                "CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS documents(
+                    document_id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, source TEXT NOT NULL,
+                    timestamp_ms INTEGER, raw_sha256 TEXT NOT NULL);
+                CREATE INDEX IF NOT EXISTS documents_owner ON documents(agent_id, source, timestamp_ms);
+                CREATE TABLE IF NOT EXISTS vectors(
+                    document_id TEXT NOT NULL REFERENCES documents(document_id) ON DELETE CASCADE,
+                    piece INTEGER NOT NULL, offset INTEGER NOT NULL, length INTEGER NOT NULL,
+                    sha256 TEXT NOT NULL, text_sha256 TEXT NOT NULL, scale REAL NOT NULL,
+                    vec BLOB NOT NULL, PRIMARY KEY(document_id, piece));
+                CREATE INDEX IF NOT EXISTS vectors_content ON vectors(text_sha256);
+                CREATE TABLE IF NOT EXISTS progress(k TEXT PRIMARY KEY, v INTEGER NOT NULL);",
             )?;
-            conn.execute(
-                "INSERT INTO meta VALUES('model', ?1) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
-                [identity],
-            )?;
+            let identity = format!("{space}:{dims}");
+            let current: Option<String> = conn
+                .query_row("SELECT v FROM meta WHERE k='model'", [], |r| r.get(0))
+                .optional()?;
+            if current.as_deref() != Some(identity.as_str()) {
+                conn.execute_batch(
+                    "DELETE FROM vectors; DELETE FROM documents; DELETE FROM progress;",
+                )?;
+                conn.execute(
+                    "INSERT INTO meta VALUES('model', ?1) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                    [identity],
+                )?;
+            }
+            Ok(())
+        })();
+        match prepared {
+            Ok(()) => conn.execute_batch("COMMIT;")?,
+            Err(error) => {
+                let _ = conn.execute_batch("ROLLBACK;");
+                return Err(error);
+            }
         }
         Ok(Self { conn })
     }
@@ -166,6 +184,14 @@ impl DenseIndex {
             params![key, value],
         )?;
         Ok(())
+    }
+
+    /// Every progress mark whose key starts with `prefix`.
+    pub fn progress_with_prefix(&self, prefix: &str) -> rusqlite::Result<Vec<(String, i64)>> {
+        self.conn
+            .prepare("SELECT k, v FROM progress WHERE substr(k, 1, length(?1)) = ?1")?
+            .query_map([prefix], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect()
     }
 
     pub fn progress(&self, key: &str) -> rusqlite::Result<Option<i64>> {

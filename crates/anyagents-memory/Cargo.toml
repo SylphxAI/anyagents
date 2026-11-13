@@ -11,7 +11,7 @@ default = []
 # The service itself: local ONNX inference, the dense index and the offline
 # evaluation. Without it the crate is the protocol, its client and the fusion
 # the kernel uses.
-service = ["dep:ort", "dep:tokenizers", "dep:anyagents-installer", "dep:flate2", "dep:tar", "dep:libc"]
+service = ["dep:ort", "dep:tokenizers", "dep:anyagents-installer", "dep:flate2", "dep:tar", "dep:libc", "dep:ureq"]
 
 [dependencies]
 anyagents-core = { path = "../anyagents-core" }
@@ -26,6 +26,8 @@ libc = { version = "0.2", optional = true }
 # library: no build-time download and no linked copy.
 ort = { version = "=2.0.0-rc.15", default-features = false, features = ["load-dynamic", "std", "api-31"], optional = true }
 tar = { version = "0.4", default-features = false, optional = true }
+# Remote embedding and rerank providers, bound to AnyAgents profiles.
+ureq = { version = "3", optional = true }
 # Oniguruma for the pre-tokenizer regexes: the pure-Rust backend made
 # regex-heavy tokenizers the bottleneck of embedding.
 tokenizers = { version = "0.23", default-features = false, features = ["onig"], optional = true }

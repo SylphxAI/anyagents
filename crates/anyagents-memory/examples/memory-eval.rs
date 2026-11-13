@@ -1,8 +1,10 @@
 //! The evaluation without the full `anyagents` binary, for a developer
 //! machine: `cargo run -p anyagents-memory --features service --release
-//! --example memory-eval -- <sample|fetch|eval> ...`. The same library code
-//! backs `anyagents memory-service eval-sample|fetch|eval`.
-use anyagents_memory::{eval, model, service};
+//! --example memory-eval -- <sample|fetch|estimate|eval> ...`. The same
+//! library code backs `anyagents memory-service eval-sample|fetch|eval`.
+//! `--data` names the data directory whose profiles remote models use;
+//! `--plan` a JSON `eval::Plan` of candidates and budget.
+use anyagents_memory::{eval, model, providers, service};
 use std::path::PathBuf;
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -18,25 +20,42 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if let Some(models) = arg("--models") {
         config.models = models.into();
     }
-    for (flag, slot) in [
-        ("--embedder", &mut config.embedder),
-        ("--reranker", &mut config.reranker),
-    ] {
-        if let Some(name) = arg(flag) {
-            *slot =
-                anyagents_memory::pins::by_name(&name).ok_or(format!("no pinned model {name}"))?;
-        }
+    config.providers = providers::ProviderConfig::load(
+        &arg("--config").map_or_else(|| providers::ProviderConfig::path(&data), PathBuf::from),
+    )?;
+    if let Some(name) = arg("--embedder") {
+        config.providers.embedder = providers::EmbedderConfig::Local { model: Some(name) };
+    }
+    if let Some(name) = arg("--reranker") {
+        config.providers.reranker = providers::RerankerConfig::Local { model: Some(name) };
     }
     if let Some(n) = arg("--threads") {
         config.index_threads = n.parse()?;
         config.query_threads = config.index_threads;
     }
+    // An evaluation plan: the candidates and the budget. Without one, the
+    // configured pair alone.
+    let plan: eval::Plan = match arg("--plan") {
+        Some(path) => serde_json::from_slice(&std::fs::read(path)?)?,
+        None => eval::Plan {
+            embedders: vec![config.providers.embedder.clone()],
+            rerankers: vec![config.providers.reranker.clone()],
+            ..eval::Plan::default()
+        },
+    };
     match args.first().map(String::as_str) {
         Some("fetch") => {
-            for url in model::fetch(&config.models, &config.pins())? {
+            let mut pins = config.local_pins()?;
+            for embedder in &plan.embedders {
+                pins.extend(providers::local_embedder_pin(embedder)?);
+            }
+            for reranker in &plan.rerankers {
+                pins.extend(providers::local_reranker_pin(reranker)?);
+            }
+            for url in model::fetch(&config.models, &pins)? {
                 println!("fetched {url}");
             }
-            model::check(&config.models, &config.pins())?;
+            model::check(&config.models, &pins)?;
         }
         Some("sample") => {
             let agents: Vec<String> = args
@@ -50,12 +69,19 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let stats = eval::build_sample(&data.join("state.db"), &agents, since, &out)?;
             println!("{}", serde_json::to_string_pretty(&stats)?);
         }
+        Some("estimate") => {
+            let sample = PathBuf::from(arg("--sample").ok_or("--sample")?);
+            for (model, tokens) in eval::estimate(&sample, &config, &plan)? {
+                println!("{model}\t{tokens} tokens");
+            }
+        }
         Some("eval") => {
             let sample = PathBuf::from(arg("--sample").ok_or("--sample")?);
             let max = arg("--max-queries").map(|s| s.parse()).transpose()?;
-            let report = eval::run(&sample, &config, max)?;
+            let report = eval::run(&sample, &config, &plan, max)?;
             let text = serde_json::to_string_pretty(&report)?;
-            std::fs::write(sample.join("report.json"), &text)?;
+            let out = arg("--report").map_or_else(|| sample.join("report.json"), PathBuf::from);
+            std::fs::write(out, &text)?;
             println!("{text}");
         }
         Some("serve") => service::serve(config)?,
@@ -85,7 +111,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
         _ => {
             return Err(
-                "usage: memory-eval <fetch|sample|eval|serve|search> [--data DIR] [--models DIR] ..."
+                "usage: memory-eval <fetch|sample|estimate|eval|serve|search> [--data DIR] [--models DIR] [--plan FILE] ..."
                     .into(),
             );
         }

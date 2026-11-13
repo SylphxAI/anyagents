@@ -5,14 +5,18 @@
 //! replies in Telegram to an earlier message, the reply text (without its
 //! quote) is a later message that refers back to an earlier fact, and the
 //! quoted message is the one it refers to. [`run`] indexes the sample with the
-//! production host index (BM25) and the dense pipeline, then scores BM25 alone,
-//! dense alone, their reciprocal-rank fusion, and the fusion reranked by the
-//! cross-encoder (plus BM25 reranked, to separate the two effects).
+//! production host index (BM25) and, for every embedder of a [`Plan`], the
+//! dense pipeline; then it scores BM25 alone, BM25 reranked by each reranker
+//! (no embeddings at all), and per embedder dense alone, its reciprocal-rank
+//! fusion with BM25, and that fusion reranked. Remote models are called
+//! through AnyAgents profiles; the run refuses to start above its budget and
+//! stops when what the providers report spent reaches it.
 use crate::{
     dense::DenseIndex,
     embed::HostCatalog,
     fusion,
-    runtime::{Encoder, Error},
+    providers::{Embedder, EmbedderConfig, Local, Reranker, RerankerConfig, Usage},
+    runtime::Error,
     service, text,
 };
 use anyagents_core::{
@@ -310,15 +314,69 @@ pub struct BuildStats {
     pub model_seconds: f64,
 }
 
-/// Embed the whole sample on `threads` workers, each with its own
-/// single-threaded session: small models use cores best one batch per core.
-fn embed_sample(
-    host_path: &Path,
-    dense_path: &Path,
-    config: &service::Config,
-    environment: &'static ort::environment::Environment,
-) -> Result<BuildStats, Error> {
-    let host = HostCatalog::open(host_path)?;
+/// What one evaluation compares, and what it may spend.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Plan {
+    #[serde(default = "default_embedders")]
+    pub embedders: Vec<EmbedderConfig>,
+    #[serde(default = "default_rerankers")]
+    pub rerankers: Vec<RerankerConfig>,
+    /// US$: the run refuses to start when its estimate is higher, and stops
+    /// when the spend providers report reaches it.
+    #[serde(default = "default_max_usd")]
+    pub max_usd: f64,
+    /// Characters of a passage a remote reranker reads.
+    #[serde(default = "default_rerank_chars")]
+    pub rerank_chars: usize,
+}
+fn default_embedders() -> Vec<EmbedderConfig> {
+    vec![EmbedderConfig::default()]
+}
+fn default_rerankers() -> Vec<RerankerConfig> {
+    vec![RerankerConfig::default()]
+}
+fn default_max_usd() -> f64 {
+    5.0
+}
+fn default_rerank_chars() -> usize {
+    1500
+}
+impl Default for Plan {
+    fn default() -> Self {
+        Self {
+            embedders: default_embedders(),
+            rerankers: default_rerankers(),
+            max_usd: default_max_usd(),
+            rerank_chars: default_rerank_chars(),
+        }
+    }
+}
+
+/// Spend shared by every remote call of a run.
+struct Budget {
+    max_usd: f64,
+    spent: std::sync::Mutex<f64>,
+}
+impl Budget {
+    fn charge(&self, usd: f64) -> Result<(), Error> {
+        let mut spent = self.spent.lock().map_err(|_| "budget poisoned")?;
+        *spent += usd;
+        if *spent > self.max_usd {
+            return Err(format!(
+                "evaluation stopped: providers report US${:.4} spent, over its US${:.2} budget",
+                *spent, self.max_usd
+            )
+            .into());
+        }
+        Ok(())
+    }
+    fn spent(&self) -> f64 {
+        self.spent.lock().map_or(0.0, |s| *s)
+    }
+}
+
+fn all_documents(host: &HostCatalog) -> Result<Vec<crate::embed::HostDocument>, Error> {
     let mut documents = Vec::new();
     let mut cursor = 0;
     loop {
@@ -327,31 +385,51 @@ fn embed_sample(
         cursor = last.rowid;
         documents.extend(batch);
     }
+    Ok(documents)
+}
+
+/// Embed the whole sample into `dense_path` on `threads` workers. An index
+/// left by an interrupted run is resumed: documents already embedded at
+/// their digest are skipped.
+fn embed_sample(
+    host_path: &Path,
+    dense_path: &Path,
+    load: &(dyn Fn() -> Result<Embedder, Error> + Sync),
+    threads: usize,
+    budget: &Budget,
+) -> Result<(BuildStats, Usage), Error> {
+    let host = HostCatalog::open(host_path)?;
+    let documents = all_documents(&host)?;
     let raw_bytes = documents.iter().map(|d| d.raw.length).sum();
-    // Create the index (and its model identity) once before the workers.
+    let queue = std::sync::Mutex::new(documents.chunks(64).collect::<Vec<_>>().into_iter());
+    // Create the index and its space once, before the workers open it.
+    let stamp = load()?.stamp();
     drop(DenseIndex::open(
         dense_path,
-        config.embedder.name,
-        config.embedder.dims,
+        &stamp.key(),
+        stamp.dimensions,
     )?);
-    let queue = std::sync::Mutex::new(documents.chunks(64).collect::<Vec<_>>().into_iter());
     let started = Instant::now();
-    let totals = std::sync::Mutex::new(crate::embed::Embedded::default());
+    let totals = std::sync::Mutex::new((crate::embed::Embedded::default(), Usage::default()));
     std::thread::scope(|scope| -> Result<(), Error> {
-        let workers: Vec<_> = (0..config.index_threads.max(1))
+        let workers: Vec<_> = (0..threads.max(1))
             .map(|_| {
                 scope.spawn(|| -> Result<(), Error> {
-                    let mut encoder =
-                        Encoder::load(environment, &config.models, &config.embedder, 1)?;
-                    let mut dense =
-                        DenseIndex::open(dense_path, config.embedder.name, config.embedder.dims)?;
+                    let mut encoder = load()?;
+                    let stamp = encoder.stamp();
+                    let mut dense = DenseIndex::open(dense_path, &stamp.key(), stamp.dimensions)?;
                     loop {
                         let next = queue.lock().map_err(|_| "queue poisoned")?.next();
-                        let Some(batch) = next else { return Ok(()) };
+                        let Some(batch) = next else { break };
+                        let before = encoder.usage();
                         let done =
                             crate::embed::embed_documents(&mut encoder, &mut dense, batch, "eval")?;
-                        *totals.lock().map_err(|_| "totals poisoned")? += done;
+                        let spent = encoder.usage().usd - before.usd;
+                        totals.lock().map_err(|_| "totals poisoned")?.0 += done;
+                        budget.charge(spent)?;
                     }
+                    totals.lock().map_err(|_| "totals poisoned")?.1 += encoder.usage();
+                    Ok(())
                 })
             })
             .collect();
@@ -360,20 +438,23 @@ fn embed_sample(
         }
         Ok(())
     })?;
-    let done = totals.into_inner().map_err(|_| "totals poisoned")?;
-    Ok(BuildStats {
-        documents: done.documents,
-        pieces: done.pieces,
-        reused_pieces: done.reused,
-        tokens: done.tokens,
-        seconds: started.elapsed().as_secs_f64(),
-        raw_bytes,
-        dense_bytes: fs::metadata(dense_path).map(|m| m.len()).unwrap_or(0),
-        host_index_bytes: fs::metadata(host_path).map(|m| m.len()).unwrap_or(0),
-        threads: config.index_threads.max(1),
-        prepare_seconds: done.prepare_ms as f64 / 1e3,
-        model_seconds: done.model_ms as f64 / 1e3,
-    })
+    let (done, usage) = totals.into_inner().map_err(|_| "totals poisoned")?;
+    Ok((
+        BuildStats {
+            documents: done.documents,
+            pieces: done.pieces,
+            reused_pieces: done.reused,
+            tokens: done.tokens,
+            seconds: started.elapsed().as_secs_f64(),
+            raw_bytes,
+            dense_bytes: fs::metadata(dense_path).map(|m| m.len()).unwrap_or(0),
+            host_index_bytes: fs::metadata(host_path).map(|m| m.len()).unwrap_or(0),
+            threads: threads.max(1),
+            prepare_seconds: done.prepare_ms as f64 / 1e3,
+            model_seconds: done.model_ms as f64 / 1e3,
+        },
+        usage,
+    ))
 }
 
 /// Rank metrics of one method.
@@ -441,12 +522,36 @@ impl Tally {
     }
 }
 
+/// One embedder of a run.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct EmbedderRun {
+    pub name: String,
+    pub space: String,
+    /// Tokens of the sample's pieces, counted before any call.
+    pub estimated_tokens: u64,
+    pub build: BuildStats,
+    /// What building and the queries cost, as providers reported it.
+    pub usage: Usage,
+}
+
+/// One reranker of a run.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct RerankerRun {
+    pub name: String,
+    pub usage: Usage,
+    /// Mean seconds to score one query's passages.
+    pub mean_seconds: f64,
+}
+
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct Report {
-    pub embedder: String,
-    pub reranker: String,
-    pub build: BuildStats,
+    pub embedders: Vec<EmbedderRun>,
+    pub rerankers: Vec<RerankerRun>,
+    /// US$ the providers reported for the whole run.
+    pub spent_usd: f64,
     /// method -> language bucket (`all`, `yue`, `zh`, `en`) -> metrics.
+    /// Methods: `bm25`, `bm25+rerank[R]`, `dense[E]`, `hybrid[E]`,
+    /// `hybrid[E]+rerank[R]`.
     pub methods: BTreeMap<String, BTreeMap<String, Metrics>>,
 }
 
@@ -455,42 +560,193 @@ const CANDIDATES: usize = 50;
 /// Candidates the cross-encoder rescores, as the server does.
 const RERANK_DEPTH: usize = 20;
 
-pub fn run(
+/// A short name for a model in method names.
+fn label(name: &str) -> String {
+    name.rsplit('/').next().unwrap_or(name).to_owned()
+}
+
+/// Count what a run would embed with each embedder of `plan`, without any
+/// remote call: the sample's pieces as each embedder cuts them. Remote
+/// embedders are cut with their approximate counter, so no profile is read.
+pub fn estimate(
     sample: &Path,
     config: &service::Config,
-    max_queries: Option<usize>,
-) -> Result<Report, Error> {
-    let [embed_pin, rerank_pin] = config.pins();
-    crate::model::check(&config.models, &[embed_pin, rerank_pin])?;
-    let runtime = crate::model::runtime_pin().ok_or("no pinned ONNX Runtime for this platform")?;
-    let environment = crate::runtime::init(&config.models, &runtime)?;
-    let mut embedder = Encoder::load(
-        environment,
-        &config.models,
-        &embed_pin,
-        config.index_threads,
-    )?;
-    let mut reranker = Encoder::load(
-        environment,
-        &config.models,
-        &rerank_pin,
-        config.query_threads,
-    )?;
+    plan: &Plan,
+) -> Result<Vec<(String, u64)>, Error> {
     let work = sample.join("work");
     fs::create_dir_all(&work)?;
     let host_path = index_sample(sample, &work)?;
-    let dense_path = work.join(format!("dense-{}.db", embed_pin.name));
-    let build = embed_sample(&host_path, &dense_path, config, environment)?;
-    let host = HostIndex::open(&host_path)?;
-    let dense = DenseIndex::open(&dense_path, embed_pin.name, embed_pin.dims)?;
+    let documents = all_documents(&HostCatalog::open(&host_path)?)?;
+    let environment = plan_runtime(config, plan)?;
+    let mut out = Vec::new();
+    for embedder in &plan.embedders {
+        let (name, counter) = match embedder {
+            EmbedderConfig::OpenAi(remote) => {
+                let mut offline = (**remote).clone();
+                offline.dimensions = Some(offline.dimensions.unwrap_or(1));
+                let counter = Embedder::remote(offline, crate::providers::Endpoint::offline())?;
+                (remote.model.clone(), counter)
+            }
+            local => {
+                let local_runtime = environment.map(|environment| Local {
+                    environment,
+                    models: &config.models,
+                    threads: 1,
+                });
+                let loaded = Embedder::load(local, &config.data_dir, local_runtime.as_ref())?;
+                (loaded.stamp().model, loaded)
+            }
+        };
+        let mut tokens = 0u64;
+        for document in &documents {
+            if let Ok(raw) = read_raw(&document.raw) {
+                tokens += counter
+                    .chunks_of(&raw)?
+                    .iter()
+                    .map(|c| c.tokens as u64)
+                    .sum::<u64>();
+            }
+        }
+        out.push((name, tokens));
+    }
+    Ok(out)
+}
 
+/// The ONNX runtime, when the plan runs any local model.
+fn plan_runtime(
+    config: &service::Config,
+    plan: &Plan,
+) -> Result<Option<&'static ort::environment::Environment>, Error> {
+    let mut pins = Vec::new();
+    for embedder in &plan.embedders {
+        pins.extend(crate::providers::local_embedder_pin(embedder)?);
+    }
+    for reranker in &plan.rerankers {
+        pins.extend(crate::providers::local_reranker_pin(reranker)?);
+    }
+    if pins.is_empty() {
+        return Ok(None);
+    }
+    crate::model::check(&config.models, &pins)?;
+    let runtime = crate::model::runtime_pin().ok_or("no pinned ONNX Runtime for this platform")?;
+    Ok(Some(crate::runtime::init(&config.models, &runtime)?))
+}
+
+/// Run `plan` on `sample`. Profiles are read from `config.data_dir`.
+pub fn run(
+    sample: &Path,
+    config: &service::Config,
+    plan: &Plan,
+    max_queries: Option<usize>,
+) -> Result<Report, Error> {
+    let budget = Budget {
+        max_usd: plan.max_usd,
+        spent: std::sync::Mutex::new(0.0),
+    };
+    let environment = plan_runtime(config, plan)?;
+    let local = |threads: usize| {
+        environment.map(|environment| Local {
+            environment,
+            models: &config.models,
+            threads,
+        })
+    };
+    let work = sample.join("work");
+    fs::create_dir_all(&work)?;
+    let host_path = index_sample(sample, &work)?;
     let queries: Vec<Query> = fs::read_to_string(sample.join("queries.jsonl"))?
         .lines()
         .filter(|l| !l.trim().is_empty())
         .map(serde_json::from_str)
         .collect::<Result<_, _>>()?;
+    let queries: Vec<Query> = queries
+        .into_iter()
+        .take(max_queries.unwrap_or(usize::MAX))
+        .collect();
+    let estimates = estimate(sample, config, plan)?;
+
+    // Build every embedder's index, then embed every query with it.
+    struct Space {
+        name: String,
+        dense: DenseIndex,
+        vectors: Vec<Vec<f32>>,
+        query_ms: f64,
+    }
+    let mut report = Report::default();
+    let mut spaces: Vec<Space> = Vec::new();
+    for (embedder_config, (_, estimated_tokens)) in plan.embedders.iter().zip(&estimates) {
+        let threads = match embedder_config {
+            EmbedderConfig::Local { .. } => config.index_threads,
+            EmbedderConfig::OpenAi(_) => 2,
+        };
+        let load = || Embedder::load(embedder_config, &config.data_dir, local(1).as_ref());
+        let mut query_embedder = Embedder::load(
+            embedder_config,
+            &config.data_dir,
+            local(config.query_threads).as_ref(),
+        )?;
+        let stamp = query_embedder.stamp();
+        let dense_path = work.join(format!("dense-{}.db", stamp.digest()));
+        let (build, mut usage) = embed_sample(&host_path, &dense_path, &load, threads, &budget)?;
+        let started = Instant::now();
+        let texts: Vec<&str> = queries.iter().map(|q| q.query.as_str()).collect();
+        let mut vectors = Vec::with_capacity(texts.len());
+        for batch in texts.chunks(64) {
+            let before = query_embedder.usage().usd;
+            vectors.extend(query_embedder.embed_queries(batch)?);
+            budget.charge(query_embedder.usage().usd - before)?;
+        }
+        let query_ms = started.elapsed().as_secs_f64() * 1e3 / texts.len().max(1) as f64;
+        usage += query_embedder.usage();
+        // Two candidates of one model (another width or prefix) are two
+        // spaces: never merge their tallies.
+        let mut name = label(&stamp.model);
+        if spaces.iter().any(|s| s.name == name) {
+            name = format!("{name}~{}", &stamp.digest()[..6]);
+        }
+        report.embedders.push(EmbedderRun {
+            name: stamp.model.clone(),
+            space: stamp.key(),
+            estimated_tokens: *estimated_tokens,
+            build,
+            usage,
+        });
+        spaces.push(Space {
+            name,
+            dense: DenseIndex::open(&dense_path, &stamp.key(), stamp.dimensions)?,
+            vectors,
+            query_ms,
+        });
+    }
+    let mut rerankers: Vec<(String, Reranker, bool, f64)> = Vec::new();
+    for reranker_config in &plan.rerankers {
+        let reranker = Reranker::load(
+            reranker_config,
+            &config.data_dir,
+            local(config.query_threads).as_ref(),
+        )?;
+        let remote = matches!(reranker_config, RerankerConfig::Rerank(_));
+        let mut name = match reranker_config {
+            RerankerConfig::Rerank(r) => label(&r.model),
+            _ => label(&reranker.name()),
+        };
+        if rerankers.iter().any(|(n, ..)| *n == name) {
+            name = format!("{name}#{}", rerankers.len() + 1);
+        }
+        rerankers.push((name, reranker, remote, 0.0));
+    }
+
+    let host = HostIndex::open(&host_path)?;
     let mut tallies: BTreeMap<(String, String), Tally> = BTreeMap::new();
-    for query in queries.iter().take(max_queries.unwrap_or(usize::MAX)) {
+    let mut tally = |method: String, query: &Query, ranked: &[String], ms: f64| {
+        for bucket in ["all", query.language.as_str()] {
+            tallies
+                .entry((method.clone(), bucket.to_owned()))
+                .or_default()
+                .add(ranked, &query.relevant, ms);
+        }
+    };
+    for (q, query) in queries.iter().enumerate() {
         let owners = [query.agent.clone()];
         let started = Instant::now();
         let lexical = host.search(
@@ -504,95 +760,132 @@ pub fn run(
             },
         )?;
         let bm25_ms = started.elapsed().as_secs_f64() * 1e3;
-        let started = Instant::now();
-        let vector = embedder.embed_queries(&[query.query.as_str()])?.remove(0);
-        let dense_hits = dense.search(
-            &vector,
-            &owners,
-            None,
-            None,
-            Some(query.until_ms),
-            CANDIDATES,
-        )?;
-        let dense_ms = started.elapsed().as_secs_f64() * 1e3;
-
         let bm25_ids: Vec<String> = lexical.iter().map(|h| h.id.clone()).collect();
-        let dense_ids: Vec<String> = dense_hits.iter().map(|h| h.document_id.clone()).collect();
-        let hybrid: Vec<String> =
-            fusion::reciprocal_rank(&[bm25_ids.clone(), dense_ids.clone()], fusion::K)
-                .into_iter()
-                .map(|(id, _)| id)
-                .collect();
-
         // The passage a reranker reads is the cited raw range: the matching
         // window of a lexical hit, the matching piece of a dense hit.
         let mut passages: HashMap<String, String> = HashMap::new();
         for hit in &lexical {
             passages.insert(hit.id.clone(), text::readable(&read_raw(&hit.window)?));
         }
-        for hit in &dense_hits {
-            if passages.contains_key(&hit.document_id) {
-                continue;
-            }
-            let Some(document) =
-                host.document(&owners, MemoryScope::Transcripts, &hit.document_id)?
-            else {
-                continue;
-            };
-            let piece = RawCoordinate {
-                segment: document.raw.segment.clone(),
-                offset: hit.offset,
-                length: hit.length,
-                sha256: hit.sha256.clone(),
-                seq: document.raw.seq,
-            };
-            passages.insert(hit.document_id.clone(), text::readable(&read_raw(&piece)?));
-        }
-        let mut rerank = |ids: &[String]| -> Result<(Vec<String>, f64), Error> {
+        let mut lists: Vec<(String, Vec<String>, f64)> = Vec::new();
+        for space in &spaces {
             let started = Instant::now();
-            let head: Vec<&String> = ids.iter().take(RERANK_DEPTH).collect();
-            let texts: Vec<&str> = head
-                .iter()
-                .map(|id| passages.get(*id).map_or("", String::as_str))
-                .collect();
-            let mut scores = Vec::with_capacity(texts.len());
-            for batch in texts.chunks(8) {
-                scores.extend(reranker.score(&query.query, batch)?);
+            let dense_hits = space.dense.search(
+                &space.vectors[q],
+                &owners,
+                None,
+                None,
+                Some(query.until_ms),
+                CANDIDATES,
+            )?;
+            let dense_ms = started.elapsed().as_secs_f64() * 1e3 + space.query_ms;
+            for hit in &dense_hits {
+                if passages.contains_key(&hit.document_id) {
+                    continue;
+                }
+                let Some(document) =
+                    host.document(&owners, MemoryScope::Transcripts, &hit.document_id)?
+                else {
+                    continue;
+                };
+                let piece = RawCoordinate {
+                    segment: document.raw.segment.clone(),
+                    offset: hit.offset,
+                    length: hit.length,
+                    sha256: hit.sha256.clone(),
+                    seq: document.raw.seq,
+                };
+                passages.insert(hit.document_id.clone(), text::readable(&read_raw(&piece)?));
             }
-            let mut order: Vec<(f32, usize)> = scores.into_iter().zip(0..).collect();
-            order.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
-            let mut ranked: Vec<String> = order.into_iter().map(|(_, i)| head[i].clone()).collect();
-            ranked.extend(ids.iter().skip(RERANK_DEPTH).cloned());
-            Ok((ranked, started.elapsed().as_secs_f64() * 1e3))
-        };
-        let (hybrid_reranked, hybrid_rerank_ms) = rerank(&hybrid)?;
-        let (bm25_reranked, bm25_rerank_ms) = rerank(&bm25_ids)?;
-
-        for (method, ranked, ms) in [
-            ("bm25", &bm25_ids, bm25_ms),
-            ("dense", &dense_ids, dense_ms),
-            ("hybrid", &hybrid, bm25_ms + dense_ms),
-            ("bm25+rerank", &bm25_reranked, bm25_ms + bm25_rerank_ms),
-            (
-                "hybrid+rerank",
-                &hybrid_reranked,
-                bm25_ms + dense_ms + hybrid_rerank_ms,
-            ),
-        ] {
-            for bucket in ["all", query.language.as_str()] {
-                tallies
-                    .entry((method.to_owned(), bucket.to_owned()))
-                    .or_default()
-                    .add(ranked, &query.relevant, ms);
+            let dense_ids: Vec<String> = dense_hits.iter().map(|h| h.document_id.clone()).collect();
+            let hybrid: Vec<String> =
+                fusion::reciprocal_rank(&[bm25_ids.clone(), dense_ids.clone()], fusion::K)
+                    .into_iter()
+                    .map(|(id, _)| id)
+                    .collect();
+            tally(
+                format!("dense[{}]", space.name),
+                query,
+                &dense_ids,
+                dense_ms,
+            );
+            tally(
+                format!("hybrid[{}]", space.name),
+                query,
+                &hybrid,
+                bm25_ms + dense_ms,
+            );
+            lists.push((space.name.clone(), hybrid, bm25_ms + dense_ms));
+        }
+        tally("bm25".into(), query, &bm25_ids, bm25_ms);
+        // A cross-encoder scores each (query, passage) pair on its own, so
+        // every list's head is scored in one pass over their union.
+        let mut union: Vec<String> = Vec::new();
+        for id in bm25_ids.iter().take(RERANK_DEPTH).chain(
+            lists
+                .iter()
+                .flat_map(|(_, l, _)| l.iter().take(RERANK_DEPTH)),
+        ) {
+            if !union.contains(id) {
+                union.push(id.clone());
+            }
+        }
+        for (name, reranker, remote, seconds) in &mut rerankers {
+            let texts: Vec<String> = union
+                .iter()
+                .map(|id| {
+                    let text = passages.get(id).map_or("", String::as_str);
+                    if *remote {
+                        text.chars().take(plan.rerank_chars).collect()
+                    } else {
+                        text.to_owned()
+                    }
+                })
+                .collect();
+            let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+            let started = Instant::now();
+            let before = reranker.usage().usd;
+            let scores = reranker.score(&query.query, &refs)?;
+            budget.charge(reranker.usage().usd - before)?;
+            let rerank_ms = started.elapsed().as_secs_f64() * 1e3;
+            *seconds += rerank_ms / 1e3;
+            let score_of: HashMap<&String, f32> = union.iter().zip(scores).collect();
+            let rerank = |ids: &[String]| -> Vec<String> {
+                let mut head: Vec<(usize, &String)> =
+                    ids.iter().take(RERANK_DEPTH).enumerate().collect();
+                head.sort_by(|a, b| {
+                    let sa = score_of.get(a.1).copied().unwrap_or(f32::MIN);
+                    let sb = score_of.get(b.1).copied().unwrap_or(f32::MIN);
+                    sb.total_cmp(&sa).then(a.0.cmp(&b.0))
+                });
+                let mut ranked: Vec<String> = head.into_iter().map(|(_, id)| id.clone()).collect();
+                ranked.extend(ids.iter().skip(RERANK_DEPTH).cloned());
+                ranked
+            };
+            tally(
+                format!("bm25+rerank[{name}]"),
+                query,
+                &rerank(&bm25_ids),
+                bm25_ms + rerank_ms,
+            );
+            for (space, hybrid, ms) in &lists {
+                tally(
+                    format!("hybrid[{space}]+rerank[{name}]"),
+                    query,
+                    &rerank(hybrid),
+                    ms + rerank_ms,
+                );
             }
         }
     }
-    let mut report = Report {
-        embedder: embed_pin.name.into(),
-        reranker: rerank_pin.name.into(),
-        build,
-        methods: BTreeMap::new(),
-    };
+    for (name, reranker, _, seconds) in &rerankers {
+        report.rerankers.push(RerankerRun {
+            name: name.clone(),
+            usage: reranker.usage(),
+            mean_seconds: seconds / queries.len().max(1) as f64,
+        });
+    }
+    report.spent_usd = budget.spent();
     for ((method, bucket), tally) in tallies {
         report
             .methods

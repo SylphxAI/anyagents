@@ -3,8 +3,9 @@
 //! that fit the model, and embed each piece once.
 use crate::{
     dense::{DenseIndex, Document, Piece, quantize},
-    runtime::{Encoder, Error},
-    text::{Span, project},
+    providers::Embedder,
+    runtime::Error,
+    text::Span,
 };
 use anyagents_core::raw_segment::{RawCoordinate, read_raw};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
@@ -14,8 +15,6 @@ use std::path::{Path, PathBuf};
 /// A document is embedded up to this many pieces; the rest of a very large
 /// event (a long log or file dump) stays reachable through lexical search.
 pub const MAX_PIECES: usize = 16;
-/// Tokens kept free for special tokens and the passage prefix.
-const RESERVED_TOKENS: usize = 16;
 
 fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
@@ -116,6 +115,16 @@ impl HostCatalog {
         stripe: Stripe,
     ) -> rusqlite::Result<Vec<HostDocument>> {
         self.rows("rowid<?1 ORDER BY rowid DESC", rowid, limit, stripe)
+    }
+
+    /// Up to `n` documents chosen uniformly at random, to estimate from.
+    pub fn sample(&self, n: usize) -> rusqlite::Result<Vec<HostDocument>> {
+        self.rows(
+            "rowid IN (SELECT rowid FROM host_documents ORDER BY random() LIMIT ?1)",
+            n as i64,
+            n,
+            Stripe::ALL,
+        )
     }
 
     pub fn max_rowid(&self) -> rusqlite::Result<i64> {
@@ -225,25 +234,6 @@ pub fn chunk(
     Ok(chunks)
 }
 
-/// The pieces of one raw event as the embedder will read them.
-pub fn chunks_of(encoder: &Encoder, raw: &[u8]) -> Result<Vec<Chunk>, Error> {
-    let spans = project(raw);
-    let tokenizer = encoder.counter();
-    let budget = encoder
-        .pin()
-        .max_tokens
-        .saturating_sub(RESERVED_TOKENS)
-        .max(16);
-    let mut count = |text: &str| -> Result<Vec<(usize, usize)>, Error> {
-        Ok(tokenizer
-            .encode(text, false)
-            .map_err(|e| e.to_string())?
-            .get_offsets()
-            .to_vec())
-    };
-    chunk(&spans, &mut count, budget, MAX_PIECES)
-}
-
 /// What embedding a batch of documents did.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Embedded {
@@ -252,7 +242,7 @@ pub struct Embedded {
     pub pieces: usize,
     /// Pieces whose vector came from identical text already embedded.
     pub reused: usize,
-    /// Tokens the model read.
+    /// Tokens the model read (approximate for a remote model).
     pub tokens: usize,
     /// Time spent reading and cutting text, and in the model.
     pub prepare_ms: u64,
@@ -270,17 +260,14 @@ impl std::ops::AddAssign for Embedded {
     }
 }
 
-/// Pieces one model run reads together. Pieces are sorted by length first,
-/// so a batch pads little.
-const MODEL_BATCH: usize = 16;
-
 /// Embed `documents` and store each with its rowid as the `progress` mark,
 /// in order, so a restart resumes after the last one stored. A document the
 /// index already holds at this raw digest is only marked; one whose bytes no
 /// longer match its coordinate is skipped (the host index republishes it).
-/// The uncached pieces of the whole batch go through the model together.
+/// The uncached pieces of the whole batch go through the model together,
+/// sorted by length so a local batch pads little.
 pub fn embed_documents(
-    encoder: &mut Encoder,
+    encoder: &mut Embedder,
     dense: &mut DenseIndex,
     documents: &[HostDocument],
     progress: &str,
@@ -300,7 +287,7 @@ pub fn embed_documents(
             continue;
         };
         let mut pieces = Vec::new();
-        for (i, chunk) in chunks_of(encoder, &raw)?.into_iter().enumerate() {
+        for (i, chunk) in encoder.chunks_of(&raw)?.into_iter().enumerate() {
             let text_sha256 = sha256(chunk.text.as_bytes());
             let (scale, vector) = match dense.cached(&text_sha256)? {
                 Some(cached) => {
@@ -338,7 +325,7 @@ pub fn embed_documents(
     stats.prepare_ms = prepare.elapsed().as_millis() as u64;
     let model = std::time::Instant::now();
     let mut vectors: Vec<(f32, Vec<u8>)> = Vec::with_capacity(unique.len());
-    for batch in unique.chunks(MODEL_BATCH) {
+    for batch in unique.chunks(encoder.batch()) {
         let texts: Vec<&str> = batch.iter().map(|(t, _)| t.as_str()).collect();
         stats.tokens += batch.iter().map(|(_, n)| n).sum::<usize>();
         for vector in encoder.embed_passages(&texts)? {

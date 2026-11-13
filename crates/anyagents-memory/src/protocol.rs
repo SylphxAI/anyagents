@@ -65,6 +65,34 @@ pub struct Status {
     pub embedded_documents: u64,
     pub pending_documents: u64,
     pub vectors: u64,
+    /// The vector space the dense index holds: provider, model, dimension
+    /// and preprocessing.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub dense_space: String,
+    /// What building this space was estimated to read and cost before it
+    /// started, and where it stands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rebuild: Option<Rebuild>,
+    /// US$ spent by remote models since the service started.
+    #[serde(default)]
+    pub spent_usd: f64,
+}
+
+/// The estimate a new vector space reports before any of it is embedded.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct Rebuild {
+    pub documents: u64,
+    /// Documents read to estimate, and the tokens they extrapolate to.
+    pub sampled_documents: u64,
+    pub estimated_tokens: u64,
+    /// `None` when the model's price is not known.
+    pub estimated_usd: Option<f64>,
+    /// The cap the estimate was compared with.
+    pub max_usd: f64,
+    /// `running`, `done`, or why it waits.
+    pub state: String,
+    /// US$ the rebuild has spent so far.
+    pub spent_usd: f64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
