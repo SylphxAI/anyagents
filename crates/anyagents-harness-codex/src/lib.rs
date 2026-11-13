@@ -3,11 +3,14 @@
 //!
 //! Startup sends `initialize` (whose `userAgent` names the peer's version),
 //! `initialized`, then `thread/start`, or `thread/resume` when a session id is
-//! already known. Before anything is written into a resumed thread, its
-//! newest turns are read (`thread/items/list`): a message an earlier process
-//! already applied is answered `Duplicate` and never written again. Only these
-//! handshake calls (and `cancel`) wait for an answer, and only for a bounded
-//! time; delivery never waits.
+//! already known. A resume that fails starts a new thread only when Codex says
+//! the thread certainly does not exist (`no rollout found for thread id`, or an
+//! id that is not a thread id); any other failure fails the start, so a
+//! conversation is never dropped in silence. Before anything is written into
+//! a resumed thread, its newest turns are read (`thread/items/list`): a
+//! message an earlier process already applied is answered `Duplicate` and
+//! never written again. Only these handshake calls (and `cancel`) wait for an
+//! answer, and only for a bounded time; delivery never waits.
 //!
 //! Delivery is `next-step`. A message carries its mailbox id as
 //! `clientUserMessageId` and on the first line of its text
@@ -17,11 +20,14 @@
 //! item (`item/started`, `item/completed`) that carries our id as `clientId`
 //! when the input enters the conversation; only then is the message
 //! `Accepted`. A message is written once per process:
-//! - a refusal (`-32600`: no active turn, another turn, a turn that cannot be
-//!   steered, a draining server) certainly did not apply it: it is forgotten
-//!   and offered again once the turn changes;
+//! - a refusal the turn clears (`-32600`: no active turn, another turn, a turn
+//!   that cannot be steered, a draining server) certainly did not apply it: it
+//!   is forgotten and offered again once the turn changes, which the turn's
+//!   own events announce;
+//! - a refusal no retry clears (`-32602`: input too long or invalid; `-32600`
+//!   on `turn/start` for a request Codex finds invalid) is answered `Rejected`
+//!   on this and every later offer: the loop parks it and tells its sender;
 //! - a quota error forgets it and reports the reset time;
-//! - `-32602` (input too long) refuses that message for good;
 //! - any other error leaves its fate unknown, and so does a turn that ends
 //!   without a proof for input written into it (a steer can race the turn's
 //!   last step into history without an item event; an interrupt drops pending
@@ -33,6 +39,11 @@
 //! completes finishes the messages it consumed. A failed turn surfaces its
 //! error as a fault at once and is never re-sent: the supervisor restarts the
 //! process and sends a recovery note. `cancel` sends `turn/interrupt`.
+//!
+//! The process counts as gone only once its output reached its end, so every
+//! proof it printed is read first: a write that fails forgets that write, and
+//! stopping the process kills it and reads the rest of its output. What it
+//! proved stays answerable (`proven`) after it is gone.
 //!
 //! Token counts come from `thread/tokenUsage/updated`, one usage per completed
 //! turn. This vendor reports no currency amount, so the cost stays empty. A
@@ -50,7 +61,7 @@ use std::time::{Duration, Instant};
 
 use anyagents_harness::{
     DeliverOutcome, Delivery, DeliveryLevel, Harness, HarnessError, HarnessHealth, OutboundMessage,
-    TurnState, TurnUsage, compose_message, message_id_in_text,
+    Proof, TurnState, TurnUsage, compose_message, message_id_in_text,
 };
 use serde_json::{Value, json};
 
@@ -77,7 +88,9 @@ const SETTLE_TURNS: usize = 2;
 pub const DELIVERY: Delivery = Delivery {
     level: DeliveryLevel::NextStep,
     idempotent: true,
-    proof: std::borrow::Cow::Borrowed("userMessage item carrying our clientId; thread/items/list history"),
+    proof: std::borrow::Cow::Borrowed(
+        "userMessage item carrying our clientId; thread/items/list history",
+    ),
     peer: None,
 };
 
@@ -110,10 +123,11 @@ struct State {
     /// The running turn refused a steer it will refuse again (a review or
     /// compact turn): nothing more is written into it.
     unsteerable: Option<String>,
-    /// The vendor refused a `turn/start`: none is written until a turn event.
-    start_held: bool,
     /// The server is shutting down and takes no more input.
     draining: bool,
+    /// The process cannot take input at all (its thread is gone, or it lacks
+    /// `turn/start`): only a new process can.
+    broken: Option<String>,
 
     /// Messages written and not yet proved, refused or settled.
     inflight: HashMap<String, Custody>,
@@ -123,7 +137,8 @@ struct State {
     members: HashMap<String, Vec<String>>,
     /// Consumed into a turn that completed.
     finished: HashSet<String>,
-    /// Refused for good.
+    /// Refused for good, with the vendor's reason. Valid after the process
+    /// exits: the same message is refused again.
     rejected: HashMap<String, String>,
     /// Found in a resumed thread's history: an earlier process applied them.
     applied_before: HashSet<String>,
@@ -219,6 +234,9 @@ enum Answer {
     Refused(Refusal),
     /// Certainly not applied, and never will be.
     Rejected(String),
+    /// Certainly not applied, and this process can apply nothing: a new one
+    /// must.
+    Broken(String),
     Quota(i64),
     /// It may or may not have been applied.
     Unknown,
@@ -233,12 +251,14 @@ enum Refusal {
     /// `Server is draining`.
     Draining,
     /// The turn takes no steer (review, compact, another output schema), or
-    /// a refusal this adapter does not name.
+    /// a steer refusal this adapter does not name: held until the turn ends.
     Held,
 }
 
 enum CallFail {
     Dead,
+    /// The vendor answered with this error.
+    Refused(Value),
     Failed(String),
 }
 
@@ -255,27 +275,33 @@ impl State {
 
     /// A consumption this process proved, or an earlier process's found in
     /// history. Valid after the process exits.
-    fn proof(&self, id: &str) -> Option<DeliverOutcome> {
+    fn proof(&self, id: &str) -> Option<Proof> {
         if self.consumed.contains_key(id) {
-            return Some(DeliverOutcome::Accepted {
+            return Some(Proof::Taken {
                 turn_finished: self.finished.contains(id),
             });
         }
-        self.applied_before
-            .contains(id)
-            .then_some(DeliverOutcome::Duplicate)
+        self.applied_before.contains(id).then_some(Proof::Duplicate)
     }
 
-    /// The answer for a message this process already knows about, if any.
+    /// The answer for a message this process already knows about, if any:
+    /// what it proved or refused for good first, whether or not it still
+    /// runs.
     fn known(&self, id: &str) -> Option<Result<DeliverOutcome, HarnessError>> {
-        if let Some(proof) = self.proof(id) {
-            return Some(Ok(proof));
+        match self.proof(id) {
+            Some(Proof::Taken { turn_finished }) => {
+                return Some(Ok(DeliverOutcome::Accepted { turn_finished }));
+            }
+            Some(Proof::Duplicate) => return Some(Ok(DeliverOutcome::Duplicate)),
+            None => {}
+        }
+        if let Some(reason) = self.rejected.get(id) {
+            return Some(Ok(DeliverOutcome::Rejected {
+                reason: reason.clone(),
+            }));
         }
         if !self.alive {
             return Some(Err(HarnessError::Dead));
-        }
-        if let Some(reason) = self.rejected.get(id) {
-            return Some(Err(HarnessError::Failed(reason.clone())));
         }
         let custody = self.inflight.get(id)?;
         // A message only history can settle, when history cannot be read: a
@@ -306,7 +332,7 @@ impl State {
             Some(turn) => {
                 (self.unsteerable.as_ref() != Some(turn)).then(|| Target::Steer(turn.clone()))
             }
-            None => (!self.start_held && self.inflight.is_empty()).then_some(Target::Start),
+            None => self.inflight.is_empty().then_some(Target::Start),
         }
     }
 
@@ -345,7 +371,6 @@ impl State {
             return;
         }
         self.turn = Some(turn.to_owned());
-        self.start_held = false;
         self.touch();
     }
 
@@ -358,7 +383,6 @@ impl State {
         if self.unsteerable.as_deref() == Some(turn) {
             self.unsteerable = None;
         }
-        self.start_held = false;
         for custody in self.inflight.values_mut() {
             if custody.stage == Stage::Pending && custody.turn.as_deref() == Some(turn) {
                 custody.stage = Stage::Doubtful;
@@ -406,7 +430,7 @@ impl State {
                     return;
                 };
                 let turn = custody.turn.clone();
-                match classify(&error) {
+                match classify(&error, start) {
                     Answer::Unknown => {
                         custody.stage = Stage::Doubtful;
                         self.touch();
@@ -418,6 +442,10 @@ impl State {
                     Answer::Rejected(reason) => {
                         self.forget(&id);
                         self.rejected.insert(id, reason);
+                    }
+                    Answer::Broken(reason) => {
+                        self.forget(&id);
+                        self.broken = Some(reason);
                     }
                     Answer::Refused(refusal) => {
                         self.forget(&id);
@@ -434,13 +462,9 @@ impl State {
                                 self.turn_started(&found);
                             }
                             Refusal::Draining => self.draining = true,
-                            Refusal::OtherTurn(None) | Refusal::Held => {
-                                if start {
-                                    self.start_held = true;
-                                } else {
-                                    self.unsteerable = turn;
-                                }
-                            }
+                            // Held until the turn ends; its `turn/completed`
+                            // announces when the message can go again.
+                            Refusal::OtherTurn(None) | Refusal::Held => self.unsteerable = turn,
                         }
                     }
                 }
@@ -540,11 +564,11 @@ impl State {
 
     /// The thread can never be continued: the process is ended and the
     /// session pointer retired, so the next process starts a fresh thread.
+    /// The process counts as gone once its output ends.
     fn invalidate_thread(&mut self) {
         self.thread_id = None;
         self.turn = None;
         self.thread_invalidated = true;
-        self.alive = false;
         if let Some(child) = self.child.as_mut() {
             let _ = child.kill();
         }
@@ -894,12 +918,13 @@ impl CodexHarness {
             .and_then(peer_from_user_agent);
         self.notify("initialized", json!({}))?;
         let (result, resumed) = match session {
-            Some(session) => match self.rpc("thread/resume", self.thread_params(Some(session))) {
+            Some(session) => match self.call("thread/resume", self.thread_params(Some(session))) {
                 Ok(result) => (result, true),
-                Err(_) if !fake_mode() => {
+                // Only a thread Codex certainly does not have is replaced.
+                Err(CallFail::Refused(error)) if thread_missing(&error) => {
                     (self.rpc("thread/start", self.thread_params(None))?, false)
                 }
-                Err(err) => return Err(err),
+                Err(fail) => return Err(fail.into_error("thread/resume")),
             },
             None => (self.rpc("thread/start", self.thread_params(None))?, false),
         };
@@ -989,25 +1014,21 @@ impl CodexHarness {
     }
 
     fn rpc(&self, method: &str, params: Value) -> Result<Value, HarnessError> {
-        match self.call(method, params) {
-            Ok(value) => Ok(value),
-            Err(CallFail::Dead) => Err(HarnessError::Dead),
-            Err(CallFail::Failed(reason)) => Err(HarnessError::Failed(reason)),
-        }
+        self.call(method, params)
+            .map_err(|fail| fail.into_error(method))
     }
 
+    /// A notification. One that cannot be written fails the call; the
+    /// process counts as gone only once its output ends.
     fn notify(&self, method: &str, params: Value) -> Result<(), HarnessError> {
         let line = json!({"jsonrpc": "2.0", "method": method, "params": params});
-        if write_stdin(&self.stdin, &line).is_err() {
-            mark_dead(&self.shared, &self.wake);
-            Err(HarnessError::Dead)
-        } else {
-            Ok(())
-        }
+        write_stdin(&self.stdin, &line)
+            .map_err(|err| HarnessError::Failed(format!("{method}: cannot write: {err}")))
     }
 
     /// One handshake call: write it and wait, at most [`CALL_WAIT`], for its
-    /// answer.
+    /// answer. A call that cannot be written waits for the process's output
+    /// to end, which says it is gone.
     fn call(&self, method: &str, params: Value) -> Result<Value, CallFail> {
         let id = {
             let mut state = lock(&self.shared);
@@ -1017,11 +1038,7 @@ impl CodexHarness {
             state.register(Request::Call(None))
         };
         let line = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
-        if write_stdin(&self.stdin, &line).is_err() {
-            lock(&self.shared).requests.remove(&id);
-            mark_dead(&self.shared, &self.wake);
-            return Err(CallFail::Dead);
-        }
+        let unwritten = write_stdin(&self.stdin, &line).err();
         let deadline = Instant::now() + CALL_WAIT;
         let mut state = lock(&self.shared);
         loop {
@@ -1033,7 +1050,7 @@ impl CodexHarness {
                     if let Some(reset_at_ms) = quota_from_rpc_error(&error) {
                         state.quota_reset_at_ms = Some(reset_at_ms);
                     }
-                    CallFail::Failed(format!("{method}: {}", rpc_failure(&error)))
+                    CallFail::Refused(error)
                 });
             }
             if !state.alive {
@@ -1043,10 +1060,10 @@ impl CodexHarness {
             let now = Instant::now();
             if now >= deadline {
                 state.requests.remove(&id);
-                return Err(CallFail::Failed(format!(
-                    "{method}: no answer within {}s",
-                    CALL_WAIT.as_secs()
-                )));
+                return Err(CallFail::Failed(match &unwritten {
+                    Some(err) => format!("{method}: cannot write: {err}"),
+                    None => format!("{method}: no answer within {}s", CALL_WAIT.as_secs()),
+                }));
             }
             let (guard, _) = self
                 .wake
@@ -1062,18 +1079,15 @@ impl CodexHarness {
         if let Some(request) = request
             && write_stdin(&self.stdin, &request).is_err()
         {
-            mark_dead(&self.shared, &self.wake);
+            unsent(&self.shared, &request);
         }
     }
 
+    /// Stop the child and read what it printed up to the end of its output,
+    /// so every proof it gave is known. Proof state stays.
     fn stop_child(&mut self) {
         *lock(&self.stdin) = None;
-        let child = {
-            let mut state = lock(&self.shared);
-            state.alive = false;
-            state.child.take()
-        };
-        self.wake.notify_all();
+        let child = lock(&self.shared).child.take();
         if let Some(mut child) = child {
             anyagents_harness::kill_child(&mut child, &self.environment);
             let _ = child.wait();
@@ -1081,6 +1095,14 @@ impl CodexHarness {
         if let Some(handle) = self.reader.take() {
             let _ = handle.join();
         }
+        // Without a reader (it never started), nothing else says it is gone.
+        let mut state = lock(&self.shared);
+        if state.alive {
+            state.alive = false;
+            state.touch();
+        }
+        drop(state);
+        self.wake.notify_all();
     }
 }
 
@@ -1091,14 +1113,24 @@ impl Drop for CodexHarness {
 }
 
 impl Harness for CodexHarness {
+    fn proven(&self, message_id: &str) -> Option<Proof> {
+        lock(&self.shared).proof(message_id)
+    }
+
+    /// Kill the child and read its output to the end: a proof it printed
+    /// before it went is known to `proven` afterwards.
+    fn stop(&mut self) {
+        self.stop_child();
+    }
+
     fn deliver(&mut self, message: &OutboundMessage) -> Result<DeliverOutcome, HarnessError> {
         let id = message.id.as_str();
-        let (rpc, line) = {
+        let (rpc, line, start) = {
             let mut state = lock(&self.shared);
             if let Some(known) = state.known(id) {
                 return known;
             }
-            if let Some(reason) = &state.history_failure {
+            if let Some(reason) = state.history_failure.as_ref().or(state.broken.as_ref()) {
                 return Err(HarnessError::Failed(reason.clone()));
             }
             if let Some(reset_at_ms) = state.quota_reset_at_ms {
@@ -1150,18 +1182,20 @@ impl Harness for CodexHarness {
                 state.turns_started += 1;
             }
             let line = json!({"jsonrpc": "2.0", "id": rpc, "method": method, "params": params});
-            (rpc, line)
+            (rpc, line, start)
         };
         if write_stdin(&self.stdin, &line).is_err() {
-            // A broken pipe took no whole line: nothing was applied.
-            {
-                let mut state = lock(&self.shared);
-                state.requests.remove(&rpc);
-                state.inflight.remove(id);
-                state.written.retain(|written| written != id);
+            // A broken pipe took no whole line: nothing was applied. The
+            // process counts as gone once its output ends, after every proof
+            // it printed is read; that end wakes the host.
+            let mut state = lock(&self.shared);
+            state.requests.remove(&rpc);
+            state.inflight.remove(id);
+            state.written.retain(|written| written != id);
+            if start {
+                state.turns_started -= 1;
             }
-            mark_dead(&self.shared, &self.wake);
-            return Err(HarnessError::Dead);
+            return Ok(DeliverOutcome::Deferred);
         }
         // The answer may already be in: a refusal hands the message back.
         lock(&self.shared)
@@ -1281,17 +1315,42 @@ fn fake_mode() -> bool {
     std::env::var_os("ANYAGENTS_FAKE_MODE").is_some()
 }
 
-fn mark_dead(shared: &Mutex<State>, wake: &Condvar) {
-    let mut state = lock(shared);
-    state.alive = false;
-    state.touch();
-    drop(state);
-    wake.notify_all();
+impl CallFail {
+    fn into_error(self, method: &str) -> HarnessError {
+        match self {
+            Self::Dead => HarnessError::Dead,
+            Self::Refused(error) => {
+                HarnessError::Failed(format!("{method}: {}", rpc_failure(&error)))
+            }
+            Self::Failed(reason) => HarnessError::Failed(reason),
+        }
+    }
 }
 
-/// Read the child's output until it closes. A write that fails marks the
-/// process dead, and reading goes on: a proof already on its way still
-/// counts.
+/// Whether a `thread/resume` error says Codex certainly has no such thread:
+/// no rollout is recorded under its id, or the id is not a thread id at all.
+/// Anything else (a rollout it cannot read or locate, a thread still
+/// closing, a timeout) may leave the conversation intact.
+fn thread_missing(error: &Value) -> bool {
+    let message = error.get("message").and_then(Value::as_str).unwrap_or("");
+    message.starts_with("no rollout found for thread id")
+        || message.starts_with("invalid thread id")
+}
+
+/// A request the adapter owed the vendor could not be written: it is owed
+/// again. The process's output ending says it is gone.
+fn unsent(shared: &Mutex<State>, request: &Value) {
+    let mut state = lock(shared);
+    if let Some(rpc) = request.get("id").and_then(Value::as_i64) {
+        state.requests.remove(&rpc);
+    }
+    if let Some(scan) = state.history.as_mut() {
+        scan.waiting = false;
+    }
+}
+
+/// Read the child's output until it closes, which is the one place the
+/// process is marked gone: every proof it printed is read first.
 fn read_stdout(
     stdout: ChildStdout,
     shared: Arc<Mutex<State>>,
@@ -1316,7 +1375,11 @@ fn read_stdout(
                 "result": {"decision": "approved", "approved": true}
             });
             if write_stdin(&stdin, &reply).is_err() {
-                mark_dead(&shared, &wake);
+                // The child waits for an answer it can never get: end it,
+                // and its output's end says it is gone.
+                if let Some(child) = lock(&shared).child.as_mut() {
+                    let _ = child.kill();
+                }
             }
             continue;
         }
@@ -1328,7 +1391,7 @@ fn read_stdout(
         if let Some(request) = request
             && write_stdin(&stdin, &request).is_err()
         {
-            mark_dead(&shared, &wake);
+            unsent(&shared, &request);
         }
         wake.notify_all();
     }
@@ -1430,8 +1493,10 @@ fn peer_from_user_agent(agent: &str) -> Option<String> {
     Some(format!("codex {version}"))
 }
 
-/// What an error answer to `turn/start` or `turn/steer` means for its input.
-fn classify(error: &Value) -> Answer {
+/// What an error answer to `turn/start` (`start`) or `turn/steer` means for
+/// its input. A refusal is kept for a refusal the running turn's end clears;
+/// a refusal that no retry clears is a rejection.
+fn classify(error: &Value, start: bool) -> Answer {
     if let Some(reset_at_ms) = quota_from_rpc_error(error) {
         return Answer::Quota(reset_at_ms);
     }
@@ -1452,14 +1517,25 @@ fn classify(error: &Value) -> Answer {
                 || message.contains("draining")
             {
                 Answer::Refused(Refusal::Draining)
+            } else if message.starts_with("thread not found") {
+                Answer::Broken(rpc_failure(error))
             } else if message.contains("must not be empty") {
                 Answer::Rejected(rpc_failure(error))
+            } else if start {
+                // No running turn holds a `turn/start` back: Codex found the
+                // request itself invalid, and finds it so again.
+                Answer::Rejected(rpc_failure(error))
             } else {
+                // A turn that takes no steer (review, compact, another output
+                // schema): the message waits for the turn to end.
                 Answer::Refused(Refusal::Held)
             }
         }
-        // A method this peer lacks took nothing.
+        // A peer without `turn/steer` takes the message as the next turn; one
+        // without `turn/start` takes nothing.
+        Some(-32601) if start => Answer::Broken(rpc_failure(error)),
         Some(-32601) => Answer::Refused(Refusal::Held),
+        // Invalid parameters, such as input over Codex's length limit.
         Some(-32602) => Answer::Rejected(rpc_failure(error)),
         _ => Answer::Unknown,
     }
@@ -1696,52 +1772,107 @@ mod tests {
     #[test]
     fn errors_say_whether_the_input_was_applied() {
         let error = |code: i64, message: &str| json!({"code": code, "message": message});
+        for start in [false, true] {
+            assert_eq!(
+                classify(&error(-32600, "no active turn to steer"), start),
+                Answer::Refused(Refusal::NoTurn)
+            );
+            assert_eq!(
+                classify(
+                    &json!({
+                        "code": -32600,
+                        "message": "Server is draining; retry after reconnecting",
+                        "data": {"reason": "serverShuttingDown"}
+                    }),
+                    start
+                ),
+                Answer::Refused(Refusal::Draining)
+            );
+            // Refused for good: no retry and no new process clears these.
+            for refused in [
+                error(
+                    -32602,
+                    "Input exceeds the maximum length of 1048576 characters.",
+                ),
+                error(-32600, "input must not be empty"),
+            ] {
+                assert!(
+                    matches!(classify(&refused, start), Answer::Rejected(_)),
+                    "{refused}"
+                );
+            }
+            assert!(matches!(
+                classify(&error(-32600, "thread not found: thread-1"), start),
+                Answer::Broken(_)
+            ));
+            assert_eq!(
+                classify(
+                    &error(-32603, "failed to steer turn: channel closed"),
+                    start
+                ),
+                Answer::Unknown
+            );
+            assert_eq!(
+                classify(
+                    &json!({
+                        "code": -32000,
+                        "message": "usageLimitExceeded",
+                        "data": {"resetsAt": 1_700_000_000}
+                    }),
+                    start
+                ),
+                Answer::Quota(1_700_000_000_000)
+            );
+        }
         assert_eq!(
-            classify(&error(-32600, "no active turn to steer")),
-            Answer::Refused(Refusal::NoTurn)
-        );
-        assert_eq!(
-            classify(&error(
-                -32600,
-                "expected active turn id `turn-1` but found `turn-2`"
-            )),
+            classify(
+                &error(
+                    -32600,
+                    "expected active turn id `turn-1` but found `turn-2`"
+                ),
+                false
+            ),
             Answer::Refused(Refusal::OtherTurn(Some("turn-2".into())))
         );
+        // A steer the running turn will not take waits for the turn's end;
+        // a `turn/start` Codex refuses is invalid in itself.
+        let unsteerable = error(-32600, "cannot steer a review turn");
         assert_eq!(
-            classify(&json!({
-                "code": -32600,
-                "message": "Server is draining; retry after reconnecting",
-                "data": {"reason": "serverShuttingDown"}
-            })),
-            Answer::Refused(Refusal::Draining)
-        );
-        assert_eq!(
-            classify(&error(-32600, "cannot steer a review turn")),
+            classify(&unsteerable, false),
             Answer::Refused(Refusal::Held)
         );
-        assert!(matches!(
-            classify(&error(
-                -32602,
-                "Input exceeds the maximum length of 1048576 characters."
-            )),
-            Answer::Rejected(_)
-        ));
-        assert_eq!(
-            classify(&error(-32603, "failed to steer turn: channel closed")),
-            Answer::Unknown
-        );
-        assert_eq!(
-            classify(&json!({
-                "code": -32000,
-                "message": "usageLimitExceeded",
-                "data": {"resetsAt": 1_700_000_000}
-            })),
-            Answer::Quota(1_700_000_000_000)
-        );
+        assert!(matches!(classify(&unsteerable, true), Answer::Rejected(_)));
+        let missing = error(-32601, "method not found: turn/steer");
+        assert_eq!(classify(&missing, false), Answer::Refused(Refusal::Held));
+        assert!(matches!(classify(&missing, true), Answer::Broken(_)));
+    }
+
+    #[test]
+    fn only_a_thread_codex_certainly_lacks_is_replaced_on_resume() {
+        let error = |message: &str| json!({"code": -32600, "message": message});
+        assert!(thread_missing(&error(
+            "no rollout found for thread id 0199"
+        )));
+        assert!(thread_missing(&error("invalid thread id: bad uuid")));
+        for kept in [
+            "failed to locate thread id 0199: Permission denied (os error 13)",
+            "cannot resume running thread 0199 with history while it is already running",
+            "thread 0199 is closing; retry thread/resume after the thread is closed",
+            "",
+        ] {
+            assert!(!thread_missing(&error(kept)), "{kept}");
+        }
     }
 
     #[cfg(unix)]
     fn reader_fixture(script: &str, input: Stdio) -> CodexHarness {
+        reader_fixture_with(script, input, State::default())
+    }
+
+    /// A child running `script`, read by the adapter's reader, with the
+    /// adapter in `state` (alive, its history read).
+    #[cfg(unix)]
+    fn reader_fixture_with(script: &str, input: Stdio, state: State) -> CodexHarness {
         let mut child = std::process::Command::new("/bin/sh")
             .args(["-c", script])
             .stdin(input)
@@ -1754,7 +1885,7 @@ mod tests {
             alive: true,
             child: Some(child),
             history_ready: true,
-            ..State::default()
+            ..state
         }));
         let wake = Arc::new(Condvar::new());
         let (s, w, i) = (Arc::clone(&shared), Arc::clone(&wake), Arc::clone(&stdin));
@@ -1792,5 +1923,92 @@ mod tests {
                 == Some("reply-received"))
         );
         assert!(harness.health().process_alive);
+    }
+
+    /// A write the child cannot take forgets that write and hands the message
+    /// back; the process counts as gone only when its output ends.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_write_hands_the_message_back_and_dead_waits_for_the_end_of_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let go = dir.path().join("go");
+        let script = format!("while [ ! -e '{}' ]; do sleep 0.01; done", go.display());
+        let mut harness = reader_fixture_with(
+            &script,
+            Stdio::null(),
+            State {
+                thread_id: Some("thread-1".into()),
+                ..State::default()
+            },
+        );
+        let message = OutboundMessage {
+            id: "m1".into(),
+            seq: 1,
+            text: "hello".into(),
+            sender: None,
+            reply_to: None,
+            source_time_ms: None,
+            context: anyagents_harness::Context::default(),
+        };
+        assert_eq!(harness.deliver(&message), Ok(DeliverOutcome::Deferred));
+        {
+            let state = lock(&harness.shared);
+            assert!(state.inflight.is_empty() && state.written.is_empty());
+            assert_eq!(state.turns_started, 0);
+        }
+        assert!(
+            harness.health().process_alive,
+            "dead before its output ended"
+        );
+        std::fs::write(&go, "").unwrap();
+        assert!(harness.wait_dead(Duration::from_secs(5)));
+    }
+
+    /// A proof the child printed before the host stopped it is read, and
+    /// answered by `proven` once the process is gone.
+    #[cfg(unix)]
+    #[test]
+    fn a_proof_printed_before_stop_is_proven_after_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let printed = dir.path().join("printed");
+        let proof = json!({"method": "item/completed", "params": {"turnId": "t1",
+            "item": {"type": "userMessage", "id": "item-1", "clientId": "m1",
+                "content": [{"type": "text", "text": "anyagents-message:m1\nhello"}]}}});
+        let script = format!(
+            "printf '%s\\n' '{proof}'; : > '{}'; exec sleep 30",
+            printed.display()
+        );
+        let mut inflight = HashMap::new();
+        inflight.insert(
+            "m1".to_string(),
+            Custody {
+                stage: Stage::Pending,
+                turn: Some("t1".into()),
+            },
+        );
+        let mut harness = reader_fixture_with(
+            &script,
+            Stdio::null(),
+            State {
+                thread_id: Some("thread-1".into()),
+                turn: Some("t1".into()),
+                inflight,
+                ..State::default()
+            },
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !printed.exists() {
+            assert!(Instant::now() < deadline, "the child never printed");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        harness.stop();
+        assert!(!harness.health().process_alive);
+        assert_eq!(
+            harness.proven("m1"),
+            Some(Proof::Taken {
+                turn_finished: false
+            })
+        );
+        assert_eq!(harness.proven("m2"), None);
     }
 }

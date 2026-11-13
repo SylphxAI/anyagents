@@ -4,7 +4,8 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use anyagents_harness::{
-    Context, DeliverOutcome, DeliveryLevel, Harness, HarnessError, OutboundMessage, TurnState,
+    Context, DeliverOutcome, DeliveryLevel, Harness, HarnessError, OutboundMessage, Proof,
+    TurnState,
 };
 use anyagents_harness_codex::CodexHarness;
 use tempfile::TempDir;
@@ -28,6 +29,14 @@ fn log_path(dir: &TempDir) -> std::path::PathBuf {
 }
 
 fn start(dir: &TempDir, mode: &str, session: Option<&str>) -> CodexHarness {
+    try_start(dir, mode, session).expect("start")
+}
+
+fn try_start(
+    dir: &TempDir,
+    mode: &str,
+    session: Option<&str>,
+) -> Result<CodexHarness, HarnessError> {
     let log = log_path(dir);
     let log = log.to_str().expect("log path");
     let history = dir.path().join("history");
@@ -41,7 +50,6 @@ fn start(dir: &TempDir, mode: &str, session: Option<&str>) -> CodexHarness {
             ("ANYAGENTS_FAKE_HISTORY", history),
         ],
     )
-    .expect("start")
 }
 
 fn read_log(path: &Path) -> String {
@@ -414,4 +422,97 @@ fn launch_resumes_when_a_session_is_known() {
     assert!(log.contains("\"method\":\"thread/resume\""));
     assert!(!log.contains("\"method\":\"thread/start\""));
     drop(harness);
+}
+
+#[test]
+fn an_input_codex_refuses_for_good_is_parked_and_never_written_again() {
+    let dir = TempDir::new().unwrap();
+    let mut harness = start(&dir, "hold", None);
+    let mut poison = msg("m1");
+    poison.text = "x".repeat((1 << 20) + 1);
+    let rejected = settle(&mut harness, &poison);
+    let DeliverOutcome::Rejected { reason } = &rejected else {
+        panic!("not parked: {rejected:?}");
+    };
+    assert!(reason.contains("-32602"), "{reason}");
+    // Every later offer gets the same answer, with nothing written and no
+    // restart.
+    for _ in 0..20 {
+        assert_eq!(harness.deliver(&poison).unwrap(), rejected);
+    }
+    assert_eq!(writes_of(&dir, "turn/start", "m1"), 1);
+    assert_eq!(writes_of(&dir, "turn/steer", "m1"), 0);
+    assert!(harness.health().process_alive);
+    assert_eq!(harness.proven("m1"), None, "a rejection is not a proof");
+    // The mail behind it goes on.
+    assert_eq!(
+        settle(&mut harness, &msg("m2")),
+        DeliverOutcome::Accepted {
+            turn_finished: false
+        }
+    );
+    // The refusal outlives the process.
+    harness.stop();
+    assert!(!harness.health().process_alive);
+    assert_eq!(harness.deliver(&poison).unwrap(), rejected);
+}
+
+#[test]
+fn a_resume_of_a_thread_codex_does_not_have_starts_a_new_one() {
+    let dir = TempDir::new().unwrap();
+    let harness = start(&dir, "resume-missing", Some("thread-gone"));
+    let log = read_log(&log_path(&dir));
+    assert!(log.contains("\"method\":\"thread/resume\""), "{log}");
+    assert!(log.contains("\"method\":\"thread/start\""), "{log}");
+    assert_eq!(harness.session_id().as_deref(), Some("thread-1"));
+}
+
+#[test]
+fn a_resume_that_fails_for_another_reason_fails_the_start() {
+    let dir = TempDir::new().unwrap();
+    let err = try_start(&dir, "resume-unreadable", Some("thread-9"))
+        .err()
+        .expect("the start fails");
+    assert!(
+        matches!(&err, HarnessError::Failed(reason)
+            if reason.contains("thread/resume") && reason.contains("failed to locate")),
+        "{err:?}"
+    );
+    let log = read_log(&log_path(&dir));
+    assert!(
+        !log.contains("\"method\":\"thread/start\""),
+        "the conversation is never replaced in silence: {log}"
+    );
+}
+
+#[test]
+fn a_proof_given_just_before_stop_is_proven_after_it() {
+    let dir = TempDir::new().unwrap();
+    let mut harness = start(&dir, "hold", None);
+    assert_eq!(
+        harness.deliver(&msg("m1")).unwrap(),
+        DeliverOutcome::InFlight
+    );
+    // The vendor wrote its proof; the adapter may not have read it yet.
+    let deadline = Instant::now() + PATIENCE;
+    while !read_log(&log_path(&dir)).contains("proved:m1") {
+        assert!(Instant::now() < deadline, "the vendor never proved m1");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    harness.stop();
+    assert!(!harness.health().process_alive);
+    assert_eq!(
+        harness.proven("m1"),
+        Some(Proof::Taken {
+            turn_finished: false
+        })
+    );
+    // `deliver` answers the proof before it looks at liveness.
+    assert_eq!(
+        harness.deliver(&msg("m1")).unwrap(),
+        DeliverOutcome::Accepted {
+            turn_finished: false
+        }
+    );
+    assert_eq!(harness.deliver(&msg("m2")), Err(HarnessError::Dead));
 }

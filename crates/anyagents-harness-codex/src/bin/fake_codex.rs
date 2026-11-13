@@ -22,11 +22,19 @@
 //! - `quota`: a rate-limit notice arrives with the thread
 //! - `rpc-quota`: `turn/start` is refused for quota
 //! - `401`, `turn-error`: a turn fails with that error
+//! - `resume-missing`: `thread/resume` answers that no rollout is recorded
+//!   under the id (`-32600 no rollout found for thread id X`)
+//! - `resume-unreadable`: `thread/resume` answers that the rollout cannot be
+//!   located (`-32600 failed to locate thread id X: ...`)
 //! - `die`: the process exits at once
 //!
-//! `ANYAGENTS_FAKE_LOG` receives argv and stdin. `ANYAGENTS_FAKE_HISTORY`
-//! names a file of `{"turnId", "clientId", "text"}` lines the thread already
-//! holds.
+//! In every mode, as Codex does, an input longer than 1,048,576 characters is
+//! refused with `-32602 Input exceeds the maximum length of 1048576
+//! characters.` and nothing is recorded.
+//!
+//! `ANYAGENTS_FAKE_LOG` receives argv and stdin, and `proved:<id>` once the
+//! items proving an input are written. `ANYAGENTS_FAKE_HISTORY` names a file
+//! of `{"turnId", "clientId", "text"}` lines the thread already holds.
 
 use std::env;
 use std::fs::OpenOptions;
@@ -37,8 +45,12 @@ use serde_json::{Value, json};
 
 const THREAD: &str = "thread-1";
 
+/// Codex's limit on one input's text, in characters.
+const MAX_INPUT_CHARS: usize = 1 << 20;
+
 struct Fake {
     mode: String,
+    log: Option<PathBuf>,
     out: io::Stdout,
     turn: Option<String>,
     turns: u32,
@@ -69,6 +81,7 @@ fn main() {
         .collect();
     let mut fake = Fake {
         mode,
+        log: log_path.clone(),
         out: io::stdout(),
         turn: None,
         turns: 0,
@@ -101,6 +114,23 @@ impl Fake {
                     "platformOs": "linux"
                 }),
             ),
+            "thread/resume" if self.mode == "resume-missing" => {
+                let thread = params["threadId"].as_str().unwrap_or_default();
+                self.error(
+                    &id,
+                    json!({"code": -32600, "message": format!("no rollout found for thread id {thread}")}),
+                );
+            }
+            "thread/resume" if self.mode == "resume-unreadable" => {
+                let thread = params["threadId"].as_str().unwrap_or_default();
+                self.error(
+                    &id,
+                    json!({
+                        "code": -32600,
+                        "message": format!("failed to locate thread id {thread}: Permission denied (os error 13)")
+                    }),
+                );
+            }
             "thread/start" | "thread/resume" => {
                 if self.mode == "quota" {
                     self.note(
@@ -123,6 +153,13 @@ impl Fake {
                     "code": -32000,
                     "message": "usageLimitExceeded",
                     "data": {"resetsAt": 1_700_000_000_000_i64}
+                }),
+            ),
+            "turn/start" | "turn/steer" if too_long(&params) => self.error(
+                &id,
+                json!({
+                    "code": -32602,
+                    "message": format!("Input exceeds the maximum length of {MAX_INPUT_CHARS} characters.")
                 }),
             ),
             "turn/start" => self.start(&id, &params),
@@ -246,6 +283,9 @@ impl Fake {
                     json!({"threadId": THREAD, "turnId": turn, "item": row["item"], stamp: 0}),
                 );
             }
+            if let Some(id) = params["clientUserMessageId"].as_str() {
+                log(&self.log, &format!("proved:{id}"));
+            }
         }
         self.history.push(row);
     }
@@ -347,6 +387,18 @@ impl Fake {
         let _ = writeln!(self.out, "{value}");
         let _ = self.out.flush();
     }
+}
+
+/// Whether an input's text is over Codex's limit.
+fn too_long(params: &Value) -> bool {
+    let chars: usize = params["input"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|part| part["text"].as_str())
+        .map(|text| text.chars().count())
+        .sum();
+    chars > MAX_INPUT_CHARS
 }
 
 fn turn_value(turn: &str, status: &str) -> Value {

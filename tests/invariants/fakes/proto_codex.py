@@ -1,11 +1,16 @@
 """`codex app-server` 0.169: JSON-RPC 2.0, one object per line."""
 import json
+import uuid
 
 from engine import Input, Protocol, marker_id
 
 # JSON-RPC error codes the app-server answers with.
 INVALID_REQUEST = -32600
 METHOD_NOT_FOUND = -32601
+INVALID_PARAMS = -32602
+
+# The longest input text Codex takes, in characters.
+MAX_INPUT_CHARS = 1 << 20
 
 
 class Codex(Protocol):
@@ -20,7 +25,12 @@ class Codex(Protocol):
     our `clientUserMessageId` as `clientId`. A turn samples again while input
     is pending, so it never completes on unconsumed input; an interrupt drops
     it. The server keeps no record of our ids: the same input sent twice is
-    applied twice. `thread/items/list` pages through the thread's history."""
+    applied twice. `thread/items/list` pages through the thread's history.
+
+    `thread/start` mints a thread id; `thread/resume` of an id with no
+    recorded rollout answers `-32600 no rollout found for thread id <id>`.
+    An input over 1,048,576 characters is refused with `-32602`, and
+    nothing is recorded."""
 
     def reply(self, rid, result):
         self.emit({"jsonrpc": "2.0", "id": rid, "result": result})
@@ -78,8 +88,19 @@ class Codex(Protocol):
                              "platformOs": "linux"})
         elif method == "initialized":
             pass
-        elif method in ("thread/start", "thread/resume"):
-            self.session = params.get("threadId") or self.session
+        elif method == "thread/start":
+            self.session = str(uuid.uuid4())
+            with (engine.root / "codex-threads").open("a") as out:
+                out.write(self.session + "\n")
+            self.reply(rid, {"thread": {"id": self.session}})
+        elif method == "thread/resume":
+            thread = params.get("threadId")
+            threads = engine.root / "codex-threads"
+            known = threads.read_text().split() if threads.exists() else []
+            if thread not in known:
+                self.error(rid, INVALID_REQUEST, "no rollout found for thread id %s" % thread)
+                return
+            self.session = thread
             self.reply(rid, {"thread": {"id": self.session}})
         elif method == "thread/items/list":
             self.reply(rid, self.history(params))
@@ -100,6 +121,10 @@ class Codex(Protocol):
         text = "".join(part.get("text", "") for part in params.get("input") or [])
         inp = Input(params.get("clientUserMessageId") or marker_id(text), text, method)
         engine.received(inp)
+        if len(text) > MAX_INPUT_CHARS:
+            message = "Input exceeds the maximum length of %d characters." % MAX_INPUT_CHARS
+            self.later(lambda: self.error(rid, INVALID_PARAMS, message))
+            return
         if method == "turn/steer":
             if engine.turn is None:
                 self.later(lambda: self.error(rid, INVALID_REQUEST, "no active turn to steer"))
