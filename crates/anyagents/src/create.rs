@@ -3057,7 +3057,11 @@ pub(crate) fn reconcile_agent_runtime_config(
                     &command,
                     &args,
                 )?;
-                crate::vendor::ensure_agy_steering_settings(config, work_dir)?;
+                crate::vendor::ensure_agy_steering_settings(
+                    config,
+                    work_dir,
+                    &data.join(anyagents_harness::media::MEDIA_DIR),
+                )?;
             }
             "muse" => {
                 muse_config::write(config, agent.model.as_deref(), &command, &args)?;
