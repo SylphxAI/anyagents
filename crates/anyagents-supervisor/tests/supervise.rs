@@ -1695,3 +1695,131 @@ fn deferred_pending_mail_precedes_interrupted_turn_recovery() {
     assert!(store.open_turn(&agent.id).unwrap().is_none());
     drop(supervisor);
 }
+
+/// A real Claude Code adapter whose `health` reads are counted: every
+/// supervisor pass reads the harness's health, so the count bounds the passes.
+struct CountedClaude {
+    inner: ClaudeHarness,
+    health_reads: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl anyagents_harness::Harness for CountedClaude {
+    fn deliver(
+        &mut self,
+        message: &anyagents_harness::OutboundMessage,
+    ) -> Result<anyagents_harness::DeliverOutcome, anyagents_harness::HarnessError> {
+        self.inner.deliver(message)
+    }
+    fn background(&mut self) -> Result<(), anyagents_harness::HarnessError> {
+        self.inner.background()
+    }
+    fn resume(&mut self, session: &str) -> Result<(), anyagents_harness::HarnessError> {
+        self.inner.resume(session)
+    }
+    fn cancel(&mut self) -> Result<(), anyagents_harness::HarnessError> {
+        self.inner.cancel()
+    }
+    fn health(&self) -> anyagents_harness::HarnessHealth {
+        self.health_reads
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.health()
+    }
+    fn turns_served(&self) -> u32 {
+        self.inner.turns_served()
+    }
+    fn served_usage(&self) -> anyagents_harness::TurnUsage {
+        self.inner.served_usage()
+    }
+    fn process_id(&self) -> Option<u32> {
+        self.inner.process_id()
+    }
+    fn exit_diagnostic(&self) -> Option<String> {
+        self.inner.exit_diagnostic()
+    }
+    fn watch_activity(&self, notify: Arc<dyn Fn() + Send + Sync>) {
+        self.inner.watch_activity(notify)
+    }
+}
+
+#[test]
+fn a_streaming_turn_costs_a_bounded_number_of_supervisor_passes() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const LINES: usize = 400;
+    let dir = short_dir();
+    let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+    let agent = store
+        .create_agent(NewAgent::new("streamer", "claude-code"))
+        .unwrap();
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    store
+        .set_agent_running(&agent.id, &work.display().to_string())
+        .unwrap();
+    // Each turn streams LINES assistant events, a few milliseconds apart, so
+    // a pass per line could not coalesce them, then closes with a result.
+    let program = dir.path().join("streaming-claude");
+    std::fs::write(
+        &program,
+        format!(
+            r#"#!/bin/sh
+while IFS= read -r line; do
+    i=0
+    while [ "$i" -lt {LINES} ]; do
+        printf '%s\n' "{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"chunk $i\"}}]}}}}"
+        i=$((i + 1))
+        case "$i" in *0) sleep 0.01 ;; esac
+    done
+    printf '%s\n' '{{"type":"result","subtype":"success","session_id":"streaming","usage":{{"input_tokens":3,"output_tokens":2}}}}'
+done
+"#
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let health_reads = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&health_reads);
+    let supervisor = Supervisor::start(
+        Arc::clone(&store),
+        Arc::new(anyagents_supervisor::SystemClock::new()) as Arc<dyn Clock>,
+        Arc::new(move |request: LaunchRequest| {
+            ClaudeHarness::start_in(
+                program.to_str().unwrap(),
+                None,
+                &[],
+                Some(&request.work_dir),
+            )
+            .map(|inner| CountedClaude {
+                inner,
+                health_reads: Arc::clone(&counted),
+            })
+            .map_err(|err| err.to_string())
+        }),
+        Vec::new(),
+    )
+    .unwrap();
+    assert!(wait_until(|| supervisor
+        .live(&agent.id)
+        .is_some_and(|live| live.process_alive)));
+    let before = health_reads.load(Ordering::SeqCst);
+    store
+        .receive(&agent.id, Incoming::new("stream a long answer"))
+        .unwrap();
+    assert!(wait_until(|| {
+        store.delivered_cursor(&agent.id).unwrap() == 1
+            && store.open_turn(&agent.id).unwrap().is_none()
+    }));
+    let usage = store.list_usage(Some(&agent.id)).unwrap();
+    assert_eq!(usage.len(), 1, "the streamed turn is recorded once");
+    let passes = health_reads.load(Ordering::SeqCst) - before;
+    eprintln!("streaming turn: {LINES} lines, {passes} harness health reads");
+    // A pass per line read the harness several times per line (thousands of
+    // reads). Transitions are few: accepted, turn ended, and the reviews a
+    // multi-second open turn takes on its backoff.
+    assert!(
+        passes <= 60,
+        "a {LINES}-line turn took {passes} harness health reads"
+    );
+    drop(supervisor);
+}

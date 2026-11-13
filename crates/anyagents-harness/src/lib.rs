@@ -9,6 +9,7 @@ mod fake;
 pub mod masking;
 mod name;
 mod seat;
+mod stamp;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -20,6 +21,7 @@ pub use atomic_fs::{
 };
 pub use fake::FakeHarness;
 pub use name::normalize_harness_name;
+pub use stamp::FileStamp;
 
 /// Internal environment key the server sets when an agent has an OS seat. It
 /// carries `<launcher>\t<uid>\t<gid>\t<groups>` and is removed from the child's
@@ -434,14 +436,22 @@ pub fn kill_pid(pid: u32, signal: &str, environment: &[(String, String)]) {
     if let Some((launcher, uid, gid)) = seat_spec(environment) {
         let pid_str = pid.to_string();
         let _ = run_seat_kill(launcher, uid, gid, &[signal, &pid_str]);
-    } else {
-        let _ = std::process::Command::new("kill")
-            .args([signal, &pid.to_string()])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        return;
     }
+    #[cfg(unix)]
+    if let (Some(raw_pid), Some(sig)) = (
+        i32::try_from(pid).ok().filter(|pid| *pid > 0),
+        unix_signal::signal_number(signal),
+    ) {
+        let _ = unix_signal::signal_target(raw_pid, sig);
+        return;
+    }
+    let _ = std::process::Command::new("kill")
+        .args([signal, &pid.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 fn kill_process_group(pid: u32, signal: &str, environment: &[(String, String)]) {
@@ -460,11 +470,10 @@ fn kill_process_group(pid: u32, signal: &str, environment: &[(String, String)]) 
     kill_pid(pid, signal, environment);
 }
 
-fn pgid_alive(pid: u32, environment: &[(String, String)]) -> bool {
-    if let Some((launcher, uid, gid)) = seat_spec(environment) {
-        let pgid_str = format!("-{pid}");
-        return run_seat_kill(launcher, uid, gid, &["-0", "--", &pgid_str]);
-    }
+/// Whether any process is left in the group `pid` leads. A probe with signal
+/// 0 needs no permission to answer: a group of another uid (a seat) answers
+/// `EPERM`, which still means it exists, so no seat launcher is spawned.
+fn pgid_alive(pid: u32) -> bool {
     #[cfg(unix)]
     if let Ok(raw_pid) = i32::try_from(pid) {
         return unix_signal::pgid_alive(raw_pid);
@@ -472,22 +481,79 @@ fn pgid_alive(pid: u32, environment: &[(String, String)]) -> bool {
     false
 }
 
+#[cfg(target_os = "linux")]
+mod pidfd {
+    use std::ffi::{c_int, c_long, c_ulong};
+    use std::time::Duration;
+
+    const SYS_PIDFD_OPEN: c_long = 434;
+    const POLLIN: i16 = 0x1;
+
+    #[repr(C)]
+    struct PollFd {
+        fd: c_int,
+        events: i16,
+        revents: i16,
+    }
+
+    unsafe extern "C" {
+        fn syscall(number: c_long, ...) -> c_long;
+        fn poll(fds: *mut PollFd, count: c_ulong, timeout: c_int) -> c_int;
+        fn close(fd: c_int) -> c_int;
+    }
+
+    /// Wait until `pid` exits or `timeout` passes: `Some(true)` when it has
+    /// exited, `Some(false)` on timeout, `None` when the kernel offers no
+    /// pidfd for it or the wait failed.
+    pub(super) fn wait_exit(pid: u32, timeout: Duration) -> Option<bool> {
+        let pid = c_int::try_from(pid).ok()?;
+        // SAFETY: pidfd_open takes a pid and flags and returns a new
+        // descriptor or -1.
+        let fd = unsafe { syscall(SYS_PIDFD_OPEN, pid, 0 as c_int) };
+        let fd = c_int::try_from(fd).ok().filter(|fd| *fd >= 0)?;
+        let mut polled = PollFd {
+            fd,
+            events: POLLIN,
+            revents: 0,
+        };
+        let millis = c_int::try_from(timeout.as_millis()).unwrap_or(c_int::MAX);
+        // SAFETY: `polled` is one valid entry; `fd` is owned here.
+        let ready = unsafe { poll(&mut polled, 1, millis) };
+        // SAFETY: `fd` was opened above and is closed once.
+        unsafe { close(fd) };
+        (ready >= 0).then_some(ready > 0)
+    }
+}
+
+/// Wait up to `grace` for `child` to exit and its process group to empty.
+/// The child's own exit is an event (its pidfd); only the descendants left in
+/// its group, which nothing reports, are probed on a short interval.
 fn wait_child_or_group_exit(
     child: &mut std::process::Child,
     pid: u32,
-    environment: &[(String, String)],
     grace: std::time::Duration,
 ) -> bool {
+    const GROUP_PROBE: std::time::Duration = std::time::Duration::from_millis(25);
     let deadline = std::time::Instant::now() + grace;
+    while !matches!(child.try_wait(), Ok(Some(_))) {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return false;
+        }
+        #[cfg(target_os = "linux")]
+        if pidfd::wait_exit(pid, left).is_some() {
+            continue;
+        }
+        std::thread::sleep(left.min(GROUP_PROBE));
+    }
     loop {
-        let exited = matches!(child.try_wait(), Ok(Some(_)));
-        if exited && !pgid_alive(pid, environment) {
+        if !pgid_alive(pid) {
             return true;
         }
         if std::time::Instant::now() >= deadline {
             return false;
         }
-        std::thread::sleep(std::time::Duration::from_millis(25));
+        std::thread::sleep(GROUP_PROBE);
     }
 }
 
@@ -497,16 +563,16 @@ pub fn kill_child(child: &mut std::process::Child, environment: &[(String, Strin
     const KILL_REAP_GRACE: std::time::Duration = std::time::Duration::from_millis(100);
 
     let pid = child.id();
-    if matches!(child.try_wait(), Ok(Some(_))) && !pgid_alive(pid, environment) {
+    if matches!(child.try_wait(), Ok(Some(_))) && !pgid_alive(pid) {
         return;
     }
     kill_process_group(pid, "-TERM", environment);
-    if wait_child_or_group_exit(child, pid, environment, TERM_GRACE) {
+    if wait_child_or_group_exit(child, pid, TERM_GRACE) {
         return;
     }
     kill_process_group(pid, "-KILL", environment);
     let _ = child.kill();
-    let _ = wait_child_or_group_exit(child, pid, environment, KILL_REAP_GRACE);
+    let _ = wait_child_or_group_exit(child, pid, KILL_REAP_GRACE);
 }
 
 /// How a harness takes input that arrives during a turn.
@@ -1069,11 +1135,11 @@ mod tests {
             .read_line(&mut line)
             .unwrap();
         let grandchild_pid: i32 = line.trim().parse().expect("grandchild pid");
-        assert!(pgid_alive(wrapper_pid, &[]));
+        assert!(pgid_alive(wrapper_pid));
         kill_child(&mut child, &[]);
         assert!(matches!(child.try_wait(), Ok(Some(_))));
         assert!(
-            !pgid_alive(wrapper_pid, &[]),
+            !pgid_alive(wrapper_pid),
             "process group still alive after kill_child"
         );
         assert!(
