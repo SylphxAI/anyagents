@@ -261,7 +261,7 @@ memory-eval` for development.
 Results on 2026-11-13, from two lead agents whose operator talks to them in
 Telegram, mostly in Cantonese. Recall@k counts a query as answered when the
 quoted message is in the first k; MRR@10 and nDCG@10 use the same single
-relevant message. The reranker is `hs-rerank-1` throughout.
+relevant message. The reranker is `hs-rerank-1` unless stated.
 
 5-day window: 6,941 messages, 170 queries (154 Cantonese, 5 Chinese, 11 English).
 
@@ -271,7 +271,12 @@ relevant message. The reranker is `hs-rerank-1` throughout.
 | Dense | 0.294 | 0.134 | 0.172 | 0.235 | 0.106 | 0.136 |
 | Hybrid (RRF) | 0.324 | 0.149 | 0.190 | 0.288 | 0.138 | 0.173 |
 | BM25 + rerank | 0.265 | 0.147 | 0.174 | 0.265 | 0.147 | 0.174 |
-| Hybrid + rerank | **0.347** | **0.176** | **0.216** | 0.335 | 0.169 | 0.208 |
+| Hybrid + rerank | 0.347 | 0.176 | 0.216 | 0.335 | 0.169 | 0.208 |
+| Hybrid + rerank (`multilingual-reranker-small`) | **0.365** | **0.203** | **0.241** | | | |
+
+With `multilingual-reranker-small` the reranked hybrid also puts the quoted
+message first for 14.7% of queries, against 10.6% with `hs-rerank-1` and 8.2%
+for BM25.
 
 10-day window: 13,656 messages, 380 queries (335 Cantonese, 16 Chinese, 29
 English).
@@ -304,11 +309,13 @@ ONNX export, Apache-2.0): it is the better dense retriever on this history
 (dense MRR@10 0.134 against 0.106) and keeps Cantonese-only characters whole,
 where the 97M model's pruned vocabulary breaks all 26 tested ones into bytes;
 the cost is about 3.4 times the CPU per token. The default reranker is
-`hs-rerank-1` (MIT, mmBERT-small, about 5 pairs/s per thread at 512 tokens),
-fast enough to rerank 20 passages inside the server's 8 s bound on two
-threads. Larger cross-encoders (`bge-reranker-v2-m3`, Apache-2.0) score
-higher on published multilingual benchmarks but take several seconds per
-query on CPU. Every candidate in `pins.rs` can be selected with
+`Horizon-Labs/multilingual-reranker-small` (int8, Apache-2.0, mmBERT-small
+distilled from a 4B reranker, 384 tokens per pair): on the 5-day window it
+lifts the reranked hybrid's MRR@10 from 0.176 (`hs-rerank-1`) to 0.203.
+Reranking 20 passages took about 2.8 s on four threads of the loaded host
+against 1.3 s for `hs-rerank-1`, inside the server's 8 s bound; `hs-rerank-1`
+(MIT) stays pinned as the faster choice. Larger cross-encoders
+(`bge-reranker-v2-m3`) take several times longer per query on CPU. Every candidate in `pins.rs` can be selected with
 `--embedder` / `--reranker` and evaluated with the same command.
 
 ## Incremental indexing and migration

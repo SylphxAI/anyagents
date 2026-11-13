@@ -111,28 +111,10 @@ pub const EMBEDDERS: &[ModelPin] = &[
     },
 ];
 
-/// Cross-encoders, compared the same way. The first is the default.
+/// Cross-encoders, compared the same way. The first is the default: it
+/// reranked real history best of the ones fast enough to answer within the
+/// server's bound; `hs-rerank-1` is about twice as fast and a little weaker.
 pub const RERANKERS: &[ModelPin] = &[
-    ModelPin {
-        name: "hs-rerank-1",
-        repo: "hindsight-ai/hs-rerank-1",
-        revision: "927f5be31280298a51cf29af8a29cb111ed812c5",
-        onnx: PinnedFile {
-            path: "onnx/model.onnx",
-            size: 160_582_339,
-            sha256: "c866580692c6bf274b11ca622db4329f4cbfd6f08f96af964badc31d748ef243",
-        },
-        tokenizer: PinnedFile {
-            path: "tokenizer.json",
-            size: 34_363_188,
-            sha256: "609d8f4c067cd3950f88594c5a802616cea245823836ef5848ee4fc40aab5b6f",
-        },
-        head: Head::Logit,
-        max_tokens: 512,
-        query_prefix: "",
-        passage_prefix: "",
-        dims: 1,
-    },
     ModelPin {
         name: "multilingual-reranker-small-int8",
         repo: "Horizon-Labs/multilingual-reranker-small",
@@ -154,18 +136,18 @@ pub const RERANKERS: &[ModelPin] = &[
         dims: 1,
     },
     ModelPin {
-        name: "mmarco-mminilmv2-l12-h384-int8",
-        repo: "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
-        revision: "1427fd652930e4ba29e8149678df786c240d8825",
+        name: "hs-rerank-1",
+        repo: "hindsight-ai/hs-rerank-1",
+        revision: "927f5be31280298a51cf29af8a29cb111ed812c5",
         onnx: PinnedFile {
-            path: "onnx/model_qint8_avx512_vnni.onnx",
-            size: 118_620_017,
-            sha256: "1825907d6c1a9001ff78124780bbde20a614a8c3df3b63409cf3c72c6fe5c8b4",
+            path: "onnx/model.onnx",
+            size: 160_582_339,
+            sha256: "c866580692c6bf274b11ca622db4329f4cbfd6f08f96af964badc31d748ef243",
         },
         tokenizer: PinnedFile {
             path: "tokenizer.json",
-            size: 17_082_660,
-            sha256: "62c24cdc13d4c9952d63718d6c9fa4c287974249e16b7ade6d5a85e7bbb75626",
+            size: 34_363_188,
+            sha256: "609d8f4c067cd3950f88594c5a802616cea245823836ef5848ee4fc40aab5b6f",
         },
         head: Head::Logit,
         max_tokens: 512,
@@ -186,6 +168,26 @@ pub const RERANKERS: &[ModelPin] = &[
             path: "tokenizer.json",
             size: 17_082_900,
             sha256: "8bf8afbfd11306bd872018c53bfdf2e160a56f8edbcf49933324404791c148d3",
+        },
+        head: Head::Logit,
+        max_tokens: 512,
+        query_prefix: "",
+        passage_prefix: "",
+        dims: 1,
+    },
+    ModelPin {
+        name: "mmarco-mminilmv2-l12-h384-int8",
+        repo: "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
+        revision: "1427fd652930e4ba29e8149678df786c240d8825",
+        onnx: PinnedFile {
+            path: "onnx/model_qint8_avx512_vnni.onnx",
+            size: 118_620_017,
+            sha256: "1825907d6c1a9001ff78124780bbde20a614a8c3df3b63409cf3c72c6fe5c8b4",
+        },
+        tokenizer: PinnedFile {
+            path: "tokenizer.json",
+            size: 17_082_660,
+            sha256: "62c24cdc13d4c9952d63718d6c9fa4c287974249e16b7ade6d5a85e7bbb75626",
         },
         head: Head::Logit,
         max_tokens: 512,
