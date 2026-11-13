@@ -170,7 +170,7 @@ process again.
 
 ## The conformance suite
 
-`tests/invariants/src/conformance.rs` runs the same ten scenarios against
+`tests/invariants/src/conformance.rs` runs the same eleven scenarios against
 every adapter, through a real `DeliveryLoop` and a scripted vendor process
 that speaks the vendor's own protocol (`tests/invariants/fakes/`: the shared
 session engine in `engine.py`, one `proto_<vendor>.py` per protocol). The
@@ -191,6 +191,7 @@ ahead of mail.
 | an offer twice reaches the vendor once | a message offered again to the process that took it is not written again |
 | a refused message waits without a restart | the vendor refuses a message for its running turn: no restart, applied once later |
 | a slow answer neither fails nor duplicates | every vendor answer is 1.5 s late: no failure, no restart, no second write |
+| a photo in the mailbox reaches the model as its path | a message naming a file in `<data>/media`, to an idle agent and to a busy one: the model is given the text, which names the file, and no image; the agent decides whether to look ([media.md](media.md)) |
 
 A new harness gets the suite by implementing `Subject` (how to start the
 adapter against the scripted vendor) and invoking `conformance_suite!` once,
