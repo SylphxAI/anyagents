@@ -1,6 +1,7 @@
 //! Delivery loop. It hands each message past the delivery cursor to the
-//! harness, in sequence order, and moves the cursor only after the harness's
-//! own input or steer API has taken the message. It never looks at a turn.
+//! harness, in sequence order, and moves the cursor only over the contiguous
+//! prefix the harness's own input or steer API has taken. A line the vendor
+//! holds in flight never stops the lines behind it. It never looks at a turn.
 
 use anyagents_core::{AgentId, Message, Store};
 use anyagents_harness::{DeliverOutcome, Harness, HarnessError, OutboundMessage, SteerItem};
@@ -100,9 +101,7 @@ impl<H: Harness> DeliveryLoop<H> {
         }
     }
 
-    /// Hand every undelivered message to the harness in sequence order, moving
-    /// the cursor after each one its native input or steer API has taken. A
-    /// quota answer is returned, not retried.
+    /// Rewind the cursor over steers the harness gave back as unconfirmed.
     fn drain_reclaimed_steers(&mut self) -> Result<(), Error> {
         let reclaimed = self.harness.take_reclaimed_steers();
         if !reclaimed.is_empty() {
@@ -112,6 +111,16 @@ impl<H: Harness> DeliveryLoop<H> {
         Ok(())
     }
 
+    /// One pass over the mailbox, in sequence order. Every line the harness
+    /// can take is handed over in this pass; the cursor moves only over the
+    /// contiguous prefix the harness proved consumed. Behind a line it holds
+    /// in flight, the pass keeps writing, so the vendor takes the whole inbox
+    /// at its next step, and the next pass commits what it consumed.
+    ///
+    /// A quota answer is returned, not retried. `Delivered` counts the lines
+    /// committed as new work. A line the vendor
+    /// already consumed in an earlier process (`Duplicate`) is committed too,
+    /// but it woke nothing, so an interrupted turn still gets its recovery note.
     pub fn run_once(&mut self) -> Result<RunOutcome, Error> {
         self.drain_reclaimed_steers()?;
         let mut delivered = 0u64;
@@ -120,14 +129,22 @@ impl<H: Harness> DeliveryLoop<H> {
         {
             return Ok(RunOutcome::Idle);
         }
+        // The last line handed over that is not committed: once there is one,
+        // later lines are written behind it and none of them is committed.
+        let mut behind: Option<i64> = None;
         loop {
             if delivered > 0
+                && behind.is_none()
                 && self.harness.health().turn_state == TurnState::Idle
                 && !self.store.has_actionable_undelivered(&self.agent_id)?
             {
                 return Ok(RunOutcome::Delivered { delivered });
             }
-            let Some(message) = self.store.next_undelivered(&self.agent_id)? else {
+            let next = match behind {
+                None => self.store.next_undelivered(&self.agent_id)?,
+                Some(seq) => self.store.undelivered_after(&self.agent_id, seq)?,
+            };
+            let Some(message) = next else {
                 return Ok(if delivered == 0 {
                     RunOutcome::Idle
                 } else {
@@ -136,6 +153,20 @@ impl<H: Harness> DeliveryLoop<H> {
             };
             let seq = message.seq;
             match self.harness.deliver(&outbound(&message)) {
+                // Consumed, but an older line is not yet: the pass that sees
+                // that one consumed commits both, in order.
+                Ok(
+                    DeliverOutcome::Accepted { .. }
+                    | DeliverOutcome::Duplicate
+                    | DeliverOutcome::InFlight,
+                ) if behind.is_some() => behind = Some(seq),
+                Ok(DeliverOutcome::InFlight) => behind = Some(seq),
+                Ok(DeliverOutcome::Duplicate) => {
+                    // Part of the turn the earlier process ran: it extends
+                    // that turn and never completes it.
+                    self.store.note_delivered(&self.agent_id, seq)?;
+                    self.quota_reset_at_ms = None;
+                }
                 Ok(DeliverOutcome::Accepted { turn_finished }) => {
                     self.store.note_delivered(&self.agent_id, seq)?;
                     if turn_finished && self.harness.health().sign_in_fault.is_none() {
@@ -278,6 +309,15 @@ impl<H: Harness> DeliveryLoop<H> {
     ) -> Result<DeliverOutcome, Error> {
         let note = recovery_outbound_with_reconciliation(open, reconciled);
         match self.harness.deliver(&note) {
+            // A note an earlier process already consumed was delivered then.
+            Ok(DeliverOutcome::Duplicate) => {
+                self.store
+                    .note_turn_recovered(&self.agent_id, open.opened_seq)?;
+                self.quota_reset_at_ms = None;
+                Ok(DeliverOutcome::Accepted {
+                    turn_finished: false,
+                })
+            }
             Ok(DeliverOutcome::Accepted { turn_finished }) => {
                 self.store
                     .note_turn_recovered(&self.agent_id, open.opened_seq)?;
@@ -287,7 +327,9 @@ impl<H: Harness> DeliveryLoop<H> {
                 self.quota_reset_at_ms = None;
                 Ok(DeliverOutcome::Accepted { turn_finished })
             }
-            Ok(DeliverOutcome::Deferred) => Ok(DeliverOutcome::Deferred),
+            // Written but not yet consumed: the note is offered again, by
+            // the same id, until the vendor proves it took it.
+            Ok(DeliverOutcome::Deferred | DeliverOutcome::InFlight) => Ok(DeliverOutcome::Deferred),
             Ok(DeliverOutcome::Quota { reset_at_ms }) => {
                 self.quota_reset_at_ms = Some(reset_at_ms);
                 Ok(DeliverOutcome::Quota { reset_at_ms })
@@ -537,6 +579,147 @@ mod tests {
         );
         loop_.run_once().unwrap();
         assert_eq!(loop_.health(6_000).unwrap().oldest_undelivered_age_ms, None);
+    }
+
+    /// A harness that answers each id with what the test says the vendor has
+    /// proved so far: a line it was handed is in flight until then.
+    struct Proving {
+        answers: std::collections::HashMap<String, DeliverOutcome>,
+        written: Vec<String>,
+    }
+
+    impl Harness for Proving {
+        fn deliver(&mut self, message: &OutboundMessage) -> Result<DeliverOutcome, HarnessError> {
+            let answer = self.answers.entry(message.id.clone()).or_insert_with(|| {
+                self.written.push(message.id.clone());
+                DeliverOutcome::InFlight
+            });
+            Ok(answer.clone())
+        }
+        fn background(&mut self) -> Result<(), HarnessError> {
+            Ok(())
+        }
+        fn resume(&mut self, _session: &str) -> Result<(), HarnessError> {
+            Ok(())
+        }
+        fn cancel(&mut self) -> Result<(), HarnessError> {
+            Ok(())
+        }
+        fn health(&self) -> anyagents_harness::HarnessHealth {
+            anyagents_harness::HarnessHealth {
+                process_alive: true,
+                turn_state: TurnState::InTurn,
+                delivery_mode: DeliveryMode::Steer,
+                steer_support: SteerSupport::Yes,
+                quota_reset_at_ms: None,
+                sign_in_fault: None,
+            }
+        }
+    }
+
+    fn proving() -> (
+        tempfile::TempDir,
+        DeliveryLoop<Proving>,
+        AgentId,
+        Vec<Message>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(NewAgent::new("alpha", "spiron"))
+            .unwrap();
+        let messages = ["one", "two", "three", "four"]
+            .iter()
+            .map(
+                |text| match store.receive(&agent.id, Incoming::new(*text)).unwrap() {
+                    anyagents_core::ReceiveOutcome::New(message) => message,
+                    anyagents_core::ReceiveOutcome::Duplicate(_) => panic!("unexpected duplicate"),
+                },
+            )
+            .collect();
+        let harness = Proving {
+            answers: std::collections::HashMap::new(),
+            written: Vec::new(),
+        };
+        let id = agent.id.clone();
+        (
+            dir,
+            DeliveryLoop::start(store, agent.id, harness).unwrap(),
+            id,
+            messages,
+        )
+    }
+
+    fn prove(loop_: &mut DeliveryLoop<Proving>, message: &Message, answer: DeliverOutcome) {
+        loop_
+            .harness_mut()
+            .answers
+            .insert(message.id.as_str().to_string(), answer);
+    }
+
+    #[test]
+    fn lines_behind_one_in_flight_are_written_at_once_and_committed_only_in_order() {
+        let (_dir, mut loop_, _id, messages) = proving();
+        let consumed = DeliverOutcome::Accepted {
+            turn_finished: false,
+        };
+        // Nothing is proved: the whole inbox is written, nothing committed.
+        assert_eq!(loop_.run_once().unwrap(), RunOutcome::Idle);
+        assert_eq!(loop_.harness().written.len(), 4);
+        assert_eq!(loop_.delivered_cursor().unwrap(), 0);
+        // The first and third are proved; the second still is not, so only
+        // the first is committed.
+        prove(&mut loop_, &messages[0], consumed.clone());
+        prove(&mut loop_, &messages[2], consumed.clone());
+        assert_eq!(
+            loop_.run_once().unwrap(),
+            RunOutcome::Delivered { delivered: 1 }
+        );
+        assert_eq!(loop_.delivered_cursor().unwrap(), messages[0].seq);
+        // The second is proved: it and the third are committed, in order.
+        prove(&mut loop_, &messages[1], consumed.clone());
+        assert_eq!(
+            loop_.run_once().unwrap(),
+            RunOutcome::Delivered { delivered: 2 }
+        );
+        assert_eq!(loop_.delivered_cursor().unwrap(), messages[2].seq);
+        assert_eq!(loop_.harness().written.len(), 4, "nothing is written twice");
+        assert_eq!(loop_.run_once().unwrap(), RunOutcome::Idle);
+        assert_eq!(loop_.delivered_cursor().unwrap(), messages[2].seq);
+    }
+
+    #[test]
+    fn a_line_an_earlier_process_consumed_is_committed_but_wakes_nothing() {
+        let (_dir, mut loop_, id, messages) = proving();
+        loop_.store().note_delivered(&id, messages[0].seq).unwrap();
+        prove(&mut loop_, &messages[1], DeliverOutcome::Duplicate);
+        prove(&mut loop_, &messages[2], DeliverOutcome::Duplicate);
+        prove(&mut loop_, &messages[3], DeliverOutcome::Deferred);
+        // Only replays: the cursor moves, but nothing new was delivered, so
+        // the interrupted turn they belong to stays open for its recovery.
+        assert_eq!(loop_.run_once().unwrap(), RunOutcome::Idle);
+        assert_eq!(loop_.delivered_cursor().unwrap(), messages[2].seq);
+        let open = loop_.store().open_turn(&id).unwrap().unwrap();
+        let ids: Vec<&str> = open.messages.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                messages[0].id.as_str(),
+                messages[1].id.as_str(),
+                messages[2].id.as_str()
+            ]
+        );
+        prove(
+            &mut loop_,
+            &messages[3],
+            DeliverOutcome::Accepted {
+                turn_finished: false,
+            },
+        );
+        assert_eq!(
+            loop_.run_once().unwrap(),
+            RunOutcome::Delivered { delivered: 1 }
+        );
     }
 
     #[test]

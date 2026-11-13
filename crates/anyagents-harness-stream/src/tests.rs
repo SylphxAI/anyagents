@@ -460,7 +460,10 @@ line3 = sys.stdin.readline()
         }
     ));
 
-    // Before `step_update` (`step_type: "user_input"`) arrives, m2 is deferred.
+    // The cascade is known from `init`. Before the turn's first
+    // `step_update` (`step_type: "user_input"`) arrives, m2 is deferred: the
+    // cascade may still be idle, and a steer would overtake the turn.
+    assert!(harness.wait_pred(Duration::from_secs(3), |state| state.session_id.is_some()));
     let mut m2 = m1.clone();
     m2.id = "m2".into();
     m2.text = "second-steered".into();
@@ -1323,11 +1326,7 @@ fn agy_rpc_discovers_running_turn_one_trajectory_and_accepts_steer_before_stdout
             turn_finished: false
         }
     );
-    assert!(!harness.input_ready());
-    let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    while !harness.input_ready() && std::time::Instant::now() < ready_deadline {
-        std::thread::sleep(std::time::Duration::from_millis(15));
-    }
+    // No time gate: a fresh session asks the language server at once.
     assert!(harness.input_ready());
 
     let second = anyagents_harness::OutboundMessage {
