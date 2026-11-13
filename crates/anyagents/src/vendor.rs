@@ -736,7 +736,7 @@ fn vendor_launch_inner(
         ensure_agy_steering_settings(
             &request.config_dir,
             &request.work_dir,
-            &request.data_dir.join(anyagents_harness::media::MEDIA_DIR),
+            &request.data_dir.join("media"),
         )
         .map_err(|err| err.to_string())?;
     }
