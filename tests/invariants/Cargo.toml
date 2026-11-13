@@ -13,6 +13,7 @@ publish = false
 anyagents-agent = { path = "../../crates/anyagents-agent" }
 anyagents-core = { path = "../../crates/anyagents-core" }
 anyagents-harness = { path = "../../crates/anyagents-harness" }
+image = { version = "0.25", default-features = false, features = ["png"] }
 serde_json = "1"
 tempfile = "3"
 

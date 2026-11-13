@@ -20,6 +20,8 @@ live records (marked "inferred" where neither shows it):
     GetCascadeTrajectoryGeneratorMetadata  the planner config a new
                 invocation needs
     SendUserCascadeMessage  with `MESSAGE_DELIVERY_STRATEGY_NEXT_INVOCATION`
+                (its `items` the text, its `media` `{mimeType,
+                inlineData}` the images the model is given with it)
                 writes the message to the cascade's durable mailbox
                 (`messages.(*FileStore).Save`):
                 `brain/<cid>/.system_generated/messages/<uuid>.json`, its
@@ -75,7 +77,7 @@ import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from engine import Input, Protocol, marker_id
+from engine import Input, Protocol, image_b64, marker_id
 
 VERSION = "1.5.8"
 SERVICE = "/exa.language_server_pb.LanguageServerService/"
@@ -414,7 +416,10 @@ class Agy(Protocol):
     def send_message(self, request):
         engine = self.engine
         text = "".join(item.get("text", "") for item in request.get("items") or [])
-        inp = Input(marker_id(text), text, "SendUserCascadeMessage")
+        # The input's own media, which the model is given beside its text.
+        media = [image_b64(item["inlineData"], item["mimeType"])
+                 for item in request.get("media") or [] if item.get("inlineData")]
+        inp = Input(marker_id(text), text, "SendUserCascadeMessage", media=media)
         engine.append("rpc.jsonl", {"id": inp.id, "launch": engine.launch})
         if self.once("drop-request"):
             return DROP

@@ -44,6 +44,9 @@ pub struct Seen {
     pub step: u64,
     pub launch: u64,
     pub text: String,
+    /// The images the input carried beside the text: their type and the
+    /// SHA-256 of their bytes, in order.
+    pub images: Vec<(String, String)>,
 }
 
 /// The one wrapper every fixture's vendor program links to, written once per
@@ -142,6 +145,20 @@ impl Fixture {
                 step: row["step"].as_u64().unwrap_or_default(),
                 launch: row["launch"].as_u64().unwrap_or_default(),
                 text: row["text"].as_str().unwrap_or_default().to_string(),
+                images: row["media"]
+                    .as_array()
+                    .map(|images| {
+                        images
+                            .iter()
+                            .map(|image| {
+                                (
+                                    image["mime"].as_str().unwrap_or_default().to_string(),
+                                    image["sha256"].as_str().unwrap_or_default().to_string(),
+                                )
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
             })
             .collect()
     }
@@ -221,6 +238,34 @@ impl<S: Subject> World<S> {
 
     pub fn delivery_level(&self) -> Delivery {
         self.delivery.harness().health().delivery
+    }
+
+    /// A file a channel received, as the server keeps it: in the data
+    /// directory's `media`, readable by every seat.
+    pub fn media_file(&self, name: &str, bytes: &[u8]) -> PathBuf {
+        let dir = self
+            .delivery
+            .store()
+            .data_dir()
+            .join(anyagents_harness::media::MEDIA_DIR);
+        std::fs::create_dir_all(&dir).expect("media directory");
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).expect("media file");
+        path
+    }
+
+    /// One new mailbox message with `text`.
+    pub fn receive_text(&mut self, text: &str) -> Message {
+        self.received += 1;
+        match self
+            .delivery
+            .store()
+            .receive(&self.agent, Incoming::new(text))
+            .expect("receive")
+        {
+            ReceiveOutcome::New(message) => message,
+            ReceiveOutcome::Duplicate(_) => panic!("unexpected duplicate"),
+        }
     }
 
     /// `count` new mailbox messages, in sequence order.
@@ -789,6 +834,74 @@ pub fn a_slow_answer_neither_fails_nor_duplicates<S: Subject>() {
     assert_eq!(world.fixture.launches(), 1, "{}: restarted", S::HARNESS);
 }
 
+/// A PNG of `width` by one pixels.
+pub fn png(width: u32) -> Vec<u8> {
+    let image = image::RgbImage::from_fn(width, 1, |x, _| image::Rgb([x as u8, 40, 200]));
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgb8(image)
+        .write_to(&mut bytes, image::ImageFormat::Png)
+        .expect("png");
+    bytes.into_inner()
+}
+
+/// A photo a channel delivered reaches the model as its path alone: the
+/// line that names the file is in the text, and no image goes with it, sent
+/// to an idle agent or while its turn runs. The agent decides whether to
+/// look (`docs/media.md`); the scripted vendors record any image an input
+/// carries, so one an adapter attached would show.
+pub fn a_photo_in_the_mailbox_reaches_the_model_as_its_path<S: Subject>() {
+    let mut world = World::<S>::new();
+    let mut photos = Vec::new();
+    let bytes = png(3);
+    let path = world.media_file("complete_photo_conformance-1.png", &bytes);
+    let line = anyagents_harness::media::local_media_line("photo", &path);
+    let first = world.receive_text(&format!("what is in this photo?\n{line}"));
+    photos.push((first.clone(), line));
+    world.pump_until("the photo prompt is committed", |w| w.cursor() == first.seq);
+    let bytes = png(5);
+    let path = world.media_file("complete_photo_conformance-2.png", &bytes);
+    let line = anyagents_harness::media::local_media_line("photo", &path);
+    let second = world.receive_text(&format!("and this one?\n{line}"));
+    if world.delivery_level().level != DeliveryLevel::TurnEnd {
+        world.pump_until("the second photo reaches the vendor", |w| {
+            w.fixture.wire().contains(&second.id.to_string())
+        });
+        world.fixture.command("step");
+    }
+    photos.push((second, line));
+    let last = photos.last().unwrap().0.seq;
+    world.drain(last);
+    let journal = world.fixture.journal();
+    for (message, line) in &photos {
+        let seen = journal
+            .iter()
+            .find(|seen| seen.id == message.id.as_str())
+            .unwrap_or_else(|| {
+                panic!(
+                    "{}: {} never reached the model; journal {:?}",
+                    S::HARNESS,
+                    message.id,
+                    ids(&journal)
+                )
+            });
+        assert!(
+            seen.text.contains(line.as_str()),
+            "{}: the text no longer names the file: {}",
+            S::HARNESS,
+            seen.text
+        );
+        assert!(
+            seen.images.is_empty(),
+            "{}: {} carried images into the model's input: {:?}",
+            S::HARNESS,
+            message.id,
+            seen.images
+        );
+    }
+    let messages: Vec<Message> = photos.into_iter().map(|(message, _)| message).collect();
+    assert_once_in_order(&world, &messages);
+}
+
 /// Every scenario as a `#[test]` for one [`Subject`].
 #[macro_export]
 macro_rules! conformance_suite {
@@ -836,6 +949,10 @@ macro_rules! conformance_suite {
         #[test]
         fn a_slow_answer_neither_fails_nor_duplicates() {
             $crate::conformance::a_slow_answer_neither_fails_nor_duplicates::<$subject>();
+        }
+        #[test]
+        fn a_photo_in_the_mailbox_reaches_the_model_as_its_path() {
+            $crate::conformance::a_photo_in_the_mailbox_reaches_the_model_as_its_path::<$subject>();
         }
     };
 }

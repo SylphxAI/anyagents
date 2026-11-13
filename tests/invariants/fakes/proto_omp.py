@@ -26,6 +26,8 @@ Read from the package's own source (`src/modes/rpc/rpc-mode.ts`,
   steering queued. When it yields: `agent_end`, one `prompt_result` {id,
   agentInvoked, status, sessionSettled} per prompt it took (the steered ones,
   then the one that opened it), then `session_settled`.
+- A `prompt` may carry `images`, `[{type: "image", data, mimeType}]`; the
+  user message holds them after its text block.
 - Nothing is deduplicated by `id`.
 - The session file (`get_state` names it `sessionFile`): a `session` header,
   then `{type: "message", id, parentId, timestamp, message}` per message.
@@ -44,7 +46,7 @@ import json
 import os
 import sys
 
-from engine import Input, Protocol, marker_id
+from engine import Input, Protocol, image_b64, marker_id
 
 READY = {"type": "ready", "protocolVersion": 1, "supportedProtocolVersions": [1, 2],
          "maxFrameBytes": 1024 * 1024, "maxReassembledFrameBytes": 64 * 1024 * 1024}
@@ -137,8 +139,9 @@ class Omp(Protocol):
 
     @staticmethod
     def user(inp, steering):
-        message = {"role": "user", "content": [{"type": "text", "text": inp.text}],
-                   "attribution": "user", "timestamp": 0}
+        # The prompt's images follow its text in the user message.
+        content = [{"type": "text", "text": inp.text}] + inp.meta.get("images", [])
+        message = {"role": "user", "content": content, "attribution": "user", "timestamp": 0}
         if steering:
             message["steering"] = True
         return message
@@ -197,7 +200,9 @@ class Omp(Protocol):
             self.respond(rid, kind)
         elif kind == "prompt":
             text = msg.get("message", "")
-            inp = Input(marker_id(text), text, kind, {"rid": rid})
+            images = msg.get("images") or []
+            inp = Input(marker_id(text), text, kind, {"rid": rid, "images": images},
+                        [image_b64(item["data"], item["mimeType"]) for item in images])
             engine.received(inp)
             if engine.turn is None:
                 engine.open_turn(inp)

@@ -3,6 +3,8 @@
 See `vendor.py` for how a test drives it.
 """
 
+import base64
+import hashlib
 import json
 import queue
 import os
@@ -19,12 +21,38 @@ def marker_id(text):
     return first[len(MARKER):] if first.startswith(MARKER) else None
 
 
+def image(data, mime):
+    """An image the model is given: its type and the digest of its bytes."""
+    return {"mime": mime, "sha256": hashlib.sha256(data).hexdigest()}
+
+
+def image_b64(data, mime):
+    return image(base64.b64decode(data), mime)
+
+
+def image_url(url):
+    """An image given as a `data:<mime>;base64,<data>` URL."""
+    head, data = url.split(",", 1)
+    assert head.startswith("data:") and head.endswith(";base64"), head
+    return image_b64(data, head[len("data:"):-len(";base64")])
+
+
+def image_file(path, mime):
+    """An image the vendor reads from `path` itself."""
+    if path.startswith("file://"):
+        path = path[len("file://"):]
+    with open(path, "rb") as source:
+        return image(source.read(), mime)
+
+
 class Input:
-    def __init__(self, ident, text, kind, meta=None):
+    def __init__(self, ident, text, kind, meta=None, media=None):
         self.id = ident
         self.text = text
         self.kind = kind
         self.meta = meta or {}
+        # The images the model is given beside the text, as `image` makes them.
+        self.media = media or []
 
 
 class Engine:
@@ -73,7 +101,7 @@ class Engine:
             kind = "note"
         self.append("journal.jsonl", {
             "id": inp.id, "kind": kind, "turn": self.turn, "step": self.step_no,
-            "launch": self.launch, "text": inp.text,
+            "launch": self.launch, "text": inp.text, "media": inp.media,
         })
         return True
 

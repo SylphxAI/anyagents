@@ -16,7 +16,7 @@ import json
 import os
 import pathlib
 
-from engine import Input, Protocol, marker_id
+from engine import Input, Protocol, image_b64, marker_id
 
 VERSION = "2.1.323"
 
@@ -26,6 +26,14 @@ def text_of(content):
         return content
     return "".join(block.get("text", "") for block in content or []
                    if block.get("type") == "text")
+
+
+def images_of(content):
+    """The base64 `image` blocks of a user message, which the model sees."""
+    if isinstance(content, str):
+        return []
+    return [image_b64(block["source"]["data"], block["source"]["media_type"])
+            for block in content or [] if block.get("type") == "image"]
 
 
 class Claude(Protocol):
@@ -102,7 +110,8 @@ class Claude(Protocol):
         content = (msg.get("message") or {}).get("content")
         text = text_of(content)
         uuid = msg.get("uuid")
-        inp = Input(marker_id(text), text, kind, {"uuid": uuid, "content": content})
+        inp = Input(marker_id(text), text, kind, {"uuid": uuid, "content": content},
+                    images_of(content))
         self.engine.received(inp)
         if uuid and (uuid in self.seen_uuids or uuid in self.user_row_uuids()):
             self.later(lambda: self.echo(inp))

@@ -1,6 +1,7 @@
 """`muse serve` (Muse 1.4.20): JSON-RPC 2.0, one object per line.
 
-`turn/start {commandId, sessionId, input, ifBusy: "steer"}` opens a turn when
+`turn/start {commandId, sessionId, input, ifBusy: "steer"}` (`input` text
+parts, then `image` parts `{mediaType, base64Data, width, height}`) opens a turn when
 none runs (the turn is named after its `commandId`) and otherwise writes the
 input durably into the running turn's inbox before it answers. The answer is
 an admission ack only: `{commandId, status, disposition, turnId,
@@ -38,7 +39,10 @@ import json
 import time
 import uuid
 
-from engine import Input, Protocol, marker_id
+from engine import Input, Protocol, image_b64, marker_id
+
+# The image types Muse stores as input.
+IMAGE_TYPES = ("image/png", "image/jpeg", "image/webp")
 
 COMMANDS = "muse-commands.json"
 INBOX = "muse-inbox.json"
@@ -190,9 +194,14 @@ class Muse(Protocol):
     def turn_start(self, rid, params):
         engine = self.engine
         command = params.get("commandId")
-        text = "".join(part.get("text", "") for part in params.get("input") or []
-                       if part.get("type") == "text")
-        inp = Input(marker_id(text) or command, text, "turn/start", {"commandId": command})
+        parts = params.get("input") or []
+        text = "".join(part.get("text", "") for part in parts if part.get("type") == "text")
+        # `{"type": "image", "mediaType", "base64Data"}` parts follow the text.
+        images = [image_b64(part["base64Data"], part["mediaType"])
+                  for part in parts if part.get("type") == "image"]
+        assert all(image["mime"] in IMAGE_TYPES for image in images), images
+        inp = Input(marker_id(text) or command, text, "turn/start", {"commandId": command},
+                    images)
         engine.received(inp)
         payload = {key: value for key, value in params.items() if key != "commandId"}
         fingerprint = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()

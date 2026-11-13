@@ -23,9 +23,11 @@ A state file is read while it exists:
   slow      the vendor answers each input this many milliseconds late
 
 Records, one JSON object per line:
-  journal.jsonl  {"id", "kind", "turn", "step", "launch", "text"}: an input the
-                 model saw, in the order it saw them ("prompt" opens a turn,
-                 "steer" joined a running one at a step)
+  journal.jsonl  {"id", "kind", "turn", "step", "launch", "text", "media"}: an
+                 input the model saw, in the order it saw them ("prompt" opens
+                 a turn, "steer" joined a running one at a step), with any
+                 image the input carried beside the text (`{"mime",
+                 "sha256"}`)
   wire.jsonl     {"id", "launch", "kind"}: every input as it arrived
   launches       how many processes have started on this fixture
 """

@@ -7,7 +7,7 @@ BODY]` makes one request against it and prints the answer's body; an answer
 that is not 2xx also prints `HTTP <status> <text>` on stderr and exits 1. An
 error's body is `{"_tag": <error>, "message": ...}`.
 
-`POST /api/session/{id}/prompt` (`{id?, text, delivery}`) admits one input
+`POST /api/session/{id}/prompt` (`{id?, text, files?, delivery}`) admits one input
 to the session's durable inbox and answers with that inbox record. Given an
 `id` (it must start with `msg_`, or the payload does not decode: 400) the
 session already holds, as an inbox record or as a message it consumed, it
@@ -21,6 +21,10 @@ event stream (`session.inbox.delivered`), which this fake does not serve:
 `GET /api/session/{id}/message/{messageID}` finds a consumed input under its
 own id. `POST /api/experimental/session/{id}/wait` answers 204 once the
 session is idle.
+
+A `files` entry `{"uri": "file://<path>"}` is read by the service and given
+to the model beside the text; one it cannot read or decode refuses the whole
+prompt with a 400 `AttachmentError` and admits nothing.
 
 The refusal the test asks for is the service's readiness gate: while it is
 (re)starting, every route but `GET /api/info` answers 503 `{"code":
@@ -41,7 +45,18 @@ import threading
 import time
 import urllib.parse
 
-from engine import Input, Protocol, marker_id
+from engine import Input, Protocol, image_file, marker_id
+
+
+def sniff(path):
+    """The image type of a file, from its bytes, as OpenCode reads it."""
+    with open(path, "rb") as source:
+        head = source.read(12)
+    if head.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if head.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    return None
 
 VERSION = "2.1.4"
 
@@ -277,9 +292,20 @@ class OpenCode(Protocol):
         delivery = body.get("delivery") or "steer"
         engine = self.engine
         with engine.lock:
+            images = []
+            for attached in body.get("files") or []:
+                uri = attached.get("uri") or ""
+                path = urllib.parse.unquote(uri[len("file://"):]) if uri.startswith("file://") \
+                    else None
+                mime = sniff(path) if path and os.path.isfile(path) else None
+                if mime is None:
+                    # An attachment it cannot read or decode: the whole
+                    # prompt is refused, and nothing is admitted.
+                    raise Failure(400, "AttachmentError", "Cannot read attachment %s" % uri)
+                images.append(image_file(path, mime))
             vid = ident or "msg_" + secrets.token_hex(13)
             inp = Input(marker_id(text) or vid, text, "prompt" if engine.turn is None else "steer",
-                        {"vid": vid, "session": session, "created": now_ms()})
+                        {"vid": vid, "session": session, "created": now_ms()}, images)
             engine.received(inp)
             if engine.turn is not None and self.take_refusal():
                 # The gate answers before the route reads the inbox.

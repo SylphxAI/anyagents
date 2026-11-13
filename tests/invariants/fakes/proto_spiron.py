@@ -21,9 +21,16 @@ Besides the engine's commands, this vendor reads these files:
   reject  the next input is refused with the code the file holds (a code
           Spiron answers for a line no offer can make it take)
 """
-from engine import Input, Protocol
+from engine import Input, Protocol, image_file
 
 LEASED = "This Session already has an active turn."
+CAPABILITIES = ["steer_consumed", "idempotent_input"]
+
+
+def images_of(msg):
+    """Images an input line would carry (`images: [{"path", "mime_type"}]`);
+    `spiron.headless/v1` defines none, so AnyAgents sends none."""
+    return [image_file(item["path"], item["mime_type"]) for item in msg.get("images") or []]
 
 
 class Spiron(Protocol):
@@ -40,7 +47,7 @@ class Spiron(Protocol):
         if "--session" in self.args:
             self.session = self.args[self.args.index("--session") + 1]
         self.frame({"type": "ready", "protocol": "spiron.headless/v1",
-                    "capabilities": ["steer_consumed", "idempotent_input"]}, None)
+                    "capabilities": CAPABILITIES}, None)
 
     def refused(self, msg):
         """The code Spiron refuses `msg` with before any turn sees it."""
@@ -62,7 +69,7 @@ class Spiron(Protocol):
         rid = msg.get("request_id")
         if kind in ("cancel", "interrupt"):
             return
-        inp = Input(rid, msg.get("text", ""), kind)
+        inp = Input(rid, msg.get("text", ""), kind, media=images_of(msg))
         self.engine.received(inp)
         engine = self.engine
         code = self.refused(msg)

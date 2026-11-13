@@ -2,7 +2,7 @@
 import json
 import uuid
 
-from engine import Input, Protocol, marker_id
+from engine import Input, Protocol, image_url, marker_id
 
 # JSON-RPC error codes the app-server answers with.
 INVALID_REQUEST = -32600
@@ -118,8 +118,12 @@ class Codex(Protocol):
 
     def input(self, method, rid, params):
         engine = self.engine
-        text = "".join(part.get("text", "") for part in params.get("input") or [])
-        inp = Input(params.get("clientUserMessageId") or marker_id(text), text, method)
+        parts = params.get("input") or []
+        text = "".join(part.get("text", "") for part in parts)
+        # `{"type": "image", "url": "data:..."}` reaches the model as an image.
+        images = [image_url(part["url"]) for part in parts if part.get("type") == "image"]
+        inp = Input(params.get("clientUserMessageId") or marker_id(text), text, method,
+                    media=images)
         engine.received(inp)
         if len(text) > MAX_INPUT_CHARS:
             message = "Input exceeds the maximum length of %d characters." % MAX_INPUT_CHARS
