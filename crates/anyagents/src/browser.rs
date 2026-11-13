@@ -570,10 +570,68 @@ fn load_runtime(data: &Path, profile: &str) -> Result<Option<BrowserRuntimeState
 }
 
 fn save_runtime(data: &Path, state: &BrowserRuntimeState) -> Result<(), Error> {
+    note_active_profile(data, &state.profile);
     write_profile_json(
         &profile_dir(data, &state.profile).join("runtime.json"),
         state,
     )
+}
+
+/// Profiles that may hold a running browser or an open takeover, per profiles
+/// root, so the idle reaper never lists every profile ever created. A root is
+/// read from disk once, since a browser can outlive the daemon that started it;
+/// launches and takeovers in this process add to it, and the reaper drops a
+/// profile once neither remains.
+#[derive(Default)]
+struct ActiveProfiles {
+    seeded: bool,
+    names: std::collections::BTreeSet<String>,
+}
+
+static ACTIVE_PROFILES: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<PathBuf, ActiveProfiles>>,
+> = std::sync::LazyLock::new(Default::default);
+
+fn active_profiles()
+-> std::sync::MutexGuard<'static, std::collections::HashMap<PathBuf, ActiveProfiles>> {
+    ACTIVE_PROFILES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn note_active_profile(data: &Path, profile: &str) {
+    active_profiles()
+        .entry(profiles_root(data))
+        .or_default()
+        .names
+        .insert(profile.to_string());
+}
+
+fn forget_active_profile(data: &Path, profile: &str) {
+    if let Some(active) = active_profiles().get_mut(&profiles_root(data)) {
+        active.names.remove(profile);
+    }
+}
+
+/// The profiles the idle reaper must look at.
+fn candidate_profiles(data: &Path) -> Vec<String> {
+    let root = profiles_root(data);
+    let mut all = active_profiles();
+    let active = all.entry(root.clone()).or_default();
+    if !active.seeded {
+        if let Ok(entries) = std::fs::read_dir(&root) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if (path.join("runtime.json").is_file() || path.join("takeover.json").is_file())
+                    && let Some(name) = path.file_name().and_then(|n| n.to_str())
+                {
+                    active.names.insert(name.to_string());
+                }
+            }
+        }
+        active.seeded = true;
+    }
+    active.names.iter().cloned().collect()
 }
 
 fn touch_runtime(data: &Path, state: &mut BrowserRuntimeState) -> Result<(), Error> {
@@ -892,29 +950,27 @@ pub fn reap_idle_browsers(data: &Path) {
         .and_then(|s| s.trim().parse::<i64>().ok())
         .map(|s| s * 1000)
         .unwrap_or(DEFAULT_IDLE_TIMEOUT_MS);
-    let root = profiles_root(data);
-    let Ok(entries) = std::fs::read_dir(&root) else {
-        return;
-    };
     let now = now_ms();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
+    for name in candidate_profiles(data) {
+        let name = name.as_str();
+        if !profile_dir(data, name).is_dir() {
+            forget_active_profile(data, name);
             continue;
         }
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
         if reap_expired_takeover(data, name, now).is_err() {
             continue;
         }
         if is_human_takeover_active(data, name, now).unwrap_or(true) {
             continue;
         }
-        if let Ok(Some(rt)) = load_runtime(data, name)
-            && now.saturating_sub(rt.last_used_at_ms) > idle_ms
-        {
-            let _ = stop_profile(data, name);
+        match load_runtime(data, name) {
+            Ok(Some(rt)) if now.saturating_sub(rt.last_used_at_ms) > idle_ms => {
+                if stop_profile(data, name).is_ok() {
+                    forget_active_profile(data, name);
+                }
+            }
+            Ok(Some(_)) | Err(_) => {}
+            Ok(None) => forget_active_profile(data, name),
         }
     }
 }
@@ -1682,6 +1738,9 @@ fn load_takeover_state(data: &Path, profile: &str) -> Result<Option<BrowserTakeo
 }
 
 fn save_takeover_state(data: &Path, state: &BrowserTakeoverState) -> Result<(), Error> {
+    if !state.completed {
+        note_active_profile(data, &state.profile);
+    }
     write_profile_json(&takeover_path(data, &state.profile), state)
 }
 
@@ -3499,7 +3558,7 @@ fn start_or_reuse_takeover_session(
                         );
                     }
                     Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(5));
+                        wait_acceptable(&listener, TAKEOVER_STATE_CHECK);
                     }
                     Err(_) => break,
                 }
@@ -3508,6 +3567,32 @@ fn start_or_reuse_takeover_session(
         .map_err(|e| Error::Message(format!("failed to spawn takeover server thread: {e}")))?;
 
     Ok(state)
+}
+
+/// How often an idle takeover accept loop rechecks its session state:
+/// completion, expiry and a viewer's lost heartbeat. A connection ends the wait
+/// at once.
+const TAKEOVER_STATE_CHECK: Duration = Duration::from_secs(1);
+
+/// Block until `listener` has a connection to accept or `timeout` passes.
+fn wait_acceptable(listener: &TcpListener, timeout: Duration) {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let mut fd = libc::pollfd {
+            fd: listener.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let timeout_ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
+        // SAFETY: one valid pollfd that outlives the call.
+        unsafe { libc::poll(&mut fd, 1, timeout_ms) };
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = listener;
+        std::thread::sleep(timeout);
+    }
 }
 
 fn wait_for_takeover_completion(
@@ -8610,6 +8695,54 @@ esac
             "mobile takeover acceptance failed; captures: {output}"
         );
     }
+    #[test]
+    fn idle_reaper_visits_only_profiles_with_a_browser_or_takeover() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path();
+        let crashed_state = |profile: &str| BrowserRuntimeState {
+            profile: profile.into(),
+            // Above any pid: the browser is gone.
+            pid: u32::MAX,
+            cdp_port: 9,
+            headless: true,
+            display_mode: "headless".into(),
+            proxy: None,
+            active_target_id: None,
+            started_at_ms: 0,
+            last_used_at_ms: 0,
+        };
+        // A profile kept only for its logins, and one whose browser died while
+        // no daemon was watching.
+        std::fs::create_dir_all(profile_dir(data, "dormant").join("user-data")).unwrap();
+        write_profile_json(
+            &profile_dir(data, "crashed").join("runtime.json"),
+            &crashed_state("crashed"),
+        )
+        .unwrap();
+
+        reap_idle_browsers(data);
+        assert!(!profile_dir(data, "crashed").join("runtime.json").exists());
+        assert!(
+            !profile_dir(data, "dormant").join("takeover.lock").exists(),
+            "a profile with no browser was visited"
+        );
+        assert!(candidate_profiles(data).is_empty());
+
+        // Once seeded, only what this process starts is visited.
+        write_profile_json(
+            &profile_dir(data, "dormant").join("runtime.json"),
+            &crashed_state("dormant"),
+        )
+        .unwrap();
+        reap_idle_browsers(data);
+        assert!(profile_dir(data, "dormant").join("runtime.json").exists());
+        save_runtime(data, &crashed_state("dormant")).unwrap();
+        assert_eq!(candidate_profiles(data), ["dormant"]);
+        reap_idle_browsers(data);
+        assert!(!profile_dir(data, "dormant").join("runtime.json").exists());
+        assert!(candidate_profiles(data).is_empty());
+    }
+
     #[test]
     fn accepted_takeover_request_is_fenced_after_completion_or_replacement() {
         for revoked in ["completed", "replaced", "expired", "agent", "missing"] {
