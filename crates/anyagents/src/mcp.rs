@@ -29,12 +29,11 @@ use crate::api::{
 use crate::operator::CAPABILITY_FILE;
 use crate::server;
 
-mod code_contract;
+pub(crate) mod code_contract;
 #[cfg(test)]
 mod contract_tests;
-mod exec_jobs;
 
-use code_contract::CodeLimits;
+pub(crate) use code_contract::CodeLimits;
 
 /// MCP tool surface profile.
 #[derive(
@@ -512,7 +511,10 @@ pub fn run(data: &Path, config: Option<&Path>, profile: Option<McpProfile>) -> R
     let config_buf = config.to_path_buf();
     tool_server_runtime()?.block_on(async {
         let client = Client::new(socket, config_buf.clone(), capability);
-        let (who, harness) = client.whoami_with_harness().await.map_err(Error::Message)?;
+        let (who, harness, limits) = client.whoami_with_harness().await.map_err(Error::Message)?;
+        // The limits come from the server's environment only; a server that
+        // names none leaves the defaults.
+        CodeLimits::serve(limits.unwrap_or_default());
         // A harness names the agent id it was given; the server already
         // answered with the agent this session acts as, and the two may not
         // differ.
@@ -739,7 +741,9 @@ impl Client {
     }
 
     /// The agent this capability authenticates, as the server resolved it.
-    async fn whoami_with_harness(&self) -> Result<(AgentRef, Option<String>), String> {
+    async fn whoami_with_harness(
+        &self,
+    ) -> Result<(AgentRef, Option<String>, Option<CodeLimits>), String> {
         let named = crate::client::agent_identity().map(|id| id.to_string());
         let cap = self.current_capability();
         let who: serde_json::Value = self
@@ -772,6 +776,11 @@ impl Client {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string);
+        let limits = who.get("code_limits").and_then(|value| {
+            serde_json::from_value::<CodeLimits>(value.clone())
+                .ok()
+                .map(|l| CodeLimits::from_parts(Some(l.default_ms), Some(l.max_ms)))
+        });
         Ok((
             AgentRef {
                 id: AgentId::parse(id).map_err(|err| err.to_string())?,
@@ -779,6 +788,7 @@ impl Client {
                 workdir,
             },
             harness,
+            limits,
         ))
     }
 
@@ -868,7 +878,7 @@ struct SendArgs {
     #[serde(default, deserialize_with = "crate::api::absent_if_null")]
     target: Option<String>,
     /// Emoji reaction when `action = "react"` (e.g. `"👍"`, `"🔥"`, `"❤️"`, `"🎉"`, or `""` to clear).
-    #[serde(default, deserialize_with = "crate::api::absent_if_placeholder")]
+    #[serde(default, deserialize_with = "crate::api::absent_if_null")]
     emoji: Option<String>,
     /// Selected poll option(s) when `action = "vote"` (1-based option numbers `"1"`, `"2"` or option text)
     /// or checklist item numbers when `action = "check" | "uncheck"`.
@@ -1677,22 +1687,15 @@ struct FilesArgs {
     /// Optional working directory (relative to the agent's `workdir` or absolute) when `action = "exec"`.
     #[serde(default, alias = "workdir")]
     cwd: Option<String>,
-    /// Optional execution timeout in milliseconds when `action = "exec"` (default `30000`, max `600000`
-    /// unless configured). A longer `timeout_ms` starts the command as a job.
+    /// Optional execution timeout in milliseconds when `action = "exec"` (default `30000`, max
+    /// `600000` unless the server sets another ceiling; a remote sandbox stops at `120000`).
     #[serde(default, alias = "timeout")]
     timeout_ms: Option<u64>,
-    /// Start the `exec` command as a background job and return its `job_id` at once.
-    #[serde(default, alias = "async", alias = "detach")]
-    background: Option<bool>,
-    /// Job to read, await or kill when `action = "job"` (omit to list jobs).
-    #[serde(default, alias = "id", alias = "job")]
-    job_id: Option<String>,
-    /// How long `action = "job"` waits for the job to end before answering (default `0`).
-    #[serde(default, alias = "wait")]
-    wait_ms: Option<u64>,
-    /// Stop the job when `action = "job"`.
+    /// The `timeout_ms` a `code` snippet asked for, when its call had less
+    /// time left to give; only the result's note reads it.
     #[serde(default)]
-    kill: Option<bool>,
+    #[schemars(skip)]
+    requested_timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -3487,18 +3490,12 @@ impl AgentMcp {
     ) -> Result<MultimediaJson, String> {
         let base_dir = self.resolve_workdir();
         let config_dir = self.client.config.clone();
-        let limits = CodeLimits::load(self.client.socket.parent());
-        let jobs_root = self.jobs_root();
+        let limits = CodeLimits::current();
         let (val, media) = tokio::task::spawn_blocking(move || {
             let backend = <dyn anyagents_tools::WorkspaceBackend>::resolve(
                 Some(&config_dir),
                 base_dir.clone(),
             );
-            if let Some(job) =
-                execute_job_action(backend.as_ref(), &jobs_root, &base_dir, &args, limits)
-            {
-                return job.map(|val| (val, Vec::new()));
-            }
             execute_files_tool_with_media_backend(backend.as_ref(), &base_dir, args, limits)
         })
         .await
@@ -3521,19 +3518,29 @@ const SCHEDULES_TOOL_DESCRIPTION: &str = "Wake yourself later or on an event. Cr
 /// The `code` tool's contract: language, scope, limits and every callable
 /// name, compact because every agent turn pays for it.
 /// `tool_definitions_with_roles` rewrites the limits to the configured ones.
-const CODE_TOOL_DESCRIPTION: &str = "Run a TypeScript snippet (plain JS works; NOT Python). `code` is the body of an async function: `await` calls, `return` a JSON value; you get `{result, logs, duration_ms}`. No `import`, `require`, `process`, `Buffer`, `fs` or `fetch`; use the globals below. `timeout_ms`: default 30000, max 600000. An inner `workspace.exec` gets the remaining time, or its own `timeout_ms` (the call stretches to fit, up to the max). Longer: `const j = await workspace.exec({cmd, background: true})`, then (now or in a later call) `await workspace.job({id: j.job_id, wait_ms: 60000})` -> `{status, exit_code, stdout, stderr}`; `kill: true` stops it.\n\
-workspace: read(path|{path, start_line?, end_line?}), write(path, content), edit({path, target, replacement}), multi_edit({path, edits: [{target, replacement}]}), patch(text), glob(pattern|{pattern, path?}), grep(query|{query, path?, glob?}), list(path?), exec(cmd|{cmd, cwd?, timeout_ms?, background?}) -> {exit_code, stdout, stderr}, job({id, wait_ms?, kill?}).\n\
+const CODE_TOOL_DESCRIPTION: &str = "Run a TypeScript snippet (plain JS works; NOT Python). `code` is the body of an async function: `await` calls, `return` a JSON value; you get `{result, logs, duration_ms}`. No `import`, `require`, `process`, `Buffer`, `fs` or `fetch`; use the globals below. `timeout_ms`: default 30000, max 600000. An inner `workspace.exec` gets the remaining time, or its own `timeout_ms` (the call stretches to fit, up to the max).\n\
+workspace: read(path|{path, start_line?, end_line?}), write(path, content), edit({path, target, replacement}), multi_edit({path, edits: [{target, replacement}]}), patch(text), glob(pattern|{pattern, path?}), grep(query|{query, path?, glob?}), list(path?), exec(cmd|{cmd, cwd?, timeout_ms?}) -> {exit_code, stdout, stderr}.\n\
 anyagents: send, inbox, agents, schedule, conversation, groups, browser, skills, interact; each takes its MCP tool's object, e.g. `anyagents.schedule({action: \"create\", watch: \"github:pr:o/r#1\", prompt: \"...\"})`. memory: read(topic), write({topic, description, content}), search(query), list(). web: search(query), fetch(url). computer, device, media: `<ns>.<action>(opts)`. All also under `tools.`.\n\
 `console.log` goes to `logs`. Use `Promise.all` for independent calls. Run other languages from a file you `workspace.write`, not a quoted one-liner. Reading images, PDF, audio or video, and screenshots, attach the media.";
 
 const CODE_TOOL_LIMITS_TEXT: &str = "default 30000, max 600000";
 
-/// The `code` description with the limits this server enforces.
-fn code_tool_description(limits: CodeLimits) -> String {
-    CODE_TOOL_DESCRIPTION.replace(
-        CODE_TOOL_LIMITS_TEXT,
-        &format!("default {}, max {}", limits.default_ms, limits.max_ms),
-    )
+/// The `code` description with the limits this server enforces and what the
+/// agent's workspace backend (`WorkspaceBackend::kind`) does with an exec's
+/// `timeout_ms`.
+fn code_tool_description(limits: CodeLimits, backend: &str) -> String {
+    let mut limits_text = format!("default {}, max {}", limits.default_ms, limits.max_ms);
+    match backend {
+        "local" => {}
+        "docker" => limits_text.push_str(
+            "; `workspace.exec` runs in your container, which does not stop a command at its `timeout_ms`",
+        ),
+        _ => limits_text.push_str(&format!(
+            "; `workspace.exec` runs in your remote sandbox, which stops a command at {}",
+            anyagents_tools::REMOTE_EXEC_MAX_TIMEOUT_MS
+        )),
+    }
+    CODE_TOOL_DESCRIPTION.replace(CODE_TOOL_LIMITS_TEXT, &limits_text)
 }
 
 /// Remove prose keys (`description`, `title`) from a JSON Schema tree. Field
@@ -3597,12 +3604,6 @@ pub fn tool_definitions_with_roles(
     data_dir: Option<&Path>,
 ) -> Vec<rmcp::model::Tool> {
     let mut tools = tool_definitions(profile);
-    let limits = CodeLimits::load(data_dir);
-    if limits != CodeLimits::default() {
-        for tool in tools.iter_mut().filter(|t| t.name == "code") {
-            tool.description = Some(code_tool_description(limits).into());
-        }
-    }
     let Some(dd) = data_dir else {
         return tools;
     };
@@ -3655,9 +3656,7 @@ impl rmcp::ServerHandler for AgentMcp {
         let supports_cache_hints = context
             .protocol_version()
             .is_some_and(|version| version >= rmcp::model::ProtocolVersion::V_2026_07_28);
-        let wd = self.resolve_workdir();
-        let data_dir = self.client.socket.parent();
-        let tools = tool_definitions_with_roles(self.profile, Some(&wd), data_dir);
+        let tools = self.listed_tools();
         Ok(rmcp::model::ListToolsResult {
             result_type: Some(rmcp::model::ResultType::COMPLETE),
             tools,
@@ -3987,7 +3986,6 @@ rl.on("line", async (line) => {
           grep: (opts = {}) => callTool("files", { ...(typeof opts === "string" ? { query: opts } : opts), action: "grep" }),
           list: (opts = {}) => callTool("files", { ...(typeof opts === "string" ? { path: opts } : opts), action: "list" }),
           exec: (opts = {}, extra = {}) => callTool("files", { ...(typeof opts === "string" ? { ...extra, cmd: opts } : opts), action: "exec" }),
-          job: (opts = {}) => callTool("files", { ...(typeof opts === "string" ? { job_id: opts } : opts), action: "job" }),
         });
         const tools = Object.freeze({ anyagents, workspace, memory: memoryFn, web: webFn, computer: computerFn, device: deviceFn, media: mediaFn });
         const console = Object.freeze({
@@ -4088,11 +4086,11 @@ async fn until_deadline<F: std::future::Future>(
     }
 }
 
-/// Fit a call a snippet makes into the time its `code` call has. A
-/// `workspace.exec` without `timeout_ms` gets what is left of the call; one
-/// with `timeout_ms`, or a `workspace.job` that waits, holds the call open
-/// that much longer, up to the ceiling. A command asking for more than the
-/// ceiling becomes a job (`execute_job_action`) and returns at once.
+/// Fit a `workspace.exec` a snippet runs into the time its `code` call has.
+/// Without `timeout_ms` the command gets what is left of the call. With one,
+/// the call stays open that much longer, up to the ceiling; a command asking
+/// for more than the ceiling still allows is cut to fit, and its result says
+/// so (`requested_timeout_ms`).
 fn budget_code_call(
     tool: &str,
     mut args: serde_json::Value,
@@ -4107,48 +4105,34 @@ fn budget_code_call(
     let Some(obj) = args.as_object_mut() else {
         return args;
     };
-    let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
     let action = obj
         .get("action")
         .and_then(serde_json::Value::as_str)
         .map(|a| a.trim().to_ascii_lowercase())
         .unwrap_or_default();
-    let truthy = |key: &str| obj.get(key).and_then(serde_json::Value::as_bool) == Some(true);
-    let (key, wanted) = match action.as_str() {
-        "exec" | "bash" | "sh" | "command" => {
-            if truthy("background") || truthy("async") || truthy("detach") {
-                return args;
-            }
-            let own = ["timeout_ms", "timeout"]
-                .iter()
-                .find_map(|key| obj.get(*key).and_then(serde_json::Value::as_u64));
-            match own {
-                Some(ms) if ms > max_ms => return args,
-                Some(ms) => ("timeout_ms", ms),
-                None => {
-                    let left = deadline_ms
-                        .load(Ordering::SeqCst)
-                        .saturating_sub(elapsed_ms)
-                        .saturating_sub(CODE_CALL_GRACE_MS)
-                        .max(100);
-                    obj.insert("timeout_ms".to_string(), left.into());
-                    return args;
-                }
-            }
-        }
-        "job" | "jobs" | "poll" | "wait" => {
-            match ["wait_ms", "wait"]
-                .iter()
-                .find_map(|key| obj.get(*key).and_then(serde_json::Value::as_u64))
-            {
-                Some(ms) if ms > 0 => ("wait_ms", ms),
-                _ => return args,
-            }
-        }
-        _ => return args,
+    let is_exec = match action.as_str() {
+        "exec" | "bash" | "sh" | "command" => true,
+        "" => obj.contains_key("cmd") || obj.contains_key("command"),
+        _ => false,
     };
-    // What the ceiling still allows this call, leaving the grace for its
-    // answer to reach the snippet.
+    if !is_exec {
+        return args;
+    }
+    let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+    let wanted = ["timeout_ms", "timeout"]
+        .iter()
+        .find_map(|key| obj.get(*key).and_then(serde_json::Value::as_u64));
+    let Some(wanted) = wanted else {
+        let left = deadline_ms
+            .load(Ordering::SeqCst)
+            .saturating_sub(elapsed_ms)
+            .saturating_sub(CODE_CALL_GRACE_MS)
+            .max(100);
+        obj.insert("timeout_ms".to_string(), left.into());
+        return args;
+    };
+    // What the ceiling still allows this call, leaving the grace for the
+    // command's answer to reach the snippet.
     let room = max_ms
         .saturating_sub(elapsed_ms)
         .saturating_sub(CODE_CALL_GRACE_MS)
@@ -4156,8 +4140,8 @@ fn budget_code_call(
     let granted = wanted.min(room);
     if granted < wanted {
         obj.remove("timeout");
-        obj.remove("wait");
-        obj.insert(key.to_string(), granted.into());
+        obj.insert("timeout_ms".to_string(), granted.into());
+        obj.insert("requested_timeout_ms".to_string(), wanted.into());
     }
     deadline_ms.fetch_max(
         (elapsed_ms + granted + CODE_CALL_GRACE_MS).min(max_ms),
@@ -4205,13 +4189,21 @@ impl AgentMcp {
         Ok(parent.name)
     }
 
-    /// Where this agent's jobs are recorded: its own state directory, which
-    /// its seat may write and archiving reaps.
-    fn jobs_root(&self) -> PathBuf {
-        self.client
-            .config
-            .join("state-home")
-            .join(exec_jobs::JOBS_DIR)
+    /// The tools this agent sees, with the `code` limits its workspace
+    /// backend enforces.
+    fn listed_tools(&self) -> Vec<rmcp::model::Tool> {
+        let wd = self.resolve_workdir();
+        let mut tools =
+            tool_definitions_with_roles(self.profile, Some(&wd), self.client.socket.parent());
+        if tools.iter().any(|t| t.name == "code") {
+            let backend =
+                <dyn anyagents_tools::WorkspaceBackend>::resolve(Some(&self.client.config), wd);
+            let description = code_tool_description(CodeLimits::current(), backend.kind());
+            for tool in tools.iter_mut().filter(|t| t.name == "code") {
+                tool.description = Some(description.clone().into());
+            }
+        }
+        tools
     }
 
     fn resolve_workdir(&self) -> PathBuf {
@@ -4989,9 +4981,7 @@ impl AgentMcp {
                 "result": {}
             })),
             "tools/list" => {
-                let wd = self.resolve_workdir();
-                let data_dir = self.client.socket.parent();
-                let tools = tool_definitions_with_roles(self.profile, Some(&wd), data_dir);
+                let tools = self.listed_tools();
                 Some(serde_json::json!({
                     "jsonrpc": "2.0",
                     "id": id_val,
@@ -5247,7 +5237,7 @@ impl AgentMcp {
         use std::sync::{Arc, Mutex};
         use std::time::Instant;
 
-        let limits = CodeLimits::load(self.client.socket.parent());
+        let limits = CodeLimits::current();
         let timeout_ms = limits.resolve(args.timeout_ms);
         // Milliseconds after `started` at which the call ends. A command the
         // snippet runs with its own `timeout_ms` moves it out, up to the
@@ -6203,112 +6193,6 @@ fn execute_files_tool_with_media_backend(
     execute_files_tool_with_media(base_dir, args, limits)
 }
 
-/// `workspace.job`, and a `workspace.exec` that runs as a job: started with
-/// `background: true`, or asking for more time than one call may hold.
-/// `None` for every other action.
-fn execute_job_action(
-    backend: &dyn anyagents_tools::WorkspaceBackend,
-    jobs_root: &Path,
-    base_dir: &Path,
-    args: &FilesArgs,
-    limits: CodeLimits,
-) -> Option<Result<serde_json::Value, String>> {
-    let action = args
-        .action
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_ascii_lowercase)
-        .unwrap_or_else(|| {
-            if args.cmd.is_some() {
-                "exec".to_string()
-            } else if args.job_id.is_some() {
-                "job".to_string()
-            } else {
-                String::new()
-            }
-        });
-    let is_job_read = matches!(action.as_str(), "job" | "jobs" | "poll" | "wait" | "kill");
-    let is_exec = matches!(action.as_str(), "exec" | "bash" | "sh" | "command");
-    // A remote workspace has no jobs; there a long `timeout_ms` is clamped
-    // as it always was, and only an explicit `background` is refused.
-    let as_job = is_exec
-        && match args.background {
-            Some(background) => background,
-            None => !backend.is_remote() && args.timeout_ms.is_some_and(|ms| ms > limits.max_ms),
-        };
-    if !is_job_read && !as_job {
-        return None;
-    }
-    if backend.is_remote() {
-        return Some(Err(format!(
-            "jobs run only in a local workspace; this agent's workspace is `{}`. Run the command \
-             with `workspace.exec({{cmd, timeout_ms}})` (up to {}ms)",
-            backend.kind(),
-            limits.max_ms
-        )));
-    }
-    if is_job_read {
-        let id = args
-            .job_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
-        return Some(match id {
-            None if action == "kill" => Err("`kill` needs the job's `id`".to_string()),
-            None => exec_jobs::list(jobs_root),
-            Some(id) if action == "kill" || args.kill == Some(true) => {
-                exec_jobs::kill(jobs_root, id)
-            }
-            Some(id) => exec_jobs::status(
-                jobs_root,
-                id,
-                args.wait_ms.unwrap_or(0).min(limits.max_ms),
-                args.max_bytes,
-            ),
-        });
-    }
-    if let Some(refusal) = workspace_exec_refusal() {
-        return Some(Err(refusal));
-    }
-    let Some(cmd) = args
-        .cmd
-        .as_deref()
-        .or(args.content.as_deref())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    else {
-        return Some(Err(
-            "`workspace.exec` requires a non-empty `cmd`".to_string()
-        ));
-    };
-    let cwd = match resolve_workspace_path(
-        base_dir,
-        args.cwd.as_deref().or(args.path.as_deref()),
-        false,
-    ) {
-        Ok(cwd) if cwd.is_dir() => cwd,
-        Ok(cwd) => {
-            return Some(Err(format!(
-                "workspace.exec cwd {} does not exist or is not a directory",
-                cwd.display()
-            )));
-        }
-        Err(err) => return Some(Err(err)),
-    };
-    Some(exec_jobs::start(jobs_root, cmd, &cwd, args.timeout_ms))
-}
-
-/// Why `workspace.exec` may not run here, when it may not.
-fn workspace_exec_refusal() -> Option<String> {
-    std::env::var("ANYAGENTS_DISABLE_WORKSPACE_EXEC")
-        .ok()
-        .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-        .then(|| {
-            "workspace.exec is disabled for this agent (ANYAGENTS_DISABLE_WORKSPACE_EXEC=1); delegate command execution to a subagent".to_string()
-        })
-}
-
 fn execute_remote_files_tool_with_media(
     backend: &dyn anyagents_tools::WorkspaceBackend,
     args: FilesArgs,
@@ -6536,18 +6420,34 @@ fn execute_remote_files_tool_with_media(
             let started = std::time::Instant::now();
             let out = backend.exec(cmd_str, Some(&resolved_cwd), Some(timeout_ms))?;
             let duration_ms = started.elapsed().as_millis() as u64;
-            Ok((
-                serde_json::json!({
-                    "action": "exec",
-                    "cmd": cmd_str,
-                    "cwd": resolved_cwd,
-                    "exit_code": out.exit_code,
-                    "stdout": out.stdout,
-                    "stderr": out.stderr,
-                    "duration_ms": duration_ms,
-                }),
-                Vec::new(),
-            ))
+            let mut result = serde_json::json!({
+                "action": "exec",
+                "cmd": cmd_str,
+                "cwd": resolved_cwd,
+                "exit_code": out.exit_code,
+                "stdout": out.stdout,
+                "stderr": out.stderr,
+                "duration_ms": duration_ms,
+            });
+            let asked = args.requested_timeout_ms.or(args.timeout_ms);
+            let note = match backend.kind() {
+                "docker" => None,
+                _ => code_contract::exec_clamp_note(
+                    asked,
+                    timeout_ms.min(anyagents_tools::REMOTE_EXEC_MAX_TIMEOUT_MS),
+                    &format!(
+                        "your remote sandbox stops a command at {}ms",
+                        anyagents_tools::REMOTE_EXEC_MAX_TIMEOUT_MS
+                    ),
+                ),
+            }
+            .or_else(|| {
+                code_contract::exec_clamp_note(asked, timeout_ms, &limits.ceiling_reason())
+            });
+            if let Some(note) = note {
+                result["note"] = note.into();
+            }
+            Ok((result, Vec::new()))
         }
         other => Err(format!(
             "remote sandbox `files` action `{other}` is not supported directly; use `read`, `write`, `edit`, `multi_edit`, `list`, or `exec`"
@@ -7182,16 +7082,24 @@ fn execute_files_tool(
             let stdout = stdout_handle.join().unwrap_or_default();
             let stderr = stderr_handle.join().unwrap_or_default();
             let duration_ms = started.elapsed().as_millis() as u64;
+            let note = code_contract::exec_clamp_note(
+                args.requested_timeout_ms.or(args.timeout_ms),
+                timeout_ms,
+                &limits.ceiling_reason(),
+            );
             let Some(status) = status_opt else {
                 return Err(format!(
-                    "workspace.exec timed out after {timeout_ms}ms and was killed; {} (stdout: {}, stderr: {})",
+                    "workspace.exec timed out after {timeout_ms}ms and was killed{}; {} (stdout: {}, stderr: {})",
+                    note.as_deref()
+                        .map(|n| format!(" ({n})"))
+                        .unwrap_or_default(),
                     code_contract::exec_timeout_hint(limits.max_ms),
                     stdout.trim(),
                     stderr.trim()
                 ));
             };
             let exit_code = status.code().unwrap_or(-1);
-            Ok(serde_json::json!({
+            let mut result = serde_json::json!({
                 "action": "exec",
                 "cmd": cmd_str,
                 "cwd": resolved_cwd.display().to_string(),
@@ -7199,10 +7107,14 @@ fn execute_files_tool(
                 "stdout": stdout,
                 "stderr": stderr,
                 "duration_ms": duration_ms,
-            }))
+            });
+            if let Some(note) = note {
+                result["note"] = note.into();
+            }
+            Ok(result)
         }
         other => Err(format!(
-            "unknown `files` action `{other}`; expected `read`, `write`, `edit`, `multi_edit`, `patch`, `list`, `glob`, `grep`, `exec`, or `job`"
+            "unknown `files` action `{other}`; expected `read`, `write`, `edit`, `multi_edit`, `patch`, `list`, `glob`, `grep`, or `exec`"
         )),
     }
 }

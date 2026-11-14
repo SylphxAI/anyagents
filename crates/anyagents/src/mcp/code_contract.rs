@@ -7,26 +7,26 @@
 //! names. Each failure names its fix here, so the next call is right instead
 //! of the next ten.
 
-use std::path::Path;
+use std::sync::OnceLock;
 
 /// Default wall time of one `code` call, and of a `workspace.exec` that names
 /// no `timeout_ms`.
-pub(super) const DEFAULT_CODE_TIMEOUT_MS: u64 = 30_000;
+pub(crate) const DEFAULT_CODE_TIMEOUT_MS: u64 = 30_000;
 /// Default ceiling for a per-call `timeout_ms`.
-pub(super) const DEFAULT_CODE_MAX_TIMEOUT_MS: u64 = 600_000;
+pub(crate) const DEFAULT_CODE_MAX_TIMEOUT_MS: u64 = 600_000;
 const MIN_TIMEOUT_MS: u64 = 100;
 /// No configuration may hold one tool call open longer than a day.
 const HARD_MAX_TIMEOUT_MS: u64 = 86_400_000;
 
-/// `<data>/tool-limits.json`, read on every call so an operator's change
-/// applies to the next call without a restart.
-pub(super) const LIMITS_FILE: &str = "tool-limits.json";
-const DEFAULT_ENV: &str = "ANYAGENTS_CODE_TIMEOUT_MS";
-const MAX_ENV: &str = "ANYAGENTS_CODE_MAX_TIMEOUT_MS";
+/// The server's own environment sets the limits. Nothing an agent can write
+/// does: the server reads these once and hands them to each tool server in
+/// its `whoami` answer.
+pub(crate) const DEFAULT_ENV: &str = "ANYAGENTS_CODE_TIMEOUT_MS";
+pub(crate) const MAX_ENV: &str = "ANYAGENTS_CODE_MAX_TIMEOUT_MS";
 
 /// How long one `code` call or synchronous `workspace.exec` may run.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct CodeLimits {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct CodeLimits {
     pub default_ms: u64,
     pub max_ms: u64,
 }
@@ -40,35 +40,28 @@ impl Default for CodeLimits {
     }
 }
 
-#[derive(serde::Deserialize, Default)]
-struct LimitsFile {
-    #[serde(default)]
-    code_timeout_ms: Option<u64>,
-    #[serde(default)]
-    code_max_timeout_ms: Option<u64>,
+/// The limits the server handed this tool server at start.
+static SERVED: OnceLock<CodeLimits> = OnceLock::new();
+
+#[cfg(test)]
+thread_local! {
+    static TEST_LIMITS: std::cell::Cell<Option<CodeLimits>> = const { std::cell::Cell::new(None) };
 }
 
 impl CodeLimits {
-    /// The environment (`ANYAGENTS_CODE_TIMEOUT_MS`,
-    /// `ANYAGENTS_CODE_MAX_TIMEOUT_MS`) over `<data>/tool-limits.json`
-    /// (`code_timeout_ms`, `code_max_timeout_ms`) over the defaults.
-    pub(super) fn load(data_dir: Option<&Path>) -> Self {
-        let file = data_dir
-            .and_then(|dir| std::fs::read_to_string(dir.join(LIMITS_FILE)).ok())
-            .and_then(|text| serde_json::from_str::<LimitsFile>(&text).ok())
-            .unwrap_or_default();
-        let env = |name: &str| {
-            std::env::var(name)
-                .ok()
-                .and_then(|raw| raw.trim().parse::<u64>().ok())
-        };
-        Self::from_parts(
-            env(DEFAULT_ENV).or(file.code_timeout_ms),
-            env(MAX_ENV).or(file.code_max_timeout_ms),
-        )
+    /// The server's limits, from its environment.
+    pub(crate) fn from_env() -> Self {
+        Self::from_lookup(|name| std::env::var(name).ok())
     }
 
-    fn from_parts(default_ms: Option<u64>, max_ms: Option<u64>) -> Self {
+    fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Self {
+        let read = |name: &str| lookup(name).and_then(|raw| raw.trim().parse::<u64>().ok());
+        Self::from_parts(read(DEFAULT_ENV), read(MAX_ENV))
+    }
+
+    /// Valid limits: a ceiling between a second and a day, and a default
+    /// no higher than the ceiling.
+    pub(crate) fn from_parts(default_ms: Option<u64>, max_ms: Option<u64>) -> Self {
         let max_ms = max_ms
             .unwrap_or(DEFAULT_CODE_MAX_TIMEOUT_MS)
             .clamp(1_000, HARD_MAX_TIMEOUT_MS);
@@ -78,11 +71,41 @@ impl CodeLimits {
         Self { default_ms, max_ms }
     }
 
+    /// Record what the server answered at start. A tool server that never
+    /// hears from its server keeps the defaults, never its own environment.
+    pub(crate) fn serve(limits: Self) {
+        let _ = SERVED.set(limits);
+    }
+
+    /// The limits in force: what the server handed this tool server, or, in
+    /// the server's own process, its environment.
+    pub(crate) fn current() -> Self {
+        #[cfg(test)]
+        if let Some(limits) = TEST_LIMITS.with(std::cell::Cell::get) {
+            return limits;
+        }
+        SERVED.get().copied().unwrap_or_else(Self::from_env)
+    }
+
+    /// Limits for the code that runs on this test thread.
+    #[cfg(test)]
+    pub(crate) fn set_for_test_thread(limits: Option<Self>) {
+        TEST_LIMITS.with(|cell| cell.set(limits));
+    }
+
     /// The timeout one call runs with: its own `timeout_ms` up to the ceiling.
-    pub(super) fn resolve(&self, requested: Option<u64>) -> u64 {
+    pub(crate) fn resolve(&self, requested: Option<u64>) -> u64 {
         requested
             .unwrap_or(self.default_ms)
             .clamp(MIN_TIMEOUT_MS, self.max_ms)
+    }
+
+    /// Why a command ran with less than it asked, on this host.
+    pub(crate) fn ceiling_reason(&self) -> String {
+        format!(
+            "one call, start to end, may run at most {}ms (the ceiling)",
+            self.max_ms
+        )
     }
 }
 
@@ -94,18 +117,23 @@ pub(super) fn code_timeout_message(timeout_ms: u64, requested: Option<u64>, max_
     };
     format!(
         "`code` execution timed out after {timeout_ms}ms{clamped} and was terminated. \
-         Pass `timeout_ms` (up to {max_ms}) on the `code` call, or start long commands as jobs: \
-         `const j = await workspace.exec({{cmd, background: true}})`, then \
-         `await workspace.job({{id: j.job_id, wait_ms: 60000}})` in this or a later call."
+         Pass `timeout_ms` (up to {max_ms}) on the `code` call; work that needs longer than that \
+         must be split across calls."
     )
 }
 
 /// What a synchronous `workspace.exec` that ran out of time tells the model.
 pub(super) fn exec_timeout_hint(max_ms: u64) -> String {
     format!(
-        "pass `timeout_ms` (up to {max_ms}), or run it as a job with `background: true` \
-         and poll it with `workspace.job({{id, wait_ms}})`"
+        "pass `timeout_ms` (up to {max_ms}) on the exec, and on its `code` call when it runs in one"
     )
+}
+
+/// The note an exec result carries when the command ran with less time than
+/// it asked for. The result keeps its shape; only `note` is added.
+pub(super) fn exec_clamp_note(asked: Option<u64>, ran_ms: u64, reason: &str) -> Option<String> {
+    let asked = asked?;
+    (asked > ran_ms).then(|| format!("asked timeout_ms {asked} but ran with {ran_ms}ms: {reason}"))
 }
 
 /// Every function a snippet can call, by namespace. The model guesses names;
@@ -123,7 +151,6 @@ pub(super) const SANDBOX_API: &[(&str, &[&str])] = &[
             "grep",
             "list",
             "exec",
-            "job",
         ],
     ),
     (
@@ -380,6 +407,7 @@ mod tests {
     #[test]
     fn limits_default_to_thirty_seconds_and_a_ten_minute_ceiling() {
         let limits = CodeLimits::from_parts(None, None);
+        assert_eq!(limits, CodeLimits::default());
         assert_eq!(limits.default_ms, 30_000);
         assert_eq!(limits.max_ms, 600_000);
         assert_eq!(limits.resolve(None), 30_000);
@@ -389,20 +417,28 @@ mod tests {
     }
 
     #[test]
-    fn limits_come_from_the_data_file_and_stay_consistent() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join(LIMITS_FILE),
-            r#"{"code_timeout_ms": 45000, "code_max_timeout_ms": 900000}"#,
-        )
-        .unwrap();
-        // The environment is process-wide; the file path is what this
-        // asserts, so only run the file assertion when neither is set.
-        if std::env::var_os(DEFAULT_ENV).is_none() && std::env::var_os(MAX_ENV).is_none() {
-            let limits = CodeLimits::load(Some(dir.path()));
-            assert_eq!(limits.default_ms, 45_000);
-            assert_eq!(limits.max_ms, 900_000);
-        }
+    fn limits_come_from_the_server_environment_and_stay_consistent() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| (*value).to_string())
+            }
+        };
+        assert_eq!(
+            CodeLimits::from_lookup(env(&[(DEFAULT_ENV, "45000"), (MAX_ENV, " 900000 ")])),
+            CodeLimits {
+                default_ms: 45_000,
+                max_ms: 900_000
+            }
+        );
+        // Unset or unreadable values are the defaults.
+        assert_eq!(CodeLimits::from_lookup(env(&[])), CodeLimits::default());
+        assert_eq!(
+            CodeLimits::from_lookup(env(&[(MAX_ENV, "ten minutes")])),
+            CodeLimits::default()
+        );
         // A default above the ceiling is the ceiling; a ceiling is never
         // below a second or above a day.
         assert_eq!(
@@ -417,24 +453,31 @@ mod tests {
             CodeLimits::from_parts(None, Some(u64::MAX)).max_ms,
             HARD_MAX_TIMEOUT_MS
         );
-        // A missing or malformed file is the defaults.
-        std::fs::write(dir.path().join(LIMITS_FILE), "not json").unwrap();
-        if std::env::var_os(DEFAULT_ENV).is_none() && std::env::var_os(MAX_ENV).is_none() {
-            assert_eq!(CodeLimits::load(Some(dir.path())), CodeLimits::default());
-        }
     }
 
     #[test]
-    fn timeout_messages_name_the_ceiling_and_the_job_route() {
+    fn timeout_messages_name_the_ceiling_and_clamps_are_noted() {
         let msg = code_timeout_message(30_000, None, 600_000);
         assert!(msg.contains("timed out after 30000ms"), "{msg}");
         assert!(msg.contains("`timeout_ms` (up to 600000)"), "{msg}");
-        assert!(msg.contains("background: true"), "{msg}");
-        assert!(msg.contains("workspace.job"), "{msg}");
+        assert!(
+            !msg.contains("background") && !msg.contains("workspace.job"),
+            "{msg}"
+        );
         let clamped = code_timeout_message(600_000, Some(1_800_000), 600_000);
         assert!(clamped.contains("asked 1800000ms"), "{clamped}");
         let hint = exec_timeout_hint(600_000);
-        assert!(hint.contains("up to 600000") && hint.contains("background: true"));
+        assert!(
+            hint.contains("up to 600000") && !hint.contains("background"),
+            "{hint}"
+        );
+        let note = exec_clamp_note(Some(900_000), 600_000, "the reason").unwrap();
+        assert_eq!(
+            note,
+            "asked timeout_ms 900000 but ran with 600000ms: the reason"
+        );
+        assert!(exec_clamp_note(Some(600_000), 600_000, "x").is_none());
+        assert!(exec_clamp_note(None, 600_000, "x").is_none());
     }
 
     #[test]

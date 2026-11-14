@@ -111,7 +111,16 @@ fn claude_double(data: &std::path::Path) -> std::path::PathBuf {
 }
 
 fn start_server(data: &std::path::Path) -> Serve {
-    let mut child = support::contract_server()
+    start_server_with_env(data, &[])
+}
+
+/// [`start_server`] with extra variables in the server's own environment.
+fn start_server_with_env(data: &std::path::Path, env: &[(&str, &str)]) -> Serve {
+    let mut command = support::contract_server();
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    let mut child = command
         .arg("--data")
         .arg(data)
         .arg("serve")
@@ -1989,5 +1998,43 @@ async fn tool_contracts_accept_the_shapes_agents_write() {
         "with parent: {with_parent}\nall: {everything}"
     );
     beta.cancel().await.unwrap();
+    drop(server);
+}
+
+/// The `code` limits come from the server's environment, handed to the tool
+/// server in `whoami`; nothing in the data directory sets them.
+#[tokio::test]
+async fn code_limits_come_from_the_server_environment() {
+    let dir = support::physical_tempdir();
+    let created = bin()
+        .env("PATH", machine_path(dir.path()))
+        .arg("--data")
+        .arg(dir.path())
+        .args(["agents", "create", "alpha"])
+        .output()
+        .unwrap();
+    assert!(created.status.success(), "{created:?}");
+    // A file an agent could plant is not read.
+    std::fs::write(
+        dir.path().join("tool-limits.json"),
+        r#"{"code_timeout_ms": 100, "code_max_timeout_ms": 1000}"#,
+    )
+    .unwrap();
+    let server = start_server_with_env(
+        dir.path(),
+        &[
+            ("ANYAGENTS_CODE_TIMEOUT_MS", "45000"),
+            ("ANYAGENTS_CODE_MAX_TIMEOUT_MS", "900000"),
+        ],
+    );
+    let alpha = connect(dir.path(), "alpha").await;
+    let tools = alpha.list_all_tools().await.unwrap();
+    let code = tools.iter().find(|t| t.name == "code").expect("code tool");
+    let description = code.description.as_deref().unwrap_or_default();
+    assert!(
+        description.contains("`timeout_ms`: default 45000, max 900000."),
+        "{description}"
+    );
+    alpha.cancel().await.unwrap();
     drop(server);
 }

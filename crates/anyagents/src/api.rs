@@ -520,53 +520,27 @@ pub struct SendArticle {
     pub author_name: Option<String>,
 }
 
-/// An optional field written as `null`, `"null"`, `"undefined"`, `"none"` or
-/// `""` is absent. Models fill unused optional fields with these, and a
-/// `"null"` URL or object is never what they meant.
+/// An optional field written as JSON `null`, `"null"` or `"undefined"` is
+/// absent. Harnesses fill unused optional fields with these strings, and a
+/// `"null"` URL or object is never what was meant. Every other string,
+/// `""` and `"None"` included, keeps its meaning.
 pub fn absent_if_null<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-    T: serde::de::DeserializeOwned,
-{
-    absent_if(deserializer, is_null_word)
-}
-
-/// [`absent_if_null`] for a field where `""` means something (an emoji
-/// reaction's `""` clears it).
-pub fn absent_if_placeholder<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-    T: serde::de::DeserializeOwned,
-{
-    absent_if(deserializer, |text| {
-        !text.trim().is_empty() && is_null_word(text)
-    })
-}
-
-fn absent_if<'de, D, T>(
-    deserializer: D,
-    absent: impl Fn(&str) -> bool,
-) -> Result<Option<T>, D::Error>
 where
     D: serde::Deserializer<'de>,
     T: serde::de::DeserializeOwned,
 {
     match Option::<serde_json::Value>::deserialize(deserializer)? {
         None | Some(serde_json::Value::Null) => Ok(None),
-        Some(serde_json::Value::String(text)) if absent(&text) => Ok(None),
+        Some(serde_json::Value::String(text)) if is_null_word(&text) => Ok(None),
         Some(value) => T::deserialize(value)
             .map(Some)
             .map_err(serde::de::Error::custom),
     }
 }
 
-/// Empty, or a word models write for "no value".
+/// Exactly `"null"` or `"undefined"`: what a harness writes for "no value".
 pub(crate) fn is_null_word(text: &str) -> bool {
-    let text = text.trim();
-    text.is_empty()
-        || ["null", "undefined", "none", "nil"]
-            .iter()
-            .any(|word| text.eq_ignore_ascii_case(word))
+    matches!(text, "null" | "undefined")
 }
 
 pub fn deserialize_string_or_vec<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>

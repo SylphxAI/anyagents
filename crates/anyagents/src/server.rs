@@ -1442,6 +1442,9 @@ async fn whoami(
                     "name": name,
                     "workdir": workdir,
                     "harness": harness,
+                    // The `code` limits come from this server's environment
+                    // only, never from a file an agent could write.
+                    "code_limits": crate::mcp::CodeLimits::from_env(),
                 })))
             })
             .await
