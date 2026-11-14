@@ -32,7 +32,9 @@ use anyagents_harness::{
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
-use crate::identity::{Presence, ProcessIdentity, leads_session, session_groups};
+use crate::identity::{
+    Presence, ProcessIdentity, leads_session, session_groups, session_groups_since,
+};
 use crate::keeper::Record;
 use crate::wire::{self, Event, Fault, FrameReader, Reply, Request};
 use crate::{AGENT, Hello, Hosted, LOCK, LOG, RECORD, SOCKET, SPAWNED, Spec};
@@ -453,7 +455,9 @@ pub fn attach_all(root: &Path, agent: &str) -> Result<Vec<RemoteHarness>, String
     for dir in agent_instances(root, agent) {
         let outcome = match connect(&dir, true) {
             Ok(link) => {
-                found.push(RemoteHarness::new(link, dir.clone(), None));
+                let remote = RemoteHarness::new(link, dir.clone(), None);
+                remote.prime();
+                found.push(remote);
                 Ok(())
             }
             Err(ConnectError::MaybeGone) => clear_if_gone(&dir),
@@ -539,7 +543,7 @@ fn force_end(dir: &Path) -> Result<(), String> {
     }
     let environment = trusted_seat_env(seat.as_deref())
         .ok_or("the recorded seat launcher is not trusted; nothing is signalled")?;
-    let groups = session_groups(keeper.pid);
+    let groups = session_groups_since(&keeper);
     // SAFETY: SIGKILL to the process its recorded identity proves is this
     // keeper, checked just above.
     unsafe { libc::kill(keeper.pid as i32, libc::SIGKILL) };
@@ -615,12 +619,12 @@ fn clear_if_gone(dir: &Path) -> Result<(), String> {
                 harness.end_group(&environment);
             }
             // A keeper that died before it recorded its harness leaves that
-            // harness in its session. Its pid cannot be reused while the
-            // session has members, so every group in it is the keeper's.
+            // harness in its session: each member that started after the
+            // keeper, under its session id, is its own.
             if presence == Some(Presence::Ended)
                 && let Some(keeper) = &keeper
             {
-                for group in session_groups(keeper.pid) {
+                for group in session_groups_since(keeper) {
                     anyagents_harness::terminate_group(group, &environment);
                 }
             }
@@ -1212,6 +1216,15 @@ impl RemoteHarness {
             lock: process_lock,
             done: false,
         }
+    }
+
+    /// Read the usage totals while the link answers, so a keeper that dies
+    /// after it is taken over still reports the last ones it had, never none:
+    /// none would read as usage and turns that changed.
+    fn prime(&self) {
+        let _ = self.turns_served();
+        let _ = self.served_usage();
+        let _ = self.last_usage();
     }
 
     /// What the keeper said when this kernel connected.

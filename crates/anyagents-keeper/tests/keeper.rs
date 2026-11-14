@@ -405,6 +405,24 @@ fn a_kernel_that_stops_its_own_keeper_afresh_is_not_superseded() {
     );
 }
 
+/// A keeper taken over and then gone still reports the usage it had: a
+/// kernel that read nothing before it died would see none, as if its turns
+/// had changed.
+#[test]
+fn a_keeper_taken_over_keeps_its_usage_after_it_dies() {
+    let fx = Fixture::new();
+    let mut kernel = fx.spawn();
+    kernel.deliver(&message("m1")).unwrap();
+    eventually("m1 is taken", || kernel.turns_served() == 1);
+    let mut keeper = kernel.crash().expect("this kernel started the keeper");
+    let next = attach(&fx.root, "agt_test").unwrap().unwrap();
+    keeper.kill().unwrap();
+    keeper.wait().unwrap();
+    eventually("the keeper is gone", || next.keeper_gone());
+    assert!(!next.health().process_alive);
+    assert_eq!(next.turns_served(), 1, "the usage was lost with the keeper");
+}
+
 /// Why attach refused to take over (or clear) the keeper there.
 #[cfg(target_os = "linux")]
 fn refused_attach(root: &std::path::Path) -> String {
@@ -761,6 +779,64 @@ fn a_keeper_without_its_socket_is_ended_only_by_force() {
     assert!(!dir.exists());
 }
 
+/// A dead keeper's session is swept only for members that started after the
+/// keeper did: a process under the same session id that is older than the
+/// recorded keeper is not its own, and is never signalled.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_session_member_older_than_the_keeper_is_never_signalled() {
+    use std::io::BufRead as _;
+    use std::os::unix::fs::DirBuilderExt as _;
+    use std::os::unix::process::CommandExt as _;
+    let fx = Fixture::new();
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&fx.root)
+        .unwrap();
+    let mut leader = std::process::Command::new("/bin/sh");
+    leader
+        .args(["-c", "sleep 600 & echo $!; read never"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped());
+    // SAFETY: setsid between fork and exec.
+    unsafe {
+        leader.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut leader = leader.spawn().unwrap();
+    let mut line = String::new();
+    std::io::BufReader::new(leader.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    let member: u32 = line.trim().parse().unwrap();
+    // A keeper recorded under the leader's pid, as having started long after
+    // the member: the member is not its own.
+    let mut recorded = identity(leader.id());
+    recorded["start_ticks"] = json!(recorded["start_ticks"].as_u64().unwrap() + 1_000_000_000);
+    kill9(leader.id());
+    leader.wait().unwrap();
+    let dir = fx.root.join("000000000003");
+    std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+    std::fs::write(dir.join("agent"), "agt_test").unwrap();
+    std::fs::write(
+        dir.join("spawned"),
+        json!({"keeper": recorded, "seat": null}).to_string(),
+    )
+    .unwrap();
+    assert!(attach(&fx.root, "agt_test").unwrap().is_none());
+    assert!(!dir.exists());
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        alive(member),
+        "a process older than the keeper was signalled"
+    );
+    kill9(member);
+}
+
 /// A v2 hello from a fake keeper whose record says it has `keeper` for its
 /// process, with `health` as its health.
 #[cfg(target_os = "linux")]
@@ -838,10 +914,28 @@ fn an_unreadable_answer_fails_the_call_that_waits_for_it() {
         (&stream)
             .write_all(format!("{hello}\n").as_bytes())
             .unwrap();
-        let _deliver = lines.next();
-        (&stream)
-            .write_all(b"{\"id\":2,\"ok\":{\"accepted\n")
-            .unwrap();
+        // The usage a taken-over keeper is read for at once; then `deliver`,
+        // answered in a shape the kernel cannot read.
+        for line in lines.by_ref() {
+            let request: serde_json::Value = serde_json::from_str(&line.unwrap()).unwrap();
+            let ok = match request["op"].as_str() {
+                Some("turns_served") => json!(0),
+                Some("served_usage" | "last_usage") => {
+                    serde_json::to_value(anyagents_harness::TurnUsage::default()).unwrap()
+                }
+                _ => {
+                    let id = request["id"].as_u64().unwrap();
+                    (&stream)
+                        .write_all(format!("{{\"id\":{id},\"ok\":{{\"accepted\n").as_bytes())
+                        .unwrap();
+                    break;
+                }
+            };
+            let answer = json!({"id": request["id"], "ok": ok});
+            (&stream)
+                .write_all(format!("{answer}\n").as_bytes())
+                .unwrap();
+        }
         let (fresh, _) = listener.accept().unwrap();
         serve_stop(fresh, &hello, &served);
         drop(lines);
