@@ -130,7 +130,13 @@ pub fn fake_launcher(data: &Path) -> std::path::PathBuf {
 /// and managed-seat declarations. Real cross-UID admission has a required,
 /// separately privileged acceptance fixture.
 pub fn contract_server() -> std::process::Command {
-    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_anyagents"));
+    contract_server_at(Path::new(env!("CARGO_BIN_EXE_anyagents")))
+}
+
+/// [`contract_server`] run from `binary`: a copy of this build stands for a
+/// newer binary a deployment upgrades to.
+pub fn contract_server_at(binary: &Path) -> std::process::Command {
+    let mut command = std::process::Command::new(binary);
     for name in [
         "ANYAGENTS_AGENT_ID",
         "ANYAGENTS_AGENT_CONFIG",
@@ -149,6 +155,37 @@ pub fn contract_server() -> std::process::Command {
     }
     command.env("ANYAGENTS_TESTS", "contract-double");
     command
+}
+
+/// Ends the keepers a test server left, when dropped. A killed server
+/// leaves its harness processes running in their keepers, by design
+/// (`docs/adr/0007-process-architecture.md`); a test must not leave them.
+/// Hold it beside the server's process handle, after it, so it runs once the
+/// server is gone.
+pub struct Keepers(PathBuf);
+
+impl Keepers {
+    pub fn of(data: &Path) -> Self {
+        Self(data.to_path_buf())
+    }
+}
+
+impl Drop for Keepers {
+    fn drop(&mut self) {
+        stop_keepers(&self.0);
+    }
+}
+
+/// End every keeper under `data`, and the harness each one holds.
+pub fn stop_keepers(data: &Path) {
+    let _ = std::process::Command::new(env!("CARGO_BIN_EXE_anyagents"))
+        .arg("--data")
+        .arg(data)
+        .args(["keepers", "stop", "--all"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
 }
 
 /// Take the operator's environment back out of this process.

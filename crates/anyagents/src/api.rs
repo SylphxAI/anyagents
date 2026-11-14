@@ -4,6 +4,69 @@ use anyagents_core::Quote;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+/// One harness's delivery level, as the API shows it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct DeliveryView {
+    /// `turn-end`, `mid-turn` or `next-step`.
+    pub level: String,
+    /// Mail an earlier process of the session consumed is recognised when it
+    /// is handed over again, and is not applied twice.
+    pub idempotent: bool,
+    /// The vendor signal the level rests on.
+    pub proof: String,
+    /// What the running process announced about itself (vendor, version,
+    /// protocol, capabilities). Absent while no process has.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer: Option<String>,
+}
+
+impl From<&anyagents_harness::Delivery> for DeliveryView {
+    fn from(delivery: &anyagents_harness::Delivery) -> Self {
+        Self {
+            level: delivery.level.name().to_string(),
+            idempotent: delivery.idempotent,
+            proof: delivery.proof.to_string(),
+            peer: delivery.peer.clone(),
+        }
+    }
+}
+
+impl DeliveryView {
+    /// `AgentView::delivery_mode` for a client from before `delivery`:
+    /// `steer` when mail reaches a running turn, `followup` when it waits.
+    pub fn legacy_mode(&self) -> String {
+        match self.level.as_str() {
+            "next-step" | "mid-turn" => "steer",
+            _ => "followup",
+        }
+        .to_string()
+    }
+
+    /// `AgentView::steer_support` for a client from before `delivery`: `yes`
+    /// when the vendor proves consumption, `unproven` when only acceptance
+    /// is proven, `no` when mail waits for the turn to end.
+    pub fn legacy_steer(&self) -> String {
+        match self.level.as_str() {
+            "next-step" => "yes",
+            "mid-turn" => "unproven",
+            _ => "no",
+        }
+        .to_string()
+    }
+
+    /// The level, with `+idempotent` when redelivery is safe: what a table
+    /// column shows.
+    pub fn label(&self) -> String {
+        if self.level.is_empty() {
+            "-".to_string()
+        } else if self.idempotent {
+            format!("{}+idempotent", self.level)
+        } else {
+            self.level.clone()
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct AgentView {
     #[serde(default)]
@@ -47,7 +110,17 @@ pub struct AgentView {
     pub process: String,
     #[serde(default)]
     pub turn_state: String,
+    /// What the agent's harness guarantees for mail that reaches it while a
+    /// turn runs (`docs/delivery.md`).
+    #[serde(default)]
+    pub delivery: DeliveryView,
+    /// Deprecated: `delivery.legacy_mode()`, kept for one release so a CLI or
+    /// MCP client built before `delivery` still parses this view (it requires
+    /// the field). Remove it, with `steer_support`, in the release after.
+    #[serde(default)]
     pub delivery_mode: String,
+    /// Deprecated with `delivery_mode`: `delivery.legacy_steer()`.
+    #[serde(default)]
     pub steer_support: String,
     pub quota_reset_at_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

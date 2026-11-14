@@ -1,0 +1,30 @@
+[package]
+name = "anyagents-keeper"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Harness process custody that outlives the AnyAgents kernel"
+
+[dependencies]
+anyagents-harness = { path = "../anyagents-harness" }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+# The keeper the process tests drive: it hosts a small line adapter over a
+# shell harness, so the tests exercise real processes, pipes and sockets.
+[[bin]]
+name = "kept_line"
+path = "src/bin/kept_line.rs"
+test = false
+
+# `cargo test --workspace --all-targets` reports the dependencies of a bin or a
+# test target as unused in that target. Only a workspace member that is built as
+# a linker root (like `anyagents`) is checked; an empty list keeps the ignore
+# from matching every crate.
+[package.metadata.cargo-machete]
+ignored = []

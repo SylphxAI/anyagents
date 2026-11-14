@@ -4,9 +4,7 @@ use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyagents_harness::{
-    Context, DeliverOutcome, DeliveryMode, Harness, OutboundMessage, SteerSupport,
-};
+use anyagents_harness::{Context, DeliverOutcome, DeliveryLevel, Harness, OutboundMessage};
 use anyagents_harness_agy::AgyHarness;
 use tempfile::TempDir;
 
@@ -61,8 +59,7 @@ fn a_result_records_usage_and_a_second_deliver_is_not_written() {
     assert_eq!(usage.output_tokens, 7);
     assert_eq!(usage.reported_cost_micros, None);
     assert_eq!(harness.session_id().as_deref(), Some("sess-from-vendor"));
-    assert_eq!(harness.health().delivery_mode, DeliveryMode::Followup);
-    assert_eq!(harness.health().steer_support, SteerSupport::Unproven);
+    assert_eq!(harness.health().delivery.level, DeliveryLevel::TurnEnd);
     harness.deliver(&msg("m1")).unwrap();
     assert_eq!(harness.written_ids(), vec!["m1".to_string()]);
 }
@@ -115,4 +112,46 @@ fn resume_passes_the_session_and_the_id_is_the_first_line() {
     let log = dir.path().join("log");
     assert!(wait_log(&log, "anyagents-message:m1"));
     assert!(read_log(&log).contains("argv:--output-format stream-json --resume sess-1"));
+}
+
+#[test]
+fn without_the_language_server_mail_waits_for_the_turn_end() {
+    use anyagents_harness_stream::StreamSpec;
+    let dir = TempDir::new().unwrap();
+    let log = dir.path().join("log");
+    // A work directory but no agent config directory: no language server
+    // to steer through, so a line for a busy agent waits for the turn.
+    let mut harness = AgyHarness::start_with_spec(
+        StreamSpec::for_program("agy"),
+        env!("CARGO_BIN_EXE_fake_agy"),
+        None,
+        &[
+            ("ANYAGENTS_FAKE_MODE", "hold"),
+            ("ANYAGENTS_FAKE_LOG", log.to_str().unwrap()),
+        ],
+        Some(dir.path()),
+    )
+    .expect("start");
+    assert_eq!(harness.health().delivery.level, DeliveryLevel::TurnEnd);
+    harness.deliver(&msg("m1")).unwrap();
+    harness.deliver(&msg("m2")).unwrap();
+    assert_eq!(harness.turns_started(), 1);
+    assert!(wait_log(&log, "anyagents-message:m2"));
+}
+
+#[test]
+fn with_the_language_server_mail_reaches_the_running_turn() {
+    use anyagents_harness_stream::StreamSpec;
+    let dir = TempDir::new().unwrap();
+    let config = dir.path().join("config");
+    std::fs::create_dir_all(&config).unwrap();
+    let harness = AgyHarness::start_with_spec(
+        StreamSpec::for_program("agy"),
+        env!("CARGO_BIN_EXE_fake_agy"),
+        None,
+        &[("AGY_CONFIG_DIR", config.to_str().unwrap())],
+        Some(dir.path()),
+    )
+    .expect("start");
+    assert_eq!(harness.health().delivery, anyagents_harness_agy::DELIVERY);
 }

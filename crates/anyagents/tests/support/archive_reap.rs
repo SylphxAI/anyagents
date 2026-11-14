@@ -67,24 +67,28 @@ fn production_archive_reap_does_not_recreate_seat_directories() {
     assert!(!cfg.join(".anyagents-reaped").exists());
 }
 
-struct Server(std::process::Child);
+struct Server {
+    child: std::process::Child,
+    _keepers: crate::support::Keepers,
+}
 
 impl Drop for Server {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
 fn server(data: &Path, home: &Path, stderr: &Path) -> Server {
-    Server(
-        command(data, home)
+    Server {
+        child: command(data, home)
             .arg("serve")
             .stdout(std::process::Stdio::null())
             .stderr(std::fs::File::create(stderr).unwrap())
             .spawn()
             .unwrap(),
-    )
+        _keepers: crate::support::Keepers::of(data),
+    }
 }
 
 fn wait_for_reap(server: &mut Server, cfg: &Path, stderr: &Path, stage: &str) {
@@ -101,7 +105,7 @@ fn wait_for_reap(server: &mut Server, cfg: &Path, stderr: &Path, stage: &str) {
             return;
         }
         assert!(
-            server.0.try_wait().unwrap().is_none(),
+            server.child.try_wait().unwrap().is_none(),
             "{stage} server exited: {}",
             std::fs::read_to_string(stderr).unwrap()
         );

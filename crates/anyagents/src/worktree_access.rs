@@ -2201,7 +2201,8 @@ fn walk_tree_policy(
             return Ok(());
         }
         // fdopendir owns only the duplicate; closing it does not close file.
-        let raw = unsafe { libc::dup(fd) };
+        // Close-on-exec, so a process started meanwhile never inherits it.
+        let raw = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
         if raw < 0 {
             return Err(std::io::Error::last_os_error());
         }
@@ -3301,6 +3302,7 @@ mod tests {
                 config_dir: anyagents_core::agent_config_dir(dir.path(), &bad),
                 work_dir: checkout.clone(),
                 extra_env: Vec::new(),
+                lock: None,
             });
             let error = match launch {
                 Err(error) => error,

@@ -246,6 +246,7 @@ fn single_uid_local_mode_starts_and_routes_without_setpriv_or_seat_uids() {
     let inbox_raw = support::call_raw(&socket, "GET", "/v1/agents/beta/inbox", "", &beta_auth);
     let _ = server.kill();
     let _ = server.wait();
+    support::stop_keepers(&data);
     assert!(
         inbox_raw.starts_with("HTTP/1.1 200"),
         "beta inbox failed: {inbox_raw}"

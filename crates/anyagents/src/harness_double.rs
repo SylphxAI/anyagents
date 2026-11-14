@@ -5,7 +5,9 @@
 //! The config file is the `adapter.json` the agent was created with:
 //! `{"harness": "agy", "reply_with": "<binary> --data <dir> mcp --config <dir>"}`. Each user line is answered through the tool server
 //! `reply_with` names, as an agent's model does — to whoever sent the message —
-//! and the turn then ends with a `result` line.
+//! and the turn then ends with a `result` line. With `"hold_while": "<path>"`
+//! each line is held, before its answer, while that file exists: a turn as
+//! long as a test needs.
 
 use std::io::{BufRead, Write};
 
@@ -65,6 +67,12 @@ pub fn run(config: &std::path::Path) -> Result<(), Error> {
         .and_then(serde_json::Value::as_str)
         .unwrap_or("")
         .to_string();
+    // A turn that takes as long as a test needs: the double holds each line
+    // it reads, before answering, while this file exists.
+    let hold_while = value
+        .get("hold_while")
+        .and_then(serde_json::Value::as_str)
+        .map(std::path::PathBuf::from);
     let stdout = std::io::stdout();
     for line in std::io::stdin().lock().lines() {
         let line = match line {
@@ -90,6 +98,12 @@ pub fn run(config: &std::path::Path) -> Result<(), Error> {
             .and_then(|first| first.strip_prefix(anyagents_harness::MESSAGE_MARKER_PREFIX))
             .unwrap_or("")
             .to_string();
+        if let Some(hold) = &hold_while {
+            note(&format!("holding {id}"));
+            while hold.exists() {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
         let agent = agent_file
             .as_ref()
             .and_then(|path| std::fs::read_to_string(path).ok())
@@ -171,19 +185,30 @@ mod tool_server {
         // The model answers the message it was handed: by the mailbox
         // reference in the server's trusted context when its config says so, as
         // a real model does, else by the target its config names.
-        let hinted = user
-            .lines()
-            .find_map(|line| {
-                line.strip_prefix(anyagents_harness::REPLY_HINT_PREFIX)
-                    .or_else(|| {
-                        let (_, rest) = line.split_once(" reply_to=\"")?;
-                        let (val, _) = rest.split_once('"')?;
-                        Some(val)
-                    })
-            })
-            .map(str::to_string)
-            .filter(|hint| !hint.is_empty());
-        let configured = (!reply_to.is_empty()).then(|| reply_to.to_string());
+        // A recovery note names the messages of the turn it resumes; the
+        // model answers the last of them by id, as it would have. This double
+        // is handed the note's own id and text only (no trusted context), and
+        // the note's id is no message in the mailbox.
+        let recovered = user.lines().rev().find_map(|line| {
+            let rest = line.trim_start().strip_prefix("- anyagents-message:")?;
+            rest.split(' ').next().filter(|id| !id.is_empty())
+        });
+        let hinted = recovered.map(str::to_string).or_else(|| {
+            user.lines()
+                .find_map(|line| {
+                    line.strip_prefix(anyagents_harness::REPLY_HINT_PREFIX)
+                        .or_else(|| {
+                            let (_, rest) = line.split_once(" reply_to=\"")?;
+                            let (val, _) = rest.split_once('"')?;
+                            Some(val)
+                        })
+                })
+                .map(str::to_string)
+                .filter(|hint| !hint.is_empty())
+        });
+        let configured = recovered
+            .or((!reply_to.is_empty()).then_some(reply_to))
+            .map(str::to_string);
         let reference = if context_reply_to {
             hinted.or(configured)
         } else {

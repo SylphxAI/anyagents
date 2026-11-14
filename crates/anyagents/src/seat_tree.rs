@@ -40,7 +40,8 @@ fn open_root(path: &Path) -> io::Result<File> {
 fn names(directory: &File) -> io::Result<Vec<std::ffi::OsString>> {
     // fdopendir owns a duplicate; neither enumeration nor recursion reopens a
     // pathname that the seat can replace while the grant is in progress.
-    let fd = unsafe { libc::dup(directory.as_raw_fd()) };
+    // Close-on-exec, so a process started meanwhile never inherits it.
+    let fd = unsafe { libc::fcntl(directory.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }

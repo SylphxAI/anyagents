@@ -9,7 +9,9 @@
 //!
 //! The route table is in memory. A restart rebuilds it from the stored images,
 //! before the supervisor starts any agent, and a token is kept on disk so an
-//! agent that resumes keeps the same one.
+//! agent that resumes keeps the same one. The port is kept on disk too: a
+//! harness process that outlived the last server in its keeper still has the
+//! origin it was started with, and a restarted server listens there again.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock, PoisonError};
@@ -32,20 +34,36 @@ pub fn running() -> Option<&'static Gateway> {
     GATEWAY.get()
 }
 
+/// What a start found.
+pub struct Started {
+    /// The port the last start used could not be bound again. Anything may
+    /// listen there now, so every token was replaced, and no harness started
+    /// on the old origin may be taken over.
+    pub moved: bool,
+    /// The agents that route through the gateway.
+    pub agents: Vec<AgentId>,
+}
+
 /// Start the gateway once, as part of the server starting. It is bound to the
 /// server's lifetime: a server that cannot serve harnesses reports why.
-pub fn start(data: &Path) -> Result<(), Error> {
+pub fn start(data: &Path) -> Result<Started, Error> {
     let guard = START.lock().unwrap_or_else(PoisonError::into_inner);
     if GATEWAY.get().is_some() {
-        return Ok(());
+        return Ok(Started {
+            moved: false,
+            agents: Vec::new(),
+        });
     }
-    let (port, listener) = crate::server::listen_on_loopback()?;
+    let (port, listener, moved) = bind(&data.join("gateway.port"))?;
     let routes = MemoryRoutes::new();
     let store = Store::open(data.join("state.db"))?;
     let mut provider_agents = Vec::new();
     // An archived agent runs nothing; a wake gives it its route back.
     for agent in store.list_live_agents()? {
         if let Some(image) = ProviderImage::load(data, &agent.id)? {
+            if moved {
+                rotate_token(data, &agent.id)?;
+            }
             routes.insert(token(data, &agent.id)?, image.route(&agent.name));
             provider_agents.push(agent.id);
         }
@@ -56,14 +74,52 @@ pub fn start(data: &Path) -> Result<(), Error> {
     // The port is this process's, so every agent pointed at the gateway is
     // repointed now: a recorded origin from an earlier start no longer answers.
     let origin = format!("http://127.0.0.1:{port}");
-    for agent_id in provider_agents {
-        let env = env_for(data, &agent_id, &origin);
+    for agent_id in &provider_agents {
+        let env = env_for(data, agent_id, &origin);
         if !env.is_empty() {
-            store.set_agent_launch_env(&agent_id, &env)?;
+            store.set_agent_launch_env(agent_id, &env)?;
         }
     }
     drop(guard);
-    Ok(())
+    Ok(Started {
+        moved,
+        agents: provider_agents,
+    })
+}
+
+/// The loopback listener: on the port the last start used, when it is free,
+/// else on any, recorded for the next start. `moved` when a recorded port
+/// could not be bound again.
+fn bind(port_file: &Path) -> Result<(u16, tokio::net::TcpListener, bool), Error> {
+    let previous = std::fs::read_to_string(port_file)
+        .ok()
+        .and_then(|text| text.trim().parse::<u16>().ok());
+    let (port, listener, moved) = match previous.map(crate::server::listen_on_loopback) {
+        Some(Ok((port, listener))) => (port, listener, false),
+        Some(Err(_)) => {
+            let (port, listener) = crate::server::listen_on_loopback(0)?;
+            (port, listener, true)
+        }
+        None => {
+            let (port, listener) = crate::server::listen_on_loopback(0)?;
+            (port, listener, false)
+        }
+    };
+    if previous != Some(port) {
+        anyagents_harness::atomic_write_file(port_file, format!("{port}\n").as_bytes(), 0o600)?;
+    }
+    Ok((port, listener, moved))
+}
+
+/// Replace an agent's gateway token: what was handed out before is refused.
+fn rotate_token(data: &Path, id: &AgentId) -> Result<(), Error> {
+    write_private(&token_file(data, id), &random_token()?)
+}
+
+fn token_file(data: &Path, id: &AgentId) -> PathBuf {
+    data.join("agents")
+        .join(id.to_string())
+        .join("gateway-token.txt")
 }
 
 /// The origin a harness sends its requests to.
@@ -179,10 +235,7 @@ fn env_for(data: &Path, id: &AgentId, origin: &str) -> Vec<(String, String)> {
 /// The gateway token of one agent. It is generated once, kept 0600 beside the
 /// agent's other state, and never printed.
 pub fn token(data: &Path, id: &AgentId) -> Result<String, Error> {
-    let file = data
-        .join("agents")
-        .join(id.to_string())
-        .join("gateway-token.txt");
+    let file = token_file(data, id);
     match std::fs::read_to_string(&file) {
         Ok(text) if !text.trim().is_empty() => Ok(text.trim().to_string()),
         _ => {
@@ -337,6 +390,43 @@ mod tests {
         assert_eq!(protocol_of("codex"), Protocol::OpenAiResponses);
         assert_eq!(protocol_of("opencode"), Protocol::OpenAiChat);
     }
+    /// A restarted server listens where the last one did, so a harness that
+    /// outlived it in its keeper still reaches it. When that port is taken
+    /// (by anything: a squatter), the gateway moves and says so, and the
+    /// token it handed out before is replaced.
+    #[test]
+    fn the_gateway_keeps_its_port_and_rotates_tokens_when_it_cannot() {
+        let dir = tempfile::tempdir().unwrap();
+        let port_file = dir.path().join("gateway.port");
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let (first, listener, moved) = bind(&port_file).unwrap();
+        assert!(!moved, "a first start has nothing to move from");
+        drop(listener);
+        let (again, listener, moved) = bind(&port_file).unwrap();
+        assert_eq!((again, moved), (first, false), "a free port is bound again");
+        // The port is held by someone else across the restart.
+        let squatter = listener.into_std().unwrap();
+        let (moved_to, _listener, moved) = bind(&port_file).unwrap();
+        assert!(moved, "a taken port is not reported");
+        assert_ne!(moved_to, first);
+        assert_eq!(
+            std::fs::read_to_string(&port_file).unwrap().trim(),
+            moved_to.to_string()
+        );
+        drop(squatter);
+        let id = AgentId::generate();
+        std::fs::create_dir_all(token_file(dir.path(), &id).parent().unwrap()).unwrap();
+        let before = token(dir.path(), &id).unwrap();
+        assert_eq!(token(dir.path(), &id).unwrap(), before, "a token is kept");
+        rotate_token(dir.path(), &id).unwrap();
+        assert_ne!(
+            token(dir.path(), &id).unwrap(),
+            before,
+            "the token was not replaced"
+        );
+    }
+
     #[test]
     fn present_provider_images_require_every_routing_and_authentication_field() {
         let dir = tempfile::tempdir().unwrap();
