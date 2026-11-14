@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+- `conversation` searches every harness's native history: Spiron's
+  `sessions.sqlite3`, OpenCode's `opencode.db` (tool parts included), Claude
+  Code subagents, Codex rollouts, AGY, Muse, OMP and Grok sessions, read
+  without ever creating a file beside a harness's store. A harness directory
+  the server may not read (Claude Code's owner-only `config/sessions` under a
+  seat) no longer stops the agent's other history from being indexed. The
+  server logs once when its pre-warm has indexed every agent.
+- History indexing never holds an agent's lifecycle lock or the index's write
+  lock across a long read: sources are read and projected unlocked and publish
+  in short batches that check the source is unchanged. A search indexes at most
+  4 MiB of new history before it answers and reports the rest in
+  `retrieval.pending`; a low-priority daemon thread indexes it, verifies
+  sources hourly, and pre-warms every agent's history after a start.
+- Embeddings and rerank can come from a remote model bound to an AnyAgents
+  profile: an OpenAI-compatible `/embeddings` endpoint or a Cohere/Voyage/Jina
+  style `/rerank`, chosen in `<data>/memory-service/config.json`. With nothing
+  configured the pinned local models run offline. Each dense index is stamped
+  with its vector space (provider, model, dimension, preprocessing); a new
+  embedding model is rebuilt in the background (niced, resumable, batched)
+  after its estimated tokens and cost are reported, and only within
+  `max_rebuild_usd`; while it builds, all embedding stops when the spend the
+  provider reports reaches the cap. `anyagents memory-service estimate`
+  previews the rebuild without calling a model. Spend outside a rebuild
+  (query embeddings, rerank, new history) is capped per UTC day by
+  `max_daily_usd` and persisted; past it rerank and new-history embedding
+  wait for the next day. Background workers retry failures with backoff and
+  report them in `status`; marks follow the host index's generation and the
+  worker count. No space is deleted automatically: `memory-service prune`
+  removes other spaces once the configured one is built, and a `--config`
+  that does not exist is an error. Every OpenRouter request
+  carries `provider.data_collection = "deny"`, and a remote reranker reads at
+  most `passage_chars` (1,000) characters of each passage. The desk's choice,
+  `qwen/qwen3-embedding-8b` with `mongodb/rerank-3` through
+  `openrouter/default` (MRR@10 0.296 and recall@10 0.463 on our history,
+  against 0.192 and 0.362 for the local pair), is documented with its exact
+  configuration in `docs/host-memory.md`.
+- Hybrid retrieval: BM25 fused with dense candidates from a local multilingual
+  embedder and reranked by a local cross-encoder, run by the new
+  `anyagents memory-service` process. Every result cites its raw bytes; without
+  the service the server ranks lexically and reports `retrieval.mode`
+  `lexical`, with nothing marked degraded.
 - Security: the server no longer opens host files with its own access on an
   agent's behalf (ADR 0010 D3). A `send` with a local media path uploads it
   only when the sending agent can read it itself: a seat agent's file is
@@ -109,6 +150,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   everything else; once it is configured, the local TCP listener defaults to
   loopback. Without `public_listen` nothing changes. A remote session token
   stops authenticating once its agent's harness moves back onto the host.
+- Tool contracts follow what agents write. `code` honours `timeout_ms` up to a
+  ceiling (default 30 s, max 10 min) that only the server's environment sets
+  (`ANYAGENTS_CODE_TIMEOUT_MS`, `ANYAGENTS_CODE_MAX_TIMEOUT_MS`) and hands each
+  tool server in `whoami`. An inner `workspace.exec` inherits the call's
+  remaining time, and its own `timeout_ms` stretches the call; a request past
+  the ceiling is clamped and the result says so in `note`. A remote sandbox
+  still stops a command at 120 s, and the `code` description says which limit
+  applies. Failed snippets name their fix (ESM imports, `require`/Node globals,
+  Python, guessed API names, double-escaped code), and the description lists the
+  exact sandbox API. `schedules` accepts `action: "at"|"every"|"watch"`, and its
+  errors quote a correct call. `null`, `"null"` and `"undefined"` are absent in
+  `schedules` and `send`. `self` and `parent` resolve in `conversation`,
+  `agents` and `schedules`. An ancestor may message any non-isolated descendant,
+  and messaging refusals name the route.
 
 ## 0.1.3
 

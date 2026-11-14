@@ -288,25 +288,51 @@ fn open_readonly_with_metadata(path: &Path) -> io::Result<(File, fs::Metadata)> 
 /// syscall per record or per byte. Positioned reads share no file offset.
 pub(crate) struct RawSource {
     path: PathBuf,
-    file: File,
+    /// A file read through positioned reads, or one native store row held
+    /// whole: a row is read by one query, in one snapshot of its store.
+    backing: Backing,
     stamp: crate::host_cursor::FileStamp,
     window: Vec<u8>,
     window_at: u64,
     window_len: usize,
+}
+enum Backing {
+    File(File),
+    Row,
 }
 const MIN_WINDOW: u64 = 4 * 1024;
 const READ_AHEAD: u64 = 64 * 1024;
 const MAX_WINDOW: u64 = 1024 * 1024;
 impl RawSource {
     pub(crate) fn open(path: &Path) -> io::Result<Self> {
+        if let Some(row) = crate::host_sqlite::RowRef::parse(path) {
+            let bytes = row.read()?;
+            return Self::from_row(&row, bytes);
+        }
         let (file, metadata) = open_readonly_with_metadata(path)?;
         Ok(Self {
             path: path.to_owned(),
-            file,
+            backing: Backing::File(file),
             stamp: crate::host_cursor::FileStamp::from_metadata(&metadata),
             window: Vec::new(),
             window_at: 0,
             window_len: 0,
+        })
+    }
+    /// One store row already read in the caller's snapshot. Its stamp is the
+    /// database's, with the row's own length.
+    pub(crate) fn from_row(row: &crate::host_sqlite::RowRef, bytes: Vec<u8>) -> io::Result<Self> {
+        let (_, metadata) = open_readonly_with_metadata(&row.db)?;
+        let mut stamp = crate::host_cursor::FileStamp::from_metadata(&metadata);
+        stamp.len = bytes.len() as u64;
+        let window_len = bytes.len();
+        Ok(Self {
+            path: row.segment(),
+            backing: Backing::Row,
+            stamp,
+            window: bytes,
+            window_at: 0,
+            window_len,
         })
     }
     pub(crate) fn path(&self) -> &Path {
@@ -348,6 +374,11 @@ impl RawSource {
     /// records share one read, and at most 1 MiB or the file's size.
     fn fill(&mut self, offset: u64, wanted: u64) -> io::Result<&[u8]> {
         let held = self.window_at..self.window_at + self.window_len as u64;
+        let Backing::File(file) = &self.backing else {
+            // A row is held whole; past its end there is nothing.
+            let start = offset.min(self.window_len as u64) as usize;
+            return Ok(&self.window[start..self.window_len]);
+        };
         if !held.contains(&offset) {
             let size = wanted
                 .clamp(READ_AHEAD, MAX_WINDOW)
@@ -359,10 +390,7 @@ impl RawSource {
             counters::READS.with(|n| n.set(n.get() + 1));
             self.window_at = offset;
             self.window_len = 0;
-            let mut reader = ReadAt {
-                file: &self.file,
-                offset,
-            };
+            let mut reader = ReadAt { file, offset };
             while self.window_len < size {
                 match reader.read(&mut self.window[self.window_len..size]) {
                     Ok(0) => break,
@@ -861,10 +889,22 @@ fn scan_jsonl(
 /// Exact raw bytes; callers must authorize the owning agent before using a
 /// coordinate. Coordinates come from the trusted host index, not tool arguments.
 pub fn read_raw(coordinate: &RawCoordinate) -> io::Result<Vec<u8>> {
-    let mut file = open_readonly(&coordinate.segment)?;
-    file.seek(SeekFrom::Start(coordinate.offset))?;
-    let mut bytes = Vec::new();
-    file.take(coordinate.length).read_to_end(&mut bytes)?;
+    let bytes = if let Some(row) = crate::host_sqlite::RowRef::parse(&coordinate.segment) {
+        let row = row.read()?;
+        let start = usize::try_from(coordinate.offset)
+            .unwrap_or(usize::MAX)
+            .min(row.len());
+        let end = start
+            .saturating_add(usize::try_from(coordinate.length).unwrap_or(usize::MAX))
+            .min(row.len());
+        row[start..end].to_vec()
+    } else {
+        let mut file = open_readonly(&coordinate.segment)?;
+        file.seek(SeekFrom::Start(coordinate.offset))?;
+        let mut bytes = Vec::new();
+        file.take(coordinate.length).read_to_end(&mut bytes)?;
+        bytes
+    };
     if bytes.len() as u64 != coordinate.length
         || crate::learned_memory::sha256(&bytes) != coordinate.sha256
     {
@@ -892,6 +932,36 @@ pub fn read_raw_range(
         ));
     }
     let end = offset.saturating_add(length).min(coordinate.length);
+    if let Some(row) = crate::host_sqlite::RowRef::parse(&coordinate.segment) {
+        // One query reads the whole row in one snapshot: authenticate the
+        // event, then cut the requested range from it.
+        let row = row.read()?;
+        let start = usize::try_from(coordinate.offset).unwrap_or(usize::MAX);
+        let event = start
+            .checked_add(usize::try_from(coordinate.length).unwrap_or(usize::MAX))
+            .and_then(|stop| row.get(start..stop))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "raw coordinate readback mismatch",
+                )
+            })?;
+        if crate::learned_memory::sha256(event) != coordinate.sha256 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "raw coordinate readback mismatch",
+            ));
+        }
+        let bytes = event[offset as usize..end as usize].to_vec();
+        let window = RawCoordinate {
+            segment: coordinate.segment.clone(),
+            offset: coordinate.offset + offset,
+            length: bytes.len() as u64,
+            sha256: crate::learned_memory::sha256(&bytes),
+            seq: coordinate.seq,
+        };
+        return Ok((window, bytes));
+    }
     let mut file = open_readonly(&coordinate.segment)?;
     let stamp = crate::host_cursor::FileStamp::read(&file)?;
     file.seek(SeekFrom::Start(coordinate.offset))?;
