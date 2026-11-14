@@ -78,6 +78,19 @@ pub struct DeliveryLoop<H: Harness> {
     last_rejection: Option<String>,
 }
 
+/// The reason the newest parked message was refused for, when nothing was
+/// taken after it (the cursor still stands on it) and the reason can be
+/// told to be no single message's own (`names_message_size`). The store keeps
+/// no `message_specific` flag, so another reason of one message alone could
+/// be read as the vendor's; that only parks less, never loses mail. `None`
+/// when the store cannot say.
+fn last_refusal(store: &Store, agent_id: &AgentId) -> Option<String> {
+    let newest = store.rejected_messages(agent_id).ok()?.into_iter().last()?;
+    let cursor = store.delivered_cursor(agent_id).ok()?;
+    (cursor == newest.seq && !anyagents_harness::names_message_size(&newest.reason))
+        .then_some(newest.reason)
+}
+
 /// More refusals than this in one pass, of reasons that are not one
 /// message's own, are a vendor that refuses everything: the breaker stops
 /// parking and fails the harness instead.
@@ -105,6 +118,9 @@ impl<H: Harness> DeliveryLoop<H> {
         if let Err(err) = store.send_pending_rejection_notices(&agent_id) {
             eprintln!("anyagents: notices for parked messages: {err}");
         }
+        // The process is the one that refused last: its breaker goes on from
+        // the last refusal, unless a message was taken since.
+        let last_rejection = last_refusal(&store, &agent_id);
         Self {
             store,
             agent_id,
@@ -113,7 +129,7 @@ impl<H: Harness> DeliveryLoop<H> {
             quota_reset_at_ms: None,
             recovery: None,
             rejections: Vec::new(),
-            last_rejection: None,
+            last_rejection,
         }
     }
 
@@ -897,6 +913,57 @@ mod tests {
         );
         assert_eq!(loop_.delivered_cursor().unwrap(), seqs[2]);
         assert_eq!(loop_.store().rejected_messages(&id).unwrap().len(), 2);
+    }
+
+    /// A kernel that takes over the process that refused last keeps its
+    /// breaker: the same reason again is still a vendor that refuses
+    /// everything. A message taken since the refusal resets it.
+    #[test]
+    fn the_breaker_survives_a_kernel_that_takes_the_process_over() {
+        for taken_since in [false, true] {
+            let (dir, mut loop_, id) = setup(DeliveryMode::Steer);
+            recv(loop_.store(), &id, "one");
+            let one = loop_.store().inbox(&id, None).unwrap()[0].id.to_string();
+            loop_
+                .harness_mut()
+                .refuse_forever(&one, "invalid params (-32602)");
+            loop_.run_once().unwrap();
+            assert_eq!(loop_.store().rejected_messages(&id).unwrap().len(), 1);
+            if taken_since {
+                recv(loop_.store(), &id, "two");
+                assert_eq!(
+                    loop_.run_once().unwrap(),
+                    RunOutcome::Delivered { delivered: 1 }
+                );
+            }
+            drop(loop_);
+            let store = Store::open(dir.path().join("state.db")).unwrap();
+            let next = recv(&store, &id, "three");
+            let three = store
+                .inbox(&id, None)
+                .unwrap()
+                .into_iter()
+                .find(|message| message.seq == next)
+                .unwrap()
+                .id
+                .to_string();
+            let mut process = FakeHarness::new(DeliveryMode::Steer);
+            process.refuse_forever(&three, "invalid params (-32602)");
+            let lock = store.try_lock_agent(&id).unwrap();
+            let mut adopted = DeliveryLoop::adopted(store, lock, id.clone(), process);
+            let outcome = adopted.run_once();
+            let parked = adopted.store().rejected_messages(&id).unwrap().len();
+            if taken_since {
+                assert!(outcome.is_ok(), "{outcome:?}");
+                assert_eq!(parked, 2);
+            } else {
+                assert!(
+                    matches!(outcome, Err(Error::HarnessFailed(_))),
+                    "the breaker was reset by the restart: {outcome:?}"
+                );
+                assert_eq!(parked, 1);
+            }
+        }
     }
 
     #[test]
