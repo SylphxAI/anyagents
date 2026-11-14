@@ -1,12 +1,12 @@
 //! Descriptor-bound sharing of mutable config and host overlays. Names select
 //! candidates only; metadata, recursion and effects use the opened inode.
 use std::{
-    ffi::{CString, OsStr},
+    ffi::{CString, OsStr, OsString},
     fs::File,
     io,
-    os::fd::{AsRawFd, FromRawFd},
+    os::fd::{AsRawFd, BorrowedFd, FromRawFd},
     os::unix::{ffi::OsStrExt, fs::MetadataExt},
-    path::{Component, Path},
+    path::{Component, Path, PathBuf},
 };
 
 fn open_child(parent: &File, name: &OsStr, directory: bool) -> io::Result<File> {
@@ -118,6 +118,248 @@ fn run_seat_command(command: &mut std::process::Command, stage: &str) -> io::Res
     )))
 }
 
+/// The only `PATH` a seat command sees. The helper resolves nothing on it; it
+/// is here for a launcher that wants one.
+const SEAT_PATH: &str = "/usr/bin:/bin";
+
+/// This binary, asked to run its `internal seat-file` helper.
+#[cfg(not(test))]
+fn seat_file_program() -> io::Result<(PathBuf, Vec<&'static str>)> {
+    Ok((
+        crate::data::current_exe_clean()?,
+        vec!["internal", "seat-file"],
+    ))
+}
+
+/// Under `cargo test` this binary is the test harness: its worker test takes
+/// the helper's arguments instead.
+#[cfg(test)]
+fn seat_file_program() -> io::Result<(PathBuf, Vec<&'static str>)> {
+    Ok((
+        crate::worktree_access::seat_executable_test_harness()?,
+        vec![
+            "--exact",
+            "seat_tree::tests::seat_file_worker",
+            "--nocapture",
+            "--",
+            "seat-file",
+        ],
+    ))
+}
+
+/// A command that runs this binary's `internal seat-file` helper as `uid`,
+/// `gid` and `groups` through `launcher`; the caller appends the operation.
+/// The seat runs no host tool, so a wrapper earlier on the daemon's `PATH`
+/// (the desk's `cat` once was one the seat could not run) cannot break it,
+/// and it sees a fixed environment, never the daemon's.
+fn seat_file_command(
+    launcher: &Path,
+    uid: u32,
+    gid: u32,
+    groups: &str,
+) -> io::Result<std::process::Command> {
+    let (program, helper) = seat_file_program()?;
+    let mut command = std::process::Command::new(launcher);
+    command
+        .args([
+            "--reuid",
+            &uid.to_string(),
+            "--regid",
+            &gid.to_string(),
+            "--groups",
+            groups,
+            "--no-new-privs",
+            "--",
+        ])
+        .arg(program)
+        .args(helper)
+        .env_clear()
+        .env("PATH", SEAT_PATH);
+    Ok(command)
+}
+
+/// `anyagents internal seat-file <operation>`: one file change the daemon
+/// needs made as a seat, run as that seat by [`seat_file_command`]. Each
+/// operation acts on standard input (an opened inode, never a pipe) or on one
+/// name in the working directory (an opened parent, entered with `fchdir`
+/// before the launcher runs). Exits 1 with the reason on stderr, 2 on a
+/// malformed call.
+///
+/// - `inode <mode> [<gid>]`: give standard input's inode group `gid`, then
+///   octal `mode`.
+/// - `op-dir`: mode 0700 on standard input's directory, then 0600 on its
+///   `config` when that is a regular file.
+/// - `copy <name>`: create `./<name>` (0660, never over an existing name),
+///   copy standard input into it and fsync it.
+/// - `readback <name>`: succeed only when `./<name>` holds exactly the bytes
+///   left on standard input.
+/// - `unlink <name>`: remove `./<name>` if it is there.
+pub(crate) fn seat_file_main(args: &[OsString]) -> std::process::ExitCode {
+    let usage = || {
+        eprintln!(
+            "usage: anyagents internal seat-file inode <mode> [<gid>] | op-dir | \
+             copy <name> | readback <name> | unlink <name>"
+        );
+        std::process::ExitCode::from(2)
+    };
+    // Standard input stays open for this process's life; borrowing never
+    // closes it.
+    let input = unsafe { BorrowedFd::borrow_raw(libc::STDIN_FILENO) };
+    let operation = args.first().and_then(|arg| arg.to_str());
+    let result = match (operation, &args[args.len().min(1)..]) {
+        (Some("inode"), [mode]) => match parse_mode(mode) {
+            Some(mode) => set_inode(input, None, mode),
+            None => return usage(),
+        },
+        (Some("inode"), [mode, gid]) => {
+            match (parse_mode(mode), gid.to_str().and_then(|g| g.parse().ok())) {
+                (Some(mode), Some(gid)) => set_inode(input, Some(gid), mode),
+                _ => return usage(),
+            }
+        }
+        (Some("op-dir"), []) => tighten_op_dir(input),
+        (Some(operation @ ("copy" | "readback" | "unlink")), [name]) => {
+            let Some(name) = single_name(name) else {
+                return usage();
+            };
+            match operation {
+                "copy" => copy_into(input, name),
+                "readback" => read_back(input, name),
+                _ => match std::fs::remove_file(Path::new(".").join(name)) {
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                    other => other,
+                },
+            }
+        }
+        _ => return usage(),
+    };
+    match result {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("seat-file {}: {error}", operation.unwrap_or_default());
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn parse_mode(mode: &OsStr) -> Option<libc::mode_t> {
+    libc::mode_t::from_str_radix(mode.to_str()?, 8)
+        .ok()
+        .filter(|mode| *mode <= 0o7777)
+}
+
+/// `name` when it names an entry of the working directory itself.
+fn single_name(name: &OsStr) -> Option<&OsStr> {
+    let bytes = name.as_bytes();
+    (!bytes.is_empty() && !bytes.contains(&b'/') && bytes != b"." && bytes != b"..").then_some(name)
+}
+
+/// Group `gid` (when given), then `mode`, on the inode `fd` refers to, which
+/// may be an `O_PATH` descriptor.
+fn set_inode(fd: BorrowedFd<'_>, gid: Option<libc::gid_t>, mode: libc::mode_t) -> io::Result<()> {
+    let raw = fd.as_raw_fd();
+    if let Some(gid) = gid {
+        // AT_EMPTY_PATH reaches an O_PATH descriptor too, which fchown refuses.
+        #[cfg(target_os = "linux")]
+        let changed =
+            unsafe { libc::fchownat(raw, c"".as_ptr(), u32::MAX, gid, libc::AT_EMPTY_PATH) };
+        #[cfg(not(target_os = "linux"))]
+        let changed = unsafe { libc::fchown(raw, u32::MAX, gid) };
+        if changed != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    if unsafe { libc::fchmod(raw, mode) } == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() != Some(libc::EBADF) {
+        return Err(error);
+    }
+    // An O_PATH descriptor refuses fchmod; change the inode it names, as
+    // `chmod /dev/fd/0` did.
+    let fds = if cfg!(target_os = "linux") {
+        "/proc/self/fd"
+    } else {
+        "/dev/fd"
+    };
+    let path = CString::new(format!("{fds}/{raw}")).map_err(io::Error::other)?;
+    if unsafe { libc::chmod(path.as_ptr(), mode) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+fn tighten_op_dir(dir: BorrowedFd<'_>) -> io::Result<()> {
+    set_inode(dir, None, 0o700)?;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let found = unsafe {
+        libc::fstatat(
+            dir.as_raw_fd(),
+            c"config".as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } == 0;
+    if !found || unsafe { stat.assume_init() }.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return Ok(());
+    }
+    if unsafe { libc::fchmodat(dir.as_raw_fd(), c"config".as_ptr(), 0o600, 0) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+fn copy_into(source: BorrowedFd<'_>, name: &OsStr) -> io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    unsafe {
+        libc::umask(0o007);
+    }
+    let mut copy = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o660)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(Path::new(".").join(name))?;
+    io::copy(&mut File::from(source.try_clone_to_owned()?), &mut copy)?;
+    copy.sync_all()
+}
+
+fn read_back(source: BorrowedFd<'_>, name: &OsStr) -> io::Result<()> {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    fn fill(reader: &mut File, buffer: &mut [u8]) -> io::Result<usize> {
+        let mut filled = 0;
+        while filled < buffer.len() {
+            match reader.read(&mut buffer[filled..]) {
+                Ok(0) => break,
+                Ok(read) => filled += read,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => (),
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(filled)
+    }
+    let mut copy = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(Path::new(".").join(name))?;
+    let mut source = File::from(source.try_clone_to_owned()?);
+    let (mut expected, mut actual) = (vec![0; 64 * 1024], vec![0; 64 * 1024]);
+    loop {
+        let want = fill(&mut source, &mut expected)?;
+        let have = fill(&mut copy, &mut actual)?;
+        if want != have || expected[..want] != actual[..have] {
+            return Err(io::Error::other("copy differs from its source"));
+        }
+        if want == 0 {
+            return Ok(());
+        }
+    }
+}
+
 fn grant(file: &File, uid: u32, gid: u32, capability: bool, daemon_access: bool) -> io::Result<()> {
     let meta = file.metadata()?;
     if !meta.is_dir() && (!meta.is_file() || meta.nlink() != 1) {
@@ -165,24 +407,14 @@ fn grant(file: &File, uid: u32, gid: u32, capability: bool, daemon_access: bool)
         || std::env::var_os("ANYAGENTS_REQUIRE_NATIVE_SEAT_TEST").is_some())
         && let Some(launcher) = super::sandbox::descriptor_launcher()
     {
-        let mut command = std::process::Command::new(launcher);
+        let mut command = seat_file_command(
+            &launcher,
+            meta.uid(),
+            meta.gid(),
+            &format!("{},{gid}", meta.gid()),
+        )?;
         command
-            .args([
-                "--reuid",
-                &meta.uid().to_string(),
-                "--regid",
-                &meta.gid().to_string(),
-                "--groups",
-                &format!("{},{gid}", meta.gid()),
-                "--no-new-privs",
-                "--",
-                "/bin/sh",
-                "-c",
-                "chgrp \"$1\" /dev/fd/0 && chmod \"$2\" /dev/fd/0",
-                "seat-inode",
-                &gid.to_string(),
-                &format!("{mode:o}"),
-            ])
+            .args(["inode", &format!("{mode:o}"), &gid.to_string()])
             .stdin(file.try_clone()?);
         match run_seat_command(&mut command, "seat-inode") {
             Ok(()) => return Ok(()),
@@ -320,24 +552,16 @@ fn migrate_open_file(
                 }
             }
             let dir_fd = self.parent.as_raw_fd();
-            let mut rm = std::process::Command::new(self.launcher);
-            rm.args([
-                "--reuid",
-                &self.uid.to_string(),
-                "--regid",
-                &self.gid.to_string(),
-                "--groups",
-                &self.gid.to_string(),
-                "--no-new-privs",
-                "--",
-                "/bin/rm",
-                "-f",
-                "--",
-            ])
-            .arg(Path::new(".").join(self.temp))
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
+            let Ok(mut rm) =
+                seat_file_command(self.launcher, self.uid, self.gid, &self.gid.to_string())
+            else {
+                return;
+            };
+            rm.arg("unlink")
+                .arg(self.temp)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
             unsafe {
                 rm.pre_exec(move || {
                     if libc::fchdir(dir_fd) != 0 {
@@ -357,24 +581,8 @@ fn migrate_open_file(
         gid,
         armed: true,
     };
-    let mut command = std::process::Command::new(&launcher);
-    command
-        .args([
-            "--reuid",
-            &uid.to_string(),
-            "--regid",
-            &gid.to_string(),
-            "--groups",
-            &gid.to_string(),
-            "--no-new-privs",
-            "--",
-            "/bin/sh",
-            "-c",
-            "set -euC; umask 007; cat > \"./$1\"",
-            "seat-copy",
-        ])
-        .arg(&temp)
-        .stdin(source.try_clone()?);
+    let mut command = seat_file_command(&launcher, uid, gid, &gid.to_string())?;
+    command.arg("copy").arg(&temp).stdin(source.try_clone()?);
     // Bind working directory directly to the opened parent descriptor via fchdir
     // before privilege drop, avoiding /dev/fd/3 (/proc/self/fd/3) traversal when
     // setresuid sets PR_SET_DUMPABLE=0 (mode 0500 root:root on /proc/self/fd).
@@ -397,24 +605,8 @@ fn migrate_open_file(
     original.seek(SeekFrom::Start(0))?;
     // The new inode belongs to the seat, which may not share a daemon group.
     // Read back under that exact owner rather than widening it for inspection.
-    let mut verify = std::process::Command::new(&launcher);
-    verify
-        .args([
-            "--reuid",
-            &uid.to_string(),
-            "--regid",
-            &gid.to_string(),
-            "--groups",
-            &gid.to_string(),
-            "--no-new-privs",
-            "--",
-            "/bin/sh",
-            "-c",
-            "set -eu; cmp -s - \"./$1\"; sync -f \"./$1\"",
-            "seat-readback",
-        ])
-        .arg(&temp)
-        .stdin(source.try_clone()?);
+    let mut verify = seat_file_command(&launcher, uid, gid, &gid.to_string())?;
+    verify.arg("readback").arg(&temp).stdin(source.try_clone()?);
     unsafe {
         verify.pre_exec(move || {
             if libc::fchdir(fd) != 0 {
@@ -591,26 +783,17 @@ fn tighten_private_inode(
         || std::env::var_os("ANYAGENTS_REQUIRE_NATIVE_SEAT_TEST").is_some())
         && let Some(launcher) = super::sandbox::descriptor_launcher()
     {
-        let status = std::process::Command::new(launcher)
-            .args([
-                "--reuid",
-                &meta.uid().to_string(),
-                "--regid",
-                &meta.gid().to_string(),
-                "--groups",
-                &format!("{},{gid}", meta.gid()),
-                "--no-new-privs",
-                "--",
-                "/bin/sh",
-                "-c",
-                "chmod $1 /dev/fd/0",
-                "seat-inode",
-                &format!("{mode:o}"),
-            ])
-            .stdin(file.try_clone()?)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()?;
+        let status = seat_file_command(
+            &launcher,
+            meta.uid(),
+            meta.gid(),
+            &format!("{},{gid}", meta.gid()),
+        )?
+        .args(["inode", &format!("{mode:o}")])
+        .stdin(file.try_clone()?)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()?;
         if status.success() {
             return Ok(());
         }
@@ -675,24 +858,17 @@ fn tighten_private_op_dir(parent: &File, name: &OsStr, uid: u32, gid: u32) -> io
                         || std::env::var_os("ANYAGENTS_REQUIRE_NATIVE_SEAT_TEST").is_some())
                     && let Some(launcher) = super::sandbox::descriptor_launcher()
                 {
-                    let _ = std::process::Command::new(launcher)
-                        .args([
-                            "--reuid",
-                            &meta.uid().to_string(),
-                            "--regid",
-                            &meta.gid().to_string(),
-                            "--groups",
-                            &format!("{},{gid}", meta.gid()),
-                            "--no-new-privs",
-                            "--",
-                            "/bin/sh",
-                            "-c",
-                            "chmod 700 /dev/fd/0 && if [ -f /dev/fd/0/config ] && [ ! -L /dev/fd/0/config ]; then chmod 600 /dev/fd/0/config; fi",
-                        ])
-                        .stdin(bound.try_clone()?)
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .status();
+                    let _ = seat_file_command(
+                        &launcher,
+                        meta.uid(),
+                        meta.gid(),
+                        &format!("{},{gid}", meta.gid()),
+                    )?
+                    .arg("op-dir")
+                    .stdin(bound.try_clone()?)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
                 }
             }
         }
@@ -1374,36 +1550,72 @@ mod tests {
         assert!(error.to_string().contains("seat-readback failed (signal:"));
     }
 
-    #[cfg(target_os = "linux")]
+    /// The helper as a seat, under `cargo test`: the test harness stands in
+    /// for this binary's `internal seat-file`.
     #[test]
-    fn migrate_open_file_uses_fchdir_without_dev_fd_3_and_unlinks_temp_on_failure() {
+    fn seat_file_worker() {
+        let args: Vec<OsString> = std::env::args_os().collect();
+        let Some(start) = args.iter().position(|arg| arg == "seat-file") else {
+            return;
+        };
+        let code = seat_file_main(&args[start + 1..]);
+        std::process::exit(if code == std::process::ExitCode::SUCCESS {
+            0
+        } else if code == std::process::ExitCode::from(2) {
+            2
+        } else {
+            1
+        });
+    }
+
+    /// A stand-in for setpriv that runs the command as the same user. It
+    /// records the environment it was given in `launcher-env`, fails the stage
+    /// named by a `mode` file beside it, and puts a `hostile-bin` directory
+    /// beside it first on the command's `PATH` when there is one.
+    #[cfg(target_os = "linux")]
+    fn fake_seat_launcher(dir: &Path) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
-        let _lock = crate::server::tests::env_lock();
-        let temp = crate::test_tempdir();
-        let launcher = temp.path().join("fake-seat-launcher.sh");
+        let launcher = dir.join("fake-seat-launcher.sh");
         std::fs::write(
             &launcher,
-            r#"#!/usr/bin/env python3
-import os, subprocess, sys
-args = sys.argv[1:]
-sep = args.index("--")
-cmd = args[sep + 1:]
-joined = " ".join(cmd)
-if "/dev/fd/3" in joined:
-    sys.exit(97)
-mode = os.environ.get("FAKE_LAUNCHER_MODE", "ok")
-if mode == "fail_copy_after_touch" and len(cmd) > 3 and cmd[3] == "seat-copy":
-    open("./" + cmd[4], "wb").close()
-    print("synthetic copy denied", file=sys.stderr)
-    sys.exit(41)
-if mode == "fail_verify" and len(cmd) > 3 and cmd[3] == "seat-readback":
-    print("synthetic readback denied", file=sys.stderr)
-    sys.exit(42)
-os.execvp(cmd[0], cmd)
+            r#"#!/bin/sh
+here=${0%/*}
+export -p > "$here/launcher-env"
+while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do shift; done
+shift
+case "$*" in *"/dev/fd/3"*) exit 97 ;; esac
+mode=ok
+if [ -f "$here/mode" ]; then read -r mode < "$here/mode"; fi
+op=
+for arg do
+  case $arg in copy|readback|unlink|inode|op-dir) op=$arg ;; esac
+  name=$arg
+done
+if [ "$mode" = fail_copy_after_touch ] && [ "$op" = copy ]; then
+  : > "./$name"
+  echo "synthetic copy denied" >&2
+  exit 41
+fi
+if [ "$mode" = fail_verify ] && [ "$op" = readback ]; then
+  echo "synthetic readback denied" >&2
+  exit 42
+fi
+if [ -d "$here/hostile-bin" ]; then PATH="$here/hostile-bin:$PATH"; export PATH; fi
+exec "$@"
 "#,
         )
         .unwrap();
         std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+        launcher
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn migrate_open_file_uses_fchdir_without_dev_fd_3_and_unlinks_temp_on_failure() {
+        let _lock = crate::server::tests::env_lock();
+        let temp = crate::test_tempdir();
+        let launcher = fake_seat_launcher(temp.path());
+        let mode = temp.path().join("mode");
 
         let cfg = temp.path().join("config");
         std::fs::create_dir_all(&cfg).unwrap();
@@ -1418,15 +1630,14 @@ os.execvp(cmd[0], cmd)
             fn drop(&mut self) {
                 unsafe {
                     std::env::remove_var("ANYAGENTS_LAUNCHER");
-                    std::env::remove_var("FAKE_LAUNCHER_MODE");
                 }
             }
         }
         let _reset = EnvReset;
         unsafe {
             std::env::set_var("ANYAGENTS_LAUNCHER", &launcher);
-            std::env::set_var("FAKE_LAUNCHER_MODE", "fail_copy_after_touch");
         }
+        std::fs::write(&mode, "fail_copy_after_touch\n").unwrap();
         let parent = open_root(&cfg).unwrap();
         let child = open_child(&parent, OsStr::new("sessions.sqlite3-shm"), false).unwrap();
         let err = migrate_open_file(
@@ -1459,9 +1670,7 @@ os.execvp(cmd[0], cmd)
             "failed copy must unlink 0-byte .seat-copy-* temp file: {leftovers:?}"
         );
 
-        unsafe {
-            std::env::set_var("FAKE_LAUNCHER_MODE", "fail_verify");
-        }
+        std::fs::write(&mode, "fail_verify\n").unwrap();
         let err2 = migrate_open_file(
             &parent,
             OsStr::new("sessions.sqlite3-shm"),
@@ -1492,9 +1701,7 @@ os.execvp(cmd[0], cmd)
             "failed readback must unlink .seat-copy-* temp file: {leftovers2:?}"
         );
 
-        unsafe {
-            std::env::set_var("FAKE_LAUNCHER_MODE", "ok");
-        }
+        std::fs::write(&mode, "ok\n").unwrap();
         migrate_open_file(
             &parent,
             OsStr::new("sessions.sqlite3-shm"),
@@ -1502,7 +1709,7 @@ os.execvp(cmd[0], cmd)
             other_uid,
             gid,
         )
-        .expect("fchdir ./$1 copy + verify + atomic swap must succeed without /dev/fd/3");
+        .expect("fchdir copy + verify + atomic swap must succeed without /dev/fd/3");
         assert_eq!(std::fs::read(&shm).unwrap().len(), 32768);
 
         let stale_orphan = cfg.join(".seat-copy-67774-1000-99");
@@ -1521,12 +1728,134 @@ os.execvp(cmd[0], cmd)
         unsafe {
             libc::utimensat(libc::AT_FDCWD, c_stale.as_ptr(), old_ts.as_ptr(), 0);
             std::env::remove_var("ANYAGENTS_LAUNCHER");
-            std::env::remove_var("FAKE_LAUNCHER_MODE");
         }
         share_config(&cfg, me, gid).unwrap();
         assert!(
             !stale_orphan.exists(),
             "share_config must reap stale .seat-copy-* orphan"
         );
+    }
+
+    /// Every seat command runs this binary's own helper with a fixed
+    /// environment. A `PATH` whose `cat`, `cmp`, `sync`, `chmod`, `chgrp`,
+    /// `rm` and `sh` all fail (as the desk's guard wrappers did for a seat
+    /// that could not read them) changes nothing, and the seat never sees
+    /// the daemon's environment.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn seat_file_commands_ignore_a_hostile_path_and_the_daemon_environment() {
+        use std::os::unix::fs::PermissionsExt;
+        let _lock = crate::server::tests::env_lock();
+        let temp = crate::test_tempdir();
+        let launcher = fake_seat_launcher(temp.path());
+        let hostile = temp.path().join("hostile-bin");
+        std::fs::create_dir(&hostile).unwrap();
+        for tool in ["cat", "cmp", "sync", "chmod", "chgrp", "rm", "sh"] {
+            let path = hostile.join(tool);
+            std::fs::write(&path, "#!/bin/sh\necho \"hostile $0\" >&2\nexit 1\n").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        struct EnvReset;
+        impl Drop for EnvReset {
+            fn drop(&mut self) {
+                unsafe {
+                    std::env::remove_var("ANYAGENTS_LAUNCHER");
+                    std::env::remove_var("ANYAGENTS_SEAT_TEST_DAEMON_ONLY");
+                }
+            }
+        }
+        let _reset = EnvReset;
+        unsafe {
+            std::env::set_var("ANYAGENTS_LAUNCHER", &launcher);
+            std::env::set_var("ANYAGENTS_SEAT_TEST_DAEMON_ONLY", "daemon-secret");
+        }
+        let me = crate::sandbox::server_uid();
+        let gid = crate::sandbox::server_gid();
+        let other_uid = if me == 42001 { 42002 } else { 42001 };
+
+        // The migration that stopped eight agents: copy, read back, swap.
+        let cfg = temp.path().join("config");
+        std::fs::create_dir(&cfg).unwrap();
+        let db = cfg.join("opencode.db");
+        let bytes: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&db, &bytes).unwrap();
+        let parent = open_root(&cfg).unwrap();
+        let child = open_child(&parent, OsStr::new("opencode.db"), false).unwrap();
+        migrate_open_file(&parent, OsStr::new("opencode.db"), &child, other_uid, gid)
+            .expect("migration must not depend on PATH");
+        assert_eq!(std::fs::read(&db).unwrap(), bytes);
+        assert_ne!(
+            std::fs::metadata(&db).unwrap().ino(),
+            child.metadata().unwrap().ino()
+        );
+        let seen = std::fs::read_to_string(temp.path().join("launcher-env")).unwrap();
+        assert!(seen.contains(SEAT_PATH), "{seen}");
+        assert!(!seen.contains("daemon-secret"), "{seen}");
+        assert!(!seen.contains("ANYAGENTS_LAUNCHER"), "{seen}");
+
+        let run = |args: &[&str], stdin: File| {
+            let mut command = seat_file_command(&launcher, me, gid, &gid.to_string()).unwrap();
+            command.args(args).stdin(stdin);
+            unsafe {
+                use std::os::unix::process::CommandExt as _;
+                let dir = parent.as_raw_fd();
+                command.pre_exec(move || {
+                    if libc::fchdir(dir) != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            run_seat_command(&mut command, "seat-test")
+        };
+        // A read-back that differs is refused by the helper itself.
+        let other = temp.path().join("other");
+        std::fs::write(&other, b"different").unwrap();
+        std::fs::write(cfg.join(".seat-copy-check"), b"different").unwrap();
+        run(
+            &["readback", ".seat-copy-check"],
+            File::open(&other).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(&other, b"differenT").unwrap();
+        let error = run(
+            &["readback", ".seat-copy-check"],
+            File::open(&other).unwrap(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("copy differs from its source"), "{error}");
+        run(&["unlink", ".seat-copy-check"], File::open(&other).unwrap()).unwrap();
+        assert!(!cfg.join(".seat-copy-check").exists());
+        // Group and mode through an O_PATH descriptor, as `grant` passes one.
+        let opath = |path: &Path| {
+            let name = CString::new(path.as_os_str().as_bytes()).unwrap();
+            let fd = unsafe {
+                libc::open(
+                    name.as_ptr(),
+                    libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            assert!(fd >= 0);
+            unsafe { File::from_raw_fd(fd) }
+        };
+        run(&["inode", "640", &gid.to_string()], opath(&other)).unwrap();
+        assert_eq!(std::fs::metadata(&other).unwrap().mode() & 0o7777, 0o640);
+        let op = temp.path().join("op");
+        std::fs::create_dir(&op).unwrap();
+        std::fs::write(op.join("config"), b"x").unwrap();
+        std::fs::set_permissions(&op, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(op.join("config"), std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+        run(&["op-dir"], opath(&op)).unwrap();
+        assert_eq!(std::fs::metadata(&op).unwrap().mode() & 0o7777, 0o700);
+        assert_eq!(
+            std::fs::metadata(op.join("config")).unwrap().mode() & 0o7777,
+            0o600
+        );
+        let error = run(&["copy", "../escape"], File::open(&other).unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("exit status: 2"), "{error}");
     }
 }
