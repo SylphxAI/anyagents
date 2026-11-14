@@ -2246,10 +2246,19 @@ fn native_sources(walk: &mut Walk, root: &Path) -> io::Result<Vec<NativeSource>>
         Ok(safe_components(walk, root, path.parent().unwrap_or(root))?
             && fs::symlink_metadata(path).is_ok_and(|m| m.is_file() && !m.file_type().is_symlink()))
     };
+    // One harness location; a directory the server may not read is empty.
+    let mut add = |found: io::Result<Vec<NativeSource>>| -> io::Result<()> {
+        match found {
+            Ok(found) => {
+                result.extend(found);
+                Ok(())
+            }
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => Ok(()),
+            Err(e) => Err(e),
+        }
+    };
     let sylphx = config.join("sylphx-transcript.jsonl");
-    if file(walk, &sylphx)? {
-        result.push(jsonl(sylphx));
-    }
+    add(file(walk, &sylphx).map(|found| found.then(|| jsonl(sylphx)).into_iter().collect()))?;
     for (db, kind) in [
         (config.join("sessions.sqlite3"), StoreKind::SpironSessions),
         (
@@ -2261,74 +2270,114 @@ fn native_sources(walk: &mut Walk, root: &Path) -> io::Result<Vec<NativeSource>>
             StoreKind::OpenCodeMessages,
         ),
     ] {
-        if file(walk, &db)? {
-            result.push(NativeSource {
-                path: db,
-                format: NativeFormat::Store(kind),
-            });
-        }
+        add(file(walk, &db).map(|found| {
+            found
+                .then(|| NativeSource {
+                    path: db,
+                    format: NativeFormat::Store(kind),
+                })
+                .into_iter()
+                .collect()
+        }))?;
     }
     // Claude Code: one JSONL per session in each project directory, and each
     // session's subagents below it. No guessed personal home is read.
     for projects in [config.join("projects"), config.join(".claude/projects")] {
-        for project in subdirectories(walk, root, &projects)? {
-            result.extend(jsonl_files(walk, &project, false)?.into_iter().map(jsonl));
-            for session in subdirectories(walk, root, &project)? {
+        let found = subdirectories(walk, root, &projects);
+        let Some(projects) = tolerate(found)? else {
+            continue;
+        };
+        for project in projects {
+            add(jsonl_files(walk, &project, false).map(|p| p.into_iter().map(jsonl).collect()))?;
+            let Some(sessions) = tolerate(subdirectories(walk, root, &project))? else {
+                continue;
+            };
+            for session in sessions {
                 let subagents = session.join("subagents");
-                result.extend(jsonl_files(walk, &subagents, false)?.into_iter().map(jsonl));
+                add(jsonl_files(walk, &subagents, false)
+                    .map(|p| p.into_iter().map(jsonl).collect()))?;
             }
         }
     }
-    if safe_components(walk, root, &config.join("sessions"))? {
-        result.extend(
-            jsonl_files(walk, &config.join("sessions"), true)?
-                .into_iter()
-                .map(|path| NativeSource {
-                    path,
-                    format: NativeFormat::CodexRollout,
-                }),
-        );
-    }
+    let codex = config.join("sessions");
+    add(safe_components(walk, root, &codex).and_then(|safe| {
+        if !safe {
+            return Ok(Vec::new());
+        }
+        Ok(jsonl_files(walk, &codex, true)?
+            .into_iter()
+            .map(|path| NativeSource {
+                path,
+                format: NativeFormat::CodexRollout,
+            })
+            .collect())
+    }))?;
     let brain = config.join(".gemini/antigravity-cli/brain");
-    for conversation in subdirectories(walk, root, &brain)? {
-        let transcript = conversation.join(".system_generated/logs/transcript_full.jsonl");
-        if file(walk, &transcript)? {
-            result.push(NativeSource {
-                path: transcript,
-                format: NativeFormat::AgyTranscript,
-            });
+    if let Some(conversations) = tolerate(subdirectories(walk, root, &brain))? {
+        for conversation in conversations {
+            let transcript = conversation.join(".system_generated/logs/transcript_full.jsonl");
+            add(file(walk, &transcript).map(|found| {
+                found
+                    .then(|| NativeSource {
+                        path: transcript,
+                        format: NativeFormat::AgyTranscript,
+                    })
+                    .into_iter()
+                    .collect()
+            }))?;
         }
     }
     let muse = config.join("data-home/muse/sessions");
-    if safe_components(walk, root, &muse)? {
+    add(safe_components(walk, root, &muse).and_then(|safe| {
+        if !safe {
+            return Ok(Vec::new());
+        }
         // Hidden directories hold Muse's view snapshots, not the session log.
-        result.extend(
-            regular_files(walk, &muse, true)?
-                .into_iter()
-                .filter(|p| {
-                    p.file_name().is_some_and(|n| n == "session.jsonl")
-                        && p.strip_prefix(&muse).is_ok_and(|rel| {
-                            !rel.components()
-                                .any(|c| c.as_os_str().to_string_lossy().starts_with('.'))
-                        })
-                })
-                .map(jsonl),
-        );
+        Ok(regular_files(walk, &muse, true)?
+            .into_iter()
+            .filter(|p| {
+                p.file_name().is_some_and(|n| n == "session.jsonl")
+                    && p.strip_prefix(&muse).is_ok_and(|rel| {
+                        !rel.components()
+                            .any(|c| c.as_os_str().to_string_lossy().starts_with('.'))
+                    })
+            })
+            .map(jsonl)
+            .collect())
+    }))?;
+    if let Some(cwds) = tolerate(subdirectories(
+        walk,
+        root,
+        &config.join(".omp/agent/sessions"),
+    ))? {
+        for cwd in cwds {
+            add(jsonl_files(walk, &cwd, false).map(|p| p.into_iter().map(jsonl).collect()))?;
+        }
     }
-    for cwd in subdirectories(walk, root, &config.join(".omp/agent/sessions"))? {
-        result.extend(jsonl_files(walk, &cwd, false)?.into_iter().map(jsonl));
-    }
-    for cwd in subdirectories(walk, root, &config.join(".grok/sessions"))? {
-        for session in subdirectories(walk, root, &cwd)? {
-            let history = session.join("chat_history.jsonl");
-            if file(walk, &history)? {
-                result.push(jsonl(history));
+    if let Some(cwds) = tolerate(subdirectories(walk, root, &config.join(".grok/sessions")))? {
+        for cwd in cwds {
+            let Some(sessions) = tolerate(subdirectories(walk, root, &cwd))? else {
+                continue;
+            };
+            for session in sessions {
+                let history = session.join("chat_history.jsonl");
+                add(file(walk, &history)
+                    .map(|found| found.then(|| jsonl(history)).into_iter().collect()))?;
             }
         }
     }
     result.sort_by(|a, b| a.path.cmp(&b.path));
     result.dedup_by(|a, b| a.path == b.path);
     Ok(result)
+}
+
+/// `Some(found)`, or `None` when a harness directory may not be read.
+fn tolerate<T>(found: io::Result<T>) -> io::Result<Option<T>> {
+    match found {
+        Ok(found) => Ok(Some(found)),
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 /// Directories directly below `dir`, reached without a symlink. Hidden
@@ -4367,6 +4416,61 @@ mod tests {
             )
             .unwrap();
         assert_eq!(tools.len(), 1);
+    }
+
+    /// Under a seat, Claude Code keeps `config/sessions` owner-only, which is
+    /// where Codex would keep its rollouts; a harness's projects directory
+    /// can be private too. Neither may hide the agent's other history.
+    #[test]
+    fn a_harness_directory_the_server_cannot_read_hides_no_other_history() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(NewAgent::new("private-dirs", "claude-code"))
+            .unwrap();
+        let root = dir.path().join("agents").join(agent.id.as_str());
+        every_harness_history(&root);
+        let private = [
+            root.join("config/sessions"),
+            root.join("config/.omp/agent/sessions"),
+        ];
+        for path in &private {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o000)).unwrap();
+        }
+        // A privileged test run reads everything; the case does not arise.
+        let denied = fs::read_dir(&private[0]).is_err();
+        let ids = [agent.id.to_string()];
+        let found = |needle: &str| {
+            store
+                .search_host_files(
+                    &ids,
+                    MemoryScope::Transcripts,
+                    &HistorySearchQuery {
+                        query: Some(needle.into()),
+                        ..Default::default()
+                    },
+                )
+                .map(|hits| hits.len())
+        };
+        let results: Vec<_> = [
+            "claudeneedle",
+            "spironneedle",
+            "agyneedle",
+            "museneedle",
+            "codexneedle",
+        ]
+        .iter()
+        .map(|needle| (*needle, found(needle)))
+        .collect();
+        for path in &private {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        for (needle, hits) in results {
+            let hits = hits.unwrap_or_else(|e| panic!("{needle}: {e}"));
+            let expected = usize::from(!(denied && needle == "codexneedle"));
+            assert_eq!(hits, expected, "{needle}");
+        }
     }
 
     #[test]
