@@ -1,6 +1,6 @@
 # 0010: Execution, identity and trust model
 
-Status: proposed. Date: 2026-11-14. Decided by the owner on 2026-11-14. With [0009](0009-product-boundary.md), supersedes [0002](0002-runtime-drivers-and-capability-identity.md). Simplifies [0004](0004-identity-and-credentials.md) (D4), amends [0005](0005-managed-harnesses-and-declared-toolchain.md) (D8), restates [0006](0006-runtime-state-and-lifecycle.md) decision 11 per agent (D5), and limits [0007](0007-process-architecture.md) to third-party CLIs (D6).
+Status: accepted. Date: 2026-11-14. Decided by the owner on 2026-11-14. With [0009](0009-product-boundary.md), supersedes [0002](0002-runtime-drivers-and-capability-identity.md). Simplifies [0004](0004-identity-and-credentials.md) (D4), amends [0005](0005-managed-harnesses-and-declared-toolchain.md) (D8), restates [0006](0006-runtime-state-and-lifecycle.md) decision 11 per agent (D5), and limits [0007](0007-process-architecture.md) to third-party CLIs (D6).
 
 ## Context
 
@@ -66,6 +66,13 @@ Only the executor driver (D3, D6) and the secret backend (D4) differ between mod
 - The kernel never changes file ownership across uids.
 
 Verified on the desk on 2026-11-14: Landlock ABI 7 is available unprivileged, and user namespaces are disabled (`user.max_user_namespaces = 0`), so bubblewrap cannot run there.
+
+Under `os`, each part of the spec is enforced by one mechanism:
+
+- **Files.** Landlock.
+- **Ports.** Landlock's TCP bind and connect rules can restrict ports, but not hosts.
+- **Egress by host or domain.** This goes through the D4 tier-1 proxy. It is not claimed where no proxy is configured.
+- **Privilege.** Unprivileged Landlock requires `no_new_privs`. That also neutralises setuid binaries such as `sudo` inside the sandbox, so an agent that shares the server's uid cannot gain the server's privileges through them.
 
 **Rationale.** A uid seat makes isolation a property of every file that agents and the server share. Each new shared file (a Git hub, a SQLite sidecar, a vendor cache) then needs its own ownership repair, and each repair can lock an agent out. A sandbox restricts the process instead, when it starts, and leaves the files alone. Landlock denies tracing a process outside the sandbox, and since ABI 6 it also scopes signals and abstract Unix sockets to the sandbox, so agents that share a uid still cannot trace, signal or reach each other through those channels. With one declared spec, the same agent runs under `os` on a laptop, `container` on a server and `remote` in a cloud (D1), and AnyAgents never has to write a sandbox of its own. `os` is the default because it needs no daemon, no root and no user namespaces.
 
