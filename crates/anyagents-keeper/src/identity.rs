@@ -137,8 +137,11 @@ mod linux {
 }
 
 /// The process groups of every process in the session `leader` leads.
-/// Only a keeper this process started and has not reaped is asked about, so
-/// its pid, and with it the session id, cannot have been reused.
+/// Asked only about a keeper this process started and has not reaped, or one
+/// whose recorded identity is proven ended in this boot and namespace: in
+/// both cases no other process can have its pid, and a pid is not reused
+/// while it numbers a session with members, so every group found is the
+/// keeper's.
 pub(crate) fn session_groups(leader: u32) -> Vec<u32> {
     #[cfg(target_os = "linux")]
     {

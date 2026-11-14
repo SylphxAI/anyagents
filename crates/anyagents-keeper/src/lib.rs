@@ -89,6 +89,10 @@ pub const AGENT: &str = "agent";
 pub const LOCK: &str = "lock";
 /// What a keeper records about itself, for an operator and for `list`.
 pub const RECORD: &str = "keeper.json";
+/// The keeper process's identity, written by the kernel right after it
+/// starts it: a keeper that dies before writing its own record is still
+/// proven gone, and its directory never blocks the agent.
+pub const SPAWNED: &str = "spawned";
 /// The keeper's own diagnostics. Never harness output.
 pub const LOG: &str = "keeper.log";
 

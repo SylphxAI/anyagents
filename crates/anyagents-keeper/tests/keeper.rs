@@ -511,8 +511,8 @@ fn a_keeper_that_does_not_answer_is_never_treated_as_dead() {
     process.wait().unwrap();
     // SAFETY: ending the harness group this test's keeper started.
     unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
-    // Its process ended, but its lock is held (by a keeper this record
-    // misnames, say).
+    // Nothing records which process its keeper was, and its lock is held: it
+    // may be alive. (A keeper proven ended is gone whoever holds the lock.)
     std::fs::remove_dir_all(&dir).unwrap();
     let lock_file = fx.root.with_file_name("agent.lock");
     let held = std::fs::File::create(&lock_file).unwrap();
@@ -526,7 +526,7 @@ fn a_keeper_that_does_not_answer_is_never_treated_as_dead() {
         json!({
             "protocol": [1, 1], "binary": "old", "agent": "agt_test", "harness": "line",
             "model": null, "seat": null, "started_at_ms": 1,
-            "keeper": ended_identity(), "harness_process": harness,
+            "keeper": null, "harness_process": harness,
         }),
     );
     std::fs::write(dir.join("lock"), lock_file.display().to_string()).unwrap();
@@ -671,6 +671,72 @@ fn keepers_refuse_a_directory_that_is_not_private() {
         .err()
         .expect("a keeper directory open to others was used");
     assert!(refused.contains("open to other users"), "{refused}");
+}
+
+/// A kernel that crashes while it replaces a harness can leave the new
+/// keeper's directory behind with no socket and no record of its own, while
+/// the old keeper still holds the agent lock. The identity the kernel wrote
+/// when it started that keeper proves it gone: the directory is cleared, and
+/// what the dead keeper left in its session is ended, instead of the agent
+/// waiting for a lock that will never be free.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_keeper_proven_ended_is_cleared_while_another_holds_the_lock() {
+    use std::io::BufRead as _;
+    use std::os::unix::fs::DirBuilderExt as _;
+    use std::os::unix::process::CommandExt as _;
+    let fx = Fixture::new();
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&fx.root)
+        .unwrap();
+    // The old keeper's lock, still held.
+    let lock_path = fx.root.parent().unwrap().join("agent.lock");
+    let held = std::fs::File::create(&lock_path).unwrap();
+    // SAFETY: flock on a descriptor this test owns.
+    assert_eq!(
+        unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    // A keeper that led its own session, started its harness, and died.
+    let mut keeper = std::process::Command::new("/bin/sh");
+    keeper
+        .args(["-c", "sleep 600 & echo $!; read never"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped());
+    // SAFETY: setsid between fork and exec, as a keeper starts.
+    unsafe {
+        keeper.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut keeper = keeper.spawn().unwrap();
+    let mut line = String::new();
+    std::io::BufReader::new(keeper.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    let harness: u32 = line.trim().parse().unwrap();
+    let spawned = identity(keeper.id());
+    kill9(keeper.id());
+    keeper.wait().unwrap();
+    assert!(alive(harness));
+
+    let dir = fx.root.join("000000000002");
+    std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+    std::fs::write(dir.join("agent"), "agt_test").unwrap();
+    std::fs::write(dir.join("lock"), lock_path.as_os_str().as_encoded_bytes()).unwrap();
+    std::fs::write(
+        dir.join("spawned"),
+        json!({"keeper": spawned, "seat": null}).to_string(),
+    )
+    .unwrap();
+    assert!(attach(&fx.root, "agt_test").unwrap().is_none());
+    assert!(!dir.exists(), "the stale directory was left");
+    eventually("the dead keeper's harness is ended", || !alive(harness));
+    drop(held);
 }
 
 /// A v2 hello from a fake keeper whose record says it has `keeper` for its

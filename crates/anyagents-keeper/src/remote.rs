@@ -35,7 +35,7 @@ use serde_json::{Value, json};
 use crate::identity::{Presence, ProcessIdentity, session_groups};
 use crate::keeper::Record;
 use crate::wire::{self, Event, Fault, FrameReader, Reply, Request};
-use crate::{AGENT, Hello, Hosted, LOCK, LOG, RECORD, SOCKET, Spec};
+use crate::{AGENT, Hello, Hosted, LOCK, LOG, RECORD, SOCKET, SPAWNED, Spec};
 
 /// The descriptor number the process lock has in a keeper.
 const KEEPER_LOCK_FD: i32 = 3;
@@ -292,6 +292,7 @@ fn start_keeper(
     let mut child = command
         .spawn()
         .map_err(|error| format!("cannot start {}: {error}", program.path.display()))?;
+    record_spawned(dir, child.id(), spec.seat.as_deref());
     let launch = serde_json::to_vec(spec).map_err(|error| error.to_string());
     let written = launch.and_then(|bytes| {
         let mut stdin = child.stdin.take().ok_or("keeper stdin missing")?;
@@ -363,6 +364,59 @@ fn end_start(child: &mut Child, seat: Option<&str>) {
         }
     }
     let _ = child.wait();
+}
+
+/// What the kernel records about a keeper the moment it starts it.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Spawned {
+    keeper: ProcessIdentity,
+    /// The seat its harness runs in, to end that harness as the seat.
+    seat: Option<String>,
+}
+
+/// Write the identity of the keeper just started into its directory, before
+/// anything else can happen to it.
+fn record_spawned(dir: &Path, pid: u32, seat: Option<&str>) {
+    let Some(keeper) = ProcessIdentity::of(pid) else {
+        return;
+    };
+    let spawned = Spawned {
+        keeper,
+        seat: seat.map(str::to_string),
+    };
+    match serde_json::to_vec(&spawned) {
+        Ok(bytes) => {
+            if let Err(error) =
+                anyagents_harness::atomic_write_file(&dir.join(SPAWNED), &bytes, 0o600)
+            {
+                eprintln!(
+                    "anyagents-keeper: {}: cannot record the keeper started: {error}",
+                    dir.display()
+                );
+            }
+        }
+        Err(error) => eprintln!("anyagents-keeper: cannot record a keeper: {error}"),
+    }
+}
+
+fn read_spawned(dir: &Path) -> Option<Spawned> {
+    let bytes = std::fs::read(dir.join(SPAWNED)).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// The keeper process of `dir` and its harness's seat: as the keeper
+/// recorded them, else as the kernel that started it did.
+fn keeper_identity(
+    dir: &Path,
+    record: Option<&Record>,
+) -> (Option<ProcessIdentity>, Option<String>) {
+    match record {
+        Some(record) if record.keeper.is_some() => (record.keeper.clone(), record.seat.clone()),
+        _ => match read_spawned(dir) {
+            Some(spawned) => (Some(spawned.keeper), spawned.seat),
+            None => (None, record.and_then(|record| record.seat.clone())),
+        },
+    }
 }
 
 fn log_tail(dir: &Path) -> String {
@@ -454,34 +508,49 @@ pub fn inspect(dir: &Path) -> Result<Hello, String> {
 /// same group) and its directory cleared. Without proof nothing is touched.
 fn clear_if_gone(dir: &Path) -> Result<(), String> {
     let record = read_record(dir);
-    let keeper = record.as_ref().and_then(|record| record.keeper.as_ref());
-    if keeper.is_some_and(|keeper| keeper.presence() == Presence::Running) {
+    let (keeper, seat) = keeper_identity(dir, record.as_ref());
+    let presence = keeper.as_ref().map(ProcessIdentity::presence);
+    if presence == Some(Presence::Running) {
         return Err("does not answer, but its process still runs".into());
     }
-    let lock = match lock_path(dir) {
-        Some(path) => Some(lock_if_free(&path).ok_or_else(|| {
+    // A keeper proven ended is gone, whoever holds the agent lock now (an
+    // older keeper of the same agent may). Without that proof, only a lock
+    // nobody holds proves it.
+    let lock = match (presence, lock_path(dir)) {
+        (Some(Presence::Ended), _) => None,
+        (_, Some(path)) => Some(lock_if_free(&path).ok_or_else(|| {
             format!(
                 "does not answer, and the agent lock {} is still held",
                 path.display()
             )
         })?),
-        None if keeper.is_some_and(|keeper| keeper.presence() == Presence::Ended) => None,
-        None => {
+        (_, None) => {
             return Err("does not answer, and nothing proves its keeper gone".into());
         }
     };
-    if let Some(record) = &record
-        && let Some(harness) = &record.harness_process
-    {
-        match trusted_seat_env(record.seat.as_deref()) {
-            Some(environment) => {
+    match trusted_seat_env(seat.as_deref()) {
+        Some(environment) => {
+            if let Some(harness) = record
+                .as_ref()
+                .and_then(|record| record.harness_process.as_ref())
+            {
                 harness.end_group(&environment);
             }
-            None => eprintln!(
-                "anyagents-keeper: {}: the recorded seat launcher is not trusted; its harness group is left alone",
-                dir.display()
-            ),
+            // A keeper that died before it recorded its harness leaves that
+            // harness in its session. Its pid cannot be reused while the
+            // session has members, so every group in it is the keeper's.
+            if presence == Some(Presence::Ended)
+                && let Some(keeper) = &keeper
+            {
+                for group in session_groups(keeper.pid) {
+                    anyagents_harness::terminate_group(group, &environment);
+                }
+            }
         }
+        None => eprintln!(
+            "anyagents-keeper: {}: the recorded seat launcher is not trusted; its harness group is left alone",
+            dir.display()
+        ),
     }
     let _ = std::fs::remove_dir_all(dir);
     drop(lock);
