@@ -338,6 +338,12 @@ struct ProcessNote {
     pending_recovery: bool,
 }
 
+/// Whether served totals grew past `before`: any count, or a cost where
+/// there was none.
+fn usage_advanced(served: &TurnUsage, before: &TurnUsage) -> bool {
+    served.difference(before.clone()) != TurnUsage::default()
+}
+
 /// How soon a worker looks again after it handed lines over, or while a turn
 /// is open, after it last did work or was woken. One store read, so `flush`
 /// and a restarted process never leave a line waiting for an arrival.
@@ -1222,18 +1228,39 @@ impl<H: Harness + 'static> Session<H> {
                 profile_rotated_ms: self.marker_ms(PROFILE_ROTATED).unwrap_or(0),
                 ..ProcessNote::default()
             });
+        let mut delivery = DeliveryLoop::adopted(store, lock, self.id.clone(), harness);
+        // An older process an interrupted replacement left is retired first,
+        // as a replacement retires one: what it proved is committed. Its
+        // turn was interrupted, and the newest process never saw that mail:
+        // a recovery is owed, as after any replacement.
+        let replaced = !older.is_empty();
+        for other in older {
+            if let Err(err) = delivery.retire_other(other) {
+                self.last_error = Some(format!("commit proven mail: {err}"));
+            }
+        }
         // A recovery the last kernel owed, or a turn the store holds open
         // while the process sits idle and served nothing since (it was lost
         // with no kernel to see it), is owed still. A turn the process
         // finished while no kernel ran (it served a turn, or usage, past what
         // the note recorded) is completed now instead, so a routine restart
         // sends no `[Recovery]` note; its usage is recorded on the next pass.
+        // Only live answers say a turn finished: a process (or keeper) that
+        // is gone, before or after they are read, reads as idle with nothing
+        // new, and is owed its recovery.
+        let harness = delivery.harness();
         let health = harness.health();
+        let turns = harness.turns_served();
+        let usage = harness.last_usage();
+        let live = health.process_alive && harness.health().process_alive;
         let idle = health.turn_state == TurnState::Idle && health.sign_in_fault.is_none();
-        let finished_detached = !note.pending_recovery
+        let finished_detached = !replaced
+            && !note.pending_recovery
+            && live
             && idle
-            && (harness.turns_served() > note.turns_recorded
-                || harness.last_usage() != note.served.clone().unwrap_or_default());
+            && (turns > note.turns_recorded
+                || usage_advanced(&usage, &note.served.clone().unwrap_or_default()));
+        let store = delivery.store();
         let completed = finished_detached && store.note_turn_completed(&self.id).is_ok();
         let idle_with_open_turn = health.turn_state == TurnState::Idle
             && !completed
@@ -1245,15 +1272,7 @@ impl<H: Harness + 'static> Session<H> {
         self.completed_turn_in_session = note.completed_turn;
         self.process_started_at = Some(started_at_ms.unwrap_or_else(|| self.inner.clock.now_ms()));
         self.host_lock = Some(host_lock);
-        self.adopted = Some(note.pending_recovery || idle_with_open_turn);
-        let mut delivery = DeliveryLoop::adopted(store, lock, self.id.clone(), harness);
-        // An older process an interrupted replacement left is retired as a
-        // replacement retires one: what it proved is committed first.
-        for other in older {
-            if let Err(err) = delivery.retire_other(other) {
-                self.last_error = Some(format!("commit proven mail: {err}"));
-            }
-        }
+        self.adopted = Some(replaced || note.pending_recovery || idle_with_open_turn);
         Boot::Ready(Box::new(delivery))
     }
 
@@ -1876,7 +1895,10 @@ impl<H: Harness + 'static> Session<H> {
         let served = delivery.harness().last_usage();
         let before = self.served.clone().unwrap_or_default();
         let turns_served = delivery.harness().turns_served();
-        let completed = (turns_served > self.turns_recorded || served != before)
+        // Served totals only grow: a lower reading (a process that is gone
+        // and answers nothing) is no news, neither usage nor a turn's end.
+        let advanced = usage_advanced(&served, &before);
+        let completed = (turns_served > self.turns_recorded || advanced)
             && health.turn_state == TurnState::Idle
             && health.sign_in_fault.is_none();
         // Persist completion before publishing progress or resetting the usage
@@ -1889,7 +1911,7 @@ impl<H: Harness + 'static> Session<H> {
             self.last_error = Some(format!("persist turn completion: {err}"));
             return false;
         }
-        let served_changed = served != before;
+        let served_changed = advanced;
         if served_changed {
             let turns = turns_served
                 .saturating_sub(self.turns_recorded)

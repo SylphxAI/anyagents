@@ -205,6 +205,7 @@ struct Fixture {
     store: Arc<Store>,
     left: Arc<Left>,
     launches: Arc<AtomicUsize>,
+    clock: Arc<ManualClock>,
 }
 
 impl Fixture {
@@ -216,6 +217,7 @@ impl Fixture {
             store,
             left: Arc::new(Left::default()),
             launches: Arc::new(AtomicUsize::new(0)),
+            clock: Arc::new(ManualClock::new(1_699_000_000_000)),
         }
     }
 
@@ -254,7 +256,7 @@ impl Fixture {
         let launches = Arc::clone(&self.launches);
         Supervisor::start_with_custody(
             Arc::clone(&self.store),
-            Arc::new(ManualClock::new(1_699_000_000_000)) as Arc<dyn Clock>,
+            Arc::clone(&self.clock) as Arc<dyn Clock>,
             Arc::new(move |request: LaunchRequest| {
                 let lock = request
                     .lock
@@ -618,6 +620,13 @@ fn an_older_process_left_beside_is_committed_then_ended() {
         .next_undelivered(&agent)
         .unwrap()
         .is_none()));
+    // The old process's turn was interrupted: the newer process gets that
+    // mail in a recovery note, never as a line of its own.
+    assert!(
+        wait_until(|| newer.given().iter().any(|id| id.starts_with("recovery_"))),
+        "the interrupted turn of the old process was never recovered: {:?}",
+        newer.given()
+    );
     std::thread::sleep(Duration::from_millis(300));
     assert!(
         !newer.given().contains(&first.id.as_str().to_string()),
@@ -625,6 +634,39 @@ fn an_older_process_left_beside_is_committed_then_ended() {
     );
     assert!(!newer.ended.load(Ordering::SeqCst));
     assert_eq!(fx.launches.load(Ordering::SeqCst), 0);
+    drop(supervisor);
+}
+
+/// A process found dead when it is taken over reads as idle with no usage
+/// (its keeper is gone); that is no proof its turn finished. The turn stays
+/// open and the replacement gets its recovery note.
+#[test]
+fn a_process_found_dead_is_recovered_not_completed() {
+    let fx = Fixture::new();
+    let agent = fx.running("alpha", "claude-code");
+    fx.store.receive(&agent, Incoming::new("working")).unwrap();
+    let first = fx.store.next_undelivered(&agent).unwrap().unwrap();
+    fx.store.note_delivered(&agent, first.seq).unwrap();
+    let kept = Kept::new();
+    kept.fake.lock().unwrap().kill();
+    let note = r#"{"served":{"input_tokens":5,"output_tokens":3,"cache_read_tokens":0,"cache_write_tokens":0,"reported_cost_micros":null},"turns_recorded":1,"written":1,"profile_rotated_ms":0,"completed_turn":true,"pending_recovery":false}"#;
+    fx.leave(&agent, &kept, "claude-code", Some(note));
+    let supervisor = fx.start();
+    // The dead process is replaced after its backoff.
+    let mut now = 1_699_000_000_000;
+    assert!(
+        wait_until(|| {
+            now += 60_000;
+            fx.clock.set_ms(now);
+            fx.store
+                .open_turn(&agent)
+                .unwrap()
+                .is_some_and(|open| open.recovery_count >= 1)
+        }),
+        "the interrupted turn was not recovered"
+    );
+    assert!(fx.store.has_open_turn(&agent).unwrap());
+    assert!(fx.launches.load(Ordering::SeqCst) >= 1);
     drop(supervisor);
 }
 
