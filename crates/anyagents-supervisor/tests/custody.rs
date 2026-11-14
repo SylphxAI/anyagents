@@ -777,6 +777,52 @@ fn an_idle_pass_with_unchanged_cost_bearing_usage_writes_nothing() {
     drop(supervisor);
 }
 
+/// A launch the kernel abandons because it is stopping leaves a keeper
+/// starting with a copy of the agent's lock. The worker lets go of its own
+/// copy without unlocking: the lock stays held for the keeper.
+#[test]
+fn an_abandoned_start_leaves_the_agent_lock_held_for_its_keeper() {
+    let fx = Fixture::new();
+    let agent = fx.running("alpha", "claude-code");
+    let keeper_copy: Arc<Mutex<Option<std::os::fd::OwnedFd>>> = Arc::default();
+    let started = Arc::new(AtomicBool::new(false));
+    let supervisor = {
+        let keeper_copy = Arc::clone(&keeper_copy);
+        let started = Arc::clone(&started);
+        Supervisor::start_with_custody(
+            Arc::clone(&fx.store),
+            Arc::clone(&fx.clock) as Arc<dyn Clock>,
+            Arc::new(move |request: LaunchRequest| -> Result<Handle, String> {
+                // The keeper inherits a descriptor of the lock and goes on
+                // starting after this kernel stops waiting for it.
+                let lock = request
+                    .lock
+                    .as_ref()
+                    .expect("a keeper launch carries the lock");
+                *keeper_copy.lock().unwrap() = Some(lock.as_fd().try_clone_to_owned().unwrap());
+                started.store(true, Ordering::SeqCst);
+                Err(anyagents_supervisor::LAUNCH_ABANDONED.to_string())
+            }),
+            Vec::new(),
+            Arc::new(FakeCustody(Arc::clone(&fx.left))),
+        )
+        .unwrap()
+    };
+    assert!(wait_until(|| started.load(Ordering::SeqCst)));
+    drop(supervisor);
+    assert!(keeper_copy.lock().unwrap().is_some());
+    assert!(
+        matches!(
+            fx.store.try_lock_agent(&agent),
+            Err(anyagents_core::Error::AgentBusy)
+        ),
+        "the kernel unlocked the lock its starting keeper holds"
+    );
+    // Once the keeper is gone, so is the lock.
+    keeper_copy.lock().unwrap().take();
+    assert!(fx.store.try_lock_agent(&agent).is_ok());
+}
+
 /// A kernel whose process another kernel took over stands down: it neither
 /// ends the process nor starts a second one, and the lock stays held.
 #[test]

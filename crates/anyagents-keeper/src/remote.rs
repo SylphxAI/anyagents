@@ -184,11 +184,7 @@ pub fn spawn(
         }
         // The keeper finishes its start on its own, holding the agent's
         // lock, and the next kernel takes it over.
-        Err(Start::Abandoned) => {
-            return Err(
-                "this kernel is stopping; the keeper finishes its start for the next".into(),
-            );
-        }
+        Err(Start::Abandoned) => return Err(ABANDONED_START.into()),
     };
     match connect(&dir, true) {
         Ok(link) => Ok(RemoteHarness::new(link, dir, Some(child))),
@@ -267,6 +263,12 @@ impl From<String> for Start {
         Self::Failed(error)
     }
 }
+
+/// What [`spawn`] answers for a start this kernel stopped waiting for
+/// ([`abandon_starts`]): the keeper goes on starting and holds the agent's
+/// lock, so the caller must not unlock its own copy.
+pub const ABANDONED_START: &str =
+    "this kernel is stopping; the keeper finishes its start for the next";
 
 /// Set once this kernel stops: a start in progress is no longer waited for.
 static ABANDONED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

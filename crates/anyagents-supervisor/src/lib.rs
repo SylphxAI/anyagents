@@ -323,6 +323,13 @@ impl<H> Custody<H> for InProcess {
     fn note(&self, _harness: &H, _note: &str) {}
 }
 
+/// What a launch answers when the kernel stops while the harness is still
+/// starting: the process holding it (a keeper) goes on starting, holding a
+/// copy of the agent's lock, for the next kernel. The worker leaves the lock
+/// locked: unlocking any copy would unlock the keeper's.
+pub const LAUNCH_ABANDONED: &str =
+    "the kernel is stopping; the harness's start goes on for the next kernel";
+
 /// What a kernel keeps with a process for the kernel that takes it over:
 /// the usage it already recorded from it, so none is recorded twice, the
 /// operator profile marker it was launched under, and a `[Recovery]` note it
@@ -1328,6 +1335,11 @@ impl<H: Harness + 'static> Session<H> {
         }
         let harness = match self.launch_harness() {
             Ok(harness) => harness,
+            Err(error) if error == LAUNCH_ABANDONED => {
+                // The keeper still starting holds this lock on: never unlock.
+                lock.retain();
+                return Boot::Stopped;
+            }
             Err(_) if self.stop.load(Ordering::SeqCst) => return Boot::Stopped,
             Err(_) => return Boot::Retry,
         };
@@ -1382,7 +1394,9 @@ impl<H: Harness + 'static> Session<H> {
                 }
             }
             Err(err) => {
-                self.last_error = Some(err.clone());
+                if err != LAUNCH_ABANDONED {
+                    self.last_error = Some(err.clone());
+                }
                 self.agent = serving;
             }
         }

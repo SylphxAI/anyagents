@@ -171,12 +171,23 @@ impl VendorHarness {
                     ready: launch.keeper_ready(program.ready),
                     ..program.clone()
                 };
-                Host::Kept(Box::new(anyagents_keeper::spawn(
-                    &program,
-                    &anyagents_keeper::root(&request.data_dir),
-                    &spec,
-                    lock,
-                )?))
+                Host::Kept(Box::new(
+                    anyagents_keeper::spawn(
+                        &program,
+                        &anyagents_keeper::root(&request.data_dir),
+                        &spec,
+                        lock,
+                    )
+                    .map_err(|error| {
+                        // The keeper holds the agent's lock on: the
+                        // supervisor must not unlock its own copy.
+                        if error == anyagents_keeper::ABANDONED_START {
+                            anyagents_supervisor::LAUNCH_ABANDONED.to_string()
+                        } else {
+                            error
+                        }
+                    })?,
+                ))
             }
         };
         Ok(Self {
@@ -878,6 +889,7 @@ fn vendor_launch_authorized(
                     }
                 }
             }
+            Err(err) if err == anyagents_supervisor::LAUNCH_ABANDONED => {}
             Err(err) => {
                 persist_last_error(&config_dir, Some(err), None);
             }
