@@ -97,9 +97,12 @@ cargo test -p anyagents --test cli archive_reap --locked
 The unit cases verify mail progress while cleanup is blocked in a git probe,
 durable completion across restart,
 wake/rearchive invalidation, failed cleanup retry, and preservation of shared,
-external and unpushed work. Worktree admission also retains managed-config
-provenance after the last reader retires and its private gitdir is removed,
-without restoring retired access or accepting a replacement config link. The CLI cases execute the production binary with a
+external and unpushed work. A relocated common config is recognized from the
+hub alone, with no journal, after every journal is lost; an interrupted
+relocation resumes from the hub state; planted links, directories, symlinked,
+hard-linked, extra or world-writable entries and another principal's relocation
+are refused. Orphaned journals settle in one pass and are not retried. The
+admission probe decides with nothing on `PATH` but its Git. The CLI cases execute the production binary with a
 cleared environment and synthetic host home. They verify archive cleanup does
 not recreate seat skill directories and real `serve` maintenance reaps a
 legacy archive only once across restart. Unit-test isolation disables host-home
@@ -549,8 +552,7 @@ write/unlink config or create its lock, access sibling private metadata or write
 hooks/info; an unrecorded UID cannot read config. Default ACL readbacks remain
 confined to the dedicated config directory, and survivor/last-reader revocation
 is tested across another parent rewrite. Adoption regressions cover an existing
-Git config lock, interrupted publication with original bytes retained, and
-replacement of the journal-pinned directory or link. A same-size clean-filter positive control
+Git config lock and interrupted publication with original bytes retained. A same-size clean-filter positive control
 executes as B, then a forged `.git` pointer cannot execute that filter during
 journal-pinned server cleanup or A/C seat commands in the foreign checkout.
 A second payload selects a trusted common-config driver through B's checkout

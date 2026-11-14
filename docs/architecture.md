@@ -292,32 +292,78 @@ On Linux, additive POSIX ACLs grant writes only to shared `objects/`, `refs/`,
 The common root, `worktrees/` and `logs/` are traversal-only with no default ACLs;
 the main worktree's `logs/HEAD` stays child-unwritable. Defaults
 exist only inside the shared content subtrees, the private gitdir and a dedicated
-`anyagents-config/` directory, never on mixed metadata ancestors. Common `config`
-is an exact symlink to `anyagents-config/config`: the dedicated directory grants
-recorded active readers traversal and read-only inheritance, so the parent's
-ordinary `git config`, `git remote` and `git push -u` replacements remain readable
-immediately, without a launch or wake. Its defaults grant no owning-group or
-outsider access. Adoption holds Git's original `config.lock`, journals a
-quarantined intent, hard-links the original inode into the dedicated directory
-and atomically replaces the old pathname with the link, preserving config bytes
-and ownership. The journal pins the directory and symlink identities, while Git
-may replace only the target config inode. Interrupted adoption preserves the
-original bytes and refuses launch/reap pending operator recovery. Revocation
-removes access and default entries only when no active same-seat reader remains.
-Retired server-owned journals retain the dedicated directory/link provenance for
-later admission, even after their private gitdirs are reaped; that provenance
-never restores a retired reader's access.
+`anyagents-config/` directory, never on mixed metadata ancestors. Admission
+refuses a store whose common root, `worktrees/`, `logs/`, `logs/refs/`,
+`objects/`, `refs/`, `packed-refs` or `HEAD` everyone may write, by mode or by a
+default ACL `other` entry, naming the path and the owner's repair; granting on
+top of it would hand the same write to every object a seat adds later.
+
+Common `config` becomes an exact symlink to `anyagents-config/config`: the dedicated
+directory grants active readers traversal and read-only inheritance, so the
+parent's ordinary `git config`, `git remote` and `git push -u` replacements
+remain readable immediately, without a launch or wake. Its defaults grant no
+owning-group or outsider access. The hub witnesses its own managed config; no
+journal records it. A managed config is trusted only when the link is exactly
+`anyagents-config/config`, and the link, the directory and the single-link
+config file all belong to the server's uid, no one else can write the directory
+or the file, and the directory holds nothing but `config` and Git's
+`config.lock`. Only the server (or root) can create objects the server owns, so
+grant journals, a whole data directory or a changed device number can be lost
+without making a hub unusable, and a planted link, directory, symlinked or
+hard-linked file is refused. Only a config the server owns is relocated; a store
+owner's own config stays where it is. Relocation holds Git's original
+`config.lock`, hard-links the inode into the dedicated directory, takes the new
+name's lock and atomically renames a staged symlink (`.anyagents-config.link`)
+over the original pathname, preserving config bytes and ownership. An
+interruption leaves either the plain file, or both names on one server-owned
+inode, which reads as an ordinary config; the next admission finishes the move.
+A stale `config.lock` from a crashed writer is a refusal that names the lock,
+never a lock AnyAgents removes. Revocation removes access and default entries
+only when no active same-seat reader remains, and a store's readers are
+recomputed from active grants after every revocation and at startup.
 Common `config`, `hooks/` and `info/` are not child-writable. A parent-owned sticky
 private gitdir protects `config.worktree` (and its unlink/rename), `commondir` and
 `gitdir`; mutable HEAD/index files belong to the child so Git lock+rename works.
-Temporary cleanup inspections persist each ACL target's exact path, device and
-inode before granting read/traverse access. Startup recovers those objects through
-no-follow descriptors; legacy intents use a best-effort no-follow tree walk.
+
+A seatless agent (one that runs as the server's own uid and gid) is the server
+principal: the server grants it nothing and revokes nothing, since revoking
+would strip the server's own named entries from objects seats created. Its
+journal still records the gitdir and checkout so cleanup works as for any
+agent.
+
+Temporary cleanup inspections persist each ACL target's exact path and inode
+before granting read/traverse access, and only to objects on the common store's
+file system. Recovery compares the inode on that file system as it is mounted
+then: device numbers change when a volume is attached again, inode numbers do
+not. Startup recovers those objects through no-follow descriptors; legacy
+intents use a best-effort no-follow tree walk. An object the server cannot open
+is bound by inode with `O_PATH` and only read (its ACL through
+`/proc/self/fd`); no change is ever attempted through such a descriptor, and a
+walk failure names the object and its own errno.
 An unsafe recovery target or failed revocation quarantines only the recorded
 worktree and emits a warning, never aborting unrelated server startup.
 Quarantine preserves checkout data and refuses automatic harness launch, wake and
 reap until the operator repairs the recorded recovery state; it does not assert
-that an unreachable or hard-linked object's residual ACL was removed.
+that an unreachable or hard-linked object's residual ACL was removed. A
+quarantined journal records its reason, which every refusal repeats; each
+server process lists every quarantined or unreadable journal once, and archive
+cleanup stops retrying an agent whose journal is quarantined until the next
+start.
+
+A grant journal records one agent's grant and nothing about the shared store.
+It is removed once it witnesses nothing more: the grant is revoked, no
+inspection or quarantine is pending, and the checkout directory is gone (a
+checkout that still exists keeps its journal even without a `.git` pointer).
+Failed-creation rollback, archive cleanup and deletion remove it then. A
+failed creation whose partial grant cannot be revoked keeps its journal and
+checkout, quarantined with the reason. The first maintenance pass of each
+server process settles every journal of an agent that can never run again,
+once: its grant is revoked; a failed creation's checkout (the startup repair
+released its row before admission, so it never ran) is removed as its
+rollback would have, keeping any branch with commits of its own; the journal
+is then removed, or quarantined with the reason. A deleted agent's checkout is
+never removed there and keeps its journal while it exists. Nothing is retried
+afterwards.
 Shared refs remain a same-repository integrity boundary: a child can move another
 branch ref. This is not hostile-repository isolation, and AnyAgents does not
 intercept arbitrary harness commit/push commands or provide a branch-tip guard.
@@ -338,7 +384,8 @@ ownership and effective ACLs, and passes both paths explicitly: a child-edited
 untrusted unless the deployment names that group in
 `ANYAGENTS_TRUSTED_METADATA_GIDS` (comma-separated gids or group names): a
 deployment whose seats share Git hubs by design declares those seats one trust
-domain for that metadata; world-writable metadata is never trusted. A missing, broken or changed pointer on a
+domain for that metadata; world-writable metadata is never trusted. On a file
+system without POSIX ACL support the mode bits are the whole policy. A missing, broken or changed pointer on a
 journaled checkout preserves its entire workdir (including build-named output)
 and emits a diagnostic; it cannot select non-Git directory deletion. Cleanup Git
 runs as the journaled seat UID/GID, with no inherited secret environment or socket
@@ -365,8 +412,9 @@ same OS seat; retiring one agent revokes its private metadata without removing
 the surviving agent's shared-store access. Archive, reap and failed
 admission revoke the seat's named group/user ACL entries and defaults through
 opened descriptors, read the result back, and retain the journal on failure.
-Revocation runs even when dirty or external checkout bytes must be retained.
-An ACL write or readback failure is a typed permission error; non-Linux hosts
+Revocation skips objects the revoked seat owns (an owner can always grant
+itself access again) and runs even when dirty or external checkout bytes must
+be retained. An ACL write or readback failure is a typed permission error; non-Linux hosts
 accept only already-permitted metadata access. Existing explicit directories are
 validated without rewriting their permissions. Sharing does not follow symlinks
 or alter hard-linked files that require permission changes.
