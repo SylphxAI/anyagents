@@ -26,9 +26,11 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
+#[cfg(target_os = "linux")]
+use crate::GROUPS;
 use crate::identity::ProcessIdentity;
 use crate::wire::{self, Event, Fault, FrameReader, Reply, Request};
-use crate::{GROUPS, Hello, Hosted, LOG, RECORD, SOCKET, Spec};
+use crate::{Hello, Hosted, LOG, RECORD, SOCKET, Spec};
 
 /// The most a keeper's log holds before it is rotated to `keeper.log.1`.
 const LOG_LIMIT: u64 = 1 << 20;
@@ -194,7 +196,10 @@ where
     };
     drop(input);
     redirect_to_null(libc::STDIN_FILENO);
-    // Every process group the adapter starts is recorded before it runs.
+    // Every process group the adapter starts is recorded before it runs,
+    // where a record can prove whose a process is. Elsewhere nothing recorded
+    // would ever be signalled, and nothing is recorded.
+    #[cfg(target_os = "linux")]
     if let Err(error) = record_groups(dir) {
         report(
             &mut reporter,
@@ -406,6 +411,7 @@ fn report(pipe: &mut std::fs::File, line: &str) {
 /// Record, in `<dir>/groups`, every process group this keeper starts through
 /// `spawn_command`: each child writes its pid to a pipe before it runs
 /// anything, and a thread here records the identity of that group's leader.
+#[cfg(target_os = "linux")]
 fn record_groups(dir: &Path) -> std::io::Result<()> {
     let mut ends = [0; 2];
     // SAFETY: `pipe` fills the two descriptors this function then owns.
