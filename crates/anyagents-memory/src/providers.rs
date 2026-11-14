@@ -27,6 +27,10 @@ const RESERVED_TOKENS: usize = 16;
 const REMOTE_PIECE_TOKENS: usize = 512;
 /// Inputs per remote embedding request.
 const REMOTE_BATCH: usize = 64;
+/// Characters of each passage a remote reranker reads, unless configured:
+/// what the desk's models were measured with (2026-11-14), and a bound on
+/// what one search costs.
+pub const REMOTE_RERANK_CHARS: usize = 1000;
 /// Attempts for one remote request that is throttled or fails upstream, and
 /// the longest wait between two of them.
 const ATTEMPTS: u32 = 6;
@@ -55,13 +59,19 @@ pub struct Remote {
     /// Reranker: price per search, for providers that bill searches.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usd_per_search: Option<f64>,
+    /// Reranker: characters of each passage sent
+    /// ([`REMOTE_RERANK_CHARS`] when absent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passage_chars: Option<usize>,
     /// Text put before each query or passage (an instruction some models
     /// expect).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub query_prefix: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub passage_prefix: String,
-    /// Fields added to every request body (routing or data-policy options).
+    /// Fields added to every request body (routing options). An OpenRouter
+    /// request always carries `provider.data_collection = "deny"` whatever
+    /// this says.
     #[serde(default, skip_serializing_if = "Map::is_empty")]
     pub body: Map<String, Value>,
     /// Fields added to query or passage requests only (`input_type`).
@@ -402,6 +412,36 @@ fn merged(base: Value, layers: &[&Map<String, Value>]) -> Value {
     base
 }
 
+/// Is this model reached through OpenRouter, by its profile or its API root?
+fn via_openrouter(config: &Remote, endpoint: &Endpoint) -> bool {
+    config.profile.split('/').next() == Some("openrouter")
+        || endpoint
+            .base_url
+            .split("://")
+            .nth(1)
+            .and_then(|rest| rest.split(['/', ':']).next())
+            .is_some_and(|host| host == "openrouter.ai" || host.ends_with(".openrouter.ai"))
+}
+
+/// OpenRouter routes a request only to upstream providers that do not keep
+/// or train on it: `provider.data_collection = "deny"` on every request,
+/// merged into any routing options the configuration sets, never left to
+/// configuration.
+fn deny_data_collection(body: &mut Value) {
+    let Value::Object(object) = body else {
+        return;
+    };
+    let provider = object
+        .entry("provider")
+        .or_insert_with(|| Value::Object(Map::new()));
+    if !provider.is_object() {
+        *provider = Value::Object(Map::new());
+    }
+    if let Value::Object(provider) = provider {
+        provider.insert("data_collection".into(), json!("deny"));
+    }
+}
+
 /// The cost an answer reports (`usage.cost`, as OpenRouter does), if any.
 fn reported_cost(answer: &Value) -> Option<f64> {
     answer.pointer("/usage/cost").and_then(Value::as_f64)
@@ -496,6 +536,16 @@ impl RemoteModel {
         self.last_request = Some(Instant::now());
     }
 
+    /// The body of one request: the configured fields over the base, and the
+    /// data policy a provider must honour.
+    fn body(&self, base: Value, extra: &Map<String, Value>) -> Value {
+        let mut body = merged(base, &[&self.config.body, extra]);
+        if via_openrouter(&self.config, &self.endpoint) {
+            deny_data_collection(&mut body);
+        }
+        body
+    }
+
     fn account(&mut self, answer: &Value, tokens: u64, searches: u64) {
         self.usage.requests += 1;
         self.usage.tokens += tokens;
@@ -528,7 +578,7 @@ impl RemoteModel {
             if let Some(d) = self.config.dimensions {
                 body["dimensions"] = json!(d);
             }
-            let body = merged(body, &[&self.config.body, extra]);
+            let body = self.body(body, extra);
             let answer = self.http.post(&self.endpoint, "/embeddings", &body)?;
             let mut rows: Vec<(usize, Vec<f32>)> = answer
                 .get("data")
@@ -585,9 +635,13 @@ impl RemoteModel {
             return Ok(Vec::new());
         }
         self.pace(Duration::from_millis(100));
+        let cut = self.config.passage_chars.unwrap_or(REMOTE_RERANK_CHARS);
         let documents: Vec<String> = passages
             .iter()
-            .map(|p| format!("{}{p}", self.config.passage_prefix))
+            .map(|p| {
+                let passage: String = p.chars().take(cut).collect();
+                format!("{}{passage}", self.config.passage_prefix)
+            })
             .collect();
         let body = json!({
             "model": self.config.model,
@@ -595,7 +649,7 @@ impl RemoteModel {
             "documents": documents,
             "top_n": documents.len(),
         });
-        let body = merged(body, &[&self.config.body]);
+        let body = self.body(body, &Map::new());
         let answer = self.http.post(&self.endpoint, "/rerank", &body)?;
         let rows = answer
             .get("results")
@@ -622,7 +676,7 @@ impl RemoteModel {
             .or_else(|| answer.pointer("/meta/billed_units/input_tokens"))
             .and_then(Value::as_u64)
             .unwrap_or_else(|| {
-                passages
+                documents
                     .iter()
                     .map(|p| approximate_tokens(p).len() as u64)
                     .sum::<u64>()
@@ -1204,5 +1258,115 @@ pub(crate) mod tests {
         );
         assert!((voyage.usage().usd - 0.002).abs() < 1e-12);
         assert_eq!(*calls.lock().unwrap(), 3, "one retry after 429");
+    }
+
+    /// The owner's data policy is code, not configuration: every request to
+    /// OpenRouter, the dimension probe and rerank included, asks for upstream
+    /// providers that keep nothing, alongside any routing the configuration
+    /// sets. A remote reranker reads a bounded passage.
+    #[test]
+    fn every_openrouter_request_denies_data_collection_and_rerank_passages_are_bounded() {
+        let (url, seen) = serve(|path, body| match path {
+            "/v1/embeddings" => {
+                let n = body["input"].as_array().unwrap().len();
+                let data: Vec<Value> = (0..n)
+                    .map(|i| json!({"index": i, "embedding": [1.0, 0.0]}))
+                    .collect();
+                (200, json!({"data": data}))
+            }
+            _ => {
+                let n = body["documents"].as_array().unwrap().len();
+                let results: Vec<Value> = (0..n)
+                    .map(|i| json!({"index": i, "relevance_score": 0.5}))
+                    .collect();
+                (200, json!({"results": results}))
+            }
+        });
+        let endpoint = || Endpoint::for_test(&format!("{url}/v1"), "k");
+        let remote = |profile: &str, body: Value| Remote {
+            profile: profile.into(),
+            model: "m".into(),
+            body: body.as_object().cloned().unwrap_or_default(),
+            ..Remote::default()
+        };
+        // No dimensions: the first request is the probe.
+        let mut plain =
+            Embedder::remote(remote("openrouter/default", json!({})), endpoint()).unwrap();
+        plain.embed_passages(&["p"]).unwrap();
+        let mut routed = Embedder::remote(
+            remote(
+                "openrouter/default",
+                json!({"provider": {"sort": "price", "data_collection": "allow"}}),
+            ),
+            endpoint(),
+        )
+        .unwrap();
+        routed.embed_queries(&["q"]).unwrap();
+        let mut odd = Embedder::remote(
+            remote("openrouter/default", json!({"provider": "anything"})),
+            endpoint(),
+        )
+        .unwrap();
+        odd.embed_queries(&["q"]).unwrap();
+        let mut reranker = Reranker::Remote(Box::new(RemoteModel::new(
+            remote("openrouter/default", json!({})),
+            endpoint(),
+        )));
+        let long = "長".repeat(3 * REMOTE_RERANK_CHARS);
+        reranker.score("q", &[long.as_str(), "short"]).unwrap();
+        let mut narrow = remote("openrouter/default", json!({}));
+        narrow.passage_chars = Some(5);
+        let mut narrow = Reranker::Remote(Box::new(RemoteModel::new(narrow, endpoint())));
+        narrow.score("q", &["abcdefghij"]).unwrap();
+        // Another provider's request carries no OpenRouter field.
+        let mut voyage = Embedder::remote(remote("voyage/api", json!({})), endpoint()).unwrap();
+        voyage.embed_queries(&["q"]).unwrap();
+
+        let requests = seen.lock().unwrap();
+        let (openrouter, other) = requests.split_at(requests.len() - 2);
+        assert_eq!(
+            openrouter.len(),
+            8,
+            "probe and call per embedder, two reranks"
+        );
+        for (path, _, body) in openrouter {
+            assert_eq!(
+                body["provider"]["data_collection"],
+                json!("deny"),
+                "{path}: {body}"
+            );
+        }
+        assert_eq!(
+            openrouter[3].2["provider"]["sort"],
+            json!("price"),
+            "routing is kept"
+        );
+        let documents = |i: usize| -> Vec<usize> {
+            openrouter[i].2["documents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|d| d.as_str().unwrap().chars().count())
+                .collect()
+        };
+        assert_eq!(documents(6), vec![REMOTE_RERANK_CHARS, 5]);
+        assert_eq!(documents(7), vec![5]);
+        for (_, _, body) in other {
+            assert!(body.get("provider").is_none(), "{body}");
+        }
+        // An OpenRouter root under another profile name is OpenRouter too.
+        let custom = remote("custom/x", json!({}));
+        assert!(via_openrouter(
+            &custom,
+            &Endpoint::for_test("https://openrouter.ai/api/v1", "k")
+        ));
+        assert!(!via_openrouter(
+            &custom,
+            &Endpoint::for_test("https://api.voyageai.com/v1", "k")
+        ));
+        assert!(!via_openrouter(
+            &custom,
+            &Endpoint::for_test("https://openrouter.ai.example.com/v1", "k")
+        ));
     }
 }

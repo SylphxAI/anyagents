@@ -326,9 +326,11 @@ pub struct Plan {
     /// when the spend providers report reaches it.
     #[serde(default = "default_max_usd")]
     pub max_usd: f64,
-    /// Characters of a passage a remote reranker reads.
-    #[serde(default = "default_rerank_chars")]
-    pub rerank_chars: usize,
+    /// Characters of a passage a remote reranker reads, for each remote
+    /// reranker that does not set its own `passage_chars`
+    /// (`providers::REMOTE_RERANK_CHARS` when neither does, as in service).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rerank_chars: Option<usize>,
 }
 fn default_embedders() -> Vec<EmbedderConfig> {
     vec![EmbedderConfig::default()]
@@ -339,16 +341,13 @@ fn default_rerankers() -> Vec<RerankerConfig> {
 fn default_max_usd() -> f64 {
     5.0
 }
-fn default_rerank_chars() -> usize {
-    1500
-}
 impl Default for Plan {
     fn default() -> Self {
         Self {
             embedders: default_embedders(),
             rerankers: default_rerankers(),
             max_usd: default_max_usd(),
-            rerank_chars: default_rerank_chars(),
+            rerank_chars: None,
         }
     }
 }
@@ -718,14 +717,20 @@ pub fn run(
             query_ms,
         });
     }
-    let mut rerankers: Vec<(String, Reranker, bool, f64)> = Vec::new();
+    let mut rerankers: Vec<(String, Reranker, f64)> = Vec::new();
     for reranker_config in &plan.rerankers {
+        let mut reranker_config = reranker_config.clone();
+        if let (RerankerConfig::Rerank(remote), Some(chars)) =
+            (&mut reranker_config, plan.rerank_chars)
+        {
+            remote.passage_chars = remote.passage_chars.or(Some(chars));
+        }
+        let reranker_config = &reranker_config;
         let reranker = Reranker::load(
             reranker_config,
             &config.data_dir,
             local(config.query_threads).as_ref(),
         )?;
-        let remote = matches!(reranker_config, RerankerConfig::Rerank(_));
         let mut name = match reranker_config {
             RerankerConfig::Rerank(r) => label(&r.model),
             _ => label(&reranker.name()),
@@ -733,7 +738,7 @@ pub fn run(
         if rerankers.iter().any(|(n, ..)| *n == name) {
             name = format!("{name}#{}", rerankers.len() + 1);
         }
-        rerankers.push((name, reranker, remote, 0.0));
+        rerankers.push((name, reranker, 0.0));
     }
 
     let host = HostIndex::open(&host_path)?;
@@ -830,19 +835,12 @@ pub fn run(
                 union.push(id.clone());
             }
         }
-        for (name, reranker, remote, seconds) in &mut rerankers {
-            let texts: Vec<String> = union
+        for (name, reranker, seconds) in &mut rerankers {
+            // A remote reranker cuts each passage as it does in service.
+            let refs: Vec<&str> = union
                 .iter()
-                .map(|id| {
-                    let text = passages.get(id).map_or("", String::as_str);
-                    if *remote {
-                        text.chars().take(plan.rerank_chars).collect()
-                    } else {
-                        text.to_owned()
-                    }
-                })
+                .map(|id| passages.get(id).map_or("", String::as_str))
                 .collect();
-            let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
             let started = Instant::now();
             let before = reranker.usage().usd;
             let scores = reranker.score(&query.query, &refs)?;
@@ -878,7 +876,7 @@ pub fn run(
             }
         }
     }
-    for (name, reranker, _, seconds) in &rerankers {
+    for (name, reranker, seconds) in &rerankers {
         report.rerankers.push(RerankerRun {
             name: name.clone(),
             usage: reranker.usage(),
