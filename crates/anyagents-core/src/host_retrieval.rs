@@ -818,7 +818,16 @@ impl Store {
                         .iter()
                         .map(|c| Job::Class(owner.clone(), *c))
                         .collect(),
-                    None => return Ok(false),
+                    None => {
+                        // Once: what a dense rebuild should wait for.
+                        if at == list.len() {
+                            eprintln!(
+                                "anyagents-host-history: pre-warm done: {} agents' history indexed",
+                                list.len()
+                            );
+                        }
+                        return Ok(false);
+                    }
                 }
             }
         };
