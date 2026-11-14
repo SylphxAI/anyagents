@@ -3417,6 +3417,23 @@ pub(crate) fn poke_agent_wake_socket_mail(data: &Path, agent_id: &AgentId) {
     }
 }
 
+/// Install the harness a runtime change moves an agent onto. A change of model
+/// or profile alone keeps the binary the agent already runs, so it installs
+/// nothing and cannot fail on that harness's source.
+fn install_changed_harness(
+    data: &Path,
+    previous_harness: &str,
+    target_harness: &str,
+    record: impl FnOnce(&Path, &str) -> Result<crate::install::Install, String>,
+) -> Result<(), Error> {
+    if normalize_harness_name(previous_harness) == target_harness {
+        return Ok(());
+    }
+    record(data, target_harness)
+        .map(|_| ())
+        .map_err(Error::Message)
+}
+
 /// Declaratively update an existing agent's runtime configuration (`harness`, `model`, `profile`)
 /// in `state.db` without deleting or recreating its identity, killing an in-progress turn,
 /// replaying already-delivered messages, or reopening paused scope.
@@ -3447,7 +3464,12 @@ pub(crate) fn configure_agent_runtime(
         && !crate::sandbox::is_isolated_test_env()
         && actor != "system:profile-rebalance"
     {
-        crate::install::record(data, &target_harness).map_err(Error::Message)?;
+        install_changed_harness(
+            data,
+            &previous_harness,
+            &target_harness,
+            crate::install::record,
+        )?;
     }
     let current_bound = bound_profile_name(&config);
 
@@ -10192,6 +10214,44 @@ pub(crate) fn resolve_subagent_defaults(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_model_change_on_an_unconfigured_harness_installs_nothing() {
+        let _environment = crate::server::tests::env_lock();
+        let root = crate::test_tempdir();
+        let installer = crate::install::Installer::new(root.path());
+        // `agy` ships Unconfigured, so installing it fails ...
+        assert!(installer.ensure("agy").is_err());
+        // ... but a model or profile change keeps the binary the agent runs,
+        // including under a legacy spelling of the same harness.
+        for (previous, target) in [("agy", "agy"), ("sylphx", "spiron")] {
+            let mut asked = Vec::new();
+            install_changed_harness(root.path(), previous, target, |_, harness| {
+                asked.push(harness.to_string());
+                installer.ensure(harness)
+            })
+            .unwrap();
+            assert!(
+                asked.is_empty(),
+                "{previous} -> {target} installed {asked:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_harness_change_still_verifies_the_target_harness() {
+        let _environment = crate::server::tests::env_lock();
+        let root = crate::test_tempdir();
+        let installer = crate::install::Installer::new(root.path());
+        let mut asked = Vec::new();
+        let err = install_changed_harness(root.path(), "codex", "agy", |_, harness| {
+            asked.push(harness.to_string());
+            installer.ensure(harness)
+        })
+        .unwrap_err();
+        assert_eq!(asked, ["agy"]);
+        assert!(err.to_string().contains("unverifiable source"), "{err}");
+    }
 
     #[test]
     fn legacy_harness_selectors_create_and_switch_to_spiron_without_renaming_gateway() {
