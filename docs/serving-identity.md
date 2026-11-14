@@ -1,12 +1,16 @@
 # Serving process identity
 
-`GET /v1/webhooks/healthz` identifies the running image on `anyagents.sock`
-(`serve`) and the optional public webhook listener. No token is required.
-The TCP listener also exposes `/` and `/healthz`.
+`GET /v1/webhooks/healthz` on `anyagents.sock` (`serve`) identifies the running
+image. No token is required; reaching the socket is the operator's authority.
 
 ```sh
 curl --unix-socket "$DATA/anyagents.sock" http://local/v1/webhooks/healthz
 ```
+
+The public TCP listener answers `GET /`, `/healthz` and `/v1/webhooks/healthz`
+with readiness only, `{"ok":true}` and `Cache-Control: no-store`. The exact
+version and binary digest tell a scanner which advisories apply, so they stay
+on the socket.
 
 | Field | Meaning |
 | --- | --- |
