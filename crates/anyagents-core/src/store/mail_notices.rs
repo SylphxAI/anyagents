@@ -11,7 +11,7 @@
 //!   sender is told, once per message, that it will not be read unless the
 //!   agent is resumed, and who the agent's parent is.
 //! - An agent **parked** after errored turns: its nearest live ancestor is
-//!   told, or the operator when it has none.
+//!   told, or, when it has none, the operator's inbox.
 //!
 //! Every notice comes from [`SYSTEM_SENDER`] and is keyed by its source key,
 //! so it is written once. A notice never causes another notice.
@@ -177,8 +177,9 @@ impl Store {
     }
 
     /// Tell whoever answers for a parked agent that it was parked, with the
-    /// error: its nearest live ancestor, or the operator (the server log, and
-    /// `anyagents status`) when it has none. Returns the ancestor told.
+    /// error: its nearest live ancestor, or, when it has none, the operator's
+    /// inbox (`anyagents inbox --operator`; also the server log and
+    /// `anyagents status`). Returns the ancestor told.
     pub fn notify_parked(
         &self,
         agent_id: &AgentId,
@@ -191,10 +192,23 @@ impl Store {
             .and_then(|errors| errors.faulted_at_ms)
             .unwrap_or(0);
         let Some(ancestor) = self.live_ancestor(&agent)? else {
+            // No agent answers for it: the operator's inbox does.
             eprintln!(
                 "anyagents: operator attention: agent {} ({}) was paused after {streak} turns in a row ended in an error; its mail is held until it is resumed. Last error: {error}",
                 agent.name, agent.id
             );
+            self.report_to_operator(super::OperatorReport {
+                sender: format!("agent:{}", agent.id),
+                sender_name: Some(agent.name.clone()),
+                body: format!(
+                    "[Agent Faulted] `{}` (`{}`) was paused: {streak} turns in a row ended in an error. Its mail is held until it is resumed. Last error: {}\n\nFix the cause, then resume it: `anyagents agents resume {}`.",
+                    agent.name,
+                    agent.id,
+                    error.trim(),
+                    agent.name,
+                ),
+                received_at_ms: None,
+            })?;
             return Ok(None);
         };
         let relation = if agent.parent_id.as_ref() == Some(&ancestor.id) {
@@ -388,9 +402,14 @@ mod tests {
             .notify_parked(&worker.id, 3, "context_length_exceeded")
             .unwrap();
         assert_eq!(notices(&store, &root).len(), 1);
-        // A root agent has no ancestor: the operator is told instead.
+        // A root agent has no ancestor: the operator's inbox is told instead.
         store.set_agent_state(&root.id, "running").unwrap();
         store.park_faulted(&root.id).unwrap();
         assert_eq!(store.notify_parked(&root.id, 3, "boom").unwrap(), None);
+        let reports = store.operator_inbox(None, None).unwrap();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].sender, format!("agent:{}", root.id));
+        assert!(reports[0].body.starts_with("[Agent Faulted] `root`"));
+        assert!(reports[0].body.contains("boom"));
     }
 }

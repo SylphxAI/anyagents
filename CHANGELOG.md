@@ -20,8 +20,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   discards it. A post the Telegram API refused leaves no stuck record, and a
   long post cut short is recorded as partly delivered. A legacy Spiron input
   hold is settled when its agent launches another harness, and at server start
-  when its agent is archived or has taken the held mail since. Migration 032
+  when its agent is archived or has taken the held mail since. Migration 033
   adds `turn_errors`.
+- Agents report defects to whoever runs the deployment with `send` to
+  `operator`: a defect in AnyAgents, the harness or the host that an agent
+  cannot fix within its own work. Only the operator reads it, with
+  `anyagents inbox --operator`. Each sender and the whole fleet have a small
+  burst and an hourly cap, the same text within an hour is counted on the
+  first report, and reports are kept for 30 days. No agent may be named
+  `operator`.
 - Usage accounting no longer over-counts cost for Claude Code and OpenCode
   agents. Claude Code's `total_cost_usd` is the session's running total: a
   resumed process restores it from the transcript's last `cost-state` row

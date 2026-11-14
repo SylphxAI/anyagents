@@ -78,7 +78,7 @@ way.
 A turn the adapter saw end (`turns_served` moved, or `Accepted {
 turn_finished }`) with a fault on the harness (`sign_in_fault`, not a quota
 wait) is never left holding the mailbox. The supervisor counts it at once in
-`turn_errors` (migration 032) and follows it up:
+`turn_errors` (migration 033) and follows it up:
 
 - **Retry with a note.** The work the turn held comes back as a `[Recovery]`
   note in the agent's own mailbox, from `anyagents`. It names the error,
@@ -102,7 +102,8 @@ wait) is never left holding the mailbox. The supervisor counts it at once in
   mail held, `turn_errors.faulted_at_ms` set, and the turn left open so that
   a resume recovers it. Its nearest live ancestor is told the error
   (`[Sub-Agent Faulted]`), once per parking; an agent with no live ancestor
-  is reported to the operator in the server log and `anyagents status`.
+  is reported to the operator's inbox (`anyagents inbox --operator`), the
+  server log and `anyagents status`.
   `agents list` and `status` show it as `faulted`, and `agents inspect`
   shows the run and the last error.
 - A completed turn ends the run. A resume (`agents resume`, a wake) clears
