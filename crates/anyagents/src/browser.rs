@@ -4366,11 +4366,33 @@ pub fn execute(
             let s = s.trim();
             s.starts_with("op://") || s.starts_with("op-otp://") || s.starts_with("secret://")
         });
-    execute_inner(data, default_profile, req).map_err(|err| browser_error(err, secret))
+    let mutating = !browser_action_reads(&req);
+    execute_inner(data, default_profile, req).map_err(|err| browser_error(err, secret, mutating))
 }
 
-fn browser_error(err: Error, secret: bool) -> Error {
-    use crate::computer::{ErrorDisposition, format_computer_error};
+/// Whether a browser request only reads. Anything else, including an action
+/// this list does not name, may have changed the page before it failed.
+fn browser_action_reads(req: &BrowserRequest) -> bool {
+    let action = req.action.trim().to_ascii_lowercase();
+    match action.as_str() {
+        "" => req.url.is_none(),
+        "profiles" | "list" | "status" | "info" | "fingerprint" | "snapshot" | "read" | "dom"
+        | "text" | "content" | "html" | "screenshot" | "shot" | "takeover_status"
+        | "wait_for_user" | "wait_takeover" => true,
+        "tabs" => req
+            .tab_action
+            .as_deref()
+            .map(str::trim)
+            .is_none_or(|sub| sub.is_empty() || sub.eq_ignore_ascii_case("list")),
+        "cookies" => req.cookies.is_none(),
+        _ => false,
+    }
+}
+
+/// `mutating`: whether the request can change the page; see
+/// [`crate::computer::transient_disposition`].
+fn browser_error(err: Error, secret: bool, mutating: bool) -> Error {
+    use crate::computer::{ErrorDisposition, format_computer_error, transient_disposition};
     let message = err.to_string();
     let lower = message.to_ascii_lowercase();
     let disposition = if lower.contains("stale_ref") {
@@ -4379,15 +4401,14 @@ fn browser_error(err: Error, secret: bool) -> Error {
         ErrorDisposition::settled_absence(
             "Inspect the page with a new browser snapshot before acting.",
         )
-    } else if lower.contains("timeout")
-        || lower.contains("timed out")
-        || lower.contains("temporarily unavailable")
-        || lower.contains("429")
-        || lower.contains("503")
-    {
-        ErrorDisposition::retryable(
-            "Transient browser failure; retry once or inspect browser status.",
-        )
+    } else if let Some(disposition) = transient_disposition(
+        &lower,
+        mutating,
+        "Transient browser failure; retry once or inspect browser status.",
+        "The action may already have been delivered; take a new browser snapshot and verify \
+         the page before repeating it.",
+    ) {
+        disposition
     } else {
         ErrorDisposition::terminal("Check browser input, environment, and human takeover status.")
     };
@@ -5699,10 +5720,14 @@ mod tests {
             ("CDP timed out", "retryable_failure"),
             ("invalid selector", "terminal_failure"),
         ] {
-            let err = browser_error(Error::Message(message.into()), false).to_string();
+            let err = browser_error(Error::Message(message.into()), false, false).to_string();
             assert!(err.contains(kind), "{err}");
-            let secret = browser_error(Error::Message(format!("{message}: sensitive-value")), true)
-                .to_string();
+            let secret = browser_error(
+                Error::Message(format!("{message}: sensitive-value")),
+                true,
+                false,
+            )
+            .to_string();
             assert!(secret.contains(kind));
             assert!(!secret.contains("sensitive-value"));
         }
@@ -5721,6 +5746,89 @@ mod tests {
         .to_string();
         assert!(err.contains("STALE_REF"));
         assert!(!err.contains("vault"));
+    }
+
+    #[test]
+    fn a_mutating_browser_action_that_timed_out_is_not_safe_to_retry() {
+        use super::*;
+        let request = |action: &str| BrowserRequest {
+            action: action.into(),
+            ..Default::default()
+        };
+        for action in [
+            "click",
+            "fill",
+            "type",
+            "press",
+            "key_down",
+            "open",
+            "navigate",
+            "eval",
+            "takeover",
+            "close",
+            "frobnicate",
+        ] {
+            assert!(!browser_action_reads(&request(action)), "{action}");
+        }
+        for action in [
+            "snapshot",
+            "text",
+            "screenshot",
+            "status",
+            "profiles",
+            "wait_for_user",
+        ] {
+            assert!(browser_action_reads(&request(action)), "{action}");
+        }
+        assert!(browser_action_reads(&request("")));
+        assert!(!browser_action_reads(&BrowserRequest {
+            url: Some("https://example.com".into()),
+            ..Default::default()
+        }));
+        assert!(browser_action_reads(&request("tabs")));
+        assert!(!browser_action_reads(&BrowserRequest {
+            tab_action: Some("new".into()),
+            ..request("tabs")
+        }));
+        assert!(browser_action_reads(&request("cookies")));
+        assert!(!browser_action_reads(&BrowserRequest {
+            cookies: Some(Vec::new()),
+            ..request("cookies")
+        }));
+
+        for (message, read, mutating) in [
+            (
+                "Input.dispatchMouseEvent: CDP timed out",
+                "RETRYABLE_FAILURE",
+                "DELIVERY_UNCERTAIN",
+            ),
+            (
+                "Resource temporarily unavailable (os error 11)",
+                "RETRYABLE_FAILURE",
+                "DELIVERY_UNCERTAIN",
+            ),
+            // The browser never started, so nothing was dispatched.
+            (
+                "Chromium CDP startup timed out after 100ms",
+                "RETRYABLE_FAILURE",
+                "RETRYABLE_FAILURE",
+            ),
+            (
+                "DevTools version HTTP status 503",
+                "RETRYABLE_FAILURE",
+                "RETRYABLE_FAILURE",
+            ),
+        ] {
+            let as_read = browser_error(Error::Message(message.into()), false, false).to_string();
+            assert!(as_read.contains(read), "{as_read}");
+            let as_write = browser_error(Error::Message(message.into()), false, true).to_string();
+            assert!(as_write.contains(mutating), "{as_write}");
+        }
+        let err =
+            browser_error(Error::Message("CDP timed out: secret".into()), true, true).to_string();
+        assert!(err.contains("\"retry\":\"verify_first\""), "{err}");
+        assert!(err.contains("browser snapshot"), "{err}");
+        assert!(!err.contains("CDP timed out: secret"), "{err}");
     }
 
     #[test]
@@ -7116,7 +7224,7 @@ esac
                 assert!(!msg.contains(forbidden), "leaked {forbidden} in {msg}");
             }
 
-            let public_err = browser_error(err, true).to_string();
+            let public_err = browser_error(err, true, true).to_string();
             assert!(public_err.contains("TERMINAL_FAILURE"), "{public_err}");
             assert!(
                 public_err.contains("browser secret input failed (provider/page details withheld)"),
