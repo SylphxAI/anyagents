@@ -666,7 +666,7 @@ impl Client {
                 Some(sender) => (sender, true),
                 // A tool call made while the server restarts waits for it,
                 // within what is left of the call's own wait.
-                None => (connect_until(&self.socket, call_wait_until()).await?, false),
+                None => (connect_waiting(&self.socket, &call_wait()).await?, false),
             };
             // A call its harness gave up on while it waited is not sent.
             if call_cancelled() {
@@ -8340,25 +8340,94 @@ fn build_request(
 const RECONNECT_WITHIN: std::time::Duration = std::time::Duration::from_secs(45);
 
 /// One tool call as the requests it makes see it: whether its harness
-/// cancelled it, and the end of the time it may spend waiting for the
-/// server's socket, shared by every request the call (and everything it
-/// spawns) makes.
+/// cancelled it, and the time it has spent waiting for the server's socket,
+/// shared by every request the call (and everything it spawns) makes.
 #[derive(Clone)]
 struct Call {
     cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
-    wait_until: tokio::time::Instant,
+    wait: SocketWait,
 }
 
 impl Call {
     /// A call `cancelled` reports on, with the whole wait still ahead.
     fn new(cancelled: Arc<dyn Fn() -> bool + Send + Sync>) -> Self {
-        Self::within(cancelled, RECONNECT_WITHIN)
-    }
-
-    fn within(cancelled: Arc<dyn Fn() -> bool + Send + Sync>, wait: std::time::Duration) -> Self {
         Self {
             cancelled,
-            wait_until: tokio::time::Instant::now() + wait,
+            wait: SocketWait::new(RECONNECT_WITHIN),
+        }
+    }
+
+    #[cfg(test)]
+    fn waiting_at_most(
+        cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
+        budget: std::time::Duration,
+    ) -> Self {
+        Self {
+            cancelled,
+            wait: SocketWait::new(budget),
+        }
+    }
+}
+
+/// The time spent waiting for the server's socket, against a budget: only
+/// the time some request actually waits counts (requests waiting at once
+/// count it once), so a call that has run long still has its whole wait.
+#[derive(Clone)]
+struct SocketWait {
+    budget: std::time::Duration,
+    spent: Arc<std::sync::Mutex<Spent>>,
+}
+
+#[derive(Default)]
+struct Spent {
+    before: std::time::Duration,
+    waiters: usize,
+    since: Option<tokio::time::Instant>,
+}
+
+impl SocketWait {
+    fn new(budget: std::time::Duration) -> Self {
+        Self {
+            budget,
+            spent: Arc::default(),
+        }
+    }
+
+    fn spent(&self) -> std::sync::MutexGuard<'_, Spent> {
+        self.spent.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
+    /// What is left of the budget.
+    fn left(&self) -> std::time::Duration {
+        let spent = self.spent();
+        let running = spent
+            .since
+            .map_or(std::time::Duration::ZERO, |since| since.elapsed());
+        self.budget.saturating_sub(spent.before + running)
+    }
+
+    /// One request starts waiting; the wait counts until the guard drops.
+    fn begin(&self) -> Waiting<'_> {
+        let mut spent = self.spent();
+        if spent.waiters == 0 {
+            spent.since = Some(tokio::time::Instant::now());
+        }
+        spent.waiters += 1;
+        Waiting(self)
+    }
+}
+
+/// A request waiting for the socket.
+struct Waiting<'a>(&'a SocketWait);
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        let mut spent = self.0.spent();
+        spent.waiters -= 1;
+        if spent.waiters == 0
+            && let Some(since) = spent.since.take()
+        {
+            spent.before += since.elapsed();
         }
     }
 }
@@ -8373,11 +8442,11 @@ fn call_cancelled() -> bool {
     CALL.try_with(|call| (call.cancelled)()).unwrap_or(false)
 }
 
-/// When the current tool call stops waiting for the server's socket; a
-/// request outside any call waits the whole time on its own.
-fn call_wait_until() -> tokio::time::Instant {
-    CALL.try_with(|call| call.wait_until)
-        .unwrap_or_else(|_| tokio::time::Instant::now() + RECONNECT_WITHIN)
+/// The current tool call's wait for the server's socket; a request outside
+/// any call has the whole wait to itself.
+fn call_wait() -> SocketWait {
+    CALL.try_with(|call| call.wait.clone())
+        .unwrap_or_else(|_| SocketWait::new(RECONNECT_WITHIN))
 }
 
 /// Run `body` as `call`, so the requests it makes are neither connected nor
@@ -8398,7 +8467,7 @@ const RECONNECT_PROBE: std::time::Duration = std::time::Duration::from_millis(25
 /// nothing listens. Its driver runs as a task until the server closes it or
 /// the last sender is dropped.
 async fn connect(socket: &Path) -> Result<http1::SendRequest<Full<Bytes>>, String> {
-    connect_until(socket, tokio::time::Instant::now()).await
+    connect_waiting(socket, &SocketWait::new(std::time::Duration::ZERO)).await
 }
 
 /// [`connect`], waiting up to `within` while nothing listens on `socket`.
@@ -8407,14 +8476,16 @@ async fn connect_within(
     socket: &Path,
     within: std::time::Duration,
 ) -> Result<http1::SendRequest<Full<Bytes>>, String> {
-    connect_until(socket, tokio::time::Instant::now() + within).await
+    connect_waiting(socket, &SocketWait::new(within)).await
 }
 
-/// [`connect`], waiting until `deadline` while nothing listens on `socket`.
-async fn connect_until(
+/// [`connect`], waiting within what is left of `wait` while nothing listens
+/// on `socket`.
+async fn connect_waiting(
     socket: &Path,
-    deadline: tokio::time::Instant,
+    wait: &SocketWait,
 ) -> Result<http1::SendRequest<Full<Bytes>>, String> {
+    let mut waiting = None;
     let stream = loop {
         if call_cancelled() {
             return Err("the tool call was cancelled".into());
@@ -8425,13 +8496,15 @@ async fn connect_until(
                 if matches!(
                     err.kind(),
                     std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-                ) && tokio::time::Instant::now() < deadline =>
+                ) && !wait.left().is_zero() =>
             {
-                tokio::time::sleep(RECONNECT_PROBE).await;
+                waiting.get_or_insert_with(|| wait.begin());
+                tokio::time::sleep(RECONNECT_PROBE.min(wait.left())).await;
             }
             Err(err) => return Err(format!("cannot reach the server: {err}")),
         }
     };
+    drop(waiting);
     let (sender, connection) = http1::handshake(TokioIo::new(stream))
         .await
         .map_err(|err| err.to_string())?;
@@ -8577,7 +8650,10 @@ mod reconnect_tests {
             "synthetic-test-capability".into(),
         );
         let started = std::time::Instant::now();
-        let call = super::Call::within(Arc::new(|| false), std::time::Duration::from_millis(1_000));
+        let call = super::Call::waiting_at_most(
+            Arc::new(|| false),
+            std::time::Duration::from_millis(1_000),
+        );
         let failures = super::as_call(call, async move {
             let mut failures = 0;
             for _ in 0..3 {
@@ -8598,6 +8674,46 @@ mod reconnect_tests {
             "each request waited on its own: {:?}",
             started.elapsed()
         );
+    }
+
+    /// Only time spent waiting for the socket counts against a call's wait:
+    /// a call that has run long still waits the whole time for a server
+    /// that restarts.
+    #[tokio::test]
+    async fn a_call_that_ran_long_still_waits_for_a_restarting_server() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("anyagents.sock");
+        let client = super::Client::new(
+            socket.clone(),
+            dir.path().join("config"),
+            "synthetic-test-capability".into(),
+        );
+        let call = super::Call::waiting_at_most(
+            Arc::new(|| false),
+            std::time::Duration::from_millis(1_000),
+        );
+        let answer = tokio::spawn(super::as_call(call, async move {
+            // Longer than the whole wait, at work before the server goes.
+            tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+            client.send("GET", "/v1/whoami", None, "cap", None).await
+        }));
+        // The server comes back within the wait, after the call's work.
+        tokio::time::sleep(std::time::Duration::from_millis(2_000)).await;
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut seen = Vec::new();
+        let mut buf = [0u8; 1024];
+        while !String::from_utf8_lossy(&seen).contains("\r\n\r\n") {
+            let read = stream.read(&mut buf).await.unwrap();
+            seen.extend_from_slice(&buf[..read]);
+        }
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+            .await
+            .unwrap();
+        let answer = answer.await.unwrap();
+        assert!(answer.is_ok(), "{answer:?}");
     }
 
     /// Past the wait, a server that is still gone is an error, as before.
