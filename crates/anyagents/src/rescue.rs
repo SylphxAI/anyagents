@@ -849,6 +849,9 @@ impl Reclaim<'_> {
             if matches!(plan, Plan::Delete(_)) {
                 outcome.clean += 1;
             }
+            // The store's keep ref for a converted repository goes with it;
+            // a rescued one's bundle carries everything the remotes lack.
+            crate::repo::forget(checkout);
             outcome.complete &= crate::server::remove_path_with_seat(checkout, self.seat_ids);
         }
         if outcome.kept.is_empty() && loose_saved {
@@ -1219,6 +1222,9 @@ mod tests {
         let data = dir.path().join("data");
         let id = AgentId::generate();
         let shared = published(&dir.path().join("shared"), "repo");
+        // A store adoption may borrow from never prunes (#278).
+        git(&shared, &["config", "gc.pruneExpire", "never"]);
+        git(&shared, &["config", "gc.cruftPacks", "true"]);
         let work = dir.path().join("work");
         std::fs::create_dir_all(&work).unwrap();
         let ahead = work.join("ahead");

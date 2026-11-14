@@ -501,6 +501,38 @@ pub struct ConversationResponse {
     pub agent: String,
     pub agent_id: String,
     pub turns: Vec<ConversationTurnView>,
+    /// How a relevance search was ranked; absent for reads that rank nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retrieval: Option<RetrievalView>,
+}
+
+/// The ranking stages a relevance search ran. Every turn cites its raw record
+/// whichever stage found it.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct RetrievalView {
+    /// `lexical` when no memory service runs on this data directory (the
+    /// default with nothing configured): BM25 alone, by design, not a
+    /// degradation. `hybrid` when one does.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub mode: String,
+    /// `lexical` (BM25), then `dense` and `rerank` when the memory service
+    /// answered.
+    pub stages: Vec<String>,
+    /// Why a stage that applies did not run, or ran on partial history.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub degraded: Vec<String>,
+    /// History the search could not index before answering. It is being
+    /// indexed in the background, and hits from it may be missing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending: Option<PendingHistoryView>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct PendingHistoryView {
+    /// Sources (files or stores) not yet fully indexed.
+    pub sources: usize,
+    /// Approximate bytes of history still to index.
+    pub bytes: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -510,10 +542,18 @@ pub struct SendMedia {
     /// Local file path, `https://` URL, or Telegram `file_id`.
     pub source: String,
     /// Optional track title (for `kind = "audio"` or `"music"`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "absent_if_null"
+    )]
     pub title: Option<String>,
     /// Optional artist/performer name (for `kind = "audio"` or `"music"`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "absent_if_null"
+    )]
     pub performer: Option<String>,
 }
 
@@ -522,10 +562,18 @@ pub struct SendLocation {
     pub latitude: f64,
     pub longitude: f64,
     /// Optional venue title (when both `title` and `address` are set, sends a rich venue card).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "absent_if_null"
+    )]
     pub title: Option<String>,
     /// Optional venue street address.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "absent_if_null"
+    )]
     pub address: Option<String>,
 }
 
@@ -546,7 +594,11 @@ pub struct SendChecklist {
     /// Checklist items (`1..=30` task descriptions; prefix with `[x]` or `☑` for pre-checked items).
     pub tasks: Vec<String>,
     /// Optional Telegram Business Connection ID for native `sendChecklist`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "absent_if_null"
+    )]
     pub business_connection_id: Option<String>,
 }
 
@@ -555,14 +607,49 @@ pub struct SendArticle {
     /// Article title.
     pub title: String,
     /// Markdown or plain-text body to publish as a Telegram Telegraph (`telegra.ph`) Instant View article.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "absent_if_null"
+    )]
     pub content: Option<String>,
     /// Optional external article URL (when already hosted).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "absent_if_null"
+    )]
     pub url: Option<String>,
     /// Optional author name shown on the Instant View header.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "absent_if_null"
+    )]
     pub author_name: Option<String>,
+}
+
+/// An optional field written as JSON `null`, `"null"` or `"undefined"` is
+/// absent. Harnesses fill unused optional fields with these strings, and a
+/// `"null"` URL or object is never what was meant. Every other string,
+/// `""` and `"None"` included, keeps its meaning.
+pub fn absent_if_null<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    match Option::<serde_json::Value>::deserialize(deserializer)? {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(text)) if is_null_word(&text) => Ok(None),
+        Some(value) => T::deserialize(value)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+    }
+}
+
+/// Exactly `"null"` or `"undefined"`: what a harness writes for "no value".
+pub(crate) fn is_null_word(text: &str) -> bool {
+    matches!(text, "null" | "undefined")
 }
 
 pub fn deserialize_string_or_vec<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>

@@ -57,11 +57,7 @@ impl Checkouts {
                 .filter(|path| !path.as_os_str().is_empty()),
             pool_root: anyagents_core::configured_git_pool_dir()
                 .unwrap_or_else(|| data.join(POOL_DIR)),
-            remote_base: std::env::var("ANYAGENTS_GIT_REMOTE_BASE")
-                .ok()
-                .map(|s| s.trim().trim_end_matches('/').to_string())
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "https://github.com".to_string()),
+            remote_base: remote_base(),
             author: (
                 std::env::var("ANYAGENTS_GIT_AUTHOR_NAME").ok(),
                 std::env::var("ANYAGENTS_GIT_AUTHOR_EMAIL").ok(),
@@ -96,11 +92,19 @@ impl Checkouts {
                 format!("origin/{base}")
             }
         });
+        let base_branch = base
+            .filter(|b| *b != "HEAD" && *b != "origin/HEAD" && !is_commit_id(b))
+            .filter(|b| !b.starts_with("refs/tags/"))
+            .map(|b| {
+                b.strip_prefix("origin/")
+                    .or_else(|| b.strip_prefix("refs/heads/"))
+                    .unwrap_or(b)
+            });
         if let Some(base) = base.filter(|b| *b != "HEAD" && *b != "origin/HEAD" && !is_commit_id(b))
         {
             self.fetch(&repo, base.strip_prefix("origin/").unwrap_or(base))?;
         }
-        self.checkout(&repo, target, branch, start.as_deref())
+        self.checkout(&repo, target, branch, start.as_deref(), base_branch)
     }
 
     /// Branch from a local repository (`repo: "inherit"` or a path). Its HEAD
@@ -195,7 +199,8 @@ impl Checkouts {
         })?;
         // A published feature commit may not be in the pool's default branch yet.
         self.fetch(&repo, &reference)?;
-        self.checkout(&repo, target, branch, Some(&selected))
+        let base_branch = reference.strip_prefix("refs/heads/");
+        self.checkout(&repo, target, branch, Some(&selected), base_branch)
     }
 
     fn fetch(&self, repo: &str, base: &str) -> Result<(), Error> {
@@ -215,6 +220,7 @@ impl Checkouts {
         target: &Path,
         branch: &str,
         base: Option<&str>,
+        base_branch: Option<&str>,
     ) -> Result<(), Error> {
         let author = self.author(target)?;
         match &self.provider {
@@ -232,7 +238,7 @@ impl Checkouts {
                 run_provider(provider, repo, &args)?;
                 // A linked worktree of the provider's store becomes an own
                 // repository; the store is its pool from now on.
-                if let Adoption::Declined(reason) = adopt(target, None) {
+                if let Adoption::Declined(reason) = adopt_from(target, None, base_branch, false) {
                     if let Err(error) = discard(target) {
                         eprintln!(
                             "warning: cannot remove unadopted checkout {}: {error}",
@@ -509,6 +515,64 @@ impl Checkouts {
     }
 }
 
+/// Where a GitHub slug is fetched from (`ANYAGENTS_GIT_REMOTE_BASE`).
+fn remote_base() -> String {
+    std::env::var("ANYAGENTS_GIT_REMOTE_BASE")
+        .ok()
+        .map(|s| s.trim().trim_end_matches('/').to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "https://github.com".to_string())
+}
+
+/// What a checkout's `origin` advertises now, as `(object, ref)` for its
+/// branches, tags and notes: the remote's own answer, not the checkout's
+/// remote-tracking refs. The URL is read as `seat`; the server asks with its
+/// own credentials, from outside the checkout, and only a GitHub repository
+/// or a local path. `None` when it cannot ask or gets no answer.
+pub(crate) fn published(
+    checkout: &Path,
+    seat: Option<(u32, u32)>,
+) -> Option<Vec<(String, String)>> {
+    let out = inspect_command(seat, &checkout.join(".git"), None)
+        .ok()?
+        .args(["ls-remote", "--get-url", "origin"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let url = match github_remote_repo(&url) {
+        Some(slug) => format!("{}/{slug}.git", remote_base()),
+        None if url.starts_with("file://") || Path::new(&url).is_absolute() => url,
+        None => return None,
+    };
+    let listed = run_git(
+        "origin",
+        None,
+        &[
+            "-c".as_ref(),
+            "http.lowSpeedLimit=1000".as_ref(),
+            "-c".as_ref(),
+            "http.lowSpeedTime=60".as_ref(),
+            "ls-remote".as_ref(),
+            url.as_ref(),
+            "refs/heads/*".as_ref(),
+            "refs/tags/*".as_ref(),
+            "refs/notes/*".as_ref(),
+        ],
+    )
+    .ok()?;
+    Some(
+        listed
+            .lines()
+            .filter_map(|line| line.split_once('\t'))
+            .map(|(oid, name)| (oid.to_string(), name.to_string()))
+            .collect(),
+    )
+}
+
 fn run_provider(provider: &Path, repo: &str, args: &[&std::ffi::OsStr]) -> Result<(), Error> {
     let out = Command::new(provider)
         .args(args)
@@ -627,7 +691,10 @@ fn run_git_input(
     git_result(repo, output_with_input(cmd.args(args), input))
 }
 
-fn output_with_input(cmd: &mut Command, input: &str) -> std::io::Result<std::process::Output> {
+pub(crate) fn output_with_input(
+    cmd: &mut Command,
+    input: &str,
+) -> std::io::Result<std::process::Output> {
     use std::io::Write as _;
     let mut child = cmd
         .stdin(std::process::Stdio::piped())
@@ -674,6 +741,7 @@ fn ensure_pool(repo: &str, pool: &Path, remote_url: &str) -> Result<(), Error> {
         ("fetch.prune", "false"),
         ("gc.auto", "0"),
         ("gc.pruneExpire", "never"),
+        ("gc.cruftPacks", "true"),
     ] {
         run_git(
             repo,
@@ -767,56 +835,106 @@ pub(crate) enum Adoption {
 }
 
 /// Convert a linked worktree of a shared store into an own repository, in
-/// place. Nothing in the working tree is touched. The new Git directory is
-/// built beside it: the old configuration without other checkouts' branches,
-/// the same HEAD, index, sparse patterns, excludes, hooks and remote-tracking
-/// refs, and the shared store as its object pool. Objects that only this
-/// checkout reaches (unpushed commits, staged blobs) are copied into it, so
-/// they survive whatever the store later prunes. The conversion stands only
-/// if `git status` reads the same before and after; then the old `.git`
-/// pointer and the new directory are exchanged in one rename, and the store
-/// forgets the checkout. Anything unusual (an operation in progress, a
-/// registration that does not name this checkout) declines and changes
-/// nothing. `seat` is the identity Git reads the checkout as.
+/// place. Nothing in the working tree is touched.
+///
+/// - The store must never prune (`gc.pruneExpire=never`, `gc.cruftPacks=true`):
+///   the new repository borrows its objects.
+/// - The new Git directory is built beside the `.git` pointer: the store's
+///   configuration without other checkouts' branches, this checkout's
+///   `config.worktree`, and fetch refspecs covering its own branch and its
+///   base (so a plain `git fetch origin` refreshes them); the same HEAD,
+///   index, reflogs, sparse patterns, excludes, hooks, remote-tracking refs
+///   and tags.
+/// - Objects only this checkout reaches (unpushed and reflog-only commits,
+///   staged blobs) are packed into it.
+/// - A keep ref in the store (`refs/anyagents/keep/<checkout>`) holds every
+///   commit the new repository's refs reach until it is reaped, so even an
+///   explicit prune of the store cannot take them.
+/// - The conversion stands only if `git status` reads the same before and
+///   after. Then the new directory is synced to disk and exchanged with the
+///   pointer in one rename, and the store forgets the registration. A crash
+///   after the exchange is finished by the next call.
+///
+/// An operation in progress, a locked worktree, or a registration that does
+/// not name this checkout declines and changes nothing. `seat` is the
+/// identity Git reads the checkout as.
 pub(crate) fn adopt(checkout: &Path, seat: Option<(u32, u32)>) -> Adoption {
+    adopt_from(checkout, seat, None, false)
+}
+
+/// [`adopt`], with the remote branch the checkout was made from, and (for
+/// tests) a crash right after the exchange.
+fn adopt_from(
+    checkout: &Path,
+    seat: Option<(u32, u32)>,
+    base: Option<&str>,
+    crash_after_exchange: bool,
+) -> Adoption {
     let dotgit = checkout.join(".git");
     let staging = checkout.join(ADOPT_STAGING);
     match std::fs::symlink_metadata(&dotgit) {
         Ok(meta) if meta.is_dir() => {
-            // An interrupted conversion that already swapped leaves the old pointer.
-            remove_staging(&staging);
+            finish_interrupted(checkout, &staging);
             return Adoption::Own;
         }
         Ok(meta) if meta.is_file() => {}
         Ok(_) => return Adoption::Declined(".git is neither a directory nor a file".into()),
         Err(error) => return Adoption::Declined(format!("{}: {error}", dotgit.display())),
     }
-    let linked = match Linked::read(checkout) {
+    let linked = match Linked::read(checkout, &dotgit) {
         Ok(linked) => linked,
         Err(reason) => return Adoption::Declined(reason),
     };
     if let Some(busy) = linked.busy() {
         return Adoption::Declined(busy);
     }
+    if let Err(reason) = linked.store_keeps_objects() {
+        return Adoption::Declined(reason);
+    }
+    // A build an earlier attempt did not finish.
     remove_staging(&staging);
-    if let Err(reason) = linked.build(checkout, &staging, seat) {
+    if let Err(reason) = linked.build(checkout, &staging, seat, base) {
         remove_staging(&staging);
         return Adoption::Declined(reason);
     }
-    if let Err(error) = exchange(&dotgit, &staging) {
+    let keep = match linked.keep(checkout, &staging) {
+        Ok(keep) => keep,
+        Err(reason) => {
+            remove_staging(&staging);
+            return Adoption::Declined(reason);
+        }
+    };
+    if let Err(error) = sync_tree(&staging).and_then(|()| exchange(&dotgit, &staging)) {
         remove_staging(&staging);
+        let _ = store_git(&linked.common, None, &["update-ref", "-d", &keep]);
         return Adoption::Declined(format!("cannot exchange {}: {error}", dotgit.display()));
     }
-    remove_staging(&staging);
+    let _ = sync_dir(checkout);
+    if crash_after_exchange {
+        return Adoption::Converted;
+    }
     linked.release();
+    remove_staging(&staging);
     Adoption::Converted
+}
+
+/// After an exchange, the staging path holds the old `.git` pointer until
+/// the store has forgotten the registration. Finish that, then clear it.
+fn finish_interrupted(checkout: &Path, staging: &Path) {
+    if std::fs::symlink_metadata(staging).is_ok_and(|meta| meta.is_file())
+        && let Ok(linked) = Linked::read(checkout, staging)
+    {
+        linked.release();
+    }
+    remove_staging(staging);
 }
 
 /// Remove a checkout made for a creation that failed, and its registration
 /// in a shared store if it is still a linked worktree.
 pub(crate) fn discard(checkout: &Path) -> std::io::Result<()> {
-    if std::fs::symlink_metadata(checkout.join(".git")).is_ok_and(|m| m.is_file()) {
-        Linked::read(checkout)
+    let dotgit = checkout.join(".git");
+    if std::fs::symlink_metadata(&dotgit).is_ok_and(|m| m.is_file()) {
+        Linked::read(checkout, &dotgit)
             .map_err(std::io::Error::other)?
             .release();
     }
@@ -824,6 +942,44 @@ pub(crate) fn discard(checkout: &Path) -> std::io::Result<()> {
         Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
         _ => Ok(()),
     }
+}
+
+/// The store stops keeping a converted repository's borrowed objects. Called
+/// when that repository is removed; a no-op for any other checkout.
+pub(crate) fn forget(checkout: &Path) {
+    let Ok(name) = keep_ref(checkout) else {
+        return;
+    };
+    let Ok(alternates) = std::fs::read_to_string(checkout.join(".git/objects/info/alternates"))
+    else {
+        return;
+    };
+    for line in alternates.lines() {
+        if let Some(store) = Path::new(line.trim()).parent()
+            && store.join("HEAD").is_file()
+        {
+            let _ = store_git(store, None, &["update-ref", "-d", &name]);
+        }
+    }
+}
+
+/// The store ref that keeps a converted checkout's borrowed objects, named
+/// from the checkout's canonical path.
+fn keep_ref(checkout: &Path) -> Result<String, String> {
+    let path =
+        std::fs::canonicalize(checkout).map_err(|e| format!("{}: {e}", checkout.display()))?;
+    let mut cmd = hardened_git(None).map_err(|e| e.to_string())?;
+    cmd.args(["hash-object", "--stdin"]);
+    let out =
+        output_with_input(&mut cmd, &path.display().to_string()).map_err(|e| e.to_string())?;
+    let hex = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if !out.status.success() || hex.is_empty() {
+        return Err(format!(
+            "cannot name the keep ref of {}",
+            checkout.display()
+        ));
+    }
+    Ok(format!("refs/anyagents/keep/{hex}"))
 }
 
 fn remove_staging(staging: &Path) {
@@ -836,6 +992,28 @@ fn remove_staging(staging: &Path) {
         }
         Err(_) => {}
     }
+}
+
+/// Every file and directory of a tree on disk before it is exchanged in.
+fn sync_tree(root: &Path) -> std::io::Result<()> {
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
+                pending.push(entry.path());
+            } else if kind.is_file() {
+                std::fs::File::open(entry.path())?.sync_all()?;
+            }
+        }
+        sync_dir(&dir)?;
+    }
+    Ok(())
+}
+
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
 }
 
 /// Exchange two paths in one step, so a crash leaves either the old `.git`
@@ -887,7 +1065,7 @@ enum Head {
     Detached(String),
 }
 
-/// A checkout's registration in a shared store, read from its `.git` pointer
+/// A checkout's registration in a shared store, read from a `.git` pointer
 /// and accepted only when the registration names this checkout back.
 struct Linked {
     private: PathBuf,
@@ -896,22 +1074,21 @@ struct Linked {
 }
 
 impl Linked {
-    fn read(checkout: &Path) -> Result<Self, String> {
+    fn read(checkout: &Path, pointer_file: &Path) -> Result<Self, String> {
         use std::io::Read as _;
         use std::os::unix::fs::OpenOptionsExt as _;
-        let dotgit = checkout.join(".git");
         let mut text = String::new();
         std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(&dotgit)
+            .open(pointer_file)
             .and_then(|file| file.take(8193).read_to_string(&mut text))
-            .map_err(|e| format!("{}: {e}", dotgit.display()))?;
+            .map_err(|e| format!("{}: {e}", pointer_file.display()))?;
         let pointer = text
             .trim()
             .strip_prefix("gitdir: ")
             .filter(|_| text.len() <= 8192)
-            .ok_or_else(|| format!("{} is not a gitdir pointer", dotgit.display()))?;
+            .ok_or_else(|| format!("{} is not a gitdir pointer", pointer_file.display()))?;
         let canonical = |path: PathBuf| {
             std::fs::canonicalize(&path).map_err(|e| format!("{}: {e}", path.display()))
         };
@@ -921,7 +1098,7 @@ impl Linked {
                 .map(|text| text.trim().to_string())
                 .map_err(|e| format!("{}: {e}", private.join(name).display()))
         };
-        if canonical(private.join(line("gitdir")?))? != canonical(dotgit)? {
+        if canonical(private.join(line("gitdir")?))? != canonical(checkout.join(".git"))? {
             return Err(format!(
                 "{} is registered to another checkout",
                 private.display()
@@ -951,6 +1128,7 @@ impl Linked {
         })
     }
 
+    /// An operation in progress, or a worktree its owner locked.
     fn busy(&self) -> Option<String> {
         [
             "MERGE_HEAD",
@@ -963,10 +1141,33 @@ impl Linked {
             "index.lock",
             "HEAD.lock",
             "modules",
+            "locked",
         ]
         .into_iter()
         .find(|name| std::fs::symlink_metadata(self.private.join(name)).is_ok())
         .map(|name| format!("{name} in {}", self.private.display()))
+    }
+
+    /// The store will lend objects for good only if it never prunes.
+    fn store_keeps_objects(&self) -> Result<(), String> {
+        let get = |args: &[&str]| store_git(&self.common, None, args).unwrap_or_default();
+        let prune = get(&["config", "--get", "gc.pruneExpire"]);
+        let cruft = get(&["config", "--bool", "--get", "gc.cruftPacks"]);
+        if prune != "never" || cruft != "true" {
+            return Err(format!(
+                "{} may prune objects a converted repository borrows: set gc.pruneExpire=never \
+                 and gc.cruftPacks=true on it first",
+                self.common.display()
+            ));
+        }
+        Ok(())
+    }
+
+    fn branch(&self) -> Option<&str> {
+        match &self.head {
+            Head::Branch(name, _) => name.strip_prefix("refs/heads/"),
+            Head::Detached(_) => None,
+        }
     }
 
     fn oid(&self) -> &str {
@@ -980,6 +1181,7 @@ impl Linked {
         checkout: &Path,
         staging: &Path,
         seat: Option<(u32, u32)>,
+        base: Option<&str>,
     ) -> Result<(), String> {
         let before = status(seat, &self.private, checkout)?;
         let (c, s) = (&self.common, staging);
@@ -1001,7 +1203,7 @@ impl Linked {
             &s.join("objects/info/alternates"),
             format!("{}\n", objects.display()).as_bytes(),
         )?;
-        self.copy_config(s)?;
+        self.copy_config(s, base)?;
         self.copy_refs(s)?;
         for (from, to) in [
             (self.private.join("index"), s.join("index")),
@@ -1019,28 +1221,21 @@ impl Linked {
         if let Head::Branch(name, _) = &self.head {
             copy_if_present(&c.join("logs").join(name), &s.join("logs").join(name))?;
         }
-        // A split index keeps its shared part beside the index; hooks are
-        // the store's, copied so that this repository owns them.
-        let hooks = c.join("hooks");
-        for (from, to, wanted) in [
-            (self.private.as_path(), s.to_path_buf(), "sharedindex."),
-            (hooks.as_path(), s.join("hooks"), ""),
-        ] {
-            let Ok(entries) = std::fs::read_dir(from) else {
-                continue;
-            };
+        // A split index keeps its shared part beside the index.
+        if let Ok(entries) = std::fs::read_dir(&self.private) {
             for entry in entries.flatten() {
-                let name = entry.file_name();
-                let text = name.to_string_lossy();
-                if text.starts_with(wanted)
-                    && !text.ends_with(".sample")
-                    && entry.file_type().is_ok_and(|t| t.is_file())
+                if entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("sharedindex.")
                 {
-                    copy_if_present(&entry.path(), &to.join(&name))?;
+                    copy_if_present(&entry.path(), &s.join(entry.file_name()))?;
                 }
             }
         }
-        // Objects only this checkout reaches leave the shared store's keeping.
+        copy_hooks(&c.join("hooks"), &s.join("hooks"))?;
+        // Objects only this checkout reaches leave the store's keeping:
+        // unpushed and reflog-only commits, and blobs only the index names.
         let mine = store_git(
             s,
             Some(checkout),
@@ -1048,6 +1243,7 @@ impl Linked {
                 "rev-list",
                 "--objects",
                 "--indexed-objects",
+                "--reflog",
                 "HEAD",
                 "--not",
                 "--remotes",
@@ -1090,8 +1286,10 @@ impl Linked {
     }
 
     /// The store's configuration, without the settings of other checkouts'
-    /// branches, then this checkout's own `config.worktree` over it.
-    fn copy_config(&self, staging: &Path) -> Result<(), String> {
+    /// branches, then this checkout's own `config.worktree` over it, and a
+    /// fetch refspec for this checkout's branch and base, so a plain
+    /// `git fetch origin` refreshes both.
+    fn copy_config(&self, staging: &Path, base: Option<&str>) -> Result<(), String> {
         let list = |file: &Path| -> Result<Vec<(String, String)>, String> {
             if !file.exists() {
                 return Ok(Vec::new());
@@ -1125,15 +1323,25 @@ impl Linked {
         if worktree_config {
             pairs.extend(list(&self.private.join("config.worktree"))?);
         }
-        let branch = match &self.head {
-            Head::Branch(name, _) => name.strip_prefix("refs/heads/"),
-            Head::Detached(_) => None,
-        };
+        let branch = self.branch();
         let target = staging.join("config");
+        let mut fetch = Vec::new();
+        let mut origin = false;
+        let mut upstream = None;
         for (key, value) in pairs {
             let (section, rest) = key.split_once('.').unwrap_or((&key, ""));
             let (subsection, variable) = rest.rsplit_once('.').unwrap_or(("", rest));
-            let keep = match section.to_ascii_lowercase().as_str() {
+            let section = section.to_ascii_lowercase();
+            if section == "remote" && subsection == "origin" {
+                origin |= variable == "url";
+                if variable == "fetch" {
+                    fetch.push(value.clone());
+                }
+            }
+            if section == "branch" && Some(subsection) == branch && variable == "merge" {
+                upstream = value.strip_prefix("refs/heads/").map(str::to_string);
+            }
+            let keep = match section.as_str() {
                 "core" => !matches!(variable, "bare" | "worktree" | "repositoryformatversion"),
                 "extensions" | "include" | "includeif" | "safe" => false,
                 "branch" => Some(subsection) == branch,
@@ -1149,6 +1357,32 @@ impl Linked {
                     value.as_ref(),
                 ])?;
             }
+        }
+        if !origin || fetch.iter().any(|spec| spec.contains("refs/heads/*")) {
+            return Ok(());
+        }
+        // A glob, never an exact refspec: a branch not pushed yet, or since
+        // deleted upstream, would make every `git fetch origin` fail.
+        let wanted = [
+            branch.map(str::to_string),
+            base.map(str::to_string),
+            upstream,
+        ];
+        for name in wanted.into_iter().flatten() {
+            let exact = format!("+refs/heads/{name}:refs/remotes/origin/{name}");
+            let glob = format!("+refs/heads/{name}*:refs/remotes/origin/{name}*");
+            if fetch.contains(&exact) || fetch.contains(&glob) || !valid_branch(&name) {
+                continue;
+            }
+            plain_git(&[
+                "config".as_ref(),
+                "--file".as_ref(),
+                target.as_os_str(),
+                "--add".as_ref(),
+                "remote.origin.fetch".as_ref(),
+                glob.as_ref(),
+            ])?;
+            fetch.push(glob);
         }
         Ok(())
     }
@@ -1200,6 +1434,59 @@ impl Linked {
         .map(drop)
     }
 
+    /// Point the store's keep ref for this checkout at one commit whose
+    /// parents are every commit the new repository's refs reach today, so the
+    /// store holds them however its own refs move. Returns the ref.
+    fn keep(&self, checkout: &Path, staging: &Path) -> Result<String, String> {
+        let listed = store_git(
+            staging,
+            None,
+            &[
+                "for-each-ref",
+                "--format=%(objecttype) %(objectname) %(*objecttype) %(*objectname)",
+            ],
+        )?;
+        let mut parents = vec![self.oid().to_string()];
+        for line in listed.lines() {
+            let fields: Vec<&str> = line.split(' ').collect();
+            let commit = match fields.as_slice() {
+                ["commit", oid, ..] => Some(*oid),
+                ["tag", _, "commit", peeled] => Some(*peeled),
+                _ => None,
+            };
+            if let Some(oid) = commit
+                && !parents.iter().any(|known| known == oid)
+            {
+                parents.push(oid.to_string());
+            }
+        }
+        let mut tree = store_command(&self.common, None).map_err(|e| e.to_string())?;
+        tree.arg("mktree");
+        let tree = output_with_input(&mut tree, "").map_err(|e| e.to_string())?;
+        let tree = String::from_utf8_lossy(&tree.stdout).trim().to_string();
+        let message = format!(
+            "anyagents: keep what {} borrows from this store",
+            checkout.display()
+        );
+        let mut args = vec![
+            "-c",
+            "user.name=AnyAgents",
+            "-c",
+            "user.email=anyagents@localhost",
+            "commit-tree",
+            &tree,
+            "-m",
+            &message,
+        ];
+        for parent in &parents {
+            args.extend(["-p", parent.as_str()]);
+        }
+        let commit = store_git(&self.common, None, &args)?;
+        let name = keep_ref(checkout)?;
+        store_git(&self.common, None, &["update-ref", &name, &commit])?;
+        Ok(name)
+    }
+
     /// The store forgets this checkout: its registration goes, and its branch
     /// too when another ref still holds every commit and no other checkout
     /// has it out. A failure here only leaves the store fuller.
@@ -1243,6 +1530,52 @@ impl Linked {
     }
 }
 
+/// The store's hooks, made this repository's own. A linked hook stays a
+/// link, to the same absolute target.
+fn copy_hooks(from: &Path, to: &Path) -> Result<(), String> {
+    let Ok(entries) = std::fs::read_dir(from) else {
+        return Ok(());
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if name.to_string_lossy().ends_with(".sample") {
+            continue;
+        }
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_symlink() {
+            let target = std::fs::read_link(entry.path())
+                .map_err(|e| format!("{}: {e}", entry.path().display()))?;
+            let target = if target.is_absolute() {
+                target
+            } else {
+                from.join(target)
+            };
+            std::fs::create_dir_all(to).map_err(|e| format!("{}: {e}", to.display()))?;
+            std::os::unix::fs::symlink(&target, to.join(&name))
+                .map_err(|e| format!("{}: {e}", to.join(&name).display()))?;
+        } else if kind.is_file() {
+            copy_if_present(&entry.path(), &to.join(&name))?;
+        }
+    }
+    Ok(())
+}
+
+/// A branch name Git would accept, checked without running anything.
+fn valid_branch(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with(['-', '/', '.'])
+        && !name.ends_with(['/', '.'])
+        && !name.ends_with(".lock")
+        && !name.contains("..")
+        && !name.contains("//")
+        && !name.contains("@{")
+        && name
+            .bytes()
+            .all(|b| b > b' ' && b != 0x7f && !b"~^:?*[\\".contains(&b))
+}
+
 fn write_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
@@ -1250,18 +1583,24 @@ fn write_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
     std::fs::write(path, bytes).map_err(|e| format!("{}: {e}", path.display()))
 }
 
+/// Copy a regular file with its modification time. The index needs it:
+/// Git rechecks an entry's content only while the entry is no older than the
+/// index file, so a newer copy would hide a same-size edit made within the
+/// same timestamp.
 fn copy_if_present(from: &Path, to: &Path) -> Result<(), String> {
-    match std::fs::symlink_metadata(from) {
-        Ok(meta) if meta.is_file() => {}
+    let modified = match std::fs::symlink_metadata(from) {
+        Ok(meta) if meta.is_file() => meta.modified(),
         Ok(_) => return Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(format!("{}: {error}", from.display())),
     }
+    .map_err(|e| format!("{}: {e}", from.display()))?;
     if let Some(parent) = to.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
     }
     std::fs::copy(from, to)
-        .map(drop)
+        .and_then(|_| std::fs::OpenOptions::new().write(true).open(to))
+        .and_then(|file| file.set_modified(modified))
         .map_err(|e| format!("{} -> {}: {e}", from.display(), to.display()))
 }
 
@@ -2545,6 +2884,9 @@ pub(crate) mod tests {
                 ],
             );
             git(&source, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+            // A store that lends objects never prunes them.
+            git(&source, &["config", "gc.pruneExpire", "never"]);
+            git(&source, &["config", "gc.cruftPacks", "true"]);
             // The provider owns sparse checkout and hooks; AnyAgents adopts
             // its result and must neither reimplement nor lose that policy.
             write_executable(
@@ -2646,9 +2988,18 @@ esac
             git(&local, &["rev-parse", "HEAD"]),
             git(&f.source, &["rev-parse", "HEAD"])
         );
-        // Each branch was released from the store: no commit is only there.
+        // Each branch was released from the store, which keeps what each
+        // repository borrows under one keep ref apiece instead.
         let branches = git(&f.source, &["branch", "--format=%(refname:short)"]);
         assert!(!branches.contains("remote-work") && !branches.contains("local-work"));
+        let keeps = git(
+            &f.source,
+            &["for-each-ref", "--format=%(refname)", "refs/anyagents/keep"],
+        );
+        assert_eq!(keeps.lines().count(), 2, "{keeps}");
+        for target in [&remote, &local] {
+            assert!(keeps.contains(&keep_ref(target).unwrap()));
+        }
         let log = std::fs::read_to_string(&f.log).unwrap();
         assert!(log.contains("fetch ExampleOrg/demo main"));
         assert!(log.contains("fetch ExampleOrg/demo refs/heads/main"));
@@ -3004,6 +3355,15 @@ esac
         );
     }
 
+    /// Adopt, failing with the reason when it declines.
+    fn converted(checkout: &Path) {
+        match adopt(checkout, None) {
+            Adoption::Converted => {}
+            Adoption::Own => panic!("{} was already an own repository", checkout.display()),
+            Adoption::Declined(reason) => panic!("declined: {reason}"),
+        }
+    }
+
     /// A store with a linked worktree that holds every kind of local work.
     struct Legacy {
         hub: PathBuf,
@@ -3026,6 +3386,8 @@ esac
         );
         git(&hub, &["config", "user.name", "Store Owner"]);
         git(&hub, &["config", "branch.someone-else.remote", "origin"]);
+        git(&hub, &["config", "gc.pruneExpire", "never"]);
+        git(&hub, &["config", "gc.cruftPacks", "true"]);
         std::fs::write(hub.join(".git/info/exclude"), "*.log\n").unwrap();
         write_executable(&hub.join(".git/hooks/pre-push"), "#!/bin/sh\nexit 0\n");
         let work = dir.join("work");
@@ -3053,6 +3415,9 @@ esac
             ],
         );
         git(&work, &["sparse-checkout", "set", "src"]);
+        // A commit only the reflog still names: abandoned with a reset.
+        committer(&work, &["commit", "-q", "--allow-empty", "-m", "Abandoned"]);
+        git(&work, &["reset", "-q", "--hard", "HEAD~1"]);
         committer(&work, &["commit", "-q", "--allow-empty", "-m", "Unpushed"]);
         std::fs::write(work.join("src/staged"), "staged only\n").unwrap();
         git(&work, &["add", "src/staged"]);
@@ -3105,7 +3470,7 @@ esac
         let before_head = git(&l.work, &["rev-parse", "HEAD"]);
         let before_files = tree_bytes(&l.work);
         let before_sibling = git(&l.sibling, &["rev-parse", "HEAD"]);
-        assert!(matches!(adopt(&l.work, None), Adoption::Converted));
+        converted(&l.work);
         assert!(l.work.join(".git").is_dir());
         assert!(!l.work.join(ADOPT_STAGING).exists());
         assert!(
@@ -3139,19 +3504,277 @@ esac
             git(&l.work, &["diff", "--cached", "--name-only"]),
             "src/staged"
         );
-        // The sibling and the store's history are untouched; the unpushed
-        // branch stays in the store too, since only it holds that commit.
+        // The sibling is untouched. The store keeps what the new repository
+        // borrows under its keep ref, so the branch is released.
         assert_eq!(git(&l.sibling, &["rev-parse", "HEAD"]), before_sibling);
-        assert!(git(&l.hub, &["branch"]).contains("agent/w"));
-        // Even a store that prunes everything only its own refs reach cannot
-        // take this checkout's work any more.
-        git(&l.hub, &["branch", "-D", "agent/w"]);
+        assert!(!git(&l.hub, &["branch"]).contains("agent/w"));
+        let keep = keep_ref(&l.work).unwrap();
+        assert!(
+            git(
+                &l.hub,
+                &["merge-base", "--is-ancestor", &before_head, &keep]
+            )
+            .is_empty(),
+            "the keep ref does not hold HEAD"
+        );
+        // Unpushed, staged and reflog-only work is the repository's own:
+        // a store pruning everything but its remote-tracking refs cannot
+        // take it.
+        let abandoned = git(&l.work, &["log", "-g", "--format=%H %s", "HEAD"])
+            .lines()
+            .find_map(|line| line.strip_suffix(" Abandoned").map(str::to_string))
+            .expect("the reflog keeps the abandoned commit");
+        forget(&l.work);
+        assert!(git(&l.hub, &["for-each-ref", &keep]).is_empty());
         git(&l.hub, &["reflog", "expire", "--expire=now", "--all"]);
         git(&l.hub, &["gc", "-q", "--prune=now"]);
         git(&l.work, &["fsck", "--connectivity-only", "--no-progress"]);
         assert_eq!(git(&l.work, &["rev-parse", "HEAD"]), before_head);
         assert_eq!(git(&l.work, &["show", ":src/staged"]), "staged only");
+        git(
+            &l.work,
+            &["cat-file", "-e", &format!("{abandoned}^{{commit}}")],
+        );
         assert!(matches!(adopt(&l.work, None), Adoption::Own));
+    }
+
+    /// The review's repro: a converted checkout borrows its base from the
+    /// store. Upstream rewrites the base, the store refetches, expires its
+    /// reflogs and prunes everything unreachable now; the keep ref still
+    /// holds the base, so the repository stays whole and can push. Its fetch
+    /// refspec covers the base, so a plain `git fetch origin` sees the rewrite.
+    #[test]
+    fn a_converted_repository_survives_its_base_moving_and_the_store_pruning() {
+        let dir = tempfile::tempdir().unwrap();
+        let remote = seed_remote(dir.path());
+        let seed = dir.path().join("seed");
+        git(&seed, &["checkout", "-q", "-b", "feat"]);
+        std::fs::write(seed.join("f"), "feat\n").unwrap();
+        git(&seed, &["add", "f"]);
+        committer(&seed, &["commit", "-qm", "feat v1"]);
+        git(&seed, &["push", "-q", remote.to_str().unwrap(), "feat"]);
+        let hub = dir.path().join("hub");
+        git(
+            dir.path(),
+            &[
+                "clone",
+                "-q",
+                "--single-branch",
+                "-b",
+                "main",
+                remote.to_str().unwrap(),
+                hub.to_str().unwrap(),
+            ],
+        );
+        git(
+            &hub,
+            &[
+                "fetch",
+                "-q",
+                "origin",
+                "+refs/heads/feat:refs/remotes/origin/feat",
+            ],
+        );
+        let work = dir.path().join("work");
+        git(
+            &hub,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "agent/w",
+                work.to_str().unwrap(),
+                "origin/feat",
+            ],
+        );
+        // A store that may prune is refused, and nothing changes.
+        assert!(
+            matches!(adopt(&work, None), Adoption::Declined(ref why) if why.contains("gc.pruneExpire"))
+        );
+        assert!(work.join(".git").is_file());
+        git(&hub, &["config", "gc.pruneExpire", "never"]);
+        git(&hub, &["config", "gc.cruftPacks", "true"]);
+        // As at a provider spawn, which knows the base it asked for.
+        match adopt_from(&work, None, Some("feat"), false) {
+            Adoption::Converted => {}
+            Adoption::Declined(reason) => panic!("declined: {reason}"),
+            Adoption::Own => panic!("already own"),
+        }
+        std::fs::write(work.join("mine"), "mine\n").unwrap();
+        git(&work, &["add", "mine"]);
+        committer(&work, &["commit", "-qm", "unpushed"]);
+        let v1 = git(&work, &["rev-parse", "origin/feat"]);
+        // Upstream rewrites feat; the store refetches, its reflog goes, and it
+        // prunes now, overriding its own never.
+        committer(&seed, &["commit", "-q", "--amend", "-m", "feat v2"]);
+        git(&seed, &["push", "-qf", remote.to_str().unwrap(), "feat"]);
+        git(
+            &hub,
+            &[
+                "fetch",
+                "-q",
+                "origin",
+                "+refs/heads/feat:refs/remotes/origin/feat",
+            ],
+        );
+        git(
+            &hub,
+            &["reflog", "expire", "--expire-unreachable=now", "--all"],
+        );
+        git(&hub, &["gc", "-q", "--prune=now"]);
+        git(&work, &["fsck", "--connectivity-only", "--no-progress"]);
+        git(&work, &["log", "--oneline"]);
+        git(&work, &["push", "-q", remote.to_str().unwrap(), "agent/w"]);
+        // A plain fetch refreshes the base.
+        git(&work, &["fetch", "-q", "origin"]);
+        let v2 = git(&work, &["rev-parse", "origin/feat"]);
+        assert_ne!(v1, v2);
+        assert_eq!(v2, git(&remote, &["rev-parse", "feat"]));
+        let specs = git(&work, &["config", "--get-all", "remote.origin.fetch"]);
+        assert!(specs.contains("refs/heads/feat*"), "{specs}");
+        assert!(specs.contains("refs/heads/agent/w*"), "{specs}");
+    }
+
+    /// A conversion that crashed after the exchange is finished by the next
+    /// call: the store forgets the registration and the old pointer goes.
+    #[test]
+    fn an_interrupted_conversion_is_finished_on_the_next_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let l = legacy(dir.path());
+        let head = git(&l.work, &["rev-parse", "HEAD"]);
+        assert!(matches!(
+            adopt_from(&l.work, None, None, true),
+            Adoption::Converted
+        ));
+        assert!(l.work.join(".git").is_dir());
+        assert!(
+            l.work.join(ADOPT_STAGING).is_file(),
+            "no pointer to finish from"
+        );
+        assert!(l.private.exists());
+        assert!(matches!(adopt(&l.work, None), Adoption::Own));
+        assert!(
+            !l.private.exists(),
+            "the store still registers the checkout"
+        );
+        assert!(!l.work.join(ADOPT_STAGING).exists());
+        assert!(!git(&l.hub, &["worktree", "list"]).contains(l.work.to_str().unwrap()));
+        assert_eq!(git(&l.work, &["rev-parse", "HEAD"]), head);
+        // A forged leftover pointer at another registration releases nothing.
+        std::fs::copy(l.sibling.join(".git"), l.work.join(ADOPT_STAGING)).unwrap();
+        assert!(matches!(adopt(&l.work, None), Adoption::Own));
+        assert!(l.sibling.join(".git").is_file());
+        assert!(git(&l.hub, &["worktree", "list"]).contains(l.sibling.to_str().unwrap()));
+        assert!(!l.work.join(ADOPT_STAGING).exists());
+    }
+
+    /// A staging directory an earlier attempt left behind is cleared, and the
+    /// conversion goes ahead.
+    #[test]
+    fn a_leftover_staging_directory_is_cleared_on_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let l = legacy(dir.path());
+        let staging = l.work.join(ADOPT_STAGING);
+        std::fs::create_dir_all(staging.join("objects/info")).unwrap();
+        std::fs::write(staging.join("HEAD"), "junk\n").unwrap();
+        std::fs::write(staging.join("objects/info/alternates"), "/nonexistent\n").unwrap();
+        converted(&l.work);
+        assert!(!staging.exists());
+        git(&l.work, &["fsck", "--connectivity-only", "--no-progress"]);
+    }
+
+    /// A worktree its owner locked is left alone.
+    #[test]
+    fn a_locked_worktree_is_not_converted() {
+        let dir = tempfile::tempdir().unwrap();
+        let l = legacy(dir.path());
+        git(&l.hub, &["worktree", "lock", l.work.to_str().unwrap()]);
+        assert!(
+            matches!(adopt(&l.work, None), Adoption::Declined(ref why) if why.contains("locked"))
+        );
+        assert!(l.work.join(".git").is_file());
+        assert!(l.private.join("locked").exists());
+    }
+
+    /// A store hook that is a link stays a link to the same file, absolute
+    /// or relative, and still runs.
+    #[test]
+    fn linked_hooks_are_carried_over_as_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let l = legacy(dir.path());
+        let script = dir.path().join("shared-hook");
+        write_executable(&script, "#!/bin/sh\nexit 0\n");
+        let hooks = l.hub.join(".git/hooks");
+        std::os::unix::fs::symlink(&script, hooks.join("pre-commit")).unwrap();
+        write_executable(&hooks.join("real-commit-msg"), "#!/bin/sh\nexit 0\n");
+        std::os::unix::fs::symlink("real-commit-msg", hooks.join("commit-msg")).unwrap();
+        converted(&l.work);
+        let own = l.work.join(".git/hooks");
+        assert_eq!(std::fs::read_link(own.join("pre-commit")).unwrap(), script);
+        // The same file, however the platform spells its temporary root
+        // (macOS: /var is /private/var).
+        let target = std::fs::read_link(own.join("commit-msg")).unwrap();
+        assert!(target.is_absolute(), "{}", target.display());
+        assert_eq!(
+            std::fs::canonicalize(target).unwrap(),
+            std::fs::canonicalize(hooks.join("real-commit-msg")).unwrap()
+        );
+        committer(
+            &l.work,
+            &["commit", "-q", "--allow-empty", "-m", "hooks run"],
+        );
+    }
+
+    /// Syncing a staging tree reaches every file and directory and never
+    /// follows a link out of it.
+    #[test]
+    fn syncing_a_tree_skips_links() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("a/b")).unwrap();
+        std::fs::write(dir.path().join("a/b/file"), "x").unwrap();
+        std::os::unix::fs::symlink("/nonexistent", dir.path().join("a/dangling")).unwrap();
+        sync_tree(dir.path()).unwrap();
+    }
+
+    /// A same-size edit made within the index's own timestamp is visible to
+    /// Git only because the entry is racily clean. The converted index keeps
+    /// that timestamp, so the edit stays visible instead of reading as clean.
+    #[test]
+    fn a_racily_clean_edit_stays_visible_after_conversion() {
+        let dir = tempfile::tempdir().unwrap();
+        let l = legacy(dir.path());
+        // Only timestamps decide, as on a filesystem without usable ctime.
+        git(&l.hub, &["config", "core.trustctime", "false"]);
+        let debug = git(&l.work, &["ls-files", "--debug", "src/keep"]);
+        let (sec, nsec) = debug
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("mtime: "))
+            .and_then(|stamp| stamp.split_once(':'))
+            .map(|(s, n)| (s.parse::<u64>().unwrap(), n.parse::<u32>().unwrap()))
+            .unwrap();
+        let stamp = std::time::UNIX_EPOCH + std::time::Duration::new(sec, nsec);
+        for path in [l.work.join("src/keep"), l.private.join("index")] {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(stamp)
+                .unwrap();
+        }
+        let status = |dir: &Path| git(dir, &["--no-optional-locks", "status", "--porcelain"]);
+        assert!(
+            status(&l.work)
+                .lines()
+                .any(|line| line.trim() == "M src/keep")
+        );
+        converted(&l.work);
+        assert!(
+            status(&l.work)
+                .lines()
+                .any(|line| line.trim() == "M src/keep"),
+            "the edit reads as clean"
+        );
     }
 
     /// A checkout in the middle of an operation is left exactly as it is.

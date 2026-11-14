@@ -37,6 +37,7 @@ use crate::operator;
 use crate::vendor::{self, HarnessHost, VendorHarness};
 
 mod file_cache;
+mod hybrid;
 #[cfg(test)]
 mod latency_tests;
 mod memory_backlog;
@@ -156,6 +157,43 @@ fn capability_key() -> Result<String, Error> {
     std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
+
+/// Index host history in the background: what searches left for later,
+/// sources due for full verification, and a pre-warm pass over every agent
+/// after the daemon starts. It runs on its own thread at the lowest CPU and
+/// I/O priority, so it reads only when nothing else wants the machine.
+fn start_host_history_indexer(store: Arc<Store>) {
+    let spawned = std::thread::Builder::new()
+        .name("host-history".into())
+        .spawn(move || {
+            lower_this_thread_priority();
+            // Let the daemon finish starting before the pre-warm pass reads.
+            std::thread::sleep(std::time::Duration::from_secs(60));
+            store.run_host_history_indexer();
+        });
+    if let Err(error) = spawned {
+        eprintln!("anyagents-host-history: background indexer not started: {error}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn lower_this_thread_priority() {
+    const IOPRIO_WHO_PROCESS: libc::c_long = 1;
+    const IOPRIO_CLASS_IDLE: libc::c_long = 3;
+    // SAFETY: plain syscalls that lower only the calling thread's priority.
+    unsafe {
+        let tid = libc::syscall(libc::SYS_gettid);
+        libc::setpriority(libc::PRIO_PROCESS, tid as libc::id_t, 19);
+        libc::syscall(
+            libc::SYS_ioprio_set,
+            IOPRIO_WHO_PROCESS,
+            tid,
+            IOPRIO_CLASS_IDLE << 13,
+        );
+    }
+}
+#[cfg(not(target_os = "linux"))]
+fn lower_this_thread_priority() {}
 
 fn acquire_server_lock(data: &Path) -> Result<std::fs::File, Error> {
     std::fs::create_dir_all(data)?;
@@ -315,6 +353,7 @@ async fn serve(
     if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none() && !crate::sandbox::is_isolated_test_env()
     {
         quota_rotation::start(Arc::clone(&store));
+        start_host_history_indexer(Arc::clone(&store));
         let memory_backlog = memory_backlog::start(&store);
         let reaper_root = data.to_path_buf();
         let reaper_store = Arc::clone(&store);
@@ -1647,6 +1686,9 @@ async fn whoami(
                     "name": name,
                     "workdir": workdir,
                     "harness": harness,
+                    // The `code` limits come from this server's environment
+                    // only, never from a file an agent could write.
+                    "code_limits": crate::mcp::CodeLimits::from_env(),
                 })))
             })
             .await
@@ -2115,21 +2157,38 @@ async fn transfer_agent_route(
     .await
 }
 
+/// Unused fields arrive as `null` or `"null"`; both are absent.
 #[derive(Deserialize, Default)]
 struct ScheduleRequest {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::api::absent_if_null")]
     action: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::api::absent_if_null")]
     at: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::api::absent_if_null")]
     every: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::api::absent_if_null")]
     watch: Option<String>,
-    #[serde(default)]
+    /// A trigger value or mode under a generic name; see
+    /// `schedule::resolve_schedule_call`.
+    #[serde(
+        default,
+        alias = "kind",
+        deserialize_with = "crate::api::absent_if_null"
+    )]
+    spec: Option<String>,
+    #[serde(default, deserialize_with = "crate::api::absent_if_null")]
     prompt: Option<String>,
-    #[serde(default, alias = "schedule_id")]
+    #[serde(
+        default,
+        alias = "schedule_id",
+        deserialize_with = "crate::api::absent_if_null"
+    )]
     id: Option<String>,
-    #[serde(default, alias = "name")]
+    #[serde(
+        default,
+        alias = "name",
+        deserialize_with = "crate::api::absent_if_null"
+    )]
     agent: Option<String>,
 }
 
@@ -2249,28 +2308,28 @@ async fn self_schedules_action_route(
 async fn handle_schedule_action(
     principal: Principal,
     state: AppState,
-    body: ScheduleRequest,
+    mut body: ScheduleRequest,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    use crate::schedule::ScheduleVerb;
     spawn_store(move || {
-        let has_spec = body.at.as_deref().is_some_and(|s| !s.trim().is_empty())
-            || body.every.as_deref().is_some_and(|s| !s.trim().is_empty())
-            || body.watch.as_deref().is_some_and(|s| !s.trim().is_empty());
-        let action = body
-            .action
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or(if has_spec {
-                "create"
-            } else if body.id.is_some() {
-                "cancel"
-            } else {
-                "list"
-            })
-            .to_ascii_lowercase();
+        let mut trigger = crate::schedule::ScheduleTrigger {
+            at: body.at.take(),
+            every: body.every.take(),
+            watch: body.watch.take(),
+            spec: body.spec.take(),
+        };
+        let verb = crate::schedule::resolve_schedule_call(
+            body.action.as_deref(),
+            &mut trigger,
+            body.id.is_some(),
+        )
+        .map_err(|msg| ApiError::new(StatusCode::BAD_REQUEST, msg))?;
+        body.at = trigger.at;
+        body.every = trigger.every;
+        body.watch = trigger.watch;
 
-        match action.as_str() {
-            "list" | "ls" => {
+        match verb {
+            ScheduleVerb::List => {
                 if matches!(principal, Principal::Operator) && body.agent.is_none() {
                     let schedules: Vec<crate::api::ScheduleView> = state
                         .store
@@ -2296,7 +2355,7 @@ async fn handle_schedule_action(
                     "schedules": schedules,
                 })))
             }
-            "create" | "set" | "add" | "schedule" => {
+            ScheduleVerb::Create => {
                 let target =
                     authorize_schedule_target(&state.store, &principal, body.agent.as_deref())?;
                 let prompt = body.prompt.as_deref().unwrap_or("");
@@ -2324,7 +2383,7 @@ async fn handle_schedule_action(
                     "schedules": schedules,
                 })))
             }
-            "cancel" | "delete" | "remove" | "clear" | "off" | "pause" | "disable" | "stop" => {
+            ScheduleVerb::Cancel => {
                 let target =
                     authorize_schedule_target(&state.store, &principal, body.agent.as_deref())?;
                 let id_or_all = body
@@ -2352,12 +2411,6 @@ async fn handle_schedule_action(
                     "schedules": schedules,
                 })))
             }
-            other => Err(ApiError::new(
-                StatusCode::BAD_REQUEST,
-                format!(
-                    "unknown schedule action `{other}`; expected `create`, `list`, or `cancel`"
-                ),
-            )),
         }
     })
     .await
@@ -3151,8 +3204,8 @@ fn conversation_visibility(
                 .map_err(ApiError::from_store)?;
             if !visible_ids.contains(&target.id) {
                 return Err(ApiError::forbidden(format!(
-                    "agent `{}` cannot read private conversation history of `{}`",
-                    caller.name, target.name
+                    "agent `{}` cannot read private conversation history of `{}`; your own messages with it are in your history: `conversation({{with: \"{}\"}})`",
+                    caller.name, target.name, target.name
                 )));
             }
             Ok((target.name, Some(vec![target.id.to_string()])))
@@ -3583,9 +3636,13 @@ impl<'a> RosterCaller<'a> {
             self.is_self_or_ancestor(ancestor, target)
         }));
         view.can_message = Some(
-            can_sender_message_agent_with(self.store, self.caller, agent, || {
-                self.sharing.contains(&agent.id)
-            })
+            can_sender_message_agent_with(
+                self.store,
+                self.caller,
+                agent,
+                || self.sharing.contains(&agent.id),
+                || self.is_self_or_ancestor(&self.caller.id, agent),
+            )
             .is_ok(),
         );
         // [`can_actor_read_agent_private`] for this caller.
@@ -4809,6 +4866,8 @@ fn reap_subagent_ephemeral_dirs_in(
             }
         }
         if dotgit.symlink_metadata().is_ok() && is_git_worktree_safe_to_reap(&work_dir, seat) {
+            // The store's keep ref for this repository goes with it.
+            crate::repo::forget(&work_dir);
             complete &= remove_path_with_seat(&work_dir, seat_ids);
             let _ = std::fs::remove_file(&marker_path);
             continue;
@@ -4925,16 +4984,20 @@ pub(crate) fn reap_build_outputs_in_worktree(
 }
 
 /// A checkout may go only when it is the agent's own repository, its status
-/// is clean, and every commit of HEAD and its local branches is on a
-/// remote-tracking ref. Git reads it as the agent's seat.
+/// is clean, and the remote holds everything else it has: no stash, no tag or
+/// note the remote lacks, and no commit (of HEAD, a branch, a tag, a note or
+/// any other ref but remote-tracking ones) that no advertised ref reaches.
+/// The proof is the remote's own answer, asked by the server; a checkout it
+/// cannot ask about stays. Git reads the checkout as the agent's seat.
 pub(crate) fn is_git_worktree_safe_to_reap(wt_path: &Path, seat: Option<(u32, u32)>) -> bool {
     // Only a `.git` directory: a pointer could name any other repository.
-    if !std::fs::symlink_metadata(wt_path.join(".git")).is_ok_and(|meta| meta.is_dir()) {
+    let git_dir = wt_path.join(".git");
+    if !std::fs::symlink_metadata(&git_dir).is_ok_and(|meta| meta.is_dir()) {
         return false;
     }
+    let git = || crate::repo::inspect_command(seat, &git_dir, Some(wt_path));
     let output = |args: &[&str]| {
-        crate::repo::inspect_command(seat, &wt_path.join(".git"), Some(wt_path))
-            .and_then(|mut cmd| cmd.args(args).stdin(std::process::Stdio::null()).output())
+        git().and_then(|mut cmd| cmd.args(args).stdin(std::process::Stdio::null()).output())
     };
     let Ok(status_out) = output(&["status", "--porcelain", "--untracked-files=normal"]) else {
         return false;
@@ -4963,19 +5026,50 @@ pub(crate) fn is_git_worktree_safe_to_reap(wt_path: &Path, seat: Option<(u32, u3
     if has_substantive_dirty {
         return false;
     }
-    // Require HEAD and every local branch history to be covered by at least
-    // one remote-tracking ref, including detached HEAD and branches not
-    // currently checked out. The refs are the agent's own: this is a
-    // cleanliness check, not a publication proof.
-    output(&[
+    let Ok(local) = output(&[
+        "for-each-ref",
+        "--format=%(objectname) %(refname)",
+        "refs/stash",
+        "refs/tags",
+        "refs/notes",
+    ]) else {
+        return false;
+    };
+    if !local.status.success() {
+        return false;
+    }
+    let Some(advertised) = crate::repo::published(wt_path, seat) else {
+        return false;
+    };
+    for line in String::from_utf8_lossy(&local.stdout).lines() {
+        let Some((oid, name)) = line.split_once(' ') else {
+            return false;
+        };
+        if name == "refs/stash"
+            || !advertised
+                .iter()
+                .any(|(remote_oid, remote_name)| remote_oid == oid && remote_name == name)
+        {
+            return false;
+        }
+    }
+    let covered: String = advertised
+        .iter()
+        .map(|(oid, _)| format!("^{oid}\n"))
+        .collect();
+    let Ok(mut unpublished) = git() else {
+        return false;
+    };
+    unpublished.args([
         "rev-list",
-        "HEAD",
-        "--branches",
-        "--not",
-        "--remotes",
         "--count",
-    ])
-    .is_ok_and(|out| out.status.success() && out.stdout == b"0\n")
+        "--exclude=refs/remotes/*",
+        "--all",
+        "--ignore-missing",
+        "--stdin",
+    ]);
+    crate::repo::output_with_input(&mut unpublished, &covered)
+        .is_ok_and(|out| out.status.success() && out.stdout == b"0\n")
 }
 
 #[cfg(unix)]
@@ -5736,6 +5830,7 @@ async fn conversation_route(
                     seq: 1,
                 };
                 return Ok(Json(ConversationResponse {
+                    retrieval: None,
                     agent: target.name.clone(),
                     agent_id: target.id.to_string(),
                     turns: vec![ConversationTurnView {
@@ -5872,6 +5967,7 @@ async fn conversation_route(
                 }
             };
             return Ok(Json(ConversationResponse {
+                retrieval: None,
                 agent: target.name,
                 agent_id: target.id.to_string(),
                 turns: vec![turn],
@@ -5956,6 +6052,7 @@ async fn conversation_route(
                 .agent_by_name(&hit.metadata.agent_id)
                 .map_err(ApiError::from_store)?;
             return Ok(Json(ConversationResponse {
+                retrieval: None,
                 agent: agent.name,
                 agent_id: agent.id.to_string(),
                 turns: vec![ConversationTurnView {
@@ -6053,14 +6150,72 @@ async fn conversation_route(
         let should_search_host_files = has_structured_search
             || query.scope != anyagents_core::host_index::MemoryScope::All
             || std::env::var_os("ANYAGENTS_TESTS").is_some();
-        let file_hits = if should_search_host_files {
+        // A search indexes only a bounded amount of new history before it
+        // answers; the background indexer takes the rest, and the response
+        // says the history it searched was partial.
+        let (file_hits, pending) = if should_search_host_files {
             state
                 .store
-                .search_host_files(&authorized, query.scope, &file_request)
+                .search_host_files_reporting(&authorized, query.scope, &file_request)
                 .map_err(|e| ApiError::from_store(Error::Message(e.to_string())))?
         } else {
-            Vec::new()
+            (Vec::new(), Default::default())
         };
+        // A relevance search for text also ranks by meaning: dense candidates
+        // from the memory service join the lexical ones, and the fused list
+        // is reranked below. Reads in time order rank nothing.
+        let text_query = clean_q
+            .map(str::to_string)
+            .or_else(|| (!extra_queries.is_empty()).then(|| extra_queries.join(" ")));
+        let ranks_by_relevance = should_search_host_files
+            && file_request.sort == anyagents_core::HistorySort::Relevance
+            && file_request.radius == 0;
+        let mut retrieval = None;
+        let file_hits = match text_query.as_deref().filter(|_| ranks_by_relevance) {
+            Some(text) => {
+                let owners: Vec<String> = if is_all {
+                    authorized.clone()
+                } else {
+                    let selected = state
+                        .store
+                        .agent_by_name(&name)
+                        .map_err(ApiError::from_store)?
+                        .id
+                        .to_string();
+                    authorized
+                        .iter()
+                        .filter(|id| **id == selected)
+                        .cloned()
+                        .collect()
+                };
+                let hybrid = hybrid::search(
+                    &state.store,
+                    text,
+                    &owners,
+                    query.scope,
+                    &file_request,
+                    file_hits,
+                );
+                retrieval = Some(hybrid.retrieval);
+                hybrid.hits
+            }
+            None => file_hits,
+        };
+        if pending.sources > 0 {
+            let view = retrieval.get_or_insert_with(|| crate::api::RetrievalView {
+                stages: vec!["lexical".into()],
+                ..crate::api::RetrievalView::default()
+            });
+            view.degraded.push(format!(
+                "partial: {} history source(s), about {} KiB, are still being indexed in the background; hits from them may be missing",
+                pending.sources,
+                pending.bytes.div_ceil(1024)
+            ));
+            view.pending = Some(crate::api::PendingHistoryView {
+                sources: pending.sources,
+                bytes: pending.bytes,
+            });
+        }
 
         let (agent_name, agent_id_str, raw_turns) =
             if query.scope == anyagents_core::host_index::MemoryScope::Memory {
@@ -6210,6 +6365,9 @@ async fn conversation_route(
                 b.0.total_cmp(&a.0)
                     .then_with(|| b.1.timestamp_ms.cmp(&a.1.timestamp_ms))
             });
+            if let (Some(retrieval), Some(text)) = (retrieval.as_mut(), text_query.as_deref()) {
+                hybrid::rerank(state.store.data_dir(), text, &mut ranked, retrieval);
+            }
         } else {
             ranked.sort_by_key(|(_, t)| t.timestamp_ms);
             if file_request.sort == anyagents_core::HistorySort::Newest {
@@ -6229,6 +6387,7 @@ async fn conversation_route(
             agent: agent_name,
             agent_id: agent_id_str,
             turns,
+            retrieval,
         }))
     })
     .await
@@ -7118,9 +7277,11 @@ fn can_actor_read_agent_private(
 ///   1. Itself (`sender.id == recipient.id`)
 ///   2. Its own direct Child Sub-Agents (`recipient.parent_id == Some(sender.id)`)
 ///   3. Its own direct Parent Agent (`sender.parent_id == Some(recipient.id)`)
-///   4. A Sibling Sub-Agent under the same Parent when both have `scope: "siblings"` or `"public"` (`allows_sibling_messages()`)
-///   5. Any Root Agent (when `sender.allows_sibling_messages()`) or Sub-Agent with `scope: "public"` (`recipient.is_public_subagent()`)
-///   6. Any agent with which it shares an internal virtual group (`group:<name>`) or external Telegram chat
+///   4. Any non-isolated descendant: an ancestor that may wake, pause or archive
+///      a grandchild may also message it
+///   5. A Sibling Sub-Agent under the same Parent when both have `scope: "siblings"` or `"public"` (`allows_sibling_messages()`)
+///   6. Any Root Agent (when `sender.allows_sibling_messages()`) or Sub-Agent with `scope: "public"` (`recipient.is_public_subagent()`)
+///   7. Any agent with which it shares an internal virtual group (`group:<name>`) or external Telegram chat
 fn can_actor_message_agent(
     store: &Store,
     actor: &Actor,
@@ -7140,18 +7301,23 @@ fn can_sender_message_agent(
     sender: &Agent,
     recipient: &Agent,
 ) -> Result<(), ApiError> {
-    can_sender_message_agent_with(store, sender, recipient, || {
-        store.share_any_group_or_chat(&sender.id, &recipient.id)
-    })
+    can_sender_message_agent_with(
+        store,
+        sender,
+        recipient,
+        || store.share_any_group_or_chat(&sender.id, &recipient.id),
+        || is_self_or_ancestor(store, &sender.id, recipient),
+    )
 }
 
-/// [`can_sender_message_agent`] with the group-or-chat share answered by the
-/// caller, so a roster can answer it once for every recipient.
+/// [`can_sender_message_agent`] with the group-or-chat share and the
+/// ancestry answered by the caller, so a roster can answer them from its rows.
 fn can_sender_message_agent_with(
     store: &Store,
     sender: &Agent,
     recipient: &Agent,
     share_group_or_chat: impl FnOnce() -> bool,
+    sender_is_ancestor: impl FnOnce() -> bool,
 ) -> Result<(), ApiError> {
     if sender.id == recipient.id
         || recipient.parent_id.as_ref() == Some(&sender.id)
@@ -7170,7 +7336,7 @@ fn can_sender_message_agent_with(
             sender.name, recipient.name
         )));
     }
-    if share_group_or_chat() || store.has_messaged(recipient, sender) {
+    if sender_is_ancestor() || share_group_or_chat() || store.has_messaged(recipient, sender) {
         return Ok(());
     }
     let same_parent_siblings = sender.parent_id.is_some()
@@ -7199,9 +7365,16 @@ fn can_sender_message_agent_with(
         .as_ref()
         .and_then(|pid| store.agent(pid).ok().map(|p| p.name))
         .unwrap_or_else(|| "parent".to_string());
+    if sender.parent_id.is_some() && sender.parent_id == recipient.parent_id {
+        return Err(ApiError::forbidden(format!(
+            "cannot message sub-agent `{}` directly: it is your sibling, and siblings message each other only when your parent `agent:{owner_label}` sets `scope: \"siblings\"` on both or puts you in one group. Send it through your parent (`to: [\"parent\"]`), or ask `agent:{owner_label}` for that scope or group",
+            recipient.name
+        )));
+    }
     Err(ApiError::forbidden(format!(
-        "cannot message sub-agent `{}` directly because it belongs to parent `agent:{owner_label}` and does not accept external messages (`public: false`); message `agent:{owner_label}` instead, ask `agent:{owner_label}` to set `public: true`, or collaborate in a shared group",
-        recipient.name
+        "cannot message sub-agent `{}` directly: it is private (`scope: \"{}\"`) to its parent `agent:{owner_label}`, and only its ancestors, its children and agents in a shared group reach it. Message `agent:{owner_label}` instead, or ask `agent:{owner_label}` to set `scope: \"public\"` on it or to put you both in a group",
+        recipient.name,
+        recipient.scope()
     )))
 }
 
@@ -8656,6 +8829,56 @@ pub(crate) mod tests {
         }
     }
 
+    /// Who may message whom: an ancestor reaches every non-isolated
+    /// descendant, and every refusal names the route that works.
+    #[test]
+    fn ancestors_reach_descendants_and_refusals_name_the_route() {
+        let dir = crate::test_tempdir();
+        let state = archetype_validation_state(dir.path());
+        let store = &state.store;
+        let make = |name: &str, parent: Option<&Agent>, scope: Option<&str>| {
+            let mut new = anyagents_core::NewAgent::new(name, "codex");
+            new.parent_id = parent.map(|p| p.id.clone());
+            let agent = store.create_agent(new).unwrap();
+            match scope {
+                Some(scope) => store.set_agent_scope(&agent.id, scope).unwrap(),
+                None => agent,
+            }
+        };
+        let sage = make("sage", None, None);
+        let vulcan = make("vulcan", None, None);
+        let rollout = make("rollout", Some(&sage), None);
+        let bump = make("bump", Some(&rollout), None);
+        let deeper = make("deeper", Some(&bump), None);
+        let sealed = make("sealed", Some(&rollout), Some("isolated"));
+        let fix = make("fix", Some(&rollout), None);
+        let cousin = make("cousin", Some(&vulcan), None);
+
+        // A grandparent and a great-grandparent reach their descendants.
+        assert!(can_sender_message_agent(store, &sage, &bump).is_ok());
+        assert!(can_sender_message_agent(store, &sage, &deeper).is_ok());
+        assert!(can_sender_message_agent(store, &rollout, &deeper).is_ok());
+        // An isolated descendant stays 1-to-1 with its direct parent.
+        assert!(can_sender_message_agent(store, &sage, &sealed).is_err());
+        assert!(can_sender_message_agent(store, &rollout, &sealed).is_ok());
+        // Upward stays through the parent.
+        assert!(can_sender_message_agent(store, &bump, &sage).is_err());
+
+        let text = |result: Result<(), ApiError>| result.unwrap_err().message;
+        let sibling = text(can_sender_message_agent(store, &fix, &bump));
+        assert!(sibling.contains("it is your sibling"), "{sibling}");
+        assert!(sibling.contains("`to: [\"parent\"]`"), "{sibling}");
+        assert!(sibling.contains("agent:rollout"), "{sibling}");
+        let outsider = text(can_sender_message_agent(store, &vulcan, &bump));
+        assert!(
+            outsider.contains("Message `agent:rollout` instead"),
+            "{outsider}"
+        );
+        assert!(outsider.contains("scope: \"public\""), "{outsider}");
+        let cross = text(can_sender_message_agent(store, &cousin, &fix));
+        assert!(cross.contains("Message `agent:rollout` instead"), "{cross}");
+    }
+
     /// Vendor history each harness leaves behind that the view once scanned:
     /// a Claude Code session ending in a rate-limit rejection, an AGY CLI log
     /// ending in an error, and Codex rollouts ending in a 401 turn fault.
@@ -9422,6 +9645,258 @@ pub(crate) mod tests {
                 old
             );
         });
+    }
+
+    /// A search over more new history than one request may index answers
+    /// at once from what it indexed, says the rest is pending, and queues it;
+    /// after the background indexer runs, the same history is found.
+    #[test]
+    fn a_search_past_its_index_budget_answers_partial_and_the_background_completes_it() {
+        let dir = crate::test_tempdir();
+        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        let agent = store
+            .create_agent(anyagents_core::NewAgent::new("large-history", "spiron"))
+            .unwrap();
+        let path = dir
+            .path()
+            .join("agents")
+            .join(agent.id.as_str())
+            .join("transcripts/history.jsonl");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut text = String::from("{\"role\":\"user\",\"content\":\"earlyneedle\"}\n");
+        let filler = format!(
+            "{{\"role\":\"assistant\",\"content\":\"{}\"}}\n",
+            "filler ".repeat(36)
+        );
+        while (text.len() as u64) < anyagents_core::host_retrieval::REQUEST_INDEX_BYTES * 3 / 2 {
+            text.push_str(&filler);
+        }
+        text.push_str("{\"role\":\"user\",\"content\":\"lateneedle\"}\n");
+        std::fs::write(&path, &text).unwrap();
+        let state = AppState {
+            store: Arc::clone(&store),
+            health: HealthBoard::default(),
+            sign_in: Arc::new(Mutex::new(ProcessRunner)),
+            auth: auth::Mode::Trusted {
+                data_dir: dir.path().into(),
+            },
+            identity: Arc::new(ServingIdentity::capture()),
+            profiles: Default::default(),
+        };
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let search = |term: &str| {
+            runtime.block_on(async {
+                let principal = Principal::Agent {
+                    agent_id: agent.id.clone(),
+                    name: agent.name.clone(),
+                };
+                let Json(response) = conversation_route(
+                    principal,
+                    State(state.clone()),
+                    AxumPath(agent.name.clone()),
+                    Query(
+                        serde_json::from_value(
+                            serde_json::json!({"scope":"transcripts","query":term}),
+                        )
+                        .unwrap(),
+                    ),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{}", e.message));
+                response
+            })
+        };
+        // The first answer comes from the first 4 MiB: the late record is not
+        // indexed yet, and the response says so.
+        let first = search("lateneedle");
+        assert!(first.turns.iter().all(|t| !t.text.contains("lateneedle")));
+        let retrieval = first.retrieval.clone().unwrap();
+        let pending = retrieval.pending.clone().expect("a partial search says so");
+        assert_eq!(pending.sources, 1);
+        assert!(pending.bytes > 0);
+        assert!(
+            retrieval.degraded.iter().any(|d| d.starts_with("partial:")),
+            "{retrieval:?}"
+        );
+        assert_eq!(store.host_history_backlog(), 1);
+        while store.host_history_backlog() > 0 {
+            store.index_host_history_step(u64::MAX).unwrap();
+        }
+        let done = search("lateneedle");
+        assert!(done.turns.iter().any(|t| t.text.contains("lateneedle")));
+        assert!(done.retrieval.and_then(|r| r.pending).is_none());
+        assert!(
+            search("earlyneedle")
+                .turns
+                .iter()
+                .any(|t| t.text.contains("earlyneedle"))
+        );
+    }
+
+    #[test]
+    fn hybrid_search_fuses_cited_dense_ranges_reranks_and_never_widens_access() {
+        use anyagents_memory::protocol::{self, DenseHit, Reply, Request, Status};
+        use std::io::{BufRead, Write as _};
+        let dir = crate::test_tempdir();
+        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        let parent = store
+            .create_agent(anyagents_core::NewAgent::new("hybrid-parent", "spiron"))
+            .unwrap();
+        let peer = store
+            .create_agent(anyagents_core::NewAgent::new("hybrid-peer", "spiron"))
+            .unwrap();
+        let lexical = "{\"role\":\"user\",\"content\":\"lexicalneedle about deploys\"}\n";
+        let semantic = "{\"role\":\"assistant\",\"content\":\"完全唔同嘅講法 semantic target\"}\n";
+        let write = |agent: &Agent, text: &str| {
+            let path = dir
+                .path()
+                .join("agents")
+                .join(agent.id.as_str())
+                .join("transcripts/history.jsonl");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, text).unwrap();
+            path
+        };
+        let parent_file = write(&parent, &format!("{lexical}{semantic}"));
+        let peer_file = write(&peer, "{\"content\":\"peer secret target\"}\n");
+        let doc = |agent: &Agent, path: &std::path::Path, seq: u64| {
+            format!(
+                "transcript:{}:{}:{seq}",
+                agent.id,
+                anyagents_core::learned_memory::sha256(path.as_os_str().as_encoded_bytes())
+            )
+        };
+        let cite = |document_id: String, agent: &Agent, offset: usize, text: &str| DenseHit {
+            document_id,
+            agent_id: agent.id.to_string(),
+            offset: offset as u64,
+            length: text.len() as u64,
+            sha256: anyagents_core::learned_memory::sha256(text.as_bytes()),
+            score: 0.9,
+        };
+        let target = semantic.find("semantic target").unwrap() + lexical.len();
+        let hits = vec![
+            cite(
+                doc(&parent, &parent_file, 2),
+                &parent,
+                target,
+                "semantic target",
+            ),
+            // Another owner's document, a range outside its document and a
+            // range whose bytes do not match: none may surface.
+            cite(doc(&peer, &peer_file, 1), &peer, 13, "peer secret"),
+            cite(doc(&parent, &parent_file, 1), &parent, 0, &"x".repeat(9999)),
+            DenseHit {
+                sha256: "0".repeat(64),
+                ..cite(doc(&parent, &parent_file, 1), &parent, 1, "\"role")
+            },
+        ];
+        let listener =
+            std::os::unix::net::UnixListener::bind(protocol::socket_path(dir.path())).unwrap();
+        let seen = Arc::new(Mutex::new(Vec::<Request>::new()));
+        let recorded = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let stream = stream.unwrap();
+                let mut line = String::new();
+                std::io::BufReader::new(&stream)
+                    .read_line(&mut line)
+                    .unwrap();
+                let request = protocol::decode_request(line.trim()).unwrap();
+                recorded.lock().unwrap().push(request.clone());
+                let reply = match request {
+                    Request::Search { .. } => Reply::Search {
+                        hits: hits.clone(),
+                        status: Status::default(),
+                    },
+                    // The cross-encoder prefers the semantic answer.
+                    Request::Rerank { passages, .. } => Reply::Rerank {
+                        scores: passages
+                            .iter()
+                            .map(|p| {
+                                if p.contains("semantic target") {
+                                    5.0
+                                } else {
+                                    -1.0
+                                }
+                            })
+                            .collect(),
+                    },
+                    Request::Status => Reply::Status {
+                        status: Status::default(),
+                    },
+                };
+                (&stream)
+                    .write_all(protocol::encode_reply(&Ok(reply)).as_bytes())
+                    .unwrap();
+            }
+        });
+        let state = AppState {
+            store: Arc::clone(&store),
+            health: HealthBoard::default(),
+            sign_in: Arc::new(Mutex::new(ProcessRunner)),
+            auth: auth::Mode::Trusted {
+                data_dir: dir.path().into(),
+            },
+            identity: Arc::new(ServingIdentity::capture()),
+            profiles: Default::default(),
+        };
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let principal = Principal::Agent {
+                agent_id: parent.id.clone(),
+                name: parent.name.clone(),
+            };
+            let Json(response) = conversation_route(
+                principal,
+                State(state.clone()),
+                AxumPath("all".into()),
+                Query(
+                    serde_json::from_value(
+                        serde_json::json!({"scope":"transcripts","query":"lexicalneedle"}),
+                    )
+                    .unwrap(),
+                ),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{}", e.message));
+            let retrieval = response.retrieval.clone().unwrap();
+            assert_eq!(
+                retrieval.stages,
+                vec!["lexical", "dense", "rerank"],
+                "{retrieval:?}"
+            );
+            assert!(retrieval.degraded.is_empty());
+            assert_eq!(
+                response.turns.len(),
+                2,
+                "{:?}",
+                response.turns.iter().map(|t| &t.text).collect::<Vec<_>>()
+            );
+            // Reranked first: the dense-only answer, cited to its exact bytes.
+            let first = &response.turns[0];
+            assert_eq!(first.text, "semantic target");
+            let window = first.window.as_ref().unwrap();
+            assert_eq!(
+                (window.offset, window.length),
+                (target as u64, "semantic target".len() as u64)
+            );
+            assert!(response.turns[1].text.contains("lexicalneedle"));
+            assert!(
+                response
+                    .turns
+                    .iter()
+                    .all(|t| !t.text.contains("peer secret"))
+            );
+        });
+        let requests = seen.lock().unwrap();
+        let Some(Request::Search { owners, .. }) = requests.first() else {
+            panic!("no dense search: {requests:?}");
+        };
+        assert_eq!(
+            owners,
+            &vec![parent.id.to_string()],
+            "only authorized owners reach the service"
+        );
     }
 
     #[test]
@@ -10854,6 +11329,90 @@ pub(crate) mod tests {
         );
     }
 
+    /// Archive keeps anything only the checkout holds: a stash, a tag or a
+    /// note the remote lacks. What the remote advertises is the proof, so a
+    /// branch published by URL (no remote-tracking ref moves) is reaped.
+    #[test]
+    fn cleanup_keeps_a_stash_and_unpublished_tags_or_notes() {
+        use crate::repo::tests::git;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let parent = store
+            .create_agent(anyagents_core::NewAgent::new("parent", "codex"))
+            .unwrap();
+        let child = archived_reap_fixture(&store, "worker", &parent);
+        let work = anyagents_core::agent_work_dir(dir.path(), &child.id);
+        let fixture = dir.path().join("fixture");
+        let remote = crate::repo::tests::seed_remote(&fixture);
+        crate::repo::tests::pool_checkouts(&fixture)
+            .remote("ExampleOrg/demo", &work, "worker", None)
+            .unwrap();
+        let as_author = |args: &[&str]| {
+            let mut all = vec!["-c", "user.name=t", "-c", "user.email=t@example.test"];
+            all.extend_from_slice(args);
+            git(&work, &all)
+        };
+        assert!(is_git_worktree_safe_to_reap(&work, None));
+        // A stash is the only copy of an edit.
+        std::fs::write(work.join("README.md"), "precious edit\n").unwrap();
+        as_author(&["stash", "-q"]);
+        assert!(
+            !is_git_worktree_safe_to_reap(&work, None),
+            "a stash was judged disposable"
+        );
+        // (Archive then rescues it: `rescue::tests` covers the stash, tags,
+        // notes and reflog-only commits this check refuses.)
+        git(&work, &["stash", "drop", "-q"]);
+        // A tag the remote lacks, then one it has.
+        git(&work, &["tag", "local-only"]);
+        assert!(
+            !is_git_worktree_safe_to_reap(&work, None),
+            "an unpublished tag"
+        );
+        git(&work, &["push", "-q", "origin", "refs/tags/local-only"]);
+        assert!(is_git_worktree_safe_to_reap(&work, None));
+        // A note the remote lacks, then one it has.
+        as_author(&["notes", "add", "-m", "remember this"]);
+        assert!(
+            !is_git_worktree_safe_to_reap(&work, None),
+            "an unpublished note"
+        );
+        git(&work, &["push", "-q", "origin", "refs/notes/commits"]);
+        assert!(is_git_worktree_safe_to_reap(&work, None));
+        // A commit published by URL, as a publishing tool does: no
+        // remote-tracking ref records it, the remote still has it.
+        as_author(&["commit", "-q", "--allow-empty", "-m", "Published by URL"]);
+        assert!(!is_git_worktree_safe_to_reap(&work, None));
+        git(
+            &work,
+            &[
+                "push",
+                "-q",
+                remote.to_str().unwrap(),
+                "HEAD:refs/heads/published",
+            ],
+        );
+        assert!(git(&work, &["for-each-ref", "refs/remotes/origin/published"]).is_empty());
+        assert!(is_git_worktree_safe_to_reap(&work, None));
+        // With no answer from the remote, nothing is proven.
+        git(
+            &work,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://example.invalid/x.git",
+            ],
+        );
+        assert!(!is_git_worktree_safe_to_reap(&work, None));
+        git(
+            &work,
+            &["remote", "set-url", "origin", remote.to_str().unwrap()],
+        );
+        assert!(reap_subagent_ephemeral_dirs(dir.path(), &child.id));
+        assert!(!work.exists());
+    }
+
     /// An archived agent's linked worktree from before per-agent repositories
     /// is converted, then judged like any checkout: dirty work is rescued
     /// before it is deleted, and the shared store no longer registers it.
@@ -10879,6 +11438,8 @@ pub(crate) mod tests {
                 hub.to_str().unwrap(),
             ],
         );
+        git(&hub, &["config", "gc.pruneExpire", "never"]);
+        git(&hub, &["config", "gc.cruftPacks", "true"]);
         let mut checkouts = Vec::new();
         for agent in [&dirty, &clean] {
             let work = anyagents_core::agent_work_dir(dir.path(), &agent.id);
@@ -10905,6 +11466,13 @@ pub(crate) mod tests {
                 && !registered.contains(checkouts[1].to_str().unwrap()),
             "{registered}"
         );
+        // Both checkouts are gone, the rescued one too, and their keep refs
+        // with them: the rescue bundle carries what the remote lacks.
+        let keeps = git(
+            &hub,
+            &["for-each-ref", "--format=%(refname)", "refs/anyagents/keep"],
+        );
+        assert_eq!(keeps.lines().count(), 0, "{keeps}");
     }
 
     #[test]

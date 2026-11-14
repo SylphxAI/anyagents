@@ -4,7 +4,8 @@ use crate::{
     Agent, AgentId, HistorySearchQuery, Store,
     host_cursor::{FileStamp, SourceCursor},
     host_index::{HostIndex, IndexError, IndexHit, IndexMetadata, MemoryScope},
-    host_native_metadata::{EventHeader, MetadataReader},
+    host_native_metadata::{Envelope, EventHeader, MetadataReader},
+    host_sqlite::{RowRef, StoreKind},
     learned_memory::sha256,
     raw_segment::{RawSource, open_readonly, read_raw},
 };
@@ -16,6 +17,16 @@ use std::{
 };
 
 pub const INDEX_FILE: &str = "host-history-index-v1.db";
+
+/// A raw byte range another retriever cites inside an indexed document:
+/// absolute offsets in the document's segment and the range's SHA-256.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CitedRange {
+    pub document_id: String,
+    pub offset: u64,
+    pub length: u64,
+    pub sha256: String,
+}
 
 /// ID and expected digest come from a search result; offsets are event-relative.
 pub struct HostRawRead<'a> {
@@ -87,7 +98,7 @@ impl Store {
         if !index_path.exists() {
             return Ok(false);
         }
-        let mut index = HostIndex::shared(&index_path)?;
+        let index = HostIndex::shared(&index_path)?;
         let Some((owner, path)) = index.verification_candidate(now_ms)? else {
             return Ok(false);
         };
@@ -101,41 +112,35 @@ impl Store {
             return Ok(true);
         };
         let agent = Owner { id, name };
-        // Maintenance never waits for a lifecycle: the same worker runs the WAL
-        // checkpoint and outbound settlement, which must not queue behind a
-        // delivery, search or archive holding this owner. A busy owner keeps
-        // its place in the rotation and is verified on a later pass.
-        let _guard = match self.try_lock_agent_lifecycle(&agent.id) {
-            Ok(guard) => guard,
-            Err(crate::Error::AgentBusy) => return Ok(false),
-            Err(error) => return Err(store_error(error)),
-        };
         let Some(mut cursor) = index.source_cursor(&owner, &path)? else {
             return Ok(false);
         };
-        cursor.verification_attempt_ms = now_ms;
-        index.save_source(&owner, &path, &cursor)?;
         let root = self.data_dir().join("agents").join(agent.id.as_str());
         let mut walk = Walk::new(&root);
-        if !safe_components(&mut walk, self.data_dir(), &root)?
-            || !native_transcripts(&mut walk, &root)?.contains(&path)
-            || self
+        let found = safe_components(&mut walk, self.data_dir(), &root)?
+            && native_sources(&mut walk, &root)?
+                .iter()
+                .any(|s| s.path == path)
+            && !self
                 .unresolved_host_paths(&owner)?
                 .iter()
-                .any(|p| path.starts_with(p))
-        {
+                .any(|p| path.starts_with(p));
+        if !found {
             index.clear_source(&owner, &path)?;
             index.checkpoint()?;
             return Ok(true);
         }
-        refresh_native_with_policy(
-            &mut index,
-            &agent,
-            &path,
-            true,
-            is_external_harness_transcript(&root, &path),
-            now_ms,
-        )?;
+        // Maintenance neither reads the source nor waits for a lifecycle: the
+        // same worker runs the WAL checkpoint and outbound settlement. It
+        // records the attempt, so the rotation moves on, and hands the source
+        // to the background indexer, which reads it in bounded batches with
+        // no lock held and records the verification when it has read it all.
+        cursor.verification_attempt_ms = now_ms;
+        index.save_source(&owner, &path, &cursor)?;
+        enqueue_job(
+            self.data_dir(),
+            Job::Verify(agent.id.to_string(), path, now_ms),
+        );
         Ok(true)
     }
 
@@ -206,13 +211,17 @@ impl Store {
                 .filter(|p| !is_hidden_memory_file(p))
                 .collect(),
             MemoryScope::Transcripts => {
-                let mut paths = native_transcripts(&mut walk, &root)?;
+                let mut paths: Vec<PathBuf> = native_sources(&mut walk, &root)?
+                    .into_iter()
+                    .map(|s| s.path)
+                    .collect();
                 paths.extend(history_archives(&mut walk, &root)?);
                 paths
             }
             MemoryScope::All => return Ok(None),
         };
-        if !paths.contains(&hit.raw.segment) {
+        // A row is readable while its store is one the walk still finds.
+        if !paths.contains(&crate::host_sqlite::source_of(&hit.raw.segment)) {
             return Ok(None);
         }
         let (window, bytes) =
@@ -224,28 +233,66 @@ impl Store {
     /// Immediately synchronize an agent's `memory/` directory into `HostIndex`
     /// so newly upserted, read, or
     /// deleted topics are immediately readable via `raw_id` and `search_host_files`.
+    /// The caller holds the agent's lifecycle lock, so publishing needs no
+    /// other; learned-memory topics are small whole files.
     pub fn sync_agent_memory_index(&self, agent: &Agent) -> Result<(), IndexError> {
         let mut index = HostIndex::shared(&self.data_dir().join(INDEX_FILE))?;
         let unresolved = self.unresolved_host_paths(agent.id.as_str())?;
+        let mut budget = u64::MAX;
+        let mut held =
+            || -> Result<Option<Box<dyn std::any::Any>>, IndexError> { Ok(Some(Box::new(()))) };
         self.refresh_class(
             &mut index,
             &Owner::from(agent),
             MemoryScope::Memory,
             &unresolved,
             agents_identity(self.data_dir())?,
+            crate::now_ms(),
+            &mut budget,
+            &mut held,
         )?;
         Ok(())
     }
 
-    /// The caller has already resolved the authorized immutable ID set. Locks
-    /// serialize refresh/readback against redaction, rename and lifecycle changes.
+    /// The caller has already resolved the authorized immutable ID set.
+    /// Indexing reads with no lock held; publishing each batch and reading
+    /// back each hit hold the owner's lifecycle lock, which serializes them
+    /// against redaction, rename and lifecycle changes. At most
+    /// [`REQUEST_INDEX_BYTES`] of new history is indexed before answering.
     pub fn search_host_files(
         &self,
         authorized: &[String],
         scope: MemoryScope,
         query: &HistorySearchQuery,
     ) -> Result<Vec<(IndexHit, Vec<u8>)>, IndexError> {
-        self.search_host_files_at(authorized, scope, query, crate::now_ms())
+        self.search_host_files_at(
+            authorized,
+            scope,
+            query,
+            crate::now_ms(),
+            REQUEST_INDEX_BYTES,
+        )
+        .map(|(hits, _)| hits)
+    }
+
+    /// [`Store::search_host_files`] that also says what history it could not
+    /// index before answering: at most [`REQUEST_INDEX_BYTES`] of new history
+    /// is indexed on the request path; classes with more are queued for the
+    /// background indexer, and their unindexed history is missing from these
+    /// hits.
+    pub fn search_host_files_reporting(
+        &self,
+        authorized: &[String],
+        scope: MemoryScope,
+        query: &HistorySearchQuery,
+    ) -> Result<(HostHits, PendingHistory), IndexError> {
+        self.search_host_files_at(
+            authorized,
+            scope,
+            query,
+            crate::now_ms(),
+            REQUEST_INDEX_BYTES,
+        )
     }
 
     fn search_host_files_at(
@@ -254,7 +301,8 @@ impl Store {
         scope: MemoryScope,
         query: &HistorySearchQuery,
         now_ms: i64,
-    ) -> Result<Vec<(IndexHit, Vec<u8>)>, IndexError> {
+        budget: u64,
+    ) -> Result<(HostHits, PendingHistory), IndexError> {
         let selected = query
             .agent
             .as_deref()
@@ -278,14 +326,27 @@ impl Store {
         let mut index = HostIndex::shared(&self.data_dir().join(INDEX_FILE))?;
         let unresolved = self.unresolved_host_paths_of(&owners)?;
         let agents = agents_identity(self.data_dir())?;
+        let mut remaining = budget;
+        let mut pending = PendingHistory::default();
         for owner in &owners {
             let unresolved = unresolved
                 .get(owner.id.as_str())
                 .map_or(&[][..], Vec::as_slice);
             for &class in classes(scope) {
-                self.refresh_class_if_changed(
-                    &mut index, owner, class, unresolved, agents, now_ms,
+                let refresh = self.refresh_class_if_changed(
+                    &mut index,
+                    owner,
+                    class,
+                    unresolved,
+                    agents,
+                    now_ms,
+                    &mut remaining,
                 )?;
+                if !refresh.complete {
+                    pending.sources += refresh.pending_sources.max(1);
+                    pending.bytes += refresh.pending_bytes;
+                    enqueue(self.data_dir(), owner.id.as_str(), class);
+                }
             }
         }
         let visible: Vec<_> = owners.iter().map(|a| a.id.to_string()).collect();
@@ -311,13 +372,113 @@ impl Store {
             let bytes = read_raw(&hit.window)?;
             out.push((hit, bytes));
         }
+        Ok((out, pending))
+    }
+
+    /// Raw ranges another retriever cited (a dense index, for example),
+    /// resolved exactly as lexical hits are: only documents of the authorized
+    /// owners and scope that still match every structured filter of `query`,
+    /// with the cited range inside its document, re-checked under the owner's
+    /// lifecycle lock and redaction exclusions, and read back against the
+    /// range's own digest. A candidate failing any check is dropped. The
+    /// result keeps the cited order and returns the cited range as `window`.
+    pub fn resolve_host_ranges(
+        &self,
+        authorized: &[String],
+        scope: MemoryScope,
+        query: &HistorySearchQuery,
+        cited: &[CitedRange],
+    ) -> Result<Vec<(IndexHit, Vec<u8>)>, IndexError> {
+        let index_path = self.data_dir().join(INDEX_FILE);
+        if cited.is_empty() || !index_path.exists() {
+            return Ok(Vec::new());
+        }
+        let selected = query
+            .agent
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| *s != "*" && !s.eq_ignore_ascii_case("all"))
+            .map(|s| self.agent_by_name(s).map(|a| a.id.to_string()))
+            .transpose()
+            .map_err(store_error)?;
+        let visible: Vec<String> = authorized
+            .iter()
+            .filter(|id| selected.as_ref().is_none_or(|s| s == *id))
+            .cloned()
+            .collect();
+        let index = HostIndex::shared(&index_path)?;
+        let ids: Vec<String> = cited.iter().map(|c| c.document_id.clone()).collect();
+        let mut request = query.clone();
+        request.agent = None;
+        let allowed: HashMap<String, IndexHit> = index
+            .filter_documents(&visible, scope, &request, &ids)?
+            .into_iter()
+            .map(|hit| (hit.id.clone(), hit))
+            .collect();
+        let mut out = Vec::new();
+        for range in cited {
+            let Some(hit) = allowed.get(&range.document_id) else {
+                continue;
+            };
+            let end = range.offset.checked_add(range.length);
+            if range.length == 0
+                || range.offset < hit.raw.offset
+                || end.is_none_or(|end| end > hit.raw.offset + hit.raw.length)
+            {
+                continue;
+            }
+            let owner = crate::AgentId::parse(&hit.metadata.agent_id).map_err(store_error)?;
+            let _guard = self.lock_agent_lifecycle(&owner).map_err(store_error)?;
+            let Some(current) =
+                index.document(std::slice::from_ref(&hit.metadata.agent_id), scope, &hit.id)?
+            else {
+                continue;
+            };
+            if current.raw.sha256 != hit.raw.sha256
+                || self.is_host_path_redacted(&hit.metadata.agent_id, &hit.raw.segment)?
+            {
+                continue;
+            }
+            let window = crate::raw_segment::RawCoordinate {
+                segment: hit.raw.segment.clone(),
+                offset: range.offset,
+                length: range.length,
+                sha256: range.sha256.clone(),
+                seq: hit.raw.seq,
+            };
+            let Ok(bytes) = read_raw(&window) else {
+                continue;
+            };
+            let mut hit = hit.clone();
+            hit.window = window;
+            hit.lexical_score = 0.0;
+            out.push((hit, bytes));
+        }
         Ok(out)
+    }
+
+    /// A digest of the owner's redaction receipts: a refresh that read its
+    /// history at one value publishes only while it still holds.
+    fn redaction_epoch(&self, owner: &str) -> Result<String, IndexError> {
+        let mut receipts: Vec<String> = self
+            .redaction_receipts(Some(owner))
+            .map_err(store_error)?
+            .into_iter()
+            .map(|(_, receipt)| receipt)
+            .collect();
+        receipts.sort();
+        Ok(sha256(receipts.join("\n").as_bytes()))
     }
 
     /// Skip a class whose recorded walk still matches the filesystem and the
     /// policy: it has nothing new to index, so it costs a stat per recorded
     /// entry, with no lock, no directory listing, no file open and no query
-    /// besides its own record. Otherwise refresh it under the lifecycle lock.
+    /// besides its own record. Otherwise refresh it within `budget` bytes of
+    /// new history. Walking, reading and projecting hold no lock; each
+    /// published batch holds the owner's lifecycle lock only while it
+    /// publishes, and is dropped if a redaction happened since it was read.
+    /// The walk is recorded only once every source is complete.
+    #[allow(clippy::too_many_arguments)]
     fn refresh_class_if_changed(
         &self,
         index: &mut HostIndex,
@@ -326,7 +487,8 @@ impl Store {
         unresolved: &[PathBuf],
         agents: Option<(u64, u64)>,
         now_ms: i64,
-    ) -> Result<(), IndexError> {
+        budget: &mut u64,
+    ) -> Result<ClassRefresh, IndexError> {
         let class_name = class
             .source()
             .ok_or_else(|| io::Error::other("a history class is memory or transcripts"))?;
@@ -335,29 +497,50 @@ impl Store {
             && recorded == tree_policy(owner, unresolved)?
             && serde_json::from_str::<Tree>(&tree).is_ok_and(|t| t.is_current(&root, agents))
         {
-            return Ok(());
+            return Ok(ClassRefresh::complete());
         }
         #[cfg(test)]
         tests::CLASS_WALKS.with(|n| n.set(n.get() + 1));
-        let _guard = self.lock_agent_lifecycle(&owner.id).map_err(store_error)?;
-        // Exclusions are read again under the lock, as a refresh always has.
+        let epoch = self.redaction_epoch(owner.id.as_str())?;
         let unresolved = self.unresolved_host_paths(owner.id.as_str())?;
         let policy = tree_policy(owner, &unresolved)?;
-        let walk = self.refresh_class(index, owner, class, &unresolved, agents)?;
-        let tree = Tree {
-            started_ms: now_ms,
-            agents,
-            entries: walk.entries,
+        let mut gate = || -> Result<Option<Box<dyn std::any::Any>>, IndexError> {
+            let guard = self.lock_agent_lifecycle(&owner.id).map_err(store_error)?;
+            if self.redaction_epoch(owner.id.as_str())? != epoch {
+                return Ok(None);
+            }
+            Ok(Some(Box::new(guard)))
         };
-        // A path that cannot be recorded (not UTF-8) only costs a walk later.
-        if let Ok(tree) = serde_json::to_string(&tree) {
-            index.save_agent_tree(owner.id.as_str(), class_name, &policy, &tree)?;
+        let (walk, refresh) = self.refresh_class(
+            index,
+            owner,
+            class,
+            &unresolved,
+            agents,
+            now_ms,
+            budget,
+            &mut gate,
+        )?;
+        if refresh.complete {
+            let tree = Tree {
+                started_ms: now_ms,
+                agents,
+                entries: walk.entries,
+            };
+            // A path that cannot be recorded (not UTF-8) only costs a walk later.
+            if let Ok(tree) = serde_json::to_string(&tree)
+                && let Some(_guard) = gate()?
+            {
+                index.save_agent_tree(owner.id.as_str(), class_name, &policy, &tree)?;
+            }
         }
-        Ok(())
+        Ok(refresh)
     }
 
-    /// Index what one class's walk finds and forget the class's sources it no
-    /// longer finds. The other class and its cursors are never touched.
+    /// Index what one class's walk finds, within `budget`, and forget the
+    /// class's sources it no longer finds. The other class and its cursors
+    /// are never touched.
+    #[allow(clippy::too_many_arguments)]
     fn refresh_class(
         &self,
         index: &mut HostIndex,
@@ -365,10 +548,14 @@ impl Store {
         class: MemoryScope,
         unresolved: &[PathBuf],
         agents: Option<(u64, u64)>,
-    ) -> Result<Walk, IndexError> {
+        now_ms: i64,
+        budget: &mut u64,
+        gate: &mut Gate<'_>,
+    ) -> Result<(Walk, ClassRefresh), IndexError> {
         let root = self.data_dir().join("agents").join(owner.id.as_str());
         let mut walk = Walk::new(&root);
         let mut keep = HashSet::new();
+        let mut refresh = ClassRefresh::complete();
         // The durable redactor is the only text mutation authority. A
         // pending/failed copy excludes precisely that path and descendants;
         // an unrelated unsupported store does not hide scrubbed local data.
@@ -386,27 +573,54 @@ impl Store {
                             sha256(path.as_os_str().as_encoded_bytes())
                         );
                         let metadata = memory_metadata(owner, Some(modified_ms(&path)?));
-                        let stamp = refresh_document(index, &id, &metadata, &path)?;
-                        walk.note(&path, Some(stamp));
+                        let stats = retry_later(
+                            refresh_document_ctx(
+                                index,
+                                &id,
+                                &metadata,
+                                &path,
+                                budget,
+                                gate,
+                                || Ok(()),
+                            ),
+                            &path,
+                        )?;
+                        walk.note(&path, Some(stats.stamp.clone()));
+                        refresh.add(&stats);
                         keep.insert(path.to_string_lossy().into_owned());
                     }
                 }
                 MemoryScope::Transcripts => {
-                    for path in native_transcripts(&mut walk, &root)? {
-                        if blocked(&path) {
+                    for source in native_sources(&mut walk, &root)? {
+                        if blocked(&source.path) {
                             continue;
                         }
-                        let stamp = refresh_native_with_policy(
-                            index,
-                            owner,
+                        let path = source.path;
+                        if let NativeFormat::Store(_) = source.format {
+                            // New rows land in the write-ahead log before a
+                            // checkpoint touches the database file: both stamps,
+                            // taken before the read, describe the store.
+                            let wal = crate::host_sqlite::wal_path(&path);
+                            walk.note(&wal, FileStamp::of_path(&wal)?);
+                        }
+                        let stats = retry_later(
+                            refresh_source_ctx(
+                                index,
+                                owner,
+                                &path,
+                                source.format,
+                                is_external_harness_transcript(&root, &path),
+                                now_ms,
+                                budget,
+                                gate,
+                            ),
                             &path,
-                            false,
-                            is_external_harness_transcript(&root, &path),
-                            crate::now_ms(),
-                        )?
-                        .stamp;
-                        walk.note(&path, Some(stamp));
-                        keep.insert(path.to_string_lossy().into_owned());
+                        )?;
+                        walk.note(&path, Some(stats.stamp.clone()));
+                        refresh.add(&stats);
+                        if stats.indexed {
+                            keep.insert(path.to_string_lossy().into_owned());
+                        }
                     }
                     // Reconciled archive pages are lossless historical documents,
                     // not necessarily JSONL. Their entire text remains searchable.
@@ -419,8 +633,20 @@ impl Store {
                             owner.id,
                             sha256(path.as_os_str().as_encoded_bytes())
                         );
-                        let stamp = refresh_document(index, &id, &history_metadata(owner), &path)?;
-                        walk.note(&path, Some(stamp));
+                        let stats = retry_later(
+                            refresh_document_ctx(
+                                index,
+                                &id,
+                                &history_metadata(owner),
+                                &path,
+                                budget,
+                                gate,
+                                || Ok(()),
+                            ),
+                            &path,
+                        )?;
+                        walk.note(&path, Some(stats.stamp.clone()));
+                        refresh.add(&stats);
                         keep.insert(path.to_string_lossy().into_owned());
                     }
                 }
@@ -437,8 +663,281 @@ impl Store {
             })
             .map(|(segment, _)| segment)
             .collect();
-        index.forget_sources(owner.id.as_str(), &stale)?;
-        Ok(walk)
+        if !stale.is_empty() {
+            match gate()? {
+                Some(_guard) => index.forget_sources(owner.id.as_str(), &stale)?,
+                None => refresh.complete = false,
+            }
+        }
+        Ok((walk, refresh))
+    }
+}
+
+/// A source that changed under its read is not an error: it is left for a
+/// later refresh, which reads it again.
+fn retry_later(
+    result: Result<RefreshStats, IndexError>,
+    path: &Path,
+) -> Result<RefreshStats, IndexError> {
+    match result {
+        Err(IndexError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock => {
+            let stamp = FileStamp::read(&open_readonly(path)?)?;
+            let len = stamp.len;
+            Ok(RefreshStats::new(stamp).pending(len))
+        }
+        other => other,
+    }
+}
+
+/// What refreshing one class left: everything published, or bytes still to
+/// index in the background.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ClassRefresh {
+    complete: bool,
+    pending_sources: usize,
+    pending_bytes: u64,
+}
+impl ClassRefresh {
+    fn complete() -> Self {
+        Self {
+            complete: true,
+            ..Self::default()
+        }
+    }
+    fn add(&mut self, stats: &RefreshStats) {
+        if !stats.complete {
+            self.complete = false;
+            self.pending_sources += 1;
+            self.pending_bytes += stats.pending_bytes;
+        }
+    }
+}
+
+/// Hits with the raw bytes each window read back.
+pub type HostHits = Vec<(IndexHit, Vec<u8>)>;
+
+/// History a search could not index before answering: it is being indexed
+/// in the background, so results from it may be missing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PendingHistory {
+    pub sources: usize,
+    pub bytes: u64,
+}
+
+/// Background work: a class a search left incomplete, or a source due for
+/// full verification.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Job {
+    Class(String, MemoryScope),
+    /// Owner, source, and when the verifier scheduled it: the time recorded.
+    Verify(String, PathBuf, i64),
+}
+
+/// Jobs by data directory, for the background indexer; and its pre-warm
+/// pass over every agent after the process starts.
+struct Backlog {
+    queue: std::collections::VecDeque<Job>,
+    prewarm: Option<Vec<String>>,
+    prewarm_next: usize,
+}
+static BACKLOG: std::sync::LazyLock<(
+    std::sync::Mutex<HashMap<PathBuf, Backlog>>,
+    std::sync::Condvar,
+)> = std::sync::LazyLock::new(Default::default);
+
+fn backlog() -> std::sync::MutexGuard<'static, HashMap<PathBuf, Backlog>> {
+    BACKLOG
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+fn backlog_entry<'a>(map: &'a mut HashMap<PathBuf, Backlog>, data: &Path) -> &'a mut Backlog {
+    map.entry(data.to_owned()).or_insert_with(|| Backlog {
+        queue: std::collections::VecDeque::new(),
+        prewarm: None,
+        prewarm_next: 0,
+    })
+}
+
+fn enqueue_job(data: &Path, job: Job) {
+    let mut map = backlog();
+    let entry = backlog_entry(&mut map, data);
+    if !entry.queue.contains(&job) {
+        entry.queue.push_back(job);
+    }
+    BACKLOG.1.notify_all();
+}
+fn enqueue(data: &Path, owner: &str, class: MemoryScope) {
+    enqueue_job(data, Job::Class(owner.to_owned(), class));
+}
+
+impl Store {
+    /// History classes waiting for the background indexer in this process.
+    pub fn host_history_backlog(&self) -> usize {
+        backlog().get(self.data_dir()).map_or(0, |b| b.queue.len())
+    }
+
+    /// One bounded step of background indexing: a queued job first (a class
+    /// a search left incomplete, or a source due for verification),
+    /// otherwise the next agent of the pre-warm pass that covers every agent
+    /// once per process, live agents first. A class still incomplete after
+    /// `budget` bytes is queued again behind the others. Returns whether
+    /// there was work.
+    pub fn index_host_history_step(&self, budget: u64) -> Result<bool, IndexError> {
+        let data = self.data_dir().to_owned();
+        let next = backlog_entry(&mut backlog(), &data).queue.pop_front();
+        let jobs: Vec<Job> = match next {
+            Some(job) => vec![job],
+            None => {
+                let listed = backlog().get(&data).and_then(|b| b.prewarm.clone());
+                let list = match listed {
+                    Some(list) => list,
+                    None => {
+                        let mut live = Vec::new();
+                        let mut archived = Vec::new();
+                        for agent in self.list_agents().map_err(store_error)? {
+                            if agent.state == "archived" {
+                                archived.push(agent.id.to_string());
+                            } else {
+                                live.push(agent.id.to_string());
+                            }
+                        }
+                        live.extend(archived);
+                        backlog_entry(&mut backlog(), &data).prewarm = Some(live.clone());
+                        live
+                    }
+                };
+                let at = {
+                    let mut map = backlog();
+                    let entry = backlog_entry(&mut map, &data);
+                    entry.prewarm_next += 1;
+                    entry.prewarm_next - 1
+                };
+                match list.get(at) {
+                    Some(owner) => CLASSES
+                        .iter()
+                        .map(|c| Job::Class(owner.clone(), *c))
+                        .collect(),
+                    None => {
+                        // Once: what a dense rebuild should wait for.
+                        if at == list.len() {
+                            eprintln!(
+                                "anyagents-host-history: pre-warm done: {} agents' history indexed",
+                                list.len()
+                            );
+                        }
+                        return Ok(false);
+                    }
+                }
+            }
+        };
+        let index_path = data.join(INDEX_FILE);
+        let mut index = HostIndex::shared(&index_path)?;
+        let agents = agents_identity(&data)?;
+        for job in jobs {
+            let owner = match &job {
+                Job::Class(owner, _) | Job::Verify(owner, _, _) => owner.as_str(),
+            };
+            let Some((id, name)) = self.agent_names([owner]).map_err(store_error)?.pop() else {
+                continue;
+            };
+            let owner = Owner { id, name };
+            match job {
+                Job::Class(_, class) => {
+                    let unresolved = self.unresolved_host_paths(owner.id.as_str())?;
+                    let mut remaining = budget;
+                    let refresh = self.refresh_class_if_changed(
+                        &mut index,
+                        &owner,
+                        class,
+                        &unresolved,
+                        agents,
+                        crate::now_ms(),
+                        &mut remaining,
+                    )?;
+                    if !refresh.complete {
+                        enqueue(&data, owner.id.as_str(), class);
+                    }
+                }
+                Job::Verify(_, path, at) => {
+                    self.verify_host_history_source(&mut index, &owner, &path, at)?;
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    /// Fully verify one source the verifier scheduled, if it is still one of
+    /// the owner's sources and not withheld by a pending redaction.
+    fn verify_host_history_source(
+        &self,
+        index: &mut HostIndex,
+        owner: &Owner,
+        path: &Path,
+        now_ms: i64,
+    ) -> Result<bool, IndexError> {
+        let root = self.data_dir().join("agents").join(owner.id.as_str());
+        let mut walk = Walk::new(&root);
+        let found = if safe_components(&mut walk, self.data_dir(), &root)? {
+            native_sources(&mut walk, &root)?
+                .into_iter()
+                .find(|s| s.path == path)
+        } else {
+            None
+        };
+        let Some(found) = found else {
+            return Ok(false);
+        };
+        let epoch = self.redaction_epoch(owner.id.as_str())?;
+        if self
+            .unresolved_host_paths(owner.id.as_str())?
+            .iter()
+            .any(|p| path.starts_with(p))
+        {
+            return Ok(false);
+        }
+        let mut gate = || -> Result<Option<Box<dyn std::any::Any>>, IndexError> {
+            let guard = self.lock_agent_lifecycle(&owner.id).map_err(store_error)?;
+            if self.redaction_epoch(owner.id.as_str())? != epoch {
+                return Ok(None);
+            }
+            Ok(Some(Box::new(guard)))
+        };
+        verify_source_ctx(
+            index,
+            owner,
+            path,
+            found.format,
+            is_external_harness_transcript(&root, path),
+            now_ms,
+            &mut gate,
+        )
+    }
+
+    /// Run the background indexer on the calling thread for as long as the
+    /// process lives: classes searches left incomplete, then a pre-warm pass
+    /// over every agent, then nothing until a search queues more. The caller
+    /// runs it at the lowest CPU priority. A failing class is reported and
+    /// left for the next search to queue again.
+    pub fn run_host_history_indexer(&self) {
+        loop {
+            match self.index_host_history_step(BACKGROUND_STEP_BYTES) {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(error) => {
+                    eprintln!("anyagents-host-history: background indexing: {error}");
+                    std::thread::sleep(std::time::Duration::from_secs(10));
+                    continue;
+                }
+            }
+            let map = backlog();
+            let _idle = BACKLOG
+                .1
+                .wait_while(map, |map| {
+                    map.get(self.data_dir()).is_none_or(|b| b.queue.is_empty())
+                })
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
     }
 }
 
@@ -464,7 +963,7 @@ fn classes(scope: MemoryScope) -> &'static [MemoryScope] {
 /// as belonging to whichever class is being refreshed.
 fn source_class(cursor: &str) -> Option<MemoryScope> {
     let cursor: SourceCursor = serde_json::from_str(cursor).ok()?;
-    if cursor.policy.starts_with("native-jsonl") {
+    if cursor.policy.starts_with("native-") {
         return Some(MemoryScope::Transcripts);
     }
     serde_json::from_str::<IndexMetadata>(&cursor.policy)
@@ -473,7 +972,49 @@ fn source_class(cursor: &str) -> Option<MemoryScope> {
 }
 
 fn native_policy(owner: &Owner) -> String {
-    format!("native-jsonl-v4:{}:{}", owner.id, owner.name)
+    NativeFormat::Jsonl.policy(owner)
+}
+
+/// How one native history source is laid out, and so how its events are
+/// framed and which fields carry their metadata.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeFormat {
+    /// One event per JSONL line, metadata in top-level fields: AnyAgents
+    /// transcripts, legacy Spiron `sylphx-transcript.jsonl`, Claude Code
+    /// sessions and subagents, OMP, Grok and Muse.
+    Jsonl,
+    /// Codex rollouts: `{timestamp, type, payload}` per line.
+    CodexRollout,
+    /// AGY transcripts: `{created_at, type, source, content}` per line.
+    AgyTranscript,
+    /// A harness's own SQLite store, one event per row.
+    Store(StoreKind),
+}
+impl NativeFormat {
+    /// The parser policy a published cursor records. A changed policy
+    /// rebuilds the source.
+    fn policy(self, owner: &Owner) -> String {
+        let family = match self {
+            Self::Jsonl => "native-jsonl-v4",
+            Self::CodexRollout => "native-jsonl-v4+codex",
+            Self::AgyTranscript => "native-jsonl-v4+agy",
+            Self::Store(StoreKind::SpironSessions) => "native-sqlite-v1+spiron",
+            Self::Store(StoreKind::OpenCodeMessages) => "native-sqlite-v1+opencode",
+        };
+        format!("{family}:{}:{}", owner.id, owner.name)
+    }
+    fn envelope(self) -> Envelope {
+        match self {
+            Self::Jsonl | Self::AgyTranscript => Envelope::None,
+            Self::CodexRollout => Envelope::Codex,
+            Self::Store(StoreKind::SpironSessions) => Envelope::Spiron,
+            Self::Store(StoreKind::OpenCodeMessages) => Envelope::OpenCode,
+        }
+    }
+}
+struct NativeSource {
+    path: PathBuf,
+    format: NativeFormat,
 }
 fn memory_metadata(owner: &Owner, timestamp_ms: Option<i64>) -> IndexMetadata {
     IndexMetadata {
@@ -509,7 +1050,8 @@ fn tree_policy(owner: &Owner, unresolved: &[PathBuf]) -> Result<String, IndexErr
     let mut unresolved: Vec<_> = unresolved.iter().map(|p| p.to_string_lossy()).collect();
     unresolved.sort();
     Ok(serde_json::to_string(&(
-        "host-tree-v1",
+        // v2: every harness's native history location is walked.
+        "host-tree-v2",
         native_policy(owner),
         memory_metadata(owner, None),
         history_metadata(owner),
@@ -598,6 +1140,39 @@ fn agent_root_safe(walk: &mut Walk, agents: Option<(u64, u64)>) -> io::Result<bo
     Ok(agents.is_some() && metadata.is_some_and(|m| !m.file_type().is_symlink()))
 }
 
+/// Raw bytes one batch reads before it publishes. Every read, hash and token
+/// projection of a batch happens with no lock and no index write held; only
+/// publishing a batch holds the owner's lifecycle lock and the index write,
+/// so this bounds how long either is held.
+const BATCH_BYTES: u64 = 2 * 1024 * 1024;
+fn batch_bytes() -> u64 {
+    #[cfg(test)]
+    if let Some(bytes) = tests::BATCH_BYTES_OVERRIDE.with(std::cell::Cell::get) {
+        return bytes;
+    }
+    BATCH_BYTES
+}
+/// Store rows one batch reads.
+const BATCH_ROWS: usize = 512;
+/// New history one search may index before it answers. A class with more is
+/// handed to the background indexer and the answer says it is partial.
+pub const REQUEST_INDEX_BYTES: u64 = 4 * 1024 * 1024;
+/// What one background step may index before it yields to the next class.
+pub const BACKGROUND_STEP_BYTES: u64 = 64 * 1024 * 1024;
+
+/// May a batch publish now? `Some(guard)` is what must be held while it does
+/// (the owner's lifecycle lock, unless the caller already holds it); `None`
+/// means the owner's history changed under the read (a redaction), so the
+/// batch is dropped and the class is left for a later refresh.
+pub(crate) type Gate<'a> = dyn FnMut() -> Result<Option<Box<dyn std::any::Any>>, IndexError> + 'a;
+
+/// A gate for a caller that already holds what publishing needs.
+#[cfg(test)]
+fn open_gate() -> Result<Option<Box<dyn std::any::Any>>, IndexError> {
+    Ok(Some(Box::new(())))
+}
+
+#[derive(Clone, Debug)]
 pub struct RefreshStats {
     /// The stamp of the file the published frontier describes.
     stamp: FileStamp,
@@ -605,7 +1180,55 @@ pub struct RefreshStats {
     pub boundary_capture_bytes: u64,
     pub suffix_scanned_bytes: u64,
     pub indexed_records: usize,
+    /// Everything the source held when read is published.
+    pub complete: bool,
+    /// Bytes still to index when not complete (an estimate for a store).
+    pub pending_bytes: u64,
+    /// A source this reader understands; a store of another layout is not.
+    indexed: bool,
 }
+impl RefreshStats {
+    fn new(stamp: FileStamp) -> Self {
+        Self {
+            stamp,
+            prefix_verified_bytes: 0,
+            boundary_capture_bytes: 0,
+            suffix_scanned_bytes: 0,
+            indexed_records: 0,
+            complete: false,
+            pending_bytes: 0,
+            indexed: true,
+        }
+    }
+    fn done(mut self) -> Self {
+        self.complete = true;
+        self.pending_bytes = 0;
+        self
+    }
+    fn pending(mut self, bytes: u64) -> Self {
+        self.complete = false;
+        self.pending_bytes = bytes.max(1);
+        self
+    }
+}
+
+/// The published cursor a batch was planned from must still be the
+/// published one when it publishes; anything else means another refresh
+/// moved the frontier first, and this batch is planned again.
+fn same_cursor(a: &Option<SourceCursor>, b: &Option<SourceCursor>) -> bool {
+    let key = |c: &Option<SourceCursor>| c.as_ref().and_then(|c| serde_json::to_string(c).ok());
+    key(a) == key(b)
+}
+
+fn changed_during_refresh(what: &str) -> IndexError {
+    io::Error::new(
+        io::ErrorKind::WouldBlock,
+        format!("{what} changed during refresh; retry"),
+    )
+    .into()
+}
+
+#[cfg(test)]
 fn refresh_document(
     index: &mut HostIndex,
     id: &str,
@@ -614,6 +1237,7 @@ fn refresh_document(
 ) -> Result<FileStamp, IndexError> {
     refresh_document_before_publish(index, id, metadata, path, || Ok(()))
 }
+#[cfg(test)]
 fn refresh_document_before_publish(
     index: &mut HostIndex,
     id: &str,
@@ -621,48 +1245,96 @@ fn refresh_document_before_publish(
     path: &Path,
     before_publish: impl FnOnce() -> io::Result<()>,
 ) -> Result<FileStamp, IndexError> {
+    let mut budget = u64::MAX;
+    refresh_document_ctx(
+        index,
+        id,
+        metadata,
+        path,
+        &mut budget,
+        &mut open_gate,
+        before_publish,
+    )
+    .map(|stats| stats.stamp)
+}
+
+/// Index one whole-file document (a learned-memory topic or an archive
+/// page). It is read and projected with no lock held; publishing checks
+/// that the file still has the stamp it was read at.
+fn refresh_document_ctx(
+    index: &mut HostIndex,
+    id: &str,
+    metadata: &IndexMetadata,
+    path: &Path,
+    budget: &mut u64,
+    gate: &mut Gate<'_>,
+    before_publish: impl FnOnce() -> io::Result<()>,
+) -> Result<RefreshStats, IndexError> {
     // One path walk; the stamp, hash and projection share this descriptor.
     let mut source = RawSource::open(path)?;
     let stamp = source.stamp().clone();
+    let stats = RefreshStats::new(stamp.clone());
     let policy = serde_json::to_string(metadata)?;
     if index
         .source_cursor(&metadata.agent_id, path)?
         .is_some_and(|old| old.stamp == stamp && old.policy == policy)
     {
-        return Ok(stamp);
+        return Ok(stats.done());
+    }
+    // A whole document is one batch. One larger than what is left of the
+    // budget waits, unless no smaller budget would ever take it.
+    if stamp.len > *budget && *budget < BACKGROUND_STEP_BYTES {
+        return Ok(stats.pending(stamp.len));
     }
     let raw = source.whole()?;
+    let prepared = if index.is_current(id, metadata, &raw)? {
+        None
+    } else {
+        Some(crate::host_index::prepare_document(
+            &mut source,
+            id,
+            metadata,
+            &raw,
+        )?)
+    };
+    drop(source);
+    let Some(_guard) = gate()? else {
+        return Ok(stats.pending(stamp.len));
+    };
     index.refresh_source(|index| {
-        index.index_from(&mut source, id, metadata, &raw)?;
-        before_publish()?;
-        if FileStamp::read(&open_readonly(path)?)? == stamp {
-            index.save_source(
-                &metadata.agent_id,
-                path,
-                &SourceCursor {
-                    stamp: stamp.clone(),
-                    policy,
-                    end: raw.length,
-                    next_seq: 2,
-                    boundary_sha256: String::new(),
-                    full_verified_ms: 0,
-                    verification_attempt_ms: 0,
-                },
-            )?;
-        } else {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "memory source changed during refresh; retry",
-            )
-            .into());
+        if let Some(doc) = &prepared {
+            index.publish_document(doc)?;
         }
-        Ok(stamp)
-    })
+        before_publish()?;
+        if FileStamp::read(&open_readonly(path)?)? != stamp {
+            return Err(changed_during_refresh("memory source"));
+        }
+        index.save_source(
+            &metadata.agent_id,
+            path,
+            &SourceCursor {
+                stamp: stamp.clone(),
+                policy,
+                end: raw.length,
+                next_seq: 2,
+                boundary_sha256: String::new(),
+                full_verified_ms: 0,
+                verification_attempt_ms: 0,
+                complete: true,
+                rebuilding: false,
+            },
+        )?;
+        Ok(())
+    })?;
+    *budget = budget.saturating_sub(raw.length);
+    Ok(stats.done())
 }
+
+/// A history file a harness writes, not AnyAgents. Its writer may crash
+/// mid-line or concatenate records, so a malformed complete line is indexed
+/// as text with unknown metadata instead of failing the agent's search.
 fn is_external_harness_transcript(root: &Path, path: &Path) -> bool {
-    let config = root.join("config");
-    path.strip_prefix(&config)
-        .is_ok_and(|rel| rel.starts_with("projects") || rel.starts_with(".claude/projects"))
+    path.starts_with(root.join("config"))
 }
 #[cfg(test)]
 fn refresh_native(
@@ -670,151 +1342,793 @@ fn refresh_native(
     owner: &Owner,
     path: &Path,
 ) -> Result<RefreshStats, IndexError> {
-    refresh_native_at(index, owner, path, false, crate::now_ms())
+    refresh_native_at(
+        index,
+        owner,
+        path,
+        NativeFormat::Jsonl,
+        false,
+        false,
+        crate::now_ms(),
+    )
 }
 #[cfg(test)]
 fn refresh_native_at(
     index: &mut HostIndex,
     owner: &Owner,
     path: &Path,
+    format: NativeFormat,
+    tolerate_malformed: bool,
     force_full: bool,
     now_ms: i64,
 ) -> Result<RefreshStats, IndexError> {
-    refresh_native_with_policy(index, owner, path, force_full, false, now_ms)
+    let mut budget = u64::MAX;
+    refresh_native_ctx(
+        index,
+        owner,
+        path,
+        format,
+        tolerate_malformed,
+        force_full,
+        now_ms,
+        &mut budget,
+        &mut open_gate,
+    )
 }
-fn refresh_native_with_policy(
+#[cfg(test)]
+fn refresh_store_at(
+    index: &mut HostIndex,
+    owner: &Owner,
+    db: &Path,
+    kind: StoreKind,
+    force_full: bool,
+    now_ms: i64,
+) -> Result<RefreshStats, IndexError> {
+    let mut budget = u64::MAX;
+    refresh_store_ctx(
+        index,
+        owner,
+        db,
+        kind,
+        force_full,
+        now_ms,
+        &mut budget,
+        &mut open_gate,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn refresh_source_ctx(
     index: &mut HostIndex,
     owner: &Owner,
     path: &Path,
-    force_full: bool,
+    format: NativeFormat,
     tolerate_malformed: bool,
     now_ms: i64,
+    budget: &mut u64,
+    gate: &mut Gate<'_>,
 ) -> Result<RefreshStats, IndexError> {
-    // One path walk; scan, metadata and projection share this descriptor.
-    let mut source = RawSource::open(path)?;
-    let stamp = source.stamp().clone();
-    let policy = native_policy(owner);
-    let old = index
-        .source_cursor(owner.id.as_str(), path)?
-        .filter(|old| old.policy == policy);
-    if !force_full && old.as_ref().is_some_and(|old| old.stamp == stamp) {
-        return Ok(RefreshStats {
-            stamp,
-            prefix_verified_bytes: 0,
-            boundary_capture_bytes: 0,
-            suffix_scanned_bytes: 0,
-            indexed_records: 0,
-        });
+    match format {
+        NativeFormat::Store(kind) => {
+            refresh_store_ctx(index, owner, path, kind, false, now_ms, budget, gate)
+        }
+        _ => refresh_native_ctx(
+            index,
+            owner,
+            path,
+            format,
+            tolerate_malformed,
+            false,
+            now_ms,
+            budget,
+            gate,
+        ),
     }
-    let scan =
-        crate::host_cursor::scan_jsonl(&mut source, old.as_ref(), force_full, tolerate_malformed)?;
-    index.refresh_source(|index| {
-        if scan.replace {
-            index.clear_source(owner.id.as_str(), path)?;
+}
+
+/// Metadata of one native event and the tool calls it defines. Calls are
+/// correlated within one source: a file, or one native store.
+fn native_metadata(
+    index: &HostIndex,
+    owner: &Owner,
+    source: &Path,
+    header: &EventHeader,
+    format: NativeFormat,
+    batch: &Prepared,
+) -> Result<(IndexMetadata, Vec<(String, String)>), IndexError> {
+    let mut metadata = event_metadata(owner, header, format);
+    let records = header.tool_records(format.envelope());
+    let mut names = Vec::new();
+    if let Some(name) = &metadata.tool_name {
+        names.push(name.clone());
+    }
+    for (call_id, name) in &records {
+        let name = name.map(str::to_owned).or_else(|| {
+            call_id
+                .and_then(|id| {
+                    records
+                        .iter()
+                        .find_map(|(key, name)| (*key == Some(id)).then_some(*name).flatten())
+                })
+                .map(str::to_owned)
+        });
+        let name = match (name, call_id) {
+            (Some(name), _) => name,
+            (None, Some(id)) => batch
+                .call(index, owner.id.as_str(), source, id)?
+                .unwrap_or_else(|| "unknown".into()),
+            (None, None) => "unknown".into(),
+        };
+        if !names.contains(&name) {
+            names.push(name);
         }
-        // There cannot be committed documents beyond the atomically published
-        // frontier. An interrupted outer transaction is rolled back by SQLite.
-        for raw in &scan.records {
-            // EventHeader is derivative metadata; malformed/torn external JSONL
-            // records must not break lexical indexing or fail whole-agent search.
-            let header: EventHeader = match serde_json::from_reader(MetadataReader::new(
-                source.range(raw.offset, raw.length),
-            )) {
-                Ok(header) => header,
-                Err(error)
-                    if tolerate_malformed
-                        && matches!(
-                            error.classify(),
-                            serde_json::error::Category::Syntax | serde_json::error::Category::Eof
-                        ) =>
-                {
-                    EventHeader::default()
-                }
-                Err(error) => return Err(error.into()),
-            };
-            let mut metadata = event_metadata(owner, &header);
-            let records = header.tool_records();
-            let mut names = Vec::new();
-            if let Some(name) = &metadata.tool_name {
-                names.push(name.clone());
-            }
-            for (call_id, name) in &records {
-                let name = name.map(str::to_owned).or_else(|| {
-                    call_id
-                        .and_then(|id| {
-                            records.iter().find_map(|(key, name)| {
-                                (*key == Some(id)).then_some(*name).flatten()
-                            })
-                        })
-                        .map(str::to_owned)
-                });
-                let name = match (name, call_id) {
-                    (Some(name), _) => name,
-                    (None, Some(id)) => index
-                        .call_tool(owner.id.as_str(), path, id)?
-                        .unwrap_or_else(|| "unknown".into()),
-                    (None, None) => "unknown".into(),
-                };
-                if !names.contains(&name) {
-                    names.push(name);
-                }
-            }
-            metadata.tool_name = names.first().cloned();
-            metadata.tool_names = names;
-            let id = format!(
-                "transcript:{}:{}:{}",
-                owner.id,
-                sha256(path.as_os_str().as_encoded_bytes()),
-                raw.seq
-            );
-            index.index_from(&mut source, &id, &metadata, raw)?;
-            for (call_id, name) in records {
-                if let (Some(call_id), Some(name)) = (call_id, name) {
-                    index.save_call(owner.id.as_str(), path, call_id, name, &id)?;
-                }
-            }
+    }
+    metadata.tool_name = names.first().cloned();
+    metadata.tool_names = names;
+    let defined = records
+        .into_iter()
+        .filter_map(|(call, name)| Some((call?.to_owned(), name?.to_owned())))
+        .collect();
+    Ok((metadata, defined))
+}
+
+/// A batch read and projected with no lock held, waiting to publish.
+struct Prepared {
+    docs: Vec<crate::host_index::PreparedDocument>,
+    calls: Vec<(String, String, String)>,
+    /// The batch starts a rebuild: publishing it first drops every document
+    /// of the source, so nothing published may be reused.
+    clearing: bool,
+}
+impl Prepared {
+    fn new(clearing: bool) -> Self {
+        Self {
+            docs: Vec::new(),
+            calls: Vec::new(),
+            clearing,
         }
-        // A live append racing this snapshot is not corruption. Do not advance
-        // the frontier; the next refresh revalidates and retries that suffix.
-        if FileStamp::read(&open_readonly(path)?)? == stamp {
+    }
+    /// The tool a call defined earlier in this batch or, unless the batch
+    /// starts a rebuild, by a published document.
+    fn call(
+        &self,
+        index: &HostIndex,
+        owner: &str,
+        source: &Path,
+        id: &str,
+    ) -> Result<Option<String>, IndexError> {
+        if let Some(name) = self
+            .calls
+            .iter()
+            .rev()
+            .find_map(|(call, name, _)| (call == id).then_some(name))
+        {
+            return Ok(Some(name.clone()));
+        }
+        if self.clearing {
+            return Ok(None);
+        }
+        index.call_tool(owner, source, id)
+    }
+    /// Project one event unless the index already holds it exactly, and
+    /// record the calls it defines.
+    fn add(
+        &mut self,
+        index: &HostIndex,
+        source: &mut RawSource,
+        id: String,
+        metadata: IndexMetadata,
+        raw: &crate::raw_segment::RawCoordinate,
+        calls: Vec<(String, String)>,
+    ) -> Result<(), IndexError> {
+        if self.clearing || !index.is_current(&id, &metadata, raw)? {
+            self.docs.push(crate::host_index::prepare_document(
+                source, &id, &metadata, raw,
+            )?);
+        }
+        for (call, name) in calls {
+            self.calls.push((call, name, id.clone()));
+        }
+        Ok(())
+    }
+    /// Write the batch. The caller holds the gate and the write scope.
+    fn publish(&self, index: &mut HostIndex, owner: &str, source: &Path) -> Result<(), IndexError> {
+        if self.clearing {
+            index.clear_source(owner, source)?;
+        }
+        for doc in &self.docs {
+            index.publish_document(doc)?;
+        }
+        for (call, name, id) in &self.calls {
+            index.save_call(owner, source, call, name, id)?;
+        }
+        Ok(())
+    }
+}
+
+/// One store row as a document ready to publish.
+fn prepare_row(
+    index: &HostIndex,
+    owner: &Owner,
+    db: &Path,
+    kind: StoreKind,
+    row: crate::host_sqlite::StoreRow,
+    prepared: &mut Prepared,
+) -> Result<(), IndexError> {
+    let reference = RowRef::new(db, kind, row.rowid);
+    let raw = crate::raw_segment::RawCoordinate {
+        segment: reference.segment(),
+        offset: 0,
+        length: row.bytes.len() as u64,
+        sha256: sha256(&row.bytes),
+        seq: row.rowid.max(0) as u64,
+    };
+    // A row the store accepted but this reader cannot frame still indexes
+    // its text, with unknown metadata.
+    let header: EventHeader =
+        serde_json::from_reader(MetadataReader::new(&row.bytes[..])).unwrap_or_default();
+    let (mut metadata, calls) = native_metadata(
+        index,
+        owner,
+        db,
+        &header,
+        NativeFormat::Store(kind),
+        prepared,
+    )?;
+    if let Some(role) = row.role.as_deref().filter(|r| !r.is_empty()) {
+        metadata.direction = if role == "user" { "in" } else { "out" }.into();
+        metadata.role = Some(role.into());
+    }
+    if row.timestamp_ms.is_some() {
+        metadata.timestamp_ms = row.timestamp_ms;
+    }
+    let id = format!(
+        "transcript:{}:{}:{}",
+        owner.id,
+        sha256(db.as_os_str().as_encoded_bytes()),
+        row.rowid
+    );
+    let mut source = RawSource::from_row(&reference, row.bytes)?;
+    prepared.add(index, &mut source, id, metadata, &raw, calls)
+}
+
+/// The digest of one store row, or empty for no row.
+fn row_digest(store: &crate::host_sqlite::Store, rowid: i64) -> io::Result<String> {
+    Ok(match rowid {
+        rowid if rowid > 0 => store.row(rowid)?.map(|b| sha256(&b)).unwrap_or_default(),
+        _ => String::new(),
+    })
+}
+
+/// The rows a batch read must still be the store's when it publishes: the
+/// same database file, with the batch's last row unchanged.
+fn check_store(
+    db: &Path,
+    kind: StoreKind,
+    stamp: &FileStamp,
+    last: i64,
+    digest: &str,
+) -> Result<(), IndexError> {
+    if !FileStamp::read(&open_readonly(db)?)?.same_file(stamp) {
+        return Err(changed_during_refresh("native store"));
+    }
+    if last > 0 {
+        let check = crate::host_sqlite::Store::open(db, kind)?
+            .ok_or_else(|| changed_during_refresh("native store"))?;
+        if row_digest(&check, last)? != digest {
+            return Err(changed_during_refresh("native store"));
+        }
+    }
+    Ok(())
+}
+
+/// Index what is new in one native SQLite store, in batches. Rows past the
+/// published rowid frontier are read in rowid order, a bounded batch at a
+/// time from one snapshot of the store each, projected with no lock held,
+/// and published under the gate after checking that the store is the same
+/// database and the batch's last row is unchanged. Once the frontier reaches
+/// the store's last row, rows the store rewrote after the published change
+/// mark are read the same way. A replaced database, a lower frontier or a
+/// changed frontier row rebuilds the store: its first batch drops the old
+/// documents. Deleted rows otherwise stay published until full verification
+/// and are refused at readback by their digest.
+#[allow(clippy::too_many_arguments)]
+fn refresh_store_ctx(
+    index: &mut HostIndex,
+    owner: &Owner,
+    db: &Path,
+    kind: StoreKind,
+    force_full: bool,
+    now_ms: i64,
+    budget: &mut u64,
+    gate: &mut Gate<'_>,
+) -> Result<RefreshStats, IndexError> {
+    let policy = NativeFormat::Store(kind).policy(owner);
+    let mut force = force_full;
+    let mut indexed_records = 0;
+    loop {
+        let stamp = FileStamp::read(&open_readonly(db)?)?;
+        let mut stats = RefreshStats::new(stamp.clone());
+        stats.indexed_records = indexed_records;
+        let Some(store) = crate::host_sqlite::Store::open(db, kind)? else {
+            // Not this harness's layout: nothing in it is history this reader
+            // understands. Whatever an earlier layout published is forgotten
+            // by the caller's walk.
+            stats.indexed = false;
+            return Ok(stats.done());
+        };
+        let old = index
+            .source_cursor(owner.id.as_str(), db)?
+            .filter(|old| old.policy == policy);
+        store.snapshot()?;
+        let (top, changed) = store.frontier()?;
+        let top = top.max(0);
+        let resume = match &old {
+            Some(old)
+                if !force
+                    && old.stamp.same_file(&stamp)
+                    && old.end <= top as u64
+                    && row_digest(&store, old.end as i64)? == old.boundary_sha256 =>
+            {
+                Some(old.clone())
+            }
+            _ => None,
+        };
+        // Nothing past the frontier and nothing rewritten since its mark.
+        if let Some(r) = &resume
+            && r.complete
+            && r.end == top as u64
+            && r.next_seq == changed.max(0) as u64
+        {
+            return Ok(stats.done());
+        }
+        let clearing = resume.is_none();
+        let rebuilding = clearing || resume.as_ref().is_some_and(|r| r.rebuilding);
+        let (after, mark) = match &resume {
+            Some(r) => (r.end as i64, r.next_seq as i64),
+            // A rebuild remembers the change mark it started at, so a row
+            // rewritten while it runs is read again afterwards.
+            None => (0, changed.max(0)),
+        };
+        let average = if top > 0 { stamp.len / top as u64 } else { 0 }.max(1);
+        let rewrites = after >= top;
+        if !rewrites && *budget == 0 {
+            return Ok(stats.pending((top - after) as u64 * average));
+        }
+        let rows = if rewrites {
+            store.rows_changed(top, mark, BATCH_ROWS, batch_bytes().min(*budget))?
+        } else {
+            store.rows_after(after, top, BATCH_ROWS, batch_bytes().min(*budget))?
+        };
+        if rewrites && rows.is_empty() && resume.as_ref().is_some_and(|r| r.complete) {
+            return Ok(stats.done());
+        }
+        if rewrites && !rows.is_empty() && *budget == 0 {
+            return Ok(stats.pending(average * rows.len() as u64));
+        }
+        let read: u64 = rows.iter().map(|r| r.bytes.len() as u64).sum();
+        let end = if rewrites {
+            after
+        } else {
+            rows.last().map_or(after, |r| r.rowid)
+        };
+        // The rewrites of a full batch continue from its last change mark;
+        // a short batch reads every rewrite there is.
+        let (new_mark, caught_up) = if !rewrites {
+            (mark, false)
+        } else if rows.len() < BATCH_ROWS && read < batch_bytes().min(*budget) {
+            (rows.iter().map(|r| r.changed).fold(mark, i64::max), true)
+        } else {
+            // Rows sharing the last mark past this batch are read again
+            // from the mark below it; reading one twice costs no write.
+            let last = rows.last().map_or(mark, |r| r.changed);
+            let below = rows
+                .iter()
+                .map(|r| r.changed)
+                .filter(|c| *c < last)
+                .max()
+                .unwrap_or(last);
+            (below.max(mark), false)
+        };
+        let boundary_sha256 = row_digest(&store, end)?;
+        drop(store);
+        // Project every row with no lock held.
+        let mut prepared = Prepared::new(clearing);
+        for row in rows {
+            prepare_row(index, owner, db, kind, row, &mut prepared)?;
+            stats.indexed_records += 1;
+        }
+        indexed_records = stats.indexed_records;
+        let Some(_guard) = gate()? else {
+            return Ok(stats.pending(read.max(average)));
+        };
+        let published = index.refresh_source(|index| {
+            let current = index
+                .source_cursor(owner.id.as_str(), db)?
+                .filter(|old| old.policy == policy);
+            if !same_cursor(&current, &old) {
+                return Ok(false);
+            }
+            check_store(db, kind, &stamp, end, &boundary_sha256)?;
+            prepared.publish(index, owner.id.as_str(), db)?;
+            let completed = rebuilding && caught_up;
+            index.save_source(
+                owner.id.as_str(),
+                db,
+                &SourceCursor {
+                    stamp: stamp.clone(),
+                    policy: policy.clone(),
+                    end: end.max(0) as u64,
+                    next_seq: new_mark.max(0) as u64,
+                    boundary_sha256: boundary_sha256.clone(),
+                    full_verified_ms: match (&old, completed) {
+                        (_, true) => now_ms,
+                        (Some(old), false) => old.full_verified_ms,
+                        (None, false) => 0,
+                    },
+                    verification_attempt_ms: match (&old, completed) {
+                        (_, true) => now_ms,
+                        (Some(old), false) => old.verification_attempt_ms,
+                        (None, false) => 0,
+                    },
+                    complete: caught_up,
+                    rebuilding: rebuilding && !caught_up,
+                },
+            )?;
+            Ok(true)
+        })?;
+        *budget = budget.saturating_sub(read.max(1));
+        force = false;
+        if published && caught_up {
+            return Ok(stats.done());
+        }
+    }
+}
+
+/// The records a batch read must still be the file's when it publishes: the
+/// same file, unchanged, or grown by appends with the batch's boundary (the
+/// 64 KiB before its end) unchanged.
+fn check_jsonl(path: &Path, stamp: &FileStamp, end: u64, boundary: &str) -> Result<(), IndexError> {
+    let mut check = RawSource::open(path)?;
+    let now = check.stamp().clone();
+    if now == *stamp {
+        return Ok(());
+    }
+    if !now.same_file(stamp)
+        || now.len <= stamp.len
+        || crate::host_cursor::boundary_hash(&mut check, end)?.0 != boundary
+    {
+        return Err(changed_during_refresh("native source"));
+    }
+    Ok(())
+}
+
+/// Read and project one scanned batch of JSONL records with no lock held.
+#[allow(clippy::too_many_arguments)]
+fn prepare_records(
+    index: &HostIndex,
+    owner: &Owner,
+    path: &Path,
+    format: NativeFormat,
+    tolerate_malformed: bool,
+    source: &mut RawSource,
+    records: &[crate::raw_segment::RawCoordinate],
+    prepared: &mut Prepared,
+) -> Result<(), IndexError> {
+    for raw in records {
+        // EventHeader is derivative metadata; malformed/torn external JSONL
+        // records must not break lexical indexing or fail whole-agent search.
+        let header: EventHeader = match serde_json::from_reader(MetadataReader::new(
+            source.range(raw.offset, raw.length),
+        )) {
+            Ok(header) => header,
+            Err(error)
+                if tolerate_malformed
+                    && matches!(
+                        error.classify(),
+                        serde_json::error::Category::Syntax | serde_json::error::Category::Eof
+                    ) =>
+            {
+                EventHeader::default()
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let (metadata, calls) = native_metadata(index, owner, path, &header, format, prepared)?;
+        let id = format!(
+            "transcript:{}:{}:{}",
+            owner.id,
+            sha256(path.as_os_str().as_encoded_bytes()),
+            raw.seq
+        );
+        prepared.add(index, source, id, metadata, raw, calls)?;
+    }
+    Ok(())
+}
+
+/// Index what is new in one native JSONL file, in batches. Each batch scans
+/// a bounded run of complete records from the published frontier (checking
+/// the 64 KiB boundary before it, as every incremental refresh does), reads
+/// and projects them with no lock held, then publishes under the gate after
+/// checking the file still holds them ([`check_jsonl`]). A changed boundary,
+/// a replaced file or a forced refresh rebuilds the source: its first batch
+/// drops the old documents.
+#[allow(clippy::too_many_arguments)]
+fn refresh_native_ctx(
+    index: &mut HostIndex,
+    owner: &Owner,
+    path: &Path,
+    format: NativeFormat,
+    tolerate_malformed: bool,
+    force_full: bool,
+    now_ms: i64,
+    budget: &mut u64,
+    gate: &mut Gate<'_>,
+) -> Result<RefreshStats, IndexError> {
+    let policy = format.policy(owner);
+    let mut force = force_full;
+    let mut total: Option<RefreshStats> = None;
+    loop {
+        // One path walk; scan, metadata and projection share this descriptor.
+        let mut source = RawSource::open(path)?;
+        let stamp = source.stamp().clone();
+        let mut stats = total
+            .take()
+            .unwrap_or_else(|| RefreshStats::new(stamp.clone()));
+        stats.stamp = stamp.clone();
+        let old = index
+            .source_cursor(owner.id.as_str(), path)?
+            .filter(|old| old.policy == policy);
+        if !force
+            && old
+                .as_ref()
+                .is_some_and(|old| old.complete && old.stamp == stamp)
+        {
+            return Ok(stats.done());
+        }
+        if *budget == 0 {
+            let from = old
+                .as_ref()
+                .filter(|o| o.stamp.same_file(&stamp))
+                .map_or(0, |o| o.end);
+            return Ok(stats.pending(stamp.len.saturating_sub(from)));
+        }
+        let scan = crate::host_cursor::scan_jsonl_bounded(
+            &mut source,
+            old.as_ref(),
+            force,
+            tolerate_malformed,
+            batch_bytes().min(*budget),
+        )?;
+        stats.prefix_verified_bytes += scan.prefix_verified_bytes;
+        stats.boundary_capture_bytes += scan.boundary_capture_bytes;
+        stats.suffix_scanned_bytes += scan.suffix_scanned_bytes;
+        stats.indexed_records += scan.records.len();
+        let rebuilding = scan.replace || old.as_ref().is_some_and(|o| o.rebuilding);
+        let mut prepared = Prepared::new(scan.replace);
+        prepare_records(
+            index,
+            owner,
+            path,
+            format,
+            tolerate_malformed,
+            &mut source,
+            &scan.records,
+            &mut prepared,
+        )?;
+        drop(source);
+        let Some(_guard) = gate()? else {
+            return Ok(stats.pending(stamp.len.saturating_sub(scan.start)));
+        };
+        let published = index.refresh_source(|index| {
+            let current = index
+                .source_cursor(owner.id.as_str(), path)?
+                .filter(|old| old.policy == policy);
+            if !same_cursor(&current, &old) {
+                return Ok(false);
+            }
+            check_jsonl(path, &stamp, scan.end, &scan.boundary_sha256)?;
+            prepared.publish(index, owner.id.as_str(), path)?;
+            let completed = rebuilding && scan.reached_end;
             index.save_source(
                 owner.id.as_str(),
                 path,
                 &SourceCursor {
                     stamp: stamp.clone(),
-                    policy,
+                    policy: policy.clone(),
                     end: scan.end,
                     next_seq: scan.next_seq,
                     boundary_sha256: scan.boundary_sha256.clone(),
-                    full_verified_ms: if scan.replace {
-                        now_ms
-                    } else {
-                        old.as_ref().map_or(0, |c| c.full_verified_ms)
+                    full_verified_ms: match (&old, completed) {
+                        (_, true) => now_ms,
+                        (Some(old), false) => old.full_verified_ms,
+                        (None, false) => 0,
                     },
-                    verification_attempt_ms: if scan.replace {
-                        now_ms
-                    } else {
-                        old.as_ref().map_or(0, |c| c.verification_attempt_ms)
+                    verification_attempt_ms: match (&old, completed) {
+                        (_, true) => now_ms,
+                        (Some(old), false) => old.verification_attempt_ms,
+                        (None, false) => 0,
                     },
+                    complete: scan.reached_end,
+                    rebuilding: rebuilding && !scan.reached_end,
                 },
             )?;
-        } else {
-            // Roll back the whole publication, leaving the prior committed
-            // frontier and documents consistent for the next snapshot.
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "native source changed during refresh; retry",
-            )
-            .into());
+            Ok(true)
+        })?;
+        *budget = budget.saturating_sub(scan.suffix_scanned_bytes.max(1));
+        force = false;
+        if published && scan.reached_end {
+            return Ok(stats.done());
         }
-        Ok(RefreshStats {
-            stamp,
-            prefix_verified_bytes: scan.prefix_verified_bytes,
-            boundary_capture_bytes: scan.boundary_capture_bytes,
-            suffix_scanned_bytes: scan.suffix_scanned_bytes,
-            indexed_records: scan.records.len(),
-        })
-    })
+        total = Some(stats);
+    }
+}
+
+/// Fully verify one published source, in the background: read it from the
+/// first record in bounded batches with no lock held, publish under the gate
+/// only the documents whose bytes no longer match what is indexed, and when
+/// the whole source has been read, drop documents past its last record and
+/// record the verification. The published frontier is not touched until
+/// then, so a source that fails to read keeps its frontier and documents.
+/// Returns whether the verification was recorded.
+fn verify_source_ctx(
+    index: &mut HostIndex,
+    owner: &Owner,
+    path: &Path,
+    format: NativeFormat,
+    tolerate_malformed: bool,
+    now_ms: i64,
+    gate: &mut Gate<'_>,
+) -> Result<bool, IndexError> {
+    let policy = format.policy(owner);
+    match format {
+        NativeFormat::Store(kind) => {
+            let mut after = 0i64;
+            let mut first: Option<FileStamp> = None;
+            loop {
+                let stamp = FileStamp::read(&open_readonly(path)?)?;
+                if !first.get_or_insert_with(|| stamp.clone()).same_file(&stamp) {
+                    return Ok(false);
+                }
+                let Some(store) = crate::host_sqlite::Store::open(path, kind)? else {
+                    return Ok(false);
+                };
+                store.snapshot()?;
+                let (top, _) = store.frontier()?;
+                let rows = store.rows_after(after, top.max(0), BATCH_ROWS, batch_bytes())?;
+                let last = rows.last().map_or(after, |r| r.rowid);
+                let digest = row_digest(&store, last)?;
+                let present = if last >= top {
+                    Some(store.rowids(top.max(0))?)
+                } else {
+                    None
+                };
+                drop(store);
+                let mut prepared = Prepared::new(false);
+                for row in rows {
+                    prepare_row(index, owner, path, kind, row, &mut prepared)?;
+                }
+                let Some(_guard) = gate()? else {
+                    return Ok(false);
+                };
+                let recorded = index.refresh_source(|index| {
+                    check_store(path, kind, &stamp, last, &digest)?;
+                    prepared.publish(index, owner.id.as_str(), path)?;
+                    let Some(present) = &present else {
+                        return Ok(false);
+                    };
+                    let Some(mut cursor) = index
+                        .source_cursor(owner.id.as_str(), path)?
+                        .filter(|c| c.policy == policy)
+                    else {
+                        return Ok(false);
+                    };
+                    let present: HashSet<u64> = present.iter().map(|r| *r as u64).collect();
+                    let stale: Vec<u64> = index
+                        .source_sequences(owner.id.as_str(), path)?
+                        .into_iter()
+                        .filter(|seq| *seq <= last.max(0) as u64 && !present.contains(seq))
+                        .collect();
+                    index.forget_sequences(owner.id.as_str(), path, &stale)?;
+                    cursor.full_verified_ms = now_ms;
+                    index.save_source(owner.id.as_str(), path, &cursor)?;
+                    Ok(true)
+                })?;
+                if present.is_some() {
+                    return Ok(recorded);
+                }
+                after = last;
+            }
+        }
+        _ => {
+            let mut at: Option<SourceCursor> = None;
+            loop {
+                let mut source = RawSource::open(path)?;
+                let stamp = source.stamp().clone();
+                if let Some(at) = &mut at {
+                    if !at.stamp.same_file(&stamp) {
+                        return Ok(false);
+                    }
+                    at.stamp = stamp.clone();
+                }
+                let scan = crate::host_cursor::scan_jsonl_bounded(
+                    &mut source,
+                    at.as_ref(),
+                    at.is_none(),
+                    tolerate_malformed,
+                    batch_bytes(),
+                )?;
+                if at.is_some() && scan.replace {
+                    // Rewritten under the read: the next refresh rebuilds it.
+                    return Ok(false);
+                }
+                let mut prepared = Prepared::new(false);
+                prepare_records(
+                    index,
+                    owner,
+                    path,
+                    format,
+                    tolerate_malformed,
+                    &mut source,
+                    &scan.records,
+                    &mut prepared,
+                )?;
+                drop(source);
+                let Some(_guard) = gate()? else {
+                    return Ok(false);
+                };
+                let recorded = index.refresh_source(|index| {
+                    check_jsonl(path, &stamp, scan.end, &scan.boundary_sha256)?;
+                    prepared.publish(index, owner.id.as_str(), path)?;
+                    if !scan.reached_end {
+                        return Ok(false);
+                    }
+                    let Some(current) = index
+                        .source_cursor(owner.id.as_str(), path)?
+                        .filter(|c| c.policy == policy)
+                    else {
+                        return Ok(false);
+                    };
+                    // A refresh that published past this read keeps its
+                    // frontier and documents; this read verified all before.
+                    let cursor = if current.end > scan.end {
+                        SourceCursor {
+                            full_verified_ms: now_ms,
+                            ..current
+                        }
+                    } else {
+                        index.forget_documents_from(owner.id.as_str(), path, scan.next_seq)?;
+                        SourceCursor {
+                            stamp: stamp.clone(),
+                            policy: policy.clone(),
+                            end: scan.end,
+                            next_seq: scan.next_seq,
+                            boundary_sha256: scan.boundary_sha256.clone(),
+                            full_verified_ms: now_ms,
+                            verification_attempt_ms: current.verification_attempt_ms,
+                            complete: true,
+                            rebuilding: false,
+                        }
+                    };
+                    index.save_source(owner.id.as_str(), path, &cursor)?;
+                    Ok(true)
+                })?;
+                if scan.reached_end {
+                    return Ok(recorded);
+                }
+                at = Some(SourceCursor {
+                    stamp,
+                    policy: policy.clone(),
+                    end: scan.end,
+                    next_seq: scan.next_seq,
+                    boundary_sha256: scan.boundary_sha256,
+                    full_verified_ms: 0,
+                    verification_attempt_ms: 0,
+                    complete: false,
+                    rebuilding: false,
+                });
+            }
+        }
+    }
 }
 
 /// No component below `root` may be a symlink or missing. Directories on the
@@ -906,48 +2220,231 @@ fn regular_files(walk: &mut Walk, root: &Path, recursive: bool) -> io::Result<Ve
     result.sort();
     Ok(result)
 }
-fn native_transcripts(walk: &mut Walk, root: &Path) -> io::Result<Vec<PathBuf>> {
-    let mut result = regular_files(walk, &root.join("transcripts"), true)?;
+/// Every native history source of one agent, found only below its own root
+/// and never through a symlink. Each harness keeps its history where
+/// AnyAgents points its configuration:
+///
+/// | Harness | Source |
+/// | --- | --- |
+/// | any | `transcripts/**` |
+/// | Spiron | `config/sessions.sqlite3` (`session_entries`); legacy `config/sylphx-transcript.jsonl` |
+/// | Claude Code | `config/{,.claude/}projects/*/*.jsonl` and `projects/*/*/subagents/*.jsonl` |
+/// | Codex | `config/sessions/**/*.jsonl` (`CODEX_HOME`) |
+/// | OpenCode | `config/data-home/opencode/opencode.db`, `config/.local/share/opencode/opencode.db` (`session_message`) |
+/// | AGY | `config/.gemini/antigravity-cli/brain/*/.system_generated/logs/transcript_full.jsonl` |
+/// | Muse | `config/data-home/muse/sessions/**/session.jsonl`, subagents included |
+/// | OMP | `config/.omp/agent/sessions/*/*.jsonl` (`PI_CODING_AGENT_DIR`) |
+/// | Grok | `config/.grok/sessions/*/*/chat_history.jsonl` |
+///
+/// dsh keeps zstd-compressed `session.jsonl.zstd`; it is not read until a
+/// raw coordinate can address bytes inside a compressed frame.
+fn native_sources(walk: &mut Walk, root: &Path) -> io::Result<Vec<NativeSource>> {
+    let jsonl = |path: PathBuf| NativeSource {
+        path,
+        format: NativeFormat::Jsonl,
+    };
+    let mut result: Vec<NativeSource> = regular_files(walk, &root.join("transcripts"), true)?
+        .into_iter()
+        .map(jsonl)
+        .collect();
     let config = root.join("config");
     if !safe_components(walk, root, &config)? {
         return Ok(result);
     }
+    let file = |walk: &mut Walk, path: &Path| -> io::Result<bool> {
+        Ok(safe_components(walk, root, path.parent().unwrap_or(root))?
+            && fs::symlink_metadata(path).is_ok_and(|m| m.is_file() && !m.file_type().is_symlink()))
+    };
+    // One harness location; a directory the server may not read is empty.
+    let mut add = |found: io::Result<Vec<NativeSource>>| -> io::Result<()> {
+        match found {
+            Ok(found) => {
+                result.extend(found);
+                Ok(())
+            }
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => Ok(()),
+            Err(e) => Err(e),
+        }
+    };
     let sylphx = config.join("sylphx-transcript.jsonl");
-    if fs::symlink_metadata(&sylphx).is_ok_and(|m| m.is_file() && !m.file_type().is_symlink()) {
-        result.push(sylphx);
+    add(file(walk, &sylphx).map(|found| found.then(|| jsonl(sylphx)).into_iter().collect()))?;
+    for (db, kind) in [
+        (config.join("sessions.sqlite3"), StoreKind::SpironSessions),
+        (
+            config.join("data-home/opencode/opencode.db"),
+            StoreKind::OpenCodeMessages,
+        ),
+        (
+            config.join(".local/share/opencode/opencode.db"),
+            StoreKind::OpenCodeMessages,
+        ),
+    ] {
+        add(file(walk, &db).map(|found| {
+            found
+                .then_some(NativeSource {
+                    path: db,
+                    format: NativeFormat::Store(kind),
+                })
+                .into_iter()
+                .collect()
+        }))?;
     }
+    // Claude Code: one JSONL per session in each project directory, and each
+    // session's subagents below it. No guessed personal home is read.
     for projects in [config.join("projects"), config.join(".claude/projects")] {
-        // No guessed personal home or Codex SQLite discovery.
-        if safe_components(walk, root, &projects)?
-            && fs::symlink_metadata(&projects)
-                .is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
-        {
-            for entry in fs::read_dir(projects)? {
-                let entry = entry?;
-                if entry.file_type()?.is_dir() {
-                    result.extend(
-                        regular_files(walk, &entry.path(), false)?
-                            .into_iter()
-                            .filter(|p| p.extension().is_some_and(|e| e == "jsonl")),
-                    );
-                }
+        let found = subdirectories(walk, root, &projects);
+        let Some(projects) = tolerate(found)? else {
+            continue;
+        };
+        for project in projects {
+            add(jsonl_files(walk, &project, false).map(|p| p.into_iter().map(jsonl).collect()))?;
+            let Some(sessions) = tolerate(subdirectories(walk, root, &project))? else {
+                continue;
+            };
+            for session in sessions {
+                let subagents = session.join("subagents");
+                add(jsonl_files(walk, &subagents, false)
+                    .map(|p| p.into_iter().map(jsonl).collect()))?;
             }
         }
     }
-    result.sort();
-    result.dedup();
+    let codex = config.join("sessions");
+    add(safe_components(walk, root, &codex).and_then(|safe| {
+        if !safe {
+            return Ok(Vec::new());
+        }
+        Ok(jsonl_files(walk, &codex, true)?
+            .into_iter()
+            .map(|path| NativeSource {
+                path,
+                format: NativeFormat::CodexRollout,
+            })
+            .collect())
+    }))?;
+    let brain = config.join(".gemini/antigravity-cli/brain");
+    if let Some(conversations) = tolerate(subdirectories(walk, root, &brain))? {
+        for conversation in conversations {
+            let transcript = conversation.join(".system_generated/logs/transcript_full.jsonl");
+            add(file(walk, &transcript).map(|found| {
+                found
+                    .then_some(NativeSource {
+                        path: transcript,
+                        format: NativeFormat::AgyTranscript,
+                    })
+                    .into_iter()
+                    .collect()
+            }))?;
+        }
+    }
+    let muse = config.join("data-home/muse/sessions");
+    add(safe_components(walk, root, &muse).and_then(|safe| {
+        if !safe {
+            return Ok(Vec::new());
+        }
+        // Hidden directories hold Muse's view snapshots, not the session log.
+        Ok(regular_files(walk, &muse, true)?
+            .into_iter()
+            .filter(|p| {
+                p.file_name().is_some_and(|n| n == "session.jsonl")
+                    && p.strip_prefix(&muse).is_ok_and(|rel| {
+                        !rel.components()
+                            .any(|c| c.as_os_str().to_string_lossy().starts_with('.'))
+                    })
+            })
+            .map(jsonl)
+            .collect())
+    }))?;
+    if let Some(cwds) = tolerate(subdirectories(
+        walk,
+        root,
+        &config.join(".omp/agent/sessions"),
+    ))? {
+        for cwd in cwds {
+            add(jsonl_files(walk, &cwd, false).map(|p| p.into_iter().map(jsonl).collect()))?;
+        }
+    }
+    if let Some(cwds) = tolerate(subdirectories(walk, root, &config.join(".grok/sessions")))? {
+        for cwd in cwds {
+            let Some(sessions) = tolerate(subdirectories(walk, root, &cwd))? else {
+                continue;
+            };
+            for session in sessions {
+                let history = session.join("chat_history.jsonl");
+                add(file(walk, &history)
+                    .map(|found| found.then(|| jsonl(history)).into_iter().collect()))?;
+            }
+        }
+    }
+    result.sort_by(|a, b| a.path.cmp(&b.path));
+    result.dedup_by(|a, b| a.path == b.path);
     Ok(result)
 }
-fn event_metadata(owner: &Owner, value: &EventHeader) -> IndexMetadata {
+
+/// `Some(found)`, or `None` when a harness directory may not be read.
+fn tolerate<T>(found: io::Result<T>) -> io::Result<Option<T>> {
+    match found {
+        Ok(found) => Ok(Some(found)),
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Directories directly below `dir`, reached without a symlink. Hidden
+/// directories (a harness's own snapshots and caches) are not history.
+fn subdirectories(walk: &mut Walk, root: &Path, dir: &Path) -> io::Result<Vec<PathBuf>> {
+    if !safe_components(walk, root, dir)? {
+        return Ok(Vec::new());
+    }
+    let meta = fs::symlink_metadata(dir)?;
+    if !meta.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut result = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() && !entry.file_name().to_string_lossy().starts_with('.') {
+            let path = entry.path();
+            if let Ok(meta) = fs::symlink_metadata(&path) {
+                walk.note_dir(&path, &meta);
+            }
+            result.push(path);
+        }
+    }
+    result.sort();
+    Ok(result)
+}
+
+/// `*.jsonl` regular files in `dir`, optionally below it too.
+fn jsonl_files(walk: &mut Walk, dir: &Path, recursive: bool) -> io::Result<Vec<PathBuf>> {
+    Ok(regular_files(walk, dir, recursive)?
+        .into_iter()
+        .filter(|p| p.extension().is_some_and(|e| e == "jsonl"))
+        .collect())
+}
+
+fn event_metadata(owner: &Owner, value: &EventHeader, format: NativeFormat) -> IndexMetadata {
+    // Only an enveloped format's body is read; elsewhere `data` is payload.
+    let body =
+        matches!(format.envelope(), Envelope::Codex | Envelope::Spiron).then_some(&value.data);
     let role = value
         .role
         .as_deref()
         .or_else(|| value.message.as_ref().and_then(|m| m.role.as_deref()))
+        .or_else(|| body.and_then(|b| b.role.as_deref()))
+        .or(match (format, value.kind.as_deref()) {
+            (NativeFormat::Store(StoreKind::SpironSessions), Some("tool_call")) => {
+                Some("assistant")
+            }
+            (NativeFormat::Store(StoreKind::SpironSessions), Some("tool_result")) => Some("tool"),
+            (NativeFormat::AgyTranscript, Some("USER_INPUT")) => Some("user"),
+            _ => None,
+        })
         .unwrap_or("system");
     let tool = value
         .tool_name
         .clone()
         .or_else(|| value.tool.clone())
+        .or_else(|| body.and_then(|b| b.tool_name.clone()))
         .or_else(|| {
             (role == "tool").then(|| value.name.clone().unwrap_or_else(|| "unknown".into()))
         });
@@ -962,6 +2459,10 @@ fn event_metadata(owner: &Owner, value: &EventHeader) -> IndexMetadata {
             value
                 .timestamp
                 .as_deref()
+                .or(match format {
+                    NativeFormat::AgyTranscript => value.created_at.as_deref(),
+                    _ => None,
+                })
                 .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
                 .map(|time| time.timestamp_millis())
         }),
@@ -984,8 +2485,10 @@ mod tests {
     use std::cell::Cell;
 
     thread_local! {
-        /// Class refreshes that took the lifecycle lock and walked the tree.
+        /// Class refreshes that walked the tree.
         pub(super) static CLASS_WALKS: Cell<usize> = const { Cell::new(0) };
+        /// A smaller batch, so a small fixture spans several batches.
+        pub(super) static BATCH_BYTES_OVERRIDE: Cell<Option<u64>> = const { Cell::new(None) };
     }
 
     /// A search touches an unchanged agent with a stat per recorded entry:
@@ -1032,8 +2535,10 @@ mod tests {
                         ..Default::default()
                     },
                     at,
+                    u64::MAX,
                 )
                 .unwrap()
+                .0
                 .into_iter()
                 .map(|(hit, bytes)| (hit.id, hit.metadata.sender, bytes))
                 .collect::<Vec<_>>()
@@ -1095,8 +2600,10 @@ mod tests {
                         ..Default::default()
                     },
                     now,
+                    u64::MAX,
                 )
-                .unwrap();
+                .unwrap()
+                .0;
             assert_eq!(hits.len(), 3);
         }
         assert_eq!(walks() - start, 2);
@@ -1235,8 +2742,7 @@ mod tests {
         let excessive = serde_json::json!({"content": (0..1025).map(|_| serde_json::json!({"type":"tool_use","id":"too-many","name":"wrong"})).collect::<Vec<_>>()});
         fs::OpenOptions::new().append(true).open(&native).unwrap().write_all(format!("{{\"type\":\"function_call\",\"call_id\":\"partial\",\"name\":\"not-published\"}}\n{excessive}\n").as_bytes()).unwrap();
         let failure = refresh_native(&mut index, &Owner::from(&own), &native)
-            .err()
-            .expect("metadata cap must refuse refresh");
+            .expect_err("metadata cap must refuse refresh");
         assert!(
             failure
                 .to_string()
@@ -1510,7 +3016,16 @@ mod tests {
         let index_path = dir.path().join(INDEX_FILE);
         let mut index = HostIndex::open(&index_path).unwrap();
         let t0 = crate::now_ms();
-        refresh_native_at(&mut index, &Owner::from(&agent), &path, false, t0).unwrap();
+        refresh_native_at(
+            &mut index,
+            &Owner::from(&agent),
+            &path,
+            NativeFormat::Jsonl,
+            false,
+            false,
+            t0,
+        )
+        .unwrap();
         let suffix = b"{\"content\":\"suffixneedle\"}\n";
         fs::OpenOptions::new()
             .append(true)
@@ -1518,8 +3033,16 @@ mod tests {
             .unwrap()
             .write_all(suffix)
             .unwrap();
-        let append =
-            refresh_native_at(&mut index, &Owner::from(&agent), &path, false, t0 + 1).unwrap();
+        let append = refresh_native_at(
+            &mut index,
+            &Owner::from(&agent),
+            &path,
+            NativeFormat::Jsonl,
+            false,
+            false,
+            t0 + 1,
+        )
+        .unwrap();
         assert_eq!(
             append.prefix_verified_bytes,
             crate::host_cursor::BOUNDARY_BYTES
@@ -1542,8 +3065,16 @@ mod tests {
         file.seek(SeekFrom::Start(prefix.len() as u64 + 12))
             .unwrap();
         file.write_all(b"inside").unwrap();
-        let inside =
-            refresh_native_at(&mut index, &Owner::from(&agent), &path, false, t0 + 2).unwrap();
+        let inside = refresh_native_at(
+            &mut index,
+            &Owner::from(&agent),
+            &path,
+            NativeFormat::Jsonl,
+            false,
+            false,
+            t0 + 2,
+        )
+        .unwrap();
         assert_eq!(inside.indexed_records, 2);
         assert_eq!(
             inside.suffix_scanned_bytes,
@@ -1556,8 +3087,16 @@ mod tests {
         file.write_all(b"newneedle").unwrap();
         let mut append_file = fs::OpenOptions::new().append(true).open(&path).unwrap();
         append_file.write_all(suffix).unwrap();
-        let outside =
-            refresh_native_at(&mut index, &Owner::from(&agent), &path, false, t0 + 3).unwrap();
+        let outside = refresh_native_at(
+            &mut index,
+            &Owner::from(&agent),
+            &path,
+            NativeFormat::Jsonl,
+            false,
+            false,
+            t0 + 3,
+        )
+        .unwrap();
         assert_eq!(outside.indexed_records, 1);
         assert_eq!(
             outside.prefix_verified_bytes,
@@ -1590,6 +3129,9 @@ mod tests {
                 .verify_one_host_history_source(t0 + 3_600_003)
                 .unwrap()
         );
+        // The maintenance tick only schedules it; the background indexer
+        // reads the source and repairs what changed.
+        assert!(store.index_host_history_step(u64::MAX).unwrap());
         let mut index = HostIndex::open(&index_path).unwrap();
         assert!(
             index
@@ -1610,6 +3152,8 @@ mod tests {
             &mut index,
             &Owner::from(&agent),
             &path,
+            NativeFormat::Jsonl,
+            false,
             false,
             t0 + 3_600_004,
         )
@@ -1629,6 +3173,8 @@ mod tests {
             &mut index,
             &Owner::from(&agent),
             &path,
+            NativeFormat::Jsonl,
+            false,
             false,
             t0 + 3_600_005,
         )
@@ -1643,12 +3189,336 @@ mod tests {
         );
     }
 
+    /// A transcript of `count` records, each naming its number.
+    fn numbered_transcript(path: &Path, count: usize) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for i in 0..count {
+            bytes.extend_from_slice(
+                format!(
+                    "{{\"role\":\"user\",\"content\":\"record{i:04} {}\"}}\n",
+                    "padding ".repeat(24)
+                )
+                .as_bytes(),
+            );
+        }
+        fs::write(path, &bytes).unwrap();
+        bytes
+    }
+
+    /// (a) Reading and projecting a source happen with no lifecycle lock and
+    /// no index write transaction held: the gate that takes the lock for a
+    /// batch is called only once the batch is read, the index accepts
+    /// another writer at that moment, and each batch reads a bounded share.
+    /// While the gate is held, the only read is the boundary check.
+    #[test]
+    fn indexing_reads_with_no_lock_or_write_and_publishes_bounded_batches() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        BATCH_BYTES_OVERRIDE.with(|b| b.set(Some(4096)));
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(NewAgent::new("batches", "spiron"))
+            .unwrap();
+        let root = dir
+            .path()
+            .join("agents")
+            .join(agent.id.as_str())
+            .join("transcripts");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("a.jsonl");
+        let bytes = numbered_transcript(&path, 60);
+        let index_path = dir.path().join(INDEX_FILE);
+        let mut index = HostIndex::open(&index_path).unwrap();
+
+        let prepared = || crate::host_index::PREPARED.with(Cell::get);
+        struct Held(Rc<RefCell<Vec<(usize, usize)>>>, usize);
+        impl Drop for Held {
+            fn drop(&mut self) {
+                let now = crate::host_index::PREPARED.with(Cell::get);
+                self.0.borrow_mut().push((self.1, now));
+            }
+        }
+        let holds = Rc::new(RefCell::new(Vec::new()));
+        let mut published_before = Vec::new();
+        let mut gate = || -> Result<Option<Box<dyn std::any::Any>>, IndexError> {
+            // Nothing holds this owner's lifecycle while a batch is read.
+            let lock = store.try_lock_agent_lifecycle(&agent.id).unwrap();
+            // Nor the index's write lock: another writer gets it at once.
+            let other = rusqlite::Connection::open(&index_path).unwrap();
+            other.busy_timeout(std::time::Duration::ZERO).unwrap();
+            other.execute_batch("BEGIN IMMEDIATE; ROLLBACK;").unwrap();
+            published_before.push(
+                HostIndex::open(&index_path)
+                    .unwrap()
+                    .source_documents(agent.id.as_str(), &path)
+                    .unwrap()
+                    .len(),
+            );
+            // This batch was read and projected before the gate.
+            let at = prepared();
+            let last = holds.borrow().last().map_or(0, |h: &(usize, usize)| h.1);
+            assert!(at > last, "a batch is projected before its gate");
+            Ok(Some(Box::new((lock, Held(Rc::clone(&holds), at)))))
+        };
+        let mut budget = u64::MAX;
+        let stats = refresh_native_ctx(
+            &mut index,
+            &Owner::from(&agent),
+            &path,
+            NativeFormat::Jsonl,
+            false,
+            false,
+            crate::now_ms(),
+            &mut budget,
+            &mut gate,
+        )
+        .unwrap();
+        assert!(stats.complete);
+        assert_eq!(stats.indexed_records, 60);
+        let record = bytes.len() as u64 / 60;
+        let batches = bytes.len() as u64 / (4096 + record) + 1;
+        let holds = holds.borrow();
+        assert!(holds.len() as u64 >= batches, "{} batches", holds.len());
+        // Every batch read its records before taking the gate, and published
+        // after: documents grow batch by batch, never all at once.
+        assert_eq!(published_before[0], 0);
+        assert!(published_before.windows(2).all(|w| w[0] < w[1]));
+        assert!(published_before.last().unwrap() < &60);
+        for (taken, released) in holds.iter() {
+            assert_eq!(
+                taken, released,
+                "nothing is read or projected under the gate"
+            );
+        }
+        let cursor = index
+            .source_cursor(agent.id.as_str(), &path)
+            .unwrap()
+            .unwrap();
+        assert!(cursor.complete && !cursor.rebuilding);
+        assert_eq!(cursor.end, bytes.len() as u64);
+        assert_eq!(
+            index
+                .source_documents(agent.id.as_str(), &path)
+                .unwrap()
+                .len(),
+            60
+        );
+        BATCH_BYTES_OVERRIDE.with(|b| b.set(None));
+    }
+
+    /// (a) A batch is published only if the source still holds what was
+    /// read. A batch read before a redaction (the gate refuses it) or before
+    /// an in-place rewrite is dropped and its frontier kept; an append by a
+    /// live writer is not a change to the records read. The next refresh
+    /// resumes from the last published batch.
+    #[test]
+    fn a_batch_publishes_only_while_its_source_and_owner_are_unchanged() {
+        use std::io::Write;
+        BATCH_BYTES_OVERRIDE.with(|b| b.set(Some(4096)));
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(NewAgent::new("gated", "spiron"))
+            .unwrap();
+        let owner = Owner::from(&agent);
+        let root = dir
+            .path()
+            .join("agents")
+            .join(agent.id.as_str())
+            .join("transcripts");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("a.jsonl");
+        let bytes = numbered_transcript(&path, 60);
+        let mut index = HostIndex::open(&dir.path().join(INDEX_FILE)).unwrap();
+        let refresh = |index: &mut HostIndex, gate: &mut Gate<'_>| {
+            let mut budget = u64::MAX;
+            refresh_native_ctx(
+                index,
+                &owner,
+                &path,
+                NativeFormat::Jsonl,
+                false,
+                false,
+                crate::now_ms(),
+                &mut budget,
+                gate,
+            )
+        };
+        // The owner changed under the second batch: it is dropped.
+        let mut calls = 0;
+        let stats = refresh(&mut index, &mut || {
+            calls += 1;
+            Ok((calls == 1).then(|| Box::new(()) as Box<dyn std::any::Any>))
+        })
+        .unwrap();
+        assert!(!stats.complete);
+        assert!(stats.pending_bytes > 0);
+        let first = index
+            .source_cursor(agent.id.as_str(), &path)
+            .unwrap()
+            .unwrap();
+        assert!(!first.complete);
+        assert!(first.end > 0 && first.end < bytes.len() as u64);
+        let published = index
+            .source_documents(agent.id.as_str(), &path)
+            .unwrap()
+            .len();
+        assert!(published > 0 && published < 60);
+
+        // A rewrite of the records being read refuses the batch.
+        let mut edited = bytes.clone();
+        let at = first.end as usize + 20;
+        edited[at..at + 6].copy_from_slice(b"EDITED");
+        let error = refresh(&mut index, &mut || {
+            fs::write(&path, &edited).unwrap();
+            Ok(Some(Box::new(())))
+        })
+        .unwrap_err();
+        assert!(matches!(error, IndexError::Io(ref e) if e.kind() == io::ErrorKind::WouldBlock));
+        assert_eq!(
+            serde_json::to_string(&index.source_cursor(agent.id.as_str(), &path).unwrap()).unwrap(),
+            serde_json::to_string(&Some(first.clone())).unwrap()
+        );
+        assert_eq!(
+            index
+                .source_documents(agent.id.as_str(), &path)
+                .unwrap()
+                .len(),
+            published
+        );
+        fs::write(&path, &bytes).unwrap();
+
+        // A live append under the read publishes, and the refresh resumes
+        // from the published frontier to the end.
+        let mut appended = false;
+        let stats = refresh(&mut index, &mut || {
+            if !appended {
+                appended = true;
+                fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap()
+                    .write_all(b"{\"role\":\"user\",\"content\":\"lateneedle\"}\n")
+                    .unwrap();
+            }
+            Ok(Some(Box::new(())))
+        })
+        .unwrap();
+        assert!(stats.complete);
+        assert_eq!(
+            index
+                .source_documents(agent.id.as_str(), &path)
+                .unwrap()
+                .len(),
+            61
+        );
+        BATCH_BYTES_OVERRIDE.with(|b| b.set(None));
+    }
+
+    /// (b) A search indexes at most its budget of new history before it
+    /// answers. The rest is queued for the background indexer and the answer
+    /// says what is pending; once the indexer has run, the same search finds
+    /// everything and nothing is pending. The pre-warm pass covers an agent
+    /// no search has touched.
+    #[test]
+    fn a_search_indexes_a_bounded_delta_and_the_background_indexes_the_rest() {
+        BATCH_BYTES_OVERRIDE.with(|b| b.set(Some(4096)));
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(NewAgent::new("large", "spiron"))
+            .unwrap();
+        let quiet = store
+            .create_agent(NewAgent::new("unsearched", "spiron"))
+            .unwrap();
+        let root = dir
+            .path()
+            .join("agents")
+            .join(agent.id.as_str())
+            .join("transcripts");
+        fs::create_dir_all(&root).unwrap();
+        let bytes = numbered_transcript(&root.join("a.jsonl"), 200);
+        let quiet_root = dir
+            .path()
+            .join("agents")
+            .join(quiet.id.as_str())
+            .join("transcripts");
+        fs::create_dir_all(&quiet_root).unwrap();
+        numbered_transcript(&quiet_root.join("q.jsonl"), 10);
+        let ids = [agent.id.to_string()];
+        let search = |term: &str, budget: u64| {
+            store
+                .search_host_files_at(
+                    &ids,
+                    MemoryScope::Transcripts,
+                    &HistorySearchQuery {
+                        query: Some(term.into()),
+                        ..Default::default()
+                    },
+                    crate::now_ms() + 10_000,
+                    budget,
+                )
+                .unwrap()
+        };
+        let budget = 8 * 1024;
+        let (hits, pending) = search("record0000", budget);
+        assert_eq!(hits.len(), 1, "the first records are indexed");
+        assert_eq!(pending.sources, 1);
+        assert!(pending.bytes >= bytes.len() as u64 - budget - 4096);
+        let index = HostIndex::open(&dir.path().join(INDEX_FILE)).unwrap();
+        let cursor = index
+            .source_cursor(agent.id.as_str(), &root.join("a.jsonl"))
+            .unwrap()
+            .unwrap();
+        let record = bytes.len() as u64 / 200;
+        assert!(cursor.end <= budget + record, "{} > budget", cursor.end);
+        assert_eq!(store.host_history_backlog(), 1);
+        // A later search does not wait for the rest either.
+        let (hits, pending) = search("record0199", budget);
+        assert!(hits.is_empty());
+        assert_eq!(pending.sources, 1);
+        // The background indexer completes it in bounded steps.
+        let mut steps = 0;
+        while store.host_history_backlog() > 0 {
+            assert!(store.index_host_history_step(16 * 1024).unwrap());
+            steps += 1;
+            assert!(steps < 100);
+        }
+        assert!(steps > 1, "a step stays within its budget");
+        let (hits, pending) = search("record0199", 0);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(pending, PendingHistory::default());
+
+        // Pre-warm: with nothing queued, steps cover every agent once.
+        while store.index_host_history_step(u64::MAX).unwrap() {}
+        let quiet_ids = [quiet.id.to_string()];
+        let (hits, pending) = store
+            .search_host_files_at(
+                &quiet_ids,
+                MemoryScope::Transcripts,
+                &HistorySearchQuery {
+                    query: Some("record0009".into()),
+                    ..Default::default()
+                },
+                crate::now_ms() + 10_000,
+                0,
+            )
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(pending, PendingHistory::default());
+        assert!(!store.index_host_history_step(u64::MAX).unwrap());
+        BATCH_BYTES_OVERRIDE.with(|b| b.set(None));
+    }
+
     /// The verifier runs on the maintenance worker beside the WAL checkpoint
     /// and outbound settlement. A held lifecycle (a delivery, search or archive
-    /// of that owner) must make it skip the source, not wait: before, it
-    /// blocked in `flock` for as long as the holder kept the lock.
+    /// of that owner) must not make it wait: before, it blocked in `flock` for
+    /// as long as the holder kept the lock. It now never reads the source or
+    /// takes the lock; it schedules the verification for the background
+    /// indexer, which publishes once the owner is free.
     #[test]
-    fn periodic_verifier_skips_a_busy_owner_instead_of_waiting() {
+    fn periodic_verifier_never_waits_for_a_busy_owner() {
         let dir = crate::test_tempdir();
         let store = std::sync::Arc::new(Store::open(dir.path().join("state.db")).unwrap());
         let agent = store
@@ -1664,46 +3534,47 @@ mod tests {
         fs::write(&path, "{\"content\":\"busyneedle\"}\n").unwrap();
         let index_path = dir.path().join(INDEX_FILE);
         let t0 = crate::now_ms();
-        let before = {
+        {
             let mut index = HostIndex::open(&index_path).unwrap();
-            refresh_native_at(&mut index, &Owner::from(&agent), &path, false, t0).unwrap();
-            index
-                .source_cursor(agent.id.as_str(), &path)
-                .unwrap()
-                .unwrap()
-        };
+            refresh_native_at(
+                &mut index,
+                &Owner::from(&agent),
+                &path,
+                NativeFormat::Jsonl,
+                false,
+                false,
+                t0,
+            )
+            .unwrap();
+        }
         let held = store.lock_agent_lifecycle(&agent.id).unwrap();
         let (done, outcome) = std::sync::mpsc::channel();
         let verifier = std::sync::Arc::clone(&store);
         std::thread::spawn(move || {
             let _ = done.send(verifier.verify_one_host_history_source(t0 + 3_600_001));
         });
-        let skipped = outcome
+        let scheduled = outcome
             .recv_timeout(std::time::Duration::from_secs(20))
             .expect("the verifier waited for a held lifecycle");
-        assert!(!skipped.unwrap());
+        assert!(scheduled.unwrap());
+        assert_eq!(store.host_history_backlog(), 1);
         let index = HostIndex::open(&index_path).unwrap();
         let cursor = index
             .source_cursor(agent.id.as_str(), &path)
             .unwrap()
             .unwrap();
-        assert_eq!(
-            cursor.verification_attempt_ms, before.verification_attempt_ms,
-            "a skipped source keeps its turn"
-        );
+        assert_eq!(cursor.verification_attempt_ms, t0 + 3_600_001);
+        assert!(cursor.full_verified_ms < t0 + 3_600_001);
         drop(index);
         drop(held);
-        assert!(
-            store
-                .verify_one_host_history_source(t0 + 3_600_002)
-                .unwrap()
-        );
+        assert!(store.index_host_history_step(u64::MAX).unwrap());
         let index = HostIndex::open(&index_path).unwrap();
         let cursor = index
             .source_cursor(agent.id.as_str(), &path)
             .unwrap()
             .unwrap();
-        assert_eq!(cursor.full_verified_ms, t0 + 3_600_002);
+        assert_eq!(cursor.full_verified_ms, t0 + 3_600_001);
+        assert_eq!(store.host_history_backlog(), 0);
     }
 
     #[test]
@@ -1725,23 +3596,45 @@ mod tests {
         fs::write(&good, "{\"content\":\"goodneedle\"}\n").unwrap();
         let mut index = HostIndex::open(&dir.path().join(INDEX_FILE)).unwrap();
         let t0 = crate::now_ms();
-        refresh_native_at(&mut index, &Owner::from(&agent), &bad, false, t0).unwrap();
-        refresh_native_at(&mut index, &Owner::from(&agent), &good, false, t0).unwrap();
+        refresh_native_at(
+            &mut index,
+            &Owner::from(&agent),
+            &bad,
+            NativeFormat::Jsonl,
+            false,
+            false,
+            t0,
+        )
+        .unwrap();
+        refresh_native_at(
+            &mut index,
+            &Owner::from(&agent),
+            &good,
+            NativeFormat::Jsonl,
+            false,
+            false,
+            t0,
+        )
+        .unwrap();
         let before = index
             .source_cursor(agent.id.as_str(), &bad)
             .unwrap()
             .unwrap();
         fs::write(&bad, "malformed complete line\n").unwrap();
         drop(index);
-        let error = store
-            .verify_one_host_history_source(t0 + 3_600_001)
-            .unwrap_err();
+        assert!(
+            store
+                .verify_one_host_history_source(t0 + 3_600_001)
+                .unwrap()
+        );
+        let error = store.index_host_history_step(u64::MAX).unwrap_err();
         assert!(matches!(error, IndexError::Io(ref e) if e.kind() == io::ErrorKind::InvalidData));
         assert!(
             store
                 .verify_one_host_history_source(t0 + 3_600_002)
                 .unwrap()
         );
+        assert!(store.index_host_history_step(u64::MAX).unwrap());
         let index = HostIndex::open(&dir.path().join(INDEX_FILE)).unwrap();
         let after = index
             .source_cursor(agent.id.as_str(), &bad)
@@ -1855,9 +3748,11 @@ mod tests {
             .unwrap();
         let root = dir.path().join("agents").join(agent.id.as_str());
         fs::create_dir_all(root.join("memory")).unwrap();
-        fs::create_dir_all(root.join("config")).unwrap();
+        fs::create_dir_all(root.join("transcripts")).unwrap();
         let memory = root.join("memory/MEMORY.md");
-        let native = root.join("config/sylphx-transcript.jsonl");
+        // AnyAgents' own transcript is strict; a harness's file tolerates
+        // malformed lines (see `malformed_native_jsonl_falls_back...`).
+        let native = root.join("transcripts/history.jsonl");
         fs::write(&memory, "sharedneedle").unwrap();
         fs::write(&native, "{\"content\":\"sharedneedle\"}\n").unwrap();
         let ids = [agent.id.to_string()];
@@ -2067,7 +3962,11 @@ mod tests {
                 let raw = RawSource::open(&path)?.whole()?;
                 index.index(
                     "uncommitted-batch",
-                    &event_metadata(&Owner::from(&agent), &EventHeader::default()),
+                    &event_metadata(
+                        &Owner::from(&agent),
+                        &EventHeader::default(),
+                        NativeFormat::Jsonl,
+                    ),
                     &raw,
                 )?;
                 let mut advanced: SourceCursor =
@@ -2315,6 +4214,431 @@ mod tests {
                     .search_host_files(&[], MemoryScope::Memory, &q)
                     .unwrap()
                     .is_empty()
+            );
+        }
+    }
+
+    /// One agent root holding every harness's native history where AnyAgents
+    /// points it, each event carrying its own needle.
+    fn every_harness_history(root: &Path) {
+        let line = |v: serde_json::Value| serde_json::to_string(&v).unwrap() + "\n";
+        let write = |rel: &str, text: String| {
+            let path = root.join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, text).unwrap();
+        };
+        crate::host_sqlite::tests::spiron_store(
+            &root.join("config/sessions.sqlite3"),
+            &[
+                r#"{"type":"text","timestamp":"2026-11-12T02:51:45Z","data":{"role":"user","content":"spironneedle 粵語問題"}}"#,
+                r#"{"type":"tool_call","timestamp":"2026-11-12T02:51:49Z","data":{"toolName":"mcp__anyagents__send","args":{"text":"spironcallneedle"},"callId":"c1"}}"#,
+                r#"{"type":"tool_result","timestamp":"2026-11-12T02:52:42Z","data":{"callId":"c1","toolName":"mcp__anyagents__send","result":"spironresultneedle"}}"#,
+            ],
+        );
+        let opencode = root.join("config/data-home/opencode/opencode.db");
+        fs::create_dir_all(opencode.parent().unwrap()).unwrap();
+        let conn = rusqlite::Connection::open(&opencode).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session_message(id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+                type TEXT NOT NULL, seq INTEGER NOT NULL, time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL, data TEXT NOT NULL);
+            INSERT INTO session_message VALUES('m1','s','user',1,1794162535171,1794162535171,
+                '{\"text\":\"opencodeneedle question\"}');
+            INSERT INTO session_message VALUES('m2','s','assistant',2,1794162535193,1794162538640,
+                '{\"content\":[{\"type\":\"tool\",\"id\":\"call_1\",\"name\":\"execute\",\"state\":{\"output\":\"opencodetoolneedle\"}}]}');",
+        )
+        .unwrap();
+        drop(conn);
+        let project = "config/projects/-work";
+        write(
+            &format!("{project}/s1.jsonl"),
+            line(
+                serde_json::json!({"type":"user","timestamp":"2026-11-01T00:00:00Z","message":{"role":"user","content":"claudeneedle"}}),
+            ),
+        );
+        write(
+            &format!("{project}/s1/subagents/agent-a1.jsonl"),
+            line(
+                serde_json::json!({"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"claudesubagentneedle"}}]}}),
+            ),
+        );
+        write(
+            "config/sessions/2026/11/03/rollout-2026-11-03T09-00-40-x.jsonl",
+            line(
+                serde_json::json!({"timestamp":"2026-11-03T09:00:41Z","type":"response_item","payload":{"type":"function_call","name":"exec","call_id":"k1","arguments":"codexneedle"}}),
+            ) + "{\"torn\":\"codextornneedle\"\n"
+                + &line(
+                    serde_json::json!({"timestamp":"2026-11-03T09:00:42Z","type":"response_item","payload":{"type":"function_call_output","call_id":"k1","output":"codexoutputneedle"}}),
+                ),
+        );
+        write(
+            "config/.gemini/antigravity-cli/brain/b1/.system_generated/logs/transcript_full.jsonl",
+            line(
+                serde_json::json!({"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","created_at":"2026-11-12T02:12:19Z","content":"agyneedle"}),
+            ),
+        );
+        // The non-full AGY transcript duplicates the full one and is not read.
+        write(
+            "config/.gemini/antigravity-cli/brain/b1/.system_generated/logs/transcript.jsonl",
+            line(serde_json::json!({"type":"USER_INPUT","content":"agyduplicateneedle"})),
+        );
+        write(
+            "config/data-home/muse/sessions/2026/11/12/m1/session.jsonl",
+            line(
+                serde_json::json!({"retained_frame":"session_permission_transaction","children":[{"record_json":"{\"payload\":\"museneedle\"}"}]}),
+            ),
+        );
+        write(
+            "config/data-home/muse/sessions/2026/11/12/m1/subagent/m2/session.jsonl",
+            line(
+                serde_json::json!({"retained_frame":"x","children":[{"record_json":"musesubagentneedle"}]}),
+            ),
+        );
+        write(
+            "config/data-home/muse/sessions/.msp-view-g1/m1/session.jsonl",
+            line(serde_json::json!({"snapshot":"musesnapshotneedle"})),
+        );
+        write(
+            "config/.omp/agent/sessions/--work--/2026-10-14T01-34-15-875Z_x.jsonl",
+            line(
+                serde_json::json!({"type":"message","timestamp":"2026-10-14T01:34:16.234Z","message":{"role":"user","content":[{"type":"text","text":"ompneedle"}]}}),
+            ),
+        );
+        write(
+            "config/.grok/sessions/%2Fwork/g1/chat_history.jsonl",
+            line(serde_json::json!({"role":"user","content":"grokneedle"})),
+        );
+    }
+
+    #[test]
+    fn every_harness_native_history_is_indexed_with_metadata_and_exact_readback() {
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(NewAgent::new("polyglot", "spiron"))
+            .unwrap();
+        let other = store
+            .create_agent(NewAgent::new("other", "spiron"))
+            .unwrap();
+        let root = dir.path().join("agents").join(agent.id.as_str());
+        every_harness_history(&root);
+        every_harness_history(&dir.path().join("agents").join(other.id.as_str()));
+        let ids = [agent.id.to_string()];
+        let find = |needle: &str| {
+            store
+                .search_host_files(
+                    &ids,
+                    MemoryScope::Transcripts,
+                    &HistorySearchQuery {
+                        query: Some(needle.into()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+        };
+        for needle in [
+            "spironneedle",
+            "spironcallneedle",
+            "spironresultneedle",
+            "opencodeneedle",
+            "opencodetoolneedle",
+            "claudeneedle",
+            "claudesubagentneedle",
+            "codexneedle",
+            "codextornneedle",
+            "codexoutputneedle",
+            "agyneedle",
+            "museneedle",
+            "musesubagentneedle",
+            "ompneedle",
+            "grokneedle",
+        ] {
+            let hits = find(needle);
+            assert_eq!(hits.len(), 1, "{needle}: {hits:?}");
+            let (hit, window) = &hits[0];
+            assert_eq!(hit.metadata.agent_id, agent.id.as_str(), "{needle}");
+            assert!(String::from_utf8_lossy(window).contains(needle), "{needle}");
+            // Every hit cites a raw coordinate that reads back exactly.
+            let (read, bytes) = store
+                .read_host_file_range(
+                    &ids,
+                    MemoryScope::Transcripts,
+                    None,
+                    HostRawRead {
+                        id: &hit.id,
+                        sha256: &hit.raw.sha256,
+                        offset: 0,
+                        length: 65536,
+                    },
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(read.raw, hit.raw, "{needle}");
+            assert_eq!(sha256(&bytes), hit.raw.sha256, "{needle}");
+        }
+        for skipped in ["agyduplicateneedle", "musesnapshotneedle"] {
+            assert!(find(skipped).is_empty(), "{skipped}");
+        }
+
+        // Metadata comes from each format's own fields.
+        let meta = |needle: &str| find(needle).remove(0).0;
+        let spiron = meta("spironneedle");
+        assert_eq!(spiron.metadata.role.as_deref(), Some("user"));
+        assert_eq!(spiron.metadata.direction, "in");
+        assert!(spiron.metadata.timestamp_ms.is_some());
+        assert!(
+            spiron
+                .raw
+                .segment
+                .ends_with("config/sessions.sqlite3/session_entries/1")
+        );
+        let result = meta("spironresultneedle");
+        assert_eq!(result.metadata.role.as_deref(), Some("tool"));
+        assert_eq!(
+            result.metadata.tool_name.as_deref(),
+            Some("mcp__anyagents__send")
+        );
+        let opencode = meta("opencodetoolneedle");
+        assert_eq!(opencode.metadata.role.as_deref(), Some("assistant"));
+        assert_eq!(opencode.metadata.timestamp_ms, Some(1794162535193));
+        assert_eq!(opencode.metadata.tool_names, vec!["execute".to_string()]);
+        let codex = meta("codexoutputneedle");
+        assert_eq!(codex.metadata.tool_name.as_deref(), Some("exec"));
+        assert!(codex.metadata.timestamp_ms.is_some());
+        assert_eq!(meta("agyneedle").metadata.role.as_deref(), Some("user"));
+        assert!(meta("agyneedle").metadata.timestamp_ms.is_some());
+        assert_eq!(
+            meta("claudesubagentneedle").metadata.tool_name.as_deref(),
+            Some("Bash")
+        );
+        // Tool filters reach store rows as they reach files.
+        let tools = store
+            .search_host_files(
+                &ids,
+                MemoryScope::Transcripts,
+                &HistorySearchQuery {
+                    query: Some("opencodetoolneedle".into()),
+                    tool_name: Some("execute".into()),
+                    only_tools: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(tools.len(), 1);
+    }
+
+    /// Under a seat, Claude Code keeps `config/sessions` owner-only, which is
+    /// where Codex would keep its rollouts; a harness's projects directory
+    /// can be private too. Neither may hide the agent's other history.
+    #[test]
+    fn a_harness_directory_the_server_cannot_read_hides_no_other_history() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(NewAgent::new("private-dirs", "claude-code"))
+            .unwrap();
+        let root = dir.path().join("agents").join(agent.id.as_str());
+        every_harness_history(&root);
+        let private = [
+            root.join("config/sessions"),
+            root.join("config/.omp/agent/sessions"),
+        ];
+        for path in &private {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o000)).unwrap();
+        }
+        // A privileged test run reads everything; the case does not arise.
+        let denied = fs::read_dir(&private[0]).is_err();
+        let ids = [agent.id.to_string()];
+        let found = |needle: &str| {
+            store
+                .search_host_files(
+                    &ids,
+                    MemoryScope::Transcripts,
+                    &HistorySearchQuery {
+                        query: Some(needle.into()),
+                        ..Default::default()
+                    },
+                )
+                .map(|hits| hits.len())
+        };
+        let results: Vec<_> = [
+            "claudeneedle",
+            "spironneedle",
+            "agyneedle",
+            "museneedle",
+            "codexneedle",
+        ]
+        .iter()
+        .map(|needle| (*needle, found(needle)))
+        .collect();
+        for path in &private {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        for (needle, hits) in results {
+            let hits = hits.unwrap_or_else(|e| panic!("{needle}: {e}"));
+            let expected = usize::from(!(denied && needle == "codexneedle"));
+            assert_eq!(hits, expected, "{needle}");
+        }
+    }
+
+    #[test]
+    fn store_rows_index_incrementally_follow_rewrites_and_rebuild_a_replaced_store() {
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store.create_agent(NewAgent::new("rows", "spiron")).unwrap();
+        let root = dir.path().join("agents").join(agent.id.as_str());
+        every_harness_history(&root);
+        let ids = [agent.id.to_string()];
+        let count = |needle: &str| {
+            store
+                .search_host_files(
+                    &ids,
+                    MemoryScope::Transcripts,
+                    &HistorySearchQuery {
+                        query: Some(needle.into()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+                .len()
+        };
+        assert_eq!(count("spironneedle"), 1);
+        let db = root.join("config/sessions.sqlite3");
+        let mut index = HostIndex::open(&dir.path().join(INDEX_FILE)).unwrap();
+        let owner = Owner::from(&agent);
+        let first = index
+            .source_cursor(agent.id.as_str(), &db)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.end, 3);
+        assert!(first.policy.starts_with("native-sqlite-v1+spiron:"));
+
+        // A live writer appends through its WAL; the next search sees it
+        // without the database file changing.
+        let writer = rusqlite::Connection::open(&db).unwrap();
+        writer
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+            .unwrap();
+        writer
+            .execute(
+                "INSERT INTO session_entries VALUES('s1',4,'{\"type\":\"text\",\"data\":{\"role\":\"assistant\",\"content\":\"appendedrowneedle\"}}')",
+                [],
+            )
+            .unwrap();
+        assert_eq!(count("appendedrowneedle"), 1);
+        let appended = index
+            .source_cursor(agent.id.as_str(), &db)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (appended.end, appended.full_verified_ms),
+            (4, first.full_verified_ms)
+        );
+
+        // OpenCode rewrites a streaming message in place: the new text is
+        // found and the old text is not.
+        let opencode = root.join("config/data-home/opencode/opencode.db");
+        let oc = rusqlite::Connection::open(&opencode).unwrap();
+        oc.execute(
+            "UPDATE session_message SET data='{\"text\":\"rewrittenneedle\"}', time_updated=1794162600000 WHERE id='m1'",
+            [],
+        )
+        .unwrap();
+        drop(oc);
+        assert_eq!(count("rewrittenneedle"), 1);
+        assert_eq!(count("opencodeneedle"), 0);
+
+        // A changed frontier row means the store was rebuilt beneath us.
+        writer
+            .execute(
+                "UPDATE session_entries SET event='{\"type\":\"done\"}' WHERE idx=4",
+                [],
+            )
+            .unwrap();
+        refresh_store_at(&mut index, &owner, &db, StoreKind::SpironSessions, false, 7).unwrap();
+        let rebuilt = index
+            .source_cursor(agent.id.as_str(), &db)
+            .unwrap()
+            .unwrap();
+        assert_eq!((rebuilt.end, rebuilt.full_verified_ms), (4, 7));
+        assert_eq!(count("appendedrowneedle"), 0);
+        assert_eq!(count("spironneedle"), 1);
+
+        // A deleted row is refused at readback by its digest.
+        let hit = store
+            .search_host_files(
+                &ids,
+                MemoryScope::Transcripts,
+                &HistorySearchQuery {
+                    query: Some("spironcallneedle".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .remove(0)
+            .0;
+        writer
+            .execute("DELETE FROM session_entries WHERE idx=2", [])
+            .unwrap();
+        assert!(crate::raw_segment::read_raw(&hit.raw).is_err());
+
+        // A store this reader does not know is not history: its earlier rows
+        // are forgotten with the walk that no longer finds it.
+        drop(writer);
+        fs::remove_file(&db).unwrap();
+        for suffix in ["-wal", "-shm"] {
+            let _ = fs::remove_file(crate::host_sqlite::tests::sibling_for_test(&db, suffix));
+        }
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute_batch("CREATE TABLE unrelated(x);")
+            .unwrap();
+        assert_eq!(count("spironneedle"), 0);
+        assert!(
+            index
+                .source_cursor(agent.id.as_str(), &db)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_redacted_or_linked_store_is_never_read() {
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(NewAgent::new("linked", "spiron"))
+            .unwrap();
+        let root = dir.path().join("agents").join(agent.id.as_str());
+        let elsewhere = dir.path().join("elsewhere");
+        every_harness_history(&elsewhere);
+        fs::create_dir_all(root.join("config/data-home/opencode")).unwrap();
+        std::os::unix::fs::symlink(
+            elsewhere.join("config/sessions.sqlite3"),
+            root.join("config/sessions.sqlite3"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            elsewhere.join("config/data-home/opencode"),
+            root.join("config/data-home/opencode/linked"),
+        )
+        .unwrap();
+        let ids = [agent.id.to_string()];
+        for needle in ["spironneedle", "opencodeneedle"] {
+            assert!(
+                store
+                    .search_host_files(
+                        &ids,
+                        MemoryScope::Transcripts,
+                        &HistorySearchQuery {
+                            query: Some(needle.into()),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap()
+                    .is_empty(),
+                "{needle}"
             );
         }
     }
