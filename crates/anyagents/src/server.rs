@@ -38,6 +38,7 @@ use crate::vendor::{self, HarnessHost, VendorHarness};
 
 mod file_cache;
 mod hybrid;
+mod in_flight;
 #[cfg(test)]
 mod latency_tests;
 mod memory_backlog;
@@ -538,6 +539,13 @@ async fn serve(
             }
         }
     }
+    {
+        // A spawn the last server stopped part way gets its prompt now; the
+        // socket is already bound, so this never delays serving.
+        let store = Arc::clone(&store);
+        let data = data.to_path_buf();
+        tokio::task::spawn_blocking(move || finish_interrupted_spawns(&store, &data));
+    }
     let app = build_router(state);
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let stopping = Arc::new(tokio::sync::Notify::new());
@@ -553,13 +561,17 @@ async fn serve(
         result = &mut serving => result,
         () = stop_requested(&mut terminate) => {
             // From here no new connection is taken: a call made now waits on
-            // the agent's side for the next server (`mcp::RESTART_WAIT`), so
-            // this one must exit soon rather than drain without end.
+            // the agent's side for the next server (`mcp::RESTART_WAIT`).
+            // Calls already running finish first: dropping a call's future
+            // does not stop its blocking work, and what does stop it is the
+            // process exiting, which can cut a mutation between its steps.
             eprintln!(
-                "anyagents: stopping; in-flight calls get {}s to finish{}",
-                DRAIN_GRACE.as_secs(),
+                "anyagents: stopping; no new calls are taken; waiting up to {}s for {} mutating \
+                 call(s) still running to finish (reads end with the process){}",
+                MUTATION_DRAIN_WITHIN.as_secs(),
+                in_flight::MUTATIONS.running(),
                 if kept {
-                    format!(", and this process exits within {}s", STOP_WITHIN.as_secs())
+                    format!("; this process exits within {}s", STOP_WITHIN.as_secs())
                 } else {
                     String::new()
                 }
@@ -585,15 +597,23 @@ async fn serve(
                 )
             }));
             stopping.notify_one();
-            match tokio::time::timeout(DRAIN_GRACE, &mut serving).await {
-                Ok(result) => result,
-                Err(_) => {
-                    eprintln!(
-                        "anyagents: calls still running after {}s are dropped; each caller is \
-                         told the call may or may not have applied",
-                        DRAIN_GRACE.as_secs()
-                    );
-                    Ok(())
+            // `serving` is polled throughout, so the listener closes at once.
+            tokio::select! {
+                result = &mut serving => result,
+                left = in_flight::MUTATIONS.settle(MUTATION_DRAIN_WITHIN) => {
+                    if left > 0 {
+                        eprintln!(
+                            "anyagents: {left} mutating call(s) still running after {}s end with \
+                             the process; each caller is told its call may or may not have \
+                             applied",
+                            MUTATION_DRAIN_WITHIN.as_secs()
+                        );
+                    }
+                    // Answers of calls that just finished are written out;
+                    // reads still running end with the process.
+                    tokio::time::timeout(RESPONSE_FLUSH_WITHIN, &mut serving)
+                        .await
+                        .unwrap_or(Ok(()))
                 }
             }
         }
@@ -618,23 +638,30 @@ async fn serve(
     result.map_err(Error::from)
 }
 
-/// How long calls already running get to finish once the server stops. No
-/// connection is taken meanwhile, and the agents' tool servers wait for the
-/// next server (`mcp::RESTART_WAIT`), so this bounds how long a restart
-/// refuses them. A call still running after it is dropped: its caller sees
-/// the connection close and is told the call may or may not have applied.
+/// How long a stopping server waits for the mutating calls it is running
+/// (spawn, delete, send, schedules, any call but a read) to finish before it
+/// exits. No connection is taken meanwhile; the agents' tool servers wait for
+/// the next server (`mcp::RESTART_WAIT`). A mutation still running after it
+/// ends with the process, and its caller is told the call may or may not have
+/// applied.
 ///
-/// The 2026-11-14 17:47:56Z restart drained 190 s: the old server stopped
-/// accepting at once and exited at 17:51:06Z, while the new one served one
-/// second after it started. A call waiting for a keeper's `ready` (up to
-/// three minutes) or one adapter call (up to two) could hold it that long.
-const DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(8);
+/// Sized from the fleet's own spawns (2026-11-11..14, 208 successful): the
+/// median took 4.3 s; most longer ones waited behind the store stalls fixed in
+/// #289. A minute covers a spawn that provisions a large checkout, and keeps a
+/// restart well inside agy's three-minute tool deadline.
+const MUTATION_DRAIN_WITHIN: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Once the mutations are done, how long their answers get to be written out
+/// before the server stops serving; reads still running end with the process.
+const RESPONSE_FLUSH_WITHIN: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// The longest a server whose harnesses live in keepers takes to exit once
 /// told to stop. Past it the process exits at once: its harnesses stay with
 /// their keepers for the next server, exactly as after a crash, and its store
 /// writes are transactions, so a write cut short is not half made.
-pub(crate) const STOP_WITHIN: std::time::Duration = std::time::Duration::from_secs(20);
+pub(crate) const STOP_WITHIN: std::time::Duration = std::time::Duration::from_secs(
+    MUTATION_DRAIN_WITHIN.as_secs() + RESPONSE_FLUSH_WITHIN.as_secs() + 13,
+);
 
 /// The wait for Telegram to hand back every bot's long poll at shutdown. It
 /// runs beside the drain. A bot not released in time is polled again by the
@@ -1143,6 +1170,7 @@ pub(crate) fn build_webhook_router(state: AppState) -> Router {
         .route("/v1/mcp", get(mcp_get_route).post(mcp_post_route))
         .route("/mcp", get(mcp_get_route).post(mcp_post_route))
         .with_state(state)
+        .layer(axum::middleware::from_fn(in_flight::track))
 }
 
 pub(crate) fn build_router(state: AppState) -> Router {
@@ -1225,6 +1253,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/v1/mcp", get(mcp_get_route).post(mcp_post_route))
         .route("/mcp", get(mcp_get_route).post(mcp_post_route))
         .with_state(state)
+        .layer(axum::middleware::from_fn(in_flight::track))
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1501,10 +1530,13 @@ async fn mcp_post(
     // (`crate::mcp`), so the whole call is driven from a blocking-pool thread:
     // whatever it waits on holds that thread, never an async worker.
     let runtime = tokio::runtime::Handle::current();
-    let answered =
-        tokio::task::spawn_blocking(move || runtime.block_on(mcp.handle_jsonrpc_request(payload)))
-            .await
-            .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    let call = in_flight::carry();
+    let answered = tokio::task::spawn_blocking(move || {
+        let _call = call;
+        runtime.block_on(mcp.handle_jsonrpc_request(payload))
+    })
+    .await
+    .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
     match answered {
         Some(response_json) => Ok(axum::response::IntoResponse::into_response((
             StatusCode::OK,
@@ -4549,7 +4581,7 @@ async fn create_agent_route(
         );
         require_remote_callback(state.store.data_dir(), &harness)?;
         refuse_host_placement_over_http(via_http, &harness)?;
-        let mut agent = create::create(
+        let agent = create::create(
             &state.store,
             state.store.data_dir(),
             CreateRequest {
@@ -4573,108 +4605,35 @@ async fn create_agent_route(
             Principal::Operator => "operator".to_string(),
             Principal::Agent { name, .. } => format!("agent:{name}"),
         };
-        let mut scope_changed = false;
-        if let Some(ref scope_val) = body.scope {
-            agent = state
-                .store
-                .set_agent_scope_as(&agent.id, scope_val, &actor)
-                .map_err(ApiError::from_store)?;
-            scope_changed = true;
-        } else if body.public == Some(true) {
-            agent = state
-                .store
-                .set_agent_public_as(&agent.id, true, &actor)
-                .map_err(ApiError::from_store)?;
-            scope_changed = true;
-        } else if body.public == Some(false) {
-            agent = state
-                .store
-                .set_agent_public_as(&agent.id, false, &actor)
-                .map_err(ApiError::from_store)?;
-            scope_changed = true;
+        let finish = SpawnFinish {
+            actor,
+            caller: caller_agent.as_ref().map(|(id, _)| id.to_string()),
+            scope: body.scope,
+            public: body.public,
+            lifecycle: body.lifecycle,
+            groups: requested_groups,
+            prompt: body
+                .prompt
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+        };
+        // The agent is admitted. What the spawn still does is recorded beside
+        // it first, so a server stopped part way finishes it at its next start
+        // (`finish_interrupted_spawns`) instead of leaving an agent without its
+        // prompt and a parent waiting for it.
+        let marker = spawn_finish_marker(state.store.data_dir(), &agent.id);
+        if let Err(error) = record_spawn_finish(&marker, &finish) {
+            eprintln!(
+                "warning: spawn of {} not recorded for recovery ({error}); finishing it now",
+                agent.name
+            );
         }
-        if let Some(ref lifecycle_val) = body.lifecycle {
-            agent = state
-                .store
-                .set_agent_lifecycle_as(&agent.id, lifecycle_val, &actor)
-                .map_err(ApiError::from_store)?;
-        }
-        if scope_changed {
-            let cfg = anyagents_core::agent_config_dir(state.store.data_dir(), &agent.id);
-            create::sync_agent_description_files(&state.store, &agent, &cfg)
-                .map_err(ApiError::from_store)?;
-        }
-        if !requested_group_names.is_empty() {
-            let mut targets = vec![agent.id.clone()];
-            if let Some((caller_id, _)) = &caller_agent {
-                targets.push(caller_id.clone());
-            }
-            state
-                .store
-                .join_groups_as(&group_actor, &requested_group_names, &targets)
-                .map_err(ApiError::from_store)?;
-        }
-        if !anyagents_core::agent_config_dir(state.store.data_dir(), &agent.id)
-            .join("mcp-capability")
-            .is_file()
-        {
-            operator::mint(&state.store, &agent.id).map_err(ApiError::from_store)?;
-        }
-        let mut has_prompt = false;
-        if let Some(prompt) = body
-            .prompt
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            has_prompt = true;
-            let sender = caller_agent
-                .as_ref()
-                .map(|(id, _)| format!("agent:{id}"))
-                .unwrap_or_else(|| "operator".to_string());
-            let enqueue = || {
-                let message = state
-                    .store
-                    .receive(
-                        &agent.id,
-                        Incoming {
-                            text: prompt.to_string(),
-                            sender: Some(sender),
-                            source_time_ms: None,
-                            source_key: None,
-                            reply_to: None,
-                            quote: None,
-                            origin: None,
-                            received_at_ms: None,
-                        },
-                    )
-                    .map_err(ApiError::from_store)?;
-                let (message, duplicate) = match message {
-                    ReceiveOutcome::New(message) => (message, false),
-                    ReceiveOutcome::Duplicate(message) => (message, true),
-                };
-                Ok(vec![Delivery {
-                    to: format!("agent:{}", agent.name),
-                    id: message.id.to_string(),
-                    seq: message.seq,
-                    duplicate,
-                }])
-            };
-            if let Some((ref caller_id, _)) = caller_agent {
-                outbound_history::deliver(
-                    &state.store,
-                    caller_id,
-                    &format!("agent:{}", agent.name),
-                    None,
-                    prompt,
-                    None,
-                    false,
-                    enqueue,
-                )?;
-            } else {
-                enqueue()?;
-            }
-        }
+        let finished = finish_spawn(&state.store, state.store.data_dir(), agent, &finish);
+        // Done, or refused: either way nothing is left for a restart to redo.
+        let _ = std::fs::remove_file(&marker);
+        let (agent, has_prompt) = finished?;
         if has_prompt {
             create::poke_agent_wake_socket_mail(state.store.data_dir(), &agent.id);
         } else {
@@ -4684,6 +4643,181 @@ async fn create_agent_route(
         Ok((StatusCode::CREATED, Json(view)))
     })
     .await
+}
+
+/// What a spawn does once its agent is admitted: scope, lifecycle, groups,
+/// capability and the first prompt. Recorded in the agent's config directory
+/// while it runs ([`SPAWN_FINISH_FILE`]); every step is idempotent, so it can
+/// be run again after a stop.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, Deserialize)]
+struct SpawnFinish {
+    /// Who spawned: `operator` or `agent:<name>`, for the audit.
+    actor: String,
+    /// The spawning agent's id: the prompt's sender and a group member.
+    caller: Option<String>,
+    scope: Option<String>,
+    public: Option<bool>,
+    lifecycle: Option<String>,
+    groups: Vec<String>,
+    prompt: Option<String>,
+}
+
+/// The record of a spawn still finishing, beside the agent's config.
+const SPAWN_FINISH_FILE: &str = ".anyagents-spawn-finish.json";
+
+fn spawn_finish_marker(data_dir: &Path, agent_id: &anyagents_core::AgentId) -> PathBuf {
+    anyagents_core::agent_config_dir(data_dir, agent_id).join(SPAWN_FINISH_FILE)
+}
+
+fn record_spawn_finish(marker: &Path, finish: &SpawnFinish) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec(finish).map_err(std::io::Error::other)?;
+    anyagents_harness::atomic_write_nonempty_file(marker, &bytes, 0o600)
+}
+
+/// Run what a spawn does after admission. The prompt carries a source key of
+/// its own, so a second run delivers it once.
+fn finish_spawn(
+    store: &Store,
+    data_dir: &Path,
+    mut agent: Agent,
+    finish: &SpawnFinish,
+) -> Result<(Agent, bool), ApiError> {
+    let caller = finish
+        .caller
+        .as_deref()
+        .map(anyagents_core::AgentId::parse)
+        .transpose()
+        .map_err(ApiError::from_store)?;
+    let actor = finish.actor.as_str();
+    let mut scope_changed = false;
+    if let Some(ref scope_val) = finish.scope {
+        agent = store
+            .set_agent_scope_as(&agent.id, scope_val, actor)
+            .map_err(ApiError::from_store)?;
+        scope_changed = true;
+    } else if let Some(public) = finish.public {
+        agent = store
+            .set_agent_public_as(&agent.id, public, actor)
+            .map_err(ApiError::from_store)?;
+        scope_changed = true;
+    }
+    if let Some(ref lifecycle_val) = finish.lifecycle {
+        agent = store
+            .set_agent_lifecycle_as(&agent.id, lifecycle_val, actor)
+            .map_err(ApiError::from_store)?;
+    }
+    if scope_changed {
+        let cfg = anyagents_core::agent_config_dir(data_dir, &agent.id);
+        create::sync_agent_description_files(store, &agent, &cfg).map_err(ApiError::from_store)?;
+    }
+    if !finish.groups.is_empty() {
+        let names: Vec<&str> = finish.groups.iter().map(String::as_str).collect();
+        let mut targets = vec![agent.id.clone()];
+        let group_actor = match &caller {
+            Some(caller_id) => {
+                targets.push(caller_id.clone());
+                anyagents_core::GroupActor::Agent(caller_id.clone())
+            }
+            None => anyagents_core::GroupActor::Operator,
+        };
+        store
+            .join_groups_as(&group_actor, &names, &targets)
+            .map_err(ApiError::from_store)?;
+    }
+    if !anyagents_core::agent_config_dir(data_dir, &agent.id)
+        .join("mcp-capability")
+        .is_file()
+    {
+        operator::mint(store, &agent.id).map_err(ApiError::from_store)?;
+    }
+    let Some(prompt) = finish.prompt.as_deref() else {
+        return Ok((agent, false));
+    };
+    let sender = caller
+        .as_ref()
+        .map(|id| format!("agent:{id}"))
+        .unwrap_or_else(|| "operator".to_string());
+    let key = format!("spawn-prompt:{}", agent.id);
+    let enqueue = || {
+        let message = store
+            .receive(
+                &agent.id,
+                Incoming {
+                    text: prompt.to_string(),
+                    sender: Some(sender),
+                    source_time_ms: None,
+                    source_key: Some(key.clone()),
+                    reply_to: None,
+                    quote: None,
+                    origin: None,
+                    received_at_ms: None,
+                },
+            )
+            .map_err(ApiError::from_store)?;
+        let (message, duplicate) = match message {
+            ReceiveOutcome::New(message) => (message, false),
+            ReceiveOutcome::Duplicate(message) => (message, true),
+        };
+        Ok(vec![Delivery {
+            to: format!("agent:{}", agent.name),
+            id: message.id.to_string(),
+            seq: message.seq,
+            duplicate,
+        }])
+    };
+    if let Some(ref caller_id) = caller {
+        outbound_history::deliver(
+            store,
+            caller_id,
+            &format!("agent:{}", agent.name),
+            None,
+            prompt,
+            Some(&key),
+            true,
+            enqueue,
+        )?;
+    } else {
+        enqueue()?;
+    }
+    Ok((agent, true))
+}
+
+/// Finish the spawns a stopped server left part way: each live agent whose
+/// config still holds [`SPAWN_FINISH_FILE`] gets the rest of its spawn (most
+/// often its first prompt). Run once at start, off the serving path.
+fn finish_interrupted_spawns(store: &Store, data_dir: &Path) -> usize {
+    let Ok(agents) = store.list_live_agents() else {
+        return 0;
+    };
+    let mut finished = 0;
+    for agent in agents {
+        let marker = spawn_finish_marker(data_dir, &agent.id);
+        let Ok(bytes) = std::fs::read(&marker) else {
+            continue;
+        };
+        let name = agent.name.clone();
+        let id = agent.id.clone();
+        match serde_json::from_slice::<SpawnFinish>(&bytes)
+            .map_err(|error| ApiError::new(StatusCode::BAD_REQUEST, error.to_string()))
+            .and_then(|finish| finish_spawn(store, data_dir, agent, &finish))
+        {
+            Ok((_, has_prompt)) => {
+                eprintln!("anyagents: finished the interrupted spawn of {name}");
+                if has_prompt {
+                    create::poke_agent_wake_socket_mail(data_dir, &id);
+                } else {
+                    create::poke_agent_wake_socket(data_dir, &id);
+                }
+                finished += 1;
+            }
+            Err(error) => eprintln!(
+                "anyagents: the interrupted spawn of {name} could not be finished: {}",
+                error.message
+            ),
+        }
+        let _ = std::fs::remove_file(&marker);
+    }
+    finished
 }
 
 async fn archive_agent_route(
@@ -4789,8 +4923,9 @@ fn reap_subagent_ephemeral_dirs_in(
     data_dir: &Path,
     agent_id: &anyagents_core::AgentId,
 ) -> bool {
-    // Delete calls this after removing the row; all surviving references still
-    // protect their workdirs. A failed read must never mean no shared workdirs.
+    // Archive reaping calls this with the row archived, and delete before it
+    // removes the row; all surviving references still protect their
+    // workdirs. A failed read must never mean no shared workdirs.
     let agent = match store.agent(agent_id) {
         Ok(agent) => Some(agent),
         Err(Error::AgentNotFound(_)) => None,
@@ -5304,35 +5439,32 @@ async fn delete_agent_route(
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         };
-        let deleted = state
-            .store
-            .delete_agent(&found.id)
-            .map_err(ApiError::from_store)?;
+        // Everything the agent's name or identity keys on disk goes before its
+        // row: a stop between the two then leaves an archived row that holds
+        // the name and a delete that can be run again, never a free name
+        // whose next agent inherits the old browser profile or config.
         let agent_dir = state
             .store
             .data_dir()
             .join("agents")
-            .join(deleted.id.as_str());
-        if let Some(sbx) = anyagents_tools::SandboxConfig::from_config_dir(&agent_dir.join("config"))
-        {
+            .join(found.id.as_str());
+        let data_dir = state.store.data_dir();
+        let config = agent_dir.join("config");
+        let seat_ids = detect_seat_ids(&config);
+        if let Some(sbx) = anyagents_tools::SandboxConfig::from_config_dir(&config) {
             let _ = anyagents_tools::SandboxProvider::destroy(&sbx);
         }
-        let seat_ids = detect_seat_ids(&agent_dir.join("config"));
-        let _ = crate::browser::stop_profile(state.store.data_dir(), &deleted.name);
-        remove_path_with_seat(
-            &state
-                .store
-                .data_dir()
-                .join("browser-profiles")
-                .join(&deleted.name),
-            seat_ids,
+        reap_subagent_ephemeral_dirs_in(&state.store, data_dir, &found.id);
+        remove_agent_identity_files(data_dir, &found, &agent_dir, seat_ids);
+        let deleted = state
+            .store
+            .delete_agent(&found.id)
+            .map_err(ApiError::from_store)?;
+        let _ = std::fs::remove_file(
+            data_dir
+                .join("locks")
+                .join(format!("{}.lock", deleted.id.as_str())),
         );
-        reap_subagent_ephemeral_dirs_in(&state.store, state.store.data_dir(), &deleted.id);
-        for private_tree in ["config", "memory", "skills"] {
-            let tree_path = agent_dir.join(private_tree);
-            remove_path_with_seat(&tree_path, seat_ids);
-            let _ = std::fs::remove_dir_all(&tree_path);
-        }
         if !agent_dir.join("work").exists() {
             remove_path_with_seat(&agent_dir, seat_ids);
             let _ = std::fs::remove_dir_all(&agent_dir);
@@ -5344,6 +5476,28 @@ async fn delete_agent_route(
         })))
     })
     .await
+}
+
+/// Remove what an agent being deleted keeps under its identity: its browser
+/// profile (keyed by name, so a later agent of the same name would inherit
+/// it) and its private config, memory and skills trees. Idempotent: a delete
+/// stopped part way runs it again.
+fn remove_agent_identity_files(
+    data_dir: &Path,
+    agent: &Agent,
+    agent_dir: &Path,
+    seat_ids: Option<(u32, u32, u32)>,
+) {
+    let _ = crate::browser::stop_profile(data_dir, &agent.name);
+    remove_path_with_seat(
+        &data_dir.join("browser-profiles").join(&agent.name),
+        seat_ids,
+    );
+    for private_tree in ["config", "memory", "skills"] {
+        let tree_path = agent_dir.join(private_tree);
+        remove_path_with_seat(&tree_path, seat_ids);
+        let _ = std::fs::remove_dir_all(&tree_path);
+    }
 }
 
 async fn wake_agent_route(
@@ -8368,7 +8522,15 @@ async fn web_route(
 async fn spawn_store<T: Send + 'static>(
     work: impl FnOnce() -> Result<T, ApiError> + Send + 'static,
 ) -> Result<T, ApiError> {
-    match tokio::task::spawn_blocking(work).await {
+    // The call counts toward a stop until this work returns, even if the
+    // call's future is dropped first (`in_flight`).
+    let call = in_flight::carry();
+    match tokio::task::spawn_blocking(move || {
+        let _call = call;
+        work()
+    })
+    .await
+    {
         Ok(result) => result,
         Err(err) => Err(ApiError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -10221,6 +10383,97 @@ pub(crate) mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         true
+    }
+
+    #[test]
+    fn an_interrupted_spawn_gets_its_prompt_once_at_the_next_start() {
+        let _env = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path();
+        let store = Store::open(data.join("state.db")).unwrap();
+        store
+            .hold_capability_key("test-capability-key-0123456789abcdef")
+            .unwrap();
+        let parent = store
+            .create_agent(anyagents_core::NewAgent::new("parent", "codex"))
+            .unwrap();
+        let mut new = anyagents_core::NewAgent::new("child", "codex");
+        new.parent_id = Some(parent.id.clone());
+        let child = store.create_agent(new).unwrap();
+        let finish = SpawnFinish {
+            actor: "agent:parent".into(),
+            caller: Some(parent.id.to_string()),
+            scope: None,
+            public: None,
+            lifecycle: Some("task".into()),
+            groups: Vec::new(),
+            prompt: Some("build the thing".into()),
+        };
+        // The server stopped after admitting the child, before its prompt.
+        let marker = spawn_finish_marker(data, &child.id);
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        record_spawn_finish(&marker, &finish).unwrap();
+
+        assert_eq!(finish_interrupted_spawns(&store, data), 1);
+        assert!(!marker.exists());
+        let inbox = store.inbox(&child.id, None).unwrap();
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].text, "build the thing");
+        assert_eq!(
+            inbox[0].sender.as_deref(),
+            Some(format!("agent:{}", parent.id).as_str())
+        );
+        assert_eq!(
+            store.agent(&child.id).unwrap().lifecycle().to_string(),
+            "task"
+        );
+
+        // Stopped again after the prompt landed but before the record went:
+        // the next start finishes without a second prompt.
+        record_spawn_finish(&marker, &finish).unwrap();
+        assert_eq!(finish_interrupted_spawns(&store, data), 1);
+        assert_eq!(store.inbox(&child.id, None).unwrap().len(), 1);
+        assert_eq!(finish_interrupted_spawns(&store, data), 0);
+    }
+
+    #[test]
+    fn a_deleted_agents_name_frees_only_after_its_profile_and_config_are_gone() {
+        let _env = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path();
+        let store = Store::open(data.join("state.db")).unwrap();
+        let agent = store
+            .create_agent(anyagents_core::NewAgent::new("shopper", "codex"))
+            .unwrap();
+        let agent_dir = data.join("agents").join(agent.id.as_str());
+        let profile = data.join("browser-profiles").join("shopper");
+        for path in [
+            agent_dir.join("config"),
+            agent_dir.join("memory"),
+            profile.join("user-data"),
+        ] {
+            std::fs::create_dir_all(&path).unwrap();
+        }
+        std::fs::write(profile.join("user-data").join("Cookies"), b"logged-in").unwrap();
+        // The delete route removes these before the row; the row still holds
+        // the name, so no agent can take it while they exist.
+        remove_agent_identity_files(data, &agent, &agent_dir, None);
+        assert!(!profile.exists());
+        assert!(!agent_dir.join("config").exists());
+        assert!(!agent_dir.join("memory").exists());
+        assert!(
+            store
+                .create_agent(anyagents_core::NewAgent::new("shopper", "codex"))
+                .is_err()
+        );
+        // Run again after a stop part way: nothing left, nothing fails.
+        remove_agent_identity_files(data, &agent, &agent_dir, None);
+        store.delete_agent(&agent.id).unwrap();
+        let reused = store
+            .create_agent(anyagents_core::NewAgent::new("shopper", "codex"))
+            .unwrap();
+        assert_ne!(reused.id, agent.id);
+        assert!(!profile.join("user-data").join("Cookies").exists());
     }
 
     #[test]

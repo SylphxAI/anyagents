@@ -8827,12 +8827,13 @@ fn build_request(
 /// A refused or missing socket means nothing was sent, so only the
 /// connection is tried again; no request is ever sent twice.
 ///
-/// A restart is bounded on the server's side: a stopping server gives
-/// in-flight calls a few seconds and exits within `server::STOP_WITHIN`
-/// (20 s), and a new server binds its socket within about a second of
-/// starting (measured 2026-11-14: started 17:51:07Z, serving 17:51:08Z).
-/// Two minutes covers that with room for a slow start (a migration), and is
-/// further cut to what the harness allows ([`harness_patience`]).
+/// A restart is bounded on the server's side: a stopping server lets its
+/// running mutations finish (seconds normally, at most a minute) and exits
+/// within `server::STOP_WITHIN`, and a new server binds its socket within
+/// about a second of starting (measured 2026-11-14: started 17:51:07Z,
+/// serving 17:51:08Z). Two minutes covers that with room for a slow start (a
+/// migration), and is further cut to what the harness allows
+/// ([`harness_patience`]).
 const RESTART_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// The wait of a one-shot command an agent runs in its shell (`anyagents
