@@ -47,18 +47,18 @@ pub(crate) fn search(
     lexical: Vec<(IndexHit, Vec<u8>)>,
 ) -> Hybrid {
     let mut retrieval = RetrievalView {
+        mode: "lexical".into(),
         stages: vec!["lexical".into()],
         ..RetrievalView::default()
     };
+    // No service is the default, not a fault: the mode says it once.
     let Some(client) = Client::for_data_dir(store.data_dir(), SEARCH_DEADLINE) else {
-        retrieval
-            .degraded
-            .push("dense: no memory service on this data directory".into());
         return Hybrid {
             hits: lexical,
             retrieval,
         };
     };
+    retrieval.mode = "hybrid".into();
     let candidates = match client.search(
         query_text,
         owners,
@@ -135,9 +135,6 @@ pub(crate) fn rerank(
     retrieval: &mut RetrievalView,
 ) {
     let Some(client) = Client::for_data_dir(data_dir, RERANK_DEADLINE) else {
-        retrieval
-            .degraded
-            .push("rerank: no memory service on this data directory".into());
         return;
     };
     let depth = ranked.len().min(RERANK_DEPTH);
@@ -214,8 +211,10 @@ mod tests {
         assert_eq!(ids, vec![("b", 1), ("a", 1), ("c", 2)]);
     }
 
+    /// With no memory service (nothing configured), search is lexical by
+    /// design: the mode says so once, and nothing is reported degraded.
     #[test]
-    fn an_absent_service_degrades_visibly_to_lexical() {
+    fn no_service_is_lexical_mode_not_a_degradation() {
         let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let hybrid = search(
@@ -227,11 +226,33 @@ mod tests {
             vec![hit("a", 1)],
         );
         assert_eq!(hybrid.hits.len(), 1);
+        assert_eq!(hybrid.retrieval.mode, "lexical");
         assert_eq!(hybrid.retrieval.stages, vec!["lexical".to_string()]);
-        assert_eq!(hybrid.retrieval.degraded.len(), 1);
+        assert!(hybrid.retrieval.degraded.is_empty());
         let mut ranked = vec![];
-        let mut retrieval = RetrievalView::default();
+        let mut retrieval = hybrid.retrieval;
         rerank(dir.path(), "q", &mut ranked, &mut retrieval);
-        assert!(retrieval.degraded[0].starts_with("rerank:"));
+        assert!(retrieval.degraded.is_empty());
+        assert_eq!(retrieval.mode, "lexical");
+        // A service that is configured but does not answer is a degradation.
+        std::fs::write(
+            anyagents_memory::protocol::socket_path(dir.path()),
+            b"not a socket",
+        )
+        .unwrap();
+        let down = search(
+            &store,
+            "q",
+            &["a".into()],
+            MemoryScope::All,
+            &HistorySearchQuery::default(),
+            vec![hit("a", 1)],
+        );
+        assert_eq!(down.retrieval.mode, "hybrid");
+        assert!(
+            down.retrieval.degraded[0].starts_with("dense:"),
+            "{:?}",
+            down.retrieval
+        );
     }
 }

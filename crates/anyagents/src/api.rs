@@ -510,6 +510,11 @@ pub struct ConversationResponse {
 /// whichever stage found it.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct RetrievalView {
+    /// `lexical` when no memory service runs on this data directory (the
+    /// default with nothing configured): BM25 alone, by design, not a
+    /// degradation. `hybrid` when one does.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub mode: String,
     /// `lexical` (BM25), then `dense` and `rerank` when the memory service
     /// answered.
     pub stages: Vec<String>,
