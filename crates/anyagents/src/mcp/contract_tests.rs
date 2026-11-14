@@ -88,6 +88,24 @@ async fn a_command_with_its_own_timeout_stretches_the_call_and_one_without_inher
     assert!(!timed_out.contains("background"), "{timed_out}");
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn a_command_that_ignores_sigterm_still_answers_before_its_call_ends() {
+    // The command's own timeout fires, its group gets the SIGTERM grace and
+    // then SIGKILL; the call stays open long enough for that answer, so the
+    // snippet sees the command's timeout rather than the call's.
+    let dir = tempfile::tempdir().unwrap();
+    let mcp = agent_with_limits(dir.path(), limits(4000, 15_000));
+    let err = run(
+        &mcp,
+        "return await workspace.exec({cmd: \"trap '' TERM; sleep 20\", timeout_ms: 1500});",
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("workspace.exec timed out"), "{err}");
+}
+
 #[tokio::test]
 async fn a_call_that_runs_out_of_time_says_how_to_get_more() {
     let dir = tempfile::tempdir().unwrap();
@@ -376,7 +394,7 @@ fn a_code_call_budgets_the_commands_it_runs() {
         &deadline,
         600_000,
     );
-    assert_eq!(args["timeout_ms"], 27_000);
+    assert_eq!(args["timeout_ms"], 29_000 - CODE_CALL_GRACE_MS);
     assert_eq!(deadline.load(Ordering::SeqCst), 30_000);
     // Its own timeout moves the call's end out.
     let args = budget_code_call(
@@ -387,7 +405,10 @@ fn a_code_call_budgets_the_commands_it_runs() {
         600_000,
     );
     assert_eq!(args["timeout"], 120_000);
-    assert_eq!(deadline.load(Ordering::SeqCst), 123_000);
+    assert_eq!(
+        deadline.load(Ordering::SeqCst),
+        121_000 + CODE_CALL_GRACE_MS
+    );
     // Past the ceiling's room, the command is cut to fit.
     let deadline = AtomicU64::new(30_000);
     let args = budget_code_call(
@@ -397,7 +418,7 @@ fn a_code_call_budgets_the_commands_it_runs() {
         &deadline,
         600_000,
     );
-    assert_eq!(args["timeout_ms"], 597_000);
+    assert_eq!(args["timeout_ms"], 599_000 - CODE_CALL_GRACE_MS);
     assert_eq!(deadline.load(Ordering::SeqCst), 600_000);
     assert_eq!(args["requested_timeout_ms"], 599_500);
     // A command beyond the ceiling is clamped the same way, never left to
@@ -410,13 +431,13 @@ fn a_code_call_budgets_the_commands_it_runs() {
         &deadline,
         600_000,
     );
-    assert_eq!(args["timeout_ms"], 597_000);
+    assert_eq!(args["timeout_ms"], 599_000 - CODE_CALL_GRACE_MS);
     assert_eq!(args["requested_timeout_ms"], 900_000);
     assert_eq!(deadline.load(Ordering::SeqCst), 600_000);
     // A `files` call naming no action but a `cmd` is an exec too.
     let deadline = AtomicU64::new(30_000);
     let args = budget_code_call("files", json!({"cmd": "make"}), elapsed, &deadline, 600_000);
-    assert_eq!(args["timeout_ms"], 27_000);
+    assert_eq!(args["timeout_ms"], 29_000 - CODE_CALL_GRACE_MS);
     // Other actions and tools are untouched.
     for (tool, call) in [
         ("files", json!({"action": "read", "path": "x"})),
@@ -493,4 +514,172 @@ fn relation_words_read_alike_in_any_case() {
     assert_eq!(relation_word("children"), Some("children"));
     assert_eq!(relation_word("planner"), None);
     assert_eq!(relation_word("agent:parent-of-x"), None);
+}
+
+/// Whether `pid` still runs (a zombie still answers signal 0; it is reaped
+/// by its parent, so wait for it to go).
+#[cfg(unix)]
+fn gone_within(pid: i32, within: std::time::Duration) -> bool {
+    let until = std::time::Instant::now() + within;
+    loop {
+        // SAFETY: signal 0 only checks that the process exists.
+        let alive = unsafe { libc::kill(pid, 0) == 0 };
+        let zombie = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| {
+                stat.rsplit(')')
+                    .next()
+                    .map(|rest| rest.trim_start().starts_with('Z'))
+            })
+            .unwrap_or(false);
+        if !alive || zombie {
+            return true;
+        }
+        if std::time::Instant::now() >= until {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_command_still_running_when_its_call_ends_is_stopped_with_its_whole_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let mcp = agent_with_limits(dir.path(), limits(10_000, 30_000));
+    let work = dir.path().join("work");
+    // The command's child ignores SIGTERM, as a busy grandchild might: only
+    // the group SIGKILL after the grace ends it.
+    std::fs::write(
+        work.join("stubborn.sh"),
+        "sh -c 'trap \"\" TERM; echo $$ > grandchild.pid; exec sleep 300' &\nwait\n",
+    )
+    .unwrap();
+    // The snippet starts the command, does not await it, and returns.
+    let value = run(
+        &mcp,
+        "workspace.exec({cmd: 'sh stubborn.sh', timeout_ms: 25000}); \
+         await new Promise((resolve) => setTimeout(resolve, 2000)); return 'returned';",
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(value["result"], "returned", "{value}");
+    let stopped = value["stopped"].as_str().unwrap_or_default();
+    assert!(stopped.contains("sh stubborn.sh"), "{value}");
+    assert!(stopped.contains("git status"), "{value}");
+    let grandchild: i32 = std::fs::read_to_string(work.join("grandchild.pid"))
+        .expect("the command started its child")
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(
+        gone_within(grandchild, std::time::Duration::from_secs(5)),
+        "grandchild {grandchild} outlived the call that started it"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn an_oversized_result_still_names_the_commands_its_call_stopped() {
+    let dir = tempfile::tempdir().unwrap();
+    let mcp = agent_with_limits(dir.path(), limits(10_000, 30_000));
+    // The snippet leaves a command running and returns more than the inline
+    // limit: the result goes to a file, and the stopped command is still named.
+    let value = run(
+        &mcp,
+        "workspace.exec({cmd: 'sleep 300', timeout_ms: 25000}); \
+         await new Promise((resolve) => setTimeout(resolve, 500)); return 'x'.repeat(40000);",
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(value["result"].is_null(), "{value}");
+    assert!(value["result_file"].is_string(), "{value}");
+    let stopped = value["stopped"].as_str().unwrap_or_default();
+    assert!(stopped.contains("sleep 300"), "{value}");
+}
+
+#[cfg(unix)]
+fn write_slow_write(work: &Path) {
+    std::fs::write(
+        work.join("slow-write.sh"),
+        "echo $$ > leader.pid\nsleep 300 &\necho $! > grandchild.pid\nwait\n",
+    )
+    .unwrap();
+}
+
+#[cfg(unix)]
+fn assert_group_gone(work: &Path, context: &str) {
+    for file in ["leader.pid", "grandchild.pid"] {
+        let pid: i32 = std::fs::read_to_string(work.join(file))
+            .unwrap_or_else(|e| panic!("{file}: {e}; {context}"))
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(
+            gone_within(pid, std::time::Duration::from_secs(5)),
+            "{file} {pid} outlived the call; {context}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_snippet_that_fails_stops_the_commands_it_started_and_names_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let mcp = agent_with_limits(dir.path(), limits(10_000, 30_000));
+    let work = dir.path().join("work");
+    write_slow_write(&work);
+    let err = run(
+        &mcp,
+        "workspace.exec({cmd: 'sh slow-write.sh', timeout_ms: 25000}); \
+         await new Promise((resolve) => setTimeout(resolve, 2000)); throw new Error('gave up');",
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("gave up"), "{err}");
+    assert!(err.contains("sh slow-write.sh"), "{err}");
+    assert_group_gone(&work, &err);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_command_whose_tool_call_the_harness_cancels_is_stopped() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let dir = tempfile::tempdir().unwrap();
+    let mcp = agent_with_limits(dir.path(), limits(10_000, 30_000));
+    let work = dir.path().join("work");
+    write_slow_write(&work);
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&cancelled);
+    let canceller = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        flag.store(true, Ordering::SeqCst);
+    });
+    let args: FilesArgs = serde_json::from_value(json!({
+        "action": "exec",
+        "cmd": "sh slow-write.sh",
+        "timeout_ms": 25000,
+    }))
+    .unwrap();
+    let started = std::time::Instant::now();
+    let flag = Arc::clone(&cancelled);
+    let err = match as_call(
+        Call::new(Arc::new(move || flag.load(Ordering::SeqCst))),
+        mcp.files(Parameters(args)),
+    )
+    .await
+    {
+        Ok(MultimediaJson(value, _)) => panic!("a cancelled command answered {value}"),
+        Err(err) => err,
+    };
+    canceller.await.unwrap();
+    assert!(err.contains("was stopped"), "{err}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(15),
+        "{err}"
+    );
+    assert_group_gone(&work, &err);
 }
