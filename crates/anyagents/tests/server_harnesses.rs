@@ -1181,7 +1181,7 @@ fn a_v2_spiron_needs_no_keeper_and_is_reattached_after_a_server_crash() {
             })
             .unwrap_or_default()
     };
-    let record = data.join("spiron").join(format!("{id}.json"));
+    let record = data.join("detached").join(format!("{id}.json"));
     let anyagents = Path::new(env!("CARGO_BIN_EXE_anyagents"));
     let server = Server::start_with(&data, anyagents, anyagents, &spiron_env);
     let first = send(&data, name);
@@ -1259,4 +1259,153 @@ fn a_v2_spiron_needs_no_keeper_and_is_reattached_after_a_server_crash() {
         "an idle agent's spiron was not stopped",
     );
     drop(server);
+}
+
+/// A rollback to a server without v2 Spiron, then a roll forward, with
+/// nothing stopped in between (a guardian that skipped `keepers stop`, or a
+/// crash in the middle of a switch from a kept harness). The old server
+/// starts a v1 Spiron in a keeper beside the running v2 one; the keeper
+/// holds the agent's lock. Rolled forward, the server takes the lock from
+/// the keeper, retires it (its proofs committed) and goes on with the v2
+/// process: every message is committed and one Spiron is left. Needs
+/// `SPIRON_BIN` (v2) and `OLD_ANYAGENTS_BIN` (a server with keepers and no v2
+/// Spiron, such as the current release); without them it says so.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_roll_forward_after_a_rollback_retires_the_keeper_and_keeps_one_spiron() {
+    let (Some(real), Some(old)) = (
+        std::env::var_os("SPIRON_BIN"),
+        std::env::var_os("OLD_ANYAGENTS_BIN"),
+    ) else {
+        eprintln!("SPIRON_BIN and OLD_ANYAGENTS_BIN are not set: the rollback test is not run");
+        return;
+    };
+    let _env = support::lock();
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    support::operator_for_contract(&data);
+    create_asker(&data);
+    let name = "native";
+    let out = bin()
+        .env("PATH", machine_path(&data))
+        .arg("--data")
+        .arg(&data)
+        .args(["agents", "create", name, "--harness", "spiron"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let id = String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .split('\t')
+        .next()
+        .unwrap()
+        .to_string();
+    let config = data.join("agents").join(&id).join("config");
+    let fixture = dir.path().join("fixture.sse");
+    std::fs::write(
+        &fixture,
+        concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_sleep\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"sleep 15\\\"}\"}}]}}]}\n",
+            "data: [DONE]\n---\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n",
+            "data: [DONE]\n---\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"done2\"}}]}\n",
+            "data: [DONE]\n---\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"done3\"}}]}\n",
+            "data: [DONE]\n",
+        ),
+    )
+    .unwrap();
+    let real = real.to_str().unwrap().to_string();
+    let fixture = fixture.to_str().unwrap().to_string();
+    let spiron_env = [
+        ("ANYAGENTS_SPIRON_BIN", real.as_str()),
+        ("SPIRON_GATEWAY_FIXTURE", fixture.as_str()),
+    ];
+    let spirons = || -> Vec<u32> {
+        let needle = config.to_str().unwrap().to_string();
+        std::fs::read_dir("/proc")
+            .unwrap()
+            .flatten()
+            .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+            .filter(|pid| {
+                let cmd = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+                let cmd = String::from_utf8_lossy(&cmd).replace('\0', " ");
+                cmd.contains("--headless") && cmd.contains(&needle) && !cmd.contains(" mcp ")
+            })
+            .collect()
+    };
+    let store = Store::open(data.join("state.db")).unwrap();
+    let agent = anyagents_core::AgentId::parse(&id).unwrap();
+    // Two Spiron processes share one session here, so a turn may wait for
+    // the other's session lease: longer than the usual wait.
+    let committed = |why: &str| {
+        let last = store.inbox(&agent, None).unwrap().last().unwrap().seq;
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while store.delivered_cursor(&agent).unwrap() < last {
+            assert!(Instant::now() < deadline, "{why}");
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    };
+    let record = data.join("detached").join(format!("{id}.json"));
+    let anyagents = Path::new(env!("CARGO_BIN_EXE_anyagents"));
+
+    // The new server runs a v2 Spiron, mid-turn when it stops.
+    let server = Server::start_with(&data, anyagents, anyagents, &spiron_env);
+    send(&data, name);
+    support::wait_for(|| record.exists() && !spirons().is_empty(), "no v2 spiron");
+    committed("the first message was not committed");
+    let launched: Value = serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
+    let pid = launched["process"]["pid"].as_u64().unwrap() as u32;
+    server.terminate();
+    assert!(alive(pid));
+
+    // Rolled back with nothing stopped: the old server keeps its harness in
+    // a keeper, a second Spiron on the session.
+    let old = Path::new(&old);
+    let server = Server::start_with(&data, old, old, &spiron_env);
+    send(&data, name);
+    support::wait_for(|| !no_keeper(&data, &id), "the old server kept no harness");
+    support::wait_for(
+        || spirons().len() == 2,
+        "the old server started no second spiron",
+    );
+    server.terminate();
+    assert!(alive(pid), "the v2 spiron died with the rollback");
+    assert!(!no_keeper(&data, &id));
+
+    // Rolled forward: the keeper is retired, the v2 process goes on.
+    let server = Server::start_with(&data, anyagents, anyagents, &spiron_env);
+    send(&data, name);
+    committed("the messages were not committed after the roll forward");
+    support::wait_for(|| no_keeper(&data, &id), "the keeper was not retired");
+    // The v2 process served on (an idle agent's process may since have
+    // ended, with its record): never a new one beside or after it.
+    let left = spirons();
+    assert!(
+        left.iter().all(|other| *other == pid),
+        "spirons {left:?}, v2 {pid}"
+    );
+    if let Ok(bytes) = std::fs::read(&record) {
+        let now: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            now["process"], launched["process"],
+            "the v2 spiron was replaced"
+        );
+    }
+    assert!(
+        !shared_log(&data).contains("is busy"),
+        "{}",
+        shared_log(&data)
+    );
+    drop(server);
+    support::stop_keepers(&data);
 }

@@ -133,16 +133,37 @@ impl Custody<VendorHarness> for KeeperCustody {
             return Ok(None);
         }
         // A v2 Spiron an earlier kernel left: attached again with no keeper.
-        // A keeper of the same agent is older (the agent ran v1 before) and
-        // is ended.
-        if crate::spiron_native::record_path(&self.data, agent.as_str()).exists() {
-            let lock = crate::spiron_native::take_lock(&self.data, agent)?;
-            if let Err(error) = anyagents_keeper::stop_agent(&self.root, agent.as_str()) {
-                eprintln!("anyagents-keeper: {agent}: {error}");
+        // Keepers of the same agent are older processes beside it: v1 ones a
+        // server without v2 started (a rollback), or the one a switch to
+        // Spiron was replacing. They hold the agent's lock, which is taken
+        // from them; the worker retires them (their proofs committed) before
+        // it delivers, and the v2 process goes on.
+        if crate::spiron_native::alive(&self.data, agent.as_str()) {
+            let mut lock = None;
+            let mut older = Vec::new();
+            match anyagents_keeper::attach_all(&self.root, agent.as_str()) {
+                Ok(found) => {
+                    for mut remote in found {
+                        if lock.is_none()
+                            && let Some(fd) = remote.take_lock()
+                        {
+                            lock = Some(AgentLock::adopt(fd));
+                        }
+                        older.push(VendorHarness::kept(remote));
+                    }
+                }
+                Err(error) => eprintln!("anyagents-keeper: {agent}: {error}"),
             }
+            let lock = match lock {
+                Some(lock) => lock,
+                None => crate::spiron_native::take_lock(&self.data, agent)?,
+            };
             let Some((harness, record)) =
                 crate::spiron_native::reattach(&self.data, agent.as_str())
             else {
+                // It was ended: so are the keepers, before their lock goes.
+                drop(older);
+                drop(lock);
                 return Ok(None);
             };
             return Ok(Some(Attached {
@@ -152,7 +173,7 @@ impl Custody<VendorHarness> for KeeperCustody {
                 model: record.model,
                 started_at_ms: Some(record.started_at_ms),
                 note: record.note,
-                older: Vec::new(),
+                older,
             }));
         }
         let mut found = anyagents_keeper::attach_all(&self.root, agent.as_str())?.into_iter();

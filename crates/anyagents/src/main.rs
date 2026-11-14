@@ -468,7 +468,7 @@ enum Command {
     /// The deployment's boundary contract: what an agent may read, and what it
     /// may write.
     Boundary,
-    /// The keepers that hold harness processes across server restarts.
+    /// The keepers that hold harness processes across server restarts, and the detached harness processes (v2 Spiron) that need none.
     Keepers {
         #[command(subcommand)]
         action: KeepersCommand,
@@ -701,9 +701,10 @@ enum GroupsCommand {
 enum KeepersCommand {
     /// List every keeper: its agent, its harness process and the binary it runs.
     List,
-    /// End keepers and their harness processes: one agent's, or all of them.
-    /// A running server starts a running agent's harness again in a new
-    /// keeper; use this before rolling back to a binary without keepers.
+    /// End keepers and their harness processes, and detached harness processes
+    /// (v2 Spiron): one agent's, or all of them. A running server starts a
+    /// running agent's harness again; use this before rolling back to a binary
+    /// without keepers or without detached harnesses.
     Stop {
         /// Agent name or `agt_...` id.
         agent: Option<String>,

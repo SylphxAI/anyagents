@@ -271,3 +271,24 @@ fn a_binary_without_v2_is_reported_so_and_launched_as_before() {
     );
     assert_eq!(result.err(), Some(ListenError::NotV2));
 }
+
+#[test]
+fn a_probe_that_runs_out_of_time_is_asked_again() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let root = tempfile::tempdir().unwrap();
+    // Slow the first time it is asked (a cold disk, a busy host), then a v2
+    // binary's help.
+    let marker = root.path().join("asked");
+    let slow = root.path().join("spiron");
+    std::fs::write(
+        &slow,
+        format!(
+            "#!/bin/sh\nif [ ! -e {m} ]; then touch {m}; exec sleep 30; fi\necho '      --listen <LISTEN>'\n",
+            m = marker.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&slow, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(!listens(&slow), "no answer in time");
+    assert!(listens(&slow), "the timeout was not kept as an answer");
+}

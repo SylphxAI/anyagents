@@ -45,8 +45,10 @@ pub struct SpironLaunch {
 }
 
 /// How long a v2 process may take to end after `stop` (it cancels its turn,
-/// which waits for a running tool's receipt) before its group is ended.
-const STOP_GRACE: Duration = Duration::from_secs(10);
+/// which waits for a running tool's receipt) before its group is ended,
+/// which takes its own TERM grace: together inside
+/// [`anyagents_harness::STOP_DEADLINE`], which a host waits for a stop.
+const STOP_GRACE: Duration = Duration::from_secs(3);
 
 /// One long-lived Spiron process.
 pub struct SpironHarness {
@@ -106,8 +108,10 @@ fn spec(args: Vec<String>) -> StreamSpec {
 const PROBE_WAIT: Duration = Duration::from_secs(5);
 
 /// Whether `program` speaks `spiron.headless/v2` as a listening process:
-/// its `--help` names `--listen`. Asked once per binary (path, size and
-/// modification time); a program that does not answer in time does not.
+/// its `--help` names `--listen`. An answer is kept per binary (path, size
+/// and modification time). A program that does not answer in time is taken
+/// as v1 for this launch only: no answer is kept, and the next launch asks
+/// again.
 pub fn listens(program: &Path) -> bool {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
@@ -148,8 +152,10 @@ pub fn listens(program: &Path) -> bool {
             std::thread::sleep(Duration::from_millis(10));
         }
         Some(reader.join().ok()?.contains("--listen"))
-    })()
-    .unwrap_or(false);
+    })();
+    let Some(answer) = answer else {
+        return false;
+    };
     seen.lock()
         .unwrap_or_else(|err| err.into_inner())
         .insert(key, answer);

@@ -2161,7 +2161,11 @@ fn read_stdout(
                 }
                 agy_note_opener_taken(&mut state);
             }
-            if let Some(reset_at_ms) = effect.quota_reset_at_ms {
+            // A quota a replayed frame reports is history, and one measured
+            // from now ("resets in 5h") would hold the agent anew: only the
+            // live process's own report counts.
+            let replayed = state.v2_attach.is_some() && !state.attached;
+            if let Some(reset_at_ms) = effect.quota_reset_at_ms.filter(|_| !replayed) {
                 state.quota_reset_at_ms = Some(reset_at_ms);
                 // Such a peer still closes its turn with a result that names
                 // what it consumed; nothing is dropped before that.

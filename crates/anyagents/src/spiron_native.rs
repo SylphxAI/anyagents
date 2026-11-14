@@ -2,7 +2,7 @@
 //!
 //! A Spiron that speaks `spiron.headless/v2` runs on its own, listening on
 //! `<config dir>/spiron.sock`, and outlives the server. One launch record per
-//! agent, `<data>/spiron/<agent>.json`, names the process (its identity, so a
+//! agent, `<data>/detached/<agent>.json`, names the process (its identity, so a
 //! reused pid is never signalled), its socket, and the seq a new server
 //! replays from. The server writes it once per launch, in a directory only
 //! the server can write: it names a process the server may signal, so an
@@ -65,7 +65,9 @@ impl Record {
 }
 
 fn root(data: &Path) -> PathBuf {
-    data.join("spiron")
+    // Generic, not Spiron's: the release guardian, which must not name
+    // products, finds detached harness processes here.
+    data.join("detached")
 }
 
 pub(crate) fn record_path(data: &Path, agent: &str) -> PathBuf {
@@ -203,6 +205,21 @@ pub(crate) fn launch(
     record.after_seq = harness.attach_after_seq().unwrap_or(0);
     write(&path, &record).map_err(ListenError::Failed)?;
     Ok(harness)
+}
+
+/// Whether the agent's launch record names a process that still runs and
+/// listens. A record that does not is cleared (its process ended).
+pub(crate) fn alive(data: &Path, agent: &str) -> bool {
+    let path = record_path(data, agent);
+    let Some(record) = read(&path) else {
+        let _ = std::fs::remove_file(&path);
+        return false;
+    };
+    if record.process.presence() == Presence::Running && record.socket.exists() {
+        return true;
+    }
+    end_recorded(data, agent);
+    false
 }
 
 /// Attach to the process an earlier server left for `agent`. `None` when

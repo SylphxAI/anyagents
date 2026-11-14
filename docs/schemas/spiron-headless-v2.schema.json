@@ -260,6 +260,7 @@
             "unsupported_protocol",
             "already_attached",
             "turn_open",
+            "session_in_use",
             "stopping"
           ]
         },

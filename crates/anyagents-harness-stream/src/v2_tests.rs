@@ -188,6 +188,65 @@ fn a_replay_rebuilds_the_open_turn_and_its_proofs_and_nothing_is_written_twice()
 }
 
 #[test]
+fn a_replayed_quota_holds_nothing_and_a_live_one_does() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("s.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    let (live_tx, live) = mpsc::channel::<()>();
+    let peer = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let attach: Value = serde_json::from_str(&line).unwrap();
+        let attach_id = attach["request_id"].as_str().unwrap().to_string();
+        let mut out = stream;
+        // An earlier turn that hit a quota hours ago, in the replay.
+        let limited = json!({"type": "result", "status": "failed", "is_error": true,
+            "error": "usage limit reached, resets in 5h", "duplicate": false, "usage": null,
+            "cost_micros": null, "context": null, "undelivered_steer_ids": []});
+        for chunk in [
+            frame(3, "old", json!({"type": "accepted", "mode": "turn"})),
+            frame(4, "old", limited.clone()),
+            frame(
+                5,
+                &attach_id,
+                json!({"type": "ready", "protocol": "spiron.headless/v2"}),
+            ),
+        ] {
+            out.write_all(chunk.as_bytes()).unwrap();
+        }
+        live.recv().unwrap();
+        // The same report from the live process holds the agent.
+        for chunk in [
+            frame(6, "new", json!({"type": "accepted", "mode": "turn"})),
+            frame(7, "new", limited),
+        ] {
+            out.write_all(chunk.as_bytes()).unwrap();
+        }
+        let mut rest = String::new();
+        while reader.read_line(&mut rest).is_ok_and(|n| n > 0) {}
+    });
+    let mut harness = StreamHarness::connect(Connect {
+        spec: spec(),
+        program: "spiron".into(),
+        socket: path,
+        pid: None,
+        after_seq: Some(2),
+        session_id: None,
+        environment: Vec::new(),
+        delivery: SPIRON,
+    })
+    .unwrap();
+    harness.wait_ready(Duration::from_secs(10)).unwrap();
+    assert_eq!(harness.health().quota_reset_at_ms, None);
+    live_tx.send(()).unwrap();
+    until(|| harness.health().quota_reset_at_ms.is_some());
+    harness.stop();
+    peer.join().unwrap();
+}
+
+#[test]
 fn a_refused_attach_fails_the_wait() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("s.sock");
