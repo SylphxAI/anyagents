@@ -35,6 +35,7 @@ mod operator;
 mod outbound;
 mod remote;
 mod reply;
+mod repo;
 mod sandbox;
 mod sandbox_exec;
 mod schedule;
@@ -46,8 +47,6 @@ mod telegram;
 mod ui;
 mod vendor;
 mod web;
-mod worktree;
-mod worktree_access;
 
 #[derive(Parser)]
 #[command(
@@ -170,10 +169,10 @@ enum Command {
         /// Optional upstream provider account profile (e.g. `acct-a`, `acct-b`, `anthropic/acct-b`).
         #[arg(long)]
         profile: Option<String>,
-        /// Optional repository (`<org>/<repo>`, local repo path, or `inherit`) to provision a managed Git worktree.
+        /// Optional repository (`<org>/<repo>`, local repo path, or `inherit`) to provision a Git repository of the agent's own.
         #[arg(long)]
         repo: Option<String>,
-        /// Optional Git branch name for the managed worktree when `--repo` is set (defaults to `agent/<name>`).
+        /// Optional Git branch name for the managed checkout when `--repo` is set (defaults to `agent/<name>`).
         #[arg(long)]
         branch: Option<String>,
         /// Optional starting Git ref/branch when `--repo` is set (defaults to `origin/HEAD`).
@@ -987,10 +986,10 @@ enum AgentsCommand {
         /// Optional upstream provider account profile (e.g. `acct-a`, `acct-b`, `anthropic/acct-b`).
         #[arg(long)]
         profile: Option<String>,
-        /// Optional repository (`<org>/<repo>`, local repo path, or `inherit`) to provision a managed Git worktree.
+        /// Optional repository (`<org>/<repo>`, local repo path, or `inherit`) to provision a Git repository of the agent's own.
         #[arg(long)]
         repo: Option<String>,
-        /// Optional Git branch name for the managed worktree when `--repo` is set (defaults to `agent/<name>`).
+        /// Optional Git branch name for the managed checkout when `--repo` is set (defaults to `agent/<name>`).
         #[arg(long)]
         branch: Option<String>,
         /// Optional starting Git ref/branch when `--repo` is set (defaults to `origin/HEAD`).
@@ -1121,7 +1120,7 @@ fn main() -> ExitCode {
 /// no inherited state beyond what the caller passed.
 fn internal(args: &[std::ffi::OsString]) -> ExitCode {
     match args.first().and_then(|arg| arg.to_str()) {
-        Some("admission-probe") => worktree_access::admission_probe_main(&args[1..]),
+        Some("admission-probe") => repo::admission_probe_main(&args[1..]),
         Some("seat-file") => seat_tree::seat_file_main(&args[1..]),
         Some("browser-jail") => browser::jail::main(&args[1..]),
         _ => {

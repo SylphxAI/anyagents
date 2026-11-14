@@ -328,11 +328,18 @@ the reranker, or only `query_prefix`, rebuilds nothing.
 Spend outside a rebuild (query embeddings, rerank, and embedding new history
 once the space is built) is capped per UTC day by `max_daily_usd` (US$1 by
 default) and kept in `<data>/memory-service/spend.db`, so a restart does not
-reset it. Once the day's spend reaches the cap, rerank answers with the reason
-(search keeps BM25 and dense and lists `rerank:` in `retrieval.degraded`) and
-new history waits for the next UTC day; query embeddings, a fraction of a cent
-each, go on and are counted. `status` reports `today_usd` and
+reset it. Once the day's spend reaches the cap, the service makes no remote
+request until the next UTC day: it refuses query embedding and rerank with the
+reason, so search answers from BM25 and lists `dense:` and `rerank:` in
+`retrieval.degraded`, and new history waits. `status` reports `today_usd` and
 `max_daily_usd`.
+
+A cap holds only if every request is counted. A remote model therefore needs a
+configured price (`usd_per_million_tokens`, or `usd_per_search` for a
+reranker), used whenever an answer reports no `usage.cost`; `serve` refuses to
+start with a remote model that has none. A remote query is cut to the same
+piece budget as a passage, and a remote rerank query to `passage_chars`, so a
+long query never sends or costs more than a passage.
 
 `anyagents memory-service estimate` makes the same estimate for the configured
 embedder over the host index as it stands, without calling a model, reading a
@@ -432,17 +439,25 @@ To build it:
    index. A first build has nothing to remove.
 
 Stopping the service returns search to BM25 and says so in
-`retrieval.degraded`; the dense index stays for a later start.
+`retrieval.degraded`; the dense index stays for a later start. Without the
+file the service runs the pinned local pair, which is another space and builds
+its own index on local CPU at no cost.
 
 Rolling the server back past this change: an older server cannot read the
 host index this one writes (Spiron journal rows are documents addressed as
 `<database>/<table>/<rowid>`, which an older server fails to read back), so its
 searches over Spiron history can fail. Stop it and delete
 `<data>/host-history-index-v1.db` with its `-wal` and `-shm`; the index is a
-rebuildable projection, and the older server builds it again. It ignores the
-dense indexes and `spend.db`. Without the
-file the service runs the pinned local pair, which is another space and builds
-its own index on local CPU at no cost.
+rebuildable projection. It ignores the dense indexes and `spend.db`.
+
+The older server rebuilds the index lazily: the first search that reaches an
+agent's history indexes all of it inside that agent's lifecycle lock, so mail
+to that agent waits until it is done. On the desk on 2026-11-14 that was about
+39 agents with indexed history, about 6 GB raw, and the larger agents take
+several minutes each. Either accept that wait, or warm the index before taking
+traffic: start the older server with those agents paused, run one search per
+agent (`anyagents --data <data> search <word> --agent <name> --scope
+transcripts`), then resume them.
 
 ## Retrieval quality on real history
 

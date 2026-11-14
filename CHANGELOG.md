@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+- Git: every repository-backed agent has a repository of its own (ADR 0010
+  D5). Its config, refs, index and hooks are its alone; it borrows objects
+  read-only from a pool through `objects/info/alternates`, so a checkout
+  costs a checkout and two agents on one repository cannot see each other's
+  branches or config. The pool is a bare repository per remote under
+  `ANYAGENTS_GIT_POOL_DIR`, now `<data>/git-pool` by default, so `repo:`
+  works with no checkout provider configured. Only the server fetches into
+  it, and it is never pruned. A checkout provider remains optional; a
+  linked worktree it makes is converted in place into an own repository and
+  its store becomes the pool, which must then never prune
+  (`gc.pruneExpire=never`, `gc.cruftPacks=true`, else conversion is
+  refused); a keep ref in the store holds what each converted repository
+  borrows until it is reaped. Archive removes a checkout only when the
+  remote's own answer (`ls-remote`) covers every commit, tag and note it
+  has and it has no stash. Removed: worktrees of a shared bare pool, the
+  POSIX ACL grants on its `objects/`, `refs/`, `logs/` and `packed-refs`,
+  the `anyagents-config/` config symlink, per-checkout `--worktree` config,
+  the grant journals in `<data>/worktree-grants/` with their quarantine and
+  recovery, and `ANYAGENTS_TRUSTED_METADATA_GIDS`. Existing linked
+  worktrees keep working as they are; archive cleanup converts one in place
+  (same status, HEAD, index, sparse patterns and hooks, unpushed and
+  reflog-only objects copied) before judging it. For `repo: "inherit"` and local sources, the
+  remote is asked from outside the source repository.
 - `conversation` searches every harness's native history: Spiron's
   `sessions.sqlite3`, OpenCode's `opencode.db` (tool parts included), Claude
   Code subagents, Codex rollouts, AGY, Muse, OMP and Grok sessions, read
@@ -31,12 +54,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provider reports reaches the cap. `anyagents memory-service estimate`
   previews the rebuild without calling a model. Spend outside a rebuild
   (query embeddings, rerank, new history) is capped per UTC day by
-  `max_daily_usd` and persisted; past it rerank and new-history embedding
+  `max_daily_usd` and persisted; past it query embedding, rerank and new-history embedding
   wait for the next day. Background workers retry failures with backoff and
   report them in `status`; marks follow the host index's generation and the
   worker count. No space is deleted automatically: `memory-service prune`
   removes other spaces once the configured one is built, and a `--config`
-  that does not exist is an error. Every OpenRouter request
+  that does not exist is an error. A remote model must have a configured
+  price, so its spend is always counted, and a remote query is cut to the
+  piece budget. Every OpenRouter request
   carries `provider.data_collection = "deny"`, and a remote reranker reads at
   most `passage_chars` (1,000) characters of each passage. The desk's choice,
   `qwen/qwen3-embedding-8b` with `mongodb/rerank-3` through
