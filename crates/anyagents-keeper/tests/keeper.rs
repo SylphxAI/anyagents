@@ -840,20 +840,20 @@ fn a_process_the_keeper_did_not_record_is_never_signalled() {
 }
 
 /// A keeper records each process group it starts, by its leader's identity,
-/// before that process runs anything.
+/// before that process runs anything: it is on disk by the time the harness
+/// is up.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_keeper_records_the_process_groups_it_starts() {
     let fx = Fixture::new();
     let kernel = fx.spawn();
     let harness = kernel.process_id().unwrap();
-    let dir = kernel.dir().to_path_buf();
-    eventually("the harness group is recorded", || {
-        std::fs::read(dir.join("groups"))
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<Vec<serde_json::Value>>(&bytes).ok())
-            .is_some_and(|groups| groups.iter().any(|group| group == &identity(harness)))
-    });
+    let groups: Vec<serde_json::Value> =
+        serde_json::from_slice(&std::fs::read(kernel.dir().join("groups")).unwrap()).unwrap();
+    assert!(
+        groups.iter().any(|group| group == &identity(harness)),
+        "{groups:?}"
+    );
     kernel.end().unwrap();
 }
 

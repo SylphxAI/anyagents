@@ -351,13 +351,15 @@ pub fn spawn_command(
         command.process_group(0);
         let report = spawn_report::SPAWN_REPORT.load(std::sync::atomic::Ordering::SeqCst);
         if report >= 0 {
-            // SAFETY: between fork and exec only `getpid` and one `write` of
-            // four bytes to a pipe run, both async-signal-safe.
+            // The child runs nothing until its group is recorded: it waits
+            // on a pipe of its own for the answer.
+            let waiting = spawn_report::Waiting::new()
+                .map_err(|err| HarnessError::Failed(format!("cannot report the process: {err}")))?;
+            // SAFETY: between fork and exec only `getpid`, one `write` of
+            // eight bytes to a pipe and `read` run, all async-signal-safe; the
+            // closure touches no lock and allocates nothing.
             unsafe {
-                command.pre_exec(move || {
-                    spawn_report::report(report);
-                    Ok(())
-                });
+                command.pre_exec(move || spawn_report::report(report, &waiting));
             }
         }
     }
@@ -374,35 +376,123 @@ pub fn spawn_command(
 
 /// Where the process groups this process starts are reported, before each
 /// runs anything: a keeper records them, so that what a keeper that died
-/// left can be ended by what it recorded, never by guesswork.
+/// left can be ended by what it recorded, never by guesswork. Each child
+/// waits, between fork and exec, until the recorder answers that its group
+/// is recorded.
 #[cfg(unix)]
 mod spawn_report {
-    pub(super) static SPAWN_REPORT: std::sync::atomic::AtomicI32 =
-        std::sync::atomic::AtomicI32::new(-1);
+    use std::collections::BTreeMap;
+    use std::os::fd::{AsRawFd as _, OwnedFd};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+
+    pub(super) static SPAWN_REPORT: AtomicI32 = AtomicI32::new(-1);
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    /// The write end of each child's answer pipe, by its token: whoever
+    /// takes it out closes it, so it is closed once.
+    static ANSWERS: Mutex<BTreeMap<u32, OwnedFd>> = Mutex::new(BTreeMap::new());
+
+    /// The recorder recorded the child's group: it may run.
+    const RECORDED: u8 = 1;
 
     unsafe extern "C" {
         fn getpid() -> i32;
         fn write(fd: i32, buf: *const std::ffi::c_void, count: usize) -> isize;
+        fn read(fd: i32, buf: *mut std::ffi::c_void, count: usize) -> isize;
+    }
+
+    fn answers() -> std::sync::MutexGuard<'static, BTreeMap<u32, OwnedFd>> {
+        ANSWERS.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
+    /// One child's wait for its answer, made before the fork. Dropped with
+    /// the command, it closes what was never answered.
+    pub(super) struct Waiting {
+        token: u32,
+        answer: OwnedFd,
+    }
+
+    impl Waiting {
+        pub(super) fn new() -> std::io::Result<Self> {
+            let (answer, writer) = std::io::pipe()?;
+            let token = NEXT.fetch_add(1, Ordering::SeqCst);
+            answers().insert(token, writer.into());
+            Ok(Self {
+                token,
+                answer: answer.into(),
+            })
+        }
+    }
+
+    impl Drop for Waiting {
+        fn drop(&mut self) {
+            answers().remove(&self.token);
+        }
     }
 
     /// In the child, between fork and exec: write its pid, which numbers the
-    /// process group it leads (`process_group(0)`), to `fd`.
-    pub(super) fn report(fd: i32) {
-        // SAFETY: `getpid` cannot fail; `write` of four bytes to a pipe is
-        // atomic and async-signal-safe.
-        unsafe {
-            let pid = getpid().to_ne_bytes();
-            let _ = write(fd, pid.as_ptr().cast(), pid.len());
+    /// process group it leads (`process_group(0)`), and its token to `fd`,
+    /// then wait for the answer. Anything but "recorded" fails the spawn.
+    pub(super) fn report(fd: i32, waiting: &Waiting) -> std::io::Result<()> {
+        let mut message = [0u8; 8];
+        // SAFETY: `getpid` cannot fail.
+        message[..4].copy_from_slice(&unsafe { getpid() }.to_ne_bytes());
+        message[4..].copy_from_slice(&waiting.token.to_ne_bytes());
+        // SAFETY: a write of eight bytes to a pipe is atomic.
+        if unsafe { write(fd, message.as_ptr().cast(), message.len()) } != 8 {
+            return Err(std::io::Error::last_os_error());
         }
+        let mut answer = 0u8;
+        loop {
+            // SAFETY: one byte into a local, from a descriptor `waiting` owns.
+            match unsafe { read(waiting.answer.as_raw_fd(), (&raw mut answer).cast(), 1) } {
+                1 if answer == RECORDED => return Ok(()),
+                -1 if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted => {
+                }
+                _ => return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            }
+        }
+    }
+
+    /// Answer the child that reported `token`: its group is recorded, or it
+    /// is refused and its spawn fails.
+    pub(super) fn answer(token: u32, recorded: bool) {
+        let Some(writer) = answers().remove(&token) else {
+            return;
+        };
+        let byte = [if recorded { RECORDED } else { 0 }];
+        // SAFETY: one byte from a local to a descriptor this function owns.
+        unsafe { write(writer.as_raw_fd(), byte.as_ptr().cast(), 1) };
     }
 }
 
-/// Report the pid of every process [`spawn_command`] starts from now on to
-/// `fd`, a pipe's write end this process keeps open, before the process runs
-/// anything. The pid numbers the process group it leads.
+/// Report every process [`spawn_command`] starts from now on to `fd`, a
+/// pipe's write end this process keeps open, before the process runs
+/// anything; each waits for [`answer_spawn`]. Read the reports with
+/// [`read_spawn`].
 #[cfg(unix)]
 pub fn report_spawns_to(fd: i32) {
     spawn_report::SPAWN_REPORT.store(fd, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// The next report from a reading end of the pipe given to
+/// [`report_spawns_to`]: the child's pid, which numbers the process group it
+/// leads, and the token to answer it by.
+#[cfg(unix)]
+pub fn read_spawn(reports: &mut impl std::io::Read) -> std::io::Result<(i32, u32)> {
+    let mut message = [0u8; 8];
+    reports.read_exact(&mut message)?;
+    let [a, b, c, d, e, f, g, h] = message;
+    Ok((
+        i32::from_ne_bytes([a, b, c, d]),
+        u32::from_ne_bytes([e, f, g, h]),
+    ))
+}
+
+/// Let the child that reported `token` run (`recorded`), or fail its spawn.
+#[cfg(unix)]
+pub fn answer_spawn(token: u32, recorded: bool) {
+    spawn_report::answer(token, recorded);
 }
 
 #[cfg(unix)]

@@ -425,19 +425,22 @@ fn record_groups(dir: &Path) -> std::io::Result<()> {
         .spawn(move || {
             let mut reading = reading;
             let mut groups: Vec<ProcessIdentity> = Vec::new();
-            let mut pid = [0u8; 4];
-            while reading.read_exact(&mut pid).is_ok() {
-                let Ok(pid) = u32::try_from(i32::from_ne_bytes(pid)) else {
-                    continue;
-                };
-                // Between its fork and its exec: its start time is already
-                // the one it keeps.
-                if let Some(leader) = ProcessIdentity::of(pid) {
-                    groups.push(leader);
-                    if let Ok(bytes) = serde_json::to_vec(&groups) {
-                        let _ = anyagents_harness::atomic_write_file(&path, &bytes, 0o600);
-                    }
-                }
+            while let Ok((pid, token)) = anyagents_harness::read_spawn(&mut reading) {
+                // Between its fork and its exec, waiting for this answer: its
+                // start time is already the one it keeps. It runs only once
+                // its group is on disk, in this keeper's directory still (a
+                // directory cleared meanwhile is not made again).
+                let recorded = u32::try_from(pid)
+                    .ok()
+                    .and_then(ProcessIdentity::of)
+                    .is_some_and(|leader| {
+                        groups.push(leader);
+                        serde_json::to_vec(&groups).is_ok_and(|bytes| {
+                            anyagents_harness::atomic_write_in_existing_dir(&path, &bytes, 0o600)
+                                .is_ok()
+                        })
+                    });
+                anyagents_harness::answer_spawn(token, recorded);
             }
         })?;
     // The write end stays open for the keeper's life: the reporting is
