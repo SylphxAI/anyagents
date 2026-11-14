@@ -588,11 +588,61 @@ fn process_alive(pid: u32) -> bool {
     {
         // /proc is not mounted on macOS. Signal 0 checks existence without
         // changing the process; lack of permission still proves it is alive.
-        let exists = unsafe { libc::kill(pid as i32, 0) == 0 };
-        exists || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+        let exists = unsafe { libc::kill(pid as i32, 0) == 0 }
+            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+        // Signal 0 also succeeds on a process that exited and was never
+        // reaped. A launcher this server started (`xvfb-run`, or Chromium
+        // itself) stays such a zombie once Chromium exits, and would read
+        // as a live browser whose CDP is gone until the server restarts.
+        exists && !process_exited(pid)
     }
     #[cfg(not(unix))]
     Path::new(&format!("/proc/{pid}")).exists()
+}
+
+/// Whether `/proc` shows `pid` as exited but not yet reaped (`Z`) or dead
+/// (`X`). Where there is no `/proc`, nothing is known and `false` is answered.
+fn process_exited(pid: u32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    // `pid (comm) state ...`: the command may hold spaces and parentheses,
+    // so the state is the first field after the last `)`.
+    stat.rsplit_once(')')
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+        .is_some_and(|state| matches!(state, "Z" | "X" | "x"))
+}
+
+/// Whether the live process `pid` is provably this profile's browser or its
+/// launcher: it runs as this server's user and its command line carries this
+/// profile's own `--user-data-dir`. `Some(false)` when it provably is not
+/// (another user's process, or a readable command line without the flag, as
+/// after its pid was reused); `None` when this host cannot tell (no `/proc`).
+fn process_runs_profile(pid: u32, user_data_dir: &Path) -> Option<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let proc_dir = PathBuf::from(format!("/proc/{pid}"));
+        let meta = std::fs::metadata(&proc_dir).ok()?;
+        if meta.uid() != unsafe { libc::geteuid() } {
+            return Some(false);
+        }
+        let cmdline = std::fs::read(proc_dir.join("cmdline")).ok()?;
+        if cmdline.is_empty() {
+            return None;
+        }
+        let flag = format!("--user-data-dir={}", user_data_dir.display());
+        Some(
+            cmdline
+                .split(|byte| *byte == 0)
+                .any(|arg| arg == flag.as_bytes()),
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (pid, user_data_dir);
+        None
+    }
 }
 
 fn cdp_port_alive(port: u16) -> bool {
@@ -603,23 +653,122 @@ fn cdp_port_alive(port: u16) -> bool {
     .is_ok()
 }
 
+/// A listening DevTools socket is accepted by the kernel even while Chromium
+/// is busy, so a refused connect means the endpoint is gone. Look a few times
+/// before acting on it, so a momentary failure never ends a working browser.
+fn cdp_port_gone(port: u16) -> bool {
+    for attempt in 0..3 {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        if cdp_port_alive(port) {
+            return false;
+        }
+    }
+    true
+}
+
+thread_local! {
+    /// Browsers this thread found gone, by profile, until a fresh one starts.
+    static GONE: std::cell::RefCell<std::collections::BTreeMap<String, serde_json::Value>> =
+        const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
+    /// What this thread's current request says about the browser it replaced:
+    /// set when it started a fresh browser for a profile found gone, so the
+    /// result can say open tabs were lost (see [`execute`]).
+    static RELAUNCHED: std::cell::RefCell<Option<serde_json::Value>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Take the current request's relaunch note and forget what this thread found.
+fn take_relaunch_note() -> Option<serde_json::Value> {
+    GONE.with(|gone| gone.borrow_mut().clear());
+    RELAUNCHED.with(|slot| slot.borrow_mut().take())
+}
+
+/// A fresh browser started for `profile`: when its previous one was found
+/// gone on this thread, the result says so.
+fn note_launched(profile: &str) {
+    if let Some(note) = GONE.with(|gone| gone.borrow_mut().remove(profile)) {
+        RELAUNCHED.with(|slot| *slot.borrow_mut() = Some(note));
+    }
+}
+
+fn note_relaunch(profile: &str, previous_pid: u32, reason: &str) {
+    GONE.with(|gone| {
+        gone.borrow_mut().insert(profile.to_string(), serde_json::json!({
+            "profile": profile,
+            "previous_pid": previous_pid,
+            "reason": reason,
+            "note": "The profile's previous browser was gone, so this call started a fresh one: \
+                     cookies and logins in the profile are kept, but open tabs and page state \
+                     were lost. Take a new snapshot before acting on earlier refs.",
+        }));
+    });
+}
+
+/// The recorded browser of `profile`, when it is running and reachable.
+///
+/// A record whose process exited (or only lingers unreaped) is forgotten. A
+/// live process whose DevTools endpoint is gone is ended when it provably is
+/// this profile's browser, and forgotten without a signal when it provably is
+/// not (its pid was reused); either way the caller starts a fresh browser on
+/// the same user-data directory, so logins survive. Only when this host cannot
+/// tell whose process it is does the record stay and the call fail.
 fn load_runtime(data: &Path, profile: &str) -> Result<Option<BrowserRuntimeState>, Error> {
-    let path = profile_dir(data, profile).join("runtime.json");
+    let dir = profile_dir(data, profile);
+    let path = dir.join("runtime.json");
     let Some(state) = read_profile_json::<BrowserRuntimeState>(&path)? else {
         return Ok(None);
     };
-    if process_alive(state.pid) {
-        if !cdp_port_alive(state.cdp_port) {
+    if !process_alive(state.pid) {
+        remove_profile_file(&path)?;
+        note_relaunch(profile, state.pid, "browser process exited");
+        return Ok(None);
+    }
+    if !cdp_port_gone(state.cdp_port) {
+        return Ok(Some(state));
+    }
+    let user_data_dir = dir.join("user-data");
+    match process_runs_profile(state.pid, &user_data_dir) {
+        Some(true) => {
+            eprintln!(
+                "anyagents-browser: profile `{profile}` process {} lost its DevTools endpoint \
+                 (port {}); ending it and starting a fresh browser",
+                state.pid, state.cdp_port
+            );
+            stop_process_group(state.pid);
+            if process_alive(state.pid) {
+                return Err(Error::Message(format!(
+                    "browser process {} is alive but CDP is unavailable, and it did not exit when \
+                     ended; close the profile and retry",
+                    state.pid
+                )));
+            }
+            note_relaunch(
+                profile,
+                state.pid,
+                "browser process was alive but its DevTools endpoint was gone",
+            );
+        }
+        Some(false) => {
+            note_relaunch(
+                profile,
+                state.pid,
+                "browser process exited and its pid now names another process",
+            );
+        }
+        None => {
             return Err(Error::Message(format!(
                 "browser process {} is alive but CDP is unavailable",
                 state.pid
             )));
         }
-        Ok(Some(state))
-    } else {
-        remove_profile_file(&path)?;
-        Ok(None)
     }
+    clear_held_keys(data, profile)?;
+    remove_profile_file(&path)?;
+    cleanup_singleton_locks(&user_data_dir);
+    remove_chromium_tmp(&dir);
+    Ok(None)
 }
 
 fn save_runtime(data: &Path, state: &BrowserRuntimeState) -> Result<(), Error> {
@@ -1040,6 +1189,15 @@ fn ensure_browser_running(
         stop_process_group(pid);
         return Err(err);
     }
+    // Reap the launcher whenever it exits, so an exited browser never lingers
+    // as a zombie that still answers signal 0. Without the thread the zombie
+    // is still recognised as exited ([`process_exited`]).
+    let _ = std::thread::Builder::new()
+        .name("anyagents-browser-reap".into())
+        .spawn(move || {
+            let _ = child.wait();
+        });
+    note_launched(profile);
     Ok((state, fp))
 }
 
@@ -4731,8 +4889,18 @@ pub fn execute(
             s.starts_with("op://") || s.starts_with("op-otp://") || s.starts_with("secret://")
         });
     let mutating = !browser_action_reads(&req);
-    execute_inner(data, default_profile, req, files)
-        .map_err(|err| browser_error(err, secret, mutating))
+    let _ = take_relaunch_note();
+    let result = execute_inner(data, default_profile, req, files);
+    let relaunched = take_relaunch_note();
+    match result {
+        Ok(mut value) => {
+            if let (Some(note), Some(object)) = (relaunched, value.as_object_mut()) {
+                object.insert("browser_relaunched".into(), note);
+            }
+            Ok(value)
+        }
+        Err(err) => Err(browser_error(err, secret, mutating)),
+    }
 }
 
 /// Whether a browser request only reads. Anything else, including an action
@@ -6515,26 +6683,118 @@ mod tests {
         );
     }
 
-    #[test]
-    fn live_process_without_cdp_is_not_replaced() {
-        let fixture = ScriptedBrowser::new(cdp_ok_response);
-        let mut runtime = load_runtime(fixture.data.path(), "fixture")
-            .unwrap()
-            .unwrap();
+    /// A port nothing listens on.
+    fn closed_port() -> u16 {
         let port = TcpListener::bind("127.0.0.1:0").unwrap();
-        runtime.cdp_port = port.local_addr().unwrap().port();
+        let number = port.local_addr().unwrap().port();
         drop(port);
-        save_runtime(fixture.data.path(), &runtime).unwrap();
-        let err = load_runtime(fixture.data.path(), "fixture").unwrap_err();
-        assert!(
-            err.to_string().contains("alive but CDP is unavailable"),
-            "{err}"
+        number
+    }
+
+    #[test]
+    fn live_process_that_is_not_the_profiles_is_forgotten_never_signalled() {
+        // The fixture records this test process: alive, the server's user,
+        // and no `--user-data-dir` of the profile, as when the browser's pid
+        // was reused. Its record is dropped; nothing is signalled (this test
+        // would not survive a signal), and the next action starts afresh.
+        let fixture = ScriptedBrowser::new(cdp_ok_response);
+        let data = fixture.data.path();
+        let mut runtime = load_runtime(data, "fixture").unwrap().unwrap();
+        runtime.cdp_port = closed_port();
+        save_runtime(data, &runtime).unwrap();
+        save_held_keys(data, "fixture", &[resolve_key_spec("a")]).unwrap();
+        let _ = take_relaunch_note();
+        assert!(load_runtime(data, "fixture").unwrap().is_none());
+        assert!(!profile_dir(data, "fixture").join("runtime.json").exists());
+        assert!(load_held_keys(data, "fixture").unwrap().is_empty());
+        assert!(process_alive(std::process::id()));
+        // The note waits for a fresh browser of that profile.
+        assert!(take_relaunch_note().is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn profiles_own_process_without_cdp_is_ended_and_its_profile_kept() {
+        use std::os::unix::process::CommandExt as _;
+        let fixture = ScriptedBrowser::new(cdp_ok_response);
+        let data = fixture.data.path();
+        let dir = profile_dir(data, "fixture");
+        let user_data = dir.join("user-data");
+        std::fs::create_dir_all(&user_data).unwrap();
+        std::fs::write(user_data.join("Cookies"), b"logged-in").unwrap();
+        std::fs::write(user_data.join("SingletonLock"), b"stale").unwrap();
+        // A stand-in for a hung Chromium: its own group, carrying the
+        // profile's user-data directory on its command line.
+        let mut stale = Command::new("/bin/sh")
+            .args(["-c", "sleep 60", "sh"])
+            .arg(format!("--user-data-dir={}", user_data.display()))
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut runtime = load_runtime(data, "fixture").unwrap().unwrap();
+        runtime.pid = stale.id();
+        runtime.cdp_port = closed_port();
+        save_runtime(data, &runtime).unwrap();
+        assert_eq!(process_runs_profile(stale.id(), &user_data), Some(true));
+        assert_eq!(
+            process_runs_profile(std::process::id(), &user_data),
+            Some(false)
         );
-        assert!(
-            profile_dir(fixture.data.path(), "fixture")
-                .join("runtime.json")
-                .is_file()
+
+        let _ = take_relaunch_note();
+        assert!(load_runtime(data, "fixture").unwrap().is_none());
+        let status = stale.wait().unwrap();
+        assert!(!status.success(), "the stale browser was ended: {status:?}");
+        assert!(!dir.join("runtime.json").exists());
+        assert!(!user_data.join("SingletonLock").exists());
+        assert_eq!(
+            std::fs::read(user_data.join("Cookies")).unwrap(),
+            b"logged-in"
         );
+        // A fresh browser for the profile reports what it replaced.
+        note_launched("fixture");
+        let note = take_relaunch_note().unwrap();
+        assert_eq!(note["previous_pid"], runtime.pid);
+        assert_eq!(note["profile"], "fixture");
+        assert!(take_relaunch_note().is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_unreaped_launcher_reads_as_exited_and_its_record_is_dropped() {
+        let fixture = ScriptedBrowser::new(cdp_ok_response);
+        let data = fixture.data.path();
+        let mut launcher = Command::new("/bin/true").spawn().unwrap();
+        let pid = launcher.id();
+        // Exited but not reaped: signal 0 still succeeds on it.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !process_exited(pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "launcher never exited"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(unsafe { libc::kill(pid as i32, 0) }, 0);
+        assert!(!process_alive(pid));
+        let mut runtime = load_runtime(data, "fixture").unwrap().unwrap();
+        runtime.pid = pid;
+        runtime.cdp_port = closed_port();
+        save_runtime(data, &runtime).unwrap();
+        assert!(load_runtime(data, "fixture").unwrap().is_none());
+        assert!(!profile_dir(data, "fixture").join("runtime.json").exists());
+        launcher.wait().unwrap();
+    }
+
+    #[test]
+    fn a_relaunch_note_names_only_the_profile_that_started_afresh() {
+        let _ = take_relaunch_note();
+        note_relaunch("other", 7, "browser process exited");
+        note_launched("fixture");
+        assert!(take_relaunch_note().is_none());
+        note_relaunch("fixture", 9, "browser process exited");
+        note_launched("fixture");
+        assert_eq!(take_relaunch_note().unwrap()["previous_pid"], 9);
     }
 
     #[test]
