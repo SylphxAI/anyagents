@@ -1450,9 +1450,6 @@ struct MemoryArgs {
     /// - `"write"` / `"upsert"` (inferred when `content` is provided): Create or update `<agent_root>/memory/<topic>.md` and rebuild `MEMORY.md`.
     /// - `"delete"` (inferred when `delete: true` is provided): Delete `<agent_root>/memory/<topic>.md` and rebuild `MEMORY.md`.
     /// - `"search"` (inferred when `query` is provided): Search the FTS5 learned-memory index.
-    /// - `"recall"`: Search this agent's raw history and learned memory together.
-    /// - `"status"`: Count topics and report the `MEMORY.md` size.
-    /// - `"reindex"`: Rebuild `MEMORY.md` from the topic files after an out-of-band edit.
     #[serde(default)]
     action: Option<String>,
     /// Learned-memory topic slug (`<agent_root>/memory/<topic>.md`, e.g. `"deployment-runbook"`).
@@ -3756,8 +3753,7 @@ rl.on("line", async (line) => {
         memoryFn.search = (queryOrObj = {}) => callTool("memory", typeof queryOrObj === "string" ? { action: "search", query: queryOrObj } : { ...queryOrObj, action: "search" });
         memoryFn.recall = (queryOrObj = {}) => callTool("memory", typeof queryOrObj === "string" ? { action: "recall", query: queryOrObj } : { ...queryOrObj, action: "recall" });
         memoryFn.status = (opts = {}) => callTool("memory", { ...(typeof opts === "string" ? { agent: opts } : opts), action: "status" });
-        memoryFn.reindex = (opts = {}) => callTool("memory", { ...opts, action: "reindex" });
-        memoryFn.consolidate = memoryFn.reindex;
+        memoryFn.consolidate = (opts = {}) => callTool("memory", { ...opts, action: "consolidate" });
         Object.freeze(memoryFn);
 
         const webFn = (req = {}) => callTool("web", typeof req === "string"
@@ -4365,6 +4361,7 @@ impl AgentMcp {
                 if let Some(ref root) = local_agent_root {
                     let topics = anyagents_core::learned_memory::list_memory_topics(root)
                         .unwrap_or_default();
+                    let sleep_state = anyagents_core::learned_memory::read_sleep_state(root);
                     let index_text =
                         std::fs::read_to_string(root.join("memory/MEMORY.md")).unwrap_or_default();
                     return Ok(serde_json::json!({
@@ -4373,6 +4370,8 @@ impl AgentMcp {
                         "topic_count": topics.len(),
                         "index_bytes": index_text.len(),
                         "index_lines": index_text.lines().count(),
+                        "last_consolidated_ms": sleep_state.last_consolidated_ms,
+                        "consolidated_topics": sleep_state.consolidated_topics,
                     }));
                 }
                 Err("local memory root is not available for `memory.status`".to_string())
@@ -4400,11 +4399,7 @@ impl AgentMcp {
                     "count": count,
                 }))
             }
-            // Rebuild the `MEMORY.md` catalog from the topic files after an
-            // out-of-band edit. Deterministic: no model reads or rewrites a topic.
-            // `consolidate` and `sleep` were the model-driven pass this replaced;
-            // instructions that still name them get the reindex.
-            "reindex" | "consolidate" | "sleep" => {
+            "consolidate" | "sleep" => {
                 if let Some(ref root) = local_agent_root {
                     let index_md = anyagents_core::learned_memory::rebuild_memory_index(
                         root,
@@ -4415,16 +4410,16 @@ impl AgentMcp {
                     let topics = anyagents_core::learned_memory::list_memory_topics(root)
                         .unwrap_or_default();
                     return Ok(serde_json::json!({
-                        "action": "reindex",
+                        "action": "consolidate",
                         "agent": self.agent.name,
                         "topic_count": topics.len(),
                         "index": index_md,
                     }));
                 }
-                Err("local memory root is not available for `memory.reindex`".to_string())
+                Err("local memory root is not available for `memory.consolidate`".to_string())
             }
             other => Err(format!(
-                "unknown `memory` action `{other}`; expected `list`, `read`, `write`, `delete`, `search`, `recall`, `status`, or `reindex`"
+                "unknown `memory` action `{other}`; expected `list`, `read`, `write`, `delete`, `search`, `recall`, `status`, or `consolidate`"
             )),
         }
     }

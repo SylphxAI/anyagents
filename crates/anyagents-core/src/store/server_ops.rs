@@ -115,6 +115,23 @@ impl Store {
         }
         Ok(workdirs)
     }
+
+    /// Whether this agent's sleep consolidation has taken in every message it
+    /// received and sent: the watermarks in its sleep state reach its mailbox.
+    pub fn sleep_memory_caught_up(&self, agent_id: &AgentId) -> Result<bool, Error> {
+        let agent_root = self.data_dir().join("agents").join(agent_id.as_str());
+        let sleep = crate::learned_memory::read_sleep_state(&agent_root);
+        let conn = self.read_conn();
+        let max_in_seq: i64 = conn
+            .prepare_cached("SELECT COALESCE(MAX(seq), 0) FROM messages WHERE agent_id = ?1")?
+            .query_row([agent_id.as_str()], |r| r.get(0))?;
+        let max_out_ms: i64 = conn
+            .prepare_cached(
+                "SELECT COALESCE(MAX(sent_at_ms), 0) FROM outbound_messages WHERE agent_id = ?1",
+            )?
+            .query_row([agent_id.as_str()], |r| r.get(0))?;
+        Ok(max_in_seq <= sleep.last_inbound_seq && max_out_ms <= sleep.last_outbound_ms)
+    }
 }
 
 #[cfg(test)]

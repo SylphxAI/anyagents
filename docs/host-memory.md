@@ -9,9 +9,9 @@ projection whose results cite the raw bytes they came from. Native transcript
 and runtime-state writers remain the harnesses' own.
 
 Memory has three tiers. L1 is `MEMORY.md`, the catalog pinned into every
-session; L2 is the topic files an agent writes with the `memory` tool; L3 is
-recall over raw history through `conversation`. Raw history is the truth the
-other two point back to.
+session; L2 is the topic files, written by the agent with the `memory` tool and
+by sleep consolidation while it is idle; L3 is recall over raw history through
+`conversation`. Raw history is the truth the other two point back to.
 
 Retrieval is hybrid: BM25 over the host index (CJK text indexed as character
 bigrams beside ASCII words), dense candidates from an embedding model fused by
@@ -82,24 +82,15 @@ seen before a checkpoint touches the database file.
 
 ## Learned memory
 
-Learned memory is what an agent chooses to write with the `memory` tool:
-topic files under `memory/`, and the `MEMORY.md` catalog AnyAgents rebuilds
-deterministically from them on every write (`memory` action `reindex` rebuilds
-it after an out-of-band edit). No model reads, merges, rewrites or deletes a
-topic.
-
-Sleep consolidation, which asked a hosted model every ten minutes per idle
-agent to upsert and delete topics from the last 30 mailbox turns, was removed
-rather than turned into a citation-backed note layer. Raw-history retrieval
-with dense retrieval and reranking ranks first against agentic memory systems,
-and even complete access to a transformed memory store trails raw evidence
-(arXiv:2610.30755); short working contexts lose little when raw history can be
-retrieved on demand (arXiv:2611.05306). The pass saw a clipped slice of the
-mailbox and none of the tool history, replaced the agent's own notes in place,
-and spent a paid model call per pass. A derived layer would need a generator
-model again and could only add staleness between it and the evidence.
-`memory/.sleep-state.json` files written by older builds are inert dotfiles,
-never indexed; an operator may delete them.
+Learned memory is the topic files under `memory/` and the `MEMORY.md`
+catalog AnyAgents rebuilds deterministically from them on every write (the
+`memory` tool's `consolidate` action rebuilds it on demand). An agent writes
+topics with the `memory` tool. While an agent is idle, the server's sleep
+consolidation pass reviews its recent mailbox with a model, may add, update or
+delete topics, and rebuilds `MEMORY.md`; its watermarks are in
+`memory/.sleep-state.json`, a dotfile that is never indexed. Hybrid retrieval
+leaves that pass as it is. It is to be rebuilt inside the agent's own harness
+and session; until that exists, the server-side pass stays.
 
 
 ## Files and session boundaries

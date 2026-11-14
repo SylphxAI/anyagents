@@ -138,7 +138,7 @@ The common cause is that binary identity is never data and is never verified.
 
 Streams follow 0003. Each file set has one writer; other streams make only mechanical call-site swaps, which the owner reviews.
 
-- **W1 Store:** `harness_leases` schema and typed ops, in Store's additive PR. (The learned-memory `curl` call left with sleep consolidation, which was removed; see [host-memory.md](../host-memory.md#learned-memory).)
+- **W1 Store:** `harness_leases` schema and typed ops, in Store's additive PR. The learned-memory `curl` → in-process HTTP change lands inside the Store stream.
 - **W1 Toolchain core:**
   - New `crates/anyagents-toolchain/`: manifest, verification, `ResolvedTool`, `ToolchainError`, child-`PATH` builder, report, `toolchain snapshot`.
   - `clippy.toml` and `tests/toolchain_purity.rs`, with per-file allowances that shrink as streams land.
