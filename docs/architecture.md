@@ -294,9 +294,11 @@ the main worktree's `logs/HEAD` stays child-unwritable. Defaults
 exist only inside the shared content subtrees, the private gitdir and a dedicated
 `anyagents-config/` directory, never on mixed metadata ancestors. Admission
 refuses a store whose common root, `worktrees/`, `logs/`, `logs/refs/`,
-`objects/`, `refs/`, `packed-refs` or `HEAD` everyone may write, by mode or by a
-default ACL `other` entry, naming the path and the owner's repair; granting on
-top of it would hand the same write to every object a seat adds later.
+`objects/`, `refs/`, `packed-refs`, `HEAD`, `hooks/` or `info/` everyone may
+write, by mode or by a default ACL `other` entry, and, during its own walk of
+the store, any object below them that everyone may write. The refusal names the
+path and the owner's repair; granting on top of it would hand the same write to
+every object a seat adds later. Revocation is never stopped by it.
 
 Common `config` becomes an exact symlink to `anyagents-config/config`: the dedicated
 directory grants active readers traversal and read-only inheritance, so the
@@ -306,12 +308,19 @@ owning-group or outsider access. The hub witnesses its own managed config; no
 journal records it. A managed config is trusted only when the link is exactly
 `anyagents-config/config`, and the link, the directory and the single-link
 config file all belong to the server's uid, no one else can write the directory
-or the file, and the directory holds nothing but `config` and Git's
-`config.lock`. Only the server (or root) can create objects the server owns, so
+or the file (a group named in `ANYAGENTS_TRUSTED_METADATA_GIDS` included), and
+the directory holds nothing but `config` and Git's `config.lock`. A plain common
+config, likewise, admits only its owner and the server as writers: a
+group-writable config is refused with its repair (`chmod go-w`), because every
+seat carries the trusted group and could have written it, or a server-owned
+group-writable file such as `description`, moved onto `config`. Only the server (or root) can create objects the server owns, so
 grant journals, a whole data directory or a changed device number can be lost
 without making a hub unusable, and a planted link, directory, symlinked or
 hard-linked file is refused. Only a config the server owns is relocated; a store
-owner's own config stays where it is. Relocation holds Git's original
+owner's own config stays where it is. Relocation makes its own directory and
+uses an existing one only as its own interrupted state (empty, or already
+holding this inode); a directory moved in from elsewhere is refused, never
+filled. The relocated file keeps no group or other write. Relocation holds Git's original
 `config.lock`, hard-links the inode into the dedicated directory, takes the new
 name's lock and atomically renames a staged symlink (`.anyagents-config.link`)
 over the original pathname, preserving config bytes and ownership. An
@@ -321,9 +330,17 @@ A stale `config.lock` from a crashed writer is a refusal that names the lock,
 never a lock AnyAgents removes. Revocation removes access and default entries
 only when no active same-seat reader remains, and a store's readers are
 recomputed from active grants after every revocation and at startup.
-Common `config`, `hooks/` and `info/` are not child-writable. A parent-owned sticky
+AnyAgents grants a seat no write to common `config`, `hooks/` or `info/`, and
+trusts a managed config only while nobody but the server can write it. It does
+not make those paths unwritable to a seat that already has write through the
+store's own permissions: on a deployment whose store group every seat belongs
+to (`ANYAGENTS_TRUSTED_METADATA_GIDS`), whatever that group may write (on the
+desk: the common directory, `worktrees/`, `hooks/` and several top-level
+files) any seat may change or rename, so there is no seat-to-seat boundary for
+hooks, or for a configuration file the group can write. A parent-owned sticky
 private gitdir protects `config.worktree` (and its unlink/rename), `commondir` and
-`gitdir`; mutable HEAD/index files belong to the child so Git lock+rename works.
+`gitdir` against the seat's own group entry; mutable HEAD/index files belong to
+the child so Git lock+rename works.
 
 A seatless agent (one that runs as the server's own uid and gid) is the server
 principal: the server grants it nothing and revokes nothing, since revoking
@@ -359,11 +376,16 @@ failed creation whose partial grant cannot be revoked keeps its journal and
 checkout, quarantined with the reason. The first maintenance pass of each
 server process settles every journal of an agent that can never run again,
 once: its grant is revoked; a failed creation's checkout (the startup repair
-released its row before admission, so it never ran) is removed as its
-rollback would have, keeping any branch with commits of its own; the journal
-is then removed, or quarantined with the reason. A deleted agent's checkout is
-never removed there and keeps its journal while it exists. Nothing is retried
-afterwards.
+released its row before admission, so it never ran) and its registration are
+removed; the journal is then removed, or quarantined with the reason. The
+removal runs no Git and reads nothing the seat could write: the journal's own
+record decides, only while the checkout's `.git` pointer and the
+registration's `gitdir` name each other, and never for a path that is or holds
+an admitted agent's workdir or that another journal records. Its branch stays.
+Only server-owned single-link journals that no one else can write, in a
+server-owned journal directory that no one else can write, are acted on. A
+deleted agent's checkout is never removed there and keeps its journal while it
+exists. Nothing is retried afterwards.
 Shared refs remain a same-repository integrity boundary: a child can move another
 branch ref. This is not hostile-repository isolation, and AnyAgents does not
 intercept arbitrary harness commit/push commands or provide a branch-tip guard.
