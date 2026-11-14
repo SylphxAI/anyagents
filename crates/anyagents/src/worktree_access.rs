@@ -1099,7 +1099,9 @@ fn trusted_metadata_layout(common: &Path, private: &Path, seat_uid: u32) -> std:
             Some("is not a canonical path".to_string())
         } else if path != private && writable_by_untrusted(path, &trusted)? {
             Some(format!(
-                "is writable by principals other than uid {owner} (mode {:04o}{})",
+                "is writable by principals other than uid {owner} (mode {:04o}{}); a \
+                 deployment whose seats share this store by design names that group in \
+                 ANYAGENTS_TRUSTED_METADATA_GIDS",
                 meta.mode() & 0o7777,
                 if has_access_acl(path)? {
                     " plus POSIX ACL"
@@ -1118,6 +1120,105 @@ fn trusted_metadata_layout(common: &Path, private: &Path, seat_uid: u32) -> std:
         }
     }
     Ok(owner)
+}
+
+/// Shared Git metadata that everyone may write is never admitted: any local
+/// user could rewrite the store's objects, refs or history, and a default
+/// ACL would hand the same write to every object a seat adds later. The
+/// refusal names the first such path and the owner's repair.
+fn refuse_world_writable(common: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    for name in [
+        "",
+        "worktrees",
+        "logs",
+        "logs/refs",
+        "objects",
+        "refs",
+        "packed-refs",
+        "HEAD",
+    ] {
+        let path = if name.is_empty() {
+            common.to_path_buf()
+        } else {
+            common.join(name)
+        };
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if meta.file_type().is_symlink() {
+            continue; // never followed; the sharing walk refuses it on its own
+        }
+        let access = meta.mode() & 0o002 != 0;
+        let default = meta.is_dir() && default_acl_lets_everyone_write(&path)?;
+        if !access && !default {
+            continue;
+        }
+        let shown = if name.is_empty() {
+            "the common Git directory"
+        } else {
+            name
+        };
+        let (what, repair) = match (access, default) {
+            (true, false) => (
+                format!("mode {:04o}", meta.mode() & 0o7777),
+                format!("`chmod -R o-w {}`", path.display()),
+            ),
+            (false, _) => (
+                "its default ACL gives every new entry write for everyone (other::w)".to_string(),
+                format!(
+                    "`setfacl -d -m o::rx` on {} and each directory under it",
+                    path.display()
+                ),
+            ),
+            (true, true) => (
+                format!(
+                    "mode {:04o}, and its default ACL gives every new entry write for everyone",
+                    meta.mode() & 0o7777
+                ),
+                format!(
+                    "`chmod -R o-w {}`, then `setfacl -d -m o::rx` on it and each directory \
+                     under it",
+                    path.display()
+                ),
+            ),
+        };
+        return Err(std::io::Error::other(format!(
+            "{shown} ({}) is world-writable ({what}): any local user could rewrite this \
+             repository's Git metadata. Its owner repairs it with {repair}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn default_acl_lets_everyone_write(path: &Path) -> std::io::Result<bool> {
+    let file = open_nofollow(path)?;
+    let mut bytes = vec![0u8; 65536];
+    let len = read_xattr(&file, c"system.posix_acl_default", &mut bytes);
+    if len < 0 {
+        let error = std::io::Error::last_os_error();
+        return if no_acl(&error) {
+            Ok(false)
+        } else {
+            Err(error)
+        };
+    }
+    bytes.truncate(len as usize);
+    if bytes.len() < 4 || bytes[..4] != 2u32.to_le_bytes() || !(bytes.len() - 4).is_multiple_of(8) {
+        return Err(std::io::Error::other("invalid default ACL"));
+    }
+    Ok(bytes[4..].as_chunks::<8>().0.iter().any(|e| {
+        u16::from_le_bytes([e[0], e[1]]) == 32 && u16::from_le_bytes([e[2], e[3]]) & 2 != 0
+    }))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn default_acl_lets_everyone_write(_path: &Path) -> std::io::Result<bool> {
+    Ok(false)
 }
 
 #[cfg(target_os = "linux")]
@@ -2047,9 +2148,10 @@ fn share_known_locked(
     gid: u32,
     journal: &Path,
 ) -> Result<(), Error> {
-    validate_config_files(private, common)?;
     // Fail closed before the first journal or ACL write: a store that launch
     // would refuse must not be admitted, granted, or left needing revocation.
+    refuse_world_writable(common).map_err(|e| refusal(common, e))?;
+    validate_config_files(private, common)?;
     trusted_metadata_layout(common, private, uid).map_err(|e| refusal(common, e))?;
     // A journal awaiting recovery is never overwritten by a new grant.
     match std::fs::read(journal) {
@@ -5494,6 +5596,57 @@ mod tests {
         let path = std::env::join_paths([&helper]).unwrap();
         assert_eq!(probe_git(&path).unwrap(), helper.join("git"));
         assert!(probe_git(std::ffi::OsStr::new("/nonexistent")).is_err());
+    }
+
+    /// keel's shared store had `objects/` and `refs/` at mode 2777 with a
+    /// default ACL `other::rwx`. Admission names that and its repair instead
+    /// of granting on top of it.
+    #[test]
+    fn admission_names_world_writable_metadata_and_its_repair() {
+        let dir = crate::test_tempdir();
+        let common = plain_common(dir.path());
+        refuse_world_writable(&common).unwrap();
+        for name in ["objects", "refs", ""] {
+            let path = if name.is_empty() {
+                common.clone()
+            } else {
+                common.join(name)
+            };
+            let mode = std::fs::metadata(&path).unwrap().mode() & 0o7777;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode | 0o002)).unwrap();
+            let error = refuse_world_writable(&common).unwrap_err().to_string();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert!(error.contains("is world-writable"), "{error}");
+            assert!(error.contains(path.to_str().unwrap()), "{error}");
+            assert!(error.contains("chmod -R o-w"), "{error}");
+            if !name.is_empty() {
+                assert!(error.starts_with(&format!("{name} (")), "{error}");
+            }
+        }
+        refuse_world_writable(&common).unwrap();
+    }
+
+    /// The same, for a default ACL alone: every object a seat adds later
+    /// would be world-writable.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn admission_names_a_world_writable_default_acl() {
+        let dir = crate::test_tempdir();
+        let common = plain_common(dir.path());
+        let objects = open_nofollow(&common.join("objects")).unwrap();
+        let mut acl = 2u32.to_le_bytes().to_vec();
+        for (tag, perm) in [(1u16, 7u16), (4, 5), (32, 7)] {
+            acl.extend(tag.to_le_bytes());
+            acl.extend(perm.to_le_bytes());
+            acl.extend(u32::MAX.to_le_bytes());
+        }
+        if let Err(error) = descriptor_fsetxattr(&objects, c"system.posix_acl_default", &acl) {
+            assert_eq!(error.raw_os_error(), Some(libc::EOPNOTSUPP), "{error}");
+            return; // no POSIX ACLs on this file system
+        }
+        let error = refuse_world_writable(&common).unwrap_err().to_string();
+        assert!(error.contains("default ACL"), "{error}");
+        assert!(error.contains("setfacl -d -m o::rx"), "{error}");
     }
 
     fn journal_of(data: &Path, id: &anyagents_core::AgentId, checkout: &Path, active: bool) {
