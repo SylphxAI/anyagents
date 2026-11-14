@@ -233,9 +233,12 @@ fn create_with_seat(
     let agent = store.create_agent(new)?;
     let data = std::path::absolute(data)?;
     // A checkout the consumer produced for this creation; rollback removes it.
-    let provisioned: std::cell::RefCell<Option<PathBuf>> = std::cell::RefCell::new(None);
+    let provisioned: std::cell::RefCell<Option<ProvisionedCheckout>> =
+        std::cell::RefCell::new(None);
     // Every directory this call made; rollback removes exactly these.
     let made: std::cell::RefCell<MadeDirs> = std::cell::RefCell::new(MadeDirs::default());
+    // The seat a checkout was shared with; rollback empties it as that seat.
+    let shared_with: std::cell::Cell<Option<(u32, u32)>> = std::cell::Cell::new(None);
     let finish = (|| -> Result<Agent, Error> {
         crate::sandbox::bind_principal(store, &agent)?;
         // Nothing is installed until an agent needs it: this is that moment. A
@@ -478,6 +481,7 @@ fn create_with_seat(
             .or_else(|| resolved_agent_seat_info(store, &agent))
         {
             if workdir_created || cwd == managed_abs {
+                shared_with.set(Some((uid, gid)));
                 crate::sandbox::share_worktree_with_seat(
                     &cwd,
                     uid,
@@ -526,7 +530,8 @@ fn create_with_seat(
             store,
             &data,
             &agent,
-            provisioned.into_inner().as_deref(),
+            provisioned.into_inner().as_ref(),
+            shared_with.get(),
             &made.into_inner(),
             error,
         ));
@@ -545,7 +550,8 @@ fn roll_back_failed_creation(
     store: &Store,
     data: &Path,
     agent: &Agent,
-    provisioned: Option<&Path>,
+    provisioned: Option<&ProvisionedCheckout>,
+    shared_with: Option<(u32, u32)>,
     made: &MadeDirs,
     error: Error,
 ) -> Error {
@@ -561,42 +567,53 @@ fn roll_back_failed_creation(
             agent.id
         );
     }
-    if let Err(revocation) = crate::worktree_access::revoke_recorded(data, &agent.id) {
-        // Nothing will ever run this grant again. Keep it and the checkout
-        // for an operator, quarantined so no launch, reap or retry touches it.
+    // The checkout goes as a failed creation's does at startup: emptied as
+    // its seat, then only its emptied directory and its registration's Git
+    // files removed by the server, with the store taken from the journal
+    // (never from Git run inside the checkout). Without a checkout, only the
+    // grant is taken back.
+    let cleanup = match provisioned {
+        Some(checkout) => crate::worktree_access::remove_failed_creation(
+            data,
+            &agent.id,
+            &checkout.path,
+            checkout.inode,
+            shared_with,
+        )
+        .map(|common| delete_unused_branch(&common, &checkout.branch)),
+        None => crate::worktree_access::revoke_recorded(data, &agent.id).map_err(|e| e.to_string()),
+    };
+    let mut kept_checkout = None;
+    if let Err(cleanup) = cleanup {
         let reason = format!(
-            "creation of `{}` failed ({error}) and its partial grant could not be revoked: \
-             {revocation}",
+            "creation of `{}` failed ({error}) and its partial checkout or grant could not be \
+             taken back: {cleanup}",
             agent.name
         );
-        if let Err(mark) = crate::worktree_access::quarantine_recorded(data, &agent.id, &reason) {
+        if crate::worktree_access::grant_path(data, &agent.id).exists() {
+            // Nothing will ever run this grant again. Keep it and the checkout
+            // for an operator, quarantined so no launch, reap or retry touches it.
+            if let Err(mark) = crate::worktree_access::quarantine_recorded(data, &agent.id, &reason)
+            {
+                eprintln!(
+                    "warning: cannot quarantine the worktree grant journal of {}: {mark}",
+                    agent.id
+                );
+            }
+            if let Err(release) = store.release_unadmitted_agent(&agent.id) {
+                eprintln!(
+                    "warning: failed creation of {} kept its name: {release}",
+                    agent.name
+                );
+            }
             eprintln!(
-                "warning: cannot quarantine the worktree grant journal of {}: {mark}",
+                "warning: failed creation {} keeps its worktree grant journal, quarantined: {reason}",
                 agent.id
             );
+            return error;
         }
-        if let Err(release) = store.release_unadmitted_agent(&agent.id) {
-            eprintln!(
-                "warning: failed creation of {} kept its name: {release}",
-                agent.name
-            );
-        }
-        eprintln!(
-            "warning: failed creation {} keeps its worktree grant journal, quarantined: {reason}",
-            agent.id
-        );
-        return error;
-    }
-    let mut kept_checkout = None;
-    if let Some(checkout) = provisioned
-        && let Err(cleanup) = remove_provisioned_checkout(checkout)
-    {
-        eprintln!(
-            "warning: cannot remove checkout {} of failed creation {}: {cleanup}",
-            checkout.display(),
-            agent.id
-        );
-        kept_checkout = Some(checkout);
+        eprintln!("warning: {reason}");
+        kept_checkout = provisioned.map(|checkout| checkout.path.as_path());
     }
     // A revoked grant whose checkout is gone witnesses nothing more.
     if let Err(retire) = crate::worktree_access::retire_settled(data, &agent.id) {
@@ -654,88 +671,57 @@ fn remove_made_dirs(made: &MadeDirs, kept_checkout: Option<&Path>, id: &AgentId)
     }
 }
 
-/// Undo a checkout made for a failed creation so the same name (and so the
-/// same default branch) can be provisioned again. Only this worktree's
-/// registration is removed. Its branch is deleted only by compare-and-delete
-/// when the tip is unchanged and still reachable from another ref, so no
-/// commit can be lost; otherwise the branch is kept.
-fn remove_provisioned_checkout(checkout: &Path) -> std::io::Result<()> {
-    let git = |dir: &Path, args: &[&std::ffi::OsStr]| -> std::io::Result<Option<String>> {
-        let out = std::process::Command::new("git")
+/// A checkout the consumer made for this creation: where, which directory
+/// (so rollback never removes another one put in its place), and the branch
+/// it was made on.
+pub(crate) struct ProvisionedCheckout {
+    path: PathBuf,
+    inode: crate::worktree_access::Inode,
+    branch: String,
+}
+
+/// Delete the branch a failed creation was provisioned on so the same name
+/// (and so the same default branch) can be provisioned again: by
+/// compare-and-delete, only while its tip is still reachable from another
+/// ref, so no commit can be lost; otherwise the branch is kept. Git runs on
+/// the store the journal records, with hooks and fsmonitor off, never inside
+/// the checkout.
+fn delete_unused_branch(common: &Path, branch: &str) {
+    let git = |args: &[&str]| -> Option<String> {
+        let out = anyagents_toolchain::tool("git", "checkout")
+            .ok()?
+            .command()
             .args([
                 "-c",
                 "core.fsmonitor=false",
                 "-c",
                 "core.hooksPath=/dev/null",
-                "-C",
+                "--git-dir",
             ])
-            .arg(dir)
+            .arg(common)
             .args(args)
             .stdin(std::process::Stdio::null())
-            .output()?;
-        Ok(out
-            .status
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        out.status
             .success()
-            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string()))
+            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
     };
-    let os = |s: &'static str| std::ffi::OsStr::new(s);
-    if !checkout.join(".git").exists() {
-        return Ok(());
-    }
-    let Some(common) = git(
-        checkout,
-        &[
-            os("rev-parse"),
-            os("--path-format=absolute"),
-            os("--git-common-dir"),
-        ],
-    )?
-    else {
-        return Err(std::io::Error::other(
-            "checkout has no readable common store",
-        ));
+    let refname = format!("refs/heads/{branch}");
+    let Some(tip) = git(&[
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        &format!("{refname}^{{commit}}"),
+    ]) else {
+        return;
     };
-    let common = PathBuf::from(common);
-    let branch = git(checkout, &[os("symbolic-ref"), os("--quiet"), os("HEAD")])?;
-    let tip = git(checkout, &[os("rev-parse"), os("--verify"), os("HEAD")])?;
-    if git(
-        &common,
-        &[
-            os("worktree"),
-            os("remove"),
-            os("--force"),
-            checkout.as_os_str(),
-        ],
-    )?
-    .is_none()
-    {
-        return Err(std::io::Error::other("git worktree remove refused"));
+    let containing =
+        git(&["for-each-ref", "--format=%(refname)", "--contains", &tip]).unwrap_or_default();
+    if containing.lines().any(|name| name != refname) {
+        git(&["update-ref", "-d", &refname, &tip]);
     }
-    let (Some(branch), Some(tip)) = (branch, tip) else {
-        return Ok(());
-    };
-    let containing = git(
-        &common,
-        &[
-            os("for-each-ref"),
-            os("--format=%(refname)"),
-            os("--contains"),
-            std::ffi::OsStr::new(&tip),
-        ],
-    )?
-    .unwrap_or_default();
-    if containing.lines().any(|name| name != branch) {
-        git(
-            &common,
-            &[
-                os("update-ref"),
-                os("-d"),
-                std::ffi::OsStr::new(&branch),
-                std::ffi::OsStr::new(&tip),
-            ],
-        )?;
-    }
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -749,7 +735,7 @@ fn provision_managed_worktree(
     base_opt: Option<&str>,
     target_wt: &Path,
     _parent_name: Option<&str>,
-    provisioned: &std::cell::RefCell<Option<PathBuf>>,
+    provisioned: &std::cell::RefCell<Option<ProvisionedCheckout>>,
     made: &std::cell::RefCell<MadeDirs>,
 ) -> Result<(), Error> {
     if target_wt.exists() {
@@ -797,7 +783,16 @@ fn provision_managed_worktree(
         consumer.remote(repo_raw, target_wt, &branch, base)?;
     }
     // The target was absent or empty above: this checkout belongs to us.
-    *provisioned.borrow_mut() = Some(target_wt.to_path_buf());
+    *provisioned.borrow_mut() = Some(ProvisionedCheckout {
+        path: target_wt.to_path_buf(),
+        inode: crate::worktree_access::directory_inode(target_wt).map_err(|error| {
+            Error::Message(format!(
+                "provisioned checkout {} cannot be opened: {error}",
+                target_wt.display()
+            ))
+        })?,
+        branch: branch.clone(),
+    });
 
     // Identity belongs to this checkout, not A's common config. Replacing the
     // common file as the server would drop its owner and existing named ACLs.
@@ -12661,8 +12656,33 @@ git -c safe.directory="$5" -C "$5" status --porcelain
                 "unique",
             ],
         );
-        remove_provisioned_checkout(&untouched).unwrap();
-        remove_provisioned_checkout(&worked).unwrap();
+        // No journal yet (admission never ran): the store and registration
+        // come from each checkout's own pointer.
+        let data = dir.path().join("data");
+        let roll_back = |checkout: &Path, branch: &str| {
+            let common = crate::worktree_access::remove_failed_creation(
+                &data,
+                &AgentId::generate(),
+                checkout,
+                crate::worktree_access::directory_inode(checkout).unwrap(),
+                None,
+            )
+            .unwrap();
+            delete_unused_branch(&common, branch);
+        };
+        roll_back(&untouched, "agent/untouched");
+        roll_back(&worked, "agent/worked");
+        let journals = std::fs::read_dir(data.join("worktree-grants"))
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_some_and(|x| x == "json")
+            })
+            .count();
+        assert_eq!(journals, 0, "a rollback left a journal");
         assert!(!untouched.exists() && !worked.exists());
         let branches = git(&source, &["branch", "--format=%(refname:short)"]);
         assert!(
@@ -12696,8 +12716,15 @@ git -c safe.directory="$5" -C "$5" status --porcelain
         std::fs::create_dir_all(journal.parent().unwrap()).unwrap();
         std::fs::write(&journal, b"not a journal").unwrap();
         let original = Error::Message("injected admission failure".into());
-        let returned =
-            roll_back_failed_creation(&store, data, &agent, None, &MadeDirs::default(), original);
+        let returned = roll_back_failed_creation(
+            &store,
+            data,
+            &agent,
+            None,
+            None,
+            &MadeDirs::default(),
+            original,
+        );
         assert_eq!(returned.to_string(), "injected admission failure");
         let kept = store.agent(&agent.id).unwrap();
         assert_eq!(kept.state, "archived");

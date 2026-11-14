@@ -161,6 +161,7 @@ jobs:
           test_binary=$(python3 -c 'import json,sys; artifacts=[a for line in open(sys.argv[1]) if (a:=json.loads(line)).get("reason")=="compiler-artifact" and a.get("target",{}).get("name")=="anyagents" and a.get("profile",{}).get("test") and a.get("executable")]; assert len(artifacts)==1; print(artifacts[0]["executable"])' "$RUNNER_TEMP/worktree-test-build.json")
           sudo env ANYAGENTS_REQUIRE_PRIVILEGED_WORKTREE_TEST=1 "$test_binary" --exact create::tests::privileged_cross_uid_spawn_can_create_commit_and_status --nocapture
           sudo env ANYAGENTS_REQUIRE_PRIVILEGED_WORKTREE_TEST=1 "$test_binary" --exact worktree_access::tests::privileged_store_owner_keeps_writing_its_relocated_config --nocapture
+          sudo env ANYAGENTS_REQUIRE_PRIVILEGED_WORKTREE_TEST=1 "$test_binary" --exact worktree_access::tests::privileged_seat_removal_never_deletes_what_the_seat_could_not worktree_access::tests::a_deep_checkout_is_settled_without_recursing worktree_access::tests::a_deep_store_is_refused_without_recursing --nocapture
           sudo env ANYAGENTS_REQUIRE_PRIVILEGED_WORKTREE_TEST=1 "$test_binary" --exact worktree::tests::privileged_pool_seat_workflow_receipt --nocapture
 
   # The macOS lane: the same gate on a second platform. macOS is a supported

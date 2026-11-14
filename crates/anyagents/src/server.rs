@@ -560,39 +560,58 @@ fn settle_grant_journals_once(store: &Store, data_dir: &Path) {
         }
         Ok(_) | Err(_) => crate::worktree_access::JournalOwner::Live,
     };
-    // Every admitted agent's workdir and each directory above it, by (device,
-    // inode) after resolving, archived agents included: a wake can bring them
-    // back. Computed once, only if a failed creation's checkout is found.
-    // Unknown (a store error) protects everything.
-    let protected_ids: std::cell::OnceCell<Option<std::collections::HashSet<(u64, u64)>>> =
-        std::cell::OnceCell::new();
-    let protected = |dev: u64, ino: u64| {
-        protected_ids
-            .get_or_init(|| {
-                use std::os::unix::fs::MetadataExt;
-                let agents = store.list_agents().ok()?;
-                let mut ids = std::collections::HashSet::new();
-                for workdir in agents.into_iter().filter_map(|agent| agent.workdir) {
-                    let Ok(resolved) = std::fs::canonicalize(&workdir) else {
-                        continue;
-                    };
-                    for directory in resolved.ancestors() {
-                        if let Ok(meta) = std::fs::metadata(directory)
-                            && !ids.insert((meta.dev(), meta.ino()))
-                        {
-                            break; // its ancestors are in already
-                        }
-                    }
-                }
-                Some(ids)
-            })
-            .as_ref()
-            .is_none_or(|ids| ids.contains(&(dev, ino)))
+    // Computed once, only if a failed creation's checkout is found.
+    let admitted: std::cell::OnceCell<AdmittedWorkdirs> = std::cell::OnceCell::new();
+    let protected = |checkout: &Path, dev: u64, ino: u64| {
+        protects(
+            admitted.get_or_init(|| admitted_workdirs(store)),
+            checkout,
+            (dev, ino),
+        )
     };
     if let Err(error) = crate::worktree_access::settle_grant_journals(data_dir, &owner, &protected)
     {
         eprintln!("warning: worktree grant journals not settled: {error}");
     }
+}
+
+/// Every admitted agent's workdir, archived agents included (a wake can
+/// bring them back): each workdir and every directory above it by (device,
+/// inode) after resolving, and each workdir's text. `None`: unknown (a store
+/// error, or a workdir that cannot be resolved for any reason but being
+/// gone), which protects everything.
+type AdmittedWorkdirs = Option<(std::collections::HashSet<(u64, u64)>, Vec<PathBuf>)>;
+
+fn admitted_workdirs(store: &Store) -> AdmittedWorkdirs {
+    use std::os::unix::fs::MetadataExt;
+    let agents = store.list_agents().ok()?;
+    let mut ids = std::collections::HashSet::new();
+    let mut texts = Vec::new();
+    for workdir in agents.into_iter().filter_map(|agent| agent.workdir) {
+        let workdir = PathBuf::from(workdir);
+        texts.push(std::path::absolute(&workdir).unwrap_or(workdir.clone()));
+        let resolved = match std::fs::canonicalize(&workdir) {
+            Ok(resolved) => resolved,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return None,
+        };
+        for directory in resolved.ancestors() {
+            match std::fs::metadata(directory) {
+                Ok(meta) if !ids.insert((meta.dev(), meta.ino())) => break, // ancestors are in
+                Ok(_) => {}
+                Err(_) => return None,
+            }
+        }
+    }
+    Some((ids, texts))
+}
+
+/// Whether `checkout` (the directory `inode`) is, or holds, an admitted
+/// agent's workdir: by inode, or by text for a workdir that is gone.
+fn protects(admitted: &AdmittedWorkdirs, checkout: &Path, inode: (u64, u64)) -> bool {
+    admitted.as_ref().is_none_or(|(ids, texts)| {
+        ids.contains(&inode) || texts.iter().any(|workdir| workdir.starts_with(checkout))
+    })
 }
 
 /// The maintenance worker runs this at startup and each minute without waiting
@@ -4417,8 +4436,22 @@ fn reap_git_worktree_cleanly(
     // its own Git subprocesses inside the seat-controlled checkout.
     let mut complete = remove_path_with_seat(wt_path, seat_ids);
     // Only the journal's validated private dir is eligible, never a path read
-    // back from a child-edited pointer after the check above.
-    complete &= remove_path_with_seat(record.private(), seat_ids);
+    // back from a child-edited pointer after the check above. Any seat in the
+    // store's group may write a registration, so the server removes only Git's
+    // own files from it, never a directory it does not know.
+    complete &= match crate::worktree_access::directory_inode(record.private()) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(error) => {
+            eprintln!(
+                "agent {id}: registration {} kept: {error}",
+                record.private().display()
+            );
+            false
+        }
+        Ok(inode) => crate::worktree_access::remove_registration(record.private(), inode)
+            .map_err(|error| eprintln!("agent {id}: {error}"))
+            .is_ok(),
+    };
     complete
 }
 
@@ -4471,62 +4504,67 @@ fn detect_seat_ids(_config_dir: &Path) -> Option<(u32, u32, u32)> {
     None
 }
 
+/// Remove an archived agent's `target`. A directory is emptied as the
+/// agent's seat first, so the kernel limits the removal to what that seat
+/// could remove itself; the server then removes only what is left in
+/// directories nobody else can write, and the emptied directory by inode
+/// (see [`crate::worktree_access::remove_tree`]). A directory another
+/// principal moved into the seat's tree, with contents the seat cannot
+/// delete, stays: the reap is incomplete and says why. A name that is not a
+/// directory is unlinked, by the server or else as the seat: that removes a
+/// name, nothing it may link to.
 fn remove_path_with_seat(target: &Path, seat_ids: Option<(u32, u32, u32)>) -> bool {
     let meta = match std::fs::symlink_metadata(target) {
         Ok(meta) => meta,
         Err(error) => return error.kind() == std::io::ErrorKind::NotFound,
     };
-    if meta.file_type().is_symlink() || meta.is_file() {
-        if std::fs::remove_file(target).is_ok() {
-            return true;
-        }
-    } else if meta.is_dir() && std::fs::remove_dir_all(target).is_ok() {
-        return true;
-    }
-    if !Path::new("/usr/local/bin/anyagents-setpriv").is_file() {
-        return false;
-    }
-    let mut candidate_seats = Vec::new();
-    if let Some(ids) = seat_ids {
-        candidate_seats.push(ids);
-    }
-    #[cfg(unix)]
-    if let Some(target_ids) = detect_seat_ids(target)
-        && !candidate_seats.contains(&target_ids)
-    {
-        candidate_seats.push(target_ids);
-    }
-    for (uid, gid, sock_gid) in candidate_seats {
-        let uid_s = uid.to_string();
-        let gid_s = gid.to_string();
-        let groups_s = if sock_gid != gid && sock_gid != 0 {
+    let seat = seat_ids.map(|(uid, gid, sock_gid)| {
+        let groups = if sock_gid != gid && sock_gid != 0 {
             format!("{gid},{sock_gid}")
         } else {
-            gid_s.clone()
+            gid.to_string()
         };
-        let _ = std::process::Command::new("/usr/local/bin/anyagents-setpriv")
+        crate::worktree_access::Seat::with_groups(uid, gid, &groups)
+    });
+    if meta.is_dir() {
+        let seat = seat.unwrap_or_else(crate::worktree_access::Seat::server);
+        return match crate::worktree_access::remove_tree(target, &seat) {
+            Ok(()) => true,
+            Err(error) => {
+                eprintln!("warning: {error}; kept");
+                false
+            }
+        };
+    }
+    if std::fs::remove_file(target).is_ok() {
+        return true;
+    }
+    let launcher = crate::sandbox::launcher();
+    if let Some((uid, gid, sock_gid)) = seat_ids
+        && launcher.is_file()
+    {
+        let groups = if sock_gid != gid && sock_gid != 0 {
+            format!("{gid},{sock_gid}")
+        } else {
+            gid.to_string()
+        };
+        let _ = std::process::Command::new(launcher)
             .args([
                 "--reuid",
-                &uid_s,
+                &uid.to_string(),
                 "--regid",
-                &gid_s,
+                &gid.to_string(),
                 "--groups",
-                &groups_s,
+                &groups,
                 "--no-new-privs",
                 "--",
                 "/bin/rm",
-                "-rf",
+                "-f",
+                "--",
             ])
             .arg(target)
             .stderr(std::process::Stdio::null())
             .status();
-        if std::fs::remove_dir_all(target).is_ok()
-            || std::fs::symlink_metadata(target)
-                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
-        {
-            return true;
-        }
-        let _ = std::fs::remove_file(target);
     }
     std::fs::symlink_metadata(target)
         .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
@@ -7592,6 +7630,58 @@ pub(crate) mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::sync::MutexGuard;
+
+    /// The settle pass protects every admitted workdir and the directories
+    /// above it by inode, a workdir that is gone by its text, and everything
+    /// when a workdir cannot be resolved for another reason.
+    #[test]
+    fn workdir_protection_fails_closed() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let inode = |path: &Path| {
+            let meta = std::fs::metadata(path).unwrap();
+            (meta.dev(), meta.ino())
+        };
+        let live = dir.path().join("hub/live");
+        std::fs::create_dir_all(&live).unwrap();
+        let gone = dir.path().join("gone/work");
+        for (name, workdir) in [("live", &live), ("gone", &gone)] {
+            let agent = store
+                .create_agent(anyagents_core::NewAgent::new(name, "opencode"))
+                .unwrap();
+            store
+                .set_agent_running(&agent.id, workdir.to_str().unwrap())
+                .unwrap();
+        }
+        let admitted = admitted_workdirs(&store);
+        assert!(admitted.is_some());
+        let other = dir.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        // An alias of the live workdir's parent is protected by inode.
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(dir.path().join("hub"), &alias).unwrap();
+        assert!(protects(&admitted, &alias, inode(&alias)));
+        assert!(protects(&admitted, &live, inode(&live)));
+        assert!(protects(&admitted, &dir.path().join("gone"), inode(&other)));
+        assert!(!protects(&admitted, &other, inode(&other)));
+        if unsafe { libc::geteuid() } != 0 {
+            // A workdir behind a directory the server cannot search.
+            let locked = dir.path().join("locked");
+            std::fs::create_dir_all(locked.join("work")).unwrap();
+            let agent = store
+                .create_agent(anyagents_core::NewAgent::new("locked", "opencode"))
+                .unwrap();
+            store
+                .set_agent_running(&agent.id, locked.join("work").to_str().unwrap())
+                .unwrap();
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let admitted = admitted_workdirs(&store);
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(admitted.is_none());
+            assert!(protects(&admitted, &other, inode(&other)));
+        }
+    }
 
     #[tokio::test]
     async fn single_agent_endpoint_resolves_identity_alias_and_enforces_scope() {

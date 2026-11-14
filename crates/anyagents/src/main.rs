@@ -1032,6 +1032,7 @@ fn main() -> ExitCode {
 fn internal(args: &[std::ffi::OsString]) -> ExitCode {
     match args.first().and_then(|arg| arg.to_str()) {
         Some("admission-probe") => worktree_access::admission_probe_main(&args[1..]),
+        Some("empty-tree") => worktree_access::empty_tree_main(&args[1..]),
         _ => {
             eprintln!("anyagents internal: unknown helper");
             ExitCode::from(2)
