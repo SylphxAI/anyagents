@@ -7,19 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
-- Build output has an owner and a bound
-  ([ADR 0012](docs/adr/0012-agent-storage-roots.md)). With a scratch tier
-  configured, an agent's build output and `TMPDIR` live under its own root,
-  `{scratch}/agents/{id}`, and `ANYAGENTS_AGENT_BUILD_DIR` names its `build/`
-  for host build wrappers. All build output on the scratch volume, agents'
-  and the host directories `ANYAGENTS_SCRATCH_BUILD_EXTRA_DIRS` names, stays
-  under `ANYAGENTS_SCRATCH_BUILD_BUDGET` (300 GiB unless set; `0` turns it
-  off). A server task removes the least recently written build directories
-  of archived, then stopped agents, then host output, then idle agents, never
-  one written in the last half hour or of an agent in a turn. It tells the
-  operator inbox when the budget cannot be met or the scratch filesystem is
-  90% full. It only logs what it would remove until
-  `ANYAGENTS_SCRATCH_BUILD_BUDGET_DRY_RUN=0`.
+- Build output has a bound
+  ([ADR 0012](docs/adr/0012-scratch-build-budget.md)). All build output on the
+  scratch volume, agents' build roots (`{scratch}/builds/{id}`, unchanged) and
+  the host directories `ANYAGENTS_SCRATCH_BUILD_EXTRA_DIRS` names (less
+  `ANYAGENTS_SCRATCH_BUILD_EXTRA_EXCLUDE`), stays under
+  `ANYAGENTS_SCRATCH_BUILD_BUDGET` (300 GiB unless set; `0` turns it off). A
+  server task removes only output it can prove rebuildable (Cargo targets and
+  profiles, `CACHEDIR.TAG` directories, the tool caches it assigned; never
+  anything with `.git` at its top), least recently written first: archived,
+  then stopped agents', then host output, then idle agents'. Never one written
+  in the last half hour, of an agent in a turn, or before every running
+  harness has reported since the server started; each removal takes the
+  build's own locks first. It tells the operator inbox who holds the space
+  when the budget cannot be met or the scratch filesystem is 90% full. It
+  only logs what it would remove until `ANYAGENTS_SCRATCH_BUILD_BUDGET_DRY_RUN=0`.
+  `ANYAGENTS_AGENT_BUILD_DIR` names the agent's build root for host build
+  wrappers.
 - Git: every repository-backed agent has a repository of its own (ADR 0010
   D5). Its config, refs, index and hooks are its alone; it borrows objects
   read-only from a pool through `objects/info/alternates`, so a checkout

@@ -460,18 +460,18 @@ ORDER BY id;
 
 One embedded SQLite database in WAL mode under the data directory holds every resource, the mailboxes and the usage records. A message is `received` when its insert has committed. Schema changes are versioned migrations applied at server start.
 
-### Storage tiers and agent roots
+### Storage tiers and the build budget
 
-With no tier configured, everything lives under the data directory. A deployment can split it ([ADR 0012](adr/0012-agent-storage-roots.md)):
+With no tier configured, everything lives under the data directory. A deployment can split it:
 
 | Setting | Holds | Lifecycle |
 | --- | --- | --- |
 | `ANYAGENTS_STATE_DIR` | `state.db`, capabilities, agent config | kept |
 | `ANYAGENTS_WORKSPACES_DIR` | managed work directories, `{workspaces}/{id}` | archive cleanup |
-| `ANYAGENTS_SCRATCH_DIR` | each agent's root, `{scratch}/agents/{id}/{build,tmp}` | build output under `ANYAGENTS_SCRATCH_BUILD_BUDGET` (300 GiB); `build/` and `tmp/` removed on archive |
+| `ANYAGENTS_SCRATCH_DIR` | each agent's build root `{scratch}/builds/{id}` and `TMPDIR` `{scratch}/tmp/{id}` | provable build output kept under `ANYAGENTS_SCRATCH_BUILD_BUDGET` (300 GiB); both removed on archive |
 | `ANYAGENTS_GIT_POOL_DIR` | the shared bare object pool | kept |
 
-The harness gets `CARGO_TARGET_DIR`, `GRADLE_USER_HOME`, `DERIVED_DATA_PATH` and `TMPDIR` inside its root, and `ANYAGENTS_AGENT_BUILD_DIR` naming its `build/` for host build wrappers. `ANYAGENTS_SCRATCH_BUILD_EXTRA_DIRS` adds host build directories no agent owns to the same budget. The budget check runs every ten minutes and logs its plan and every eviction; it removes nothing until `ANYAGENTS_SCRATCH_BUILD_BUDGET_DRY_RUN=0`.
+The harness gets `CARGO_TARGET_DIR`, `GRADLE_USER_HOME`, `DERIVED_DATA_PATH` and `TMPDIR` there, and `ANYAGENTS_AGENT_BUILD_DIR` naming its build root for host build wrappers. `ANYAGENTS_SCRATCH_BUILD_EXTRA_DIRS` adds host build directories no agent owns to the same budget, less `ANYAGENTS_SCRATCH_BUILD_EXTRA_EXCLUDE`. The budget removes only output it can prove rebuildable (Cargo targets and profiles, `CACHEDIR.TAG` directories, the tool caches it assigned), never anything with `.git` at its top, and only under the build's own locks ([ADR 0012](adr/0012-scratch-build-budget.md)). It runs every ten minutes, logs its plan and every eviction, and removes nothing until `ANYAGENTS_SCRATCH_BUILD_BUDGET_DRY_RUN=0`.
 
 ### Locks and their order
 
