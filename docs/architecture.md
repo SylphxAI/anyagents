@@ -24,7 +24,7 @@ The established pattern for running vendor agents is a long-lived gateway that d
                     vendor processes: claude, codex, opencode, gemini, ...
 ```
 
-`anyagents serve` is the kernel: the API, identity, the mailboxes, supervision, schedules and the one embedded database run in it. Each harness process is held by its own keeper, a small process (`anyagents keeper`, the same binary) that starts the harness, owns its pipes and hosts the vendor adapter, so the kernel can stop, crash or be replaced by a newer binary while every harness keeps running ([ADR 0007](adr/0007-process-architecture.md)); on Linux only, see [Agents](#agents-create-and-supervise). The protocol gateway, used only in API-key mode, runs inside the kernel.
+`anyagents serve` is the kernel: the API, identity, the mailboxes, supervision, schedules and the one embedded database run in it. Each harness process is held by its own keeper, a small process (`anyagents keeper`, the same binary) that starts the harness, owns its pipes and hosts the vendor adapter, so the kernel can stop, crash or be replaced by a newer binary while every harness keeps running ([ADR 0007](adr/0007-process-architecture.md)); on Linux only, see [Agents](#agents-create-and-supervise). The protocol gateway, used only in API-key mode, runs inside the kernel. Dense retrieval and reranking run beside it as a separate, optional process, `anyagents memory-service` ([host-memory.md](host-memory.md#hybrid-retrieval-and-the-memory-service)); without it the server ranks history lexically and says so.
 
 ## Three-axis vendor-neutral model (`Harness × Profile × Sandbox`)
 
@@ -240,125 +240,25 @@ this adapter does not invoke a setter or edit shared service configuration.
 
 ### Managed local checkouts
 
-Repository-backed local agents use a caller-configured checkout provider through
-`ANYAGENTS_CHECKOUT_PROVIDER_BIN`. Repository slugs and GitHub URLs, `repo: "inherit"`, and
-local repository paths use that provider for fetching and checkout. The provider
-owns sparse-checkout and hook policy. Fetch, checkout and executable-launch failures
-refuse the spawn with its diagnostic; an unavailable configured provider never
-silently selects a different checkout mechanism.
+Each repository-backed agent gets a Git repository of its own ([ADR 0010](adr/0010-execution-identity-and-trust.md) D5, [0006](adr/0006-runtime-state-and-lifecycle.md) decision 11). Its config, refs, index and hooks belong to it alone; the only thing it shares is objects, which it borrows read-only from a pool through `objects/info/alternates`. So a new checkout costs a checkout, not a download, and two agents on one repository cannot see each other's branches or configuration.
 
-Explicit `workdir` paths, including `/scratch/wt/...` and `/scratch/tmp/...`, are
-honoured or refused, never replaced by the default directory. Before an agent
-becomes running, its execution seat must be able to write and traverse its
-working tree, the per-worktree Git directory and the common objects/refs
-storage, and create lock files. The admission probe that checks this is the
-server binary's own `anyagents internal admission-probe`, run under the seat's
-uid and groups with a cleared environment (the toolchain's helper `PATH`, no
-user or system Git configuration): it walks the tree in Rust without following
-symlinks, creates and removes a uniquely named lock file in the tree, the
-private gitdir, `objects/` and `refs/`, and runs `git status` with fsmonitor and
-hooks disabled. Git (the toolchain's declared `git`, else the first `git` on
-its helper `PATH`, never an operator wrapper on the server's own `PATH`) is the
-only external program, so a host image that wraps, removes or kills `find`, `sh` or
-`test` cannot change the answer. Every seat user must therefore be able to
-execute the server binary, with every ancestor directory traversable; a seat
-that cannot is refused with a message that names the binary. A probe as the
-server's own uid and gid runs in the server process. New worktrees are shared
-with that seat's group.
-On Linux, additive POSIX ACLs grant writes only to shared `objects/`, `refs/`,
-`logs/refs/`, an existing `packed-refs`, and the child's private `worktrees/<name>/`.
-The common root, `worktrees/` and `logs/` are traversal-only with no default ACLs;
-the main worktree's `logs/HEAD` stays child-unwritable. Defaults
-exist only inside the shared content subtrees, the private gitdir and a dedicated
-`anyagents-config/` directory, never on mixed metadata ancestors. Common `config`
-is an exact symlink to `anyagents-config/config`: the dedicated directory grants
-recorded active readers traversal and read-only inheritance, so the parent's
-ordinary `git config`, `git remote` and `git push -u` replacements remain readable
-immediately, without a launch or wake. Its defaults grant no owning-group or
-outsider access. Adoption holds Git's original `config.lock`, journals a
-quarantined intent, hard-links the original inode into the dedicated directory
-and atomically replaces the old pathname with the link, preserving config bytes
-and ownership. The journal pins the directory and symlink identities, while Git
-may replace only the target config inode. Interrupted adoption preserves the
-original bytes and refuses launch/reap pending operator recovery. Revocation
-removes access and default entries only when no active same-seat reader remains.
-Retired server-owned journals retain the dedicated directory/link provenance for
-later admission, even after their private gitdirs are reaped; that provenance
-never restores a retired reader's access.
-Common `config`, `hooks/` and `info/` are not child-writable. A parent-owned sticky
-private gitdir protects `config.worktree` (and its unlink/rename), `commondir` and
-`gitdir`; mutable HEAD/index files belong to the child so Git lock+rename works.
-Temporary cleanup inspections persist each ACL target's exact path, device and
-inode before granting read/traverse access. Startup recovers those objects through
-no-follow descriptors; legacy intents use a best-effort no-follow tree walk.
-An unsafe recovery target or failed revocation quarantines only the recorded
-worktree and emits a warning, never aborting unrelated server startup.
-Quarantine preserves checkout data and refuses automatic harness launch, wake and
-reap until the operator repairs the recorded recovery state; it does not assert
-that an unreachable or hard-linked object's residual ACL was removed.
-Shared refs remain a same-repository integrity boundary: a child can move another
-branch ref. This is not hostile-repository isolation, and AnyAgents does not
-intercept arbitrary harness commit/push commands or provide a branch-tip guard.
-AnyAgents production code never runs `git commit` or `git push`; the supported
-source-publication path belongs to the caller's checkout and publication tools. Its Git metadata reads, skill sync and cleanup
-commands pin `core.hooksPath=/dev/null` and disable fsmonitor. The parent commit
-and its parent-owned hooks-path pin in the three-UID proof belong to the test fixture.
-Shared common and worktree configs refuse `include`/`includeIf` rather than
-following a potentially child-controlled configuration graph.
-Caller-configured commit identity is set in the protected private
-`config.worktree`, never by replacing the parent's common config. The consumer
-must enable `extensions.worktreeConfig`; otherwise admission refuses. Seat Git
-configuration resets legacy wildcard trust and lists only the seat's exact
-checkout and recorded common gitdir, preserving other settings. Cleanup loads
-its gitdir/worktree pair from the server journal, verifies the protected metadata
-ownership and effective ACLs, and passes both paths explicitly: a child-edited
-`.git` pointer never selects metadata. Shared metadata that a group can write is
-untrusted unless the deployment names that group in
-`ANYAGENTS_TRUSTED_METADATA_GIDS` (comma-separated gids or group names): a
-deployment whose seats share Git hubs by design declares those seats one trust
-domain for that metadata; world-writable metadata is never trusted. A missing, broken or changed pointer on a
-journaled checkout preserves its entire workdir (including build-named output)
-and emits a diagnostic; it cannot select non-Git directory deletion. Cleanup Git
-runs as the journaled seat UID/GID, with no inherited secret environment or socket
-group, because checkout and index attributes can select drivers from trusted
-configuration. It excludes global/system config and attribute files and keeps
-default dubious-ownership checks; unrecorded legacy or arbitrary repositories
-are preserved rather than inspected through their `.git` pointer. After archive
-revokes access, inspection adds only temporary read/traverse ACL entries to the
-journaled metadata allowlist, never write or default entries, and retains active
-same-seat bindings. Inspection intent is synced before granting; ACL changes are
-serialized without holding the global journal lock during Git. Success and
-failure both revoke and read back temporary access. Both server modes recover
-any open inspection intent before starting consumers; failed recovery refuses
-startup. A completed check never stands in for a fresh deletion eligibility check.
-Deletion additionally requires an empty pinned status and zero commits in HEAD
-or any local branch outside the recorded remote-tracking refs. A seat-owned
-initial-head marker cannot waive that test. Dirty or unpushed checkouts and their
-private registration remain; clean, pushed pairs are removed without invoking
-`git worktree remove` or its nested Git subprocesses. Remote-tracking refs remain
-within the documented shared-ref integrity boundary, not a live publication proof.
-A server-owned grant journal is file- and directory-synced before sharing. Its
-serialized transitions preserve bindings needed by another active agent on the
-same OS seat; retiring one agent revokes its private metadata without removing
-the surviving agent's shared-store access. Archive, reap and failed
-admission revoke the seat's named group/user ACL entries and defaults through
-opened descriptors, read the result back, and retain the journal on failure.
-Revocation runs even when dirty or external checkout bytes must be retained.
-An ACL write or readback failure is a typed permission error; non-Linux hosts
-accept only already-permitted metadata access. Existing explicit directories are
-validated without rewriting their permissions. Sharing does not follow symlinks
-or alter hard-linked files that require permission changes.
+- **The pool.** One bare repository per remote under `ANYAGENTS_GIT_POOL_DIR` (default `<data>/git-pool`), laid out as `<pool>/<org>/<repo>.git`. Only the control plane fetches into it, under a per-pool lock. It is created readable by every agent (`core.sharedRepository=0644`) and is never pruned (`gc.auto=0`, `gc.pruneExpire=never`, `gc.cruftPacks=true`): pruning a reference repository can corrupt the clones that borrow from it. Agents' branches never reach it.
+- **A checkout.** `git init`, an alternates line naming the pool's `objects/`, `origin` set to the remote, the default branch and the requested base as remote-tracking refs, then `git checkout -b <branch> <commit>` (or `--detach`). A caller-configured identity (`ANYAGENTS_GIT_AUTHOR_NAME` and `ANYAGENTS_GIT_AUTHOR_EMAIL`, both or neither) is written into the repository's own config. Pushes go to `origin` with whatever credentials the agent already has.
+- **Refreshing a base.** `git fetch origin` refreshes what the repository's fetch refspecs cover: every branch for a pool checkout; for an adopted checkout, the store's own refspec plus the agent's branch and its base. Any other branch is fetched explicitly with `git fetch origin +refs/heads/<base>:refs/remotes/origin/<base>`; `git fetch origin <base>` alone only updates `FETCH_HEAD` under a single-branch refspec. Objects the pool already has are not downloaded again.
+- **A checkout provider.** A deployment may name one with `ANYAGENTS_CHECKOUT_PROVIDER_BIN`; it accepts `fetch <source> <ref>` and `worktree <source> <target> <branch> [base]` and owns its sparse-checkout and hook policy. If it makes a linked worktree of its own store, AnyAgents adopts the result in place (below), and the provider's store becomes that repository's pool, so it must never prune either: adoption refuses a store without `gc.pruneExpire=never` and `gc.cruftPacks=true`. A failure or a result that cannot be adopted refuses the spawn with the reason; an unavailable provider never falls back to the pool.
+- **Seat access.** A new checkout is shared with its seat's group with ordinary permissions (group, `g+rw`, setgid directories), its own `.git` included, and `.git` is closed to everyone else. There are no ACLs, no shared metadata to protect and no grant journal. Before an agent becomes running, the admission probe (`anyagents internal admission-probe`, run as the seat with a cleared environment and Git as its only external program) walks the tree, creates and removes a lock file in the tree, in `.git`, `.git/objects` and `.git/refs`, and runs `git status`. A seat that cannot execute the server binary is refused with a message naming it. Seat Git configuration lists only the exact checkout in `safe.directory`.
+- **Local sources.** For `repo: "inherit"` and local paths, AnyAgents selects a GitHub remote (preferring `origin`) from the source's config and requires the source HEAD and the requested base to be reachable from the remote's live advertised branches and tags. The remote is asked from outside the source, so a source an agent owns never selects a program the server runs; only plain reads (`config`, `rev-parse`, `merge-base`) run inside it. Push unpublished commits before spawning. Sources without a GitHub remote are refused. A nonempty target is refused, never adopted.
+- **Adopting a linked worktree.** A linked worktree of a shared store is converted in place, without touching the working tree:
+  - The store must never prune (`gc.pruneExpire=never`, `gc.cruftPacks=true`); otherwise nothing changes.
+  - A new Git directory is built beside the `.git` pointer: the store's config minus other checkouts' branch settings, this checkout's `config.worktree`, glob fetch refspecs for the agent's branch and base (a glob, because an exact refspec for a branch the remote lacks makes every `git fetch origin` fail), HEAD and branch, index (and split-index part), reflogs, sparse patterns, excludes, attributes, hooks (a linked hook stays a link, to an absolute target), remote-tracking refs and tags, with the store as its pool. Copies keep their modification time: Git rechecks an index entry only while it is no older than the index, so a newer copy would hide a same-size edit.
+  - Objects only this checkout reaches (unpushed and reflog-only commits, staged blobs) are packed into it.
+  - A keep ref in the store, `refs/anyagents/keep/<hash of the checkout path>`, points at one commit whose parents are every commit the new repository's refs reach, so the store holds the base even if its own refs move and it is pruned explicitly. The ref goes when the repository is reaped.
+  - The conversion stands only if `git status` reads the same before and after. The new directory is synced to disk, then exchanged with the pointer in one rename (`renameat2(RENAME_EXCHANGE)`, `renamex_np(RENAME_SWAP)` on macOS); the store's registration is removed, and its branch when the keep ref or another ref holds every commit. A crash after the exchange leaves the old pointer at the staging path, and the next call finishes the release from it, accepting it only when the registration names this checkout back.
+  - An operation in progress (merge, rebase, cherry-pick, revert, bisect, a held index lock, submodules in the private Git directory), a locked worktree, or a registration that does not name the checkout back declines and changes nothing.
+- **Existing checkouts.** Linked worktrees made before this change keep working as they are for the life of their agent; nothing in AnyAgents writes their store's metadata any more. Archive cleanup adopts one first, then judges it like any checkout.
+- **Cleanup.** A managed checkout is removed on archive only when `.git` is its own directory (a pointer could name any other repository), `git status` is clean apart from harness files, and the remote holds everything else: no stash, no tag or note the remote does not advertise with the same object, and no commit of HEAD, a branch, a tag, a note or any other ref but remote-tracking ones that no advertised ref reaches. The proof is the remote's own answer (`ls-remote`, asked by the server from outside the checkout with its own credentials, for a GitHub repository or a local path only), never the checkout's own remote-tracking refs; a checkout it cannot ask about stays. Status and the reachability check run as the agent's seat, with the Git directory and working tree named explicitly, no inherited environment, no global or system configuration, hooks and fsmonitor off. Dirty or unproven checkouts stay, and only their build output goes; a managed repository checkout whose `.git` has gone is kept the same way. Repositories an agent made inside a private workdir are kept. AnyAgents production code never runs `git commit` or `git push`.
 
-For inherit/local sources, AnyAgents selects a GitHub remote (preferring
-`origin`), reads its live advertised branches and tags, and requires both the
-source HEAD and requested base to be reachable from them. Push unpublished
-commits before spawning. If a remote tip is not available in local history,
-fetch that remote before trying again. The consumer fetches the verified ref
-and checks out the exact selected commit, including a published feature-branch
-commit that is not on the default branch. Sources without a GitHub remote are
-refused. Existing nonempty checkout targets are not silently adopted by
-repository provisioning. `workdir: "private"` remains an empty directory and
-needs no Git consumer. Cloud-sandbox workspace preparation is unchanged.
+Explicit `workdir` paths, including `/scratch/wt/...` and `/scratch/tmp/...`, are honoured or refused, never replaced by the default directory, and never reaped. `workdir: "private"` remains an empty directory and needs no checkout. Cloud-sandbox workspace preparation is unchanged.
 
 ## Mailbox: one log per agent
 
@@ -484,12 +384,12 @@ require an authenticated server rather than an offline database fallback.
 - `send(to: [address], text, reply_to?)`. An address is an agent (`agent:<name>`, or a bare name), a named group of agents (`group:<name>`), a channel target (`telegram:chat:<id>[:<topic>]`, `telegram:user:<id>[:<message>]`), or `operator`. A list of one is a direct message; a mixed list delivers once per address. There is no default address.
 - `operator` is the operator's inbox, for a defect in AnyAgents, the harness or the host that an agent cannot fix within its own work. Agents write and only the operator reads it (`anyagents inbox --operator [--since <seq>] [-n <limit>]`, `GET /v1/operator/inbox`); a root admin cannot. No agent may be named `operator`. It is its own table, not agent mail: there is no agent row to own it and no harness to deliver to. The same text from any sender within an hour of a report is that report, and the repeat is counted on it. Each sender may store 3 reports a minute and 10 an hour, and all senders together 60 a minute and 500 an hour. The operator target is written before every other address of a send, in the transaction that decides the limit, so a refusal (HTTP 429) leaves the whole send unwritten. A report is at most 16 KiB, and reports older than 30 days are pruned.
 - `inbox(since?)` reads this agent's own mailbox. It never sends.
-- `conversation(...)` / `search(...)` run **Zero-Embedding Lossless Lexical + Structured Agentic History Search (`Raw-RAG`)**:
+- `conversation(...)` / `search(...)` run **hybrid retrieval over raw history (`Raw-RAG`)**: BM25 over the host index, dense candidates from the memory service fused by reciprocal rank, and a cross-encoder rerank of the fused head. Every result cites its raw record: a raw coordinate (segment, offset, length, SHA-256) for native history and memory, the message id for mailbox rows. The response's `retrieval` names the stages that ran and why any did not:
   - **Read authorization:** Non-admin agents read only their own and descendant mailboxes/transcripts. `agent: "all"` and `"*"` mean that authorized tree, not the workspace. Messaging scope, public reachability and shared groups do not grant private history access; explicit parent/sibling/peer reads return forbidden. `with`, sender, range and radius can only narrow the authorized rows. Operator and explicitly privileged root-admin reads are unrestricted and audited. Agent CLI reads require the authenticated server, without an offline SQLite fallback.
-  - **No vector embeddings and no LLM-written memory mutations:** History stays 100% lossless in the append-only transcript and SQLite `rag_chunks_fts` (`unicode61` over raw text + hybrid ASCII identifier sub-tokens + CJK unigrams & bigrams). There is zero embedding API cost, zero embedding latency, and zero model-lock degradation. Exceptional erasure uses the permissioned, audited [redaction operation](redaction.md), preserving ids/order and replacing only explicitly selected content; ordinary coordinator history reads remain lossless.
+  - **Raw history is the source of truth; no model rewrites it:** History stays lossless in each harness's own files and stores and in the mailbox; the lexical indexes (`rag_chunks_fts` for the mailbox, the host index for native history: `unicode61` over raw text + hybrid ASCII identifier sub-tokens + CJK unigrams & bigrams) and the dense index are rebuildable projections. By default embedding and reranking run locally on CPU with pinned open models and no network call; the operator can bind either to a remote model through an AnyAgents profile ([providers](host-memory.md#embedding-and-rerank-providers)). Exceptional erasure uses the permissioned, audited [redaction operation](redaction.md), preserving ids/order and replacing only explicitly selected content; ordinary coordinator history reads remain lossless.
   - **Multi-query & negative filtering:** `query` plus `queries: [...]` (OR-combined keyword/synonym sets) and `exclude: [...]` (negative filters).
   - **Tool history toggles:** `include_tools` (default `true`; `false` restricts search to messages without tool/system noise), `only_tools` (`true` restricts search to tool calls and outputs), and `tool_name` (filters tool history to a specific tool such as `"bash"`, `"browser"`, `"agents"`, `"schedule"`, `"send"`).
-  - **Structured filters & ordering:** Filter by `with` (peer/channel/group), `direction` (`"in"` / `"out"`), `sender`, `role` (`"user"` / `"assistant"` / `"tool"`), `since_ms` / `until_ms`, and order by `sort = "relevance"` (BM25 + CJK bigram + exact-match boost + query coverage + recency), `"newest"` (`timestamp DESC`), or `"oldest"` (`timestamp ASC`).
+  - **Structured filters & ordering:** Filter by `with` (peer/channel/group), `direction` (`"in"` / `"out"`), `sender`, `role` (`"user"` / `"assistant"` / `"tool"`), `since_ms` / `until_ms`, and order by `sort = "relevance"` (hybrid: BM25 and dense fused, then reranked; filters apply to dense candidates exactly as to lexical ones), `"newest"` (`timestamp DESC`), or `"oldest"` (`timestamp ASC`).
   - **Range reads & contiguous episode windows:** Read transcript ranges (`range = "seq:<from>-<to>"` or `"transcript:<from>-<to>"`, or `from_seq` / `to_seq`) and expand `radius` (`0..=10`) contiguous neighboring events around each hit to preserve causal paths `P(path | result)`.
 - Harness-local recall, context windowing and compaction belong to the external CLI, not AnyAgents. Spiron receives `--state-dir` and `--instructions-file` pointing into the existing agent configuration directory, plus workspace, skills and MCP paths. The adapter reads `spiron-session-id` or legacy `sylphx-session-id` and writes only the canonical session marker. Legacy transcript, window, cloud-session and Goal files remain available to Spiron's continuity reader; AnyAgents never rewrites or summarizes them.
 - `agents()` lists the agents on the server with their harness, state and lag, so agents can see each other.
@@ -582,17 +482,32 @@ message, a reaction's target, an edit's original) on a read snapshot before it
 takes the writer, because those lookups match text patterns and can read every
 stored message. Waiting file locks are taken on blocking-pool
 or dedicated threads, never on an async worker. Maintenance never waits for a
-lifecycle: the archived-agent reaper, sleep-memory consolidation and history
-verification try the lock and skip a busy agent.
+lifecycle: the archived-agent reaper and sleep-memory consolidation try the
+lock and skip a busy agent, and history verification takes none (it queues the source for the host history
+indexer). Host history indexing reads with no lock held and takes an owner's
+lifecycle only to publish one bounded batch, then the index write (3, then 5);
+a search does it on the blocking pool, and the background indexer on its own
+thread.
 
 ### Host history index refresh
 
-Host history keeps raw text in its source files. The rebuildable contentless FTS
+Host history keeps raw text in its sources: JSONL files, and the SQLite stores
+Spiron (`sessions.sqlite3`) and OpenCode (`opencode.db`) keep, read through a
+read-only connection that never creates a file beside the store. A store row is
+addressed as `<database>/<table>/<rowid>`; its bytes are the row's event text.
+The rebuildable contentless FTS
 index stores metadata, bounded search windows and SHA-256 raw coordinates, not a
-second raw transcript. Each source frontier and its documents/windows commit
-atomically. A source changing during publication defers that snapshot without
-advancing its frontier. `memory` and `transcripts` queries refresh/prune only their
-requested source class; `all` refreshes both.
+second raw transcript. A source is read, hashed and projected in bounded
+batches (about 2 MiB or 512 store rows) with no lifecycle lock and no index
+transaction held; each batch then publishes its documents, windows, call
+correlations and frontier atomically under the owner's lifecycle lock, only if
+the source still holds what was read and no redaction intervened. A batch that
+fails those checks is dropped without advancing the frontier. `memory` and
+`transcripts` queries refresh/prune only their requested source class; `all`
+refreshes both. A query indexes at most 4 MiB of new history before answering;
+the rest is queued for a daemon thread at nice 19 and idle I/O priority, and the
+response reports it in `retrieval.pending`. That thread also pre-warms every
+agent's history once per daemon start.
 
 An unchanged native JSONL source reuses its persisted cursor. For the same device
 and inode with no size decrease, a changed source checks the last **64 KiB before
@@ -604,15 +519,17 @@ always verify their own SHA; explicit whole-event readback verifies the event SH
 
 This is deliberately not an append-only proof: a same-size edit **outside** the
 boundary may remain missing/stale in the index until full verification. The daemon
-maintenance loop fully rebuilds at most **one due source every 15 minutes** (every
-15th 60-second tick), with sources due **one hour after their last full verification**. Backlog, a continuously
-changing source or failures can extend that detection delay; no fixed one-hour
-upper bound is promised. Failed sources rotate behind other due sources without
+maintenance loop schedules at most **one due source every 15 minutes** (every
+15th 60-second tick), with sources due **one hour after their last full verification**.
+The maintenance worker only records the attempt and queues the source; it never
+reads it or waits for a lock. The background indexer reads it in batches,
+republishes documents whose bytes changed, and records the verification and
+frontier once it has read the whole source. Backlog, a continuously changing
+source or failures can extend that detection delay; no fixed one-hour upper
+bound is promised. Failed sources rotate behind other due sources without
 publishing a new frontier. A stale returned window is refused immediately by its
 SHA check. Full verification uses the same pending-redaction path exclusions as
-query refresh and takes the owner's lifecycle lock only when it is free: a busy
-owner is skipped, keeps its place in the rotation, and the maintenance worker never
-waits for it. It never edits the source. This maintenance is
+query refresh. It never edits the source. This maintenance is
 host-driven, not an LLM schedule. Native transcript writers remain active in PR1;
 the host raw append port is not activated by this index.
 

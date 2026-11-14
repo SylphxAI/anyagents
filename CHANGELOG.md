@@ -7,6 +7,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+- Git: every repository-backed agent has a repository of its own (ADR 0010
+  D5). Its config, refs, index and hooks are its alone; it borrows objects
+  read-only from a pool through `objects/info/alternates`, so a checkout
+  costs a checkout and two agents on one repository cannot see each other's
+  branches or config. The pool is a bare repository per remote under
+  `ANYAGENTS_GIT_POOL_DIR`, now `<data>/git-pool` by default, so `repo:`
+  works with no checkout provider configured. Only the server fetches into
+  it, and it is never pruned. A checkout provider remains optional; a
+  linked worktree it makes is converted in place into an own repository and
+  its store becomes the pool, which must then never prune
+  (`gc.pruneExpire=never`, `gc.cruftPacks=true`, else conversion is
+  refused); a keep ref in the store holds what each converted repository
+  borrows until it is reaped. Archive removes a checkout only when the
+  remote's own answer (`ls-remote`) covers every commit, tag and note it
+  has and it has no stash. Removed: worktrees of a shared bare pool, the
+  POSIX ACL grants on its `objects/`, `refs/`, `logs/` and `packed-refs`,
+  the `anyagents-config/` config symlink, per-checkout `--worktree` config,
+  the grant journals in `<data>/worktree-grants/` with their quarantine and
+  recovery, and `ANYAGENTS_TRUSTED_METADATA_GIDS`. Existing linked
+  worktrees keep working as they are; archive cleanup converts one in place
+  (same status, HEAD, index, sparse patterns and hooks, unpushed and
+  reflog-only objects copied) before judging it. For `repo: "inherit"` and local sources, the
+  remote is asked from outside the source repository.
+- `conversation` searches every harness's native history: Spiron's
+  `sessions.sqlite3`, OpenCode's `opencode.db` (tool parts included), Claude
+  Code subagents, Codex rollouts, AGY, Muse, OMP and Grok sessions, read
+  without ever creating a file beside a harness's store. A harness directory
+  the server may not read (Claude Code's owner-only `config/sessions` under a
+  seat) no longer stops the agent's other history from being indexed. The
+  server logs once when its pre-warm has indexed every agent.
+- History indexing never holds an agent's lifecycle lock or the index's write
+  lock across a long read: sources are read and projected unlocked and publish
+  in short batches that check the source is unchanged. A search indexes at most
+  4 MiB of new history before it answers and reports the rest in
+  `retrieval.pending`; a low-priority daemon thread indexes it, verifies
+  sources hourly, and pre-warms every agent's history after a start.
+- Embeddings and rerank can come from a remote model bound to an AnyAgents
+  profile: an OpenAI-compatible `/embeddings` endpoint or a Cohere/Voyage/Jina
+  style `/rerank`, chosen in `<data>/memory-service/config.json`. With nothing
+  configured the pinned local models run offline. Each dense index is stamped
+  with its vector space (provider, model, dimension, preprocessing); a new
+  embedding model is rebuilt in the background (niced, resumable, batched)
+  after its estimated tokens and cost are reported, and only within
+  `max_rebuild_usd`; while it builds, all embedding stops when the spend the
+  provider reports reaches the cap. `anyagents memory-service estimate`
+  previews the rebuild without calling a model. Spend outside a rebuild
+  (query embeddings, rerank, new history) is capped per UTC day by
+  `max_daily_usd` and persisted; past it query embedding, rerank and new-history embedding
+  wait for the next day. Background workers retry failures with backoff and
+  report them in `status`; marks follow the host index's generation and the
+  worker count. No space is deleted automatically: `memory-service prune`
+  removes other spaces once the configured one is built, and a `--config`
+  that does not exist is an error. A remote model must have a configured
+  price, so its spend is always counted, and a remote query is cut to the
+  piece budget. Every OpenRouter request
+  carries `provider.data_collection = "deny"`, and a remote reranker reads at
+  most `passage_chars` (1,000) characters of each passage. The desk's choice,
+  `qwen/qwen3-embedding-8b` with `mongodb/rerank-3` through
+  `openrouter/default` (MRR@10 0.296 and recall@10 0.463 on our history,
+  against 0.192 and 0.362 for the local pair), is documented with its exact
+  configuration in `docs/host-memory.md`.
+- Hybrid retrieval: BM25 fused with dense candidates from a local multilingual
+  embedder and reranked by a local cross-encoder, run by the new
+  `anyagents memory-service` process. Every result cites its raw bytes; without
+  the service the server ranks lexically and reports `retrieval.mode`
+  `lexical`, with nothing marked degraded.
 - Security: the server no longer opens host files with its own access on an
   agent's behalf (ADR 0010 D3). A `send` with a local media path uploads it
   only when the sending agent can read it itself: a seat agent's file is
