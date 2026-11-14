@@ -709,14 +709,90 @@ fn chromium_home(profile_dir: &Path) -> PathBuf {
     profile_dir.join("home")
 }
 
-/// The environment that keeps Chromium's per-user files under `home`.
-fn chromium_env(home: &Path) -> [(&'static str, PathBuf); 4] {
-    [
-        ("HOME", home.to_path_buf()),
-        ("XDG_CONFIG_HOME", home.join(".config")),
-        ("XDG_CACHE_HOME", home.join(".cache")),
-        ("XDG_DATA_HOME", home.join(".local/share")),
-    ]
+/// The only `PATH` Chromium (and `xvfb-run`) sees.
+const CHROMIUM_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
+
+/// Variables passed through from the server when set: locale and fonts.
+const CHROMIUM_PASSED_ENV: &[&str] = &[
+    "LANG",
+    "LANGUAGE",
+    "LC_ALL",
+    "LC_CTYPE",
+    "FONTCONFIG_FILE",
+    "FONTCONFIG_PATH",
+];
+
+/// Chromium's whole environment: its home and XDG directories under `home`,
+/// its private `tmp`, the fingerprint's time zone, a fixed `PATH`, the
+/// server's locale and font settings, and an X display with its authority
+/// file when it draws on one. Nothing else of the server's.
+fn chromium_environment(
+    home: &Path,
+    tmp: Option<&Path>,
+    timezone: &str,
+    display: Option<&(std::ffi::OsString, Option<PathBuf>)>,
+) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    let mut env: Vec<(std::ffi::OsString, std::ffi::OsString)> = vec![
+        ("HOME".into(), home.into()),
+        ("XDG_CONFIG_HOME".into(), home.join(".config").into()),
+        ("XDG_CACHE_HOME".into(), home.join(".cache").into()),
+        ("XDG_DATA_HOME".into(), home.join(".local/share").into()),
+        ("PATH".into(), CHROMIUM_PATH.into()),
+        ("TZ".into(), timezone.into()),
+    ];
+    // xvfb-run's X authority file and Chromium's own temporary files, its
+    // singleton socket among them: in a private directory the jail opens.
+    if let Some(tmp) = tmp {
+        env.push(("TMPDIR".into(), tmp.into()));
+    }
+    if let Some((name, authority)) = display {
+        env.push(("DISPLAY".into(), name.clone()));
+        if let Some(authority) = authority {
+            env.push(("XAUTHORITY".into(), authority.into()));
+        }
+    }
+    for name in CHROMIUM_PASSED_ENV {
+        if let Some(value) = std::env::var_os(name) {
+            env.push(((*name).into(), value));
+        }
+    }
+    env
+}
+
+/// The server's X display and the authority file Chromium reads to use it
+/// (its `XAUTHORITY`, else `~/.Xauthority`), when one is set.
+fn x11_display() -> Option<(std::ffi::OsString, Option<PathBuf>)> {
+    let name = std::env::var_os("DISPLAY").filter(|v| !v.is_empty())?;
+    let authority = std::env::var_os("XAUTHORITY")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| Path::new(&home).join(".Xauthority")))
+        .filter(|path| path.is_absolute() && path.is_file());
+    Some((name, authority))
+}
+
+/// `path` as a directory only this user may enter: created 0700, or an
+/// existing one of this user's narrowed to 0700.
+fn private_dir(path: &Path) -> Result<(), Error> {
+    use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
+    match std::fs::DirBuilder::new().mode(0o700).create(path) {
+        Ok(()) => return Ok(()),
+        Err(error) if error.kind() != std::io::ErrorKind::AlreadyExists => {
+            return Err(error.into());
+        }
+        Err(_) => {}
+    }
+    let meta = std::fs::symlink_metadata(path)?;
+    if !meta.is_dir() || meta.uid() != crate::sandbox::server_uid() {
+        return Err(Error::Message(format!(
+            "{} is not this user's own directory",
+            path.display()
+        )));
+    }
+    if meta.mode() & 0o077 != 0 {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
 }
 
 /// The Chromium command line for one profile, before display and proxy.
@@ -778,7 +854,6 @@ fn ensure_browser_running(
     let port = allocate_free_port()?;
     let want_headless = headless_override.unwrap_or(false);
     let has_xvfb = Path::new("/usr/bin/xvfb-run").is_file();
-    let has_display = std::env::var_os("DISPLAY").is_some_and(|v| !v.is_empty());
     let bin = chromium_binary()?;
 
     let mut chrome_args = chromium_args(&user_data_dir, port, &fp);
@@ -795,15 +870,23 @@ fn ensure_browser_running(
     } else {
         None
     };
+    let display = if want_headless { None } else { x11_display() };
     let (program, program_args) = match &private_tmp {
         Some(tmp) => jail::wrap(
             &[&std::path::absolute(&dir)?, tmp],
+            &display
+                .iter()
+                .filter_map(|(_, auth)| auth.clone())
+                .collect::<Vec<_>>(),
+            &std::env::var_os("ANYAGENTS_BROWSER_JAIL_READ")
+                .map(|dirs| std::env::split_paths(&dirs).collect::<Vec<_>>())
+                .unwrap_or_default(),
             crate::sandbox::seats_configured(),
             &bin,
         )?,
         None => (bin.clone(), Vec::new()),
     };
-    let (mut cmd, display_mode, actual_headless) = if !want_headless && has_display {
+    let (mut cmd, display_mode, actual_headless) = if display.is_some() {
         let mut c = Command::new(&program);
         c.args(&program_args).args(&chrome_args);
         (c, "x11-display".to_string(), false)
@@ -831,24 +914,21 @@ fn ensure_browser_running(
     let err_file = log_file.try_clone()?;
     cmd.stdin(Stdio::null())
         .stdout(Stdio::from(log_file))
-        .stderr(Stdio::from(err_file))
-        .env("TZ", &fp.timezone);
+        .stderr(Stdio::from(err_file));
     // Chromium's home is inside its profile, so a download, a cache or a
-    // certificate store lands there and never in the server user's home; the
-    // distribution wrapper takes extra flags only from root's /etc.
+    // certificate store lands there and never in the server user's home. It
+    // is the profile's own: 0700, where no seat reads another's downloads.
     let home = chromium_home(&std::path::absolute(&dir)?);
-    std::fs::create_dir_all(home.join("Downloads"))?;
-    for (name, value) in chromium_env(&home) {
-        cmd.env(name, value);
-    }
-    // xvfb-run's X authority file and Chromium's own temporary files, its
-    // singleton socket among them: in a private directory the jail opens.
-    if let Some(tmp) = &private_tmp {
-        cmd.env("TMPDIR", tmp);
-    }
-    for name in ["CHROMIUM_FLAGS", "CHROMIUM_USER_FLAGS", "XDG_DOWNLOAD_DIR"] {
-        cmd.env_remove(name);
-    }
+    private_dir(&home)?;
+    private_dir(&home.join("Downloads"))?;
+    // Nothing of the server's environment (its capability key, tokens,
+    // CHROMIUM_FLAGS) reaches Chromium: only what it needs, named here.
+    cmd.env_clear().envs(chromium_environment(
+        &home,
+        private_tmp.as_deref(),
+        &fp.timezone,
+        display.as_ref(),
+    ));
 
     #[cfg(unix)]
     {
@@ -9585,8 +9665,13 @@ esac
             assert!(refuse_file_access_flags(&with).is_err(), "{flag}");
         }
         let home = chromium_home(&profile_dir(data.path(), "p"));
-        for (_, value) in chromium_env(&home) {
-            assert!(value.starts_with(profile_dir(data.path(), "p")));
+        for (name, value) in chromium_environment(&home, None, "UTC", None) {
+            if name
+                .to_str()
+                .is_some_and(|n| n == "HOME" || n.starts_with("XDG_"))
+            {
+                assert!(Path::new(&value).starts_with(profile_dir(data.path(), "p")));
+            }
         }
     }
 
@@ -9598,7 +9683,7 @@ esac
     #[ignore = "launches real Chromium; run on a Linux host with Landlock"]
     fn chromium_in_its_jail_reads_no_host_file_even_over_raw_cdp() {
         let _browser = browser_fixture_guard();
-        if !has_chromium() || jail::landlock_abi() < 1 {
+        if !has_chromium() || !jail::tests::landlock_or_skip() {
             return;
         }
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -9662,6 +9747,32 @@ esac
             std::thread::sleep(Duration::from_millis(1500));
             let shown = text(&mut session);
             assert!(!shown.contains("operator-secret"), "{headless:?}: {shown}");
+            // The server user's own shared memory, as the desk's secrets
+            // cache in /dev/shm is.
+            if Path::new("/dev/shm").is_dir() {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                let shm = PathBuf::from(format!(
+                    "/dev/shm/anyagents-cdp-test-{}-{}",
+                    std::process::id(),
+                    now_ms()
+                ));
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&shm)
+                    .unwrap()
+                    .write_all(b"shm-secret")
+                    .unwrap();
+                let _ = session.call(
+                    "Page.navigate",
+                    serde_json::json!({ "url": format!("file://{}", shm.display()) }),
+                );
+                std::thread::sleep(Duration::from_millis(1500));
+                let shown = text(&mut session);
+                let _ = std::fs::remove_file(&shm);
+                assert!(!shown.contains("shm-secret"), "{headless:?}: {shown}");
+            }
             let downloads = chromium_home(&profile_dir(data.path(), "jail")).join("Downloads");
             drop(session);
             let tmp =
@@ -9673,5 +9784,93 @@ esac
             assert!(downloads.is_dir());
             assert_eq!(std::fs::read_to_string(&token).unwrap(), "operator-secret");
         }
+    }
+
+    /// Chromium gets none of the server's environment (its capability key,
+    /// CHROMIUM_FLAGS), only the variables it is given; its home, where
+    /// downloads land, is 0700 inside the profile.
+    #[cfg(unix)]
+    #[test]
+    fn chromium_starts_with_only_its_own_environment() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _env = crate::server::tests::env_lock();
+        let _browser = browser_fixture_guard();
+        let data = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let fake = bin.path().join("fake-chromium");
+        crate::worktree::tests::write_executable(
+            &fake,
+            "#!/bin/sh\ncase \"$1\" in --version) echo 'Chromium 140.0.7339.0'; exit 0;; esac\n\
+             env > \"$HOME/env-dump\"\nexit 3\n",
+        );
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                for name in [
+                    "ANYAGENTS_CHROMIUM_BIN",
+                    "ANYAGENTS_CAPABILITY_KEY",
+                    "CHROMIUM_FLAGS",
+                ] {
+                    unsafe { std::env::remove_var(name) };
+                }
+            }
+        }
+        let _reset = Reset;
+        unsafe {
+            std::env::set_var("ANYAGENTS_CHROMIUM_BIN", &fake);
+            std::env::set_var("ANYAGENTS_CAPABILITY_KEY", "capability-secret");
+            std::env::set_var("CHROMIUM_FLAGS", "--allow-file-access-from-files");
+        }
+        let error = ensure_browser_running(data.path(), "envtest", Some(true), None).unwrap_err();
+        let profile = std::path::absolute(profile_dir(data.path(), "envtest")).unwrap();
+        let home = chromium_home(&profile);
+        let dump = std::fs::read_to_string(home.join("env-dump"))
+            .unwrap_or_else(|read| panic!("{read}; launch: {error}"));
+        assert!(!dump.contains("capability-secret"), "{dump}");
+        assert!(!dump.contains("allow-file-access"), "{dump}");
+        let mut allowed = vec![
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_DATA_HOME",
+            "PATH",
+            "TZ",
+            "TMPDIR",
+            "DISPLAY",
+            "XAUTHORITY",
+            // What the fake's own shell sets.
+            "PWD",
+            "OLDPWD",
+            "SHLVL",
+            "_",
+            // What macOS adds to any process.
+            "__CF_USER_TEXT_ENCODING",
+        ];
+        allowed.extend(CHROMIUM_PASSED_ENV);
+        for line in dump.lines() {
+            let name = line.split('=').next().unwrap_or_default();
+            assert!(allowed.contains(&name), "unexpected `{line}` in\n{dump}");
+        }
+        assert!(
+            dump.lines()
+                .any(|l| l == format!("HOME={}", home.display())),
+            "{dump}"
+        );
+        assert!(
+            dump.lines().any(|l| l == format!("PATH={CHROMIUM_PATH}")),
+            "{dump}"
+        );
+        if cfg!(target_os = "linux") {
+            assert!(
+                dump.lines()
+                    .any(|l| l.starts_with(&format!("TMPDIR={CHROMIUM_TMP_PREFIX}"))),
+                "{dump}"
+            );
+        }
+        for dir in [home.clone(), home.join("Downloads")] {
+            let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{}", dir.display());
+        }
+        stop_profile(data.path(), "envtest").unwrap();
     }
 }

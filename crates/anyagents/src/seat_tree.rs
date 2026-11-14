@@ -198,11 +198,14 @@ fn seat_file_command(
 ///   through a final symbolic link, and hand the descriptor back over
 ///   standard input (a Unix socket) when it is a regular file.
 /// - `create <path>`: the same for writing, creating or truncating it.
+/// - `kill <pid>`: SIGKILL one of the seat's own processes (a helper the
+///   daemon gave up on and may not signal itself).
 pub(crate) fn seat_file_main(args: &[OsString]) -> std::process::ExitCode {
     let usage = || {
         eprintln!(
             "usage: anyagents internal seat-file inode <mode> [<gid>] | op-dir | \
-             copy <name> | readback <name> | unlink <name> | open <path> | create <path>"
+             copy <name> | readback <name> | unlink <name> | open <path> | create <path> | \
+             kill <pid>"
         );
         std::process::ExitCode::from(2)
     };
@@ -235,6 +238,17 @@ pub(crate) fn seat_file_main(args: &[OsString]) -> std::process::ExitCode {
                 },
             }
         }
+        (Some("kill"), [pid]) => match pid.to_str().and_then(|p| p.parse::<libc::pid_t>().ok()) {
+            // Only this seat's own process can be signalled from here.
+            Some(pid) if pid > 1 => {
+                if unsafe { libc::kill(pid, libc::SIGKILL) } == 0 {
+                    Ok(())
+                } else {
+                    Err(io::Error::last_os_error())
+                }
+            }
+            _ => return usage(),
+        },
         (Some(operation @ ("open" | "create")), [path]) if Path::new(path).is_absolute() => {
             open_regular_file(Path::new(path), operation == "create")
                 .and_then(|file| hand_back(input, &file))
@@ -399,6 +413,85 @@ fn hand_back(socket: BorrowedFd<'_>, file: &File) -> io::Result<()> {
     anyagents_keeper::wire::send_frame(&stream, &"opened", &[file.as_raw_fd()])
 }
 
+/// The descriptor came from a process running as the seat; take nothing
+/// but a regular file from it.
+fn regular_file(file: File, stage: &str) -> io::Result<File> {
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::other(format!("{stage}: not a regular file")));
+    }
+    Ok(file)
+}
+
+/// `child`'s exit status if it exits within `grace`, polling, never
+/// blocking past it.
+fn exit_within(
+    child: &mut std::process::Child,
+    grace: std::time::Duration,
+) -> io::Result<Option<std::process::ExitStatus>> {
+    let deadline = std::time::Instant::now() + grace;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// Kill a seat helper that did not exit, and hand it to the reaper. The
+/// daemon may not signal another uid's process, so a kill that is refused
+/// is asked of the seat itself (`seat-file kill <pid>`); that request is
+/// reaped the same way. The child stays unreaped until then, so its pid
+/// cannot be reused under the kill.
+fn stop_seat_child(
+    mut child: std::process::Child,
+    launcher: &Path,
+    uid: u32,
+    gid: u32,
+    groups: &str,
+) {
+    if child.kill().is_err()
+        && let Ok(mut kill) = seat_file_command(launcher, uid, gid, groups)
+    {
+        kill.arg("kill")
+            .arg(child.id().to_string())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if let Ok(kill) = kill.spawn() {
+            reap_later(kill);
+        }
+    }
+    reap_later(child);
+}
+
+/// Children a request thread will not wait for, reaped by one background
+/// thread as they exit.
+static SEAT_REAPER: std::sync::Mutex<Vec<std::process::Child>> = std::sync::Mutex::new(Vec::new());
+
+fn reap_later(child: std::process::Child) {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    SEAT_REAPER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(child);
+    STARTED.call_once(|| {
+        let _ = std::thread::Builder::new()
+            .name("seat-reaper".into())
+            .spawn(|| {
+                loop {
+                    SEAT_REAPER
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .retain_mut(|child| !matches!(child.try_wait(), Ok(Some(_)) | Err(_)));
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+            });
+    });
+}
+
 /// How long the daemon waits for a seat to open one file.
 const SEAT_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -414,6 +507,22 @@ pub(crate) fn open_as_seat(
     path: &Path,
     create: bool,
 ) -> io::Result<File> {
+    open_as_seat_within(launcher, uid, gid, groups, path, create, SEAT_OPEN_TIMEOUT)
+}
+
+/// How long a seat helper that answered may take to exit before it is
+/// stopped and left to the reaper.
+const SEAT_EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+fn open_as_seat_within(
+    launcher: &Path,
+    uid: u32,
+    gid: u32,
+    groups: &str,
+    path: &Path,
+    create: bool,
+    timeout: std::time::Duration,
+) -> io::Result<File> {
     use std::io::Read as _;
     if !path.is_absolute() {
         return Err(io::Error::new(
@@ -423,7 +532,7 @@ pub(crate) fn open_as_seat(
     }
     let stage = if create { "seat-create" } else { "seat-open" };
     let (ours, theirs) = std::os::unix::net::UnixStream::pair()?;
-    ours.set_read_timeout(Some(SEAT_OPEN_TIMEOUT))?;
+    ours.set_read_timeout(Some(timeout))?;
     // The command, and with it this process's copy of the seat's end, is
     // dropped at spawn, so a seat that exits without answering reads as EOF.
     let mut child = {
@@ -441,25 +550,46 @@ pub(crate) fn open_as_seat(
         })?
     };
     let stderr = child.stderr.take().expect("piped seat stderr");
-    let drain = std::thread::spawn(move || {
+    // The reason a helper failed, read off its stderr by a thread nobody
+    // joins: a pipe the seat keeps open never holds this one.
+    let (reason_sender, reason) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
         let mut stderr = stderr;
         let mut prefix = Vec::new();
         let _ = (&mut stderr)
             .take(SEAT_STDERR_LIMIT)
             .read_to_end(&mut prefix);
+        let _ = reason_sender.send(prefix);
         let _ = io::copy(&mut stderr, &mut io::sink());
-        prefix
     });
     let mut reader = anyagents_keeper::wire::FrameReader::new(&ours);
     let answer = reader.next_frame();
     let mut fds = reader.take_fds();
-    if answer.is_err() {
-        let _ = child.kill();
-    }
-    let status = child
-        .wait()
-        .map_err(|error| io::Error::new(error.kind(), format!("{stage} wait failed: {error}")))?;
-    let prefix = drain.join().unwrap_or_default();
+    // The helper runs as the seat, which may stop or hang it; this thread
+    // never waits on it unbounded. One that does not exit promptly is
+    // killed (as the seat, when this process may not signal it) and left to
+    // the reaper.
+    let grace = if answer.is_err() {
+        std::time::Duration::ZERO
+    } else {
+        SEAT_EXIT_GRACE
+    };
+    let Some(status) = exit_within(&mut child, grace)? else {
+        stop_seat_child(child, launcher, uid, gid, groups);
+        return match (answer, fds.len()) {
+            (Ok(Some(frame)), 1) if frame == br#""opened""# => {
+                regular_file(File::from(fds.remove(0)), stage)
+            }
+            (Err(error), _) => Err(io::Error::new(
+                error.kind(),
+                format!("{stage}: the seat did not answer in time: {error}"),
+            )),
+            _ => Err(io::Error::other(format!(
+                "{stage}: the seat did not exit after answering without one opened file"
+            ))),
+        };
+    };
+    let prefix = reason.recv_timeout(SEAT_EXIT_GRACE).unwrap_or_default();
     if !status.success() {
         let stderr = String::from_utf8_lossy(&prefix);
         // The helper's own reason, without its prefix; Debug escaping keeps
@@ -482,13 +612,7 @@ pub(crate) fn open_as_seat(
     }
     match (answer, fds.len()) {
         (Ok(Some(frame)), 1) if frame == br#""opened""# => {
-            let file = File::from(fds.remove(0));
-            // The descriptor came from a process running as the seat; take
-            // nothing but a regular file from it.
-            if !file.metadata()?.is_file() {
-                return Err(io::Error::other(format!("{stage}: not a regular file")));
-            }
-            Ok(file)
+            regular_file(File::from(fds.remove(0)), stage)
         }
         (Err(error), _) => Err(io::Error::new(
             error.kind(),
@@ -2092,6 +2216,74 @@ exec "$@"
             error.contains("exit status: 3") && error.contains("denied"),
             "{error}"
         );
+    }
+
+    /// A seat that stops its own helper (or never answers) holds no daemon
+    /// thread: the open fails at its timeout, the helper is killed and left
+    /// to the reaper, and nothing waits on it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_stopped_seat_helper_never_pins_the_caller() {
+        let temp = crate::test_tempdir();
+        let launcher = temp.path().join("stopping.sh");
+        crate::worktree::tests::write_executable(&launcher, "#!/bin/sh\nkill -STOP $$\nexit 0\n");
+        let file = temp.path().join("f");
+        std::fs::write(&file, b"x").unwrap();
+        let started = std::time::Instant::now();
+        let error = open_as_seat_within(
+            &launcher,
+            42001,
+            42002,
+            "42002",
+            &file,
+            false,
+            std::time::Duration::from_millis(500),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("did not answer in time"), "{error}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        // The reaper collects the killed helper.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !SEAT_REAPER
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+        {
+            assert!(std::time::Instant::now() < deadline, "helper never reaped");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    /// `kill <pid>` signals one of the seat's own processes, and nothing
+    /// that is not a pid.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_seat_kills_its_own_helper_on_request() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let temp = crate::test_tempdir();
+        let launcher = recording_launcher(temp.path());
+        let mut sleeper = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let kill = |pid: &str| {
+            let mut command = seat_file_command(&launcher, 42001, 42002, "42002").unwrap();
+            command
+                .args(["kill", pid])
+                .stdin(std::process::Stdio::null());
+            run_seat_command(&mut command, "seat-kill")
+        };
+        kill(&sleeper.id().to_string()).unwrap();
+        assert_eq!(sleeper.wait().unwrap().signal(), Some(libc::SIGKILL));
+        for bad in ["1", "0", "-1", "self"] {
+            let error = kill(bad).unwrap_err().to_string();
+            assert!(error.contains("exit status: 2"), "{bad}: {error}");
+        }
     }
 
     /// With a real seat (root drops to a fixture uid through `setpriv`): the

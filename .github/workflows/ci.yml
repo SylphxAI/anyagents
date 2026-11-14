@@ -106,6 +106,9 @@ jobs:
       - name: Build harness helper binaries
         run: cargo build -p anyagents-harness-opencode --bin fake_opencode --locked
       - name: Test
+        env:
+          # The browser jail's acceptance fails, never skips, without Landlock.
+          ANYAGENTS_REQUIRE_LANDLOCK_TEST: '1'
         run: cargo test --workspace --locked
       - name: Takeover interaction acceptance
         if: github.event_name == 'workflow_dispatch' && inputs.takeover && github.event.repository.visibility == 'public'
