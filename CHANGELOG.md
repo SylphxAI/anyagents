@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+- Build output has an owner and a bound
+  ([ADR 0012](docs/adr/0012-agent-storage-roots.md)). With a scratch tier
+  configured, an agent's build output and `TMPDIR` live under its own root,
+  `{scratch}/agents/{id}`, and `ANYAGENTS_AGENT_BUILD_DIR` names its `build/`
+  for host build wrappers. All build output on the scratch volume, agents'
+  and the host directories `ANYAGENTS_SCRATCH_BUILD_EXTRA_DIRS` names, stays
+  under `ANYAGENTS_SCRATCH_BUILD_BUDGET` (300 GiB unless set; `0` turns it
+  off). A server task removes the least recently written build directories
+  of archived, then stopped agents, then host output, then idle agents, never
+  one written in the last half hour or of an agent in a turn. It tells the
+  operator inbox when the budget cannot be met or the scratch filesystem is
+  90% full. It only logs what it would remove until
+  `ANYAGENTS_SCRATCH_BUILD_BUDGET_DRY_RUN=0`.
 - Security: the server no longer opens host files with its own access on an
   agent's behalf (ADR 0010 D3). A `send` with a local media path uploads it
   only when the sending agent can read it itself: a seat agent's file is

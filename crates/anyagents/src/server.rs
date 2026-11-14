@@ -44,6 +44,7 @@ pub(crate) mod outbound_history;
 mod profiles;
 mod quota_rotation;
 mod reap_queue;
+pub(crate) mod scratch_budget;
 
 pub(crate) use profiles::ServedProfile;
 
@@ -316,6 +317,7 @@ async fn serve(
     if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none() && !crate::sandbox::is_isolated_test_env()
     {
         quota_rotation::start(Arc::clone(&store));
+        scratch_budget::start(Arc::clone(&store), data.to_path_buf(), state.health.clone());
         let memory_backlog = memory_backlog::start(&store);
         let reaper_root = data.to_path_buf();
         let reaper_store = Arc::clone(&store);
@@ -5003,7 +5005,11 @@ fn detect_seat_ids(_config_dir: &Path) -> Option<(u32, u32, u32)> {
     None
 }
 
-fn remove_path_with_seat(target: &Path, seat_ids: Option<(u32, u32, u32)>) -> bool {
+/// The operator-inbox sender of reports the server's storage upkeep writes.
+pub(crate) const STORAGE_SENDER: &str = "server:storage";
+pub(crate) const STORAGE_SENDER_NAME: &str = "AnyAgents storage";
+
+pub(crate) fn remove_path_with_seat(target: &Path, seat_ids: Option<(u32, u32, u32)>) -> bool {
     let meta = match std::fs::symlink_metadata(target) {
         Ok(meta) => meta,
         Err(error) => return error.kind() == std::io::ErrorKind::NotFound,

@@ -86,8 +86,7 @@ impl FileAuthority {
         own.push(anyagents_core::agent_work_dir(data, &agent.id));
         own.push(data.join("agents").join(agent.id.as_str()));
         if let Some(scratch) = anyagents_core::configured_scratch_dir() {
-            own.push(anyagents_core::agent_scratch_build_dir(&scratch, &agent.id));
-            own.push(anyagents_core::agent_scratch_tmp_dir(&scratch, &agent.id));
+            own.extend(anyagents_core::agent_scratch_dirs(&scratch, &agent.id));
         }
         Self::Beneath(Beneath {
             own,
