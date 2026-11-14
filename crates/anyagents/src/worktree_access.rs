@@ -3507,6 +3507,21 @@ fn update_metadata_acl(
 /// wraps `find`, `sh` or `test` cannot break it. A probe as the server's own
 /// identity runs in this process.
 pub(crate) fn verify(path: &Path, uid: u32, gid: u32, launch: Option<&str>) -> Result<(), Error> {
+    verify_within(path, uid, gid, launch, ADMISSION_PROBE_TIMEOUT)
+}
+
+/// How long a seat's admission probe may run before its whole process group
+/// is killed. A seat cannot hold a creation (or the restart behind it) by
+/// stopping or stalling its own probe.
+const ADMISSION_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+fn verify_within(
+    path: &Path,
+    uid: u32,
+    gid: u32,
+    launch: Option<&str>,
+    timeout: std::time::Duration,
+) -> Result<(), Error> {
     let env = probe_env();
     let git = probe_git(&env[0].1).map_err(|e| refusal(path, e))?;
     let seat = |message: String| refusal(path, format!("seat uid {uid}, gid {gid}: {message}"));
@@ -3573,8 +3588,14 @@ pub(crate) fn verify(path: &Path, uid: u32, gid: u32, launch: Option<&str>) -> R
             ),
         )
     };
-    let out = match command.output() {
-        Ok(out) => out,
+    let out = match output_within(command, timeout) {
+        Ok(Some(out)) => out,
+        Ok(None) => {
+            return Err(seat(format!(
+                "the admission probe did not finish within {} s; its processes were killed",
+                timeout.as_secs()
+            )));
+        }
         Err(error) if exec_failure(&error) => return Err(unexecutable(error.to_string())),
         Err(error) => return Err(refusal(path, error)),
     };
@@ -3593,6 +3614,65 @@ pub(crate) fn verify(path: &Path, uid: u32, gid: u32, launch: Option<&str>) -> R
         )));
     }
     Ok(())
+}
+
+/// Run `command` in its own process group and collect its output, or kill
+/// the whole group once `timeout` passes (`None`). A stopped or stalled
+/// process and everything it started go with it.
+fn output_within(
+    mut command: std::process::Command,
+    timeout: std::time::Duration,
+) -> std::io::Result<Option<std::process::Output>> {
+    use std::io::Read;
+    use std::os::unix::process::CommandExt;
+    command
+        .process_group(0)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = command.spawn()?;
+    let group = child.id() as libc::pid_t;
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut bytes);
+            }
+            bytes
+        })
+    };
+    let stdout = drain(
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let stderr = drain(
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let waiter = std::thread::spawn(move || {
+        let _ = sender.send(child.wait());
+    });
+    let status = match receiver.recv_timeout(timeout) {
+        Ok(status) => Some(status?),
+        Err(_) => {
+            // The child is not reaped yet, so its pid still names its group.
+            unsafe { libc::kill(-group, libc::SIGKILL) };
+            let _ = receiver.recv();
+            None
+        }
+    };
+    let _ = waiter.join();
+    let stdout = stdout.join().unwrap_or_default();
+    let stderr = stderr.join().unwrap_or_default();
+    Ok(status.map(|status| std::process::Output {
+        status,
+        stdout,
+        stderr,
+    }))
 }
 
 /// An `exec` refusal of the program itself, as opposed to the identity
@@ -6068,6 +6148,35 @@ mod tests {
         );
         assert!(error.contains("chmod -R o-w"), "{error}");
         revoke_common(&common, uid, gid, &[], None).unwrap();
+    }
+
+    /// A seat that stops or stalls its own admission probe holds nothing: the
+    /// probe's whole process group is killed when the time is up. The
+    /// background child keeps the output pipes open, so only a group kill
+    /// returns before it would finish.
+    #[test]
+    fn a_stalled_admission_probe_is_killed() {
+        let dir = crate::test_tempdir();
+        let launcher = dir.path().join("launcher");
+        crate::worktree::tests::write_executable(
+            &launcher,
+            "#!/bin/sh\nsleep 30 &\nexec sleep 30\n",
+        );
+        let uid = crate::sandbox::server_uid().wrapping_add(1);
+        let gid = crate::sandbox::server_gid();
+        let spec = format!("{}\t{uid}\t{gid}\t{gid}", launcher.display());
+        let started = std::time::Instant::now();
+        let error = verify_within(
+            dir.path(),
+            uid,
+            gid,
+            Some(&spec),
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("did not finish within 1 s"), "{error}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(20));
     }
 
     /// The review's attack: a seat in the trusted store group writes config
