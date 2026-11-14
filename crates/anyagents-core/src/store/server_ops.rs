@@ -85,18 +85,6 @@ impl Store {
     }
 
     /// Every archived agent that has a parent, through the state index.
-    /// Every archived agent, root or sub-agent.
-    pub fn archived_agent_ids(&self) -> Result<Vec<AgentId>, Error> {
-        let conn = self.read_conn();
-        let mut stmt = conn.prepare_cached("SELECT id FROM agents WHERE state = 'archived'")?;
-        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-        let mut ids = Vec::new();
-        for id in rows {
-            ids.push(AgentId::parse(&id?)?);
-        }
-        Ok(ids)
-    }
-
     pub fn archived_subagent_ids(&self) -> Result<Vec<AgentId>, Error> {
         let conn = self.read_conn();
         let mut stmt = conn.prepare_cached(

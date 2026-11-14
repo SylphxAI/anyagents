@@ -1090,7 +1090,6 @@ fn vendor_launch_inner(
                     | anyagents_core::WORKSPACES_DIR_ENV
                     | anyagents_core::SCRATCH_DIR_ENV
                     | anyagents_core::GIT_POOL_DIR_ENV
-                    | anyagents_core::AGENT_BUILD_DIR_ENV
                     | "ANYAGENTS_AGENT_CONFIG"
                     | "ANYAGENTS_AGENT_UID"
                     | "ANYAGENTS_OPERATOR_TOKEN_FILE"
@@ -1182,7 +1181,6 @@ fn vendor_launch_inner(
                     | anyagents_core::WORKSPACES_DIR_ENV
                     | anyagents_core::SCRATCH_DIR_ENV
                     | anyagents_core::GIT_POOL_DIR_ENV
-                    | anyagents_core::AGENT_BUILD_DIR_ENV
                     | "ANYAGENTS_AGENT_CONFIG"
                     | "ANYAGENTS_AGENT_UID"
                     | "ANYAGENTS_OPERATOR_TOKEN_FILE"
@@ -1358,9 +1356,6 @@ fn vendor_launch_inner(
         }
     }
     if let Some(scratch_root) = anyagents_core::configured_scratch_dir() {
-        // The agent's own storage root on the scratch tier: build output and
-        // temporary files only, under the server's build budget and removed
-        // when the agent is archived.
         let build_root = anyagents_core::agent_scratch_build_dir(&scratch_root, &request.agent.id);
         let cargo_target = build_root.join("cargo");
         let gradle_home = build_root.join("gradle");
@@ -1371,10 +1366,6 @@ fn vendor_launch_inner(
                 let _ = std::fs::create_dir_all(dir);
             }
         }
-        env.push((
-            anyagents_core::AGENT_BUILD_DIR_ENV.to_string(),
-            build_root.display().to_string(),
-        ));
         env.push(("TMPDIR".to_string(), scratch_tmp.display().to_string()));
         env.push(("BUN_TMPDIR".to_string(), scratch_tmp.display().to_string()));
         env.push((

@@ -1,4 +1,4 @@
-//! Archived agents whose storage cleanup is still owed.
+//! Archived sub-agents whose workspace cleanup is still owed.
 //!
 //! An archive enqueues the agent, and the maintenance worker visits only queued
 //! agents that are due. A cleanup that fails waits out a doubling backoff
@@ -94,7 +94,7 @@ pub(super) fn due(data: &Path, now_ms: i64) -> Vec<AgentId> {
         .collect()
 }
 
-/// Enqueue every archived agent the queue does not hold and whose current
+/// Enqueue every archived sub-agent the queue does not hold and whose current
 /// archive has no finished cleanup: archives an earlier binary, or a writer
 /// that bypassed the archive path, left unqueued, and archives an earlier
 /// cleanup revision finished while leaving storage this one removes. It runs
@@ -106,7 +106,7 @@ pub(super) fn backfill(store: &Store, data: &Path) {
     if !done().insert(data.to_path_buf()) {
         return;
     }
-    let Ok(archived) = store.archived_agent_ids() else {
+    let Ok(archived) = store.archived_subagent_ids() else {
         done().remove(data);
         return;
     };

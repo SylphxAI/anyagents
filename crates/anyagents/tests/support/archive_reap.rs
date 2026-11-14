@@ -6,7 +6,7 @@ use std::process::Command;
 /// What `.anyagents-reaped` holds once the cleanup of `generation` finished:
 /// the generation, then the cleanup revision that ran.
 fn reaped(generation: &[u8]) -> Vec<u8> {
-    [generation, b"reap:storage-1\n".as_slice()].concat()
+    [generation, b"reap:rescue-1\n".as_slice()].concat()
 }
 
 fn command(data: &Path, home: &Path) -> Command {

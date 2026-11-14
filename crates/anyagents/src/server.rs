@@ -44,7 +44,6 @@ pub(crate) mod outbound_history;
 mod profiles;
 mod quota_rotation;
 mod reap_queue;
-pub(crate) mod scratch_budget;
 
 pub(crate) use profiles::ServedProfile;
 
@@ -316,7 +315,6 @@ async fn serve(
     if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none() && !crate::sandbox::is_isolated_test_env()
     {
         quota_rotation::start(Arc::clone(&store));
-        scratch_budget::start(Arc::clone(&store), data.to_path_buf(), state.health.clone());
         let memory_backlog = memory_backlog::start(&store);
         let reaper_root = data.to_path_buf();
         let reaper_store = Arc::clone(&store);
@@ -582,7 +580,9 @@ fn mark_archive_generation_locked(store: &Store, data_dir: &Path, agent: &Agent)
     ) {
         eprintln!("cannot persist {}: {err}", archived_marker.display());
     }
-    reap_queue::enqueue(data_dir, &agent.id);
+    if agent.parent_id.is_some() {
+        reap_queue::enqueue(data_dir, &agent.id);
+    }
     if let Ok(schedules) = store.list_schedules(Some(&agent.id), true) {
         let any = !schedules.is_empty();
         for sched in schedules {
@@ -606,9 +606,9 @@ fn reaped_marker(generation: &[u8]) -> Vec<u8> {
 }
 
 /// Bumped when the archive cleanup starts removing something it used to keep.
-/// `storage-1`: the scratch storage root, root agents' scratch, and work
-/// rescued to the rescue area instead of kept in place.
-const REAP_REVISION: &[u8] = b"reap:storage-1\n";
+/// `rescue-1`: work no remote has is saved to the rescue area and then
+/// deleted, instead of kept in place.
+const REAP_REVISION: &[u8] = b"reap:rescue-1\n";
 
 /// The cleanup of this agent's current archive has nothing left to do.
 fn reap_finished(data_dir: &Path, agent_id: &anyagents_core::AgentId) -> bool {
@@ -637,7 +637,7 @@ pub(crate) fn reap_archived_agent_locked(
         Err(Error::AgentNotFound(_)) => return reap_queue::dequeue(data_dir, agent_id),
         Err(_) => return reap_queue::note_failure(data_dir, agent_id, now_ms()),
     };
-    if agent.state != "archived" {
+    if agent.state != "archived" || agent.parent_id.is_none() {
         return reap_queue::dequeue(data_dir, agent_id);
     }
     let cfg = anyagents_core::agent_config_dir(data_dir, agent_id);
@@ -657,14 +657,7 @@ pub(crate) fn reap_archived_agent_locked(
     if reap_finished(data_dir, agent_id) {
         return reap_queue::dequeue(data_dir, agent_id);
     }
-    // A root agent's configuration and work directory are its operator's;
-    // only its scratch root, which can be rebuilt, goes with the archive.
-    let complete = if agent.parent_id.is_some() {
-        reap_subagent_ephemeral_dirs_in(store, data_dir, agent_id)
-    } else {
-        reap_agent_scratch(agent_id, detect_seat_ids(&cfg))
-    };
-    if !complete {
+    if !reap_subagent_ephemeral_dirs_in(store, data_dir, agent_id) {
         return reap_queue::note_failure(data_dir, agent_id, now_ms());
     }
     match anyagents_harness::atomic_write_nonempty_file(&reaped, &reaped_marker(&generation), 0o644)
@@ -4728,7 +4721,16 @@ fn reap_subagent_ephemeral_dirs_in(
         complete &= remove_path_with_seat(&target, seat_ids);
     }
     complete &= remove_path_with_seat(&agent_root.join("tmp"), seat_ids);
-    complete &= reap_agent_scratch(agent_id, seat_ids);
+    if let Some(scratch_dir) = anyagents_core::configured_scratch_dir() {
+        complete &= remove_path_with_seat(
+            &anyagents_core::agent_scratch_build_dir(&scratch_dir, agent_id),
+            seat_ids,
+        );
+        complete &= remove_path_with_seat(
+            &anyagents_core::agent_scratch_tmp_dir(&scratch_dir, agent_id),
+            seat_ids,
+        );
+    }
     if agent.is_none() {
         let _ = std::fs::remove_file(
             data_dir
@@ -4877,37 +4879,15 @@ fn report_kept_work(
 pub(crate) const STORAGE_SENDER: &str = "server:storage";
 pub(crate) const STORAGE_SENDER_NAME: &str = "AnyAgents storage";
 
-/// Remove the agent's whole storage root on the scratch tier (its build
-/// output and temporary files) and the legacy per-agent scratch directories.
-/// Everything there can be rebuilt.
-pub(crate) fn reap_agent_scratch(
-    agent_id: &anyagents_core::AgentId,
-    seat_ids: Option<(u32, u32, u32)>,
-) -> bool {
-    let Some(scratch_dir) = anyagents_core::configured_scratch_dir() else {
-        return true;
-    };
-    // Every directory is attempted, even after one fails.
-    let mut complete = true;
-    for dir in anyagents_core::agent_scratch_dirs(&scratch_dir, agent_id) {
-        complete &= remove_path_with_seat(&dir, seat_ids);
-    }
-    complete
-}
-
-/// Whether anything an archive cleanup removes is still on disk for this
-/// agent: its scratch directories, or a managed work directory.
+/// Whether a managed work directory of this archived agent is still on disk:
+/// an earlier cleanup revision kept it whole.
 fn archived_storage_present(data_dir: &Path, agent_id: &anyagents_core::AgentId) -> bool {
-    let scratch = anyagents_core::configured_scratch_dir()
-        .map(|dir| anyagents_core::agent_scratch_dirs(&dir, agent_id).to_vec())
-        .unwrap_or_default();
-    scratch
-        .iter()
-        .chain([
-            &anyagents_core::agent_work_dir(data_dir, agent_id),
-            &anyagents_core::legacy_agent_work_dir(data_dir, agent_id),
-        ])
-        .any(|path| path.symlink_metadata().is_ok())
+    [
+        anyagents_core::agent_work_dir(data_dir, agent_id),
+        anyagents_core::legacy_agent_work_dir(data_dir, agent_id),
+    ]
+    .iter()
+    .any(|path| path.symlink_metadata().is_ok())
 }
 
 pub(crate) fn reap_build_outputs_in_worktree(
@@ -11119,47 +11099,13 @@ exec '{}' "$@"
     }
 
     #[test]
-    fn archive_removes_every_scratch_dir_of_roots_and_sub_agents_and_revisits_old_markers() {
-        let _env = env_lock();
+    fn archives_an_earlier_revision_kept_whole_are_revisited_once() {
         let dir = tempfile::tempdir().unwrap();
-        let scratch = dir.path().join("scratch");
-        unsafe {
-            std::env::set_var(anyagents_core::SCRATCH_DIR_ENV, &scratch);
-            std::env::set_var(anyagents_core::TEST_STORAGE_TIERS_ENV, "1");
-        }
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let root = store
             .create_agent(anyagents_core::NewAgent::new("lead", "opencode"))
             .unwrap();
-        let child = archived_reap_fixture(&store, "worker", &root);
-        let scratch_dirs = |id: &anyagents_core::AgentId| {
-            let dirs = anyagents_core::agent_scratch_dirs(&scratch, id);
-            for dir in &dirs {
-                std::fs::create_dir_all(dir.join("cargo/debug")).unwrap();
-            }
-            dirs
-        };
-        let root_dirs = scratch_dirs(&root.id);
-        let child_dirs = scratch_dirs(&child.id);
-        let root_cfg = anyagents_core::agent_config_dir(dir.path(), &root.id);
-        std::fs::create_dir_all(root_cfg.join(".claude")).unwrap();
-        mark_explicitly_archived(&store, dir.path(), &root);
-        reap_archived_agents(&store, dir.path(), &HealthBoard::default());
-        for gone in root_dirs.iter().chain(&child_dirs) {
-            assert!(!gone.exists(), "{} survived the archive", gone.display());
-        }
-        // A root agent's own configuration is its operator's to keep.
-        assert!(root_cfg.join(".claude").exists());
-        for id in [&root.id, &child.id] {
-            let cfg = anyagents_core::agent_config_dir(dir.path(), id);
-            assert_eq!(
-                std::fs::read(cfg.join(".anyagents-reaped")).unwrap(),
-                reaped_marker(&std::fs::read(cfg.join(".anyagents-archived")).unwrap())
-            );
-        }
-
-        // An archive an earlier binary finished, but whose work it kept, is
-        // owed this revision's cleanup; one with nothing left is not.
+        // Finished by an earlier binary: the bare generation in the marker.
         let kept = archived_reap_fixture(&store, "kept", &root);
         let done = archived_reap_fixture(&store, "done", &root);
         for agent in [&kept, &done] {
@@ -11170,17 +11116,15 @@ exec '{}' "$@"
             )
             .unwrap();
         }
+        // That binary kept this work directory whole; the other has none left.
         let legacy_work = anyagents_core::legacy_agent_work_dir(dir.path(), &kept.id);
         std::fs::create_dir_all(&legacy_work).unwrap();
         std::fs::write(legacy_work.join("notes.md"), b"loose notes").unwrap();
         assert!(!reap_finished(dir.path(), &kept.id));
         assert!(reap_finished(dir.path(), &done.id));
-        {
-            let _lifecycle = store.lock_agent_lifecycle(&kept.id).unwrap();
-            reap_archived_agent_locked(&store, dir.path(), &kept.id);
-        }
+        std::fs::remove_dir_all(dir.path().join("reap-pending")).unwrap();
+        reap_archived_agents(&store, dir.path(), &HealthBoard::default());
         assert!(!legacy_work.exists());
-        assert!(reap_finished(dir.path(), &kept.id));
         assert_eq!(
             tar_member(
                 &only_rescue(dir.path(), &kept.id).join("loose.tar"),
@@ -11188,10 +11132,18 @@ exec '{}' "$@"
             ),
             "loose notes"
         );
-        unsafe {
-            std::env::remove_var(anyagents_core::SCRATCH_DIR_ENV);
-            std::env::remove_var(anyagents_core::TEST_STORAGE_TIERS_ENV);
-        }
+        let cfg = anyagents_core::agent_config_dir(dir.path(), &kept.id);
+        assert_eq!(
+            std::fs::read(cfg.join(".anyagents-reaped")).unwrap(),
+            reaped_marker(&std::fs::read(cfg.join(".anyagents-archived")).unwrap())
+        );
+        assert!(reap_finished(dir.path(), &kept.id));
+        // Nothing of `done` was revisited, so nothing was rescued for it.
+        assert!(
+            !anyagents_core::rescue_dir(dir.path())
+                .join(done.id.as_str())
+                .exists()
+        );
     }
 
     #[test]

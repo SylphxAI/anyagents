@@ -4,9 +4,13 @@
 //! D5); a linked worktree from before that is converted with
 //! [`crate::repo::adopt`] first. Then, one checkout at a time:
 //!
-//! - one [`crate::server::is_git_worktree_safe_to_reap`] passes (status clean,
-//!   HEAD and every local branch on a remote-tracking ref) is deleted;
-//! - any other is first saved to the rescue area, as a `git bundle` and a tar
+//! - one that holds nothing a remote lacks is deleted. It needs a clean
+//!   status, and every commit that HEAD, a branch, the stash, a tag, a note or
+//!   a reflog reaches must be on a remote-tracking ref, with no tag the pool
+//!   lacks. Both this module's check and
+//!   [`crate::server::is_git_worktree_safe_to_reap`] must agree;
+//! - any other is first saved to the rescue area, as a `git bundle` of all
+//!   of that (reflog-only commits under `refs/anyagents-rescue/`) and a tar
 //!   of its uncommitted files, and then deleted;
 //! - files outside any checkout are saved as one tar, without build output,
 //!   tool homes or caches;
@@ -64,6 +68,25 @@ fn disposable(name: &std::ffi::OsStr) -> bool {
 
 /// The rescue area keeps at least this much free space.
 const MIN_FREE_BYTES: u64 = 2 << 30;
+
+/// Where the rescue keeps the reflog-only commits of a checkout it saves, so
+/// its bundle can name them.
+const RESCUE_REFS: &str = "refs/anyagents-rescue";
+
+/// Uncommitted paths that never make a checkout worth saving: what AnyAgents
+/// and the harnesses write into a checkout, and build output. The same list
+/// as [`crate::server::is_git_worktree_safe_to_reap`].
+fn incidental(path: &str) -> bool {
+    let path = path.trim_end_matches('/');
+    matches!(
+        path,
+        "CLAUDE.md" | "AGENTS.md" | "GEMINI.md" | ".claude" | ".gemini" | "node_modules" | "target"
+    ) || path.starts_with(".desk-worktree")
+        || path.starts_with(".claude/")
+        || path.starts_with(".gemini/")
+        || path.starts_with("node_modules/")
+        || path.starts_with("target/")
+}
 
 /// Runs tar, and plain Git outside any repository.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -170,7 +193,6 @@ pub(crate) struct Change {
 }
 
 impl Change {
-    #[cfg(test)]
     fn path_text(&self) -> String {
         String::from_utf8_lossy(&self.path).into_owned()
     }
@@ -212,14 +234,85 @@ pub(crate) struct RepoState {
     pub(crate) origin: Option<String>,
     /// It borrows objects from a pool (`objects/info/alternates`).
     pub(crate) borrows: bool,
-    /// Commits of HEAD and the local branches that no remote-tracking ref has,
-    /// counted as [`crate::server::is_git_worktree_safe_to_reap`] does.
+    /// Commits of HEAD and the local branches that no remote-tracking ref has.
     pub(crate) unpushed: u64,
+    /// Further commits no remote-tracking ref has that only the stash, notes,
+    /// tags or the reflogs reach.
+    pub(crate) hidden: u64,
+    /// `refs/stash` exists.
+    pub(crate) stash: bool,
+    /// Tags the pool does not have (every tag of a clone with its own objects).
+    pub(crate) local_tags: Vec<String>,
+    /// Reflog entries no ref reaches: dropped stashes, amended or reset commits.
+    pub(crate) reflog_only: Vec<String>,
     pub(crate) changes: Vec<Change>,
     status: Vec<u8>,
+    refs: Vec<u8>,
 }
 
-/// Read an own repository's state.
+impl RepoState {
+    /// Deleting this checkout as it is would lose something no remote has.
+    pub(crate) fn owes_rescue(&self) -> bool {
+        self.unpushed > 0
+            || self.hidden > 0
+            || self.stash
+            || !self.local_tags.is_empty()
+            || !self.reflog_only.is_empty()
+            || self.changes.iter().any(|c| !incidental(&c.path_text()))
+    }
+}
+
+fn count(out: Vec<u8>) -> Result<u64, String> {
+    String::from_utf8_lossy(&out)
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| "git rev-list printed no count".to_string())
+}
+
+fn lines(out: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(out)
+        .lines()
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+        .collect()
+}
+
+/// `(object, refname)` of every tag in the Git directory `git_dir`.
+fn tags(git_dir: &Path, seat: Option<(u32, u32)>) -> Result<Vec<(String, String)>, String> {
+    let cmd = crate::repo::inspect_command(seat, git_dir, None).map_err(|e| e.to_string())?;
+    let out = stdout(
+        cmd,
+        &[
+            "for-each-ref",
+            "--format=%(objectname) %(refname)",
+            "refs/tags",
+        ],
+    )?;
+    Ok(lines(&out)
+        .into_iter()
+        .filter_map(|line| {
+            line.split_once(' ')
+                .map(|(oid, name)| (oid.to_string(), name.to_string()))
+        })
+        .collect())
+}
+
+/// The pool a repository borrows objects from: the Git directory around the
+/// first `objects/info/alternates` entry.
+fn pool_of(checkout: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(checkout.join(".git/objects/info/alternates")).ok()?;
+    let objects = text.lines().map(str::trim).find(|l| !l.is_empty())?;
+    let objects = Path::new(objects);
+    let objects = if objects.is_absolute() {
+        objects.to_path_buf()
+    } else {
+        checkout.join(".git/objects").join(objects)
+    };
+    objects.parent().map(Path::to_path_buf)
+}
+
+/// Read an own repository's state: everything in it no remote-tracking ref
+/// reaches, and its uncommitted files.
 pub(crate) fn inspect(checkout: &Path, seat: Option<(u32, u32)>) -> Result<RepoState, String> {
     if !std::fs::symlink_metadata(checkout.join(".git")).is_ok_and(|meta| meta.is_dir()) {
         return Err("it is not a repository of its own".into());
@@ -241,8 +334,11 @@ pub(crate) fn inspect(checkout: &Path, seat: Option<(u32, u32)>) -> Result<RepoS
         .success()
         .then(|| String::from_utf8_lossy(&head.stdout).trim().to_string())
         .filter(|sha| !sha.is_empty());
+    let stash = output(git()?, &["rev-parse", "--verify", "-q", "refs/stash"])?
+        .status
+        .success();
     let unpushed = if head.is_some() {
-        let count = stdout(
+        count(stdout(
             git()?,
             &[
                 "rev-list",
@@ -252,13 +348,58 @@ pub(crate) fn inspect(checkout: &Path, seat: Option<(u32, u32)>) -> Result<RepoS
                 "--not",
                 "--remotes",
             ],
-        )?;
-        String::from_utf8_lossy(&count)
-            .trim()
-            .parse::<u64>()
-            .map_err(|_| "git rev-list printed no count".to_string())?
+        )?)?
     } else {
         0
+    };
+    // What only the stash, notes, tags or the reflogs reach.
+    let mut args = vec!["rev-list", "--count"];
+    if stash {
+        args.push("refs/stash");
+    }
+    args.extend([
+        "--tags",
+        "--glob=refs/notes/*",
+        "--reflog",
+        "--not",
+        "--remotes",
+        "--branches",
+    ]);
+    if head.is_some() {
+        args.push("HEAD");
+    }
+    let hidden = count(stdout(git()?, &args)?)?;
+    // `--stdin` (empty) lets a repository with no reflog at all list nothing
+    // instead of failing for want of a revision.
+    let tips = lines(&stdout(
+        git()?,
+        &["rev-list", "--no-walk", "--reflog", "--stdin"],
+    )?);
+    let unreached: std::collections::BTreeSet<String> = lines(&stdout(
+        git()?,
+        &["rev-list", "--reflog", "--not", "--all"],
+    )?)
+    .into_iter()
+    .collect();
+    let mut reflog_only: Vec<String> = tips
+        .into_iter()
+        .filter(|tip| unreached.contains(tip))
+        .collect();
+    reflog_only.sort();
+    reflog_only.dedup();
+    let own = tags(&checkout.join(".git"), seat)?;
+    let local_tags = match pool_of(checkout) {
+        Some(pool) => {
+            let pooled: std::collections::BTreeSet<(String, String)> =
+                tags(&pool, seat).unwrap_or_default().into_iter().collect();
+            own.into_iter()
+                .filter(|tag| !pooled.contains(tag))
+                .map(|(_, name)| name)
+                .collect()
+        }
+        // A clone with its own objects: no record of which tags came from
+        // its remote, so every tag is kept.
+        None => own.into_iter().map(|(_, name)| name).collect(),
     };
     let text = |args: &[&str]| -> Result<Option<String>, String> {
         Ok(output(git()?, args)
@@ -270,6 +411,13 @@ pub(crate) fn inspect(checkout: &Path, seat: Option<(u32, u32)>) -> Result<RepoS
     let branch =
         text(&["symbolic-ref", "-q", "HEAD"])?.filter(|name| name.starts_with("refs/heads/"));
     let origin = text(&["config", "--get", "remote.origin.url"])?;
+    let refs = stdout(
+        git()?,
+        &[
+            "for-each-ref",
+            "--format=%(objectname) %(objecttype) %(refname)",
+        ],
+    )?;
     Ok(RepoState {
         head,
         branch,
@@ -279,8 +427,13 @@ pub(crate) fn inspect(checkout: &Path, seat: Option<(u32, u32)>) -> Result<RepoS
             .symlink_metadata()
             .is_ok(),
         unpushed,
+        hidden,
+        stash,
+        local_tags,
+        reflog_only,
         changes: parse_status(&status),
         status,
+        refs,
     })
 }
 
@@ -295,6 +448,14 @@ pub(crate) struct SavedRepo {
     /// It borrowed from a pool: its bundle holds only commits no remote has.
     pub(crate) borrowed_objects: bool,
     pub(crate) unpushed_commits: u64,
+    /// Commits only the stash, notes, tags or reflogs reach.
+    pub(crate) hidden_commits: u64,
+    pub(crate) stash: bool,
+    pub(crate) local_tags: Vec<String>,
+    /// Reflog-only commits, kept in the bundle as `refs/anyagents-rescue/reflog-<n>`.
+    pub(crate) reflog_only: Vec<String>,
+    /// Every ref it had, `<object> <type> <name>` per line.
+    pub(crate) refs: String,
     pub(crate) uncommitted_paths: usize,
     pub(crate) bundle: Option<String>,
     pub(crate) bundle_refs: Vec<String>,
@@ -359,6 +520,11 @@ fn save_repo(
         origin: state.origin.clone(),
         borrowed_objects: state.borrows,
         unpushed_commits: state.unpushed,
+        hidden_commits: state.hidden,
+        stash: state.stash,
+        local_tags: state.local_tags.clone(),
+        reflog_only: state.reflog_only.clone(),
+        refs: format!("{slug}.refs"),
         uncommitted_paths: state.changes.len(),
         bundle: None,
         bundle_refs: Vec::new(),
@@ -372,25 +538,59 @@ fn save_repo(
         .map(|byte| if *byte == 0 { b'\n' } else { *byte })
         .collect();
     std::fs::write(out.join(&saved.status), &status_text).map_err(|error| error.to_string())?;
-    let refs: Option<&[&str]> = match (&state.head, state.borrows) {
-        (None, _) => None,
-        (Some(_), false) => Some(&["--all"]),
-        (Some(_), true) if state.unpushed == 0 => None,
-        (Some(_), true) => Some(&["HEAD", "--branches", "--not", "--remotes"]),
-    };
-    if let Some(refs) = refs {
+    std::fs::write(out.join(&saved.refs), &state.refs).map_err(|error| error.to_string())?;
+    // Commits only a reflog reaches get a ref, so the bundle can carry them.
+    for (n, tip) in state.reflog_only.iter().enumerate() {
+        let name = format!("{RESCUE_REFS}/reflog-{n}");
+        stdout(git_in(checkout, seat)?, &["update-ref", &name, tip])?;
+    }
+    // A clone with its own objects carries every ref, so it restores on its
+    // own. A repository that borrows from the pool carries what the remotes
+    // do not have; the pool and the remote hold the rest.
+    let mut refs: Vec<String> = Vec::new();
+    if !state.borrows {
+        refs.push("--all".into());
+    } else if state.unpushed > 0
+        || state.hidden > 0
+        || state.stash
+        || !state.local_tags.is_empty()
+        || !state.reflog_only.is_empty()
+    {
+        refs.push("--branches".into());
+        if state.head.is_some() {
+            refs.push("HEAD".into());
+        }
+        if state.stash {
+            refs.push("refs/stash".into());
+        }
+        refs.extend(state.local_tags.iter().cloned());
+        refs.push("--glob=refs/notes/*".into());
+        refs.push(format!("--glob={RESCUE_REFS}/*"));
+        refs.extend(["--not".into(), "--remotes".into()]);
+    }
+    let has_objects = state.head.is_some() || state.stash || !state.local_tags.is_empty();
+    if !refs.is_empty() && has_objects {
         let file = out.join(format!("{slug}.bundle"));
         let mut args: Vec<&OsStrLike> = vec![os("bundle"), os("create"), os("-")];
         args.extend(refs.iter().map(|r| os(r)));
-        saved.bytes += write_to(&file, git_in(checkout, seat)?, &args, None)
-            .map_err(|error| format!("git bundle failed: {error}"))?;
-        // The bundle must name its refs when read back on its own.
-        let listed = bundle_heads(&file)?;
-        if listed.is_empty() {
-            return Err("git bundle wrote no refs".into());
+        match write_to(&file, git_in(checkout, seat)?, &args, None) {
+            Ok(bytes) => {
+                saved.bytes += bytes;
+                // The bundle must name its refs when read back on its own.
+                let listed = bundle_heads(&file)?;
+                if listed.is_empty() {
+                    return Err("git bundle wrote no refs".into());
+                }
+                saved.bundle = Some(format!("{slug}.bundle"));
+                saved.bundle_refs = listed;
+            }
+            // Only refs whose commits a remote already has (a lightweight
+            // tag on a pushed commit): `{slug}.refs` names them.
+            Err(error) if error.contains("empty bundle") => {
+                let _ = std::fs::remove_file(&file);
+            }
+            Err(error) => return Err(format!("git bundle failed: {error}")),
         }
-        saved.bundle = Some(format!("{slug}.bundle"));
-        saved.bundle_refs = listed;
     }
     let mut names = Vec::new();
     for change in state.changes.iter().filter(|c| c.present()) {
@@ -510,13 +710,29 @@ fn rescue_has_room(dir: &Path) -> Result<(), String> {
         .ancestors()
         .find(|p| p.exists())
         .unwrap_or(Path::new("/"));
-    let fs = crate::server::scratch_budget::filesystem(probe)
-        .ok_or_else(|| format!("cannot read free space at {}", probe.display()))?;
-    if fs.available_bytes < MIN_FREE_BYTES.max(fs.size_bytes / 20) {
+    let c_path =
+        std::ffi::CString::new(probe.as_os_str().as_encoded_bytes()).map_err(|e| e.to_string())?;
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: c_path is NUL-terminated and stat is written by the call.
+    if unsafe { libc::statvfs(c_path.as_ptr(), stat.as_mut_ptr()) } != 0 {
+        return Err(format!(
+            "cannot read free space at {}: {}",
+            probe.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: statvfs returned 0, so it filled the struct.
+    let stat = unsafe { stat.assume_init() };
+    #[allow(clippy::unnecessary_cast)]
+    let (free, size) = (
+        stat.f_bavail as u64 * stat.f_frsize as u64,
+        stat.f_blocks as u64 * stat.f_frsize as u64,
+    );
+    if free < MIN_FREE_BYTES.max(size / 20) {
         return Err(format!(
             "the rescue area {} has only {} MiB free",
             probe.display(),
-            fs.available_bytes >> 20
+            free >> 20
         ));
     }
     Ok(())
@@ -534,7 +750,7 @@ pub(crate) struct Reclaim<'a> {
 
 enum Plan {
     Delete(PathBuf),
-    Save(PathBuf, RepoState),
+    Save(PathBuf, Box<RepoState>),
 }
 
 impl Reclaim<'_> {
@@ -554,11 +770,16 @@ impl Reclaim<'_> {
                 format!("not converted to its own repository: {reason}"),
             ));
         }
-        if crate::server::is_git_worktree_safe_to_reap(&checkout, seat) {
-            return Ok(Plan::Delete(checkout));
-        }
+        // Deleted as it is only when the clean check and this one both find
+        // nothing a remote lacks; anything either sees is saved first.
         match inspect(&checkout, seat) {
-            Ok(state) => Ok(Plan::Save(checkout, state)),
+            Ok(state)
+                if !state.owes_rescue()
+                    && crate::server::is_git_worktree_safe_to_reap(&checkout, seat) =>
+            {
+                Ok(Plan::Delete(checkout))
+            }
+            Ok(state) => Ok(Plan::Save(checkout, Box::new(state))),
             Err(reason) => Err((checkout, reason)),
         }
     }
@@ -1049,6 +1270,76 @@ mod tests {
         assert_eq!(git(&restored, &["rev-parse", "FETCH_HEAD"]), unpushed_head);
         // The shared store forgot the converted checkout.
         assert!(!git(&shared, &["worktree", "list"]).contains("ahead"));
+    }
+
+    #[test]
+    fn stash_tags_notes_and_reflog_only_commits_are_rescued() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let id = AgentId::generate();
+        let work = published(dir.path(), "repo");
+        let pushed = git(&work, &["rev-parse", "HEAD"]);
+        // Each of these alone keeps a pushed, clean checkout from being
+        // deleted as it is.
+        git(&work, &["tag", "light"]);
+        git(&work, &["tag", "-a", "release", "-m", "a local release"]);
+        git(&work, &["notes", "add", "-m", "a note", "HEAD"]);
+        git(
+            &work,
+            &["commit", "-q", "--allow-empty", "-m", "Reset away"],
+        );
+        let reset_away = git(&work, &["rev-parse", "HEAD"]);
+        git(&work, &["reset", "-q", "--hard", &pushed]);
+        std::fs::write(work.join("README.md"), b"stashed edit\n").unwrap();
+        git(&work, &["stash", "-q"]);
+        assert!(git(&work, &["status", "--porcelain"]).is_empty());
+        let state = inspect(&work, None).unwrap();
+        assert!(state.owes_rescue(), "{state:?}");
+        assert!(state.stash);
+        assert_eq!(state.local_tags, ["refs/tags/light", "refs/tags/release"]);
+        assert!(state.reflog_only.contains(&reset_away), "{state:?}");
+
+        let outcome = reclaim(&data, &id).work_dir(&work);
+        assert!(outcome.complete && outcome.kept.is_empty(), "{outcome:?}");
+        assert!(!work.exists());
+        let rescued = outcome.rescued.unwrap();
+        let heads = bundle_heads(&rescued.join("work.bundle")).unwrap();
+        for name in [
+            "refs/stash",
+            "refs/tags/light",
+            "refs/tags/release",
+            "refs/notes/commits",
+            "refs/anyagents-rescue/reflog-0",
+        ] {
+            assert!(
+                heads.contains(&name.to_string()),
+                "{name} missing: {heads:?}"
+            );
+        }
+        // The stashed edit and the reset-away commit come back.
+        let restored = dir.path().join("restored");
+        std::fs::create_dir_all(&restored).unwrap();
+        git(&restored, &["init", "-q", "--bare"]);
+        git(
+            &restored,
+            &[
+                "fetch",
+                "-q",
+                rescued.join("work.bundle").to_str().unwrap(),
+                "+refs/*:refs/*",
+            ],
+        );
+        assert_eq!(
+            git(&restored, &["show", "refs/stash:README.md"]),
+            "stashed edit"
+        );
+        git(
+            &restored,
+            &["cat-file", "-e", &format!("{reset_away}^{{commit}}")],
+        );
+        let manifest = manifest(&rescued);
+        assert_eq!(manifest["checkouts"][0]["stash"], true);
+        assert!(rescued.join("work.refs").is_file());
     }
 
     #[test]

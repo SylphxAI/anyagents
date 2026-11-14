@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+- Archive cleanup no longer keeps work in place forever, and never loses it
+  ([ADR 0013](docs/adr/0013-archive-rescue.md)). A sub-agent's checkout that
+  holds anything no remote has is first saved to `{data}/rescue/{id}/{time}/`
+  (`ANYAGENTS_RESCUE_DIR`), then deleted. That covers unpushed branches, the
+  stash, local tags, notes, reflog-only commits and uncommitted files: a
+  `git bundle` plus a tar of the uncommitted files, with a `manifest.json` that
+  says how to restore it. Files beside checkouts are saved as a tar without
+  build output or caches. A checkout that cannot be adopted, read or saved stays
+  and is reported to the operator inbox. Archives an earlier release finished
+  but kept whole are revisited once.
 - Git: every repository-backed agent has a repository of its own (ADR 0010
   D5). Its config, refs, index and hooks are its alone; it borrows objects
   read-only from a pool through `objects/info/alternates`, so a checkout
@@ -25,22 +35,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (same status, HEAD, index, sparse patterns and hooks, unpushed objects
   copied) before judging it. For `repo: "inherit"` and local sources, the
   remote is asked from outside the source repository.
-- Every agent's storage has an owner and a lifecycle
-  ([ADR 0012](docs/adr/0012-agent-storage-roots.md)). With a scratch tier
-  configured, an agent's build output and `TMPDIR` live under its own root,
-  `{scratch}/agents/{id}`, and `ANYAGENTS_AGENT_BUILD_DIR` names its `build/`
-  for host build wrappers. All agents' build output together stays under
-  `ANYAGENTS_SCRATCH_BUILD_BUDGET` (300 GiB unless set; `0` turns it off): a
-  server task removes the least recently written build directories of
-  archived, stopped and then idle agents, never one written in the last half
-  hour or of an agent in a turn, and tells the operator inbox when the budget
-  cannot be met or the scratch filesystem is 90% full. Archiving any agent
-  removes its scratch root at once. A sub-agent's work directory is reclaimed
-  without losing work: unpushed commits and uncommitted files are saved to
-  `{data}/rescue/{id}/` as a `git bundle` and a tar before the checkout is
-  deleted, and a checkout whose state cannot be read is kept and reported.
-  Archives an earlier release finished but left storage behind are cleaned
-  once more.
 - Security: the server no longer opens host files with its own access on an
   agent's behalf (ADR 0010 D3). A `send` with a local media path uploads it
   only when the sending agent can read it itself: a seat agent's file is
