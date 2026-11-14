@@ -931,6 +931,7 @@ fn vendor_launch_inner(
         && anyagents_tools::SandboxConfig::resolve(Some(&request.config_dir))
             .is_some_and(|cfg| cfg.remote_spawn)
     {
+        begin_remote_session(store_opt, &request.agent)?;
         let canonical = anyagents_harness::normalize_harness_name(&request.agent.harness);
         let session_file = format!("{canonical}-session-id");
         let session = session_from_file(&request.config_dir, &session_file)?.or(
@@ -1177,6 +1178,7 @@ fn vendor_launch_inner(
         vh.sync_session()?;
         Ok(vh)
     } else if is_cloud_harness(&request.agent.harness) {
+        begin_remote_session(store_opt, &request.agent)?;
         let canonical = anyagents_harness::normalize_harness_name(&request.agent.harness);
         let session_file = format!("{canonical}-session-id");
         let session = session_from_file(&request.config_dir, &session_file)?;
@@ -1644,6 +1646,22 @@ fn start_claude(
 /// model/tool loop.
 pub(crate) fn is_spiron_harness(harness: &str) -> bool {
     anyagents_harness::normalize_harness_name(harness) == "spiron"
+}
+
+/// A harness that runs off this host starts with a fresh remote session: its
+/// token and callback URL are in its config directory before it starts, and
+/// any earlier session of the agent is revoked.
+fn begin_remote_session(
+    store: Option<&anyagents_core::Store>,
+    agent: &anyagents_core::Agent,
+) -> Result<(), String> {
+    let store = store.ok_or_else(|| {
+        format!(
+            "remote agent `{}` cannot start: the store that issues its session token is unavailable",
+            agent.name
+        )
+    })?;
+    crate::remote::begin_session(store, agent)
 }
 
 pub(crate) fn is_cloud_harness(harness: &str) -> bool {

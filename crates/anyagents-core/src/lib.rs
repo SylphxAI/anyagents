@@ -59,6 +59,10 @@ pub use store::{
     SchedulePending, SessionLease, SteerHold, SteerState, Turn, TurnOutcome, TurnState,
     steer_allows,
 };
+pub use store::{
+    REMOTE_SESSION_TOKEN_PREFIX, RemoteSession, RemoteSessionGrant, RemoteSessionToken,
+    is_remote_session_token,
+};
 
 /// The token a client presents as an agent, when it has one. A capability is
 /// written into the agent's own config directory; it is never an argument on a

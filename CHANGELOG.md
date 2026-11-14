@@ -33,6 +33,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rework and cost per successful outcome by harness and model, role, profile,
   agent or skill. The parent reminder for idle task sub-agents now asks for a
   verdict. Usage docs no longer claim a price table or OpenTelemetry export.
+- Remote (cloud) agents call back with their own short-lived credential. Each
+  launch of a cloud harness or remote sandbox begins a remote session whose token
+  is bound to that agent and session, stored as a SHA-256 digest, rotated before
+  it expires (`remote_session_ttl_secs`, default one hour), and revoked on pause,
+  archive, relaunch or `anyagents agents revoke-remote`. The long-lived local
+  capability no longer leaves the host. Callback URLs derive from `public_url`
+  under `[server]` in `<data>/anyagents.toml`; without it a remote agent is not
+  created or started. Remote sessions get only the `remote` MCP profile, which
+  now holds coordination, `memory` and `skills`: `browser`, `computer`, `device`,
+  `media`, `web_search` and `web_fetch` run on or from the control-plane host and
+  are no longer in it. The public listener's `/`, `/healthz` and
+  `/v1/webhooks/healthz` return `{"ok":true}`; the serving identity stays on
+  `anyagents.sock`.
 
 ## 0.1.3
 

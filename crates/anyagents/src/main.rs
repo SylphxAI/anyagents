@@ -29,6 +29,7 @@ mod mcp_config;
 mod muse_config;
 mod opencode_config;
 mod operator;
+mod remote;
 mod reply;
 mod sandbox;
 mod sandbox_exec;
@@ -870,6 +871,14 @@ enum AgentsCommand {
     GrantAdmin { agent: String },
     /// Revoke administrative authority immediately (operator only).
     RevokeAdmin { agent: String },
+    /// End an agent's remote (cloud) sessions now: every token of each stops authenticating on its next call (operator or root admin).
+    RevokeRemote {
+        /// Agent name or `agt_...` ID.
+        agent: String,
+        /// Only this remote session (`rs_...`); all of the agent's sessions when omitted.
+        #[arg(long)]
+        session: Option<String>,
+    },
     /// Rename an agent in place while preserving its `agt_...` ID, history, mailbox, grants, seat, and Telegram binding, and keeping the old name as a live alias.
     Rename {
         /// Current agent name or `agt_...` ID.

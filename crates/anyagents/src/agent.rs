@@ -29,6 +29,9 @@ pub fn agents(data: &Path, action: AgentsCommand) -> Result<(), Error> {
     match action {
         AgentsCommand::GrantAdmin { agent } => set_admin(data, &agent, true)?,
         AgentsCommand::RevokeAdmin { agent } => set_admin(data, &agent, false)?,
+        AgentsCommand::RevokeRemote { agent, session } => {
+            revoke_remote_cmd(data, &agent, session.as_deref())?
+        }
         AgentsCommand::Rename { agent, new_name } => rename_cmd(data, &agent, &new_name)?,
         AgentsCommand::Role { agent, role, clear } => {
             role_cmd(data, &agent, role.as_deref(), clear)?
@@ -904,6 +907,9 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
         parsed.model,
         parsed.profile,
     );
+    if crate::vendor::is_cloud_harness(&harness) {
+        crate::remote::require_public_url(data)?;
+    }
     let mut agent = crate::create::create(
         &store,
         data,
@@ -1003,6 +1009,34 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
         seat_gid: seat_info.as_ref().map(|(_, _, gid, _)| *gid),
         schedules: crate::schedule::list_agent_schedules(&store, &agent.id, false)?,
     })
+}
+
+/// End an agent's remote sessions: through the server when it runs, else in
+/// the store directly, which every server process reads on the next call.
+fn revoke_remote_cmd(data: &Path, agent: &str, session: Option<&str>) -> Result<(), Error> {
+    if client::can_call_server(data) {
+        let body = serde_json::json!({ "session_id": session });
+        let answered = client::call::<serde_json::Value>(
+            data,
+            "POST",
+            &format!("/v1/operator/agents/{agent}/remote-sessions/revoke"),
+            Some(body.to_string().into_bytes()),
+            &client::authority(data),
+        )
+        .map_err(Error::Message)?
+        .ok_or_else(|| Error::Message("the server answered nothing".into()))?;
+        println!("{answered}");
+        return Ok(());
+    }
+    let store = open(data)?;
+    let rec = store.agent_by_name(agent)?;
+    store.record_admin_audit("operator", "agents.revoke_remote_sessions", &rec.name)?;
+    let revoked = crate::remote::revoke(&store, &rec.id, session)?;
+    println!(
+        "{}",
+        serde_json::json!({ "agent": rec.name, "session_id": session, "revoked": revoked })
+    );
+    Ok(())
 }
 
 fn set_admin(data: &Path, agent: &str, admin: bool) -> Result<(), Error> {
