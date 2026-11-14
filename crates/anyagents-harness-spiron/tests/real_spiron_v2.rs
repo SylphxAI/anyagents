@@ -116,13 +116,14 @@ fn the_adapter_reattaches_after_its_server_goes_and_rebuilds_what_it_knew() {
     let root = tempfile::tempdir().unwrap();
     let socket = root.path().join("s.sock");
     let log = root.path().join("spiron.log");
-    let mut first = SpironHarness::launch_listening(launch(&bin, root.path()), &socket, &log, WAIT)
-        .unwrap_or_else(|error| {
-            panic!(
-                "launch: {error:?}; log: {}",
-                std::fs::read_to_string(&log).unwrap_or_default()
-            )
-        });
+    let mut first =
+        SpironHarness::launch_listening(launch(&bin, root.path()), &socket, &log, WAIT, |_| Ok(()))
+            .unwrap_or_else(|error| {
+                panic!(
+                    "launch: {error:?}; log: {}",
+                    std::fs::read_to_string(&log).unwrap_or_default()
+                )
+            });
     assert!(first.listening());
     assert!(
         first
@@ -266,6 +267,7 @@ fn a_binary_without_v2_is_reported_so_and_launched_as_before() {
         &root.path().join("s.sock"),
         &root.path().join("spiron.log"),
         WAIT,
+        |_| Ok(()),
     );
     assert_eq!(result.err(), Some(ListenError::NotV2));
 }

@@ -195,11 +195,16 @@ impl SpironHarness {
     /// Start a v2 process that listens on `socket` and outlives this server,
     /// and attach to it. Its output goes to `log`. A binary that exits with a
     /// usage error naming `--listen` speaks v1 only: [`ListenError::NotV2`].
+    ///
+    /// `spawned` is told the process's pid as soon as it exists, before it
+    /// listens, so the host can record it: a host that dies before the
+    /// attach still leaves the process found and ended by its successor.
     pub fn launch_listening(
         launch: SpironLaunch,
         socket: &Path,
         log: &Path,
         patience: Duration,
+        spawned: impl FnOnce(u32) -> Result<(), String>,
     ) -> Result<Self, ListenError> {
         let failed = |error: String| ListenError::Failed(error);
         let mut args = launch.args.clone();
@@ -223,6 +228,10 @@ impl SpironHarness {
             .stdout(Stdio::from(output))
             .stderr(Stdio::from(errors));
         let mut child = command.spawn().map_err(|err| failed(err.to_string()))?;
+        if let Err(error) = spawned(child.id()) {
+            anyagents_harness::kill_child(&mut child, &launch.environment);
+            return Err(failed(error));
+        }
         let deadline = Instant::now() + patience;
         loop {
             if let Ok(Some(status)) = child.try_wait() {

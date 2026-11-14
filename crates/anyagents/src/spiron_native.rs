@@ -20,7 +20,6 @@ use std::os::fd::AsRawFd as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyagents_harness::Harness as _;
 use anyagents_harness_spiron::{ListenError, Reattach, SpironHarness, SpironLaunch};
 use anyagents_keeper::{Presence, ProcessIdentity};
 use serde::{Deserialize, Serialize};
@@ -163,36 +162,46 @@ pub(crate) fn launch(
         .rev()
         .find(|(key, _)| key == anyagents_harness::SEAT_LAUNCH_ENV)
         .map(|(_, spec)| spec.clone());
-    let program = spiron.program.clone();
-    let state_dir = spiron.state_dir.clone();
-    let log = state_dir.join("spiron.log");
-    let mut harness = SpironHarness::launch_listening(spiron, &socket, &log, patience)?;
-    harness.recognise_applied(applied);
-    let failed = |error: String| ListenError::Failed(error);
-    let process = harness
-        .process_id()
-        .and_then(ProcessIdentity::of)
-        .ok_or_else(|| failed("cannot prove the Spiron process's identity".to_string()))?;
     let path = record_path(at.data, at.agent);
-    let record = Record {
+    let mut record = Record {
         agent: at.agent.to_string(),
         harness: at.harness.to_string(),
         model: at.model.map(str::to_string),
-        program,
-        socket,
-        state_dir,
-        process,
+        program: spiron.program.clone(),
+        socket: socket.clone(),
+        state_dir: spiron.state_dir.clone(),
+        process: ProcessIdentity {
+            pid: 0,
+            start_ticks: 0,
+            boot_id: String::new(),
+            pid_ns: 0,
+        },
         seat,
-        session: harness.session_id(),
-        after_seq: harness.attach_after_seq().unwrap_or(0),
+        session: spiron.session.clone(),
+        // Until the launch's `ready` is known, a replay starts at the start.
+        after_seq: 0,
         started_at_ms: now_ms(),
         labels: at.labels,
         note: None,
     };
-    // Named before it is written: a failed write ends the process with the
-    // harness, and removes whatever was written.
+    let log = spiron.state_dir.join("spiron.log");
+    // The process is recorded the moment it exists: a server that dies
+    // before the record is complete still leaves it to be found.
+    let mut harness = SpironHarness::launch_listening(spiron, &socket, &log, patience, |pid| {
+        record.process = ProcessIdentity::of(pid)
+            .ok_or_else(|| "cannot prove the Spiron process's identity".to_string())?;
+        write(&path, &record)
+    })
+    .inspect_err(|_| {
+        let _ = std::fs::remove_file(&path);
+    })?;
+    // Named now: from here a failure ends the process with the harness and
+    // removes the record.
     harness.set_record(path.clone());
-    write(&path, &record).map_err(failed)?;
+    harness.recognise_applied(applied);
+    record.session = harness.session_id();
+    record.after_seq = harness.attach_after_seq().unwrap_or(0);
+    write(&path, &record).map_err(ListenError::Failed)?;
     Ok(harness)
 }
 
