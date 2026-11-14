@@ -292,6 +292,10 @@ pub struct Attached<H> {
     pub started_at_ms: Option<i64>,
     /// What the last kernel kept with the process ([`Custody::note`]).
     pub note: Option<String>,
+    /// Older processes of the same agent left beside it (a kernel that died
+    /// in the middle of a replacement): retired once what they proved is
+    /// committed.
+    pub older: Vec<H>,
 }
 
 /// Harness processes hosted in the kernel: they end with it.
@@ -1169,20 +1173,25 @@ impl<H: Harness + 'static> Session<H> {
             model,
             started_at_ms,
             note,
+            older,
         } = attached;
         let fresh = match store.agent(&self.id) {
             Ok(fresh) if fresh.state == "running" => fresh,
             Ok(_) | Err(anyagents_core::Error::AgentNotFound(_)) => {
-                // The process ends before its lock is released: never the
-                // other way round, which would leave it running unlocked.
+                // The processes end before their lock is released: never the
+                // other way round, which would leave one running unlocked.
                 drop(harness);
+                drop(older);
                 drop(lock);
                 return Boot::Stopped;
             }
             Err(_) => {
-                // Not this kernel's to end on a read failure: leave it.
+                // Not this kernel's to end on a read failure: leave them.
                 lock.retain();
                 self.inner.custody.retain(harness);
+                for other in older {
+                    self.inner.custody.retain(other);
+                }
                 return Boot::Retry;
             }
         };
@@ -1191,6 +1200,9 @@ impl<H: Harness + 'static> Session<H> {
             Err(_) => {
                 lock.retain();
                 self.inner.custody.retain(harness);
+                for other in older {
+                    self.inner.custody.retain(other);
+                }
                 return Boot::Retry;
             }
         };
@@ -1234,12 +1246,15 @@ impl<H: Harness + 'static> Session<H> {
         self.process_started_at = Some(started_at_ms.unwrap_or_else(|| self.inner.clock.now_ms()));
         self.host_lock = Some(host_lock);
         self.adopted = Some(note.pending_recovery || idle_with_open_turn);
-        Boot::Ready(Box::new(DeliveryLoop::adopted(
-            store,
-            lock,
-            self.id.clone(),
-            harness,
-        )))
+        let mut delivery = DeliveryLoop::adopted(store, lock, self.id.clone(), harness);
+        // An older process an interrupted replacement left is retired as a
+        // replacement retires one: what it proved is committed first.
+        for other in older {
+            if let Err(err) = delivery.retire_other(other) {
+                self.last_error = Some(format!("commit proven mail: {err}"));
+            }
+        }
+        Boot::Ready(Box::new(delivery))
     }
 
     fn boot(&mut self) -> Boot<H> {
@@ -3564,6 +3579,7 @@ mod custody_tests {
                 model: None,
                 started_at_ms: None,
                 note: None,
+                older: Vec::new(),
             })))),
             extra_env: Vec::new(),
             board: HealthBoard::default(),

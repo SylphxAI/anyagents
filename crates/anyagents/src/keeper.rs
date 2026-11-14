@@ -106,12 +106,15 @@ impl Custody<VendorHarness> for KeeperCustody {
             anyagents_keeper::stop_agent(&self.root, agent.as_str())?;
             return Ok(None);
         }
-        let Some(mut remote) = anyagents_keeper::attach(&self.root, agent.as_str())? else {
+        let mut found = anyagents_keeper::attach_all(&self.root, agent.as_str())?.into_iter();
+        let Some(mut remote) = found.next() else {
             return Ok(None);
         };
+        let older: Vec<VendorHarness> = found.map(VendorHarness::kept).collect();
         let Some(lock) = remote.take_lock() else {
             // A keeper that holds no lock cannot be held to the one-process
             // rule: end it, and let the worker start one under the lock.
+            drop(older);
             remote.end()?;
             return Ok(None);
         };
@@ -123,6 +126,7 @@ impl Custody<VendorHarness> for KeeperCustody {
             model: hello.model,
             started_at_ms: Some(hello.started_at_ms),
             note: hello.note,
+            older,
         }))
     }
 

@@ -36,7 +36,8 @@ pub use identity::{Presence, ProcessIdentity};
 pub use keeper::{KeeperOptions, keeper_main, run_keeper};
 pub use remote::{
     CALL_DEADLINE, HELLO_DEADLINE, Instance, Program, READY_DEADLINE, RemoteHarness, STOP_DEADLINE,
-    attach, check_root, inspect, instances, lock_path, spawn, stop_agent, stop_agent_with, testing,
+    attach, attach_all, check_root, inspect, instances, lock_path, spawn, stop_agent,
+    stop_agent_with, testing,
 };
 
 /// The protocol version this build speaks. A kernel and a keeper agree on the

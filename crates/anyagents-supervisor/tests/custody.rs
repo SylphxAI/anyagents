@@ -117,6 +117,8 @@ struct Left {
     notes: Mutex<Vec<String>>,
     /// Each note kept, with how many lines the process had been given then.
     given_at_note: Mutex<Vec<(serde_json::Value, usize)>>,
+    /// Older processes an interrupted replacement left beside an agent's.
+    older: Mutex<HashMap<AgentId, Vec<Kept>>>,
 }
 
 struct FakeCustody(Arc<Left>);
@@ -135,6 +137,16 @@ impl Custody<Handle> for FakeCustody {
         else {
             return Ok(None);
         };
+        let older = self
+            .0
+            .older
+            .lock()
+            .unwrap()
+            .remove(agent)
+            .into_iter()
+            .flatten()
+            .map(|kept| Handle(Some(kept), None))
+            .collect();
         let lock = AgentLock::adopt(host_lock.as_fd().try_clone_to_owned().unwrap());
         Ok(Some(Attached {
             harness: Handle(Some(kept), Some(host_lock)),
@@ -143,6 +155,7 @@ impl Custody<Handle> for FakeCustody {
             model: None,
             started_at_ms: Some(7),
             note,
+            older,
         }))
     }
 
@@ -550,7 +563,11 @@ fn an_accepted_recovery_note_is_kept_before_more_mail() {
     fx.leave(&agent, &kept, "claude-code", Some(note));
     let supervisor = fx.start();
     assert!(wait_until(|| kept.given().len() >= 2));
-    assert!(kept.given()[0].starts_with("recovery_"), "{:?}", kept.given());
+    assert!(
+        kept.given()[0].starts_with("recovery_"),
+        "{:?}",
+        kept.given()
+    );
     let kept_notes = fx.left.given_at_note.lock().unwrap().clone();
     assert!(
         kept_notes
@@ -558,6 +575,56 @@ fn an_accepted_recovery_note_is_kept_before_more_mail() {
             .any(|(note, given)| note["pending_recovery"] == false && *given == 1),
         "the accepted recovery was not kept before more mail: {kept_notes:?}"
     );
+    drop(supervisor);
+}
+
+/// A process an interrupted replacement left beside the newer one is
+/// retired as a replacement retires one: stopped, what it proved committed,
+/// then ended. What it took is never handed to the newer process.
+#[test]
+fn an_older_process_left_beside_is_committed_then_ended() {
+    let fx = Fixture::new();
+    let agent = fx.running("alpha", "claude-code");
+    fx.store
+        .receive(&agent, Incoming::new("taken by the old one"))
+        .unwrap();
+    let first = fx.store.next_undelivered(&agent).unwrap().unwrap();
+    let older = Kept::new();
+    older
+        .fake
+        .lock()
+        .unwrap()
+        .deliver(&anyagents_harness::OutboundMessage {
+            id: first.id.as_str().to_string(),
+            seq: first.seq,
+            text: first.text.clone(),
+            sender: None,
+            reply_to: None,
+            source_time_ms: None,
+            context: Default::default(),
+        })
+        .unwrap();
+    let newer = Kept::new();
+    fx.leave(&agent, &newer, "claude-code", None);
+    fx.left
+        .older
+        .lock()
+        .unwrap()
+        .insert(agent.clone(), vec![older.clone()]);
+    let supervisor = fx.start();
+    assert!(wait_until(|| older.ended.load(Ordering::SeqCst)));
+    assert!(wait_until(|| fx
+        .store
+        .next_undelivered(&agent)
+        .unwrap()
+        .is_none()));
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        !newer.given().contains(&first.id.as_str().to_string()),
+        "what the old process took was handed to the newer one"
+    );
+    assert!(!newer.ended.load(Ordering::SeqCst));
+    assert_eq!(fx.launches.load(Ordering::SeqCst), 0);
     drop(supervisor);
 }
 

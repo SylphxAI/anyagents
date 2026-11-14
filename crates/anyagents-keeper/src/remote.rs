@@ -428,20 +428,34 @@ fn log_tail(dir: &Path) -> String {
 
 /// Take over the keeper a previous kernel left for `agent`: the newest one
 /// that answers. An older live keeper of the same agent (a crash in the
-/// middle of a replacement) is stopped, and so is one that speaks no protocol
-/// this kernel speaks. A keeper that does not answer is cleared only once it
-/// is proven gone; otherwise this is an error, and nothing is started beside
-/// it.
+/// middle of a replacement) is stopped; [`attach_all`] hands them over
+/// instead, for a kernel that commits what they proved first.
 pub fn attach(root: &Path, agent: &str) -> Result<Option<RemoteHarness>, String> {
+    let mut found = attach_all(root, agent)?.into_iter();
+    let newest = found.next();
+    for older in found {
+        let dir = older.dir().to_path_buf();
+        if let Err(error) = older.end() {
+            eprintln!("anyagents-keeper: keeper {}: {error}", dir.display());
+        }
+    }
+    Ok(newest)
+}
+
+/// Take over every live keeper a previous kernel left for `agent`, newest
+/// first. A keeper that speaks no protocol this kernel speaks is stopped. A
+/// keeper that does not answer is cleared only once it is proven gone;
+/// otherwise this is an error when no keeper newer than it answered, and
+/// nothing is started beside it.
+pub fn attach_all(root: &Path, agent: &str) -> Result<Vec<RemoteHarness>, String> {
     check_root(root)?;
-    let mut found: Option<RemoteHarness> = None;
+    let mut found: Vec<RemoteHarness> = Vec::new();
     for dir in agent_instances(root, agent) {
         let outcome = match connect(&dir, true) {
-            Ok(link) if found.is_none() => {
-                found = Some(RemoteHarness::new(link, dir.clone(), None));
+            Ok(link) => {
+                found.push(RemoteHarness::new(link, dir.clone(), None));
                 Ok(())
             }
-            Ok(link) => RemoteHarness::new(link, dir.clone(), None).end(),
             Err(ConnectError::MaybeGone) => clear_if_gone(&dir),
             Err(
                 ConnectError::Protocol { stream, .. } | ConnectError::Unreadable { stream, .. },
@@ -450,7 +464,7 @@ pub fn attach(root: &Path, agent: &str) -> Result<Option<RemoteHarness>, String>
         };
         if let Err(error) = outcome {
             let error = format!("keeper {}: {error}", dir.display());
-            if found.is_none() {
+            if found.is_empty() {
                 return Err(error);
             }
             // The newest keeper is taken; an older one that cannot be

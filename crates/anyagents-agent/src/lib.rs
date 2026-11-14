@@ -78,6 +78,28 @@ pub struct DeliveryLoop<H: Harness> {
     last_rejection: Option<String>,
 }
 
+/// Commit, in sequence order, every message past the cursor `harness`
+/// proved it took, stopping at the first it has not.
+fn commit_proofs<H: Harness>(store: &Store, agent_id: &AgentId, harness: &H) -> Result<u64, Error> {
+    let mut committed = 0;
+    while let Some(message) = store.next_undelivered(agent_id)? {
+        match harness.proven(message.id.as_str()) {
+            Some(Proof::Taken { turn_finished }) => {
+                store.note_delivered(agent_id, message.seq)?;
+                if turn_finished && harness.health().sign_in_fault.is_none() {
+                    store.note_turn_completed(agent_id)?;
+                }
+            }
+            Some(Proof::Duplicate) => {
+                store.note_delivered(agent_id, message.seq)?;
+            }
+            None => break,
+        }
+        committed += 1;
+    }
+    Ok(committed)
+}
+
 /// The reason the newest parked message was refused for, when nothing was
 /// taken after it (the cursor still stands on it) and the reason can be
 /// told to be no single message's own (`names_message_size`). The store keeps
@@ -293,21 +315,21 @@ impl<H: Harness> DeliveryLoop<H> {
     /// written, so this is safe on a process about to be replaced, a dead
     /// one, or one held by a quota. Returns how many were committed.
     pub fn commit_proven(&mut self) -> Result<u64, Error> {
-        let mut committed = 0;
-        while let Some(message) = self.store.next_undelivered(&self.agent_id)? {
-            match self.harness.proven(message.id.as_str()) {
-                Some(Proof::Taken { turn_finished }) => {
-                    self.store.note_delivered(&self.agent_id, message.seq)?;
-                    if turn_finished && self.harness.health().sign_in_fault.is_none() {
-                        self.store.note_turn_completed(&self.agent_id)?;
-                    }
-                }
-                Some(Proof::Duplicate) => {
-                    self.store.note_delivered(&self.agent_id, message.seq)?;
-                }
-                None => break,
-            }
-            committed += 1;
+        let committed = commit_proofs(&self.store, &self.agent_id, &self.harness)?;
+        if committed > 0 {
+            self.last_rejection = None;
+        }
+        Ok(committed)
+    }
+
+    /// Retire another process of this agent, one an earlier replacement
+    /// left beside this loop's (a kernel that died in the middle of it):
+    /// stop it, read it to the end, commit every proof it gave, then end it.
+    /// What it took is never handed to this loop's process again.
+    pub fn retire_other(&mut self, mut other: H) -> Result<u64, Error> {
+        other.stop();
+        let committed = commit_proofs(&self.store, &self.agent_id, &other)?;
+        if committed > 0 {
             self.last_rejection = None;
         }
         Ok(committed)
