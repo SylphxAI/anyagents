@@ -32,7 +32,7 @@ use anyagents_harness::{
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
-use crate::identity::{Presence, ProcessIdentity, session_groups};
+use crate::identity::{Presence, ProcessIdentity, leads_session, session_groups};
 use crate::keeper::Record;
 use crate::wire::{self, Event, Fault, FrameReader, Reply, Request};
 use crate::{AGENT, Hello, Hosted, LOCK, LOG, RECORD, SOCKET, SPAWNED, Spec};
@@ -463,6 +463,14 @@ pub fn attach(root: &Path, agent: &str) -> Result<Option<RemoteHarness>, String>
 /// Stop every keeper of `agent`, ending its harness. Every keeper that could
 /// not be stopped, or proven gone, is an error.
 pub fn stop_agent(root: &Path, agent: &str) -> Result<(), String> {
+    stop_agent_with(root, agent, false)
+}
+
+/// [`stop_agent`], and with `force`, also end a keeper that does not answer
+/// while its process runs (its socket is gone, or it is wedged): by signal,
+/// once its recorded identity proves the process is that keeper, with the
+/// same start time, in this boot and namespace, leading its own session.
+pub fn stop_agent_with(root: &Path, agent: &str, force: bool) -> Result<(), String> {
     check_root(root)?;
     let mut failures = Vec::new();
     for dir in agent_instances(root, agent) {
@@ -474,6 +482,12 @@ pub fn stop_agent(root: &Path, agent: &str) -> Result<(), String> {
             ) => stop_unspoken(stream, &dir),
             Err(ConnectError::Io(error)) => Err(error),
         };
+        let outcome = match outcome {
+            Err(error) if force => {
+                force_end(&dir).map_err(|forced| format!("{error}; forced: {forced}"))
+            }
+            outcome => outcome,
+        };
         if let Err(error) = outcome {
             failures.push(format!("{}: {error}", dir.display()));
         }
@@ -483,6 +497,55 @@ pub fn stop_agent(root: &Path, agent: &str) -> Result<(), String> {
     } else {
         Err(failures.join("; "))
     }
+}
+
+/// End the keeper of `dir` by signal, with everything in its session, then
+/// clear the directory. Only a keeper whose recorded identity proves it the
+/// running process at that pid, leading its own session, is signalled.
+fn force_end(dir: &Path) -> Result<(), String> {
+    let record = read_record(dir);
+    let (keeper, seat) = keeper_identity(dir, record.as_ref());
+    let keeper = keeper.ok_or("nothing records which process the keeper is")?;
+    match keeper.presence() {
+        Presence::Ended => return clear_if_gone(dir),
+        Presence::Unknown => {
+            return Err(format!(
+                "pid {} cannot be proven to be the keeper (another boot, namespace or process)",
+                keeper.pid
+            ));
+        }
+        Presence::Running => {}
+    }
+    if !leads_session(keeper.pid) {
+        return Err(format!(
+            "pid {} does not lead its own session, as a keeper does",
+            keeper.pid
+        ));
+    }
+    let environment = trusted_seat_env(seat.as_deref())
+        .ok_or("the recorded seat launcher is not trusted; nothing is signalled")?;
+    let groups = session_groups(keeper.pid);
+    // SAFETY: SIGKILL to the process its recorded identity proves is this
+    // keeper, checked just above.
+    unsafe { libc::kill(keeper.pid as i32, libc::SIGKILL) };
+    let deadline = Instant::now() + STOP_DEADLINE;
+    while keeper.presence() == Presence::Running {
+        if Instant::now() >= deadline {
+            return Err(format!("pid {} did not end on SIGKILL", keeper.pid));
+        }
+        std::thread::sleep(EXIT_PROBE);
+    }
+    if let Some(harness) = record
+        .as_ref()
+        .and_then(|record| record.harness_process.as_ref())
+    {
+        harness.end_group(&environment);
+    }
+    for group in groups {
+        anyagents_harness::terminate_group(group, &environment);
+    }
+    let _ = std::fs::remove_dir_all(dir);
+    Ok(())
 }
 
 /// What the keeper in `dir` says about itself, without taking it over.

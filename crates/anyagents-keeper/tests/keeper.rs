@@ -739,6 +739,28 @@ fn a_keeper_proven_ended_is_cleared_while_another_holds_the_lock() {
     drop(held);
 }
 
+/// A keeper whose socket is gone while its process runs cannot be stopped,
+/// nor proven gone; `keepers stop --force` ends it by signal once its
+/// recorded identity proves the process is that keeper, with its harness.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_keeper_without_its_socket_is_ended_only_by_force() {
+    let fx = Fixture::new();
+    let kernel = fx.spawn();
+    let dir = kernel.dir().to_path_buf();
+    let harness = kernel.process_id().unwrap();
+    let keeper_pid = kernel.keeper_pid();
+    let mut keeper = kernel.crash().expect("this kernel started the keeper");
+    std::fs::remove_file(dir.join("s")).unwrap();
+    let refused = anyagents_keeper::stop_agent(&fx.root, "agt_test").unwrap_err();
+    assert!(refused.contains("still runs"), "{refused}");
+    assert!(alive(keeper_pid) && group_alive(harness));
+    anyagents_keeper::stop_agent_with(&fx.root, "agt_test", true).unwrap();
+    keeper.wait().unwrap();
+    eventually("the harness is ended", || !group_alive(harness));
+    assert!(!dir.exists());
+}
+
 /// A v2 hello from a fake keeper whose record says it has `keeper` for its
 /// process, with `health` as its health.
 #[cfg(target_os = "linux")]

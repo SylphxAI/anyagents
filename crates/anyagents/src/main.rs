@@ -669,6 +669,11 @@ enum KeepersCommand {
         /// Every keeper.
         #[arg(long, conflicts_with = "agent")]
         all: bool,
+        /// Also end a keeper that does not answer while its process runs
+        /// (its socket is gone, or it is wedged), by signal, once its
+        /// recorded identity proves the process is that keeper.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -1115,13 +1120,13 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
         Command::Boundary => print_boundary(&data),
         Command::Keepers { action } => match action {
             KeepersCommand::List => keeper::list(&data),
-            KeepersCommand::Stop { agent, all } => {
+            KeepersCommand::Stop { agent, all, force } => {
                 if agent.is_none() && !all {
                     return Err(anyagents_core::Error::Message(
                         "name an agent, or pass --all".into(),
                     ));
                 }
-                keeper::stop(&data, agent.as_deref())
+                keeper::stop(&data, agent.as_deref(), force)
             }
         },
         Command::FakeOpencode => fake_opencode::run(),

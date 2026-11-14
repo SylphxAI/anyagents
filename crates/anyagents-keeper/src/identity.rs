@@ -136,6 +136,20 @@ mod linux {
     }
 }
 
+/// Whether `pid` leads its own session, as every keeper does (it calls
+/// `setsid` before it runs anything). `false` where this cannot be read.
+pub(crate) fn leads_session(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        linux::session_and_group(pid).is_some_and(|(session, _)| session == pid)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
 /// The process groups of every process in the session `leader` leads.
 /// Asked only about a keeper this process started and has not reaped, or one
 /// whose recorded identity is proven ended in this boot and namespace: in

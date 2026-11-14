@@ -201,8 +201,10 @@ pub fn list(data: &Path) -> Result<(), anyagents_core::Error> {
 /// It refuses unless this user owns the keepers and no server runs on the
 /// data directory (a running server would start the harnesses again), keeps
 /// the server lock while it works so none starts meanwhile, and succeeds only
-/// when every keeper ended and every agent lock it held is free.
-pub fn stop(data: &Path, agent: Option<&str>) -> Result<(), anyagents_core::Error> {
+/// when every keeper ended and every agent lock it held is free. With `force`
+/// a keeper that does not answer while its process runs is ended by signal,
+/// once its recorded identity proves the process is that keeper.
+pub fn stop(data: &Path, agent: Option<&str>, force: bool) -> Result<(), anyagents_core::Error> {
     let fail = |message: String| anyagents_core::Error::Message(message);
     let root = anyagents_keeper::root(data);
     let meta = match std::fs::symlink_metadata(&root) {
@@ -239,7 +241,7 @@ pub fn stop(data: &Path, agent: Option<&str>) -> Result<(), anyagents_core::Erro
             .filter(|instance| &instance.agent == agent)
             .filter_map(|instance| anyagents_keeper::lock_path(&instance.dir))
             .collect();
-        if let Err(error) = anyagents_keeper::stop_agent(&root, agent) {
+        if let Err(error) = anyagents_keeper::stop_agent_with(&root, agent, force) {
             failures.push(format!("{agent}: {error}"));
             println!("{agent}\tfailed");
             continue;
