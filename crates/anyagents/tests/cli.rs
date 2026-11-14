@@ -432,6 +432,70 @@ fn closed_stdout_uses_sigpipe_without_panicking() {
     );
 }
 
+/// Worktree admission runs this binary's own helper as the seat. It decides
+/// with nothing on `PATH` but the Git it is handed (a host image that wraps
+/// `find`, `sh` or `test` cannot change the answer) and answers through its
+/// exit status: 0 admitted, 1 refused with the reason on stderr, 2 misused.
+#[test]
+fn internal_admission_probe_needs_no_host_tool_but_git() {
+    use std::os::unix::fs::PermissionsExt;
+    // A real Git binary first: the test PATH may start with an operator
+    // wrapper script, which cannot run on the probe's empty PATH.
+    let git = ["/usr/bin", "/usr/local/bin", "/bin"]
+        .into_iter()
+        .map(std::path::PathBuf::from)
+        .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap()))
+        .map(|dir| dir.join("git"))
+        .find(|path| path.is_file())
+        .expect("git on the test PATH");
+    let dir = tempfile::tempdir().unwrap();
+    let tree = dir.path().join("tree");
+    std::fs::create_dir_all(tree.join("src")).unwrap();
+    std::fs::write(tree.join("src/file"), "x").unwrap();
+    let init = Command::new(&git)
+        .args(["init", "-q", "-b", "main"])
+        .arg(&tree)
+        .output()
+        .unwrap();
+    assert!(init.status.success());
+    let probe = |args: &[&std::ffi::OsStr]| {
+        bin()
+            .env_clear()
+            .env("PATH", "/nonexistent")
+            .env("HOME", "/nonexistent")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .args(["internal", "admission-probe"])
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let full = |path: &std::path::Path| {
+        probe(&[
+            "--git".as_ref(),
+            git.as_os_str(),
+            "--".as_ref(),
+            path.as_os_str(),
+        ])
+    };
+    let admitted = full(&tree);
+    assert!(
+        admitted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&admitted.stderr)
+    );
+    assert_eq!(probe(&["--git".as_ref()]).status.code(), Some(2));
+    if unsafe { libc::geteuid() } == 0 {
+        return; // root may write everything
+    }
+    let file = tree.join("src/file");
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o444)).unwrap();
+    let refused = full(&tree);
+    assert_eq!(refused.status.code(), Some(1));
+    let reason = String::from_utf8_lossy(&refused.stderr);
+    assert!(reason.contains(file.to_str().unwrap()), "{reason}");
+}
+
 #[test]
 fn plain_log_tail_keeps_the_bounded_conversation_route() {
     use std::io::{Read, Write};

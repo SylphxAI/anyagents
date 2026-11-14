@@ -2642,95 +2642,337 @@ fn update_metadata_acl(
 }
 
 /// Run admission as the seat that will execute the agent, not as its parent.
-/// Unique probes verify lock-directory writes without touching an active index.
+/// The probe is this binary's own `internal admission-probe`, so it depends on
+/// no host tool but Git, resolved through the toolchain: a host image that
+/// wraps `find`, `sh` or `test` cannot break it. A probe as the server's own
+/// identity runs in this process.
 pub(crate) fn verify(path: &Path, uid: u32, gid: u32, launch: Option<&str>) -> Result<(), Error> {
-    let mut command = std::process::Command::new("/bin/sh");
-    #[cfg(unix)]
-    if unsafe { libc::geteuid() } != uid || unsafe { libc::getegid() } != gid {
-        if let Some(spec) = launch {
-            let parts: Vec<_> = spec.split('\t').collect();
-            if parts.len() != 4 {
-                return Err(refusal(path, "invalid seat launcher"));
+    let env = probe_env();
+    let git = probe_git(&env[0].1).map_err(|e| refusal(path, e))?;
+    let seat = |message: String| refusal(path, format!("seat uid {uid}, gid {gid}: {message}"));
+    if unsafe { libc::geteuid() } == uid && unsafe { libc::getegid() } == gid {
+        return admission_probe(path, &git, Some(&env)).map_err(seat);
+    }
+    let (program, args) = probe_program().map_err(|e| refusal(path, e))?;
+    let mut command = if let Some(spec) = launch {
+        let parts: Vec<_> = spec.split('\t').collect();
+        if parts.len() != 4 {
+            return Err(refusal(path, "invalid seat launcher"));
+        }
+        let mut command = std::process::Command::new(parts[0]);
+        command.args([
+            "--reuid",
+            parts[1],
+            "--regid",
+            parts[2],
+            "--groups",
+            parts[3],
+            "--no-new-privs",
+            "--",
+        ]);
+        command.arg(&program);
+        command
+    } else {
+        use std::os::unix::process::CommandExt;
+        let mut command = std::process::Command::new(&program);
+        // Clear supplementary grants before changing uid. These changes must
+        // all run in pre_exec: CommandExt::uid would drop privilege before a
+        // pre_exec setgroups call.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::setgroups(1, &gid) != 0 || libc::setgid(gid) != 0 || libc::setuid(uid) != 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        command
+    };
+    // The seat's process sees only what the probe needs, never the server's
+    // environment (secrets included).
+    command
+        .args(args)
+        .arg("--git")
+        .arg(&git)
+        .arg("--")
+        .arg(path)
+        .env_clear()
+        .envs(env)
+        .current_dir("/")
+        .stdin(std::process::Stdio::null());
+    // The seat itself executes this binary. A seat that cannot is a
+    // deployment fault to name, never a reason to run Rust code after fork.
+    let unexecutable = |detail: String| {
+        refusal(
+            path,
+            format!(
+                "seat uid {uid} cannot execute {}: {detail}; install AnyAgents where seat \
+                 users can execute it (every ancestor directory traversable)",
+                program.display()
+            ),
+        )
+    };
+    let out = match command.output() {
+        Ok(out) => out,
+        Err(error) if exec_failure(&error) => return Err(unexecutable(error.to_string())),
+        Err(error) => return Err(refusal(path, error)),
+    };
+    // A launcher (setpriv) that cannot exec the probe exits 126 or 127; the
+    // probe itself only ever exits 0, 1 or 2.
+    if launch.is_some() && matches!(out.status.code(), Some(126 | 127)) {
+        return Err(unexecutable(
+            String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        ));
+    }
+    if !out.status.success() {
+        return Err(seat(format!(
+            "{}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
+/// An `exec` refusal of the program itself, as opposed to the identity
+/// change before it (`EPERM` from setgroups/setgid/setuid).
+fn exec_failure(error: &std::io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EACCES | libc::ENOENT | libc::ENOEXEC | libc::ENOTDIR | libc::ELOOP)
+    )
+}
+
+/// The environment of the probe and of the Git it runs: the toolchain's helper
+/// `PATH`, and no user or system Git configuration.
+fn probe_env() -> Vec<(&'static str, std::ffi::OsString)> {
+    vec![
+        (
+            "PATH",
+            anyagents_toolchain::global().exec_path("worktree_access.admission"),
+        ),
+        ("HOME", "/nonexistent".into()),
+        ("XDG_CONFIG_HOME", "/nonexistent".into()),
+        ("GIT_CONFIG_GLOBAL", "/dev/null".into()),
+        ("GIT_CONFIG_SYSTEM", "/dev/null".into()),
+    ]
+}
+
+/// The Git the probe runs: the toolchain's declared `git` when it declares
+/// one, otherwise the first `git` on the toolchain's helper `PATH`, which is
+/// the one the shell probe ran. Never a wrapper earlier on the server's own
+/// inherited `PATH`: the desk puts its guard scripts there.
+fn probe_git(helper_path: &std::ffi::OsStr) -> std::io::Result<PathBuf> {
+    if let Ok(tool) = anyagents_toolchain::tool("git", "worktree admission")
+        && !matches!(tool.provenance, anyagents_toolchain::Provenance::Legacy)
+    {
+        return Ok(tool.path);
+    }
+    std::env::split_paths(helper_path)
+        .map(|dir| dir.join("git"))
+        .find(|candidate| candidate.is_file() && may(candidate, libc::X_OK))
+        .ok_or_else(|| std::io::Error::other("no git on the toolchain's helper PATH"))
+}
+
+/// This binary, asked to run the probe.
+#[cfg(not(test))]
+fn probe_program() -> std::io::Result<(PathBuf, Vec<&'static str>)> {
+    Ok((
+        crate::data::current_exe_clean()?,
+        vec!["internal", "admission-probe"],
+    ))
+}
+
+/// Under `cargo test` this binary is the test harness: its probe worker test
+/// takes the probe's arguments instead. A seat must be able to execute it, as
+/// it must execute the server binary, but a build tree usually sits below a
+/// home directory no other uid can traverse. The harness therefore runs from
+/// one seat-executable copy in a fresh 0755 directory under the system
+/// temporary directory.
+#[cfg(test)]
+fn probe_program() -> std::io::Result<(PathBuf, Vec<&'static str>)> {
+    use std::os::unix::fs::PermissionsExt;
+    static COPY: std::sync::OnceLock<Result<PathBuf, String>> = std::sync::OnceLock::new();
+    let copy = COPY.get_or_init(|| {
+        let copy = || -> std::io::Result<PathBuf> {
+            let harness = std::env::current_exe()?;
+            let directory = std::env::temp_dir().join(format!(
+                "anyagents-probe-harness-{}-{}",
+                std::process::id(),
+                anyagents_core::AgentId::generate()
+            ));
+            std::fs::create_dir(&directory)?;
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755))?;
+            let copy = directory.join("anyagents-test-harness");
+            // A link or a waited `cp`: this process never holds a writable
+            // descriptor of an executable a parallel fork could inherit.
+            if std::fs::hard_link(&harness, &copy).is_err() {
+                let status = std::process::Command::new("/bin/cp")
+                    .arg("--")
+                    .arg(&harness)
+                    .arg(&copy)
+                    .status()?;
+                if !status.success() {
+                    return Err(std::io::Error::other("cannot copy the test harness"));
+                }
             }
-            command = std::process::Command::new(parts[0]);
-            command.args([
-                "--reuid",
-                parts[1],
-                "--regid",
-                parts[2],
-                "--groups",
-                parts[3],
-                "--no-new-privs",
-                "--",
-                "/bin/sh",
-            ]);
+            std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o755))?;
+            Ok(copy)
+        };
+        copy().map_err(|error| error.to_string())
+    });
+    Ok((
+        copy.clone().map_err(std::io::Error::other)?,
+        vec![
+            "--exact",
+            "worktree_access::tests::admission_probe_worker",
+            "--nocapture",
+            "--",
+        ],
+    ))
+}
+
+/// `anyagents internal admission-probe --git <git> -- <path>`, run as the
+/// seat: [`admission_probe`] with the environment its parent gave it. Exits
+/// 1 with the reason on stderr, 2 on a malformed call.
+pub(crate) fn admission_probe_main(args: &[std::ffi::OsString]) -> std::process::ExitCode {
+    let [flag, git, separator, path] = args else {
+        eprintln!("usage: anyagents internal admission-probe --git <git> -- <path>");
+        return std::process::ExitCode::from(2);
+    };
+    if flag != "--git" || separator != "--" {
+        eprintln!("usage: anyagents internal admission-probe --git <git> -- <path>");
+        return std::process::ExitCode::from(2);
+    }
+    match admission_probe(Path::new(path), Path::new(git), None) {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(message) => {
+            eprintln!("{message}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+/// What the seat must be able to do, checked as the seat: write every file
+/// and directory of its working tree (its own `.git` entry aside) and
+/// traverse every directory, create a lock file in the tree, in its private
+/// gitdir and in the shared `objects/` and `refs/`, and run `git status`.
+/// `env`: the environment for Git, or `None` to inherit this process's.
+fn admission_probe(
+    path: &Path,
+    git: &Path,
+    env: Option<&[(&'static str, std::ffi::OsString)]>,
+) -> Result<(), String> {
+    check_tree(path)?;
+    probe_lock(path)?;
+    match std::fs::symlink_metadata(path.join(".git")) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("{}: {error}", path.join(".git").display())),
+    }
+    let git = |args: &[&str]| -> Result<std::process::Output, String> {
+        let mut command = std::process::Command::new(git);
+        if let Some(env) = env {
+            command.env_clear().envs(env.iter().cloned());
+        }
+        let mut safe = std::ffi::OsString::from("safe.directory=");
+        safe.push(path);
+        let out = command
+            .args([
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+            ])
+            .arg("-c")
+            .arg(safe)
+            .arg("-C")
+            .arg(path)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .map_err(|error| format!("{}: {error}", git.display()))?;
+        if out.status.success() {
+            Ok(out)
         } else {
-            use std::os::unix::process::CommandExt;
-            // Clear supplementary grants before changing uid. These changes
-            // must all run in pre_exec: CommandExt::uid would drop privilege
-            // before a pre_exec setgroups call.
-            unsafe {
-                command.pre_exec(move || {
-                    if libc::setgroups(1, &gid) != 0
-                        || libc::setgid(gid) != 0
-                        || libc::setuid(uid) != 0
-                    {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    Ok(())
-                });
+            Err(format!(
+                "git {}: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ))
+        }
+    };
+    let dir = |flag: &str| -> Result<PathBuf, String> {
+        let out = git(&["rev-parse", "--path-format=absolute", flag])?;
+        Ok(PathBuf::from(String::from_utf8_lossy(&out.stdout).trim()))
+    };
+    let private = dir("--git-dir")?;
+    let common = dir("--git-common-dir")?;
+    for directory in [private, common.join("objects"), common.join("refs")] {
+        probe_lock(&directory)?;
+    }
+    git(&["status", "--porcelain"]).map(drop)
+}
+
+/// Every regular file and directory under `root`, symlinks never followed,
+/// must be writable, and every directory traversable and listable.
+fn check_tree(root: &Path) -> Result<(), String> {
+    let refuse = |path: &Path| format!("{}: seat cannot write/traverse", path.display());
+    let meta = std::fs::symlink_metadata(root).map_err(|e| format!("{}: {e}", root.display()))?;
+    let mut pending = Vec::new();
+    if meta.is_dir() {
+        pending.push(root.to_path_buf());
+    } else if meta.is_file() && !may(root, libc::W_OK) {
+        return Err(refuse(root));
+    }
+    while let Some(directory) = pending.pop() {
+        if !may(&directory, libc::W_OK | libc::X_OK) {
+            return Err(refuse(&directory));
+        }
+        let entries = std::fs::read_dir(&directory)
+            .map_err(|e| format!("{}: seat cannot list: {e}", directory.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("{}: {e}", directory.display()))?;
+            let child = entry.path();
+            if directory == root && entry.file_name() == ".git" {
+                continue;
+            }
+            let kind = entry
+                .file_type()
+                .map_err(|e| format!("{}: {e}", child.display()))?;
+            if kind.is_dir() {
+                pending.push(child);
+            } else if kind.is_file() && !may(&child, libc::W_OK) {
+                return Err(refuse(&child));
             }
         }
     }
-    let script = r#"
-set -eu
-check_tree() {
-  find "$1" -path "$1/.git" -prune -o \( -type f -o -type d \) -exec sh -c '
-    for p do
-      if [ ! -w "$p" ] || { [ -d "$p" ] && [ ! -x "$p" ]; }; then
-        printf "%s: seat cannot write/traverse\n" "$p" >&2; exit 1
-      fi
-    done
-  ' sh {} +
-}
-probe() {
-  p="$1/.anyagents-write-check-$$"
-  (set -C; : > "$p") || { printf "%s: seat cannot create a lock\n" "$1" >&2; exit 1; }
-  rm -- "$p"
-}
-check_tree "$1"
-probe "$1"
-if [ -e "$1/.git" ] || [ -L "$1/.git" ]; then
-  private=$(git -c safe.directory="$1" -C "$1" rev-parse --path-format=absolute --git-dir)
-  common=$(git -c safe.directory="$1" -C "$1" rev-parse --path-format=absolute --git-common-dir)
-  for d in "$private" "$common/objects" "$common/refs"; do
-    probe "$d"
-  done
-  git -c safe.directory="$1" -C "$1" status --porcelain >/dev/null
-fi
-"#;
-    let path_env = anyagents_toolchain::global().exec_path("worktree_access.admission");
-    let out = command
-        .env("PATH", path_env)
-        .env("HOME", "/nonexistent")
-        .env("XDG_CONFIG_HOME", "/nonexistent")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .args(["-c", script, "workdir-admission"])
-        .arg(path)
-        .output()
-        .map_err(|e| refusal(path, e))?;
-    if !out.status.success() {
-        return Err(refusal(
-            path,
-            format!(
-                "seat uid {uid}, gid {gid}: {}: {}",
-                out.status,
-                String::from_utf8_lossy(&out.stderr).trim()
-            ),
-        ));
-    }
     Ok(())
+}
+
+/// The kernel's own answer for this process's effective identity.
+fn may(path: &Path, mode: libc::c_int) -> bool {
+    let Ok(name) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) else {
+        return false;
+    };
+    unsafe { libc::faccessat(libc::AT_FDCWD, name.as_ptr(), mode, libc::AT_EACCESS) == 0 }
+}
+
+/// Create and remove a uniquely named file, as Git's lock files need.
+fn probe_lock(directory: &Path) -> Result<(), String> {
+    let probe = directory.join(format!(
+        ".anyagents-write-check-{}-{}",
+        std::process::id(),
+        anyagents_core::AgentId::generate()
+    ));
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .map_err(|e| format!("{}: seat cannot create a lock: {e}", directory.display()))?;
+    std::fs::remove_file(&probe)
+        .map_err(|e| format!("{}: seat cannot remove its lock: {e}", directory.display()))
 }
 
 #[cfg(test)]
@@ -4492,5 +4734,154 @@ mod tests {
             assert!(seat_owns(&foreign, foreign.uid()));
             assert!(!seat_owns(&foreign, foreign.uid().wrapping_add(1)));
         }
+    }
+
+    /// The probe as another uid, under `cargo test`: the test harness stands
+    /// in for this binary's `internal admission-probe`.
+    #[test]
+    fn admission_probe_worker() {
+        let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+        let Some(start) = args.iter().position(|arg| arg == "--git") else {
+            return;
+        };
+        let code = match admission_probe_main(&args[start..]) {
+            code if code == std::process::ExitCode::SUCCESS => 0,
+            _ => 1,
+        };
+        std::process::exit(code);
+    }
+
+    /// A real Git binary. The test `PATH` may start with an operator wrapper
+    /// (the desk's `git` is a shell script), which cannot run on an empty
+    /// `PATH`.
+    fn system_git() -> PathBuf {
+        ["/usr/bin/git", "/usr/local/bin/git", "/bin/git"]
+            .into_iter()
+            .map(PathBuf::from)
+            .find(|path| path.is_file())
+            .unwrap_or_else(|| {
+                anyagents_toolchain::tool("git", "test")
+                    .unwrap()
+                    .path()
+                    .to_path_buf()
+            })
+    }
+
+    /// Admission depends on no host tool but Git: with nothing on `PATH` (a
+    /// host image may wrap or remove `find`, `sh` and `test`), the probe
+    /// still decides, and its refusals name the object that failed.
+    #[test]
+    fn the_admission_probe_needs_no_host_tool_but_git() {
+        let dir = crate::test_tempdir();
+        let tree = dir.path().join("tree");
+        std::fs::create_dir_all(tree.join("src/nested")).unwrap();
+        std::fs::write(tree.join("src/nested/file"), "x").unwrap();
+        std::os::unix::fs::symlink("/nonexistent", tree.join("dangling")).unwrap();
+        crate::worktree::tests::git(&tree, &["init", "-q", "-b", "main"]);
+        let bare: Vec<(&'static str, std::ffi::OsString)> = vec![
+            ("PATH", "/nonexistent".into()),
+            ("HOME", "/nonexistent".into()),
+            ("GIT_CONFIG_GLOBAL", "/dev/null".into()),
+            ("GIT_CONFIG_SYSTEM", "/dev/null".into()),
+        ];
+        admission_probe(&tree, &system_git(), Some(&bare)).unwrap();
+        let left: Vec<_> = std::fs::read_dir(&tree)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .filter(|n| n.to_string_lossy().starts_with(".anyagents-write-check"))
+            .collect();
+        assert!(left.is_empty(), "probe left {left:?}");
+        if crate::sandbox::server_uid() == 0 {
+            return; // root may write everything
+        }
+        let file = tree.join("src/nested/file");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let error = admission_probe(&tree, &system_git(), Some(&bare)).unwrap_err();
+        assert!(
+            error.contains(file.to_str().unwrap()) && error.contains("cannot write"),
+            "{error}"
+        );
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let refs = tree.join(".git/refs");
+        std::fs::set_permissions(&refs, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let error = admission_probe(&tree, &system_git(), Some(&bare)).unwrap_err();
+        std::fs::set_permissions(&refs, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            error.contains(refs.to_str().unwrap()) && error.contains("cannot create a lock"),
+            "{error}"
+        );
+        // A helper process (the path a seat's probe takes) reports through
+        // its exit status, with the reason on stderr.
+        let (program, args) = probe_program().unwrap();
+        let run = |path: &Path| {
+            std::process::Command::new(&program)
+                .args(&args)
+                .arg("--git")
+                .arg(system_git())
+                .arg("--")
+                .arg(path)
+                .env_clear()
+                .envs(bare.iter().cloned())
+                .output()
+                .unwrap()
+        };
+        assert!(run(&tree).status.success());
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let refused = run(&tree);
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(refused.status.code(), Some(1));
+        assert!(
+            String::from_utf8_lossy(&refused.stderr).contains(file.to_str().unwrap()),
+            "{}",
+            String::from_utf8_lossy(&refused.stderr)
+        );
+    }
+
+    /// The seat itself executes the server binary. A seat that cannot (the
+    /// binary or an ancestor directory is closed to it) is named with the
+    /// fix, never reported as a bare permission error.
+    #[test]
+    fn a_seat_that_cannot_execute_the_probe_is_named() {
+        let dir = crate::test_tempdir();
+        let launcher = dir.path().join("launcher");
+        crate::worktree::tests::write_executable(
+            &launcher,
+            "#!/bin/sh\necho 'setpriv: failed to execute probe: Permission denied' >&2\nexit 126\n",
+        );
+        let uid = crate::sandbox::server_uid().wrapping_add(1);
+        let gid = crate::sandbox::server_gid();
+        let spec = format!("{}\t{uid}\t{gid}\t{gid}", launcher.display());
+        let error = verify(dir.path(), uid, gid, Some(&spec))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(&format!("seat uid {uid} cannot execute")),
+            "{error}"
+        );
+        assert!(
+            error.contains("install AnyAgents where seat users can execute it"),
+            "{error}"
+        );
+        assert!(error.contains("Permission denied"), "{error}");
+        assert!(exec_failure(&std::io::Error::from_raw_os_error(
+            libc::EACCES
+        )));
+        assert!(!exec_failure(&std::io::Error::from_raw_os_error(
+            libc::EPERM
+        )));
+    }
+
+    /// The probe's Git is the toolchain's: a declared `git`, else the first on
+    /// the helper `PATH`. A `git` that resolves first on the server's own
+    /// inherited `PATH` (the desk's guard wrapper sits there) is never used.
+    #[test]
+    fn the_probe_runs_the_helper_path_git_not_an_inherited_wrapper() {
+        let dir = crate::test_tempdir();
+        let helper = dir.path().join("helper-bin");
+        std::fs::create_dir(&helper).unwrap();
+        crate::worktree::tests::write_executable(&helper.join("git"), "#!/bin/sh\nexit 0\n");
+        let path = std::env::join_paths([&helper]).unwrap();
+        assert_eq!(probe_git(&path).unwrap(), helper.join("git"));
+        assert!(probe_git(std::ffi::OsStr::new("/nonexistent")).is_err());
     }
 }
