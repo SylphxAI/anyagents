@@ -512,6 +512,9 @@ pub fn run(data: &Path, config: Option<&Path>, profile: Option<McpProfile>) -> R
     tool_server_runtime()?.block_on(async {
         let client = Client::new(socket, config_buf.clone(), capability);
         let (who, harness, limits) = client.whoami_with_harness().await.map_err(Error::Message)?;
+        // A call waits out a server restart only while its harness still
+        // waits for the answer.
+        let _ = SERVED_HARNESS.set(harness.clone());
         // The limits come from the server's environment only; a server that
         // names none leaves the defaults.
         CodeLimits::serve(limits.unwrap_or_default());
@@ -674,8 +677,10 @@ impl Client {
 
     /// One call on a kept-alive connection to the server. A connection the
     /// server closed (it restarted, or it is stopping) is dropped and the
-    /// call goes on a new one; a call is sent again only when hyper hands it
-    /// back unsent, so nothing the server may have received is repeated.
+    /// call goes on a new one. A request hyper hands back unsent goes again,
+    /// on any connection; one the server may have received is repeated only
+    /// when it reads (`GET`), and otherwise ends in [`interrupted_call`], so
+    /// nothing that changes state is ever applied twice.
     async fn send(
         &self,
         method: &str,
@@ -684,15 +689,20 @@ impl Client {
         capability: &str,
         agent_id: Option<&str>,
     ) -> Result<(hyper::StatusCode, Vec<u8>), String> {
-        let mut request = build_request(
-            method,
-            path,
-            body,
-            Some(capability),
-            None,
-            agent_id,
-            self.via_http,
-        )?;
+        let payload = body.unwrap_or_default();
+        let fresh = || {
+            build_request(
+                method,
+                path,
+                Some(payload.clone()),
+                Some(capability),
+                None,
+                agent_id,
+                self.via_http,
+            )
+        };
+        let mut request = fresh()?;
+        let mut reads_repeated = false;
         loop {
             let (mut sender, reused) = match self.idle_connection().await {
                 Some(sender) => (sender, true),
@@ -706,22 +716,40 @@ impl Client {
             }
             let response = match sender.try_send_request(request).await {
                 Ok(response) => response,
-                Err(mut error) => match error.take_message() {
-                    Some(unsent) if reused => {
+                Err(mut error) => {
+                    if let Some(unsent) = error.take_message() {
+                        // Nothing reached the server: the next connection
+                        // (to this server or the next one) takes it. A new
+                        // connection closed unused is a server stopping, so
+                        // that pause counts against the call's wait.
                         request = unsent;
+                        if !reused {
+                            pause_for_restart(&call_wait(), &error.into_error().to_string())
+                                .await?;
+                        }
                         continue;
                     }
-                    _ => return Err(error.into_error().to_string()),
-                },
+                    let error = error.into_error().to_string();
+                    match after_lost_connection(method, &mut reads_repeated) {
+                        Some(()) => {
+                            request = fresh()?;
+                            continue;
+                        }
+                        None => return Err(interrupted_call(method, path, &error)),
+                    }
+                }
             };
             let status = response.status();
-            let bytes = response
-                .into_body()
-                .collect()
-                .await
-                .map_err(|err| err.to_string())?
-                .to_bytes()
-                .to_vec();
+            let bytes = match response.into_body().collect().await {
+                Ok(collected) => collected.to_bytes().to_vec(),
+                Err(error) => match after_lost_connection(method, &mut reads_repeated) {
+                    Some(()) => {
+                        request = fresh()?;
+                        continue;
+                    }
+                    None => return Err(interrupted_call(method, path, &error.to_string())),
+                },
+            };
             let mut idle = locked(&self.link.idle);
             if idle.len() < MAX_IDLE_CONNECTIONS {
                 idle.push(sender);
@@ -8671,9 +8699,11 @@ fn error_message(bytes: &[u8]) -> String {
         .unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned())
 }
 
-/// One call on its own connection to the socket: the status code and the
-/// body. For a one-shot command; a tool server keeps its connections open
-/// between calls (see [`Client`]).
+/// One call on its own connection to the socket, without waiting for a
+/// server that is not listening: the status code and the body. Commands use
+/// [`request_waiting`]; a tool server keeps its connections open between
+/// calls (see [`Client`]).
+#[cfg(test)]
 pub(crate) async fn request(
     socket: &Path,
     method: &str,
@@ -8682,21 +8712,70 @@ pub(crate) async fn request(
     capability: Option<&str>,
     operator: Option<&str>,
 ) -> Result<(hyper::StatusCode, Vec<u8>), String> {
-    let request = build_request(method, path, body, capability, operator, None, false)?;
-    let response = connect(socket)
-        .await?
-        .send_request(request)
-        .await
-        .map_err(|err| err.to_string())?;
-    let status = response.status();
-    let bytes = response
-        .into_body()
-        .collect()
-        .await
-        .map_err(|err| err.to_string())?
-        .to_bytes()
-        .to_vec();
-    Ok((status, bytes))
+    request_waiting(
+        socket,
+        method,
+        path,
+        body,
+        capability,
+        operator,
+        std::time::Duration::ZERO,
+    )
+    .await
+}
+
+/// [`request`], waiting up to `within` for a server that is restarting (its
+/// socket missing or refusing: nothing was sent). A connection lost after the
+/// request went out is retried once for a read; any other call ends in
+/// [`interrupted_call`], since it may have applied.
+pub(crate) async fn request_waiting(
+    socket: &Path,
+    method: &str,
+    path: &str,
+    body: Option<Vec<u8>>,
+    capability: Option<&str>,
+    operator: Option<&str>,
+    within: std::time::Duration,
+) -> Result<(hyper::StatusCode, Vec<u8>), String> {
+    let payload = body.unwrap_or_default();
+    let wait = SocketWait::new(within);
+    let mut repeated = false;
+    loop {
+        let request = build_request(
+            method,
+            path,
+            Some(payload.clone()),
+            capability,
+            operator,
+            None,
+            false,
+        )?;
+        let mut sender = connect_waiting(socket, &wait).await?;
+        let response = match sender.try_send_request(request).await {
+            Ok(response) => response,
+            Err(mut error) => {
+                if error.take_message().is_some() {
+                    pause_for_restart(&wait, &error.into_error().to_string()).await?;
+                    continue;
+                }
+                let error = error.into_error().to_string();
+                if after_lost_connection(method, &mut repeated).is_some() {
+                    continue;
+                }
+                return Err(interrupted_call(method, path, &error));
+            }
+        };
+        let status = response.status();
+        match response.into_body().collect().await {
+            Ok(collected) => return Ok((status, collected.to_bytes().to_vec())),
+            Err(error) => {
+                if after_lost_connection(method, &mut repeated).is_some() {
+                    continue;
+                }
+                return Err(interrupted_call(method, path, &error.to_string()));
+            }
+        }
+    }
 }
 
 /// One request to the server's API, with whichever credentials the caller
@@ -8740,20 +8819,47 @@ fn build_request(
         .map_err(|err| err.to_string())
 }
 
-/// How long a tool server's call waits for the server's socket to come back.
+/// How long a call waits for the server's socket to come back, at most.
 /// The harness outlives a server restart or upgrade (its keeper holds it),
 /// and for that moment nothing listens: the socket is missing or refuses.
-/// Only the connection is tried again; no request is ever sent twice. A
-/// one-shot command does not wait: an operator's read falls back to the
-/// store at once.
+/// A refused or missing socket means nothing was sent, so only the
+/// connection is tried again; no request is ever sent twice.
 ///
-/// The wait stays well inside the shortest tool-call timeout found among the
-/// harnesses AnyAgents runs, so a call is not carried out after the harness
-/// gave up on it: Codex 60 s (`tool_timeout_sec`); Claude Code (stdio: about
-/// 28 h, 30 min idle), OpenCode (12 h) and Gemini CLI (10 min) wait longer.
-/// A harness that cancels the call (`notifications/cancelled`) ends the wait
-/// at once.
-const RECONNECT_WITHIN: std::time::Duration = std::time::Duration::from_secs(45);
+/// A restart is bounded on the server's side: a stopping server gives
+/// in-flight calls a few seconds and exits within `server::STOP_WITHIN`
+/// (20 s), and a new server binds its socket within about a second of
+/// starting (measured 2026-11-14: started 17:51:07Z, serving 17:51:08Z).
+/// Two minutes covers that with room for a slow start (a migration), and is
+/// further cut to what the harness allows ([`harness_patience`]).
+const RESTART_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// The wait of a one-shot command an agent runs in its shell (`anyagents
+/// send ...`): shell tools time out sooner than MCP calls, so it stays short.
+/// An operator's read does not wait; it falls back to the store at once.
+pub(crate) const RECONNECT_WITHIN: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// How long the harness waits for one tool call before giving up on it, where
+/// that is known: a call is never sent after its harness gave up, so the
+/// socket wait ends [`PATIENCE_MARGIN`] before this, counted from the call's
+/// start. Codex: 60 s (`tool_timeout_sec`). agy: 3 min (its MCP calls end in
+/// "timed out after 3m0s"). Claude Code (stdio: about 28 h, 30 min idle),
+/// OpenCode (12 h) and Spiron (no stdio call deadline) wait longer than any
+/// restart. Any other harness gets the shortest known, Codex's. A harness
+/// that cancels the call (`notifications/cancelled`) ends the wait at once.
+fn harness_patience(harness: Option<&str>) -> Option<std::time::Duration> {
+    match harness.map(str::trim).unwrap_or_default() {
+        "claude-code" | "opencode" | "spiron" => None,
+        "agy" => Some(std::time::Duration::from_secs(180)),
+        _ => Some(std::time::Duration::from_secs(60)),
+    }
+}
+
+/// Room left between the end of a socket wait and the harness's deadline: the
+/// request must still be answered.
+const PATIENCE_MARGIN: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// The harness this tool server serves, as the server named it at start.
+static SERVED_HARNESS: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
 
 /// One tool call as the requests it makes see it: whether its harness
 /// cancelled it, and the time it has spent waiting for the server's socket,
@@ -8765,11 +8871,16 @@ struct Call {
 }
 
 impl Call {
-    /// A call `cancelled` reports on, with the whole wait still ahead.
+    /// A call `cancelled` reports on, starting now, with the whole wait
+    /// still ahead: up to [`RESTART_WAIT`], ending before its harness would
+    /// give up on it.
     fn new(cancelled: Arc<dyn Fn() -> bool + Send + Sync>) -> Self {
+        let harness = SERVED_HARNESS.get().and_then(Option::as_deref);
+        let until = harness_patience(harness)
+            .map(|patience| tokio::time::Instant::now() + patience.saturating_sub(PATIENCE_MARGIN));
         Self {
             cancelled,
-            wait: SocketWait::new(RECONNECT_WITHIN),
+            wait: SocketWait::new(RESTART_WAIT).until(until),
         }
     }
 
@@ -8787,10 +8898,12 @@ impl Call {
 
 /// The time spent waiting for the server's socket, against a budget: only
 /// the time some request actually waits counts (requests waiting at once
-/// count it once), so a call that has run long still has its whole wait.
+/// count it once), so a call that has run long still has its whole wait —
+/// unless its harness's deadline (`until`) comes first.
 #[derive(Clone)]
 struct SocketWait {
     budget: std::time::Duration,
+    until: Option<tokio::time::Instant>,
     spent: Arc<std::sync::Mutex<Spent>>,
 }
 
@@ -8805,21 +8918,32 @@ impl SocketWait {
     fn new(budget: std::time::Duration) -> Self {
         Self {
             budget,
+            until: None,
             spent: Arc::default(),
         }
+    }
+
+    /// The same wait, ending by `until` whatever is left of the budget.
+    fn until(mut self, until: Option<tokio::time::Instant>) -> Self {
+        self.until = until;
+        self
     }
 
     fn spent(&self) -> std::sync::MutexGuard<'_, Spent> {
         self.spent.lock().unwrap_or_else(|error| error.into_inner())
     }
 
-    /// What is left of the budget.
+    /// What is left of the budget, and before the deadline.
     fn left(&self) -> std::time::Duration {
         let spent = self.spent();
         let running = spent
             .since
             .map_or(std::time::Duration::ZERO, |since| since.elapsed());
-        self.budget.saturating_sub(spent.before + running)
+        let left = self.budget.saturating_sub(spent.before + running);
+        match self.until {
+            Some(until) => left.min(until.saturating_duration_since(tokio::time::Instant::now())),
+            None => left,
+        }
     }
 
     /// One request starts waiting; the wait counts until the guard drops.
@@ -8879,14 +9003,65 @@ fn current_call() -> Call {
 /// How often a missing or refusing socket is tried again.
 const RECONNECT_PROBE: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// A new HTTP/1 connection to the server's socket, or an error at once when
-/// nothing listens. Its driver runs as a task until the server closes it or
-/// the last sender is dropped.
-async fn connect(socket: &Path) -> Result<http1::SendRequest<Full<Bytes>>, String> {
-    connect_waiting(socket, &SocketWait::new(std::time::Duration::ZERO)).await
+/// A connect error that means no server listens right now (between one
+/// server's stop and the next one's start): the socket file is missing, it
+/// refuses, or its backlog is full. Nothing reached a server.
+fn server_restarting(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound
+            | std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::WouldBlock
+    )
 }
 
-/// [`connect`], waiting up to `within` while nothing listens on `socket`.
+/// A new connection the server closed before taking the request: it is
+/// stopping. Wait a probe's length, counted against the call's wait.
+async fn pause_for_restart(wait: &SocketWait, error: &str) -> Result<(), String> {
+    if wait.left().is_zero() {
+        return Err(format!(
+            "cannot reach the server: {error}. The call was not sent; the server is \
+             restarting, so try it again shortly"
+        ));
+    }
+    let _waiting = wait.begin();
+    tokio::time::sleep(RECONNECT_PROBE.min(wait.left())).await;
+    Ok(())
+}
+
+/// After a connection was lost with a request on it: a read is sent once
+/// more (reading twice changes nothing); anything else is not.
+fn after_lost_connection(method: &str, repeated: &mut bool) -> Option<()> {
+    if method.eq_ignore_ascii_case("GET") && !*repeated {
+        *repeated = true;
+        return Some(());
+    }
+    None
+}
+
+/// The error for a call whose connection the server closed after it may have
+/// received it: the server restarted (or stopped) mid-call, so the change may
+/// or may not have been made, and repeating it blindly could make it twice.
+pub(crate) fn interrupted_call(method: &str, path: &str, error: &str) -> String {
+    let check = match path.split('?').next().unwrap_or(path) {
+        "/v1/send" => {
+            "read your recent messages with `conversation` (or send again with the same \
+             `idempotency_key`, which never delivers twice)"
+        }
+        p if p.ends_with("/schedules") => "`schedules` with `action: \"list\"`",
+        "/v1/agents" => "`agents` list (a spawn shows up there once it applied)",
+        p if p.starts_with("/v1/agents/") => "`agents` inspect on that agent",
+        p if p.starts_with("/v1/groups") => "`groups` list",
+        _ => "a read of what it changes",
+    };
+    format!(
+        "the server restarted during this call ({method} {path}: {error}); it may or may not \
+         have applied. Check with {check} before trying it again"
+    )
+}
+
+/// [`connect_waiting`] for a test, waiting up to `within` while nothing
+/// listens on `socket`.
 #[cfg(test)]
 async fn connect_within(
     socket: &Path,
@@ -8895,8 +9070,10 @@ async fn connect_within(
     connect_waiting(socket, &SocketWait::new(within)).await
 }
 
-/// [`connect`], waiting within what is left of `wait` while nothing listens
-/// on `socket`.
+/// A new HTTP/1 connection to the server's socket, waiting within what is
+/// left of `wait` while nothing listens on it (an error at once with no wait
+/// left). Its driver runs as a task until the server closes it or the last
+/// sender is dropped.
 async fn connect_waiting(
     socket: &Path,
     wait: &SocketWait,
@@ -8908,19 +9085,32 @@ async fn connect_waiting(
         }
         match tokio::net::UnixStream::connect(socket).await {
             Ok(stream) => break stream,
-            Err(err)
-                if matches!(
-                    err.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-                ) && !wait.left().is_zero() =>
-            {
-                waiting.get_or_insert_with(|| wait.begin());
+            Err(err) if server_restarting(&err) && !wait.left().is_zero() => {
+                waiting.get_or_insert_with(|| {
+                    eprintln!(
+                        "anyagents: the server is not listening ({err}); nothing was sent, \
+                         waiting up to {}s for it to come back",
+                        wait.left().as_secs()
+                    );
+                    (wait.begin(), tokio::time::Instant::now())
+                });
                 tokio::time::sleep(RECONNECT_PROBE.min(wait.left())).await;
+            }
+            Err(err) if server_restarting(&err) => {
+                return Err(format!(
+                    "cannot reach the server: {err}. The call was not sent; the server is \
+                     restarting or down, so try it again shortly"
+                ));
             }
             Err(err) => return Err(format!("cannot reach the server: {err}")),
         }
     };
-    drop(waiting);
+    if let Some((_, since)) = waiting.take() {
+        eprintln!(
+            "anyagents: the server is back after {:.1}s",
+            since.elapsed().as_secs_f64()
+        );
+    }
     let (sender, connection) = http1::handshake(TokioIo::new(stream))
         .await
         .map_err(|err| err.to_string())?;
@@ -9144,6 +9334,184 @@ mod reconnect_tests {
             .expect_err("a missing server was reached");
         assert!(error.starts_with("cannot reach the server"), "{error}");
         assert!(started.elapsed() >= std::time::Duration::from_millis(600));
+    }
+
+    /// A missing, refusing or full socket means nothing was sent, so the
+    /// connection is tried again; a lost connection repeats only a read, once.
+    #[test]
+    fn what_a_restart_lets_a_call_try_again() {
+        use std::io::{Error, ErrorKind};
+        for kind in [
+            ErrorKind::NotFound,
+            ErrorKind::ConnectionRefused,
+            ErrorKind::WouldBlock,
+        ] {
+            assert!(super::server_restarting(&Error::from(kind)), "{kind:?}");
+        }
+        for kind in [ErrorKind::PermissionDenied, ErrorKind::InvalidInput] {
+            assert!(!super::server_restarting(&Error::from(kind)), "{kind:?}");
+        }
+        let mut repeated = false;
+        assert!(super::after_lost_connection("GET", &mut repeated).is_some());
+        assert!(super::after_lost_connection("GET", &mut repeated).is_none());
+        for method in ["POST", "PUT", "DELETE"] {
+            let mut repeated = false;
+            assert!(super::after_lost_connection(method, &mut repeated).is_none());
+        }
+        for (path, check) in [
+            ("/v1/send", "idempotency_key"),
+            ("/v1/schedules", "schedules"),
+            ("/v1/agents/worker/schedules", "schedules"),
+            ("/v1/agents", "agents` list"),
+            ("/v1/agents/worker/archive", "agents` inspect"),
+        ] {
+            let error = super::interrupted_call("POST", path, "connection closed");
+            assert!(error.contains("may or may not have applied"), "{error}");
+            assert!(error.contains(check), "{path}: {error}");
+        }
+    }
+
+    /// The wait ends before the harness would give up on the call.
+    #[test]
+    fn a_call_waits_only_while_its_harness_still_waits() {
+        use std::time::Duration;
+        assert_eq!(
+            super::harness_patience(Some("codex")),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(
+            super::harness_patience(Some("agy")),
+            Some(Duration::from_secs(180))
+        );
+        assert_eq!(super::harness_patience(Some("spiron")), None);
+        assert_eq!(super::harness_patience(Some("claude-code")), None);
+        assert_eq!(
+            super::harness_patience(Some("something-new")),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(super::harness_patience(None), Some(Duration::from_secs(60)));
+        let soon = tokio::time::Instant::now() + Duration::from_millis(200);
+        let wait = super::SocketWait::new(Duration::from_secs(120)).until(Some(soon));
+        assert!(wait.left() <= Duration::from_millis(200));
+        let open = super::SocketWait::new(Duration::from_secs(120));
+        assert!(open.left() > Duration::from_secs(119));
+    }
+
+    /// Read one HTTP request's head from `stream`.
+    async fn read_head(stream: &mut tokio::net::UnixStream) -> String {
+        use tokio::io::AsyncReadExt;
+        let mut seen = Vec::new();
+        let mut buf = [0u8; 1024];
+        while !String::from_utf8_lossy(&seen).contains("\r\n\r\n") {
+            let read = stream.read(&mut buf).await.unwrap();
+            if read == 0 {
+                break;
+            }
+            seen.extend_from_slice(&buf[..read]);
+        }
+        String::from_utf8_lossy(&seen).into_owned()
+    }
+
+    /// A command waits while the socket is missing (between one server and
+    /// the next) and is answered by the server that comes up.
+    #[tokio::test]
+    async fn a_command_waits_while_the_socket_is_missing() {
+        use tokio::io::AsyncWriteExt;
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("anyagents.sock");
+        let path = socket.clone();
+        let call = tokio::spawn(async move {
+            super::request_waiting(
+                &path,
+                "POST",
+                "/v1/send",
+                Some(b"{}".to_vec()),
+                Some("cap"),
+                None,
+                std::time::Duration::from_secs(10),
+            )
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        assert!(
+            !call.is_finished(),
+            "the command gave up while the socket was missing"
+        );
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let head = read_head(&mut stream).await;
+        assert!(
+            head.starts_with("POST ") && head.contains("/v1/send"),
+            "{head}"
+        );
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+            .await
+            .unwrap();
+        let (status, body) = call.await.unwrap().unwrap();
+        assert_eq!(status, hyper::StatusCode::OK);
+        assert_eq!(body, b"ok");
+    }
+
+    /// A change whose connection is lost after it was sent is not sent again:
+    /// the caller is told it may or may not have applied. A read is sent once
+    /// more and answered.
+    #[tokio::test]
+    async fn a_lost_connection_repeats_only_a_read() {
+        use tokio::io::AsyncWriteExt;
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("anyagents.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let mut heads = Vec::new();
+            // The first request of each call: read it, then drop the
+            // connection unanswered, as a server stopping mid-call does.
+            for answer in [false, false, true] {
+                let accepted =
+                    tokio::time::timeout(std::time::Duration::from_secs(3), listener.accept())
+                        .await;
+                let Ok(Ok((mut stream, _))) = accepted else {
+                    break;
+                };
+                heads.push(read_head(&mut stream).await);
+                if answer {
+                    stream
+                        .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+                        .await
+                        .unwrap();
+                }
+            }
+            heads
+        });
+        let error = super::request_waiting(
+            &socket,
+            "POST",
+            "/v1/schedules",
+            Some(b"{}".to_vec()),
+            Some("cap"),
+            None,
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect_err("a change was answered by a dropped connection");
+        assert!(error.contains("may or may not have applied"), "{error}");
+        let (status, body) = super::request_waiting(
+            &socket,
+            "GET",
+            "/v1/schedules",
+            None,
+            Some("cap"),
+            None,
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, hyper::StatusCode::OK);
+        assert_eq!(body, b"ok");
+        let heads = server.await.unwrap();
+        let posts = heads.iter().filter(|h| h.starts_with("POST ")).count();
+        let gets = heads.iter().filter(|h| h.starts_with("GET ")).count();
+        assert_eq!((posts, gets), (1, 2), "{heads:?}");
     }
 }
 

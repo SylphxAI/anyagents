@@ -98,13 +98,21 @@ fn run_with_identity(
     host: HarnessHost,
 ) -> Result<(), Error> {
     let runtime = tokio::runtime::Runtime::new()?;
-    runtime.block_on(async {
+    let result = runtime.block_on(async {
         tokio::select! {
             result = serve(data, runner, identity, host) => result,
             _ = &mut stop => Ok(()),
         }
-    })
+    });
+    // Dropping a runtime waits for every blocking task without end: a call
+    // dropped at the end of the drain may still be in one (a store write
+    // waiting for the writer). Those are abandoned with the process.
+    runtime.shutdown_timeout(RUNTIME_STOP_WITHIN);
+    result
 }
+
+/// What a stopped server's runtime waits for its blocking tasks.
+const RUNTIME_STOP_WITHIN: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// The supervisor of a serving kernel. However the kernel stops (a signal, an
 /// error, a test dropping it), its harness processes are left to the next
@@ -494,29 +502,132 @@ async fn serve(
     }
     let app = build_router(state);
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    let result = axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
-                _ = terminate.recv() => {}
-            }
+    let stopping = Arc::new(tokio::sync::Notify::new());
+    let serving = axum::serve(listener, app)
+        .with_graceful_shutdown({
+            let stopping = Arc::clone(&stopping);
+            async move { stopping.notified().await }
         })
-        .await;
-    // A long poll ends at Telegram, not here: signal the poller to stop first
-    // so released long polls exit instead of re-entering a 30s wait, then
-    // release every bot so each bot's last offset is written before shutdown.
-    poller.signal_stop();
-    if let Err(reason) = crate::telegram::poller::release_every_bot(
-        &store,
-        store.data_dir(),
-        std::time::Duration::from_secs(30),
-    ) {
+        .into_future();
+    tokio::pin!(serving);
+    let mut releasing = None;
+    let result = tokio::select! {
+        result = &mut serving => result,
+        () = stop_requested(&mut terminate) => {
+            // From here no new connection is taken: a call made now waits on
+            // the agent's side for the next server (`mcp::RESTART_WAIT`), so
+            // this one must exit soon rather than drain without end.
+            eprintln!(
+                "anyagents: stopping; in-flight calls get {}s to finish{}",
+                DRAIN_GRACE.as_secs(),
+                if kept {
+                    format!(", and this process exits within {}s", STOP_WITHIN.as_secs())
+                } else {
+                    String::new()
+                }
+            );
+            if kept {
+                // A keeper still starting is the next server's to take over:
+                // a call waiting for its `ready` (up to three minutes) returns
+                // now instead of holding the stop.
+                anyagents_keeper::abandon_starts();
+                exit_after(STOP_WITHIN);
+            }
+            // A long poll ends at Telegram, not here: signal the poller to
+            // stop so released long polls exit instead of re-entering a 30s
+            // wait, and release every bot while the calls drain, so each
+            // bot's last offset is written before shutdown.
+            poller.signal_stop();
+            let release_store = Arc::clone(&store);
+            releasing = Some(tokio::task::spawn_blocking(move || {
+                crate::telegram::poller::release_every_bot(
+                    &release_store,
+                    release_store.data_dir(),
+                    TELEGRAM_RELEASE_WITHIN,
+                )
+            }));
+            stopping.notify_one();
+            match tokio::time::timeout(DRAIN_GRACE, &mut serving).await {
+                Ok(result) => result,
+                Err(_) => {
+                    eprintln!(
+                        "anyagents: calls still running after {}s are dropped; each caller is \
+                         told the call may or may not have applied",
+                        DRAIN_GRACE.as_secs()
+                    );
+                    Ok(())
+                }
+            }
+        }
+    };
+    let released = match releasing {
+        Some(task) => task.await.unwrap_or_else(|error| Err(error.to_string())),
+        None => {
+            poller.signal_stop();
+            crate::telegram::poller::release_every_bot(
+                &store,
+                store.data_dir(),
+                TELEGRAM_RELEASE_WITHIN,
+            )
+        }
+    };
+    if let Err(reason) = released {
         eprintln!("anyagents-telegram: shutdown did not release every bot: {reason}");
     }
     poller.stop();
     drop(supervisor);
     let _ = std::fs::remove_file(&path);
     result.map_err(Error::from)
+}
+
+/// How long calls already running get to finish once the server stops. No
+/// connection is taken meanwhile, and the agents' tool servers wait for the
+/// next server (`mcp::RESTART_WAIT`), so this bounds how long a restart
+/// refuses them. A call still running after it is dropped: its caller sees
+/// the connection close and is told the call may or may not have applied.
+///
+/// The 2026-11-14 17:47:56Z restart drained 190 s: the old server stopped
+/// accepting at once and exited at 17:51:06Z, while the new one served one
+/// second after it started. A call waiting for a keeper's `ready` (up to
+/// three minutes) or one adapter call (up to two) could hold it that long.
+const DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// The longest a server whose harnesses live in keepers takes to exit once
+/// told to stop. Past it the process exits at once: its harnesses stay with
+/// their keepers for the next server, exactly as after a crash, and its store
+/// writes are transactions, so a write cut short is not half made.
+pub(crate) const STOP_WITHIN: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// The wait for Telegram to hand back every bot's long poll at shutdown. It
+/// runs beside the drain. A bot not released in time is polled again by the
+/// next server from its last written offset; the store deduplicates updates
+/// by their source key.
+const TELEGRAM_RELEASE_WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// SIGINT or SIGTERM.
+async fn stop_requested(terminate: &mut tokio::signal::unix::Signal) {
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = terminate.recv() => {}
+    }
+}
+
+/// End the process after `within`, however its stop is going: a worker in a
+/// call to a keeper that does not answer, a store write waiting for the
+/// writer, or a poller join cannot keep it alive. Only for a server whose
+/// harnesses live in keepers, which outlive it by design.
+fn exit_after(within: std::time::Duration) {
+    let _ = std::thread::Builder::new()
+        .name("anyagents-stop-deadline".into())
+        .spawn(move || {
+            std::thread::sleep(within);
+            eprintln!(
+                "anyagents: stop still running after {}s; exiting now (harnesses stay with \
+                 their keepers for the next server)",
+                within.as_secs()
+            );
+            std::process::exit(0);
+        });
 }
 
 pub(crate) fn has_explicit_archive_marker(

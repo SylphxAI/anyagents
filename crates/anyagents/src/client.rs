@@ -62,10 +62,14 @@ pub(crate) fn get<T: serde::de::DeserializeOwned>(
     data: &Path,
     path: &str,
 ) -> Result<Option<T>, String> {
-    if !can_call_server(data) {
+    let authority = authority(data);
+    // An agent cannot read the store itself: while the server restarts (its
+    // socket gone for a moment) its read waits for the next one instead.
+    let waits = matches!(authority, Authority::Agent(_));
+    if !waits && !can_call_server(data) {
         return Ok(None);
     }
-    match call_inner(data, "GET", path, None, &authority(data)) {
+    match call_inner(data, "GET", path, None, &authority) {
         Err(err) if may_read_offline(&err, agent_identity().is_some()) => Ok(None),
         result => result.map_err(CallError::message),
     }
@@ -86,6 +90,18 @@ impl CallError {
 
 fn may_read_offline(error: &CallError, is_agent: bool) -> bool {
     !is_agent && matches!(error, CallError::Transport(_))
+}
+
+/// How long one command waits for a server that is restarting (its socket
+/// missing or refusing, so nothing was sent). An operator's read does not
+/// wait: it is answered from the store at once. Everything else (an agent's
+/// command, any change) waits the restart out.
+fn restart_wait(method: &str, authority: &Authority) -> std::time::Duration {
+    if method.eq_ignore_ascii_case("GET") && matches!(authority, Authority::Operator) {
+        std::time::Duration::ZERO
+    } else {
+        crate::mcp::RECONNECT_WITHIN
+    }
 }
 
 fn capability(data: &Path, id: &AgentId) -> Option<String> {
@@ -132,16 +148,18 @@ fn call_inner<T: serde::de::DeserializeOwned>(
         .enable_all()
         .build()
         .map_err(|err| CallError::Response(err.to_string()))?;
+    let within = restart_wait(method, authority);
     let (status, bytes) = runtime.block_on(async {
         tokio::time::timeout(
             TIMEOUT,
-            crate::mcp::request(
+            crate::mcp::request_waiting(
                 &socket,
                 method,
                 path,
                 body,
                 agent_token.as_deref(),
                 operator_token.as_deref(),
+                within,
             ),
         )
         .await
