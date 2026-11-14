@@ -26,7 +26,7 @@ Status: proposed. Date: 2026-11-14. Implements [0010](0010-execution-identity-an
 
 The frames are the same on every transport. Only framing, authentication and who speaks first differ.
 
-- **stdio.** The process ends at end of input after draining accepted work, as in v1.
+- **stdio.** The process ends at end of input after draining accepted work, as in v1. No other client can follow, so end of input answers every pending host tool call with an error (`host_gone`).
 - **Unix socket.** Spiron binds `<path>`, mode `0660`, and does not read stdin. It replaces only a socket no process serves; any other file at the path, or a socket another process serves, fails the start. Access control is the socket's directory and mode: the host picks a directory that only it and the agent's uid can enter (on the desk, the agent's config directory, `kyle:<seat group>`, `2770`). The process outlives every connection. It serves one attached client at a time: a new `attach` takes the session over, and the server closes the connection it replaces, as `tmux attach -d` does. While no client is attached, the turn goes on, every frame is journaled (D3), and a `host_tool_call` (D7) waits. The process ends on `stop` (D5) or a signal.
 - **wss** (specified here, built later for Spiron cloud). The client opens the session's `attach_url` with `Authorization: Bearer <token>` and the WebSocket subprotocol `spiron.headless.v2`. The token is the short-lived, per-session, revocable token of 0010 D2; an expired or revoked token closes the socket with code `4401`. A second connection supersedes the first, which is closed with `4409`. Ping and pong are WebSocket control frames; the protocol adds no heartbeat. `create` is Spiron cloud's HTTPS call, not a frame: `POST /v1/headless-sessions` with `{model, instructions, host_tools, workdir}` (the same inputs as the CLI's flags) answers `{session_id, attach_url, token, expires_at}`. A token is renewed with `POST /v1/headless-sessions/{session_id}:token`.
 
@@ -37,7 +37,7 @@ The frames are the same on every transport. Only framing, authentication and who
 ### D2. Version negotiation: v1 and v2 side by side
 
 - On stdio the first frame is a v1 `ready` that adds `protocols: ["spiron.headless/v1", "spiron.headless/v2"]`. A v1 client ignores the field and speaks v1, unchanged.
-- A v2 client answers the greeting with `attach {protocol: "spiron.headless/v2", after_seq}`. From then on that connection is v2: the server answers with the replay and a v2 `ready` (D4), and every later frame is v2.
+- A v2 client answers the greeting with `attach {protocol: "spiron.headless/v2", after_seq}`. From then on that connection is v2: the server answers with the replay and a v2 `ready` (D4), and every later frame is v2. While a v1 turn is open or v1 prompts wait, the switch is refused `turn_open`, so v1 identities never reach v2 frames.
 - On a socket or wss the first frame must be `attach`. Anything else is answered `rejected {code: "not_attached"}` and the connection is closed. An `attach` naming a protocol the server does not speak is answered `rejected {code: "unsupported_protocol"}` and closed.
 - A v1-only Spiron does not know `--listen` and exits with a usage error (status 2) before it starts a session. A host that launches with `--listen` and sees that falls back to v1 over stdio.
 - A new optional feature is a field added with a default; a client ignores fields it does not know. Changing what a frame means, or what a client must send, is a new version.
@@ -52,7 +52,7 @@ The frames are the same on every transport. Only framing, authentication and who
 - A frame is written to Spiron's session database before it is sent. A frame a client was sent is therefore always in the journal; a client that sees seq `n` saw every frame before `n` (in its replay or live).
 - Every v2 frame is journaled, `ready` included. The stdio v1 greeting and frames written before a session exists (startup `error`) are not, and carry no `seq`.
 - Frames on a v1 connection carry no `seq` and are not journaled, so a replay carries v2 frames only.
-- **Retention.** A process keeps every frame it journaled. When a new process opens the session (after it owns its socket, so a process that cannot start changes nothing), it discards the frames of earlier processes except the newest one, so numbering never restarts. A session's journal therefore holds about one process's lifetime of frames.
+- **Retention.** A process keeps every frame it journaled. When a new process opens the session (after it owns its socket, so a process that cannot start changes nothing), it discards the frames of earlier processes except the newest one, so numbering never restarts. It does so only while it holds the session's headless lock, which a live process holds for its whole life: a second process on a session another one still serves discards nothing. A cursor past every seq replays nothing. A session's journal therefore holds about one process's lifetime of frames.
 - The frame journal is not the session journal. The session journal is what the model saw and keeps it in full; the frame journal is what the host was told.
 
 **Rationale.** A host that reattaches needs the exact frames it missed, in order, once each. A number assigned by the writer, before the frame leaves, gives that without a second source of truth. Keeping one process's frames is enough for a client to reattach to a running process (the case D6 exists for); a process that died is replaced, and the mailbox redelivers past its cursor, deduplicated by request id (D6).
@@ -104,7 +104,7 @@ Every input is one frame. There are no aliases.
 - **Idempotency.** `prompt` and `steer` are journaled under `input:<request_id>`. A repeated input is never journaled or shown to the model again: a repeated `prompt` with no turn open answers `accepted {mode: "duplicate"}` and `result {duplicate: true}` without model work; repeated into a turn, it is consumed as `steer_consumed {duplicate: true}`.
 - **Consumption proof.** Only `accepted` and `steer_consumed` prove an input is in the session journal. `steer_ack` is admission. A turn that ends before journaling its opening input did not start: that input and every steer admitted to it are `rejected {code: "turn_not_started"}`. `result.undelivered_steer_ids` lists steers acknowledged and never consumed; the host delivers them again.
 
-Rejection codes: `empty_prompt`, `missing_request_id`, `no_active_turn`, `turn_closed`, `turn_not_started`, `wrong_session`, `unknown_command`, `unknown_call`, `not_attached`, `unsupported_protocol`, `already_attached`, `stopping`.
+Rejection codes: `empty_prompt`, `missing_request_id`, `no_active_turn`, `turn_closed`, `turn_not_started`, `wrong_session`, `unknown_command`, `unknown_call`, `not_attached`, `unsupported_protocol`, `already_attached`, `turn_open`, `stopping`.
 
 ### D6. Outputs
 
