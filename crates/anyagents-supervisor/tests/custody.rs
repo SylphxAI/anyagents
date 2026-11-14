@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use anyagents_core::{AgentId, AgentLock, Incoming, NewAgent, Store};
 use anyagents_harness::{
     DeliverOutcome, DeliveryMode, FakeHarness, Harness, HarnessError, HarnessHealth,
-    OutboundMessage, TurnUsage,
+    OutboundMessage, Proof, TurnUsage,
 };
 use anyagents_supervisor::{Attached, Clock, Custody, LaunchRequest, ManualClock, Supervisor};
 
@@ -63,6 +63,10 @@ impl Drop for Handle {
 impl Harness for Handle {
     fn deliver(&mut self, message: &OutboundMessage) -> Result<DeliverOutcome, HarnessError> {
         self.kept().fake.lock().unwrap().deliver(message)
+    }
+
+    fn proven(&self, message_id: &str) -> Option<Proof> {
+        self.kept().fake.lock().unwrap().proven(message_id)
     }
 
     fn background(&mut self) -> Result<(), HarnessError> {

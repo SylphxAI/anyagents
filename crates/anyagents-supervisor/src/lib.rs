@@ -3480,8 +3480,12 @@ mod custody_tests {
             HarnessHealth {
                 process_alive: true,
                 turn_state: TurnState::Idle,
-                delivery_mode: DeliveryMode::Steer,
-                steer_support: SteerSupport::Yes,
+                delivery: anyagents_harness::Delivery {
+                    level: anyagents_harness::DeliveryLevel::TurnEnd,
+                    idempotent: false,
+                    proof: "a probe proves nothing".into(),
+                    peer: None,
+                },
                 quota_reset_at_ms: None,
                 sign_in_fault: None,
             }

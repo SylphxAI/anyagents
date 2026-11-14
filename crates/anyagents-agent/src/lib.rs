@@ -101,12 +101,19 @@ impl<H: Harness> DeliveryLoop<H> {
         agent_id: AgentId,
         harness: H,
     ) -> Self {
+        // A sender notice a crash cut off is sent now.
+        if let Err(err) = store.send_pending_rejection_notices(&agent_id) {
+            eprintln!("anyagents: notices for parked messages: {err}");
+        }
         Self {
             store,
             agent_id,
             harness,
             _lock: lock,
             quota_reset_at_ms: None,
+            recovery: None,
+            rejections: Vec::new(),
+            last_rejection: None,
         }
     }
 

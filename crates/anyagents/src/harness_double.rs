@@ -186,9 +186,9 @@ mod tool_server {
         // reference in the server's trusted context when its config says so, as
         // a real model does, else by the target its config names.
         // A recovery note names the messages of the turn it resumes; the
-        // model answers the last of them by id, as it would have. (The note's
-        // own id and reply hint name the note, which is no message in the
-        // mailbox.)
+        // model answers the last of them by id, as it would have. This double
+        // is handed the note's own id and text only (no trusted context), and
+        // the note's id is no message in the mailbox.
         let recovered = user.lines().rev().find_map(|line| {
             let rest = line.trim_start().strip_prefix("- anyagents-message:")?;
             rest.split(' ').next().filter(|id| !id.is_empty())

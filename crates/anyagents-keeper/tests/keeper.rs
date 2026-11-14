@@ -9,7 +9,10 @@ use std::os::fd::{AsFd as _, AsRawFd as _};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use anyagents_harness::{DeliverOutcome, Harness, OutboundMessage};
+use anyagents_harness::{
+    DeliverOutcome, Delivery, DeliveryLevel, Harness, HarnessHealth, OutboundMessage, Proof,
+    TurnState,
+};
 use anyagents_keeper::{Hosted as _, Program, RemoteHarness, Spec, attach, testing};
 use serde_json::json;
 
@@ -223,7 +226,7 @@ fn a_detached_keeper_keeps_the_note_and_the_process_lock_for_the_next_kernel() {
     assert_eq!(next.hello().model.as_deref(), Some("m-1"));
     assert_eq!(next.process_id(), Some(pid));
     let adopted = next.take_lock().expect("the keeper hands its lock over");
-    next.stop().unwrap();
+    next.end().unwrap();
     assert!(!probe(), "the adopted copy no longer holds the lock");
     drop(adopted);
     eventually("the lock is free once every copy closed", probe);
@@ -288,14 +291,14 @@ fn a_harness_that_dies_is_reported_and_its_keeper_stops_on_drop() {
 fn a_keeper_speaking_no_shared_protocol_is_refused_at_start_and_stopped_on_attach() {
     let fx = Fixture::new();
     let refused =
-        anyagents_keeper::spawn(&program(&["--protocol", "2-3"]), &fx.root, &fx.spec(), None);
+        anyagents_keeper::spawn(&program(&["--protocol", "3-4"]), &fx.root, &fx.spec(), None);
     let error = refused.err().expect("an unspoken protocol was accepted");
-    assert!(error.contains("protocol 2..=3"), "{error}");
+    assert!(error.contains("protocol 3..=4"), "{error}");
     assert!(anyagents_keeper::instances(&fx.root).is_empty());
 
     // One a previous kernel started, from a binary this kernel cannot speak to.
     let (dir, mut keeper) =
-        testing::start_unattached(&program(&["--protocol", "2-3"]), &fx.root, &fx.spec());
+        testing::start_unattached(&program(&["--protocol", "1-1"]), &fx.root, &fx.spec());
     assert!(dir.exists());
     assert!(attach(&fx.root, "agt_test").unwrap().is_none());
     keeper.wait().unwrap();
@@ -380,7 +383,7 @@ fn a_second_kernel_supersedes_the_first_without_ending_the_harness() {
     // The superseded handle lets go without stopping anything.
     drop(first);
     assert!(group_alive(pid));
-    second.stop().unwrap();
+    second.end().unwrap();
     assert!(!group_alive(pid));
 }
 
@@ -652,8 +655,67 @@ fn keepers_refuse_a_directory_that_is_not_private() {
     assert!(refused.contains("open to other users"), "{refused}");
 }
 
+/// A v2 hello from a fake keeper whose record says it has `keeper` for its
+/// process, with `health` as its health.
+#[cfg(target_os = "linux")]
+fn fake_hello(keeper: &serde_json::Value, health: serde_json::Value) -> serde_json::Value {
+    json!({"id": 1, "ok": {
+        "protocol": anyagents_keeper::PROTOCOL, "binary": "fake", "keeper_pid": 1,
+        "keeper": keeper, "harness_pid": null, "agent": "agt_test", "harness": "line",
+        "model": null, "seat": null, "started_at_ms": 1, "labels": {}, "note": null,
+        "lock": false, "health": health,
+    }})
+}
+
+#[cfg(target_os = "linux")]
+fn idle_health() -> serde_json::Value {
+    serde_json::to_value(HarnessHealth {
+        process_alive: true,
+        turn_state: TurnState::Idle,
+        delivery: Delivery {
+            level: DeliveryLevel::NextStep,
+            idempotent: true,
+            proof: "took <id>".into(),
+            peer: None,
+        },
+        quota_reset_at_ms: None,
+        sign_in_fault: None,
+    })
+    .unwrap()
+}
+
+/// Serve one owner connection of a fake keeper: answer its hello with
+/// `hello`, then carry out its `stop` as a keeper does (the directory goes,
+/// then the answer, then the connection). Every other request is ignored.
+#[cfg(target_os = "linux")]
+fn serve_stop(
+    stream: std::os::unix::net::UnixStream,
+    hello: &serde_json::Value,
+    dir: &std::path::Path,
+) {
+    use std::io::BufRead as _;
+    let mut lines = std::io::BufReader::new(stream.try_clone().unwrap()).lines();
+    let _hello = lines.next();
+    (&stream)
+        .write_all(format!("{hello}\n").as_bytes())
+        .unwrap();
+    for line in lines {
+        let request: serde_json::Value = serde_json::from_str(&line.unwrap()).unwrap();
+        if request["op"] == "stop" {
+            std::fs::remove_dir_all(dir).unwrap();
+            let answer = json!({"id": request["id"], "ok": {"stopped": true}});
+            (&stream)
+                .write_all(format!("{answer}\n").as_bytes())
+                .unwrap();
+            return;
+        }
+    }
+}
+
 /// An answer the kernel cannot read is an error to its caller, never a wait
-/// without end.
+/// without end. The keeper is driven no further: its harness reads as dead,
+/// so the supervisor replaces it, and `stop` reaches it over a fresh
+/// connection.
 #[cfg(target_os = "linux")]
 #[test]
 fn an_unreadable_answer_fails_the_call_that_waits_for_it() {
@@ -661,18 +723,12 @@ fn an_unreadable_answer_fails_the_call_that_waits_for_it() {
     let fx = Fixture::new();
     let dir = left_behind(&fx.root, json!({}));
     let listener = std::os::unix::net::UnixListener::bind(dir.join("s")).unwrap();
-    let keeper = ended_identity();
+    let hello = fake_hello(&ended_identity(), idle_health());
+    let served = dir.clone();
     let fake = std::thread::spawn(move || {
         let (stream, _) = listener.accept().unwrap();
         let mut lines = std::io::BufReader::new(stream.try_clone().unwrap()).lines();
         let _hello = lines.next();
-        let hello = json!({"id": 1, "ok": {
-            "protocol": 1, "binary": "fake", "keeper_pid": 1, "keeper": keeper,
-            "harness_pid": null, "agent": "agt_test", "harness": "line", "model": null,
-            "seat": null, "started_at_ms": 1, "labels": {}, "note": null, "lock": false,
-            "health": {"process_alive": true, "turn_state": "idle", "delivery_mode": "steer",
-                "steer_support": "yes", "quota_reset_at_ms": null, "sign_in_fault": null},
-        }});
         (&stream)
             .write_all(format!("{hello}\n").as_bytes())
             .unwrap();
@@ -680,14 +736,101 @@ fn an_unreadable_answer_fails_the_call_that_waits_for_it() {
         (&stream)
             .write_all(b"{\"id\":2,\"ok\":{\"accepted\n")
             .unwrap();
-        // Hold the connection open: only the unreadable answer ends the wait.
-        let _ = lines.next();
+        let (fresh, _) = listener.accept().unwrap();
+        serve_stop(fresh, &hello, &served);
+        drop(lines);
     });
     let mut kernel = attach(&fx.root, "agt_test").unwrap().unwrap();
     let started = Instant::now();
     let refused = kernel.deliver(&message("m1")).unwrap_err();
     assert!(format!("{refused:?}").contains("unreadable"), "{refused:?}");
     assert!(started.elapsed() < Duration::from_secs(10));
+    assert!(!kernel.health().process_alive);
     drop(kernel);
     fake.join().unwrap();
+    assert!(!dir.exists(), "the keeper was not stopped");
+}
+
+/// A keeper whose hello this kernel cannot read (a newer health shape under
+/// a version both claim) is stopped through the hello that took it over and
+/// replaced: never an error retried while it holds the agent lock.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_keeper_whose_hello_cannot_be_read_is_stopped_not_retried() {
+    let fx = Fixture::new();
+    let dir = left_behind(&fx.root, json!({}));
+    let listener = std::os::unix::net::UnixListener::bind(dir.join("s")).unwrap();
+    let mut newer = idle_health();
+    newer["delivery"] = json!("a shape from a later release");
+    let hello = fake_hello(&ended_identity(), newer);
+    let served = dir.clone();
+    let fake = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        serve_stop(stream, &hello, &served);
+    });
+    let started = Instant::now();
+    assert!(attach(&fx.root, "agt_test").unwrap().is_none());
+    assert!(started.elapsed() < Duration::from_secs(10));
+    fake.join().unwrap();
+    assert!(!dir.exists(), "the keeper was not stopped");
+}
+
+/// What the conformance contract adds crosses the keeper: a rejection for
+/// good, proofs, the delivery a harness reports, and `stop` of the vendor
+/// process with its proofs still answered after. `proven` only reads: a
+/// kernel that dies before reading its answer loses nothing, and the next
+/// kernel is answered the same.
+#[test]
+fn a_kept_adapter_forwards_rejections_proofs_and_stop() {
+    let fx = Fixture::new();
+    let mut kernel = fx.spawn();
+    let health = kernel.health();
+    assert_eq!(health.delivery.level, DeliveryLevel::NextStep);
+    assert_eq!(health.delivery.proof, "took <id>");
+    assert_eq!(
+        kernel.deliver(&message("refuse")).unwrap(),
+        DeliverOutcome::rejected("refused for good", true)
+    );
+    assert_eq!(
+        kernel.deliver(&message("m1")).unwrap(),
+        DeliverOutcome::InFlight
+    );
+    eventually("m1 is proven", || {
+        kernel.proven("m1")
+            == Some(Proof::Taken {
+                turn_finished: true,
+            })
+    });
+    assert_eq!(kernel.proven("m2"), None);
+
+    let dir = kernel.dir().to_path_buf();
+    kernel.crash();
+    let raw = testing::raw_owner(&dir);
+    let request = json!({"id": 9, "op": "proven", "args": {"id": "m1"}});
+    (&raw).write_all(format!("{request}\n").as_bytes()).unwrap();
+    drop(raw);
+    let mut next = attach(&fx.root, "agt_test").unwrap().unwrap();
+    assert_eq!(
+        next.proven("m1"),
+        Some(Proof::Taken {
+            turn_finished: true,
+        })
+    );
+
+    let pid = next.process_id().unwrap();
+    Harness::stop(&mut next);
+    assert!(!group_alive(pid), "stop left the vendor process");
+    eventually("the harness reads as ended", || {
+        !next.health().process_alive
+    });
+    assert!(dir.exists(), "stop ended the keeper, not only its harness");
+    assert_eq!(
+        next.proven("m1"),
+        Some(Proof::Taken {
+            turn_finished: true,
+        }),
+        "a proof was lost with the process that gave it"
+    );
+    next.end().unwrap();
+    assert!(!dir.exists());
 }

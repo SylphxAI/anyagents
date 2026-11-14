@@ -9,7 +9,9 @@
 //!
 //! Two faults on purpose: a launch with `"hang_start": true` never finishes
 //! starting, and the message id `wedge` is never answered (its call holds the
-//! adapter for good), as a blocking write into a stuck vendor would.
+//! adapter for good), as a blocking write into a stuck vendor would. The
+//! message id `refuse` is refused for good, as a vendor refuses a malformed
+//! request.
 
 use std::collections::HashSet;
 use std::io::{BufRead as _, BufReader, Write as _};
@@ -17,8 +19,8 @@ use std::process::{Child, ChildStdin, Stdio};
 use std::sync::{Arc, Mutex};
 
 use anyagents_harness::{
-    DeliverOutcome, DeliveryMode, Harness, HarnessError, HarnessHealth, OutboundMessage,
-    SteerSupport, TurnState,
+    DeliverOutcome, Delivery, DeliveryLevel, Harness, HarnessError, HarnessHealth, OutboundMessage,
+    Proof, TurnState,
 };
 use anyagents_keeper::{Hosted, KeeperOptions, Spec};
 
@@ -111,6 +113,9 @@ impl Harness for LineAdapter {
                 std::thread::sleep(std::time::Duration::from_secs(3600));
             }
         }
+        if message.id == "refuse" {
+            return Ok(DeliverOutcome::rejected("refused for good", true));
+        }
         let mut state = self.state.lock().unwrap();
         if state.taken.contains(&message.id) {
             return Ok(DeliverOutcome::Accepted {
@@ -128,6 +133,24 @@ impl Harness for LineAdapter {
         stdin.flush().map_err(|_| HarnessError::Dead)?;
         state.written.push(message.id.clone());
         Ok(DeliverOutcome::InFlight)
+    }
+
+    fn proven(&self, message_id: &str) -> Option<Proof> {
+        self.state
+            .lock()
+            .unwrap()
+            .taken
+            .contains(message_id)
+            .then_some(Proof::Taken {
+                turn_finished: true,
+            })
+    }
+
+    /// The harness ends; what it answered before stays proven.
+    fn stop(&mut self) {
+        self.stdin = None;
+        anyagents_harness::kill_child(&mut self.child, &[]);
+        let _ = self.child.wait();
     }
 
     fn background(&mut self) -> Result<(), HarnessError> {
@@ -152,8 +175,12 @@ impl Harness for LineAdapter {
             } else {
                 TurnState::Idle
             },
-            delivery_mode: DeliveryMode::Steer,
-            steer_support: SteerSupport::Yes,
+            delivery: Delivery {
+                level: DeliveryLevel::NextStep,
+                idempotent: true,
+                proof: "took <id>".into(),
+                peer: None,
+            },
             quota_reset_at_ms: None,
             sign_in_fault: None,
         }

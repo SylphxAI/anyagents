@@ -774,6 +774,13 @@ fn millis(value: u64) -> Duration {
 fn dispatch<A: Hosted>(adapter: &mut A, op: &str, args: &Value) -> Result<Value, Fault> {
     match op {
         "deliver" => harness(adapter.deliver(&arg(args, "message")?)),
+        "proven" => value(adapter.proven(&arg::<String>(args, "id")?)),
+        // `Harness::stop`: the vendor process ends and is read to the end;
+        // the adapter stays to answer `proven`. Not the keeper's own `stop`.
+        "stop_harness" => {
+            adapter.stop();
+            value(())
+        }
         "background" => harness(adapter.background()),
         "resume" => harness(adapter.resume(&arg::<String>(args, "session")?)),
         "cancel" => harness(adapter.cancel()),
@@ -796,24 +803,10 @@ fn dispatch<A: Hosted>(adapter: &mut A, op: &str, args: &Value) -> Result<Value,
             adapter.clear_quota();
             value(())
         }
-        "take_reclaimed_steers" => value(adapter.take_reclaimed_steers()),
-        "has_unconfirmed_hold" => value(adapter.has_unconfirmed_hold()),
-        "has_unconfirmed_idle_hold" => value(adapter.has_unconfirmed_idle_hold()),
-        "peek_unconfirmed_request_ids" => value(adapter.peek_unconfirmed_request_ids()),
-        "reconcile_unconfirmed_for_recovery" => {
-            harness(adapter.reconcile_unconfirmed_for_recovery())
-        }
-        "poll_steer" => harness(adapter.poll_steer()),
-        "inject" => harness(adapter.inject(&arg(args, "message")?)),
-        "release_steer" => {
-            adapter.release_steer(&arg::<String>(args, "keep")?);
-            value(())
-        }
         "exit_diagnostic" => value(adapter.exit_diagnostic()),
         "process_id" => value(adapter.process_id()),
         "session_id" => value(adapter.session_id()),
         "session_invalidated" => value(adapter.session_invalidated()),
-        "state_dir" => value(adapter.state_dir()),
         _ => Err(Fault::UnknownOp),
     }
 }

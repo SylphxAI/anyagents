@@ -43,12 +43,19 @@ pub use remote::{
 /// highest version both speak. Ops are added without a version change: a
 /// keeper that does not know an op answers `unknown_op`, and the kernel uses
 /// the adapter contract's default for it. A change to an existing op's meaning
-/// or to a carried type's shape is a new version, and a kernel keeps speaking
-/// the previous one for at least one release so running keepers stay
-/// reachable across an upgrade.
-pub const PROTOCOL: u32 = 1;
-/// The oldest protocol version this build still speaks.
-pub const PROTOCOL_MIN: u32 = 1;
+/// or to a carried type's shape is a new version, and a binary claims only the
+/// versions whose shapes it can still write: a kernel that cannot read a
+/// keeper's answers stops and replaces it rather than retrying.
+///
+/// - 1: the first keepers (never released).
+/// - 2: health carries the harness's delivery level (`delivery`) in place of
+///   its delivery mode and steer support; `deliver` may answer `rejected`;
+///   `proven` and `stop_harness` (the contract's `stop`) are added; the
+///   between-steps steering and unconfirmed-hold ops are gone.
+pub const PROTOCOL: u32 = 2;
+/// The oldest protocol version this build still speaks: version 1's health
+/// has no shape here.
+pub const PROTOCOL_MIN: u32 = 2;
 
 /// The environment variable that pins the protocol versions this binary
 /// speaks, as `<min>-<max>`, on both sides. It exists to run a kernel and its
@@ -99,11 +106,6 @@ pub trait Hosted: Harness {
     /// The vendor dropped the session it was resumed on.
     fn session_invalidated(&self) -> bool {
         false
-    }
-
-    /// Where the adapter keeps its custody files for this agent.
-    fn state_dir(&self) -> Option<PathBuf> {
-        None
     }
 }
 

@@ -674,7 +674,7 @@ fn keepers_across_protocol_versions_are_taken_over_or_replaced() {
 
     // A newer binary that also speaks this one's version: taken over.
     std::fs::write(&hold, b"").unwrap();
-    let server = Server::start_with(&data, anyagents, anyagents, &speaking("1-2"));
+    let server = Server::start_with(&data, anyagents, anyagents, &speaking("2-3"));
     let first = send(&data, name);
     support::wait_for(
         || shared_log(&data).contains(&format!("holding {first}")),
@@ -709,7 +709,7 @@ fn keepers_across_protocol_versions_are_taken_over_or_replaced() {
 
     // A binary that speaks only a later version: stopped and replaced. The
     // turn it held is interrupted once, and recovered by the replacement.
-    let server = Server::start_with(&data, anyagents, anyagents, &speaking("2-2"));
+    let server = Server::start_with(&data, anyagents, anyagents, &speaking("3-3"));
     let second = send(&data, name);
     wait_logged(
         &data,

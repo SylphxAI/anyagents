@@ -213,6 +213,7 @@ impl VendorHarness {
     }
 
     /// Whether this runs the external Spiron CLI.
+    #[cfg(test)]
     pub fn is_spiron(&self) -> bool {
         is_spiron_harness(&self.selector)
     }
@@ -420,8 +421,7 @@ impl AdapterLaunch {
                 work_dir,
                 cloud,
             } => {
-                let harness =
-                    start_claude(&program, &args, session.as_deref(), &env, &work_dir)?;
+                let harness = start_claude(&program, &args, session.as_deref(), &env, &work_dir)?;
                 LocalAdapter::Claude(Box::new(if cloud {
                     harness.with_delivery(anyagents_harness_claude::CLOUD_DELIVERY)
                 } else {
@@ -3575,6 +3575,47 @@ done
         assert_eq!(std::fs::read(&registry).unwrap(), b"not json");
         std::fs::write(&registry, saved).unwrap();
         assert_eq!(std::fs::read_to_string(&pointer).unwrap(), "vendor-1\n");
+    }
+
+    /// A cloud harness runs behind the Claude adapter at turn-end delivery
+    /// (`docs/delivery.md`). The launch the kernel hands its keeper says so,
+    /// and keeps saying so across the wire.
+    #[test]
+    fn a_cloud_harness_launch_keeps_turn_end_delivery_across_its_keeper() {
+        use anyagents_core::{NewAgent, Store};
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(NewAgent::new("cloudy", "claude-cloud"))
+            .unwrap();
+        let config = anyagents_core::agent_config_dir(dir.path(), &agent.id);
+        std::fs::create_dir_all(&config).unwrap();
+        let request = LaunchRequest {
+            agent,
+            data_dir: dir.path().to_owned(),
+            config_dir: config.clone(),
+            work_dir: dir.path().join("work"),
+            extra_env: vec![],
+            lock: None,
+        };
+        let planned = plan_adapter(&request, dir.path(), Vec::new()).unwrap();
+        let wire = serde_json::to_value(&planned.launch).unwrap();
+        assert!(
+            matches!(
+                serde_json::from_value(wire).unwrap(),
+                AdapterLaunch::Claude { cloud: true, .. }
+            ),
+            "{:?}",
+            planned.launch
+        );
+        assert_eq!(
+            declared_delivery("claude-cloud"),
+            anyagents_harness_claude::CLOUD_DELIVERY
+        );
+        assert_eq!(
+            anyagents_harness_claude::CLOUD_DELIVERY.level,
+            anyagents_harness::DeliveryLevel::TurnEnd
+        );
     }
 
     #[test]

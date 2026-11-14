@@ -645,7 +645,11 @@ for raw in sys.stdin:
                 session.as_deref(),
                 &[],
             )?;
-            let vh = VendorHarness::local(LocalAdapter::Spiron(Box::new(h)), Some(req.config_dir.join("spiron-session-id")), "spiron");
+            let vh = VendorHarness::local(
+                LocalAdapter::Spiron(Box::new(h)),
+                Some(req.config_dir.join("spiron-session-id")),
+                "spiron",
+            );
             vh.sync_session()?;
             Ok(vh)
         }),
@@ -729,7 +733,11 @@ impl FakeSpiron {
         )
         .unwrap();
         assert_eq!(harness.proves_consumption(), self.capable);
-        VendorHarness::local(LocalAdapter::Spiron(Box::new(harness)), Some(self.config.join("spiron-session-id")), "spiron")
+        VendorHarness::local(
+            LocalAdapter::Spiron(Box::new(harness)),
+            Some(self.config.join("spiron-session-id")),
+            "spiron",
+        )
     }
 
     fn delivery(&self, store: Store) -> anyagents_agent::DeliveryLoop<VendorHarness> {
@@ -1116,7 +1124,11 @@ fn spiron_supervisor_sends_the_recovery_note_first_after_the_lease_and_commits_a
                 session.as_deref(),
                 &[("FAKE_SPIRON_CAPABLE".to_string(), "1".to_string())],
             )?;
-            let vendor = VendorHarness::local(LocalAdapter::Spiron(Box::new(harness)), Some(req.config_dir.join("spiron-session-id")), "spiron");
+            let vendor = VendorHarness::local(
+                LocalAdapter::Spiron(Box::new(harness)),
+                Some(req.config_dir.join("spiron-session-id")),
+                "spiron",
+            );
             vendor.sync_session()?;
             Ok(vendor)
         }),

@@ -8,6 +8,11 @@
 //! socket), then a keeper process that is provably not running and an agent
 //! lock that nobody holds. Recorded pids are only signalled when their
 //! identity proves them the recorded processes ([`ProcessIdentity`]).
+//!
+//! A keeper whose answers this kernel cannot read (a newer or older shape
+//! than the protocol it agreed to) is not a keeper that failed to answer: it
+//! is stopped with the frozen `stop` and replaced, never retried while it
+//! holds the agent's lock.
 
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
@@ -21,8 +26,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyagents_harness::{
-    DeliverOutcome, Harness, HarnessError, HarnessHealth, OutboundMessage, ReconciledUnconfirmed,
-    SteerItem, TurnState, TurnUsage,
+    DeliverOutcome, Harness, HarnessError, HarnessHealth, OutboundMessage, Proof, TurnState,
+    TurnUsage,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -188,6 +193,7 @@ pub fn spawn(
                         keeper.0, keeper.1
                     )
                 }
+                ConnectError::Unreadable { why, .. } => why,
                 ConnectError::MaybeGone => "keeper exited after it was ready".into(),
                 ConnectError::Io(error) => error,
             })
@@ -380,9 +386,11 @@ pub fn attach(root: &Path, agent: &str) -> Result<Option<RemoteHarness>, String>
                 found = Some(RemoteHarness::new(link, dir.clone(), None));
                 Ok(())
             }
-            Ok(link) => RemoteHarness::new(link, dir.clone(), None).stop(),
+            Ok(link) => RemoteHarness::new(link, dir.clone(), None).end(),
             Err(ConnectError::MaybeGone) => clear_if_gone(&dir),
-            Err(ConnectError::Protocol { stream, .. }) => stop_unspoken(stream, &dir),
+            Err(
+                ConnectError::Protocol { stream, .. } | ConnectError::Unreadable { stream, .. },
+            ) => stop_unspoken(stream, &dir),
             Err(ConnectError::Io(error)) => Err(error),
         };
         if let Err(error) = outcome {
@@ -405,9 +413,11 @@ pub fn stop_agent(root: &Path, agent: &str) -> Result<(), String> {
     let mut failures = Vec::new();
     for dir in agent_instances(root, agent) {
         let outcome = match connect(&dir, true) {
-            Ok(link) => RemoteHarness::new(link, dir.clone(), None).stop(),
+            Ok(link) => RemoteHarness::new(link, dir.clone(), None).end(),
             Err(ConnectError::MaybeGone) => clear_if_gone(&dir),
-            Err(ConnectError::Protocol { stream, .. }) => stop_unspoken(stream, &dir),
+            Err(
+                ConnectError::Protocol { stream, .. } | ConnectError::Unreadable { stream, .. },
+            ) => stop_unspoken(stream, &dir),
             Err(ConnectError::Io(error)) => Err(error),
         };
         if let Err(error) = outcome {
@@ -433,6 +443,7 @@ pub fn inspect(dir: &Path) -> Result<Hello, String> {
         Err(ConnectError::Protocol { keeper, .. }) => {
             Err(format!("speaks protocol {}..={} only", keeper.0, keeper.1))
         }
+        Err(ConnectError::Unreadable { why, .. }) => Err(why),
         Err(ConnectError::Io(error)) => Err(error),
     }
 }
@@ -560,6 +571,10 @@ enum ConnectError {
         keeper: (u32, u32),
         stream: UnixStream,
     },
+    /// It answers, in a shape this kernel cannot read: a binary that claims a
+    /// version it does not write. It cannot be driven, so it is stopped (the
+    /// owning `hello` took it over) and replaced, never retried.
+    Unreadable { why: String, stream: UnixStream },
     /// Anything else, including a refusal or no answer in time: the keeper
     /// may well be alive.
     Io(String),
@@ -599,7 +614,8 @@ fn connect(dir: &Path, owner: bool) -> Result<Connected, ConnectError> {
     };
     wire::send_frame(&stream, &hello, &[]).map_err(|error| io("cannot greet the keeper", error))?;
     let mut reader = FrameReader::new(&stream);
-    // An owner may be told of activity before its hello is answered.
+    // An owner may be told of activity before its hello is answered. An
+    // event this kernel does not know is skipped, as the reader does.
     let reply = loop {
         let frame = match reader.next_frame() {
             Ok(Some(frame)) => frame,
@@ -610,16 +626,30 @@ fn connect(dir: &Path, owner: bool) -> Result<Connected, ConnectError> {
             }
             Err(error) => return Err(io("the keeper did not answer hello", error)),
         };
-        let reply: Reply = serde_json::from_slice(&frame)
-            .map_err(|error| ConnectError::Io(format!("unreadable hello: {error}")))?;
-        if !matches!(reply, Reply::Event { .. }) {
-            break reply;
+        if is_event(&frame) {
+            continue;
+        }
+        match serde_json::from_slice::<Reply>(&frame) {
+            Ok(reply) => break reply,
+            Err(error) => {
+                return Err(ConnectError::Unreadable {
+                    why: format!("unreadable answer to hello: {error}"),
+                    stream,
+                });
+            }
         }
     };
     match reply {
         Reply::Ok { ok, .. } => {
-            let hello: Hello = serde_json::from_value(ok)
-                .map_err(|error| ConnectError::Io(format!("unreadable hello: {error}")))?;
+            let hello: Hello = match serde_json::from_value(ok) {
+                Ok(hello) => hello,
+                Err(error) => {
+                    return Err(ConnectError::Unreadable {
+                        why: format!("unreadable hello: {error}"),
+                        stream,
+                    });
+                }
+            };
             let lock = if hello.lock {
                 reader.take_fds().into_iter().next()
             } else {
@@ -646,6 +676,12 @@ fn connect(dir: &Path, owner: bool) -> Result<Connected, ConnectError> {
     }
 }
 
+/// A frame the keeper sent unasked: it has an `event` and no `id`.
+fn is_event(frame: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(frame)
+        .is_ok_and(|value| value.get("event").is_some() && value.get("id").is_none())
+}
+
 /// Why a call has no answer.
 enum CallError {
     /// The keeper is gone (or going): the harness is dead to this kernel.
@@ -666,7 +702,8 @@ struct LinkState {
     /// The reader has finished what an unasked close requires.
     settled: bool,
     superseded: bool,
-    /// A call went unanswered past its deadline: no further call is sent.
+    /// A call went unanswered past its deadline, or was answered in a shape
+    /// this kernel cannot read: no further call is sent.
     wedged: bool,
     /// This kernel asked for the connection to end (stop or detach).
     ending: bool,
@@ -806,15 +843,30 @@ impl Link {
     /// activity callback, and the end of the connection.
     fn read(self: Arc<Self>, mut reader: FrameReader) {
         while let Ok(Some(frame)) = reader.next_frame() {
+            if is_event(&frame) {
+                // An event this kernel does not know changes nothing it reads.
+                match serde_json::from_slice::<Reply>(&frame) {
+                    Ok(Reply::Event {
+                        event: Event::Activity,
+                    }) => self.fire(),
+                    Ok(Reply::Event {
+                        event: Event::Superseded,
+                    }) => lock(&self.state).superseded = true,
+                    _ => {}
+                }
+                continue;
+            }
             let reply = match serde_json::from_slice::<Reply>(&frame) {
                 Ok(reply) => reply,
                 Err(error) => {
                     // An answer this kernel cannot read is still the answer:
-                    // its caller gets an error, never a wait without end.
+                    // its caller gets an error, never a wait without end, and
+                    // the keeper is driven no further.
                     let id = serde_json::from_slice::<Value>(&frame)
                         .ok()
                         .and_then(|value| value.get("id").and_then(Value::as_u64))
                         .or(lock(&self.state).waiting);
+                    self.unreadable(&format!("unreadable answer: {error}"));
                     if let Some(id) = id {
                         lock(&self.state).answer = Some((
                             id,
@@ -836,12 +888,7 @@ impl Link {
                     lock(&self.state).answer = Some((id, Err(err)));
                     self.changed.notify_all();
                 }
-                Reply::Event {
-                    event: Event::Activity,
-                } => self.fire(),
-                Reply::Event {
-                    event: Event::Superseded,
-                } => lock(&self.state).superseded = true,
+                Reply::Event { .. } => {}
             }
         }
         let (asked, superseded) = {
@@ -865,6 +912,19 @@ impl Link {
         lock(&self.state).settled = true;
         self.changed.notify_all();
         self.fire();
+    }
+
+    /// The keeper answered in a shape this kernel cannot read: it is driven
+    /// no further. Its harness reads as dead, so the supervisor replaces it,
+    /// and `stop` reaches it over a fresh connection.
+    fn unreadable(&self, why: &str) {
+        let mut state = lock(&self.state);
+        if !state.wedged {
+            eprintln!("anyagents-keeper: {}: {why}", self.dir.display());
+        }
+        state.wedged = true;
+        drop(state);
+        self.changed.notify_all();
     }
 
     /// Whether the keeper process ends within `within`: by its exit status
@@ -933,7 +993,9 @@ impl Link {
 fn stop_afresh(dir: &Path) -> bool {
     match connect(dir, true) {
         Ok(connected) => stop_unspoken(connected.stream, dir).is_ok(),
-        Err(ConnectError::Protocol { stream, .. }) => stop_unspoken(stream, dir).is_ok(),
+        Err(ConnectError::Protocol { stream, .. } | ConnectError::Unreadable { stream, .. }) => {
+            stop_unspoken(stream, dir).is_ok()
+        }
         Err(_) => false,
     }
 }
@@ -1054,7 +1116,7 @@ impl RemoteHarness {
     }
 
     /// End the harness and its keeper, and wait until both are gone.
-    pub fn stop(mut self) -> Result<(), String> {
+    pub fn end(mut self) -> Result<(), String> {
         self.stop_now()
     }
 
@@ -1118,9 +1180,22 @@ impl RemoteHarness {
     /// not know the op, `dead` when the keeper is gone or wedged.
     fn plain<T: DeserializeOwned>(&self, op: &str, args: Value, default: T, dead: T) -> T {
         match self.call(op, args) {
-            Ok(value) => serde_json::from_value(value).unwrap_or(default),
+            Ok(value) => self.read(op, value).unwrap_or(dead),
             Err(CallError::Unknown) => default,
             Err(CallError::Dead | CallError::Timeout(_) | CallError::Fault(_)) => dead,
+        }
+    }
+
+    /// An answer in the shape this kernel expects, or `None` with the link
+    /// marked unreadable.
+    fn read<T: DeserializeOwned>(&self, op: &str, value: Value) -> Option<T> {
+        match serde_json::from_value(value) {
+            Ok(answer) => Some(answer),
+            Err(error) => {
+                self.link
+                    .unreadable(&format!("unreadable answer to {op}: {error}"));
+                None
+            }
         }
     }
 
@@ -1132,8 +1207,7 @@ impl RemoteHarness {
         default: T,
     ) -> Result<T, HarnessError> {
         match self.call(op, args) {
-            Ok(value) => serde_json::from_value(value)
-                .map_err(|error| HarnessError::Failed(format!("keeper answer: {error}"))),
+            Ok(value) => self.read(op, value).ok_or(HarnessError::Dead),
             Err(CallError::Unknown) => Ok(default),
             Err(CallError::Dead) => Err(HarnessError::Dead),
             Err(CallError::Timeout(within)) => Err(HarnessError::Failed(format!(
@@ -1169,6 +1243,31 @@ impl Harness for RemoteHarness {
         }
     }
 
+    /// What the adapter in the keeper proved. A keeper that is gone took
+    /// its proofs with it: nothing is proven, and the mail is offered again
+    /// to the next process (`docs/delivery.md`, when the keeper dies).
+    fn proven(&self, message_id: &str) -> Option<Proof> {
+        self.plain("proven", json!({ "id": message_id }), None, None)
+    }
+
+    /// The vendor process ends and is read to the end; the keeper stays, so
+    /// `proven` still answers. A keeper that cannot do that within its
+    /// deadline is ended with its harness group, so no old process shares
+    /// the vendor session with the one launched next.
+    fn stop(&mut self) {
+        match self
+            .link
+            .call_within("stop_harness", Value::Null, STOP_DEADLINE)
+        {
+            Ok(_) => {}
+            Err(_) => {
+                if let Err(error) = self.stop_now() {
+                    eprintln!("anyagents-keeper: {}: {error}", self.link.dir.display());
+                }
+            }
+        }
+    }
+
     fn background(&mut self) -> Result<(), HarnessError> {
         self.fallible("background", Value::Null, ())
     }
@@ -1185,7 +1284,7 @@ impl Harness for RemoteHarness {
     /// supervisor replaces it (or, superseded, stands down).
     fn health(&self) -> HarnessHealth {
         if let Ok(value) = self.call("health", Value::Null)
-            && let Ok(health) = serde_json::from_value::<HarnessHealth>(value)
+            && let Some(health) = self.read::<HarnessHealth>("health", value)
         {
             lock(&self.link.cache).health = Some(health.clone());
             return health;
@@ -1219,7 +1318,7 @@ impl Harness for RemoteHarness {
             json!({"id": id, "quiet_ms": millis(quiet), "patience_ms": millis(patience)}),
             within,
         ) {
-            Ok(value) => serde_json::from_value(value).unwrap_or(false),
+            Ok(value) => self.read("quiet_for", value).unwrap_or(false),
             Err(_) => false,
         }
     }
@@ -1242,7 +1341,9 @@ impl Harness for RemoteHarness {
         let known = lock(&self.link.cache).last_usage.clone();
         match self.call("last_usage", Value::Null) {
             Ok(value) => {
-                let usage: TurnUsage = serde_json::from_value(value).unwrap_or_default();
+                let Some(usage) = self.read::<TurnUsage>("last_usage", value) else {
+                    return known;
+                };
                 lock(&self.link.cache).last_usage = usage.clone();
                 usage
             }
@@ -1253,45 +1354,6 @@ impl Harness for RemoteHarness {
 
     fn clear_quota(&mut self) {
         let _ = self.call("clear_quota", Value::Null);
-    }
-
-    fn take_reclaimed_steers(&mut self) -> Vec<String> {
-        self.plain("take_reclaimed_steers", Value::Null, Vec::new(), Vec::new())
-    }
-
-    fn has_unconfirmed_hold(&self) -> bool {
-        self.plain("has_unconfirmed_hold", Value::Null, false, false)
-    }
-
-    fn has_unconfirmed_idle_hold(&self) -> bool {
-        self.plain("has_unconfirmed_idle_hold", Value::Null, false, false)
-    }
-
-    fn peek_unconfirmed_request_ids(&self) -> Vec<String> {
-        self.plain(
-            "peek_unconfirmed_request_ids",
-            Value::Null,
-            Vec::new(),
-            Vec::new(),
-        )
-    }
-
-    fn reconcile_unconfirmed_for_recovery(
-        &mut self,
-    ) -> Result<Option<ReconciledUnconfirmed>, HarnessError> {
-        self.fallible("reconcile_unconfirmed_for_recovery", Value::Null, None)
-    }
-
-    fn poll_steer(&mut self) -> Result<Option<SteerItem>, HarnessError> {
-        self.fallible("poll_steer", Value::Null, None)
-    }
-
-    fn inject(&mut self, message: &OutboundMessage) -> Result<bool, HarnessError> {
-        self.fallible("inject", Self::message(message), false)
-    }
-
-    fn release_steer(&mut self, keep: &str) {
-        let _ = self.call("release_steer", json!({ "keep": keep }));
     }
 
     fn exit_diagnostic(&self) -> Option<String> {
@@ -1323,10 +1385,6 @@ impl Hosted for RemoteHarness {
 
     fn session_invalidated(&self) -> bool {
         self.plain("session_invalidated", Value::Null, false, false)
-    }
-
-    fn state_dir(&self) -> Option<PathBuf> {
-        self.plain("state_dir", Value::Null, None, None)
     }
 }
 

@@ -112,7 +112,7 @@ impl Custody<VendorHarness> for KeeperCustody {
         let Some(lock) = remote.take_lock() else {
             // A keeper that holds no lock cannot be held to the one-process
             // rule: end it, and let the worker start one under the lock.
-            remote.stop()?;
+            remote.end()?;
             return Ok(None);
         };
         let hello = remote.hello().clone();
