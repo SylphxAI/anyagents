@@ -9406,7 +9406,7 @@ esac
             assert_eq!(navigable_url(raw).unwrap(), want, "{raw}");
         }
         for raw in [
-            "file:///scratch/coordinator/anyagents-data/secrets/operator-token",
+            "file:///srv/anyagents/secrets/operator-token",
             "FILE:///etc/passwd",
             "file:/etc/passwd",
             "fi\tle:///etc/passwd",

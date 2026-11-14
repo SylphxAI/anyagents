@@ -20,10 +20,12 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 /// Directories Chromium may read and execute from.
+#[cfg(target_os = "linux")]
 const SYSTEM_READ_EXECUTE: &[&str] = &[
     "/usr", "/lib", "/lib32", "/lib64", "/libx32", "/bin", "/sbin", "/etc", "/opt",
 ];
 /// Directories Chromium may read.
+#[cfg(target_os = "linux")]
 const SYSTEM_READ: &[&str] = &[
     "/sys",
     "/var/cache/fontconfig",
@@ -72,6 +74,7 @@ pub(crate) fn main(args: &[OsString]) -> std::process::ExitCode {
 
 /// The paths the jail grants, as `(path, read-write)`; only existing ones
 /// are added.
+#[cfg(target_os = "linux")]
 fn grants(writable: &[PathBuf], program: &Path) -> Vec<(PathBuf, Access)> {
     let mut out: Vec<(PathBuf, Access)> = SYSTEM_READ_EXECUTE
         .iter()
@@ -106,6 +109,7 @@ fn grants(writable: &[PathBuf], program: &Path) -> Vec<(PathBuf, Access)> {
     out
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Access {
     Read,
