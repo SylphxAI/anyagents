@@ -137,6 +137,40 @@ fn validate_config_files(private: &Path, common: &Path) -> Result<(), Error> {
         if !file.metadata()?.is_file() {
             return Err(refusal(&path, "Git configuration is not a regular file"));
         }
+        // Worktree configuration (the store's and the checkout's own) is read
+        // by every Git in the store, the server's included, so it meets the
+        // rule the common config meets: owned by the store's owner or the
+        // server, and written by nobody else, a trusted metadata group
+        // included.
+        if path != common.join("config") {
+            use std::os::unix::fs::MetadataExt;
+            let owners = [
+                open_nofollow(common)?.metadata()?.uid(),
+                crate::sandbox::server_uid(),
+            ];
+            let meta = file.metadata()?;
+            if meta.nlink() != 1 || !owners.contains(&meta.uid()) {
+                return Err(refusal(
+                    &path,
+                    format!(
+                        "worktree configuration must be a single-link file owned by the \
+                         store's owner or the server (uids {owners:?}), not uid {}",
+                        meta.uid()
+                    ),
+                ));
+            }
+            if writable_by_anyone_else(&file, &owners)? {
+                return Err(refusal(
+                    &path,
+                    format!(
+                        "worktree configuration is writable by someone other than its owner \
+                         (mode {:04o}); its owner repairs it with `chmod go-w {}`",
+                        meta.mode() & 0o7777,
+                        path.display()
+                    ),
+                ));
+            }
+        }
         // --file - and --no-includes inspect only the opened input. Never
         // follow the include or print config values in a diagnostic.
         let out = anyagents_toolchain::tool("git", "checkout")
@@ -2530,6 +2564,7 @@ fn share_known_locked(
     // Fail closed before the first journal or ACL write: a store that launch
     // would refuse must not be admitted, granted, or left needing revocation.
     refuse_world_writable(common).map_err(|e| refusal(common, e))?;
+    secure_private_config(common, private).map_err(|e| refusal(private, e))?;
     validate_config_files(private, common)?;
     trusted_metadata_layout(common, private, uid).map_err(|e| refusal(common, e))?;
     // A journal awaiting recovery is never overwritten by a new grant.
@@ -2620,6 +2655,31 @@ fn share_known_locked(
         .map_err(|e| refusal(&head, e))?;
     }
     protect_private_gitdir(private, uid, gid).map_err(|e| refusal(private, e))?;
+    Ok(())
+}
+
+/// A fresh private gitdir's `config.worktree` is the checkout provider's or
+/// the server's own file, written moments ago under the store's
+/// `core.sharedRepository=group`. Admission takes custody of it: from here on
+/// nobody but its owner writes it. Another principal's file is left as it is
+/// for validation to refuse.
+fn secure_private_config(common: &Path, private: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let path = private.join("config.worktree");
+    let file = match open_nofollow(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let meta = file.metadata()?;
+    let owners = [
+        open_nofollow(common)?.metadata()?.uid(),
+        crate::sandbox::server_uid(),
+    ];
+    let mode = meta.mode() & 0o7777;
+    if meta.is_file() && meta.nlink() == 1 && owners.contains(&meta.uid()) && mode & 0o022 != 0 {
+        descriptor_fchmod(&file, (mode & !0o022) as libc::mode_t)?;
+    }
     Ok(())
 }
 
@@ -6148,6 +6208,41 @@ mod tests {
         );
         assert!(error.contains("chmod -R o-w"), "{error}");
         revoke_common(&common, uid, gid, &[], None).unwrap();
+    }
+
+    /// Worktree configuration (the store's and a checkout's own) meets the
+    /// common config's rule at launch and at admission. Admission takes
+    /// custody of a fresh checkout's own file, which the provider writes
+    /// group-writable under `core.sharedRepository=group`; the store's file
+    /// is refused, never repaired.
+    #[test]
+    fn worktree_configuration_admits_only_its_owners_as_writers() {
+        let dir = crate::test_tempdir();
+        let common = plain_common(dir.path());
+        let private = common.join("worktrees/child");
+        std::fs::create_dir_all(&private).unwrap();
+        let own = private.join("config.worktree");
+        std::fs::write(&own, "[core]\n\tsparseCheckout = true\n").unwrap();
+        std::fs::set_permissions(&own, std::fs::Permissions::from_mode(0o664)).unwrap();
+        let error = validate_config_files(&private, &common)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("worktree configuration is writable") && error.contains("chmod go-w"),
+            "{error}"
+        );
+        secure_private_config(&common, &private).unwrap();
+        assert_eq!(std::fs::metadata(&own).unwrap().mode() & 0o022, 0);
+        validate_config_files(&private, &common).unwrap();
+        let store = common.join("config.worktree");
+        std::fs::write(&store, "").unwrap();
+        std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o664)).unwrap();
+        secure_private_config(&common, &private).unwrap();
+        assert_eq!(std::fs::metadata(&store).unwrap().mode() & 0o777, 0o664);
+        let error = validate_config_files(&private, &common)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(store.to_str().unwrap()), "{error}");
     }
 
     /// A seat that stops or stalls its own admission probe holds nothing: the
