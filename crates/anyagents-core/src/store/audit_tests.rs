@@ -763,3 +763,228 @@ fn deleted_immutable_sender_refuses_receive_before_wake_mail_or_index_mutation()
         before.len() + 1
     );
 }
+
+/// Search rows filed under `name`, found through the index.
+fn fts_rows_named(store: &Store, name: &str) -> i64 {
+    store
+        .conn()
+        .query_row(
+            "SELECT count(*) FROM rag_chunks_fts WHERE agent_name MATCH ?1 AND agent_name = ?2",
+            params![fts_exact_phrase(name), name],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+#[test]
+fn deleting_or_renaming_an_agent_changes_only_its_own_search_rows() {
+    let (_dir, store, kept) = setup();
+    let leaving = store
+        .create_agent(NewAgent::new("leaving", "test"))
+        .unwrap();
+    let renamed = store
+        .create_agent(NewAgent::new("before-rename", "test"))
+        .unwrap();
+    for (agent, text) in [
+        (&kept, "keptneedle"),
+        (&leaving, "leavingneedle"),
+        (&renamed, "renamedneedle"),
+    ] {
+        store.receive(&agent.id, Incoming::new(text)).unwrap();
+    }
+    assert_eq!(fts_rows_named(&store, "leaving"), 1);
+
+    store.delete_agent(&leaving.id).unwrap();
+    assert_eq!(fts_rows_named(&store, "leaving"), 0);
+    assert_fts(&store, "keptneedle");
+    assert_eq!(count(&store, "rag_chunks_fts"), count(&store, "rag_chunks"));
+
+    store.rename_agent(&renamed.id, "after-rename").unwrap();
+    assert_eq!(fts_rows_named(&store, "before-rename"), 0);
+    assert_eq!(fts_rows_named(&store, "after-rename"), 1);
+    assert_eq!(fts_rows_named(&store, "worker"), 1);
+    assert_fts(&store, "renamedneedle");
+}
+
+/// Pages a statement reads on a connection without mmap: every page access
+/// goes through the pager and counts (hit or miss), so the number does not
+/// depend on what is cached or on timing.
+fn pages_read(conn: &Connection, sql: &str, params: &[&dyn rusqlite::ToSql]) -> (i64, i64) {
+    fn accesses(conn: &Connection) -> i64 {
+        let mut total = 0;
+        for op in [
+            rusqlite::ffi::SQLITE_DBSTATUS_CACHE_HIT,
+            rusqlite::ffi::SQLITE_DBSTATUS_CACHE_MISS,
+        ] {
+            let (mut current, mut highwater) = (0, 0);
+            // SAFETY: the handle is this live connection's; the call only
+            // reads its counters.
+            unsafe {
+                rusqlite::ffi::sqlite3_db_status(
+                    conn.handle(),
+                    op,
+                    &mut current,
+                    &mut highwater,
+                    0,
+                );
+            }
+            total += i64::from(current);
+        }
+        total
+    }
+    let before = accesses(conn);
+    let rows: i64 = conn.query_row(sql, params, |r| r.get(0)).unwrap();
+    (rows, accesses(conn) - before)
+}
+
+/// A store shaped like the fleet's: `fleet_rows` chunks of one large agent,
+/// every id starting with the `msg` token, plus one small agent.
+fn fleet_store(fleet_rows: usize) -> (tempfile::TempDir, Store, Agent, Connection) {
+    let (dir, store, small) = setup();
+    for i in 0..20 {
+        store
+            .receive(&small.id, Incoming::new(format!("smallneedle {i}")))
+            .unwrap();
+    }
+    {
+        let conn = store.conn();
+        let tx = conn.unchecked_transaction().unwrap();
+        for i in 0..fleet_rows {
+            let id = format!("msg_01m7{:022}", i * 7919);
+            let text = format!("fleet history line {i} about the build and its review");
+            tx.execute(
+                "INSERT INTO rag_chunks (chunk_id, agent_id, agent_name, direction, sender,
+                     destination, timestamp_ms, content_hash, text, kind, tool_name, seq, text_format)
+                 VALUES (?1, 'agt_fleet', 'fleet', 'in', 'agent:x', 'agent:fleet', ?2, 'h', ?3,
+                     'message', '', ?2, 2)",
+                params![id, i as i64, text],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO rag_chunks_fts (chunk_id, agent_name, sender, destination, kind,
+                     tool_name, text, search_tokens)
+                 VALUES (?1, 'fleet', 'agent:x', 'agent:fleet', 'message', '', ?2, ?2)",
+                params![id, text],
+            )
+            .unwrap();
+        }
+        // One merged segment, so page counts compare across fleet sizes
+        // without depending on how many segments the inserts left.
+        tx.execute(
+            "INSERT INTO rag_chunks_fts(rag_chunks_fts) VALUES('optimize')",
+            [],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
+    let reader = Connection::open(dir.path().join("custom-mailbox.sqlite")).unwrap();
+    reader.pragma_update(None, "mmap_size", 0).unwrap();
+    (dir, store, small, reader)
+}
+
+/// The rows a maintenance statement touches, read instead of written.
+fn as_count(statement: &str) -> String {
+    let count = statement.replacen(
+        "DELETE FROM rag_chunks_fts",
+        "SELECT count(*) FROM rag_chunks_fts",
+        1,
+    );
+    assert_ne!(count, statement, "{statement}");
+    count
+}
+
+/// Pages each maintenance lookup reads on a fleet of `fleet` rows: the
+/// unique-token chunk lookup, one agent's rows, and the name scan the
+/// latter replaced.
+fn maintenance_pages(fleet: usize) -> [i64; 3] {
+    let (_dir, _store, small, reader) = fleet_store(fleet);
+    let id = format!("msg_01m7{:022}", (fleet / 2) * 7919);
+    let lookup = fts_chunk_lookup(&id).unwrap();
+    let (found, token) = pages_read(&reader, &as_count(FTS_DELETE_CHUNK), &[&id, &lookup]);
+    assert_eq!(found, 1);
+    let (own, agent) = pages_read(
+        &reader,
+        &as_count(FTS_DELETE_AGENT_ROWS),
+        &[&"worker", &fts_exact_phrase("worker"), &small.id.as_str()],
+    );
+    assert_eq!(own, 20);
+    let (_, scan) = pages_read(
+        &reader,
+        "SELECT count(*) FROM rag_chunks_fts WHERE agent_name = ?1",
+        &[&"worker"],
+    );
+    [token, agent, scan]
+}
+
+#[test]
+fn search_index_maintenance_cost_does_not_grow_with_the_fleet() {
+    // Report #4/#5: a failed spawn's rollback scanned the whole index with
+    // the writer held. Cost is counted in pages read, so it does not depend
+    // on caching or timing. On a fleet eight times larger, a name scan reads
+    // about eight times the pages; what maintenance reads grows only with the
+    // B-tree's depth.
+    let small = maintenance_pages(2_000);
+    let large = maintenance_pages(16_000);
+    eprintln!("pages [lookup, agent rows, scan] at 2k rows {small:?}, at 16k rows {large:?}");
+    let [token_s, agent_s, scan_s] = small;
+    let [token_l, agent_l, scan_l] = large;
+    assert!(scan_l > scan_s * 6, "scan control: {scan_s} -> {scan_l}");
+    assert!(
+        token_l * 2 < token_s * 3,
+        "chunk lookup grew: {token_s} -> {token_l}"
+    );
+    assert!(
+        agent_l < agent_s * 2,
+        "agent rows grew: {agent_s} -> {agent_l}"
+    );
+    assert!(
+        agent_l * 5 < scan_l,
+        "agent rows {agent_l} against a scan of {scan_l}"
+    );
+}
+
+#[test]
+fn deleting_renaming_and_rolling_back_keep_the_index_exact_on_a_fleet() {
+    let fleet = 3_000;
+    let (_dir, store, small, _reader) = fleet_store(fleet);
+    let failed = store
+        .create_agent(NewAgent::new("failed-spawn", "test"))
+        .unwrap();
+    store.delete_agent(&failed.id).unwrap();
+    store.rename_agent(&small.id, "renamed-small").unwrap();
+    assert_eq!(fts_rows_named(&store, "renamed-small"), 20);
+    assert_eq!(fts_rows_named(&store, "worker"), 0);
+    assert_eq!(fts_rows_named(&store, "fleet"), fleet as i64);
+    store.delete_agent(&small.id).unwrap();
+    assert_eq!(fts_rows_named(&store, "renamed-small"), 0);
+    assert_eq!(fts_rows_named(&store, "fleet"), fleet as i64);
+    assert_eq!(count(&store, "rag_chunks_fts"), count(&store, "rag_chunks"));
+}
+
+#[test]
+fn reindexing_a_chunk_replaces_only_its_own_search_row() {
+    let (_dir, store, _small, _reader) = fleet_store(50);
+    let id = format!("msg_01m7{:022}", 7 * 7919);
+    let longer = format!("{id}_part");
+    {
+        let conn = store.conn();
+        conn.execute(
+            "INSERT INTO rag_chunks_fts (chunk_id, agent_name, sender, destination, kind,
+                 tool_name, text, search_tokens)
+             VALUES (?1, 'fleet', 'agent:x', 'agent:fleet', 'message', '', 'part', 'part')",
+            [&longer],
+        )
+        .unwrap();
+        assert_eq!(delete_fts_chunk(&conn, &id).unwrap(), 1);
+        let left: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM rag_chunks_fts WHERE chunk_id MATCH ?2 AND chunk_id = ?1",
+                params![longer, fts_chunk_lookup(&longer).unwrap()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(left, 1, "a chunk whose id extends this one keeps its row");
+    }
+    assert_eq!(fts_chunk_lookup("msg_01ABC"), Some("\"01ABC\"".to_string()));
+    assert_eq!(fts_chunk_lookup("___"), None);
+}
