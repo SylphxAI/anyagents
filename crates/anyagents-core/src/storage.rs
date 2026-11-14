@@ -5,15 +5,14 @@
 //! configuration. Deployments with multi-tier storage volumes can configure:
 //! - `ANYAGENTS_STATE_DIR`: control-plane state (`state.db`, capabilities, configs)
 //! - `ANYAGENTS_WORKSPACES_DIR`: managed per-agent workspaces (`{workspaces}/{id}`)
-//! - `ANYAGENTS_SCRATCH_DIR`: each agent's own storage root on local disk
-//!   (`{scratch}/agents/{id}`), holding its disposable `build/` and `tmp/`
+//! - `ANYAGENTS_SCRATCH_DIR`: disposable per-agent build/tmp outputs (`{scratch}/{builds,tmp}/{id}`)
 //! - `ANYAGENTS_GIT_POOL_DIR`: the read-only Git object pool agents' own repositories
 //!   borrow from (`{pool}/{org}/{repo}.git`; `{data}/git-pool` when unset)
 //!
-//! Source and other state that cannot be rebuilt stay on the workspaces and
-//! state tiers. Everything under an agent's scratch root can be rebuilt, so the
-//! server may evict its `build/` when the scratch budget is exceeded and removes
-//! the whole root when the agent is archived.
+//! Source and other state that cannot be rebuilt belong on the workspaces and
+//! state tiers. The server removes an agent's scratch directories when it is
+//! archived, and evicts verifiable build output from them (and only that) when
+//! the scratch build budget is exceeded.
 
 use std::path::{Path, PathBuf};
 
@@ -24,8 +23,7 @@ pub const WORKSPACES_DIR_ENV: &str = "ANYAGENTS_WORKSPACES_DIR";
 pub const SCRATCH_DIR_ENV: &str = "ANYAGENTS_SCRATCH_DIR";
 pub const GIT_POOL_DIR_ENV: &str = "ANYAGENTS_GIT_POOL_DIR";
 pub const TEST_STORAGE_TIERS_ENV: &str = "ANYAGENTS_TEST_STORAGE_TIERS";
-/// Total bytes of build output all agents may keep under `{scratch}/agents`
-/// (and the legacy `{scratch}/builds`). A size such as `300G`, `300GiB` or a
+/// Total bytes of build output all agents may keep under `{scratch}/builds`. A size such as `300G`, `300GiB` or a
 /// byte count; `0` turns enforcement off. Default [`DEFAULT_SCRATCH_BUILD_BUDGET`].
 pub const SCRATCH_BUILD_BUDGET_ENV: &str = "ANYAGENTS_SCRATCH_BUILD_BUDGET";
 /// `0` makes the server enforce the scratch build budget. Unset (or anything
@@ -37,6 +35,10 @@ pub const SCRATCH_BUILD_BUDGET_DRY_RUN_ENV: &str = "ANYAGENTS_SCRATCH_BUILD_BUDG
 /// build directory. The last path component may end in `*`
 /// (`/scratch/build-targets/cargo-*`).
 pub const SCRATCH_BUILD_EXTRA_DIRS_ENV: &str = "ANYAGENTS_SCRATCH_BUILD_EXTRA_DIRS";
+/// Directories, in the same form, that [`SCRATCH_BUILD_EXTRA_DIRS_ENV`] must
+/// not cover: build output a host keeps on purpose (the desk janitor's
+/// `retained_cache_users`).
+pub const SCRATCH_BUILD_EXTRA_EXCLUDE_ENV: &str = "ANYAGENTS_SCRATCH_BUILD_EXTRA_EXCLUDE";
 /// Exported to every harness: the agent's own build directory, so build tools
 /// and host wrappers (the desk's Cargo wrapper) put output under its root.
 pub const AGENT_BUILD_DIR_ENV: &str = "ANYAGENTS_AGENT_BUILD_DIR";
@@ -101,36 +103,17 @@ pub fn configured_git_pool_dir() -> Option<PathBuf> {
     non_empty_path_env(GIT_POOL_DIR_ENV)
 }
 
-/// `{scratch}/agents/{id}`: the agent's own storage root on the scratch tier.
-/// It holds only output that can be rebuilt, and nothing else writes there.
-pub fn agent_scratch_root(scratch_dir: &Path, id: &AgentId) -> PathBuf {
-    scratch_dir.join("agents").join(id.as_str())
-}
-
-/// `{scratch}/agents/{id}/build`: Cargo, Gradle and Xcode output.
+/// `{scratch}/builds/{id}`: the agent's build root. Cargo, Gradle and Xcode
+/// output, and the private tool caches a seat gets (`cache/<tool>`), live
+/// here. It stays where it always was: moving it would rebuild every agent's
+/// output beside the old copy on a volume that cannot grow.
 pub fn agent_scratch_build_dir(scratch_dir: &Path, id: &AgentId) -> PathBuf {
-    agent_scratch_root(scratch_dir, id).join("build")
+    scratch_dir.join("builds").join(id.as_str())
 }
 
-/// `{scratch}/agents/{id}/tmp`: the agent's `TMPDIR`.
+/// `{scratch}/tmp/{id}`: the agent's `TMPDIR`.
 pub fn agent_scratch_tmp_dir(scratch_dir: &Path, id: &AgentId) -> PathBuf {
-    agent_scratch_root(scratch_dir, id).join("tmp")
-}
-
-/// The layout before agent roots: `{scratch}/builds/{id}` and
-/// `{scratch}/tmp/{id}`. A harness started by an older server keeps writing
-/// there until it is restarted, so cleanup and the budget still cover them.
-pub fn legacy_agent_scratch_dirs(scratch_dir: &Path, id: &AgentId) -> [PathBuf; 2] {
-    [
-        scratch_dir.join("builds").join(id.as_str()),
-        scratch_dir.join("tmp").join(id.as_str()),
-    ]
-}
-
-/// Every scratch directory that belongs to this agent, current and legacy.
-pub fn agent_scratch_dirs(scratch_dir: &Path, id: &AgentId) -> [PathBuf; 3] {
-    let [builds, tmp] = legacy_agent_scratch_dirs(scratch_dir, id);
-    [agent_scratch_root(scratch_dir, id), builds, tmp]
+    scratch_dir.join("tmp").join(id.as_str())
 }
 
 /// The configured scratch build budget in bytes; `None` when enforcement is
@@ -183,12 +166,22 @@ pub fn scratch_build_budget_dry_run() -> bool {
 }
 
 /// The directories [`SCRATCH_BUILD_EXTRA_DIRS_ENV`] names, with a trailing
-/// `*` in the last component expanded to the directories that exist now.
+/// `*` in the last component expanded to the directories that exist now,
+/// less those [`SCRATCH_BUILD_EXTRA_EXCLUDE_ENV`] names.
 pub fn configured_scratch_build_extra_dirs() -> Vec<PathBuf> {
     let Ok(raw) = std::env::var(SCRATCH_BUILD_EXTRA_DIRS_ENV) else {
         return Vec::new();
     };
-    expand_extra_dirs(&raw)
+    let exclude = std::env::var(SCRATCH_BUILD_EXTRA_EXCLUDE_ENV).unwrap_or_default();
+    extra_dirs_without(&raw, &exclude)
+}
+
+fn extra_dirs_without(raw: &str, exclude: &str) -> Vec<PathBuf> {
+    let excluded = expand_extra_dirs(exclude);
+    expand_extra_dirs(raw)
+        .into_iter()
+        .filter(|dir| !excluded.contains(dir))
+        .collect()
 }
 
 fn expand_extra_dirs(raw: &str) -> Vec<PathBuf> {
@@ -229,20 +222,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn scratch_paths_share_one_root_per_agent() {
+    fn scratch_paths_scope_by_agent_id() {
         let id = AgentId::generate();
         let scratch = Path::new("/var/tmp/scratch-tier");
-        let root = PathBuf::from(format!("/var/tmp/scratch-tier/agents/{id}"));
-        assert_eq!(agent_scratch_root(scratch, &id), root);
-        assert_eq!(agent_scratch_build_dir(scratch, &id), root.join("build"));
-        assert_eq!(agent_scratch_tmp_dir(scratch, &id), root.join("tmp"));
         assert_eq!(
-            agent_scratch_dirs(scratch, &id),
-            [
-                root,
-                PathBuf::from(format!("/var/tmp/scratch-tier/builds/{id}")),
-                PathBuf::from(format!("/var/tmp/scratch-tier/tmp/{id}")),
-            ]
+            agent_scratch_build_dir(scratch, &id),
+            PathBuf::from(format!("/var/tmp/scratch-tier/builds/{id}"))
+        );
+        assert_eq!(
+            agent_scratch_tmp_dir(scratch, &id),
+            PathBuf::from(format!("/var/tmp/scratch-tier/tmp/{id}"))
         );
     }
 
@@ -272,6 +261,31 @@ mod tests {
                 root.join("cargo-seat-sage"),
                 root.join("sccache-kyle")
             ]
+        );
+    }
+
+    /// The desk janitor retains `kyle`'s caches: an excluded directory is
+    /// never covered, however the include list is written.
+    #[test]
+    fn excluded_extra_dirs_are_never_covered() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for name in ["cargo-kyle", "cargo-seat-sage"] {
+            std::fs::create_dir_all(root.join(name)).unwrap();
+        }
+        let include = format!("{}/cargo-*", root.display());
+        let exclude = format!(
+            "{}/cargo-kyle:{}/cargo-gone",
+            root.display(),
+            root.display()
+        );
+        assert_eq!(
+            extra_dirs_without(&include, &exclude),
+            [root.join("cargo-seat-sage")]
+        );
+        assert_eq!(
+            extra_dirs_without(&include, ""),
+            [root.join("cargo-kyle"), root.join("cargo-seat-sage")]
         );
     }
 

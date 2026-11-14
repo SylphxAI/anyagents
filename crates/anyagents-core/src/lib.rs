@@ -37,11 +37,11 @@ pub use secret::{CredentialStore, FileCredentialStore, Secret};
 pub use storage::{
     AGENT_BUILD_DIR_ENV, DEFAULT_SCRATCH_BUILD_BUDGET, GIT_POOL_DIR_ENV,
     SCRATCH_BUILD_BUDGET_DRY_RUN_ENV, SCRATCH_BUILD_BUDGET_ENV, SCRATCH_BUILD_EXTRA_DIRS_ENV,
-    SCRATCH_DIR_ENV, STATE_DIR_ENV, TEST_STORAGE_TIERS_ENV, WORKSPACES_DIR_ENV,
-    agent_scratch_build_dir, agent_scratch_dirs, agent_scratch_root, agent_scratch_tmp_dir,
-    configured_git_pool_dir, configured_scratch_build_budget, configured_scratch_build_extra_dirs,
-    configured_scratch_dir, configured_state_dir, configured_workspaces_dir,
-    legacy_agent_scratch_dirs, parse_size, scratch_build_budget_dry_run, storage_env_enabled,
+    SCRATCH_BUILD_EXTRA_EXCLUDE_ENV, SCRATCH_DIR_ENV, STATE_DIR_ENV, TEST_STORAGE_TIERS_ENV,
+    WORKSPACES_DIR_ENV, agent_scratch_build_dir, agent_scratch_tmp_dir, configured_git_pool_dir,
+    configured_scratch_build_budget, configured_scratch_build_extra_dirs, configured_scratch_dir,
+    configured_state_dir, configured_workspaces_dir, parse_size, scratch_build_budget_dry_run,
+    storage_env_enabled,
 };
 pub use store::holds_store_writer;
 pub use store::{

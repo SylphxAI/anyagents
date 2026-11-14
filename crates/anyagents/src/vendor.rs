@@ -779,7 +779,7 @@ impl anyagents_harness::Harness for ContractHarness {
 
 /// The tool caches a harness writes into, by the environment key that names
 /// them, and the name of the private cache a seat gets in their place.
-const WRITTEN_TOOL_CACHES: &[(&str, &str)] = &[
+pub(crate) const WRITTEN_TOOL_CACHES: &[(&str, &str)] = &[
     ("BUN_INSTALL_CACHE_DIR", "bun"),
     ("UV_CACHE_DIR", "uv"),
     ("PIP_CACHE_DIR", "pip"),
