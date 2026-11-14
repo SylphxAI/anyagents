@@ -288,8 +288,10 @@ that cannot is refused with a message that names the binary. A seat's probe
 runs in its own process group and is killed with everything it started after
 300 seconds (as the seat, through the seat launcher's `/bin/kill`, when the
 server may not signal it), so a seat that stops or stalls it cannot hold a
-creation. A probe
-as the server's own uid and gid runs in the server process. New worktrees are
+creation. The probe is not reaped before that kill, so its process group
+cannot be reused under it, and its output is read only until the same
+deadline (another process of the seat can hold the pipe open). A probe as the
+server's own uid and gid runs in the server process. New worktrees are
 shared with that seat's group.
 On Linux, additive POSIX ACLs grant writes only to shared `objects/`, `refs/`,
 `logs/refs/`, an existing `packed-refs`, and the child's private `worktrees/<name>/`.
@@ -305,7 +307,12 @@ writes a journal, so a refused wake never leaves an active grant behind. The
 refusal names the path, its owning uid and the repair (as root for an object a
 seat owns: a seat can block admissions on a store by making its own file
 world-writable); granting on top of it would hand the same write to every
-object a seat adds later. Revocation is never stopped by it.
+object a seat adds later. Revocation is never stopped by it. Every walk of a
+store or a checkout (admission, sharing, revocation) is iterative and refuses
+a tree nested deeper than 512 directories: a seat decides how deep its own
+directories in `refs/`, `objects/` or a checkout go, and an unbounded
+recursion would abort the server on each start. A revocation refused this
+way quarantines its journal.
 
 Common `config` becomes an exact symlink to `anyagents-config/config`: the dedicated
 directory grants active readers traversal and read-only inheritance, so the
@@ -336,6 +343,9 @@ owner owns it; the directory is handed to the config's owner. Relocation makes i
 uses an existing one only as its own interrupted state (empty, or already
 holding this inode); a directory moved in from elsewhere is refused, never
 filled; a `config.lock` already there is named as Git's lock, stale or not.
+Handing the directory to another user's config takes root: a server that is
+not root refuses such a store at admission, before it writes a journal or a
+grant, instead of failing the relocation afterwards.
 The relocated file keeps no group or other write; readers are granted named ACL
 entries after that, so the mask never hides them. Relocation holds Git's original
 `config.lock`, hard-links the inode into the dedicated directory, takes the new
@@ -359,9 +369,13 @@ files) any seat may change or rename, so there is no seat-to-seat boundary for
 hooks, or for a configuration file the group can write. In particular the
 name `config` in a common directory the group can write is replaceable by any
 seat, and every Git run in the store reads it, including the server's own Git
-and the checkout provider's (as the server's user). The managed config is a
-real boundary only once the hub's own layout gives the group no write to the
-common directory, `hooks/`, `info/` and the configuration files. A parent-owned sticky
+and the checkout provider's (as the server's user). The same holds one level
+up: a group-writable hub directory (on the desk `desk-git-hubs/<hub>` is
+2775, and so is `desk-git-hubs/` itself) lets any seat rename `.git`, or the
+whole hub, and put its own in place. The managed config is a real boundary
+only once the hub's own layout gives the group no write to the hub
+directory, the common directory, `hooks/`, `info/` and the configuration
+files. A parent-owned sticky
 private gitdir protects `config.worktree` (and its unlink/rename), `commondir` and
 `gitdir` against the seat's own group entry; mutable HEAD/index files belong to
 the child so Git lock+rename works.
@@ -396,21 +410,43 @@ It is removed once it witnesses nothing more: the grant is revoked, no
 inspection or quarantine is pending, and the checkout directory is gone (a
 checkout that still exists keeps its journal even without a `.git` pointer).
 Failed-creation rollback, archive cleanup and deletion remove it then. A
-failed creation whose partial grant cannot be revoked keeps its journal and
-checkout, quarantined with the reason. The first maintenance pass of each
+failed creation whose partial grant or checkout cannot be taken back keeps its
+journal and checkout, quarantined with the reason. The first maintenance pass of each
 server process settles every journal of an agent that can never run again,
 once: its grant is revoked; a failed creation's checkout (the startup repair
 released its row before admission, so it never ran) and its registration are
-removed; the journal is then removed, or quarantined with the reason. The
-removal runs no Git and holds descriptors throughout: both directories are
-opened component by component from `/` without following a symlink, the
-checkout's `.git` pointer and the registration's `gitdir` back link are read
-through those descriptors and must name each other by inode, and the trees are
-removed relative to the held descriptors, removing a symlink itself and never
-leaving the checkout's file system. A path that resolves only through a
-symlink, or to another inode, is kept and its journal quarantined. Never
-removed: a directory that is (or holds) an admitted agent's workdir, compared
-by inode, or one another journal records. Its branch stays.
+removed; the journal is then removed, or quarantined with the reason.
+Creation rollback removes its checkout the same way, at once: the store and
+the registration come from the journal, or, before admission wrote one, from
+the fresh checkout's own pointer (the directory must still be the inode the
+provider made), never from Git run inside the checkout; the branch it was
+made on is deleted afterwards by compare-and-delete on that store, only while
+another ref holds its tip. The removal runs no Git and holds descriptors
+throughout. Both directories are opened component by component from `/`
+without following a symlink (a host alias aside: a link root owns in a
+directory only root can write, such as macOS `/var`); the checkout's `.git` pointer (a single-link
+file of the server or the store's owner) and the registration's `gitdir`
+back link are read through those descriptors and must name each other by
+inode. The journal is then marked, so a server that stops midway leaves it
+quarantined, never resumed unseen. The checkout is emptied as the grant's
+seat, in a process of its own (`anyagents internal empty-tree`, through the
+seat launcher), while the grant still stands: the kernel limits the removal
+to what that seat could remove itself, so a directory another principal
+moved in, with contents the seat cannot delete, stays. The server then
+removes only what is left in directories nobody but it can write (nothing
+another principal could have put there), revokes the grant, removes the
+emptied checkout directory by inode, and from the registration (which any
+seat of the store's group may write) only Git's own files, by name, never a
+directory it does not know. Every walk is iterative and stops at 512 nested
+directories, never leaves the checkout's file system and removes a symlink
+itself. Whatever is left keeps the journal, quarantined with what is left.
+Never removed: a checkout that is (or holds) an admitted agent's workdir,
+compared by inode and, for a workdir that is gone, by path (a workdir that
+cannot be resolved protects everything), or one another journal records. The
+settle pass keeps the branch. The archive reaper removes an archived agent's
+directories in the same order: as its seat first, then the server only for
+directories nobody else can write and the emptied directory itself, and only
+Git's own files from its registration.
 Only server-owned single-link journals that no one else can write, in a
 server-owned journal directory that no one else can write, are acted on. A
 deleted agent's checkout is never removed there and keeps its journal while it
