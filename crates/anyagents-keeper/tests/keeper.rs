@@ -1,8 +1,9 @@
 //! The keeper with real processes: a kernel that crashes, detaches or is
 //! replaced while its harness runs; a keeper or a harness that dies; a kernel
 //! and a keeper that speak different protocol versions; a request cut off by
-//! a dying kernel.
-#![cfg(unix)]
+//! a dying kernel. Keepers host harnesses on Linux only
+//! (`docs/adr/0007-process-architecture.md`), so they are tested there.
+#![cfg(target_os = "linux")]
 
 use std::io::Write as _;
 use std::os::fd::{AsFd as _, AsRawFd as _};

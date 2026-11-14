@@ -8,6 +8,12 @@
 //!   previous kernel left, end the ones whose agent no longer runs, leave
 //!   them all to the next kernel on shutdown.
 //! - `anyagents keepers list|stop` is the operator's.
+//!
+//! Keepers are used on Linux only ([`HOSTED_IN_KEEPERS`]). Taking a keeper
+//! over after a kernel restart, and every liveness and signal decision about
+//! one, rest on proving a process's identity (start time, boot id and pid
+//! namespace from `/proc`). A platform without that proof could never take a
+//! keeper over safely, so there `serve` hosts harnesses in its own process.
 
 use std::collections::BTreeSet;
 use std::os::fd::AsRawFd as _;
@@ -19,6 +25,14 @@ use anyagents_core::{AgentId, AgentLock, Store};
 use anyagents_supervisor::{Attached, Custody};
 
 use crate::vendor::{AdapterLaunch, HarnessHost, VendorHarness};
+
+/// Whether `serve` hosts harnesses in keepers on this platform: only where a
+/// process's identity can be proven (Linux).
+pub const HOSTED_IN_KEEPERS: bool = cfg!(target_os = "linux");
+
+/// What `keepers list|stop` says where keepers are not used.
+const NOT_USED: &str = "keepers are not used on this platform: \
+     the server hosts each harness in its own process";
 
 /// The subcommand that runs a keeper. It is dispatched before argument
 /// parsing so a keeper does nothing but keep.
@@ -52,8 +66,12 @@ pub fn try_run(argv: &[String]) -> Option<i32> {
 /// How `anyagents serve` hosts adapters: in keepers run from the binary it
 /// was started from. The path is read once, so a binary replaced on disk
 /// during an upgrade serves this kernel's later launches from the new file,
-/// which speaks this kernel's protocol version.
+/// which speaks this kernel's protocol version. Where keepers are not used,
+/// in the server's own process.
 pub fn host() -> Result<HarnessHost, String> {
+    if !HOSTED_IN_KEEPERS {
+        return Ok(HarnessHost::InProcess);
+    }
     let path = crate::data::current_exe_clean()
         .map_err(|error| format!("cannot find this binary to run keepers: {error}"))?;
     Ok(HarnessHost::Keeper(anyagents_keeper::Program::new(
@@ -168,6 +186,10 @@ pub fn custody(
 
 /// `anyagents keepers list`: every keeper, what it runs and which binary.
 pub fn list(data: &Path) -> Result<(), anyagents_core::Error> {
+    if !HOSTED_IN_KEEPERS {
+        eprintln!("{NOT_USED}");
+        return Ok(());
+    }
     let root = anyagents_keeper::root(data);
     anyagents_keeper::check_root(&root).map_err(anyagents_core::Error::Message)?;
     println!(
@@ -213,6 +235,10 @@ pub fn list(data: &Path) -> Result<(), anyagents_core::Error> {
 /// a keeper that does not answer while its process runs is ended by signal,
 /// once its recorded identity proves the process is that keeper.
 pub fn stop(data: &Path, agent: Option<&str>, force: bool) -> Result<(), anyagents_core::Error> {
+    if !HOSTED_IN_KEEPERS {
+        eprintln!("{NOT_USED}");
+        return Ok(());
+    }
     let fail = |message: String| anyagents_core::Error::Message(message);
     let root = anyagents_keeper::root(data);
     let meta = match std::fs::symlink_metadata(&root) {

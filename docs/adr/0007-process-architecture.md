@@ -142,12 +142,15 @@ Without seats (the single-user `local` mode of [0002](0002-runtime-drivers-and-c
 
 ### 9. Where in-process hosting remains
 
-`HarnessHost::InProcess` hosts the adapter in the calling process. It remains for two callers:
+`HarnessHost::InProcess` hosts the adapter in the calling process. It remains for three callers:
 
 - a server embedded in a test binary, which has no keeper mode;
-- the one-shot offline `anyagents agents flush`, whose harness ends when the command does. `flush` now takes the agent's process lock, so it never starts a second process beside a live keeper.
+- the one-shot offline `anyagents agents flush`, whose harness ends when the command does. `flush` now takes the agent's process lock, so it never starts a second process beside a live keeper;
+- `anyagents serve` on a platform other than Linux (below).
 
-`anyagents serve` always uses keepers. **Removal note:** delete `InProcess` once the server tests that embed a server run against the real binary (or the test binary gains a keeper entry point), and `flush` is a kernel command.
+`anyagents serve` uses keepers on Linux.
+
+**Platform limitation: keepers are Linux-only.** Taking a keeper over after a kernel restart, and every liveness and signal decision about one, rest on proving a process's identity: its start time, the boot id and the pid namespace, read from `/proc`. Without that proof a kernel can never safely take a keeper over (a recorded pid may name any process by then), so the keepers' purpose cannot be met. On macOS and other platforms `serve` hosts each harness in its own process, as before keepers: a server restart there ends its harnesses, and `anyagents keepers list|stop` say that keepers are not used. Keepers there need a process-identity source for that platform; on macOS, `proc_pidinfo` for the process and its start time from `kinfo_proc` (`sysctl` `KERN_PROC_PID`, `p_starttime`), with the boot time (`KERN_BOOTTIME`) in place of the boot id. **Removal note:** delete `InProcess` once the server tests that embed a server run against the real binary (or the test binary gains a keeper entry point), and `flush` is a kernel command.
 
 ## Invariants
 

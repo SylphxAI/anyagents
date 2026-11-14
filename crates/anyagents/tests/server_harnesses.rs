@@ -74,6 +74,7 @@ impl Server {
 
     /// The server dies without a word, as a crash or an OOM kill does. Its
     /// keepers are left running.
+    #[cfg(target_os = "linux")]
     fn crash(mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -81,6 +82,7 @@ impl Server {
     }
 
     /// A clean stop, as a deployment's restart sends.
+    #[cfg(target_os = "linux")]
     fn terminate(mut self) {
         // SAFETY: SIGTERM to the server this test started.
         unsafe { libc::kill(self.child.id() as i32, libc::SIGTERM) };
@@ -476,7 +478,11 @@ fn an_agy_agent_and_a_muse_agent_each_answer_a_mailbox_message() {
     drop(server);
 }
 
+// Keepers host harnesses on Linux only (`docs/adr/0007-process-architecture.md`):
+// what follows tests them, and the server elsewhere hosts each harness itself.
+
 /// Send `text` to `name` as the asker; the id of the message it became.
+#[cfg(target_os = "linux")]
 fn send(data: &Path, name: &str) -> String {
     let sent = call(
         &data.join("anyagents.sock"),
@@ -490,6 +496,7 @@ fn send(data: &Path, name: &str) -> String {
 }
 
 /// Wait for the shared log to say `line`; on failure show the log.
+#[cfg(target_os = "linux")]
 fn wait_logged(data: &Path, line: &str, why: &str) {
     let deadline = Instant::now() + support::WAIT;
     while !shared_log(data).contains(line) {
@@ -499,6 +506,7 @@ fn wait_logged(data: &Path, line: &str, why: &str) {
 }
 
 /// How many answers to `sent_id` reached the asker.
+#[cfg(target_os = "linux")]
 fn answers(data: &Path, sent_id: &str) -> usize {
     let store = Store::open(data.join("state.db")).unwrap();
     let asker = store.agent_by_name("kind").unwrap();
@@ -511,6 +519,7 @@ fn answers(data: &Path, sent_id: &str) -> usize {
 }
 
 /// Make the agent's contract double hold each turn open while `hold` exists.
+#[cfg(target_os = "linux")]
 fn hold_turns(data: &Path, agent_id: &str, hold: &Path) {
     let path = data
         .join("agents")
@@ -523,6 +532,7 @@ fn hold_turns(data: &Path, agent_id: &str, hold: &Path) {
 }
 
 /// The harness process the agent's newest live keeper holds.
+#[cfg(target_os = "linux")]
 fn kept_harness(data: &Path, agent_id: &str) -> u32 {
     let mut found = None;
     support::wait_for(
@@ -550,6 +560,7 @@ fn kept_harness(data: &Path, agent_id: &str) -> u32 {
 }
 
 /// No keeper directory serves the agent.
+#[cfg(target_os = "linux")]
 fn no_keeper(data: &Path, agent_id: &str) -> bool {
     let Ok(entries) = std::fs::read_dir(data.join("keepers")) else {
         return true;
@@ -561,11 +572,13 @@ fn no_keeper(data: &Path, agent_id: &str) -> bool {
     })
 }
 
+#[cfg(target_os = "linux")]
 fn alive(pid: u32) -> bool {
     // SAFETY: signal 0 only asks whether the process exists.
     unsafe { libc::kill(pid as i32, 0) == 0 }
 }
 
+#[cfg(target_os = "linux")]
 fn shared_log(data: &Path) -> String {
     std::fs::read_to_string(data.join("shared.log")).unwrap_or_default()
 }
@@ -576,6 +589,7 @@ fn shared_log(data: &Path) -> String {
 /// turn and starts again. Each time the same vendor process finishes the turn,
 /// every message is answered exactly once, and delivery resumes from the
 /// mailbox cursor.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_harness_outlives_a_server_crash_an_upgrade_and_a_clean_stop() {
     let _env = support::lock();
@@ -655,6 +669,7 @@ fn a_harness_outlives_a_server_crash_an_upgrade_and_a_clean_stop() {
 /// range overlapping the next server's has them taken over; one whose
 /// keepers speak no version the next server speaks has them stopped and
 /// started again, and mail sent before and after is answered exactly once.
+#[cfg(target_os = "linux")]
 #[test]
 fn keepers_across_protocol_versions_are_taken_over_or_replaced() {
     let _env = support::lock();
@@ -741,6 +756,7 @@ fn keepers_across_protocol_versions_are_taken_over_or_replaced() {
 /// the gateway moves: every agent's token is replaced, and an API-key agent's
 /// kept harness is replaced rather than taken over, so none keeps sending its
 /// token to the old port. The turn it held is recovered and answered once.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_moved_gateway_replaces_the_kept_harnesses_of_api_key_agents() {
     let _env = support::lock();
@@ -822,6 +838,7 @@ fn a_moved_gateway_replaces_the_kept_harnesses_of_api_key_agents() {
 /// A server that stops while one of its agents' keepers is still starting
 /// does not wait for that start: it stops at once, and the keeper finishes
 /// its start on its own for the next server.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_server_stops_at_once_while_a_keeper_is_still_starting() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -894,6 +911,7 @@ fn a_server_stops_at_once_while_a_keeper_is_still_starting() {
 /// It refuses while a server runs (that server would start them again),
 /// exits non-zero when it refuses, and once no server runs it ends every
 /// harness and frees every agent lock.
+#[cfg(target_os = "linux")]
 #[test]
 fn keepers_stop_only_when_no_server_runs() {
     let _env = support::lock();
@@ -962,6 +980,7 @@ fn keepers_stop_only_when_no_server_runs() {
 /// server crashes. The next server, another binary, offers both again; the
 /// adapter in the keeper answers from its memory, and the vendor process reads
 /// each exactly once.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_spiron_adapter_in_its_keeper_never_writes_a_line_twice_across_a_restart() {
     use std::os::unix::fs::PermissionsExt as _;

@@ -57,7 +57,7 @@ AnyAgents is a **100% vendor-neutral multi-agent orchestrator**. It never implem
 
 ## How it works
 
-`anyagents serve` is one long-lived server. The CLI, an MCP server registered into each agent, and channels such as Telegram are its clients. Each agent is one vendor process in that vendor's programmatic mode, supervised by the server and held by its own keeper process, so restarting or upgrading the server does not stop any agent.
+`anyagents serve` is one long-lived server. The CLI, an MCP server registered into each agent, and channels such as Telegram are its clients. Each agent is one vendor process in that vendor's programmatic mode, supervised by the server and held by its own keeper process, so restarting or upgrading the server does not stop any agent. Keepers are Linux-only for now: on macOS the server hosts each harness itself, so a server restart there restarts its agents ([ADR 0007](docs/adr/0007-process-architecture.md#9-where-in-process-hosting-remains)).
 
 - [Vision](docs/vision.md): goal, first-version scope, boundaries.
 - [Architecture](docs/architecture.md): state, the three axes, harnesses, the mailbox and its guarantees, runtime boundaries, channels, the gateway, usage.
