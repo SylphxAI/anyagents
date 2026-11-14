@@ -427,6 +427,254 @@ fn parse_gh_check_coords(spec: &str) -> Result<WatchTarget, String> {
     ))
 }
 
+/// One correct call, quoted in every schedule error.
+const SCHEDULE_EXAMPLE: &str = "`{action: \"create\", watch: \"github:pr:owner/repo#12\", prompt: \"PR 12 finished; review it\"}`";
+
+/// What a schedule call does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ScheduleVerb {
+    List,
+    Create,
+    Cancel,
+}
+
+/// The trigger fields of a schedule call, as the model wrote them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ScheduleTrigger {
+    pub at: Option<String>,
+    pub every: Option<String>,
+    pub watch: Option<String>,
+    /// A trigger value under a generic name (`spec`, `kind`): the field the
+    /// action names takes it.
+    pub spec: Option<String>,
+}
+
+/// Fold the shapes models write into one verb: `action` naming the trigger
+/// (`{action: "watch", watch}`, `{action: "at", spec}`), a mode under `kind`
+/// (`{kind: "watch", watch}`), and a bare watch spec under `spec`.
+pub(crate) fn resolve_schedule_call(
+    action: Option<&str>,
+    trigger: &mut ScheduleTrigger,
+    has_id: bool,
+) -> Result<ScheduleVerb, String> {
+    let mut action = action
+        .map(str::trim)
+        .filter(|a| !a.is_empty())
+        .map(str::to_ascii_lowercase);
+    let spec = trigger
+        .spec
+        .take()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let mut spec = match spec {
+        Some(mode) if matches!(mode.as_str(), "at" | "every" | "watch") => {
+            if action.as_deref().is_none_or(is_create_word) {
+                action = Some(mode);
+            }
+            None
+        }
+        other => other,
+    };
+    if let Some(mode @ ("at" | "every" | "watch")) = action.as_deref() {
+        let slot = match mode {
+            "at" => &mut trigger.at,
+            "every" => &mut trigger.every,
+            _ => &mut trigger.watch,
+        };
+        if slot.is_none() {
+            *slot = spec.take();
+        }
+        if slot.is_none() {
+            return Err(format!(
+                "`action: \"{mode}\"` needs the `{mode}` value, e.g. {SCHEDULE_EXAMPLE}"
+            ));
+        }
+        return Ok(ScheduleVerb::Create);
+    }
+    let has_trigger = trigger.at.is_some() || trigger.every.is_some() || trigger.watch.is_some();
+    if !has_trigger && let Some(value) = spec {
+        if !is_watch_spec(&value) {
+            return Err(format!(
+                "`spec: \"{value}\"` does not say which trigger it is; pass it as `at` (\"20m\" or an ISO time), `every` (\"15m\") or `watch`, e.g. {SCHEDULE_EXAMPLE}"
+            ));
+        }
+        trigger.watch = Some(value);
+    }
+    let has_trigger = trigger.at.is_some() || trigger.every.is_some() || trigger.watch.is_some();
+    match action.as_deref() {
+        None if has_trigger => Ok(ScheduleVerb::Create),
+        None if has_id => Ok(ScheduleVerb::Cancel),
+        None => Ok(ScheduleVerb::List),
+        Some(word) if is_create_word(word) => Ok(ScheduleVerb::Create),
+        Some("list" | "ls" | "get" | "show" | "inspect" | "status") => Ok(ScheduleVerb::List),
+        Some("cancel" | "delete" | "remove" | "clear" | "off" | "pause" | "disable" | "stop") => {
+            Ok(ScheduleVerb::Cancel)
+        }
+        Some(other) => Err(format!(
+            "unknown schedule action `{other}`. Use {SCHEDULE_EXAMPLE} (exactly one of `at`, `every`, `watch`), `{{action: \"list\"}}`, or `{{action: \"cancel\", id: \"sch_...\" | \"all\"}}`"
+        )),
+    }
+}
+
+fn is_create_word(word: &str) -> bool {
+    matches!(word, "create" | "set" | "add" | "schedule" | "new")
+}
+
+fn is_watch_spec(value: &str) -> bool {
+    [
+        "github:", "spiron:", "agent:", "pid:", "process:", "file:", "path:",
+    ]
+    .iter()
+    .any(|scheme| value.starts_with(scheme))
+}
+
+#[cfg(test)]
+mod call_shape_tests {
+    use super::*;
+
+    fn resolve(
+        action: Option<&str>,
+        trigger: ScheduleTrigger,
+    ) -> (Result<ScheduleVerb, String>, ScheduleTrigger) {
+        let mut trigger = trigger;
+        let verb = resolve_schedule_call(action, &mut trigger, false);
+        (verb, trigger)
+    }
+
+    #[test]
+    fn an_action_naming_the_trigger_creates_it() {
+        for (mode, trigger) in [
+            (
+                "watch",
+                ScheduleTrigger {
+                    watch: Some("github:pr:o/r#1".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "at",
+                ScheduleTrigger {
+                    at: Some("20m".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "every",
+                ScheduleTrigger {
+                    every: Some("15m".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "WATCH",
+                ScheduleTrigger {
+                    spec: Some("agent:idle:worker".into()),
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let (verb, resolved) = resolve(Some(mode), trigger);
+            assert_eq!(verb, Ok(ScheduleVerb::Create), "{mode}");
+            assert!(resolved.spec.is_none());
+        }
+        let (_, resolved) = resolve(
+            Some("at"),
+            ScheduleTrigger {
+                spec: Some("2026-11-13T23:28:00Z".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(resolved.at.as_deref(), Some("2026-11-13T23:28:00Z"));
+        // `{action: "watch", kind: "agent:idle:x"}`: `kind` carries the value.
+        let (_, resolved) = resolve(
+            Some("watch"),
+            ScheduleTrigger {
+                spec: Some("agent:idle:sage-m1".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(resolved.watch.as_deref(), Some("agent:idle:sage-m1"));
+    }
+
+    #[test]
+    fn a_mode_under_kind_and_a_bare_watch_spec_create() {
+        let (verb, resolved) = resolve(
+            None,
+            ScheduleTrigger {
+                every: Some("5m".into()),
+                spec: Some("every".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(verb, Ok(ScheduleVerb::Create));
+        assert_eq!(resolved.every.as_deref(), Some("5m"));
+        let (verb, resolved) = resolve(
+            Some("create"),
+            ScheduleTrigger {
+                spec: Some("github:check:o/r@abc".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(verb, Ok(ScheduleVerb::Create));
+        assert_eq!(resolved.watch.as_deref(), Some("github:check:o/r@abc"));
+    }
+
+    #[test]
+    fn existing_shapes_keep_their_meaning() {
+        let (verb, _) = resolve(None, ScheduleTrigger::default());
+        assert_eq!(verb, Ok(ScheduleVerb::List));
+        let mut empty = ScheduleTrigger::default();
+        assert_eq!(
+            resolve_schedule_call(None, &mut empty, true),
+            Ok(ScheduleVerb::Cancel)
+        );
+        for word in ["list", "inspect", "ls"] {
+            assert_eq!(
+                resolve(Some(word), ScheduleTrigger::default()).0,
+                Ok(ScheduleVerb::List)
+            );
+        }
+        for word in ["cancel", "delete", "stop"] {
+            assert_eq!(
+                resolve(Some(word), ScheduleTrigger::default()).0,
+                Ok(ScheduleVerb::Cancel)
+            );
+        }
+        let (verb, _) = resolve(
+            Some("set"),
+            ScheduleTrigger {
+                at: Some("1m".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(verb, Ok(ScheduleVerb::Create));
+    }
+
+    #[test]
+    fn wrong_shapes_name_the_right_one() {
+        let (verb, _) = resolve(Some("update"), ScheduleTrigger::default());
+        let err = verb.unwrap_err();
+        assert!(err.contains("unknown schedule action `update`"), "{err}");
+        assert!(err.contains(SCHEDULE_EXAMPLE), "{err}");
+        assert!(err.contains("\"cancel\""), "{err}");
+        let (verb, _) = resolve(Some("watch"), ScheduleTrigger::default());
+        let err = verb.unwrap_err();
+        assert!(
+            err.contains("`action: \"watch\"` needs the `watch` value"),
+            "{err}"
+        );
+        let (verb, _) = resolve(
+            Some("create"),
+            ScheduleTrigger {
+                spec: Some("20m".into()),
+                ..Default::default()
+            },
+        );
+        let err = verb.unwrap_err();
+        assert!(err.contains("does not say which trigger"), "{err}");
+    }
+}
+
 /// Create a new schedule for `agent` from `(at, every, watch, prompt)`.
 pub fn create_agent_schedule(
     store: &Store,
@@ -438,20 +686,37 @@ pub fn create_agent_schedule(
     prompt: &str,
 ) -> Result<ScheduleView, String> {
     let clean_prompt = prompt.trim();
-    if clean_prompt.is_empty() {
-        return Err("`schedule` requires a non-empty `prompt`".to_string());
+    if clean_prompt.is_empty() || crate::api::is_null_word(clean_prompt) {
+        return Err(format!(
+            "`schedule` requires a non-empty `prompt`: the message you get when it fires, e.g. {SCHEDULE_EXAMPLE}"
+        ));
     }
-    let at_opt = at.map(str::trim).filter(|s| !s.is_empty());
-    let every_opt = every.map(str::trim).filter(|s| !s.is_empty());
-    let watch_opt = watch.map(str::trim).filter(|s| !s.is_empty());
-    let mode_count = usize::from(at_opt.is_some())
-        + usize::from(every_opt.is_some())
-        + usize::from(watch_opt.is_some());
-    if mode_count == 0 {
-        return Err("`schedule` requires one of `at`, `every`, or `watch`".to_string());
+    fn given(value: Option<&str>) -> Option<&str> {
+        value
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !crate::api::is_null_word(s))
     }
-    if mode_count > 1 {
-        return Err("specify only one of `at`, `every`, or `watch` per schedule".to_string());
+    let at_opt = given(at);
+    let every_opt = given(every);
+    let watch_opt = given(watch);
+    let set: Vec<&str> = [
+        ("`at`", at_opt),
+        ("`every`", every_opt),
+        ("`watch`", watch_opt),
+    ]
+    .into_iter()
+    .filter_map(|(name, value)| value.map(|_| name))
+    .collect();
+    if set.is_empty() {
+        return Err(format!(
+            "a schedule needs one trigger: `at` (\"20m\" or an ISO time), `every` (\"15m\") or `watch` (\"github:pr:owner/repo#12\", \"github:check:owner/repo@sha\", \"agent:idle:<name>\"), e.g. {SCHEDULE_EXAMPLE}"
+        ));
+    }
+    if set.len() > 1 {
+        return Err(format!(
+            "a schedule has exactly one trigger, and this call set {}. Make one call per trigger, e.g. {SCHEDULE_EXAMPLE} and `{{action: \"create\", at: \"30m\", prompt: \"...\"}}`",
+            set.join(" and ")
+        ));
     }
     let now = anyagents_core::now_ms();
     let input = if let Some(at_str) = at_opt {

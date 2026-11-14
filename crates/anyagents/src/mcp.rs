@@ -29,6 +29,12 @@ use crate::api::{
 use crate::operator::CAPABILITY_FILE;
 use crate::server;
 
+pub(crate) mod code_contract;
+#[cfg(test)]
+mod contract_tests;
+
+pub(crate) use code_contract::CodeLimits;
+
 /// MCP tool surface profile.
 #[derive(
     Clone,
@@ -505,7 +511,10 @@ pub fn run(data: &Path, config: Option<&Path>, profile: Option<McpProfile>) -> R
     let config_buf = config.to_path_buf();
     tool_server_runtime()?.block_on(async {
         let client = Client::new(socket, config_buf.clone(), capability);
-        let (who, harness) = client.whoami_with_harness().await.map_err(Error::Message)?;
+        let (who, harness, limits) = client.whoami_with_harness().await.map_err(Error::Message)?;
+        // The limits come from the server's environment only; a server that
+        // names none leaves the defaults.
+        CodeLimits::serve(limits.unwrap_or_default());
         // A harness names the agent id it was given; the server already
         // answered with the agent this session acts as, and the two may not
         // differ.
@@ -732,7 +741,9 @@ impl Client {
     }
 
     /// The agent this capability authenticates, as the server resolved it.
-    async fn whoami_with_harness(&self) -> Result<(AgentRef, Option<String>), String> {
+    async fn whoami_with_harness(
+        &self,
+    ) -> Result<(AgentRef, Option<String>, Option<CodeLimits>), String> {
         let named = crate::client::agent_identity().map(|id| id.to_string());
         let cap = self.current_capability();
         let who: serde_json::Value = self
@@ -765,6 +776,11 @@ impl Client {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string);
+        let limits = who.get("code_limits").and_then(|value| {
+            serde_json::from_value::<CodeLimits>(value.clone())
+                .ok()
+                .map(|l| CodeLimits::from_parts(Some(l.default_ms), Some(l.max_ms)))
+        });
         Ok((
             AgentRef {
                 id: AgentId::parse(id).map_err(|err| err.to_string())?,
@@ -772,6 +788,7 @@ impl Client {
                 workdir,
             },
             harness,
+            limits,
         ))
     }
 
@@ -823,7 +840,7 @@ struct SendArgs {
     /// Broadcasts, channel updates and system events do not. May be
     /// empty (`[]`) when `reply_to` names a mailbox reference (`anyagents:reply:<msg_id>`)
     /// or when performing a message interaction (`action`: `"react"` | `"vote"` | `"edit"` | `"delete"` | `"pin"` | `"unpin"` | `"stop_poll"`).
-    #[serde(default, deserialize_with = "crate::api::deserialize_string_or_vec")]
+    #[serde(default, deserialize_with = "deserialize_send_targets")]
     to: Vec<String>,
     /// Message text or caption (Markdown is automatically rendered as rich HTML on Telegram).
     /// Also used as new message text when `action = "edit"` or optional comment when `action = "vote"`.
@@ -831,46 +848,66 @@ struct SendArgs {
     text: String,
     /// Optional reply or interaction target: `anyagents:reply:<msg_id>` from the message header
     /// (answers or reacts in the same chat/topic/agent), or a plain destination address.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::api::absent_if_null")]
     reply_to: Option<String>,
     /// Optional quoted substring or message text to attach as a quote.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::api::absent_if_null")]
     quote: Option<String>,
     /// Optional media attachment (`photo`, `video`, `audio`, `music`, `voice`, `document`, `animation`)
     /// by local file path, `https://` URL, or Telegram `file_id` (plus optional `title` and `performer` for `music`/`audio`).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::api::absent_if_null")]
     media: Option<SendMedia>,
     /// Optional GPS coordinates or venue (`latitude`, `longitude`, optional `title` and `address`).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::api::absent_if_null")]
     location: Option<SendLocation>,
     /// Optional interactive poll (`question`, `options`, optional `is_anonymous` and `allows_multiple_answers`).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::api::absent_if_null")]
     poll: Option<SendPoll>,
     /// Optional interactive checklist (`title`, `tasks`, optional `business_connection_id`).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::api::absent_if_null")]
     checklist: Option<SendChecklist>,
     /// Optional rich Instant View article (`title`, `content` or `url`, optional `author_name`).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::api::absent_if_null")]
     article: Option<SendArticle>,
     /// Optional message interaction action (`"send"` default, or `"react"`, `"vote"`, `"check"`, `"uncheck"`,
     /// `"edit"`, `"delete"`, `"pin"`, `"unpin"`, `"stop_poll"` on an existing message identified by `target` or `reply_to`).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::api::absent_if_null")]
     action: Option<String>,
     /// Target message for interactions (`anyagents:reply:msg_...`, `msg_...`, or `telegram:chat:<chat_id>:<message_id>`).
     /// Falls back to `reply_to` if omitted.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::api::absent_if_null")]
     target: Option<String>,
     /// Emoji reaction when `action = "react"` (e.g. `"👍"`, `"🔥"`, `"❤️"`, `"🎉"`, or `""` to clear).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::api::absent_if_null")]
     emoji: Option<String>,
     /// Selected poll option(s) when `action = "vote"` (1-based option numbers `"1"`, `"2"` or option text)
     /// or checklist item numbers when `action = "check" | "uncheck"`.
-    #[serde(default, deserialize_with = "crate::api::deserialize_string_or_vec")]
+    #[serde(default, deserialize_with = "deserialize_send_targets")]
     options: Vec<String>,
     /// Names this send. Send it again with the same value only when an earlier
     /// attempt got no answer.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::api::absent_if_null")]
     idempotency_key: Option<String>,
+}
+
+/// A destination word that names agents by their relation to the sender.
+fn relation_word(raw: &str) -> Option<&'static str> {
+    let raw = raw.trim();
+    let word = raw.strip_prefix("agent:").unwrap_or(raw);
+    ["parent", "children", "siblings", "peers", "team", "all"]
+        .into_iter()
+        .find(|known| word.eq_ignore_ascii_case(known))
+}
+
+/// `send` destinations or options, without the `"null"` placeholders models
+/// write for an unused list.
+fn deserialize_send_targets<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let mut targets = crate::api::deserialize_string_or_vec(deserializer)?;
+    targets.retain(|target| !crate::api::is_null_word(target));
+    Ok(targets)
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -1411,16 +1448,16 @@ struct InteractArgs {
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 struct ScheduleArgs {
-    /// Action: `"set"` (create a one-off `at`, recurring `every`, or event `watch` wake),
-    /// `"list"` (list active schedules), or `"cancel"` (cancel a schedule by `id` or `"all"`).
-    /// Inferred automatically when `at`, `every`, `watch`, or `id` is provided.
-    #[serde(default)]
+    /// `"create"` (exactly one of `at`, `every`, `watch`, plus `prompt`), `"list"`, or
+    /// `"cancel"` (`id` or `"all"`). `"at"`, `"every"` and `"watch"` create with that trigger.
+    /// Inferred when omitted: a trigger creates, an `id` cancels, otherwise list.
+    #[serde(default, deserialize_with = "crate::api::absent_if_null")]
     action: Option<String>,
     /// One-off wake time: relative duration (`"1m"`, `"30s"`, `"2h"`) or ISO-8601 / Unix timestamp (`"2026-10-29T16:30:00Z"`).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::api::absent_if_null")]
     at: Option<String>,
     /// Recurring wake interval (`"1m"`, `"5m"`, `"15m"`, `"30m"`, `"1h"`). Each tick enters your mailbox like any other message; ticks missed while one is still undelivered coalesce into it.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::api::absent_if_null")]
     every: Option<String>,
     /// Event watch specification:
     /// - `"github:pr:<owner>/<repo>#<num>"` (GitHub PR reaching a terminal state: merged/closed or checks terminal)
@@ -1429,16 +1466,37 @@ struct ScheduleArgs {
     /// - `"agent:idle:<name_or_id>"` (AnyAgents agent transitioning to idle)
     /// - `"pid:<pid>"` / `"process:<pid>"` (local background process PID exiting)
     /// - `"file:<path>"` / `"path:<path>"` (local file/directory created or modified)
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::api::absent_if_null")]
     watch: Option<String>,
+    /// The trigger value when `action` names the trigger (`{action: "at", spec: "20m"}`).
+    #[serde(
+        default,
+        alias = "kind",
+        deserialize_with = "crate::api::absent_if_null"
+    )]
+    spec: Option<String>,
     /// Prompt delivered to the agent when the schedule or event watch fires.
-    #[serde(default, alias = "text", alias = "message")]
+    #[serde(
+        default,
+        alias = "text",
+        alias = "message",
+        deserialize_with = "crate::api::absent_if_null"
+    )]
     prompt: Option<String>,
     /// Schedule ID (`sch_...`) or `"all"` when `action = "cancel"`.
-    #[serde(default, alias = "schedule_id")]
+    #[serde(
+        default,
+        alias = "schedule_id",
+        deserialize_with = "crate::api::absent_if_null"
+    )]
     id: Option<String>,
     /// Optional target agent name or `agt_...` ID (defaults to this agent; owners/parents can also inspect or manage a peer/child's schedules).
-    #[serde(default, alias = "name", alias = "target")]
+    #[serde(
+        default,
+        alias = "name",
+        alias = "target",
+        deserialize_with = "crate::api::absent_if_null"
+    )]
     agent: Option<String>,
 }
 
@@ -1629,9 +1687,15 @@ struct FilesArgs {
     /// Optional working directory (relative to the agent's `workdir` or absolute) when `action = "exec"`.
     #[serde(default, alias = "workdir")]
     cwd: Option<String>,
-    /// Optional execution timeout in milliseconds when `action = "exec"` (default `30000`, max `120000`).
+    /// Optional execution timeout in milliseconds when `action = "exec"` (default `30000`, max
+    /// `600000` unless the server sets another ceiling; a remote sandbox stops at `120000`).
     #[serde(default, alias = "timeout")]
     timeout_ms: Option<u64>,
+    /// The `timeout_ms` a `code` snippet asked for, when its call had less
+    /// time left to give; only the result's note reads it.
+    #[serde(default)]
+    #[schemars(skip)]
+    requested_timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -1660,13 +1724,10 @@ impl DynamicObjectArgs {
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 struct CodeArgs {
-    /// Async TypeScript / JavaScript snippet body to execute in the AnyAgents capability sandbox.
-    /// Has access to `anyagents.{memory,conversation,send,agents,schedule,groups,browser,files}` (and `tools.anyagents.*`)
-    /// plus `workspace.{read,write,edit,multi_edit,patch,glob,grep,list}` (and `tools.workspace.*`) and `console.{log,warn,error}`.
-    /// Ambient `process.env`, `require`, `child_process`, and raw `fs` are isolated and unavailable.
+    /// TypeScript body of an async function, run in the AnyAgents capability sandbox.
     #[serde(alias = "script", alias = "source")]
     code: String,
-    /// Optional execution timeout in milliseconds (default `30000`, max `120000`).
+    /// Wall time for the call in milliseconds (default `30000`, max `600000` unless configured).
     #[serde(default, alias = "timeout")]
     timeout_ms: Option<u64>,
 }
@@ -1707,6 +1768,24 @@ impl AgentMcp {
         &self,
         Parameters(args): Parameters<SendArgs>,
     ) -> Result<rmcp::handler::server::wrapper::Json<serde_json::Value>, String> {
+        let mut args = args;
+        // Relation words (`parent`, `children`, ...) read the same in `to` and
+        // in `reply_to`, whatever their case or `agent:` prefix.
+        for target in &mut args.to {
+            if let Some(word) = relation_word(target) {
+                *target = word.to_string();
+            }
+        }
+        if args.to.is_empty()
+            && let Some(word) = args
+                .reply_to
+                .as_deref()
+                .and_then(relation_word)
+                .filter(|word| matches!(*word, "parent" | "children"))
+        {
+            args.to = vec![word.to_string()];
+            args.reply_to = None;
+        }
         let inferred_interact = args
             .action
             .as_deref()
@@ -1821,13 +1900,21 @@ impl AgentMcp {
                 None => self.agent.id.to_string(),
             }
         };
-        let target = args
+        let target = match args
             .agent
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .map(|s| s.strip_prefix("agent:").unwrap_or(s).to_string())
-            .unwrap_or(default_agent);
+        {
+            Some(raw) => {
+                let resolved = self.resolve_agent_word(raw).await?;
+                resolved
+                    .strip_prefix("agent:")
+                    .unwrap_or(&resolved)
+                    .to_string()
+            }
+            None => default_agent,
+        };
         let mut query = Vec::new();
         if let Some(id) = args.raw_id {
             query.push(format!("raw_id={}", urlencoding_simple(&id)));
@@ -1892,7 +1979,8 @@ impl AgentMcp {
             .map(str::trim)
             .filter(|s| !s.is_empty())
         {
-            query.push(format!("with={}", urlencoding_simple(with_peer)));
+            let with_peer = self.resolve_agent_word(with_peer).await?;
+            query.push(format!("with={}", urlencoding_simple(&with_peer)));
         }
         if let Some(dir) = args
             .direction
@@ -1969,7 +2057,7 @@ impl AgentMcp {
     )]
     async fn agents(
         &self,
-        Parameters(args): Parameters<AgentsArgs>,
+        Parameters(mut args): Parameters<AgentsArgs>,
     ) -> Result<rmcp::handler::server::wrapper::Json<serde_json::Value>, String> {
         let action = args
             .action
@@ -1994,6 +2082,12 @@ impl AgentMcp {
                     "list".to_string()
                 }
             });
+        // `name` names the agent acted on, except where it names a new one.
+        if !matches!(action.as_str(), "list" | "spawn" | "create")
+            && let Some(raw) = args.name.as_deref()
+        {
+            args.name = Some(self.resolve_agent_word(raw).await?);
+        }
         match action.as_str() {
             "usage" | "outcomes" => {
                 let mut qs = String::new();
@@ -3178,18 +3272,23 @@ impl AgentMcp {
     }
 
     #[tool(
-        description = "Schedule your own wakes (`at` or `every` with `prompt`) and external event watches (`watch` with `prompt`), or `list` and `cancel` (`id`: `<sch_...>` | `\"all\"`) your schedules. Supported `watch` specs: `github:pr:<owner>/<repo>#<num>` (PR or checks terminal), `github:check:<owner>/<repo>@<ref>` (check runs terminal), `spiron:promise:<id>` (Spiron promise state change pulled from the public API), and `agent:idle:<name_or_id>` (AnyAgents agent going idle). A due wake or triggered watch enters your mailbox like any other message (steered into a running turn, or held while you are paused or quota-blocked), and a schedule never queues a second wake while its previous one is undelivered."
+        description = SCHEDULES_TOOL_DESCRIPTION
     )]
     async fn schedule(
         &self,
         Parameters(args): Parameters<ScheduleArgs>,
     ) -> Result<rmcp::handler::server::wrapper::Json<serde_json::Value>, String> {
-        let target_opt = args
+        let target_opt = match args
             .agent
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("self"))
-            .map(|s| s.strip_prefix("agent:").unwrap_or(s).to_string());
+        {
+            Some(raw) => Some(self.resolve_agent_word(raw).await?),
+            None => None,
+        }
+        .map(|s| s.strip_prefix("agent:").unwrap_or(&s).to_string())
+        .filter(|s| s != &self.agent.name && s != self.agent.id.as_str());
         let path = match target_opt.as_deref() {
             Some(target) => format!("/v1/agents/{target}/schedules"),
             None => "/v1/schedules".to_string(),
@@ -3199,6 +3298,7 @@ impl AgentMcp {
             "at": args.at,
             "every": args.every,
             "watch": args.watch,
+            "spec": args.spec,
             "prompt": args.prompt,
             "id": args.id,
             "agent": target_opt,
@@ -3248,7 +3348,7 @@ impl AgentMcp {
     }
 
     #[tool(
-        description = "Schedule your own wakes (`at` or `every` with `prompt`) and external event watches (`watch` with `prompt`), or `list` and `cancel` (`id`: `<sch_...>` | `\"all\"`) your schedules. Supported `watch` specs: `github:pr:<owner>/<repo>#<num>` (PR or checks terminal), `github:check:<owner>/<repo>@<ref>` (check runs terminal), `spiron:promise:<id>` (Spiron promise state change pulled from the public API), and `agent:idle:<name_or_id>` (AnyAgents agent going idle). A due wake or triggered watch enters your mailbox like any other message (steered into a running turn, or held while you are paused or quota-blocked), and a schedule never queues a second wake while its previous one is undelivered."
+        description = SCHEDULES_TOOL_DESCRIPTION
     )]
     async fn schedules(
         &self,
@@ -3390,21 +3490,20 @@ impl AgentMcp {
     ) -> Result<MultimediaJson, String> {
         let base_dir = self.resolve_workdir();
         let config_dir = self.client.config.clone();
+        let limits = CodeLimits::current();
         let (val, media) = tokio::task::spawn_blocking(move || {
             let backend = <dyn anyagents_tools::WorkspaceBackend>::resolve(
                 Some(&config_dir),
                 base_dir.clone(),
             );
-            execute_files_tool_with_media_backend(backend.as_ref(), &base_dir, args)
+            execute_files_tool_with_media_backend(backend.as_ref(), &base_dir, args, limits)
         })
         .await
         .map_err(|e| format!("files task join error: {e}"))??;
         Ok(MultimediaJson(val, media))
     }
 
-    #[tool(
-        description = "Unified Cross-Harness Code Mode / Programmatic Tool Calling (`code`, optional `timeout_ms` default 30000, max 120000). Executes an async TypeScript / JavaScript snippet in an isolated capability sandbox (`process.env`, `require`, `child_process`, and raw `fs` are unavailable) with `anyagents.{memory,conversation,send,agents,schedule,groups,browser,web,computer,device,media,files}` (alias `tools.anyagents`), `web.{search,fetch}` (alias `tools.web`), `computer.{snapshot,list_windows,focus_window,clipboard_get,clipboard_set,screenshot,cursor_position,move,click,mouse_down,mouse_up,drag,scroll,type,key,hold_key,wait,zoom,action}` (alias `tools.computer`), `device.{screenshot,tap,swipe,type,press,install_app,launch_app,terminate_app,open_url,rotate}` (alias `tools.device`), `media.{image_generate,speech,transcribe}` (alias `tools.media`), and `workspace.{read,write,edit,multi_edit,patch,glob,grep,list,exec}` (alias `tools.workspace`). Calling `workspace.read(path)` on images, PDFs, audio, or video (or calling `browser.screenshot`, `computer.screenshot`, `device.screenshot`, `media.image_generate`, `media.speech`) natively attaches MCP multimedia content blocks (`image`, `audio`, `resource`) directly to the tool response for visual/multimodal inspection. Compose parallel multi-tool queries with `await Promise.all([...])`, filter/aggregate intermediate data in memory, log diagnostics via `console.log`, and `return` only the compact result `{ result, logs, duration_ms }`."
-    )]
+    #[tool(description = CODE_TOOL_DESCRIPTION)]
     async fn code(&self, Parameters(args): Parameters<CodeArgs>) -> Result<MultimediaJson, String> {
         self.execute_code_tool(args).await
     }
@@ -3412,6 +3511,37 @@ impl AgentMcp {
 
 #[cfg(test)]
 pub const CANONICAL_MCP_TOOLS: &[&str] = &["code"];
+
+/// The `schedules` tool's contract, with the exact shape of each action.
+const SCHEDULES_TOOL_DESCRIPTION: &str = "Wake yourself later or on an event. Create: `{action: \"create\", prompt, <one trigger>}` with `at` (\"20m\" or an ISO time), `every` (\"15m\") or `watch`: `github:pr:<owner>/<repo>#<num>` (PR or its checks terminal), `github:check:<owner>/<repo>@<ref>`, `spiron:promise:<id>`, `agent:idle:<name_or_id>`. `action: \"at\"|\"every\"|\"watch\"` with that field also creates. One trigger per schedule; make two calls for a watch plus a deadline. `{action: \"list\"}`; `{action: \"cancel\", id: \"sch_...\"|\"all\"}`. A fired schedule enters your mailbox like any message (steered into a running turn, held while you are paused or quota-blocked) and never queues a second wake while its last one is undelivered.";
+
+/// The `code` tool's contract: language, scope, limits and every callable
+/// name, compact because every agent turn pays for it.
+/// `tool_definitions_with_roles` rewrites the limits to the configured ones.
+const CODE_TOOL_DESCRIPTION: &str = "Run a TypeScript snippet (plain JS works; NOT Python). `code` is the body of an async function: `await` calls, `return` a JSON value; you get `{result, logs, duration_ms}`. No `import`, `require`, `process`, `Buffer`, `fs` or `fetch`; use the globals below. `timeout_ms`: default 30000, max 600000. An inner `workspace.exec` gets the remaining time, or its own `timeout_ms` (the call stretches to fit, up to the max).\n\
+workspace: read(path|{path, start_line?, end_line?}), write(path, content), edit({path, target, replacement}), multi_edit({path, edits: [{target, replacement}]}), patch(text), glob(pattern|{pattern, path?}), grep(query|{query, path?, glob?}), list(path?), exec(cmd|{cmd, cwd?, timeout_ms?}) -> {exit_code, stdout, stderr}.\n\
+anyagents: send, inbox, agents, schedule, conversation, groups, browser, skills, interact; each takes its MCP tool's object, e.g. `anyagents.schedule({action: \"create\", watch: \"github:pr:o/r#1\", prompt: \"...\"})`. memory: read(topic), write({topic, description, content}), search(query), list(). web: search(query), fetch(url). computer, device, media: `<ns>.<action>(opts)`. All also under `tools.`.\n\
+`console.log` goes to `logs`. Use `Promise.all` for independent calls. Run other languages from a file you `workspace.write`, not a quoted one-liner. Reading images, PDF, audio or video, and screenshots, attach the media.";
+
+const CODE_TOOL_LIMITS_TEXT: &str = "default 30000, max 600000";
+
+/// The `code` description with the limits this server enforces and what the
+/// agent's workspace backend (`WorkspaceBackend::kind`) does with an exec's
+/// `timeout_ms`.
+fn code_tool_description(limits: CodeLimits, backend: &str) -> String {
+    let mut limits_text = format!("default {}, max {}", limits.default_ms, limits.max_ms);
+    match backend {
+        "local" => {}
+        "docker" => limits_text.push_str(
+            "; `workspace.exec` runs in your container, which does not stop a command at its `timeout_ms`",
+        ),
+        _ => limits_text.push_str(&format!(
+            "; `workspace.exec` runs in your remote sandbox, which stops a command at {}",
+            anyagents_tools::REMOTE_EXEC_MAX_TIMEOUT_MS
+        )),
+    }
+    CODE_TOOL_DESCRIPTION.replace(CODE_TOOL_LIMITS_TEXT, &limits_text)
+}
 
 /// Remove prose keys (`description`, `title`) from a JSON Schema tree. Field
 /// prose duplicates the tool-level description and is the main driver of
@@ -3526,9 +3656,7 @@ impl rmcp::ServerHandler for AgentMcp {
         let supports_cache_hints = context
             .protocol_version()
             .is_some_and(|version| version >= rmcp::model::ProtocolVersion::V_2026_07_28);
-        let wd = self.resolve_workdir();
-        let data_dir = self.client.socket.parent();
-        let tools = tool_definitions_with_roles(self.profile, Some(&wd), data_dir);
+        let tools = self.listed_tools();
         Ok(rmcp::model::ListToolsResult {
             result_type: Some(rmcp::model::ResultType::COMPLETE),
             tools,
@@ -3594,8 +3722,9 @@ const DEFAULT_GREP_MAX_RESULTS: usize = 100;
 const HARD_GREP_MAX_RESULTS: usize = 2_000;
 const DEFAULT_LIST_MAX_RESULTS: usize = 500;
 const HARD_LIST_MAX_RESULTS: usize = 5_000;
-const DEFAULT_CODE_TIMEOUT_MS: u64 = 30_000;
-const MAX_CODE_TIMEOUT_MS: u64 = 120_000;
+/// How far past a command's own timeout the `code` call it runs in stays
+/// open, so the command's error reaches the snippet before the call ends.
+const CODE_CALL_GRACE_MS: u64 = 2_000;
 const MAX_CODE_RESULT_BYTES: usize = 48 * 1024;
 const MAX_CODE_TOOL_CALLS: usize = 256;
 
@@ -3664,10 +3793,23 @@ function hostCallRaw(tool, reqJson, onOk, onErr) {
 }
 
 function hostSleepRaw(ms, cb) {
-  const delay = Math.max(0, Math.min(120000, Number(ms) || 0));
+  const delay = Math.max(0, Math.min(86400000, Number(ms) || 0));
   outerSetTimeout(() => {
     try { cb(); } catch {}
   }, delay);
+}
+
+// A compile error without the host's stack, numbered by the snippet's own
+// lines: the statement wrapper puts two lines above it.
+function compileError(err) {
+  const text = err && err.stack ? String(err.stack) : String(err);
+  const lines = text.split("\n").filter((line) => !/^\s+at /.test(line));
+  const where = lines.length ? /^(?:evalmachine\.<anonymous>)?:(\d+)$/.exec(lines[0]) : null;
+  if (where) {
+    const line = Number(where[1]) - 2;
+    lines[0] = line >= 1 ? `snippet line ${line}:` : "";
+  }
+  return lines.join("\n").trim();
 }
 
 function compileUserCode(rawCode, ctx) {
@@ -3683,7 +3825,9 @@ function compileUserCode(rawCode, ctx) {
       return vm.runInContext(exprJs, ctx);
     } catch {}
   }
-  const stmtTs = "var __fn = async (tools: any, anyagents: any, workspace: any, web: any, console: any) => {\n  \"use strict\";\n" + rawCode + "\n};";
+  // The inner block lets the snippet declare its own `tools`, `web`, ...
+  // over the parameters instead of failing to compile.
+  const stmtTs = "var __fn = async (tools: any, anyagents: any, workspace: any, web: any, console: any) => {\n  \"use strict\"; {\n" + rawCode + "\n}};";
   const stmtJs = stripTS(stmtTs) + "\n;__fn;";
   return vm.runInContext(stmtJs, ctx);
 }
@@ -3820,6 +3964,9 @@ rl.on("line", async (line) => {
           search: (req = {}) => callTool("conversation", req),
           groups: (req = {}) => callTool("groups", req),
           schedule: (req = {}) => callTool("schedule", req),
+          schedules: (req = {}) => callTool("schedule", req),
+          inbox: (req = {}) => callTool("inbox", req),
+          skills: (req = {}) => callTool("skills", typeof req === "string" ? { action: "read", name: req } : req),
           browser: (req = {}) => callTool("browser", req),
           files: (req = {}) => callTool("files", req),
           subagents: (req = {}) => callTool("subagents", req),
@@ -3830,7 +3977,7 @@ rl.on("line", async (line) => {
           interact: (req = {}) => callTool("interact", req),
         });
         const workspace = Object.freeze({
-          read: (opts = {}) => callTool("files", { ...(typeof opts === "string" ? { path: opts } : opts), action: "read" }),
+          read: (opts = {}, extra = {}) => callTool("files", { ...(typeof opts === "string" ? { ...extra, path: opts } : opts), action: "read" }),
           write: (opts = {}, content) => callTool("files", typeof opts === "string" ? { path: opts, content: content ?? "", action: "write" } : { ...opts, action: "write" }),
           edit: (opts = {}) => callTool("files", { ...opts, action: "edit" }),
           multi_edit: (opts = {}) => callTool("files", { ...opts, action: "multi_edit" }),
@@ -3838,7 +3985,7 @@ rl.on("line", async (line) => {
           glob: (opts = {}) => callTool("files", { ...(typeof opts === "string" ? { pattern: opts } : opts), action: "glob" }),
           grep: (opts = {}) => callTool("files", { ...(typeof opts === "string" ? { query: opts } : opts), action: "grep" }),
           list: (opts = {}) => callTool("files", { ...(typeof opts === "string" ? { path: opts } : opts), action: "list" }),
-          exec: (opts = {}) => callTool("files", { ...(typeof opts === "string" ? { cmd: opts } : opts), action: "exec" }),
+          exec: (opts = {}, extra = {}) => callTool("files", { ...(typeof opts === "string" ? { ...extra, cmd: opts } : opts), action: "exec" }),
         });
         const tools = Object.freeze({ anyagents, workspace, memory: memoryFn, web: webFn, computer: computerFn, device: deviceFn, media: mediaFn });
         const console = Object.freeze({
@@ -3866,7 +4013,13 @@ rl.on("line", async (line) => {
         return Object.freeze({ tools, anyagents, workspace, memory: memoryFn, web: webFn, computer: computerFn, device: deviceFn, media: mediaFn, console });
       })`, ctx);
       const env = bootstrap(hostCallRaw, hostLogRaw, hostSleepRaw);
-      const fn = compileUserCode(msg.code, ctx);
+      let fn;
+      try {
+        fn = compileUserCode(msg.code, ctx);
+      } catch (err) {
+        stdoutWrite(JSON.stringify({ type: "done", ok: false, phase: "compile", error: compileError(err), logs }) + "\n", () => exitProcess(0));
+        return;
+      }
       try {
         Object.defineProperty(Function.prototype, "constructor", { value: undefined, writable: false, configurable: false });
         Object.defineProperty((async () => {}).constructor.prototype, "constructor", { value: undefined, writable: false, configurable: false });
@@ -3910,6 +4063,93 @@ impl Drop for CodeChildGuard {
     }
 }
 
+/// Drive `work` until it finishes or the moving deadline (milliseconds after
+/// `started`) passes.
+async fn until_deadline<F: std::future::Future>(
+    started: std::time::Instant,
+    deadline_ms: &std::sync::atomic::AtomicU64,
+    work: F,
+) -> Result<F::Output, ()> {
+    use std::sync::atomic::Ordering;
+    let mut work = std::pin::pin!(work);
+    loop {
+        let at = started + std::time::Duration::from_millis(deadline_ms.load(Ordering::SeqCst));
+        tokio::select! {
+            out = &mut work => return Ok(out),
+            () = tokio::time::sleep_until(at.into()) => {
+                let now = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                if now >= deadline_ms.load(Ordering::SeqCst) {
+                    return Err(());
+                }
+            }
+        }
+    }
+}
+
+/// Fit a `workspace.exec` a snippet runs into the time its `code` call has.
+/// Without `timeout_ms` the command gets what is left of the call. With one,
+/// the call stays open that much longer, up to the ceiling; a command asking
+/// for more than the ceiling still allows is cut to fit, and its result says
+/// so (`requested_timeout_ms`).
+fn budget_code_call(
+    tool: &str,
+    mut args: serde_json::Value,
+    elapsed: std::time::Duration,
+    deadline_ms: &std::sync::atomic::AtomicU64,
+    max_ms: u64,
+) -> serde_json::Value {
+    use std::sync::atomic::Ordering;
+    if tool.trim().trim_start_matches("mcp__anyagents__") != "files" {
+        return args;
+    }
+    let Some(obj) = args.as_object_mut() else {
+        return args;
+    };
+    let action = obj
+        .get("action")
+        .and_then(serde_json::Value::as_str)
+        .map(|a| a.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    let is_exec = match action.as_str() {
+        "exec" | "bash" | "sh" | "command" => true,
+        "" => obj.contains_key("cmd") || obj.contains_key("command"),
+        _ => false,
+    };
+    if !is_exec {
+        return args;
+    }
+    let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+    let wanted = ["timeout_ms", "timeout"]
+        .iter()
+        .find_map(|key| obj.get(*key).and_then(serde_json::Value::as_u64));
+    let Some(wanted) = wanted else {
+        let left = deadline_ms
+            .load(Ordering::SeqCst)
+            .saturating_sub(elapsed_ms)
+            .saturating_sub(CODE_CALL_GRACE_MS)
+            .max(100);
+        obj.insert("timeout_ms".to_string(), left.into());
+        return args;
+    };
+    // What the ceiling still allows this call, leaving the grace for the
+    // command's answer to reach the snippet.
+    let room = max_ms
+        .saturating_sub(elapsed_ms)
+        .saturating_sub(CODE_CALL_GRACE_MS)
+        .max(100);
+    let granted = wanted.min(room);
+    if granted < wanted {
+        obj.remove("timeout");
+        obj.insert("timeout_ms".to_string(), granted.into());
+        obj.insert("requested_timeout_ms".to_string(), wanted.into());
+    }
+    deadline_ms.fetch_max(
+        (elapsed_ms + granted + CODE_CALL_GRACE_MS).min(max_ms),
+        Ordering::SeqCst,
+    );
+    args
+}
+
 fn find_js_runtime() -> Result<(PathBuf, bool), String> {
     let resolved = anyagents_toolchain::global()
         .first_of(&["node", "bun"], "mcp.js")
@@ -3919,6 +4159,53 @@ fn find_js_runtime() -> Result<(PathBuf, bool), String> {
 }
 
 impl AgentMcp {
+    /// `self`, `me` and `parent` as the agent they name for this caller; any
+    /// other name as written. Every tool that takes an agent name reads these
+    /// words the way `send` reads them in `to`.
+    async fn resolve_agent_word(&self, raw: &str) -> Result<String, String> {
+        let name = raw.trim();
+        let word = name.strip_prefix("agent:").unwrap_or(name);
+        if word.eq_ignore_ascii_case("self") || word.eq_ignore_ascii_case("me") {
+            return Ok(self.agent.name.clone());
+        }
+        if !word.eq_ignore_ascii_case("parent") {
+            return Ok(name.to_string());
+        }
+        let me: AgentView = self
+            .client
+            .get(&format!("/v1/agents/{}", self.agent.id), None)
+            .await?;
+        let parent_id = me.parent.ok_or_else(|| {
+            format!(
+                "`parent`: `{}` is a root agent and has no parent",
+                self.agent.name
+            )
+        })?;
+        // History and peer filters match names, so answer with the name.
+        let parent: AgentView = self
+            .client
+            .get(&format!("/v1/agents/{parent_id}"), None)
+            .await?;
+        Ok(parent.name)
+    }
+
+    /// The tools this agent sees, with the `code` limits its workspace
+    /// backend enforces.
+    fn listed_tools(&self) -> Vec<rmcp::model::Tool> {
+        let wd = self.resolve_workdir();
+        let mut tools =
+            tool_definitions_with_roles(self.profile, Some(&wd), self.client.socket.parent());
+        if tools.iter().any(|t| t.name == "code") {
+            let backend =
+                <dyn anyagents_tools::WorkspaceBackend>::resolve(Some(&self.client.config), wd);
+            let description = code_tool_description(CodeLimits::current(), backend.kind());
+            for tool in tools.iter_mut().filter(|t| t.name == "code") {
+                tool.description = Some(description.clone().into());
+            }
+        }
+        tools
+    }
+
     fn resolve_workdir(&self) -> PathBuf {
         if let Some(ref wd) = self.agent.workdir
             && !wd.as_os_str().is_empty()
@@ -4694,9 +4981,7 @@ impl AgentMcp {
                 "result": {}
             })),
             "tools/list" => {
-                let wd = self.resolve_workdir();
-                let data_dir = self.client.socket.parent();
-                let tools = tool_definitions_with_roles(self.profile, Some(&wd), data_dir);
+                let tools = self.listed_tools();
                 Some(serde_json::json!({
                     "jsonrpc": "2.0",
                     "id": id_val,
@@ -4950,12 +5235,14 @@ impl AgentMcp {
         use std::io::{BufRead, BufReader, Write};
         use std::process::{Command, Stdio};
         use std::sync::{Arc, Mutex};
-        use std::time::{Duration, Instant};
+        use std::time::Instant;
 
-        let timeout_ms = args
-            .timeout_ms
-            .unwrap_or(DEFAULT_CODE_TIMEOUT_MS)
-            .clamp(100, MAX_CODE_TIMEOUT_MS);
+        let limits = CodeLimits::current();
+        let timeout_ms = limits.resolve(args.timeout_ms);
+        // Milliseconds after `started` at which the call ends. A command the
+        // snippet runs with its own `timeout_ms` moves it out, up to the
+        // ceiling (`budget_code_call`).
+        let deadline_ms = std::sync::atomic::AtomicU64::new(timeout_ms);
         let (runtime_bin, is_node) = find_js_runtime()?;
 
         let started = Instant::now();
@@ -5045,7 +5332,7 @@ impl AgentMcp {
         let mut in_flight = tokio::task::JoinSet::new();
         let mut call_count = 0usize;
 
-        let loop_res = tokio::time::timeout(Duration::from_millis(timeout_ms), async {
+        let loop_res = until_deadline(started, &deadline_ms, async {
             while let Some(msg) = rx.recv().await {
                 let msg_type = msg.get("type").and_then(serde_json::Value::as_str).unwrap_or("");
                 match msg_type {
@@ -5074,6 +5361,13 @@ impl AgentMcp {
                             .get("args")
                             .cloned()
                             .unwrap_or_else(|| serde_json::json!({}));
+                        let tool_args = budget_code_call(
+                            &tool_name,
+                            tool_args,
+                            started.elapsed(),
+                            &deadline_ms,
+                            limits.max_ms,
+                        );
                         let mcp = self.clone();
                         let stdin_clone = Arc::clone(&shared_stdin);
                         let deliveries = Arc::clone(&deliveries);
@@ -5127,7 +5421,8 @@ impl AgentMcp {
         .await;
 
         in_flight.abort_all();
-        let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(timeout_ms);
+        let ran_until_ms = deadline_ms.load(std::sync::atomic::Ordering::SeqCst);
+        let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(ran_until_ms);
 
         let done_msg = match loop_res {
             Ok(Ok(msg)) => msg,
@@ -5139,9 +5434,11 @@ impl AgentMcp {
                 }
                 return Err(format!("{err}: {stderr_trimmed}"));
             }
-            Err(_) => {
-                return Err(format!(
-                    "`code` execution timed out after {timeout_ms}ms and was terminated"
+            Err(()) => {
+                return Err(code_contract::code_timeout_message(
+                    ran_until_ms,
+                    args.timeout_ms,
+                    limits.max_ms,
                 ));
             }
         };
@@ -5166,13 +5463,18 @@ impl AgentMcp {
                 .get("error")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("unknown code execution error");
-            if logs.is_empty() {
-                return Err(format!("code execution error: {err}"));
+            let compile =
+                done_msg.get("phase").and_then(serde_json::Value::as_str) == Some("compile");
+            let mut text = format!("code execution error: {err}");
+            if let Some(fix) = code_contract::diagnose(&args.code, err, compile) {
+                text.push_str("\nfix: ");
+                text.push_str(&fix);
             }
-            return Err(format!(
-                "code execution error: {err}\nlogs:\n{}",
-                logs.join("\n")
-            ));
+            if !logs.is_empty() {
+                text.push_str("\nlogs:\n");
+                text.push_str(&logs.join("\n"));
+            }
+            return Err(text);
         }
 
         let deliveries = deliveries
@@ -5883,16 +6185,18 @@ fn execute_files_tool_with_media_backend(
     backend: &dyn anyagents_tools::WorkspaceBackend,
     base_dir: &Path,
     args: FilesArgs,
+    limits: CodeLimits,
 ) -> Result<(serde_json::Value, Vec<rmcp::model::ContentBlock>), String> {
     if backend.is_remote() {
-        return execute_remote_files_tool_with_media(backend, args);
+        return execute_remote_files_tool_with_media(backend, args, limits);
     }
-    execute_files_tool_with_media(base_dir, args)
+    execute_files_tool_with_media(base_dir, args, limits)
 }
 
 fn execute_remote_files_tool_with_media(
     backend: &dyn anyagents_tools::WorkspaceBackend,
     args: FilesArgs,
+    limits: CodeLimits,
 ) -> Result<(serde_json::Value, Vec<rmcp::model::ContentBlock>), String> {
     let action = args
         .action
@@ -6112,25 +6416,38 @@ fn execute_remote_files_tool_with_media(
                 .ok_or_else(|| "`workspace.exec` requires a non-empty `cmd`".to_string())?;
             let raw_cwd = args.cwd.as_deref().or(args.path.as_deref());
             let resolved_cwd = backend.resolve_path(raw_cwd, false)?;
-            let timeout_ms = args
-                .timeout_ms
-                .unwrap_or(DEFAULT_CODE_TIMEOUT_MS)
-                .clamp(100, MAX_CODE_TIMEOUT_MS);
+            let timeout_ms = limits.resolve(args.timeout_ms);
             let started = std::time::Instant::now();
             let out = backend.exec(cmd_str, Some(&resolved_cwd), Some(timeout_ms))?;
             let duration_ms = started.elapsed().as_millis() as u64;
-            Ok((
-                serde_json::json!({
-                    "action": "exec",
-                    "cmd": cmd_str,
-                    "cwd": resolved_cwd,
-                    "exit_code": out.exit_code,
-                    "stdout": out.stdout,
-                    "stderr": out.stderr,
-                    "duration_ms": duration_ms,
-                }),
-                Vec::new(),
-            ))
+            let mut result = serde_json::json!({
+                "action": "exec",
+                "cmd": cmd_str,
+                "cwd": resolved_cwd,
+                "exit_code": out.exit_code,
+                "stdout": out.stdout,
+                "stderr": out.stderr,
+                "duration_ms": duration_ms,
+            });
+            let asked = args.requested_timeout_ms.or(args.timeout_ms);
+            let note = match backend.kind() {
+                "docker" => None,
+                _ => code_contract::exec_clamp_note(
+                    asked,
+                    timeout_ms.min(anyagents_tools::REMOTE_EXEC_MAX_TIMEOUT_MS),
+                    &format!(
+                        "your remote sandbox stops a command at {}ms",
+                        anyagents_tools::REMOTE_EXEC_MAX_TIMEOUT_MS
+                    ),
+                ),
+            }
+            .or_else(|| {
+                code_contract::exec_clamp_note(asked, timeout_ms, &limits.ceiling_reason())
+            });
+            if let Some(note) = note {
+                result["note"] = note.into();
+            }
+            Ok((result, Vec::new()))
         }
         other => Err(format!(
             "remote sandbox `files` action `{other}` is not supported directly; use `read`, `write`, `edit`, `multi_edit`, `list`, or `exec`"
@@ -6141,6 +6458,7 @@ fn execute_remote_files_tool_with_media(
 fn execute_files_tool_with_media(
     base_dir: &Path,
     args: FilesArgs,
+    limits: CodeLimits,
 ) -> Result<(serde_json::Value, Vec<rmcp::model::ContentBlock>), String> {
     let is_read_action = matches!(
         args.action
@@ -6178,11 +6496,15 @@ fn execute_files_tool_with_media(
         }
     }
 
-    let val = execute_files_tool(base_dir, args)?;
+    let val = execute_files_tool(base_dir, args, limits)?;
     Ok((val, Vec::new()))
 }
 
-fn execute_files_tool(base_dir: &Path, args: FilesArgs) -> Result<serde_json::Value, String> {
+fn execute_files_tool(
+    base_dir: &Path,
+    args: FilesArgs,
+    limits: CodeLimits,
+) -> Result<serde_json::Value, String> {
     let action = args
         .action
         .as_deref()
@@ -6699,10 +7021,7 @@ fn execute_files_tool(base_dir: &Path, args: FilesArgs) -> Result<serde_json::Va
                     resolved_cwd.display()
                 ));
             }
-            let timeout_ms = args
-                .timeout_ms
-                .unwrap_or(DEFAULT_CODE_TIMEOUT_MS)
-                .clamp(100, MAX_CODE_TIMEOUT_MS);
+            let timeout_ms = limits.resolve(args.timeout_ms);
             let started = std::time::Instant::now();
             let mut cmd = std::process::Command::new("/bin/bash");
             cmd.arg("-c")
@@ -6763,15 +7082,24 @@ fn execute_files_tool(base_dir: &Path, args: FilesArgs) -> Result<serde_json::Va
             let stdout = stdout_handle.join().unwrap_or_default();
             let stderr = stderr_handle.join().unwrap_or_default();
             let duration_ms = started.elapsed().as_millis() as u64;
+            let note = code_contract::exec_clamp_note(
+                args.requested_timeout_ms.or(args.timeout_ms),
+                timeout_ms,
+                &limits.ceiling_reason(),
+            );
             let Some(status) = status_opt else {
                 return Err(format!(
-                    "workspace.exec timed out after {timeout_ms}ms (stdout: {}, stderr: {})",
+                    "workspace.exec timed out after {timeout_ms}ms and was killed{}; {} (stdout: {}, stderr: {})",
+                    note.as_deref()
+                        .map(|n| format!(" ({n})"))
+                        .unwrap_or_default(),
+                    code_contract::exec_timeout_hint(limits.max_ms),
                     stdout.trim(),
                     stderr.trim()
                 ));
             };
             let exit_code = status.code().unwrap_or(-1);
-            Ok(serde_json::json!({
+            let mut result = serde_json::json!({
                 "action": "exec",
                 "cmd": cmd_str,
                 "cwd": resolved_cwd.display().to_string(),
@@ -6779,7 +7107,11 @@ fn execute_files_tool(base_dir: &Path, args: FilesArgs) -> Result<serde_json::Va
                 "stdout": stdout,
                 "stderr": stderr,
                 "duration_ms": duration_ms,
-            }))
+            });
+            if let Some(note) = note {
+                result["note"] = note.into();
+            }
+            Ok(result)
         }
         other => Err(format!(
             "unknown `files` action `{other}`; expected `read`, `write`, `edit`, `multi_edit`, `patch`, `list`, `glob`, `grep`, or `exec`"

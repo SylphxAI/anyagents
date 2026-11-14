@@ -7,6 +7,9 @@ use crate::encoding::{base64_decode, base64_encode, sha256_hex, url_encode_query
 use crate::path::resolve_workspace_path;
 use crate::sandbox::{DEFAULT_EXEC_TIMEOUT_MS, SandboxConfig, ureq_agent};
 
+/// The longest a remote sandbox (`cloud-sandbox`, `e2b`) runs one command.
+pub const REMOTE_EXEC_MAX_TIMEOUT_MS: u64 = 120_000;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecOutput {
     #[serde(default)]
@@ -356,7 +359,7 @@ impl WorkspaceBackend for RemoteSandboxWorkspace {
         }
         let effective_timeout = timeout_ms
             .unwrap_or(DEFAULT_EXEC_TIMEOUT_MS)
-            .clamp(100, 120_000);
+            .clamp(100, REMOTE_EXEC_MAX_TIMEOUT_MS);
         let resolved_cwd = self.resolve_path(cwd, false)?;
         remote_exec(&self.config, cmd_trimmed, &resolved_cwd, effective_timeout)
     }

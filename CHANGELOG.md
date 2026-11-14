@@ -73,6 +73,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Calls over HTTP MCP also cannot place an agent on a host harness, wake an
   agent that runs on the host (directly or by a send to an archived one), or
   attach media by a local path.
+- Tool contracts follow what agents write. `code` honours `timeout_ms` up to a
+  ceiling (default 30 s, max 10 min) that only the server's environment sets
+  (`ANYAGENTS_CODE_TIMEOUT_MS`, `ANYAGENTS_CODE_MAX_TIMEOUT_MS`) and hands each
+  tool server in `whoami`. An inner `workspace.exec` inherits the call's
+  remaining time, and its own `timeout_ms` stretches the call; a request past
+  the ceiling is clamped and the result says so in `note`. A remote sandbox
+  still stops a command at 120 s, and the `code` description says which limit
+  applies. Failed snippets name their fix (ESM imports, `require`/Node globals,
+  Python, guessed API names, double-escaped code), and the description lists the
+  exact sandbox API. `schedules` accepts `action: "at"|"every"|"watch"`, and its
+  errors quote a correct call. `null`, `"null"` and `"undefined"` are absent in
+  `schedules` and `send`. `self` and `parent` resolve in `conversation`,
+  `agents` and `schedules`. An ancestor may message any non-isolated descendant,
+  and messaging refusals name the route.
 
 ## 0.1.3
 

@@ -1442,6 +1442,9 @@ async fn whoami(
                     "name": name,
                     "workdir": workdir,
                     "harness": harness,
+                    // The `code` limits come from this server's environment
+                    // only, never from a file an agent could write.
+                    "code_limits": crate::mcp::CodeLimits::from_env(),
                 })))
             })
             .await
@@ -1910,21 +1913,38 @@ async fn transfer_agent_route(
     .await
 }
 
+/// Unused fields arrive as `null` or `"null"`; both are absent.
 #[derive(Deserialize, Default)]
 struct ScheduleRequest {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::api::absent_if_null")]
     action: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::api::absent_if_null")]
     at: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::api::absent_if_null")]
     every: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::api::absent_if_null")]
     watch: Option<String>,
-    #[serde(default)]
+    /// A trigger value or mode under a generic name; see
+    /// `schedule::resolve_schedule_call`.
+    #[serde(
+        default,
+        alias = "kind",
+        deserialize_with = "crate::api::absent_if_null"
+    )]
+    spec: Option<String>,
+    #[serde(default, deserialize_with = "crate::api::absent_if_null")]
     prompt: Option<String>,
-    #[serde(default, alias = "schedule_id")]
+    #[serde(
+        default,
+        alias = "schedule_id",
+        deserialize_with = "crate::api::absent_if_null"
+    )]
     id: Option<String>,
-    #[serde(default, alias = "name")]
+    #[serde(
+        default,
+        alias = "name",
+        deserialize_with = "crate::api::absent_if_null"
+    )]
     agent: Option<String>,
 }
 
@@ -2044,28 +2064,28 @@ async fn self_schedules_action_route(
 async fn handle_schedule_action(
     principal: Principal,
     state: AppState,
-    body: ScheduleRequest,
+    mut body: ScheduleRequest,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    use crate::schedule::ScheduleVerb;
     spawn_store(move || {
-        let has_spec = body.at.as_deref().is_some_and(|s| !s.trim().is_empty())
-            || body.every.as_deref().is_some_and(|s| !s.trim().is_empty())
-            || body.watch.as_deref().is_some_and(|s| !s.trim().is_empty());
-        let action = body
-            .action
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or(if has_spec {
-                "create"
-            } else if body.id.is_some() {
-                "cancel"
-            } else {
-                "list"
-            })
-            .to_ascii_lowercase();
+        let mut trigger = crate::schedule::ScheduleTrigger {
+            at: body.at.take(),
+            every: body.every.take(),
+            watch: body.watch.take(),
+            spec: body.spec.take(),
+        };
+        let verb = crate::schedule::resolve_schedule_call(
+            body.action.as_deref(),
+            &mut trigger,
+            body.id.is_some(),
+        )
+        .map_err(|msg| ApiError::new(StatusCode::BAD_REQUEST, msg))?;
+        body.at = trigger.at;
+        body.every = trigger.every;
+        body.watch = trigger.watch;
 
-        match action.as_str() {
-            "list" | "ls" => {
+        match verb {
+            ScheduleVerb::List => {
                 if matches!(principal, Principal::Operator) && body.agent.is_none() {
                     let schedules: Vec<crate::api::ScheduleView> = state
                         .store
@@ -2091,7 +2111,7 @@ async fn handle_schedule_action(
                     "schedules": schedules,
                 })))
             }
-            "create" | "set" | "add" | "schedule" => {
+            ScheduleVerb::Create => {
                 let target =
                     authorize_schedule_target(&state.store, &principal, body.agent.as_deref())?;
                 let prompt = body.prompt.as_deref().unwrap_or("");
@@ -2119,7 +2139,7 @@ async fn handle_schedule_action(
                     "schedules": schedules,
                 })))
             }
-            "cancel" | "delete" | "remove" | "clear" | "off" | "pause" | "disable" | "stop" => {
+            ScheduleVerb::Cancel => {
                 let target =
                     authorize_schedule_target(&state.store, &principal, body.agent.as_deref())?;
                 let id_or_all = body
@@ -2147,12 +2167,6 @@ async fn handle_schedule_action(
                     "schedules": schedules,
                 })))
             }
-            other => Err(ApiError::new(
-                StatusCode::BAD_REQUEST,
-                format!(
-                    "unknown schedule action `{other}`; expected `create`, `list`, or `cancel`"
-                ),
-            )),
         }
     })
     .await
@@ -2945,8 +2959,8 @@ fn conversation_visibility(
                 .map_err(ApiError::from_store)?;
             if !visible_ids.contains(&target.id) {
                 return Err(ApiError::forbidden(format!(
-                    "agent `{}` cannot read private conversation history of `{}`",
-                    caller.name, target.name
+                    "agent `{}` cannot read private conversation history of `{}`; your own messages with it are in your history: `conversation({{with: \"{}\"}})`",
+                    caller.name, target.name, target.name
                 )));
             }
             Ok((target.name, Some(vec![target.id.to_string()])))
@@ -3377,9 +3391,13 @@ impl<'a> RosterCaller<'a> {
             self.is_self_or_ancestor(ancestor, target)
         }));
         view.can_message = Some(
-            can_sender_message_agent_with(self.store, self.caller, agent, || {
-                self.sharing.contains(&agent.id)
-            })
+            can_sender_message_agent_with(
+                self.store,
+                self.caller,
+                agent,
+                || self.sharing.contains(&agent.id),
+                || self.is_self_or_ancestor(&self.caller.id, agent),
+            )
             .is_ok(),
         );
         // [`can_actor_read_agent_private`] for this caller.
@@ -6771,9 +6789,11 @@ fn can_actor_read_agent_private(
 ///   1. Itself (`sender.id == recipient.id`)
 ///   2. Its own direct Child Sub-Agents (`recipient.parent_id == Some(sender.id)`)
 ///   3. Its own direct Parent Agent (`sender.parent_id == Some(recipient.id)`)
-///   4. A Sibling Sub-Agent under the same Parent when both have `scope: "siblings"` or `"public"` (`allows_sibling_messages()`)
-///   5. Any Root Agent (when `sender.allows_sibling_messages()`) or Sub-Agent with `scope: "public"` (`recipient.is_public_subagent()`)
-///   6. Any agent with which it shares an internal virtual group (`group:<name>`) or external Telegram chat
+///   4. Any non-isolated descendant: an ancestor that may wake, pause or archive
+///      a grandchild may also message it
+///   5. A Sibling Sub-Agent under the same Parent when both have `scope: "siblings"` or `"public"` (`allows_sibling_messages()`)
+///   6. Any Root Agent (when `sender.allows_sibling_messages()`) or Sub-Agent with `scope: "public"` (`recipient.is_public_subagent()`)
+///   7. Any agent with which it shares an internal virtual group (`group:<name>`) or external Telegram chat
 fn can_actor_message_agent(
     store: &Store,
     actor: &Actor,
@@ -6793,18 +6813,23 @@ fn can_sender_message_agent(
     sender: &Agent,
     recipient: &Agent,
 ) -> Result<(), ApiError> {
-    can_sender_message_agent_with(store, sender, recipient, || {
-        store.share_any_group_or_chat(&sender.id, &recipient.id)
-    })
+    can_sender_message_agent_with(
+        store,
+        sender,
+        recipient,
+        || store.share_any_group_or_chat(&sender.id, &recipient.id),
+        || is_self_or_ancestor(store, &sender.id, recipient),
+    )
 }
 
-/// [`can_sender_message_agent`] with the group-or-chat share answered by the
-/// caller, so a roster can answer it once for every recipient.
+/// [`can_sender_message_agent`] with the group-or-chat share and the
+/// ancestry answered by the caller, so a roster can answer them from its rows.
 fn can_sender_message_agent_with(
     store: &Store,
     sender: &Agent,
     recipient: &Agent,
     share_group_or_chat: impl FnOnce() -> bool,
+    sender_is_ancestor: impl FnOnce() -> bool,
 ) -> Result<(), ApiError> {
     if sender.id == recipient.id
         || recipient.parent_id.as_ref() == Some(&sender.id)
@@ -6823,7 +6848,7 @@ fn can_sender_message_agent_with(
             sender.name, recipient.name
         )));
     }
-    if share_group_or_chat() || store.has_messaged(recipient, sender) {
+    if sender_is_ancestor() || share_group_or_chat() || store.has_messaged(recipient, sender) {
         return Ok(());
     }
     let same_parent_siblings = sender.parent_id.is_some()
@@ -6852,9 +6877,16 @@ fn can_sender_message_agent_with(
         .as_ref()
         .and_then(|pid| store.agent(pid).ok().map(|p| p.name))
         .unwrap_or_else(|| "parent".to_string());
+    if sender.parent_id.is_some() && sender.parent_id == recipient.parent_id {
+        return Err(ApiError::forbidden(format!(
+            "cannot message sub-agent `{}` directly: it is your sibling, and siblings message each other only when your parent `agent:{owner_label}` sets `scope: \"siblings\"` on both or puts you in one group. Send it through your parent (`to: [\"parent\"]`), or ask `agent:{owner_label}` for that scope or group",
+            recipient.name
+        )));
+    }
     Err(ApiError::forbidden(format!(
-        "cannot message sub-agent `{}` directly because it belongs to parent `agent:{owner_label}` and does not accept external messages (`public: false`); message `agent:{owner_label}` instead, ask `agent:{owner_label}` to set `public: true`, or collaborate in a shared group",
-        recipient.name
+        "cannot message sub-agent `{}` directly: it is private (`scope: \"{}\"`) to its parent `agent:{owner_label}`, and only its ancestors, its children and agents in a shared group reach it. Message `agent:{owner_label}` instead, or ask `agent:{owner_label}` to set `scope: \"public\"` on it or to put you both in a group",
+        recipient.name,
+        recipient.scope()
     )))
 }
 
@@ -8232,6 +8264,56 @@ pub(crate) mod tests {
                 }
             }
         }
+    }
+
+    /// Who may message whom: an ancestor reaches every non-isolated
+    /// descendant, and every refusal names the route that works.
+    #[test]
+    fn ancestors_reach_descendants_and_refusals_name_the_route() {
+        let dir = crate::test_tempdir();
+        let state = archetype_validation_state(dir.path());
+        let store = &state.store;
+        let make = |name: &str, parent: Option<&Agent>, scope: Option<&str>| {
+            let mut new = anyagents_core::NewAgent::new(name, "codex");
+            new.parent_id = parent.map(|p| p.id.clone());
+            let agent = store.create_agent(new).unwrap();
+            match scope {
+                Some(scope) => store.set_agent_scope(&agent.id, scope).unwrap(),
+                None => agent,
+            }
+        };
+        let sage = make("sage", None, None);
+        let vulcan = make("vulcan", None, None);
+        let rollout = make("rollout", Some(&sage), None);
+        let bump = make("bump", Some(&rollout), None);
+        let deeper = make("deeper", Some(&bump), None);
+        let sealed = make("sealed", Some(&rollout), Some("isolated"));
+        let fix = make("fix", Some(&rollout), None);
+        let cousin = make("cousin", Some(&vulcan), None);
+
+        // A grandparent and a great-grandparent reach their descendants.
+        assert!(can_sender_message_agent(store, &sage, &bump).is_ok());
+        assert!(can_sender_message_agent(store, &sage, &deeper).is_ok());
+        assert!(can_sender_message_agent(store, &rollout, &deeper).is_ok());
+        // An isolated descendant stays 1-to-1 with its direct parent.
+        assert!(can_sender_message_agent(store, &sage, &sealed).is_err());
+        assert!(can_sender_message_agent(store, &rollout, &sealed).is_ok());
+        // Upward stays through the parent.
+        assert!(can_sender_message_agent(store, &bump, &sage).is_err());
+
+        let text = |result: Result<(), ApiError>| result.unwrap_err().message;
+        let sibling = text(can_sender_message_agent(store, &fix, &bump));
+        assert!(sibling.contains("it is your sibling"), "{sibling}");
+        assert!(sibling.contains("`to: [\"parent\"]`"), "{sibling}");
+        assert!(sibling.contains("agent:rollout"), "{sibling}");
+        let outsider = text(can_sender_message_agent(store, &vulcan, &bump));
+        assert!(
+            outsider.contains("Message `agent:rollout` instead"),
+            "{outsider}"
+        );
+        assert!(outsider.contains("scope: \"public\""), "{outsider}");
+        let cross = text(can_sender_message_agent(store, &cousin, &fix));
+        assert!(cross.contains("Message `agent:rollout` instead"), "{cross}");
     }
 
     /// Vendor history each harness leaves behind that the view once scanned:
