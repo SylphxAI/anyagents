@@ -438,6 +438,55 @@ fn resolve_sylphx_codex_provider(config_dir: Option<&Path>) -> (String, Option<S
     (base_url, api_key)
 }
 
+/// How a `claude-code` agent bound to a Sylphx profile (or given a
+/// `sylphx/...` model) reaches its model: Sylphx answers the Anthropic
+/// Messages API at its origin (`POST /v1/messages`, bearer key, streaming and
+/// tools), so Claude Code gets that origin and the profile's key. Without it
+/// Claude Code falls back to a Claude.ai sign-in the agent does not have and
+/// every turn fails "Not logged in" (operator report #34).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ClaudeSylphxRoute {
+    /// `ANTHROPIC_BASE_URL`: the origin, without `/v1` (Claude Code adds it).
+    pub base_url: String,
+    /// `ANTHROPIC_AUTH_TOKEN`: the profile's Sylphx key, sent as a bearer.
+    pub token: String,
+    /// The model id Sylphx serves (`openai/gpt-6.1-sol` for
+    /// `sylphx/openai/gpt-6.1-sol`), without a `#effort` suffix.
+    pub model: Option<String>,
+}
+
+/// The Sylphx route of a Claude Code agent, or `None` when it is not bound to
+/// Sylphx (or no key is found, which leaves Claude Code's own sign-in).
+pub(crate) fn claude_sylphx_route(
+    config_dir: &Path,
+    model: Option<&str>,
+) -> Option<ClaudeSylphxRoute> {
+    let profile_is_sylphx = std::fs::read_to_string(config_dir.join(".anyagents-profile"))
+        .ok()
+        .is_some_and(|s| {
+            let t = s.trim();
+            t == "sylphx" || t.starts_with("sylphx/")
+        });
+    let model = model.map(str::trim).filter(|m| !m.is_empty());
+    let model_is_sylphx = model.is_some_and(|m| m.starts_with("sylphx/"));
+    if !profile_is_sylphx && !model_is_sylphx {
+        return None;
+    }
+    let (base_url, key) = resolve_sylphx_codex_provider(Some(config_dir));
+    let token = key.filter(|k| !k.is_empty())?;
+    let origin = base_url.trim_end_matches('/');
+    let origin = origin.strip_suffix("/v1").unwrap_or(origin).to_string();
+    let model = model.map(|m| {
+        let base = m.split('#').next().unwrap_or(m).trim();
+        base.strip_prefix("sylphx/").unwrap_or(base).to_string()
+    });
+    Some(ClaudeSylphxRoute {
+        base_url: origin,
+        token,
+        model,
+    })
+}
+
 fn toml_args(args: &[String]) -> String {
     let parts: Vec<String> = args
         .iter()

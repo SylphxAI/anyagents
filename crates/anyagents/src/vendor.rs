@@ -1787,6 +1787,29 @@ fn plan_adapter(
             "CLAUDE_CONFIG_DIR".to_string(),
             request.config_dir.display().to_string(),
         ));
+        // A Sylphx-bound agent reaches its model through Sylphx's Anthropic
+        // Messages API with the profile's key, and asks for the id Sylphx
+        // serves; the background calls Claude Code makes on its small model
+        // go to the same model rather than to a Claude id Sylphx may not have.
+        let sylphx = crate::mcp_config::claude_sylphx_route(&request.config_dir, model.as_deref());
+        if let Some(route) = &sylphx {
+            env.retain(|(key, _)| {
+                !matches!(
+                    key.as_str(),
+                    "ANTHROPIC_BASE_URL"
+                        | "ANTHROPIC_AUTH_TOKEN"
+                        | "ANTHROPIC_API_KEY"
+                        | "ANTHROPIC_SMALL_FAST_MODEL"
+                        | "ANTHROPIC_DEFAULT_HAIKU_MODEL"
+                )
+            });
+            env.push(("ANTHROPIC_BASE_URL".to_string(), route.base_url.clone()));
+            env.push(("ANTHROPIC_AUTH_TOKEN".to_string(), route.token.clone()));
+            if let Some(served) = &route.model {
+                env.push(("ANTHROPIC_SMALL_FAST_MODEL".to_string(), served.clone()));
+                env.push(("ANTHROPIC_DEFAULT_HAIKU_MODEL".to_string(), served.clone()));
+            }
+        }
         let session = session_from_file(&request.config_dir, "claude-session-id")?;
         let args = if scripted {
             Vec::new()
@@ -1800,8 +1823,12 @@ fn plan_adapter(
                     }
                     _ => (model, None),
                 };
+                let served = sylphx
+                    .as_ref()
+                    .and_then(|route| route.model.clone())
+                    .unwrap_or_else(|| base_model.to_string());
                 args.push("--model".to_string());
-                args.push(base_model.to_string());
+                args.push(served);
                 if let Some(v) = variant {
                     effort = v.to_string();
                 }
@@ -3918,6 +3945,104 @@ done
             anyagents_harness_claude::CLOUD_DELIVERY.level,
             anyagents_harness::DeliveryLevel::TurnEnd
         );
+    }
+
+    /// Report #34: a claude-code agent on a Sylphx profile had no way to its
+    /// model and failed every turn "Not logged in". It is started against
+    /// Sylphx's Anthropic Messages API with the profile's key and the model id
+    /// Sylphx serves; an agent on Anthropic is started exactly as before.
+    #[test]
+    fn a_claude_code_agent_on_sylphx_reaches_it_with_the_profile_key() {
+        use anyagents_core::{NewAgent, Store};
+        let _env = crate::server::tests::env_lock();
+        let dir = crate::test_tempdir();
+        let data = dir.path();
+        let store = Store::open(data.join("state.db")).unwrap();
+        let key_dir = data.join("profiles/sylphx/default/.config/sylphx");
+        std::fs::create_dir_all(&key_dir).unwrap();
+        std::fs::write(key_dir.join("key"), "sk-sylphx-fixture-key\n").unwrap();
+
+        let launch = |name: &str, model: &str, profile: Option<&str>| {
+            let mut new = NewAgent::new(name, "claude-code");
+            new.model = Some(model.to_string());
+            let agent = store.create_agent(new).unwrap();
+            let config = anyagents_core::agent_config_dir(data, &agent.id);
+            std::fs::create_dir_all(&config).unwrap();
+            if let Some(profile) = profile {
+                std::fs::write(config.join(".anyagents-profile"), format!("{profile}\n")).unwrap();
+            }
+            let request = LaunchRequest {
+                agent,
+                data_dir: data.to_owned(),
+                config_dir: config,
+                work_dir: data.join("work"),
+                extra_env: vec![],
+                lock: None,
+            };
+            match plan_adapter(
+                &request,
+                data,
+                vec![("ANTHROPIC_API_KEY".into(), "leaked".into())],
+            )
+            .unwrap()
+            .launch
+            {
+                AdapterLaunch::Claude { args, env, .. } => (args, env),
+                other => panic!("{other:?}"),
+            }
+        };
+        let value = |env: &[(String, String)], key: &str| {
+            env.iter()
+                .rev()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+        };
+        let scripted = std::env::var_os("ANYAGENTS_FAKE_MODE").is_some();
+
+        let (args, env) = launch(
+            "on-sylphx",
+            "sylphx/openai/gpt-6.1-sol#high",
+            Some("sylphx/default"),
+        );
+        assert_eq!(
+            value(&env, "ANTHROPIC_BASE_URL").as_deref(),
+            Some("https://api.sylphx.com")
+        );
+        assert_eq!(
+            value(&env, "ANTHROPIC_AUTH_TOKEN").as_deref(),
+            Some("sk-sylphx-fixture-key")
+        );
+        assert_eq!(
+            value(&env, "ANTHROPIC_API_KEY"),
+            None,
+            "a stray key would win"
+        );
+        assert_eq!(
+            value(&env, "ANTHROPIC_SMALL_FAST_MODEL").as_deref(),
+            Some("openai/gpt-6.1-sol")
+        );
+        if !scripted {
+            let model_at = args.iter().position(|a| a == "--model").unwrap();
+            assert_eq!(args[model_at + 1], "openai/gpt-6.1-sol");
+            let effort_at = args.iter().position(|a| a == "--effort").unwrap();
+            assert_eq!(args[effort_at + 1], "high");
+        }
+
+        // A Sylphx model without the profile marker takes the same route.
+        let (_, env) = launch("model-only", "sylphx/openai/gpt-6.1-sol", None);
+        assert_eq!(
+            value(&env, "ANTHROPIC_BASE_URL").as_deref(),
+            Some("https://api.sylphx.com")
+        );
+
+        // An agent on Anthropic gets nothing of the kind.
+        let (args, env) = launch("on-anthropic", "claude-opus-5-5", Some("anthropic/default"));
+        assert_eq!(value(&env, "ANTHROPIC_BASE_URL"), None);
+        assert_eq!(value(&env, "ANTHROPIC_AUTH_TOKEN"), None);
+        if !scripted {
+            let model_at = args.iter().position(|a| a == "--model").unwrap();
+            assert_eq!(args[model_at + 1], "claude-opus-5-5");
+        }
     }
 
     #[test]
