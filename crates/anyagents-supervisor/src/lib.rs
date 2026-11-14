@@ -15,8 +15,8 @@ use std::time::Duration;
 pub use anyagents_agent::recovery_outbound;
 use anyagents_agent::{DeliveryLoop, RunOutcome};
 use anyagents_core::{
-    Agent, AgentId, AgentLock, BillingMode, ErroredTurn, MAX_ERRORED_TURNS,
-    MAX_TRANSIENT_ERRORED_TURNS, NewUsage, Store, Wake, agent_config_dir, agent_work_dir, utc_day,
+    Agent, AgentId, AgentLock, BillingMode, ErroredTurn, MAX_ERRORED_TURNS, NewUsage, Store, Wake,
+    agent_config_dir, agent_work_dir, is_session_turn_error, utc_day,
 };
 use anyagents_harness::{DeliverOutcome, Delivery, Harness, HarnessHealth, TurnState, TurnUsage};
 
@@ -969,6 +969,9 @@ struct Session<H: Harness> {
     /// not yet followed up: a recovery note for the work it held (after which
     /// it is closed), or, at the limit, the agent parked.
     errored_turn: Option<ErroredFollowUp>,
+    /// Systemic errored turns (the provider's, the host's) since the last
+    /// completed turn: what their backoff doubles on.
+    systemic_errors: i64,
     /// Current idle review interval, between `IDLE_REVIEW_MS` and
     /// `IDLE_REVIEW_MAX_MS`.
     idle_review_ms: i64,
@@ -1026,6 +1029,7 @@ impl<H: Harness + 'static> Session<H> {
             last_error: None,
             consecutive_turn_errors: 0,
             errored_turn: None,
+            systemic_errors: 0,
             idle_review_ms: IDLE_REVIEW_MS,
             process_scan_logged: false,
             exit_watch: None,
@@ -1985,17 +1989,33 @@ impl<H: Harness + 'static> Session<H> {
             return false;
         }
         if let Some(error) = &errored {
-            match delivery.store().note_turn_errored(&self.id, error) {
+            // Only an error of the session's own is a strike; anything else
+            // is the fleet's and backs off instead (docs/delivery.md).
+            let strike = is_session_turn_error(error);
+            // The turn the store holds open now is the one the follow-up
+            // may close; a turn completed or replaced by then is left alone.
+            let opened_seq = match delivery.store().open_turn(&self.id) {
+                Ok(open) => open.map(|open| open.opened_seq),
+                Err(err) => {
+                    self.last_error = Some(format!("read errored turn: {err}"));
+                    return false;
+                }
+            };
+            match delivery.store().note_turn_errored(&self.id, error, strike) {
                 Ok(streak) => {
-                    let transient = is_retryable_turn_error(error);
+                    if !strike {
+                        self.systemic_errors = self.systemic_errors.saturating_add(1);
+                    }
                     let now = self.inner.clock.now_ms();
                     self.errored_turn = Some(ErroredFollowUp {
                         streak,
+                        strike,
                         error: error.clone(),
-                        not_before: if transient {
-                            now.saturating_add(transient_turn_backoff_ms(streak))
-                        } else {
+                        opened_seq,
+                        not_before: if strike {
                             now
+                        } else {
+                            now.saturating_add(systemic_backoff_ms(self.systemic_errors))
                         },
                     });
                 }
@@ -2035,6 +2055,7 @@ impl<H: Harness + 'static> Session<H> {
             self.turns_recorded = turns_served;
             self.completed_turn_in_session = true;
             self.consecutive_turn_errors = 0;
+            self.systemic_errors = 0;
             self.last_error = None;
         }
         if let Some(error) = errored {
@@ -2047,24 +2068,23 @@ impl<H: Harness + 'static> Session<H> {
         true
     }
 
-    /// Follow up a turn that ended in an error. Below the limit, the work it
-    /// held comes back as a `[Recovery]` note in the agent's own mailbox, so
-    /// the next turn starts with it and with any mail that waits, and only
-    /// then is the turn closed: a restart before that finds it open and
-    /// recovers it as any interrupted turn. A transient error first waits
-    /// out a backoff. At the limit ([`MAX_ERRORED_TURNS`], or
-    /// [`MAX_TRANSIENT_ERRORED_TURNS`] while each error is transient) the
-    /// agent is parked (`paused`, mail held, the turn left for a resume to
-    /// recover), and its nearest live ancestor, or the operator when it has
-    /// none, is told the error.
+    /// Follow up a turn that ended in an error. The work it held comes back
+    /// as a `[Recovery]` note in the agent's own mailbox, stored in the same
+    /// transaction that closes the turn, so the next turn starts with it and
+    /// with any mail that waits; a restart before then finds the turn open
+    /// and recovers it as any interrupted turn. A systemic error (the
+    /// provider's, the model's, the host's) first waits out a backoff, and
+    /// never parks. At [`MAX_ERRORED_TURNS`] strikes (errors of the session's
+    /// own) in a row the agent is parked instead (`paused`, mail held, the
+    /// turn left for a resume to recover), and its nearest running ancestor,
+    /// or the operator's inbox, is told the error.
     fn follow_errored_turn(&mut self) {
         let Some(follow) = self.errored_turn.take() else {
             return;
         };
         let inner = Arc::clone(&self.inner);
         let store = &inner.store;
-        let limit = errored_turn_limit(&follow.error);
-        if follow.streak >= limit {
+        if follow.strike && follow.streak >= MAX_ERRORED_TURNS {
             match store.park_faulted(&self.id) {
                 Ok(parked) => {
                     if parked {
@@ -2112,34 +2132,34 @@ impl<H: Harness + 'static> Session<H> {
                 return;
             }
         };
+        // Only the turn that errored is carried: one the store no longer
+        // holds open (completed since) or holds open past it is not.
+        let Some(open) = open.filter(|open| Some(open.opened_seq) == follow.opened_seq) else {
+            self.publish();
+            return;
+        };
+        let opened_seq = open.opened_seq;
         let turn = ErroredTurn {
             streak: follow.streak,
-            open,
+            open: Some(open),
         };
-        let note = anyagents_agent::errored_turn_note(&turn, &follow.error, limit);
-        let opened_seq = turn.open.as_ref().map_or(0, |open| open.opened_seq);
+        let note = anyagents_agent::errored_turn_note(
+            &turn,
+            &follow.error,
+            follow.strike.then_some(MAX_ERRORED_TURNS),
+        );
         let mut incoming = anyagents_core::Incoming::new(note);
         incoming.sender = Some(anyagents_core::SYSTEM_SENDER.to_string());
         incoming.source_key = Some(format!(
             "anyagents:errored-turn:{}:{opened_seq}:{}",
             self.id, follow.streak
         ));
-        if let Err(err) = store.receive(&self.id, incoming) {
+        if let Err(err) = store.post_errored_turn_note(&self.id, opened_seq, incoming) {
             self.last_error = Some(format!("post recovery note after errored turn: {err}"));
             self.errored_turn = Some(follow);
             let retry_at = self.inner.clock.now_ms() + IDLE_REVIEW_MS;
             self.sleep(Some(retry_at));
             return;
-        }
-        // The note carries the work now: the turn closes with its error.
-        if let Some(open) = &turn.open
-            && let Err(err) = store.close_errored_turn(&self.id, open.opened_seq)
-        {
-            // Left open, the note joins it and the next completion closes both.
-            eprintln!(
-                "anyagents-supervisor: {}: close errored turn failed: {err}",
-                self.id
-            );
         }
         self.publish();
     }
@@ -2394,45 +2414,22 @@ impl<H: Harness + 'static> Session<H> {
 
 /// A turn the harness ended with an error, waiting for its follow-up.
 struct ErroredFollowUp {
-    /// Errored turns in a row, this one included.
+    /// Strikes in a row, this one included when it is one.
     streak: i64,
+    /// The error is the session's own (`is_session_turn_error`).
+    strike: bool,
     error: String,
-    /// The follow-up waits until then: later for an error the provider may
-    /// clear on its own.
+    /// The turn the store held open when the error was seen.
+    opened_seq: Option<i64>,
+    /// The follow-up waits until then: later for a systemic error.
     not_before: i64,
 }
 
-/// The wait before following up the `streak`th transient errored turn in a
-/// row: 15 s, doubling, at most 10 minutes. Eight in a row (the parking
-/// limit) span about 25 minutes of failing turns.
-fn transient_turn_backoff_ms(streak: i64) -> i64 {
-    let doublings = u32::try_from(streak.saturating_sub(1).clamp(0, 16)).unwrap_or(16);
+/// The wait before following up the `n`th systemic errored turn since the
+/// last completed one: 15 s, doubling, at most 10 minutes.
+fn systemic_backoff_ms(n: i64) -> i64 {
+    let doublings = u32::try_from(n.saturating_sub(1).clamp(0, 16)).unwrap_or(16);
     15_000i64.saturating_mul(1i64 << doublings).min(600_000)
-}
-
-/// Errored turns in a row that park an agent whose last error is `error`.
-pub fn errored_turn_limit(error: &str) -> i64 {
-    if is_retryable_turn_error(error) {
-        MAX_TRANSIENT_ERRORED_TURNS
-    } else {
-        MAX_ERRORED_TURNS
-    }
-}
-
-/// An error a later turn may not hit: the provider was overloaded,
-/// unreachable or rate limited, rather than refusing the request itself.
-fn is_retryable_turn_error(error: &str) -> bool {
-    let lower = error.to_ascii_lowercase();
-    is_transient_turn_fault(error)
-        || [
-            "service_unavailable",
-            "rate_limit",
-            "rate limit",
-            "too many requests",
-            "temporarily",
-        ]
-        .iter()
-        .any(|needle| lower.contains(needle))
 }
 
 fn is_transient_turn_fault(error: &str) -> bool {

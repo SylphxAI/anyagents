@@ -1,27 +1,72 @@
 //! Turns that end in an error (`docs/delivery.md`, "A turn that ends in an
 //! error"). The harness reported the turn's end, and with it an error. The
-//! turn is counted at once, and closed with that outcome as soon as the note
-//! that carries its work is in the mailbox, so it never holds the mailbox; a
-//! restart before then finds it open and recovers it as any interrupted turn.
-//! At the limit the supervisor parks the agent instead; a resume clears the
-//! count and the parking.
+//! turn is closed with that outcome in the same transaction that stores the
+//! note carrying its work, so it never holds the mailbox; a restart before
+//! then finds it open and recovers it as any interrupted turn.
+//!
+//! Only an error of the agent's own session (its context is full, the
+//! vendor refuses what the session holds) is a strike: at
+//! [`MAX_ERRORED_TURNS`] strikes in a row the supervisor parks the agent. A
+//! provider, model, auth, network, host or store error is the fleet's, not
+//! the agent's: it is retried after a backoff and never parks anyone, so one
+//! outage cannot pause every busy agent. A resume clears the strikes and the
+//! parking.
 
 use std::collections::HashMap;
 
 use rusqlite::{OptionalExtension, params};
 
-use super::{OpenTurn, Store, Wake, agent_exists, now_ms};
+use super::{Incoming, OpenTurn, Store, Wake, agent_exists, now_ms};
 use crate::error::Error;
 use crate::id::AgentId;
 
-/// Errored turns in a row that park an agent when the last error is one no
-/// retry clears (a context the model cannot take, a request it refuses).
+/// Strikes (errors of the agent's own session) in a row that park it.
 pub const MAX_ERRORED_TURNS: i64 = 3;
 
-/// Errored turns in a row that park an agent while each error is transient
-/// (an overloaded or unreachable provider). The supervisor backs off between
-/// them, so this is about half an hour of failing turns.
-pub const MAX_TRANSIENT_ERRORED_TURNS: i64 = 8;
+/// Whether `error` belongs to the agent's own session, so that retrying the
+/// same session cannot clear it: its context is full, or the vendor refuses
+/// the content the session holds. Anything else, and anything unknown, is
+/// systemic: a provider, model, auth, network, host or store error that the
+/// next success clears.
+pub fn is_session_turn_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    // Named as the fleet's even when the wording also names the request.
+    const SYSTEMIC: &[&str] = &[
+        "model_not_found",
+        "model not found",
+        "auth",
+        "credential",
+        "unauthorized",
+        "forbidden",
+        "api key",
+        "api_key",
+        "rate limit",
+        "rate_limit",
+        "quota",
+        "overloaded",
+        "unavailable",
+        "timeout",
+        "timed out",
+        "stalled",
+        "database is locked",
+        "already has an active turn",
+    ];
+    if SYSTEMIC.iter().any(|needle| lower.contains(needle)) {
+        return false;
+    }
+    const SESSION: &[&str] = &[
+        "context_length_exceeded",
+        "context_exhausted",
+        "context window",
+        "context length",
+        "maximum context",
+        "prompt is too long",
+        "tool_use",
+        "tool_result",
+        "roles must alternate",
+    ];
+    SESSION.iter().any(|needle| lower.contains(needle))
+}
 
 /// An agent's run of errored turns, and its parking.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -61,19 +106,27 @@ fn row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TurnErrors> {
 }
 
 impl Store {
-    /// Count a turn the harness ended with `error`, and return the run it
-    /// makes. The turn stays open until [`Store::close_errored_turn`].
-    pub fn note_turn_errored(&self, agent_id: &AgentId, error: &str) -> Result<i64, Error> {
+    /// Record a turn the harness ended with `error`, and return the strikes
+    /// in a row: a `strike` (an error of the session's own) adds one, any
+    /// other error leaves them as they are. The turn stays open until
+    /// [`Store::post_errored_turn_note`] closes it.
+    pub fn note_turn_errored(
+        &self,
+        agent_id: &AgentId,
+        error: &str,
+        strike: bool,
+    ) -> Result<i64, Error> {
+        let add = i64::from(strike);
         self.write_tx(|tx| {
             agent_exists(tx, agent_id)?;
             tx.execute(
                 "INSERT INTO turn_errors (agent_id, streak, last_error, last_error_at_ms)
-                 VALUES (?1, 1, ?2, ?3)
+                 VALUES (?1, ?4, ?2, ?3)
                  ON CONFLICT(agent_id) DO UPDATE SET
-                     streak = turn_errors.streak + 1,
+                     streak = turn_errors.streak + ?4,
                      last_error = excluded.last_error,
                      last_error_at_ms = excluded.last_error_at_ms",
-                params![agent_id.as_str(), error, now_ms()],
+                params![agent_id.as_str(), error, now_ms(), add],
             )?;
             Ok(tx.query_row(
                 "SELECT streak FROM turn_errors WHERE agent_id = ?1",
@@ -83,20 +136,28 @@ impl Store {
         })
     }
 
-    /// Close the turn an errored turn left open, once the note that carries
-    /// its work is in the mailbox: the one open through `opened_seq`, never
-    /// one a later message opened. `true` when it was still open.
-    pub fn close_errored_turn(&self, agent_id: &AgentId, opened_seq: i64) -> Result<bool, Error> {
-        self.write_tx(|tx| {
-            agent_exists(tx, agent_id)?;
-            Ok(tx.execute(
+    /// Store the note that carries an errored turn's work in the agent's own
+    /// mailbox and close that turn with its error, in one transaction: the
+    /// turn open through `opened_seq` only, never one a later message
+    /// opened. A note already stored under its source key closes it too.
+    pub fn post_errored_turn_note(
+        &self,
+        agent_id: &AgentId,
+        opened_seq: i64,
+        note: Incoming,
+    ) -> Result<(), Error> {
+        let close = |conn: &rusqlite::Connection| -> Result<bool, Error> {
+            conn.execute(
                 "UPDATE turn_recovery
                  SET completed_seq = opened_seq,
                      recovery_count = 0
                  WHERE agent_id = ?1 AND opened_seq = ?2 AND completed_seq < opened_seq",
                 params![agent_id.as_str(), opened_seq],
-            )? > 0)
-        })
+            )?;
+            Ok(true)
+        };
+        self.receive_with_admission(agent_id, note, false, close)?;
+        Ok(())
     }
 
     /// Park an agent whose turns keep ending in an error: it is `paused`, so
@@ -216,8 +277,42 @@ mod tests {
         seq
     }
 
+    fn note(text: &str, key: &str) -> Incoming {
+        let mut note = Incoming::new(text);
+        note.sender = Some(crate::SYSTEM_SENDER.into());
+        note.source_key = Some(key.into());
+        note
+    }
+
     #[test]
-    fn an_errored_turn_is_counted_and_closed_only_through_its_own_turn() {
+    fn only_an_error_of_the_session_itself_is_a_strike() {
+        for strike in [
+            r#"Sylphx AI failure Some("context_length_exceeded"): The request exceeds the model's context window."#,
+            "context_exhausted",
+            "invalid_request_error: prompt is too long: 210000 tokens > 200000 maximum",
+            "messages.12: `tool_use` ids were found without `tool_result` blocks",
+        ] {
+            assert!(super::is_session_turn_error(strike), "{strike}");
+        }
+        // What the live fleet logged that is the provider's, the host's or
+        // unknown: never a strike.
+        for systemic in [
+            r#"Sylphx AI failure Some("model_not_found"): The model does not exist."#,
+            "AUTH_REQUIRED: the provider rejected credentials",
+            "Sylphx AI failure (upstream_stalled)",
+            "stream_no_output: output timeout after 300s",
+            "store: database is locked",
+            "This Session already has an active turn",
+            r#"Sylphx AI failure Some("service_unavailable"): Retry the request."#,
+            "invalid_request_error: context window of model_not_found",
+            "something nobody has seen before",
+        ] {
+            assert!(!super::is_session_turn_error(systemic), "{systemic}");
+        }
+    }
+
+    #[test]
+    fn strikes_count_and_the_note_closes_only_its_own_turn() {
         let (_dir, store) = store();
         let agent = store
             .create_agent(NewAgent::new("worker", "spiron"))
@@ -226,7 +321,14 @@ mod tests {
         deliver(&store, &agent.id, "second");
         assert_eq!(
             store
-                .note_turn_errored(&agent.id, "context_length_exceeded")
+                .note_turn_errored(&agent.id, "context_length_exceeded", true)
+                .unwrap(),
+            1
+        );
+        // A systemic error is recorded but adds no strike.
+        assert_eq!(
+            store
+                .note_turn_errored(&agent.id, "upstream_stalled", false)
                 .unwrap(),
             1
         );
@@ -235,31 +337,43 @@ mod tests {
         assert_eq!(texts, ["first", "second"]);
         let errors = store.turn_errors(&agent.id).unwrap().unwrap();
         assert_eq!(errors.streak, 1);
-        assert_eq!(
-            errors.last_error.as_deref(),
-            Some("context_length_exceeded")
-        );
+        assert_eq!(errors.last_error.as_deref(), Some("upstream_stalled"));
         assert!(errors.faulted_at_ms.is_none());
 
-        // A later message extends the turn: the stale close leaves it open.
+        // A later message extends the turn: a note for the stale one is
+        // stored but closes nothing.
         deliver(&store, &agent.id, "third");
-        assert!(
-            !store
-                .close_errored_turn(&agent.id, open.opened_seq)
-                .unwrap()
-        );
+        store
+            .post_errored_turn_note(&agent.id, open.opened_seq, note("stale", "k1"))
+            .unwrap();
         assert!(store.has_open_turn(&agent.id).unwrap());
+        // The note and the close of the turn it covers commit together.
         let open = store.open_turn(&agent.id).unwrap().unwrap();
-        assert!(
-            store
-                .close_errored_turn(&agent.id, open.opened_seq)
-                .unwrap()
-        );
+        store
+            .post_errored_turn_note(&agent.id, open.opened_seq, note("carries", "k2"))
+            .unwrap();
         assert!(!store.has_open_turn(&agent.id).unwrap());
-        assert_eq!(store.note_turn_errored(&agent.id, "again").unwrap(), 2);
+        let last = store.inbox(&agent.id, None).unwrap().pop().unwrap();
+        assert_eq!(last.text, "carries");
+        assert!(store.next_undelivered(&agent.id).unwrap().is_some());
 
         // A completed turn ends the run.
-        deliver(&store, &agent.id, "fourth");
+        assert_eq!(
+            store
+                .note_turn_errored(&agent.id, "context_exhausted", true)
+                .unwrap(),
+            2
+        );
+        let pending: Vec<i64> = store
+            .inbox(&agent.id, None)
+            .unwrap()
+            .into_iter()
+            .filter(|m| m.delivered_at_ms.is_none())
+            .map(|m| m.seq)
+            .collect();
+        for seq in pending {
+            store.note_delivered(&agent.id, seq).unwrap();
+        }
         store.note_turn_completed(&agent.id).unwrap();
         assert_eq!(store.turn_errors(&agent.id).unwrap().unwrap().streak, 0);
         assert!(store.current_turn_errors().unwrap().is_empty());
@@ -274,7 +388,9 @@ mod tests {
         store.set_agent_state(&agent.id, "running").unwrap();
         for _ in 0..MAX_ERRORED_TURNS {
             deliver(&store, &agent.id, "work");
-            store.note_turn_errored(&agent.id, "boom").unwrap();
+            store
+                .note_turn_errored(&agent.id, "context_length_exceeded", true)
+                .unwrap();
         }
         assert!(
             store.has_open_turn(&agent.id).unwrap(),
@@ -293,7 +409,11 @@ mod tests {
         let errors = store.turn_errors(&agent.id).unwrap().unwrap();
         assert_eq!(errors.streak, 0, "a resume starts the count again");
         assert!(errors.faulted_at_ms.is_none());
-        assert_eq!(errors.last_error.as_deref(), Some("boom"), "history stays");
+        assert_eq!(
+            errors.last_error.as_deref(),
+            Some("context_length_exceeded"),
+            "history stays"
+        );
     }
 
     #[test]

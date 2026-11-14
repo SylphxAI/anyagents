@@ -77,40 +77,56 @@ way.
 
 A turn the adapter saw end (`turns_served` moved, or `Accepted {
 turn_finished }`) with a fault on the harness (`sign_in_fault`, not a quota
-wait) is never left holding the mailbox. The supervisor counts it at once in
-`turn_errors` (migration 033) and follows it up:
+wait) is never left holding the mailbox. The supervisor records it at once in
+`turn_errors` (migration 033) and follows it up. This covers adapters that
+report an errored turn that way (the stream harnesses: Spiron, AGY,
+OpenCode). Claude Code reports a non-auth errored result as a finished turn
+with no fault, so the turn completes as usual and is not seen here; Codex
+does not count a failed turn as served, so its errored turns are not seen
+here either.
 
 - **Retry with a note.** The work the turn held comes back as a `[Recovery]`
   note in the agent's own mailbox, from `anyagents`. It names the error,
   quotes the turn's messages (each clipped; the whole message stays in the
-  mailbox under its id) and the outbound messages already sent, and says
-  which errored turn in a row this is. Only once the note is stored is the
-  turn closed with its error, so a restart in between finds the turn open and
-  recovers it as an interrupted turn. Being mail, the note is durable and
-  ordered behind any mail that waits; the next turn starts with both.
-- **Transient errors back off.** A fault the provider may clear on its own
-  (overloaded, unavailable, rate limited, a dropped stream) is not a
-  refusal. One the supervisor already treats as a transient mid-turn fault
-  (a 5xx, `server_error`, a reset connection) is first retried in a new
+  mailbox under its id) and the outbound messages already sent. The note is
+  stored in the same transaction that closes the turn with its error, so a
+  restart before then finds the turn open and recovers it as an interrupted
+  turn. Only the turn that errored is carried: if the store no longer holds
+  it open by the time of the follow-up (it completed since), nothing is
+  posted. Being mail, the note is durable and ordered behind any mail that
+  waits; the next turn starts with both.
+- **Strikes are the session's own errors.** Only an error that retrying the
+  same session cannot clear is a strike: its context is full
+  (`context_length_exceeded`, `context_exhausted`, the prompt is too long) or
+  the vendor refuses what the session holds (an unmatched `tool_use`).
+- **Every other error is systemic, and never parks.** A provider, model,
+  auth, network, host or store error (`model_not_found`, rejected
+  credentials, `upstream_stalled`, an output timeout, `database is locked`,
+  an active turn already running, an unavailable or rate-limited provider),
+  and any error not known to be the session's, is the fleet's trouble, not
+  the agent's. One the supervisor treats as a transient mid-turn fault (a
+  5xx, `server_error`, a reset connection) is first retried in a new
   process, as before, up to three times. After that, and at once for the
-  rest (`service_unavailable`, a rate limit), each follow-up waits 15 s,
-  doubling to at most 10 minutes; the turn stays open while it waits, and
-  mail waits behind it.
-- **Park at the limit.** At `MAX_ERRORED_TURNS` (3) errored turns in a row,
-  or `MAX_TRANSIENT_ERRORED_TURNS` (8, about 25 minutes) while each error is
-  transient, the agent is parked: `state = paused`, its process stopped, its
-  mail held, `turn_errors.faulted_at_ms` set, and the turn left open so that
-  a resume recovers it. Its nearest live ancestor is told the error
-  (`[Sub-Agent Faulted]`), once per parking; an agent with no live ancestor
-  is reported to the operator's inbox (`anyagents inbox --operator`), the
-  server log and `anyagents status`.
-  `agents list` and `status` show it as `faulted`, and `agents inspect`
-  shows the run and the last error.
+  rest, each follow-up waits 15 s, doubling to at most 10 minutes; the turn
+  stays open while it waits, and mail waits behind it. The next completed
+  turn resets the backoff. So a gateway that misroutes every request slows
+  every busy agent down; it pauses none of them.
+- **Park at three strikes.** At `MAX_ERRORED_TURNS` (3) strikes in a row the
+  agent is parked: `state = paused`, its process stopped, its mail held,
+  `turn_errors.faulted_at_ms` set, and the turn left open so that a resume
+  recovers it. Its nearest running or idle ancestor is told the error
+  (`[Sub-Agent Faulted]`), once per parking; a paused or archived ancestor
+  reads nothing and is passed over. With no such ancestor, the operator's
+  inbox is told (`anyagents inbox --operator`); when the inbox is over its
+  rate limit, the server log says so and `anyagents status` still lists the
+  agent. `agents list` and `status` show it as `faulted`, and `agents
+  inspect` shows the strikes and the last error.
 - A completed turn ends the run. A resume (`agents resume`, a wake) clears
-  the parking and the count.
+  the parking and the strikes; `anyagents resume --faulted` resumes every
+  faulted agent at once.
 
 A recovery note whose own turn ends with a fault is not completed; it is
-counted like any other errored turn.
+handled like any other errored turn.
 
 ### Mail that cannot be delivered now
 
@@ -118,19 +134,24 @@ No message waits or goes unread without someone being told. Every notice
 comes from `anyagents`, is keyed by its source key so it is written once,
 and never causes another notice; a child's own lifecycle notices
 (`[Sub-Agent Completed]`, `[Sub-Agent Error]`) are not announced back to it.
+"Who answers for" an agent is its nearest running or idle ancestor: a paused
+or archived one reads nothing.
 
 - **To an archived agent.** A send that cannot wake its archived recipient
-  (one sent through `parent` or another alias, or to several recipients) is
-  refused for that recipient: the response lists it in `skipped` with
-  `agent X is archived; its parent is Y`, and nothing is stored unread. A
-  send with no other recipient fails with that reason. A direct send to the
-  archived agent alone, by name, still wakes it. Mail that reaches an
-  archived agent another way is stored, and its agent sender is told
-  (`[Undeliverable]`), once per message.
-- **To a paused agent.** The mail is stored and waits. Its agent sender, or
-  the paused agent's parent when the sender is a person, a schedule or the
-  operator, is told once per pause (`[Queued]`); the notice is keyed by the
-  paused agent's delivery cursor, which a pause holds still. A parked agent's
+  (one sent through `parent` or another alias, to several recipients, or
+  over HTTP MCP to a host agent) is refused for that recipient: the response
+  lists it in `skipped` with `agent X is archived; its parent is Y` (or the
+  nearest running agent above it), and nothing is stored unread. A send with
+  no other recipient fails with that reason. A direct send to the archived
+  agent alone, by name, still wakes it where the caller may. Mail that
+  reaches an archived agent another way is stored, and its agent sender is
+  told (`[Undeliverable]`), once per message.
+- **To a paused agent.** The mail is stored and waits. Its agent sender, or,
+  when the sender is a person, a schedule or the operator, whoever answers
+  for the paused agent, is told once per pause (`[Queued]`); the notice is
+  keyed by the paused agent's delivery cursor, which a pause holds still.
+  With no one to answer for it, the operator's inbox is told (one body per
+  agent, so repeats within the hour are counted on it). A parked agent's
   notice says why it was parked. An answer to something the paused agent
   asked (a message with `reply_to`) waits for it without a notice: whoever
   answered has nothing to act on.

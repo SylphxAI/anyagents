@@ -67,7 +67,7 @@ pub use runtime::{
     QuotaReset, QuotaSource, RecoveryOffer, RuntimeChange, RuntimeState, SessionLease, Turn,
     TurnOutcome, TurnState,
 };
-pub use turn_errors::{ErroredTurn, MAX_ERRORED_TURNS, MAX_TRANSIENT_ERRORED_TURNS, TurnErrors};
+pub use turn_errors::{ErroredTurn, MAX_ERRORED_TURNS, TurnErrors, is_session_turn_error};
 
 /// A line's provider coordinates: the chat, the forum topic and the message id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

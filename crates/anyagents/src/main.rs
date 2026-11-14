@@ -209,10 +209,15 @@ enum Command {
     /// Resume an archived or paused agent (`state = running`) and optionally send a task prompt.
     Resume {
         /// Agent name or `agt_...` id.
-        name: String,
+        #[arg(required_unless_present = "faulted")]
+        name: Option<String>,
         /// Optional task/message to deliver immediately after waking.
         #[arg(long)]
         prompt: Option<String>,
+        /// Resume every agent parked as `faulted` (its own session's errors
+        /// paused it), once its cause is fixed. Operator only.
+        #[arg(long, conflicts_with_all = ["name", "prompt"])]
+        faulted: bool,
     },
     /// Permanently delete an agent and its on-disk directory.
     Delete {
@@ -1295,7 +1300,10 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
         Command::Archive { name } => agent::archive_cmd(&data, name),
         Command::Pause { name } => agent::pause_cmd(&data, name),
         Command::Wake { name, prompt } => agent::resume_cmd(&data, &name, prompt),
-        Command::Resume { name, prompt } => agent::resume_cmd(&data, &name, prompt),
+        Command::Resume { faulted: true, .. } => agent::resume_faulted(&data),
+        Command::Resume { name, prompt, .. } => {
+            agent::resume_cmd(&data, name.as_deref().unwrap_or_default(), prompt)
+        }
         Command::Delete { name } => agent::delete_cmd(&data, &name),
         Command::Flush { agent } => agent::flush(&data, &agent),
         Command::Requeue { agent, message } => agent::requeue(&data, &agent, message.as_deref()),
@@ -3214,6 +3222,18 @@ mod cli_query_tests {
                 Command::Peers { .. }
             ));
         }
+        // `resume` takes a name, or `--faulted` for every parked agent.
+        let faulted = Cli::try_parse_from(["anyagents", "resume", "--faulted"]).unwrap();
+        assert!(matches!(
+            faulted.command,
+            Command::Resume {
+                faulted: true,
+                name: None,
+                ..
+            }
+        ));
+        assert!(Cli::try_parse_from(["anyagents", "resume"]).is_err());
+        assert!(Cli::try_parse_from(["anyagents", "resume", "vulcan", "--faulted"]).is_err());
         let inspected = Cli::try_parse_from(["anyagents", "inspect", "vulcan", "-n", "5"]).unwrap();
         assert!(matches!(
             inspected.command,

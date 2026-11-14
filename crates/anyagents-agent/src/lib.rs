@@ -539,8 +539,14 @@ pub fn recovery_outbound(open: &anyagents_core::OpenTurn) -> OutboundMessage {
 /// error. The host closes that turn with the error as its outcome once this
 /// note, stored in the agent's own mailbox, is there: it starts the next turn
 /// with the work the failed one held, together with any mail that waits.
-/// `limit` is how many errored turns in a row park the agent.
-pub fn errored_turn_note(turn: &anyagents_core::ErroredTurn, error: &str, limit: i64) -> String {
+/// `strike_limit` is how many errors of the session's own in a row park the
+/// agent, when this error is one; `None` for a systemic error, which never
+/// parks it.
+pub fn errored_turn_note(
+    turn: &anyagents_core::ErroredTurn,
+    error: &str,
+    strike_limit: Option<i64>,
+) -> String {
     let mut lines = vec![
         format!(
             "[Recovery] Your previous turn ended with an error, and AnyAgents closed it: {}",
@@ -577,10 +583,13 @@ pub fn errored_turn_note(turn: &anyagents_core::ErroredTurn, error: &str, limit:
         ),
     }
     lines.push(String::new());
-    lines.push(format!(
-        "This is errored turn {} of {limit} in a row. At {limit}, the agent is paused, its mail is held, and its parent (or the operator) is told the error.",
-        turn.streak
-    ));
+    lines.push(match strike_limit {
+        Some(limit) => format!(
+            "This is error {} of {limit} in a row about this session's own content. At {limit}, the agent is paused, its mail is held, and the agent above it (or the operator) is told the error.",
+            turn.streak
+        ),
+        None => "The error came from the provider, the model or the host, not from this session: it was retried after a backoff, and it never pauses the agent.".to_string(),
+    });
     lines.push(
         "Check the actual state before repeating anything that may have taken effect, then carry on with the task in smaller steps."
             .to_string(),

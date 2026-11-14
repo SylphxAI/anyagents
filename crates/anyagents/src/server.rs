@@ -7545,8 +7545,8 @@ fn archived_refusal(store: &Store, name: &str) -> Option<crate::api::SkippedDeli
         Some(parent) if recipient.parent_id.as_ref() == Some(&parent.id) => {
             format!("its parent is `{}`", parent.name)
         }
-        Some(ancestor) => format!("its nearest live ancestor is `{}`", ancestor.name),
-        None => "it has no live parent".to_string(),
+        Some(ancestor) => format!("the nearest running agent above it is `{}`", ancestor.name),
+        None => "no running agent is above it".to_string(),
     };
     Some(crate::api::SkippedDelivery {
         to: format!("agent:{}", recipient.name),
@@ -10767,6 +10767,8 @@ exec '{}' "$@"
         let root = store
             .create_agent(anyagents_core::NewAgent::new("root", "opencode"))
             .unwrap();
+        // Running, as an agent that answers for its archived child.
+        store.set_agent_state(&root.id, "running").unwrap();
         let mut new = anyagents_core::NewAgent::new("lead", "opencode");
         new.parent_id = Some(root.id.clone());
         let lead = store.create_agent(new).unwrap();
@@ -10832,7 +10834,7 @@ exec '{}' "$@"
         store.set_agent_state(&agent.id, "running").unwrap();
         for _ in 0..anyagents_core::MAX_ERRORED_TURNS {
             store
-                .note_turn_errored(&agent.id, "context_length_exceeded")
+                .note_turn_errored(&agent.id, "context_length_exceeded", true)
                 .unwrap();
         }
         assert!(store.park_faulted(&agent.id).unwrap());

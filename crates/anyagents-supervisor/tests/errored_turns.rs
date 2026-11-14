@@ -8,9 +8,7 @@ mod support;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyagents_core::{
-    Incoming, MAX_ERRORED_TURNS, MAX_TRANSIENT_ERRORED_TURNS, NewAgent, SYSTEM_SENDER, Store,
-};
+use anyagents_core::{Incoming, MAX_ERRORED_TURNS, NewAgent, SYSTEM_SENDER, Store};
 use anyagents_harness::{
     DeliverOutcome, Delivery, DeliveryLevel, Harness, HarnessError, HarnessHealth, OutboundMessage,
     TurnState,
@@ -116,6 +114,8 @@ fn start_with(fail: usize, error: Option<&'static str>, clock: Arc<dyn Clock>) -
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
     let lead = store.create_agent(NewAgent::new("lead", "spiron")).unwrap();
+    // Idle, as an agent a notice can reach and wake; it never launches here.
+    let lead = store.set_agent_state(&lead.id, "idle").unwrap();
     let worker = store
         .create_agent(NewAgent {
             parent_id: Some(lead.id.clone()),
@@ -196,7 +196,10 @@ fn an_errored_turn_is_closed_and_its_work_comes_back_with_a_recovery_note() {
     assert!(note.contains("context_length_exceeded"), "{note}");
     assert!(note.contains(task.id.as_str()), "{note}");
     assert!(note.contains("summarise the incident"), "{note}");
-    assert!(note.contains("errored turn 1 of"), "{note}");
+    assert!(
+        note.contains("error 1 of 3 in a row about this session's own content"),
+        "{note}"
+    );
     assert!(wait_until(|| {
         fx.store
             .turn_errors(&fx.worker.id)
@@ -298,11 +301,11 @@ fn turns_that_keep_erroring_park_the_agent_and_tell_its_parent() {
     support::stop(fx.supervisor);
 }
 
-/// A provider that is unavailable is not a refusal: each retry waits out a
-/// growing backoff, the turn stays open (a restart would recover it) while
-/// it waits, and only a long run parks the agent.
+/// A provider that is unavailable is the fleet's trouble, not the agent's:
+/// each retry waits out a growing backoff, the turn stays open (a restart
+/// would recover it) while it waits, and no run of them ever parks it.
 #[test]
-fn transient_errors_back_off_and_park_only_after_a_long_run() {
+fn systemic_errors_back_off_and_never_park() {
     let clock = ManualClock::new(1_700_000_000_000);
     let fx = start_with(
         usize::MAX,
@@ -321,7 +324,7 @@ fn transient_errors_back_off_and_park_only_after_a_long_run() {
         fx.store
             .turn_errors(&fx.worker.id)
             .unwrap()
-            .is_some_and(|errors| errors.streak == 1)
+            .is_some_and(|errors| errors.last_error.as_deref() == Some(UNAVAILABLE))
     }));
     advance(10_000);
     std::thread::sleep(Duration::from_millis(200));
@@ -330,34 +333,38 @@ fn transient_errors_back_off_and_park_only_after_a_long_run() {
         fx.store.has_open_turn(&fx.worker.id).unwrap(),
         "the turn stays open while it waits"
     );
-    // Past it, the note goes out and the turn closes.
+    // Past it, the note goes out and the turn closes with it.
     advance(5_000);
     assert!(wait_until(|| given() == 2));
     let (_, note) = fx.vendor.lock().unwrap().given[1].clone();
-    assert!(note.contains("errored turn 1 of 8"), "{note}");
+    assert!(note.contains("never pauses the agent"), "{note}");
 
-    // Long after the refusal limit, a transient run still retries.
+    // Far past the strike limit, it still only retries.
     let mut steps = 0;
-    while given() < MAX_ERRORED_TURNS as usize + 1 && steps < 200 {
+    while given() < 3 * MAX_ERRORED_TURNS as usize && steps < 300 {
         advance(700_000);
         std::thread::sleep(Duration::from_millis(30));
         steps += 1;
     }
-    assert!(given() > MAX_ERRORED_TURNS as usize);
+    assert!(given() >= 3 * MAX_ERRORED_TURNS as usize, "{}", given());
     assert_ne!(fx.store.agent(&fx.worker.id).unwrap().state, "paused");
-    // Until its own limit.
+    let errors = fx.store.turn_errors(&fx.worker.id).unwrap().unwrap();
+    assert_eq!(errors.streak, 0, "a systemic error is no strike");
+    assert!(errors.faulted_at_ms.is_none());
+    assert!(notices(&fx.store, &fx.lead).is_empty());
+
+    // The next success clears it.
+    fx.vendor.lock().unwrap().fail = 0;
+    let before = given();
     let mut steps = 0;
-    while fx.store.agent(&fx.worker.id).unwrap().state != "paused" && steps < 400 {
+    while given() == before && steps < 100 {
         advance(700_000);
         std::thread::sleep(Duration::from_millis(30));
         steps += 1;
     }
-    assert_eq!(fx.store.agent(&fx.worker.id).unwrap().state, "paused");
-    assert_eq!(
-        fx.store.turn_errors(&fx.worker.id).unwrap().unwrap().streak,
-        MAX_TRANSIENT_ERRORED_TURNS
-    );
-    assert_eq!(given(), MAX_TRANSIENT_ERRORED_TURNS as usize);
-    assert!(wait_until(|| notices(&fx.store, &fx.lead).len() == 1));
+    assert!(wait_until(|| !fx
+        .store
+        .has_open_turn(&fx.worker.id)
+        .unwrap()));
     support::stop(fx.supervisor);
 }

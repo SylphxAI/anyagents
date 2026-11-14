@@ -8,20 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Unreleased
 
 - Mail and turn trouble is no longer silent (`docs/delivery.md`). A turn the
-  harness ends with an error is closed with that outcome instead of staying
-  open; its work comes back as a `[Recovery]` note, and after three errored
-  turns in a row the agent is parked (`paused`, listed as `faulted`) and its
-  parent, or the operator, is told the error. A resume clears it. A send that
-  cannot wake an archived recipient is refused for it with the reason and its
-  parent, never stored unread. Mail queued to a paused agent tells its sender,
-  or the agent's parent, once per pause. A channel post whose outcome is
-  unknown is held, never resent automatically, and its sender is told once;
-  `agents inspect` and `status` list it, and `anyagents outbound` retries or
-  discards it. A post the Telegram API refused leaves no stuck record, and a
-  long post cut short is recorded as partly delivered. A legacy Spiron input
-  hold is settled when its agent launches another harness, and at server start
-  when its agent is archived or has taken the held mail since. Migration 033
-  adds `turn_errors`.
+  harness ends with an error no longer stays open: its work comes back as a
+  `[Recovery]` note, stored in the same transaction that closes the turn.
+  Only an error of the agent's own session (a full context, content the
+  vendor refuses) is a strike; after three in a row the agent is parked
+  (`paused`, listed as `faulted`) and its nearest running ancestor, or the
+  operator's inbox, is told. Provider, model, auth, network, host and store
+  errors back off (15 s doubling to 10 minutes) and never park anyone.
+  `anyagents resume --faulted` resumes every parked agent. A send that cannot
+  wake an archived recipient is refused for it with the reason and who
+  answers for it, never stored unread. Mail queued to a paused agent tells
+  its sender, or whoever answers for the agent, once per pause. A channel
+  post whose outcome is unknown is held, never resent automatically, and its
+  sender is told once; `agents inspect` and `status` list it, and `anyagents
+  outbound` retries or discards it. A post the Telegram API refused leaves
+  no stuck record, and a long post cut short is recorded as partly
+  delivered. A legacy Spiron input hold is settled when its agent launches
+  another harness, and at server start when its agent is archived or has
+  taken the held mail since. Migration 033 adds `turn_errors`.
 - Agents report defects to whoever runs the deployment with `send` to
   `operator`: a defect in AnyAgents, the harness or the host that an agent
   cannot fix within its own work. Only the operator reads it, with

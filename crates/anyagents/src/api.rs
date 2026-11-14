@@ -180,9 +180,11 @@ impl AgentView {
 /// An agent's run of errored turns.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct TurnErrorsView {
-    /// Turns in a row that ended in an error.
+    /// Turns in a row that ended in an error of the agent's own session
+    /// (strikes). A provider, model, auth, network or host error is recorded
+    /// as `last_error` but is no strike.
     pub streak: i64,
-    /// Errored turns in a row that park the agent.
+    /// Strikes in a row that park the agent.
     pub limit: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
@@ -197,10 +199,7 @@ impl From<anyagents_core::TurnErrors> for TurnErrorsView {
     fn from(errors: anyagents_core::TurnErrors) -> Self {
         Self {
             streak: errors.streak,
-            limit: errors.last_error.as_deref().map_or(
-                anyagents_core::MAX_ERRORED_TURNS,
-                anyagents_supervisor::errored_turn_limit,
-            ),
+            limit: anyagents_core::MAX_ERRORED_TURNS,
             last_error: errors.last_error,
             last_error_at_ms: errors.last_error_at_ms,
             faulted_at_ms: errors.faulted_at_ms,

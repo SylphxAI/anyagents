@@ -33,11 +33,18 @@ fn is_lifecycle_notice(message: &Message) -> bool {
     })
 }
 
-/// The parent sentence of a notice.
-fn parent_clause(parent: Option<&Agent>) -> String {
-    match parent {
-        Some(parent) => format!("its parent is `{}` (`{}`)", parent.name, parent.id),
-        None => "it has no parent; the operator resumes it".to_string(),
+/// Who answers for `agent`, as a notice says it: its parent, or the
+/// nearest running or idle agent above it.
+fn answers_for(agent: &Agent, ancestor: Option<&Agent>) -> String {
+    match ancestor {
+        Some(parent) if agent.parent_id.as_ref() == Some(&parent.id) => {
+            format!("its parent is `{}` (`{}`)", parent.name, parent.id)
+        }
+        Some(above) => format!(
+            "the nearest running agent above it is `{}` (`{}`)",
+            above.name, above.id
+        ),
+        None => "no running agent is above it; the operator resumes it".to_string(),
     }
 }
 
@@ -54,7 +61,10 @@ impl Store {
         ))
     }
 
-    /// The agent's nearest ancestor that is not archived.
+    /// The agent's nearest ancestor that runs or can wake on mail (`running`
+    /// or `idle`). A paused or archived ancestor reads nothing, so a notice
+    /// for it goes past it, and the operator's inbox answers when no
+    /// ancestor does.
     pub fn live_ancestor(&self, agent: &Agent) -> Result<Option<Agent>, Error> {
         let mut next = agent.parent_id.clone();
         // A cycle cannot be written, but a bound costs nothing.
@@ -67,7 +77,7 @@ impl Store {
                 Err(Error::AgentNotFound(_)) => return Ok(None),
                 Err(err) => return Err(err),
             };
-            if parent.state != "archived" {
+            if matches!(parent.state.as_str(), "running" | "idle") {
                 return Ok(Some(parent));
             }
             next = parent.parent_id.clone();
@@ -132,24 +142,59 @@ impl Store {
                     recipient.name,
                     recipient.id,
                     message.id,
-                    parent_clause(parent.as_ref()),
+                    answers_for(recipient, parent.as_ref()),
                 ),
             )?;
             return Ok(());
         }
-        // Mail from a person, a schedule or the operator: the parent decides.
-        if let Some(parent) = parent {
-            self.post_notice(
-                &parent.id,
-                key,
+        // Mail from a person, a schedule or the operator: whoever answers
+        // for the paused agent decides.
+        match parent {
+            Some(parent) => {
+                let relation = if recipient.parent_id.as_ref() == Some(&parent.id) {
+                    "Your sub-agent"
+                } else {
+                    "An agent below you"
+                };
+                self.post_notice(
+                    &parent.id,
+                    key,
+                    format!(
+                        "[Queued] {relation} `{}` (`{}`) is paused, and mail is waiting for it: anyagents-message:{} from {}. {why} It is delivered when that agent is resumed. Further mail to it is not announced again while it stays paused.",
+                        recipient.name,
+                        recipient.id,
+                        message.id,
+                        message.sender.as_deref().unwrap_or("an unnamed sender"),
+                    ),
+                )?;
+            }
+            // One body per agent, so the inbox counts repeats on it.
+            None => self.tell_operator(
+                recipient,
                 format!(
-                    "[Queued] Your sub-agent `{}` (`{}`) is paused, and mail is waiting for it: anyagents-message:{} from {}. {why} It is delivered when the sub-agent is resumed. Further mail to it is not announced again while it stays paused.",
-                    recipient.name,
-                    recipient.id,
-                    message.id,
-                    message.sender.as_deref().unwrap_or("an unnamed sender"),
+                    "[Queued] `{}` (`{}`) is paused, and mail is waiting for it. {why} It is delivered when the agent is resumed: `anyagents agents resume {}`.",
+                    recipient.name, recipient.id, recipient.name,
                 ),
-            )?;
+            )?,
+        }
+        Ok(())
+    }
+
+    /// Post `body` about `agent` to the operator's inbox. Over the inbox's
+    /// rate limit nothing is stored; the agent's state still shows in
+    /// `anyagents status`, and the server log says so.
+    fn tell_operator(&self, agent: &Agent, body: String) -> Result<(), Error> {
+        let receipt = self.report_to_operator(super::OperatorReport {
+            sender: format!("agent:{}", agent.id),
+            sender_name: Some(agent.name.clone()),
+            body,
+            received_at_ms: None,
+        })?;
+        if let super::OperatorReceipt::Limited { retry_after_ms } = receipt {
+            eprintln!(
+                "anyagents: operator inbox is rate limited ({retry_after_ms} ms); notice about {} ({}) not stored, `anyagents status` shows its state",
+                agent.name, agent.id
+            );
         }
         Ok(())
     }
@@ -170,7 +215,7 @@ impl Store {
                 message.id,
                 recipient.name,
                 recipient.name,
-                parent_clause(parent.as_ref()),
+                answers_for(recipient, parent.as_ref()),
             ),
         )?;
         Ok(())
@@ -197,18 +242,16 @@ impl Store {
                 "anyagents: operator attention: agent {} ({}) was paused after {streak} turns in a row ended in an error; its mail is held until it is resumed. Last error: {error}",
                 agent.name, agent.id
             );
-            self.report_to_operator(super::OperatorReport {
-                sender: format!("agent:{}", agent.id),
-                sender_name: Some(agent.name.clone()),
-                body: format!(
-                    "[Agent Faulted] `{}` (`{}`) was paused: {streak} turns in a row ended in an error. Its mail is held until it is resumed. Last error: {}\n\nFix the cause, then resume it: `anyagents agents resume {}`.",
+            self.tell_operator(
+                &agent,
+                format!(
+                    "[Agent Faulted] `{}` (`{}`) was paused: {streak} turns in a row ended in an error of its own session. Its mail is held until it is resumed. Last error: {}\n\nFix the cause, then resume it: `anyagents agents resume {}`, or every faulted agent at once: `anyagents resume --faulted`.",
                     agent.name,
                     agent.id,
                     error.trim(),
                     agent.name,
                 ),
-                received_at_ms: None,
-            })?;
+            )?;
             return Ok(None);
         };
         let relation = if agent.parent_id.as_ref() == Some(&ancestor.id) {
@@ -220,7 +263,7 @@ impl Store {
             &ancestor.id,
             format!("anyagents:faulted:{}:{faulted_at}", agent.id),
             format!(
-                "[Sub-Agent Faulted] {relation} `{}` (`{}`) was paused: {streak} turns in a row ended in an error. Its mail is held until it is resumed. Last error: {}\n\nFix the cause (or decide the work is done), then resume it (`anyagents agents resume {}`) or archive it.",
+                "[Sub-Agent Faulted] {relation} `{}` (`{}`) was paused: {streak} turns in a row ended in an error of its own session. Its mail is held until it is resumed. Last error: {}\n\nFix the cause (or decide the work is done), then resume it (`anyagents agents resume {}`) or archive it.",
                 agent.name,
                 agent.id,
                 error.trim(),
@@ -242,13 +285,20 @@ mod tests {
         (dir, store)
     }
 
+    /// An agent that runs, as one a notice can reach.
+    fn root(store: &Store, name: &str) -> Agent {
+        let agent = store.create_agent(NewAgent::new(name, "spiron")).unwrap();
+        store.set_agent_state(&agent.id, "running").unwrap()
+    }
+
     fn child(store: &Store, name: &str, parent: &Agent) -> Agent {
-        store
+        let agent = store
             .create_agent(NewAgent {
                 parent_id: Some(parent.id.clone()),
                 ..NewAgent::new(name, "spiron")
             })
-            .unwrap()
+            .unwrap();
+        store.set_agent_state(&agent.id, "running").unwrap()
     }
 
     fn send(store: &Store, to: &Agent, from: &Agent, text: &str) -> Message {
@@ -272,9 +322,9 @@ mod tests {
     #[test]
     fn mail_to_a_paused_agent_tells_each_agent_sender_once_per_pause() {
         let (_dir, store) = store();
-        let lead = store.create_agent(NewAgent::new("lead", "spiron")).unwrap();
+        let lead = root(&store, "lead");
         let worker = child(&store, "worker", &lead);
-        let peer = store.create_agent(NewAgent::new("peer", "spiron")).unwrap();
+        let peer = root(&store, "peer");
         store.set_agent_state(&worker.id, "paused").unwrap();
 
         // An answer to what the paused agent asked tells no one.
@@ -317,7 +367,7 @@ mod tests {
     #[test]
     fn mail_from_a_person_to_a_paused_agent_tells_its_parent_once() {
         let (_dir, store) = store();
-        let lead = store.create_agent(NewAgent::new("lead", "spiron")).unwrap();
+        let lead = root(&store, "lead");
         let worker = child(&store, "worker", &lead);
         store.set_agent_state(&worker.id, "paused").unwrap();
         for text in ["a", "b"] {
@@ -334,7 +384,7 @@ mod tests {
     #[test]
     fn mail_stored_for_an_archived_agent_bounces_to_its_agent_sender() {
         let (_dir, store) = store();
-        let lead = store.create_agent(NewAgent::new("lead", "spiron")).unwrap();
+        let lead = root(&store, "lead");
         let worker = child(&store, "worker", &lead);
         store.set_agent_state(&worker.id, "archived").unwrap();
         let reply = send(&store, &worker, &lead, "status?");
@@ -343,10 +393,7 @@ mod tests {
         assert!(
             told[0]
                 .text
-                .contains("agent `worker` is archived; it has no parent")
-                || told[0]
-                    .text
-                    .contains("agent `worker` is archived; its parent is"),
+                .contains("agent `worker` is archived; its parent is `lead`"),
             "{}",
             told[0].text
         );
@@ -361,7 +408,7 @@ mod tests {
     #[test]
     fn automatic_and_system_notices_are_never_announced() {
         let (_dir, store) = store();
-        let root = store.create_agent(NewAgent::new("root", "spiron")).unwrap();
+        let root = root(&store, "root");
         let lead = child(&store, "lead", &root);
         let worker = child(&store, "worker", &lead);
         store.set_agent_state(&lead.id, "paused").unwrap();
@@ -376,10 +423,62 @@ mod tests {
         assert!(notices(&store, &root).is_empty());
     }
 
+    /// A paused ancestor reads nothing: a notice goes past it to the nearest
+    /// running one, or to the operator's inbox when none runs.
+    #[test]
+    fn notices_pass_paused_ancestors_and_end_with_the_operator() {
+        let (_dir, store) = store();
+        let top = root(&store, "top");
+        let lead = child(&store, "lead", &top);
+        let worker = child(&store, "worker", &lead);
+        store.set_agent_state(&lead.id, "paused").unwrap();
+        store.set_agent_state(&worker.id, "paused").unwrap();
+        let mut human = Incoming::new("hello");
+        human.sender = Some("telegram:user:42".into());
+        store.receive(&worker.id, human.clone()).unwrap();
+        assert!(
+            notices(&store, &lead).is_empty(),
+            "a paused parent is passed"
+        );
+        let told = notices(&store, &top);
+        assert_eq!(told.len(), 1, "{told:?}");
+        assert!(
+            told[0]
+                .text
+                .starts_with("[Queued] An agent below you `worker`")
+        );
+
+        // With no running ancestor, the operator's inbox is told.
+        store.set_agent_state(&top.id, "paused").unwrap();
+        let loner = child(&store, "loner", &lead);
+        store.set_agent_state(&loner.id, "paused").unwrap();
+        store.receive(&loner.id, human).unwrap();
+        let reports = store.operator_inbox(None, None).unwrap();
+        assert_eq!(reports.len(), 1);
+        assert!(
+            reports[0].body.starts_with("[Queued] `loner`"),
+            "{}",
+            reports[0].body
+        );
+
+        // The same holds for a parking.
+        store.set_agent_state(&worker.id, "running").unwrap();
+        store.park_faulted(&worker.id).unwrap();
+        assert_eq!(
+            store
+                .notify_parked(&worker.id, 3, "context_length_exceeded")
+                .unwrap(),
+            None
+        );
+        let reports = store.operator_inbox(None, None).unwrap();
+        assert_eq!(reports.len(), 2);
+        assert!(reports[1].body.starts_with("[Agent Faulted] `worker`"));
+    }
+
     #[test]
     fn a_parked_agent_is_announced_to_its_nearest_live_ancestor() {
         let (_dir, store) = store();
-        let root = store.create_agent(NewAgent::new("root", "spiron")).unwrap();
+        let root = root(&store, "root");
         let lead = child(&store, "lead", &root);
         let worker = child(&store, "worker", &lead);
         store.set_agent_state(&lead.id, "archived").unwrap();

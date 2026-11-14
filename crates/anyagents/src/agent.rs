@@ -728,6 +728,41 @@ pub fn resume_cmd(data: &Path, name: &str, prompt: Option<String>) -> Result<(),
     Ok(())
 }
 
+/// Resume every agent parked as `faulted`: each is woken as `resume` wakes
+/// one, which clears its parking. Prints one line per agent.
+pub fn resume_faulted(data: &Path) -> Result<(), Error> {
+    if client::agent_identity().is_some() {
+        return Err(Error::Message(
+            "resuming every faulted agent is the operator's".into(),
+        ));
+    }
+    let query = server::ListAgentsQuery {
+        state: Some("paused".to_string()),
+        parent: None,
+        name: None,
+    };
+    let listed = match client::get::<AgentsResponse>(data, "/v1/agents?state=paused")
+        .map_err(Error::Message)?
+    {
+        Some(listed) => listed,
+        None => offline_roster(data, &query)?,
+    };
+    let faulted: Vec<_> = listed
+        .agents
+        .iter()
+        .filter(|agent| agent.display_state() == "faulted")
+        .collect();
+    if faulted.is_empty() {
+        println!("no faulted agent");
+        return Ok(());
+    }
+    for agent in faulted {
+        let view = set_state(data, &agent.id, "running")?;
+        println!("{}\t{}\t{}", view.id, view.name, view.state);
+    }
+    Ok(())
+}
+
 pub fn peers_with_options(
     data: &Path,
     state: Option<&str>,
