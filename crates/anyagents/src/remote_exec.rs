@@ -534,10 +534,9 @@ mod tests {
         );
         // The session consumed it under the last kernel: the new one knows,
         // and would never write it again.
-        assert_eq!(
-            attached.harness.proven("msg_1"),
-            Some(anyagents_harness::Proof::Duplicate)
-        );
+        wait_until("it knows", || {
+            attached.harness.proven("msg_1") == Some(anyagents_harness::Proof::Duplicate)
+        });
         assert_eq!(vendor.lock().sessions.len(), 1, "no second session");
         drop(attached);
 

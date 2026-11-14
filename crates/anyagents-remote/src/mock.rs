@@ -86,6 +86,9 @@ pub struct Inner {
     pub fail_session_creates: u32,
     /// Delay `POST /v1/sessions/{id}/archive` by this many ms.
     pub archive_delay_ms: u64,
+    /// Mark a message processed on its record without showing it again on
+    /// the stream (a client that lost the echo).
+    pub hide_processed_echo: bool,
 }
 
 #[derive(Clone)]
@@ -388,7 +391,9 @@ fn process(inner: &mut Inner, session: &str, message: &str) {
         record.clone()
     };
     // The stream shows the input again, processed; the history keeps one.
-    emit(inner, session, updated.clone(), false);
+    if !inner.hide_processed_echo {
+        emit(inner, session, updated.clone(), false);
+    }
     let cost = inner.cost_per_request_cents;
     inner.sessions.get_mut(session).unwrap().cost_cents += cost;
     let span = json!({

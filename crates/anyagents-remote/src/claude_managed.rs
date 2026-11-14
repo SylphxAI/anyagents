@@ -690,6 +690,44 @@ impl ClaudeManaged {
         Ok(stopped.is_some_and(|event| is_marker(&event)))
     }
 
+    /// Which of these inputs carry `processed_at` now: the history is read
+    /// newest first until each was found.
+    async fn inputs_consumed(
+        &self,
+        handle: &Handle,
+        request_ids: &[String],
+    ) -> Result<Vec<String>, AdapterError> {
+        if request_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let wanted: std::collections::HashSet<&str> =
+            request_ids.iter().map(String::as_str).collect();
+        let found = std::sync::Mutex::new(std::collections::HashSet::<String>::new());
+        let consumed = std::sync::Mutex::new(Vec::new());
+        let (_, _) = self
+            .read_history_newest_first(handle, |event| {
+                if let EventKind::Input {
+                    request_id: Some(id),
+                    consumed: done,
+                    ..
+                } = map_event(event).kind
+                    && wanted.contains(id.as_str())
+                {
+                    let mut found = found.lock().unwrap_or_else(|err| err.into_inner());
+                    if found.insert(id.clone()) && done {
+                        consumed
+                            .lock()
+                            .unwrap_or_else(|err| err.into_inner())
+                            .push(id);
+                    }
+                    return found.len() == wanted.len();
+                }
+                false
+            })
+            .await?;
+        Ok(consumed.into_inner().unwrap_or_else(|err| err.into_inner()))
+    }
+
     async fn custom_tool_result(
         &self,
         handle: &Handle,
@@ -763,6 +801,14 @@ impl Adapter for ClaudeManaged {
         after: Option<&'a str>,
     ) -> Fut<'a, bool> {
         Box::pin(self.session_holds(handle, request_id, after))
+    }
+
+    fn consumed<'a>(
+        &'a self,
+        handle: &'a Handle,
+        request_ids: &'a [String],
+    ) -> Fut<'a, Vec<String>> {
+        Box::pin(self.inputs_consumed(handle, request_ids))
     }
 
     fn snapshot<'a>(&'a self, handle: &'a Handle) -> Fut<'a, Snapshot> {

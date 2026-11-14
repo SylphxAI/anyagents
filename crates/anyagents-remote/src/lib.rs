@@ -329,6 +329,17 @@ pub trait Adapter: Send + Sync + 'static {
         after: Option<&'a str>,
     ) -> Fut<'a, bool>;
 
+    /// Which of `request_ids`, inputs the session holds and the executor
+    /// has not seen consumed, the session has consumed by now. A vendor that
+    /// marks consumption on the input's own record (Claude Managed Agents'
+    /// `processed_at`) can do so behind the attach cursor, where no replay
+    /// shows it; one whose proofs are events of their own answers none.
+    fn consumed<'a>(
+        &'a self,
+        handle: &'a Handle,
+        request_ids: &'a [String],
+    ) -> Fut<'a, Vec<String>>;
+
     fn snapshot<'a>(&'a self, handle: &'a Handle) -> Fut<'a, Snapshot>;
 
     /// Stop the running turn; the session stays.

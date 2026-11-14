@@ -199,6 +199,8 @@ struct State {
 /// Work an applied event asks for.
 enum Effect {
     Snapshot,
+    /// Ask whether inputs held behind the cursor were consumed since.
+    Reconcile,
     Interrupt,
     HostCall {
         call_id: String,
@@ -388,6 +390,9 @@ impl State {
             EventKind::CaughtUp => {
                 self.synced = true;
                 effects.push(Effect::Snapshot);
+                if !self.queued.is_empty() {
+                    effects.push(Effect::Reconcile);
+                }
             }
             EventKind::Input {
                 request_id: Some(id),
@@ -653,6 +658,7 @@ impl Shared {
         for effect in effects {
             match effect {
                 Effect::Snapshot => self.refresh().await,
+                Effect::Reconcile => self.reconcile().await,
                 Effect::Interrupt => {
                     if let Err(err) = self.adapter.interrupt(&self.handle).await {
                         self.state().last_error = Some(format!("interrupt: {err}"));
@@ -687,6 +693,29 @@ impl Shared {
         };
         self.persist(&patch);
         self.notify();
+    }
+
+    /// Inputs the session held unconsumed when the last connection ended
+    /// may have been consumed since, on a record the replay starts after.
+    async fn reconcile(&self) {
+        let queued: Vec<String> = self.state().queued.iter().cloned().collect();
+        match self.adapter.consumed(&self.handle, &queued).await {
+            Ok(consumed) if !consumed.is_empty() => {
+                let patch = {
+                    let mut state = self.state();
+                    for id in &consumed {
+                        state.mark_consumed(id);
+                    }
+                    state.progress()
+                };
+                self.persist(&patch);
+                self.notify();
+            }
+            Ok(_) => {}
+            Err(err) => {
+                self.state().last_error = Some(format!("reading what the session took: {err}"));
+            }
+        }
     }
 
     async fn host_call(&self, call_id: String, name: String, input: Value) {
@@ -1997,6 +2026,7 @@ mod tests {
                 match effect {
                     Effect::Interrupt => done.push("interrupt"),
                     Effect::Snapshot => done.push("snapshot"),
+                    Effect::Reconcile => done.push("reconcile"),
                     Effect::HostCall { .. } => done.push("host_call"),
                 }
             }

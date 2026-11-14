@@ -798,3 +798,52 @@ fn a_failed_create_keeps_the_vendor_agent_and_environment_for_the_retry() {
     // The vault the failed create made was purged.
     assert_eq!(vendor.lock().archived_vaults.len(), 1);
 }
+
+/// A session marks an input processed on its own record: when the kernel
+/// stopped between applying the queued echo and the processed one, the next
+/// kernel's replay starts after that record, and asks the session instead.
+#[test]
+fn an_input_processed_behind_the_cursor_is_proven_after_a_takeover() {
+    let vendor = Vendor::start();
+    vendor.set_hold(true);
+    vendor.lock().hide_processed_echo = true;
+    let (_dir, store, agent) = store_with_agent("running");
+    let mut executor = Executor::launch(config(&vendor, &store, &agent, 2500)).unwrap();
+    executor.deliver(&message("msg_1", "one")).unwrap();
+    let session = vendor.only_session();
+    wait_until("the turn runs", || {
+        executor.health().turn_state == TurnState::InTurn && vendor.status(&session) == "running"
+    });
+    wait_until("the queued echo is recorded", || {
+        store
+            .remote_execution(&agent.id)
+            .unwrap()
+            .unwrap()
+            .resume
+            .queued
+            == ["msg_1"]
+    });
+    assert_eq!(
+        executor.proven("msg_1"),
+        None,
+        "the processed echo never came"
+    );
+    executor.detach();
+
+    let (again, _lock) = anyagents_remote::take_over(config(&vendor, &store, &agent, 2500))
+        .unwrap()
+        .unwrap();
+    wait_until("the session's record proves it", || {
+        again.proven("msg_1") == Some(Proof::Duplicate)
+    });
+    assert!(
+        store
+            .remote_execution(&agent.id)
+            .unwrap()
+            .unwrap()
+            .resume
+            .queued
+            .is_empty()
+    );
+    assert_eq!(vendor.sent("user.message").len(), 1);
+}
