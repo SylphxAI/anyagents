@@ -97,6 +97,8 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Release cut policy
+        run: node --test tests/release-cut.test.mjs
       - name: Release admission policy
         run: python3 -m unittest discover -s tests -p 'test_release_admission.py' -v
       - name: Deploy build policy

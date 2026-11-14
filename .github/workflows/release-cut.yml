@@ -1,0 +1,44 @@
+name: release cut
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+# This is a desired-state reconciler: pending pushes intentionally coalesce.
+# Each invocation reads current main and all changes since the last release.
+concurrency:
+  group: release-cut
+  cancel-in-progress: false
+
+jobs:
+  cut:
+    if: github.event.repository.visibility == 'public' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22.14.0'
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+      - id: writer
+        uses: SylphxAI/.github/.github/actions/broker-write-token@5ede88f802c688912391ac375ce8150a61ac63cc
+        with:
+          ci-name: release-cut-anyagents
+          trust-policy: ${{ vars.SYLPHX_RELEASE_CUT_TRUST_POLICY }}
+          repository: ${{ github.repository }}
+          permissions: '{"contents":"write","pull_requests":"write"}'
+          expected-issuer: github-apps/1299545
+      - name: Reconcile the rolling release pull request
+        env:
+          GH_TOKEN: ${{ steps.writer.outputs.token }}
+        run: node scripts/release-cut.mjs
