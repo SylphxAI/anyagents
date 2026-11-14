@@ -111,7 +111,16 @@ fn claude_double(data: &std::path::Path) -> std::path::PathBuf {
 }
 
 fn start_server(data: &std::path::Path) -> Serve {
-    let mut child = support::contract_server()
+    start_server_with_env(data, &[])
+}
+
+/// [`start_server`] with extra variables in the server's own environment.
+fn start_server_with_env(data: &std::path::Path, env: &[(&str, &str)]) -> Serve {
+    let mut command = support::contract_server();
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    let mut child = command
         .arg("--data")
         .arg(data)
         .arg("serve")
@@ -735,20 +744,30 @@ async fn mcp_tools_use_the_server_socket() {
     assert_eq!(l2_to_parent.deliveries.len(), 1);
     assert_eq!(l2_to_parent.deliveries[0].to, "agent:worker-1");
 
-    // Encapsulation boundary across levels: Root `alpha` (grandparent) and `beta` (unrelated root)
-    // cannot skip `worker-1` to message private L2 sub-agent `worker-1-child` (`public: false`) directly.
-    let root_skip_l1_err = error_text(
-        &call(
+    // An ancestor reaches every non-isolated descendant: grandparent `alpha` may wake, steer,
+    // pause and archive private L2 sub-agent `worker-1-child`, so it may also message it.
+    let grandparent_to_l2: SendResponse = ok_json(
+        call(
             &alpha,
+            "send",
+            serde_json::json!({"to": ["worker-1-child"], "text": "grandparent to L2"}),
+        )
+        .await,
+    );
+    assert_eq!(grandparent_to_l2.deliveries[0].to, "agent:worker-1-child");
+    // Unrelated root `beta` still cannot reach it, and the refusal names the route.
+    let outsider_to_l2_err = error_text(
+        &call(
+            &beta,
             "send",
             serde_json::json!({"to": ["worker-1-child"], "text": "skipping L1 to L2"}),
         )
         .await,
     );
     assert!(
-        root_skip_l1_err.contains("cannot message sub-agent `worker-1-child` directly")
-            && root_skip_l1_err.contains("agent:worker-1"),
-        "unexpected error: {root_skip_l1_err}"
+        outsider_to_l2_err.contains("cannot message sub-agent `worker-1-child` directly")
+            && outsider_to_l2_err.contains("Message `agent:worker-1` instead"),
+        "unexpected error: {outsider_to_l2_err}"
     );
 
     // Sub-agent communication encapsulation (`public: false` by default):
@@ -777,7 +796,9 @@ async fn mcp_tools_use_the_server_socket() {
     );
     assert!(
         p2p_direct_err.contains("cannot message sub-agent `worker-2` directly")
-            && p2p_direct_err.contains("public: false"),
+            && p2p_direct_err.contains("it is your sibling")
+            && p2p_direct_err.contains("`to: [\"parent\"]`")
+            && p2p_direct_err.contains("scope: \"siblings\""),
         "unexpected error: {p2p_direct_err}"
     );
     let p2p_alias_err = error_text(
@@ -1588,6 +1609,8 @@ async fn history_search_defaults_and_all_never_escape_a_private_childs_tree() {
         "tester",
         coordinator.id.as_str(),
         tester.id.as_str(),
+        // A relation word names the same agent it names in `send`.
+        "parent",
     ] {
         for tool in ["conversation", "search"] {
             let denied = call(
@@ -1596,10 +1619,9 @@ async fn history_search_defaults_and_all_never_escape_a_private_childs_tree() {
                 serde_json::json!({"agent":target, "query":"C"}),
             )
             .await;
-            assert!(
-                error_text(&denied).contains("cannot read private conversation"),
-                "{denied:?}"
-            );
+            let text = error_text(&denied);
+            assert!(text.contains("cannot read private conversation"), "{text}");
+            assert!(text.contains("conversation({with:"), "{text}");
         }
     }
     client.cancel().await.unwrap();
@@ -1822,4 +1844,197 @@ async fn skill_reads_verdicts_and_outcomes_share_the_authenticated_api() {
     assert!(text.starts_with("prove-it\t1\t1\t0\t0\t0\t0\t"), "{text}");
     worker_mcp.cancel().await.unwrap();
     lead_mcp.cancel().await.unwrap();
+}
+
+/// The shapes agents were seen writing reach the call they meant, and a shape
+/// that cannot be read names the one that can.
+#[tokio::test]
+async fn tool_contracts_accept_the_shapes_agents_write() {
+    let dir = support::physical_tempdir();
+    for name in ["alpha", "beta"] {
+        let created = bin()
+            .env("PATH", machine_path(dir.path()))
+            .arg("--data")
+            .arg(dir.path())
+            .args(["agents", "create", name])
+            .output()
+            .unwrap();
+        assert!(created.status.success(), "{created:?}");
+    }
+    let server = start_server(dir.path());
+    let alpha = connect(dir.path(), "alpha").await;
+
+    // `schedules`: the action names the trigger, unused fields are `"null"`.
+    let watched: serde_json::Value = ok_json(
+        call(
+            &alpha,
+            "schedules",
+            serde_json::json!({"action": "watch", "watch": "agent:idle:beta", "prompt": "beta idle", "at": "null", "every": null, "id": "null", "agent": "null"}),
+        )
+        .await,
+    );
+    assert_eq!(watched["schedule"]["kind"], "watch", "{watched}");
+    let at: serde_json::Value = ok_json(
+        call(
+            &alpha,
+            "schedules",
+            serde_json::json!({"action": "at", "spec": "10m", "prompt": "check back"}),
+        )
+        .await,
+    );
+    assert_eq!(at["schedule"]["kind"], "at", "{at}");
+    let listed: serde_json::Value =
+        ok_json(call(&alpha, "schedules", serde_json::json!({"action": "list"})).await);
+    assert_eq!(listed["schedules"].as_array().unwrap().len(), 2, "{listed}");
+    let unknown = error_text(
+        &call(
+            &alpha,
+            "schedules",
+            serde_json::json!({"action": "update", "id": "sch_x"}),
+        )
+        .await,
+    );
+    assert!(
+        unknown.contains("unknown schedule action `update`")
+            && unknown.contains("{action: \"create\", watch: \"github:pr:owner/repo#12\""),
+        "{unknown}"
+    );
+    let two = error_text(
+        &call(
+            &alpha,
+            "schedules",
+            serde_json::json!({"action": "create", "watch": "agent:idle:beta", "at": "30m", "prompt": "p"}),
+        )
+        .await,
+    );
+    assert!(
+        two.contains("exactly one trigger") && two.contains("`at` and `watch`"),
+        "{two}"
+    );
+
+    // `send`: optional fields a harness filled with `"null"` are absent.
+    let sent: SendResponse = ok_json(
+        call(
+            &alpha,
+            "send",
+            serde_json::json!({"action": "send", "to": ["agent:beta"], "text": "report", "article": "null", "checklist": "null", "emoji": "null", "idempotency_key": "null", "location": "null", "media": "null", "options": "null", "poll": "null", "quote": "null", "reply_to": "null", "target": "null"}),
+        )
+        .await,
+    );
+    assert_eq!(sent.deliveries[0].to, "agent:beta");
+
+    // `agents`: `self` names the caller.
+    let inspected: serde_json::Value = ok_json(
+        call(
+            &alpha,
+            "agents",
+            serde_json::json!({"action": "inspect", "name": "self", "limit": 1}),
+        )
+        .await,
+    );
+    assert_eq!(inspected["agent"]["name"], "alpha", "{inspected}");
+    // A root agent has no parent, and says so.
+    let no_parent = error_text(
+        &call(
+            &alpha,
+            "conversation",
+            serde_json::json!({"agent": "parent"}),
+        )
+        .await,
+    );
+    assert!(
+        no_parent.contains("is a root agent and has no parent"),
+        "{no_parent}"
+    );
+    alpha.cancel().await.unwrap();
+
+    // A child's `parent` in `conversation` is its parent, and the refusal
+    // to read that private history names the route that works.
+    let store = anyagents_core::Store::open(dir.path().join("state.db")).unwrap();
+    let alpha_row = store.agent_by_name("alpha").unwrap();
+    let beta_row = store.agent_by_name("beta").unwrap();
+    store
+        .set_agent_parent(&beta_row.id, Some(&alpha_row.id))
+        .unwrap();
+    let beta = connect(dir.path(), "beta").await;
+    let parent_history = error_text(
+        &call(
+            &beta,
+            "conversation",
+            serde_json::json!({"agent": "parent", "limit": 5}),
+        )
+        .await,
+    );
+    assert!(
+        parent_history.contains("cannot read private conversation history of `alpha`")
+            && parent_history.contains("conversation({with: \"alpha\"})"),
+        "{parent_history}"
+    );
+    let with_parent: serde_json::Value = ok_json(
+        call(
+            &beta,
+            "conversation",
+            serde_json::json!({"with": "parent", "limit": 5}),
+        )
+        .await,
+    );
+    let everything: serde_json::Value =
+        ok_json(call(&beta, "conversation", serde_json::json!({"limit": 20})).await);
+    let with_name: serde_json::Value = ok_json(
+        call(
+            &beta,
+            "conversation",
+            serde_json::json!({"with": "alpha", "limit": 5}),
+        )
+        .await,
+    );
+    assert_eq!(with_parent["turns"], with_name["turns"]);
+    assert!(
+        with_parent["turns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|turn| turn["text"].as_str().unwrap_or("").contains("report")),
+        "with parent: {with_parent}\nall: {everything}"
+    );
+    beta.cancel().await.unwrap();
+    drop(server);
+}
+
+/// The `code` limits come from the server's environment, handed to the tool
+/// server in `whoami`; nothing in the data directory sets them.
+#[tokio::test]
+async fn code_limits_come_from_the_server_environment() {
+    let dir = support::physical_tempdir();
+    let created = bin()
+        .env("PATH", machine_path(dir.path()))
+        .arg("--data")
+        .arg(dir.path())
+        .args(["agents", "create", "alpha"])
+        .output()
+        .unwrap();
+    assert!(created.status.success(), "{created:?}");
+    // A file an agent could plant is not read.
+    std::fs::write(
+        dir.path().join("tool-limits.json"),
+        r#"{"code_timeout_ms": 100, "code_max_timeout_ms": 1000}"#,
+    )
+    .unwrap();
+    let server = start_server_with_env(
+        dir.path(),
+        &[
+            ("ANYAGENTS_CODE_TIMEOUT_MS", "45000"),
+            ("ANYAGENTS_CODE_MAX_TIMEOUT_MS", "900000"),
+        ],
+    );
+    let alpha = connect(dir.path(), "alpha").await;
+    let tools = alpha.list_all_tools().await.unwrap();
+    let code = tools.iter().find(|t| t.name == "code").expect("code tool");
+    let description = code.description.as_deref().unwrap_or_default();
+    assert!(
+        description.contains("`timeout_ms`: default 45000, max 900000."),
+        "{description}"
+    );
+    alpha.cancel().await.unwrap();
+    drop(server);
 }
