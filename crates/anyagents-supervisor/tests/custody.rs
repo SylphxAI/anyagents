@@ -4,6 +4,8 @@
 //! leave every process to the next one; a process left for an agent that no
 //! longer runs is ended.
 
+mod support;
+
 use std::collections::HashMap;
 use std::os::fd::AsFd as _;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -351,7 +353,9 @@ fn a_running_agent_takes_over_the_process_its_last_kernel_left() {
     );
 
     // A kernel that stops for an upgrade leaves the process and its lock.
-    supervisor.retain_processes();
+    support::within("the kernel stops for an upgrade", move || {
+        supervisor.retain_processes()
+    });
     assert!(!kept.ended.load(Ordering::SeqCst), "the process was ended");
     assert_eq!(fx.left.retained.lock().unwrap().len(), 1);
     assert!(matches!(
@@ -400,7 +404,7 @@ fn a_turn_in_a_process_taken_over_gets_no_recovery_note() {
     assert_eq!(fx.launches.load(Ordering::SeqCst), 0);
     // The turn ends in the process that ran it.
     kept.fake.lock().unwrap().complete_turn();
-    drop(supervisor);
+    support::stop(supervisor);
 }
 
 #[test]
@@ -415,7 +419,7 @@ fn a_stopping_kernel_without_retention_ends_the_process_and_frees_the_lock() {
             .live(&agent)
             .is_some_and(|live| live.process_alive)
     }));
-    drop(supervisor);
+    support::stop(supervisor);
     assert!(kept.ended.load(Ordering::SeqCst));
     assert!(fx.left.retained.lock().unwrap().is_empty());
     fx.store.try_lock_agent(&agent).unwrap();
@@ -437,7 +441,7 @@ fn a_process_left_for_an_agent_that_no_longer_runs_is_ended() {
         .contains(&agent)));
     assert!(kept.ended.load(Ordering::SeqCst));
     assert_eq!(fx.launches.load(Ordering::SeqCst), 0);
-    drop(supervisor);
+    support::stop(supervisor);
 }
 
 #[test]
@@ -453,7 +457,7 @@ fn a_process_launched_for_another_harness_is_switched_at_its_boundary() {
         "the idle process was not replaced"
     );
     assert!(wait_until(|| kept.ended.load(Ordering::SeqCst)));
-    drop(supervisor);
+    support::stop(supervisor);
 }
 
 #[test]
@@ -470,7 +474,7 @@ fn the_note_a_kernel_kept_restores_its_usage_accounting() {
     assert_eq!(saved["turns_recorded"], 2);
     assert_eq!(saved["served"]["input_tokens"], 5);
     assert_eq!(saved["completed_turn"], true);
-    drop(supervisor);
+    support::stop(supervisor);
 }
 
 /// A usage row the last kernel recorded for a process is not recorded again
@@ -493,7 +497,7 @@ fn usage_a_previous_kernel_recorded_is_not_recorded_again() {
     fx.leave(&agent, &kept, "claude-code", None);
     let first = fx.start();
     assert!(wait_until(|| fx.store.list_usage(None).unwrap().len() == 1));
-    first.retain_processes();
+    support::within("the first kernel stops", move || first.retain_processes());
     let note = fx.left.notes.lock().unwrap().last().cloned();
     let (kept_again, keeper_lock) = fx.left.retained.lock().unwrap().pop().unwrap();
     // The next kernel finds the same process, with the note the last one kept.
@@ -509,7 +513,7 @@ fn usage_a_previous_kernel_recorded_is_not_recorded_again() {
         1,
         "the usage was recorded twice"
     );
-    drop(second);
+    support::stop(second);
 }
 
 /// A recovery note the last kernel still owed (it died before sending it) is
@@ -536,7 +540,7 @@ fn an_owed_recovery_survives_the_kernel_that_owed_it() {
             "the owed recovery note was not sent (owed in the note: {owed_in_note})"
         );
         assert_eq!(fx.launches.load(Ordering::SeqCst), 0);
-        drop(supervisor);
+        support::stop(supervisor);
     }
 }
 
@@ -575,7 +579,7 @@ fn a_turn_that_ended_while_no_kernel_ran_is_completed_not_recovered() {
     );
     assert_eq!(fx.store.list_usage(None).unwrap().len(), 1);
     assert_eq!(fx.launches.load(Ordering::SeqCst), 0);
-    drop(supervisor);
+    support::stop(supervisor);
 }
 
 /// The note kept with a process says an owed recovery is no longer owed as
@@ -606,7 +610,7 @@ fn an_accepted_recovery_note_is_kept_before_more_mail() {
             .any(|(note, given)| note["pending_recovery"] == false && *given == 1),
         "the accepted recovery was not kept before more mail: {kept_notes:?}"
     );
-    drop(supervisor);
+    support::stop(supervisor);
 }
 
 /// A process an interrupted replacement left beside the newer one is
@@ -663,7 +667,7 @@ fn an_older_process_left_beside_is_committed_then_ended() {
     );
     assert!(!newer.ended.load(Ordering::SeqCst));
     assert_eq!(fx.launches.load(Ordering::SeqCst), 0);
-    drop(supervisor);
+    support::stop(supervisor);
 }
 
 /// A process found dead when it is taken over reads as idle with no usage
@@ -696,7 +700,7 @@ fn a_process_found_dead_is_recovered_not_completed() {
     );
     assert!(fx.store.has_open_turn(&agent).unwrap());
     assert!(fx.launches.load(Ordering::SeqCst) >= 1);
-    drop(supervisor);
+    support::stop(supervisor);
 }
 
 fn costed(input: u64, output: u64, cost: i64) -> TurnUsage {
@@ -764,7 +768,7 @@ fn a_process_that_dies_mid_turn_with_cost_bearing_usage_is_recovered() {
         "the turn the dead process held was completed, not recovered: {:?}",
         fx.launched.lock().unwrap().first().map(Kept::given)
     );
-    drop(supervisor);
+    support::stop(supervisor);
 }
 
 /// A process taken over with the mail it was given in its open turn.
@@ -840,7 +844,7 @@ fn a_turn_served_before_its_process_exited_gets_no_recovery() {
         "a turn the adapter saw end was recovered: {:?}",
         fx.launched.lock().unwrap().first().map(Kept::given)
     );
-    drop(supervisor);
+    support::stop(supervisor);
 }
 
 /// A served turn read from a keeper that is gone is what it last knew, not
@@ -865,7 +869,7 @@ fn a_turn_count_from_a_keeper_that_is_gone_is_no_completion() {
     }
     fx.store.receive(&agent, Incoming::new("more")).unwrap();
     assert_eq!(replacement_recovers(&fx), Some(true));
-    drop(supervisor);
+    support::stop(supervisor);
 }
 
 /// An idle pass over a live process whose cost-bearing totals did not move
@@ -890,7 +894,7 @@ fn an_idle_pass_with_unchanged_cost_bearing_usage_writes_nothing() {
         );
     }
     assert!(fx.store.list_usage(None).unwrap().is_empty());
-    drop(supervisor);
+    support::stop(supervisor);
 }
 
 /// A launch the kernel abandons because it is stopping leaves a keeper
@@ -925,7 +929,7 @@ fn an_abandoned_start_leaves_the_agent_lock_held_for_its_keeper() {
         .unwrap()
     };
     assert!(wait_until(|| started.load(Ordering::SeqCst)));
-    drop(supervisor);
+    support::stop(supervisor);
     assert!(keeper_copy.lock().unwrap().is_some());
     assert!(
         matches!(
@@ -977,5 +981,5 @@ fn a_superseded_kernel_stands_down() {
         fx.store.try_lock_agent(&agent),
         Err(anyagents_core::Error::AgentBusy)
     ));
-    drop(supervisor);
+    support::stop(supervisor);
 }

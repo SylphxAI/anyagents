@@ -13,6 +13,8 @@ use anyagents_harness::{
 };
 use anyagents_supervisor::{Clock, LaunchRequest, ManualClock, Supervisor};
 
+mod support;
+
 const CEILING: Duration = Duration::from_secs(30);
 const START_MS: i64 = 1_700_000_000_000;
 
@@ -169,13 +171,27 @@ impl Harness for Scripted {
 }
 
 struct Scene {
-    _dir: tempfile::TempDir,
+    /// Stopped before the directory goes ([`Drop`]).
+    supervisor: Option<Supervisor<Scripted>>,
     data: std::path::PathBuf,
     store: Arc<Store>,
     clock: ManualClock,
     vendor: Vendor,
     agent: AgentId,
-    supervisor: Supervisor<Scripted>,
+    _dir: tempfile::TempDir,
+}
+
+impl Drop for Scene {
+    /// The supervisor stops while its data directory, which holds its wake
+    /// socket, is still there, and within a bound. Off Linux a shutdown does
+    /// not wake a blocked datagram receive: only a datagram sent to that
+    /// socket ends its listener, and a socket deleted first left the stop
+    /// waiting for ever (macOS CI).
+    fn drop(&mut self) {
+        if let Some(supervisor) = self.supervisor.take() {
+            support::stop(supervisor);
+        }
+    }
 }
 
 impl Scene {
@@ -203,13 +219,13 @@ impl Scene {
         )
         .unwrap();
         let scene = Self {
-            _dir: dir,
+            supervisor: Some(supervisor),
             data,
             store,
             clock,
             vendor,
             agent: agent.id,
-            supervisor,
+            _dir: dir,
         };
         scene.until("the first process starts", |scene| {
             scene.vendor.launches() == 1
@@ -432,7 +448,12 @@ fn a_poison_message_is_parked_its_sender_told_and_the_mail_behind_it_flows() {
         .expect("the sender is told");
     assert!(note.text.starts_with("[Undeliverable]"), "{}", note.text);
     assert!(note.text.contains(poison.id.as_str()));
-    let live = scene.supervisor.live(&scene.agent).unwrap();
+    let live = scene
+        .supervisor
+        .as_ref()
+        .expect("a running supervisor")
+        .live(&scene.agent)
+        .unwrap();
     assert!(
         live.last_error
             .as_deref()

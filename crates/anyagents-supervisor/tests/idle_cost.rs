@@ -9,6 +9,8 @@
 
 #![cfg(target_os = "linux")]
 
+mod support;
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -353,5 +355,5 @@ fn an_idle_fleet_on_a_large_store_sleeps_while_a_neighbour_is_busy() {
         "idle_cost: wake latency {} ms",
         sent_at.elapsed().as_millis()
     );
-    drop(supervisor);
+    support::stop(supervisor);
 }

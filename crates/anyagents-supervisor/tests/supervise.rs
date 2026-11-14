@@ -1,3 +1,5 @@
+mod support;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -83,7 +85,7 @@ fn a_message_in_another_process_wakes_the_supervisor() {
         .unwrap();
     let wake = events.recv_timeout(Duration::from_secs(2)).unwrap();
     assert!(matches!(wake, Wake::Mail { .. }));
-    drop(supervisor);
+    support::stop(supervisor);
 }
 
 #[test]
@@ -149,7 +151,7 @@ fn one_process_restarts_after_a_kill_and_refuses_a_second() {
             live.process_alive && live.pid.is_some_and(|next| next != pid) && argv_count(&log) >= 2
         })
     }));
-    drop(supervisor);
+    support::stop(supervisor);
 }
 
 #[test]
@@ -187,7 +189,7 @@ fn a_running_agent_receives_mail_without_a_manual_deliver() {
         "{}",
         std::fs::read_to_string(&log).unwrap_or_default()
     );
-    drop(supervisor);
+    support::stop(supervisor);
 }
 
 #[test]
@@ -234,7 +236,7 @@ fn a_message_proved_before_the_process_died_is_committed_and_never_handed_over_a
         clock.set_ms(start + ticks * 1_000);
         log_contains(&log, "[Recovery]")
     }));
-    drop(supervisor);
+    support::stop(supervisor);
     let written = std::fs::read_to_string(&log).unwrap();
     assert_eq!(
         written
@@ -288,7 +290,7 @@ fn quota_pauses_until_the_reset_time() {
         "{}",
         std::fs::read_to_string(&log).unwrap_or_default()
     );
-    drop(supervisor);
+    support::stop(supervisor);
 }
 
 #[test]
@@ -388,7 +390,7 @@ fn finished_turns_sum_by_agent_and_day() {
     assert_eq!(beta_input, 11);
     assert!(rows.iter().any(|row| row.day == utc_day(later)));
     assert_ne!(utc_day(later), first_day);
-    drop(supervisor);
+    support::stop(supervisor);
 }
 
 /// Three lines arrive while the child holds its turn open. Tool-boundary hook
@@ -458,7 +460,7 @@ fn three_lines_sent_while_a_turn_is_open_are_all_taken_and_none_twice() {
             .iter()
             .all(|message| message.ack == anyagents_core::Ack::Delivered)
     );
-    drop(supervisor);
+    support::stop(supervisor);
 }
 
 /// A line already taken is not written again after the server restarts, and a
@@ -555,7 +557,7 @@ fn a_restart_mid_stream_loses_nothing_and_writes_nothing_twice() {
         note < two,
         "the recovery note goes ahead of later mail: {text}"
     );
-    drop(supervisor);
+    support::stop(supervisor);
 }
 
 #[test]
@@ -650,7 +652,12 @@ fn backpressure_parks_until_the_input_activity_notification() {
         })
     };
     let supervisor = Supervisor::start(Arc::clone(&store), clock, launch, vec![]).unwrap();
+    let deadline = Instant::now() + WAIT_CEILING;
     loop {
+        assert!(
+            Instant::now() < deadline,
+            "backpressure never reached a clock wait"
+        );
         if rx
             .recv_timeout(Duration::from_secs(3))
             .expect("backpressure must reach clock wait")
@@ -665,7 +672,7 @@ fn backpressure_parks_until_the_input_activity_notification() {
     assert!(wait_until(
         || store.delivered_cursor(&agent.id).unwrap() == 1
     ));
-    drop(supervisor);
+    support::stop(supervisor);
 }
 
 #[test]
@@ -741,7 +748,7 @@ fn an_interrupted_turn_with_no_new_messages_receives_a_recovery_note_on_restart(
         text.contains("completed (do not resend): part 1 report already delivered"),
         "{text}"
     );
-    drop(supervisor);
+    support::stop(supervisor);
 }
 
 #[test]
@@ -842,7 +849,7 @@ fn a_finished_turn_does_not_receive_a_recovery_note_on_restart() {
         "finished turn must not receive recovery note:\n{}",
         std::fs::read_to_string(&log).unwrap_or_default()
     );
-    drop(supervisor);
+    support::stop(supervisor);
 }
 
 #[test]
@@ -933,7 +940,7 @@ fn assert_finished_agent_scales_to_zero(is_root: bool, role: Option<&str>) {
         clock.set_ms(due + 150_000 + ticks * 250);
         other.agent(&sub.id).unwrap().state == "idle"
     }));
-    drop(supervisor);
+    support::stop(supervisor);
 }
 
 #[test]
@@ -978,7 +985,7 @@ fn a_model_or_harness_change_automatically_switches_running_process_at_next_idle
                 && live.live_model.as_deref() == Some("opus")
         })
     }));
-    drop(supervisor);
+    support::stop(supervisor);
 }
 
 #[test]
@@ -1054,7 +1061,7 @@ fn a_model_or_harness_change_drains_and_cuts_over_even_when_turn_never_ends_and_
                 && live.live_model.as_deref() == Some("opus")
         }) && log_contains(&log, "queued-for-new-model")
     }));
-    drop(supervisor);
+    support::stop(supervisor);
 }
 
 // Observe the worker reaching its blocking wait, not an arbitrary sleep:
@@ -1154,7 +1161,9 @@ wait
         &dir.path().join("vendor.log"),
         "initial-long-turn"
     )));
+    let until = Instant::now() + WAIT_CEILING;
     loop {
+        assert!(Instant::now() < until, "the worker never waited 250 ms");
         let (now, deadline) = rx.recv_timeout(WAIT_CEILING).unwrap();
         if deadline == Some(now + 250) {
             break;
@@ -1180,7 +1189,9 @@ wait
     for elapsed in [15_001, 30_001] {
         let now = 1_700_000_000_000 + elapsed;
         clock.set_ms(now);
+        let until = Instant::now() + WAIT_CEILING;
         loop {
+            assert!(Instant::now() < until, "the worker never waited at {now}");
             let (observed, _) = rx.recv_timeout(WAIT_CEILING).unwrap();
             if observed == now {
                 break;
@@ -1240,7 +1251,7 @@ wait
     }
     std::fs::write(dir.path().join("finish-turn"), "finish-last-turn\n").unwrap();
     assert!(wait_until(|| store.open_turn(&agent.id).unwrap().is_none()));
-    drop(supervisor);
+    support::stop(supervisor);
 }
 
 #[test]
@@ -1298,7 +1309,12 @@ fn profile_rotation_cannot_replace_an_in_turn_harness_via_quota_recovery() {
     });
     assert!(wait_until(|| old.lock().unwrap().health_reads > reads + 1));
     clock.set_ms(clock.now_ms() + 30_001);
+    let until = Instant::now() + WAIT_CEILING;
     loop {
+        assert!(
+            Instant::now() < until,
+            "the worker never waited at the clock's time"
+        );
         let (now, _) = rx.recv_timeout(WAIT_CEILING).unwrap();
         if now == clock.now_ms() {
             break;
@@ -1314,7 +1330,7 @@ fn profile_rotation_cannot_replace_an_in_turn_harness_via_quota_recovery() {
         agent_id: agent.id.clone(),
     });
     assert!(wait_until(|| probes.lock().unwrap().len() == 2));
-    drop(supervisor);
+    support::stop(supervisor);
 }
 
 /// A controllable adapter keeps replacement and delivery as separate observable
@@ -1561,7 +1577,7 @@ fn a_model_switch_stops_the_old_process_before_the_new_one_launches() {
         clock.set_ms(1_700_000_000_000 + ticks * 1_000);
         probes.lock().unwrap().len() == 2
     }));
-    drop(supervisor);
+    support::stop(supervisor);
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1867,7 +1883,7 @@ fn interrupted_turn_recovery_goes_ahead_of_pending_mail() {
     assert!(store.next_undelivered(&agent.id).unwrap().is_none());
     assert!(store.open_turn(&agent.id).unwrap().is_none());
     let _ = open;
-    drop(supervisor);
+    support::stop(supervisor);
 }
 
 /// A real Claude Code adapter whose `health` reads are counted: every
@@ -2005,5 +2021,5 @@ done
         passes <= 60,
         "a {LINES}-line turn took {passes} harness health reads"
     );
-    drop(supervisor);
+    support::stop(supervisor);
 }
