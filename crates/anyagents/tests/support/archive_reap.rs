@@ -3,6 +3,12 @@
 use std::path::Path;
 use std::process::Command;
 
+/// What `.anyagents-reaped` holds once the cleanup of `generation` finished:
+/// the generation, then the cleanup revision that ran.
+fn reaped(generation: &[u8]) -> Vec<u8> {
+    [generation, b"reap:storage-1\n".as_slice()].concat()
+}
+
 fn command(data: &Path, home: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_anyagents"));
     command
@@ -47,7 +53,7 @@ fn production_archive_reap_does_not_recreate_seat_directories() {
     }
     let archive_generation = std::fs::read(cfg.join(".anyagents-archived")).unwrap();
     let reaped_generation = std::fs::read(cfg.join(".anyagents-reaped")).unwrap();
-    assert_eq!(reaped_generation, archive_generation);
+    assert_eq!(reaped_generation, reaped(&archive_generation));
     let work = anyagents_core::agent_work_dir(&data, &child.id);
     assert!(!work.exists(), "archive recreated an empty workdir");
     let woken = command(&data, &home)
@@ -99,7 +105,8 @@ fn wait_for_reap(server: &mut Server, cfg: &Path, stderr: &Path, stage: &str) {
             .ok()
             .filter(|generation| !generation.is_empty())
             .is_some_and(|generation| {
-                std::fs::read(cfg.join(".anyagents-reaped")).is_ok_and(|done| done == generation)
+                std::fs::read(cfg.join(".anyagents-reaped"))
+                    .is_ok_and(|done| done == reaped(&generation))
             });
         if completed {
             return;
@@ -147,7 +154,7 @@ fn production_maintenance_reaps_legacy_archive_once_across_restart() {
     assert!(!generation.is_empty());
     assert_eq!(
         std::fs::read(cfg.join(".anyagents-reaped")).unwrap(),
-        generation
+        reaped(&generation)
     );
     drop(first);
     // A second pending legacy row proves the restarted worker has completed a
@@ -166,7 +173,7 @@ fn production_maintenance_reaps_legacy_archive_once_across_restart() {
     );
     assert_eq!(
         std::fs::read(cfg.join(".anyagents-reaped")).unwrap(),
-        generation
+        reaped(&generation)
     );
 }
 
