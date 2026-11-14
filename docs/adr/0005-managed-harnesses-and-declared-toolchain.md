@@ -1,6 +1,6 @@
 # 0005: Managed harnesses and a declared toolchain
 
-Status: proposed. Date: 2026-11-12. Part of [0003](0003-runtime-rebuild.md). Builds on [0001](0001-server-first-one-binary.md) decision 1 ("drive the vendor's own binary") and the lazy install described in [architecture](../architecture.md#harnesses-install-update-sign-in).
+Status: proposed; amended on 2026-11-14 by [0009](0009-product-boundary.md) and [0010](0010-execution-identity-and-trust.md) D8. Managed harnesses are kept. The declared toolchain is an opt-in hardened mode, the catalog gains a `system` source, and decision 11 (the deployment image contract) moves to the desk's infrastructure (`SylphxAI/infra`). Date: 2026-11-12. Part of [0003](0003-runtime-rebuild.md). Builds on [0001](0001-server-first-one-binary.md) decision 1 ("drive the vendor's own binary") and the lazy install described in [architecture](../architecture.md#harnesses-install-update-sign-in).
 
 ## Context
 

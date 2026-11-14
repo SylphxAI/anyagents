@@ -1,6 +1,6 @@
 # 0008: A quality loop: outcomes, evaluation, skills, memory and routing from evidence
 
-Status: proposed. Date: 2026-11-13. The first slice (section 8) ships with this record. Turn outcomes depend on [0006](0006-runtime-state-and-lifecycle.md) W2; memory retrieval follows the hybrid-retrieval change to [host memory](../host-memory.md).
+Status: proposed; amended on 2026-11-14 by [0009](0009-product-boundary.md): outcomes are kept, and the verdict prompts and the turn-ownership guard move to the deployment profile (0009 decision 8). Date: 2026-11-13. The first slice (section 8) ships with this record. Turn outcomes depend on [0006](0006-runtime-state-and-lifecycle.md) W2; memory retrieval follows the hybrid-retrieval change to [host memory](../host-memory.md).
 
 ## Context
 
@@ -123,7 +123,7 @@ The next measure is feedback opportunity: external verdicts per unit of work (re
 
 ### 4. Memory
 
-- **Raw history is the source of truth.** That is mailbox bodies, native transcripts and archive pages. A memory change in progress beside this one makes retrieval over it hybrid (BM25, dense and rerank) and turns off or removes LLM sleep consolidation. This decision adds no summariser and depends on neither choice.
+- **Raw history is the source of truth.** That is mailbox bodies, native transcripts and archive pages. A memory change in progress beside this one makes retrieval over it hybrid (BM25, dense and rerank). LLM sleep consolidation is not removed: it is being rebuilt to run in the agent's own harness instead of as a model call from the server's maintenance loop. This decision adds no summariser and depends on neither change.
 - **Failures become memory by labelling raw history, not by rewriting it.** An outcome row, together with the agent's previous terminal outcome, bounds a stretch of that agent's work in time. Retrieval can filter or rank by outcome kind ("the failed attempts at X", "the accepted one") and returns raw coordinates.
 - **Lessons cite their evidence.** A lesson is an agent-authored learned-memory topic that cites the outcome id and raw coordinates it draws on. This is Reflexion's reflection after an external failure signal, kept as a cited note. The pinned section stays within 150 lines and 4 KiB.
 - **Retrieval telemetry (next).** Each call records the ids it returned (section 1), so retrieved memory is evaluated the same way as skills.
@@ -188,7 +188,7 @@ The next measure is feedback opportunity: external verdicts per unit of work (re
   - `anyagents outcomes`.
 
   All three take the same target, window and caller boundary as usage (`usage_scope`). `group_by` is `model` (harness and model, the default), `harness`, `role`, `profile`, `agent` or `skill`.
-- **Prompting.** The turn-ownership guard's reminder to a parent, and the generated agent context, now ask the parent to record a verdict before following up or archiving.
+- **Prompting.** The turn-ownership guard's reminder to a parent, and the generated agent context, now ask the parent to record a verdict before following up or archiving. Both move to the deployment profile (0009 decision 8).
 
 Not in this slice:
 

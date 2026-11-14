@@ -1,6 +1,6 @@
 # 0006: Runtime state and lifecycle: one writer per agent, explicit persisted state machines
 
-Status: proposed. Date: 2026-11-12. Part of [0003](0003-runtime-rebuild.md). Refines [0001](0001-server-first-one-binary.md) decisions 3 and 8 and the supervisor section of [architecture.md](../architecture.md#agents-create-and-supervise).
+Status: proposed; amended on 2026-11-14 by [0009](0009-product-boundary.md): decisions 3, 8, 9 and 11 are kept, and decisions 1, 2 and 7 are deferred. Decision 11 now applies per agent ([0010](0010-execution-identity-and-trust.md) D5). Date: 2026-11-12. Part of [0003](0003-runtime-rebuild.md). Refines [0001](0001-server-first-one-binary.md) decisions 3 and 8 and the supervisor section of [architecture.md](../architecture.md#agents-create-and-supervise).
 
 ## Context
 

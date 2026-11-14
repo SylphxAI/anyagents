@@ -1,6 +1,6 @@
 # 0003: Rebuild the runtime foundation around declared identity, managed binaries and single-writer state
 
-Status: proposed. Date: 2026-11-12.
+Status: replaced on 2026-11-14 by [0009](0009-product-boundary.md) and [0010](0010-execution-identity-and-trust.md). Work ships as one connected vertical slice at a time, not as the streams and waves below. Decision 6 is restated by 0009 decision 5. Date: 2026-11-12.
 
 This is the umbrella decision. The detailed designs, with their invariants, tests and migrations, are:
 

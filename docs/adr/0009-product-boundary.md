@@ -1,6 +1,6 @@
 # 0009: The product boundary: the master, its integrations, and deployment profiles
 
-Status: proposed. Date: 2026-11-13. Amends [0003](0003-runtime-rebuild.md) decision 6, [0004](0004-identity-and-credentials.md) decision 4 and [0005](0005-managed-harnesses-and-declared-toolchain.md) decisions 1 and 6–7, and restates the position in [vision](../vision.md).
+Status: proposed. Date: 2026-11-13; amended 2026-11-14 together with [0010](0010-execution-identity-and-trust.md). Amends [0003](0003-runtime-rebuild.md) decision 6, [0004](0004-identity-and-credentials.md) decision 4 and [0005](0005-managed-harnesses-and-declared-toolchain.md) decisions 1 and 6–7, and restates the position in [vision](../vision.md). Decision 13 records the status of ADR 0001–0008.
 
 ## Context
 
@@ -41,9 +41,9 @@ Disabling vendors' native tools does not belong in this list. It is the product,
 
 | Layer | Contains | Rule |
 |---|---|---|
-| **Core (the master)** | Identity and authorization, mailboxes and delivery, topology and groups, schedules, supervision and keepers ([0007](0007-process-architecture.md)), profiles, managed harness installs, Code Mode, memory, skills, outcomes ([0008](0008-quality-loop.md)) | Works on a laptop with zero configuration, with safe defaults |
-| **Integrations** | Spiron, Sylphx, Telegram and other channels, GitHub watches, secret-reference providers (1Password), cloud sandboxes | First-class and native, always optional. The core never requires one and never defaults to one; an integration is enabled by configuration or by a profile that names it |
-| **Deployment profiles** | Seats (per-agent uids), the sha-pinned toolchain, guard wrappers, build-cache layout, account pools, subagent defaults, org working rules and prompts | Configuration that lives with the deployment (for the desk: `SylphxAI/infra` and `SylphxAI/owner`), never product code |
+| **Core (the master)** | Identity and authorization, mailboxes and delivery, topology and groups, schedules, supervision and executors ([0010](0010-execution-identity-and-trust.md) D6), profiles, managed harness installs, per-agent Git repositories (decision 10), Code Mode, memory, skills, outcomes ([0008](0008-quality-loop.md)) | Works on a laptop with zero configuration, with safe defaults |
+| **Integrations** | Spiron, Sylphx, Telegram and other channels, GitHub watches, secret backends (1Password, OpenBao), remote executors and cloud agents ([0010](0010-execution-identity-and-trust.md) D7) | First-class and native, always optional. The core never requires one and never defaults to one; an integration is enabled by configuration or by a profile that names it |
+| **Deployment profiles** | The executor driver and the secret backend ([0010](0010-execution-identity-and-trust.md) D1), the opt-in sha-pinned toolchain, guard wrappers, build-cache layout, account pools, subagent defaults, org working rules and prompts | Configuration that lives with the deployment (for the desk: `SylphxAI/infra` and `SylphxAI/owner`), never product code |
 
 ### 2. AnyAgents owns capabilities; harnesses supply the model
 
@@ -59,7 +59,7 @@ Disabling vendors' native tools does not belong in this list. It is the product,
 
 - A vendor tool is disabled only through the vendor's supported configuration (flags, settings files, hooks); nothing patches a vendor binary.
 - **No capability disappears.** A vendor tool is disabled only when AnyAgents' replacement works in that deployment. Web search ships a keyless default engine; configured engines improve on it.
-- **No duplicates.** Spiron runs on the same tool engine natively (`coordination` plus the Code Mode services it lacks), not on its own tools plus the MCP set.
+- **No duplicates.** Spiron runs on the same tool engine natively (`coordination` plus the Code Mode services it lacks), not on its own tools plus the MCP set. Decision 11 makes that engine one shared library.
 - **Our tools are measured against the vendors' tools.** A comparative evaluation and outcome data (0008) show where Code Mode loses, and that is where it is improved. The vendor tool is never a fallback.
 
 ### 3. Profiles and compliance
@@ -71,8 +71,10 @@ Disabling vendors' native tools does not belong in this list. It is the product,
 
 ### 4. Executors anywhere, with least privilege
 
-- A keeper ([0007](0007-process-architecture.md)) is the runner. On the same host it is a local process; in a remote sandbox it speaks the same kernel protocol over the network, with the same exactly-once and steering guarantees.
-- Each run receives only its own profile's credentials, short-lived where the vendor allows, never a store of other organizations' keys.
+Amended 2026-11-14 by [0010](0010-execution-identity-and-trust.md) D6 and D7:
+
+- An executor is a local process in a sandbox, a keeper ([0007](0007-process-architecture.md)) for a third-party CLI that cannot reattach, or a remote session with no local process.
+- Each run receives only the credentials its grants name, delivered by the tiers of [0010](0010-execution-identity-and-trust.md) D4, never a store of other organizations' keys.
 
 ### 5. Hardening is a mode, never the only shape
 
@@ -82,17 +84,18 @@ Disabling vendors' native tools does not belong in this list. It is the product,
   - `detect` is the default. Ordinary tools resolve from the system directories plus directories the user configures, and versions are reported by `anyagents doctor`. The constructed helper `PATH` never includes a user-writable wrapper directory unless configured.
   - `strict` is opt-in. Tools are sha-pinned and enforced, and `anyagents toolchain snapshot` writes the manifest from what `detect` resolved.
   - Managed harnesses and runtimes stay managed in both modes.
-- **Seats**: per-agent uids, ACLs and the seat launcher apply only when seats are configured. Single-user mode uses the user's own identity, `~/.gitconfig` and tools.
-- **Tool credentials** ([0004](0004-identity-and-credentials.md)):
-  - An unbound `tool:<name>` passes the user's environment through in single-user mode.
-  - Brokering and fail-closed behaviour apply when bound or when seats are configured.
+  - Harnesses resolve from three catalog sources ([0010](0010-execution-identity-and-trust.md) D8): `npm`, `github-release` (checksum plus signature), and `system`, an absolute path and a recorded version with no hash. `system` is the default for a vendor client the user installed. Hash-pinned `harnesses.toml` `local` entries belong to `strict`.
+  - A model or profile change never triggers an installation.
+- **Seats** are deleted ([0010](0010-execution-identity-and-trust.md) D3). Isolation is each agent's `SandboxSpec`, enforced by its driver. No product code changes uids or file ownership.
+- **Tool credentials** ([0004](0004-identity-and-credentials.md), simplified by [0010](0010-execution-identity-and-trust.md) D4):
+  - A credential reaches an agent only through a grant, by the most preferred delivery tier it supports, from a pluggable secret backend.
   - Credential kinds become an open `tool:<name>`.
 
 ### 6. Safe defaults
 
-- No network listener unless configured. The desk configures one behind its tunnel.
+- No network listener unless configured. The default bind is a Unix socket or loopback, never `0.0.0.0` ([0010](0010-execution-identity-and-trust.md) D2). The desk configures one behind its tunnel.
 - No background model calls unless a deployment configures an endpoint and model. There is no key discovery in `$HOME`, and no vendor default.
-- Every place AnyAgents hands an agent elevated permission is documented. Because Code Mode is the tool layer, Code Mode's workspace boundary is the safety boundary in every mode, single-user included.
+- Every place AnyAgents hands an agent elevated permission is documented. The safety boundary is each agent's `SandboxSpec`, enforced by its driver ([0010](0010-execution-identity-and-trust.md) D3). Code Mode runs inside it.
 
 ### 7. Integrations
 
@@ -102,13 +105,13 @@ Disabling vendors' native tools does not belong in this list. It is the product,
 | Sylphx | Provider and engine presets (models, web, media) selected by a profile, never core defaults |
 | Telegram and channels | A connector. Rich actions (polls, checklists, articles) belong to a channel tool that exists only when that channel is attached; core `send` is `{to, text, reply_to, attachments}` |
 | GitHub, Spiron promises | Watch sources behind one interface, not cases inside the scheduler |
-| Secret references | A provider interface; `op://` is one provider |
+| Secret backends | One backend interface ([0010](0010-execution-identity-and-trust.md) D4): the OS keychain locally; OpenBao, 1Password or a cloud secret manager in deployments. `op://` is one provider |
 
 ### 8. Deployment profiles
 
 The desk's profile holds:
 
-- seat names and groups;
+- the executor driver, the secret backend and `public_url` ([0010](0010-execution-identity-and-trust.md) D1, D2);
 - guard wrappers and the constructed `PATH`;
 - `toolchain.toml` and `harnesses.toml`;
 - build-cache environment;
@@ -120,6 +123,37 @@ The product ships the mechanisms (events such as `[Sub-Agent Completed]`, a conf
 ### 9. One configuration file
 
 `<data>/anyagents.toml`, with per-agent overrides, holds settings that today are environment variables. Environment variables remain for bootstrap only, such as the data directory.
+
+Decisions 10–13 were added on 2026-11-14, with [0010](0010-execution-identity-and-trust.md).
+
+### 10. Git: one repository per agent
+
+- Each agent gets its own repository, cloned with `--reference` (git alternates) to a read-only object pool.
+- No shared mutable Git metadata.
+- Pushes use the agent's tier-2 token (short-lived and scoped).
+
+Rationale, precedent and what it deletes: [0010](0010-execution-identity-and-trust.md) D5.
+
+### 11. One capability library
+
+Code Mode, memory, skills, web, and computer use through agent-workstation are one shared library, MIT licensed, kept in this repository. AnyAgents, Spiron (local and cloud) and Sylphx all consume it. With one implementation, "no duplicates" (decision 2) holds by construction: Spiron runs the same tools that AnyAgents gives every other harness, and a fix reaches all three products at once.
+
+### 12. Cloud agents through remote-session adapters
+
+The `claude-cloud`, `openai-cloud`, `cursor-cloud` and `spiron-cloud` harnesses (`cloud_harness.rs`) do not work as cloud agents and are removed. Cloud agents run through the remote-session contract and the per-provider adapters of [0010](0010-execution-identity-and-trust.md) D7. `cloud_harness.rs` is deleted when those adapters land.
+
+### 13. Status of ADR 0001–0008
+
+| ADR | Status | What changes |
+|---|---|---|
+| [0001](0001-server-first-one-binary.md) | accepted | Unchanged. |
+| [0002](0002-runtime-drivers-and-capability-identity.md) | superseded | By this record and [0010](0010-execution-identity-and-trust.md): deployment modes (D1), identity (D2), isolation (D3) and credentials (D4) replace its runtime models and its credential rule. |
+| [0003](0003-runtime-rebuild.md) | replaced | Work ships one connected vertical slice at a time, not as disjoint streams and waves. Its decision 6 is restated by decision 5 here. |
+| [0004](0004-identity-and-credentials.md) | simplified by [0010](0010-execution-identity-and-trust.md) D4 | AnyAgents authorizes and brokers, and is not a vault: storage is a pluggable backend, delivery follows D4's tiers, and the vendor's binary performs every refresh. |
+| [0005](0005-managed-harnesses-and-declared-toolchain.md) | amended | Managed harnesses are kept. The toolchain manifest is opt-in (`strict`, decision 5), and the catalog gains the `system` source ([0010](0010-execution-identity-and-trust.md) D8). Decision 11, the deployment image contract, moves to the desk's infrastructure (`SylphxAI/infra`). |
+| [0006](0006-runtime-state-and-lifecycle.md) | amended | Kept: decisions 3, 8, 9 and 11. Deferred: decisions 1, 2 and 7. |
+| [0007](0007-process-architecture.md) | kept for third-party CLIs | Keepers hold only third-party CLIs that cannot reattach. Spiron reattaches natively, and remote agents run no local process ([0010](0010-execution-identity-and-trust.md) D6). |
+| [0008](0008-quality-loop.md) | amended | Outcomes are kept. The verdict prompts and the turn-ownership guard move to the deployment profile (decision 8). LLM sleep consolidation is being rebuilt in the agent's own harness, not removed. |
 
 ## Acceptance
 
@@ -133,10 +167,10 @@ The product ships the mechanisms (events such as `[Sub-Agent Completed]`, a conf
 
 Ordered by risk. Each step says what it interrupts on a running deployment.
 
-1. **Safety and compliance.** Listener default; background model calls opt-in with no key discovery; vendor-facing actions through vendor binaries; least-privilege credentials per seat. Interrupts nothing beyond a daemon restart; the desk sets its listener and consolidation endpoint in its profile first.
+1. **Safety and compliance.** Listener default; background model calls opt-in with no key discovery; vendor-facing actions through vendor binaries; least-privilege credentials per agent. Interrupts nothing beyond a daemon restart; the desk sets its listener and consolidation endpoint in its profile first.
 2. **Spiron native.** Managed source and doctor; cost and served model; one usage row per turn; history indexing; protocol specification; the Spiron tool profile.
 3. **Capability table and Code Mode completeness.** Keyless web default; the table replaces the env switches; Spiron runs without duplicates; the Code Mode comparative evaluation.
-4. **Modes.** `detect`/`strict` toolchain with `snapshot`; seats and the tool broker only when configured; one config file.
+4. **Modes.** `detect`/`strict` toolchain with `snapshot` and the `system` source; sandbox drivers in place of seats ([0010](0010-execution-identity-and-trust.md) D3); one config file.
 5. **Policy out of the product.** The `agy`→Spiron default, guard text and prompts move into the desk's profile and role templates; integrations move behind their interfaces.
 
 ## Consequences
