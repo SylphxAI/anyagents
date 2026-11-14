@@ -314,6 +314,7 @@ dependencies = [
  "anyagents-core",
  "anyagents-harness",
  "anyagents-keeper",
+ "anyagents-remote",
  "anyagents-supervisor",
  "axum",
  "bytes",

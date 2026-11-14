@@ -179,7 +179,8 @@ pub struct RemoteSessionView {
     /// `terminated`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vendor_status: Option<String>,
-    /// The spend cap and what the session cost so far, in US cents.
+    /// The agent's spend cap and what it spent so far across its sessions,
+    /// in US cents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget_cents: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -196,7 +197,8 @@ impl From<&anyagents_core::RemoteExecution> for RemoteSessionView {
             status: row.status.clone(),
             vendor_status: row.vendor_status.clone(),
             budget_cents: row.budget_cents,
-            cost_cents: row.cost_cents,
+            // What the agent spent across its sessions: what the cap holds.
+            cost_cents: Some(row.spent_micros() / 10_000),
             last_error: row.last_error.clone(),
         }
     }

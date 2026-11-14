@@ -19,10 +19,17 @@ serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 
+# The scripted vendor API (`mock`), for this crate's tests and the kernel's.
+axum = { version = "0.8", features = ["json"], optional = true }
+tempfile = { version = "3", optional = true }
+
+[features]
+mock = ["dep:axum", "dep:tempfile", "tokio/net"]
+
 [dev-dependencies]
 anyagents-agent = { path = "../anyagents-agent" }
+anyagents-remote = { path = ".", features = ["mock"] }
 anyagents-supervisor = { path = "../anyagents-supervisor" }
-axum = { version = "0.8", features = ["json"] }
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 

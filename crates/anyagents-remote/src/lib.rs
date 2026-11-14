@@ -35,10 +35,14 @@ use serde_json::Value;
 
 pub mod claude_managed;
 mod executor;
+#[cfg(feature = "mock")]
+pub mod mock;
+pub mod pacing;
 mod sse;
 
 pub use executor::{
-    Config, Executor, HostTools, Settled, attached, block_on, change_budget, settle, take_over,
+    Config, Executor, HostTools, Settled, attached, block_on, change_budget, end_before_delete,
+    settle, spawn_blocking, take_over,
 };
 
 /// What an adapter call returns.
@@ -249,8 +253,12 @@ pub enum Admission {
         reason: String,
         message_specific: bool,
     },
-    /// Not taken now; a later offer can succeed.
-    Wait(String),
+    /// Not taken now, and not applied; a later offer can succeed, no sooner
+    /// than `retry_after_ms` when the vendor said.
+    Wait {
+        reason: String,
+        retry_after_ms: Option<u64>,
+    },
     /// The answer was lost: [`Adapter::holds`] settles it before anything is
     /// written again.
     Unknown(String),
@@ -282,12 +290,23 @@ pub trait Adapter: Send + Sync + 'static {
 
     /// Create a session. `previous` is the adapter state of the agent's last
     /// session, so a vendor-side agent definition is reused, not recreated.
-    fn create<'a>(&'a self, spec: &'a Spec, previous: &'a Value) -> Fut<'a, Handle>;
+    /// `checkpoint` is handed the adapter state as soon as each vendor-side
+    /// object exists, so a create that fails halfway leaves nothing a retry
+    /// would make again.
+    fn create<'a>(
+        &'a self,
+        spec: &'a Spec,
+        previous: &'a Value,
+        checkpoint: &'a (dyn Fn(&Value) + Send + Sync),
+    ) -> Fut<'a, Handle>;
 
     /// Attach to the session's events: every event after `after` (all of
-    /// them when `None`), then [`EventKind::CaughtUp`], then live events, each
+    /// them when `None`; none when `after` is past every event the vendor
+    /// still holds), then [`EventKind::CaughtUp`], then live events, each
     /// once. A dropped stream is followed by a new `attach` from the last
-    /// cursor applied.
+    /// cursor applied. On `spiron.headless/v2` the cursor is a `seq` and
+    /// `CaughtUp` is the live `ready`, the one echoing this attach's
+    /// `request_id`, not a `ready` inside the replay (ADR 0011 D4).
     fn attach<'a>(&'a self, handle: &'a Handle, after: Option<&'a str>) -> Fut<'a, Events>;
 
     /// Hand the session one message under its mailbox id. A running session
@@ -301,7 +320,14 @@ pub trait Adapter: Send + Sync + 'static {
 
     /// Whether the session already holds the input delivered as
     /// `request_id`: how a lost answer is settled before a second write.
-    fn holds<'a>(&'a self, handle: &'a Handle, request_id: &'a str) -> Fut<'a, bool>;
+    /// Only events after the cursor `after` need to be read: the executor
+    /// already applied everything before it.
+    fn holds<'a>(
+        &'a self,
+        handle: &'a Handle,
+        request_id: &'a str,
+        after: Option<&'a str>,
+    ) -> Fut<'a, bool>;
 
     fn snapshot<'a>(&'a self, handle: &'a Handle) -> Fut<'a, Snapshot>;
 

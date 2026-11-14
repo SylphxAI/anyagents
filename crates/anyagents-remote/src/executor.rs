@@ -3,9 +3,9 @@
 //! The executor is what the supervisor and the delivery loop drive, through
 //! the same harness contract as a local process or a keeper. Behind it there
 //! is no process: one task on the shared runtime holds the agent's connection
-//! to its vendor session, applies each event once, and records what it
-//! applied (the cursor, usage, the mailbox ids the session holds) in the
-//! agent's `remote_executions` row before it applies the next.
+//! to its vendor session and applies each event once. An event and everything
+//! it changes (the cursor, a turn it closes, usage, the mailbox ids the
+//! session holds) reach the agent's `remote_executions` row in one write.
 //!
 //! * **Lifecycle.** [`Executor::launch`] reconnects to the session the row
 //!   names or creates one; [`Executor::reattach`] takes over a session a
@@ -13,16 +13,23 @@
 //!   settles the session by the agent's state ([`settle`]): a stopping
 //!   kernel or a replaced process leaves it attached for the next one, a
 //!   paused agent's session is interrupted and its token revoked, an archived
-//!   or moved agent's session is ended.
+//!   or moved agent's session is ended. A session is stopped before another
+//!   replaces it, and a session the vendor keeps ending is replaced no faster
+//!   than a doubling backoff.
 //! * **Delivery** at the adapter's level: `mid-turn` on admission, `next-step`
-//!   on the session's consumption proof. A lost answer is settled with
-//!   [`Adapter::holds`] before anything is written again; a message the
-//!   session held before this executor existed is a duplicate.
+//!   on the session's proof that it consumed the message. A message an
+//!   interrupted turn never consumed is offered again. A lost answer is
+//!   settled with [`Adapter::holds`] before anything is written again; a
+//!   message the session held before this executor existed is a duplicate.
+//!   Mail the vendor did not take waits out an exponential backoff with
+//!   jitter, never less than the vendor's `retry-after`.
 //! * **Events** become the agent's history (a transcript the host index
 //!   reads), its usage and cost, and its turn state.
-//! * **Budget.** A metered adapter never starts without a cap. At the cap the
-//!   agent's mail is held as a quota wait until the cap is raised; when the
-//!   kernel holds the cap, it interrupts the running turn there too.
+//! * **Budget.** The cap belongs to the agent: every session is created with
+//!   what is left of it after the agent's earlier sessions, and none starts
+//!   once it is spent. At the cap the agent's mail is held as a quota wait
+//!   until the cap is raised; when the kernel holds the cap, it interrupts
+//!   the running turn there too.
 //! * **Identity.** A session that calls back over MCP gets a remote session
 //!   token minted at create, rotated before it expires and revoked when the
 //!   session stops.
@@ -31,7 +38,7 @@ use std::collections::HashSet;
 use std::future::Future;
 use std::io::Write as _;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
@@ -40,8 +47,8 @@ use anyagents_core::{
     RemoteTotals, Store, now_ms, remote_execution_status as status,
 };
 use anyagents_harness::{
-    DeliverOutcome, Harness, HarnessError, HarnessHealth, OutboundMessage, Proof, TurnState,
-    TurnUsage, compose_message,
+    DeliverOutcome, DeliveryLevel, Harness, HarnessError, HarnessHealth, OutboundMessage, Proof,
+    TurnState, TurnUsage, compose_message,
 };
 use futures::StreamExt;
 use serde_json::{Value, json};
@@ -65,6 +72,10 @@ const ROTATION_CHECK: Duration = Duration::from_secs(30);
 const KEEP_IDS: usize = 512;
 /// One US cent in millionths of a dollar.
 const MICROS_PER_CENT: i64 = 10_000;
+/// The wait before replacing a session the vendor ended: this, doubling
+/// with each one ended in a row, up to [`TERMINATION_BACKOFF_MAX_MS`].
+const TERMINATION_BACKOFF_MS: i64 = 60_000;
+const TERMINATION_BACKOFF_MAX_MS: i64 = 3_600_000;
 
 /// The runtime every remote session's connection lives on.
 fn runtime() -> &'static tokio::runtime::Runtime {
@@ -98,6 +109,12 @@ where
     }
 }
 
+/// Run `work` on the remote runtime's blocking pool, so a caller that must
+/// not wait on a vendor (the supervisor's router) returns at once.
+pub fn spawn_blocking(work: impl FnOnce() + Send + 'static) {
+    drop(runtime().spawn_blocking(work));
+}
+
 /// Tools the kernel serves a session over its connection
 /// ([`Coordination::HostTools`]).
 pub trait HostTools: Send + Sync {
@@ -115,7 +132,7 @@ pub struct Config {
     /// The public MCP URL a session calls back to ([`Coordination::Mcp`]).
     pub mcp_url: Option<String>,
     pub token_ttl_ms: i64,
-    /// The spend cap, in US cents.
+    /// The agent's spend cap, in US cents, across all its sessions.
     pub budget_cents: Option<i64>,
     pub host_tools: Option<Arc<dyn HostTools>>,
 }
@@ -130,7 +147,7 @@ enum HoldKind {
 }
 
 struct State {
-    /// The replay after the cursor has been applied at least once.
+    /// The replay after the cursor has been applied since the last connect.
     synced: bool,
     /// The session can still run.
     alive: bool,
@@ -152,17 +169,27 @@ struct State {
     cost_seen: Option<i64>,
     base: RemoteTotals,
     resume: RemoteResume,
-    /// Mailbox ids the session holds, from its own record.
-    held: HashSet<String>,
-    answered: HashSet<String>,
-    /// Written by this executor and admitted (`mid-turn`).
-    admitted: HashSet<String>,
-    /// Written by this executor, waiting for consumption (`next-step`).
-    inflight: HashSet<String>,
+    /// Mailbox ids the session consumed, from its own record.
     consumed: HashSet<String>,
+    /// Mailbox ids the session holds and has not consumed yet.
+    queued: HashSet<String>,
+    answered: HashSet<String>,
+    /// Written by this executor and admitted (`mid-turn` proof).
+    admitted: HashSet<String>,
+    /// Written by this executor (or found queued), waiting for consumption.
+    inflight: HashSet<String>,
     /// Answers lost: settled from the session before another write.
     uncertain: HashSet<String>,
-    budget_cents: Option<i64>,
+    /// An interrupt was sent for the running turn.
+    interrupted: bool,
+    /// A turn completed since the record last said so.
+    completed: bool,
+    /// The agent's cap, and what its earlier sessions spent.
+    cap_cents: Option<i64>,
+    spent_before_micros: i64,
+    /// Mail the vendor did not take waits until then.
+    retry_at_ms: i64,
+    retry_attempt: u32,
     token_session: Option<String>,
     token_expires_at_ms: i64,
     note: Option<String>,
@@ -172,13 +199,28 @@ struct State {
 /// Work an applied event asks for.
 enum Effect {
     Snapshot,
-    EndTurn(Stop),
     Interrupt,
     HostCall {
         call_id: String,
         name: String,
         input: Value,
     },
+}
+
+fn remember(list: &mut Vec<String>, set: &mut HashSet<String>, id: &str) {
+    if set.insert(id.to_string()) {
+        list.push(id.to_string());
+        if list.len() > KEEP_IDS {
+            let drop = list.len() - KEEP_IDS;
+            list.drain(..drop);
+        }
+    }
+}
+
+fn forget(list: &mut Vec<String>, set: &mut HashSet<String>, id: &str) {
+    if set.remove(id) {
+        list.retain(|kept| kept != id);
+    }
 }
 
 impl State {
@@ -209,14 +251,19 @@ impl State {
                 .cost_cents
                 .map(|cents| cents.saturating_mul(MICROS_PER_CENT)),
             base,
-            held: row.resume.held.iter().cloned().collect(),
+            consumed: row.resume.held.iter().cloned().collect(),
+            queued: row.resume.queued.iter().cloned().collect(),
             answered: row.resume.answered.iter().cloned().collect(),
             resume: row.resume.clone(),
             admitted: HashSet::new(),
             inflight: HashSet::new(),
-            consumed: HashSet::new(),
             uncertain: HashSet::new(),
-            budget_cents: row.budget_cents,
+            interrupted: false,
+            completed: false,
+            cap_cents: row.budget_cents,
+            spent_before_micros: row.spent_before_micros,
+            retry_at_ms: 0,
+            retry_attempt: 0,
             token_session: row.token_session.clone(),
             token_expires_at_ms: 0,
             note: row.note.clone(),
@@ -224,7 +271,7 @@ impl State {
         }
     }
 
-    /// What the session has cost so far, finished turns and the open one.
+    /// What this session has cost so far, finished turns and the open one.
     fn cost_micros(&self) -> Option<i64> {
         let summed = match (
             self.totals.usage.reported_cost_micros,
@@ -239,12 +286,54 @@ impl State {
         }
     }
 
-    /// A turn ended (or paused): its usage and the session's cost become
-    /// what the supervisor reads, and a finished turn is counted.
-    fn end_turn(&mut self, stop: &Stop, cost: Option<i64>, now: i64) {
-        if let Some(cost) = cost {
-            self.cost_seen = Some(self.cost_seen.unwrap_or(0).max(cost));
+    /// What this session may still spend: the agent's cap less what its
+    /// earlier sessions spent.
+    fn allowance_micros(&self) -> Option<i64> {
+        self.cap_cents.map(|cap| {
+            cap.saturating_mul(MICROS_PER_CENT)
+                .saturating_sub(self.spent_before_micros)
+        })
+    }
+
+    fn over_cap(&self) -> bool {
+        match self.allowance_micros() {
+            Some(allowance) => self.cost_micros().unwrap_or(0) >= allowance,
+            None => false,
         }
+    }
+
+    fn mark_consumed(&mut self, id: &str) {
+        forget(&mut self.resume.queued, &mut self.queued, id);
+        remember(&mut self.resume.held, &mut self.consumed, id);
+    }
+
+    fn proof(&self, id: &str) -> Option<Proof> {
+        if self.consumed.contains(id) {
+            // Written by this executor (an answer it lost included): taken;
+            // by an earlier process: a duplicate.
+            return Some(
+                if self.inflight.contains(id)
+                    || self.admitted.contains(id)
+                    || self.uncertain.contains(id)
+                {
+                    Proof::Taken {
+                        turn_finished: false,
+                    }
+                } else {
+                    Proof::Duplicate
+                },
+            );
+        }
+        self.admitted.contains(id).then_some(Proof::Taken {
+            turn_finished: false,
+        })
+    }
+
+    /// A turn ended (or paused): it is closed here, with the event that ended
+    /// it, so the cursor is never recorded past an end the record does not
+    /// show. Its usage and the cost known so far become what the supervisor
+    /// reads; a finished turn is counted.
+    fn end_turn(&mut self, stop: &Stop, now: i64) {
         let cost = self.cost_micros();
         let open = std::mem::take(&mut self.open);
         let totals = &mut self.totals.usage;
@@ -261,6 +350,7 @@ impl State {
                 self.pending = false;
                 if was_running {
                     self.totals.turns += 1;
+                    self.completed = true;
                 }
                 if let Stop::Failed(error) = stop {
                     self.turn_fault = Some(format!("the remote turn failed: {error}"));
@@ -268,39 +358,27 @@ impl State {
                 if matches!(self.hold, Some((HoldKind::Vendor, _))) {
                     self.hold = None;
                 }
+                if std::mem::take(&mut self.interrupted) {
+                    // An interrupted turn may leave mail it never consumed:
+                    // it goes back to the mailbox and is offered again.
+                    let unconsumed: Vec<String> = self
+                        .inflight
+                        .iter()
+                        .chain(self.queued.iter())
+                        .filter(|id| !self.consumed.contains(*id))
+                        .cloned()
+                        .collect();
+                    for id in unconsumed {
+                        self.inflight.remove(&id);
+                        forget(&mut self.resume.queued, &mut self.queued, &id);
+                    }
+                }
             }
             Stop::BudgetReached => {
                 self.vendor_status = "budget_reached";
                 self.hold = Some((HoldKind::Vendor, now + BUDGET_RECHECK_MS));
             }
         }
-    }
-
-    fn over_cap(&self) -> bool {
-        match (self.budget_cents, self.cost_micros()) {
-            (Some(cap), Some(cost)) => cost >= cap.saturating_mul(MICROS_PER_CENT),
-            _ => false,
-        }
-    }
-
-    fn remember(list: &mut Vec<String>, set: &mut HashSet<String>, id: &str) {
-        if set.insert(id.to_string()) {
-            list.push(id.to_string());
-            if list.len() > KEEP_IDS {
-                let drop = list.len() - KEEP_IDS;
-                list.drain(..drop);
-            }
-        }
-    }
-
-    fn proof(&self, id: &str) -> Option<Proof> {
-        if self.admitted.contains(id) || (self.inflight.contains(id) && self.consumed.contains(id))
-        {
-            return Some(Proof::Taken {
-                turn_finished: false,
-            });
-        }
-        (self.held.contains(id) && !self.inflight.contains(id)).then_some(Proof::Duplicate)
     }
 
     /// Apply one event, once.
@@ -313,13 +391,17 @@ impl State {
             }
             EventKind::Input {
                 request_id: Some(id),
+                consumed,
                 ..
-            } => Self::remember(&mut self.resume.held, &mut self.held, id),
-            EventKind::Input { .. } => {}
-            EventKind::Consumed { request_id, .. } => {
-                Self::remember(&mut self.resume.held, &mut self.held, request_id);
-                self.consumed.insert(request_id.clone());
+            } => {
+                if *consumed {
+                    self.mark_consumed(id);
+                } else if !self.consumed.contains(id) {
+                    remember(&mut self.resume.queued, &mut self.queued, id);
+                }
             }
+            EventKind::Input { .. } => {}
+            EventKind::Consumed { request_id, .. } => self.mark_consumed(request_id),
             EventKind::Returned {
                 request_ids,
                 reason,
@@ -327,6 +409,7 @@ impl State {
                 for id in request_ids {
                     self.inflight.remove(id);
                     self.admitted.remove(id);
+                    forget(&mut self.resume.queued, &mut self.queued, id);
                 }
                 self.last_error = Some(format!("the session handed input back: {reason}"));
             }
@@ -359,10 +442,14 @@ impl State {
                     "the session asked for a decision AnyAgents does not give; it was interrupted"
                         .into(),
                 );
+                self.interrupted = true;
                 effects.push(Effect::Interrupt);
             }
-            // Finished once the vendor's cost of it is read.
-            EventKind::TurnEnded(stop) => effects.push(Effect::EndTurn(stop.clone())),
+            EventKind::TurnEnded(stop) => {
+                self.end_turn(stop, now);
+                // The vendor prices a turn after it ends: read it next.
+                effects.push(Effect::Snapshot);
+            }
             EventKind::Terminated(reason) => {
                 self.alive = false;
                 self.running = false;
@@ -405,15 +492,29 @@ impl State {
             && self.over_cap()
         {
             self.hold = Some((HoldKind::Kernel, now + BUDGET_RECHECK_MS));
-            self.last_error = Some("the session reached its spend cap".into());
+            self.last_error = Some("the agent reached its spend cap".into());
             if self.running {
+                self.interrupted = true;
                 effects.push(Effect::Interrupt);
             }
         }
         effects
     }
 
-    fn progress(&self) -> RemoteExecutionPatch {
+    /// The vendor's word on what the session cost: what a turn that already
+    /// ended cost is reported at once; a running turn's, when it ends.
+    fn absorb_cost(&mut self, cost: Option<i64>) {
+        let Some(cost) = cost else {
+            return;
+        };
+        self.cost_seen = Some(self.cost_seen.unwrap_or(0).max(cost));
+        if !self.running && self.open == TurnUsage::default() {
+            let reported = &mut self.totals.usage.reported_cost_micros;
+            *reported = Some(reported.unwrap_or(0).max(cost));
+        }
+    }
+
+    fn progress(&mut self) -> RemoteExecutionPatch {
         RemoteExecutionPatch {
             vendor_status: Some(self.vendor_status.to_string()),
             cost_cents: self.cost_micros().map(|micros| micros / MICROS_PER_CENT),
@@ -421,6 +522,7 @@ impl State {
             open_usage: Some(self.open.clone()),
             resume: Some(self.resume.clone()),
             last_error: Some(self.last_error.clone()),
+            terminations: std::mem::take(&mut self.completed).then_some(0),
             ..RemoteExecutionPatch::default()
         }
     }
@@ -444,6 +546,8 @@ struct Shared {
     changed: Condvar,
     closed: AtomicBool,
     activity: Mutex<Option<Notify>>,
+    /// A wake is already scheduled for this time.
+    wake_at: AtomicI64,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -455,12 +559,31 @@ impl Shared {
         lock(&self.state)
     }
 
+    /// Wake whoever drives this agent: something it would act on changed.
     fn notify(&self) {
         self.changed.notify_all();
         let notify = lock(&self.activity).clone();
         if let Some(notify) = notify {
             notify();
         }
+    }
+
+    /// Wake the agent's driver at `at_ms`, once, however many deliveries
+    /// were put off until then.
+    fn wake_at(self: &Arc<Self>, at_ms: i64) {
+        let scheduled = self.wake_at.load(Ordering::SeqCst);
+        if scheduled >= at_ms && scheduled > now_ms() {
+            return;
+        }
+        self.wake_at.store(at_ms, Ordering::SeqCst);
+        let shared = Arc::clone(self);
+        drop(runtime().spawn(async move {
+            let wait = at_ms.saturating_sub(now_ms()).max(0) as u64;
+            tokio::time::sleep(Duration::from_millis(wait)).await;
+            if !shared.closed.load(Ordering::SeqCst) {
+                shared.notify();
+            }
+        }));
     }
 
     fn persist(&self, patch: &RemoteExecutionPatch) {
@@ -508,32 +631,28 @@ impl Shared {
     }
 
     async fn apply(&self, event: Event) {
-        let (effects, patch) = {
+        let (effects, patch, echo) = {
             let mut state = self.state();
+            // An input's processed echo proves it; its text is already in
+            // the history.
+            let echo = matches!(
+                &event.kind,
+                EventKind::Input { request_id: Some(id), consumed: true, .. }
+                    if state.queued.contains(id)
+            );
             let effects = state.apply(&event, self.caps.budget, now_ms());
-            (effects, state.progress())
+            (effects, state.progress(), echo)
         };
-        self.record(&event);
+        if !echo {
+            self.record(&event);
+        }
+        // The event, the cursor past it and whatever turn it closed are
+        // written together.
         self.persist(&patch);
         self.notify();
         for effect in effects {
             match effect {
                 Effect::Snapshot => self.refresh().await,
-                Effect::EndTurn(stop) => {
-                    let cost = self
-                        .adapter
-                        .snapshot(&self.handle)
-                        .await
-                        .ok()
-                        .and_then(|snapshot| snapshot.cost_micros);
-                    let patch = {
-                        let mut state = self.state();
-                        state.end_turn(&stop, cost, now_ms());
-                        state.progress()
-                    };
-                    self.persist(&patch);
-                    self.notify();
-                }
                 Effect::Interrupt => {
                     if let Err(err) = self.adapter.interrupt(&self.handle).await {
                         self.state().last_error = Some(format!("interrupt: {err}"));
@@ -556,9 +675,7 @@ impl Shared {
         };
         let patch = {
             let mut state = self.state();
-            if let Some(cost) = snapshot.cost_micros {
-                state.cost_seen = Some(state.cost_seen.unwrap_or(0).max(cost));
-            }
+            state.absorb_cost(snapshot.cost_micros);
             // Only an end is taken from the snapshot: the vendor's queryable
             // status trails its event stream, so a `running` here may be a
             // turn the events already ended.
@@ -597,7 +714,7 @@ impl Shared {
                 let patch = {
                     let mut state = self.state();
                     let state = &mut *state;
-                    State::remember(&mut state.resume.answered, &mut state.answered, &call_id);
+                    remember(&mut state.resume.answered, &mut state.answered, &call_id);
                     state.progress()
                 };
                 self.persist(&patch);
@@ -658,6 +775,7 @@ impl Shared {
     /// reached again.
     fn failed(&self, error: AdapterError) -> bool {
         let mut state = self.state();
+        state.synced = false;
         match error {
             AdapterError::Gone(why) => {
                 state.alive = false;
@@ -723,6 +841,9 @@ impl Shared {
                             },
                         }
                     }
+                    // Until the next attach replays what was missed, a
+                    // delivery would not know what the session holds.
+                    self.state().synced = false;
                 }
             }
             tokio::time::sleep(backoff).await;
@@ -833,26 +954,28 @@ fn decide(store: &Store, row: &RemoteExecution, alive: bool) -> Settled {
     }
 }
 
-/// Carry out `settled` on a session nothing is connected to.
+/// Carry out `settled` on a session nothing is connected to. A session the
+/// vendor ended (`terminated`) counts toward the replacement backoff.
 fn carry_out(
     store: &Store,
     adapter: &dyn Adapter,
     agent: &AgentId,
     handle: Option<&Handle>,
     settled: Settled,
+    terminated: bool,
 ) {
-    let patch = |state: &str| RemoteExecutionPatch {
-        status: Some(state.to_string()),
-        ..RemoteExecutionPatch::default()
-    };
     let write = |patch: RemoteExecutionPatch| {
         if let Err(err) = store.update_remote_execution(agent, &patch) {
             eprintln!("anyagents-remote: {agent}: the session record was not written: {err}");
         }
     };
+    let status_patch = |state: &str| RemoteExecutionPatch {
+        status: Some(state.to_string()),
+        ..RemoteExecutionPatch::default()
+    };
     match settled {
         Settled::Kept => {}
-        Settled::Parked => write(patch(status::PARKED)),
+        Settled::Parked => write(status_patch(status::PARKED)),
         Settled::Paused => {
             if let Some(handle) = handle
                 && let Err(err) = block_on(adapter.interrupt(handle))
@@ -862,7 +985,7 @@ fn carry_out(
                 );
             }
             let _ = store.revoke_remote_sessions(agent, None);
-            write(patch(status::PARKED));
+            write(status_patch(status::PARKED));
         }
         Settled::Ended => {
             if let Some(handle) = handle
@@ -871,14 +994,31 @@ fn carry_out(
                 eprintln!("anyagents-remote: {agent}: the session was not stopped: {err}");
             }
             let _ = store.revoke_remote_sessions(agent, None);
-            write(patch(status::ENDED));
+            let terminations = store
+                .remote_execution(agent)
+                .ok()
+                .flatten()
+                .map_or(0, |row| row.terminations);
+            write(RemoteExecutionPatch {
+                status: Some(status::ENDED.into()),
+                ended_at_ms: Some(now_ms()),
+                terminations: terminated.then_some(terminations + 1),
+                ..RemoteExecutionPatch::default()
+            });
         }
     }
 }
 
+fn handle_of(row: &RemoteExecution) -> Option<Handle> {
+    row.vendor_session.clone().map(|session| Handle {
+        session,
+        state: row.adapter_state.clone(),
+    })
+}
+
 /// Settle an agent's remote session that no executor holds (a session a
-/// previous kernel left for an agent that no longer runs), by the agent's
-/// state.
+/// previous kernel left for an agent that no longer runs, a parked session
+/// whose agent was archived), by the agent's state.
 pub fn settle(store: &Store, agent: &AgentId, adapter: &dyn Adapter) -> Settled {
     let Ok(Some(row)) = store.remote_execution(agent) else {
         return Settled::Kept;
@@ -886,21 +1026,42 @@ pub fn settle(store: &Store, agent: &AgentId, adapter: &dyn Adapter) -> Settled 
     if !row.is_live() {
         return Settled::Kept;
     }
-    let settled = decide(
+    let alive = row.vendor_status.as_deref() != Some("terminated");
+    let settled = decide(store, &row, alive);
+    carry_out(
         store,
-        &row,
-        row.vendor_status.as_deref() != Some("terminated"),
+        adapter,
+        agent,
+        handle_of(&row).as_ref(),
+        settled,
+        !alive,
     );
-    let handle = row.vendor_session.clone().map(|session| Handle {
-        session,
-        state: row.adapter_state.clone(),
-    });
-    carry_out(store, adapter, agent, handle.as_ref(), settled);
     settled
 }
 
+/// End a session whose record is about to go with its agent: what is needed
+/// to stop it is read now, and the vendor is called in the background.
+pub fn end_before_delete(store: &Store, agent: &AgentId, adapter: Arc<dyn Adapter>) {
+    let Ok(Some(row)) = store.remote_execution(agent) else {
+        return;
+    };
+    let Some(handle) = handle_of(&row).filter(|_| row.is_live()) else {
+        return;
+    };
+    let _ = store.revoke_remote_sessions(agent, None);
+    let agent = agent.clone();
+    spawn_blocking(move || {
+        if let Err(err) = block_on(adapter.stop(&handle)) {
+            eprintln!(
+                "anyagents-remote: {agent}: the deleted agent's session was not stopped: {err}"
+            );
+        }
+    });
+}
+
 /// Change an agent's spend cap from outside its executor (an operator call):
-/// the vendor's cap when the vendor holds it, and the record, which the
+/// the vendor's cap for the session (the cap less what the agent's earlier
+/// sessions spent) when the vendor holds it, and the record, which the
 /// executor reads again when its hold comes due. A vendor session paused at
 /// the old cap resumes on its own.
 pub fn change_budget(
@@ -909,22 +1070,16 @@ pub fn change_budget(
     adapter: &dyn Adapter,
     cents: i64,
 ) -> Result<(), String> {
-    if cents <= 0 {
-        return Err("a spend cap must be positive".into());
-    }
     let row = store
         .remote_execution(agent)
         .map_err(|err| err.to_string())?
         .ok_or_else(|| "the agent has no remote session".to_string())?;
+    let allowance = session_allowance(cents, &row)?;
     if adapter.capabilities().budget == Budgeting::Vendor
         && row.is_live()
-        && let Some(session) = row.vendor_session.clone()
+        && let Some(handle) = handle_of(&row)
     {
-        let handle = Handle {
-            session,
-            state: row.adapter_state.clone(),
-        };
-        block_on(adapter.set_budget(&handle, cents)).map_err(|err| err.to_string())?;
+        block_on(adapter.set_budget(&handle, allowance)).map_err(|err| err.to_string())?;
     }
     store
         .update_remote_execution(
@@ -936,6 +1091,29 @@ pub fn change_budget(
         )
         .map_err(|err| err.to_string())?;
     Ok(())
+}
+
+fn dollars(micros: i64) -> String {
+    let cents = micros / MICROS_PER_CENT;
+    format!("${}.{:02}", cents / 100, cents % 100)
+}
+
+/// What the agent's current session may spend under a cap of `cents`: the
+/// cap less the earlier sessions' spend, which must exceed what this session
+/// already cost.
+fn session_allowance(cents: i64, row: &RemoteExecution) -> Result<i64, String> {
+    if cents <= 0 {
+        return Err("a spend cap must be positive".into());
+    }
+    let allowance = cents.saturating_mul(MICROS_PER_CENT) - row.spent_before_micros;
+    if allowance <= row.session_cost_micros() {
+        return Err(format!(
+            "a cap of {} is not above what the agent already spent ({})",
+            dollars(cents.saturating_mul(MICROS_PER_CENT)),
+            dollars(row.spent_micros())
+        ));
+    }
+    Ok(allowance / MICROS_PER_CENT)
 }
 
 /// Agents whose remote session a kernel held when it stopped: the next
@@ -994,26 +1172,50 @@ impl Executor {
                 && row.model == agent.model
         });
         if let Some(row) = reusable.cloned() {
-            // A session the vendor no longer has is replaced below.
-            if let Some(executor) = Self::reconnect(&config, &caps, &row, false)? {
-                return Ok(executor);
+            match Self::reconnect(&config, &caps, &row, false) {
+                Ok(executor) => return Ok(executor),
+                // The session, or what it calls back with, is gone: it is
+                // stopped before another replaces it.
+                Err(AdapterError::Gone(why)) => {
+                    eprintln!(
+                        "anyagents-remote: {}: session {} is replaced: {why}",
+                        agent.id,
+                        row.vendor_session.as_deref().unwrap_or("-")
+                    );
+                    carry_out(
+                        &store,
+                        config.adapter.as_ref(),
+                        &agent.id,
+                        handle_of(&row).as_ref(),
+                        Settled::Ended,
+                        false,
+                    );
+                }
+                Err(err) => {
+                    return Err(format!(
+                        "remote agent `{}` cannot reconnect: {err}",
+                        agent.name
+                    ));
+                }
             }
         } else if let Some(old) = row.as_ref().filter(|row| row.is_live())
             && old.adapter == caps.adapter
         {
-            // The agent moved to another model: its old session ends.
-            let handle = old.vendor_session.clone().map(|session| Handle {
-                session,
-                state: old.adapter_state.clone(),
-            });
+            // The agent moved to another model, or the vendor ended the
+            // session: it is stopped before another replaces it.
+            let terminated = old.vendor_status.as_deref() == Some("terminated");
             carry_out(
                 &store,
                 config.adapter.as_ref(),
                 &agent.id,
-                handle.as_ref(),
+                handle_of(old).as_ref(),
                 Settled::Ended,
+                terminated,
             );
         }
+        let row = store
+            .remote_execution(&agent.id)
+            .map_err(|e| e.to_string())?;
         Self::create(&config, &caps, row.as_ref())
     }
 
@@ -1032,7 +1234,24 @@ impl Executor {
         {
             return Ok(None);
         }
-        Self::reconnect(&config, &caps, &row, true)
+        match Self::reconnect(&config, &caps, &row, true) {
+            Ok(executor) => Ok(Some(executor)),
+            Err(AdapterError::Gone(_)) => {
+                // Left for the launch, which stops it and replaces it.
+                let _ = config.store.update_remote_execution(
+                    &config.agent.id,
+                    &RemoteExecutionPatch {
+                        vendor_status: Some("terminated".into()),
+                        ..RemoteExecutionPatch::default()
+                    },
+                );
+                Ok(None)
+            }
+            Err(err) => Err(format!(
+                "remote agent `{}` cannot reconnect: {err}",
+                config.agent.name
+            )),
+        }
     }
 
     fn reconnect(
@@ -1040,34 +1259,11 @@ impl Executor {
         caps: &Capabilities,
         row: &RemoteExecution,
         takeover: bool,
-    ) -> Result<Option<Self>, String> {
+    ) -> Result<Self, AdapterError> {
         let store = &config.store;
         let agent = &config.agent;
-        let handle = Handle {
-            session: row.vendor_session.clone().unwrap_or_default(),
-            state: row.adapter_state.clone(),
-        };
-        let issued = Self::hand_grant(config, caps, &handle, row.token_session.as_deref());
-        let issued = match issued {
-            Ok(issued) => issued,
-            Err(AdapterError::Gone(_)) => {
-                let _ = store.update_remote_execution(
-                    &agent.id,
-                    &RemoteExecutionPatch {
-                        status: Some(status::ENDED.into()),
-                        vendor_status: Some("terminated".into()),
-                        ..RemoteExecutionPatch::default()
-                    },
-                );
-                return Ok(None);
-            }
-            Err(err) => {
-                return Err(format!(
-                    "remote agent `{}` cannot reconnect: {err}",
-                    agent.name
-                ));
-            }
-        };
+        let handle = handle_of(row).ok_or_else(|| AdapterError::Gone("no session".into()))?;
+        let issued = Self::hand_grant(config, caps, &handle, row.token_session.as_deref())?;
         let mut patch = RemoteExecutionPatch {
             status: Some(status::ATTACHED.into()),
             token_session: issued.as_ref().map(|t| t.session_id.clone()),
@@ -1076,15 +1272,22 @@ impl Executor {
         if let Some(cents) = config.budget_cents
             && row.budget_cents != Some(cents)
         {
-            if caps.budget == Budgeting::Vendor
-                && let Err(err) = block_on(config.adapter.set_budget(&handle, cents))
-            {
-                eprintln!(
-                    "anyagents-remote: {}: the spend cap was not changed: {err}",
-                    agent.id
-                );
-            } else {
-                patch.budget_cents = Some(cents);
+            let applied = match session_allowance(cents, row) {
+                Ok(allowance) if caps.budget == Budgeting::Vendor => {
+                    block_on(config.adapter.set_budget(&handle, allowance))
+                        .map_err(|err| err.to_string())
+                }
+                Ok(_) => Ok(()),
+                Err(why) => Err(why),
+            };
+            match applied {
+                Ok(()) => patch.budget_cents = Some(cents),
+                Err(why) => {
+                    eprintln!(
+                        "anyagents-remote: {}: the spend cap was not changed: {why}",
+                        agent.id
+                    );
+                }
             }
         }
         // A new start is a new "process" for the supervisor: what it served
@@ -1104,10 +1307,10 @@ impl Executor {
         };
         store
             .update_remote_execution(&agent.id, &patch)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| AdapterError::Other(e.to_string()))?;
         let mut state = State::from_row(row, base, started);
         if let Some(cents) = patch.budget_cents {
-            state.budget_cents = Some(cents);
+            state.cap_cents = Some(cents);
         }
         if let Some(issued) = &issued {
             state.token_session = Some(issued.session_id.clone());
@@ -1116,7 +1319,7 @@ impl Executor {
         if !takeover {
             state.note = None;
         }
-        Ok(Some(Self::start(config, caps.clone(), handle, state)))
+        Ok(Self::start(config, caps.clone(), handle, state))
     }
 
     /// The token a reconnecting session calls back with, handed over.
@@ -1159,10 +1362,45 @@ impl Executor {
     ) -> Result<Self, String> {
         let store = &config.store;
         let agent = &config.agent;
-        let previous_state = previous
-            .filter(|row| row.adapter == caps.adapter)
-            .map(|row| row.adapter_state.clone())
-            .unwrap_or_else(|| json!({}));
+        let now = now_ms();
+        // A session the vendor keeps ending is not replaced at the
+        // supervisor's pace.
+        if let Some(row) = previous
+            && row.terminations > 0
+            && let Some(ended) = row.ended_at_ms
+        {
+            let wait = TERMINATION_BACKOFF_MS
+                .saturating_mul(1 << (row.terminations - 1).clamp(0, 16))
+                .min(TERMINATION_BACKOFF_MAX_MS);
+            if now < ended.saturating_add(wait) {
+                return Err(format!(
+                    "remote agent `{}`: its last {} session(s) ended at the vendor; the next starts \
+                     no sooner than {} s from now",
+                    agent.name,
+                    row.terminations,
+                    (ended + wait - now) / 1000
+                ));
+            }
+        }
+        // The cap is the agent's: a new session gets what is left of it.
+        let spent = previous.map_or(0, RemoteExecution::spent_micros);
+        let allowance_cents = match config.budget_cents {
+            Some(cap) => {
+                let left = cap.saturating_mul(MICROS_PER_CENT) - spent;
+                if left < MICROS_PER_CENT {
+                    return Err(format!(
+                        "remote agent `{}` reached its spend cap: {} of {} spent; raise it with \
+                         `anyagents agents budget {} <usd>`",
+                        agent.name,
+                        dollars(spent),
+                        dollars(cap.saturating_mul(MICROS_PER_CENT)),
+                        agent.name
+                    ));
+                }
+                Some(left / MICROS_PER_CENT)
+            }
+            None => None,
+        };
         let row = store
             .begin_remote_execution(
                 &agent.id,
@@ -1205,9 +1443,25 @@ impl Executor {
                 .as_ref()
                 .map(|tools| tools.tools())
                 .unwrap_or_default(),
-            budget_cents: config.budget_cents,
+            budget_cents: allowance_cents,
         };
-        let handle = match block_on(config.adapter.create(&spec, &previous_state)) {
+        // Each vendor-side object reaches the record as soon as it exists.
+        let checkpoint_store = Arc::clone(store);
+        let checkpoint_agent = agent.id.clone();
+        let checkpoint = move |state: &Value| {
+            let _ = checkpoint_store.update_remote_execution(
+                &checkpoint_agent,
+                &RemoteExecutionPatch {
+                    adapter_state: Some(state.clone()),
+                    ..RemoteExecutionPatch::default()
+                },
+            );
+        };
+        let handle = match block_on(
+            config
+                .adapter
+                .create(&spec, &row.adapter_state, &checkpoint),
+        ) {
             Ok(handle) => handle,
             Err(err) => {
                 if let Some(issued) = &issued {
@@ -1228,7 +1482,6 @@ impl Executor {
                 return Err(why);
             }
         };
-        let now = now_ms();
         let patch = RemoteExecutionPatch {
             status: Some(status::ATTACHED.into()),
             vendor_session: Some(handle.session.clone()),
@@ -1276,6 +1529,7 @@ impl Executor {
             changed: Condvar::new(),
             closed: AtomicBool::new(false),
             activity: Mutex::new(None),
+            wake_at: AtomicI64::new(0),
         });
         let task = runtime().spawn(Arc::clone(&shared).run());
         shared.wait_synced(SYNC_WAIT);
@@ -1320,19 +1574,27 @@ impl Executor {
         });
     }
 
-    /// Change the session's spend cap. A cap above what it has cost releases
+    /// Change the agent's spend cap. A cap above what it has spent releases
     /// the mail held at the old one.
     pub fn set_budget(&self, cents: i64) -> Result<(), String> {
-        if cents <= 0 {
-            return Err("a spend cap must be positive".into());
-        }
+        let row = self
+            .shared
+            .store
+            .remote_execution(&self.shared.agent_id)
+            .map_err(|err| err.to_string())?
+            .ok_or_else(|| "the agent has no remote session".to_string())?;
+        let allowance = session_allowance(cents, &row)?;
         if self.shared.caps.budget == Budgeting::Vendor {
-            block_on(self.shared.adapter.set_budget(&self.shared.handle, cents))
-                .map_err(|err| err.to_string())?;
+            block_on(
+                self.shared
+                    .adapter
+                    .set_budget(&self.shared.handle, allowance),
+            )
+            .map_err(|err| err.to_string())?;
         }
         {
             let mut state = self.shared.state();
-            state.budget_cents = Some(cents);
+            state.cap_cents = Some(cents);
             if !state.over_cap() {
                 state.hold = None;
                 if state.vendor_status == "budget_reached" {
@@ -1361,6 +1623,42 @@ impl Executor {
             task.abort();
         }
         self.shared.changed.notify_all();
+    }
+
+    /// What the session's record already says about a message: proven, in
+    /// flight, or held by the session from an earlier process.
+    fn known(&self, id: &str) -> Option<DeliverOutcome> {
+        let mut state = self.shared.state();
+        if let Some(proof) = state.proof(id) {
+            return Some(match proof {
+                Proof::Taken { turn_finished } => DeliverOutcome::Accepted { turn_finished },
+                Proof::Duplicate => DeliverOutcome::Duplicate,
+            });
+        }
+        if state.inflight.contains(id) {
+            return Some(DeliverOutcome::InFlight);
+        }
+        if state.queued.contains(id) {
+            state.uncertain.remove(id);
+            state.inflight.insert(id.to_string());
+            return Some(DeliverOutcome::InFlight);
+        }
+        None
+    }
+
+    /// Put off mail the vendor did not take: exponential backoff with
+    /// jitter, never sooner than the vendor asked, and a wake when it is due.
+    fn put_off(&self, retry_after_ms: Option<u64>, why: String) -> DeliverOutcome {
+        let at = {
+            let mut state = self.shared.state();
+            state.retry_attempt = state.retry_attempt.saturating_add(1);
+            let wait = crate::pacing::backoff_ms(state.retry_attempt, retry_after_ms);
+            state.retry_at_ms = now_ms().saturating_add(i64::try_from(wait).unwrap_or(i64::MAX));
+            state.last_error = Some(why);
+            state.retry_at_ms
+        };
+        self.shared.wake_at(at);
+        DeliverOutcome::Deferred
     }
 }
 
@@ -1392,6 +1690,7 @@ impl Drop for Executor {
             &self.shared.agent_id,
             Some(&self.shared.handle),
             settled,
+            !alive,
         );
     }
 }
@@ -1410,110 +1709,119 @@ fn file_safe(text: &str) -> String {
 
 impl Harness for Executor {
     fn deliver(&mut self, message: &OutboundMessage) -> Result<DeliverOutcome, HarnessError> {
-        let shared = &self.shared;
+        let shared = Arc::clone(&self.shared);
         let id = message.id.as_str();
+        let next_step = shared.caps.delivery.level == DeliveryLevel::NextStep;
+        if let Some(outcome) = self.known(id) {
+            return Ok(outcome);
+        }
         let settle_lost = {
             let state = shared.state();
-            if let Some(proof) = state.proof(id) {
-                return Ok(match proof {
-                    Proof::Taken { turn_finished } => DeliverOutcome::Accepted { turn_finished },
-                    Proof::Duplicate => DeliverOutcome::Duplicate,
-                });
-            }
-            if state.inflight.contains(id) {
-                return Ok(DeliverOutcome::InFlight);
-            }
             if !state.alive {
                 return Err(HarnessError::Dead);
             }
             if let Some((_, until)) = state.hold {
                 return Ok(DeliverOutcome::Quota { reset_at_ms: until });
             }
+            // Mail the vendor did not take waits out its backoff; a wake is
+            // already set for when it is due.
+            if now_ms() < state.retry_at_ms {
+                return Ok(DeliverOutcome::Deferred);
+            }
             state.uncertain.contains(id)
         };
         if !shared.wait_synced(DELIVER_SYNC_WAIT) {
+            // The replay that follows the reconnect wakes the agent.
             return Ok(DeliverOutcome::Deferred);
         }
-        let next_step = shared.caps.delivery.level == anyagents_harness::DeliveryLevel::NextStep;
-        if settle_lost {
-            match block_on(shared.adapter.holds(&shared.handle, id)) {
-                Ok(true) => {
-                    let mut state = shared.state();
-                    state.uncertain.remove(id);
-                    return Ok(if next_step {
-                        state.inflight.insert(id.to_string());
-                        DeliverOutcome::InFlight
-                    } else {
-                        state.admitted.insert(id.to_string());
-                        DeliverOutcome::Accepted {
-                            turn_finished: false,
-                        }
-                    });
-                }
-                Ok(false) => {
-                    shared.state().uncertain.remove(id);
-                }
-                Err(err) => {
-                    shared.state().last_error = Some(err.to_string());
-                    return Ok(DeliverOutcome::Deferred);
-                }
-            }
+        // The replay may have just shown the session holds it.
+        if let Some(outcome) = self.known(id) {
+            return Ok(outcome);
         }
-        let text = compose_message(id, &message.context, &message.text);
-        let answer = block_on(shared.adapter.deliver(&shared.handle, id, &text));
-        let outcome = {
+        let taken = |shared: &Shared| {
             let mut state = shared.state();
-            match answer {
-                Ok(Admission::Accepted { .. }) => {
-                    state.admitted.insert(id.to_string());
-                    state.pending = true;
-                    Ok(DeliverOutcome::Accepted {
-                        turn_finished: false,
-                    })
-                }
-                Ok(Admission::InFlight) => {
-                    state.inflight.insert(id.to_string());
-                    state.pending = true;
-                    Ok(DeliverOutcome::InFlight)
-                }
-                Ok(Admission::Duplicate) => {
-                    let state = &mut *state;
-                    State::remember(&mut state.resume.held, &mut state.held, id);
-                    Ok(DeliverOutcome::Duplicate)
-                }
-                Ok(Admission::Refused {
-                    reason,
-                    message_specific,
-                }) => Ok(DeliverOutcome::Rejected {
-                    reason,
-                    message_specific,
-                }),
-                Ok(Admission::Wait(reason)) => {
-                    state.last_error = Some(reason);
-                    Ok(DeliverOutcome::Deferred)
-                }
-                Ok(Admission::Unknown(reason)) => {
-                    state.uncertain.insert(id.to_string());
-                    state.last_error = Some(reason);
-                    Ok(DeliverOutcome::Deferred)
-                }
-                Err(AdapterError::Auth(why)) => {
-                    state.auth_fault = Some(why.clone());
-                    Err(HarnessError::Failed(why))
-                }
-                Err(AdapterError::Gone(why)) => {
-                    state.alive = false;
-                    state.terminated = Some(why);
-                    Err(HarnessError::Dead)
-                }
-                Err(err) => {
-                    state.last_error = Some(err.to_string());
-                    Ok(DeliverOutcome::Deferred)
+            state.retry_attempt = 0;
+            state.retry_at_ms = 0;
+            state.pending = true;
+            if next_step {
+                state.inflight.insert(id.to_string());
+                DeliverOutcome::InFlight
+            } else {
+                state.admitted.insert(id.to_string());
+                DeliverOutcome::Accepted {
+                    turn_finished: false,
                 }
             }
         };
-        shared.notify();
-        outcome
+        if settle_lost {
+            let cursor = shared.state().resume.cursor.clone();
+            match block_on(shared.adapter.holds(&shared.handle, id, cursor.as_deref())) {
+                Ok(true) => {
+                    shared.state().uncertain.remove(id);
+                    return Ok(taken(&shared));
+                }
+                Ok(false) => {
+                    shared.state().uncertain.remove(id);
+                    // Before the cursor, the executor's own record answers.
+                    if let Some(outcome) = self.known(id) {
+                        return Ok(outcome);
+                    }
+                }
+                Err(err) => return Ok(self.put_off(None, err.to_string())),
+            }
+        }
+        let text = compose_message(id, &message.context, &message.text);
+        match block_on(shared.adapter.deliver(&shared.handle, id, &text)) {
+            Ok(Admission::Accepted { .. }) => {
+                let mut state = shared.state();
+                state.retry_attempt = 0;
+                state.retry_at_ms = 0;
+                state.pending = true;
+                state.admitted.insert(id.to_string());
+                Ok(DeliverOutcome::Accepted {
+                    turn_finished: false,
+                })
+            }
+            Ok(Admission::InFlight) => {
+                let mut state = shared.state();
+                state.retry_attempt = 0;
+                state.retry_at_ms = 0;
+                state.pending = true;
+                state.inflight.insert(id.to_string());
+                Ok(DeliverOutcome::InFlight)
+            }
+            Ok(Admission::Duplicate) => {
+                let mut state = shared.state();
+                state.mark_consumed(id);
+                Ok(DeliverOutcome::Duplicate)
+            }
+            Ok(Admission::Refused {
+                reason,
+                message_specific,
+            }) => Ok(DeliverOutcome::Rejected {
+                reason,
+                message_specific,
+            }),
+            Ok(Admission::Wait {
+                reason,
+                retry_after_ms,
+            }) => Ok(self.put_off(retry_after_ms, reason)),
+            Ok(Admission::Unknown(reason)) => {
+                shared.state().uncertain.insert(id.to_string());
+                Ok(self.put_off(None, reason))
+            }
+            Err(AdapterError::Auth(why)) => {
+                shared.state().auth_fault = Some(why.clone());
+                Err(HarnessError::Failed(why))
+            }
+            Err(AdapterError::Gone(why)) => {
+                let mut state = shared.state();
+                state.alive = false;
+                state.terminated = Some(why);
+                Err(HarnessError::Dead)
+            }
+            Err(err) => Ok(self.put_off(None, err.to_string())),
+        }
     }
 
     fn proven(&self, message_id: &str) -> Option<Proof> {
@@ -1539,6 +1847,7 @@ impl Harness for Executor {
                 "this remote session cannot be interrupted".into(),
             ));
         }
+        self.shared.state().interrupted = true;
         block_on(self.shared.adapter.interrupt(&self.shared.handle))
             .map_err(|err| HarnessError::Failed(err.to_string()))
     }
@@ -1592,11 +1901,9 @@ impl Harness for Executor {
             .and_then(|row| row.budget_cents);
         let mut state = shared.state();
         if recorded_cap.is_some() {
-            state.budget_cents = recorded_cap;
+            state.cap_cents = recorded_cap;
         }
-        if let Some(cost) = snapshot.as_ref().and_then(|s| s.cost_micros) {
-            state.cost_seen = Some(state.cost_seen.unwrap_or(0).max(cost));
-        }
+        state.absorb_cost(snapshot.as_ref().and_then(|s| s.cost_micros));
         let released = match kind {
             HoldKind::Vendor => snapshot.as_ref().is_some_and(|snapshot| {
                 snapshot.status == VendorStatus::Running
@@ -1645,6 +1952,14 @@ mod tests {
         }
     }
 
+    fn input(id: &str, consumed: bool) -> EventKind {
+        EventKind::Input {
+            request_id: Some(id.into()),
+            text: String::new(),
+            consumed,
+        }
+    }
+
     fn fresh() -> State {
         let row = RemoteExecution {
             agent_id: AgentId::generate(),
@@ -1663,6 +1978,9 @@ mod tests {
             base: RemoteTotals::default(),
             resume: RemoteResume::default(),
             process_started_at_ms: None,
+            spent_before_micros: 0,
+            terminations: 0,
+            ended_at_ms: None,
             note: None,
             last_error: None,
             created_at_ms: 0,
@@ -1671,14 +1989,12 @@ mod tests {
         State::from_row(&row, RemoteTotals::default(), 0)
     }
 
-    /// Apply events as the connection does: a turn end is finished with
-    /// the vendor's cost of it (none here).
+    /// Apply events as the connection does.
     fn feed(state: &mut State, events: &[Event], budgeting: Budgeting) -> Vec<&'static str> {
         let mut done = Vec::new();
         for e in events {
             for effect in state.apply(e, budgeting, 0) {
                 match effect {
-                    Effect::EndTurn(stop) => state.end_turn(&stop, None, 0),
                     Effect::Interrupt => done.push("interrupt"),
                     Effect::Snapshot => done.push("snapshot"),
                     Effect::HostCall { .. } => done.push("host_call"),
@@ -1689,7 +2005,7 @@ mod tests {
     }
 
     #[test]
-    fn turns_usage_cursor_and_held_ids_follow_the_events() {
+    fn a_turn_closes_with_the_event_that_ends_it_and_its_cost_follows() {
         let mut state = fresh();
         let usage = TurnUsage {
             input_tokens: 7,
@@ -1699,35 +2015,37 @@ mod tests {
         feed(
             &mut state,
             &[
-                event(
-                    "e1",
-                    EventKind::Input {
-                        request_id: Some("msg_a".into()),
-                        text: String::new(),
-                        consumed: false,
-                    },
-                ),
+                event("e1", input("msg_a", false)),
                 event("e2", EventKind::TurnStarted),
-                event("e3", EventKind::Usage(usage.clone())),
-                event("e4", EventKind::CostTotal { micros: 50_000 }),
+                event("e3", input("msg_a", true)),
+                event("e4", EventKind::Usage(usage.clone())),
             ],
             Budgeting::Vendor,
         );
         // Nothing is reported while the turn runs.
         assert_eq!(state.totals, RemoteTotals::default());
-        assert_eq!(state.cost_micros(), Some(50_000));
-        feed(
+        let done = feed(
             &mut state,
-            &[event("", EventKind::TurnEnded(Stop::EndTurn))],
+            &[event("e5", EventKind::TurnEnded(Stop::EndTurn))],
             Budgeting::Vendor,
+        );
+        assert_eq!(
+            done,
+            vec!["snapshot"],
+            "the cost is read after the turn closed"
         );
         assert_eq!(state.totals.turns, 1);
         assert_eq!(state.totals.usage.input_tokens, 7);
+        assert_eq!(state.resume.cursor.as_deref(), Some("e5"));
+        let patch = state.progress();
+        assert_eq!(patch.totals.unwrap().turns, 1, "closed in the same write");
+        assert_eq!(patch.terminations, Some(0));
+        // The vendor's price of the closed turn is reported on its own.
+        state.absorb_cost(Some(50_000));
         assert_eq!(state.totals.usage.reported_cost_micros, Some(50_000));
-        assert_eq!(state.open, TurnUsage::default());
-        assert_eq!(state.resume.cursor.as_deref(), Some("e4"));
+        // Consumed by an earlier process: a duplicate; by this one: taken.
         assert_eq!(state.proof("msg_a"), Some(Proof::Duplicate));
-        state.admitted.insert("msg_a".into());
+        state.inflight.insert("msg_a".into());
         assert_eq!(
             state.proof("msg_a"),
             Some(Proof::Taken {
@@ -1737,15 +2055,44 @@ mod tests {
         // An idle without a turn before it is no turn.
         feed(
             &mut state,
-            &[event("e5", EventKind::TurnEnded(Stop::EndTurn))],
+            &[event("e6", EventKind::TurnEnded(Stop::EndTurn))],
             Budgeting::Vendor,
         );
         assert_eq!(state.totals.turns, 1);
     }
 
     #[test]
-    fn a_kernel_cap_interrupts_the_running_turn_and_a_vendor_pause_holds_until_it_resumes() {
+    fn mail_an_interrupted_turn_never_consumed_is_offered_again() {
         let mut state = fresh();
+        state.inflight.insert("msg_1".into());
+        state.inflight.insert("msg_2".into());
+        feed(
+            &mut state,
+            &[
+                event("1", input("msg_1", false)),
+                event("2", EventKind::TurnStarted),
+                event("3", input("msg_1", true)),
+                event("4", input("msg_2", false)),
+            ],
+            Budgeting::Vendor,
+        );
+        assert_eq!(state.proof("msg_2"), None, "queued is not consumed");
+        state.interrupted = true;
+        feed(
+            &mut state,
+            &[event("5", EventKind::TurnEnded(Stop::EndTurn))],
+            Budgeting::Vendor,
+        );
+        assert!(state.proof("msg_1").is_some());
+        assert!(!state.inflight.contains("msg_2") && !state.queued.contains("msg_2"));
+        assert!(state.resume.queued.is_empty());
+        assert_eq!(state.proof("msg_2"), None);
+    }
+
+    #[test]
+    fn a_kernel_cap_counts_what_earlier_sessions_spent() {
+        let mut state = fresh();
+        state.spent_before_micros = 600_000; // 60 of the 100 cents
         let done = feed(
             &mut state,
             &[
@@ -1753,7 +2100,7 @@ mod tests {
                 event(
                     "2",
                     EventKind::Usage(TurnUsage {
-                        reported_cost_micros: Some(1_000_000),
+                        reported_cost_micros: Some(400_000),
                         ..TurnUsage::default()
                     }),
                 ),
@@ -1762,6 +2109,7 @@ mod tests {
         );
         assert_eq!(done, vec!["interrupt"]);
         assert!(matches!(state.hold, Some((HoldKind::Kernel, _))));
+        assert!(state.interrupted);
 
         let mut state = fresh();
         feed(

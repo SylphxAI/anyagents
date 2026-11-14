@@ -370,6 +370,7 @@ async fn serve(
                     if let Err(error) = crate::remote::rotate_due(&store) {
                         eprintln!("anyagents-remote: session rotation deferred: {error}");
                     }
+                    crate::remote_exec::sweep(&store);
                     record_live_quota_resets(&store, &root, &health);
                     crate::create::sync_fresher_bound_agent_credentials_in(&store, &root);
                     #[cfg(unix)]
@@ -5216,6 +5217,7 @@ async fn delete_agent_route(
         };
         crate::worktree_access::revoke_recorded(state.store.data_dir(), &found.id)
             .map_err(ApiError::from_store)?;
+        crate::remote_exec::end_before_delete(&state.store, &found.id);
         let deleted = state
             .store
             .delete_agent(&found.id)

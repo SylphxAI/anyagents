@@ -82,6 +82,9 @@ struct RemoteTable {
     /// A Claude Managed Agents environment every session runs in, instead
     /// of one created per agent.
     anthropic_environment_id: Option<String>,
+    /// The Anthropic API origin, when a proxy (or a test double) is in front
+    /// of it.
+    anthropic_base_url: Option<String>,
 }
 
 /// `[server]`. Unknown keys are refused so a misspelt key fails loudly
@@ -105,6 +108,7 @@ pub struct Settings {
     /// `[remote] budget_usd`, in US cents.
     pub remote_budget_cents: Option<i64>,
     pub anthropic_environment_id: Option<String>,
+    pub anthropic_base_url: Option<String>,
 }
 
 impl Default for Settings {
@@ -115,6 +119,7 @@ impl Default for Settings {
             remote_session_ttl: DEFAULT_TTL,
             remote_budget_cents: None,
             anthropic_environment_id: None,
+            anthropic_base_url: None,
         }
     }
 }
@@ -199,6 +204,11 @@ impl Settings {
                 .anthropic_environment_id
                 .map(|id| id.trim().to_string())
                 .filter(|id| !id.is_empty()),
+            anthropic_base_url: file
+                .remote
+                .anthropic_base_url
+                .map(|url| url.trim().trim_end_matches('/').to_string())
+                .filter(|url| !url.is_empty()),
         })
     }
 

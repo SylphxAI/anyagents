@@ -46,6 +46,9 @@ pub struct RemoteResume {
     pub held: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub answered: Vec<String>,
+    /// Mailbox ids the session holds and has not consumed yet.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub queued: Vec<String>,
 }
 
 /// One agent's remote execution.
@@ -67,7 +70,7 @@ pub struct RemoteExecution {
     pub vendor_status: Option<String>,
     /// The remote session token session (`rs_…`) whose tokens the vendor holds.
     pub token_session: Option<String>,
-    /// The spend cap the vendor enforces, in US cents.
+    /// The agent's spend cap, in US cents, across all its sessions.
     pub budget_cents: Option<i64>,
     /// What the session has cost so far, at list price, in US cents.
     pub cost_cents: Option<i64>,
@@ -81,6 +84,11 @@ pub struct RemoteExecution {
     /// Where the next attach resumes, and what the session already holds.
     pub resume: RemoteResume,
     pub process_started_at_ms: Option<i64>,
+    /// What the agent's earlier sessions cost, in millionths of a dollar.
+    pub spent_before_micros: i64,
+    /// Sessions the vendor ended in a row, and when the last one ended.
+    pub terminations: i64,
+    pub ended_at_ms: Option<i64>,
     /// What the last kernel kept with the session for the next one.
     pub note: Option<String>,
     pub last_error: Option<String>,
@@ -89,6 +97,21 @@ pub struct RemoteExecution {
 }
 
 impl RemoteExecution {
+    /// What this session has cost so far, in millionths of a dollar.
+    pub fn session_cost_micros(&self) -> i64 {
+        self.totals
+            .usage
+            .reported_cost_micros
+            .unwrap_or(0)
+            .max(self.cost_cents.unwrap_or(0).saturating_mul(10_000))
+    }
+
+    /// What the agent has spent across all its sessions.
+    pub fn spent_micros(&self) -> i64 {
+        self.spent_before_micros
+            .saturating_add(self.session_cost_micros())
+    }
+
     /// Whether a kernel that starts must reconnect to this session.
     pub fn is_attached(&self) -> bool {
         self.status == remote_execution_status::ATTACHED && self.vendor_session.is_some()
@@ -119,6 +142,8 @@ pub struct RemoteExecutionPatch {
     pub base: Option<RemoteTotals>,
     pub resume: Option<RemoteResume>,
     pub process_started_at_ms: Option<i64>,
+    pub terminations: Option<i64>,
+    pub ended_at_ms: Option<i64>,
     pub note: Option<String>,
     /// `Some(None)` clears the error.
     pub last_error: Option<Option<String>>,
@@ -126,7 +151,8 @@ pub struct RemoteExecutionPatch {
 
 const COLUMNS: &str = "agent_id, adapter, harness, model, vendor_session, adapter_state, status, \
      vendor_status, token_session, budget_cents, cost_cents, totals, base, process_started_at_ms, \
-     note, last_error, created_at_ms, updated_at_ms, resume, open_usage";
+     note, last_error, created_at_ms, updated_at_ms, resume, open_usage, spent_before_micros, \
+     terminations, ended_at_ms";
 
 fn json_or_default<T: for<'de> Deserialize<'de> + Default>(text: &str) -> T {
     serde_json::from_str(text).unwrap_or_default()
@@ -165,6 +191,9 @@ fn from_row(row: &Row<'_>) -> rusqlite::Result<Raw> {
             updated_at_ms: row.get(17)?,
             resume: json_or_default(&row.get::<_, String>(18)?),
             open_usage: json_or_default(&row.get::<_, String>(19)?),
+            spent_before_micros: row.get(20)?,
+            terminations: row.get(21)?,
+            ended_at_ms: row.get(22)?,
         },
     ))
 }
@@ -182,8 +211,11 @@ fn to_json<T: Serialize>(value: &T) -> Result<String, Error> {
 
 impl Store {
     /// Start a new record for `agent_id`: a vendor session is about to be
-    /// created. Any earlier record of the agent is replaced, so the caller
-    /// ends the earlier vendor session first.
+    /// created. It replaces the agent's earlier record, so the caller ends
+    /// the earlier vendor session first. What the agent spent in earlier
+    /// sessions, its run of terminated sessions, and the adapter's handle on
+    /// its vendor-side definitions (agent, environment) carry over; only the
+    /// session itself is new.
     pub fn begin_remote_execution(
         &self,
         agent_id: &AgentId,
@@ -193,6 +225,20 @@ impl Store {
         budget_cents: Option<i64>,
     ) -> Result<RemoteExecution, Error> {
         let now = now_ms();
+        let earlier = self.remote_execution(agent_id)?;
+        let (spent_before, terminations, ended_at, adapter_state) = match &earlier {
+            Some(row) => (
+                row.spent_micros(),
+                row.terminations,
+                row.ended_at_ms,
+                if row.adapter == adapter {
+                    to_json(&row.adapter_state)?
+                } else {
+                    "{}".to_string()
+                },
+            ),
+            None => (0, 0, None, "{}".to_string()),
+        };
         self.write_tx(|tx| {
             agent_exists(tx, agent_id)?;
             tx.execute(
@@ -200,17 +246,21 @@ impl Store {
                     (agent_id, adapter, harness, model, vendor_session, adapter_state, status,
                      vendor_status, token_session, budget_cents, cost_cents, totals, base,
                      resume, process_started_at_ms, note, last_error, created_at_ms,
-                     updated_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, NULL, '{}', ?5, NULL, NULL, ?6, NULL, '{}', '{}',
-                         '{}', NULL, NULL, NULL, ?7, ?7)",
+                     updated_at_ms, spent_before_micros, terminations, ended_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, NULL, NULL, ?7, NULL, '{}', '{}',
+                         '{}', NULL, NULL, NULL, ?8, ?8, ?9, ?10, ?11)",
                 params![
                     agent_id.as_str(),
                     adapter,
                     harness,
                     model,
+                    adapter_state,
                     remote_execution_status::CREATING,
                     budget_cents,
-                    now
+                    now,
+                    spent_before,
+                    terminations,
+                    ended_at
                 ],
             )?;
             Ok(())
@@ -295,6 +345,12 @@ impl Store {
         if let Some(value) = patch.process_started_at_ms {
             set("process_started_at_ms", V::Integer(value));
         }
+        if let Some(value) = patch.terminations {
+            set("terminations", V::Integer(value));
+        }
+        if let Some(value) = patch.ended_at_ms {
+            set("ended_at_ms", V::Integer(value));
+        }
         if let Some(value) = &patch.note {
             set("note", text(value));
         }
@@ -361,6 +417,7 @@ mod tests {
                             cursor: Some("sevt_9".into()),
                             held: vec!["msg_1".into()],
                             answered: Vec::new(),
+                            queued: vec!["msg_2".into()],
                         }),
                         last_error: Some(Some("boom".into())),
                         ..RemoteExecutionPatch::default()
@@ -374,6 +431,7 @@ mod tests {
         assert_eq!(row.base, RemoteTotals::default());
         assert_eq!(row.resume.cursor.as_deref(), Some("sevt_9"));
         assert_eq!(row.resume.held, vec!["msg_1".to_string()]);
+        assert_eq!(row.resume.queued, vec!["msg_2".to_string()]);
         assert_eq!(row.adapter_state["vault_id"], "vlt_1");
         assert_eq!(row.last_error.as_deref(), Some("boom"));
         store
@@ -394,6 +452,23 @@ mod tests {
             None
         );
         assert_eq!(store.remote_executions().unwrap().len(), 1);
+
+        // A replacement session starts its own totals, and carries what the
+        // agent spent and the adapter's handle on its definitions.
+        let replaced = store
+            .begin_remote_execution(
+                &agent.id,
+                "claude-managed",
+                "claude-cloud",
+                Some("m"),
+                Some(2500),
+            )
+            .unwrap();
+        assert_eq!(replaced.totals, RemoteTotals::default());
+        assert_eq!(replaced.spent_before_micros, 70_000);
+        assert_eq!(replaced.spent_micros(), 70_000);
+        assert_eq!(replaced.adapter_state["vault_id"], "vlt_1");
+        assert_eq!(replaced.vendor_session, None);
 
         store.delete_agent(&agent.id).unwrap();
         assert!(store.remote_executions().unwrap().is_empty());

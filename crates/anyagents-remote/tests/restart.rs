@@ -196,3 +196,25 @@ fn a_kernel_restart_mid_turn_takes_the_session_over_without_recovery_or_duplicat
     });
     within("the second kernel stops", move || drop(second));
 }
+
+/// Review item 1, through the real supervisor: a vendor that answers every
+/// message with a 503 is asked again on a backoff, not in a loop.
+#[test]
+fn a_persistent_503_is_retried_on_a_backoff_not_in_a_loop() {
+    let vendor = Vendor::start();
+    let (_dir, store, agent) = store_with_agent("running");
+    vendor.lock().fail_before_apply = Some(503);
+    store.receive(&agent.id, Incoming::new("hello")).unwrap();
+    let supervisor = start(&store, &vendor);
+    wait_until("the first POST", || !vendor.sent("user.message").is_empty());
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    let posts = vendor.sent("user.message").len();
+    assert!(posts <= 3, "{posts} POSTs in 3 s");
+    // Once the vendor takes it again, the mail goes through.
+    vendor.lock().fail_before_apply = None;
+    wait_until("the mail is delivered", || {
+        store.next_undelivered(&agent.id).unwrap().is_none()
+    });
+    assert_eq!(vendor.stored_messages(&vendor.only_session()), 1);
+    within("the kernel stops", move || drop(supervisor));
+}

@@ -686,6 +686,7 @@ pub fn delete_cmd(data: &Path, name: &str) -> Result<(), Error> {
     let found = store.agent_by_name(name)?;
     let _lifecycle = store.lock_agent_lifecycle(&found.id)?;
     let found = store.agent(&found.id)?;
+    crate::remote_exec::end_before_delete(&store, &found.id);
     let deleted = store.delete_agent(&found.id)?;
     let agent_dir = data.join("agents").join(deleted.id.as_str());
     let _ = std::fs::remove_dir_all(&agent_dir);

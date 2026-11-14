@@ -2,25 +2,30 @@
 //! adapter, over the documented REST API; there is no Rust SDK.
 //!
 //! * The vendor agent definition (model, system prompt, tools and the
-//!   AnyAgents coordination MCP server) is created once per AnyAgents agent
-//!   and updated in place, as a new version, when its model or prompt change.
+//!   AnyAgents coordination MCP server) and its environment are created once
+//!   per AnyAgents agent, each recorded as soon as it exists, and the
+//!   definition is updated in place, as a new version, when its model or
+//!   prompt change.
 //! * Each session gets its own vault holding the remote session token as a
 //!   `static_bearer` credential for the coordination MCP URL. The token never
 //!   enters the session's container: the vendor's MCP proxy attaches it at
 //!   egress (ADR 0010 D4 tier 1). Rotation updates the credential in place.
-//! * Every session is created with a hard dollar budget; at the cap the vendor
-//!   pauses it, and raising the cap resumes it.
-//! * A running session queues `user.message` events and takes them in order,
-//!   so mail steers it mid-turn; `user.interrupt` stops the running turn.
-//! * Events stream over SSE with no replay; the executor reopens the stream
-//!   and reads `GET /v1/sessions/{id}/events` on every reconnect, deduplicating
-//!   by event id.
+//! * Every session is created with a hard dollar budget: what is left of the
+//!   agent's cap. At it the vendor pauses the session; raising it resumes.
+//! * A running session queues `user.message` events and takes them in order.
+//!   A message counts as delivered only once the session processed it (its
+//!   echo carries `processed_at`); `user.interrupt` stops the running turn.
+//! * Events stream over SSE with no replay. On every reconnect the stream is
+//!   opened first, then the history newer than the cursor is read newest
+//!   first, stopping at the cursor, and replayed oldest first; the stream
+//!   follows with what the history gave dropped by event id.
+//! * Every request of every agent on one API key goes through one
+//!   [`RequestBudget`], and a `retry-after` pauses all of them.
 
 use std::borrow::Cow;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 use std::time::Duration;
-
-use std::collections::HashSet;
 
 use anyagents_harness::{
     Delivery, DeliveryLevel, TurnUsage, message_id_in_text, names_message_size,
@@ -28,6 +33,7 @@ use anyagents_harness::{
 use futures::StreamExt;
 use serde_json::{Value, json};
 
+use crate::pacing::RequestBudget;
 use crate::{
     Adapter, AdapterError, Admission, Budgeting, Capabilities, Coordination, Event, EventKind,
     Events, Fut, Grant, Handle, Snapshot, Spec, Stop, VendorStatus,
@@ -44,21 +50,26 @@ const BETA: &str = "managed-agents-2026-04-01";
 const MCP_SERVER: &str = "anyagents";
 /// One page of session history.
 const PAGE: usize = 1000;
+/// The most history pages one lookup reads, newest first, before it gives up.
+const MAX_PAGES: usize = 50;
 /// A control call that has not answered by then is a lost answer.
 const CALL_TIMEOUT: Duration = Duration::from_secs(60);
 /// The event stream carries heartbeats; this long without a byte is a dead
 /// connection.
 const STREAM_SILENCE: Duration = Duration::from_secs(120);
+/// How long every caller of the account waits after a 429 or 529 that named
+/// no `retry-after`.
+const DEFAULT_PAUSE: Duration = Duration::from_secs(1);
 
 /// What Claude Managed Agents guarantees for mail (`docs/delivery.md`).
 pub const DELIVERY: Delivery = Delivery {
-    level: DeliveryLevel::MidTurn,
+    level: DeliveryLevel::NextStep,
     idempotent: true,
     proof: Cow::Borrowed(
-        "the session's event log admits the user.message (POST /v1/sessions/{id}/events answers \
-         with its event id); a running session queues it and takes it in order; an unknown answer \
-         is settled from the session's history, by the message's marker, before anything is \
-         written again",
+        "the session processed the user.message: its echo on the event stream or in the history \
+         carries processed_at; a running session queues it and takes it in order; a message an \
+         interrupted turn never processed is offered again; a lost answer is settled from the \
+         session's history, by the message's marker, before anything is written again",
     ),
     peer: None,
 };
@@ -70,6 +81,8 @@ pub struct ClaudeManaged {
     key: String,
     /// An environment to run every session in, instead of one per agent.
     environment: Option<String>,
+    /// The request budget of the account the key belongs to.
+    pacer: Arc<RequestBudget>,
 }
 
 impl std::fmt::Debug for ClaudeManaged {
@@ -84,7 +97,8 @@ impl std::fmt::Debug for ClaudeManaged {
 
 impl ClaudeManaged {
     /// An adapter calling `base_url` (the Anthropic API when `None`) with
-    /// `api_key`, which comes from the agent's bound API-key profile.
+    /// `api_key`, which comes from the agent's bound API-key profile. Every
+    /// adapter on the same key shares one request budget.
     pub fn new(api_key: &str, base_url: Option<&str>) -> Result<Self, String> {
         let key = api_key.trim();
         if key.is_empty() || key.contains(char::is_whitespace) {
@@ -95,12 +109,15 @@ impl ClaudeManaged {
             .read_timeout(STREAM_SILENCE)
             .build()
             .map_err(|err| err.to_string())?;
+        let base = base_url
+            .unwrap_or(DEFAULT_BASE_URL)
+            .trim_end_matches('/')
+            .to_string();
+        let account = format!("{ADAPTER}:{base}:{}", fingerprint(&json!(key)));
         Ok(Self {
             http,
-            base: base_url
-                .unwrap_or(DEFAULT_BASE_URL)
-                .trim_end_matches('/')
-                .to_string(),
+            pacer: RequestBudget::shared(&account),
+            base,
             key: key.to_string(),
             environment: None,
         })
@@ -112,6 +129,12 @@ impl ClaudeManaged {
         self
     }
 
+    /// Use `pacer` instead of the account's shared request budget.
+    pub fn with_request_budget(mut self, pacer: Arc<RequestBudget>) -> Self {
+        self.pacer = pacer;
+        self
+    }
+
     fn request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
         self.http
             .request(method, format!("{}{path}", self.base))
@@ -120,18 +143,31 @@ impl ClaudeManaged {
             .header("anthropic-beta", BETA)
     }
 
+    /// The vendor asked to slow down: every caller of the account does.
+    fn throttled(&self, status: u16, retry_after_ms: Option<u64>) {
+        if matches!(status, 429 | 529) {
+            self.pacer.pause_for(
+                retry_after_ms
+                    .map(Duration::from_millis)
+                    .unwrap_or(DEFAULT_PAUSE),
+            );
+        }
+    }
+
     async fn call(
         &self,
         method: reqwest::Method,
         path: &str,
         body: Option<Value>,
     ) -> Result<Value, Failure> {
+        self.pacer.acquire().await;
         let mut request = self.request(method, path).timeout(CALL_TIMEOUT);
         if let Some(body) = body {
             request = request.json(&body);
         }
         let response = request.send().await.map_err(Failure::transport)?;
         let status = response.status();
+        let retry_after_ms = retry_after(response.headers());
         let text = response.text().await.map_err(Failure::transport)?;
         if status.is_success() {
             if text.trim().is_empty() {
@@ -140,12 +176,15 @@ impl ClaudeManaged {
             return serde_json::from_str(&text).map_err(|err| Failure {
                 status: Some(status.as_u16()),
                 sent: true,
+                retry_after_ms: None,
                 message: format!("unreadable answer from {path}: {err}"),
             });
         }
+        self.throttled(status.as_u16(), retry_after_ms);
         Err(Failure {
             status: Some(status.as_u16()),
             sent: true,
+            retry_after_ms,
             message: format!("{path}: HTTP {}: {}", status.as_u16(), error_message(&text)),
         })
     }
@@ -212,9 +251,36 @@ impl ClaudeManaged {
         Ok((id, version, fingerprint))
     }
 
-    async fn create_session(&self, spec: &Spec, previous: &Value) -> Result<Handle, AdapterError> {
-        let environment = self.environment_for(spec, previous).await?;
-        let (agent_id, agent_version, definition) = self.agent_for(spec, previous).await?;
+    async fn create_session(
+        &self,
+        spec: &Spec,
+        previous: &Value,
+        checkpoint: &(dyn Fn(&Value) + Send + Sync),
+    ) -> Result<Handle, AdapterError> {
+        let grant = spec.grant.as_ref().ok_or_else(|| {
+            AdapterError::Other("a Managed Agents session needs the coordination MCP grant".into())
+        })?;
+        // Each vendor-side object is recorded the moment it exists, so a
+        // create that fails later is retried with it, not with a new one.
+        let mut state = match previous {
+            Value::Object(map) => Value::Object(map.clone()),
+            _ => json!({}),
+        };
+        let environment = self.environment_for(spec, &state).await?;
+        if self.environment.is_none() && state.get("environment_id").is_none() {
+            state["environment_id"] = json!(environment);
+            checkpoint(&state);
+        }
+        let (agent_id, agent_version, definition) = self.agent_for(spec, &state).await?;
+        if state.get("agent_id").and_then(Value::as_str) != Some(agent_id.as_str())
+            || state.get("agent_version").and_then(Value::as_i64) != Some(agent_version)
+            || state.get("definition").and_then(Value::as_str) != Some(definition.as_str())
+        {
+            state["agent_id"] = json!(agent_id);
+            state["agent_version"] = json!(agent_version);
+            state["definition"] = json!(definition);
+            checkpoint(&state);
+        }
         let vault = self
             .post(
                 "/v1/vaults",
@@ -222,9 +288,6 @@ impl ClaudeManaged {
             )
             .await?;
         let vault_id = required_id(&vault, "vault")?;
-        let grant = spec.grant.as_ref().ok_or_else(|| {
-            AdapterError::Other("a Managed Agents session needs the coordination MCP grant".into())
-        })?;
         let made = async {
             let credential = self
                 .post(
@@ -264,17 +327,12 @@ impl ClaudeManaged {
                 return Err(err);
             }
         };
-        Ok(Handle {
-            session,
-            state: json!({
-                "environment_id": environment,
-                "agent_id": agent_id,
-                "agent_version": agent_version,
-                "definition": definition,
-                "vault_id": vault_id,
-                "credential_id": credential_id,
-            }),
-        })
+        state["vault_id"] = json!(vault_id);
+        state["credential_id"] = json!(credential_id);
+        if self.environment.is_some() {
+            state["environment_id"] = json!(environment);
+        }
+        Ok(Handle { session, state })
     }
 
     /// The message text carries its mailbox id as its first line
@@ -285,50 +343,54 @@ impl ClaudeManaged {
         let body = json!({
             "events": [{ "type": "user.message", "content": [{ "type": "text", "text": text }] }],
         });
-        match self.call(reqwest::Method::POST, &path, Some(body)).await {
-            Ok(answer) => Ok(Admission::Accepted {
-                event_id: answer
-                    .get("data")
-                    .and_then(Value::as_array)
-                    .and_then(|events| events.first())
-                    .and_then(|event| event.get("id"))
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
+        let failure = match self.call(reqwest::Method::POST, &path, Some(body)).await {
+            Ok(_) => return Ok(Admission::InFlight),
+            Err(failure) => failure,
+        };
+        let wait = |failure: Failure| {
+            Ok(Admission::Wait {
+                reason: failure.message,
+                retry_after_ms: failure.retry_after_ms,
+            })
+        };
+        match failure.status {
+            // Never reached the vendor: not applied.
+            None if !failure.sent => wait(failure),
+            // Throttled before anything was applied.
+            Some(429) | Some(529) => wait(failure),
+            Some(413) => Ok(Admission::Refused {
+                reason: failure.message,
+                message_specific: true,
             }),
-            Err(failure) => match failure.status {
-                None if failure.sent => Ok(Admission::Unknown(failure.message)),
-                None => Ok(Admission::Wait(failure.message)),
-                Some(413) => Ok(Admission::Refused {
-                    reason: failure.message,
-                    message_specific: true,
-                }),
-                Some(400) | Some(422) => {
-                    let lower = failure.message.to_ascii_lowercase();
-                    // At the budget cap, or while a tool decision is pending,
-                    // the session takes only settle events: not now, later.
-                    if [
-                        "budget",
-                        "settle",
-                        "requires_action",
-                        "only accepts",
-                        "paused",
-                    ]
-                    .iter()
-                    .any(|word| lower.contains(word))
-                    {
-                        Ok(Admission::Wait(failure.message))
-                    } else {
-                        let message_specific = names_message_size(&failure.message);
-                        Ok(Admission::Refused {
-                            reason: failure.message,
-                            message_specific,
-                        })
-                    }
+            Some(400) | Some(422) => {
+                let lower = failure.message.to_ascii_lowercase();
+                // At the budget cap, or while a tool decision is pending,
+                // the session takes only settle events: not now, later.
+                if [
+                    "budget",
+                    "settle",
+                    "requires_action",
+                    "only accepts",
+                    "paused",
+                ]
+                .iter()
+                .any(|word| lower.contains(word))
+                {
+                    wait(failure)
+                } else {
+                    let message_specific = names_message_size(&failure.message);
+                    Ok(Admission::Refused {
+                        reason: failure.message,
+                        message_specific,
+                    })
                 }
-                Some(401) | Some(403) => Err(AdapterError::Auth(failure.message)),
-                Some(404) => Err(AdapterError::Gone(failure.message)),
-                Some(_) => Ok(Admission::Wait(failure.message)),
-            },
+            }
+            Some(401) | Some(403) => Err(AdapterError::Auth(failure.message)),
+            Some(404) | Some(410) => Err(AdapterError::Gone(failure.message)),
+            // A lost answer, a timeout, a server error after the request
+            // arrived, or a success whose body cannot be read: the vendor may
+            // hold the message. The session's history settles it.
+            _ => Ok(Admission::Unknown(failure.message)),
         }
     }
 
@@ -340,6 +402,7 @@ impl ClaudeManaged {
         std::pin::Pin<Box<dyn futures::Stream<Item = Result<Value, AdapterError>> + Send>>,
         AdapterError,
     > {
+        self.pacer.acquire().await;
         let path = format!("/v1/sessions/{}/events/stream", handle.session);
         let response = self
             .request(reqwest::Method::GET, &path)
@@ -349,10 +412,13 @@ impl ClaudeManaged {
             .map_err(|err| Failure::transport(err).into_error())?;
         let status = response.status();
         if !status.is_success() {
+            let retry_after_ms = retry_after(response.headers());
+            self.throttled(status.as_u16(), retry_after_ms);
             let text = response.text().await.unwrap_or_default();
             return Err(Failure {
                 status: Some(status.as_u16()),
                 sent: true,
+                retry_after_ms,
                 message: format!("{path}: HTTP {}: {}", status.as_u16(), error_message(&text)),
             }
             .into_error());
@@ -393,38 +459,48 @@ impl ClaudeManaged {
         Ok(Box::pin(stream))
     }
 
-    /// Attach: the stream is opened first and buffers, the history is read,
-    /// what lies after `after` is replayed, and the stream follows with every
-    /// event the history already gave dropped by id.
+    /// Attach: the stream is opened first and buffers; the history after
+    /// `after` is read newest first, stopping at the cursor, and replayed
+    /// oldest first (all of it, read oldest first, when there is no cursor);
+    /// the stream follows with every event the history already gave dropped
+    /// by id. An input's processed echo is the same event id as its queued
+    /// one, and passes once.
     async fn attach_events(
         &self,
         handle: &Handle,
         after: Option<&str>,
     ) -> Result<Events, AdapterError> {
         let live = self.open_stream(handle).await?;
-        let history = self.read_history(handle).await?;
-        let mut seen: HashSet<String> = history
-            .iter()
-            .filter_map(|event| event.get("id").and_then(Value::as_str))
-            .filter(|id| !id.is_empty())
-            .map(str::to_string)
-            .collect();
-        let start = match after {
-            None => 0,
-            Some(cursor) => match history
-                .iter()
-                .position(|event| event.get("id").and_then(Value::as_str) == Some(cursor))
-            {
-                Some(index) => index + 1,
-                // The history no longer holds the cursor: replaying it all
-                // would count it twice, so nothing before now is replayed.
-                None => history.len(),
-            },
+        let replayed = match after {
+            None => self.read_history_oldest_first(handle).await?,
+            Some(cursor) => {
+                let (mut newer, found) = self
+                    .read_history_newest_first(handle, |event| {
+                        event.get("id").and_then(Value::as_str) == Some(cursor)
+                    })
+                    .await?;
+                if found.is_some() {
+                    newer.reverse();
+                    newer
+                } else {
+                    // The history no longer holds the cursor: replaying what
+                    // was read would count it twice, so nothing before now is
+                    // replayed.
+                    Vec::new()
+                }
+            }
         };
-        let mut replay: Vec<Result<Event, AdapterError>> = history[start..]
+        // What the stream may show again: what the replay gave, with whether
+        // an input was processed when it did.
+        let mut seen: HashMap<String, bool> = replayed
             .iter()
-            .map(|value| Ok(map_event(value)))
+            .filter_map(|event| {
+                let id = event.get("id").and_then(Value::as_str)?;
+                (!id.is_empty()).then(|| (id.to_string(), processed(event)))
+            })
             .collect();
+        let mut replay: Vec<Result<Event, AdapterError>> =
+            replayed.iter().map(|value| Ok(map_event(value))).collect();
         replay.push(Ok(Event {
             cursor: String::new(),
             at_ms: None,
@@ -435,13 +511,18 @@ impl ClaudeManaged {
                 Err(err) => Some(Err(err)),
                 Ok(value) => {
                     let id = value.get("id").and_then(Value::as_str).unwrap_or("");
-                    // A queued input appears twice on the stream (queued, then
-                    // processed) under one id; the history gave the rest.
-                    if !id.is_empty() && !seen.insert(id.to_string()) {
-                        None
-                    } else {
-                        Some(Ok(map_event(&value)))
+                    let now_processed = processed(&value);
+                    let pass = id.is_empty()
+                        || match seen.get(id) {
+                            None => true,
+                            // Queued before, processed now: the proof.
+                            Some(false) => now_processed,
+                            Some(true) => false,
+                        };
+                    if pass && !id.is_empty() {
+                        seen.insert(id.to_string(), now_processed);
                     }
+                    pass.then(|| Ok(map_event(&value)))
                 }
             };
             std::future::ready(out)
@@ -449,16 +530,26 @@ impl ClaudeManaged {
         Ok(Box::pin(futures::stream::iter(replay).chain(live)))
     }
 
-    async fn read_history(&self, handle: &Handle) -> Result<Vec<Value>, AdapterError> {
+    fn history_path(handle: &Handle, order: &str, page: Option<&str>) -> String {
+        let mut path = format!(
+            "/v1/sessions/{}/events?limit={PAGE}&order={order}",
+            handle.session
+        );
+        if let Some(cursor) = page {
+            path.push_str("&page=");
+            path.push_str(&encode(cursor));
+        }
+        path
+    }
+
+    /// The whole history, oldest first.
+    async fn read_history_oldest_first(&self, handle: &Handle) -> Result<Vec<Value>, AdapterError> {
         let mut events = Vec::new();
         let mut page: Option<String> = None;
         loop {
-            let mut path = format!("/v1/sessions/{}/events?limit={PAGE}", handle.session);
-            if let Some(cursor) = &page {
-                path.push_str("&page=");
-                path.push_str(&encode(cursor));
-            }
-            let answer = self.get(&path).await?;
+            let answer = self
+                .get(&Self::history_path(handle, "asc", page.as_deref()))
+                .await?;
             if let Some(data) = answer.get("data").and_then(Value::as_array) {
                 events.extend(data.iter().cloned());
             }
@@ -469,6 +560,43 @@ impl ClaudeManaged {
                 _ => return Ok(events),
             }
         }
+    }
+
+    /// The history newest first, up to (not including) the first event
+    /// `stop` matches, and that event when one did. Reads at most
+    /// [`MAX_PAGES`] pages.
+    async fn read_history_newest_first(
+        &self,
+        handle: &Handle,
+        stop: impl Fn(&Value) -> bool,
+    ) -> Result<(Vec<Value>, Option<Value>), AdapterError> {
+        let mut events = Vec::new();
+        let mut page: Option<String> = None;
+        for _ in 0..MAX_PAGES {
+            let answer = self
+                .get(&Self::history_path(handle, "desc", page.as_deref()))
+                .await?;
+            for event in answer
+                .get("data")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if stop(event) {
+                    return Ok((events, Some(event.clone())));
+                }
+                events.push(event.clone());
+            }
+            match answer.get("next_page").and_then(Value::as_str) {
+                Some(next) if !next.is_empty() && page.as_deref() != Some(next) => {
+                    page = Some(next.to_string());
+                }
+                _ => return Ok((events, None)),
+            }
+        }
+        Err(AdapterError::Transient(format!(
+            "the session's history is longer than {MAX_PAGES} pages past the point sought"
+        )))
     }
 
     async fn read_snapshot(&self, handle: &Handle) -> Result<Snapshot, AdapterError> {
@@ -540,13 +668,26 @@ impl ClaudeManaged {
         }
     }
 
-    async fn session_holds(&self, handle: &Handle, request_id: &str) -> Result<bool, AdapterError> {
-        Ok(self.read_history(handle).await?.iter().any(|value| {
+    /// Whether an input with this marker lies after the cursor: the history
+    /// is read newest first and stops at the marker or at the cursor.
+    async fn session_holds(
+        &self,
+        handle: &Handle,
+        request_id: &str,
+        after: Option<&str>,
+    ) -> Result<bool, AdapterError> {
+        let is_marker = |event: &Value| {
             matches!(
-                map_event(value).kind,
+                map_event(event).kind,
                 EventKind::Input { request_id: Some(ref id), .. } if id == request_id
             )
-        }))
+        };
+        let is_cursor =
+            |event: &Value| after.is_some() && event.get("id").and_then(Value::as_str) == after;
+        let (_, stopped) = self
+            .read_history_newest_first(handle, |event| is_marker(event) || is_cursor(event))
+            .await?;
+        Ok(stopped.is_some_and(|event| is_marker(&event)))
     }
 
     async fn custom_tool_result(
@@ -593,8 +734,13 @@ impl Adapter for ClaudeManaged {
         }
     }
 
-    fn create<'a>(&'a self, spec: &'a Spec, previous: &'a Value) -> Fut<'a, Handle> {
-        Box::pin(self.create_session(spec, previous))
+    fn create<'a>(
+        &'a self,
+        spec: &'a Spec,
+        previous: &'a Value,
+        checkpoint: &'a (dyn Fn(&Value) + Send + Sync),
+    ) -> Fut<'a, Handle> {
+        Box::pin(self.create_session(spec, previous, checkpoint))
     }
 
     fn attach<'a>(&'a self, handle: &'a Handle, after: Option<&'a str>) -> Fut<'a, Events> {
@@ -610,8 +756,13 @@ impl Adapter for ClaudeManaged {
         Box::pin(self.send(handle, text))
     }
 
-    fn holds<'a>(&'a self, handle: &'a Handle, request_id: &'a str) -> Fut<'a, bool> {
-        Box::pin(self.session_holds(handle, request_id))
+    fn holds<'a>(
+        &'a self,
+        handle: &'a Handle,
+        request_id: &'a str,
+        after: Option<&'a str>,
+    ) -> Fut<'a, bool> {
+        Box::pin(self.session_holds(handle, request_id, after))
     }
 
     fn snapshot<'a>(&'a self, handle: &'a Handle) -> Fut<'a, Snapshot> {
@@ -787,6 +938,8 @@ fn error_message(body: &str) -> String {
 struct Failure {
     status: Option<u16>,
     sent: bool,
+    /// What the vendor's `retry-after` asked for.
+    retry_after_ms: Option<u64>,
     message: String,
 }
 
@@ -796,6 +949,7 @@ impl Failure {
             status: None,
             // A request that never connected was not applied.
             sent: !err.is_connect() && !err.is_builder(),
+            retry_after_ms: None,
             message: format!("Anthropic API: {err}"),
         }
     }
@@ -809,6 +963,23 @@ impl Failure {
             Some(_) => AdapterError::Other(self.message),
         }
     }
+}
+
+/// A `retry-after` header in seconds, as milliseconds.
+fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    let seconds: f64 = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    (seconds.is_finite() && seconds >= 0.0).then(|| (seconds * 1000.0).min(3_600_000.0) as u64)
+}
+
+/// Whether a vendor event is an input the session already processed.
+fn processed(event: &Value) -> bool {
+    event.get("processed_at").is_some_and(|at| !at.is_null())
 }
 
 fn text_of(content: Option<&Value>) -> String {

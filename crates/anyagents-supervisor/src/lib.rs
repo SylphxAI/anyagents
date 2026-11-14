@@ -2039,7 +2039,13 @@ impl<H: Harness + 'static> Session<H> {
                 .max(self.written.max(1));
             let unit = owned_share(served.difference(before), turns);
             for _ in 0..turns {
-                if unit.input_tokens == 0 && unit.output_tokens == 0 {
+                // A cost the vendor priced after the tokens were recorded (a
+                // remote session reads it once its turn ended) is recorded on
+                // its own, not dropped with the baseline moving past it.
+                if unit.input_tokens == 0
+                    && unit.output_tokens == 0
+                    && unit.reported_cost_micros.unwrap_or(0) == 0
+                {
                     break;
                 }
                 if let Err(err) = record_turn(delivery, &self.agent, &self.inner.clock, &unit) {
