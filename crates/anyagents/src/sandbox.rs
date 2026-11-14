@@ -400,35 +400,6 @@ pub fn existing_config_seat(config_dir: &Path) -> Option<(String, u32, u32, Opti
     None
 }
 
-/// Give a minted capability to its seat's group: 0640, owned by the server's
-/// user, readable by that one seat. The mode and group are read back; a file
-/// any other seat could read is a refusal.
-pub fn share_capability_with_seat(path: &Path, gid: u32) -> std::io::Result<()> {
-    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-    if let Err(err) = chown_to_seat_group(path, gid) {
-        // The server may hand the file to a group it already belongs to and to
-        // no other; anything else is a refusal, said as itself.
-        if err.raw_os_error() != Some(libc::EPERM) {
-            return Err(err);
-        }
-        return Err(std::io::Error::other(format!(
-            "the server cannot give {} to group {gid}: {err}",
-            path.display()
-        )));
-    }
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o640))?;
-    let meta = std::fs::metadata(path)?;
-    if meta.permissions().mode() & 0o777 != 0o640 || meta.gid() != gid {
-        return Err(std::io::Error::other(format!(
-            "{} is {:o} in group {}",
-            path.display(),
-            meta.permissions().mode() & 0o777,
-            meta.gid()
-        )));
-    }
-    Ok(())
-}
-
 /// Restore execute/traverse bits on `config_dir.parent()` (`<data>/agents/<id>`)
 /// if owned by the server user and blocking seat traversal (e.g. `0o700`/`0o2700`),
 /// preserving any existing setgid bit.

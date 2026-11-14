@@ -1831,11 +1831,13 @@ pub(crate) fn ensure_agy_steering_settings(
     work_dir: &Path,
     media_dir: &Path,
 ) -> Result<(), anyagents_core::Error> {
+    // The agent's seat writes its config directory: every read and write
+    // below it here goes through the agent tree, never through a link.
     let dir = config_dir.join(".gemini").join("antigravity-cli");
-    std::fs::create_dir_all(&dir)?;
     {
         let path = dir.join("settings.json");
-        let mut root = crate::mcp_config::read_candidates(std::slice::from_ref(&path))?;
+        let mut root =
+            crate::mcp_config::read_candidates_below(config_dir, std::slice::from_ref(&path))?;
         let map = root.as_object_mut().ok_or_else(|| {
             anyagents_core::Error::Message("AGY settings is not an object".into())
         })?;
@@ -1966,19 +1968,21 @@ pub(crate) fn ensure_agy_steering_settings(
         if changed {
             let body = serde_json::to_vec_pretty(&root)
                 .map_err(|err| anyagents_core::Error::Message(err.to_string()))?;
-            crate::create::write_required_file(&path, &body, 0o664)?;
+            crate::mcp_config::write_below(config_dir, &path, &body, 0o664)?;
+        } else {
+            anyagents_core::agent_tree::AgentTree::open(config_dir)?
+                .create_dir_all(Path::new(".gemini/antigravity-cli"), 0o777)?;
         }
     }
     let hook_dir = config_dir.join(".gemini").join("config");
-    std::fs::create_dir_all(&hook_dir)?;
-    let _ = std::fs::remove_file(hook_dir.join("anyagents-steer-hook.sh"));
-    let _ = std::fs::remove_file(hook_dir.join("steer.jsonl"));
+    let tree = anyagents_core::agent_tree::AgentTree::open(config_dir)?;
+    tree.create_dir_all(Path::new(".gemini/config"), 0o777)?;
+    for legacy in ["anyagents-steer-hook.sh", "steer.jsonl"] {
+        let _ = tree.remove_file(&Path::new(".gemini/config").join(legacy));
+    }
     let hooks_path = hook_dir.join("hooks.json");
-    let mut hooks_root = if hooks_path.exists() {
-        crate::mcp_config::read_candidates(std::slice::from_ref(&hooks_path))?
-    } else {
-        serde_json::json!({})
-    };
+    let mut hooks_root =
+        crate::mcp_config::read_candidates_below(config_dir, std::slice::from_ref(&hooks_path))?;
     let hooks_map = hooks_root
         .as_object_mut()
         .ok_or_else(|| anyagents_core::Error::Message("AGY hooks.json is not an object".into()))?;
@@ -2008,12 +2012,12 @@ pub(crate) fn ensure_agy_steering_settings(
     }
     if hooks_changed {
         if hooks_map.is_empty() {
-            let _ = std::fs::remove_file(&hooks_path);
+            let _ = tree.remove_file(Path::new(".gemini/config/hooks.json"));
         } else {
             let mut body = serde_json::to_vec_pretty(&hooks_root)
                 .map_err(|err| anyagents_core::Error::Message(err.to_string()))?;
             body.push(b'\n');
-            crate::create::write_required_file(&hooks_path, &body, 0o664)?;
+            crate::mcp_config::write_below(config_dir, &hooks_path, &body, 0o664)?;
         }
     }
     Ok(())

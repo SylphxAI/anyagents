@@ -110,19 +110,24 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| io::Error::other("missing parent"))?;
+    // fs-ok: atomic_write is for server-owned paths; agent trees use Dir::write_atomic
     fs::create_dir_all(parent)?;
     let temp = parent.join(format!(".memory-{}.tmp", uuid::Uuid::now_v7()));
     let result = (|| {
+        // fs-ok: atomic_write is for server-owned paths
         let mut out = fs::OpenOptions::new()
             .create_new(true)
             .write(true)
             .open(&temp)?;
         out.write_all(bytes)?;
         out.sync_all()?;
+        // fs-ok: atomic_write is for server-owned paths
         fs::rename(&temp, path)?;
+        // fs-ok: atomic_write is for server-owned paths
         fs::File::open(parent)?.sync_all()
     })();
     if result.is_err() {
+        // fs-ok: atomic_write is for server-owned paths
         let _ = fs::remove_file(temp);
     }
     result
@@ -211,6 +216,7 @@ pub fn pin_session_from_source(
 /// `ANYAGENTS_MEMORY_SOURCE`) and is opened as named.
 fn open_below(root: &Dir, relative: &Path) -> io::Result<fs::File> {
     if relative.is_absolute() {
+        // fs-ok: an absolute source is the operator's own configuration
         return fs::File::open(relative);
     }
     let name = relative.file_name().ok_or_else(|| {
@@ -519,6 +525,7 @@ fn list_topics_in(mem_dir: &Dir) -> io::Result<Vec<MemoryTopicEntry>> {
 /// `<agent_root>/memory`, created 0700 when absent and never through a
 /// link; an existing one open to others is narrowed.
 fn ensure_private_memory_dir(agent_root: &Path) -> io::Result<Dir> {
+    // fs-ok: the agent root itself, which the server made and chose
     fs::create_dir_all(agent_root)?;
     let mem_dir = Dir::open(agent_root)?.create_dir(OsStr::new("memory"), 0o700)?;
     #[cfg(unix)]
@@ -1026,6 +1033,7 @@ pub fn parse_sleep_consolidation_plan(
 fn read_sylphx_key_candidate(base: &Path, no_follow: bool) -> Option<(String, bool)> {
     let read = |rel: &str| -> io::Result<String> {
         if !no_follow {
+            // fs-ok: the server's own profile and home directories
             return fs::read_to_string(base.join(rel));
         }
         let rel = Path::new(rel);
@@ -1244,6 +1252,7 @@ fn post_json_curl(
     impl Drop for TempHeaderGuard {
         fn drop(&mut self) {
             if let Some(p) = self.0.take() {
+                // fs-ok: the request header file in the server's temporary directory
                 let _ = fs::remove_file(p);
             }
         }
@@ -1265,6 +1274,7 @@ fn post_json_curl(
             std::process::id(),
             uuid::Uuid::now_v7()
         ));
+        // fs-ok: the request header file in the server's temporary directory
         let mut opts = fs::OpenOptions::new();
         opts.write(true).create_new(true);
         #[cfg(unix)]

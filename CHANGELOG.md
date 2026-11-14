@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+- Security: server code reaches the trees an agent's seat can write
+  (`agents/<id>/{config,memory,skills,sessions,work}`) only through
+  `anyagents_core::agent_tree::AgentTree`, which opens every component below
+  the agent root with `O_NOFOLLOW`, reads with a size limit and writes by an
+  `O_EXCL` temporary renamed into place (ADR 0010 D3). Moved onto it: the
+  capability write (a link at `mcp-capability.new` could truncate `state.db`),
+  the instructions route's `SYSTEM_PROMPT.md`, the host session registry, lock
+  and reset rename (a forged registry plus a linked `retired-<gen>` could move
+  seat files anywhere), the Codex/Claude/AGY/OpenCode/Muse config read-merges
+  and the sylphx key copied into `config.toml`, config home links, and the HTTP
+  skills read. `crates/anyagents/tests/agent_tree_fs.rs` fails CI on a raw path
+  call in an agent-tree module and on any new raw path call naming an agent
+  tree elsewhere; `agent_tree_fs.counts` records what remains and only drops.
 - Security: the server no longer follows a link a seat planted in an agent's
   `memory/` (ADR 0010 D3). Memory topic upsert, read-back, delete, listing,
   index rebuild, sleep state, session pins, the sleep consolidation prompt and

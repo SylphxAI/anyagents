@@ -5,6 +5,7 @@
 //! The accepted and processed cursors move only over a contiguous prefix.
 
 mod address;
+pub mod agent_tree;
 pub mod beneath;
 pub mod boundary;
 mod error;

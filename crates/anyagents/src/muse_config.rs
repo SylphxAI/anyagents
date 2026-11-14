@@ -69,11 +69,14 @@ pub fn write(
     args: &[String],
 ) -> Result<(), Error> {
     let path = dir.join("settings.json");
-    let mut root = crate::mcp_config::read_candidates(&[
-        path.clone(),
-        dir.join("muse/settings.json"),
-        dir.join(".config/muse/settings.json"),
-    ])?;
+    let mut root = crate::mcp_config::read_candidates_below(
+        dir,
+        &[
+            path.clone(),
+            dir.join("muse/settings.json"),
+            dir.join(".config/muse/settings.json"),
+        ],
+    )?;
     if !root.is_object() {
         return Err(Error::Message("settings.json is not an object".into()));
     }

@@ -1,0 +1,15 @@
+# Raw path calls on agent trees, per file, that predate AgentTree
+# (see agent_tree_fs.rs). Only ever lower these numbers: route the calls
+# through anyagents_core::agent_tree::AgentTree.
+crates/anyagents-core/src/host_skills.rs 6
+crates/anyagents-core/src/store.rs 1
+crates/anyagents/src/cloud_harness.rs 1
+crates/anyagents/src/create.rs 7
+crates/anyagents/src/main.rs 1
+crates/anyagents/src/mcp.rs 1
+crates/anyagents/src/muse_config.rs 2
+crates/anyagents/src/server.rs 4
+crates/anyagents/src/signin.rs 1
+crates/anyagents/src/spiron.rs 6
+crates/anyagents/src/vendor.rs 7
+crates/anyagents/src/worktree_access.rs 3

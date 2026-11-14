@@ -1391,32 +1391,20 @@ pub(crate) fn ensure_seat_environment(target_config: &Path, workdir: &Path) -> R
                 Error::Message("configured shared home paths require an available host home".into())
             })?;
             let src = home.join(rel);
-            let dst = target_config.join(rel);
-            if !dst.exists() {
-                if let Some(parent) = dst.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                std::os::unix::fs::symlink(&src, &dst)?;
-            }
+            link_in_config(target_config, rel, &src)?;
         }
         for (rel, key) in [
             (".rustup", "ANYAGENTS_RUSTUP_HOME"),
             (".cargo", "ANYAGENTS_CARGO_HOME"),
         ] {
-            if let Some(src) = std::env::var_os(key)
-                && !target_config.join(rel).exists()
-            {
-                std::os::unix::fs::symlink(PathBuf::from(src), target_config.join(rel))?;
+            if let Some(src) = std::env::var_os(key) {
+                link_in_config(target_config, Path::new(rel), Path::new(&src))?;
             }
         }
         if let Some(host_home) = host_home {
             let host_local_opt = host_home.join(".local/opt");
-            let dst_local_opt = target_config.join(".local/opt");
-            if host_local_opt.exists() && !dst_local_opt.exists() {
-                if let Some(parent) = dst_local_opt.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                let _ = std::os::unix::fs::symlink(&host_local_opt, &dst_local_opt);
+            if host_local_opt.exists() {
+                let _ = link_in_config(target_config, Path::new(".local/opt"), &host_local_opt);
             }
             ensure_seat_skills(target_config, &host_home);
         }
@@ -1754,6 +1742,25 @@ pub(crate) fn ensure_seat_op_config(target_config: &Path, seat_launch: &str) {
             .stderr(std::process::Stdio::null())
             .status();
     }
+}
+
+/// A link at `rel` in the agent's config directory naming `target`, when
+/// nothing is there yet. The directories above it are made, and walked,
+/// without following a link the seat put there: a planted directory link
+/// never makes the server create a link somewhere else.
+fn link_in_config(config: &Path, rel: &Path, target: &Path) -> Result<(), Error> {
+    let tree = anyagents_core::agent_tree::AgentTree::open(config)?;
+    let (Some(parent), Some(name)) = (rel.parent(), rel.file_name()) else {
+        return Err(Error::Message(format!("{} names no link", rel.display())));
+    };
+    let dir = tree.create_dir_all(parent, 0o777)?;
+    if dir.kind(name)?.is_none() {
+        match dir.symlink(target, name) {
+            Err(err) if err.kind() != std::io::ErrorKind::AlreadyExists => return Err(err.into()),
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn chmod_seat_file_readable(path: &Path) {
@@ -10181,6 +10188,32 @@ pub(crate) fn resolve_subagent_defaults(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A directory link the seat put in its config never makes the server
+    /// create a link somewhere else.
+    #[cfg(unix)]
+    #[test]
+    fn config_links_are_made_only_below_the_config_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, config.join(".local")).unwrap();
+        assert!(link_in_config(&config, Path::new(".local/opt"), Path::new("/opt")).is_err());
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+        link_in_config(&config, Path::new(".cargo"), Path::new("/opt/cargo")).unwrap();
+        assert_eq!(
+            std::fs::read_link(config.join(".cargo")).unwrap(),
+            Path::new("/opt/cargo")
+        );
+        // An existing entry is left as it is.
+        link_in_config(&config, Path::new(".cargo"), Path::new("/elsewhere")).unwrap();
+        assert_eq!(
+            std::fs::read_link(config.join(".cargo")).unwrap(),
+            Path::new("/opt/cargo")
+        );
+    }
 
     #[test]
     fn a_model_change_on_an_unconfigured_harness_installs_nothing() {

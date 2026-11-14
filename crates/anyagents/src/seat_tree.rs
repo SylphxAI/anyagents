@@ -360,6 +360,51 @@ fn read_back(source: BorrowedFd<'_>, name: &OsStr) -> io::Result<()> {
     }
 }
 
+/// Give the opened `file` group `gid` and `mode`, through its descriptor
+/// only, then read both back. When this process may not change the group
+/// itself (its supplementary groups predate the seat's), the file's owner
+/// does it through the launcher with the same descriptor on stdin.
+pub(crate) fn share_open_file(file: &File, gid: u32, mode: libc::mode_t) -> io::Result<()> {
+    let fd = file.as_raw_fd();
+    let meta = file.metadata()?;
+    #[allow(
+        clippy::unnecessary_cast,
+        reason = "MetadataExt::mode is u32 while libc::mode_t is u16 on macOS"
+    )]
+    let settled = |meta: &std::fs::Metadata| {
+        meta.gid() == gid && (meta.mode() as libc::mode_t & 0o7777) == mode
+    };
+    if settled(&meta) {
+        return Ok(());
+    }
+    // SAFETY: fchown and fchmod on a descriptor `file` owns.
+    let direct = (meta.gid() == gid || unsafe { libc::fchown(fd, u32::MAX, gid) } == 0)
+        && unsafe { libc::fchmod(fd, mode) } == 0;
+    if !direct {
+        let error = io::Error::last_os_error();
+        let Some(launcher) = super::sandbox::descriptor_launcher() else {
+            return Err(error);
+        };
+        let mut command = seat_file_command(
+            &launcher,
+            meta.uid(),
+            meta.gid(),
+            &format!("{},{gid}", meta.gid()),
+        )?;
+        command
+            .args(["inode", &format!("{mode:o}"), &gid.to_string()])
+            .stdin(file.try_clone()?);
+        run_seat_command(&mut command, "seat-inode")?;
+    }
+    if settled(&file.metadata()?) {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "the file is not group {gid} mode {mode:o} after sharing"
+        )))
+    }
+}
+
 fn grant(file: &File, uid: u32, gid: u32, capability: bool, daemon_access: bool) -> io::Result<()> {
     let meta = file.metadata()?;
     if !meta.is_dir() && (!meta.is_file() || meta.nlink() != 1) {

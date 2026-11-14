@@ -1,13 +1,87 @@
 //! Per-agent MCP registration. Claude Code reads `.claude.json`. Codex reads
 //! `config.toml`. Both files live in the agent's own config directory.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyagents_core::Error;
+use anyagents_core::agent_tree::AgentTree;
 
-pub(crate) fn read_candidates(paths: &[std::path::PathBuf]) -> Result<serde_json::Value, Error> {
+/// The largest harness config file the server reads to merge.
+const CONFIG_LIMIT: u64 = 4 * 1024 * 1024;
+
+/// `path`, below `root`, a directory the server chose (an agent's config
+/// directory): read with no link at any component below `root`, at most
+/// [`CONFIG_LIMIT`] bytes; `None` when absent. The agent's seat writes that
+/// tree, so a link there never makes the server read a file of its own into
+/// a config the seat then reads back (ADR 0010 D3).
+pub(crate) fn read_below(root: &Path, path: &Path) -> Result<Option<Vec<u8>>, Error> {
+    let relative = path.strip_prefix(root).map_err(|_| {
+        Error::Message(format!(
+            "{} is not below {}",
+            path.display(),
+            root.display()
+        ))
+    })?;
+    AgentTree::open(root)?
+        .read_optional(relative, CONFIG_LIMIT)
+        .map_err(|err| Error::Message(format!("{}: {err}", path.display())))
+}
+
+/// Replace `path` below `root` with `bytes` at `mode`, creating the
+/// directories above it; nothing below `root` is reached through a link.
+pub(crate) fn write_below(root: &Path, path: &Path, bytes: &[u8], mode: u32) -> Result<(), Error> {
+    if bytes.is_empty() {
+        return Err(Error::Message(format!(
+            "refusing to write an empty {}",
+            path.display()
+        )));
+    }
+    let relative = path.strip_prefix(root).map_err(|_| {
+        Error::Message(format!(
+            "{} is not below {}",
+            path.display(),
+            root.display()
+        ))
+    })?;
+    // fs-ok: the config directory itself, which the server made and chose
+    std::fs::create_dir_all(root)?;
+    AgentTree::open(root)?
+        .write(relative, bytes, mode, 0o777)
+        .map_err(|err| Error::Message(format!("{}: {err}", path.display())))
+}
+
+/// The first of `paths` (each below `root`, the agent's config directory)
+/// that exists, as a JSON object; read as [`read_below`] reads.
+pub(crate) fn read_candidates_below(
+    root: &Path,
+    paths: &[PathBuf],
+) -> Result<serde_json::Value, Error> {
     let mut selected = None;
     for path in paths {
+        if let Some(bytes) = read_below(root, path)? {
+            let value: serde_json::Value = serde_json::from_slice(&bytes)
+                .map_err(|err| Error::Message(format!("{}: {err}", path.display())))?;
+            if !value.is_object() {
+                return Err(Error::Message(format!(
+                    "{} is not an object",
+                    path.display()
+                )));
+            }
+            if selected.is_none() {
+                selected = Some(value);
+            }
+        }
+    }
+    Ok(selected.unwrap_or_else(|| serde_json::json!({})))
+}
+
+/// The first of `paths` that exists, as a JSON object, for files the server
+/// owns (a provider profile, the data directory), read as named. Never for a
+/// file in an agent's tree: use [`read_candidates_below`].
+pub(crate) fn read_server_candidates(paths: &[PathBuf]) -> Result<serde_json::Value, Error> {
+    let mut selected = None;
+    for path in paths {
+        // fs-ok: read_server_candidates reads files the server owns
         match std::fs::read(path) {
             Ok(bytes) => {
                 let value: serde_json::Value = serde_json::from_slice(&bytes)
@@ -30,12 +104,26 @@ pub(crate) fn read_candidates(paths: &[std::path::PathBuf]) -> Result<serde_json
 }
 
 pub fn write_claude(path: &Path, command: &Path, args: &[String]) -> Result<(), Error> {
-    let mut root = match read_json(path) {
-        Ok(val) if val.is_object() => val,
-        Ok(_) | Err(_) if path.is_file() => serde_json::json!({}),
-        Err(err) => return Err(err),
-        Ok(_) => return Err(Error::Message("claude config is not an object".into())),
-    };
+    let config_dir = path
+        .parent()
+        .ok_or_else(|| Error::Message("claude config has no directory".into()))?;
+    write_claude_below(config_dir, path, command, args)
+}
+
+/// [`write_claude`] for `path` below `config_dir`, the agent's config
+/// directory: nothing below it is read or written through a link.
+pub fn write_claude_below(
+    config_dir: &Path,
+    path: &Path,
+    command: &Path,
+    args: &[String],
+) -> Result<(), Error> {
+    // A malformed or non-object file of the agent's own is replaced; a link
+    // (or anything but a plain file) is refused.
+    let mut root = read_below(config_dir, path)?
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}));
     let servers = root
         .as_object_mut()
         .ok_or_else(|| Error::Message("claude config is not an object".into()))?
@@ -57,23 +145,21 @@ pub fn write_claude(path: &Path, command: &Path, args: &[String]) -> Result<(), 
         }),
     );
     let bytes = serde_json::to_vec_pretty(&root).map_err(|err| Error::Message(err.to_string()))?;
-    atomic_write_shared(path, &bytes)?;
-    Ok(())
+    write_below(config_dir, path, &bytes, 0o664)
 }
 
 /// Write a clean, isolated `settings.json` for a `claude-code` agent in `config_dir`,
 /// stripping any host-leaked `apiKeyHelper`, `ANTHROPIC_BASE_URL`, legacy hooks,
 /// or `claudeMdExcludes` so the agent uses its bound `<provider>/<profile>` cleanly.
 pub fn sanitize_claude_settings(config_dir: &Path) -> Result<(), Error> {
-    let is_anthropic_oauth = std::fs::read_to_string(config_dir.join(".anyagents-profile"))
-        .ok()
+    let is_anthropic_oauth = read_text_below(config_dir, &config_dir.join(".anyagents-profile"))
         .map(|s| {
             let t = s.trim();
             t.is_empty() || t == "anthropic" || t.starts_with("anthropic/")
         })
         .unwrap_or(true);
     let settings_path = config_dir.join("settings.json");
-    let mut root = read_json(&settings_path)?;
+    let mut root = read_json(config_dir, &settings_path)?;
     if !root.is_object() {
         return Err(Error::Message("settings.json is not an object".into()));
     }
@@ -149,17 +235,20 @@ pub fn sanitize_claude_settings(config_dir: &Path) -> Result<(), Error> {
     let mut bytes =
         serde_json::to_vec_pretty(&root).map_err(|err| Error::Message(err.to_string()))?;
     bytes.push(b'\n');
-    atomic_write_shared(&settings_path, &bytes)?;
-    let nested = config_dir.join(".claude").join("settings.json");
-    if nested.exists() {
-        let _ = std::fs::remove_file(&nested);
-    }
+    write_below(config_dir, &settings_path, &bytes, 0o664)?;
+    // Only a regular file of the agent's own; a link there is left alone.
+    let _ = AgentTree::open(config_dir)
+        .and_then(|tree| tree.remove_file(Path::new(".claude/settings.json")));
     Ok(())
 }
 
-fn atomic_write_shared(path: &Path, bytes: &[u8]) -> Result<(), Error> {
-    anyagents_harness::atomic_write_nonempty_file(path, bytes, 0o664)?;
-    Ok(())
+/// A small text file below `root`, trimmed of nothing; `None` when absent,
+/// unreadable or a link.
+fn read_text_below(root: &Path, path: &Path) -> Option<String> {
+    read_below(root, path)
+        .ok()
+        .flatten()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
 }
 
 #[allow(dead_code)]
@@ -178,15 +267,13 @@ pub fn write_codex_with_model(
         toml_escape(&command.display().to_string()),
         toml_args(args),
     );
-    let mut existing = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(err) => return Err(err.into()),
-    };
-    let config_dir = path.parent();
-    let profile_is_sylphx = config_dir
-        .and_then(|dir| std::fs::read_to_string(dir.join(".anyagents-profile")).ok())
-        .is_some_and(|s| {
+    let dir = path
+        .parent()
+        .ok_or_else(|| Error::Message("codex config has no directory".into()))?;
+    let mut existing = read_toml_text(dir, path)?;
+    let config_dir = Some(dir);
+    let profile_is_sylphx =
+        read_text_below(dir, &dir.join(".anyagents-profile")).is_some_and(|s| {
             let trimmed = s.trim();
             trimmed == "sylphx" || trimmed.starts_with("sylphx/")
         });
@@ -269,18 +356,17 @@ pub fn write_codex_with_model(
             "[features]\napps = false\ncode_mode = false\ncode_mode_only = false\nmulti_agent = false\n",
         );
     }
-    atomic_write_shared(path, updated.as_bytes())
+    write_below(dir, path, updated.as_bytes(), 0o664)
 }
 
 pub fn sync_codex_developer_instructions(
     path: &Path,
     instructions: Option<&str>,
 ) -> Result<(), Error> {
-    let existing = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(err) => return Err(err.into()),
-    };
+    let dir = path
+        .parent()
+        .ok_or_else(|| Error::Message("codex config has no directory".into()))?;
+    let existing = read_toml_text(dir, path)?;
     let updated = match instructions.map(str::trim).filter(|s| !s.is_empty()) {
         Some(text) => upsert_top_key(
             &existing,
@@ -289,10 +375,19 @@ pub fn sync_codex_developer_instructions(
         ),
         None => remove_top_key(&existing, "developer_instructions"),
     };
-    if updated == existing && path.is_file() {
+    if updated == existing && read_below(dir, path)?.is_some() {
         return Ok(());
     }
-    atomic_write_shared(path, updated.as_bytes())
+    write_below(dir, path, updated.as_bytes(), 0o664)
+}
+
+/// A TOML config below `dir` as text; empty when absent.
+fn read_toml_text(dir: &Path, path: &Path) -> Result<String, Error> {
+    match read_below(dir, path)? {
+        Some(bytes) => String::from_utf8(bytes)
+            .map_err(|err| Error::Message(format!("{}: {err}", path.display()))),
+        None => Ok(String::new()),
+    }
 }
 
 fn remove_top_key(text: &str, key: &str) -> String {
@@ -351,12 +446,11 @@ fn upsert_top_key(text: &str, key: &str, value_literal: &str) -> String {
     out
 }
 
-fn read_json(path: &Path) -> Result<serde_json::Value, Error> {
-    match std::fs::read(path) {
-        Ok(bytes) => serde_json::from_slice(&bytes)
+fn read_json(root: &Path, path: &Path) -> Result<serde_json::Value, Error> {
+    match read_below(root, path)? {
+        Some(bytes) => serde_json::from_slice(&bytes)
             .map_err(|err| Error::Message(format!("{}: {err}", path.display()))),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(serde_json::json!({})),
-        Err(err) => Err(err.into()),
+        None => Ok(serde_json::json!({})),
     }
 }
 
@@ -390,7 +484,7 @@ fn resolve_sylphx_codex_provider(config_dir: Option<&Path>) -> (String, Option<S
             "opencode/opencode.json",
             "opencode.json",
         ] {
-            if let Ok(text) = std::fs::read_to_string(dir.join(opencode_rel))
+            if let Some(text) = read_text_below(dir, &dir.join(opencode_rel))
                 && let Ok(val) = serde_json::from_str::<serde_json::Value>(&text)
                 && let Some(url) = val
                     .pointer("/provider/sylphx/options/baseURL")
@@ -407,27 +501,32 @@ fn resolve_sylphx_codex_provider(config_dir: Option<&Path>) -> (String, Option<S
             }
         }
         if let Some(data_dir) = dir.parent().and_then(Path::parent).and_then(Path::parent) {
-            let prof_name = std::fs::read_to_string(dir.join(".anyagents-profile"))
-                .ok()
+            let prof_name = read_text_below(dir, &dir.join(".anyagents-profile"))
                 .and_then(|s| {
                     let t = s.trim();
                     t.strip_prefix("sylphx/").map(str::to_string)
                 })
                 .unwrap_or_else(|| "default".to_string());
             let prof_dir = data_dir.join("profiles").join("sylphx").join(&prof_name);
-            key_candidates.push(prof_dir.join(".config/opencode/sylphx.key"));
-            key_candidates.push(prof_dir.join(".config/sylphx/key"));
+            // The provider profile is the server's own: read as named.
+            key_candidates.push((None, prof_dir.join(".config/opencode/sylphx.key")));
+            key_candidates.push((None, prof_dir.join(".config/sylphx/key")));
         }
-        key_candidates.push(dir.join(".config/opencode/sylphx.key"));
-        key_candidates.push(dir.join(".config/sylphx/key"));
+        // The agent's own keys: never through a link, which would put a
+        // server file into config.toml as the bearer token.
+        key_candidates.push((Some(dir), dir.join(".config/opencode/sylphx.key")));
+        key_candidates.push((Some(dir), dir.join(".config/sylphx/key")));
     }
     let mut resolved_keys: Vec<String> = key_candidates
         .into_iter()
-        .filter_map(|p| {
-            std::fs::read_to_string(p)
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
+        .filter_map(|(below, p)| {
+            match below {
+                Some(root) => read_text_below(root, &p),
+                // fs-ok: the provider profile is the server's own
+                None => std::fs::read_to_string(p).ok(),
+            }
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
         })
         .collect();
     let api_key = resolved_keys
@@ -588,7 +687,7 @@ mod tests {
         let path = dir.path().join("settings.json");
         std::fs::write(&path, br#"{"theme":"night"}"#).unwrap();
         sanitize_claude_settings(dir.path()).unwrap();
-        assert_eq!(read_json(&path).unwrap()["theme"], "night");
+        assert_eq!(read_json(dir.path(), &path).unwrap()["theme"], "night");
     }
 
     #[test]
@@ -604,7 +703,7 @@ mod tests {
                 &["mcp".to_string()],
             )
             .unwrap();
-            let parsed = read_json(&mcp_path).unwrap();
+            let parsed = read_json(dir.path(), &mcp_path).unwrap();
             assert_eq!(
                 parsed
                     .pointer("/mcpServers/anyagents/command")
@@ -612,5 +711,73 @@ mod tests {
                 Some("/usr/local/bin/anyagents")
             );
         }
+    }
+
+    /// The agent's seat writes its config directory. A config file it links
+    /// at a server file is never read into the merged config (where the seat
+    /// would read it back) nor written through, and its own key file linked
+    /// out is never copied into `config.toml` as the bearer token.
+    #[cfg(unix)]
+    #[test]
+    fn planted_links_in_the_config_dir_are_never_read_or_written_through() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("agents/a1/config");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret"), "outside-secret").unwrap();
+        let unchanged = || {
+            assert_eq!(
+                std::fs::read_to_string(outside.join("secret")).unwrap(),
+                "outside-secret"
+            );
+            assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 1);
+        };
+        let command = Path::new("/usr/local/bin/anyagents");
+        let args = ["mcp".to_string()];
+        for (rel, write) in [
+            ("config.toml", 0),
+            (".claude.json", 1),
+            ("settings.json", 2),
+        ] {
+            let path = config.join(rel);
+            symlink(outside.join("secret"), &path).unwrap();
+            let result = match write {
+                0 => write_codex_with_model(&path, None, command, &args),
+                1 => write_claude(&path, command, &args),
+                _ => sanitize_claude_settings(&config),
+            };
+            assert!(result.is_err(), "{rel}");
+            assert!(
+                std::fs::symlink_metadata(&path)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            std::fs::remove_file(&path).unwrap();
+            unchanged();
+        }
+        // A directory link above the file: nothing is created through it.
+        symlink(&outside, config.join(".gemini")).unwrap();
+        assert!(
+            write_claude_below(
+                &config,
+                &config.join(".gemini/config/mcp_config.json"),
+                command,
+                &args
+            )
+            .is_err()
+        );
+        std::fs::remove_file(config.join(".gemini")).unwrap();
+        unchanged();
+        // The agent's own sylphx key linked out is not the bearer token.
+        std::fs::write(config.join(".anyagents-profile"), "sylphx").unwrap();
+        std::fs::create_dir_all(config.join(".config/sylphx")).unwrap();
+        symlink(outside.join("secret"), config.join(".config/sylphx/key")).unwrap();
+        write_codex_with_model(&config.join("config.toml"), None, command, &args).unwrap();
+        let toml = std::fs::read_to_string(config.join("config.toml")).unwrap();
+        assert!(!toml.contains("outside-secret"), "{toml}");
+        unchanged();
     }
 }

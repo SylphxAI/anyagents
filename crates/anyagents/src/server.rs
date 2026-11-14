@@ -2699,6 +2699,20 @@ struct DescriptionRequest {
     clear: Option<bool>,
 }
 
+/// `config/SYSTEM_PROMPT.md` of an agent, read through its tree: never a
+/// file a link the seat planted there names.
+fn agent_system_prompt(data_dir: &Path, id: &anyagents_core::AgentId) -> Option<String> {
+    anyagents_core::agent_tree::AgentTree::of(data_dir, id)
+        .and_then(|tree| {
+            tree.read(
+                Path::new("config/SYSTEM_PROMPT.md"),
+                anyagents_core::agent_tree::READ_LIMIT,
+            )
+        })
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+}
+
 async fn get_description_route(
     principal: Principal,
     State(state): State<AppState>,
@@ -2725,9 +2739,10 @@ async fn get_description_route(
         };
         let can_read_private = can_actor_read_agent_private(&state.store, &principal, &rec);
         let aliases = state.store.agent_aliases(&rec.id).unwrap_or_default();
-        let cfg = anyagents_core::agent_config_dir(state.store.data_dir(), &rec.id);
+        // The agent's seat writes its config directory: read the prompt there
+        // without following a link it planted (at a server file, say).
         let system_prompt = if can_read_private {
-            std::fs::read_to_string(cfg.join("SYSTEM_PROMPT.md")).ok()
+            agent_system_prompt(state.store.data_dir(), &rec.id)
         } else {
             None
         };
@@ -9544,6 +9559,29 @@ pub(crate) mod tests {
     /// server started by one never reads another's settings.
     pub(crate) fn env_lock() -> MutexGuard<'static, ()> {
         ENV.lock().unwrap_or_else(|err| err.into_inner())
+    }
+
+    /// The instructions route reads the agent's own prompt, never a server
+    /// file a link in its config directory names.
+    #[test]
+    fn the_system_prompt_is_never_read_through_a_link() {
+        let dir = crate::test_tempdir();
+        let id = anyagents_core::AgentId::generate();
+        let config = anyagents_core::agent_config_dir(dir.path(), &id);
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(dir.path().join("operator-token"), b"operator-secret").unwrap();
+        std::os::unix::fs::symlink(
+            dir.path().join("operator-token"),
+            config.join("SYSTEM_PROMPT.md"),
+        )
+        .unwrap();
+        assert_eq!(agent_system_prompt(dir.path(), &id), None);
+        std::fs::remove_file(config.join("SYSTEM_PROMPT.md")).unwrap();
+        std::fs::write(config.join("SYSTEM_PROMPT.md"), b"be kind").unwrap();
+        assert_eq!(
+            agent_system_prompt(dir.path(), &id).as_deref(),
+            Some("be kind")
+        );
     }
 
     /// Process-local environment locks do not isolate forked children or

@@ -267,8 +267,27 @@ impl Dir {
     /// it (a link there is replaced, never followed), then the directory
     /// synced. A failure leaves `name` as it was.
     pub fn write_atomic(&self, name: &OsStr, bytes: &[u8]) -> io::Result<()> {
+        self.write_atomic_with(name, bytes, None, |_| Ok(()))
+    }
+
+    /// [`Self::write_atomic`] with the new file's `mode` set exactly (not
+    /// masked by the umask).
+    pub fn write_atomic_mode(&self, name: &OsStr, bytes: &[u8], mode: u32) -> io::Result<()> {
+        self.write_atomic_with(name, bytes, Some(mode), |_| Ok(()))
+    }
+
+    /// [`Self::write_atomic`], with `prepare` run on the written new file
+    /// before it replaces `name` (to give it a group, say): through its
+    /// descriptor, never a name.
+    pub fn write_atomic_with(
+        &self,
+        name: &OsStr,
+        bytes: &[u8],
+        mode: Option<u32>,
+        prepare: impl FnOnce(&File) -> io::Result<()>,
+    ) -> io::Result<()> {
         let target = c_name(name)?;
-        let temp_name = OsString::from(format!(".memory-{}.tmp", uuid::Uuid::now_v7()));
+        let temp_name = OsString::from(format!(".anyagents-{}.tmp", uuid::Uuid::now_v7()));
         let temp = c_name(&temp_name)?;
         // SAFETY: a directory descriptor and a NUL-terminated name.
         let mut out = check(unsafe {
@@ -276,32 +295,118 @@ impl Dir {
                 self.0.as_raw_fd(),
                 temp.as_ptr(),
                 libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                0o666 as libc::c_uint,
+                mode.unwrap_or(0o666) as libc::c_uint,
             )
         })?;
-        let result = out
-            .write_all(bytes)
-            .and_then(|()| out.sync_all())
-            .and_then(|()| {
-                // SAFETY: one directory descriptor and two NUL-terminated names.
-                if unsafe {
-                    libc::renameat(
-                        self.0.as_raw_fd(),
-                        temp.as_ptr(),
-                        self.0.as_raw_fd(),
-                        target.as_ptr(),
-                    )
-                } != 0
-                {
-                    return Err(io::Error::last_os_error());
-                }
-                self.0.sync_all()
-            });
+        let result = (|| {
+            if let Some(mode) = mode {
+                use std::os::unix::fs::PermissionsExt as _;
+                out.set_permissions(std::fs::Permissions::from_mode(mode))?;
+            }
+            out.write_all(bytes)?;
+            out.sync_all()?;
+            prepare(&out)?;
+            // SAFETY: one directory descriptor and two NUL-terminated names.
+            if unsafe {
+                libc::renameat(
+                    self.0.as_raw_fd(),
+                    temp.as_ptr(),
+                    self.0.as_raw_fd(),
+                    target.as_ptr(),
+                )
+            } != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            self.0.sync_all()
+        })();
         if result.is_err() {
             // SAFETY: a directory descriptor and a NUL-terminated name.
             unsafe { libc::unlinkat(self.0.as_raw_fd(), temp.as_ptr(), 0) };
         }
         result
+    }
+
+    /// The regular file `name` opened read-write, created with `mode` when
+    /// absent; never through a link.
+    pub fn open_or_create(&self, name: &OsStr, mode: u32) -> io::Result<File> {
+        let c = c_name(name)?;
+        // SAFETY: a directory descriptor and a NUL-terminated name.
+        let file = check(unsafe {
+            libc::openat(
+                self.0.as_raw_fd(),
+                c.as_ptr(),
+                libc::O_RDWR
+                    | libc::O_CREAT
+                    | libc::O_NOFOLLOW
+                    | libc::O_NONBLOCK
+                    | libc::O_CLOEXEC,
+                mode as libc::c_uint,
+            )
+        })
+        .map_err(not_plain)?;
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "not a regular file",
+            ));
+        }
+        Ok(file)
+    }
+
+    /// The directory `relative` below this one, each missing component
+    /// created with `mode`; no component is ever a link.
+    pub fn create_dir_all(&self, relative: &Path, mode: libc::mode_t) -> io::Result<Self> {
+        let mut current = Self(self.0.try_clone()?);
+        for part in relative.components() {
+            match part {
+                Component::Normal(name) => current = current.create_dir(name, mode)?,
+                Component::CurDir => {}
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "a relative path below the directory is required",
+                    ));
+                }
+            }
+        }
+        Ok(current)
+    }
+
+    /// Move `name` here to `to_name` in `to`, both entries themselves, never
+    /// what a link names.
+    pub fn rename_to(&self, name: &OsStr, to: &Dir, to_name: &OsStr) -> io::Result<()> {
+        let from = c_name(name)?;
+        let into = c_name(to_name)?;
+        // SAFETY: two directory descriptors and two NUL-terminated names.
+        if unsafe {
+            libc::renameat(
+                self.0.as_raw_fd(),
+                from.as_ptr(),
+                to.0.as_raw_fd(),
+                into.as_ptr(),
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// A new link `name` here naming `target`; an existing entry is left.
+    pub fn symlink(&self, target: &Path, name: &OsStr) -> io::Result<()> {
+        let c = c_name(name)?;
+        let target = CString::new(target.as_os_str().as_bytes()).map_err(io::Error::other)?;
+        // SAFETY: a directory descriptor and two NUL-terminated strings.
+        if unsafe { libc::symlinkat(target.as_ptr(), self.0.as_raw_fd(), c.as_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// The opened directory itself, to sync or to hand to another call.
+    pub fn file(&self) -> &File {
+        &self.0
     }
 
     /// Remove `name` when it is a regular file; `false` when it is absent or

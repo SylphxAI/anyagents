@@ -24,7 +24,7 @@ pub fn write(
         dir.join(".config").join("opencode").join("opencode.json"),
         dir.join("opencode.json"),
     ];
-    let mut root = crate::mcp_config::read_candidates(&candidates)?;
+    let mut root = crate::mcp_config::read_candidates_below(dir, &candidates)?;
     let bound_profile = read_bound_profile(dir);
     let profile_dir = resolve_bound_profile_dir(dir, bound_profile.as_deref());
 
@@ -193,8 +193,9 @@ fn donor_provider_block(
     if let Some(data_dir) = resolve_data_dir_from_seat(dir) {
         candidates.push(data_dir.join("opencode-provider.json"));
     }
+    // A provider profile and the data directory are the server's own.
     for path in candidates {
-        let val = crate::mcp_config::read_candidates(&[path])?;
+        let val = crate::mcp_config::read_server_candidates(&[path])?;
         if let Some(provider) = val.get("provider").cloned() {
             return Ok(Some(provider));
         }

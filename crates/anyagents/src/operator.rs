@@ -44,6 +44,7 @@ pub fn operator_token(data: &std::path::Path) -> Option<String> {
 pub const TOKEN_FILE: &str = "operator-token";
 
 /// The agent's config directory: `agents/<id>/config`.
+#[cfg(test)]
 fn config_dir(data_dir: &Path, agent_id: &str) -> std::path::PathBuf {
     data_dir.join("agents").join(agent_id).join("config")
 }
@@ -53,16 +54,28 @@ fn config_dir(data_dir: &Path, agent_id: &str) -> std::path::PathBuf {
 /// authenticates as `agent_id`, keep it so running MCP tool processes do not
 /// lose their session across a server restart; otherwise mint a fresh one.
 pub fn ensure(store: &Store, agent_id: &anyagents_core::AgentId) -> Result<(), Error> {
-    let dir = config_dir(store.data_dir(), agent_id.as_str());
-    let path = dir.join(CAPABILITY_FILE);
-    if let Ok(raw) = std::fs::read_to_string(&path) {
+    // Read and re-share the existing file through its own descriptor, opened
+    // without following a link the seat may have put there.
+    let existing = anyagents_core::agent_tree::AgentTree::of(store.data_dir(), agent_id)
+        .and_then(|tree| tree.dir(Path::new("config")))
+        .and_then(|config| config.open_file(CAPABILITY_FILE.as_ref()));
+    if let Ok(file) = existing
+        && let Ok(raw) = anyagents_core::beneath::read_capped(file.try_clone()?, 4096)
+        && let Ok(raw) = String::from_utf8(raw)
+    {
         let token = raw.trim();
         if !token.is_empty()
             && store
                 .authenticate_capability(token)
                 .is_ok_and(|id| &id == agent_id)
         {
-            share_capability_if_needed(store, agent_id, &path)?;
+            if let Some((name, gid)) = seat_group(store, agent_id) {
+                crate::seat_tree::share_open_file(&file, gid, 0o640).map_err(|err| {
+                    Error::Message(format!(
+                        "the capability for {name} is not shared with its seat: {err}"
+                    ))
+                })?;
+            }
             return Ok(());
         }
     }
@@ -135,59 +148,52 @@ pub fn mint(store: &Store, agent_id: &anyagents_core::AgentId) -> Result<(), Err
 /// Write one secret into the agent's own config directory, readable by the
 /// server and that agent's seat only, and replace any earlier value
 /// atomically. The value is never printed, never an argument and never logged.
+///
+/// The config directory is the seat's to write, so the new file is made with
+/// `O_EXCL|O_NOFOLLOW` under a random name, shared through its descriptor and
+/// renamed into place: a link the seat planted at `<name>` or `<name>.new`
+/// (at `state.db`, say) is replaced, never written through or truncated.
 pub(crate) fn write_agent_secret(
     store: &Store,
     agent_id: &anyagents_core::AgentId,
     file_name: &str,
     value: &str,
 ) -> Result<(), Error> {
-    let dir = config_dir(store.data_dir(), agent_id.as_str());
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join(file_name);
-    let temp = dir.join(format!("{file_name}.new"));
-    {
-        use std::io::Write as _;
-        use std::os::unix::fs::OpenOptionsExt as _;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&temp)?;
-        file.write_all(value.as_bytes())?;
-        file.write_all(b"\n")?;
-        file.sync_all()?;
-    }
-    if let Err(err) = share_capability_if_needed(store, agent_id, &temp) {
-        let _ = std::fs::remove_file(&temp);
-        return Err(err);
-    }
-    std::fs::rename(&temp, &path)?;
-    std::fs::File::open(&dir)?.sync_all()?;
-    Ok(())
+    let tree =
+        anyagents_core::agent_tree::AgentTree::of(store.data_dir(), agent_id).or_else(|_| {
+            std::fs::create_dir_all(store.data_dir().join("agents").join(agent_id.as_str()))?;
+            anyagents_core::agent_tree::AgentTree::of(store.data_dir(), agent_id)
+        })?;
+    let config = tree.create_dir_all(Path::new("config"), 0o777)?;
+    let seat_group = seat_group(store, agent_id);
+    let mut bytes = value.as_bytes().to_vec();
+    bytes.push(b'\n');
+    config
+        .write_atomic_with(
+            file_name.as_ref(),
+            &bytes,
+            Some(0o600),
+            |file| match seat_group {
+                Some((name, gid)) => {
+                    crate::seat_tree::share_open_file(file, gid, 0o640).map_err(|err| {
+                        std::io::Error::other(format!(
+                            "the capability for {name} is not shared with its seat: {err}"
+                        ))
+                    })
+                }
+                None => Ok(()),
+            },
+        )
+        .map_err(Error::from)
 }
 
-fn share_capability_if_needed(
-    store: &Store,
-    agent_id: &anyagents_core::AgentId,
-    path: &Path,
-) -> Result<(), Error> {
-    // The capability belongs to this agent's own seat group, 0640, and is read
-    // back: no other seat can read it. A seat group that is the server's own
-    // group adds nothing, so that file stays 0600.
-    if let Ok(agent) = store.agent(agent_id)
-        && let Some((_, seat_uid, gid, _)) = crate::create::resolved_agent_seat_info(store, &agent)
-        && seat_uid != crate::sandbox::server_uid()
-        && gid != crate::sandbox::server_gid()
-    {
-        crate::sandbox::share_capability_with_seat(path, gid).map_err(|err| {
-            anyagents_core::Error::Message(format!(
-                "the capability for {} is not shared with its seat: {err}",
-                agent.name
-            ))
-        })?;
-    }
-    Ok(())
+/// The agent's seat group when the capability belongs to it: a seat group
+/// that is the server's own group adds nothing, so that file stays 0600.
+fn seat_group(store: &Store, agent_id: &anyagents_core::AgentId) -> Option<(String, u32)> {
+    let agent = store.agent(agent_id).ok()?;
+    let (_, seat_uid, gid, _) = crate::create::resolved_agent_seat_info(store, &agent)?;
+    (seat_uid != crate::sandbox::server_uid() && gid != crate::sandbox::server_gid())
+        .then_some((agent.name, gid))
 }
 
 #[cfg(test)]
@@ -195,6 +201,56 @@ mod tests {
     use super::*;
     use anyagents_core::{NewAgent, Store};
     use std::os::unix::fs::PermissionsExt;
+
+    /// The seat writes its config directory. Links it plants at the
+    /// capability or at the old `<name>.new` temporary (at `state.db`, say)
+    /// are replaced, never written through or truncated.
+    #[test]
+    fn a_planted_link_never_carries_the_capability_write() {
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        store
+            .hold_capability_key("test-capability-key-0123456789abcdef")
+            .unwrap();
+        let agent = store
+            .create_agent(NewAgent::new("linker", "codex"))
+            .unwrap();
+        let config = config_dir(dir.path(), agent.id.as_str());
+        std::fs::create_dir_all(&config).unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        for name in ["victim", "victim-new"] {
+            std::fs::write(outside.join(name), b"keep").unwrap();
+        }
+        std::os::unix::fs::symlink(outside.join("victim"), config.join(CAPABILITY_FILE)).unwrap();
+        std::os::unix::fs::symlink(
+            outside.join("victim-new"),
+            config.join(format!("{CAPABILITY_FILE}.new")),
+        )
+        .unwrap();
+        ensure(&store, &agent.id).unwrap();
+        for name in ["victim", "victim-new"] {
+            assert_eq!(
+                std::fs::read(outside.join(name)).unwrap(),
+                b"keep",
+                "{name}"
+            );
+        }
+        let meta = std::fs::symlink_metadata(config.join(CAPABILITY_FILE)).unwrap();
+        assert!(meta.file_type().is_file());
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        let token = std::fs::read_to_string(config.join(CAPABILITY_FILE)).unwrap();
+        assert_eq!(
+            store.authenticate_capability(token.trim()).unwrap(),
+            agent.id
+        );
+        // ensure() keeps a valid file and reads no link.
+        ensure(&store, &agent.id).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(config.join(CAPABILITY_FILE)).unwrap(),
+            token
+        );
+    }
 
     #[test]
     fn reopened_store_verification_requires_exact_primary_daemon_identity() {

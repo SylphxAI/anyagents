@@ -4482,10 +4482,25 @@ impl AgentMcp {
         } else {
             dir.to_path_buf()
         };
-        let mut file = anyagents_core::raw_segment::open_readonly(&base.join(rel))?;
-        let mut text = String::new();
-        std::io::Read::read_to_string(&mut file, &mut text)?;
-        Ok(text)
+        // Below the agent root (the seat's) or the shared skill root (the
+        // server's), every component is opened without following a link, and
+        // a file is read up to a fixed size.
+        let mut roots = Vec::new();
+        if let Some(agent_root) = self.client.config.parent() {
+            roots.push(agent_root.to_path_buf());
+        }
+        if let Some(data_dir) = self.client.socket.parent() {
+            roots.push(data_dir.join("skills"));
+        }
+        let path = base.join(rel);
+        let (root, relative) = roots
+            .iter()
+            .find_map(|root| Some((root, path.strip_prefix(root).ok()?)))
+            .ok_or_else(|| std::io::Error::other("a skill file outside the skill roots"))?;
+        let bytes = anyagents_core::agent_tree::AgentTree::open(root)?
+            .read(relative, anyagents_core::agent_tree::READ_LIMIT)?;
+        String::from_utf8(bytes)
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))
     }
 
     fn collect_skill_directories(&self) -> std::collections::BTreeMap<String, PathBuf> {

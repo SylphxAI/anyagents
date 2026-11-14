@@ -1,41 +1,62 @@
 //! Host-owned logical sessions. Vendor IDs are aliases learned after dispatch,
 //! not authority to refresh memory. Call lifecycle operations under the host's
 //! per-agent lifecycle lock; no marker/mtime/compaction heuristic starts a session.
-use crate::learned_memory::{MemoryPin, atomic_write, pin_session_from_source, read_pin, sha256};
+use crate::agent_tree::AgentTree;
+use crate::beneath::Dir;
+use crate::learned_memory::{MemoryPin, pin_session_from_source, read_pin, sha256};
 use anyagents_harness::normalize_harness_name;
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::BTreeMap,
-    fs,
-    io::{self, Read},
-    path::Path,
-};
+use std::{collections::BTreeMap, ffi::OsStr, fs, io, path::Path};
+
+// `sessions/` is seat-admitted like `config/` (0o2770): the seat can put a
+// link, a FIFO or a forged registry in it. Everything here works from the
+// opened agent root and never follows a link below it (ADR 0010 D3), and the
+// registry is untrusted input: only well-formed generations are accepted.
+fn tree(root: &Path) -> io::Result<AgentTree> {
+    // fs-ok: the agent root itself, which the server made and chose
+    fs::create_dir_all(root)?;
+    AgentTree::open(root)
+}
+
+fn sessions(root: &Path) -> io::Result<Dir> {
+    let sessions = tree(root)?
+        .root()
+        .create_dir(OsStr::new("sessions"), 0o2770)?;
+    // Keep 0o2770 with the existing seat group instead of clamping to a
+    // private 0o700. The daemon stays owner and keeps full access through
+    // owner bits, while the seat principal can enter the directory for
+    // harness resume. Clamping to 0o700 here ran on every active-turn call
+    // and caused seat-side resume to fail with Permission denied.
+    let _ = sessions.set_mode(0o2770);
+    Ok(sessions)
+}
+
+/// The agent's `config/`, when it is a plain directory.
+fn config(root: &Path) -> io::Result<Option<Dir>> {
+    match tree(root)?.dir(Path::new("config")) {
+        Ok(dir) => Ok(Some(dir)),
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::InvalidData
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
 
 // Serialize host transitions and late vendor aliases across daemon threads and
 // restarts. This lock is host-only, outside the writable learned-memory tree.
 fn lock(root: &Path) -> io::Result<fs::File> {
-    let sessions = root.join("sessions");
-    fs::create_dir_all(&sessions)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        // Sessions is seat-admitted exactly like config: keep 0o2770 with the
-        // existing seat group instead of clamping to a private 0o700. The
-        // daemon stays owner and keeps full access through owner bits, while
-        // the seat principal can enter the directory for harness resume.
-        // Clamping to 0o700 here ran on every active-turn call and caused
-        // seat-side resume to fail with Permission denied (os error 13).
-        let _ = fs::set_permissions(&sessions, fs::Permissions::from_mode(0o2770));
-    }
-    let file = fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(sessions.join("registry.lock"))?;
+    let file = sessions(root)?.open_or_create(OsStr::new("registry.lock"), 0o660)?;
     file.lock()?;
     Ok(file)
 }
+
+/// The largest registry the server parses.
+const REGISTRY_LIMIT: u64 = 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Session {
@@ -63,10 +84,26 @@ pub struct HostSession {
 }
 
 fn read(root: &Path) -> io::Result<Registry> {
-    match fs::read(root.join("sessions/registry.json")) {
+    match sessions(root)?.read(OsStr::new("registry.json"), REGISTRY_LIMIT) {
         Ok(bytes) => {
             let mut registry: Registry =
                 serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+            // Every generation names `sessions/<sha256>` and `retired-<gen>`:
+            // only a UUID is one (a seat can write this file).
+            if registry
+                .active
+                .iter()
+                .chain(registry.aliases.values())
+                .chain(
+                    registry
+                        .pending_reset
+                        .iter()
+                        .map(|pending| &pending.session),
+                )
+                .any(|session| uuid::Uuid::parse_str(&session.generation).is_err())
+            {
+                return Err(io::Error::other("invalid host session registry"));
+            }
             // Renaming a selector is not a harness switch: retain the generation,
             // pinned memory and vendor aliases when an agent row is migrated.
             for session in registry
@@ -105,8 +142,8 @@ fn read(root: &Path) -> io::Result<Registry> {
     }
 }
 fn write(root: &Path, registry: &Registry) -> io::Result<()> {
-    atomic_write(
-        &root.join("sessions/registry.json"),
+    sessions(root)?.write_atomic(
+        OsStr::new("registry.json"),
         &serde_json::to_vec(registry).map_err(io::Error::other)?,
     )
 }
@@ -139,18 +176,20 @@ pub fn active(root: &Path) -> io::Result<Option<HostSession>> {
         .transpose()
 }
 
-fn marker_bytes(path: &Path) -> io::Result<Option<Vec<u8>>> {
-    let file = match crate::raw_segment::open_readonly(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
+/// A native resume pointer `name` in `dir`, read without following a link;
+/// `None` when absent.
+fn marker_bytes(dir: Option<&Dir>, name: &str) -> io::Result<Option<Vec<u8>>> {
+    let Some(dir) = dir else {
+        return Ok(None);
     };
-    let mut bytes = Vec::new();
-    file.take(4097).read_to_end(&mut bytes)?;
-    if bytes.len() > 4096 {
-        return Err(io::Error::other("native resume pointer exceeds 4096 bytes"));
+    match dir.read(OsStr::new(name), 4096) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::InvalidData => Err(io::Error::other(
+            "native resume pointer is not a regular file of at most 4096 bytes",
+        )),
+        Err(error) => Err(error),
     }
-    Ok(Some(bytes))
 }
 
 fn single_filename(name: &str) -> bool {
@@ -178,33 +217,49 @@ fn complete_reset(root: &Path, registry: &mut Registry) -> io::Result<()> {
     // The pin was durable before the intent. Recovery never rereads live memory.
     materialize(root, &pending.session)?;
     if let Some((name, expected)) = &pending.marker {
-        let source = root.join("config").join(name);
-        let retired_dir = root
-            .join("sessions")
-            .join(format!("retired-{}", pending.session.generation));
-        let retired = retired_dir.join(name);
-        let old = marker_bytes(&source)?;
-        let saved = marker_bytes(&retired)?;
-        match (old, saved) {
+        // Both ends are opened directories below the agent root, and the
+        // move is a renameat between them: a link the seat put at
+        // `retired-<gen>` or at the pointer is refused, never followed.
+        let config = config(root)?;
+        let sessions = sessions(root)?;
+        let retired_name = format!("retired-{}", pending.session.generation);
+        let existing_retired = match sessions.dir(Path::new(&retired_name)) {
+            Ok(dir) => Some(dir),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        let old = marker_bytes(config.as_ref(), name)?;
+        let saved = marker_bytes(existing_retired.as_ref(), name)?;
+        let retired = match (old, saved) {
             (Some(bytes), None) if sha256(&bytes) == *expected => {
-                fs::create_dir_all(&retired_dir)?;
-                fs::File::open(root.join("sessions"))?.sync_all()?;
-                fs::rename(&source, &retired)?;
+                let retired = match existing_retired {
+                    Some(dir) => dir,
+                    None => sessions.create_dir(OsStr::new(&retired_name), 0o2770)?,
+                };
+                sessions.file().sync_all()?;
+                let config = config
+                    .as_ref()
+                    .ok_or_else(|| io::Error::other("native resume pointer has no config"))?;
+                config.rename_to(OsStr::new(name), &retired, OsStr::new(name))?;
+                retired
             }
-            (None, Some(bytes)) if sha256(&bytes) == *expected => (),
+            (None, Some(bytes)) if sha256(&bytes) == *expected => existing_retired
+                .ok_or_else(|| io::Error::other("retired resume pointer vanished"))?,
             _ => {
                 return Err(io::Error::other(
                     "native resume pointer changed during session reset",
                 ));
             }
-        }
-        if marker_bytes(&retired)?.is_none_or(|bytes| sha256(&bytes) != *expected) {
+        };
+        if marker_bytes(Some(&retired), name)?.is_none_or(|bytes| sha256(&bytes) != *expected) {
             return Err(io::Error::other(
                 "retired resume pointer verification failed",
             ));
         }
-        fs::File::open(&retired_dir)?.sync_all()?;
-        fs::File::open(root.join("config"))?.sync_all()?;
+        retired.file().sync_all()?;
+        if let Some(config) = &config {
+            config.file().sync_all()?;
+        }
     }
     retire_session_errors(root)?;
     registry.active = Some(pending.session);
@@ -212,15 +267,12 @@ fn complete_reset(root: &Path, registry: &mut Registry) -> io::Result<()> {
     write(root, registry)
 }
 fn retire_session_errors(root: &Path) -> io::Result<()> {
-    let config_dir = root.join("config");
-    // Never through a symlink: the config directory itself must be a directory.
-    if !fs::symlink_metadata(&config_dir).is_ok_and(|meta| meta.file_type().is_dir()) {
-        return Ok(());
-    }
-    match fs::remove_file(config_dir.join(".anyagents-last-error.json")) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err),
+    // Never through a link: only a regular file in a plain config directory.
+    match config(root)? {
+        Some(config) => config
+            .remove_file(OsStr::new(".anyagents-last-error.json"))
+            .map(|_| ()),
+        None => Ok(()),
     }
 }
 
@@ -263,7 +315,7 @@ pub fn prepare_harness_with_source(
     // never to the outgoing generation. Keep its existing alias unchanged.
     let retired_marker = marker
         .map(|name| {
-            marker_bytes(&root.join("config").join(name))
+            marker_bytes(config(root)?.as_ref(), name)
                 .map(|bytes| bytes.map(|bytes| (name.to_owned(), sha256(&bytes))))
         })
         .transpose()?
@@ -301,8 +353,7 @@ pub fn reset_session_with_source(
     }
     let old_marker = marker
         .map(|name| {
-            marker_bytes(&root.join("config").join(name))
-                .map(|bytes| bytes.map(|bytes| (name, bytes)))
+            marker_bytes(config(root)?.as_ref(), name).map(|bytes| bytes.map(|bytes| (name, bytes)))
         })
         .transpose()?
         .flatten();
@@ -492,6 +543,80 @@ mod tests {
     fn memory(root: &Path, text: &str) {
         fs::create_dir_all(root.join("memory")).unwrap();
         fs::write(root.join("memory/MEMORY.md"), text).unwrap();
+    }
+
+    /// `sessions/` is the seat's to write. A forged pending reset whose
+    /// `retired-<gen>` is a link to another directory never makes the server
+    /// move the seat's file there; a linked lock or registry is never opened
+    /// through; a generation that is not a UUID is refused.
+    #[cfg(unix)]
+    #[test]
+    fn a_forged_registry_and_planted_links_move_nothing_outside() {
+        use std::os::unix::fs::symlink;
+        let dir = crate::test_tempdir();
+        let root = dir.path().join("agent");
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(root.join("config")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        // The seat's file, which the forged reset would move outside.
+        fs::write(root.join("config/.bashrc"), b"seat payload").unwrap();
+        let generation = uuid::Uuid::now_v7().to_string();
+        pin_session_from_source(&root, &generation, None).unwrap();
+        let registry = serde_json::json!({
+            "active": null,
+            "aliases": {},
+            "pending_reset": {
+                "session": {"generation": generation, "harness": "codex"},
+                "marker": [".bashrc", sha256(b"seat payload")],
+            },
+        });
+        fs::write(root.join("sessions/registry.json"), registry.to_string()).unwrap();
+        symlink(
+            &outside,
+            root.join(format!("sessions/retired-{generation}")),
+        )
+        .unwrap();
+        assert!(recover_pending(&root).is_err());
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+        assert_eq!(
+            fs::read(root.join("config/.bashrc")).unwrap(),
+            b"seat payload"
+        );
+
+        // A linked registry is never parsed from its target.
+        fs::remove_file(root.join("sessions/registry.json")).unwrap();
+        fs::write(outside.join("target.json"), registry.to_string()).unwrap();
+        symlink(
+            outside.join("target.json"),
+            root.join("sessions/registry.json"),
+        )
+        .unwrap();
+        assert!(active(&root).is_err());
+        fs::remove_file(root.join("sessions/registry.json")).unwrap();
+
+        // A linked lock is never created or opened through.
+        fs::remove_file(root.join("sessions/registry.lock")).ok();
+        symlink(
+            outside.join("created-by-lock"),
+            root.join("sessions/registry.lock"),
+        )
+        .unwrap();
+        assert!(recover_pending(&root).is_err());
+        assert!(!outside.join("created-by-lock").exists());
+        fs::remove_file(root.join("sessions/registry.lock")).unwrap();
+
+        // A generation that is not a UUID names nothing.
+        fs::write(
+            root.join("sessions/registry.json"),
+            serde_json::json!({
+                "active": {"generation": "../../outside", "harness": "codex"},
+                "aliases": {},
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(active(&root).is_err());
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 1);
     }
     #[cfg(unix)]
     #[test]
@@ -741,7 +866,7 @@ mod tests {
                 .to_string()
                 .contains("invalid pending session reset")
         );
-        atomic_write(&root.join("sessions/registry.json"), &before).unwrap();
+        crate::learned_memory::atomic_write(&root.join("sessions/registry.json"), &before).unwrap();
         assert!(reset_session(root, "opencode", Some("../foreign")).is_err());
         assert_eq!(
             fs::read(root.join("sessions/registry.json")).unwrap(),
