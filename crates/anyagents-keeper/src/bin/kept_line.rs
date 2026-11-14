@@ -12,6 +12,12 @@
 //! adapter for good), as a blocking write into a stuck vendor would. The
 //! message id `refuse` is refused for good, as a vendor refuses a malformed
 //! request.
+//!
+//! Two probes: `"slow_health": "<path>"` makes the first health read after
+//! `<path>` appears take a while (it removes `<path>` and writes
+//! `<path>.reading` as it starts), as a vendor's can under load; and
+//! `"dropped": "<path>"` is written once the adapter's drop has ended the
+//! harness.
 
 use std::collections::HashSet;
 use std::io::{BufRead as _, BufReader, Write as _};
@@ -46,6 +52,8 @@ struct LineAdapter {
     child: Child,
     stdin: Option<ChildStdin>,
     state: Arc<Mutex<State>>,
+    slow_health: Option<std::path::PathBuf>,
+    dropped: Option<std::path::PathBuf>,
 }
 
 impl LineAdapter {
@@ -98,10 +106,13 @@ impl LineAdapter {
             state.alive = false;
             state.changed();
         });
+        let path = |key: &str| spec.launch[key].as_str().map(std::path::PathBuf::from);
         Ok(Self {
             child,
             stdin,
             state,
+            slow_health: path("slow_health"),
+            dropped: path("dropped"),
         })
     }
 }
@@ -166,6 +177,12 @@ impl Harness for LineAdapter {
     }
 
     fn health(&self) -> HarnessHealth {
+        if let Some(trigger) = &self.slow_health
+            && std::fs::remove_file(trigger).is_ok()
+        {
+            let _ = std::fs::write(trigger.with_extension("reading"), b"");
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
         let state = self.state.lock().unwrap();
         let open = state.written.iter().any(|id| !state.taken.contains(id));
         HarnessHealth {
@@ -213,6 +230,9 @@ impl Drop for LineAdapter {
         self.stdin = None;
         anyagents_harness::kill_child(&mut self.child, &[]);
         let _ = self.child.wait();
+        if let Some(dropped) = &self.dropped {
+            let _ = std::fs::write(dropped, b"");
+        }
     }
 }
 
