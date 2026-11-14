@@ -46,14 +46,16 @@ pub enum McpProfile {
     /// Exposes all AnyAgents MCP tools (`send`, `inbox`, `agents`, `groups`, `schedules`,
     /// `conversation`, `code`, `web_search`, `web_fetch`, `memory`, `skills`, `browser`,
     /// `computer`). Default for `anyagents mcp` over `stdio` across all local CLI harnesses
-    /// (`spiron`, `claude-code`, `codex`, `agy`, `opencode`) and for cloud agents bound to a
-    /// `SandboxConfig` or with built-in tools disabled.
+    /// (`spiron`, `claude-code`, `codex`, `agy`, `opencode`), and for an HTTP caller holding a
+    /// local capability whose agent is bound to a `SandboxConfig` or has built-in tools
+    /// disabled. Never available to a remote session token.
     #[default]
     Full,
-    /// Default for Streamable HTTP `POST /mcp` across all Cloud Agents (`spiron-cloud`,
-    /// `claude-cloud`, `openai-cloud`, `cursor-cloud`) when no remote `SandboxConfig` is bound.
-    /// Exposes coordination, `memory`, `skills`, `web_search`, `web_fetch`, `browser`, and
-    /// `computer` while omitting host-local `code`.
+    /// The only profile a remote session token gets, and the default for Streamable HTTP
+    /// `POST /mcp` across all Cloud Agents (`spiron-cloud`, `claude-cloud`, `openai-cloud`,
+    /// `cursor-cloud`). Exposes coordination, `memory` and `skills`: control-plane state that
+    /// belongs to the agent. Every tool that runs on or from the control-plane host (`code`,
+    /// `files`, `browser`, `computer`, `device`, `media`, `web_search`, `web_fetch`) is omitted.
     Remote,
     /// Optional explicit coordination-only profile (`--profile coordination` or `?profile=coordination`).
     /// Exposes only pure multi-agent coordination tools (`send`, `inbox`, `agents`, `groups`,
@@ -77,6 +79,9 @@ pub const FULL_MCP_TOOLS: &[&str] = &[
     "computer",
 ];
 
+/// The remote profile: coordination plus the agent's own memory and skills.
+/// `web_search` and `web_fetch` stay out: they spend the server's provider keys
+/// and fetch from the control-plane network, so they are not host-free.
 pub const REMOTE_MCP_TOOLS: &[&str] = &[
     "send",
     "inbox",
@@ -84,12 +89,8 @@ pub const REMOTE_MCP_TOOLS: &[&str] = &[
     "groups",
     "schedules",
     "conversation",
-    "web_search",
-    "web_fetch",
     "memory",
     "skills",
-    "browser",
-    "computer",
 ];
 
 pub const COORDINATION_MCP_TOOLS: &[&str] = &[
@@ -133,11 +134,10 @@ impl McpProfile {
             .strip_prefix("mcp__anyagents__")
             .unwrap_or(raw_name.trim());
         match clean {
-            "code" | "files" => matches!(self, Self::Full),
-            "web" | "web_search" | "web_fetch" | "memory" | "skills" | "browser" | "computer"
-            | "device" | "media" => {
-                matches!(self, Self::Full | Self::Remote)
-            }
+            // Run on, or reach out from, the control-plane host.
+            "code" | "files" | "web" | "web_search" | "web_fetch" | "browser" | "computer"
+            | "device" | "media" => matches!(self, Self::Full),
+            "memory" | "skills" => matches!(self, Self::Full | Self::Remote),
             "send" | "inbox" | "agents" | "groups" | "schedules" | "schedule" | "conversation"
             | "search" | "spawn" | "subagents" | "describe" | "archive" | "wake" | "interact" => {
                 true
@@ -148,6 +148,25 @@ impl McpProfile {
 
     pub fn resolve_stdio(explicit: Option<Self>, _harness: Option<&str>, _config: &Path) -> Self {
         explicit.unwrap_or(Self::Full)
+    }
+
+    /// The profile a remote session token gets: `remote`, or the narrower
+    /// `coordination` when asked for. Nothing a remote session asks for widens
+    /// it.
+    pub fn resolve_remote_session(explicit: Option<&str>) -> Result<Self, String> {
+        match explicit.map(str::trim).filter(|s| !s.is_empty()) {
+            None => Ok(Self::Remote),
+            Some(raw) => match Self::from_str_opt(raw) {
+                Some(Self::Remote) => Ok(Self::Remote),
+                Some(Self::Coordination) => Ok(Self::Coordination),
+                Some(Self::Full) => Err(format!(
+                    "MCP profile `{raw}` is not available to a remote session; it gets `remote` or `coordination`"
+                )),
+                None => Err(format!(
+                    "invalid MCP profile `{raw}`; a remote session gets `remote` or `coordination`"
+                )),
+            },
+        }
     }
 
     pub fn resolve_http_with_config(
@@ -546,7 +565,7 @@ fn tool_server_runtime() -> std::io::Result<tokio::runtime::Runtime> {
 
 /// The capability an agent's harness reads: a file only that agent's own
 /// config directory holds.
-fn capability_of(config: &Path) -> Result<String, Error> {
+pub(crate) fn capability_of(config: &Path) -> Result<String, Error> {
     let path = config.join(CAPABILITY_FILE);
     let text = std::fs::read_to_string(&path).map_err(|err| {
         Error::Message(format!(

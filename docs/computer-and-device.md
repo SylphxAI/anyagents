@@ -29,12 +29,18 @@ Snapshots prune unnamed, noninteractive layout wrappers and return
 `@<snapshot_id>:e<N>` refs. Desktop and mobile refs require the qualified form.
 Each new snapshot replaces the active ref map. Old refs fail with `STALE_REF`;
 take a fresh snapshot instead of retrying them. Errors include a disposition:
-`settled_absence`, `retryable_failure`, `stale_ref`, or `terminal_failure`.
+`settled_absence`, `retryable_failure`, `delivery_uncertain`, `stale_ref`, or
+`terminal_failure`. A read that timed out is `retryable_failure`. A click,
+keystroke, scroll, drag, navigation or other mutating action that timed out
+may already have been delivered, so it is `delivery_uncertain` (`retry:
+"verify_first"`): take a snapshot and verify the state before repeating it.
+Only a mutating action refused before dispatch (429 or 503 at admission) is
+`retryable_failure`.
 
 Browser snapshots additionally expose `snapshot_id` and each element's
 `qualified_ref`. Existing short `@e<N>` refs resolve against the active browser
 snapshot for compatibility. Prefer qualified refs to detect stale snapshots.
-Browser errors use the same four dispositions and redact secret input details.
+Browser errors use the same dispositions and redact secret input details.
 
 ## Android and iOS
 

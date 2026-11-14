@@ -33,6 +33,7 @@ mod mcp_ops;
 mod operator_inbox;
 mod outcomes;
 mod registry;
+mod remote_sessions;
 pub use registry::holds_store_writer;
 mod runtime;
 #[cfg(test)]
@@ -53,6 +54,10 @@ pub use operator_inbox::{
 };
 pub use outcomes::{
     NewOutcome, Outcome, OutcomeCost, OutcomeGroup, OutcomeGroupBy, OutcomeKind, OutcomeReport,
+};
+pub use remote_sessions::{
+    REMOTE_SESSION_TOKEN_PREFIX, RemoteSession, RemoteSessionGrant, RemoteSessionToken,
+    is_remote_session_token,
 };
 pub use runtime::{
     AgentRuntime, BackfillReport, Fault, FaultKind, ProcessIdentity, QUOTA_ESTIMATE_MS, QuotaBlock,
@@ -3158,6 +3163,7 @@ impl Store {
                 "harness_leases",
                 "agent_aliases",
                 "agent_capabilities",
+                "remote_session_tokens",
                 "usage_records",
                 "outcomes",
                 "skill_reads",
