@@ -596,7 +596,7 @@ fn health_reports_running_image_and_survives_atomic_install() {
     assert!(serving.get("pid").is_none());
     assert!(serving.get("process_started_at_ms").is_none());
     assert_eq!(serving.as_object().unwrap().len(), 5);
-    // Public health aliases report the same image with no process-local details.
+    // The public listener reports readiness only; the identity stays on the socket.
     let addr = std::fs::read_to_string(data.join("webhook.addr")).unwrap();
     for path in ["/", "/healthz", "/v1/webhooks/healthz"] {
         let mut stream = std::net::TcpStream::connect(addr.trim()).unwrap();
@@ -611,8 +611,12 @@ fn health_reports_running_image_and_survives_atomic_install() {
         let mut raw = String::new();
         stream.read_to_string(&mut raw).unwrap();
         assert!(raw.starts_with("HTTP/1.1 200"), "{raw}");
+        assert!(
+            raw.to_ascii_lowercase().contains("cache-control: no-store"),
+            "{raw}"
+        );
         let value: Value = serde_json::from_str(raw.split_once("\r\n\r\n").unwrap().1).unwrap();
-        assert_eq!(value, serving);
+        assert_eq!(value, json!({ "ok": true }), "{path}");
     }
 
     let replacement = dir.path().join("replacement");
