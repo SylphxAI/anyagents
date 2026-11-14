@@ -136,7 +136,7 @@ fn seat_file_program() -> io::Result<(PathBuf, Vec<&'static str>)> {
 #[cfg(test)]
 fn seat_file_program() -> io::Result<(PathBuf, Vec<&'static str>)> {
     Ok((
-        crate::worktree_access::seat_executable_test_harness()?,
+        crate::repo::seat_executable_test_harness()?,
         vec![
             "--exact",
             "seat_tree::tests::seat_file_worker",
@@ -2191,7 +2191,7 @@ exec "$@"
     #[cfg(target_os = "linux")]
     fn recording_launcher(dir: &Path) -> PathBuf {
         let launcher = dir.join("recording-launcher.sh");
-        crate::worktree::tests::write_executable(
+        crate::repo::tests::write_executable(
             &launcher,
             "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"${0%/*}/launcher-args\"\n\
              while [ \"$#\" -gt 0 ] && [ \"$1\" != \"--\" ]; do shift; done\nshift\nexec \"$@\"\n",
@@ -2263,7 +2263,7 @@ exec "$@"
     fn a_seat_that_hands_back_nothing_opens_nothing() {
         let temp = crate::test_tempdir();
         let launcher = temp.path().join("silent.sh");
-        crate::worktree::tests::write_executable(&launcher, "#!/bin/sh\nexit 0\n");
+        crate::repo::tests::write_executable(&launcher, "#!/bin/sh\nexit 0\n");
         let file = temp.path().join("f");
         std::fs::write(&file, b"x").unwrap();
         let error = open_as_seat(&launcher, 42001, 42002, "42002", &file, false)
@@ -2271,7 +2271,7 @@ exec "$@"
             .to_string();
         assert!(error.contains("without one opened file"), "{error}");
         let launcher = temp.path().join("denying.sh");
-        crate::worktree::tests::write_executable(&launcher, "#!/bin/sh\necho denied >&2\nexit 3\n");
+        crate::repo::tests::write_executable(&launcher, "#!/bin/sh\necho denied >&2\nexit 3\n");
         let error = open_as_seat(&launcher, 42001, 42002, "42002", &file, false)
             .unwrap_err()
             .to_string();
@@ -2289,7 +2289,7 @@ exec "$@"
     fn a_stopped_seat_helper_never_pins_the_caller() {
         let temp = crate::test_tempdir();
         let launcher = temp.path().join("stopping.sh");
-        crate::worktree::tests::write_executable(&launcher, "#!/bin/sh\nkill -STOP $$\nexit 0\n");
+        crate::repo::tests::write_executable(&launcher, "#!/bin/sh\nkill -STOP $$\nexit 0\n");
         let file = temp.path().join("f");
         std::fs::write(&file, b"x").unwrap();
         let started = std::time::Instant::now();
@@ -2330,7 +2330,7 @@ exec "$@"
     fn a_held_stderr_and_a_full_reaper_never_pin_the_caller() {
         let temp = crate::test_tempdir();
         let launcher = temp.path().join("holding.sh");
-        crate::worktree::tests::write_executable(
+        crate::repo::tests::write_executable(
             &launcher,
             "#!/bin/sh\n/bin/sleep 30 </dev/null >/dev/null &\necho denied >&2\nexit 3\n",
         );
