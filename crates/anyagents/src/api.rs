@@ -340,6 +340,12 @@ pub struct OperatorMessageView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sender_name: Option<String>,
     pub received_at_ms: i64,
+    /// How many times the same text arrived again, from any sender, within an
+    /// hour of this report.
+    #[serde(default)]
+    pub repeats: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_repeated_at_ms: Option<i64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -356,6 +362,8 @@ impl From<anyagents_core::OperatorMessage> for OperatorMessageView {
             sender: message.sender,
             sender_name: message.sender_name,
             received_at_ms: message.received_at_ms,
+            repeats: message.repeats,
+            last_repeated_at_ms: message.last_repeated_at_ms,
         }
     }
 }

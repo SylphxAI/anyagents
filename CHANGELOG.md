@@ -10,8 +10,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Agents report defects to whoever runs the deployment with `send` to
   `operator`: a defect in AnyAgents, the harness or the host that an agent
   cannot fix within its own work. Only the operator reads it, with
-  `anyagents inbox --operator`. Each sender has a small burst and an hourly
-  cap, and a repeated report within an hour is answered as a duplicate.
+  `anyagents inbox --operator`. Each sender and the whole fleet have a small
+  burst and an hourly cap, the same text within an hour is counted on the
+  first report, and reports are kept for 30 days. No agent may be named
+  `operator`.
 - Usage accounting no longer over-counts cost for Claude Code and OpenCode
   agents. Claude Code's `total_cost_usd` is the session's running total: a
   resumed process restores it from the transcript's last `cost-state` row

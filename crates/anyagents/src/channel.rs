@@ -259,7 +259,7 @@ fn report_stored(
         }
         anyagents_core::OperatorReceipt::Limited { retry_after_ms } => {
             return Err(Error::Message(format!(
-                "the operator inbox is rate limited for this sender; retry in {}s",
+                "the operator inbox is at its rate limit; retry in {}s",
                 (retry_after_ms + 999) / 1000
             )));
         }
@@ -465,6 +465,10 @@ fn operator_inbox(data: &Path, args: &InboxArgs) -> Result<(), Error> {
             Some(name) => format!("agent:{name}"),
             None => m.sender.clone(),
         };
+        let text = |m: &crate::api::OperatorMessageView| match m.repeats {
+            0 => m.text.clone(),
+            n => format!("{} [repeated {n}x]", m.text),
+        };
         if args.json {
             if args.follow {
                 for message in &read.messages {
@@ -489,7 +493,7 @@ fn operator_inbox(data: &Path, args: &InboxArgs) -> Result<(), Error> {
                     crate::ui::format_timestamp_ms(m.received_at_ms),
                     reporter(m),
                     m.sender,
-                    m.text
+                    text(m)
                 );
             }
         } else {
@@ -499,7 +503,7 @@ fn operator_inbox(data: &Path, args: &InboxArgs) -> Result<(), Error> {
                 .map(|m| crate::api::MessageView {
                     id: m.id.clone(),
                     seq: m.seq,
-                    text: m.text.clone(),
+                    text: text(m),
                     sender: Some(reporter(m)),
                     reply_to: None,
                     source_time_ms: None,

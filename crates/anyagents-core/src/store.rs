@@ -48,7 +48,8 @@ pub use group_policy::{Group, GroupAction, GroupActor};
 pub use harness_leases::HarnessLease;
 pub use lifecycle::{LifecycleKind, LifecycleOp, LifecyclePhase, NewLifecycleOp, SchedulePending};
 pub use operator_inbox::{
-    OPERATOR_BURST, OPERATOR_HOURLY_CAP, OperatorMessage, OperatorReceipt, OperatorReport,
+    OPERATOR_BURST, OPERATOR_FLEET_BURST, OPERATOR_FLEET_HOURLY_CAP, OPERATOR_HOURLY_CAP,
+    OperatorMessage, OperatorReceipt, OperatorReport,
 };
 pub use outcomes::{
     NewOutcome, Outcome, OutcomeCost, OutcomeGroup, OutcomeGroupBy, OutcomeKind, OutcomeReport,
@@ -1456,6 +1457,7 @@ impl Store {
 
     pub fn create_agent(&self, new: NewAgent) -> Result<Agent, Error> {
         validate_token(&new.name, "agent name")?;
+        refuse_reserved_agent_name(&new.name)?;
         let harness = normalize_harness_name(&new.harness);
         if harness.is_empty() {
             return Err(Error::Message("harness is empty".into()));
@@ -1600,6 +1602,7 @@ impl Store {
             .strip_prefix("agent:")
             .unwrap_or(new_name.trim());
         validate_token(clean, "agent name")?;
+        refuse_reserved_agent_name(clean)?;
         let (updated, changed) = self.write_tx(|tx| {
             let current = agent_by_id(tx, agent_id)?;
             if current.name == clean {
@@ -6200,6 +6203,17 @@ fn data_dir_for(path: &Path) -> PathBuf {
         Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
         _ => PathBuf::from("."),
     }
+}
+
+/// `operator` addresses the operator's inbox in `send`, so no agent may hold
+/// that name, in any case.
+fn refuse_reserved_agent_name(name: &str) -> Result<(), Error> {
+    if name.eq_ignore_ascii_case("operator") {
+        return Err(Error::Message(
+            "`operator` is reserved for the operator's inbox and cannot name an agent".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_token(value: &str, what: &str) -> Result<(), Error> {
