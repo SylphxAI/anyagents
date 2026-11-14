@@ -1666,24 +1666,39 @@ pub(crate) enum JournalOwner {
 /// Once per server start, from the first maintenance pass: bring every
 /// journal whose agent can never run again to a final state. A grant it still
 /// holds is revoked. A failed creation's checkout is removed as its rollback
-/// should have (`remove_checkout` never drops a commit). The journal is then
-/// removed once its checkout is gone. Whatever cannot be revoked or removed
+/// should have (see [`remove_failed_checkout`]). The journal is then removed
+/// once its checkout is gone. Whatever cannot be revoked or removed
 /// quarantines the journal with the reason. Nothing here is retried later.
 /// Every quarantined or unreadable journal is listed, one line each, so an
-/// operator sees what waits for them.
+/// operator sees what waits for them. Only server-owned journals in a
+/// server-owned directory that no one else can write are acted on.
+/// `protected`: whether a path is, or contains, an admitted agent's workdir.
 pub(crate) fn settle_grant_journals(
     data: &Path,
     owner: &dyn Fn(&anyagents_core::AgentId) -> JournalOwner,
-    remove_checkout: &dyn Fn(&Path) -> std::io::Result<()>,
+    protected: &dyn Fn(&Path) -> bool,
 ) -> Result<(), Error> {
+    use std::os::unix::fs::MetadataExt;
+    let server = crate::sandbox::server_uid();
     let directory = data.join("worktree-grants");
-    let mut entries: Vec<PathBuf> = match std::fs::read_dir(&directory) {
+    let listed = match std::fs::symlink_metadata(&directory) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e.into()),
-        Ok(entries) => entries
-            .map(|entry| entry.map(|entry| entry.path()))
-            .collect::<std::io::Result<_>>()?,
+        Ok(_) => open_nofollow(&directory)?,
     };
+    let meta = listed.metadata()?;
+    if !meta.is_dir() || meta.uid() != server || writable_by_anyone_else(&listed, &[server])? {
+        return Err(refusal(
+            &directory,
+            format!(
+                "the grant journal directory must be owned by the server (uid {server}) and \
+                 writable by no one else; journals are not settled"
+            ),
+        ));
+    }
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(&directory)?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::io::Result<_>>()?;
     entries.sort();
     let mut retired = 0usize;
     for path in entries {
@@ -1697,11 +1712,34 @@ pub(crate) fn settle_grant_journals(
             continue;
         };
         let lock = lock_journals(&path)?;
-        let grant = match std::fs::read(&path)
-            .and_then(|bytes| serde_json::from_slice::<Grant>(&bytes).map_err(Into::into))
+        let file = match open_nofollow(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                eprintln!(
+                    "worktree grant journal {} is unreadable ({error})",
+                    path.display()
+                );
+                continue;
+            }
+        };
+        let journal_meta = file.metadata()?;
+        if !journal_meta.is_file()
+            || journal_meta.uid() != server
+            || journal_meta.nlink() != 1
+            || writable_by_anyone_else(&file, &[server])?
+        {
+            eprintln!(
+                "worktree grant journal {} is not a single-link file only the server (uid \
+                 {server}) owns and writes; it is not acted on",
+                path.display()
+            );
+            continue;
+        }
+        let grant = match std::io::read_to_string(&file)
+            .and_then(|text| serde_json::from_str::<Grant>(&text).map_err(Into::into))
         {
             Ok(grant) => grant,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => {
                 eprintln!(
                     "worktree grant journal {} is unreadable ({error}); it blocks launch and \
@@ -1731,15 +1769,12 @@ pub(crate) fn settle_grant_journals(
         } else {
             Ok(())
         };
-        // A slow removal must not hold every other agent's lifecycle work.
-        drop(lock);
         if settled.is_ok() && failed_creation {
-            settled = remove_checkout(&grant.checkout).map_err(|e| {
-                format!(
-                    "the checkout {} of failed creation {id} could not be removed: {e}",
-                    grant.checkout.display()
-                )
-            });
+            settled = grants_except(&path)
+                .map_err(|e| e.to_string())
+                .and_then(|others| remove_failed_checkout(&grant, &others, protected, lock));
+        } else {
+            drop(lock);
         }
         let _lock = lock_journals(&path)?;
         if let Err(reason) = settled {
@@ -1787,6 +1822,112 @@ pub(crate) fn settle_grant_journals(
         eprintln!("removed {retired} settled worktree grant journals of agents that can never run");
     }
     Ok(())
+}
+
+/// Every other journal in `journal`'s directory.
+fn grants_except(journal: &Path) -> std::io::Result<Vec<Grant>> {
+    let mut grants = Vec::new();
+    for entry in std::fs::read_dir(journal.parent().unwrap())? {
+        let path = entry?.path();
+        if path == journal || path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        grants.push(serde_json::from_slice(&std::fs::read(path)?)?);
+    }
+    Ok(grants)
+}
+
+/// Remove a failed creation's checkout and its registration, the two
+/// directories Git keeps for a linked worktree, as cleanup does: no Git
+/// process runs, so nothing in the seat-writable checkout (a `.git` pointer,
+/// attributes, a config the seat could have written) is consulted or
+/// executed with the server's rights. Only the journal's own record decides,
+/// and only when the checkout and the registration still name each other.
+/// Never removed: a path an admitted agent's workdir is (or lies inside), or
+/// one another journal records. The branch stays: its name may be in use by
+/// a later agent, and an unused branch costs nothing. The journal lock is
+/// released while the trees are removed.
+fn remove_failed_checkout(
+    grant: &Grant,
+    others: &[Grant],
+    protected: &dyn Fn(&Path) -> bool,
+    lock: std::fs::File,
+) -> Result<(), String> {
+    let checkout = &grant.checkout;
+    if std::fs::symlink_metadata(checkout)
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    {
+        return Ok(());
+    }
+    let overlaps = |a: &Path, b: &Path| a.starts_with(b) || b.starts_with(a);
+    if protected(checkout) {
+        return Err(format!(
+            "the checkout {} of a failed creation is (or holds) an admitted agent's workdir; \
+             it is kept",
+            checkout.display()
+        ));
+    }
+    if let Some(other) = others.iter().find(|other| {
+        overlaps(&other.checkout, checkout)
+            || overlaps(&other.private, &grant.private)
+            || overlaps(&other.private, checkout)
+    }) {
+        return Err(format!(
+            "the checkout {} of a failed creation is also recorded for {}; it is kept",
+            checkout.display(),
+            other.checkout.display()
+        ));
+    }
+    let record = RecordedWorktree {
+        grant: grant.clone(),
+        journal: PathBuf::new(),
+    };
+    if grant.private.parent() != Some(grant.common.join("worktrees").as_path())
+        || !record.checkout_pointer_matches()
+        || !registration_names(&grant.private, checkout)
+    {
+        return Err(format!(
+            "the checkout {} and its registration {} no longer name each other; both are kept",
+            checkout.display(),
+            grant.private.display()
+        ));
+    }
+    drop(lock);
+    std::fs::remove_dir_all(checkout).map_err(|e| {
+        format!(
+            "the checkout {} could not be removed: {e}",
+            checkout.display()
+        )
+    })?;
+    match std::fs::remove_dir_all(&grant.private) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "the registration {} could not be removed: {error}",
+            grant.private.display()
+        )),
+    }
+}
+
+/// The registration's `gitdir` file, read without following links, points
+/// back at this checkout's `.git`.
+fn registration_names(private: &Path, checkout: &Path) -> bool {
+    use std::io::Read;
+    let Ok(file) = open_nofollow(&private.join("gitdir")) else {
+        return false;
+    };
+    if !file.metadata().is_ok_and(|meta| meta.is_file()) {
+        return false;
+    }
+    let mut text = String::new();
+    if file.take(8193).read_to_string(&mut text).is_err() || text.len() > 8192 {
+        return false;
+    }
+    let named = Path::new(text.trim());
+    named == checkout.join(".git")
+        || std::fs::canonicalize(named).is_ok_and(|named| {
+            std::fs::canonicalize(checkout.join(".git")).is_ok_and(|c| c == named)
+        })
 }
 
 /// Run before either server mode starts consumers. An inspection intent is
@@ -5841,35 +5982,78 @@ mod tests {
         .unwrap();
     }
 
+    /// A linked-worktree layout without Git: the checkout's `.git` pointer
+    /// and the registration's `gitdir` back link name each other.
+    fn registered_checkout(data: &Path, name: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let common = data.join("hub/.git");
+        let private = common.join("worktrees").join(name);
+        let checkout = data.join(name);
+        std::fs::create_dir_all(&private).unwrap();
+        std::fs::create_dir_all(checkout.join("src")).unwrap();
+        std::fs::write(checkout.join("src/file"), "provisioned").unwrap();
+        std::fs::write(
+            checkout.join(".git"),
+            format!("gitdir: {}\n", private.display()),
+        )
+        .unwrap();
+        std::fs::write(
+            private.join("gitdir"),
+            format!("{}\n", checkout.join(".git").display()),
+        )
+        .unwrap();
+        (common, private, checkout)
+    }
+
+    fn failed_journal(data: &Path, id: &anyagents_core::AgentId, name: &str) -> PathBuf {
+        let (common, private, checkout) = registered_checkout(data, name);
+        write_grant(
+            &grant_path(data, id),
+            &Grant {
+                common,
+                private,
+                checkout: checkout.clone(),
+                uid: crate::sandbox::server_uid(),
+                gid: crate::sandbox::server_gid(),
+                active: false,
+                inspection: false,
+                inspection_paths: None,
+                quarantined: false,
+                reason: None,
+            },
+        )
+        .unwrap();
+        checkout
+    }
+
+    fn reason_of(data: &Path, id: &anyagents_core::AgentId) -> String {
+        let grant: Grant =
+            serde_json::from_slice(&std::fs::read(grant_path(data, id)).unwrap()).unwrap();
+        assert!(grant.quarantined, "not quarantined");
+        grant.reason.unwrap()
+    }
+
     /// A journal left by an agent that can never run again ends in one pass:
     /// removed once nothing remains to witness (a failed creation's checkout
-    /// removed first), kept while a deleted agent's checkout exists,
-    /// quarantined with the reason when its grant or checkout cannot be
-    /// undone. A live agent's journal is never touched, and a later pass
+    /// and registration removed first), kept while a deleted agent's checkout
+    /// exists, quarantined with the reason when its grant or checkout cannot
+    /// be undone. A live agent's journal is never touched, and a later pass
     /// retries nothing.
     #[test]
     fn startup_settles_orphaned_journals_once() {
         let dir = crate::test_tempdir();
         let data = dir.path();
         let id = || anyagents_core::AgentId::generate();
-        let (gone, kept, live, held, failed, stuck, corrupt) =
-            (id(), id(), id(), id(), id(), id(), id());
-        let checkout = |name: &str| {
-            let path = data.join(name);
-            std::fs::create_dir(&path).unwrap();
-            path
-        };
+        let (gone, kept, live, held, failed, corrupt) = (id(), id(), id(), id(), id(), id());
+        std::fs::create_dir(data.join("deleted-agent-work")).unwrap();
         journal_of(data, &gone, &data.join("removed-checkout"), true);
-        journal_of(data, &kept, &checkout("deleted-agent-work"), false);
+        journal_of(data, &kept, &data.join("deleted-agent-work"), false);
         journal_of(data, &live, &data.join("removed-checkout"), false);
-        journal_of(data, &failed, &checkout("failed-work"), false);
-        journal_of(data, &stuck, &checkout("stuck-work"), false);
+        let failed_checkout = failed_journal(data, &failed, "failed-work");
         // A seat grant on a store that no longer exists cannot be revoked.
         let mut grant: Grant =
             serde_json::from_slice(&std::fs::read(grant_path(data, &gone)).unwrap()).unwrap();
         grant.gid = grant.gid.wrapping_add(100000);
         write_grant(&grant_path(data, &held), &grant).unwrap();
-        std::fs::write(grant_path(data, &corrupt), b"not a journal").unwrap();
         let staging = data.join("worktree-grants/gitconfig-x.tmp");
         let fresh_staging = data.join("worktree-grants/gitconfig-y.safe");
         std::fs::write(&fresh_staging, b"").unwrap();
@@ -5880,21 +6064,14 @@ mod tests {
         let owner = |agent: &anyagents_core::AgentId| {
             if agent == &live {
                 JournalOwner::Live
-            } else if agent == &failed || agent == &stuck {
+            } else if agent == &failed {
                 JournalOwner::FailedCreation
             } else {
                 JournalOwner::Deleted
             }
         };
-        let removed = std::cell::RefCell::new(Vec::new());
-        let remove = |path: &Path| {
-            removed.borrow_mut().push(path.to_path_buf());
-            if path.ends_with("stuck-work") {
-                return Err(std::io::Error::other("injected removal failure"));
-            }
-            std::fs::remove_dir(path)
-        };
-        settle_grant_journals(data, &owner, &remove).unwrap();
+        let unprotected = |_: &Path| false;
+        settle_grant_journals(data, &owner, &unprotected).unwrap();
         // The server's own grant needs no revocation: removed outright.
         assert!(!grant_path(data, &gone).exists());
         assert!(
@@ -5907,39 +6084,103 @@ mod tests {
             "a live agent's journal moved"
         );
         assert!(!grant_path(data, &failed).exists());
-        assert!(!data.join("failed-work").exists());
-        assert!(grant_path(data, &corrupt).exists());
+        assert!(!failed_checkout.exists());
+        assert!(!data.join("hub/.git/worktrees/failed-work").exists());
         assert!(!staging.exists());
         assert!(fresh_staging.exists(), "a staging file in use was removed");
-        for (agent, expected) in [
-            (&held, "could not be revoked"),
-            (&stuck, "could not be removed"),
-        ] {
-            let quarantined: Grant =
-                serde_json::from_slice(&std::fs::read(grant_path(data, agent)).unwrap()).unwrap();
-            let reason = quarantined.reason.clone().unwrap();
-            assert!(
-                quarantined.quarantined && reason.contains(expected),
-                "{reason}"
-            );
-            assert!(reaping_blocked(data, agent));
-            assert!(
-                ensure_launchable(data, agent)
-                    .unwrap_err()
-                    .to_string()
-                    .contains(&reason)
-            );
-        }
-        // A later pass changes nothing: no retry, no new state.
+        let reason = reason_of(data, &held);
+        assert!(reason.contains("could not be revoked"), "{reason}");
+        assert!(reaping_blocked(data, &held));
+        assert!(
+            ensure_launchable(data, &held)
+                .unwrap_err()
+                .to_string()
+                .contains(&reason)
+        );
+        // A later pass changes nothing: no retry, no new state. An unreadable
+        // journal is listed and left for an operator.
+        std::fs::write(grant_path(data, &corrupt), b"not a journal").unwrap();
         let before = std::fs::read(grant_path(data, &held)).unwrap();
-        let attempts = removed.borrow().len();
-        settle_grant_journals(data, &owner, &remove).unwrap();
+        settle_grant_journals(data, &owner, &unprotected).unwrap();
         assert_eq!(std::fs::read(grant_path(data, &held)).unwrap(), before);
-        assert_eq!(removed.borrow().len(), attempts, "a removal was retried");
+        assert_eq!(
+            std::fs::read(grant_path(data, &corrupt)).unwrap(),
+            b"not a journal"
+        );
         // Once a deleted agent's checkout is gone, its journal goes too.
         std::fs::remove_dir(data.join("deleted-agent-work")).unwrap();
-        settle_grant_journals(data, &owner, &remove).unwrap();
+        settle_grant_journals(data, &owner, &unprotected).unwrap();
         assert!(!grant_path(data, &kept).exists());
+    }
+
+    /// A failed creation's checkout is removed only from the journal's own
+    /// record, never through anything in the checkout, and never when an
+    /// admitted agent or another journal names it, or when the checkout and
+    /// its registration no longer name each other. Every refusal keeps both
+    /// trees and quarantines the journal with the reason. Journals the
+    /// server alone does not own and write are not acted on at all.
+    #[test]
+    fn settling_a_failed_creation_removes_only_its_own_checkout() {
+        let dir = crate::test_tempdir();
+        let data = dir.path();
+        let id = || anyagents_core::AgentId::generate();
+        let (swapped, named, shared, sharer, loose) = (id(), id(), id(), id(), id());
+        let swapped_checkout = failed_journal(data, &swapped, "swapped");
+        // The seat-writable pointer now names another registration.
+        let elsewhere = data.join("hub/.git/worktrees/elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(
+            swapped_checkout.join(".git"),
+            format!("gitdir: {}\n", elsewhere.display()),
+        )
+        .unwrap();
+        let named_checkout = failed_journal(data, &named, "named");
+        let shared_checkout = failed_journal(data, &shared, "shared");
+        journal_of(data, &sharer, &shared_checkout, false);
+        let loose_checkout = failed_journal(data, &loose, "loose");
+        std::fs::set_permissions(
+            grant_path(data, &loose),
+            std::fs::Permissions::from_mode(0o666),
+        )
+        .unwrap();
+        let owner = |agent: &anyagents_core::AgentId| {
+            if agent == &sharer {
+                JournalOwner::Live
+            } else {
+                JournalOwner::FailedCreation
+            }
+        };
+        let live_workdir = named_checkout.join("src");
+        let protected = |checkout: &Path| live_workdir.starts_with(checkout);
+        settle_grant_journals(data, &owner, &protected).unwrap();
+        for (agent, checkout, expected) in [
+            (&swapped, &swapped_checkout, "no longer name each other"),
+            (&named, &named_checkout, "admitted agent's workdir"),
+            (&shared, &shared_checkout, "also recorded"),
+        ] {
+            let reason = reason_of(data, agent);
+            assert!(reason.contains(expected), "{reason}");
+            assert_eq!(
+                std::fs::read_to_string(checkout.join("src/file")).unwrap(),
+                "provisioned"
+            );
+        }
+        assert!(elsewhere.exists());
+        assert!(data.join("hub/.git/worktrees/swapped").exists());
+        // A journal others can write is left exactly as it is.
+        assert!(loose_checkout.join("src/file").exists());
+        let untouched: Grant =
+            serde_json::from_slice(&std::fs::read(grant_path(data, &loose)).unwrap()).unwrap();
+        assert!(!untouched.quarantined);
+        // A journal directory others can write settles nothing.
+        let journals = data.join("worktree-grants");
+        std::fs::set_permissions(&journals, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let error = settle_grant_journals(data, &owner, &protected).unwrap_err();
+        std::fs::set_permissions(&journals, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            error.to_string().contains("writable by no one else"),
+            "{error}"
+        );
     }
 
     /// A journal written before this release still reads: its store

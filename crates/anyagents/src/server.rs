@@ -560,11 +560,21 @@ fn settle_grant_journals_once(store: &Store, data_dir: &Path) {
         }
         Ok(_) | Err(_) => crate::worktree_access::JournalOwner::Live,
     };
-    if let Err(error) = crate::worktree_access::settle_grant_journals(
-        data_dir,
-        &owner,
-        &crate::create::remove_provisioned_checkout,
-    ) {
+    // Every admitted agent's workdir, archived ones included: a wake can
+    // bring them back. Unknown (a store error) protects everything.
+    let workdirs: Option<Vec<PathBuf>> = store.list_agents().ok().map(|agents| {
+        agents
+            .into_iter()
+            .filter_map(|agent| agent.workdir.map(PathBuf::from))
+            .collect()
+    });
+    let protected = |checkout: &Path| {
+        workdirs
+            .as_ref()
+            .is_none_or(|dirs| dirs.iter().any(|dir| dir.starts_with(checkout)))
+    };
+    if let Err(error) = crate::worktree_access::settle_grant_journals(data_dir, &owner, &protected)
+    {
         eprintln!("warning: worktree grant journals not settled: {error}");
     }
 }

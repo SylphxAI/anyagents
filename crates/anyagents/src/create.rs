@@ -659,7 +659,7 @@ fn remove_made_dirs(made: &MadeDirs, kept_checkout: Option<&Path>, id: &AgentId)
 /// registration is removed. Its branch is deleted only by compare-and-delete
 /// when the tip is unchanged and still reachable from another ref, so no
 /// commit can be lost; otherwise the branch is kept.
-pub(crate) fn remove_provisioned_checkout(checkout: &Path) -> std::io::Result<()> {
+fn remove_provisioned_checkout(checkout: &Path) -> std::io::Result<()> {
     let git = |dir: &Path, args: &[&std::ffi::OsStr]| -> std::io::Result<Option<String>> {
         let out = std::process::Command::new("git")
             .args([
