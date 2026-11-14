@@ -15,25 +15,58 @@ use anyagents_harness_codex::CodexHarness;
 use anyagents_harness_muse::MuseHarness;
 use anyagents_harness_omp::OmpHarness;
 use anyagents_harness_opencode::OpenCodeHarness;
-use anyagents_harness_stream::{Launch, LineProtocol, StreamHarness, StreamSpec};
+use anyagents_harness_spiron::{SpironHarness, SpironLaunch};
+use anyagents_harness_stream::{Launch, StreamHarness, StreamSpec};
+use anyagents_keeper::{Hosted, RemoteHarness};
 use anyagents_supervisor::LaunchRequest;
+use serde::{Deserialize, Serialize};
 
 use crate::dsh::DshHarness;
 use crate::grok::GrokHarness;
 
-pub enum VendorHarness {
-    Claude(Box<ClaudeHarness>, SessionPointer),
-    Codex(Box<CodexHarness>, SessionPointer),
-    OpenCode(Box<OpenCodeHarness>, SessionPointer),
-    Agy(Box<AgyHarness>, SessionPointer),
-    Muse(Box<MuseHarness>, SessionPointer),
-    Omp(Box<OmpHarness>, SessionPointer),
-    Dsh(Box<DshHarness>, SessionPointer),
-    Grok(Box<GrokHarness>, SessionPointer),
-    /// The external Spiron CLI.  The pointer is the canonical session file;
-    /// legacy `sylphx-session-id` is read once when this adapter starts.
-    Spiron(Box<StreamHarness>, SessionPointer, String),
+/// One vendor adapter over its vendor process, in the process that hosts it:
+/// its keeper, or this one.
+pub enum LocalAdapter {
+    Claude(Box<ClaudeHarness>),
+    Codex(Box<CodexHarness>),
+    OpenCode(Box<OpenCodeHarness>),
+    Agy(Box<AgyHarness>),
+    Muse(Box<MuseHarness>),
+    Omp(Box<OmpHarness>),
+    Dsh(Box<DshHarness>),
+    Grok(Box<GrokHarness>),
+    /// The external Spiron CLI.
+    Spiron(Box<SpironHarness>),
     Contract(Box<ContractHarness>),
+}
+
+/// Where vendor adapters run.
+#[derive(Clone, Debug)]
+pub enum HarnessHost {
+    /// Each in its own keeper (`anyagents keeper`), so the harness outlives
+    /// this kernel. What `anyagents serve` uses.
+    Keeper(anyagents_keeper::Program),
+    /// In this process, so the harness ends with it: a server embedded in a
+    /// test binary (which has no keeper mode) and the one-shot offline
+    /// `flush`.
+    InProcess,
+}
+
+enum Host {
+    Local(LocalAdapter),
+    Kept(Box<RemoteHarness>),
+}
+
+/// An agent's harness as the kernel drives it: the adapter, wherever it is
+/// hosted, plus the native resume pointer and host session record the kernel
+/// keeps for it.
+pub struct VendorHarness {
+    host: Host,
+    /// The canonical session file beside the agent's config; none for the
+    /// contract double. Legacy `sylphx-session-id` is read once at launch.
+    pointer: Option<SessionPointer>,
+    /// The harness name the host session registry records the session under.
+    selector: String,
 }
 
 /// The native resume pointer beside an agent's config, and the vendor session
@@ -85,10 +118,158 @@ impl SessionPointer {
 }
 
 impl VendorHarness {
-    fn sync_session(&self) -> Result<(), String> {
-        if let Self::Codex(harness, path) = self
-            && harness.thread_invalidated()
+    /// An adapter hosted in this process.
+    #[cfg(test)]
+    pub fn local(adapter: LocalAdapter, pointer: Option<PathBuf>, selector: &str) -> Self {
+        Self {
+            host: Host::Local(adapter),
+            pointer: pointer.map(SessionPointer::from),
+            selector: selector.to_string(),
+        }
+    }
+
+    /// Start the adapter `launch` describes, in a keeper or in this process.
+    fn start(
+        planned: Planned,
+        request: &LaunchRequest,
+        host: &HarnessHost,
+    ) -> Result<Self, String> {
+        let Planned {
+            launch,
+            pointer,
+            selector,
+        } = planned;
+        let host = match host {
+            HarnessHost::InProcess => Host::Local(launch.start()?),
+            HarnessHost::Keeper(program) => {
+                use std::os::fd::AsFd as _;
+                let seat = launch
+                    .environment()
+                    .iter()
+                    .rev()
+                    .find(|(key, _)| key == anyagents_harness::SEAT_LAUNCH_ENV)
+                    .map(|(_, spec)| spec.clone());
+                let mut labels = std::collections::BTreeMap::new();
+                labels.insert(LABEL_SELECTOR.to_string(), selector.clone());
+                if let Some(pointer) = &pointer {
+                    labels.insert(LABEL_POINTER.to_string(), pointer.display().to_string());
+                }
+                let spec = anyagents_keeper::Spec {
+                    agent: request.agent.id.as_str().to_string(),
+                    harness: request.agent.harness.clone(),
+                    model: request.agent.model.clone(),
+                    seat,
+                    labels,
+                    lock_path: Some(anyagents_core::agent_lock_path(
+                        &request.data_dir,
+                        &request.agent.id,
+                    )),
+                    launch: serde_json::to_value(&launch).map_err(|error| error.to_string())?,
+                };
+                let lock = request.lock.as_deref().map(|lock| lock.as_fd());
+                let program = anyagents_keeper::Program {
+                    ready: launch.keeper_ready(program.ready),
+                    ..program.clone()
+                };
+                Host::Kept(Box::new(
+                    anyagents_keeper::spawn(
+                        &program,
+                        &anyagents_keeper::root(&request.data_dir),
+                        &spec,
+                        lock,
+                    )
+                    .map_err(|error| {
+                        // The keeper holds the agent's lock on: the
+                        // supervisor must not unlock its own copy.
+                        if error == anyagents_keeper::ABANDONED_START {
+                            anyagents_supervisor::LAUNCH_ABANDONED.to_string()
+                        } else {
+                            error
+                        }
+                    })?,
+                ))
+            }
+        };
+        Ok(Self {
+            host,
+            pointer: pointer.map(SessionPointer::from),
+            selector,
+        })
+    }
+
+    /// A keeper a previous kernel left, taken over: the pointer and session
+    /// record follow the labels its launch gave it.
+    pub(crate) fn kept(remote: RemoteHarness) -> Self {
+        let labels = &remote.hello().labels;
+        let selector = labels
+            .get(LABEL_SELECTOR)
+            .cloned()
+            .unwrap_or_else(|| remote.hello().harness.clone());
+        let pointer = labels.get(LABEL_POINTER).map(PathBuf::from);
+        Self {
+            host: Host::Kept(Box::new(remote)),
+            pointer: pointer.map(SessionPointer::from),
+            selector,
+        }
+    }
+
+    fn adapter(&self) -> &dyn Hosted {
+        match &self.host {
+            Host::Local(adapter) => adapter,
+            Host::Kept(remote) => remote.as_ref(),
+        }
+    }
+
+    fn adapter_mut(&mut self) -> &mut dyn Hosted {
+        match &mut self.host {
+            Host::Local(adapter) => adapter,
+            Host::Kept(remote) => remote.as_mut(),
+        }
+    }
+
+    /// Whether this runs the external Spiron CLI.
+    #[cfg(test)]
+    pub fn is_spiron(&self) -> bool {
+        is_spiron_harness(&self.selector)
+    }
+
+    /// Leave a kept harness running for the next kernel. One hosted here
+    /// ends with this process anyway.
+    pub(crate) fn detach(self) {
+        if let Host::Kept(remote) = self.host {
+            (*remote).detach();
+        }
+    }
+
+    /// What this harness answers comes from its adapter: always in this
+    /// process, and from a keeper only while its link is open and answering.
+    pub(crate) fn answers_live(&self) -> bool {
+        match &self.host {
+            Host::Local(_) => true,
+            Host::Kept(remote) => remote.answers_live(),
+        }
+    }
+
+    /// Another kernel took this harness's keeper over.
+    pub(crate) fn superseded(&self) -> bool {
+        matches!(&self.host, Host::Kept(remote) if remote.superseded())
+    }
+
+    /// Keep `note` with a kept harness for the next kernel.
+    pub(crate) fn set_note(&self, note: &str) {
+        if let Host::Kept(remote) = &self.host
+            && let Err(error) = remote.set_note(note)
         {
+            eprintln!("anyagents-keeper: cannot keep the process note: {error}");
+        }
+    }
+
+    fn sync_session(&self) -> Result<(), String> {
+        let Some(path) = &self.pointer else {
+            return Ok(());
+        };
+        let adapter = self.adapter();
+        if adapter.session_invalidated() {
             let mut recorded = path.recorded();
             if *recorded != Recorded::Retired {
                 retire_session_pointer(path)?;
@@ -96,75 +277,394 @@ impl VendorHarness {
             }
             return Ok(());
         }
-        let (session, path) = match self {
-            Self::Claude(harness, path) => (harness.session_id(), Some(path)),
-            Self::Codex(harness, path) => (harness.session_id(), Some(path)),
-            Self::Agy(harness, path) => (harness.session_id(), Some(path)),
-            Self::Muse(harness, path) => (harness.session_id(), Some(path)),
-            Self::Omp(harness, path) => (harness.session_id(), Some(path)),
-            Self::Dsh(harness, path) => (harness.session_id(), Some(path)),
-            Self::Grok(harness, path) => (harness.session_id(), Some(path)),
-            Self::Spiron(harness, path, _) => (harness.session_id(), Some(path)),
-            Self::OpenCode(harness, path) => (harness.session_id(), Some(path)),
-            Self::Contract(_) => (None, None),
+        let Some(id) = adapter.session_id() else {
+            return Ok(());
         };
-        if let (Some(id), Some(path)) = (session, path) {
-            let trimmed = id.trim();
-            let mut recorded = path.recorded();
-            if matches!(&*recorded, Recorded::Session(done) if done == trimmed) {
-                return Ok(());
+        let trimmed = id.trim();
+        let mut recorded = path.recorded();
+        if matches!(&*recorded, Recorded::Session(done) if done == trimmed) {
+            return Ok(());
+        }
+        if !trimmed.is_empty() {
+            let existing = match std::fs::read_to_string(path) {
+                Ok(text) => Some(text),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+                Err(err) => return Err(format!("cannot read native session pointer: {err}")),
+            };
+            if let Some(root) = path.parent().and_then(Path::parent)
+                && let Err(error) =
+                    anyagents_core::host_session::bind_vendor(root, &self.selector, trimmed)
+            {
+                return Err(format!("host session alias refused: {error}"));
             }
-            if !trimmed.is_empty() {
-                let existing = match std::fs::read_to_string(path) {
-                    Ok(text) => Some(text),
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
-                    Err(err) => return Err(format!("cannot read native session pointer: {err}")),
-                };
-                if let Some(root) = path.parent().and_then(Path::parent) {
-                    let harness = match self {
-                        Self::Claude(_, path) => match path.file_name().and_then(|n| n.to_str()) {
-                            Some("spiron-cloud-session-id") => "spiron-cloud",
-                            Some("claude-cloud-session-id") => "claude-cloud",
-                            Some("openai-cloud-session-id") => "openai-cloud",
-                            Some("cursor-cloud-session-id") => "cursor-cloud",
-                            Some("codex-session-id") => "codex",
-                            Some("opencode-session-id") => "opencode",
-                            Some("agy-session-id") => "agy",
-                            Some("muse-session-id") => "muse",
-                            Some("omp-session-id") => "omp",
-                            Some("dsh-session-id") => "dsh",
-                            Some("grok-session-id") => "grok",
-                            Some("spiron-session-id") => "spiron",
-                            _ => "claude-code",
-                        },
-                        Self::Codex(..) => "codex",
-                        Self::OpenCode(..) => "opencode",
-                        Self::Agy(..) => "agy",
-                        Self::Muse(..) => "muse",
-                        Self::Omp(..) => "omp",
-                        Self::Dsh(..) => "dsh",
-                        Self::Grok(..) => "grok",
-                        Self::Spiron(_, _, selector) => selector.as_str(),
-                        _ => unreachable!(),
-                    };
-                    if let Err(error) =
-                        anyagents_core::host_session::bind_vendor(root, harness, trimmed)
-                    {
-                        return Err(format!("host session alias refused: {error}"));
-                    }
-                }
-                if existing.as_deref().map(str::trim) != Some(trimmed) {
-                    crate::create::write_required_file(
-                        path,
-                        format!("{trimmed}\n").as_bytes(),
-                        0o660,
-                    )
+            if existing.as_deref().map(str::trim) != Some(trimmed) {
+                crate::create::write_required_file(path, format!("{trimmed}\n").as_bytes(), 0o660)
                     .map_err(|err| err.to_string())?;
-                }
-                *recorded = Recorded::Session(trimmed.to_string());
             }
+            *recorded = Recorded::Session(trimmed.to_string());
         }
         Ok(())
+    }
+}
+
+/// Labels a kernel gives a keeper, to know the session record again when it
+/// takes the keeper over.
+const LABEL_POINTER: &str = "session_pointer";
+const LABEL_SELECTOR: &str = "session_selector";
+
+/// What one launch starts: the adapter call, the native resume pointer and
+/// the name the host session registry knows the session by.
+struct Planned {
+    launch: AdapterLaunch,
+    pointer: Option<PathBuf>,
+    selector: String,
+}
+
+/// How a host starts one vendor adapter: the call the launch path decided
+/// on, as data, so a keeper can make it. Everything that reads the store or
+/// writes the agent's configuration has already happened in the kernel.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "adapter", rename_all = "snake_case")]
+pub enum AdapterLaunch {
+    Contract {
+        program: String,
+        config: String,
+        env: Vec<(String, String)>,
+        work_dir: PathBuf,
+    },
+    Claude {
+        program: String,
+        args: Vec<String>,
+        session: Option<String>,
+        env: Vec<(String, String)>,
+        work_dir: PathBuf,
+        /// A cloud harness behind the Claude adapter: mail waits for the turn
+        /// to end (`docs/delivery.md`).
+        #[serde(default)]
+        cloud: bool,
+    },
+    Agy {
+        program: String,
+        session: Option<String>,
+        env: Vec<(String, String)>,
+        work_dir: PathBuf,
+        model: Option<String>,
+        /// The scripted double (`ANYAGENTS_FAKE_MODE`) speaks no stream-json.
+        scripted: bool,
+    },
+    Muse {
+        program: String,
+        args: Vec<String>,
+        session: Option<String>,
+        env: Vec<(String, String)>,
+        work_dir: PathBuf,
+        config_dir: PathBuf,
+        scripted: bool,
+    },
+    Omp {
+        program: String,
+        args: Vec<String>,
+        session: Option<String>,
+        env: Vec<(String, String)>,
+        work_dir: PathBuf,
+    },
+    Dsh {
+        program: PathBuf,
+        patch: Option<PathBuf>,
+        session: Option<String>,
+        env: Vec<(String, String)>,
+        work_dir: PathBuf,
+    },
+    Grok {
+        program: PathBuf,
+        model: Option<String>,
+        session: Option<String>,
+        env: Vec<(String, String)>,
+        work_dir: PathBuf,
+        exe: PathBuf,
+        mcp_args: Vec<String>,
+    },
+    Spiron {
+        program: PathBuf,
+        config_dir: PathBuf,
+        work_dir: PathBuf,
+        agent_id: String,
+        agent_name: String,
+        model: Option<String>,
+        session: Option<String>,
+        env: Vec<(String, String)>,
+    },
+    OpenCode {
+        program: PathBuf,
+        session: Option<String>,
+        env: Vec<(String, String)>,
+        work_dir: PathBuf,
+        config_dir: PathBuf,
+    },
+    Codex {
+        program: String,
+        session: Option<String>,
+        env: Vec<(String, String)>,
+        work_dir: PathBuf,
+    },
+}
+
+/// What a keeper adds to its adapter's own start: its own start and the
+/// vendor process's spawn.
+const KEEPER_START_SLACK: Duration = Duration::from_secs(30);
+
+impl AdapterLaunch {
+    /// Whether this launch runs the harness off this host: the cloud adapter
+    /// or a remote-sandbox spawn. Such a launch begins a remote session.
+    fn runs_off_host(&self) -> bool {
+        matches!(self, Self::Claude { args, .. }
+            if args.iter().any(|arg| arg == "cloud-harness" || arg == "sandbox-exec"))
+    }
+
+    /// How long this adapter's start may take, as the adapter declares it.
+    fn start_budget(&self) -> Option<Duration> {
+        match self {
+            Self::Muse { .. } => Some(anyagents_harness_muse::START_BUDGET),
+            Self::Codex { .. } => Some(anyagents_harness_codex::START_BUDGET),
+            Self::Spiron { .. } => Some(SPIRON_READY_WAIT),
+            _ => None,
+        }
+    }
+
+    /// How long its keeper may take to say `ready`: never less than `floor`,
+    /// and never less than the adapter's own start budget.
+    fn keeper_ready(&self, floor: Duration) -> Duration {
+        self.start_budget()
+            .map_or(floor, |budget| floor.max(budget + KEEPER_START_SLACK))
+    }
+
+    fn environment(&self) -> &[(String, String)] {
+        match self {
+            Self::Contract { env, .. }
+            | Self::Claude { env, .. }
+            | Self::Agy { env, .. }
+            | Self::Muse { env, .. }
+            | Self::Omp { env, .. }
+            | Self::Dsh { env, .. }
+            | Self::Grok { env, .. }
+            | Self::Spiron { env, .. }
+            | Self::OpenCode { env, .. }
+            | Self::Codex { env, .. } => env,
+        }
+    }
+
+    /// Start the vendor process and its adapter.
+    pub fn start(self) -> Result<LocalAdapter, String> {
+        Ok(match self {
+            Self::Contract {
+                program,
+                config,
+                env,
+                work_dir,
+            } => LocalAdapter::Contract(Box::new(
+                ContractHarness::start(&program, &config, &pairs(&env), Some(&work_dir))
+                    .map_err(|err| err.to_string())?,
+            )),
+            Self::Claude {
+                program,
+                args,
+                session,
+                env,
+                work_dir,
+                cloud,
+            } => {
+                let harness = start_claude(&program, &args, session.as_deref(), &env, &work_dir)?;
+                LocalAdapter::Claude(Box::new(if cloud {
+                    harness.with_delivery(anyagents_harness_claude::CLOUD_DELIVERY)
+                } else {
+                    harness
+                }))
+            }
+            Self::Agy {
+                program,
+                session,
+                env,
+                work_dir,
+                model,
+                scripted,
+            } => {
+                let harness = if scripted {
+                    AgyHarness::start(&program, session.as_deref(), &pairs(&env))
+                } else {
+                    let mut spec = StreamSpec::for_program("agy");
+                    spec.args = vec![
+                        "--input-format".to_string(),
+                        "stream-json".to_string(),
+                        "--output-format".to_string(),
+                        "stream-json".to_string(),
+                        "--dangerously-skip-permissions".to_string(),
+                    ];
+                    if let Some(model) = model {
+                        spec.args.push("--model".to_string());
+                        spec.args.push(model);
+                    }
+                    spec.resume_flag = "--conversation";
+                    AgyHarness::start_with_spec(
+                        spec,
+                        &program,
+                        session.as_deref(),
+                        &pairs(&env),
+                        Some(&work_dir),
+                    )
+                };
+                LocalAdapter::Agy(Box::new(harness.map_err(|err| err.to_string())?))
+            }
+            Self::Muse {
+                program,
+                args,
+                session,
+                env,
+                work_dir,
+                config_dir,
+                scripted,
+            } => {
+                let harness = MuseHarness::start_in_with_args(
+                    &program,
+                    &args,
+                    session.as_deref(),
+                    &pairs(&env),
+                    Some(&work_dir),
+                )
+                .map_err(|err| {
+                    read_muse_exit_error(&config_dir).unwrap_or_else(|| err.to_string())
+                })?;
+                if !scripted && !harness.health().process_alive {
+                    return Err(read_muse_exit_error(&config_dir).unwrap_or_else(|| {
+                        "muse serve exited during startup handshake".to_string()
+                    }));
+                }
+                LocalAdapter::Muse(Box::new(harness))
+            }
+            Self::Omp {
+                program,
+                args,
+                session,
+                env,
+                work_dir,
+            } => {
+                let mut spec = StreamSpec::for_program("omp");
+                spec.args.extend(args);
+                let harness = OmpHarness::start_with_spec(
+                    spec,
+                    program,
+                    session.as_deref(),
+                    &pairs(&env),
+                    Some(&work_dir),
+                )
+                .map_err(|err| err.to_string())?;
+                LocalAdapter::Omp(Box::new(harness))
+            }
+            Self::Dsh {
+                program,
+                patch,
+                session,
+                env,
+                work_dir,
+            } => LocalAdapter::Dsh(Box::new(
+                DshHarness::start(
+                    &program,
+                    patch.as_deref(),
+                    session.as_deref(),
+                    &pairs(&env),
+                    &work_dir,
+                )
+                .map_err(|err| err.to_string())?,
+            )),
+            Self::Grok {
+                program,
+                model,
+                session,
+                env,
+                work_dir,
+                exe,
+                mcp_args,
+            } => LocalAdapter::Grok(Box::new(
+                GrokHarness::start(
+                    &program,
+                    model.as_deref(),
+                    session.as_deref(),
+                    &pairs(&env),
+                    &work_dir,
+                    &exe,
+                    &mcp_args,
+                )
+                .map_err(|err| err.to_string())?,
+            )),
+            Self::Spiron {
+                program,
+                config_dir,
+                work_dir,
+                agent_id,
+                agent_name,
+                model,
+                session,
+                env,
+            } => LocalAdapter::Spiron(Box::new(start_spiron(
+                &program,
+                &config_dir,
+                &work_dir,
+                SpironAgent {
+                    id: &agent_id,
+                    name: &agent_name,
+                    model: model.as_deref(),
+                },
+                session.as_deref(),
+                &env,
+            )?)),
+            Self::OpenCode {
+                program,
+                session,
+                env,
+                work_dir,
+                config_dir,
+            } => LocalAdapter::OpenCode(Box::new(
+                OpenCodeHarness::start_in_config(
+                    &program,
+                    session.as_deref(),
+                    &pairs(&env),
+                    Some(&work_dir),
+                    &config_dir,
+                )
+                .map_err(|err| {
+                    read_opencode_exit_error(&config_dir).unwrap_or_else(|| err.to_string())
+                })?,
+            )),
+            Self::Codex {
+                program,
+                session,
+                env,
+                work_dir,
+            } => LocalAdapter::Codex(Box::new(start_codex(
+                &program,
+                session.as_deref(),
+                &env,
+                &work_dir,
+            )?)),
+        })
+    }
+}
+
+/// What the adapter for `harness` guarantees for mail that reaches a busy
+/// agent, before a process has announced itself (`docs/delivery.md`). A live
+/// process reports its own, from its handshake.
+pub(crate) fn declared_delivery(harness: &str) -> anyagents_harness::Delivery {
+    match anyagents_harness::normalize_harness_name(harness) {
+        "codex" => anyagents_harness_codex::DELIVERY,
+        "opencode" => anyagents_harness_opencode::DELIVERY,
+        "agy" => anyagents_harness_agy::DELIVERY,
+        "muse" => anyagents_harness_muse::DELIVERY,
+        "omp" => anyagents_harness_omp::DELIVERY,
+        "dsh" => crate::dsh::DELIVERY,
+        "grok" => crate::grok::DELIVERY,
+        "spiron" => anyagents_harness_stream::SPIRON,
+        "claude-code" => anyagents_harness_claude::DELIVERY,
+        name if is_cloud_harness(name) => anyagents_harness_claude::CLOUD_DELIVERY,
+        _ => anyagents_harness_stream::LINE_PER_TURN,
     }
 }
 
@@ -210,7 +710,7 @@ impl ContractHarness {
                 work_dir: work_dir.map(Path::to_path_buf),
                 session_id: None,
                 mode: anyagents_harness::DeliveryMode::Followup,
-                steer: anyagents_harness::SteerSupport::Unproven,
+                delivery: anyagents_harness_stream::LINE_PER_TURN,
             })?,
         })
     }
@@ -226,6 +726,14 @@ impl anyagents_harness::Harness for ContractHarness {
             "text": anyagents_harness::marked_message(&message.id, &message.text)
         });
         self.inner.deliver(message, &line)
+    }
+
+    fn proven(&self, message_id: &str) -> Option<anyagents_harness::Proof> {
+        self.inner.proven(message_id)
+    }
+
+    fn stop(&mut self) {
+        self.inner.stop();
     }
 
     fn background(&mut self) -> Result<(), HarnessError> {
@@ -250,28 +758,6 @@ impl anyagents_harness::Harness for ContractHarness {
 
     fn clear_quota(&mut self) {
         self.inner.clear_quota()
-    }
-
-    fn take_reclaimed_steers(&mut self) -> Vec<String> {
-        self.inner.take_reclaimed_steers()
-    }
-
-    fn has_unconfirmed_hold(&self) -> bool {
-        self.inner.has_unconfirmed_hold()
-    }
-
-    fn has_unconfirmed_idle_hold(&self) -> bool {
-        self.inner.has_unconfirmed_idle_hold()
-    }
-
-    fn peek_unconfirmed_request_ids(&self) -> Vec<String> {
-        self.inner.peek_unconfirmed_request_ids()
-    }
-
-    fn reconcile_unconfirmed_for_recovery(
-        &mut self,
-    ) -> Result<Option<anyagents_harness::ReconciledUnconfirmed>, HarnessError> {
-        self.inner.reconcile_unconfirmed_for_recovery()
     }
 
     fn process_id(&self) -> Option<u32> {
@@ -362,7 +848,7 @@ pub fn persist_last_error(config_dir: &Path, error: Option<&str>, quota_reset_at
 
 #[cfg(test)]
 pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
-    vendor_launch_authorized(request, None)
+    vendor_launch_authorized(request, None, &HarnessHost::InProcess)
 }
 
 /// Reuse the daemon's admitted in-memory authority; reopening SQLite alone does
@@ -371,12 +857,22 @@ pub fn vendor_launch_with_store(
     request: LaunchRequest,
     store: &anyagents_core::Store,
 ) -> Result<VendorHarness, String> {
-    vendor_launch_authorized(request, Some(store))
+    vendor_launch_authorized(request, Some(store), &HarnessHost::InProcess)
+}
+
+/// Launch with the daemon's authority, hosting the adapter where `host` says.
+pub fn vendor_launch_hosted(
+    request: LaunchRequest,
+    store: &anyagents_core::Store,
+    host: &HarnessHost,
+) -> Result<VendorHarness, String> {
+    vendor_launch_authorized(request, Some(store), host)
 }
 
 fn vendor_launch_authorized(
     request: LaunchRequest,
     store: Option<&anyagents_core::Store>,
+    host: &HarnessHost,
 ) -> Result<VendorHarness, String> {
     // The supervisor owns the agent process lock. Allocate the host generation
     // before any vendor can consume its instructions, never from a late marker.
@@ -392,7 +888,7 @@ fn vendor_launch_authorized(
     })?;
     prepare_host_session(&request)?;
     let config_dir = request.config_dir.clone();
-    let res = vendor_launch_inner(request, store);
+    let res = vendor_launch_inner(request, store, host);
     if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none() {
         match &res {
             Ok(vh) => {
@@ -409,6 +905,7 @@ fn vendor_launch_authorized(
                     }
                 }
             }
+            Err(err) if err == anyagents_supervisor::LAUNCH_ABANDONED => {}
             Err(err) => {
                 persist_last_error(&config_dir, Some(err), None);
             }
@@ -516,6 +1013,10 @@ fn prepare_host_session(request: &LaunchRequest) -> Result<(), String> {
     // Also render in contract-test mode, exercising the shipping launch boundary.
     crate::create::write_agent_instructions(&request.config_dir, &request.agent, None)
         .map_err(|err| err.to_string())?;
+    // A session reset used to leave this marker to force a recovery note
+    // ahead of new mail; nothing reads it now. Remove once no agent
+    // directory carries one.
+    let _ = std::fs::remove_file(request.config_dir.join(".anyagents-session-reset-recovery"));
     Ok(())
 }
 
@@ -567,14 +1068,14 @@ fn read_opencode_exit_error(config_dir: &Path) -> Option<String> {
 }
 
 fn vendor_launch_inner(
-    request: LaunchRequest,
+    mut request: LaunchRequest,
     authority: Option<&anyagents_core::Store>,
+    host: &HarnessHost,
 ) -> Result<VendorHarness, String> {
     crate::worktree_access::ensure_launchable(&request.data_dir, &request.agent.id)
         .map_err(|error| error.to_string())?;
     // Strip any untrusted launch or authority variables from caller/stored env.
-    let mut env: Vec<(String, String)> = request
-        .extra_env
+    let mut env: Vec<(String, String)> = std::mem::take(&mut request.extra_env)
         .into_iter()
         .filter(|(k, _)| {
             !matches!(
@@ -736,7 +1237,7 @@ fn vendor_launch_inner(
         ensure_agy_steering_settings(
             &request.config_dir,
             &request.work_dir,
-            &request.data_dir.join("media"),
+            &request.data_dir.join(anyagents_harness::media::MEDIA_DIR),
         )
         .map_err(|err| err.to_string())?;
     }
@@ -914,24 +1415,54 @@ fn vendor_launch_inner(
         }
     }
     enforce_host_memory_env(&request.agent.harness, &mut env);
+    let planned = plan_adapter(&request, &root, env)?;
+    if planned.launch.runs_off_host() {
+        begin_remote_session(store_opt, &request.agent)?;
+    }
+    let vh = VendorHarness::start(planned, &request, host)?;
+    vh.sync_session()?;
+    Ok(vh)
+}
+
+/// Decide which adapter this agent runs and how it is started. Only what the
+/// adapter needs at its start is recorded; everything else was prepared above.
+fn plan_adapter(
+    request: &LaunchRequest,
+    root: &Path,
+    mut env: Vec<(String, String)>,
+) -> Result<Planned, String> {
+    let scripted = std::env::var_os("ANYAGENTS_FAKE_MODE").is_some();
+    let model = request
+        .agent
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(str::to_string);
+    let planned = |launch, pointer: Option<&str>, selector: &str| Planned {
+        launch,
+        pointer: pointer.map(|name| request.config_dir.join(name)),
+        selector: selector.to_string(),
+    };
     if let Some(config) = adapter_config(&request.config_dir, &request.agent.harness) {
         let program =
             std::env::var("ANYAGENTS_HARNESS_BIN").unwrap_or_else(|_| "anyagents-harness".into());
-        let harness = ContractHarness::start(
-            &program,
-            &config.display().to_string(),
-            &pairs(&env),
-            Some(&request.work_dir),
-        )
-        .map_err(|err| err.to_string())?;
-        return Ok(VendorHarness::Contract(Box::new(harness)));
+        return Ok(planned(
+            AdapterLaunch::Contract {
+                program,
+                config: config.display().to_string(),
+                env,
+                work_dir: request.work_dir.clone(),
+            },
+            None,
+            &request.agent.harness,
+        ));
     }
-    if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none()
+    if !scripted
         && !is_cloud_harness(&request.agent.harness)
         && anyagents_tools::SandboxConfig::resolve(Some(&request.config_dir))
             .is_some_and(|cfg| cfg.remote_spawn)
     {
-        begin_remote_session(store_opt, &request.agent)?;
         let canonical = anyagents_harness::normalize_harness_name(&request.agent.harness);
         let session_file = format!("{canonical}-session-id");
         let session = session_from_file(&request.config_dir, &session_file)?.or(
@@ -940,11 +1471,11 @@ fn vendor_launch_inner(
                 _ => None,
             },
         );
-        let target_program = crate::install::program(&root, canonical);
+        let target_program = crate::install::program(root, canonical);
         let exe = std::env::current_exe()
             .or_else(|_| crate::data::current_exe_clean())
             .unwrap_or_else(|_| PathBuf::from("anyagents"));
-        let extra_args = vec![
+        let args = vec![
             "sandbox-exec".to_string(),
             "--config".to_string(),
             request.config_dir.display().to_string(),
@@ -953,63 +1484,36 @@ fn vendor_launch_inner(
             "--program".to_string(),
             target_program.display().to_string(),
         ];
-        let harness = start_claude(
-            &exe.display().to_string(),
-            &extra_args,
-            session.as_deref(),
-            &env,
-            &request.work_dir,
-        )?;
-        let vh = VendorHarness::Claude(
-            Box::new(harness),
-            request.config_dir.join(&session_file).into(),
-        );
-        vh.sync_session()?;
-        return Ok(vh);
+        return Ok(planned(
+            AdapterLaunch::Claude {
+                program: exe.display().to_string(),
+                args,
+                session,
+                env,
+                work_dir: request.work_dir.clone(),
+                cloud: false,
+            },
+            Some(&session_file),
+            canonical,
+        ));
     }
     if request.agent.harness == "agy" {
         retire_poisoned_agy_session(&request.config_dir, anyagents_core::now_ms())?;
         crate::create::clear_stale_agy_quota_error_steps(&request.config_dir);
         let program = std::env::var("ANYAGENTS_AGY_BIN").unwrap_or_else(|_| "agy".to_string());
         let session = session_from_file(&request.config_dir, "agy-session-id")?;
-        let harness = if std::env::var_os("ANYAGENTS_FAKE_MODE").is_some() {
-            AgyHarness::start(&program, session.as_deref(), &pairs(&env))
-                .map_err(|err| err.to_string())?
-        } else {
-            let mut spec = anyagents_harness_stream::StreamSpec::for_program("agy");
-            spec.args = vec![
-                "--input-format".to_string(),
-                "stream-json".to_string(),
-                "--output-format".to_string(),
-                "stream-json".to_string(),
-                "--dangerously-skip-permissions".to_string(),
-            ];
-            if let Some(model) = request
-                .agent
-                .model
-                .as_deref()
-                .map(str::trim)
-                .filter(|m| !m.is_empty())
-            {
-                spec.args.push("--model".to_string());
-                spec.args.push(model.to_string());
-            }
-            spec.resume_flag = "--conversation";
-            AgyHarness::start_with_spec(
-                spec,
-                &program,
-                session.as_deref(),
-                &pairs(&env),
-                Some(&request.work_dir),
-            )
-            .map_err(|err| err.to_string())?
-        };
-        let vh = VendorHarness::Agy(
-            Box::new(harness),
-            request.config_dir.join("agy-session-id").into(),
-        );
-        vh.sync_session()?;
-        Ok(vh)
+        Ok(planned(
+            AdapterLaunch::Agy {
+                program,
+                session,
+                env,
+                work_dir: request.work_dir.clone(),
+                model,
+                scripted,
+            },
+            Some("agy-session-id"),
+            "agy",
+        ))
     } else if request.agent.harness == "muse" {
         env.push((
             "XDG_CONFIG_HOME".to_string(),
@@ -1018,17 +1522,10 @@ fn vendor_launch_inner(
         env.push(("MUSE_NO_AUTO_UPDATE".to_string(), "1".to_string()));
         let program = std::env::var("ANYAGENTS_MUSE_BIN").unwrap_or_else(|_| "muse".to_string());
         let session = session_from_file(&request.config_dir, "muse-session-id")?;
-        let extra_args = if std::env::var_os("ANYAGENTS_FAKE_MODE").is_some() {
+        let args = if scripted {
             Vec::new()
         } else {
-            let model = request
-                .agent
-                .model
-                .as_deref()
-                .map(str::trim)
-                .filter(|m| !m.is_empty())
-                .unwrap_or("muse-wonder-1.0")
-                .to_string();
+            let model = model.unwrap_or_else(|| "muse-wonder-1.0".to_string());
             let mut args = vec![
                 "--provider".to_string(),
                 "meta".to_string(),
@@ -1056,26 +1553,19 @@ fn vendor_launch_inner(
             }
             args
         };
-        let harness = MuseHarness::start_in_with_args(
-            &program,
-            &extra_args,
-            session.as_deref(),
-            &pairs(&env),
-            Some(&request.work_dir),
-        )
-        .map_err(|err| {
-            read_muse_exit_error(&request.config_dir).unwrap_or_else(|| err.to_string())
-        })?;
-        if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none() && !harness.health().process_alive {
-            return Err(read_muse_exit_error(&request.config_dir)
-                .unwrap_or_else(|| "muse serve exited during startup handshake".to_string()));
-        }
-        let vh = VendorHarness::Muse(
-            Box::new(harness),
-            request.config_dir.join("muse-session-id").into(),
-        );
-        vh.sync_session()?;
-        Ok(vh)
+        Ok(planned(
+            AdapterLaunch::Muse {
+                program,
+                args,
+                session,
+                env,
+                work_dir: request.work_dir.clone(),
+                config_dir: request.config_dir.clone(),
+                scripted,
+            },
+            Some("muse-session-id"),
+            "muse",
+        ))
     } else if request.agent.harness == "omp" {
         let omp_agent_dir = request.config_dir.join(".omp").join("agent");
         let _ = std::fs::create_dir_all(&omp_agent_dir);
@@ -1083,75 +1573,54 @@ fn vendor_launch_inner(
             "PI_CODING_AGENT_DIR".to_string(),
             omp_agent_dir.display().to_string(),
         ));
-        let program = crate::install::program(&root, &request.agent.harness);
+        let program = crate::install::program(root, &request.agent.harness);
         let session = session_from_file(&request.config_dir, "omp-session-id")?;
-        let harness = if std::env::var_os("ANYAGENTS_FAKE_MODE").is_some() {
-            OmpHarness::start(
-                program.display().to_string(),
-                session.as_deref(),
-                &pairs(&env),
-            )
-            .map_err(|err| err.to_string())?
-        } else {
-            let mut spec = anyagents_harness_stream::StreamSpec::for_program("omp");
-            if let Some(model) = request
-                .agent
-                .model
-                .as_deref()
-                .map(str::trim)
-                .filter(|m| !m.is_empty())
-            {
-                spec.args.push("--model".to_string());
-                spec.args.push(model.to_string());
-            }
-            if std::env::var_os("ANYAGENTS_ALLOW_NATIVE_SUBAGENTS").is_none() {
-                let policy_path = crate::grok::ensure_omp_policy(&omp_agent_dir)
-                    .map_err(|err| err.to_string())?;
-                spec.args.push("--config".to_string());
-                spec.args.push(policy_path.display().to_string());
-                spec.args.push("--no-extensions".to_string());
-            }
-            let sys_prompt = request.config_dir.join("SYSTEM_PROMPT.md");
-            if sys_prompt.is_file() {
-                spec.args.push("--append-system-prompt".to_string());
-                spec.args.push(sys_prompt.display().to_string());
-            }
-            OmpHarness::start_with_spec(
-                spec,
-                program.display().to_string(),
-                session.as_deref(),
-                &pairs(&env),
-                Some(&request.work_dir),
-            )
-            .map_err(|err| err.to_string())?
-        };
-        let vh = VendorHarness::Omp(
-            Box::new(harness),
-            request.config_dir.join("omp-session-id").into(),
-        );
-        vh.sync_session()?;
-        Ok(vh)
+        let mut args = Vec::new();
+        if let Some(model) = model {
+            args.push("--model".to_string());
+            args.push(model);
+        }
+        if std::env::var_os("ANYAGENTS_ALLOW_NATIVE_SUBAGENTS").is_none() {
+            let policy_path =
+                crate::grok::ensure_omp_policy(&omp_agent_dir).map_err(|err| err.to_string())?;
+            args.push("--config".to_string());
+            args.push(policy_path.display().to_string());
+            args.push("--no-extensions".to_string());
+        }
+        let sys_prompt = request.config_dir.join("SYSTEM_PROMPT.md");
+        if sys_prompt.is_file() {
+            args.push("--append-system-prompt".to_string());
+            args.push(sys_prompt.display().to_string());
+        }
+        Ok(planned(
+            AdapterLaunch::Omp {
+                program: program.display().to_string(),
+                args,
+                session,
+                env,
+                work_dir: request.work_dir.clone(),
+            },
+            Some("omp-session-id"),
+            "omp",
+        ))
     } else if request.agent.harness == "dsh" {
-        let program = crate::install::program(&root, &request.agent.harness);
+        let program = crate::install::program(root, &request.agent.harness);
         let session = session_from_file(&request.config_dir, "dsh-session-id")?;
         let patch_path = request.config_dir.join("dsh-mcp-patch.yml");
-        let patch = patch_path.is_file().then_some(patch_path.as_path());
-        let harness = DshHarness::start(
-            &program,
-            patch,
-            session.as_deref(),
-            &pairs(&env),
-            &request.work_dir,
-        )
-        .map_err(|err| err.to_string())?;
-        let vh = VendorHarness::Dsh(
-            Box::new(harness),
-            request.config_dir.join("dsh-session-id").into(),
-        );
-        vh.sync_session()?;
-        Ok(vh)
+        let patch = patch_path.is_file().then_some(patch_path);
+        Ok(planned(
+            AdapterLaunch::Dsh {
+                program,
+                patch,
+                session,
+                env,
+                work_dir: request.work_dir.clone(),
+            },
+            Some("dsh-session-id"),
+            "dsh",
+        ))
     } else if request.agent.harness == "grok" {
-        let program = crate::install::program(&root, &request.agent.harness);
+        let program = crate::install::program(root, &request.agent.harness);
         let session = session_from_file(&request.config_dir, "grok-session-id")?;
         let exe = crate::data::current_exe_clean().unwrap_or_else(|_| PathBuf::from("anyagents"));
         let mcp_args = vec![
@@ -1161,78 +1630,66 @@ fn vendor_launch_inner(
             "--config".to_string(),
             request.config_dir.display().to_string(),
         ];
-        let harness = GrokHarness::start(
-            &program,
-            request.agent.model.as_deref(),
-            session.as_deref(),
-            &pairs(&env),
-            &request.work_dir,
-            &exe,
-            &mcp_args,
-        )
-        .map_err(|err| err.to_string())?;
-        let vh = VendorHarness::Grok(
-            Box::new(harness),
-            request.config_dir.join("grok-session-id").into(),
-        );
-        vh.sync_session()?;
-        Ok(vh)
+        Ok(planned(
+            AdapterLaunch::Grok {
+                program,
+                model: request.agent.model.clone(),
+                session,
+                env,
+                work_dir: request.work_dir.clone(),
+                exe,
+                mcp_args,
+            },
+            Some("grok-session-id"),
+            "grok",
+        ))
     } else if is_cloud_harness(&request.agent.harness) {
-        begin_remote_session(store_opt, &request.agent)?;
         let canonical = anyagents_harness::normalize_harness_name(&request.agent.harness);
         let session_file = format!("{canonical}-session-id");
         let session = session_from_file(&request.config_dir, &session_file)?;
-        let program = crate::install::program(&root, canonical);
-        let mut extra_args = vec![
+        let program = crate::install::program(root, canonical);
+        let mut args = vec![
             "cloud-harness".to_string(),
             "--config".to_string(),
             request.config_dir.display().to_string(),
             "--harness".to_string(),
             canonical.to_string(),
         ];
-        if let Some(model) = request
-            .agent
-            .model
-            .as_deref()
-            .map(str::trim)
-            .filter(|m| !m.is_empty())
-        {
-            extra_args.push("--model".to_string());
-            extra_args.push(model.to_string());
+        if let Some(model) = model {
+            args.push("--model".to_string());
+            args.push(model);
         }
-        let harness = start_claude(
-            &program.display().to_string(),
-            &extra_args,
-            session.as_deref(),
-            &env,
-            &request.work_dir,
-        )?;
-        let vh = VendorHarness::Claude(
-            Box::new(harness),
-            request.config_dir.join(&session_file).into(),
-        );
-        vh.sync_session()?;
-        Ok(vh)
+        Ok(planned(
+            AdapterLaunch::Claude {
+                program: program.display().to_string(),
+                args,
+                session,
+                env,
+                work_dir: request.work_dir.clone(),
+                cloud: true,
+            },
+            Some(&session_file),
+            canonical,
+        ))
     } else if is_spiron_harness(&request.agent.harness) {
         let session = session_from_file(&request.config_dir, "spiron-session-id")?;
         let program = std::env::var("ANYAGENTS_SPIRON_BIN")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| crate::install::program(&root, "spiron"));
-        let harness = start_spiron(
-            &program,
-            &request.config_dir,
-            &request.work_dir,
-            &request.agent,
-            session.as_deref(),
-            &env,
-        )?;
-        let vh = VendorHarness::Spiron(
-            Box::new(harness),
-            request.config_dir.join("spiron-session-id").into(),
-            request.agent.harness.clone(),
-        );
-        vh.sync_session()?;
-        Ok(vh)
+            .unwrap_or_else(|_| crate::install::program(root, "spiron"));
+        Ok(planned(
+            AdapterLaunch::Spiron {
+                program,
+                config_dir: request.config_dir.clone(),
+                work_dir: request.work_dir.clone(),
+                agent_id: request.agent.id.as_str().to_string(),
+                agent_name: request.agent.name.clone(),
+                model: request.agent.model.clone(),
+                session,
+                env,
+            },
+            Some("spiron-session-id"),
+            &request.agent.harness,
+        ))
     } else if request.agent.harness == "opencode" {
         // Each agent gets its own OpenCode data root. Without this every agent
         // shares ~/.local/share/opencode/opencode.db with the desk's own
@@ -1249,64 +1706,51 @@ fn vendor_launch_inner(
             "XDG_STATE_HOME".to_string(),
             request.config_dir.join("state-home").display().to_string(),
         ));
-        let program = crate::install::program(&root, &request.agent.harness);
+        let program = crate::install::program(root, &request.agent.harness);
         // The session this agent last ran is kept beside its config, so a
         // restart resumes that exact conversation instead of starting one.
         let session = session_from_file(&request.config_dir, "opencode-session-id")?;
         // The service speaks HTTP; the adapter drives it with `opencode api`.
-        let harness = OpenCodeHarness::start_in_config(
-            &program,
-            session.as_deref(),
-            &pairs(&env),
-            Some(&request.work_dir),
-            &request.config_dir,
-        )
-        .map_err(|err| {
-            read_opencode_exit_error(&request.config_dir).unwrap_or_else(|| err.to_string())
-        })?;
-        let vh = VendorHarness::OpenCode(
-            Box::new(harness),
-            request.config_dir.join("opencode-session-id").into(),
-        );
-        vh.sync_session()?;
-        Ok(vh)
+        Ok(planned(
+            AdapterLaunch::OpenCode {
+                program,
+                session,
+                env,
+                work_dir: request.work_dir.clone(),
+                config_dir: request.config_dir.clone(),
+            },
+            Some("opencode-session-id"),
+            "opencode",
+        ))
     } else if request.agent.harness == "codex" {
         env.push((
             "CODEX_HOME".to_string(),
             request.config_dir.display().to_string(),
         ));
         let session = session_from_file(&request.config_dir, "codex-session-id")?;
-        let program = crate::install::program(&root, &request.agent.harness);
-        let harness = start_codex(
-            &program.display().to_string(),
-            session.as_deref(),
-            &env,
-            &request.work_dir,
-        )?;
-        let vh = VendorHarness::Codex(
-            Box::new(harness),
-            request.config_dir.join("codex-session-id").into(),
-        );
-        vh.sync_session()?;
-        Ok(vh)
+        let program = crate::install::program(root, &request.agent.harness);
+        Ok(planned(
+            AdapterLaunch::Codex {
+                program: program.display().to_string(),
+                session,
+                env,
+                work_dir: request.work_dir.clone(),
+            },
+            Some("codex-session-id"),
+            "codex",
+        ))
     } else {
         env.push((
             "CLAUDE_CONFIG_DIR".to_string(),
             request.config_dir.display().to_string(),
         ));
         let session = session_from_file(&request.config_dir, "claude-session-id")?;
-        let extra_args = if std::env::var_os("ANYAGENTS_FAKE_MODE").is_some() {
+        let args = if scripted {
             Vec::new()
         } else {
             let mut args = vec!["--dangerously-skip-permissions".to_string()];
             let mut effort = "medium".to_string();
-            if let Some(model) = request
-                .agent
-                .model
-                .as_deref()
-                .map(str::trim)
-                .filter(|m| !m.is_empty())
-            {
+            if let Some(model) = model.as_deref() {
                 let (base_model, variant) = match model.split_once('#') {
                     Some((b, v)) if !b.trim().is_empty() && !v.trim().is_empty() => {
                         (b.trim(), Some(v.trim()))
@@ -1355,20 +1799,19 @@ fn vendor_launch_inner(
             }
             args
         };
-        let program = crate::install::program(&root, &request.agent.harness);
-        let harness = start_claude(
-            &program.display().to_string(),
-            &extra_args,
-            session.as_deref(),
-            &env,
-            &request.work_dir,
-        )?;
-        let vh = VendorHarness::Claude(
-            Box::new(harness),
-            request.config_dir.join("claude-session-id").into(),
-        );
-        vh.sync_session()?;
-        Ok(vh)
+        let program = crate::install::program(root, &request.agent.harness);
+        Ok(planned(
+            AdapterLaunch::Claude {
+                program: program.display().to_string(),
+                args,
+                session,
+                env,
+                work_dir: request.work_dir.clone(),
+                cloud: false,
+            },
+            Some("claude-session-id"),
+            "claude-code",
+        ))
     }
 }
 
@@ -1671,14 +2114,31 @@ pub(crate) fn is_cloud_harness(harness: &str) -> bool {
     )
 }
 
+/// Who a Spiron process runs as.
+pub(crate) struct SpironAgent<'a> {
+    pub id: &'a str,
+    pub name: &'a str,
+    pub model: Option<&'a str>,
+}
+
+impl<'a> From<&'a anyagents_core::Agent> for SpironAgent<'a> {
+    fn from(agent: &'a anyagents_core::Agent) -> Self {
+        Self {
+            id: agent.id.as_str(),
+            name: &agent.name,
+            model: agent.model.as_deref(),
+        }
+    }
+}
+
 fn start_spiron(
     program: &Path,
     config_dir: &Path,
     work_dir: &Path,
-    agent: &anyagents_core::Agent,
+    agent: SpironAgent<'_>,
     session: Option<&str>,
     env: &[(String, String)],
-) -> Result<StreamHarness, String> {
+) -> Result<SpironHarness, String> {
     let mcp_config = config_dir.join("spiron-mcp.json");
     let skills = config_dir.join(".agents/skills");
     let mut args = vec![
@@ -1697,29 +2157,12 @@ fn start_spiron(
         "--agent-id".to_string(),
         agent.id.to_string(),
         "--agent-name".to_string(),
-        agent.name.clone(),
+        agent.name.to_string(),
     ];
-    if let Some(model) = agent
-        .model
-        .as_deref()
-        .map(str::trim)
-        .filter(|model| !model.is_empty())
-    {
+    if let Some(model) = agent.model.map(str::trim).filter(|model| !model.is_empty()) {
         let normalized = crate::spiron::strip_coding_plan_prefix(model);
         args.extend(["--model".to_string(), normalized.to_string()]);
     }
-    let base_args = args.clone();
-    if let Some(session) = session {
-        args.extend(["--session".to_string(), session.to_string()]);
-    }
-    let spec = StreamSpec {
-        name: "anyagents-spiron".to_string(),
-        args: base_args,
-        resume_flag: "--session",
-        start_line: "user",
-        cancel: "cancel",
-        protocol: LineProtocol::AcknowledgedResult,
-    };
     let mut environment = env.to_vec();
     environment.push(("HOME".to_string(), config_dir.display().to_string()));
     // Profiles are materialized into the seat config by create.rs. Do not pass
@@ -1735,23 +2178,22 @@ fn start_spiron(
         ),
         ("SPIRON_SKILLS".to_string(), skills.display().to_string()),
     ]);
-    let harness = StreamHarness::launch(Launch {
-        spec,
-        program: program.to_path_buf(),
-        args,
-        environment,
-        work_dir: Some(work_dir.to_path_buf()),
-        session_id: session.map(str::to_string),
-        mode: anyagents_harness::DeliveryMode::Steer,
-        steer: anyagents_harness::SteerSupport::Yes,
-    })
-    .map_err(|err| err.to_string())?;
-    harness.set_state_dir(config_dir);
+    let applied = settle_legacy_spiron_hold(config_dir)?;
     // Its `ready` says whether every input may be steered at once; nothing
-    // is offered before it, so recovery and mail start on the right rules.
-    harness
-        .wait_ready(SPIRON_READY_WAIT)
-        .map_err(|err| err.to_string())?;
+    // is offered before it, so mail starts on the right rules.
+    let harness = SpironHarness::start(
+        SpironLaunch {
+            program: program.to_path_buf(),
+            args,
+            environment,
+            work_dir: work_dir.to_path_buf(),
+            session: session.map(str::to_string),
+            state_dir: config_dir.to_path_buf(),
+        },
+        SPIRON_READY_WAIT,
+    )
+    .map_err(|err| err.to_string())?;
+    harness.recognise_applied(applied);
     Ok(harness)
 }
 
@@ -1759,38 +2201,98 @@ fn start_spiron(
 /// fails, as Codex's `initialize` handshake. An exit ends the wait at once.
 const SPIRON_READY_WAIT: Duration = Duration::from_secs(60);
 
-fn populate_spiron_journal_reconciliation(
-    config_dir: &Path,
-    session_id: &str,
-    rec: &mut anyagents_harness::ReconciledUnconfirmed,
-) {
+/// The hold a Spiron process from before `steer_consumed` could leave:
+/// AnyAgents wrote it before it gave such a process input, naming input it
+/// could not yet prove reached the session journal.
+const LEGACY_SPIRON_HOLD: &str = "spiron-unconfirmed-steers.json";
+
+/// Where a settled hold is kept, with the ids the journal showed applied:
+/// `{"hold": <the hold>, "applied": [ids]}`. Every launch reads it again, so
+/// an applied id is answered as a duplicate until it is committed, even when
+/// a launch fails after the hold was settled.
+const LEGACY_SPIRON_RECONCILED: &str = "spiron-unconfirmed-steers.reconciled.json";
+
+/// Settle a hold an earlier AnyAgents left beside a Spiron agent's config. An
+/// id that a user input in the agent's Spiron journal (`sessions.sqlite3`,
+/// any session) carries was applied: it is returned, to be committed without
+/// being written again. Any other id was never journaled and is delivered as
+/// new input. The applied ids are written to the reconciled record before
+/// the hold is removed, and are returned on every later launch too.
+///
+/// Compatibility for agent directories written before the hold was retired;
+/// remove, with the reconciled records, once no agent directory carries a
+/// hold and every agent's cursor has passed the ids its record names.
+fn settle_legacy_spiron_hold(config_dir: &Path) -> Result<Vec<String>, String> {
+    let reconciled = config_dir.join(LEGACY_SPIRON_RECONCILED);
+    let mut applied: Vec<String> = std::fs::read(&reconciled)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|record| record.get("applied").cloned())
+        .and_then(|ids| serde_json::from_value(ids).ok())
+        .unwrap_or_default();
+    let hold = config_dir.join(LEGACY_SPIRON_HOLD);
+    let bytes = match std::fs::read(&hold) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(applied),
+        Err(err) => return Err(format!("cannot read {}: {err}", hold.display())),
+    };
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+    let mut ids: Vec<String> = value
+        .get("request_ids")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .chain(value.get("turn_id").and_then(serde_json::Value::as_str))
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .collect();
+    ids.sort();
+    ids.dedup();
+    applied.extend(spiron_journal_holds(config_dir, &ids));
+    applied.sort();
+    applied.dedup();
+    let record = serde_json::json!({"hold": value, "applied": applied});
+    crate::create::write_required_file(&reconciled, record.to_string().as_bytes(), 0o664)
+        .map_err(|err| err.to_string())?;
+    std::fs::remove_file(&hold)
+        .map_err(|err| format!("cannot retire {}: {err}", hold.display()))?;
+    Ok(applied)
+}
+
+/// The ids among `ids` that a user input in any session of the agent's
+/// Spiron journal carries: an event `{"type":"text","data":{"role":"user",
+/// "content":"anyagents-message:<id>\n..."}}`. A mention anywhere else (a
+/// tool result quoting the id, an assistant reply) is not one. An
+/// unreadable journal names none, so that input is delivered rather than
+/// lost.
+fn spiron_journal_holds(config_dir: &Path, ids: &[String]) -> Vec<String> {
     let db_path = config_dir.join("sessions.sqlite3");
-    if !db_path.is_file() {
-        return;
+    if ids.is_empty() || !db_path.is_file() {
+        return Vec::new();
     }
     let Some(conn) = crate::seat_tree::open_readonly_seat_sqlite(&db_path) else {
-        return;
+        return Vec::new();
     };
-    let Ok(mut stmt) =
-        conn.prepare("SELECT event FROM session_entries WHERE session_id = ?1 ORDER BY idx ASC")
-    else {
-        return;
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT 1 FROM session_entries
+         WHERE json_valid(event)
+           AND json_extract(event, '$.type') = 'text'
+           AND json_extract(event, '$.data.role') = 'user'
+           AND (json_extract(event, '$.data.content') = ?1
+                OR substr(json_extract(event, '$.data.content'), 1, length(?1) + 1)
+                   = ?1 || char(10))
+         LIMIT 1",
+    ) else {
+        return Vec::new();
     };
-    let Ok(rows) = stmt.query_map([session_id], |row| row.get::<_, String>(0)) else {
-        return;
-    };
-    let events: Vec<String> = rows.flatten().collect();
-    for id in &rec.request_ids {
-        let marker = format!("anyagents-message:{id}");
-        if events
-            .iter()
-            .any(|ev| ev.contains(&marker) || ev.contains(id))
-        {
-            rec.journal_committed_ids.push(id.clone());
-        } else {
-            rec.journal_missing_ids.push(id.clone());
-        }
-    }
+    ids.iter()
+        .filter(|id| {
+            stmt.exists([format!("anyagents-message:{id}")])
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect()
 }
 
 fn start_codex(
@@ -1809,129 +2311,145 @@ fn pairs(env: &[(String, String)]) -> Vec<(&str, &str)> {
         .collect()
 }
 
-impl Harness for VendorHarness {
+impl Harness for LocalAdapter {
     fn deliver(&mut self, message: &OutboundMessage) -> Result<DeliverOutcome, HarnessError> {
-        let out = match self {
-            Self::Claude(harness, _) => harness.deliver(message),
-            Self::Codex(harness, _) => harness.deliver(message),
-            Self::OpenCode(harness, _) => harness.deliver(message),
-            Self::Agy(harness, _) => harness.deliver(message),
-            Self::Muse(harness, _) => harness.deliver(message),
-            Self::Omp(harness, _) => harness.deliver(message),
-            Self::Dsh(harness, _) => harness.deliver(message),
-            Self::Grok(harness, _) => harness.deliver(message),
-            Self::Spiron(harness, _, _) => harness.deliver(message, &serde_json::json!({
-                "type": "user",
-                "request_id": message.id,
-                "text": anyagents_harness::compose_message(&message.id, &message.context, &message.text),
-            })),
+        match self {
+            Self::Claude(harness) => harness.deliver(message),
+            Self::Codex(harness) => harness.deliver(message),
+            Self::OpenCode(harness) => harness.deliver(message),
+            Self::Agy(harness) => harness.deliver(message),
+            Self::Muse(harness) => harness.deliver(message),
+            Self::Omp(harness) => harness.deliver(message),
+            Self::Dsh(harness) => harness.deliver(message),
+            Self::Grok(harness) => harness.deliver(message),
+            Self::Spiron(harness) => harness.deliver(message),
             Self::Contract(harness) => harness.deliver(message),
-        };
-        self.sync_session().map_err(HarnessError::Failed)?;
-        out
+        }
+    }
+
+    fn proven(&self, message_id: &str) -> Option<anyagents_harness::Proof> {
+        match self {
+            Self::Claude(harness) => harness.proven(message_id),
+            Self::Codex(harness) => harness.proven(message_id),
+            Self::OpenCode(harness) => harness.proven(message_id),
+            Self::Agy(harness) => harness.proven(message_id),
+            Self::Muse(harness) => harness.proven(message_id),
+            Self::Omp(harness) => harness.proven(message_id),
+            Self::Dsh(harness) => harness.proven(message_id),
+            Self::Grok(harness) => harness.proven(message_id),
+            Self::Spiron(harness) => harness.proven(message_id),
+            Self::Contract(harness) => harness.proven(message_id),
+        }
+    }
+
+    fn stop(&mut self) {
+        match self {
+            Self::Claude(harness) => harness.stop(),
+            Self::Codex(harness) => harness.stop(),
+            Self::OpenCode(harness) => harness.stop(),
+            Self::Agy(harness) => harness.stop(),
+            Self::Muse(harness) => harness.stop(),
+            Self::Omp(harness) => harness.stop(),
+            Self::Dsh(harness) => harness.stop(),
+            Self::Grok(harness) => harness.stop(),
+            Self::Spiron(harness) => harness.stop(),
+            Self::Contract(harness) => harness.stop(),
+        }
     }
 
     fn background(&mut self) -> Result<(), HarnessError> {
         match self {
-            Self::Claude(harness, _) => harness.background(),
-            Self::Codex(harness, _) => harness.background(),
-            Self::OpenCode(harness, _) => harness.background(),
-            Self::Agy(harness, _) => harness.background(),
-            Self::Muse(harness, _) => harness.background(),
-            Self::Omp(harness, _) => harness.background(),
-            Self::Dsh(harness, _) => harness.background(),
-            Self::Grok(harness, _) => harness.background(),
-            Self::Spiron(harness, _, _) => harness.background(),
+            Self::Claude(harness) => harness.background(),
+            Self::Codex(harness) => harness.background(),
+            Self::OpenCode(harness) => harness.background(),
+            Self::Agy(harness) => harness.background(),
+            Self::Muse(harness) => harness.background(),
+            Self::Omp(harness) => harness.background(),
+            Self::Dsh(harness) => harness.background(),
+            Self::Grok(harness) => harness.background(),
+            Self::Spiron(harness) => harness.background(),
             Self::Contract(harness) => harness.background(),
         }
     }
 
     fn resume(&mut self, session: &str) -> Result<(), HarnessError> {
-        let out = match self {
-            Self::Claude(harness, _) => harness.resume(session),
-            Self::Codex(harness, _) => harness.resume(session),
-            Self::OpenCode(harness, _) => harness.resume(session),
-            Self::Agy(harness, _) => harness.resume(session),
-            Self::Muse(harness, _) => harness.resume(session),
-            Self::Omp(harness, _) => harness.resume(session),
-            Self::Dsh(harness, _) => harness.resume(session),
-            Self::Grok(harness, _) => harness.resume(session),
-            Self::Spiron(harness, _, _) => harness.resume(session),
+        match self {
+            Self::Claude(harness) => harness.resume(session),
+            Self::Codex(harness) => harness.resume(session),
+            Self::OpenCode(harness) => harness.resume(session),
+            Self::Agy(harness) => harness.resume(session),
+            Self::Muse(harness) => harness.resume(session),
+            Self::Omp(harness) => harness.resume(session),
+            Self::Dsh(harness) => harness.resume(session),
+            Self::Grok(harness) => harness.resume(session),
+            Self::Spiron(harness) => harness.resume(session),
             Self::Contract(harness) => harness.resume(session),
-        };
-        self.sync_session().map_err(HarnessError::Failed)?;
-        out
+        }
     }
 
     fn cancel(&mut self) -> Result<(), HarnessError> {
         match self {
-            Self::Claude(harness, _) => harness.cancel(),
-            Self::Codex(harness, _) => harness.cancel(),
-            Self::OpenCode(harness, _) => harness.cancel(),
-            Self::Agy(harness, _) => harness.cancel(),
-            Self::Muse(harness, _) => harness.cancel(),
-            Self::Omp(harness, _) => harness.cancel(),
-            Self::Dsh(harness, _) => harness.cancel(),
-            Self::Grok(harness, _) => harness.cancel(),
-            Self::Spiron(harness, _, _) => harness.cancel(&serde_json::json!({"type": "cancel"})),
+            Self::Claude(harness) => harness.cancel(),
+            Self::Codex(harness) => harness.cancel(),
+            Self::OpenCode(harness) => harness.cancel(),
+            Self::Agy(harness) => harness.cancel(),
+            Self::Muse(harness) => harness.cancel(),
+            Self::Omp(harness) => harness.cancel(),
+            Self::Dsh(harness) => harness.cancel(),
+            Self::Grok(harness) => harness.cancel(),
+            Self::Spiron(harness) => harness.cancel(),
             Self::Contract(harness) => harness.cancel(),
         }
     }
 
     fn exit_diagnostic(&self) -> Option<String> {
         match self {
-            Self::Claude(harness, _) => harness.exit_diagnostic(),
+            Self::Claude(harness) => harness.exit_diagnostic(),
             _ => None,
         }
     }
 
     fn health(&self) -> HarnessHealth {
-        if let Err(error) = self.sync_session() {
-            eprintln!("session synchronization failed: {error}");
-        }
         match self {
-            Self::Claude(harness, _) => harness.health(),
-            Self::Codex(harness, _) => harness.health(),
-            Self::OpenCode(harness, _) => harness.health(),
-            Self::Agy(harness, _) => harness.health(),
-            Self::Muse(harness, _) => harness.health(),
-            Self::Omp(harness, _) => harness.health(),
-            Self::Dsh(harness, _) => harness.health(),
-            Self::Grok(harness, _) => harness.health(),
-            Self::Spiron(harness, _, _) => harness.health(),
+            Self::Claude(harness) => harness.health(),
+            Self::Codex(harness) => harness.health(),
+            Self::OpenCode(harness) => harness.health(),
+            Self::Agy(harness) => harness.health(),
+            Self::Muse(harness) => harness.health(),
+            Self::Omp(harness) => harness.health(),
+            Self::Dsh(harness) => harness.health(),
+            Self::Grok(harness) => harness.health(),
+            Self::Spiron(harness) => harness.health(),
             Self::Contract(harness) => harness.health(),
         }
     }
 
     fn input_ready(&self) -> bool {
         match self {
-            Self::Claude(harness, _) => harness.input_ready(),
-            Self::Codex(harness, _) => harness.input_ready(),
-            Self::OpenCode(harness, _) => harness.input_ready(),
-            Self::Agy(harness, _) => harness.input_ready(),
-            Self::Muse(harness, _) => harness.input_ready(),
-            Self::Omp(harness, _) => harness.input_ready(),
-            Self::Dsh(harness, _) => harness.input_ready(),
-            Self::Grok(harness, _) => harness.input_ready(),
-            Self::Spiron(harness, _, _) => harness.input_ready(),
+            Self::Claude(harness) => harness.input_ready(),
+            Self::Codex(harness) => harness.input_ready(),
+            Self::OpenCode(harness) => harness.input_ready(),
+            Self::Agy(harness) => harness.input_ready(),
+            Self::Muse(harness) => harness.input_ready(),
+            Self::Omp(harness) => harness.input_ready(),
+            Self::Dsh(harness) => harness.input_ready(),
+            Self::Grok(harness) => harness.input_ready(),
+            Self::Spiron(harness) => harness.input_ready(),
             Self::Contract(harness) => harness.input_ready(),
         }
     }
 
     fn last_usage(&self) -> TurnUsage {
-        if let Err(error) = self.sync_session() {
-            eprintln!("session synchronization failed: {error}");
-        }
         match self {
-            Self::Claude(harness, _) => harness.last_usage(),
-            Self::Codex(harness, _) => harness.last_usage(),
-            Self::OpenCode(harness, _) => harness.last_usage(),
-            Self::Agy(harness, _) => harness.last_usage(),
-            Self::Muse(harness, _) => harness.last_usage(),
-            Self::Omp(harness, _) => harness.last_usage(),
-            Self::Dsh(harness, _) => harness.last_usage(),
-            Self::Grok(harness, _) => harness.last_usage(),
-            Self::Spiron(harness, _, _) => harness.served_usage(),
+            Self::Claude(harness) => harness.last_usage(),
+            Self::Codex(harness) => harness.last_usage(),
+            Self::OpenCode(harness) => harness.last_usage(),
+            Self::Agy(harness) => harness.last_usage(),
+            Self::Muse(harness) => harness.last_usage(),
+            Self::Omp(harness) => harness.last_usage(),
+            Self::Dsh(harness) => harness.last_usage(),
+            Self::Grok(harness) => harness.last_usage(),
+            Self::Spiron(harness) => harness.served_usage(),
             Self::Contract(harness) => harness.last_usage(),
         }
     }
@@ -1942,199 +2460,193 @@ impl Harness for VendorHarness {
 
     fn turns_served(&self) -> u32 {
         match self {
-            Self::Claude(harness, _) => harness.turns_served(),
-            Self::Codex(harness, _) => harness.turns_served(),
-            Self::OpenCode(harness, _) => harness.turns_served(),
-            Self::Agy(harness, _) => harness.turns_served(),
-            Self::Muse(harness, _) => harness.turns_served(),
-            Self::Omp(harness, _) => harness.turns_served(),
-            Self::Dsh(harness, _) => harness.turns_served(),
-            Self::Grok(harness, _) => harness.turns_served(),
-            Self::Spiron(harness, _, _) => harness.turns_served(),
+            Self::Claude(harness) => harness.turns_served(),
+            Self::Codex(harness) => harness.turns_served(),
+            Self::OpenCode(harness) => harness.turns_served(),
+            Self::Agy(harness) => harness.turns_served(),
+            Self::Muse(harness) => harness.turns_served(),
+            Self::Omp(harness) => harness.turns_served(),
+            Self::Dsh(harness) => harness.turns_served(),
+            Self::Grok(harness) => harness.turns_served(),
+            Self::Spiron(harness) => harness.turns_served(),
             Self::Contract(harness) => harness.turns_served(),
         }
     }
 
     fn quiet_for(&self, id: &str, quiet: Duration, patience: Duration) -> bool {
         match self {
-            Self::Claude(harness, _) => harness.quiet_for(id, quiet, patience),
-            Self::Codex(harness, _) => harness.quiet_for(id, quiet, patience),
-            Self::OpenCode(harness, _) => harness.quiet_for(id, quiet, patience),
-            Self::Agy(harness, _) => harness.quiet_for(id, quiet, patience),
-            Self::Muse(harness, _) => harness.quiet_for(id, quiet, patience),
-            Self::Omp(harness, _) => harness.quiet_for(id, quiet, patience),
-            Self::Dsh(harness, _) => harness.quiet_for(id, quiet, patience),
-            Self::Grok(harness, _) => harness.quiet_for(id, quiet, patience),
-            Self::Spiron(_, _, _) => false,
+            Self::Claude(harness) => harness.quiet_for(id, quiet, patience),
+            Self::Codex(harness) => harness.quiet_for(id, quiet, patience),
+            Self::OpenCode(harness) => harness.quiet_for(id, quiet, patience),
+            Self::Agy(harness) => harness.quiet_for(id, quiet, patience),
+            Self::Muse(harness) => harness.quiet_for(id, quiet, patience),
+            Self::Omp(harness) => harness.quiet_for(id, quiet, patience),
+            Self::Dsh(harness) => harness.quiet_for(id, quiet, patience),
+            Self::Grok(harness) => harness.quiet_for(id, quiet, patience),
+            Self::Spiron(_) => false,
             Self::Contract(harness) => harness.quiet_for(id, quiet, patience),
         }
     }
 
     fn ends_on_quiet(&self) -> Option<Duration> {
         match self {
-            Self::Claude(harness, _) => harness.ends_on_quiet(),
-            Self::Codex(harness, _) => harness.ends_on_quiet(),
-            Self::OpenCode(harness, _) => harness.ends_on_quiet(),
-            Self::Agy(harness, _) => harness.ends_on_quiet(),
-            Self::Muse(harness, _) => harness.ends_on_quiet(),
-            Self::Omp(harness, _) => harness.ends_on_quiet(),
-            Self::Dsh(harness, _) => harness.ends_on_quiet(),
-            Self::Grok(harness, _) => harness.ends_on_quiet(),
-            Self::Spiron(_, _, _) => None,
+            Self::Claude(harness) => harness.ends_on_quiet(),
+            Self::Codex(harness) => harness.ends_on_quiet(),
+            Self::OpenCode(harness) => harness.ends_on_quiet(),
+            Self::Agy(harness) => harness.ends_on_quiet(),
+            Self::Muse(harness) => harness.ends_on_quiet(),
+            Self::Omp(harness) => harness.ends_on_quiet(),
+            Self::Dsh(harness) => harness.ends_on_quiet(),
+            Self::Grok(harness) => harness.ends_on_quiet(),
+            Self::Spiron(_) => None,
             Self::Contract(harness) => harness.ends_on_quiet(),
         }
     }
 
     fn clear_quota(&mut self) {
         match self {
-            Self::Claude(harness, _) => harness.clear_quota(),
-            Self::Codex(harness, _) => harness.clear_quota(),
-            Self::OpenCode(harness, _) => harness.clear_quota(),
-            Self::Agy(harness, _) => harness.clear_quota(),
-            Self::Muse(harness, _) => harness.clear_quota(),
-            Self::Omp(harness, _) => harness.clear_quota(),
-            Self::Dsh(harness, _) => harness.clear_quota(),
-            Self::Grok(harness, _) => harness.clear_quota(),
-            Self::Spiron(harness, _, _) => harness.clear_quota(),
+            Self::Claude(harness) => harness.clear_quota(),
+            Self::Codex(harness) => harness.clear_quota(),
+            Self::OpenCode(harness) => harness.clear_quota(),
+            Self::Agy(harness) => harness.clear_quota(),
+            Self::Muse(harness) => harness.clear_quota(),
+            Self::Omp(harness) => harness.clear_quota(),
+            Self::Dsh(harness) => harness.clear_quota(),
+            Self::Grok(harness) => harness.clear_quota(),
+            Self::Spiron(harness) => harness.clear_quota(),
             Self::Contract(harness) => harness.clear_quota(),
-        }
-    }
-
-    fn take_reclaimed_steers(&mut self) -> Vec<String> {
-        match self {
-            Self::Agy(harness, _) => harness.take_reclaimed_steers(),
-            Self::Spiron(harness, _, _) => harness.take_reclaimed_steers(),
-            Self::Contract(harness) => harness.take_reclaimed_steers(),
-            _ => Vec::new(),
-        }
-    }
-
-    fn has_unconfirmed_hold(&self) -> bool {
-        match self {
-            Self::Spiron(harness, _, _) => harness.has_unconfirmed_hold(),
-            Self::Contract(harness) => harness.has_unconfirmed_hold(),
-            _ => false,
-        }
-    }
-
-    fn has_unconfirmed_idle_hold(&self) -> bool {
-        match self {
-            Self::Spiron(harness, _, _) => harness.has_unconfirmed_idle_hold(),
-            Self::Contract(harness) => harness.has_unconfirmed_idle_hold(),
-            _ => false,
-        }
-    }
-
-    fn peek_unconfirmed_request_ids(&self) -> Vec<String> {
-        match self {
-            Self::Spiron(harness, _, _) => harness.peek_unconfirmed_request_ids(),
-            Self::Contract(harness) => harness.peek_unconfirmed_request_ids(),
-            _ => Vec::new(),
-        }
-    }
-
-    fn reconcile_unconfirmed_for_recovery(
-        &mut self,
-    ) -> Result<Option<anyagents_harness::ReconciledUnconfirmed>, HarnessError> {
-        match self {
-            Self::Spiron(harness, marker, _) => {
-                let dir = harness.state_dir();
-                let session_id = harness.session_id().or_else(|| {
-                    std::fs::read_to_string(marker)
-                        .ok()
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                });
-                let Some(mut rec) = harness.reconcile_unconfirmed_for_recovery()? else {
-                    return Ok(None);
-                };
-                if let (Some(dir), Some(sid)) = (dir, session_id)
-                    && !rec.request_ids.is_empty()
-                {
-                    populate_spiron_journal_reconciliation(&dir, &sid, &mut rec);
-                }
-                Ok(Some(rec))
-            }
-            Self::Contract(harness) => harness.reconcile_unconfirmed_for_recovery(),
-            _ => Ok(None),
         }
     }
 
     fn process_id(&self) -> Option<u32> {
         match self {
-            Self::Claude(harness, _) => harness.process_id(),
-            Self::Codex(harness, _) => harness.process_id(),
-            Self::OpenCode(harness, _) => harness.process_id(),
-            Self::Agy(harness, _) => harness.process_id(),
-            Self::Muse(harness, _) => harness.process_id(),
-            Self::Omp(harness, _) => harness.process_id(),
-            Self::Dsh(harness, _) => harness.process_id(),
-            Self::Grok(harness, _) => harness.process_id(),
-            Self::Spiron(harness, _, _) => harness.process_id(),
+            Self::Claude(harness) => harness.process_id(),
+            Self::Codex(harness) => harness.process_id(),
+            Self::OpenCode(harness) => harness.process_id(),
+            Self::Agy(harness) => harness.process_id(),
+            Self::Muse(harness) => harness.process_id(),
+            Self::Omp(harness) => harness.process_id(),
+            Self::Dsh(harness) => harness.process_id(),
+            Self::Grok(harness) => harness.process_id(),
+            Self::Spiron(harness) => harness.process_id(),
             Self::Contract(harness) => harness.process_id(),
         }
     }
 
     fn watch_activity(&self, notify: std::sync::Arc<dyn Fn() + Send + Sync>) {
         match self {
-            Self::Claude(harness, _) => harness.watch_activity(notify),
-            Self::Codex(harness, _) => harness.watch_activity(notify),
-            Self::OpenCode(harness, _) => harness.watch_activity(notify),
-            Self::Agy(harness, _) => harness.watch_activity(notify),
-            Self::Muse(harness, _) => harness.watch_activity(notify),
-            Self::Omp(harness, _) => harness.watch_activity(notify),
-            Self::Dsh(harness, _) => harness.watch_activity(notify),
-            Self::Grok(harness, _) => harness.watch_activity(notify),
-            Self::Spiron(harness, _, _) => harness.watch_activity(notify),
+            Self::Claude(harness) => harness.watch_activity(notify),
+            Self::Codex(harness) => harness.watch_activity(notify),
+            Self::OpenCode(harness) => harness.watch_activity(notify),
+            Self::Agy(harness) => harness.watch_activity(notify),
+            Self::Muse(harness) => harness.watch_activity(notify),
+            Self::Omp(harness) => harness.watch_activity(notify),
+            Self::Dsh(harness) => harness.watch_activity(notify),
+            Self::Grok(harness) => harness.watch_activity(notify),
+            Self::Spiron(harness) => harness.watch_activity(notify),
             Self::Contract(harness) => harness.watch_activity(notify),
         }
     }
+}
 
-    fn poll_steer(&mut self) -> Result<Option<anyagents_harness::SteerItem>, HarnessError> {
+impl Hosted for LocalAdapter {
+    fn session_id(&self) -> Option<String> {
         match self {
-            Self::Claude(harness, _) => harness.poll_steer(),
-            Self::Codex(harness, _) => harness.poll_steer(),
-            Self::OpenCode(harness, _) => harness.poll_steer(),
-            Self::Agy(harness, _) => harness.poll_steer(),
-            Self::Muse(harness, _) => harness.poll_steer(),
-            Self::Omp(harness, _) => harness.poll_steer(),
-            Self::Dsh(harness, _) => harness.poll_steer(),
-            Self::Grok(harness, _) => harness.poll_steer(),
-            Self::Spiron(..) => Ok(None),
-            Self::Contract(harness) => harness.poll_steer(),
+            Self::Claude(harness) => harness.session_id(),
+            Self::Codex(harness) => harness.session_id(),
+            Self::OpenCode(harness) => harness.session_id(),
+            Self::Agy(harness) => harness.session_id(),
+            Self::Muse(harness) => harness.session_id(),
+            Self::Omp(harness) => harness.session_id(),
+            Self::Dsh(harness) => harness.session_id(),
+            Self::Grok(harness) => harness.session_id(),
+            Self::Spiron(harness) => harness.session_id(),
+            Self::Contract(_) => None,
         }
     }
 
-    fn inject(&mut self, message: &OutboundMessage) -> Result<bool, HarnessError> {
-        let out = match self {
-            Self::Claude(harness, _) => harness.inject(message),
-            Self::Codex(harness, _) => harness.inject(message),
-            Self::OpenCode(harness, _) => harness.inject(message),
-            Self::Agy(harness, _) => harness.inject(message),
-            Self::Muse(harness, _) => harness.inject(message),
-            Self::Omp(harness, _) => harness.inject(message),
-            Self::Dsh(harness, _) => harness.inject(message),
-            Self::Grok(harness, _) => harness.inject(message),
-            Self::Spiron(..) => Ok(false),
-            Self::Contract(harness) => harness.inject(message),
-        };
+    fn session_invalidated(&self) -> bool {
+        matches!(self, Self::Codex(harness) if harness.thread_invalidated())
+    }
+}
+
+impl Harness for VendorHarness {
+    fn deliver(&mut self, message: &OutboundMessage) -> Result<DeliverOutcome, HarnessError> {
+        let out = self.adapter_mut().deliver(message);
         self.sync_session().map_err(HarnessError::Failed)?;
         out
     }
 
-    fn release_steer(&mut self, keep: &str) {
-        match self {
-            Self::Claude(harness, _) => harness.release_steer(keep),
-            Self::Codex(harness, _) => harness.release_steer(keep),
-            Self::OpenCode(harness, _) => harness.release_steer(keep),
-            Self::Agy(harness, _) => harness.release_steer(keep),
-            Self::Muse(harness, _) => harness.release_steer(keep),
-            Self::Omp(harness, _) => harness.release_steer(keep),
-            Self::Dsh(harness, _) => harness.release_steer(keep),
-            Self::Grok(harness, _) => harness.release_steer(keep),
-            Self::Spiron(..) => {}
-            Self::Contract(harness) => harness.release_steer(keep),
+    fn proven(&self, message_id: &str) -> Option<anyagents_harness::Proof> {
+        self.adapter().proven(message_id)
+    }
+
+    fn stop(&mut self) {
+        self.adapter_mut().stop();
+    }
+
+    fn background(&mut self) -> Result<(), HarnessError> {
+        self.adapter_mut().background()
+    }
+
+    fn resume(&mut self, session: &str) -> Result<(), HarnessError> {
+        let out = self.adapter_mut().resume(session);
+        self.sync_session().map_err(HarnessError::Failed)?;
+        out
+    }
+
+    fn cancel(&mut self) -> Result<(), HarnessError> {
+        self.adapter_mut().cancel()
+    }
+
+    fn exit_diagnostic(&self) -> Option<String> {
+        self.adapter().exit_diagnostic()
+    }
+
+    fn health(&self) -> HarnessHealth {
+        if let Err(error) = self.sync_session() {
+            eprintln!("session synchronization failed: {error}");
         }
+        self.adapter().health()
+    }
+
+    fn input_ready(&self) -> bool {
+        self.adapter().input_ready()
+    }
+
+    fn last_usage(&self) -> TurnUsage {
+        if let Err(error) = self.sync_session() {
+            eprintln!("session synchronization failed: {error}");
+        }
+        self.adapter().last_usage()
+    }
+
+    fn served_usage(&self) -> TurnUsage {
+        self.last_usage()
+    }
+
+    fn turns_served(&self) -> u32 {
+        self.adapter().turns_served()
+    }
+
+    fn quiet_for(&self, id: &str, quiet: Duration, patience: Duration) -> bool {
+        self.adapter().quiet_for(id, quiet, patience)
+    }
+
+    fn ends_on_quiet(&self) -> Option<Duration> {
+        self.adapter().ends_on_quiet()
+    }
+
+    fn clear_quota(&mut self) {
+        self.adapter_mut().clear_quota()
+    }
+
+    fn process_id(&self) -> Option<u32> {
+        self.adapter().process_id()
+    }
+
+    fn watch_activity(&self, notify: std::sync::Arc<dyn Fn() + Send + Sync>) {
+        self.adapter().watch_activity(notify)
     }
 }
 
@@ -2555,6 +3067,7 @@ cat >/dev/null
                     config_dir: config.clone(),
                     work_dir: root.join("work"),
                     extra_env: vec![],
+                    lock: None,
                 },
                 &store,
             )
@@ -2714,6 +3227,7 @@ cat >/dev/null
                 config_dir: config.clone(),
                 work_dir: root.join("work"),
                 extra_env: vec![],
+                lock: None,
             },
             &store,
         );
@@ -2749,7 +3263,12 @@ cat >/dev/null
             std::io::ErrorKind::PermissionDenied
         );
         assert!(
-            ensure_agy_steering_settings(&config, &root.join("work"), &root.join("media")).is_err()
+            ensure_agy_steering_settings(
+                &config,
+                &root.join("work"),
+                &root.join(anyagents_harness::media::MEDIA_DIR)
+            )
+            .is_err()
         );
         // Relaunch with the inaccessible replacement still in place. This
         // exercises actual pre-read preparation, not a helper-only repair.
@@ -2761,6 +3280,7 @@ cat >/dev/null
                 config_dir: config.clone(),
                 work_dir: root.join("work"),
                 extra_env: vec![],
+                lock: None,
             },
             &store,
         )
@@ -2777,7 +3297,12 @@ cat >/dev/null
         assert_eq!(value["retained"], "synthetic");
         assert_eq!(value["queuedMessages"], "send-immediately");
         crate::sandbox::prepare_config_with_seat_uid(&config, uid, gid).unwrap();
-        ensure_agy_steering_settings(&config, &root.join("work"), &root.join("media")).unwrap();
+        ensure_agy_steering_settings(
+            &config,
+            &root.join("work"),
+            &root.join(anyagents_harness::media::MEDIA_DIR),
+        )
+        .unwrap();
         assert_eq!(std::fs::metadata(&settings).unwrap().mode() & 0o060, 0o060);
         println!("NATIVE_AGY_GROUP_DEFAULTS_AND_PRIVATE_REPLACEMENT_REPAIRED");
         for name in ["memory", "skills", "config"] {
@@ -2987,6 +3512,7 @@ done
                     config_dir: config.clone(),
                     work_dir: root.join("work"),
                     extra_env: vec![],
+                    lock: None,
                 },
                 &store,
             )
@@ -3091,20 +3617,28 @@ done
         let config = root.join("config");
         std::fs::create_dir_all(&config).unwrap();
         let first = host_session::new_session(&root, "spiron").unwrap();
-        let harness = StreamHarness::launch(anyagents_harness_stream::Launch {
-            spec: StreamSpec::for_program("spiron"),
-            program: "/bin/sh".into(),
-            args: vec!["-c".into(), "exec sleep 30".into()],
-            environment: vec![],
-            work_dir: None,
-            session_id: Some("vendor-1".into()),
-            mode: anyagents_harness::DeliveryMode::Steer,
-            steer: anyagents_harness::SteerSupport::Yes,
-        })
+        let harness = SpironHarness::start(
+            SpironLaunch {
+                program: "/bin/sh".into(),
+                args: vec![
+                    "-c".into(),
+                    r#"echo '{"type":"ready","protocol":"spiron.headless/v1"}'; exec sleep 30"#
+                        .into(),
+                ],
+                environment: vec![],
+                work_dir: config.clone(),
+                session: Some("vendor-1".into()),
+                state_dir: config.clone(),
+            },
+            Duration::from_secs(10),
+        )
         .unwrap();
         let pointer = config.join("spiron-session-id");
-        let vendor =
-            VendorHarness::Spiron(Box::new(harness), pointer.clone().into(), "spiron".into());
+        let vendor = VendorHarness::local(
+            LocalAdapter::Spiron(Box::new(harness)),
+            Some(pointer.clone()),
+            "spiron",
+        );
         vendor.sync_session().unwrap();
         assert_eq!(std::fs::read_to_string(&pointer).unwrap(), "vendor-1\n");
         assert_eq!(
@@ -3123,6 +3657,72 @@ done
         assert_eq!(std::fs::read(&registry).unwrap(), b"not json");
         std::fs::write(&registry, saved).unwrap();
         assert_eq!(std::fs::read_to_string(&pointer).unwrap(), "vendor-1\n");
+    }
+
+    /// A keeper waits for its adapter's start as long as the adapter's own
+    /// waits allow: Muse's initialize and resume retries outlast the default.
+    #[test]
+    fn a_keeper_waits_for_its_adapter_start_budget() {
+        let floor = anyagents_keeper::READY_DEADLINE;
+        let muse = AdapterLaunch::Muse {
+            program: "muse".into(),
+            args: Vec::new(),
+            session: Some("s".into()),
+            env: Vec::new(),
+            work_dir: "/w".into(),
+            config_dir: "/c".into(),
+            scripted: false,
+        };
+        assert!(anyagents_harness_muse::START_BUDGET > floor);
+        assert!(muse.keeper_ready(floor) > anyagents_harness_muse::START_BUDGET);
+        let contract = AdapterLaunch::Contract {
+            program: "anyagents-harness".into(),
+            config: "/c/adapter.json".into(),
+            env: Vec::new(),
+            work_dir: "/w".into(),
+        };
+        assert_eq!(contract.keeper_ready(floor), floor);
+    }
+
+    /// A cloud harness runs behind the Claude adapter at turn-end delivery
+    /// (`docs/delivery.md`). The launch the kernel hands its keeper says so,
+    /// and keeps saying so across the wire.
+    #[test]
+    fn a_cloud_harness_launch_keeps_turn_end_delivery_across_its_keeper() {
+        use anyagents_core::{NewAgent, Store};
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(NewAgent::new("cloudy", "claude-cloud"))
+            .unwrap();
+        let config = anyagents_core::agent_config_dir(dir.path(), &agent.id);
+        std::fs::create_dir_all(&config).unwrap();
+        let request = LaunchRequest {
+            agent,
+            data_dir: dir.path().to_owned(),
+            config_dir: config.clone(),
+            work_dir: dir.path().join("work"),
+            extra_env: vec![],
+            lock: None,
+        };
+        let planned = plan_adapter(&request, dir.path(), Vec::new()).unwrap();
+        let wire = serde_json::to_value(&planned.launch).unwrap();
+        assert!(
+            matches!(
+                serde_json::from_value(wire).unwrap(),
+                AdapterLaunch::Claude { cloud: true, .. }
+            ),
+            "{:?}",
+            planned.launch
+        );
+        assert_eq!(
+            declared_delivery("claude-cloud"),
+            anyagents_harness_claude::CLOUD_DELIVERY
+        );
+        assert_eq!(
+            anyagents_harness_claude::CLOUD_DELIVERY.level,
+            anyagents_harness::DeliveryLevel::TurnEnd
+        );
     }
 
     #[test]
@@ -3144,6 +3744,7 @@ done
             config_dir: config.clone(),
             work_dir: root.join("work"),
             extra_env: vec![],
+            lock: None,
         };
         prepare_host_session(&request(agent.clone())).unwrap();
         let first = host_session::active(root).unwrap().unwrap();
@@ -3211,6 +3812,7 @@ done
                     config_dir: config.clone(),
                     work_dir: root.join("work"),
                     extra_env: vec![],
+                    lock: None,
                 };
                 prepare_host_session(&request()).unwrap();
                 let first = host_session::active(root).unwrap().unwrap();
@@ -3269,7 +3871,12 @@ done
         std::fs::create_dir_all(&config_dir).unwrap();
         std::fs::create_dir_all(&work_dir).unwrap();
 
-        ensure_agy_steering_settings(&config_dir, &work_dir, &dir.path().join("media")).unwrap();
+        ensure_agy_steering_settings(
+            &config_dir,
+            &work_dir,
+            &dir.path().join(anyagents_harness::media::MEDIA_DIR),
+        )
+        .unwrap();
 
         let settings_path = config_dir
             .join(".gemini")
@@ -3343,7 +3950,12 @@ done
         }
 
         // Calling a second time is idempotent and does not duplicate entries.
-        ensure_agy_steering_settings(&config_dir, &work_dir, &dir.path().join("media")).unwrap();
+        ensure_agy_steering_settings(
+            &config_dir,
+            &work_dir,
+            &dir.path().join(anyagents_harness::media::MEDIA_DIR),
+        )
+        .unwrap();
         let text2 = std::fs::read_to_string(&settings_path).unwrap();
         let json2: serde_json::Value = serde_json::from_str(&text2).unwrap();
         assert_eq!(json2, json);
@@ -3382,7 +3994,12 @@ done
         )
         .unwrap();
 
-        ensure_agy_steering_settings(&config_dir, &work_dir, &dir.path().join("media")).unwrap();
+        ensure_agy_steering_settings(
+            &config_dir,
+            &work_dir,
+            &dir.path().join(anyagents_harness::media::MEDIA_DIR),
+        )
+        .unwrap();
         let healed: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
         let deny_list = healed["permissions"]["deny"].as_array().unwrap();
@@ -3509,7 +4126,7 @@ done
         let dir = crate::test_tempdir();
         let config_dir = dir.path().join("config");
         let work_dir = dir.path().join("work");
-        let media_dir = dir.path().join("media");
+        let media_dir = dir.path().join(anyagents_harness::media::MEDIA_DIR);
         let elsewhere = dir.path().join("elsewhere");
         let step =
             config_dir.join(".gemini/antigravity-cli/brain/324a320d/.system_generated/steps/3921");

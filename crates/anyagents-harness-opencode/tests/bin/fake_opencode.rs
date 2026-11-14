@@ -2,8 +2,10 @@
 //!
 //! It speaks the same surface the real CLI does: `opencode serve` starts a
 //! service that answers nothing on stdin, and `opencode api <METHOD> <path>`
-//! prints one JSON answer. Every call is appended to `ANYAGENTS_FAKE_LOG`, so a
-//! test can read what the adapter asked for.
+//! prints the answer's body; a non-2xx answer also prints `HTTP <status>
+//! <text>` on stderr and exits 1, its body an error tagged `_tag`. Every call
+//! is appended to `ANYAGENTS_FAKE_LOG`, so a test can read what the adapter
+//! asked for.
 //!
 //! `ANYAGENTS_FAKE_MODE` chooses what a prompt does:
 //! - `finish` (default): the next `GET .../message` carries the answer and an
@@ -16,10 +18,29 @@
 //!   and the session lists all of them, with no answer and no idle until the
 //!   test's own file says the turn ended. This is a turn that is open for the
 //!   whole test, so a prompt written mid-turn stays in the session's inbox.
+//!
+//! - `applied`: every prompt names a line an earlier process wrote and the
+//!   session already consumed; `parked`: one it admitted and has not yet.
+//! - `prompt-503-once`: the first prompt meets the readiness gate (503
+//!   `{"code":"service_starting"}`, nothing admitted); `prompt-502-once`: it
+//!   fails without saying whether it was admitted.
+//! - `prompt-400` / `prompt-409` / `prompt-401` / `prompt-500` /
+//!   `prompt-503-failed`: every prompt fails so, with the body OpenCode 2.1.4
+//!   gives (`InvalidRequestError`, `ConflictError`, …).
+//! - `v1`: `serve` announces itself as OpenCode 1.19.5 does (`opencode server
+//!   listening on …`, no password) and `api` is not a command; `info-404` and
+//!   `info-1x`: a service whose `GET /api/info` answers 404, or names 1.19.5.
+//!
+//! `ANYAGENTS_FAKE_DELAY_MS` holds every prompt's answer back that long.
+//!
+//! `POST /api/experimental/session/{id}/wait` answers at once (the turn is
+//! over) except in `hold`, `inbox` and `interrupt-failed`, where the turn never
+//! ends: it answers only when the service stops, as the real one does.
 
 use std::env;
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::io::Write;
+use std::path::Path;
 use std::process::exit;
 use std::thread;
 use std::time::Duration;
@@ -28,18 +49,22 @@ fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("serve") => serve(&args[1..]),
+        // OpenCode 1.x has no `api` command.
+        Some("api") if env::var("ANYAGENTS_FAKE_MODE").as_deref() == Ok("v1") => {
+            log("api:unknown command");
+            exit(1)
+        }
         Some("api") => {
             // A missing explicit endpoint would discover a managed service.
             // Refuse that in the fixture instead of masking isolation bugs.
             let mut rest: Vec<String> = args[1..].to_vec();
-            if let Some(at) = rest.iter().position(|arg| arg == "--server") {
-                let endpoint = rest.get(at + 1).expect("server URL");
-                log(&format!("server:{endpoint}"));
-                rest.drain(at..(at + 2).min(rest.len()));
-            } else {
+            let Some(at) = rest.iter().position(|arg| arg == "--server") else {
                 panic!("refusing managed service discovery");
-            }
-            api(&rest)
+            };
+            let endpoint = rest.get(at + 1).expect("server URL").clone();
+            log(&format!("server:{endpoint}"));
+            rest.drain(at..(at + 2).min(rest.len()));
+            api(&rest, &endpoint)
         }
         _ => exit(2),
     }
@@ -55,6 +80,20 @@ fn serve(args: &[String]) {
     ));
     if env::var("ANYAGENTS_FAKE_MODE").as_deref() == Ok("no-announcement") {
         return;
+    }
+    // OpenCode 1.19.5: a warning when no password is set, its address with
+    // its name in front, and never a password.
+    if env::var("ANYAGENTS_FAKE_MODE").as_deref() == Ok("v1") {
+        let port = args
+            .windows(2)
+            .find(|pair| pair[0] == "--port")
+            .map_or("4096", |pair| pair[1].as_str());
+        println!("Warning: OPENCODE_SERVER_PASSWORD is not set; server is unsecured.");
+        println!("opencode server listening on http://127.0.0.1:{port}");
+        let _ = std::io::stdout().flush();
+        loop {
+            thread::sleep(Duration::from_secs(3600));
+        }
     }
     let port = args
         .windows(2)
@@ -128,7 +167,7 @@ fn serve(args: &[String]) {
     }
 }
 
-fn api(args: &[String]) {
+fn api(args: &[String], endpoint: &str) {
     let method = args.first().map(String::as_str).unwrap_or("");
     let path = args.get(1).map(String::as_str).unwrap_or("");
     let body = args
@@ -140,24 +179,86 @@ fn api(args: &[String]) {
     log(&format!("api:{method} {path} {body}"));
 
     let mode = env::var("ANYAGENTS_FAKE_MODE").unwrap_or_else(|_| "finish".into());
-    let dir =
-        env::var("ANYAGENTS_FAKE_STATE").unwrap_or_else(|_| env::temp_dir().display().to_string());
-    let _ = dir;
     match (method, path) {
+        ("GET", "/api/info") if mode == "info-404" => {
+            // No such route: an older service.
+            eprintln!("HTTP 404 Not Found");
+            exit(1);
+        }
+        ("GET", "/api/info") if mode == "info-1x" => {
+            print!("{{\"version\":\"1.19.5\"}}");
+        }
+        ("GET", "/api/info") => {
+            print!(
+                "{{\"version\":\"2.1.4\",\"pid\":{},\"urls\":[\"{endpoint}\"],\"paths\":{{\"tmp\":\"/tmp\"}},\"capabilities\":{{}}}}",
+                std::process::id()
+            );
+        }
         ("GET", "/api/session") => {
             print!("{{\"data\":[{{\"id\":\"ses_fake\"}}]}}");
         }
+        ("GET", "/api/session/active") => {
+            print!("{{\"data\":{{}}}}");
+        }
+        ("POST", p) if p.starts_with("/api/experimental/session/") && p.ends_with("/wait") => {
+            // A turn that never ends answers only when the service stops.
+            if matches!(mode.as_str(), "hold" | "inbox" | "interrupt-failed") {
+                let address = endpoint.trim_start_matches("http://");
+                while std::net::TcpStream::connect(address).is_ok() {
+                    thread::sleep(Duration::from_millis(50));
+                }
+                eprintln!("error: Unable to connect. Is the computer able to access the url?");
+                exit(1);
+            }
+            // 204: the session is idle, and the CLI prints nothing.
+        }
+        ("GET", p) if p.starts_with("/api/session/ses_") && p.contains("/message/") => {
+            // `applied`: the session took the line into its conversation.
+            if mode == "applied" {
+                let id = p.rsplit('/').next().unwrap_or_default();
+                print!(
+                    "{{\"data\":{{\"id\":\"{id}\",\"type\":\"user\",\"text\":\"\",\"time\":{{\"created\":1}}}}}}"
+                );
+                return;
+            }
+            fail(
+                404,
+                "Not Found",
+                "MessageNotFoundError",
+                "Message not found",
+            );
+        }
         ("GET", p) if p.starts_with("/api/session/ses_") && !p.contains("/message") => {
             if mode == "session-unavailable" {
-                eprintln!("service unavailable (503)");
-                exit(1);
+                fail(
+                    503,
+                    "Service Unavailable",
+                    "ServiceUnavailableError",
+                    "service unavailable",
+                );
             }
             // `gone` mode: the stored session no longer exists in this store.
             if mode == "gone" {
-                print!("{{\"error\":{{\"code\":404,\"message\":\"no such session\"}}}}");
-                exit(1);
+                fail(
+                    404,
+                    "Not Found",
+                    "SessionNotFoundError",
+                    "Session not found",
+                );
             }
-            print!("{{\"data\":{{\"id\":\"ses_fake\",\"title\":\"fake\"}}}}");
+            // The session's running totals, when the test wrote them: they
+            // outlive any one process, as a real session's do.
+            let mut session = serde_json::json!({"id": "ses_fake", "title": "fake"});
+            let usage = env::var("ANYAGENTS_FAKE_STATE")
+                .ok()
+                .and_then(|dir| fs::read_to_string(Path::new(&dir).join("session-usage.json")).ok())
+                .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+            if let (Some(session), Some(serde_json::Value::Object(usage))) =
+                (session.as_object_mut(), usage)
+            {
+                session.extend(usage);
+            }
+            print!("{}", serde_json::json!({ "data": session }));
         }
         ("POST", "/api/session") => {
             let id = if mode == "gone" || mode.starts_with("prompt-404") {
@@ -170,42 +271,105 @@ fn api(args: &[String]) {
         ("POST", p) if p.ends_with("/prompt") => {
             let dir = env::var("ANYAGENTS_FAKE_STATE").unwrap_or_default();
             if mode == "prompt-500" {
-                eprintln!("HTTP 500 Internal Server Error");
-                print!("{{\"error\":{{\"code\":500,\"message\":\"internal server error\"}}}}");
-                exit(1);
+                fail(
+                    500,
+                    "Internal Server Error",
+                    "UnknownError",
+                    "internal server error",
+                );
             }
             if mode == "prompt-400" {
-                eprintln!("HTTP 400 Bad Request");
-                print!("{{\"error\":{{\"code\":400,\"message\":\"bad request\"}}}}");
-                exit(1);
+                fail(
+                    400,
+                    "Bad Request",
+                    "InvalidRequestError",
+                    "Skill not found: missing",
+                );
+            }
+            if mode == "prompt-409" {
+                let request: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+                let id = request["id"].as_str().unwrap_or_default();
+                fail(
+                    409,
+                    "Conflict",
+                    "ConflictError",
+                    &format!("Prompt message ID conflicts with an existing durable record: {id}"),
+                );
+            }
+            if mode == "prompt-503-failed" {
+                fail_with(
+                    503,
+                    "Service Unavailable",
+                    &serde_json::json!({
+                        "code": "service_failed",
+                        "message": "The background service could not start.",
+                        "action": "Run `opencode service restart` after checking the service logs.",
+                    }),
+                );
+            }
+            if mode == "prompt-401" {
+                fail(401, "Unauthorized", "UnauthorizedError", "Unauthorized");
             }
             if mode == "prompt-404-always" {
+                fail(
+                    404,
+                    "Not Found",
+                    "SessionNotFoundError",
+                    "Session not found",
+                );
+            }
+            if mode == "prompt-404" && p == "/api/session/ses_fake/prompt" {
+                fail(
+                    404,
+                    "Not Found",
+                    "SessionNotFoundError",
+                    "Session not found",
+                );
+            }
+            // A 404 whose body says nothing still names the session gone.
+            if mode == "prompt-404-stderr" && p == "/api/session/ses_fake/prompt" {
                 eprintln!("HTTP 404 Not Found");
-                print!("{{\"error\":{{\"code\":404,\"message\":\"session not found\"}}}}");
                 exit(1);
             }
-            if (mode == "prompt-404" || mode == "prompt-404-stderr")
-                && p == "/api/session/ses_fake/prompt"
-            {
-                eprintln!("HTTP 404 Not Found");
-                if mode == "prompt-404" {
-                    print!("{{\"error\":{{\"code\":404,\"message\":\"session not found\"}}}}");
+            // The first prompt fails once: the readiness gate turns it away,
+            // or an outcome does not say whether the line was admitted.
+            if matches!(mode.as_str(), "prompt-503-once" | "prompt-502-once") {
+                let marker = format!("{dir}/failed-once");
+                if !std::path::Path::new(&marker).exists() {
+                    let _ = std::fs::write(&marker, "1");
+                    if mode == "prompt-503-once" {
+                        fail_with(
+                            503,
+                            "Service Unavailable",
+                            &serde_json::json!({"code": "service_starting"}),
+                        );
+                    }
+                    fail(502, "Bad Gateway", "UnknownError", "bad gateway");
                 }
-                exit(1);
+            }
+            if let Some(delay) = env::var("ANYAGENTS_FAKE_DELAY_MS")
+                .ok()
+                .and_then(|delay| delay.parse().ok())
+            {
+                thread::sleep(Duration::from_millis(delay));
             }
             if mode == "prompt-404-after-first" && p == "/api/session/ses_fake/prompt" {
                 let first_marker = format!("{dir}/first-prompt-delivered");
                 if std::path::Path::new(&first_marker).exists() {
-                    eprintln!("HTTP 404 Not Found");
-                    print!("{{\"error\":{{\"code\":404,\"message\":\"session not found\"}}}}");
-                    exit(1);
+                    fail(
+                        404,
+                        "Not Found",
+                        "SessionNotFoundError",
+                        "Session not found",
+                    );
                 }
                 if !dir.is_empty() {
                     let _ = std::fs::write(&first_marker, "1");
                 }
             }
-            let steered = body.contains("\"delivery\":\"steer\"");
-            let text = prompt_text(&body);
+            let request: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+            let steered = request["delivery"] == "steer";
+            let text = request["text"].as_str().unwrap_or_default().to_string();
             if !dir.is_empty() {
                 let _ = std::fs::write(format!("{dir}/last-prompt"), &text);
             }
@@ -227,14 +391,36 @@ fn api(args: &[String]) {
             } else {
                 log(&format!("prompt:{text}"));
             }
-            print!("{{\"data\":{{\"id\":\"msg_1\"}}}}");
+            // The inbox record the service admitted, under the prompt's own id.
+            // `applied` and `parked`: an earlier process wrote this id, so the
+            // service answers with the record it already holds.
+            let created = if matches!(mode.as_str(), "applied" | "parked") {
+                1
+            } else {
+                now_ms()
+            };
+            let session = p
+                .trim_start_matches("/api/session/")
+                .trim_end_matches("/prompt");
+            let record = serde_json::json!({
+                "id": request["id"].as_str().unwrap_or("msg_minted"),
+                "sessionID": session,
+                "time": {"created": created},
+                "type": "user",
+                "payload": {"text": text},
+                "delivery": request["delivery"],
+            });
+            print!("{}", serde_json::json!({ "data": record }));
         }
         ("POST", p) if p.ends_with("/interrupt") => {
             if mode == "interrupt-failed" {
-                eprintln!("interruption refused (503)");
-                exit(1);
+                fail(
+                    503,
+                    "Service Unavailable",
+                    "ServiceUnavailableError",
+                    "interruption refused",
+                );
             }
-            print!("{{\"data\":true}}");
         }
         ("GET", p) if p.ends_with("/message") => {
             // The user message this service last received, as JSON, so the
@@ -325,32 +511,26 @@ fn api(args: &[String]) {
     }
 }
 
+/// Answer the way `opencode api` reports a non-2xx answer: the error's body on
+/// stdout, `HTTP <status> <text>` on stderr, exit status 1.
+fn fail(status: u16, text: &str, tag: &str, message: &str) -> ! {
+    fail_with(
+        status,
+        text,
+        &serde_json::json!({ "_tag": tag, "message": message }),
+    )
+}
+
+/// The same, with the body as the service writes it.
+fn fail_with(status: u16, text: &str, body: &serde_json::Value) -> ! {
+    print!("{body}");
+    eprintln!("HTTP {status} {text}");
+    exit(1)
+}
+
 /// The answer the scripted service gives, from `ANYAGENTS_FAKE_ANSWER`.
 fn scripted_answer() -> String {
     env::var("ANYAGENTS_FAKE_ANSWER").unwrap_or_else(|_| "pong from opencode".into())
-}
-
-/// The prompt's text, unescaped enough to log and to read the marker.
-fn prompt_text(body: &str) -> String {
-    let Some(at) = body.find("\"text\":\"") else {
-        return String::new();
-    };
-    let rest = &body[at + 8..];
-    let mut out = String::new();
-    let mut chars = rest.chars();
-    while let Some(ch) = chars.next() {
-        match ch {
-            '"' => break,
-            '\\' => match chars.next() {
-                Some('n') => out.push('\n'),
-                Some('t') => out.push('\t'),
-                Some(other) => out.push(other),
-                None => break,
-            },
-            other => out.push(other),
-        }
-    }
-    out
 }
 
 fn log(line: &str) {
