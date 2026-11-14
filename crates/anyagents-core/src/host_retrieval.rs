@@ -2281,7 +2281,7 @@ fn native_sources(walk: &mut Walk, root: &Path) -> io::Result<Vec<NativeSource>>
     ] {
         add(file(walk, &db).map(|found| {
             found
-                .then(|| NativeSource {
+                .then_some(NativeSource {
                     path: db,
                     format: NativeFormat::Store(kind),
                 })
@@ -2327,7 +2327,7 @@ fn native_sources(walk: &mut Walk, root: &Path) -> io::Result<Vec<NativeSource>>
             let transcript = conversation.join(".system_generated/logs/transcript_full.jsonl");
             add(file(walk, &transcript).map(|found| {
                 found
-                    .then(|| NativeSource {
+                    .then_some(NativeSource {
                         path: transcript,
                         format: NativeFormat::AgyTranscript,
                     })
