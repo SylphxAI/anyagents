@@ -109,7 +109,7 @@ fn run_with_identity(
 /// The supervisor of a serving kernel. However the kernel stops (a signal, an
 /// error, a test dropping it), its harness processes are left to the next
 /// kernel when they live in keepers; hosted in this process, they end.
-struct Retaining(Option<Supervisor<VendorHarness>>);
+struct Retaining(Option<Supervisor<VendorHarness>>, bool);
 
 impl std::ops::Deref for Retaining {
     type Target = Supervisor<VendorHarness>;
@@ -122,6 +122,11 @@ impl std::ops::Deref for Retaining {
 impl Drop for Retaining {
     fn drop(&mut self) {
         if let Some(supervisor) = self.0.take() {
+            // A keeper still starting is not waited for: it finishes its
+            // start on its own, and the next kernel takes it over.
+            if self.1 {
+                anyagents_keeper::abandon_starts();
+            }
             supervisor.retain_processes();
         }
     }
@@ -277,16 +282,22 @@ async fn serve(
         Vec::new()
     };
     let custody = crate::keeper::custody(data, &host, refused);
-    let supervisor = Retaining(Some(
-        Supervisor::<VendorHarness>::start_with_custody(
-            Arc::clone(&store),
-            Arc::new(SystemClock::new()),
-            Arc::new(move |request| vendor::vendor_launch_hosted(request, &launch_store, &host)),
-            vendor::child_env(),
-            custody,
-        )
-        .map_err(Error::Message)?,
-    ));
+    let kept = matches!(host, HarnessHost::Keeper(_));
+    let supervisor = Retaining(
+        Some(
+            Supervisor::<VendorHarness>::start_with_custody(
+                Arc::clone(&store),
+                Arc::new(SystemClock::new()),
+                Arc::new(move |request| {
+                    vendor::vendor_launch_hosted(request, &launch_store, &host)
+                }),
+                vendor::child_env(),
+                custody,
+            )
+            .map_err(Error::Message)?,
+        ),
+        kept,
+    );
     if auth.is_confined() {
         crate::sandbox::share_socket_with_seats(&data.join("wake.sock"));
     }

@@ -819,6 +819,77 @@ fn a_moved_gateway_replaces_the_kept_harnesses_of_api_key_agents() {
     drop(squatter);
 }
 
+/// A server that stops while one of its agents' keepers is still starting
+/// does not wait for that start: it stops at once, and the keeper finishes
+/// its start on its own for the next server.
+#[test]
+fn a_server_stops_at_once_while_a_keeper_is_still_starting() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let _env = support::lock();
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    support::operator_for_contract(&data);
+    create_asker(&data);
+    let name = "slow-start";
+    let out = bin()
+        .env("PATH", machine_path(&data))
+        .arg("--data")
+        .arg(&data)
+        .args(["agents", "create", name, "--harness", "spiron"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // A vendor that never says it is ready: its keeper's start takes as long
+    // as Spiron's own ready wait.
+    let spiron = data.join("bin").join("spiron-never-ready");
+    std::fs::create_dir_all(spiron.parent().unwrap()).unwrap();
+    std::fs::write(&spiron, "#!/bin/sh\nexec sleep 600\n").unwrap();
+    std::fs::set_permissions(&spiron, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let anyagents = Path::new(env!("CARGO_BIN_EXE_anyagents"));
+    let server = Server::start_with(
+        &data,
+        anyagents,
+        anyagents,
+        &[("ANYAGENTS_SPIRON_BIN", spiron.to_str().unwrap())],
+    );
+    send(&data, name);
+    support::wait_for(
+        || {
+            std::fs::read_dir(data.join("keepers"))
+                .map(|entries| {
+                    entries
+                        .flatten()
+                        .any(|entry| entry.path().join("spawned").exists())
+                })
+                .unwrap_or(false)
+        },
+        "no keeper started",
+    );
+    let started = Instant::now();
+    server.terminate();
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "the server waited {:?} for a keeper's start",
+        started.elapsed()
+    );
+    let stopped = bin()
+        .arg("--data")
+        .arg(&data)
+        .args(["keepers", "stop", "--all", "--force"])
+        .output()
+        .unwrap();
+    assert!(
+        stopped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+}
+
 /// Stopping keepers is the step before a rollback to a binary without them.
 /// It refuses while a server runs (that server would start them again),
 /// exits non-zero when it refuses, and once no server runs it ends every

@@ -178,9 +178,16 @@ pub fn spawn(
     let dir = new_instance(root, spec)?;
     let mut child = match start_keeper(program, &dir, spec, lock) {
         Ok(child) => child,
-        Err(error) => {
+        Err(Start::Failed(error)) => {
             let _ = std::fs::remove_dir_all(&dir);
             return Err(error);
+        }
+        // The keeper finishes its start on its own, holding the agent's
+        // lock, and the next kernel takes it over.
+        Err(Start::Abandoned) => {
+            return Err(
+                "this kernel is stopping; the keeper finishes its start for the next".into(),
+            );
         }
     };
     match connect(&dir, true) {
@@ -248,12 +255,42 @@ fn new_instance(root: &Path, spec: &Spec) -> Result<PathBuf, String> {
     Err(format!("no free keeper directory in {}", root.display()))
 }
 
+/// Why a keeper did not start for this kernel.
+enum Start {
+    Failed(String),
+    /// This kernel stops ([`abandon_starts`]): the keeper is left to finish.
+    Abandoned,
+}
+
+impl From<String> for Start {
+    fn from(error: String) -> Self {
+        Self::Failed(error)
+    }
+}
+
+/// Set once this kernel stops: a start in progress is no longer waited for.
+static ABANDONED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Wakes a start waiting for its keeper's `ready`: the keeper answered, or
+/// this kernel stops.
+static START_WAKE: Condvar = Condvar::new();
+static START_LOCK: Mutex<()> = Mutex::new(());
+
+/// Stop waiting for every keeper start in progress, now and later: this
+/// kernel is stopping and leaves its keepers to the next one. A keeper in
+/// its start goes on starting, holding the agent's lock, and is taken over
+/// once it answers; nothing is ended. Called once, as the kernel exits.
+pub fn abandon_starts() {
+    ABANDONED.store(true, std::sync::atomic::Ordering::SeqCst);
+    let _guard = lock(&START_LOCK);
+    START_WAKE.notify_all();
+}
+
 fn start_keeper(
     program: &Program,
     dir: &Path,
     spec: &Spec,
     lock: Option<BorrowedFd<'_>>,
-) -> Result<Child, String> {
+) -> Result<Child, Start> {
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -268,8 +305,8 @@ fn start_keeper(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(log);
-    let lock = lock.map(|fd| fd.as_raw_fd());
-    if lock.is_some() {
+    let lock_fd = lock.map(|fd| fd.as_raw_fd());
+    if lock_fd.is_some() {
         command.arg("--lock-fd").arg(KEEPER_LOCK_FD.to_string());
     }
     // SAFETY: only async-signal-safe calls between fork and exec: setsid,
@@ -279,7 +316,7 @@ fn start_keeper(
             if libc::setsid() < 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            if let Some(fd) = lock {
+            if let Some(fd) = lock_fd {
                 if fd == KEEPER_LOCK_FD {
                     let flags = libc::fcntl(fd, libc::F_GETFD);
                     if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
@@ -303,7 +340,9 @@ fn start_keeper(
             .write_all(&bytes)
             .map_err(|error| format!("cannot hand the launch to the keeper: {error}"))
     });
-    let (sent, started) = std::sync::mpsc::channel();
+    type Line = std::io::Result<(usize, String)>;
+    let answer: Arc<Mutex<Option<Line>>> = Arc::default();
+    let sent = Arc::clone(&answer);
     match (written, child.stdout.take()) {
         (Ok(()), Some(stdout)) => {
             let reading = std::thread::Builder::new()
@@ -313,25 +352,49 @@ fn start_keeper(
                     let read = BufReader::new(stdout)
                         .read_line(&mut line)
                         .map(|count| (count, line));
-                    let _ = sent.send(read);
+                    *self::lock(&sent) = Some(read);
+                    let _guard = self::lock(&START_LOCK);
+                    START_WAKE.notify_all();
                 });
             if let Err(error) = reading {
                 end_start(&mut child, spec.seat.as_deref());
-                return Err(format!("cannot read the keeper's start: {error}"));
+                return Err(format!("cannot read the keeper's start: {error}").into());
             }
         }
         (Err(error), _) => {
             end_start(&mut child, spec.seat.as_deref());
-            return Err(error);
+            return Err(error.into());
         }
         (Ok(()), None) => {
             end_start(&mut child, spec.seat.as_deref());
-            return Err("keeper stdout missing".into());
+            return Err(String::from("keeper stdout missing").into());
         }
     }
-    let failure = match started.recv_timeout(program.ready) {
-        Ok(Ok((_, line))) if line.trim_end() == "ready" => return Ok(child),
-        Ok(Ok((0, _))) => {
+    let deadline = Instant::now() + program.ready;
+    let read = {
+        let mut guard = self::lock(&START_LOCK);
+        loop {
+            if let Some(read) = self::lock(&answer).take() {
+                break Some(read);
+            }
+            if ABANDONED.load(std::sync::atomic::Ordering::SeqCst) {
+                // Left running, unreaped: the next kernel takes it over.
+                drop(child);
+                return Err(Start::Abandoned);
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break None;
+            }
+            guard = START_WAKE
+                .wait_timeout(guard, left)
+                .unwrap_or_else(|error| error.into_inner())
+                .0;
+        }
+    };
+    let failure = match read {
+        Some(Ok((_, line))) if line.trim_end() == "ready" => return Ok(child),
+        Some(Ok((0, _))) => {
             let tail = log_tail(dir);
             if tail.is_empty() {
                 "keeper exited before it was ready".to_string()
@@ -339,19 +402,19 @@ fn start_keeper(
                 format!("keeper exited before it was ready: {tail}")
             }
         }
-        Ok(Ok((_, line))) => line
+        Some(Ok((_, line))) => line
             .trim_end()
             .strip_prefix("error ")
             .unwrap_or(line.trim_end())
             .to_string(),
-        Ok(Err(error)) => error.to_string(),
-        Err(_) => format!(
+        Some(Err(error)) => error.to_string(),
+        None => format!(
             "keeper was not ready within {} s (its harness did not finish starting)",
             program.ready.as_secs()
         ),
     };
     end_start(&mut child, spec.seat.as_deref());
-    Err(failure)
+    Err(failure.into())
 }
 
 /// End a keeper this kernel started and has not reaped, with everything in
@@ -1568,7 +1631,9 @@ pub mod testing {
     pub fn start_unattached(program: &Program, root: &Path, spec: &Spec) -> (PathBuf, Child) {
         private_dir(root).unwrap();
         let dir = new_instance(root, spec).unwrap();
-        let child = start_keeper(program, &dir, spec, None).unwrap();
+        let Ok(child) = start_keeper(program, &dir, spec, None) else {
+            panic!("the keeper did not start");
+        };
         (dir, child)
     }
 
