@@ -5642,12 +5642,17 @@ async fn conversation_route(
                         format!("memory topic `{filename}` not found"),
                     ));
                 }
-                let mut bytes = Vec::new();
+                let bytes: Vec<u8>;
                 let timestamp_ms = match anyagents_core::raw_segment::open_readonly(&path) {
-                    Ok(mut file) => {
-                        use std::io::Read as _;
-                        file.read_to_end(&mut bytes)
-                            .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.to_string()))?;
+                    Ok(file) => {
+                        // A seat can make a topic claim terabytes (a sparse
+                        // file); it is refused, never read into memory.
+                        let modified = file.metadata().ok().and_then(|m| m.modified().ok());
+                        bytes = anyagents_core::beneath::read_capped(
+                            file,
+                            anyagents_core::learned_memory::MEMORY_FILE_LIMIT,
+                        )
+                        .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.to_string()))?;
                         let text_preview = String::from_utf8_lossy(&bytes);
                         let fm_updated_ms =
                             anyagents_core::learned_memory::parse_topic_frontmatter_full(
@@ -5657,9 +5662,7 @@ async fn conversation_route(
                             .3
                             .filter(|&ts| ts > 0);
                         fm_updated_ms.or_else(|| {
-                            file.metadata()
-                                .ok()
-                                .and_then(|m| m.modified().ok())
+                            modified
                                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                                 .map(|d| d.as_millis() as i64)
                         })
@@ -5803,9 +5806,11 @@ async fn conversation_route(
                 // Read back without following a link, as the read route does:
                 // `memory/` is the seat's to write.
                 let bytes = anyagents_core::raw_segment::open_readonly(&path)
-                    .and_then(|mut file| {
-                        let mut bytes = Vec::new();
-                        std::io::Read::read_to_end(&mut file, &mut bytes).map(|_| bytes)
+                    .and_then(|file| {
+                        anyagents_core::beneath::read_capped(
+                            file,
+                            anyagents_core::learned_memory::MEMORY_FILE_LIMIT,
+                        )
                     })
                     .unwrap_or_default();
                 let digest = anyagents_core::learned_memory::sha256(&bytes);
@@ -11749,6 +11754,46 @@ exec '{}' "$@"
         unsafe {
             std::env::remove_var("ANYAGENTS_FAKE_MODE");
         }
+    }
+
+    #[test]
+    fn a_sparse_memory_topic_is_refused_not_read() {
+        let _env = env_lock();
+        let dir = crate::test_tempdir();
+        let state = archetype_validation_state(dir.path());
+        let agent = state
+            .store
+            .create_agent(anyagents_core::NewAgent::new("sparse", "agy"))
+            .unwrap();
+        let memory = dir
+            .path()
+            .join("agents")
+            .join(agent.id.as_str())
+            .join("memory");
+        std::fs::create_dir_all(&memory).unwrap();
+        // What `truncate -s 1T memory/huge.md` in the seat leaves.
+        std::fs::File::create(memory.join("huge.md"))
+            .unwrap()
+            .set_len(1 << 40)
+            .unwrap();
+        let error = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(conversation_route(
+                Principal::Agent {
+                    agent_id: agent.id.clone(),
+                    name: agent.name.clone(),
+                },
+                State(state.clone()),
+                AxumPath(agent.name.clone()),
+                Query(ConversationQuery {
+                    scope: anyagents_core::host_index::MemoryScope::Memory,
+                    topic: Some("huge".into()),
+                    ..Default::default()
+                }),
+            ))
+            .expect_err("an oversized topic is refused");
+        assert_eq!(error.status, StatusCode::BAD_REQUEST, "{}", error.message);
+        assert!(error.message.contains("limit"), "{}", error.message);
     }
 
     #[test]

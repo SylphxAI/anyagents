@@ -14,9 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   root (`anyagents_core::beneath`), opening every component with `O_NOFOLLOW`
   and reading at most a fixed size per file; the host index lists and
   descends `memory/`, transcripts and history the same way, and
-  `raw_segment::open_readonly` no longer waits on a FIFO. In `config/` only the
-  sleep-model key lookup is covered so far; other server access to `config/`,
-  `skills/` and `sessions/` is not yet routed this way.
+  `raw_segment::open_readonly` no longer waits on a FIFO; the memory read
+  and write routes read at most 4 MiB per topic. In `config/` this change
+  covers only the sleep-model key lookup; the rest of `config/`, `skills/`
+  and `sessions/` moves onto `AgentTree` separately (#275).
 - Mail and turn trouble is no longer silent (`docs/delivery.md`). A turn the
   harness ends with an error no longer stays open: its work comes back as a
   `[Recovery]` note, stored in the same transaction that closes the turn.
