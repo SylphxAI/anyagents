@@ -602,14 +602,10 @@ pub(crate) fn prepare_config_with_seat_uid(config: &Path, uid: u32, gid: u32) ->
     })
 }
 
-/// Share a working directory and both per-worktree and common Git metadata.
-/// A protected shared root or failed permission change is a typed refusal.
-pub fn share_worktree_with_seat(
-    path: &Path,
-    uid: u32,
-    gid: u32,
-    journal: &Path,
-) -> Result<(), Error> {
+/// Share a working directory, and its own Git repository, with a seat's
+/// group. A protected shared root or failed permission change is a typed
+/// refusal.
+pub fn share_worktree_with_seat(path: &Path, gid: u32) -> Result<(), Error> {
     let canon = std::fs::canonicalize(path).map_err(|error| Error::WorkdirPermission {
         path: path.display().to_string(),
         message: error.to_string(),
@@ -629,7 +625,7 @@ pub fn share_worktree_with_seat(
             message: "refusing recursive permission changes to a shared root".into(),
         });
     }
-    crate::worktree_access::share(path, uid, gid, journal)
+    crate::repo::share(path, gid)
 }
 
 fn protected_roots() -> Vec<PathBuf> {
@@ -1341,33 +1337,11 @@ mod tests {
             std::env::set_var(key, std::env::join_paths([&alias]).unwrap());
         }
         assert_eq!(protected_roots(), vec![selected.canonicalize().unwrap()]);
-        assert!(
-            share_worktree_with_seat(
-                &selected,
-                server_uid(),
-                server_gid(),
-                &dir.path().join("refused.json")
-            )
-            .is_err()
-        );
+        assert!(share_worktree_with_seat(&selected, server_gid()).is_err());
         let nested = selected.join("nested");
         std::fs::create_dir(&nested).unwrap();
-        assert!(
-            share_worktree_with_seat(
-                &nested,
-                server_uid(),
-                server_gid(),
-                &dir.path().join("nested-refused.json")
-            )
-            .is_err()
-        );
-        share_worktree_with_seat(
-            &allowed,
-            server_uid(),
-            server_gid(),
-            &dir.path().join("allowed.json"),
-        )
-        .unwrap();
+        assert!(share_worktree_with_seat(&nested, server_gid()).is_err());
+        share_worktree_with_seat(&allowed, server_gid()).unwrap();
         unsafe {
             match old {
                 Some(value) => std::env::set_var(key, value),
