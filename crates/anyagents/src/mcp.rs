@@ -8607,7 +8607,8 @@ mod reconnect_tests {
         let mut sender = super::connect_within(&socket, std::time::Duration::from_secs(20))
             .await
             .unwrap();
-        let request = super::build_request("GET", "/v1/health", None, None, None, None).unwrap();
+        let request =
+            super::build_request("GET", "/v1/health", None, None, None, None, false).unwrap();
         let response = sender.send_request(request).await.unwrap();
         assert_eq!(response.status(), hyper::StatusCode::OK);
         let seen = server.await.unwrap();
