@@ -645,6 +645,50 @@ fn process_runs_profile(pid: u32, user_data_dir: &Path) -> Option<bool> {
     }
 }
 
+/// Whether the process group `pgid` still runs this profile's browser: its
+/// leader provably does ([`process_runs_profile`]), or the leader is gone
+/// and a member left in the group does (Chromium outliving `xvfb-run`). The
+/// kernel never hands out a pid that still names a live group, so a group
+/// whose members carry this profile's `--user-data-dir` is this browser's.
+fn profile_owns_group(pgid: u32, user_data_dir: &Path) -> bool {
+    if pgid == 0 || pgid > i32::MAX as u32 {
+        return false;
+    }
+    match process_runs_profile(pgid, user_data_dir) {
+        Some(true) => return true,
+        Some(false) => return false,
+        None => {}
+    }
+    group_member_runs_profile(pgid, user_data_dir)
+}
+
+/// Whether any live process in group `pgid` provably runs this profile.
+#[cfg(target_os = "linux")]
+fn group_member_runs_profile(pgid: u32, user_data_dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return false;
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| process_group_of(*pid) == Some(pgid))
+        .any(|pid| process_runs_profile(pid, user_data_dir) == Some(true))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn group_member_runs_profile(_pgid: u32, _user_data_dir: &Path) -> bool {
+    false
+}
+
+/// The process group `pid` is in, from `/proc/<pid>/stat`.
+#[cfg(target_os = "linux")]
+fn process_group_of(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // `pid (comm) state ppid pgrp ...`; the command may hold `)`.
+    let (_, rest) = stat.rsplit_once(')')?;
+    rest.split_whitespace().nth(2)?.parse().ok()
+}
+
 fn cdp_port_alive(port: u16) -> bool {
     TcpStream::connect_timeout(
         &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
@@ -1349,8 +1393,13 @@ pub fn stop_profile(data: &Path, profile: &str) -> Result<serde_json::Value, Err
         {
             released_keys = release_recorded_held_keys(data, profile, &mut cdp)?;
         }
-        stopped_pid = Some(rt.pid);
-        stop_process_group(rt.pid);
+        // The recorded pid may have been reused since the browser exited:
+        // the launcher is reaped now, and pids wrap within hours. Only a
+        // group still provably running this profile is ever signalled.
+        if profile_owns_group(rt.pid, &dir.join("user-data")) {
+            stopped_pid = Some(rt.pid);
+            stop_process_group(rt.pid);
+        }
     }
     clear_held_keys(data, profile)?;
     cleanup_takeover_session(data, profile)?;
@@ -6684,6 +6733,7 @@ mod tests {
     }
 
     /// A port nothing listens on.
+    #[cfg(target_os = "linux")]
     fn closed_port() -> u16 {
         let port = TcpListener::bind("127.0.0.1:0").unwrap();
         let number = port.local_addr().unwrap().port();
@@ -6691,6 +6741,7 @@ mod tests {
         number
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn live_process_that_is_not_the_profiles_is_forgotten_never_signalled() {
         // The fixture records this test process: alive, the server's user,
@@ -6784,6 +6835,68 @@ mod tests {
         assert!(load_runtime(data, "fixture").unwrap().is_none());
         assert!(!profile_dir(data, "fixture").join("runtime.json").exists());
         launcher.wait().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn close_never_signals_a_pid_that_no_longer_runs_the_profile() {
+        // After a crash the recorded pid can name another process of the
+        // server's user (here this test). Close forgets the record and
+        // signals nothing; this test would not survive a signal.
+        let fixture = ScriptedBrowser::new(cdp_ok_response);
+        let data = fixture.data.path();
+        let stopped = stop_profile(data, "fixture").unwrap();
+        assert_eq!(stopped["stopped_pid"], serde_json::Value::Null);
+        assert!(!profile_dir(data, "fixture").join("runtime.json").exists());
+        assert!(process_alive(std::process::id()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn close_ends_the_profiles_group_even_after_its_launcher_exited() {
+        use std::io::BufRead as _;
+        use std::os::unix::process::CommandExt as _;
+        let fixture = ScriptedBrowser::new(cdp_ok_response);
+        let data = fixture.data.path();
+        let user_data = profile_dir(data, "fixture").join("user-data");
+        std::fs::create_dir_all(&user_data).unwrap();
+        // A launcher that starts the "browser" in its own group and exits,
+        // as xvfb-run does when Chromium outlives it.
+        let flag = format!("--user-data-dir={}", user_data.display());
+        let mut launcher = Command::new("/bin/sh")
+            .args([
+                "-c",
+                "/bin/sh -c 'sleep 60' sh \"$1\" </dev/null >/dev/null 2>&1 & echo $!",
+                "sh",
+            ])
+            .arg(&flag)
+            .stdout(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(launcher.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let member: u32 = line.trim().parse().unwrap();
+        let leader = launcher.id();
+        launcher.wait().unwrap();
+        assert_eq!(process_runs_profile(leader, &user_data), None);
+        assert_eq!(process_runs_profile(member, &user_data), Some(true));
+        let mut runtime = load_runtime(data, "fixture").unwrap().unwrap();
+        runtime.pid = leader;
+        save_runtime(data, &runtime).unwrap();
+
+        let stopped = stop_profile(data, "fixture").unwrap();
+        assert_eq!(stopped["stopped_pid"], leader);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while process_alive(member) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the browser group was not ended"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     #[test]
