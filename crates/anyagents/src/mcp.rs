@@ -667,6 +667,10 @@ impl Client {
                 // A tool call made while the server restarts waits for it.
                 None => (connect_within(&self.socket, RECONNECT_WITHIN).await?, false),
             };
+            // A call its harness gave up on while it waited is not sent.
+            if call_cancelled() {
+                return Err("the tool call was cancelled".into());
+            }
             let response = match sender.try_send_request(request).await {
                 Ok(response) => response,
                 Err(mut error) => match error.take_message() {
@@ -3526,8 +3530,13 @@ impl rmcp::ServerHandler for AgentMcp {
                 None,
             ));
         }
+        let ct = context.ct.clone();
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
-        Self::tool_router().call(tcc).await
+        as_call(
+            Arc::new(move || ct.is_cancelled()),
+            Self::tool_router().call(tcc),
+        )
+        .await
     }
 
     fn get_tool(&self, name: &str) -> Option<rmcp::model::Tool> {
@@ -5045,7 +5054,8 @@ impl AgentMcp {
                         let stdin_clone = Arc::clone(&shared_stdin);
                         let deliveries = Arc::clone(&deliveries);
                         let media_blocks = Arc::clone(&media_blocks);
-                        in_flight.spawn(async move {
+                        let call = current_call();
+                        in_flight.spawn(as_call(call, async move {
                             let res = mcp.dispatch_code_tool(&tool_name, tool_args).await;
                             if tool_name.trim().trim_start_matches("mcp__anyagents__") == "send"
                                 && let Ok((val, _)) = &res
@@ -5080,7 +5090,7 @@ impl AgentMcp {
                                 let _ = writeln!(guard, "{reply}");
                                 let _ = guard.flush();
                             }
-                        });
+                        }));
                     }
                     "done" => {
                         return Ok(msg);
@@ -8319,7 +8329,42 @@ fn build_request(
 /// Only the connection is tried again; no request is ever sent twice. A
 /// one-shot command does not wait: an operator's read falls back to the
 /// store at once.
-const RECONNECT_WITHIN: std::time::Duration = std::time::Duration::from_secs(90);
+///
+/// The wait stays well inside the shortest tool-call timeout found among the
+/// harnesses AnyAgents runs, so a call is not carried out after the harness
+/// gave up on it: Codex 60 s (`tool_timeout_sec`); Claude Code (stdio: about
+/// 28 h, 30 min idle), OpenCode (12 h) and Gemini CLI (10 min) wait longer.
+/// A harness that cancels the call (`notifications/cancelled`) ends the wait
+/// at once.
+const RECONNECT_WITHIN: std::time::Duration = std::time::Duration::from_secs(45);
+
+tokio::task_local! {
+    /// Whether the tool call this task serves was cancelled by the harness.
+    static CALL_CANCELLED: Arc<dyn Fn() -> bool + Send + Sync>;
+}
+
+/// The current tool call was cancelled by its harness.
+fn call_cancelled() -> bool {
+    CALL_CANCELLED
+        .try_with(|cancelled| cancelled())
+        .unwrap_or(false)
+}
+
+/// Run `call` as the tool call `cancelled` reports on, so the requests it
+/// makes are neither connected nor sent once its harness cancelled it.
+async fn as_call<F: std::future::Future>(
+    cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
+    call: F,
+) -> F::Output {
+    CALL_CANCELLED.scope(cancelled, call).await
+}
+
+/// The current call's cancellation, to carry into a task it spawns.
+fn current_call() -> Arc<dyn Fn() -> bool + Send + Sync> {
+    CALL_CANCELLED
+        .try_with(Arc::clone)
+        .unwrap_or_else(|_| Arc::new(|| false))
+}
 /// How often a missing or refusing socket is tried again.
 const RECONNECT_PROBE: std::time::Duration = std::time::Duration::from_millis(250);
 
@@ -8337,6 +8382,9 @@ async fn connect_within(
 ) -> Result<http1::SendRequest<Full<Bytes>>, String> {
     let deadline = tokio::time::Instant::now() + within;
     let stream = loop {
+        if call_cancelled() {
+            return Err("the tool call was cancelled".into());
+        }
         match tokio::net::UnixStream::connect(socket).await {
             Ok(stream) => break stream,
             Err(err)
@@ -8390,6 +8438,7 @@ fn parse_sequence_range(range: Option<&str>) -> Result<(Option<i64>, Option<i64>
 
 #[cfg(test)]
 mod reconnect_tests {
+    use std::sync::Arc;
     /// A tool call made while the server restarts waits for its socket to
     /// come back, and its request is sent once, on the new server.
     #[tokio::test]
@@ -8428,6 +8477,58 @@ mod reconnect_tests {
             seen.starts_with("GET ") && seen.contains("/v1/health"),
             "{seen}"
         );
+    }
+
+    /// A call its harness cancels while it waits for the server is never
+    /// carried out: the next server never sees it.
+    #[tokio::test]
+    async fn a_call_cancelled_while_it_waits_never_reaches_the_next_server() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("anyagents.sock");
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&cancelled);
+        let client = super::Client::new(
+            socket.clone(),
+            dir.path().join("config"),
+            "synthetic-test-capability".into(),
+        );
+        let call = tokio::spawn(super::as_call(
+            Arc::new(move || flag.load(Ordering::SeqCst)),
+            async move {
+                client
+                    .send("POST", "/v1/send", Some(b"{}".to_vec()), "cap", None)
+                    .await
+            },
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        cancelled.store(true, Ordering::SeqCst);
+        // The harness gave up; then the next server comes up.
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let error = call
+            .await
+            .unwrap()
+            .expect_err("a cancelled call was carried out");
+        assert!(error.contains("cancelled"), "{error}");
+        // It may have connected in the instant before it saw the cancel, but
+        // it sends nothing on that connection.
+        if let Ok(accepted) =
+            tokio::time::timeout(std::time::Duration::from_millis(800), listener.accept()).await
+        {
+            use tokio::io::AsyncReadExt as _;
+            let (mut stream, _) = accepted.unwrap();
+            let mut seen = Vec::new();
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                stream.read_to_end(&mut seen),
+            )
+            .await;
+            assert!(
+                seen.is_empty(),
+                "the cancelled call reached the next server: {}",
+                String::from_utf8_lossy(&seen)
+            );
+        }
     }
 
     /// Past the wait, a server that is still gone is an error, as before.
