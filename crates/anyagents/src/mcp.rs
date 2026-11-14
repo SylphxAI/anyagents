@@ -664,8 +664,9 @@ impl Client {
         loop {
             let (mut sender, reused) = match self.idle_connection().await {
                 Some(sender) => (sender, true),
-                // A tool call made while the server restarts waits for it.
-                None => (connect_within(&self.socket, RECONNECT_WITHIN).await?, false),
+                // A tool call made while the server restarts waits for it,
+                // within what is left of the call's own wait.
+                None => (connect_until(&self.socket, call_wait_until()).await?, false),
             };
             // A call its harness gave up on while it waited is not sent.
             if call_cancelled() {
@@ -3533,7 +3534,7 @@ impl rmcp::ServerHandler for AgentMcp {
         let ct = context.ct.clone();
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
         as_call(
-            Arc::new(move || ct.is_cancelled()),
+            Call::new(Arc::new(move || ct.is_cancelled())),
             Self::tool_router().call(tcc),
         )
         .await
@@ -8338,32 +8339,57 @@ fn build_request(
 /// at once.
 const RECONNECT_WITHIN: std::time::Duration = std::time::Duration::from_secs(45);
 
+/// One tool call as the requests it makes see it: whether its harness
+/// cancelled it, and the end of the time it may spend waiting for the
+/// server's socket, shared by every request the call (and everything it
+/// spawns) makes.
+#[derive(Clone)]
+struct Call {
+    cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
+    wait_until: tokio::time::Instant,
+}
+
+impl Call {
+    /// A call `cancelled` reports on, with the whole wait still ahead.
+    fn new(cancelled: Arc<dyn Fn() -> bool + Send + Sync>) -> Self {
+        Self::within(cancelled, RECONNECT_WITHIN)
+    }
+
+    fn within(cancelled: Arc<dyn Fn() -> bool + Send + Sync>, wait: std::time::Duration) -> Self {
+        Self {
+            cancelled,
+            wait_until: tokio::time::Instant::now() + wait,
+        }
+    }
+}
+
 tokio::task_local! {
-    /// Whether the tool call this task serves was cancelled by the harness.
-    static CALL_CANCELLED: Arc<dyn Fn() -> bool + Send + Sync>;
+    /// The tool call this task serves.
+    static CALL: Call;
 }
 
 /// The current tool call was cancelled by its harness.
 fn call_cancelled() -> bool {
-    CALL_CANCELLED
-        .try_with(|cancelled| cancelled())
-        .unwrap_or(false)
+    CALL.try_with(|call| (call.cancelled)()).unwrap_or(false)
 }
 
-/// Run `call` as the tool call `cancelled` reports on, so the requests it
-/// makes are neither connected nor sent once its harness cancelled it.
-async fn as_call<F: std::future::Future>(
-    cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
-    call: F,
-) -> F::Output {
-    CALL_CANCELLED.scope(cancelled, call).await
+/// When the current tool call stops waiting for the server's socket; a
+/// request outside any call waits the whole time on its own.
+fn call_wait_until() -> tokio::time::Instant {
+    CALL.try_with(|call| call.wait_until)
+        .unwrap_or_else(|_| tokio::time::Instant::now() + RECONNECT_WITHIN)
 }
 
-/// The current call's cancellation, to carry into a task it spawns.
-fn current_call() -> Arc<dyn Fn() -> bool + Send + Sync> {
-    CALL_CANCELLED
-        .try_with(Arc::clone)
-        .unwrap_or_else(|_| Arc::new(|| false))
+/// Run `body` as `call`, so the requests it makes are neither connected nor
+/// sent once its harness cancelled it, and wait no longer than it may.
+async fn as_call<F: std::future::Future>(call: Call, body: F) -> F::Output {
+    CALL.scope(call, body).await
+}
+
+/// The current call, to carry into a task it spawns.
+fn current_call() -> Call {
+    CALL.try_with(Call::clone)
+        .unwrap_or_else(|_| Call::new(Arc::new(|| false)))
 }
 /// How often a missing or refusing socket is tried again.
 const RECONNECT_PROBE: std::time::Duration = std::time::Duration::from_millis(250);
@@ -8372,15 +8398,23 @@ const RECONNECT_PROBE: std::time::Duration = std::time::Duration::from_millis(25
 /// nothing listens. Its driver runs as a task until the server closes it or
 /// the last sender is dropped.
 async fn connect(socket: &Path) -> Result<http1::SendRequest<Full<Bytes>>, String> {
-    connect_within(socket, std::time::Duration::ZERO).await
+    connect_until(socket, tokio::time::Instant::now()).await
 }
 
 /// [`connect`], waiting up to `within` while nothing listens on `socket`.
+#[cfg(test)]
 async fn connect_within(
     socket: &Path,
     within: std::time::Duration,
 ) -> Result<http1::SendRequest<Full<Bytes>>, String> {
-    let deadline = tokio::time::Instant::now() + within;
+    connect_until(socket, tokio::time::Instant::now() + within).await
+}
+
+/// [`connect`], waiting until `deadline` while nothing listens on `socket`.
+async fn connect_until(
+    socket: &Path,
+    deadline: tokio::time::Instant,
+) -> Result<http1::SendRequest<Full<Bytes>>, String> {
     let stream = loop {
         if call_cancelled() {
             return Err("the tool call was cancelled".into());
@@ -8494,7 +8528,7 @@ mod reconnect_tests {
             "synthetic-test-capability".into(),
         );
         let call = tokio::spawn(super::as_call(
-            Arc::new(move || flag.load(Ordering::SeqCst)),
+            super::Call::new(Arc::new(move || flag.load(Ordering::SeqCst))),
             async move {
                 client
                     .send("POST", "/v1/send", Some(b"{}".to_vec()), "cap", None)
@@ -8529,6 +8563,41 @@ mod reconnect_tests {
                 String::from_utf8_lossy(&seen)
             );
         }
+    }
+
+    /// The wait is the call's, not each request's: requests a call makes one
+    /// after another while the server is gone share it.
+    #[tokio::test]
+    async fn requests_in_one_call_share_its_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("anyagents.sock");
+        let client = super::Client::new(
+            socket,
+            dir.path().join("config"),
+            "synthetic-test-capability".into(),
+        );
+        let started = std::time::Instant::now();
+        let call = super::Call::within(Arc::new(|| false), std::time::Duration::from_millis(1_000));
+        let failures = super::as_call(call, async move {
+            let mut failures = 0;
+            for _ in 0..3 {
+                if client
+                    .send("GET", "/v1/whoami", None, "cap", None)
+                    .await
+                    .is_err()
+                {
+                    failures += 1;
+                }
+            }
+            failures
+        })
+        .await;
+        assert_eq!(failures, 3);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(1_900),
+            "each request waited on its own: {:?}",
+            started.elapsed()
+        );
     }
 
     /// Past the wait, a server that is still gone is an error, as before.
