@@ -273,7 +273,17 @@ Explicit `workdir` paths, including `/scratch/wt/...` and `/scratch/tmp/...`, ar
 honoured or refused, never replaced by the default directory. Before an agent
 becomes running, its execution seat must be able to write and traverse its
 working tree, the per-worktree Git directory and the common objects/refs
-storage, and create lock files. New worktrees are shared with that seat's group.
+storage, and create lock files. The admission probe that checks this is the
+server binary's own `anyagents internal admission-probe`, run under the seat's
+uid and groups with a cleared environment (the toolchain's helper `PATH`, no
+user or system Git configuration): it walks the tree in Rust without following
+symlinks, creates and removes a uniquely named lock file in the tree, the
+private gitdir, `objects/` and `refs/`, and runs `git status` with fsmonitor and
+hooks disabled. Git (the toolchain's declared `git`, else the first `git` on
+its helper `PATH`, never an operator wrapper on the server's own `PATH`) is the
+only external program, so a host image that wraps, removes or kills `find`, `sh` or
+`test` cannot change the answer. A probe as the server's own uid and gid runs in
+the server process. New worktrees are shared with that seat's group.
 On Linux, additive POSIX ACLs grant writes only to shared `objects/`, `refs/`,
 `logs/refs/`, an existing `packed-refs`, and the child's private `worktrees/<name>/`.
 The common root, `worktrees/` and `logs/` are traversal-only with no default ACLs;
