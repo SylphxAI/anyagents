@@ -204,7 +204,28 @@ struct State {
     turns_completed: u32,
     /// `turns_completed` when the session's totals were last read.
     usage_read_at: Option<u32>,
+    /// What this process served, as last read: the host records differences
+    /// of it, so it counts from this process's start, never the session's.
     cached_usage: TurnUsage,
+    /// The session this process serves now, and its totals when this process
+    /// began serving it: what came before is an earlier process's.
+    usage_base: Option<(String, TurnUsage)>,
+    /// What this process served in sessions it served before this one.
+    usage_earlier: TurnUsage,
+}
+
+/// `a` and `b` added, field by field.
+fn plus(a: &TurnUsage, b: &TurnUsage) -> TurnUsage {
+    TurnUsage {
+        input_tokens: a.input_tokens + b.input_tokens,
+        output_tokens: a.output_tokens + b.output_tokens,
+        cache_read_tokens: a.cache_read_tokens + b.cache_read_tokens,
+        cache_write_tokens: a.cache_write_tokens + b.cache_write_tokens,
+        reported_cost_micros: match (a.reported_cost_micros, b.reported_cost_micros) {
+            (Some(a), Some(b)) => Some(a + b),
+            (a, b) => a.or(b),
+        },
+    }
 }
 
 impl OpenCodeHarness {
@@ -598,6 +619,10 @@ impl OpenCodeHarness {
         };
         if usable {
             vendor.remember_session()?;
+            if let Some(session) = wanted.as_deref() {
+                // A resumed session's totals so far are earlier processes'.
+                vendor.begin_usage(session, vendor.session_totals(session));
+            }
         } else {
             vendor.recreate_session(wanted.as_deref(), Some(CALL_TIMEOUT))?;
         }
@@ -789,6 +814,8 @@ impl Vendor {
             self.lock().session = previous;
             return Err(err);
         }
+        // A session this process created holds nothing of an earlier one.
+        self.begin_usage(&id, Some(TurnUsage::default()));
         if let Some(stale) = stale_session {
             self.sync_config_recovery_instructions();
             let mut state = self.lock();
@@ -798,6 +825,55 @@ impl Vendor {
             state.turn_open = false;
         }
         Ok(id)
+    }
+
+    /// The session's own running totals, as the service reports them.
+    fn session_totals(&self, session: &str) -> Option<TurnUsage> {
+        let info = self
+            .call(
+                "GET",
+                &format!("/api/session/{session}"),
+                None,
+                Some(CALL_TIMEOUT),
+            )
+            .ok()?
+            .get("data")
+            .cloned()?;
+        let tokens = info.get("tokens").cloned().unwrap_or(Value::Null);
+        let number = |key: &str| tokens.get(key).and_then(Value::as_u64).unwrap_or(0);
+        Some(TurnUsage {
+            input_tokens: number("input"),
+            output_tokens: number("output"),
+            cache_read_tokens: tokens
+                .pointer("/cache/read")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            cache_write_tokens: tokens
+                .pointer("/cache/write")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            reported_cost_micros: info
+                .get("cost")
+                .and_then(Value::as_f64)
+                .map(|cost| (cost * 1_000_000.0) as i64),
+        })
+    }
+
+    /// This process begins serving `session`, whose totals are `base` now:
+    /// what it serves from here is counted from them, on top of what it
+    /// served in sessions before. Unknown totals are taken at the first
+    /// reading, so an earlier process's usage is never counted as this one's.
+    fn begin_usage(&self, session: &str, base: Option<TurnUsage>) {
+        let mut state = self.lock();
+        if state
+            .usage_base
+            .as_ref()
+            .is_some_and(|(serving, _)| serving == session)
+        {
+            return;
+        }
+        state.usage_earlier = state.cached_usage.clone();
+        state.usage_base = base.map(|base| (session.to_string(), base));
     }
 
     fn sync_config_recovery_instructions(&self) {
@@ -1327,8 +1403,11 @@ impl Harness for OpenCodeHarness {
         self.vendor.lock().turns_completed
     }
 
-    /// The session's own running totals, read from the session itself once
-    /// per finished turn. The host records the difference.
+    /// What this process served: the session's running totals, read from
+    /// the session once per finished turn, less what the session held when
+    /// this process began serving it (the session outlives a process, and the
+    /// host counts from each process's start). The host records the
+    /// difference.
     fn served_usage(&self) -> TurnUsage {
         let (session, turns) = {
             let state = self.vendor.lock();
@@ -1340,34 +1419,21 @@ impl Harness for OpenCodeHarness {
             }
             (session, state.turns_completed)
         };
-        let info = self.vendor.call(
-            "GET",
-            &format!("/api/session/{session}"),
-            None,
-            Some(CALL_TIMEOUT),
-        );
-        let Some(info) = info.ok().and_then(|info| info.get("data").cloned()) else {
+        let Some(total) = self.vendor.session_totals(&session) else {
             return self.vendor.lock().cached_usage.clone();
         };
-        let tokens = info.get("tokens").cloned().unwrap_or(Value::Null);
-        let number = |key: &str| tokens.get(key).and_then(Value::as_u64).unwrap_or(0);
-        let usage = TurnUsage {
-            input_tokens: number("input"),
-            output_tokens: number("output"),
-            cache_read_tokens: tokens
-                .pointer("/cache/read")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-            cache_write_tokens: tokens
-                .pointer("/cache/write")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-            reported_cost_micros: info
-                .get("cost")
-                .and_then(Value::as_f64)
-                .map(|cost| (cost * 1_000_000.0) as i64),
-        };
         let mut state = self.vendor.lock();
+        let base = match &state.usage_base {
+            Some((serving, base)) if *serving == session => base.clone(),
+            _ => {
+                // Totals read before this process began counting are none of
+                // its own.
+                state.usage_earlier = state.cached_usage.clone();
+                state.usage_base = Some((session.clone(), total.clone()));
+                total.clone()
+            }
+        };
+        let usage = plus(&state.usage_earlier, &total.difference(base));
         state.usage_read_at = Some(turns);
         state.cached_usage = usage.clone();
         usage

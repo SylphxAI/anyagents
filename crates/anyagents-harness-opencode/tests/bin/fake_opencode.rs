@@ -38,8 +38,9 @@
 //! ends: it answers only when the service stops, as the real one does.
 
 use std::env;
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::io::Write;
+use std::path::Path;
 use std::process::exit;
 use std::thread;
 use std::time::Duration;
@@ -245,7 +246,19 @@ fn api(args: &[String], endpoint: &str) {
                     "Session not found",
                 );
             }
-            print!("{{\"data\":{{\"id\":\"ses_fake\",\"title\":\"fake\"}}}}");
+            // The session's running totals, when the test wrote them: they
+            // outlive any one process, as a real session's do.
+            let mut session = serde_json::json!({"id": "ses_fake", "title": "fake"});
+            let usage = env::var("ANYAGENTS_FAKE_STATE")
+                .ok()
+                .and_then(|dir| fs::read_to_string(Path::new(&dir).join("session-usage.json")).ok())
+                .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+            if let (Some(session), Some(serde_json::Value::Object(usage))) =
+                (session.as_object_mut(), usage)
+            {
+                session.extend(usage);
+            }
+            print!("{}", serde_json::json!({ "data": session }));
         }
         ("POST", "/api/session") => {
             let id = if mode == "gone" || mode.starts_with("prompt-404") {

@@ -1238,3 +1238,34 @@ fn what_the_service_admitted_stands_after_it_died() {
     assert_eq!(harness.deliver(&msg("m1")).unwrap(), accepted());
     assert_eq!(harness.deliver(&msg("m2")), Err(HarnessError::Dead));
 }
+
+/// The session's running totals outlive a process; what a process serves is
+/// counted from its own start. The host's baseline starts again with each
+/// process, so the session's earlier totals are never counted again.
+#[test]
+fn a_process_serves_only_what_it_added_to_the_session() {
+    let dir = TempDir::new().unwrap();
+    // Earlier processes left these totals in the session.
+    std::fs::write(
+        dir.path().join("session-usage.json"),
+        r#"{"tokens":{"input":100,"output":50,"cache":{"read":0,"write":0}},"cost":1.0}"#,
+    )
+    .unwrap();
+    let harness = start(&dir, "finish");
+    // This process's turn added to them.
+    std::fs::write(
+        dir.path().join("session-usage.json"),
+        r#"{"tokens":{"input":110,"output":57,"cache":{"read":0,"write":0}},"cost":1.25}"#,
+    )
+    .unwrap();
+    let served = harness.served_usage();
+    assert_eq!(
+        (
+            served.input_tokens,
+            served.output_tokens,
+            served.reported_cost_micros
+        ),
+        (10, 7, Some(250_000)),
+        "the session's earlier totals were counted as this process's"
+    );
+}
