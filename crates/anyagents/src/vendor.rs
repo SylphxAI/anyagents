@@ -1209,7 +1209,7 @@ fn vendor_launch_inner(
         ensure_agy_steering_settings(
             &request.config_dir,
             &request.work_dir,
-            &request.data_dir.join("media"),
+            &request.data_dir.join(anyagents_harness::media::MEDIA_DIR),
         )
         .map_err(|err| err.to_string())?;
     }
@@ -3216,7 +3216,12 @@ cat >/dev/null
             std::io::ErrorKind::PermissionDenied
         );
         assert!(
-            ensure_agy_steering_settings(&config, &root.join("work"), &root.join("media")).is_err()
+            ensure_agy_steering_settings(
+                &config,
+                &root.join("work"),
+                &root.join(anyagents_harness::media::MEDIA_DIR)
+            )
+            .is_err()
         );
         // Relaunch with the inaccessible replacement still in place. This
         // exercises actual pre-read preparation, not a helper-only repair.
@@ -3245,7 +3250,12 @@ cat >/dev/null
         assert_eq!(value["retained"], "synthetic");
         assert_eq!(value["queuedMessages"], "send-immediately");
         crate::sandbox::prepare_config_with_seat_uid(&config, uid, gid).unwrap();
-        ensure_agy_steering_settings(&config, &root.join("work"), &root.join("media")).unwrap();
+        ensure_agy_steering_settings(
+            &config,
+            &root.join("work"),
+            &root.join(anyagents_harness::media::MEDIA_DIR),
+        )
+        .unwrap();
         assert_eq!(std::fs::metadata(&settings).unwrap().mode() & 0o060, 0o060);
         println!("NATIVE_AGY_GROUP_DEFAULTS_AND_PRIVATE_REPLACEMENT_REPAIRED");
         for name in ["memory", "skills", "config"] {
@@ -3814,7 +3824,12 @@ done
         std::fs::create_dir_all(&config_dir).unwrap();
         std::fs::create_dir_all(&work_dir).unwrap();
 
-        ensure_agy_steering_settings(&config_dir, &work_dir, &dir.path().join("media")).unwrap();
+        ensure_agy_steering_settings(
+            &config_dir,
+            &work_dir,
+            &dir.path().join(anyagents_harness::media::MEDIA_DIR),
+        )
+        .unwrap();
 
         let settings_path = config_dir
             .join(".gemini")
@@ -3888,7 +3903,12 @@ done
         }
 
         // Calling a second time is idempotent and does not duplicate entries.
-        ensure_agy_steering_settings(&config_dir, &work_dir, &dir.path().join("media")).unwrap();
+        ensure_agy_steering_settings(
+            &config_dir,
+            &work_dir,
+            &dir.path().join(anyagents_harness::media::MEDIA_DIR),
+        )
+        .unwrap();
         let text2 = std::fs::read_to_string(&settings_path).unwrap();
         let json2: serde_json::Value = serde_json::from_str(&text2).unwrap();
         assert_eq!(json2, json);
@@ -3927,7 +3947,12 @@ done
         )
         .unwrap();
 
-        ensure_agy_steering_settings(&config_dir, &work_dir, &dir.path().join("media")).unwrap();
+        ensure_agy_steering_settings(
+            &config_dir,
+            &work_dir,
+            &dir.path().join(anyagents_harness::media::MEDIA_DIR),
+        )
+        .unwrap();
         let healed: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
         let deny_list = healed["permissions"]["deny"].as_array().unwrap();
@@ -4054,7 +4079,7 @@ done
         let dir = crate::test_tempdir();
         let config_dir = dir.path().join("config");
         let work_dir = dir.path().join("work");
-        let media_dir = dir.path().join("media");
+        let media_dir = dir.path().join(anyagents_harness::media::MEDIA_DIR);
         let elsewhere = dir.path().join("elsewhere");
         let step =
             config_dir.join(".gemini/antigravity-cli/brain/324a320d/.system_generated/steps/3921");
