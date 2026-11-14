@@ -16,6 +16,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   way; a sleep-model key in the agent's own config is never read through a
   link. A linked topic is not listed, read, removed or written through, and
   a write replaces the link with the agent's own file.
+- Mail and turn trouble is no longer silent (`docs/delivery.md`). A turn the
+  harness ends with an error no longer stays open: its work comes back as a
+  `[Recovery]` note, stored in the same transaction that closes the turn.
+  Only an error of the agent's own session (a full context, content the
+  vendor refuses) is a strike; after three in a row the agent is parked
+  (`paused`, listed as `faulted`) and its nearest running ancestor, or the
+  operator's inbox, is told. Provider, model, auth, network, host and store
+  errors back off (15 s doubling to 10 minutes) and never park anyone.
+  `anyagents resume --faulted` resumes every parked agent. A send that cannot
+  wake an archived recipient is refused for it with the reason and who
+  answers for it, never stored unread. Mail queued to a paused agent tells
+  its sender, or whoever answers for the agent, once per pause. A channel
+  post whose outcome is unknown is held, never resent automatically, and its
+  sender is told once; `agents inspect` and `status` list it, and `anyagents
+  outbound` retries or discards it. A post the Telegram API refused leaves
+  no stuck record, and a long post cut short is recorded as partly
+  delivered. A legacy Spiron input hold is settled when its agent launches
+  another harness, and at server start when its agent is archived or has
+  taken the held mail since. Migration 033 adds `turn_errors`.
 - Agents report defects to whoever runs the deployment with `send` to
   `operator`: a defect in AnyAgents, the harness or the host that an agent
   cannot fix within its own work. Only the operator reads it, with
@@ -82,6 +101,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Calls over HTTP MCP also cannot place an agent on a host harness, wake an
   agent that runs on the host (directly or by a send to an archived one), or
   attach media by a local path.
+- A separate public listener (`public_listen` under `[server]`) serves only
+  readiness, Telegram webhooks and MCP for remote session tokens, and 404 for
+  everything else; once it is configured, the local TCP listener defaults to
+  loopback. Without `public_listen` nothing changes. A remote session token
+  stops authenticating once its agent's harness moves back onto the host.
 
 ## 0.1.3
 

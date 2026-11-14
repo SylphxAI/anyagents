@@ -2484,12 +2484,21 @@ pub fn post_text(
             &FileCredentialStore::new(data_dir),
             &outbound.credential_ref,
         )?;
+        // A refusal of a later chunk is no refusal of the post: the earlier
+        // chunks are already in the chat.
         let response = call_api(
             &token,
             &outbound.call,
             SHORT_TIMEOUT_S,
             Some(&outbound.channel_id),
-        )?;
+        )
+        .map_err(|err| {
+            if idx == 0 {
+                err
+            } else {
+                partly_posted(err, idx)
+            }
+        })?;
         let message_id = sent_message_id(&response).map_err(|_| {
             api_error(
                 &outbound.call.method,
@@ -2518,6 +2527,27 @@ pub fn post_text(
         )?;
     }
     Ok(first_message_id.expect("at least one chunk"))
+}
+
+/// The error of a post whose first `posted` chunks reached the chat before
+/// this one failed: whatever the API answered, the post as a whole is partly
+/// delivered (`class: partial_delivery`), never a refusal that posted nothing.
+fn partly_posted(err: anyagents_core::Error, posted: usize) -> anyagents_core::Error {
+    let text = err.to_string();
+    let mut detail = text
+        .strip_prefix("telegram ")
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+        .unwrap_or_else(|| serde_json::json!({ "description": text }));
+    let description = detail
+        .get("description")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("Telegram post failed")
+        .to_string();
+    detail["class"] = serde_json::json!("partial_delivery");
+    detail["description"] = serde_json::json!(format!(
+        "{description}; {posted} earlier part(s) of this post were already delivered"
+    ));
+    anyagents_core::Error::Message(format!("telegram {detail}"))
 }
 
 /// Post a GPS location or venue through the agent's bot.
@@ -4071,6 +4101,34 @@ pub(crate) mod tests {
     pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
         ENV.lock().unwrap_or_else(|err| err.into_inner())
+    }
+
+    /// A later chunk refused after earlier ones were posted is a partly
+    /// delivered post, never a refusal that posted nothing.
+    #[test]
+    fn a_refused_later_chunk_is_a_partial_delivery() {
+        let refused = api_error(
+            "sendMessage",
+            None,
+            "provider",
+            Some(400),
+            Some(400),
+            "Bad Request: message thread not found",
+            None,
+        );
+        let partly = partly_posted(refused, 2).to_string();
+        let detail: serde_json::Value =
+            serde_json::from_str(partly.strip_prefix("telegram ").unwrap()).unwrap();
+        assert_eq!(detail["class"], "partial_delivery");
+        assert_eq!(detail["status"], 400);
+        assert!(
+            detail["description"]
+                .as_str()
+                .unwrap()
+                .contains("2 earlier part(s) of this post were already delivered")
+        );
+        let local = partly_posted(anyagents_core::Error::Message("disk full".into()), 1);
+        assert!(local.to_string().contains("\"class\":\"partial_delivery\""));
     }
 
     #[test]
