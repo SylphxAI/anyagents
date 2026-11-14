@@ -474,6 +474,10 @@ fn a_proof_printed_just_before_a_stop_is_answered_after_it() {
     let (m1, m2) = (msg("m1", 1), msg("m2", 2));
     until(&mut harness, &m1, CONSUMED);
     until(&mut harness, &m2, DeliverOutcome::InFlight);
+    // In flight once written: the step consumes m2 only once the vendor holds it.
+    eventually("m2 is admitted", || {
+        vendor.answers_of(&command_id("m2", 0)).len() == 1
+    });
     vendor.command("step");
     harness.stop();
     assert!(!harness.health().process_alive);

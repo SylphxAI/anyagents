@@ -38,6 +38,11 @@ const LOG_LIMIT: u64 = 1 << 20;
 /// How long a refusal may take to write before the connection is dropped.
 const REFUSAL_WRITE: Duration = Duration::from_secs(2);
 
+/// How long `stop` waits for the adapter before it takes it for wedged. The
+/// event thread holds it for a moment to read its health; only a call that
+/// never returns holds it longer.
+const ADAPTER_WAIT: Duration = Duration::from_secs(1);
+
 /// What a keeper advertises.
 #[derive(Clone, Debug)]
 pub struct KeeperOptions {
@@ -771,10 +776,9 @@ impl<A: Hosted + 'static> Shared<A> {
     /// ended directly from its recorded identity. The process lock is
     /// released when the last copy of it closes.
     fn stop(&self, conn: &Conn, id: u64) -> ! {
-        match self.adapter.try_lock() {
-            Ok(mut adapter) => drop(adapter.take()),
-            Err(TryLockError::Poisoned(poisoned)) => drop(poisoned.into_inner().take()),
-            Err(TryLockError::WouldBlock) => self.end_harness_group(),
+        match self.adapter_within(ADAPTER_WAIT) {
+            Some(mut adapter) => drop(adapter.take()),
+            None => self.end_harness_group(),
         }
         // The harness is gone: the keeper's copy of the lock goes before the
         // answer, so whoever reads `stopped` finds no copy here.
@@ -782,6 +786,25 @@ impl<A: Hosted + 'static> Shared<A> {
         let _ = std::fs::remove_dir_all(&self.dir);
         conn.answer(id, Ok(json!({"stopped": true})));
         std::process::exit(0)
+    }
+
+    /// The adapter, once nothing holds it, or `None` when something still
+    /// does after `within`. The event thread's moment over it (a health
+    /// read) is waited out: taking that for a wedged call would end the
+    /// harness without its adapter, and leave it unreaped when the keeper
+    /// exits.
+    fn adapter_within(&self, within: Duration) -> Option<MutexGuard<'_, Option<A>>> {
+        let deadline = std::time::Instant::now() + within;
+        loop {
+            match self.adapter.try_lock() {
+                Ok(adapter) => return Some(adapter),
+                Err(TryLockError::Poisoned(poisoned)) => return Some(poisoned.into_inner()),
+                Err(TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(TryLockError::WouldBlock) => return None,
+            }
+        }
     }
 
     fn end_harness_group(&self) {

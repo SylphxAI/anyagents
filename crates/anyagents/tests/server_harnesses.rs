@@ -705,6 +705,15 @@ fn keepers_across_protocol_versions_are_taken_over_or_replaced() {
     );
     std::fs::remove_file(&hold).unwrap();
     ask(&data, name, "claude-code", &first);
+    // The double ends its turn with `result` only after its answer is in: a
+    // crash before the server reads that leaves the turn open, and the next
+    // server recovers it with a note the hold below would keep forever.
+    let store = Store::open(data.join("state.db")).unwrap();
+    let responder = store.agent_by_name(name).unwrap();
+    support::wait_for(
+        || store.open_turn(&responder.id).unwrap().is_none(),
+        "the answered first turn stayed open",
+    );
     // A keeper only the later binary speaks to: none of the older ones
     // may be left, so they are stopped while no server runs.
     std::fs::write(&hold, b"").unwrap();

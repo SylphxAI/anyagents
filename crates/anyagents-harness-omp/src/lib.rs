@@ -1165,9 +1165,18 @@ mod tests {
         );
         let mut harness = scripted(&script);
         until("the session file is read", || lock(&harness.shared).known);
-        assert_eq!(
-            harness.deliver(&message("m1")),
-            Ok(DeliverOutcome::InFlight)
+        // The child proves the prompt as soon as it reads it: the first offer
+        // can already find the proof in.
+        let first = harness.deliver(&message("m1"));
+        assert!(
+            matches!(
+                first,
+                Ok(DeliverOutcome::InFlight
+                    | DeliverOutcome::Accepted {
+                        turn_finished: false
+                    })
+            ),
+            "{first:?}"
         );
         until("the child printed its proof", || printed.exists());
         harness.stop();

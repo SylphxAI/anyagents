@@ -118,10 +118,20 @@ fn a_prompt_is_accepted_only_once_its_user_message_item_proves_it() {
     assert_eq!(health.delivery.level, DeliveryLevel::NextStep);
     assert!(health.delivery.idempotent);
     assert_eq!(health.delivery.peer.as_deref(), Some("codex 0.169.0"));
-    assert_eq!(
-        harness.deliver(&msg("m1")).unwrap(),
-        DeliverOutcome::InFlight,
-        "the answer to turn/start is not a proof"
+    // The vendor proves the prompt right behind its answer to `turn/start`,
+    // so the first offer can already find the proof in. That the answer
+    // alone proves nothing is the unit test
+    // `the_answer_to_turn_start_is_not_a_proof`.
+    let first = harness.deliver(&msg("m1")).unwrap();
+    assert!(
+        matches!(
+            first,
+            DeliverOutcome::InFlight
+                | DeliverOutcome::Accepted {
+                    turn_finished: false
+                }
+        ),
+        "{first:?}"
     );
     assert_eq!(
         settle(&mut harness, &msg("m1")),
@@ -489,9 +499,18 @@ fn a_resume_that_fails_for_another_reason_fails_the_start() {
 fn a_proof_given_just_before_stop_is_proven_after_it() {
     let dir = TempDir::new().unwrap();
     let mut harness = start(&dir, "hold", None);
-    assert_eq!(
-        harness.deliver(&msg("m1")).unwrap(),
-        DeliverOutcome::InFlight
+    // The vendor proves m1 right behind its answer: the first offer can
+    // already find the proof in.
+    let first = harness.deliver(&msg("m1")).unwrap();
+    assert!(
+        matches!(
+            first,
+            DeliverOutcome::InFlight
+                | DeliverOutcome::Accepted {
+                    turn_finished: false
+                }
+        ),
+        "{first:?}"
     );
     // The vendor wrote its proof; the adapter may not have read it yet.
     let deadline = Instant::now() + PATIENCE;
