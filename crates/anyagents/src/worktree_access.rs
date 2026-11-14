@@ -4624,7 +4624,16 @@ mod tests {
             .remote("ExampleOrg/demo", &second, "second", None)
             .unwrap();
         let second_id = anyagents_core::AgentId::generate();
-        share(&second, uid, gid + 1, &grant_path(dir.path(), &second_id)).unwrap();
+        let second_dirs = git_dirs(&second).unwrap();
+        share_known(
+            &second,
+            &second_dirs[0],
+            &common,
+            uid,
+            gid + 1,
+            &grant_path(dir.path(), &second_id),
+        )
+        .unwrap();
         assert!(is_managed(&common));
         ensure_launchable(dir.path(), &second_id).unwrap();
         revoke_recorded(dir.path(), &second_id).unwrap();
@@ -5124,9 +5133,20 @@ mod tests {
         let store_group = std::fs::metadata(&common).unwrap().gid();
         let id = anyagents_core::AgentId::generate();
         let uid = crate::sandbox::server_uid();
-        // A seat's group: the server's own grant relocates nothing.
+        // A seat's group: the server's own grant relocates nothing. Only the
+        // metadata grant is under test; a checkout chgrp to a group the test
+        // user is not in needs root.
         let gid = crate::sandbox::server_gid().wrapping_add(100000);
-        share(&work, uid, gid, &grant_path(dir.path(), &id)).unwrap();
+        let dirs = git_dirs(&work).unwrap();
+        share_known(
+            &work,
+            &dirs[0],
+            dirs.last().unwrap(),
+            uid,
+            gid,
+            &grant_path(dir.path(), &id),
+        )
+        .unwrap();
         revoke_recorded(dir.path(), &id).unwrap();
 
         let directory = common.join(CONFIG_DIRECTORY);
