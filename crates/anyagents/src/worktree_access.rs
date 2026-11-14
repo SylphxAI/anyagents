@@ -1417,6 +1417,9 @@ fn revoke_binding(
     if keep_group && keep_user {
         return Ok(());
     }
+    if seat_owns(&file.metadata()?, uid) {
+        return Ok(());
+    }
     update_metadata_acl(
         file,
         if keep_group { u32::MAX } else { gid },
@@ -1424,6 +1427,16 @@ fn revoke_binding(
         false,
         (!keep_user).then_some(uid),
     )
+}
+
+/// An object the seat itself owns stays under its control whatever its ACL
+/// says: an owner can always grant itself access again. The files a seat
+/// writes into its own private gitdir inherit its group entry, and the server
+/// cannot change another principal's ACL, so revocation leaves them as they
+/// are instead of refusing the whole archive or delete.
+fn seat_owns(meta: &std::fs::Metadata, seat_uid: u32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    meta.uid() == seat_uid && !server_may_change(meta)
 }
 
 fn revoke_common(
@@ -4461,5 +4474,23 @@ mod tests {
             parse_trusted_gids(" 2100, ,abc-no-such-group-xyz ,7"),
             vec![2100, 7]
         );
+    }
+
+    /// Revoking a seat skips only the objects that seat owns and the server
+    /// cannot change. The server's own objects are still revoked as before.
+    #[cfg(unix)]
+    #[test]
+    fn revocation_skips_only_objects_the_revoked_seat_owns() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = crate::test_tempdir();
+        let own = std::fs::metadata(dir.path()).unwrap();
+        let server = crate::sandbox::server_uid();
+        assert!(!seat_owns(&own, own.uid()), "server-owned stays revocable");
+        assert!(!seat_owns(&own, own.uid().wrapping_add(1)));
+        let foreign = std::fs::metadata("/").unwrap();
+        if server != 0 && foreign.uid() != server {
+            assert!(seat_owns(&foreign, foreign.uid()));
+            assert!(!seat_owns(&foreign, foreign.uid().wrapping_add(1)));
+        }
     }
 }
