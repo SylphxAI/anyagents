@@ -227,6 +227,14 @@ fn create_with_seat(
         .map(str::to_string)
         .or_else(|| new.description.clone());
     new.parent_id = request.parent_id;
+    // Refused before the row exists: a creation rolled back later costs a
+    // delete of everything keyed by the agent.
+    ensure_harness_runs_profile_and_model(
+        data,
+        &normalized_harness,
+        request.profile.as_deref(),
+        new.model.as_deref(),
+    )?;
     let agent = store.create_agent(new)?;
     let data = std::path::absolute(data)?;
     // A checkout the consumer produced for this creation; rollback removes it.
@@ -5007,6 +5015,12 @@ pub(crate) fn default_kind_and_harnesses(provider: &str) -> (&'static str, Vec<S
         "spiron" => ("api-key", harnesses(&["spiron", "spiron-cloud"])),
         "opencode" => ("api-key", harnesses(&["opencode"])),
         "omp" => ("api-key", harnesses(&["omp"])),
+        // Sylphx serves its models through an OpenAI-compatible API (its own
+        // catalog says so), and nothing here gives Claude Code a Sylphx sign-in
+        // or an Anthropic-compatible route for a profile: a claude-code agent
+        // on this profile starts, then fails every turn with "Not logged in"
+        // (operator report #34). The Claude harnesses are therefore not
+        // listed; a profile.json that names them explicitly still wins.
         "sylphx" => (
             "api-key",
             harnesses(&[
@@ -5014,8 +5028,6 @@ pub(crate) fn default_kind_and_harnesses(provider: &str) -> (&'static str, Vec<S
                 "spiron-cloud",
                 "opencode",
                 "omp",
-                "claude-code",
-                "claude-cloud",
                 "codex",
                 "openai-cloud",
                 "cursor-cloud",
@@ -5175,6 +5187,61 @@ pub(crate) fn ensure_profile_compatible_and_mapped(
         }
     }
     Ok(())
+}
+
+/// Whether `harness` can run the profile (or, without one, the model's
+/// provider) a creation asks for, checked before anything is created. Only
+/// compatibility is checked here; [`ensure_profile_compatible_and_mapped`]
+/// still checks a profile's mapping once the agent's config exists.
+///
+/// A model with a provider prefix (`sylphx/openai/...`) is served by that
+/// provider: a harness its profiles do not list cannot reach it, and would
+/// start only to fail its first turn (a claude-code agent given a Sylphx model
+/// reports "Not logged in").
+pub(crate) fn ensure_harness_runs_profile_and_model(
+    data: &Path,
+    harness: &str,
+    profile: Option<&str>,
+    model: Option<&str>,
+) -> Result<(), Error> {
+    let harness = normalize_harness_name(harness);
+    let (provider, profile_name, from_model) =
+        match profile.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(explicit) => match explicit.split_once('/') {
+                Some((p, n)) => (p.trim().to_string(), n.trim().to_string(), false),
+                None => (
+                    upstream_provider_of(harness, model),
+                    explicit.to_string(),
+                    false,
+                ),
+            },
+            None => {
+                let provider = upstream_provider_of(harness, model);
+                if provider == upstream_provider_of(harness, None) {
+                    return Ok(());
+                }
+                (provider, "default".to_string(), true)
+            }
+        };
+    let profile_dir = data.join("profiles").join(&provider).join(&profile_name);
+    let compatible = profile_compatible_harnesses(&profile_dir, &provider);
+    if compatible.iter().any(|h| h == harness) {
+        return Ok(());
+    }
+    let what = if from_model {
+        format!(
+            "model `{}` (served by provider `{provider}`)",
+            model.unwrap_or_default().trim()
+        )
+    } else {
+        format!("provider profile `{provider}/{profile_name}`")
+    };
+    Err(Error::Message(format!(
+        "harness `{harness}` cannot run {what}; it runs on: {}. Pick one of those harnesses, \
+         or a model and profile of `{}` for `{harness}`",
+        compatible.join(", "),
+        upstream_provider_of(harness, None),
+    )))
 }
 
 fn copy_host_file(src: &Path, dst: &Path) -> bool {
@@ -13783,6 +13850,116 @@ Connection: close
         )
         .expect_err("parent traversal in relative path must fail closed");
         assert!(trav.to_string().contains("escapes base"), "{trav}");
+    }
+
+    #[test]
+    fn a_claude_harness_is_refused_a_sylphx_profile_or_model_before_it_exists() {
+        // Report #34: claude-code with `sylphx/default` and a Sylphx model
+        // started, then failed every turn with "Not logged in".
+        let dir = crate::test_tempdir();
+        let data = dir.path();
+        let store = Store::open(data.join("state.db")).unwrap();
+        store
+            .hold_capability_key("0123456789abcdef0123456789abcdef")
+            .unwrap();
+        let sylphx_model = Some("sylphx/openai/gpt-6.1-sol");
+
+        let by_profile = ensure_harness_runs_profile_and_model(
+            data,
+            "claude-code",
+            Some("sylphx/default"),
+            sylphx_model,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            by_profile.contains("cannot run provider profile `sylphx/default`")
+                && by_profile.contains("spiron")
+                && !by_profile.contains("claude-code, "),
+            "{by_profile}"
+        );
+        let by_model =
+            ensure_harness_runs_profile_and_model(data, "claude-code", None, sylphx_model)
+                .unwrap_err()
+                .to_string();
+        assert!(
+            by_model.contains("model `sylphx/openai/gpt-6.1-sol` (served by provider `sylphx`)"),
+            "{by_model}"
+        );
+        assert!(
+            ensure_harness_runs_profile_and_model(data, "claude-cloud", None, sylphx_model)
+                .is_err()
+        );
+        // A model-and-harness switch takes the same refusal.
+        assert!(
+            ensure_profile_compatible_and_mapped(
+                data,
+                "sylphx",
+                "default",
+                "claude-code",
+                sylphx_model,
+                None
+            )
+            .is_err()
+        );
+
+        // The pairings the fleet runs are untouched.
+        for (harness, profile, model) in [
+            ("spiron", None, sylphx_model),
+            ("spiron", Some("sylphx/default"), sylphx_model),
+            ("codex", Some("sylphx/default"), sylphx_model),
+            ("opencode", None, sylphx_model),
+            (
+                "claude-code",
+                Some("anthropic/default"),
+                Some("claude-opus-5-5"),
+            ),
+            ("claude-code", None, Some("claude-opus-5-5")),
+            ("claude-code", None, None),
+        ] {
+            ensure_harness_runs_profile_and_model(data, harness, profile, model)
+                .unwrap_or_else(|e| panic!("{harness} {profile:?} {model:?}: {e}"));
+        }
+        // A profile that names a Claude harness itself is honored.
+        let custom = data.join("profiles/sylphx/claude-gateway");
+        std::fs::create_dir_all(&custom).unwrap();
+        std::fs::write(
+            custom.join("profile.json"),
+            r#"{"provider":"sylphx","kind":"api-key","compatible_harnesses":["claude-code"]}"#,
+        )
+        .unwrap();
+        ensure_harness_runs_profile_and_model(
+            data,
+            "claude-code",
+            Some("sylphx/claude-gateway"),
+            sylphx_model,
+        )
+        .unwrap();
+
+        // A refused creation leaves no agent behind (nothing to roll back).
+        let refused = create(
+            &store,
+            data,
+            CreateRequest {
+                name: "claude-on-sylphx".to_string(),
+                role: None,
+                harness: "claude-code".to_string(),
+                model: sylphx_model.map(str::to_string),
+                profile: Some("sylphx/default".to_string()),
+                repo: None,
+                branch: None,
+                base: None,
+                workdir: None,
+                workdir_default: Some(data.to_path_buf()),
+                description: Some("test".to_string()),
+                instructions: Some("test".to_string()),
+                parent_id: None,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(refused.contains("cannot run"), "{refused}");
+        assert!(store.agent_by_name("claude-on-sylphx").is_err());
     }
 
     #[test]
