@@ -1001,31 +1001,21 @@ struct McpCaller {
 }
 
 impl McpCaller {
-    /// The tool profile this call gets. A remote session gets `remote`, or
-    /// `coordination` when it asks; a local capability keeps its own rules.
-    fn profile(
-        &self,
-        store: &Store,
-        requested: Option<&str>,
-    ) -> Result<crate::mcp::McpProfile, ApiError> {
-        if self.remote.is_some() {
-            return crate::mcp::McpProfile::resolve_remote_session(requested).map_err(|msg| {
-                let known = requested.and_then(crate::mcp::McpProfile::from_str_opt);
-                let status = if known.is_some() {
-                    StatusCode::FORBIDDEN
-                } else {
-                    StatusCode::BAD_REQUEST
-                };
-                ApiError::new(status, msg)
-            });
-        }
-        let config_dir = anyagents_core::agent_config_dir(store.data_dir(), &self.agent.id);
-        crate::mcp::McpProfile::resolve_http_with_config(
-            requested,
-            &self.agent.harness,
-            Some(&config_dir),
-        )
-        .map_err(|msg| ApiError::new(StatusCode::BAD_REQUEST, msg))
+    /// The tool profile this call gets: `remote`, or `coordination` when it
+    /// asks, for every credential kind. Over HTTP the tools run inside the
+    /// server process as the server's own user, so `full` is never served
+    /// here (403); it exists only over stdio, where the tool server runs as
+    /// the agent.
+    fn profile(&self, requested: Option<&str>) -> Result<crate::mcp::McpProfile, ApiError> {
+        crate::mcp::McpProfile::resolve_http(requested).map_err(|msg| {
+            let known = requested.and_then(crate::mcp::McpProfile::from_str_opt);
+            let status = if known.is_some() {
+                StatusCode::FORBIDDEN
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            ApiError::new(status, msg)
+        })
     }
 }
 
@@ -1121,7 +1111,7 @@ async fn mcp_get_route(
     let presented = headers.clone();
     let (caller, profile) = spawn_store(move || {
         let caller = authenticate_mcp_request(&state.store, &presented)?;
-        let profile = caller.profile(&state.store, query.profile.as_deref())?;
+        let profile = caller.profile(query.profile.as_deref())?;
         Ok((caller, profile))
     })
     .await?;
@@ -1178,7 +1168,7 @@ async fn mcp_post_route(
 ) -> Result<axum::response::Response, ApiError> {
     let mcp = spawn_store(move || {
         let caller = authenticate_mcp_request(&state.store, &headers)?;
-        let profile = caller.profile(&state.store, query.profile.as_deref())?;
+        let profile = caller.profile(query.profile.as_deref())?;
         let McpCaller {
             agent,
             internal_token: token,
@@ -1691,8 +1681,10 @@ async fn harness_route(
     principal: Principal,
     State(state): State<AppState>,
     AxumPath(name): AxumPath<String>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<HarnessRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let via_http = via_http_mcp(&headers);
     spawn_store(move || {
         let found = state
             .store
@@ -1710,6 +1702,7 @@ async fn harness_route(
             }
         };
         require_remote_callback(state.store.data_dir(), &body.harness)?;
+        refuse_host_placement_over_http(via_http, &body.harness)?;
         let out = create::set_agent_harness(
             &state.store,
             state.store.data_dir(),
@@ -1725,6 +1718,49 @@ async fn harness_route(
         Ok(Json(out))
     })
     .await
+}
+
+/// Whether this call was made by the tool server behind the HTTP MCP route.
+/// That tool server runs inside the server process as the server's own user,
+/// so a call it makes may not start or read anything on the host.
+fn via_http_mcp(headers: &axum::http::HeaderMap) -> bool {
+    headers.contains_key(crate::mcp::HTTP_MCP_HEADER)
+}
+
+/// Whether an agent's harness runs off this host.
+fn runs_off_host(data_dir: &Path, agent: &Agent) -> bool {
+    crate::remote::runs_off_host(
+        agent,
+        &anyagents_core::agent_config_dir(data_dir, &agent.id),
+    )
+}
+
+/// Over HTTP MCP an agent is created on, or moved to, a cloud harness only:
+/// any other harness would run on this host on the call's behalf.
+fn refuse_host_placement_over_http(via_http: bool, harness: &str) -> Result<(), ApiError> {
+    if via_http && !vendor::is_cloud_harness(harness) {
+        return Err(ApiError::forbidden(format!(
+            "a call over HTTP MCP places agents only on a cloud harness (`claude-cloud`, \
+             `openai-cloud`, `cursor-cloud`, `spiron-cloud`); `{harness}` would run on this host"
+        )));
+    }
+    Ok(())
+}
+
+/// Over HTTP MCP a media attachment is a URL. A local path would have the
+/// server read a host file as its own user and upload it, and a bare name may
+/// resolve against the server's working directory.
+fn refuse_host_media_over_http(body: &SendRequest) -> Result<(), ApiError> {
+    if let Some(media) = &body.media {
+        let source = media.source.trim();
+        if !(source.starts_with("https://") || source.starts_with("http://")) {
+            return Err(ApiError::forbidden(
+                "a call over HTTP MCP attaches media by `https://` URL only; a local path or file id \
+                 would be read on this host",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// A harness that runs off this host can only call back through
@@ -4117,8 +4153,10 @@ fn installed_on_disk(files: &file_cache::FileCache, root: &Path, harness: &str) 
 async fn create_agent_route(
     principal: Principal,
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Json(mut body): Json<CreateAgentRequest>,
 ) -> Result<(StatusCode, Json<AgentView>), ApiError> {
+    let via_http = via_http_mcp(&headers);
     let caller_agent = match &principal {
         Principal::Operator => None,
         Principal::Agent { agent_id, name } => Some((agent_id.clone(), name.clone())),
@@ -4184,6 +4222,7 @@ async fn create_agent_route(
             body.profile,
         );
         require_remote_callback(state.store.data_dir(), &harness)?;
+        refuse_host_placement_over_http(via_http, &harness)?;
         let mut agent = create::create(
             &state.store,
             state.store.data_dir(),
@@ -5003,12 +5042,20 @@ async fn wake_agent_route(
     principal: Principal,
     State(state): State<AppState>,
     AxumPath(name): AxumPath<String>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Json<AgentView>, ApiError> {
+    let via_http = via_http_mcp(&headers);
     spawn_store(move || {
         let found = state
             .store
             .agent_by_name(&name)
             .map_err(ApiError::from_store)?;
+        if via_http && !runs_off_host(state.store.data_dir(), &found) {
+            return Err(ApiError::forbidden(format!(
+                "`{}` runs on this host; a call over HTTP MCP cannot wake it",
+                found.name
+            )));
+        }
         if let Principal::Agent {
             agent_id: ref caller_id,
             name: ref caller_name,
@@ -6020,8 +6067,13 @@ fn inbox_of(
 async fn send(
     principal: Principal,
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<SendRequest>,
 ) -> Result<Json<SendResponse>, ApiError> {
+    let via_http = via_http_mcp(&headers);
+    if via_http {
+        refuse_host_media_over_http(&body)?;
+    }
     // The authenticated principal decides who the message is from; a body
     // `sender` is only a check, and a disagreement is refused with no write.
     // On a machine without the boundary, its own agent route names the sender;
@@ -6075,7 +6127,12 @@ async fn send(
             sender: Some(actor.as_address()),
             ..body
         };
-        let plan = plan_send(&state.store, &principal, &actor, &body)?;
+        let mut plan = plan_send(&state.store, &principal, &actor, &body)?;
+        // Over HTTP MCP a send never revives an archived host agent: that
+        // would start a host process on the call's behalf. Such a send is
+        // refused for it with the reason, as any send that cannot wake an
+        // archived recipient is.
+        plan.revive_host_agents = !via_http;
         let key_body = SendRequest {
             sender: plan
                 .sender_id
@@ -6619,6 +6676,9 @@ struct SendPlan {
     /// Immutable identity admitted at planning; a reused display name is not authority.
     sender_id: Option<anyagents_core::AgentId>,
     principal_id: Option<anyagents_core::AgentId>,
+    /// Whether an authored send may revive an archived agent that runs on
+    /// this host. False for a call made over HTTP MCP.
+    revive_host_agents: bool,
 }
 
 #[derive(Debug)]
@@ -6832,6 +6892,7 @@ impl SendPlan {
             reply: None,
             sender_id: sender.as_ref().map(|agent| agent.id.clone()),
             principal_id: None,
+            revive_host_agents: true,
         })
     }
 }
@@ -7151,7 +7212,11 @@ fn send_sync(
                 let wake_archived = wake_archived
                     && body.to.len() == 1
                     && matches!(Address::parse(&body.to[0]), Ok(Address::Agent(ref name))
-                        if !matches!(name.as_str(), "all" | "peers" | "siblings" | "team" | "children" | "parent"));
+                        if !matches!(name.as_str(), "all" | "peers" | "siblings" | "team" | "children" | "parent"))
+                    && (plan.revive_host_agents
+                        || store
+                            .agent_by_name(name)
+                            .is_ok_and(|agent| runs_off_host(store.data_dir(), &agent)));
                 // An archived recipient this send cannot wake would never read
                 // it: refused with the reason, never stored unread.
                 if !wake_archived && let Some(refusal) = archived_refusal(store, name) {
@@ -9466,7 +9531,7 @@ pub(crate) mod tests {
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             for (name, role, scope) in [("labelled", Some("Researcher"), "private"), ("task", None, "private")] {
                 let body = serde_json::from_value(serde_json::json!({"name":name,"role":role,"harness":"codex","model":"test-model","workdir":"private"})).unwrap();
-                let (_, Json(created)) = create_agent_route(Principal::Agent { agent_id: parent.id.clone(), name: parent.name.clone() }, State(state.clone()), Json(body)).await.unwrap_or_else(|e| panic!("{}: {}",e.status,e.message));
+                let (_, Json(created)) = create_agent_route(Principal::Agent { agent_id: parent.id.clone(), name: parent.name.clone() }, State(state.clone()), axum::http::HeaderMap::new(), Json(body)).await.unwrap_or_else(|e| panic!("{}: {}",e.status,e.message));
                 assert_eq!(created.scope, scope);
                 let _ = set_description_route(Principal::Agent { agent_id: parent.id.clone(), name: parent.name.clone() }, State(state.clone()), AxumPath(name.into()), Json(serde_json::from_value(serde_json::json!({"public":true})).unwrap())).await.unwrap_or_else(|e| panic!("{}",e.message));
                 let _ = set_description_route(Principal::Agent { agent_id: parent.id.clone(), name: parent.name.clone() }, State(state.clone()), AxumPath(name.into()), Json(serde_json::from_value(serde_json::json!({"public":false})).unwrap())).await.unwrap_or_else(|e| panic!("{}",e.message));
@@ -11171,6 +11236,7 @@ exec '{}' "$@"
                     name: parent.name.clone(),
                 },
                 State(state.clone()),
+                axum::http::HeaderMap::new(),
                 Json(
                     serde_json::from_value(serde_json::json!({
                         "name": "writer-sub-1",
@@ -11205,6 +11271,7 @@ exec '{}' "$@"
                     name: parent.name.clone(),
                 },
                 State(state.clone()),
+                axum::http::HeaderMap::new(),
                 Json(
                     serde_json::from_value(serde_json::json!({
                         "name": "reviewer-sub-1",
@@ -11233,6 +11300,7 @@ exec '{}' "$@"
                     name: parent.name.clone(),
                 },
                 State(state),
+                axum::http::HeaderMap::new(),
                 Json(
                     serde_json::from_value(serde_json::json!({
                         "name": "auditor-sub-1",
@@ -11278,7 +11346,7 @@ exec '{}' "$@"
                 if let Some(harness) = harness { body["harness"] = serde_json::json!(harness); }
                 if let Some(role) = role { body["role"] = serde_json::json!(role); }
                 let (status, Json(created)) = create_agent_route(
-                    Principal::Operator, State(state.clone()), Json(serde_json::from_value(body).unwrap()),
+                    Principal::Operator, State(state.clone()), axum::http::HeaderMap::new(), Json(serde_json::from_value(body).unwrap()),
                 ).await.unwrap_or_else(|e| panic!("{}", e.message));
                 assert_eq!(status, StatusCode::CREATED);
                 assert_eq!(created.harness, expected, "{name}");
@@ -11315,6 +11383,7 @@ exec '{}' "$@"
         let result = create_agent_route(
             Principal::Operator,
             State(state.clone()),
+            axum::http::HeaderMap::new(),
             Json(serde_json::from_value(body).unwrap()),
         )
         .await;
@@ -12244,19 +12313,11 @@ exec '{}' "$@"
                 StatusCode::FORBIDDEN
             );
 
-            // A local capability keeps its own rules, including `full`.
-            let (_, local_full) = post_mcp_as(&state, &peer_cap, Some("full"), tools_list())
+            // Over HTTP a local capability gets no more than a remote token.
+            let local_full = post_mcp_as(&state, &peer_cap, Some("full"), tools_list())
                 .await
-                .unwrap();
-            let local_tools = listed_tools(&local_full);
-            assert!(
-                local_tools.contains(&"browser".to_string()),
-                "{local_tools:?}"
-            );
-            assert!(
-                local_tools.contains(&"computer".to_string()),
-                "{local_tools:?}"
-            );
+                .unwrap_err();
+            assert_eq!(local_full.status, StatusCode::FORBIDDEN);
             let (_, local_default) = post_mcp_as(&state, &peer_cap, None, tools_list())
                 .await
                 .unwrap();
@@ -12423,6 +12484,7 @@ exec '{}' "$@"
             let refused = create_agent_route(
                 Principal::Operator,
                 State(state.clone()),
+                axum::http::HeaderMap::new(),
                 Json(
                     serde_json::from_value(serde_json::json!({
                         "name": "cloud-unconfigured",
@@ -12456,6 +12518,7 @@ exec '{}' "$@"
                 Principal::Operator,
                 State(state.clone()),
                 AxumPath("local-first".into()),
+                axum::http::HeaderMap::new(),
                 Json(HarnessRequest {
                     harness: "openai-cloud".into(),
                     model: None,
@@ -12470,6 +12533,270 @@ exec '{}' "$@"
                 state.store.agent_by_name("local-first").unwrap().harness,
                 "claude-code"
             );
+        });
+    }
+
+    #[test]
+    fn http_mcp_never_serves_more_than_the_remote_profile_to_any_credential() {
+        let _env = env_lock();
+        let dir = crate::test_tempdir();
+        let state = archetype_validation_state(dir.path());
+        let local = state
+            .store
+            .create_agent(anyagents_core::NewAgent::new("seat-agent", "claude-code"))
+            .unwrap();
+        let cap = state.store.issue_capability(&local.id).unwrap();
+        // Neither a sandbox binding nor disabled built-in tools upgrades HTTP
+        // any more: over HTTP the tools would run as the server.
+        let cfg = anyagents_core::agent_config_dir(dir.path(), &local.id);
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::write(cfg.join("cloud.json"), r#"{"disable_builtin_tools":true}"#).unwrap();
+        anyagents_tools::SandboxConfig {
+            endpoint: "https://sandbox.example.com".into(),
+            sandbox_id: "sbx-1".into(),
+            token: None,
+            workdir: "/workspace".into(),
+            remote_spawn: false,
+        }
+        .write_to_config_dir(&cfg)
+        .unwrap();
+        let marker = dir.path().join("exec-ran");
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            for asked in [None, Some("remote"), Some("http")] {
+                let (status, list) = post_mcp_as(&state, &cap, asked, tools_list())
+                    .await
+                    .unwrap();
+                assert_eq!(status, StatusCode::OK);
+                assert_eq!(
+                    listed_tools(&list),
+                    crate::mcp::REMOTE_MCP_TOOLS,
+                    "{asked:?}"
+                );
+            }
+            let (_, list) = post_mcp_as(&state, &cap, Some("coordination"), tools_list())
+                .await
+                .unwrap();
+            assert_eq!(listed_tools(&list), crate::mcp::COORDINATION_MCP_TOOLS);
+            for asked in ["full", "FULL", "local", "stdio"] {
+                let refused = post_mcp_as(&state, &cap, Some(asked), tools_list())
+                    .await
+                    .unwrap_err();
+                assert_eq!(refused.status, StatusCode::FORBIDDEN, "{asked}");
+                assert!(
+                    refused.message.contains("not served over HTTP"),
+                    "{}",
+                    refused.message
+                );
+            }
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(
+                axum::http::header::AUTHORIZATION,
+                format!("Bearer {cap}").parse().unwrap(),
+            );
+            let refused = mcp_get_route(
+                State(state.clone()),
+                headers,
+                Query(McpRouteQuery {
+                    profile: Some("full".into()),
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(refused.status, StatusCode::FORBIDDEN);
+
+            // Nothing that executes or reads on the host is callable.
+            let exec = serde_json::json!({
+                "action": "exec",
+                "command": format!("touch {}", marker.display()),
+            });
+            for (tool, args) in [
+                ("files", exec.clone()),
+                ("mcp__anyagents__files", exec.clone()),
+                ("code", serde_json::json!({ "code": "return 1" })),
+                ("browser", serde_json::json!({ "action": "status" })),
+                ("computer", serde_json::json!({ "action": "screenshot" })),
+                ("device", serde_json::json!({ "action": "screenshot" })),
+                ("media", serde_json::json!({ "action": "speech" })),
+                ("web", serde_json::json!({ "url": "https://example.com" })),
+                ("web_search", serde_json::json!({ "query": "x" })),
+                (
+                    "web_fetch",
+                    serde_json::json!({ "url": "https://example.com" }),
+                ),
+            ] {
+                let (_, refused) = post_mcp_as(&state, &cap, None, tool_call(tool, args))
+                    .await
+                    .unwrap();
+                assert!(
+                    refused["error"]["message"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("disabled by active MCP profile"),
+                    "{tool}: {refused}"
+                );
+            }
+            assert!(!marker.exists(), "an HTTP call ran a host command");
+        });
+    }
+
+    #[test]
+    fn calls_over_http_mcp_cannot_start_or_read_on_the_host() {
+        let _env = env_lock();
+        let dir = crate::test_tempdir();
+        let state = archetype_validation_state(dir.path());
+        std::fs::write(
+            dir.path().join(crate::remote::CONFIG_FILE),
+            "[server]\npublic_url = \"https://agents.example.com\"\n",
+        )
+        .unwrap();
+        let local = state
+            .store
+            .create_agent(anyagents_core::NewAgent::new("http-local", "claude-code"))
+            .unwrap();
+        let local_cap = state.store.issue_capability(&local.id).unwrap();
+        let cloud = state
+            .store
+            .create_agent(anyagents_core::NewAgent::new("http-cloud", "claude-cloud"))
+            .unwrap();
+        crate::remote::begin_session(&state.store, &cloud).unwrap();
+        let remote =
+            crate::remote::session_token(&anyagents_core::agent_config_dir(dir.path(), &cloud.id))
+                .unwrap();
+        let mut children = Vec::new();
+        for parent in [&local, &cloud] {
+            let child = state
+                .store
+                .create_agent(anyagents_core::NewAgent {
+                    parent_id: Some(parent.id.clone()),
+                    ..anyagents_core::NewAgent::new(
+                        format!("{}-child", parent.name),
+                        "claude-cloud",
+                    )
+                })
+                .unwrap();
+            let sleeper = state
+                .store
+                .create_agent(anyagents_core::NewAgent {
+                    parent_id: Some(parent.id.clone()),
+                    ..anyagents_core::NewAgent::new(
+                        format!("{}-sleeper", parent.name),
+                        "claude-code",
+                    )
+                })
+                .unwrap();
+            state
+                .store
+                .set_agent_state(&sleeper.id, "archived")
+                .unwrap();
+            children.push((child, sleeper));
+        }
+        let secret = dir.path().join("host-secret");
+        std::fs::write(&secret, "not for a remote caller").unwrap();
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            for (token, (child, sleeper)) in [&local_cap, &remote].into_iter().zip(&children) {
+                let call = |tool: &str, args: serde_json::Value| {
+                    let state = state.clone();
+                    let token = token.to_string();
+                    let request = tool_call(tool, args);
+                    async move {
+                        post_mcp_as(&state, &token, None, request)
+                            .await
+                            .unwrap()
+                            .1
+                    }
+                };
+                let refused = |result: &serde_json::Value, why: &str| {
+                    assert_eq!(result["result"]["isError"], true, "{result}");
+                    assert!(result.to_string().contains(why), "{why}: {result}");
+                };
+
+                // Spawning a host-executed agent, through either tool. Left to
+                // the default, a host caller's child resolves to its own host
+                // harness and is refused too; a cloud caller's inherits a
+                // cloud harness, which is allowed.
+                let prefix = token.chars().take(6).collect::<String>();
+                let named = |n: &str| format!("host-{prefix}-{n}");
+                let mut attempts = vec![
+                    (
+                        "agents",
+                        serde_json::json!({ "action": "spawn", "name": named("a"), "harness": "claude-code" }),
+                        named("a"),
+                    ),
+                    (
+                        "spawn",
+                        serde_json::json!({ "name": named("c"), "harness": "codex" }),
+                        named("c"),
+                    ),
+                ];
+                if token == &local_cap {
+                    attempts.push((
+                        "agents",
+                        serde_json::json!({ "action": "spawn", "name": named("b") }),
+                        named("b"),
+                    ));
+                }
+                for (tool, args, name) in attempts {
+                    refused(&call(tool, args).await, "only on a cloud harness");
+                    assert!(state.store.agent_by_name(&name).is_err(), "{name}");
+                }
+                // Moving a child onto a host harness.
+                refused(
+                    &call(
+                        "agents",
+                        serde_json::json!({ "action": "harness", "name": child.name, "harness": "claude-code" }),
+                    )
+                    .await,
+                    "only on a cloud harness",
+                );
+                assert_eq!(state.store.agent(&child.id).unwrap().harness, "claude-cloud");
+                // Waking an archived host agent, explicitly or by a direct send.
+                refused(
+                    &call("wake", serde_json::json!({ "agent": sleeper.name })).await,
+                    "cannot wake it",
+                );
+                let _ = call(
+                    "send",
+                    serde_json::json!({ "to": [sleeper.name], "text": "wake up" }),
+                )
+                .await;
+                assert_eq!(state.store.agent(&sleeper.id).unwrap().state, "archived");
+                // Attaching a host file as media, by path or by bare name.
+                for source in [secret.display().to_string(), "operator-token".to_string()] {
+                    refused(
+                        &call(
+                            "send",
+                            serde_json::json!({
+                                "to": [child.name],
+                                "text": "here",
+                                "media": { "kind": "document", "source": source },
+                            }),
+                        )
+                        .await,
+                        "by `https://` URL only",
+                    );
+                }
+                // A URL attachment and an ordinary send still work.
+                let sent = call(
+                    "send",
+                    serde_json::json!({
+                        "to": [child.name],
+                        "text": "with a link",
+                        "media": { "kind": "photo", "source": "https://example.com/a.png" },
+                    }),
+                )
+                .await;
+                assert_ne!(sent["result"]["isError"], true, "{sent}");
+                assert!(
+                    state
+                        .store
+                        .inbox(&child.id, None)
+                        .unwrap()
+                        .iter()
+                        .any(|message| message.text.contains("with a link"))
+                );
+            }
         });
     }
 
@@ -12610,6 +12937,7 @@ exec '{}' "$@"
             send(
                 principal,
                 State(state.clone()),
+                axum::http::HeaderMap::new(),
                 Json(SendRequest {
                     to: to.iter().map(|to| to.to_string()).collect(),
                     text: text.to_string(),
