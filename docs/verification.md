@@ -529,60 +529,56 @@ is not a skipped pass or actual alternate-UID evidence: acceptance requires the
 required Linux job's receipt for the tested head. The CI invocation is documented
 in `.github/workflows/ci.yml`; it never falls back when privilege is missing.
 
-### Cross-seat worktree permission boundary
+### Cross-seat repositories
 
-The Linux CI `Cross-seat worktree writes` step runs
-`create::tests::privileged_cross_uid_spawn_can_create_commit_and_status` with
-`ANYAGENTS_REQUIRE_PRIVILEGED_WORKTREE_TEST=1`. It creates three real OS users:
-A provisions B, B commits, A still writes B-created Git content and commits using
-an explicit protected hooks path. B cannot write common config/hooks/info,
-write or unlink/replace its `config.worktree`, or alter `commondir`; C can use
-its own checkout but cannot read B's HEAD/index, nor can B read C's metadata.
-B's ordinary status, commit and local bare-remote push use its generated seat
-config, with no `-c user.*` or author/committer environment overrides; the commit
-records the exact caller-configured author and committer. A's common config retains its owner,
-inode, content and owner read access during adoption. Parent config, remote-add
-and `git push -u` each replace the target inode while retaining the managed link;
-both active child UIDs must immediately read common config and run status, with
-no launch, wake or inspection call between the write and probe. They still cannot
-write/unlink config or create its lock, access sibling private metadata or write
-hooks/info; an unrecorded UID cannot read config. Default ACL readbacks remain
-confined to the dedicated config directory, and survivor/last-reader revocation
-is tested across another parent rewrite. Adoption regressions cover an existing
-Git config lock, interrupted publication with original bytes retained, and
-replacement of the journal-pinned directory or link. A same-size clean-filter positive control
-executes as B, then a forged `.git` pointer cannot execute that filter during
-journal-pinned server cleanup or A/C seat commands in the foreign checkout.
-A second payload selects a trusted common-config driver through B's checkout
-and staged attributes after archive revocation. Cleanup must execute the driver
-only as B; a B-readable execution receipt records that UID while a root-only
-marker remains absent. An inspection worker is SIGKILLed mid-check without unwinding;
-the durable open intent and read-only ACL are observed before startup recovery
-removes the grant, reads it back and preserves the dirty checkout on a fresh check.
-The temporary grant cannot write parent-owned common config or create objects.
-A non-privileged counterpart requires pinned status to execute successfully,
-checks the marker stays absent and rejects included or writable metadata config.
-A cleanup regression snapshots every checkout and private-registration file and
-requires byte-for-byte retention for an unpushed HEAD and for another unpushed
-local branch beside a published detached HEAD; publishing both permits removal.
-The same snapshot case removes or breaks the journaled checkout's `.git` pointer
-with an unpushed HEAD and a report under `target/`: every checkout and private
-registration byte must survive, without falling back to non-Git deletion.
-Archive immediately revokes B's common-store access while preserving its external
-checkout bytes; reap is idempotent and C remains admitted. A separate post-sharing
-admission failure verifies rollback revocation. ACL readbacks cover every changed
-object. A missing privilege is an explicit local skip, never the CI acceptance:
-the required environment flag makes a privilege skip fail.
+The Linux CI `Cross-seat repositories` step runs
+`repo::tests::privileged_seats_own_their_repositories` with
+`ANYAGENTS_REQUIRE_PRIVILEGED_WORKTREE_TEST=1`. Two seat uids each get their
+own repository over one pool, shared with the seat's group and admitted by the
+real admission probe run as that seat. Each seat commits, makes a branch,
+writes its own config and pushes to a bare remote as itself. The second seat
+cannot list the first seat's refs or read its `.git/config`, and the pool's
+object count is unchanged by everything the seats did. A missing privilege is
+an explicit local skip, never the CI acceptance: the required environment flag
+makes a privilege skip fail.
 
-Three Linux recovery regressions plant a FIFO, a hard link or an outside-target
-symlink during a durably open inspection. Each covers legacy and exact-object
-journals through both primary and admin HTTP servers: the affected worktree is
-quarantined, wake/reap/automatic harness launch refuse it, remaining targets and
-an independent interrupted inspection are revoked, an active same-common seat's
-ACLs remain unchanged, and outside-link contents and ACLs are preserved.
+The unprivileged tests in `repo.rs`, `server.rs` and `create.rs` cover the rest
+in every lane:
 
-Shared refs are intentionally writable within one repository. These checks do not
-claim branch-tip integrity for arbitrary agent shell commits or pushes.
+- a pool checkout is an own repository whose alternates name the pool, with no
+  objects of its own until the agent writes some; commits, branches, `pack-refs`
+  and `gc` in it never change the pool's objects or refs, and a push reaches the
+  remote;
+- two agents on one repository see neither each other's branches, config nor
+  unpushed objects, and exchange work only through the remote;
+- a linked worktree converts in place with its status, HEAD, branch, staged and
+  unstaged changes, untracked and ignored files, sparse patterns and hooks
+  intact, without another checkout's branch settings; the store forgets only
+  that registration and keeps the repository's objects under a keep ref; after
+  the keep ref goes and the store is pruned, the unpushed commit, the staged
+  blob and a reflog-only commit are still the repository's own;
+- a converted repository survives its base being rewritten upstream and the
+  store being refetched, reflog-expired and pruned with `--prune=now`: `fsck`,
+  `log` and `push` still work, and a plain `git fetch origin` sees the new base;
+- a store that may prune is refused; an operation in progress, a locked
+  worktree, or a pointer at another checkout's registration declines and
+  changes nothing;
+- a same-size edit within the index's timestamp stays visible after
+  conversion (the test fails if the copied index takes a new mtime);
+- a conversion that crashed after the exchange is finished by the next call,
+  and a forged leftover pointer releases nothing; a leftover staging directory
+  is cleared; linked hooks stay links;
+- a provider checkout that cannot be adopted is discarded with its
+  registration, so a failed creation leaves no row, directory or branch and
+  the same name is retryable;
+- cleanup keeps an unpushed HEAD, another unpushed local branch beside a
+  published detached HEAD, a stash, a tag or note the remote lacks, a checkout
+  whose remote cannot be asked, and a checkout whose `.git` is missing or points
+  elsewhere, byte for byte (only build output goes); it removes a checkout whose
+  work the remote advertises, including a branch published by URL with no
+  remote-tracking ref; an archived legacy worktree is converted first, and the
+  reaped one's keep ref goes with it;
+- a cleanup blocked in Git does not delay other agents' mail.
 
 ## Scheduler isolation and clean-host server fixtures
 

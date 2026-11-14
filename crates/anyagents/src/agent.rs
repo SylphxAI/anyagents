@@ -830,7 +830,6 @@ fn set_state(data: &Path, name: &str, state: &str) -> Result<AgentView, Error> {
         }
     }
     if state == "running" {
-        crate::worktree_access::restore_recorded(data, &found.id)?;
         server::clear_explicitly_archived(data, &found.id);
     }
     let agent = store.set_agent_state(&found.id, state)?;
