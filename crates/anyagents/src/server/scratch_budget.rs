@@ -7,7 +7,8 @@
 //!
 //! The unit of eviction is one build directory inside an agent's build tools:
 //! `build/cargo/<one checkout's target>`, a Cargo profile such as
-//! `build/cargo/debug`, a Gradle cache. When the total is over budget, units
+//! `build/cargo/debug`, a Gradle cache, a private tool cache
+//! (`build/cache/uv`). When the total is over budget, units
 //! are removed until it is back under 90% of the budget, in this order:
 //!
 //! 1. those of agents that no longer exist or are archived;
@@ -815,6 +816,47 @@ mod tests {
         remove_interrupted(&scratch, &[]);
         assert!(!stale.exists());
         assert!(cargo.join("release/app").exists());
+    }
+
+    /// A seat that cannot write the shared tool caches gets private ones in
+    /// its build root (`build/cache/<tool>`, #283). uv, pip and npm never
+    /// trim their caches, so each is a unit like a build target.
+    #[test]
+    fn private_tool_caches_are_units_on_the_same_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let scratch = dir.path().join("scratch");
+        let down = store
+            .create_agent(anyagents_core::NewAgent::new("down", "opencode"))
+            .unwrap();
+        let busy = store
+            .create_agent(anyagents_core::NewAgent::new("busy", "opencode"))
+            .unwrap();
+        let mib = 1 << 20;
+        for (id, tool, minutes) in [
+            (&down.id, "uv", 600),
+            (&down.id, "npm", 10),
+            (&busy.id, "pip", 600),
+        ] {
+            let unit = anyagents_core::agent_scratch_build_dir(&scratch, id)
+                .join("cache")
+                .join(tool);
+            write(&unit.join("wheels/blob"), mib);
+            age(&unit, minutes);
+        }
+        // The same under an older server's layout.
+        let legacy = scratch
+            .join("builds")
+            .join(down.id.as_str())
+            .join("cache/bun");
+        write(&legacy.join("blob"), mib);
+        age(&legacy, 900);
+        let alive = |id: &AgentId| Some(id == &busy.id);
+        let open = |id: &AgentId| id == &busy.id;
+        let plan = plan_with(&store, &scratch, 1, &alive, &open);
+        assert_eq!(plan.usages.len(), 4, "{plan:#?}");
+        // Written ten minutes ago, or the agent is in a turn: kept.
+        assert_eq!(order(&plan), ["down:bun", "down:uv"], "{plan:#?}");
     }
 
     #[test]
