@@ -447,11 +447,16 @@ fn open_common_config(common: &Path) -> std::io::Result<CommonConfig> {
 }
 
 /// [`open_common_config`] for a given server uid, so the ownership rule is
-/// testable without a second principal.
+/// testable without a second principal. The link witnesses the relocation:
+/// only the server makes it. The directory and the file belong to the server
+/// or to the store's owner, whose own Git keeps rewriting its configuration
+/// through the link (lock and rename inside the directory). Nobody else may
+/// write any of them, a trusted metadata group included.
 fn open_common_config_as(common: &Path, server: u32) -> std::io::Result<CommonConfig> {
     use std::os::unix::fs::MetadataExt;
     let path = common.join("config");
     let link = std::fs::symlink_metadata(&path)?;
+    let owners = [open_nofollow(common)?.metadata()?.uid(), server];
     if link.file_type().is_symlink() {
         if std::fs::read_link(&path)? != Path::new(CONFIG_DIRECTORY).join("config") {
             return Err(std::io::Error::other(format!(
@@ -467,7 +472,7 @@ fn open_common_config_as(common: &Path, server: u32) -> std::io::Result<CommonCo
                 link.uid()
             )));
         }
-        let directory = managed_directory(common, server).map_err(|error| {
+        let directory = managed_directory(common, &owners).map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
                 std::io::Error::other(format!(
                     "managed Git config link {} has no {CONFIG_DIRECTORY}/ directory",
@@ -481,29 +486,30 @@ fn open_common_config_as(common: &Path, server: u32) -> std::io::Result<CommonCo
         let meta = file.metadata()?;
         if !meta.is_file()
             || meta.nlink() != 1
-            || meta.uid() != server
-            || writable_by_anyone_else(&file, &[server])?
+            || !owners.contains(&meta.uid())
+            || writable_by_anyone_else(&file, &owners)?
         {
             return Err(std::io::Error::other(format!(
                 "untrusted managed Git config {}/config: it must be a single-link regular \
-                 file owned by the server (uid {server}) that no one else can write",
-                common.join(CONFIG_DIRECTORY).display()
+                 file owned by the server (uid {server}) or the store's owner (uid {}) that \
+                 no one else can write",
+                common.join(CONFIG_DIRECTORY).display(),
+                owners[0]
             )));
         }
         return Ok(CommonConfig::Managed { file, directory });
     }
-    let owners = [open_nofollow(common)?.metadata()?.uid(), server];
     let file = open_nofollow(&path)?;
     let meta = file.metadata()?;
-    // Only the server's own interrupted adoption explains a second link.
+    // Only an interrupted relocation explains a second link.
     if meta.is_file()
         && meta.nlink() == 2
-        && meta.uid() == server
-        && let Ok(directory) = managed_directory(common, server)
+        && owners.contains(&meta.uid())
+        && let Ok(directory) = managed_directory(common, &owners)
         && let Ok(linked) = open_at_nofollow(&directory, c"config").and_then(|f| f.metadata())
         && linked.dev() == meta.dev()
         && linked.ino() == meta.ino()
-        && !writable_by_anyone_else(&file, &[server])?
+        && !writable_by_anyone_else(&file, &owners)?
     {
         return Ok(CommonConfig::Linked(file));
     }
@@ -532,18 +538,21 @@ fn writable_by_anyone_else(file: &std::fs::File, owners: &[u32]) -> std::io::Res
     writable_file_by_untrusted_with(file, owners, &[])
 }
 
-/// The dedicated directory, trusted only as the server's own: owned by the
-/// server, writable by no one else, holding nothing but the config and Git's
-/// lock for it.
-fn managed_directory(common: &Path, server: u32) -> std::io::Result<std::fs::File> {
+/// The dedicated directory: owned by the server or the store's owner
+/// (`owners`), writable by no one else, holding nothing but the config and
+/// Git's lock for it.
+fn managed_directory(common: &Path, owners: &[u32]) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::MetadataExt;
     let path = common.join(CONFIG_DIRECTORY);
     let directory = open_nofollow(&path)?;
     let meta = directory.metadata()?;
-    if !meta.is_dir() || meta.uid() != server || writable_by_anyone_else(&directory, &[server])? {
+    if !meta.is_dir()
+        || !owners.contains(&meta.uid())
+        || writable_by_anyone_else(&directory, owners)?
+    {
         return Err(std::io::Error::other(format!(
             "untrusted managed Git config directory {}: it must be a directory owned by the \
-             server (uid {server}) that no one else can write",
+             server or the store's owner (uids {owners:?}) that no one else can write",
             path.display()
         )));
     }
@@ -690,8 +699,10 @@ fn manage_config(common: &Path, readers: &[u32]) -> std::io::Result<()> {
     config_default_readers(&directory, &readers)
 }
 
-/// Move the server's own plain config into `anyagents-config/` behind an
-/// exact symlink, or finish an interrupted move. Git's `config.lock` on the
+/// Move the store's plain config into `anyagents-config/` behind an exact
+/// symlink the server makes, or finish an interrupted move. The directory and
+/// the file stay with the config's owner, whose Git keeps writing through the
+/// link. Git's `config.lock` on the
 /// original path is held throughout, and the new name's lock from before the
 /// link is published: the caller keeps that one (the returned lock) while it
 /// sets the readers, so no Git write through the link precedes them. Every
@@ -703,7 +714,10 @@ fn relocate_config(
     before_publish: &dyn Fn() -> std::io::Result<()>,
 ) -> std::io::Result<Option<ConfigLock>> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
-    let server = crate::sandbox::server_uid();
+    let owners = [
+        open_nofollow(common)?.metadata()?.uid(),
+        crate::sandbox::server_uid(),
+    ];
     if matches!(open_common_config(common)?, CommonConfig::Managed { .. }) {
         return Ok(None);
     }
@@ -714,16 +728,13 @@ fn relocate_config(
         CommonConfig::Plain(file) | CommonConfig::Linked(file) => file,
     };
     let meta = source.metadata()?;
-    if meta.uid() != server {
-        return Ok(None);
-    }
     let path = common.join(CONFIG_DIRECTORY);
     let created = match std::fs::DirBuilder::new().mode(0o700).create(&path) {
         Ok(()) => true,
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
         Err(error) => return Err(error),
     };
-    let directory = managed_directory(common, server)?;
+    let directory = managed_directory(common, &owners)?;
     let same = |file: &std::fs::File| {
         file.metadata()
             .is_ok_and(|m| m.is_file() && m.dev() == meta.dev() && m.ino() == meta.ino())
@@ -755,6 +766,12 @@ fn relocate_config(
         )?;
     }
     clear_default_acl(&directory)?;
+    // The config's owner (the store's owner or the server) owns the directory:
+    // its Git creates config.lock there and renames it over the config.
+    let directory_meta = directory.metadata()?;
+    if directory_meta.uid() != meta.uid() || directory_meta.gid() != meta.gid() {
+        descriptor_fchown(&directory, Some(meta.uid()), Some(meta.gid()))?;
+    }
     let target_lock = lock_config(path.join("config.lock"))?;
     match open_at_nofollow(&directory, c"config") {
         Ok(linked) if same(&linked) => {}
@@ -774,8 +791,9 @@ fn relocate_config(
         }
         Err(error) => return Err(error),
     }
-    // Only the server writes the relocated config: no group or other write,
-    // whatever mode Git or an ACL mask gave the original.
+    // Only its owner writes the relocated config: no group or other write,
+    // whatever mode Git or an ACL mask gave the original. Readers get named
+    // ACL entries afterwards, so the mask set here never hides them.
     let mode = source.metadata()?.mode() & 0o7777;
     if mode & 0o022 != 0 {
         descriptor_fchmod(&source, (mode & !0o022) as libc::mode_t)?;
@@ -4390,12 +4408,14 @@ mod tests {
             let entries = std::cell::RefCell::new(Vec::new());
             walk_tree(&common, false, &|_| {}, &|file, path| {
                 let meta = file.metadata()?;
-                let mut acl = [0u8; 256];
                 #[cfg(target_os = "linux")]
-                let len = read_xattr(file, c"system.posix_acl_access", &mut acl);
+                let acl = {
+                    let mut bytes = [0u8; 256];
+                    let len = read_xattr(file, c"system.posix_acl_access", &mut bytes);
+                    (len > 0).then(|| bytes[..len as usize].to_vec())
+                };
                 #[cfg(not(target_os = "linux"))]
-                let len = -1;
-                let acl = (len > 0).then(|| acl[..len as usize].to_vec());
+                let acl: Option<Vec<u8>> = None;
                 entries.borrow_mut().push((
                     path.to_path_buf(),
                     meta.mode(),
@@ -6196,5 +6216,174 @@ mod tests {
         let grant: Grant = serde_json::from_str(legacy).unwrap();
         assert_eq!(grant.inspection_paths.unwrap()[0].ino, 7);
         assert!(grant.reason.is_none());
+    }
+
+    /// Three principals with real ACLs, as the privileged cross-seat CI job
+    /// has them, without adding accounts: the server (root here), the store's
+    /// owner A and a seat B, as numeric ids. A's own 0600 config is relocated
+    /// behind a server-made link; the directory and file stay A's, so A keeps
+    /// rewriting it through the link, and B reads every version and can write
+    /// none. Run it as root: `sudo env TMPDIR=<dir on an ACL file system>
+    /// <test binary> --exact worktree_access::tests::privileged_store_owner_keeps_writing_its_relocated_config`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn privileged_store_owner_keeps_writing_its_relocated_config() {
+        use std::process::Command;
+        if unsafe { libc::geteuid() } != 0 {
+            assert!(
+                std::env::var_os("ANYAGENTS_REQUIRE_PRIVILEGED_WORKTREE_TEST").is_none(),
+                "requires root"
+            );
+            return;
+        }
+        let (a, b) = (3_999_901u32, 3_999_902u32);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let source = root.join("source");
+        let checkout = root.join("checkout");
+        std::fs::create_dir(&source).unwrap();
+        let git = crate::worktree::tests::git;
+        git(&source, &["init", "-q", "-b", "main"]);
+        git(&source, &["config", "user.name", "Store owner"]);
+        git(&source, &["config", "user.email", "owner@example.invalid"]);
+        git(&source, &["config", "extensions.worktreeConfig", "true"]);
+        git(&source, &["commit", "-q", "--allow-empty", "-m", "base"]);
+        git(
+            &source,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "child",
+                checkout.to_str().unwrap(),
+            ],
+        );
+        let common = root.join("source/.git");
+        let config = common.join("config");
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+        for tree in [&source, &checkout] {
+            assert!(
+                Command::new("chown")
+                    .args(["-R", &format!("{a}:{a}")])
+                    .arg(tree)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let before = std::fs::metadata(&config).unwrap();
+        let private = common.join("worktrees/checkout");
+        let journal = grant_path(&root.join("data"), &anyagents_core::AgentId::generate());
+        share_known(&checkout, &private, &common, b, b, &journal).unwrap();
+
+        // The server made the link; the directory and the file stay A's, and
+        // nobody but A writes either.
+        let link = std::fs::symlink_metadata(&config).unwrap();
+        assert!(link.file_type().is_symlink() && link.uid() == 0);
+        let directory = std::fs::metadata(common.join(CONFIG_DIRECTORY)).unwrap();
+        let file = std::fs::metadata(common.join(CONFIG_DIRECTORY).join("config")).unwrap();
+        assert_eq!(
+            (directory.uid(), file.uid(), file.ino()),
+            (a, a, before.ino())
+        );
+        assert_eq!((directory.mode() & 0o022, file.mode() & 0o022), (0, 0));
+        assert!(is_managed(&common));
+
+        let as_principal = |uid: u32, args: &[&str]| {
+            Command::new("/usr/bin/setpriv")
+                .args([
+                    "--reuid",
+                    &uid.to_string(),
+                    "--regid",
+                    &uid.to_string(),
+                    "--clear-groups",
+                    "--",
+                    "/usr/bin/env",
+                    "-i",
+                    "PATH=/usr/bin:/bin",
+                    "HOME=/nonexistent",
+                    "GIT_CONFIG_GLOBAL=/dev/null",
+                    "GIT_CONFIG_SYSTEM=/dev/null",
+                    "git",
+                    "-c",
+                    "safe.directory=*",
+                ])
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        let read = |uid: u32| {
+            let out = as_principal(
+                uid,
+                &[
+                    "-C",
+                    checkout.to_str().unwrap(),
+                    "config",
+                    "--get",
+                    "user.name",
+                ],
+            );
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        assert_eq!(read(b), "Store owner");
+        // A rewrites through the link (lock and rename in its directory).
+        let out = as_principal(
+            a,
+            &[
+                "-C",
+                source.to_str().unwrap(),
+                "config",
+                "user.name",
+                "Rewritten",
+            ],
+        );
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            std::fs::symlink_metadata(&config)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(read(b), "Rewritten");
+        assert!(is_managed(&common));
+        // B never writes it.
+        let out = as_principal(
+            b,
+            &[
+                "-C",
+                checkout.to_str().unwrap(),
+                "config",
+                "user.name",
+                "Seat",
+            ],
+        );
+        assert!(!out.status.success());
+        assert_eq!(read(b), "Rewritten");
+        let out = as_principal(
+            b,
+            &[
+                "-C",
+                checkout.to_str().unwrap(),
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-dir",
+            ],
+        );
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 }
