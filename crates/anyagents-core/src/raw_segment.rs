@@ -251,10 +251,16 @@ fn open_readonly_with_metadata(path: &Path) -> io::Result<(File, fs::Metadata)> 
         for (i, part) in parts.iter().enumerate() {
             let name = CString::new(part.as_bytes()).map_err(io::Error::other)?;
             let final_part = i + 1 == parts.len();
+            // O_NONBLOCK: a FIFO swapped in for the file never holds the
+            // opening thread waiting for a writer; it is refused below.
             let flags = libc::O_RDONLY
                 | libc::O_NOFOLLOW
                 | libc::O_CLOEXEC
-                | if final_part { 0 } else { libc::O_DIRECTORY };
+                | if final_part {
+                    libc::O_NONBLOCK | libc::O_NOCTTY
+                } else {
+                    libc::O_DIRECTORY
+                };
             let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
             if fd < 0 {
                 return Err(io::Error::last_os_error());

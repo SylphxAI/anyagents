@@ -4019,7 +4019,9 @@ impl AgentMcp {
                                 .collect();
                         }
                     }
-                    if let Ok(txt) = std::fs::read_to_string(root.join("memory/MEMORY.md")) {
+                    if let Ok(Some((txt, _))) =
+                        anyagents_core::learned_memory::read_memory_index(root)
+                    {
                         index_text = txt;
                     }
                 }
@@ -4100,31 +4102,32 @@ impl AgentMcp {
                         }))
                     }
                     Err(err) => {
-                        if is_self_target && let Some(ref root) = local_agent_root {
-                            let path = root.join("memory").join(&filename);
-                            if let Ok(content) = std::fs::read_to_string(&path) {
-                                let (_, description) =
-                                    anyagents_core::learned_memory::parse_topic_frontmatter(
-                                        &slug, &content,
-                                    );
-                                return Ok(serde_json::json!({
-                                    "action": "read",
-                                    "agent": self.agent.name,
-                                    "topic": slug,
-                                    "filename": filename,
-                                    "description": description,
-                                    "content": content,
-                                    "turns": [{
-                                        "id": format!("memory:{}:{}", self.agent.id, slug),
-                                        "text": content,
-                                        "source": "memory",
-                                        "direction": "in",
-                                        "from": format!("agent:{}", self.agent.name),
-                                        "to": format!("agent:{}", self.agent.name),
-                                        "reply_to": filename,
-                                    }],
-                                }));
-                            }
+                        if is_self_target
+                            && let Some(ref root) = local_agent_root
+                            && let Ok(content) =
+                                anyagents_core::learned_memory::read_memory_file(root, &filename)
+                        {
+                            let (_, description) =
+                                anyagents_core::learned_memory::parse_topic_frontmatter(
+                                    &slug, &content,
+                                );
+                            return Ok(serde_json::json!({
+                                "action": "read",
+                                "agent": self.agent.name,
+                                "topic": slug,
+                                "filename": filename,
+                                "description": description,
+                                "content": content,
+                                "turns": [{
+                                    "id": format!("memory:{}:{}", self.agent.id, slug),
+                                    "text": content,
+                                    "source": "memory",
+                                    "direction": "in",
+                                    "from": format!("agent:{}", self.agent.name),
+                                    "to": format!("agent:{}", self.agent.name),
+                                    "reply_to": filename,
+                                }],
+                            }));
                         }
                         Err(err)
                     }
@@ -4174,7 +4177,7 @@ impl AgentMcp {
                     }
                     Err(err) => {
                         if is_self_target && let Some(ref root) = local_agent_root {
-                            let (path, entry, index_md) =
+                            let (_, entry, index_md) =
                                 anyagents_core::learned_memory::upsert_memory_topic(
                                     root,
                                     &self.agent.name,
@@ -4185,7 +4188,11 @@ impl AgentMcp {
                                     anyagents_core::now_ms(),
                                 )
                                 .map_err(|e| e.to_string())?;
-                            let written_text = std::fs::read_to_string(&path).unwrap_or_default();
+                            let written_text = anyagents_core::learned_memory::read_memory_file(
+                                root,
+                                &entry.filename,
+                            )
+                            .unwrap_or_default();
                             let sha256 = sha256_hex(written_text.as_bytes());
                             return Ok(serde_json::json!({
                                 "action": "write",
@@ -4318,8 +4325,11 @@ impl AgentMcp {
                             let limit = args.limit.unwrap_or(20).max(1);
                             let mut hits = Vec::new();
                             for entry in topics {
-                                let path = root.join("memory").join(&entry.filename);
-                                let text = std::fs::read_to_string(&path).unwrap_or_default();
+                                let text = anyagents_core::learned_memory::read_memory_file(
+                                    root,
+                                    &entry.filename,
+                                )
+                                .unwrap_or_default();
                                 let hay = format!("{} {} {}", entry.slug, entry.description, text)
                                     .to_ascii_lowercase();
                                 if tokens.iter().all(|tok| hay.contains(tok)) {
@@ -4360,8 +4370,11 @@ impl AgentMcp {
                     let topics = anyagents_core::learned_memory::list_memory_topics(root)
                         .unwrap_or_default();
                     let sleep_state = anyagents_core::learned_memory::read_sleep_state(root);
-                    let index_text =
-                        std::fs::read_to_string(root.join("memory/MEMORY.md")).unwrap_or_default();
+                    let index_text = anyagents_core::learned_memory::read_memory_index(root)
+                        .ok()
+                        .flatten()
+                        .map(|(text, _)| text)
+                        .unwrap_or_default();
                     return Ok(serde_json::json!({
                         "action": "status",
                         "agent": self.agent.name,

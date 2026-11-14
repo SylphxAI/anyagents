@@ -47,6 +47,26 @@ fn check(fd: libc::c_int) -> io::Result<File> {
     }
 }
 
+/// At most `limit` bytes of `file`; a file larger than that is an error.
+pub fn read_capped(file: File, limit: u64) -> io::Result<Vec<u8>> {
+    let size = file.metadata()?.len();
+    if size > limit {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{size} bytes is larger than the {limit}-byte limit"),
+        ));
+    }
+    let mut bytes = Vec::with_capacity(size as usize);
+    io::Read::read_to_end(&mut io::Read::take(file, limit + 1), &mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("grew past the {limit}-byte limit while read"),
+        ));
+    }
+    Ok(bytes)
+}
+
 /// A link where a directory or file was expected reads as this error.
 fn not_plain(error: io::Error) -> io::Error {
     match error.raw_os_error() {
@@ -155,11 +175,10 @@ impl Dir {
         Ok(file)
     }
 
-    /// The bytes of the regular file `name`.
-    pub fn read(&self, name: &OsStr) -> io::Result<Vec<u8>> {
-        let mut bytes = Vec::new();
-        io::Read::read_to_end(&mut self.open_file(name)?, &mut bytes)?;
-        Ok(bytes)
+    /// The bytes of the regular file `name`, at most `limit` of them; a
+    /// larger file (a sparse one claiming terabytes) is an error, never read.
+    pub fn read(&self, name: &OsStr, limit: u64) -> io::Result<Vec<u8>> {
+        read_capped(self.open_file(name)?, limit)
     }
 
     /// What `name` is, without following it; `None` when it is absent.
@@ -338,20 +357,20 @@ mod tests {
         assert_eq!(
             dir.dir(Path::new("dir"))
                 .unwrap()
-                .read(OsStr::new("file"))
+                .read(OsStr::new("file"), 64)
                 .unwrap(),
             b"inside"
         );
         let inner = dir.dir(Path::new("dir")).unwrap();
         assert_eq!(
-            inner.read(OsStr::new("file-link")).unwrap_err().kind(),
+            inner.read(OsStr::new("file-link"), 64).unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
         assert!(dir.dir(Path::new("dir-link")).is_err());
         assert!(dir.create_dir(OsStr::new("dir-link"), 0o700).is_err());
         assert!(dir.dir(Path::new("../outside")).is_err());
         for bad in ["", ".", "..", "a/b"] {
-            assert!(inner.read(OsStr::new(bad)).is_err(), "{bad}");
+            assert!(inner.read(OsStr::new(bad), 64).is_err(), "{bad}");
         }
         let mut entries = inner.entries().unwrap();
         entries.sort();
@@ -366,9 +385,26 @@ mod tests {
         assert!(!inner.remove_file(OsStr::new("file-link")).unwrap());
         inner.write_atomic(OsStr::new("file-link"), b"new").unwrap();
         assert_eq!(std::fs::read(outside.join("secret")).unwrap(), b"secret");
-        assert_eq!(inner.read(OsStr::new("file-link")).unwrap(), b"new");
+        assert_eq!(inner.read(OsStr::new("file-link"), 64).unwrap(), b"new");
         assert!(inner.remove_file(OsStr::new("file")).unwrap());
         assert!(!root.join("dir/file").exists());
         assert!(Dir::open_no_follow(&root.join("dir-link")).is_err());
+        // A file over the limit, however sparse, is never read into memory.
+        let big = std::fs::File::create(root.join("dir/big")).unwrap();
+        big.set_len(1 << 40).unwrap();
+        assert_eq!(
+            inner.read(OsStr::new("big"), 1 << 20).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            inner.read(OsStr::new("new"), 0).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        // A FIFO is refused at once, never waited on.
+        let fifo = root.join("dir/fifo");
+        let c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        assert!(inner.read(OsStr::new("fifo"), 64).is_err());
+        assert!(crate::raw_segment::open_readonly(&std::fs::canonicalize(&fifo).unwrap()).is_err());
     }
 }

@@ -11,6 +11,10 @@ use std::{
 };
 
 pub const MAX_BYTES: usize = 4096;
+/// The largest memory topic or index file the server reads.
+pub const MEMORY_FILE_LIMIT: u64 = 4 * 1024 * 1024;
+/// The largest pin, sleep-state or key file the server reads.
+const PIN_FILE_LIMIT: u64 = 64 * 1024;
 pub const MAX_LINES: usize = 150;
 const MARKER: &str = "[Memory truncated; consult the configured source for full text.]\n";
 const FOOTER: &str = "</learned_memory>\n";
@@ -130,7 +134,7 @@ pub fn read_pin(agent_root: &Path, session_id: &str) -> io::Result<MemoryPin> {
     // Below the agent root nothing is reached through a link (ADR 0010 D3).
     let bytes = Dir::open(agent_root)?
         .dir(&Path::new("sessions").join(sha256(session_id.as_bytes())))?
-        .read(OsStr::new("memory-pin.json"))?;
+        .read(OsStr::new("memory-pin.json"), PIN_FILE_LIMIT)?;
     let pin: MemoryPin = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
     if pin.session_id != session_id
         || pin.sha256 != sha256(pin.section.as_bytes())
@@ -241,12 +245,20 @@ pub fn read_memory_index(agent_root: &Path) -> io::Result<Option<(String, i64)>>
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| i64::try_from(d.as_millis()).unwrap_or(0))
         .unwrap_or(0);
-    let mut bytes = Vec::new();
-    (&file).read_to_end(&mut bytes)?;
+    let bytes = crate::beneath::read_capped(file, MEMORY_FILE_LIMIT)?;
     Ok(Some((
         String::from_utf8_lossy(&bytes).into_owned(),
         mtime_ms,
     )))
+}
+
+/// `memory/<filename>` as text, read without following a link and at most
+/// [`MEMORY_FILE_LIMIT`] bytes.
+pub fn read_memory_file(agent_root: &Path, filename: &str) -> io::Result<String> {
+    let dir = memory_dir(agent_root)?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no memory directory"))?;
+    let bytes = dir.read(OsStr::new(filename), MEMORY_FILE_LIMIT)?;
+    String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
 /// Whether `<agent_root>/memory` is a plain directory, never a link.
@@ -284,7 +296,10 @@ pub fn read_sleep_state(agent_root: &Path) -> SleepState {
     memory_dir(agent_root)
         .ok()
         .flatten()
-        .and_then(|dir| dir.read(OsStr::new(".sleep-state.json")).ok())
+        .and_then(|dir| {
+            dir.read(OsStr::new(".sleep-state.json"), PIN_FILE_LIMIT)
+                .ok()
+        })
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or_default()
 }
@@ -484,8 +499,8 @@ fn list_topics_in(mem_dir: &Dir) -> io::Result<Vec<MemoryTopicEntry>> {
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| i64::try_from(d.as_millis()).unwrap_or(0))
             .unwrap_or(0);
-        let mut raw = Vec::new();
-        let _ = (&file).read_to_end(&mut raw);
+        // An oversized topic is listed, never read into memory.
+        let raw = crate::beneath::read_capped(file, MEMORY_FILE_LIMIT).unwrap_or_default();
         let text = String::from_utf8_lossy(&raw);
         let (_, description, _, fm_updated_ms, _) = parse_topic_frontmatter_full(&slug, &text);
         let updated_at_ms = fm_updated_ms.filter(|&ts| ts > 0).unwrap_or(fs_mtime_ms);
@@ -650,7 +665,7 @@ pub fn rebuild_memory_index(
 
     let full = format!("{header}{body}");
     let index = OsStr::new("MEMORY.md");
-    if mem_dir.read(index).ok().as_deref() != Some(full.as_bytes()) {
+    if mem_dir.read(index, MEMORY_FILE_LIMIT).ok().as_deref() != Some(full.as_bytes()) {
         mem_dir.write_atomic(index, full.as_bytes())?;
     }
     Ok(full)
@@ -670,7 +685,7 @@ pub fn upsert_memory_topic(
     let filename = format!("{slug}.md");
     let path = agent_root.join("memory").join(&filename);
     let existing_created_ms = mem_dir
-        .read(OsStr::new(&filename))
+        .read(OsStr::new(&filename), MEMORY_FILE_LIMIT)
         .ok()
         .and_then(|old| parse_topic_frontmatter_full(&slug, &String::from_utf8_lossy(&old)).2);
     let trimmed = content.trim();
@@ -865,7 +880,7 @@ Output ONLY valid JSON with no markdown code fences or commentary."
         for (_, t) in scored.into_iter().take(12) {
             if let Some(raw) = mem_dir
                 .as_ref()
-                .and_then(|dir| dir.read(OsStr::new(&t.filename)).ok())
+                .and_then(|dir| dir.read(OsStr::new(&t.filename), MEMORY_FILE_LIMIT).ok())
                 .and_then(|bytes| String::from_utf8(bytes).ok())
             {
                 let (_, _, _, _, body) = parse_topic_frontmatter_full(&t.slug, &raw);
@@ -1014,10 +1029,8 @@ fn read_sylphx_key_candidate(base: &Path, no_follow: bool) -> Option<(String, bo
             return fs::read_to_string(base.join(rel));
         }
         let rel = Path::new(rel);
-        let bytes = open_below(&Dir::open(base)?, rel).and_then(|mut file| {
-            let mut bytes = Vec::new();
-            file.read_to_end(&mut bytes).map(|_| bytes)
-        })?;
+        let bytes = open_below(&Dir::open(base)?, rel)
+            .and_then(|file| crate::beneath::read_capped(file, PIN_FILE_LIMIT))?;
         String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     };
     for rel in [
