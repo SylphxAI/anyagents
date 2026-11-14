@@ -146,11 +146,13 @@ pub fn run_with_io<R: BufRead, W: Write + Send + 'static>(
             let _ = prev_handle.join();
         }
 
-        // Echo the user message back immediately so `ClaudeHarness` records the
-        // message marker as echoed (`note_echo` / `note_markers`).
+        // The line starts its turn now: echo it back as Claude Code's
+        // `--replay-user-messages` does, the proof `ClaudeHarness` waits for.
         {
+            let mut echo = event.clone();
+            echo["isReplay"] = Value::Bool(true);
             let mut out = writer.lock().unwrap();
-            writeln!(out, "{trimmed}")?;
+            writeln!(out, "{echo}")?;
             out.flush()?;
         }
 

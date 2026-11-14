@@ -614,13 +614,14 @@ fn is_healthy_active_turn(agent: &AgentView, on_quota: bool) -> bool {
             .is_none_or(|e| e.trim().is_empty())
 }
 
-/// Mail that waits for a healthy turn by design: a followup harness takes it
-/// when the turn ends, and a pending switch holds it for the replacement. A
-/// steering harness has no expected queue, whatever its name: its mail waiting
-/// is lag.
+/// Mail that waits for a healthy turn by design: a `turn-end` harness takes
+/// it when the turn ends, and a pending switch holds it for the replacement.
+/// A `mid-turn` or `next-step` harness takes mail into the running turn, so
+/// its mail waiting is lag, shown as lag: a stuck mailbox must not read as a
+/// queue.
 fn is_expected_turn_queue(agent: &AgentView, on_quota: bool) -> bool {
     is_healthy_active_turn(agent, on_quota)
-        && (agent.delivery_mode == "followup" || agent.pending_switch)
+        && (agent.delivery.level == "turn-end" || agent.pending_switch)
 }
 
 fn format_status_with_alerts(agent: &AgentView, now: i64) -> String {
@@ -1088,6 +1089,7 @@ pub fn print_agents_table_with_options(
         ("STATUS", false),
         ("TREE", false),
         ("RUNTIME", false),
+        ("DELIVERY", false),
     ];
     if profile_lookup.is_some() {
         headers.push(("PROFILE", false));
@@ -1170,7 +1172,16 @@ pub fn print_agents_table_with_options(
             None => dim("-"),
         };
 
-        let mut row = vec![node.display_name, role_cell, status, tree_cell, runtime];
+        let delivery = agent.delivery.label();
+        let delivery_cell = if is_dim { dim(&delivery) } else { delivery };
+        let mut row = vec![
+            node.display_name,
+            role_cell,
+            status,
+            tree_cell,
+            runtime,
+            delivery_cell,
+        ];
         if let Some(lookup) = profile_lookup {
             let prof = lookup(agent);
             row.push(if is_dim { dim(&prof) } else { prof });
@@ -1716,7 +1727,7 @@ mod tests {
     #[test]
     fn status_formatting_separates_active_turn_duration_from_true_lag() {
         let sample_agent = |turn_state: &str,
-                            delivery_mode: &str,
+                            level: &str,
                             open_turn_age_ms: Option<i64>,
                             oldest_undelivered_age_ms: Option<i64>|
          -> AgentView {
@@ -1732,8 +1743,7 @@ mod tests {
                 "state": "running",
                 "process": "alive",
                 "turn_state": turn_state,
-                "delivery_mode": delivery_mode,
-                "steer_support": if delivery_mode == "steer" { "yes" } else { "no" },
+                "delivery": {"level": level, "idempotent": false, "proof": "test"},
                 "quota_reset_at_ms": null,
                 "oldest_undelivered_age_ms": oldest_undelivered_age_ms,
                 "install": "installed",
@@ -1745,39 +1755,47 @@ mod tests {
         };
 
         // 1. Healthy steered long turn: shows active turn duration, zero ! lag.
-        let steered = sample_agent("working", "steer", Some(56 * 60_000), None);
+        let steered = sample_agent("working", "mid-turn", Some(56 * 60_000), None);
         let rendered_steered = format_status_with_alerts(&steered, 10_000_000);
         assert!(rendered_steered.contains("working"));
         assert!(rendered_steered.contains("(56m)"));
         assert!(!rendered_steered.contains("! lag"));
 
-        // 2. Healthy followup turn with queued mail: shows dim queued age, zero ! lag.
-        let followup = sample_agent("working", "followup", Some(20 * 60_000), Some(180_000));
+        // 2. Healthy turn-end turn with queued mail: shows dim queued age, zero ! lag.
+        let followup = sample_agent("working", "turn-end", Some(20 * 60_000), Some(180_000));
         let rendered_followup = format_status_with_alerts(&followup, 10_000_000);
         assert!(rendered_followup.contains("(20m)"));
         assert!(rendered_followup.contains("queued 3m"));
         assert!(!rendered_followup.contains("! lag"));
 
         // 3. Genuine undelivered backlog: renders ! lag and increments subtree lagging count.
-        let stalled = sample_agent("idle", "steer", None, Some(180_000));
+        let stalled = sample_agent("idle", "mid-turn", None, Some(180_000));
         let rendered_stalled = format_status_with_alerts(&stalled, 10_000_000);
         assert!(rendered_stalled.contains("! lag 3m"));
 
-        // 4. A steering agent mid-turn whose mail still waits is lag, not a
-        //    queue, whatever the harness is called.
-        let stuck_steer = sample_agent("working", "steer", Some(20 * 60_000), Some(180_000));
+        // 4. A mid-turn agent whose mail still waits is lag, not a queue,
+        //    whatever the harness is called.
+        let stuck_steer = sample_agent("working", "mid-turn", Some(20 * 60_000), Some(180_000));
         let rendered_stuck = format_status_with_alerts(&stuck_steer, 10_000_000);
         assert!(rendered_stuck.contains("! lag 3m"), "{rendered_stuck}");
         assert!(!rendered_stuck.contains("queued"));
 
+        // 5. A next-step agent's mail that still waits is lag too: its turn
+        //    takes mail at the next step, and a mailbox stuck behind a step
+        //    that never comes must not read as a queue.
+        let next_step = sample_agent("working", "next-step", Some(20 * 60_000), Some(180_000));
+        let rendered_next = format_status_with_alerts(&next_step, 10_000_000);
+        assert!(rendered_next.contains("! lag 3m"), "{rendered_next}");
+        assert!(!rendered_next.contains("queued"));
+
         let mut children: HashMap<&str, Vec<&AgentView>> = HashMap::new();
         children.insert(
             "agt_root",
-            vec![&steered, &followup, &stalled, &stuck_steer],
+            vec![&steered, &followup, &stalled, &stuck_steer, &next_step],
         );
         let mut memo = HashMap::new();
         let stats = compute_subtree_stats("agt_root", &children, 10_000_000, &mut memo);
-        assert_eq!(stats.working, 3);
-        assert_eq!(stats.lagging, 2);
+        assert_eq!(stats.working, 4);
+        assert_eq!(stats.lagging, 3);
     }
 }

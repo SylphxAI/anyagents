@@ -24,6 +24,7 @@ mod harness_double;
 mod host_memory;
 mod identity;
 mod install;
+mod keeper;
 mod mcp;
 mod mcp_config;
 mod muse_config;
@@ -458,6 +459,11 @@ enum Command {
     /// The deployment's boundary contract: what an agent may read, and what it
     /// may write.
     Boundary,
+    /// The keepers that hold harness processes across server restarts.
+    Keepers {
+        #[command(subcommand)]
+        action: KeepersCommand,
+    },
     /// Test double for a streaming vendor. It prints text and no result line,
     /// and records its argv and stdin when `ANYAGENTS_FAKE_LOG` names a file.
     #[command(hide = true)]
@@ -484,6 +490,14 @@ enum Command {
     Flush {
         /// The agent name, or `all`.
         agent: String,
+    },
+    /// List the messages an agent's harness refused for good, or put one
+    /// back in its mailbox as a new message.
+    Requeue {
+        /// The agent name.
+        agent: String,
+        /// A parked message id (`msg_...`). Without it, list the parked ones.
+        message: Option<String>,
     },
     /// Record a channel. The secret is copied into the credential store.
     Channels {
@@ -641,6 +655,27 @@ enum GroupsCommand {
     Members { group: String },
     /// List all named groups and their members.
     List,
+}
+
+#[derive(Subcommand)]
+enum KeepersCommand {
+    /// List every keeper: its agent, its harness process and the binary it runs.
+    List,
+    /// End keepers and their harness processes: one agent's, or all of them.
+    /// A running server starts a running agent's harness again in a new
+    /// keeper; use this before rolling back to a binary without keepers.
+    Stop {
+        /// Agent name or `agt_...` id.
+        agent: Option<String>,
+        /// Every keeper.
+        #[arg(long, conflicts_with = "agent")]
+        all: bool,
+        /// Also end a keeper that does not answer while its process runs
+        /// (its socket is gone, or it is wedged), by signal, once its
+        /// recorded identity proves the process is that keeper.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -998,6 +1033,9 @@ fn main() -> ExitCode {
     }
     sandbox::hydrate_operator_groups_if_needed();
     let raw_argv: Vec<String> = std::env::args().collect();
+    if let Some(code) = keeper::try_run(&raw_argv) {
+        return ExitCode::from(u8::try_from(code).unwrap_or(1));
+    }
     if let Some(cloud_args) = cloud_harness::try_parse_from_raw_argv(&raw_argv) {
         return match cloud_harness::run(cloud_args) {
             Ok(()) => ExitCode::SUCCESS,
@@ -1041,6 +1079,7 @@ fn main() -> ExitCode {
 fn internal(args: &[std::ffi::OsString]) -> ExitCode {
     match args.first().and_then(|arg| arg.to_str()) {
         Some("admission-probe") => worktree_access::admission_probe_main(&args[1..]),
+        Some("seat-file") => seat_tree::seat_file_main(&args[1..]),
         _ => {
             eprintln!("anyagents internal: unknown helper");
             ExitCode::from(2)
@@ -1089,6 +1128,17 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
         Command::Mcp { config, profile } => mcp::run(&data, config.as_deref(), profile),
         Command::AgentRun { config, command } => sandbox::run(&data, config.as_deref(), &command),
         Command::Boundary => print_boundary(&data),
+        Command::Keepers { action } => match action {
+            KeepersCommand::List => keeper::list(&data),
+            KeepersCommand::Stop { agent, all, force } => {
+                if agent.is_none() && !all {
+                    return Err(anyagents_core::Error::Message(
+                        "name an agent, or pass --all".into(),
+                    ));
+                }
+                keeper::stop(&data, agent.as_deref(), force)
+            }
+        },
         Command::FakeOpencode => fake_opencode::run(),
         Command::Harness {
             config,
@@ -1215,6 +1265,7 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
         Command::Resume { name, prompt } => agent::resume_cmd(&data, &name, prompt),
         Command::Delete { name } => agent::delete_cmd(&data, &name),
         Command::Flush { agent } => agent::flush(&data, &agent),
+        Command::Requeue { agent, message } => agent::requeue(&data, &agent, message.as_deref()),
         Command::Model {
             agent,
             target_model,
@@ -1721,6 +1772,15 @@ fn inspect_cmd(data: &Path, agent: Option<String>, limit: usize, json: bool) -> 
             "Open turn: {}   Profile: {}",
             view.has_open_turn,
             view.profile.as_deref().unwrap_or("default")
+        );
+        println!(
+            "Delivery: {} ({}){}",
+            view.delivery.label(),
+            view.delivery.proof,
+            view.delivery
+                .peer
+                .as_deref()
+                .map_or_else(String::new, |peer| format!("   Peer: {peer}"))
         );
         for schedule in &view.schedules {
             println!("  {} {}: {}", schedule.kind, schedule.spec, schedule.prompt);
@@ -2681,7 +2741,7 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
         let bin_path = install::program(data, &entry.id);
         let present = install::is_healthy(data, &entry.id) || bin_path.is_file();
         let version = install::recorded_version(data, &entry.id);
-        let (mode, steer) = anyagents_supervisor::declared(&entry.id);
+        let delivery = api::DeliveryView::from(&vendor::declared_delivery(&entry.id));
         let profiles: Vec<String> = provider_profiles
             .iter()
             .filter(|p| p.compatible_harnesses.iter().any(|h| h == &entry.id))
@@ -2692,8 +2752,7 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
             "installed": present,
             "version": version,
             "binary": bin_path.display().to_string(),
-            "delivery_mode": anyagents_supervisor::mode_name(mode),
-            "steer_support": anyagents_supervisor::steer_name(steer),
+            "delivery": delivery,
             "profiles": profiles,
         }));
     }
@@ -2753,7 +2812,6 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
             ("STATUS", false),
             ("VERSION", false),
             ("DELIVERY", false),
-            ("STEER", false),
             ("PROFILES", false),
         ]);
         for h in &harness_rows {
@@ -2769,8 +2827,7 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
             } else {
                 ver.to_string()
             };
-            let mode = h["delivery_mode"].as_str().unwrap_or("-");
-            let steer = h["steer_support"].as_str().unwrap_or("-");
+            let delivery = delivery_label(&h["delivery"]);
             let profs = h["profiles"]
                 .as_array()
                 .map(|arr| {
@@ -2786,8 +2843,7 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
                 ui::bold(&ui::cyan(id)),
                 inst,
                 ver_cell,
-                mode.to_string(),
-                steer.to_string(),
+                delivery,
                 profs,
             ]);
         }
@@ -2824,8 +2880,7 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
         } else {
             "on-demand"
         };
-        let mode = h["delivery_mode"].as_str().unwrap_or("-");
-        let steer = h["steer_support"].as_str().unwrap_or("-");
+        let delivery = delivery_label(&h["delivery"]);
         let profs = h["profiles"]
             .as_array()
             .map(|arr| {
@@ -2837,7 +2892,7 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
                 }
             })
             .unwrap_or_else(|| "auto".to_string());
-        println!("  {id}\t{inst}\tdelivery={mode}\tsteer={steer}\tprofiles={profs}");
+        println!("  {id}\t{inst}\tdelivery={delivery}\tprofiles={profs}");
     }
     let running_count = agents_list.iter().filter(|a| a.state == "running").count();
     let archived_count = agents_list.iter().filter(|a| a.state == "archived").count();
@@ -2852,11 +2907,24 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
             .and_then(|id| create::bound_profile_name(&anyagents_core::agent_config_dir(data, id)))
             .unwrap_or_else(|| "default".to_string());
         println!(
-            "  {}\t{}\tharness={}\tprofile={prof}\tstate={}\tprocess={}\tmode={}",
-            a.name, a.id, a.harness, a.state, a.process, a.delivery_mode
+            "  {}\t{}\tharness={}\tprofile={prof}\tstate={}\tprocess={}\tdelivery={}",
+            a.name,
+            a.id,
+            a.harness,
+            a.state,
+            a.process,
+            a.delivery.label()
         );
     }
     Ok(())
+}
+
+/// The delivery column of one harness row: its level, `+idempotent` when a
+/// replay is recognised.
+fn delivery_label(value: &serde_json::Value) -> String {
+    serde_json::from_value::<api::DeliveryView>(value.clone())
+        .map(|delivery| delivery.label())
+        .unwrap_or_else(|_| "-".to_string())
 }
 
 fn groups(data: &Path, action: GroupsCommand) -> Result<(), anyagents_core::Error> {
