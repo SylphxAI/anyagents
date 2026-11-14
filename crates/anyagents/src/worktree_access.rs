@@ -1300,9 +1300,17 @@ fn refuse_world_writable_object(
         Some(label) => format!("{label} ({})", path.display()),
         None => path.display().to_string(),
     };
+    // A seat can make its own object world-writable and so block admissions
+    // on the store: the owner is named, and root repairs what a seat owns.
+    let repairer = if meta.uid() == crate::sandbox::server_uid() {
+        "the server's user"
+    } else {
+        "its owner or root"
+    };
     Err(std::io::Error::other(format!(
-        "{named} is world-writable ({what}): any local user could rewrite this repository's \
-         Git metadata. Its owner (root, for objects a seat owns) repairs it with {repair}"
+        "{named}, owned by uid {}, is world-writable ({what}): any local user could rewrite \
+         this repository's Git metadata. Repair it as {repairer} with {repair}",
+        meta.uid()
     )))
 }
 
@@ -2357,11 +2365,6 @@ fn revoke_common(
         Err(error) => return Err(error),
     };
     walk_tree(common, false, &|_| {}, &|file, path| {
-        // Admission (the only caller with a regrant) refuses any object of
-        // the store everyone may write; revocation never stops for it.
-        if regrant.is_some() {
-            refuse_world_writable_object(file, path, None)?;
-        }
         revoke_binding(file, path, common, uid, gid, retained, regrant)
     })
 }
@@ -2563,7 +2566,13 @@ fn share_known_locked(
 ) -> Result<(), Error> {
     // Fail closed before the first journal or ACL write: a store that launch
     // would refuse must not be admitted, granted, or left needing revocation.
+    // The world-writable scan reads the whole store first, so a refusal never
+    // leaves an active journal that a later wake would trust.
     refuse_world_writable(common).map_err(|e| refusal(common, e))?;
+    walk_tree(common, false, &|_| {}, &|file, path| {
+        refuse_world_writable_object(file, path, None)
+    })
+    .map_err(|e| refusal(common, e))?;
     secure_private_config(common, private).map_err(|e| refusal(private, e))?;
     validate_config_files(private, common)?;
     trusted_metadata_layout(common, private, uid).map_err(|e| refusal(common, e))?;
@@ -6172,9 +6181,11 @@ mod tests {
         refuse_world_writable(&common).unwrap();
     }
 
-    /// Below the top-level names, admission's own walk of the store refuses
+    /// Below the top-level names, admission reads the whole store and refuses
     /// any object everyone may write (cloud had one world-writable private
-    /// gitdir). Revocation is never stopped by it.
+    /// gitdir), before it writes a journal, so a refused wake never leaves an
+    /// active grant a later wake would trust. The refusal names the owner.
+    /// Revocation is never stopped by it.
     #[test]
     fn admission_refuses_a_world_writable_object_anywhere_in_the_store() {
         let dir = crate::test_tempdir();
@@ -6187,26 +6198,24 @@ mod tests {
             crate::sandbox::server_uid(),
             crate::sandbox::server_gid().wrapping_add(100000),
         );
-        let grant = Grant {
-            common: common.clone(),
-            private: common.join("worktrees/child"),
-            checkout: dir.path().join("child"),
+        let journal = grant_path(dir.path(), &anyagents_core::AgentId::generate());
+        let error = share_known(
+            &dir.path().join("child"),
+            &common.join("worktrees/child"),
+            &common,
             uid,
             gid,
-            active: true,
-            inspection: false,
-            inspection_paths: None,
-            quarantined: false,
-            reason: None,
-        };
-        let error = revoke_common(&common, uid, gid, &[], Some(&grant))
-            .unwrap_err()
-            .to_string();
+            &journal,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(
             error.contains(deep.to_str().unwrap()) && error.contains("is world-writable"),
             "{error}"
         );
+        assert!(error.contains(&format!("owned by uid {uid}")), "{error}");
         assert!(error.contains("chmod -R o-w"), "{error}");
+        assert!(!journal.exists(), "a refused admission wrote a journal");
         revoke_common(&common, uid, gid, &[], None).unwrap();
     }
 
