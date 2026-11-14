@@ -91,6 +91,10 @@ pub const AGENT: &str = "agent";
 pub const LOCK: &str = "lock";
 /// What a keeper records about itself, for an operator and for `list`.
 pub const RECORD: &str = "keeper.json";
+/// The process groups the keeper started (each by the identity of its
+/// leader), written as each starts, before it runs anything: what a keeper
+/// that died left is ended by this record alone.
+pub const GROUPS: &str = "groups";
 /// The keeper process's identity, written by the kernel right after it
 /// starts it: a keeper that dies before writing its own record is still
 /// proven gone, and its directory never blocks the agent.

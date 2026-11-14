@@ -32,12 +32,10 @@ use anyagents_harness::{
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
-use crate::identity::{
-    Presence, ProcessIdentity, leads_session, session_groups, session_groups_since,
-};
+use crate::identity::{Presence, ProcessIdentity, leads_session, session_groups};
 use crate::keeper::Record;
 use crate::wire::{self, Event, Fault, FrameReader, Reply, Request};
-use crate::{AGENT, Hello, Hosted, LOCK, LOG, RECORD, SOCKET, SPAWNED, Spec};
+use crate::{AGENT, GROUPS, Hello, Hosted, LOCK, LOG, RECORD, SOCKET, SPAWNED, Spec};
 
 /// The descriptor number the process lock has in a keeper.
 const KEEPER_LOCK_FD: i32 = 3;
@@ -608,7 +606,6 @@ fn force_end(dir: &Path) -> Result<(), String> {
     }
     let environment = trusted_seat_env(seat.as_deref())
         .ok_or("the recorded seat launcher is not trusted; nothing is signalled")?;
-    let groups = session_groups_since(&keeper);
     // SAFETY: SIGKILL to the process its recorded identity proves is this
     // keeper, checked just above.
     unsafe { libc::kill(keeper.pid as i32, libc::SIGKILL) };
@@ -625,11 +622,20 @@ fn force_end(dir: &Path) -> Result<(), String> {
     {
         harness.end_group(&environment);
     }
-    for group in groups {
-        anyagents_harness::terminate_group(group, &environment);
+    for group in recorded_groups(dir) {
+        group.end_group(&environment);
     }
     let _ = std::fs::remove_dir_all(dir);
     Ok(())
+}
+
+/// The process groups the keeper in `dir` recorded starting, by the
+/// identity of each leader.
+fn recorded_groups(dir: &Path) -> Vec<ProcessIdentity> {
+    std::fs::read(dir.join(GROUPS))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
 }
 
 /// What the keeper in `dir` says about itself, without taking it over.
@@ -684,13 +690,13 @@ fn clear_if_gone(dir: &Path) -> Result<(), String> {
                 harness.end_group(&environment);
             }
             // A keeper that died before it recorded its harness leaves that
-            // harness in its session: each member that started after the
-            // keeper, under its session id, is its own.
-            if presence == Some(Presence::Ended)
-                && let Some(keeper) = &keeper
-            {
-                for group in session_groups_since(keeper) {
-                    anyagents_harness::terminate_group(group, &environment);
+            // harness in a process group it recorded as it started it: each
+            // is ended when its leader is still the one recorded, or gone
+            // (a pid is not reused while it numbers a live group). Nothing
+            // it did not record is touched.
+            if presence == Some(Presence::Ended) {
+                for group in recorded_groups(dir) {
+                    group.end_group(&environment);
                 }
             }
         }

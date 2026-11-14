@@ -136,44 +136,6 @@ mod linux {
     }
 }
 
-/// The process groups of the session `keeper` led, counting only members
-/// whose session id is the keeper's pid and that started no earlier than
-/// the keeper did, in this boot and namespace. For a keeper whose identity
-/// is proven ended: no process has its pid now, and a pid is not reused
-/// while a session it numbers has members, so the members found are the
-/// keeper's own; a member older than the keeper cannot be, and is never
-/// counted. Empty where this cannot be read.
-pub(crate) fn session_groups_since(keeper: &ProcessIdentity) -> Vec<u32> {
-    #[cfg(target_os = "linux")]
-    {
-        if linux::boot_id().as_deref() != Some(keeper.boot_id.as_str())
-            || linux::pid_ns() != Some(keeper.pid_ns)
-        {
-            return Vec::new();
-        }
-        let Ok(entries) = std::fs::read_dir("/proc") else {
-            return Vec::new();
-        };
-        let mut groups: Vec<u32> = entries
-            .flatten()
-            .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
-            .filter_map(|pid| {
-                let (session, group) = linux::session_and_group(pid)?;
-                let (_, started) = linux::state_and_start(pid)?;
-                (session == keeper.pid && started >= keeper.start_ticks).then_some(group)
-            })
-            .collect();
-        groups.sort_unstable();
-        groups.dedup();
-        groups
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = keeper;
-        Vec::new()
-    }
-}
-
 /// Whether `pid` leads its own session, as every keeper does (it calls
 /// `setsid` before it runs anything). `false` where this cannot be read.
 pub(crate) fn leads_session(pid: u32) -> bool {

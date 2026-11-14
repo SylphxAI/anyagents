@@ -349,6 +349,17 @@ pub fn spawn_command(
     {
         use std::os::unix::process::CommandExt as _;
         command.process_group(0);
+        let report = spawn_report::SPAWN_REPORT.load(std::sync::atomic::Ordering::SeqCst);
+        if report >= 0 {
+            // SAFETY: between fork and exec only `getpid` and one `write` of
+            // four bytes to a pipe run, both async-signal-safe.
+            unsafe {
+                command.pre_exec(move || {
+                    spawn_report::report(report);
+                    Ok(())
+                });
+            }
+        }
     }
     for (key, value) in environment {
         if !SERVER_ONLY_ENV.contains(&key.as_str()) {
@@ -359,6 +370,39 @@ pub fn spawn_command(
         command.env_remove(key);
     }
     Ok(command)
+}
+
+/// Where the process groups this process starts are reported, before each
+/// runs anything: a keeper records them, so that what a keeper that died
+/// left can be ended by what it recorded, never by guesswork.
+#[cfg(unix)]
+mod spawn_report {
+    pub(super) static SPAWN_REPORT: std::sync::atomic::AtomicI32 =
+        std::sync::atomic::AtomicI32::new(-1);
+
+    unsafe extern "C" {
+        fn getpid() -> i32;
+        fn write(fd: i32, buf: *const std::ffi::c_void, count: usize) -> isize;
+    }
+
+    /// In the child, between fork and exec: write its pid, which numbers the
+    /// process group it leads (`process_group(0)`), to `fd`.
+    pub(super) fn report(fd: i32) {
+        // SAFETY: `getpid` cannot fail; `write` of four bytes to a pipe is
+        // atomic and async-signal-safe.
+        unsafe {
+            let pid = getpid().to_ne_bytes();
+            let _ = write(fd, pid.as_ptr().cast(), pid.len());
+        }
+    }
+}
+
+/// Report the pid of every process [`spawn_command`] starts from now on to
+/// `fd`, a pipe's write end this process keeps open, before the process runs
+/// anything. The pid numbers the process group it leads.
+#[cfg(unix)]
+pub fn report_spawns_to(fd: i32) {
+    spawn_report::SPAWN_REPORT.store(fd, std::sync::atomic::Ordering::SeqCst);
 }
 
 #[cfg(unix)]

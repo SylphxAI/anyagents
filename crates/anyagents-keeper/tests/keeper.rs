@@ -695,12 +695,11 @@ fn keepers_refuse_a_directory_that_is_not_private() {
 /// keeper's directory behind with no socket and no record of its own, while
 /// the old keeper still holds the agent lock. The identity the kernel wrote
 /// when it started that keeper proves it gone: the directory is cleared, and
-/// what the dead keeper left in its session is ended, instead of the agent
-/// waiting for a lock that will never be free.
+/// the process group the dead keeper recorded starting is ended, instead of
+/// the agent waiting for a lock that will never be free.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_keeper_proven_ended_is_cleared_while_another_holds_the_lock() {
-    use std::io::BufRead as _;
     use std::os::unix::fs::DirBuilderExt as _;
     use std::os::unix::process::CommandExt as _;
     let fx = Fixture::new();
@@ -716,12 +715,12 @@ fn a_keeper_proven_ended_is_cleared_while_another_holds_the_lock() {
         unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
         0
     );
-    // A keeper that led its own session, started its harness, and died.
+    // A keeper that led its own session and died; the harness it started,
+    // in a process group of its own, runs on.
     let mut keeper = std::process::Command::new("/bin/sh");
     keeper
-        .args(["-c", "sleep 600 & echo $!; read never"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped());
+        .args(["-c", "read never"])
+        .stdin(std::process::Stdio::piped());
     // SAFETY: setsid between fork and exec, as a keeper starts.
     unsafe {
         keeper.pre_exec(|| {
@@ -732,15 +731,14 @@ fn a_keeper_proven_ended_is_cleared_while_another_holds_the_lock() {
         });
     }
     let mut keeper = keeper.spawn().unwrap();
-    let mut line = String::new();
-    std::io::BufReader::new(keeper.stdout.take().unwrap())
-        .read_line(&mut line)
+    let mut harness = std::process::Command::new("sleep")
+        .arg("600")
+        .process_group(0)
+        .spawn()
         .unwrap();
-    let harness: u32 = line.trim().parse().unwrap();
     let spawned = identity(keeper.id());
     kill9(keeper.id());
     keeper.wait().unwrap();
-    assert!(alive(harness));
 
     let dir = fx.root.join("000000000002");
     std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
@@ -751,9 +749,16 @@ fn a_keeper_proven_ended_is_cleared_while_another_holds_the_lock() {
         json!({"keeper": spawned, "seat": null}).to_string(),
     )
     .unwrap();
+    std::fs::write(
+        dir.join("groups"),
+        json!([identity(harness.id())]).to_string(),
+    )
+    .unwrap();
     assert!(attach(&fx.root, "agt_test").unwrap().is_none());
     assert!(!dir.exists(), "the stale directory was left");
-    eventually("the dead keeper's harness is ended", || !alive(harness));
+    eventually("the dead keeper's harness is ended", || {
+        harness.try_wait().unwrap().is_some()
+    });
     drop(held);
 }
 
@@ -779,12 +784,12 @@ fn a_keeper_without_its_socket_is_ended_only_by_force() {
     assert!(!dir.exists());
 }
 
-/// A dead keeper's session is swept only for members that started after the
-/// keeper did: a process under the same session id that is older than the
-/// recorded keeper is not its own, and is never signalled.
+/// A dead keeper's session is not swept: only the process groups it
+/// recorded starting are ended. A process under its session id that it did
+/// not record (whatever reused that number) is never signalled.
 #[cfg(target_os = "linux")]
 #[test]
-fn a_session_member_older_than_the_keeper_is_never_signalled() {
+fn a_process_the_keeper_did_not_record_is_never_signalled() {
     use std::io::BufRead as _;
     use std::os::unix::fs::DirBuilderExt as _;
     use std::os::unix::process::CommandExt as _;
@@ -813,10 +818,7 @@ fn a_session_member_older_than_the_keeper_is_never_signalled() {
         .read_line(&mut line)
         .unwrap();
     let member: u32 = line.trim().parse().unwrap();
-    // A keeper recorded under the leader's pid, as having started long after
-    // the member: the member is not its own.
-    let mut recorded = identity(leader.id());
-    recorded["start_ticks"] = json!(recorded["start_ticks"].as_u64().unwrap() + 1_000_000_000);
+    let recorded = identity(leader.id());
     kill9(leader.id());
     leader.wait().unwrap();
     let dir = fx.root.join("000000000003");
@@ -832,9 +834,27 @@ fn a_session_member_older_than_the_keeper_is_never_signalled() {
     std::thread::sleep(Duration::from_millis(300));
     assert!(
         alive(member),
-        "a process older than the keeper was signalled"
+        "a process the keeper never recorded was signalled"
     );
     kill9(member);
+}
+
+/// A keeper records each process group it starts, by its leader's identity,
+/// before that process runs anything.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_keeper_records_the_process_groups_it_starts() {
+    let fx = Fixture::new();
+    let kernel = fx.spawn();
+    let harness = kernel.process_id().unwrap();
+    let dir = kernel.dir().to_path_buf();
+    eventually("the harness group is recorded", || {
+        std::fs::read(dir.join("groups"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Vec<serde_json::Value>>(&bytes).ok())
+            .is_some_and(|groups| groups.iter().any(|group| group == &identity(harness)))
+    });
+    kernel.end().unwrap();
 }
 
 /// A v2 hello from a fake keeper whose record says it has `keeper` for its

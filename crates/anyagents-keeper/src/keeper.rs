@@ -28,7 +28,7 @@ use serde_json::{Value, json};
 
 use crate::identity::ProcessIdentity;
 use crate::wire::{self, Event, Fault, FrameReader, Reply, Request};
-use crate::{Hello, Hosted, LOG, RECORD, SOCKET, Spec};
+use crate::{GROUPS, Hello, Hosted, LOG, RECORD, SOCKET, Spec};
 
 /// The most a keeper's log holds before it is rotated to `keeper.log.1`.
 const LOG_LIMIT: u64 = 1 << 20;
@@ -194,6 +194,14 @@ where
     };
     drop(input);
     redirect_to_null(libc::STDIN_FILENO);
+    // Every process group the adapter starts is recorded before it runs.
+    if let Err(error) = record_groups(dir) {
+        report(
+            &mut reporter,
+            &format!("error cannot record the processes it starts: {error}"),
+        );
+        return 1;
+    }
     let adapter = match start(&spec) {
         Ok(adapter) => adapter,
         Err(error) => {
@@ -393,6 +401,49 @@ fn copy_log(mut from: std::fs::File, path: &Path) {
 fn report(pipe: &mut std::fs::File, line: &str) {
     let _ = writeln!(pipe, "{line}");
     let _ = pipe.flush();
+}
+
+/// Record, in `<dir>/groups`, every process group this keeper starts through
+/// `spawn_command`: each child writes its pid to a pipe before it runs
+/// anything, and a thread here records the identity of that group's leader.
+fn record_groups(dir: &Path) -> std::io::Result<()> {
+    let mut ends = [0; 2];
+    // SAFETY: `pipe` fills the two descriptors this function then owns.
+    if unsafe { libc::pipe(ends.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    for fd in ends {
+        // SAFETY: close-on-exec on descriptors this function owns: the write
+        // end reaches a child only between its fork and its exec.
+        unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    }
+    // SAFETY: the read end is this function's, and handed to the thread.
+    let reading = unsafe { std::fs::File::from_raw_fd(ends[0]) };
+    let path = dir.join(GROUPS);
+    std::thread::Builder::new()
+        .name("keeper-groups".into())
+        .spawn(move || {
+            let mut reading = reading;
+            let mut groups: Vec<ProcessIdentity> = Vec::new();
+            let mut pid = [0u8; 4];
+            while reading.read_exact(&mut pid).is_ok() {
+                let Ok(pid) = u32::try_from(i32::from_ne_bytes(pid)) else {
+                    continue;
+                };
+                // Between its fork and its exec: its start time is already
+                // the one it keeps.
+                if let Some(leader) = ProcessIdentity::of(pid) {
+                    groups.push(leader);
+                    if let Ok(bytes) = serde_json::to_vec(&groups) {
+                        let _ = anyagents_harness::atomic_write_file(&path, &bytes, 0o600);
+                    }
+                }
+            }
+        })?;
+    // The write end stays open for the keeper's life: the reporting is
+    // process-wide.
+    anyagents_harness::report_spawns_to(ends[1]);
+    Ok(())
 }
 
 /// Point `fd` at `/dev/null`: the keeper never holds the kernel's pipes, so a
