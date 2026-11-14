@@ -46,6 +46,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are no longer in it. The public listener's `/`, `/healthz` and
   `/v1/webhooks/healthz` return `{"ok":true}`; the serving identity stays on
   `anyagents.sock`.
+- MCP over HTTP serves at most the `remote` profile, whatever credential is
+  presented: `?profile=full` is refused with 403 and no binding upgrades it,
+  because over HTTP the tools run inside the server process as its own user.
+  `full` remains available over stdio, where the tool server runs as the agent.
+  Calls over HTTP MCP also cannot place an agent on a host harness, wake an
+  agent that runs on the host (directly or by a send to an archived one), or
+  attach media by a local path.
 
 ## 0.1.3
 

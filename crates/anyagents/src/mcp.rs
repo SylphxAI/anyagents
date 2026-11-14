@@ -46,14 +46,13 @@ pub enum McpProfile {
     /// Exposes all AnyAgents MCP tools (`send`, `inbox`, `agents`, `groups`, `schedules`,
     /// `conversation`, `code`, `web_search`, `web_fetch`, `memory`, `skills`, `browser`,
     /// `computer`). Default for `anyagents mcp` over `stdio` across all local CLI harnesses
-    /// (`spiron`, `claude-code`, `codex`, `agy`, `opencode`), and for an HTTP caller holding a
-    /// local capability whose agent is bound to a `SandboxConfig` or has built-in tools
-    /// disabled. Never available to a remote session token.
+    /// (`spiron`, `claude-code`, `codex`, `agy`, `opencode`). Never served over HTTP, where
+    /// tools run inside the server process ([`McpProfile::resolve_http`]).
     #[default]
     Full,
-    /// The only profile a remote session token gets, and the default for Streamable HTTP
-    /// `POST /mcp` across all Cloud Agents (`spiron-cloud`, `claude-cloud`, `openai-cloud`,
-    /// `cursor-cloud`). Exposes coordination, `memory` and `skills`: control-plane state that
+    /// The most any Streamable HTTP `POST /mcp` call gets, whatever its credential, and the
+    /// default there: all Cloud Agents (`spiron-cloud`, `claude-cloud`, `openai-cloud`,
+    /// `cursor-cloud`) and remote sandboxes. Exposes coordination, `memory` and `skills`: control-plane state that
     /// belongs to the agent. Every tool that runs on or from the control-plane host (`code`,
     /// `files`, `browser`, `computer`, `device`, `media`, `web_search`, `web_fetch`) is omitted.
     Remote,
@@ -150,41 +149,27 @@ impl McpProfile {
         explicit.unwrap_or(Self::Full)
     }
 
-    /// The profile a remote session token gets: `remote`, or the narrower
-    /// `coordination` when asked for. Nothing a remote session asks for widens
-    /// it.
-    pub fn resolve_remote_session(explicit: Option<&str>) -> Result<Self, String> {
+    /// The profile an MCP call over HTTP gets, whatever credential it
+    /// presents: `remote`, or the narrower `coordination` when asked for.
+    /// Over HTTP the tools run inside the server process, as the server's own
+    /// user, so `full` (files, exec, code, browser, computer, ...) would hand
+    /// the caller the server's identity. It is never served here; `full`
+    /// exists only on stdio, where the tool server runs as the agent itself.
+    pub fn resolve_http(explicit: Option<&str>) -> Result<Self, String> {
         match explicit.map(str::trim).filter(|s| !s.is_empty()) {
             None => Ok(Self::Remote),
             Some(raw) => match Self::from_str_opt(raw) {
                 Some(Self::Remote) => Ok(Self::Remote),
                 Some(Self::Coordination) => Ok(Self::Coordination),
                 Some(Self::Full) => Err(format!(
-                    "MCP profile `{raw}` is not available to a remote session; it gets `remote` or `coordination`"
+                    "MCP profile `{raw}` is not served over HTTP, where tools would run as the server; \
+                     HTTP serves `remote` or `coordination`, and `full` is available only over stdio \
+                     (`anyagents mcp`)"
                 )),
                 None => Err(format!(
-                    "invalid MCP profile `{raw}`; a remote session gets `remote` or `coordination`"
+                    "invalid MCP profile `{raw}`; HTTP serves `remote` or `coordination`"
                 )),
             },
-        }
-    }
-
-    pub fn resolve_http_with_config(
-        explicit: Option<&str>,
-        _harness: &str,
-        config_dir: Option<&Path>,
-    ) -> Result<Self, String> {
-        if let Some(raw) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
-            return Self::from_str_opt(raw).ok_or_else(|| {
-                format!("invalid MCP profile `{raw}`; expected `full`, `remote`, or `coordination`")
-            });
-        }
-        if anyagents_tools::SandboxConfig::resolve(config_dir).is_some()
-            || config_dir.is_some_and(crate::cloud_harness::disable_builtin_tools_flag)
-        {
-            Ok(Self::Full)
-        } else {
-            Ok(Self::Remote)
         }
     }
 }
@@ -588,6 +573,10 @@ pub(crate) struct Client {
     pub(crate) config: PathBuf,
     /// The capability read at start, used while the file cannot be read.
     pub(crate) capability: String,
+    /// Set for the tool server the HTTP MCP route runs inside the server
+    /// process: every call it makes carries [`HTTP_MCP_HEADER`], so routes
+    /// that would start or read something on the host refuse it.
+    via_http: bool,
     /// What every clone of this client shares: idle connections to the
     /// server and the capability file as last read.
     link: Arc<ServerLink>,
@@ -640,8 +629,15 @@ impl Client {
             socket,
             config,
             capability,
+            via_http: false,
             link: Arc::default(),
         }
+    }
+
+    /// The client of a tool server that answers MCP over HTTP.
+    fn over_http(mut self) -> Self {
+        self.via_http = true;
+        self
     }
 
     /// The capability in the agent's config directory now. The server may
@@ -679,7 +675,15 @@ impl Client {
         capability: &str,
         agent_id: Option<&str>,
     ) -> Result<(hyper::StatusCode, Vec<u8>), String> {
-        let mut request = build_request(method, path, body, Some(capability), None, agent_id)?;
+        let mut request = build_request(
+            method,
+            path,
+            body,
+            Some(capability),
+            None,
+            agent_id,
+            self.via_http,
+        )?;
         loop {
             let (mut sender, reused) = match self.idle_connection().await {
                 Some(sender) => (sender, true),
@@ -4407,7 +4411,7 @@ impl AgentMcp {
     ) -> Self {
         Self {
             agent,
-            client: Client::new(socket, config, capability),
+            client: Client::new(socket, config, capability).over_http(),
             profile,
         }
     }
@@ -8261,7 +8265,7 @@ pub(crate) async fn request(
     capability: Option<&str>,
     operator: Option<&str>,
 ) -> Result<(hyper::StatusCode, Vec<u8>), String> {
-    let request = build_request(method, path, body, capability, operator, None)?;
+    let request = build_request(method, path, body, capability, operator, None, false)?;
     let response = connect(socket)
         .await?
         .send_request(request)
@@ -8282,6 +8286,11 @@ pub(crate) async fn request(
 /// presents. The agent id is what a deployment without the boundary uses to
 /// name its one route; with the boundary only the capability decides, and an
 /// operator token alone is accepted beside it.
+/// Marks a call made by the tool server behind the HTTP MCP route. It can only
+/// narrow what a call may do, so a caller that omits it gains nothing: the
+/// tool server that runs as the server's own user always sets it.
+pub(crate) const HTTP_MCP_HEADER: &str = "x-anyagents-via-http-mcp";
+
 fn build_request(
     method: &str,
     path: &str,
@@ -8289,6 +8298,7 @@ fn build_request(
     capability: Option<&str>,
     operator: Option<&str>,
     agent_id: Option<&str>,
+    via_http: bool,
 ) -> Result<hyper::Request<Full<Bytes>>, String> {
     let payload = body.unwrap_or_default();
     let mut builder = hyper::Request::builder()
@@ -8304,6 +8314,9 @@ fn build_request(
     }
     if let Some(id) = agent_id {
         builder = builder.header(crate::auth::AGENT_ID_HEADER, id);
+    }
+    if via_http {
+        builder = builder.header(HTTP_MCP_HEADER, "1");
     }
     builder
         .body(Full::new(Bytes::from(payload)))
@@ -9743,7 +9756,7 @@ mod spawn_args_tests {
     }
 
     #[tokio::test]
-    async fn remote_sandbox_backend_executes_files_and_code_and_upgrades_http_mcp_profile() {
+    async fn remote_sandbox_backend_executes_files_and_code_and_never_upgrades_http_mcp_profile() {
         use axum::{
             Router,
             body::Bytes,
@@ -9899,11 +9912,8 @@ mod spawn_args_tests {
         std::fs::create_dir_all(&config_dir).unwrap();
         std::fs::create_dir_all(&host_workdir).unwrap();
 
-        // Without sandbox.json, HTTP MCP defaults to Remote profile (code disabled).
-        assert_eq!(
-            McpProfile::resolve_http_with_config(None, "claude-cloud", Some(&config_dir)),
-            Ok(McpProfile::Remote)
-        );
+        // HTTP MCP defaults to the Remote profile (code disabled).
+        assert_eq!(McpProfile::resolve_http(None), Ok(McpProfile::Remote));
 
         // Write sandbox.json into agent config_dir.
         std::fs::write(
@@ -9918,11 +9928,10 @@ mod spawn_args_tests {
         )
         .unwrap();
 
-        // With sandbox.json present, HTTP MCP upgrades to Full profile so remote sandbox agents can use `code` and `files`.
-        assert_eq!(
-            McpProfile::resolve_http_with_config(None, "claude-cloud", Some(&config_dir)),
-            Ok(McpProfile::Full)
-        );
+        // A sandbox.json never upgrades HTTP MCP: over HTTP the tools would run
+        // as the server, so `full` is refused there and served only over stdio.
+        assert_eq!(McpProfile::resolve_http(None), Ok(McpProfile::Remote));
+        assert!(McpProfile::resolve_http(Some("full")).is_err());
 
         let mcp = AgentMcp {
             agent: AgentRef {
