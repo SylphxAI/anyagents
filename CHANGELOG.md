@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+- Security: the server no longer follows a link a seat planted in an agent's
+  `memory/` or `config/` (ADR 0010 D3). Memory topic upsert, read-back,
+  delete, listing, index rebuild, sleep state, session pins and the sleep
+  consolidation prompt work from directory descriptors below the agent root
+  (`anyagents_core::beneath`), opening every component with `O_NOFOLLOW`; the
+  host index lists and descends `memory/`, transcripts and history the same
+  way; a sleep-model key in the agent's own config is never read through a
+  link. A linked topic is not listed, read, removed or written through, and
+  a write replaces the link with the agent's own file.
 - Agents report defects to whoever runs the deployment with `send` to
   `operator`: a defect in AnyAgents, the harness or the host that an agent
   cannot fix within its own work. Only the operator reads it, with

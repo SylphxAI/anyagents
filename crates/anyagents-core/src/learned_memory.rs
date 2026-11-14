@@ -1,8 +1,10 @@
 //! Host-owned learned memory. File edits are live for retrieval, never for an
 //! already pinned session. Callers supply the authoritative host session ID.
+use crate::beneath::{Dir, Kind};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    ffi::OsStr,
     fs,
     io::{self, Read, Write},
     path::{Path, PathBuf},
@@ -125,11 +127,10 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// Read an existing pin without ever opening learned-memory source files.
 /// A known session with a missing pin must fail, not silently repin live facts.
 pub fn read_pin(agent_root: &Path, session_id: &str) -> io::Result<MemoryPin> {
-    let path = agent_root
-        .join("sessions")
-        .join(sha256(session_id.as_bytes()))
-        .join("memory-pin.json");
-    let bytes = fs::read(&path)?;
+    // Below the agent root nothing is reached through a link (ADR 0010 D3).
+    let bytes = Dir::open(agent_root)?
+        .dir(&Path::new("sessions").join(sha256(session_id.as_bytes())))?
+        .read(OsStr::new("memory-pin.json"))?;
     let pin: MemoryPin = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
     if pin.session_id != session_id
         || pin.sha256 != sha256(pin.section.as_bytes())
@@ -163,12 +164,11 @@ pub fn pin_session_from_source(
         Err(e) if e.kind() == io::ErrorKind::NotFound => (),
         Err(e) => return Err(e),
     }
-    let path = agent_root
-        .join("sessions")
-        .join(sha256(session_id.as_bytes()))
-        .join("memory-pin.json");
     // Only enough input for the bounded prompt. Full raw bytes remain on disk.
-    let input = match source.map(|source| fs::File::open(agent_root.join(source))) {
+    // The source is opened below the agent root without following a link: a
+    // seat's planted `memory/MEMORY.md` link never pins a server file.
+    let root = Dir::open(agent_root)?;
+    let input = match source.map(|source| open_below(&root, source)) {
         None => String::new(),
         Some(Ok(file)) => {
             let mut bytes = Vec::new();
@@ -192,8 +192,75 @@ pub fn pin_session_from_source(
         sha256: sha256(section.as_bytes()),
         section,
     };
-    atomic_write(&path, &serde_json::to_vec(&pin).map_err(io::Error::other)?)?;
+    root.create_dir(OsStr::new("sessions"), 0o777)?
+        .create_dir(OsStr::new(&sha256(session_id.as_bytes())), 0o777)?
+        .write_atomic(
+            OsStr::new("memory-pin.json"),
+            &serde_json::to_vec(&pin).map_err(io::Error::other)?,
+        )?;
     Ok(pin)
+}
+
+/// A memory source: a relative one is the regular file below `root` with no
+/// component a link, since the agent's seat writes there. An absolute one is
+/// the operator's own configuration (an agent never sets
+/// `ANYAGENTS_MEMORY_SOURCE`) and is opened as named.
+fn open_below(root: &Dir, relative: &Path) -> io::Result<fs::File> {
+    if relative.is_absolute() {
+        return fs::File::open(relative);
+    }
+    let name = relative.file_name().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "a memory source names a file")
+    })?;
+    root.dir(relative.parent().unwrap_or(Path::new("")))?
+        .open_file(name)
+}
+
+/// `memory/MEMORY.md` as text with its modification time, read without
+/// following a link; `None` when there is no such regular file.
+pub fn read_memory_index(agent_root: &Path) -> io::Result<Option<(String, i64)>> {
+    let Some(dir) = memory_dir(agent_root)? else {
+        return Ok(None);
+    };
+    let file = match dir.open_file(OsStr::new("MEMORY.md")) {
+        Ok(file) => file,
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::InvalidData
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    let mtime_ms = file
+        .metadata()?
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or(0))
+        .unwrap_or(0);
+    let mut bytes = Vec::new();
+    (&file).read_to_end(&mut bytes)?;
+    Ok(Some((
+        String::from_utf8_lossy(&bytes).into_owned(),
+        mtime_ms,
+    )))
+}
+
+/// Whether `<agent_root>/memory` is a plain directory, never a link.
+pub fn has_memory_dir(agent_root: &Path) -> bool {
+    matches!(memory_dir(agent_root), Ok(Some(_)))
+}
+
+/// `<agent_root>/memory`, when it is a plain directory. Absent is `None`.
+fn memory_dir(agent_root: &Path) -> io::Result<Option<Dir>> {
+    match Dir::open(agent_root).and_then(|root| root.dir(Path::new("memory"))) {
+        Ok(dir) => Ok(Some(dir)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -214,15 +281,17 @@ pub struct SleepState {
 }
 
 pub fn read_sleep_state(agent_root: &Path) -> SleepState {
-    fs::read(agent_root.join("memory/.sleep-state.json"))
+    memory_dir(agent_root)
         .ok()
+        .flatten()
+        .and_then(|dir| dir.read(OsStr::new(".sleep-state.json")).ok())
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or_default()
 }
 
 pub fn write_sleep_state(agent_root: &Path, state: &SleepState) -> io::Result<()> {
     let bytes = serde_json::to_vec_pretty(state).map_err(io::Error::other)?;
-    atomic_write(&agent_root.join("memory/.sleep-state.json"), &bytes)
+    ensure_private_memory_dir(agent_root)?.write_atomic(OsStr::new(".sleep-state.json"), &bytes)
 }
 
 pub fn sanitize_topic_slug(raw: &str) -> io::Result<String> {
@@ -382,33 +451,41 @@ pub fn parse_topic_frontmatter(slug: &str, text: &str) -> (String, String) {
 }
 
 pub fn list_memory_topics(agent_root: &Path) -> io::Result<Vec<MemoryTopicEntry>> {
-    let mem_dir = agent_root.join("memory");
-    if !mem_dir.is_dir() {
+    let Some(mem_dir) = memory_dir(agent_root)? else {
         return Ok(Vec::new());
-    }
+    };
+    list_topics_in(&mem_dir)
+}
+
+/// The topic files of an opened `memory/`: regular files only, each read
+/// through this descriptor without following a link.
+fn list_topics_in(mem_dir: &Dir) -> io::Result<Vec<MemoryTopicEntry>> {
     let mut entries = Vec::new();
-    for entry in fs::read_dir(&mem_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        let Some(fname) = path.file_name().and_then(|s| s.to_str()) else {
+    for (name, kind) in mem_dir.entries()? {
+        let Some(fname) = name.to_str() else {
             continue;
         };
         if fname.starts_with('.')
             || fname.eq_ignore_ascii_case("MEMORY.md")
             || !fname.ends_with(".md")
-            || !path.is_file()
+            || kind != Kind::File
         {
             continue;
         }
+        // Swapped for a link or removed since the listing: not a topic.
+        let Ok(file) = mem_dir.open_file(&name) else {
+            continue;
+        };
         let slug = fname.strip_suffix(".md").unwrap_or(fname).to_string();
-        let meta = fs::metadata(&path)?;
+        let meta = file.metadata()?;
         let fs_mtime_ms = meta
             .modified()
             .ok()
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| i64::try_from(d.as_millis()).unwrap_or(0))
             .unwrap_or(0);
-        let raw = fs::read(&path).unwrap_or_default();
+        let mut raw = Vec::new();
+        let _ = (&file).read_to_end(&mut raw);
         let text = String::from_utf8_lossy(&raw);
         let (_, description, _, fm_updated_ms, _) = parse_topic_frontmatter_full(&slug, &text);
         let updated_at_ms = fm_updated_ms.filter(|&ts| ts > 0).unwrap_or(fs_mtime_ms);
@@ -424,28 +501,23 @@ pub fn list_memory_topics(agent_root: &Path) -> io::Result<Vec<MemoryTopicEntry>
     Ok(entries)
 }
 
-fn ensure_private_memory_dir(agent_root: &Path) -> io::Result<std::path::PathBuf> {
-    let mem_dir = agent_root.join("memory");
+/// `<agent_root>/memory`, created 0700 when absent and never through a
+/// link; an existing one open to others is narrowed.
+fn ensure_private_memory_dir(agent_root: &Path) -> io::Result<Dir> {
     fs::create_dir_all(agent_root)?;
+    let mem_dir = Dir::open(agent_root)?.create_dir(OsStr::new("memory"), 0o700)?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
-        let mut builder = fs::DirBuilder::new();
-        builder.recursive(true).mode(0o700);
-        builder.create(&mem_dir)?;
-        let meta = fs::symlink_metadata(&mem_dir)?;
-        if !meta.file_type().is_symlink() && (meta.mode() & 0o007) != 0 {
+        use std::os::unix::fs::MetadataExt as _;
+        let meta = mem_dir.metadata()?;
+        if (meta.mode() & 0o007) != 0 {
             let safe_mode = if meta.uid() == meta.gid() {
                 0o700
             } else {
                 meta.mode() & 0o7770
             };
-            fs::set_permissions(&mem_dir, fs::Permissions::from_mode(safe_mode))?;
+            mem_dir.set_mode(safe_mode)?;
         }
-    }
-    #[cfg(not(unix))]
-    {
-        fs::create_dir_all(&mem_dir)?;
     }
     Ok(mem_dir)
 }
@@ -459,7 +531,7 @@ pub fn rebuild_memory_index(
     role: Option<&str>,
 ) -> io::Result<String> {
     let mem_dir = ensure_private_memory_dir(agent_root)?;
-    let topics = list_memory_topics(agent_root)?;
+    let topics = list_topics_in(&mem_dir)?;
     let role_suffix = role
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -577,9 +649,9 @@ pub fn rebuild_memory_index(
     }
 
     let full = format!("{header}{body}");
-    let mem_path = mem_dir.join("MEMORY.md");
-    if fs::read(&mem_path).ok().as_deref() != Some(full.as_bytes()) {
-        atomic_write(&mem_path, full.as_bytes())?;
+    let index = OsStr::new("MEMORY.md");
+    if mem_dir.read(index).ok().as_deref() != Some(full.as_bytes()) {
+        mem_dir.write_atomic(index, full.as_bytes())?;
     }
     Ok(full)
 }
@@ -596,10 +668,11 @@ pub fn upsert_memory_topic(
     let slug = sanitize_topic_slug(topic)?;
     let mem_dir = ensure_private_memory_dir(agent_root)?;
     let filename = format!("{slug}.md");
-    let path = mem_dir.join(&filename);
-    let existing_created_ms = fs::read_to_string(&path)
+    let path = agent_root.join("memory").join(&filename);
+    let existing_created_ms = mem_dir
+        .read(OsStr::new(&filename))
         .ok()
-        .and_then(|old_text| parse_topic_frontmatter_full(&slug, &old_text).2);
+        .and_then(|old| parse_topic_frontmatter_full(&slug, &String::from_utf8_lossy(&old)).2);
     let trimmed = content.trim();
     let (_, inferred_desc, fm_created_ms, _, body_without_fm) =
         parse_topic_frontmatter_full(&slug, trimmed);
@@ -622,7 +695,7 @@ pub fn upsert_memory_topic(
     let formatted = format!(
         "---\nname: {slug}\ndescription: \"{safe_desc}\"\nmetadata:\n  node_type: memory\n  created_at_ms: {created_at_ms}\n  updated_at_ms: {now_ms}\n---\n\n{clean_body}\n"
     );
-    atomic_write(&path, formatted.as_bytes())?;
+    mem_dir.write_atomic(OsStr::new(&filename), formatted.as_bytes())?;
     let index = rebuild_memory_index(agent_root, agent_name, role)?;
     let entry = MemoryTopicEntry {
         slug,
@@ -641,12 +714,10 @@ pub fn delete_memory_topic(
     topic: &str,
 ) -> io::Result<(bool, String)> {
     let slug = sanitize_topic_slug(topic)?;
-    let path = agent_root.join("memory").join(format!("{slug}.md"));
-    let existed = if path.is_file() {
-        fs::remove_file(&path)?;
-        true
-    } else {
-        false
+    // Only a regular file of `memory/` itself is removed; a link is left.
+    let existed = match memory_dir(agent_root)? {
+        Some(dir) => dir.remove_file(OsStr::new(&format!("{slug}.md")))?,
+        None => false,
     };
     let index = rebuild_memory_index(agent_root, agent_name, role)?;
     Ok((existed, index))
@@ -788,10 +859,15 @@ Output ONLY valid JSON with no markdown code fences or commentary."
         });
 
         user_prompt.push_str("## Existing Topic Bodies (Up to 12 Relevant/Recent)\n");
-        let mem_dir = agent_root.join("memory");
+        // Read through `memory/` itself: a linked topic never puts a server
+        // file into the prompt, or from there into the agent's memory.
+        let mem_dir = memory_dir(agent_root).ok().flatten();
         for (_, t) in scored.into_iter().take(12) {
-            let path = mem_dir.join(&t.filename);
-            if let Ok(raw) = fs::read_to_string(&path) {
+            if let Some(raw) = mem_dir
+                .as_ref()
+                .and_then(|dir| dir.read(OsStr::new(&t.filename)).ok())
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+            {
                 let (_, _, _, _, body) = parse_topic_frontmatter_full(&t.slug, &raw);
                 let snippet = truncate_utf8_chars(body.trim(), 2000);
                 user_prompt.push_str(&format!(
@@ -929,21 +1005,34 @@ pub fn parse_sleep_consolidation_plan(
     Ok(SleepConsolidationPlan { operations })
 }
 
-fn read_sylphx_key_candidate(base: &Path) -> Option<(String, bool)> {
+/// A key file below `base`. The agent's own config directory is its seat's
+/// to write, so there (`no_follow`) nothing is read through a link: a planted
+/// link never sends a server file to the sleep model as a bearer key.
+fn read_sylphx_key_candidate(base: &Path, no_follow: bool) -> Option<(String, bool)> {
+    let read = |rel: &str| -> io::Result<String> {
+        if !no_follow {
+            return fs::read_to_string(base.join(rel));
+        }
+        let rel = Path::new(rel);
+        let bytes = open_below(&Dir::open(base)?, rel).and_then(|mut file| {
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).map(|_| bytes)
+        })?;
+        String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    };
     for rel in [
         ".config/sylphx/key",
         ".config/opencode/sylphx.key",
         "sylphx.key",
     ] {
-        if let Ok(raw) = fs::read_to_string(base.join(rel)) {
+        if let Ok(raw) = read(rel) {
             let trimmed = raw.trim();
             if !trimmed.is_empty() {
                 return Some((trimmed.to_string(), trimmed.starts_with("sk-sx-")));
             }
         }
     }
-    let creds_path = base.join(".config/sylphx/credentials.json");
-    if let Ok(raw) = fs::read_to_string(&creds_path)
+    if let Ok(raw) = read(".config/sylphx/credentials.json")
         && let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw)
     {
         if let Some(k) = val
@@ -1038,8 +1127,9 @@ pub fn resolve_sleep_model_endpoint(
             dirs.push(home);
         }
         let mut fallback = None;
+        let agent_config = crate::agent_config_dir(data_dir, agent_id);
         for dir in &dirs {
-            if let Some((k, is_gw)) = read_sylphx_key_candidate(dir) {
+            if let Some((k, is_gw)) = read_sylphx_key_candidate(dir, *dir == agent_config) {
                 if is_gw {
                     key = Some(k);
                     break;
@@ -1264,6 +1354,148 @@ fn build_sleep_consolidation_messages_internal(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The seat owns `memory/`. Links it plants there (in place of a topic,
+    /// the index, the sleep state, or a nested directory), or in place of
+    /// `memory/` itself, never carry a server read or write outside the agent
+    /// root: nothing outside is listed, pinned, overwritten or removed.
+    #[test]
+    fn links_planted_in_memory_reach_nothing_outside() {
+        use std::os::unix::fs::symlink;
+        let temp = crate::test_tempdir();
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        let secret = "---\ndescription: outside-secret\n---\nsecret body\n";
+        let files = [
+            ("secret.md", secret),
+            ("index.md", "outside-index\n"),
+            ("state.json", "{\"last_consolidated_ms\":42}"),
+            ("victim.md", "outside-victim\n"),
+        ];
+        for (name, text) in files {
+            fs::write(outside.join(name), text).unwrap();
+        }
+        let unchanged = || {
+            for (name, text) in files {
+                assert_eq!(
+                    fs::read_to_string(outside.join(name)).unwrap(),
+                    text,
+                    "{name}"
+                );
+            }
+            let mut names: Vec<_> = fs::read_dir(&outside)
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            names.sort();
+            assert_eq!(names, ["index.md", "secret.md", "state.json", "victim.md"]);
+        };
+
+        let root = temp.path().join("agent");
+        let memory = root.join("memory");
+        fs::create_dir_all(&memory).unwrap();
+        fs::write(memory.join("own.md"), "own topic\n").unwrap();
+        symlink(outside.join("secret.md"), memory.join("leak.md")).unwrap();
+        symlink(outside.join("index.md"), memory.join("MEMORY.md")).unwrap();
+        symlink(outside.join("state.json"), memory.join(".sleep-state.json")).unwrap();
+        symlink(outside.join("victim.md"), memory.join("victim.md")).unwrap();
+        symlink(&outside, memory.join("nested")).unwrap();
+
+        let topics = list_memory_topics(&root).unwrap();
+        assert_eq!(
+            topics.iter().map(|t| t.slug.as_str()).collect::<Vec<_>>(),
+            ["own"]
+        );
+        assert_eq!(read_memory_index(&root).unwrap(), None);
+        assert!(has_memory_dir(&root));
+        assert_eq!(read_sleep_state(&root), SleepState::default());
+        // The default pin source is a planted link: refused, never pinned.
+        assert!(pin_session(&root, "linked-index").is_err());
+        for source in [
+            Path::new("memory/leak.md"),
+            Path::new("memory/nested/secret.md"),
+            Path::new("memory/../../outside/secret.md"),
+        ] {
+            assert!(
+                pin_session_from_source(&root, &format!("pin-{}", source.display()), Some(source))
+                    .is_err(),
+                "{}",
+                source.display()
+            );
+        }
+        unchanged();
+
+        // Writes replace a planted link in `memory/` with the agent's own file.
+        let (_, _, index) =
+            upsert_memory_topic(&root, "ada", None, "victim", None, "replaced", 7).unwrap();
+        assert!(!index.contains("outside-secret"), "{index}");
+        assert!(
+            !fs::symlink_metadata(memory.join("victim.md"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            !fs::symlink_metadata(memory.join("MEMORY.md"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        write_sleep_state(&root, &SleepState::default()).unwrap();
+        assert!(
+            !fs::symlink_metadata(memory.join(".sleep-state.json"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        // Removing a linked topic removes nothing, there or outside.
+        let (removed, _) = delete_memory_topic(&root, "ada", None, "leak").unwrap();
+        assert!(!removed);
+        assert!(
+            fs::symlink_metadata(memory.join("leak.md"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        unchanged();
+
+        // `memory/` itself a link to the outside directory.
+        let linked = temp.path().join("linked-agent");
+        fs::create_dir_all(&linked).unwrap();
+        symlink(&outside, linked.join("memory")).unwrap();
+        assert!(list_memory_topics(&linked).is_err());
+        assert!(upsert_memory_topic(&linked, "eve", None, "planted", None, "x", 7).is_err());
+        assert!(delete_memory_topic(&linked, "eve", None, "secret").is_err());
+        assert!(write_sleep_state(&linked, &SleepState::default()).is_err());
+        assert!(rebuild_memory_index(&linked, "eve", None).is_err());
+        assert_eq!(read_sleep_state(&linked), SleepState::default());
+        assert!(pin_session(&linked, "linked-memory").is_err());
+        assert!(!has_memory_dir(&linked));
+        unchanged();
+    }
+
+    /// A key file the seat links from its own config directory is never
+    /// read as the sleep model's bearer key; the server's own dirs are read
+    /// as before.
+    #[test]
+    fn a_linked_key_in_the_agent_config_is_never_sent() {
+        use std::os::unix::fs::symlink;
+        let temp = crate::test_tempdir();
+        let secret = temp.path().join("operator-token");
+        fs::write(&secret, "sk-sx-operator-secret").unwrap();
+        let config = temp.path().join("config");
+        fs::create_dir_all(config.join(".config/sylphx")).unwrap();
+        symlink(&secret, config.join(".config/sylphx/key")).unwrap();
+        symlink(&secret, config.join("sylphx.key")).unwrap();
+        assert_eq!(read_sylphx_key_candidate(&config, true), None);
+        assert!(read_sylphx_key_candidate(&config, false).is_some());
+        fs::remove_file(config.join("sylphx.key")).unwrap();
+        fs::write(config.join("sylphx.key"), "sk-sx-own").unwrap();
+        assert_eq!(
+            read_sylphx_key_candidate(&config, true),
+            Some(("sk-sx-own".to_string(), true))
+        );
+    }
     #[test]
     fn cap_includes_wrappers_and_marker() {
         for input in [
