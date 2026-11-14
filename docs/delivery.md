@@ -73,6 +73,33 @@ so the note goes first, and new mail follows it once it is written. A
 message a `mid-turn` vendor accepted but never read reaches the agent this
 way.
 
+### Where the adapter runs: a server restart, and a keeper that dies
+
+The adapter runs in a keeper, a process of its own beside the vendor
+process, not in the server
+([ADR 0007](adr/0007-process-architecture.md)). A server that stops,
+crashes or is upgraded ends no vendor process and loses no proof: the next
+server takes the keeper over and offers the mail past the cursor again, and
+the adapter answers what it already wrote from its own memory (`InFlight`,
+`Accepted`, `Duplicate`) and writes nothing twice. No turn was interrupted,
+so no `[Recovery]` note is sent beyond one the last server still owed. Every
+call the server makes across the keeper is a read (`proven`, `health`) or a
+command that is safe to repeat (`deliver` by id, `stop`), so an answer lost
+with a dying server loses nothing.
+
+A keeper that dies takes the adapter's memory with it, and the server ends
+the vendor process the keeper held before anything replaces it. That is the
+crash above, with one difference from a vendor process that dies under a
+live adapter: a proof the server had not yet committed is gone with the
+adapter (`proven` answers nothing for a keeper that is gone). Those messages
+stay past the cursor and are offered to the next process, so nothing is
+lost; an idempotent harness recognises what its predecessor consumed
+(`Duplicate`), and a turn left open gets its `[Recovery]` note. A harness
+that is not idempotent can apply such a message twice, within the window
+between the vendor's proof and the server's commit, as when the server held
+the adapter and crashed. A keeper whose answers the server cannot read is
+stopped and replaced the same way.
+
 ## Rules every level keeps
 
 1. **Nothing is lost.** A message is committed only on the evidence its
