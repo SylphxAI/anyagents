@@ -190,19 +190,28 @@ pub struct AgentRef {
 }
 
 /// Hard cap for one JSON-RPC frame written to stdio, including the trailing
-/// newline: 56 KiB, strictly below the 64 KiB single-line scanner buffer many
-/// stdio clients use. A frame over the cap is spilled to a `0600` file and
-/// replaced by a compact summary so the pipe never breaks.
-pub(crate) const MCP_STDIO_FRAME_CAP_BYTES: usize = 56 * 1024;
+/// newline. Every harness client reads a frame far larger than this: Spiron's
+/// MCP client reads whole lines (`read_line`), the TypeScript SDK (Claude
+/// Code, OpenCode) and Codex buffer a line until its newline, and the Go SDK
+/// (agy) bounds one frame at 16 MiB (`DefaultMaxLineLength`). The cap stays
+/// below that smallest bound, so a frame within it is never refused; a frame
+/// over it is spilled to a `0600` file and replaced by a compact summary so
+/// the pipe never breaks.
+pub(crate) const MCP_STDIO_FRAME_CAP_BYTES: usize = 15 * 1024 * 1024;
+// The served cap stays below the Go SDK's 16 MiB frame bound (agy).
+const _: () = assert!(MCP_STDIO_FRAME_CAP_BYTES < 16 * 1024 * 1024);
 const MCP_STDIO_FRAME_PREVIEW_CHARS: usize = 2_000;
 
 /// Write one oversize frame verbatim to a fresh `0600` file under `dir`.
 fn spill_oversize_frame(frame: &[u8], dir: &Path, seq: u64) -> std::io::Result<PathBuf> {
+    spill_file("anyagents-mcp-stdio-frame", frame, dir, seq)
+}
+
+/// Write `bytes` verbatim to a fresh `0600` file `<prefix>-<pid>-<seq>.json`
+/// under `dir`. The name is never reused (`create_new`).
+fn spill_file(prefix: &str, bytes: &[u8], dir: &Path, seq: u64) -> std::io::Result<PathBuf> {
     use std::io::Write as _;
-    let path = dir.join(format!(
-        "anyagents-mcp-stdio-frame-{}-{seq}.json",
-        std::process::id()
-    ));
+    let path = dir.join(format!("{prefix}-{}-{seq}.json", std::process::id()));
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -210,14 +219,14 @@ fn spill_oversize_frame(frame: &[u8], dir: &Path, seq: u64) -> std::io::Result<P
         use std::os::unix::fs::OpenOptionsExt as _;
         options.mode(0o600);
     }
-    options.open(&path)?.write_all(frame)?;
+    options.open(&path)?.write_all(bytes)?;
     Ok(path)
 }
 
 /// Build the bounded replacement frame (with trailing newline) for one
 /// oversize frame. The preview shrinks until the serialized, escaped frame
-/// fits the cap, so the check runs on final bytes, not on the input size.
-fn capped_frame(frame: &[u8], dir: &Path, seq: u64) -> Vec<u8> {
+/// fits `cap`, so the check runs on final bytes, not on the input size.
+fn capped_frame(frame: &[u8], dir: &Path, seq: u64, cap: usize) -> Vec<u8> {
     let spill = spill_oversize_frame(frame, dir, seq)
         .map(|path| path.display().to_string())
         .unwrap_or_else(|_| dir.display().to_string());
@@ -230,7 +239,7 @@ fn capped_frame(frame: &[u8], dir: &Path, seq: u64) -> Vec<u8> {
     loop {
         let preview: String = text.chars().take(preview_chars).collect();
         let summary = format!(
-            "This response exceeded the {MCP_STDIO_FRAME_CAP_BYTES}-byte single-line stdio frame limit \
+            "This response exceeded the {cap}-byte single-line stdio frame limit \
              (original: {} bytes) and was written in full to {spill} with file mode 0600. \
              Read that file in pages (offset/length windows) instead of requesting the whole response again.\n\n\
              Preview (first {preview_chars} characters):\n{preview}",
@@ -246,7 +255,7 @@ fn capped_frame(frame: &[u8], dir: &Path, seq: u64) -> Vec<u8> {
         }))
         .expect("summary frame serializes");
         bytes.push(b'\n');
-        if bytes.len() <= MCP_STDIO_FRAME_CAP_BYTES || preview_chars == 0 {
+        if bytes.len() <= cap || preview_chars == 0 {
             return bytes;
         }
         preview_chars /= 2;
@@ -262,35 +271,30 @@ pub(crate) struct FrameCapStdout<W> {
     out: Vec<u8>,
     spill_dir: PathBuf,
     seq: u64,
+    cap: usize,
 }
 
 impl<W> FrameCapStdout<W> {
     pub(crate) fn new(inner: W) -> Self {
-        Self {
-            inner,
-            pending: Vec::new(),
-            out: Vec::new(),
-            spill_dir: std::env::temp_dir(),
-            seq: 0,
-        }
+        Self::with_limits(inner, std::env::temp_dir(), MCP_STDIO_FRAME_CAP_BYTES)
     }
 
-    #[cfg(test)]
-    fn with_spill_dir(inner: W, spill_dir: PathBuf) -> Self {
+    fn with_limits(inner: W, spill_dir: PathBuf, cap: usize) -> Self {
         Self {
             inner,
             pending: Vec::new(),
             out: Vec::new(),
             spill_dir,
             seq: 0,
+            cap,
         }
     }
 
     fn transform_line(&mut self, line: &[u8]) {
         let frame = line.strip_suffix(b"\n").unwrap_or(line);
-        if frame.len() + 1 > MCP_STDIO_FRAME_CAP_BYTES {
+        if frame.len() + 1 > self.cap {
             self.seq += 1;
-            let capped = capped_frame(frame, &self.spill_dir.clone(), self.seq);
+            let capped = capped_frame(frame, &self.spill_dir.clone(), self.seq, self.cap);
             self.out.extend_from_slice(&capped);
         } else {
             self.out.extend_from_slice(line);
@@ -423,7 +427,9 @@ mod stdio_frame_cap_tests {
         assert!(frame.len() > 128 * 1024, "frame is {} bytes", frame.len());
 
         let dir = tempfile::tempdir().unwrap();
-        let mut gated = FrameCapStdout::with_spill_dir(Vec::new(), dir.path().to_path_buf());
+        // A 64 KiB gate, so a 128 KiB frame is over it.
+        let cap = 64 * 1024;
+        let mut gated = FrameCapStdout::with_limits(Vec::new(), dir.path().to_path_buf(), cap);
         let mut wire = frame.clone();
         wire.push(b'\n');
         // Write in 8 KiB chunks so partial-line buffering is exercised.
@@ -433,12 +439,7 @@ mod stdio_frame_cap_tests {
         gated.flush().await.unwrap();
         let out = gated.inner;
 
-        assert!(
-            out.len() <= MCP_STDIO_FRAME_CAP_BYTES,
-            "capped frame is {} bytes",
-            out.len()
-        );
-        assert!(out.len() < 64 * 1024);
+        assert!(out.len() <= cap, "capped frame is {} bytes", out.len());
         assert_eq!(out.iter().filter(|byte| **byte == b'\n').count(), 1);
         let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(value["jsonrpc"], "2.0");
@@ -469,10 +470,53 @@ mod stdio_frame_cap_tests {
         }
     }
 
+    /// Report #13: a `code` result of a 25 KB patch plus a receipt came back
+    /// as a spill summary because the gate stopped every frame at 56 KiB,
+    /// though no harness client reads less than 16 MiB per frame.
+    #[tokio::test]
+    async fn multi_megabyte_frame_passes_through_the_served_gate() {
+        let payload = "patch line with \"quotes\" and \\ backslashes\n".repeat(64 * 1024);
+        let frame = serde_json::to_vec(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "result": {
+                "content": [{"type": "text", "text": payload}],
+                "structuredContent": {"result": payload},
+                "isError": false,
+            }
+        }))
+        .unwrap();
+        assert!(
+            frame.len() > 4 * 1024 * 1024,
+            "frame is {} bytes",
+            frame.len()
+        );
+        assert!(frame.len() + 1 < MCP_STDIO_FRAME_CAP_BYTES);
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut gated = FrameCapStdout::with_limits(
+            Vec::new(),
+            dir.path().to_path_buf(),
+            MCP_STDIO_FRAME_CAP_BYTES,
+        );
+        let mut wire = frame.clone();
+        wire.push(b'\n');
+        for chunk in wire.chunks(64 * 1024) {
+            gated.write_all(chunk).await.unwrap();
+        }
+        gated.flush().await.unwrap();
+        assert_eq!(gated.inner, wire, "the frame reaches the client unchanged");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
     #[tokio::test]
     async fn small_frame_passes_through_untouched() {
         let dir = tempfile::tempdir().unwrap();
-        let mut gated = FrameCapStdout::with_spill_dir(Vec::new(), dir.path().to_path_buf());
+        let mut gated = FrameCapStdout::with_limits(
+            Vec::new(),
+            dir.path().to_path_buf(),
+            MCP_STDIO_FRAME_CAP_BYTES,
+        );
         gated
             .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"ok\":true}}\n")
             .await
@@ -3725,7 +3769,68 @@ const HARD_LIST_MAX_RESULTS: usize = 5_000;
 /// How far past a command's own timeout the `code` call it runs in stays
 /// open, so the command's error reaches the snippet before the call ends.
 const CODE_CALL_GRACE_MS: u64 = 2_000;
-const MAX_CODE_RESULT_BYTES: usize = 48 * 1024;
+/// The largest `code` result returned inline, as serialized JSON: the hard
+/// bound of one `workspace.read`. A larger result is written whole to a file
+/// ([`oversize_code_result`]), never cut.
+const MAX_CODE_RESULT_BYTES: usize = 256 * 1024;
+const CODE_RESULT_PREVIEW_HEAD_BYTES: usize = 16 * 1024;
+const CODE_RESULT_PREVIEW_TAIL_BYTES: usize = 4 * 1024;
+
+/// The answer for a `code` result over [`MAX_CODE_RESULT_BYTES`]. The whole
+/// result goes to a fresh `0600` JSON file under `dir`, named by
+/// `result_file`; `result` stays `null` so no fragment ever stands in for the
+/// value, and `result_preview` shows its head and tail. Report #13: the old
+/// answer put a 36 KiB head, a marker line and an 8 KiB tail in `result`,
+/// which lost the middle and did not parse.
+fn oversize_code_result(
+    serialized: &str,
+    dir: &Path,
+    deliveries: serde_json::Value,
+    logs: serde_json::Value,
+    duration_ms: serde_json::Value,
+) -> serde_json::Value {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let file = spill_file("anyagents-code-result", serialized.as_bytes(), dir, seq);
+    let head_end = floor_char_boundary_str(serialized, CODE_RESULT_PREVIEW_HEAD_BYTES);
+    let tail_start = ceil_char_boundary_str(
+        serialized,
+        serialized
+            .len()
+            .saturating_sub(CODE_RESULT_PREVIEW_TAIL_BYTES)
+            .max(head_end),
+    );
+    let note = match &file {
+        Ok(path) => format!(
+            "result is {} bytes, over the {MAX_CODE_RESULT_BYTES}-byte inline limit; the whole result \
+             is JSON in {} (mode 0600): read it in windows with workspace.read, or filter or map \
+             fields inside `code` before returning",
+            serialized.len(),
+            path.display()
+        ),
+        Err(error) => format!(
+            "result is {} bytes, over the {MAX_CODE_RESULT_BYTES}-byte inline limit, and could not \
+             be written to {}: {error}; filter or map fields inside `code` before returning",
+            serialized.len(),
+            dir.display()
+        ),
+    };
+    serde_json::json!({
+        "result": serde_json::Value::Null,
+        "result_file": file.as_ref().ok().map(|path| path.display().to_string()),
+        "result_preview": {
+            "head": &serialized[..head_end],
+            "tail": &serialized[tail_start..],
+        },
+        "note": note,
+        "deliveries": deliveries,
+        "truncated": true,
+        "original_bytes": serialized.len(),
+        "max_bytes": MAX_CODE_RESULT_BYTES,
+        "logs": logs,
+        "duration_ms": duration_ms,
+    })
+}
 const MAX_CODE_TOOL_CALLS: usize = 256;
 
 const DEFAULT_IGNORED_DIRS: &[&str] = &[
@@ -5543,26 +5648,14 @@ impl AgentMcp {
             .unwrap_or(serde_json::Value::Null);
         let serialized = serde_json::to_string(&raw_result).unwrap_or_default();
         if serialized.len() > MAX_CODE_RESULT_BYTES {
-            let head_end = floor_char_boundary_str(&serialized, 36 * 1024);
-            let tail_start =
-                ceil_char_boundary_str(&serialized, serialized.len().saturating_sub(8 * 1024));
-            let preview = format!(
-                "{}\n...[result truncated: {} bytes exceeded {} byte cap; filter or map fields inside `code` before returning]...\n{}",
-                &serialized[..head_end],
-                serialized.len(),
-                MAX_CODE_RESULT_BYTES,
-                &serialized[tail_start..]
-            );
             return Ok(MultimediaJson(
-                serde_json::json!({
-                    "result": preview,
-                    "deliveries": deliveries,
-                    "truncated": true,
-                    "original_bytes": serialized.len(),
-                    "max_bytes": MAX_CODE_RESULT_BYTES,
-                    "logs": logs,
-                    "duration_ms": duration_ms,
-                }),
+                oversize_code_result(
+                    &serialized,
+                    &std::env::temp_dir(),
+                    serde_json::json!(deliveries),
+                    serde_json::json!(logs),
+                    serde_json::json!(duration_ms),
+                ),
                 media_blocks,
             ));
         }
@@ -10327,23 +10420,40 @@ mod spawn_args_tests {
             );
         }
 
-        // 4. Oversized return payloads (>48 KB) are safely truncated with `truncated: true`.
+        // 4. A result the old 48 KiB cap cut (a 25 KB patch plus a receipt,
+        // report #13) comes back whole; one over the inline limit is written
+        // whole to a file, and `result` never holds a fragment.
+        let patch_res = mcp
+            .code(Parameters(CodeArgs {
+                code: r#"return { patch: "diff --git a/x b/x\n+\"line\"\n".repeat(1500), receipt: { ok: true } };"#
+                    .to_string(),
+                timeout_ms: Some(10_000),
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(patch_res["truncated"], false, "{patch_res}");
+        assert_eq!(patch_res["result"]["receipt"]["ok"], true);
+        assert_eq!(
+            patch_res["result"]["patch"].as_str().unwrap().len(),
+            "diff --git a/x b/x\n+\"line\"\n".len() * 1500
+        );
         let huge_res = mcp
             .code(Parameters(CodeArgs {
-                code: r#"return "x".repeat(60000);"#.to_string(),
+                code: r#"return { big: "x".repeat(300000) };"#.to_string(),
                 timeout_ms: Some(10_000),
             }))
             .await
             .unwrap()
             .0;
         assert_eq!(huge_res["truncated"], true);
-        assert!(huge_res["original_bytes"].as_u64().unwrap() >= 60_000);
-        assert!(
-            huge_res["result"]
-                .as_str()
-                .unwrap()
-                .contains("result truncated:")
-        );
+        assert!(huge_res["result"].is_null(), "{}", huge_res["note"]);
+        assert!(huge_res["original_bytes"].as_u64().unwrap() >= 300_000);
+        let file = huge_res["result_file"].as_str().unwrap();
+        let whole: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap();
+        assert_eq!(whole["big"].as_str().unwrap().len(), 300_000);
+        let _ = std::fs::remove_file(file);
 
         // 5. Pure Code Mode exposes only `code` in CANONICAL_MCP_TOOLS, and `anyagents.memory` + `workspace.{list,patch,edit}` work end-to-end inside `code`.
         assert_eq!(CANONICAL_MCP_TOOLS, &["code"]);
