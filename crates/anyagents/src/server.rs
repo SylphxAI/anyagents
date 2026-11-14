@@ -560,18 +560,34 @@ fn settle_grant_journals_once(store: &Store, data_dir: &Path) {
         }
         Ok(_) | Err(_) => crate::worktree_access::JournalOwner::Live,
     };
-    // Every admitted agent's workdir, archived ones included: a wake can
-    // bring them back. Unknown (a store error) protects everything.
-    let workdirs: Option<Vec<PathBuf>> = store.list_agents().ok().map(|agents| {
-        agents
-            .into_iter()
-            .filter_map(|agent| agent.workdir.map(PathBuf::from))
-            .collect()
-    });
-    let protected = |checkout: &Path| {
-        workdirs
+    // Every admitted agent's workdir and each directory above it, by (device,
+    // inode) after resolving, archived agents included: a wake can bring them
+    // back. Computed once, only if a failed creation's checkout is found.
+    // Unknown (a store error) protects everything.
+    let protected_ids: std::cell::OnceCell<Option<std::collections::HashSet<(u64, u64)>>> =
+        std::cell::OnceCell::new();
+    let protected = |dev: u64, ino: u64| {
+        protected_ids
+            .get_or_init(|| {
+                use std::os::unix::fs::MetadataExt;
+                let agents = store.list_agents().ok()?;
+                let mut ids = std::collections::HashSet::new();
+                for workdir in agents.into_iter().filter_map(|agent| agent.workdir) {
+                    let Ok(resolved) = std::fs::canonicalize(&workdir) else {
+                        continue;
+                    };
+                    for directory in resolved.ancestors() {
+                        if let Ok(meta) = std::fs::metadata(directory)
+                            && !ids.insert((meta.dev(), meta.ino()))
+                        {
+                            break; // its ancestors are in already
+                        }
+                    }
+                }
+                Some(ids)
+            })
             .as_ref()
-            .is_none_or(|dirs| dirs.iter().any(|dir| dir.starts_with(checkout)))
+            .is_none_or(|ids| ids.contains(&(dev, ino)))
     };
     if let Err(error) = crate::worktree_access::settle_grant_journals(data_dir, &owner, &protected)
     {

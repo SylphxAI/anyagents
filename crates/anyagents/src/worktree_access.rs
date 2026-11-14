@@ -1690,11 +1690,12 @@ pub(crate) enum JournalOwner {
 /// Every quarantined or unreadable journal is listed, one line each, so an
 /// operator sees what waits for them. Only server-owned journals in a
 /// server-owned directory that no one else can write are acted on.
-/// `protected`: whether a path is, or contains, an admitted agent's workdir.
+/// `protected`: whether the directory with this (device, inode) is, or
+/// holds, an admitted agent's workdir.
 pub(crate) fn settle_grant_journals(
     data: &Path,
     owner: &dyn Fn(&anyagents_core::AgentId) -> JournalOwner,
-    protected: &dyn Fn(&Path) -> bool,
+    protected: &dyn Fn(u64, u64) -> bool,
 ) -> Result<(), Error> {
     use std::os::unix::fs::MetadataExt;
     let server = crate::sandbox::server_uid();
@@ -1858,33 +1859,26 @@ fn grants_except(journal: &Path) -> std::io::Result<Vec<Grant>> {
 /// Remove a failed creation's checkout and its registration, the two
 /// directories Git keeps for a linked worktree, as cleanup does: no Git
 /// process runs, so nothing in the seat-writable checkout (a `.git` pointer,
-/// attributes, a config the seat could have written) is consulted or
-/// executed with the server's rights. Only the journal's own record decides,
-/// and only when the checkout and the registration still name each other.
-/// Never removed: a path an admitted agent's workdir is (or lies inside), or
-/// one another journal records. The branch stays: its name may be in use by
-/// a later agent, and an unused branch costs nothing. The journal lock is
-/// released while the trees are removed.
+/// attributes, a config the seat could have written) is executed with the
+/// server's rights. Every step holds descriptors. Both directories are opened
+/// component by component from `/` without following a symlink; the `.git`
+/// pointer and the registration's `gitdir` back link are read through those
+/// descriptors and must name each other by inode, not by text; the trees are
+/// removed relative to the held descriptors, never following a symlink and
+/// never leaving the checkout's file system. Never removed: a directory that
+/// is (or holds) an admitted agent's workdir, by inode, or one another journal
+/// records. The branch stays: its name may be in use by a later agent, and an
+/// unused branch costs nothing. The journal lock is released while the trees
+/// are removed.
 fn remove_failed_checkout(
     grant: &Grant,
     others: &[Grant],
-    protected: &dyn Fn(&Path) -> bool,
+    protected: &dyn Fn(u64, u64) -> bool,
     lock: std::fs::File,
 ) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
     let checkout = &grant.checkout;
-    if std::fs::symlink_metadata(checkout)
-        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
-    {
-        return Ok(());
-    }
     let overlaps = |a: &Path, b: &Path| a.starts_with(b) || b.starts_with(a);
-    if protected(checkout) {
-        return Err(format!(
-            "the checkout {} of a failed creation is (or holds) an admitted agent's workdir; \
-             it is kept",
-            checkout.display()
-        ));
-    }
     if let Some(other) = others.iter().find(|other| {
         overlaps(&other.checkout, checkout)
             || overlaps(&other.private, &grant.private)
@@ -1896,56 +1890,218 @@ fn remove_failed_checkout(
             other.checkout.display()
         ));
     }
-    let record = RecordedWorktree {
-        grant: grant.clone(),
-        journal: PathBuf::new(),
+    let checkout_dir = match open_directory_nofollow(checkout) {
+        Ok(directory) => directory,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!(
+                "the checkout {} of a failed creation does not resolve to a directory \
+                 without following a symlink ({error}); it is kept",
+                checkout.display()
+            ));
+        }
     };
-    if grant.private.parent() != Some(grant.common.join("worktrees").as_path())
-        || !record.checkout_pointer_matches()
-        || !registration_names(&grant.private, checkout)
-    {
+    let checkout_meta = checkout_dir.metadata().map_err(|e| e.to_string())?;
+    if protected(checkout_meta.dev(), checkout_meta.ino()) {
         return Err(format!(
-            "the checkout {} and its registration {} no longer name each other; both are kept",
-            checkout.display(),
-            grant.private.display()
+            "the checkout {} of a failed creation is (or holds) an admitted agent's workdir; \
+             it is kept",
+            checkout.display()
         ));
     }
+    let kept = |why: String| {
+        format!(
+            "the checkout {} and its registration {} do not name each other ({why}); both \
+             are kept",
+            checkout.display(),
+            grant.private.display()
+        )
+    };
+    if grant.private.parent() != Some(grant.common.join("worktrees").as_path()) {
+        return Err(kept(
+            "the registration is not under the store's worktrees/".into(),
+        ));
+    }
+    let private_dir =
+        open_directory_nofollow(&grant.private).map_err(|e| kept(format!("registration: {e}")))?;
+    let private_meta = private_dir.metadata().map_err(|e| e.to_string())?;
+    // The checkout's pointer names this registration, by inode.
+    let dotgit =
+        open_at_nofollow(&checkout_dir, c".git").map_err(|e| kept(format!(".git: {e}")))?;
+    let dotgit_meta = dotgit.metadata().map_err(|e| e.to_string())?;
+    if !dotgit_meta.is_file() {
+        return Err(kept(".git is not a file".into()));
+    }
+    let pointer = read_small(&dotgit).map_err(|e| kept(format!(".git: {e}")))?;
+    let Some(named) = pointer.trim().strip_prefix("gitdir: ") else {
+        return Err(kept(".git holds no gitdir pointer".into()));
+    };
+    let named = checkout.join(named);
+    let pointed = open_directory_nofollow(&named)
+        .and_then(|directory| directory.metadata())
+        .map_err(|e| kept(format!("{}: {e}", named.display())))?;
+    if (pointed.dev(), pointed.ino()) != (private_meta.dev(), private_meta.ino()) {
+        return Err(kept(".git points at another directory".into()));
+    }
+    // The registration's back link names this checkout's .git, by inode.
+    let back = open_at_nofollow(&private_dir, c"gitdir")
+        .and_then(|file| read_small(&file))
+        .map_err(|e| kept(format!("gitdir: {e}")))?;
+    let back = Path::new(back.trim());
+    let linked = back
+        .parent()
+        .ok_or_else(|| std::io::Error::other("no parent"))
+        .and_then(open_directory_nofollow)
+        .and_then(|parent| {
+            let name = back
+                .file_name()
+                .ok_or_else(|| std::io::Error::other("no file name"))?;
+            open_at_nofollow(&parent, &std::ffi::CString::new(name.as_encoded_bytes())?)?.metadata()
+        })
+        .map_err(|e| kept(format!("{}: {e}", back.display())))?;
+    if (linked.dev(), linked.ino()) != (dotgit_meta.dev(), dotgit_meta.ino()) {
+        return Err(kept("the registration names another .git".into()));
+    }
     drop(lock);
-    std::fs::remove_dir_all(checkout).map_err(|e| {
+    remove_directory(checkout, &checkout_dir).map_err(|e| {
         format!(
             "the checkout {} could not be removed: {e}",
             checkout.display()
         )
     })?;
-    match std::fs::remove_dir_all(&grant.private) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(format!(
-            "the registration {} could not be removed: {error}",
+    remove_directory(&grant.private, &private_dir).map_err(|e| {
+        format!(
+            "the registration {} could not be removed: {e}",
             grant.private.display()
-        )),
-    }
+        )
+    })
 }
 
-/// The registration's `gitdir` file, read without following links, points
-/// back at this checkout's `.git`.
-fn registration_names(private: &Path, checkout: &Path) -> bool {
+/// A directory opened component by component from `/`, no symlink followed.
+fn open_directory_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
+    let directory = open_nofollow(path)?;
+    if !directory.metadata()?.is_dir() {
+        return Err(std::io::Error::other("not a directory"));
+    }
+    Ok(directory)
+}
+
+/// At most 8 KiB of a small text file, through its descriptor.
+fn read_small(file: &std::fs::File) -> std::io::Result<String> {
     use std::io::Read;
-    let Ok(file) = open_nofollow(&private.join("gitdir")) else {
-        return false;
-    };
-    if !file.metadata().is_ok_and(|meta| meta.is_file()) {
-        return false;
-    }
     let mut text = String::new();
-    if file.take(8193).read_to_string(&mut text).is_err() || text.len() > 8192 {
-        return false;
+    file.take(8193).read_to_string(&mut text)?;
+    if text.len() > 8192 {
+        return Err(std::io::Error::other("file too large"));
     }
-    let named = Path::new(text.trim());
-    named == checkout.join(".git")
-        || std::fs::canonicalize(named).is_ok_and(|named| {
-            std::fs::canonicalize(checkout.join(".git")).is_ok_and(|c| c == named)
-        })
+    Ok(text)
+}
+
+/// Remove the directory `path`, already opened as `directory`: empty it
+/// through the descriptor, then remove its name from its parent, opened
+/// without following a symlink, only while that name is still this inode.
+fn remove_directory(path: &Path, directory: &std::fs::File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+    let meta = directory.metadata()?;
+    empty_directory_at(directory, meta.dev())?;
+    let parent = open_directory_nofollow(
+        path.parent()
+            .ok_or_else(|| std::io::Error::other("no parent directory"))?,
+    )?;
+    let name = std::ffi::CString::new(
+        path.file_name()
+            .ok_or_else(|| std::io::Error::other("no directory name"))?
+            .as_encoded_bytes(),
+    )?;
+    let current = stat_at(&parent, &name)?;
+    #[allow(
+        clippy::unnecessary_cast,
+        reason = "stat fields differ across Unix targets"
+    )]
+    if (current.st_dev as u64, current.st_ino as u64) != (meta.dev(), meta.ino()) {
+        return Err(std::io::Error::other(
+            "the directory was replaced while being removed",
+        ));
+    }
+    if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Remove everything inside an opened directory, relative to descriptors:
+/// a symlink is removed itself, never followed, and a directory on another
+/// file system (`dev`) stops the removal.
+fn empty_directory_at(directory: &std::fs::File, dev: u64) -> std::io::Result<()> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
+    for name in entry_names(directory)? {
+        let c_name = std::ffi::CString::new(name.as_bytes())?;
+        let stat = stat_at(directory, &c_name)?;
+        let flags = if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
+            #[allow(
+                clippy::unnecessary_cast,
+                reason = "stat fields differ across Unix targets"
+            )]
+            if stat.st_dev as u64 != dev {
+                return Err(std::io::Error::other(format!(
+                    "{name:?} is another file system mounted inside; it is kept"
+                )));
+            }
+            let fd = unsafe {
+                libc::openat(
+                    directory.as_raw_fd(),
+                    c_name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let child = unsafe { std::fs::File::from_raw_fd(fd) };
+            let opened = child.metadata()?;
+            #[allow(
+                clippy::unnecessary_cast,
+                reason = "stat fields differ across Unix targets"
+            )]
+            if (opened.dev(), opened.ino()) != (stat.st_dev as u64, stat.st_ino as u64) {
+                return Err(std::io::Error::other(format!(
+                    "{name:?} was replaced while being removed"
+                )));
+            }
+            empty_directory_at(&child, dev)?;
+            libc::AT_REMOVEDIR
+        } else {
+            0
+        };
+        if unsafe { libc::unlinkat(directory.as_raw_fd(), c_name.as_ptr(), flags) } != 0 {
+            let error = std::io::Error::last_os_error();
+            return Err(std::io::Error::new(
+                error.kind(),
+                format!("{name:?}: {error}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `fstatat` of `name` in an opened directory, without following a symlink.
+fn stat_at(directory: &std::fs::File, name: &std::ffi::CStr) -> std::io::Result<libc::stat> {
+    use std::os::fd::AsRawFd;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe {
+        libc::fstatat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { stat.assume_init() })
 }
 
 /// Run before either server mode starts consumers. An inspection intent is
@@ -6090,7 +6246,7 @@ mod tests {
                 JournalOwner::Deleted
             }
         };
-        let unprotected = |_: &Path| false;
+        let unprotected = |_: u64, _: u64| false;
         settle_grant_journals(data, &owner, &unprotected).unwrap();
         // The server's own grant needs no revocation: removed outright.
         assert!(!grant_path(data, &gone).exists());
@@ -6170,11 +6326,20 @@ mod tests {
                 JournalOwner::FailedCreation
             }
         };
-        let live_workdir = named_checkout.join("src");
-        let protected = |checkout: &Path| live_workdir.starts_with(checkout);
+        // An admitted workdir inside the checkout, named through a symlinked
+        // alias: protection compares inodes, not text.
+        let alias = data.join("alias");
+        std::os::unix::fs::symlink(&named_checkout, &alias).unwrap();
+        let live_workdir = std::fs::canonicalize(alias.join("src")).unwrap();
+        let protected_ids: std::collections::HashSet<(u64, u64)> = live_workdir
+            .ancestors()
+            .filter_map(|dir| std::fs::metadata(dir).ok())
+            .map(|meta| (meta.dev(), meta.ino()))
+            .collect();
+        let protected = |dev: u64, ino: u64| protected_ids.contains(&(dev, ino));
         settle_grant_journals(data, &owner, &protected).unwrap();
         for (agent, checkout, expected) in [
-            (&swapped, &swapped_checkout, "no longer name each other"),
+            (&swapped, &swapped_checkout, "points at another directory"),
             (&named, &named_checkout, "admitted agent's workdir"),
             (&shared, &shared_checkout, "also recorded"),
         ] {
@@ -6200,6 +6365,77 @@ mod tests {
         assert!(
             error.to_string().contains("writable by no one else"),
             "{error}"
+        );
+    }
+
+    /// The review's attack on the settle pass: after a failed creation, a
+    /// component of its checkout path is swapped for a symlink to a directory
+    /// the server must keep, with a `.git` planted there that names the
+    /// registration. Nothing is followed and nothing outside is removed; the
+    /// journal is quarantined. A symlink inside a real checkout is removed
+    /// itself, never followed.
+    #[test]
+    fn settling_never_follows_a_swapped_path_or_a_symlink_inside() {
+        let dir = crate::test_tempdir();
+        let data = dir.path();
+        let id = || anyagents_core::AgentId::generate();
+        let (swapped, honest) = (id(), id());
+        std::fs::create_dir_all(data.join("wt/x")).unwrap();
+        let (common, private, _) = registered_checkout(data, "victim");
+        // The journal records wt/x/agent; move it aside and plant a symlink.
+        let checkout = data.join("wt/x/agent");
+        std::fs::rename(data.join("victim"), &checkout).unwrap();
+        std::fs::write(
+            private.join("gitdir"),
+            format!("{}\n", checkout.join(".git").display()),
+        )
+        .unwrap();
+        write_grant(
+            &grant_path(data, &swapped),
+            &Grant {
+                common: common.clone(),
+                private: private.clone(),
+                checkout: checkout.clone(),
+                uid: crate::sandbox::server_uid(),
+                gid: crate::sandbox::server_gid(),
+                active: false,
+                inspection: false,
+                inspection_paths: None,
+                quarantined: false,
+                reason: None,
+            },
+        )
+        .unwrap();
+        let precious = data.join("precious");
+        std::fs::create_dir_all(precious.join("agent")).unwrap();
+        std::fs::write(precious.join("agent/state.db"), "keep me").unwrap();
+        std::fs::write(
+            precious.join("agent/.git"),
+            format!("gitdir: {}\n", private.display()),
+        )
+        .unwrap();
+        std::fs::rename(data.join("wt/x"), data.join("wt/x.real")).unwrap();
+        std::os::unix::fs::symlink(&precious, data.join("wt/x")).unwrap();
+        // A failed creation whose checkout holds a symlink to the outside.
+        let honest_checkout = failed_journal(data, &honest, "honest");
+        let outside = data.join("outside-target");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("file"), "outside").unwrap();
+        std::os::unix::fs::symlink(&outside, honest_checkout.join("src/link")).unwrap();
+        let owner = |_: &anyagents_core::AgentId| JournalOwner::FailedCreation;
+        settle_grant_journals(data, &owner, &|_, _| false).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(precious.join("agent/state.db")).unwrap(),
+            "keep me"
+        );
+        assert!(data.join("wt/x.real/agent/src/file").exists());
+        assert!(private.exists());
+        let reason = reason_of(data, &swapped);
+        assert!(reason.contains("without following a symlink"), "{reason}");
+        assert!(!honest_checkout.exists());
+        assert_eq!(
+            std::fs::read_to_string(outside.join("file")).unwrap(),
+            "outside"
         );
     }
 
