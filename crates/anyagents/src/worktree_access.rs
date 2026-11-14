@@ -778,6 +778,13 @@ fn relocate_config(
     // (a directory moved in from elsewhere) is refused, never filled.
     if !created {
         let entries = entry_names(&directory)?;
+        if entries.iter().any(|name| name == "config.lock") {
+            return Err(std::io::Error::other(format!(
+                "{} exists: a Git process is writing the config, or one crashed while it \
+                 did. If none is running, the lock is stale and its owner removes it",
+                path.join("config.lock").display()
+            )));
+        }
         let interrupted = entries.is_empty()
             || entries == ["config"]
                 && open_at_nofollow(&directory, c"config").is_ok_and(|f| same(&f));
@@ -6252,6 +6259,31 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains(store.to_str().unwrap()), "{error}");
+    }
+
+    /// A relocation that finds Git's lock in the dedicated directory names the
+    /// lock and its repair instead of calling the directory foreign.
+    #[test]
+    fn a_stale_relocation_lock_is_named() {
+        let dir = crate::test_tempdir();
+        let common = plain_common(dir.path());
+        let managed = common.join(CONFIG_DIRECTORY);
+        std::fs::create_dir(&managed).unwrap();
+        std::fs::set_permissions(&managed, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(managed.join("config.lock"), "").unwrap();
+        let error = relocate_config(&common, &|| Ok(()))
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            error.contains("config.lock exists") && error.contains("stale"),
+            "{error}"
+        );
+        assert!(
+            std::fs::symlink_metadata(common.join("config"))
+                .unwrap()
+                .is_file()
+        );
     }
 
     /// A seat that stops or stalls its own admission probe holds nothing: the
