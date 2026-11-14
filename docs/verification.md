@@ -554,17 +554,30 @@ in every lane:
 - a linked worktree converts in place with its status, HEAD, branch, staged and
   unstaged changes, untracked and ignored files, sparse patterns and hooks
   intact, without another checkout's branch settings; the store forgets only
-  that registration, and even a store pruned afterwards cannot take the
-  converted checkout's unpushed commit or staged blob;
-- an operation in progress, or a pointer at another checkout's registration,
-  declines and changes nothing;
+  that registration and keeps the repository's objects under a keep ref; after
+  the keep ref goes and the store is pruned, the unpushed commit, the staged
+  blob and a reflog-only commit are still the repository's own;
+- a converted repository survives its base being rewritten upstream and the
+  store being refetched, reflog-expired and pruned with `--prune=now`: `fsck`,
+  `log` and `push` still work, and a plain `git fetch origin` sees the new base;
+- a store that may prune is refused; an operation in progress, a locked
+  worktree, or a pointer at another checkout's registration declines and
+  changes nothing;
+- a same-size edit within the index's timestamp stays visible after
+  conversion (the test fails if the copied index takes a new mtime);
+- a conversion that crashed after the exchange is finished by the next call,
+  and a forged leftover pointer releases nothing; a leftover staging directory
+  is cleared; linked hooks stay links;
 - a provider checkout that cannot be adopted is discarded with its
   registration, so a failed creation leaves no row, directory or branch and
   the same name is retryable;
 - cleanup keeps an unpushed HEAD, another unpushed local branch beside a
-  published detached HEAD, and a checkout whose `.git` is missing or points
-  elsewhere byte for byte (only build output goes), and removes the checkout
-  once both are published; an archived legacy worktree is converted first;
+  published detached HEAD, a stash, a tag or note the remote lacks, a checkout
+  whose remote cannot be asked, and a checkout whose `.git` is missing or points
+  elsewhere, byte for byte (only build output goes); it removes a checkout whose
+  work the remote advertises, including a branch published by URL with no
+  remote-tracking ref; an archived legacy worktree is converted first, and the
+  reaped one's keep ref goes with it;
 - a cleanup blocked in Git does not delay other agents' mail.
 
 ## Scheduler isolation and clean-host server fixtures

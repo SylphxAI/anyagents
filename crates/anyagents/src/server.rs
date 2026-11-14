@@ -4760,6 +4760,7 @@ fn reap_subagent_ephemeral_dirs_in(
         }
         if dotgit.symlink_metadata().is_ok() {
             if is_git_worktree_safe_to_reap(&work_dir, seat) {
+                crate::repo::forget(&work_dir);
                 complete &= remove_path_with_seat(&work_dir, seat_ids);
                 let _ = std::fs::remove_file(&marker_path);
             } else {
@@ -4828,16 +4829,20 @@ fn reap_build_outputs_in_worktree(wt_path: &Path, seat_ids: Option<(u32, u32, u3
 }
 
 /// A checkout may go only when it is the agent's own repository, its status
-/// is clean, and every commit of HEAD and its local branches is on a
-/// remote-tracking ref. Git reads it as the agent's seat.
+/// is clean, and the remote holds everything else it has: no stash, no tag or
+/// note the remote lacks, and no commit (of HEAD, a branch, a tag, a note or
+/// any other ref but remote-tracking ones) that no advertised ref reaches.
+/// The proof is the remote's own answer, asked by the server; a checkout it
+/// cannot ask about stays. Git reads the checkout as the agent's seat.
 pub(crate) fn is_git_worktree_safe_to_reap(wt_path: &Path, seat: Option<(u32, u32)>) -> bool {
     // Only a `.git` directory: a pointer could name any other repository.
-    if !std::fs::symlink_metadata(wt_path.join(".git")).is_ok_and(|meta| meta.is_dir()) {
+    let git_dir = wt_path.join(".git");
+    if !std::fs::symlink_metadata(&git_dir).is_ok_and(|meta| meta.is_dir()) {
         return false;
     }
+    let git = || crate::repo::inspect_command(seat, &git_dir, Some(wt_path));
     let output = |args: &[&str]| {
-        crate::repo::inspect_command(seat, &wt_path.join(".git"), Some(wt_path))
-            .and_then(|mut cmd| cmd.args(args).stdin(std::process::Stdio::null()).output())
+        git().and_then(|mut cmd| cmd.args(args).stdin(std::process::Stdio::null()).output())
     };
     let Ok(status_out) = output(&["status", "--porcelain", "--untracked-files=normal"]) else {
         return false;
@@ -4866,19 +4871,50 @@ pub(crate) fn is_git_worktree_safe_to_reap(wt_path: &Path, seat: Option<(u32, u3
     if has_substantive_dirty {
         return false;
     }
-    // Require HEAD and every local branch history to be covered by at least
-    // one remote-tracking ref, including detached HEAD and branches not
-    // currently checked out. The refs are the agent's own: this is a
-    // cleanliness check, not a publication proof.
-    output(&[
+    let Ok(local) = output(&[
+        "for-each-ref",
+        "--format=%(objectname) %(refname)",
+        "refs/stash",
+        "refs/tags",
+        "refs/notes",
+    ]) else {
+        return false;
+    };
+    if !local.status.success() {
+        return false;
+    }
+    let Some(advertised) = crate::repo::published(wt_path, seat) else {
+        return false;
+    };
+    for line in String::from_utf8_lossy(&local.stdout).lines() {
+        let Some((oid, name)) = line.split_once(' ') else {
+            return false;
+        };
+        if name == "refs/stash"
+            || !advertised
+                .iter()
+                .any(|(remote_oid, remote_name)| remote_oid == oid && remote_name == name)
+        {
+            return false;
+        }
+    }
+    let covered: String = advertised
+        .iter()
+        .map(|(oid, _)| format!("^{oid}\n"))
+        .collect();
+    let Ok(mut unpublished) = git() else {
+        return false;
+    };
+    unpublished.args([
         "rev-list",
-        "HEAD",
-        "--branches",
-        "--not",
-        "--remotes",
         "--count",
-    ])
-    .is_ok_and(|out| out.status.success() && out.stdout == b"0\n")
+        "--exclude=refs/remotes/*",
+        "--all",
+        "--ignore-missing",
+        "--stdin",
+    ]);
+    crate::repo::output_with_input(&mut unpublished, &covered)
+        .is_ok_and(|out| out.status.success() && out.stdout == b"0\n")
 }
 
 #[cfg(unix)]
@@ -10727,6 +10763,90 @@ pub(crate) mod tests {
         assert!(!work.exists());
     }
 
+    /// Archive keeps anything only the checkout holds: a stash, a tag or a
+    /// note the remote lacks. What the remote advertises is the proof, so a
+    /// branch published by URL (no remote-tracking ref moves) is reaped.
+    #[test]
+    fn cleanup_keeps_a_stash_and_unpublished_tags_or_notes() {
+        use crate::repo::tests::git;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let parent = store
+            .create_agent(anyagents_core::NewAgent::new("parent", "codex"))
+            .unwrap();
+        let child = archived_reap_fixture(&store, "worker", &parent);
+        let work = anyagents_core::agent_work_dir(dir.path(), &child.id);
+        let fixture = dir.path().join("fixture");
+        let remote = crate::repo::tests::seed_remote(&fixture);
+        crate::repo::tests::pool_checkouts(&fixture)
+            .remote("ExampleOrg/demo", &work, "worker", None)
+            .unwrap();
+        let as_author = |args: &[&str]| {
+            let mut all = vec!["-c", "user.name=t", "-c", "user.email=t@example.test"];
+            all.extend_from_slice(args);
+            git(&work, &all)
+        };
+        assert!(is_git_worktree_safe_to_reap(&work, None));
+        // A stash is the only copy of an edit.
+        std::fs::write(work.join("README.md"), "precious edit\n").unwrap();
+        as_author(&["stash", "-q"]);
+        assert!(
+            !is_git_worktree_safe_to_reap(&work, None),
+            "a stash was judged disposable"
+        );
+        assert!(reap_subagent_ephemeral_dirs(dir.path(), &child.id));
+        assert_eq!(git(&work, &["stash", "list"]).lines().count(), 1);
+        git(&work, &["stash", "drop", "-q"]);
+        // A tag the remote lacks, then one it has.
+        git(&work, &["tag", "local-only"]);
+        assert!(
+            !is_git_worktree_safe_to_reap(&work, None),
+            "an unpublished tag"
+        );
+        git(&work, &["push", "-q", "origin", "refs/tags/local-only"]);
+        assert!(is_git_worktree_safe_to_reap(&work, None));
+        // A note the remote lacks, then one it has.
+        as_author(&["notes", "add", "-m", "remember this"]);
+        assert!(
+            !is_git_worktree_safe_to_reap(&work, None),
+            "an unpublished note"
+        );
+        git(&work, &["push", "-q", "origin", "refs/notes/commits"]);
+        assert!(is_git_worktree_safe_to_reap(&work, None));
+        // A commit published by URL, as a publishing tool does: no
+        // remote-tracking ref records it, the remote still has it.
+        as_author(&["commit", "-q", "--allow-empty", "-m", "Published by URL"]);
+        assert!(!is_git_worktree_safe_to_reap(&work, None));
+        git(
+            &work,
+            &[
+                "push",
+                "-q",
+                remote.to_str().unwrap(),
+                "HEAD:refs/heads/published",
+            ],
+        );
+        assert!(git(&work, &["for-each-ref", "refs/remotes/origin/published"]).is_empty());
+        assert!(is_git_worktree_safe_to_reap(&work, None));
+        // With no answer from the remote, nothing is proven.
+        git(
+            &work,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://example.invalid/x.git",
+            ],
+        );
+        assert!(!is_git_worktree_safe_to_reap(&work, None));
+        git(
+            &work,
+            &["remote", "set-url", "origin", remote.to_str().unwrap()],
+        );
+        assert!(reap_subagent_ephemeral_dirs(dir.path(), &child.id));
+        assert!(!work.exists());
+    }
+
     /// An archived agent's linked worktree from before per-agent repositories
     /// is converted, then judged like any checkout: dirty work stays, and the
     /// shared store no longer registers it.
@@ -10752,6 +10872,8 @@ pub(crate) mod tests {
                 hub.to_str().unwrap(),
             ],
         );
+        git(&hub, &["config", "gc.pruneExpire", "never"]);
+        git(&hub, &["config", "gc.cruftPacks", "true"]);
         let mut checkouts = Vec::new();
         for agent in [&dirty, &clean] {
             let work = anyagents_core::agent_work_dir(dir.path(), &agent.id);
@@ -10777,6 +10899,13 @@ pub(crate) mod tests {
                 && !registered.contains(checkouts[1].to_str().unwrap()),
             "{registered}"
         );
+        // The kept checkout's borrowed objects stay held; the reaped one's
+        // keep ref went with it.
+        let keeps = git(
+            &hub,
+            &["for-each-ref", "--format=%(refname)", "refs/anyagents/keep"],
+        );
+        assert_eq!(keeps.lines().count(), 1, "{keeps}");
     }
 
     #[test]

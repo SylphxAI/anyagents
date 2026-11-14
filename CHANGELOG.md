@@ -16,14 +16,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   works with no checkout provider configured. Only the server fetches into
   it, and it is never pruned. A checkout provider remains optional; a
   linked worktree it makes is converted in place into an own repository and
-  its store becomes the pool. Removed: worktrees of a shared bare pool, the
+  its store becomes the pool, which must then never prune
+  (`gc.pruneExpire=never`, `gc.cruftPacks=true`, else conversion is
+  refused); a keep ref in the store holds what each converted repository
+  borrows until it is reaped. Archive removes a checkout only when the
+  remote's own answer (`ls-remote`) covers every commit, tag and note it
+  has and it has no stash. Removed: worktrees of a shared bare pool, the
   POSIX ACL grants on its `objects/`, `refs/`, `logs/` and `packed-refs`,
   the `anyagents-config/` config symlink, per-checkout `--worktree` config,
   the grant journals in `<data>/worktree-grants/` with their quarantine and
   recovery, and `ANYAGENTS_TRUSTED_METADATA_GIDS`. Existing linked
   worktrees keep working as they are; archive cleanup converts one in place
-  (same status, HEAD, index, sparse patterns and hooks, unpushed objects
-  copied) before judging it. For `repo: "inherit"` and local sources, the
+  (same status, HEAD, index, sparse patterns and hooks, unpushed and
+  reflog-only objects copied) before judging it. For `repo: "inherit"` and local sources, the
   remote is asked from outside the source repository.
 - Security: the server no longer opens host files with its own access on an
   agent's behalf (ADR 0010 D3). A `send` with a local media path uploads it
