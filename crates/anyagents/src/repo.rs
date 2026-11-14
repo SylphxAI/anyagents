@@ -3712,9 +3712,13 @@ esac
         converted(&l.work);
         let own = l.work.join(".git/hooks");
         assert_eq!(std::fs::read_link(own.join("pre-commit")).unwrap(), script);
+        // The same file, however the platform spells its temporary root
+        // (macOS: /var is /private/var).
+        let target = std::fs::read_link(own.join("commit-msg")).unwrap();
+        assert!(target.is_absolute(), "{}", target.display());
         assert_eq!(
-            std::fs::read_link(own.join("commit-msg")).unwrap(),
-            hooks.join("real-commit-msg")
+            std::fs::canonicalize(target).unwrap(),
+            std::fs::canonicalize(hooks.join("real-commit-msg")).unwrap()
         );
         committer(
             &l.work,
