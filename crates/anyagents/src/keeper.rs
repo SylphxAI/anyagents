@@ -80,8 +80,10 @@ pub fn host() -> Result<HarnessHost, String> {
     )))
 }
 
-/// Harness processes in keepers, which outlive the kernel.
+/// Harness processes that outlive the kernel: in keepers, and v2 Spiron
+/// processes, which need none (`crate::spiron_native`).
 pub struct KeeperCustody {
+    data: PathBuf,
     root: PathBuf,
     /// Agents whose kept harnesses must not be taken over: they would send
     /// their gateway token to a port this kernel no longer holds.
@@ -91,6 +93,7 @@ pub struct KeeperCustody {
 impl KeeperCustody {
     pub fn new(data: &Path, refused: impl IntoIterator<Item = AgentId>) -> Self {
         Self {
+            data: data.to_path_buf(),
             root: anyagents_keeper::root(data),
             refused: refused.into_iter().collect(),
         }
@@ -103,14 +106,18 @@ impl Custody<VendorHarness> for KeeperCustody {
     }
 
     fn retained(&self) -> Vec<AgentId> {
+        let mut agents: BTreeSet<String> = crate::spiron_native::agents(&self.data)
+            .into_iter()
+            .collect();
         if let Err(error) = anyagents_keeper::check_root(&self.root) {
             eprintln!("anyagents-keeper: no keeper is taken over: {error}");
-            return Vec::new();
+        } else {
+            agents.extend(
+                anyagents_keeper::instances(&self.root)
+                    .into_iter()
+                    .map(|instance| instance.agent),
+            );
         }
-        let agents: BTreeSet<String> = anyagents_keeper::instances(&self.root)
-            .into_iter()
-            .map(|instance| instance.agent)
-            .collect();
         agents
             .iter()
             .filter_map(|agent| AgentId::parse(agent).ok())
@@ -121,8 +128,32 @@ impl Custody<VendorHarness> for KeeperCustody {
         if self.refused.contains(agent) {
             // Its harness has the gateway's old origin and token: end it, and
             // the worker starts one with the new ones.
+            crate::spiron_native::end_recorded(&self.data, agent.as_str());
             anyagents_keeper::stop_agent(&self.root, agent.as_str())?;
             return Ok(None);
+        }
+        // A v2 Spiron an earlier kernel left: attached again with no keeper.
+        // A keeper of the same agent is older (the agent ran v1 before) and
+        // is ended.
+        if crate::spiron_native::record_path(&self.data, agent.as_str()).exists() {
+            let lock = crate::spiron_native::take_lock(&self.data, agent)?;
+            if let Err(error) = anyagents_keeper::stop_agent(&self.root, agent.as_str()) {
+                eprintln!("anyagents-keeper: {agent}: {error}");
+            }
+            let Some((harness, record)) =
+                crate::spiron_native::reattach(&self.data, agent.as_str())
+            else {
+                return Ok(None);
+            };
+            return Ok(Some(Attached {
+                harness: VendorHarness::native(harness, &record.labels),
+                lock,
+                harness_name: record.harness,
+                model: record.model,
+                started_at_ms: Some(record.started_at_ms),
+                note: record.note,
+                older: Vec::new(),
+            }));
         }
         let mut found = anyagents_keeper::attach_all(&self.root, agent.as_str())?.into_iter();
         let Some(mut remote) = found.next() else {
@@ -149,6 +180,7 @@ impl Custody<VendorHarness> for KeeperCustody {
     }
 
     fn release(&self, agent: &AgentId) {
+        crate::spiron_native::end_recorded(&self.data, agent.as_str());
         if let Err(error) = anyagents_keeper::stop_agent(&self.root, agent.as_str()) {
             eprintln!("anyagents-keeper: {agent}: {error}");
         }
@@ -244,7 +276,10 @@ pub fn stop(data: &Path, agent: Option<&str>, force: bool) -> Result<(), anyagen
     let meta = match std::fs::symlink_metadata(&root) {
         Ok(meta) => meta,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            println!("no keepers");
+            let _server = hold_server_lock(data)?;
+            if !stop_native(data, agent)? {
+                println!("no keepers");
+            }
             return Ok(());
         }
         Err(error) => return Err(fail(format!("cannot read {}: {error}", root.display()))),
@@ -260,6 +295,7 @@ pub fn stop(data: &Path, agent: Option<&str>, force: bool) -> Result<(), anyagen
     }
     anyagents_keeper::check_root(&root).map_err(fail)?;
     let _server = hold_server_lock(data)?;
+    stop_native(data, agent)?;
     let instances = anyagents_keeper::instances(&root);
     let agents: BTreeSet<String> = match agent {
         Some(name) => [resolve_agent(data, name)?].into(),
@@ -298,6 +334,25 @@ pub fn stop(data: &Path, agent: Option<&str>, force: bool) -> Result<(), anyagen
             failures.join("; ")
         )))
     }
+}
+
+/// End the v2 Spiron processes (`crate::spiron_native`) of `agent`, or of
+/// every agent: they need no keeper, but outlive the server all the same.
+/// Whether there was any.
+fn stop_native(data: &Path, agent: Option<&str>) -> Result<bool, anyagents_core::Error> {
+    let agents = match agent {
+        Some(name) => vec![resolve_agent(data, name)?],
+        None => crate::spiron_native::agents(data),
+    };
+    let mut any = false;
+    for agent in agents {
+        if crate::spiron_native::record_path(data, &agent).exists() {
+            crate::spiron_native::end_recorded(data, &agent);
+            println!("{agent}\tstopped (spiron)");
+            any = true;
+        }
+    }
+    Ok(any)
 }
 
 /// Hold the data directory's server lock, which a running server holds:

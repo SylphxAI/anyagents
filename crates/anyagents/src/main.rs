@@ -41,6 +41,7 @@ mod seat_tree;
 mod server;
 mod signin;
 mod spiron;
+mod spiron_native;
 mod telegram;
 mod ui;
 mod vendor;

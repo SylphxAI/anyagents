@@ -242,6 +242,7 @@ dependencies = [
  "anyagents-harness",
  "anyagents-harness-stream",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

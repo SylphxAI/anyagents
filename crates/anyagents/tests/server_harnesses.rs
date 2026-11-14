@@ -1094,3 +1094,169 @@ fn a_spiron_adapter_in_its_keeper_never_writes_a_line_twice_across_a_restart() {
     );
     drop(server);
 }
+
+/// Local Spiron with no keeper (ADR 0011 D9), against the real binary
+/// (`SPIRON_BIN`, a Spiron with `spiron.headless/v2`): the process runs on its
+/// own behind its socket, survives a server crash in the middle of a turn
+/// with a steer in it, and the next server reattaches from the launch record
+/// and commits both messages once the turn ends; Spiron's frame journal shows
+/// each consumed exactly once. `keepers stop` then ends it. Without
+/// `SPIRON_BIN` the test says so and passes, unless `ANYAGENTS_REQUIRE_SPIRON=1`.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_v2_spiron_needs_no_keeper_and_is_reattached_after_a_server_crash() {
+    let Some(real) = std::env::var_os("SPIRON_BIN") else {
+        assert!(
+            std::env::var("ANYAGENTS_REQUIRE_SPIRON").as_deref() != Ok("1"),
+            "ANYAGENTS_REQUIRE_SPIRON=1 needs SPIRON_BIN"
+        );
+        eprintln!("SPIRON_BIN is not set: the real-Spiron server test is not run");
+        return;
+    };
+    let _env = support::lock();
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    support::operator_for_contract(&data);
+    create_asker(&data);
+    let name = "native";
+    let out = bin()
+        .env("PATH", machine_path(&data))
+        .arg("--data")
+        .arg(&data)
+        .args(["agents", "create", name, "--harness", "spiron"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let id = String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .split('\t')
+        .next()
+        .unwrap()
+        .to_string();
+    let config = data.join("agents").join(&id).join("config");
+    // The model runs `sleep` (the window to steer and to crash in), then answers.
+    let fixture = dir.path().join("fixture.sse");
+    std::fs::write(
+        &fixture,
+        concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_sleep\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"sleep 12\\\"}\"}}]}}]}\n",
+            "data: [DONE]\n---\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":2,\"cost\":0.000078}}\n",
+            "data: [DONE]\n",
+        ),
+    )
+    .unwrap();
+    let real = real.to_str().unwrap().to_string();
+    let fixture = fixture.to_str().unwrap().to_string();
+    let spiron_env = [
+        ("ANYAGENTS_SPIRON_BIN", real.as_str()),
+        ("SPIRON_GATEWAY_FIXTURE", fixture.as_str()),
+    ];
+    let frames = |kind: &str| -> Vec<Value> {
+        let Ok(db) = rusqlite::Connection::open_with_flags(
+            config.join("sessions.sqlite3"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        ) else {
+            return Vec::new();
+        };
+        let Ok(mut query) = db.prepare("SELECT frame FROM headless_frames ORDER BY seq") else {
+            return Vec::new();
+        };
+        query
+            .query_map([], |row| row.get::<_, String>(0))
+            .map(|rows| {
+                rows.flatten()
+                    .filter_map(|frame| serde_json::from_str::<Value>(&frame).ok())
+                    .filter(|frame| frame["type"] == kind)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let record = data.join("spiron").join(format!("{id}.json"));
+    let anyagents = Path::new(env!("CARGO_BIN_EXE_anyagents"));
+    let server = Server::start_with(&data, anyagents, anyagents, &spiron_env);
+    let first = send(&data, name);
+    support::wait_for(
+        || {
+            frames("accepted")
+                .iter()
+                .any(|f| f["request_id"] == first.as_str())
+        },
+        "the first message did not open a turn",
+    );
+    // Steered while `sleep` runs, so it is consumed at the next step.
+    support::wait_for(
+        || !frames("tool_call").is_empty(),
+        "the turn did not reach its tool",
+    );
+    let second = send(&data, name);
+    support::wait_for(
+        || {
+            frames("steer_ack")
+                .iter()
+                .any(|f| f["request_id"] == second.as_str())
+        },
+        "the second message was not steered into the turn",
+    );
+    assert!(no_keeper(&data, &id), "a v2 Spiron runs without a keeper");
+    let launched: Value = serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
+    let pid = launched["process"]["pid"].as_u64().unwrap() as u32;
+
+    // The server dies mid-turn; Spiron and its turn go on.
+    server.crash();
+    assert!(alive(pid), "spiron died with the server");
+    // A clean stop leaves it running too.
+    let server = Server::start_with(&data, anyagents, anyagents, &spiron_env);
+    server.terminate();
+    assert!(alive(pid), "a clean server stop ended spiron");
+    assert!(record.exists());
+    // The next server reattaches and commits both messages once consumed.
+    let server = Server::start_with(&data, anyagents, anyagents, &spiron_env);
+    let store = Store::open(data.join("state.db")).unwrap();
+    let agent = anyagents_core::AgentId::parse(&id).unwrap();
+    let last = store.inbox(&agent, None).unwrap().last().unwrap().seq;
+    support::wait_for(
+        || store.delivered_cursor(&agent).unwrap() >= last,
+        "the consumed messages were not committed after the restart",
+    );
+    support::wait_for(|| !frames("result").is_empty(), "the turn did not end");
+    let again: Value =
+        serde_json::from_slice(&std::fs::read(&record).unwrap_or_default()).unwrap_or(Value::Null);
+    assert!(
+        again.is_null() || again["process"] == launched["process"],
+        "the process was restarted"
+    );
+    assert!(no_keeper(&data, &id));
+    // Each input consumed exactly once, never re-sent as new input.
+    let consumed: Vec<String> = frames("accepted")
+        .iter()
+        .filter(|f| f["mode"] == "turn")
+        .filter_map(|f| f["request_id"].as_str().map(str::to_string))
+        .chain(
+            frames("steer_consumed")
+                .iter()
+                .filter(|f| f["duplicate"] == false)
+                .filter_map(|f| f["steer_request_id"].as_str().map(str::to_string)),
+        )
+        .collect();
+    assert_eq!(consumed, [first.clone(), second.clone()]);
+    let results = frames("result");
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert_eq!(results[0]["duplicate"], false);
+    assert_eq!(results[0]["cost_micros"], 78);
+    // The agent goes idle: its process ends with its launch record.
+    support::wait_for(
+        || !alive(pid) && !record.exists(),
+        "an idle agent's spiron was not stopped",
+    );
+    drop(server);
+}
