@@ -89,10 +89,13 @@ wait) is never left holding the mailbox. The supervisor counts it at once in
   recovers it as an interrupted turn. Being mail, the note is durable and
   ordered behind any mail that waits; the next turn starts with both.
 - **Transient errors back off.** A fault the provider may clear on its own
-  (overloaded, unavailable, rate limited, a dropped stream) is first retried
-  in a new process, as before (up to three times). After that, each
-  follow-up waits 15 s, doubling to at most 10 minutes; the turn stays open
-  while it waits, and mail waits behind it.
+  (overloaded, unavailable, rate limited, a dropped stream) is not a
+  refusal. One the supervisor already treats as a transient mid-turn fault
+  (a 5xx, `server_error`, a reset connection) is first retried in a new
+  process, as before, up to three times. After that, and at once for the
+  rest (`service_unavailable`, a rate limit), each follow-up waits 15 s,
+  doubling to at most 10 minutes; the turn stays open while it waits, and
+  mail waits behind it.
 - **Park at the limit.** At `MAX_ERRORED_TURNS` (3) errored turns in a row,
   or `MAX_TRANSIENT_ERRORED_TURNS` (8, about 25 minutes) while each error is
   transient, the agent is parked: `state = paused`, its process stopped, its
