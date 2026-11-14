@@ -133,7 +133,7 @@ Each output carries `seq`, `type`, `session_id`, `request_id`, and the host iden
 
 ### D7. Host tools over the same connection
 
-- A host declares tools at launch: `--host-tools <file>`, `{"tools": [{"name", "description", "input_schema"}]}`. A tool is accepted when its name matches `^[A-Za-z0-9_-]{1,64}$` and is no built-in or mounted tool's name; `ready.host_tools` lists the accepted names, and the model sees them for the life of the process.
+- A host declares tools at launch: `--host-tools <file>`, `{"tools": [{"name", "description", "input_schema"}]}`. Over stdio, an initial prompt (`-p`) with host tools fails at start (`host_tools_need_v2`): it would start on v1, where no call can be answered. A tool is accepted when its name matches `^[A-Za-z0-9_-]{1,64}$` and is no built-in or mounted tool's name; `ready.host_tools` lists the accepted names, and the model sees them for the life of the process.
 - When the model calls one, Spiron journals the `tool_call` event, then writes `host_tool_call {call_id, name, input}`, where `call_id` is the model's tool call id (`tool_call.data.callId`). It waits for `host_tool_result {call_id, output, is_error}`. The model sees `output` as the tool's result, or `{"error": output}` when `is_error` is true.
 - The first result for a call is used. A result for a call that is not pending is `rejected {code: "unknown_call"}`.
 - Like every frame, `input` is credential-masked.
