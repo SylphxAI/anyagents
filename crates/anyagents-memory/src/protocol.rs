@@ -296,7 +296,7 @@ mod tests {
 
     #[test]
     fn an_absent_service_is_an_error_not_a_wait() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         assert!(Client::for_data_dir(dir.path(), Duration::from_secs(1)).is_none());
         let client = Client::new(dir.path().join("missing.sock"), Duration::from_secs(1));
         let started = std::time::Instant::now();

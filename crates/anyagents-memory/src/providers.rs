@@ -1036,7 +1036,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_profile_key_is_read_where_the_profile_pool_keeps_it() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let profiles = dir.path().join("profiles");
         assert_eq!(
             yaml_ref_in(

@@ -777,7 +777,7 @@ mod tests {
     /// space's files go once the new one has no backlog.
     #[test]
     fn a_new_embedding_space_is_estimated_capped_built_apart_and_replaces_the_old() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let host_path = host_with(dir.path(), 12);
         let host = HostCatalog::open(&host_path).unwrap();
         let (url, seen) = crate::providers::tests::serve(|_, body: &Value| {
@@ -932,7 +932,7 @@ mod tests {
     /// nothing.
     #[test]
     fn a_rebuild_above_its_cap_is_estimated_and_refused_before_any_model_call() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         host_with(dir.path(), 12);
         openrouter_profile(dir.path());
         let (url, seen) = crate::providers::tests::serve(|_, _| (500, json!({})));
@@ -981,7 +981,7 @@ mod tests {
     /// toward it.
     #[test]
     fn a_building_space_stops_when_reported_spend_reaches_the_cap() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         // More than two background steps of documents.
         host_with(dir.path(), 2 * BATCH + 2);
         openrouter_profile(dir.path());
@@ -1071,7 +1071,7 @@ mod tests {
     /// emptied and rebuilt.
     #[test]
     fn a_stamp_mismatch_triggers_a_rebuild_and_nothing_else_does() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let host_path = host_with(dir.path(), 12);
         let host = HostCatalog::open(&host_path).unwrap();
         let (url, seen) = crate::providers::tests::serve(|_, body: &Value| {
@@ -1181,7 +1181,7 @@ mod tests {
             HistorySearchQuery,
             host_index::{HostIndex, MemoryScope},
         };
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let texts = [
             ("agt", "deploy failed on staging"),
             ("agt", "部署失敗 要 rollback"),
@@ -1314,7 +1314,7 @@ mod tests {
     #[test]
     fn the_socket_is_owner_only_and_a_live_service_is_never_taken_over() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let path = dir.path().join("memory-service.sock");
         let live = bind(&path).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;

@@ -271,7 +271,7 @@ mod tests {
 
     #[test]
     fn a_file_is_used_only_with_its_pinned_size_and_digest() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let path = dir.path().join("f");
         fs::write(&path, b"abc").unwrap();
         let sha = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";

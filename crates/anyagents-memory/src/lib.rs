@@ -28,3 +28,16 @@ pub mod providers;
 pub mod runtime;
 #[cfg(feature = "service")]
 pub mod service;
+
+/// A temporary directory under the physical temporary root. Raw reads refuse
+/// a path through a symbolic link, and macOS keeps its temporary directory
+/// behind one (`/var` is `/private/var`).
+#[cfg(test)]
+pub(crate) fn test_tempdir() -> tempfile::TempDir {
+    tempfile::tempdir_in(
+        std::env::temp_dir()
+            .canonicalize()
+            .expect("physical temporary root"),
+    )
+    .expect("owned temporary fixture")
+}

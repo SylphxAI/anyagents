@@ -359,7 +359,7 @@ mod tests {
 
     #[test]
     fn quantised_search_ranks_by_best_piece_within_authorized_owners() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let mut index = DenseIndex::open(&dir.path().join("dense.db"), "m", 3).unwrap();
         index
             .put(

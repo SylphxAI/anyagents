@@ -367,7 +367,7 @@ mod tests {
             host_index::{HostIndex, IndexMetadata, MemoryScope},
             raw_segment::retained_jsonl_records,
         };
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let file = dir.path().join("history.jsonl");
         let lines: String = (0..7)
             .map(|i| format!("{{\"content\":\"line {i}\"}}\n"))
