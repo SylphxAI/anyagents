@@ -80,7 +80,7 @@ The server answers, in order:
 | `host_tools` | names of the host tools Spiron accepted (D7) |
 | `replay` | `{after_seq, complete}`: `complete` is false when the journal no longer held every frame after `after_seq` |
 
-`ready` is journaled like any frame, so it marks where each connection began.
+`ready` is journaled like any frame, so it marks where each connection began. It carries the `request_id` of the `attach` it answers, which tells it apart from the `ready` frames of earlier connections in the replay.
 
 **Rationale.** Sending `ready` after the replay keeps `seq` increasing on the wire, and tells the client exactly when it is caught up. Putting the policy and window in `ready` gives a host what it needs before the first turn, instead of a per-turn report it has to collect.
 
@@ -136,6 +136,7 @@ Each output carries `seq`, `type`, `session_id`, `request_id`, and the host iden
 - A host declares tools at launch: `--host-tools <file>`, `{"tools": [{"name", "description", "input_schema"}]}`. A tool is accepted when its name matches `^[A-Za-z0-9_-]{1,64}$` and is no built-in or mounted tool's name; `ready.host_tools` lists the accepted names, and the model sees them for the life of the process.
 - When the model calls one, Spiron journals the `tool_call` event, then writes `host_tool_call {call_id, name, input}`, where `call_id` is the model's tool call id (`tool_call.data.callId`). It waits for `host_tool_result {call_id, output, is_error}`. The model sees `output` as the tool's result, or `{"error": output}` when `is_error` is true.
 - The first result for a call is used. A result for a call that is not pending is `rejected {code: "unknown_call"}`.
+- Like every frame, `input` is credential-masked.
 - A call waits across disconnects. A reattaching client finds unanswered calls in its replay: a `host_tool_call` with no later `tool_result` for its `call_id`. A host keeps the call ids it has run, so a replayed call is never run twice.
 - `cancel` and `stop` answer every pending call with an error (`cancelled`) so the turn can end.
 
@@ -159,9 +160,9 @@ Capability level, as 0010 D7 asks each adapter to declare: delivery `next-step`,
 
 ### D9. How AnyAgents uses v2 locally
 
-- **Launch.** The Spiron adapter launches `spiron --headless --json --listen <config dir>/spiron.sock` in its own session (`setsid`), stdin on `/dev/null` and output in `<config dir>/spiron.log`, connects, and sends `attach {after_seq: null}`. It speaks v2 only when `ready.protocol` says so. A binary that exits with a usage error is launched again over stdio with v1, in a keeper, as before.
-- **Launch record.** The adapter writes `<config dir>/spiron-attach.json` once per launch: the socket, the process's pid and start time, the session, and `after_seq`, which is the `seq` of the launch's first `ready` minus one.
-- **Reattach after a restart.** At startup the supervisor finds each running agent's record, proves the process is the recorded one (pid, start time, boot id), takes the agent's lock, connects and sends `attach {after_seq}` from the record. The replay rebuilds the adapter exactly as the last server had it: the open turn, every proof, and the served usage counted from the launch, so the usage note the supervisor keeps (0007 §4) is compared with the same totals. No keeper runs for Spiron.
+- **Launch.** The Spiron adapter launches `spiron --headless --json --listen <config dir>/spiron.sock` in its own process group (as every harness), stdin on `/dev/null` and output in `<config dir>/spiron.log`, connects, and sends `attach {after_seq: null}`. It speaks v2 only when the `ready` answering that `attach` says so. A binary that exits with a usage error naming `--listen` is launched again over stdio with v1, in a keeper, as before.
+- **Launch record.** The server writes `<data>/spiron/<agent>.json` once per launch: the socket, the process's identity (pid, start time, boot id, pid namespace), its seat, the session, and `after_seq`, which is the `seq` of the launch's first `ready` minus one. It lives in a directory only the server can write, because it names a process the server may signal.
+- **Reattach after a restart.** At startup the supervisor finds each running agent's record, proves the process is the recorded one, takes the agent's lock, connects and sends `attach {after_seq, request_id}` from the record; the adapter is ready when the `ready` carrying that `request_id` arrives, after the whole replay. The replay rebuilds the adapter exactly as the last server had it: the open turn, every proof, and the served usage counted from the launch, so the usage note the supervisor keeps (0007 §4) is compared with the same totals. No keeper runs for Spiron.
 - **The mailbox.** The cursor moves only on `accepted` or `steer_consumed`. A replayed proof for a message already past the cursor changes nothing; a message the server re-offers after a restart is answered from the replayed proofs, or written again and deduplicated by Spiron under its `request_id`.
 - **Kernel shutdown.** The adapter closes its connection and leaves the process running. `stop` (or a kill of the recorded process group, when it does not end within its grace) is sent only when the agent stops or its harness is replaced.
 - **The agent lock.** While a server runs, it holds the agent's lock. While none runs, the lock is free and the Spiron process runs unlocked; the next server takes the lock before it attaches. Every Spiron launch first ends the process a launch record still names, so an agent never has two.
