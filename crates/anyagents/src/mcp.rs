@@ -3757,6 +3757,7 @@ rl.on("line", async (line) => {
         memoryFn.recall = (queryOrObj = {}) => callTool("memory", typeof queryOrObj === "string" ? { action: "recall", query: queryOrObj } : { ...queryOrObj, action: "recall" });
         memoryFn.status = (opts = {}) => callTool("memory", { ...(typeof opts === "string" ? { agent: opts } : opts), action: "status" });
         memoryFn.reindex = (opts = {}) => callTool("memory", { ...opts, action: "reindex" });
+        memoryFn.consolidate = memoryFn.reindex;
         Object.freeze(memoryFn);
 
         const webFn = (req = {}) => callTool("web", typeof req === "string"
@@ -4401,7 +4402,9 @@ impl AgentMcp {
             }
             // Rebuild the `MEMORY.md` catalog from the topic files after an
             // out-of-band edit. Deterministic: no model reads or rewrites a topic.
-            "reindex" => {
+            // `consolidate` and `sleep` were the model-driven pass this replaced;
+            // instructions that still name them get the reindex.
+            "reindex" | "consolidate" | "sleep" => {
                 if let Some(ref root) = local_agent_root {
                     let index_md = anyagents_core::learned_memory::rebuild_memory_index(
                         root,
